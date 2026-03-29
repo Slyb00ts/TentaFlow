@@ -1,0 +1,13 @@
+[package]
+name = "tentaflow-desktop-linux"
+version = "0.1.0"
+edition = "2021"
+description = "TentaFlow Desktop — Linux wrapper"
+
+[[bin]]
+name = "tentaflow-desktop"
+path = "src/main.rs"
+
+[dependencies]
+tentaflow-desktop-core = { path = "../core" }
+anyhow = "1.0"

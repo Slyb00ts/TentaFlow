@@ -1,0 +1,380 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		275C52482F6EBF9300AF3541 /* MLXEmbedders in Frameworks */ = {isa = PBXBuildFile; productRef = 275C52472F6EBF9300AF3541 /* MLXEmbedders */; };
+		275C524A2F6EBF9300AF3541 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 275C52492F6EBF9300AF3541 /* MLXLLM */; };
+		275C524C2F6EBF9300AF3541 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524B2F6EBF9300AF3541 /* MLXLMCommon */; };
+		275C524E2F6EBF9300AF3541 /* MLXMNIST in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524D2F6EBF9300AF3541 /* MLXMNIST */; };
+		275C52502F6EBF9300AF3541 /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524F2F6EBF9300AF3541 /* MLXVLM */; };
+		275C52522F6EC6CE00AF3541 /* MLXSwiftEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */; };
+		A0000001 /* DeviceInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000002 /* DeviceInfo.swift */; };
+		A0000003 /* NativeDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000004 /* NativeDiscovery.swift */; };
+		A1000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* App.swift */; };
+		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* ContentView.swift */; };
+		A1000003 /* libsolutio_ai_mobile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000003 /* libsolutio_ai_mobile.a */; };
+		A1000004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000004 /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MLXSwiftEngine.swift; sourceTree = "<group>"; };
+		A0000002 /* DeviceInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceInfo.swift; sourceTree = "<group>"; };
+		A0000004 /* NativeDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeDiscovery.swift; sourceTree = "<group>"; };
+		A2000001 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A2000003 /* libsolutio_ai_mobile.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libsolutio_ai_mobile.a; sourceTree = "<group>"; };
+		A2000004 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A2000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A2000006 /* SolutioAI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SolutioAI-Bridging-Header.h"; sourceTree = "<group>"; };
+		A2000010 /* SolutioAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SolutioAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A3000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				275C524A2F6EBF9300AF3541 /* MLXLLM in Frameworks */,
+				275C524E2F6EBF9300AF3541 /* MLXMNIST in Frameworks */,
+				275C52502F6EBF9300AF3541 /* MLXVLM in Frameworks */,
+				275C52482F6EBF9300AF3541 /* MLXEmbedders in Frameworks */,
+				275C524C2F6EBF9300AF3541 /* MLXLMCommon in Frameworks */,
+				A1000003 /* libsolutio_ai_mobile.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A4000001 = {
+			isa = PBXGroup;
+			children = (
+				A4000002 /* SolutioAI */,
+				A4000003 /* Products */,
+				A4000004 /* Frameworks */,
+			);
+			sourceTree = "<group>";
+		};
+		A4000002 /* SolutioAI */ = {
+			isa = PBXGroup;
+			children = (
+				275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */,
+				A0000002 /* DeviceInfo.swift */,
+				A0000004 /* NativeDiscovery.swift */,
+				A2000001 /* App.swift */,
+				A2000002 /* ContentView.swift */,
+				A2000004 /* Assets.xcassets */,
+				A2000005 /* Info.plist */,
+				A2000006 /* SolutioAI-Bridging-Header.h */,
+			);
+			path = SolutioAI;
+			sourceTree = "<group>";
+		};
+		A4000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A2000010 /* SolutioAI.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A4000004 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				A2000003 /* libsolutio_ai_mobile.a */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A5000001 /* SolutioAI */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A7000001 /* Build configuration list for PBXNativeTarget "SolutioAI" */;
+			buildPhases = (
+				A8000001 /* Sources */,
+				A3000001 /* Frameworks */,
+				A9000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = SolutioAI;
+			productName = SolutioAI;
+			productReference = A2000010 /* SolutioAI.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A6000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1540;
+				LastUpgradeCheck = 1540;
+			};
+			buildConfigurationList = A7000002 /* Build configuration list for PBXProject "SolutioAI" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				pl,
+			);
+			mainGroup = A4000001;
+			packageReferences = (
+				275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */,
+			);
+			productRefGroup = A4000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A5000001 /* SolutioAI */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A9000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000004 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A8000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A0000001 /* DeviceInfo.swift in Sources */,
+				A0000003 /* NativeDiscovery.swift in Sources */,
+				A1000001 /* App.swift in Sources */,
+				275C52522F6EC6CE00AF3541 /* MLXSwiftEngine.swift in Sources */,
+				A1000002 /* ContentView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AB000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = KZXD4ZWQ85;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = SolutioAI/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)",
+					"$(PROJECT_DIR)/../target/aarch64-apple-ios/debug",
+					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
+					"$(TOOLCHAIN_DIR)/usr/lib/clang/17/lib/darwin",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"-lsolutio_ai_mobile",
+					"-lc++",
+					"-framework",
+					Metal,
+					"-framework",
+					MetalKit,
+					"-framework",
+					MetalPerformanceShaders,
+					"-framework",
+					Accelerate,
+					"-framework",
+					CoreML,
+					"-framework",
+					Security,
+					"-framework",
+					SystemConfiguration,
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin/libclang_rt.ios.a,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.solutio.mobile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_OBJC_BRIDGING_HEADER = "SolutioAI/SolutioAI-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		AB000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = KZXD4ZWQ85;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = SolutioAI/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)",
+					"$(PROJECT_DIR)/../target/aarch64-apple-ios/debug",
+					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
+					"$(TOOLCHAIN_DIR)/usr/lib/clang/17/lib/darwin",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"-lsolutio_ai_mobile",
+					"-lc++",
+					"-framework",
+					Metal,
+					"-framework",
+					MetalKit,
+					"-framework",
+					MetalPerformanceShaders,
+					"-framework",
+					Accelerate,
+					"-framework",
+					CoreML,
+					"-framework",
+					Security,
+					"-framework",
+					SystemConfiguration,
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin/libclang_rt.ios.a,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.solutio.mobile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_OBJC_BRIDGING_HEADER = "SolutioAI/SolutioAI-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		AC000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		AC000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A7000001 /* Build configuration list for PBXNativeTarget "SolutioAI" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB000001 /* Debug */,
+				AB000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A7000002 /* Build configuration list for PBXProject "SolutioAI" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AC000001 /* Debug */,
+				AC000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift-examples.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.29.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		275C52472F6EBF9300AF3541 /* MLXEmbedders */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXEmbedders;
+		};
+		275C52492F6EBF9300AF3541 /* MLXLLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXLLM;
+		};
+		275C524B2F6EBF9300AF3541 /* MLXLMCommon */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXLMCommon;
+		};
+		275C524D2F6EBF9300AF3541 /* MLXMNIST */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXMNIST;
+		};
+		275C524F2F6EBF9300AF3541 /* MLXVLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXVLM;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A6000001 /* Project object */;
+}

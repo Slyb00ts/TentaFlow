@@ -1,0 +1,37 @@
+[package]
+name = "tentaflow-desktop-core"
+version = "0.1.0"
+edition = "2021"
+description = "TentaFlow Desktop — natywna aplikacja z tray icon i GUI"
+
+[lib]
+name = "tentaflow_desktop_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tentaflow-desktop"
+path = "src/main.rs"
+
+[dependencies]
+tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "dashboard-api"] }
+tentaflow-ui = { path = "../../tentaflow-ui" }
+tentaflow-protocol = { path = "../../tentaflow-protocol" }
+
+tokio = { version = "1.35", features = ["full"] }
+eframe = { version = "0.30", features = ["wgpu"] }
+egui = "0.30"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+tray-icon = "0.19"
+dirs = "5"
+open = "5"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ctrlc = "3.4"
+uuid = { version = "1.0", features = ["v4"] }
+hostname = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "inference-mlx", "dashboard-api"] }
