@@ -1,0 +1,18 @@
+[package]
+name = "tentaflow-addon-template"
+version = "0.1.0"
+edition = "2021"
+description = "Przykladowy addon dla TentaFlow — szablon do tworzenia wlasnych addonow"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-addon-sdk = { path = "../sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

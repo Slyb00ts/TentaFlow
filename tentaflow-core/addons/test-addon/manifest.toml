@@ -1,0 +1,59 @@
+[addon]
+id = "test-addon"
+name = "Test Addon"
+version = "1.0.0"
+description = "Addon do testow integracyjnych — weryfikuje host functions, uprawnienia, limity"
+author = "TentaFlow Tests"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+[permissions]
+required = ["storage", "log"]
+optional = ["http", "llm", "secrets"]
+
+[[addon_permissions]]
+id = "test_read"
+name = "Odczyt testowy"
+description = "Testowe uprawnienie odczytu"
+category = "Test"
+
+[[addon_permissions]]
+id = "test_write"
+name = "Zapis testowy"
+description = "Testowe uprawnienie zapisu"
+category = "Test"
+
+[config]
+[config.schema]
+test_value = { type = "string", label = "Wartosc testowa", default = "hello" }
+
+[tools]
+[tools.echo]
+description = "Zwraca przekazany tekst"
+[tools.echo.parameters]
+type = "object"
+required = ["text"]
+[tools.echo.parameters.properties.text]
+type = "string"
+
+[tools.test_storage]
+description = "Testuje zapis i odczyt storage"
+[tools.test_storage.parameters]
+type = "object"
+required = ["key", "value"]
+
+[tools.test_permissions]
+description = "Testuje sprawdzanie uprawnien"
+[tools.test_permissions.parameters]
+type = "object"
+required = ["permission"]
+
+[tools.test_log]
+description = "Testuje logowanie"
+[tools.test_log.parameters]
+type = "object"
+
+[tools.test_crash]
+description = "Testuje fuel metering — infinite loop"
+[tools.test_crash.parameters]
+type = "object"

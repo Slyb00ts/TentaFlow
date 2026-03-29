@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>TentaFlow</string>
+    <key>CFBundleDisplayName</key>
+    <string>TentaFlow Desktop</string>
+    <key>CFBundleIdentifier</key>
+    <string>ai.tentaflow.desktop</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>tentaflow-desktop</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSHighRetentaflownCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>TentaFlow requires local network access for mesh networking and peer discovery.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_tentaflow._tcp</string>
+        <string>_tentaflow._udp</string>
+    </array>
+</dict>
+</plist>

@@ -1,0 +1,613 @@
+/* =============================================================================
+   Plik: flows.css
+   Opis: Style modulu Flow Builder - edytor wizualny DAG, paleta, canvas, panel
+         konfiguracji, lista flow.
+   ============================================================================= */
+
+/* --- Layout glowny --- */
+.flow-builder {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 120px);
+}
+
+.flow-builder-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.flow-name-input {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-text-primary);
+  font-size: 16px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 4px;
+  min-width: 180px;
+}
+
+.flow-name-input:hover {
+  border-color: var(--color-border);
+}
+
+.flow-name-input:focus {
+  border-color: var(--color-accent);
+  outline: none;
+}
+
+.flow-toolbar-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.flow-toolbar-actions select {
+  width: auto;
+  min-width: 120px;
+  padding: 4px 28px 4px 8px;
+  font-size: var(--font-size-sm);
+}
+
+.flow-toolbar-actions label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.flow-toolbar-separator {
+  width: 1px;
+  height: 24px;
+  background: var(--color-border);
+}
+
+.flow-builder-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* --- Paleta klocków --- */
+.flow-palette {
+  width: 220px;
+  background: var(--color-bg-secondary);
+  border-right: 1px solid var(--color-border);
+  overflow-y: auto;
+  padding: 12px;
+  flex-shrink: 0;
+  contain: layout style;
+}
+
+.palette-search {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 12px;
+  background: var(--color-bg-input);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+  outline: none;
+}
+
+.palette-search:focus {
+  border-color: var(--color-accent);
+}
+
+.palette-search::placeholder {
+  color: var(--color-text-muted);
+}
+
+.palette-category {
+  margin-bottom: 16px;
+}
+
+.palette-category-header {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+  padding: 0 4px;
+}
+
+.palette-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: grab;
+  font-size: 13px;
+  color: var(--color-text-primary);
+  transition: background 0.15s;
+  user-select: none;
+}
+
+.palette-node:hover {
+  background: var(--color-bg-hover);
+}
+
+.palette-node:active {
+  cursor: grabbing;
+}
+
+.palette-node.hidden {
+  display: none;
+}
+
+.palette-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.palette-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- Canvas SVG --- */
+.flow-canvas-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--color-bg-primary);
+  contain: layout style paint;
+}
+
+.flow-canvas-container svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Siatka tla */
+.flow-grid-line {
+  stroke: var(--color-border);
+  stroke-width: 0.5;
+}
+
+.flow-grid-line-major {
+  stroke: var(--color-border);
+  stroke-width: 1;
+  opacity: 0.6;
+}
+
+/* Wezly SVG */
+.flow-node {
+  cursor: move;
+  will-change: transform;
+}
+
+.flow-node rect.node-bg {
+  rx: 8;
+  ry: 8;
+  stroke-width: 1.5;
+  transition: opacity 0.15s;
+}
+
+.flow-node:hover rect.node-bg {
+  opacity: 0.85;
+}
+
+.flow-node.selected rect.node-bg {
+  stroke: var(--color-accent);
+  stroke-width: 2.5;
+}
+
+.flow-node text.node-label {
+  font-family: var(--font-family);
+  font-size: 13px;
+  font-weight: 600;
+  fill: #fff;
+  pointer-events: none;
+}
+
+.flow-node text.node-type {
+  font-family: var(--font-family);
+  font-size: 10px;
+  fill: rgba(255, 255, 255, 0.65);
+  pointer-events: none;
+}
+
+/* Porty */
+.flow-port {
+  cursor: crosshair;
+  transition: r 0.15s, fill 0.15s;
+}
+
+.flow-port:hover {
+  r: 8;
+}
+
+.flow-port-input {
+  fill: var(--color-bg-primary);
+  stroke: var(--color-text-muted);
+  stroke-width: 1.5;
+}
+
+.flow-port-output {
+  fill: var(--color-accent);
+  stroke: none;
+}
+
+.flow-port-drop-target {
+  fill: var(--color-accent);
+  stroke: var(--color-accent);
+  r: 9;
+}
+
+/* Krawedzie SVG */
+.flow-edge {
+  fill: none;
+  stroke: var(--color-text-muted);
+  stroke-width: 2;
+  cursor: pointer;
+  transition: stroke 0.15s;
+}
+
+.flow-edge:hover {
+  stroke: var(--color-accent);
+}
+
+.flow-edge.selected {
+  stroke: var(--color-accent);
+  stroke-width: 2.5;
+}
+
+.flow-edge.conditional {
+  stroke-dasharray: 6 3;
+}
+
+/* Linia polaczeniowa podczas laczenia */
+.flow-connecting-line {
+  fill: none;
+  stroke: var(--color-accent);
+  stroke-width: 2;
+  stroke-dasharray: 4 4;
+  pointer-events: none;
+}
+
+/* Etykieta portu na krawedzi */
+.flow-edge-label {
+  font-family: var(--font-family);
+  font-size: 10px;
+  fill: var(--color-text-muted);
+  pointer-events: none;
+}
+
+/* Przycisk usun na krawedzi */
+.flow-edge-delete {
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.flow-edge-group:hover .flow-edge-delete {
+  opacity: 1;
+}
+
+/* --- Panel konfiguracji --- */
+.flow-config-panel {
+  width: 320px;
+  background: var(--color-bg-secondary);
+  border-left: 1px solid var(--color-border);
+  overflow-y: auto;
+  padding: 16px;
+  flex-shrink: 0;
+  contain: layout style;
+}
+
+.flow-config-panel[hidden] {
+  display: none;
+}
+
+.flow-config-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.flow-config-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.flow-config-close {
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.flow-config-close:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.flow-config-section {
+  margin-bottom: 16px;
+}
+
+.flow-config-section-header {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.flow-config-section .form-group {
+  margin-bottom: 12px;
+}
+
+.flow-config-section .form-group label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.flow-config-section input[type="text"],
+.flow-config-section input[type="number"],
+.flow-config-section select,
+.flow-config-section textarea {
+  width: 100%;
+  padding: 6px 10px;
+  font-size: var(--font-size-sm);
+}
+
+.flow-config-section textarea {
+  min-height: 80px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+}
+
+.flow-config-section input[type="range"] {
+  width: 100%;
+  accent-color: var(--color-accent);
+}
+
+.flow-config-range-value {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  text-align: right;
+  margin-top: 2px;
+}
+
+/* Lista case'ow (Switch node) */
+.flow-config-case-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.flow-config-case-item {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.flow-config-case-item input {
+  flex: 1;
+}
+
+.flow-config-case-remove {
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 4px;
+  font-size: 14px;
+  border-radius: 4px;
+}
+
+.flow-config-case-remove:hover {
+  background: var(--color-error-light);
+  color: var(--color-error);
+}
+
+/* --- Lista flow --- */
+.flow-list-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.flow-status-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.flow-status-draft {
+  background: rgba(234, 179, 8, 0.15);
+  color: #eab308;
+}
+
+.flow-status-active {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22c55e;
+}
+
+.flow-status-archived {
+  background: rgba(148, 163, 184, 0.15);
+  color: #94a3b8;
+}
+
+.flow-default-badge {
+  background: rgba(59, 130, 246, 0.15);
+  color: #3b82f6;
+  padding: 2px 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-left: 4px;
+}
+
+.flow-row-clickable {
+  cursor: pointer;
+}
+
+.flow-row-clickable:hover {
+  background: var(--color-bg-hover);
+}
+
+/* --- Sekcja powiazan model -> flow --- */
+.flow-bindings-section {
+  margin-top: var(--spacing-lg);
+}
+
+.flow-bindings-section .card-header h3 {
+  font-size: var(--font-size-md);
+}
+
+/* --- Miniatura siatki na liscie (opcjonalnie) --- */
+.flow-mini-preview {
+  width: 60px;
+  height: 36px;
+  background: var(--color-bg-tertiary);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+/* --- Drop zone na canvas --- */
+.flow-canvas-container.drag-over {
+  outline: 2px dashed var(--color-accent);
+  outline-offset: -2px;
+}
+
+/* --- Undo/Redo toolbar --- */
+.flow-toolbar-undo-redo {
+  display: flex;
+  gap: 2px;
+}
+
+.flow-toolbar-undo-redo button {
+  padding: 4px 8px;
+  font-size: 16px;
+}
+
+/* --- Auto-layout przycisk --- */
+.flow-toolbar-layout-btn {
+  font-size: var(--font-size-sm);
+}
+
+/* Opis typu wezla w panelu konfiguracji */
+.flow-config-description {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  margin-bottom: 12px;
+  line-height: 1.4;
+}
+
+/* Etykiety portow na wezlach SVG */
+.flow-port-label {
+  font-family: var(--font-family);
+  font-size: 9px;
+  fill: rgba(255, 255, 255, 0.8);
+  pointer-events: none;
+  user-select: none;
+}
+
+/* --- Animacja drop --- */
+@keyframes flow-node-drop {
+  from {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.flow-node-new {
+  animation: flow-node-drop 0.2s ease-out;
+}
+
+/* I/O schema w panelu konfiguracji */
+.flow-io-group {
+  margin-bottom: 8px;
+}
+.flow-io-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--color-accent);
+  margin-bottom: 4px;
+}
+.flow-io-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.flow-io-badge {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.flow-io-text { background: rgba(59,130,246,0.2); color: #3b82f6; }
+.flow-io-json { background: rgba(168,85,247,0.2); color: #a855f7; }
+.flow-io-bool { background: rgba(34,197,94,0.2); color: #22c55e; }
+.flow-io-number { background: rgba(234,179,8,0.2); color: #eab308; }
+.flow-io-binary { background: rgba(239,68,68,0.2); color: #ef4444; }
+.flow-io-pass { background: rgba(107,114,128,0.2); color: #6b7280; }
+.flow-io-any { background: rgba(107,114,128,0.2); color: #9ca3af; }
+.flow-io-name {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.flow-io-desc {
+  width: 100%;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  padding-left: 4px;
+}
+
+/* I/O summary na nodach SVG */
+.flow-node text.node-io-summary {
+  font-family: var(--font-family);
+  font-size: 8px;
+  fill: rgba(255, 255, 255, 0.45);
+  pointer-events: none;
+}
+
+/* Shared state info w panelu I/O */
+.flow-io-shared {
+  margin-top: 6px;
+  padding: 4px 8px;
+  font-size: 10px;
+  font-style: italic;
+  color: var(--color-text-muted);
+  background: rgba(107,114,128,0.1);
+  border-radius: 3px;
+  border-left: 2px solid var(--color-text-muted);
+}
