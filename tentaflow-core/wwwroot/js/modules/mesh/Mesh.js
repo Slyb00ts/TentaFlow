@@ -245,6 +245,9 @@ const Mesh = (() => {
     }
 
     const localClass = type === 'local' ? ' mesh-node-local' : '';
+    const pairBtn = (type !== 'local' && type !== 'trusted')
+      ? `<button class="btn btn-sm btn-primary" data-node-pair="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.pair')}</button>`
+      : '';
 
     return `
       <div class="mesh-node-card${localClass}" data-node-detail="${Utils.escapeAttr(nodeId)}">
@@ -255,6 +258,7 @@ const Mesh = (() => {
         </div>
         ${gauges.length > 0 ? `<div class="mesh-node-gauges">${gauges.join('')}</div>` : ''}
         ${footerParts.length > 0 ? `<div class="mesh-node-footer">${footerParts.join('')}</div>` : ''}
+        ${pairBtn}
       </div>
     `;
   }
