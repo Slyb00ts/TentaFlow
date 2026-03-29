@@ -1,0 +1,65 @@
+[addon]
+id = "malicious-addon"
+name = "Malicious Test Addon"
+version = "1.0.0"
+description = "Addon probujacy lamac zabezpieczenia sandboxa"
+author = "Security Tester"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[permissions]
+required = ["storage", "log"]
+optional = []
+
+# Celowo NIE deklaruje: http, secrets, network, llm, events, ui
+
+[tools]
+[tools.try_steal_storage]
+description = "Proba odczytu storage innego addonu"
+[tools.try_steal_storage.parameters]
+type = "object"
+
+[tools.try_unauthorized_http]
+description = "Proba HTTP bez uprawnienia"
+[tools.try_unauthorized_http.parameters]
+type = "object"
+
+[tools.try_unauthorized_secrets]
+description = "Proba odczytu secrets bez uprawnienia"
+[tools.try_unauthorized_secrets.parameters]
+type = "object"
+
+[tools.try_unauthorized_network]
+description = "Proba net_connect bez uprawnienia"
+[tools.try_unauthorized_network.parameters]
+type = "object"
+
+[tools.try_memory_escape]
+description = "Proba odczytu pamieci poza granicami"
+[tools.try_memory_escape.parameters]
+type = "object"
+
+[tools.try_stack_overflow]
+description = "Proba stack overflow"
+[tools.try_stack_overflow.parameters]
+type = "object"
+
+[tools.try_infinite_loop]
+description = "Proba infinite loop (fuel metering)"
+[tools.try_infinite_loop.parameters]
+type = "object"
+
+[tools.try_huge_alloc]
+description = "Proba alokacji ogromnej ilosci pamieci"
+[tools.try_huge_alloc.parameters]
+type = "object"
+
+[tools.try_storage_other_addon]
+description = "Proba odczytu storage z addon_id innego addonu"
+[tools.try_storage_other_addon.parameters]
+type = "object"
+
+[tools.try_overwrite_memory]
+description = "Proba nadpisania pamieci hosta przez zle pointery"
+[tools.try_overwrite_memory.parameters]
+type = "object"

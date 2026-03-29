@@ -1,0 +1,36 @@
+[package]
+name = "tentaflow"
+version = "0.1.0"
+edition = "2021"
+description = "TentaFlow — API Gateway i mesh node"
+
+[dependencies]
+tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "metrics-prometheus"] }
+tentaflow-protocol = { path = "../tentaflow-protocol" }
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rkyv = { version = "0.8.12", features = ["unaligned"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http-body = "1"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+
+# MLX inference — tylko na macOS (mlx-rs wymaga Metal)
+[target.'cfg(target_os = "macos")'.dependencies]
+tentaflow-core = { path = "../tentaflow-core", features = ["inference-mlx"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

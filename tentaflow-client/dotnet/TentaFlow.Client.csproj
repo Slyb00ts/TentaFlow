@@ -1,0 +1,141 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <PackageId>TentaFlow.Client</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Piotr Jarocki</Authors>
+    <Company>Euvic TentaFlowns S.A.</Company>
+    <Description>High-performance .NET client for TentaFlow Router using QUIC protocol</Description>
+    <PackageTags>AI;LLM;Embeddings;RAG;QUIC;TTS;STT</PackageTags>
+
+    <!-- Native library paths -->
+    <NativeSourceDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../native'))</NativeSourceDir>
+    <NativeTargetDir>$(NativeSourceDir)/target/release</NativeTargetDir>
+  </PropertyGroup>
+
+  <!-- ========================================================================= -->
+  <!-- AUTOMATIC RUST BUILD                                                      -->
+  <!-- Builds the native Rust library before .NET build                          -->
+  <!-- ========================================================================= -->
+
+  <Target Name="BuildNativeLibrary" BeforeTargets="Build" Condition="'$(SkipNativeBuild)' != 'true'">
+    <Message Importance="High" Text="Building native Rust library..." />
+
+    <!-- Check if cargo is available -->
+    <Exec Command="cargo --version" IgnoreExitCode="true" ConsoleToMSBuild="true">
+      <Output TaskParameter="ExitCode" PropertyName="CargoExitCode" />
+    </Exec>
+
+    <Error Condition="'$(CargoExitCode)' != '0'"
+           Text="Rust/Cargo is not installed. Please install from https://rustup.rs/" />
+
+    <!-- Build Rust library in release mode -->
+    <Exec Command="cargo build --release" WorkingDirectory="$(NativeSourceDir)" />
+
+    <Message Importance="High" Text="Native library built successfully" />
+  </Target>
+
+  <!-- ========================================================================= -->
+  <!-- COPY NATIVE LIBRARY TO OUTPUT                                             -->
+  <!-- Copies the correct native library based on current OS                     -->
+  <!-- ========================================================================= -->
+
+  <Target Name="CopyNativeLibrary" AfterTargets="BuildNativeLibrary" BeforeTargets="Build">
+    <!-- Determine library filename based on OS -->
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+      <NativeLibName>libtentaflow_client_native.so</NativeLibName>
+      <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+    </PropertyGroup>
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+      <NativeLibName>tentaflow_client_native.dll</NativeLibName>
+      <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    </PropertyGroup>
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+      <NativeLibName>libtentaflow_client_native.dylib</NativeLibName>
+      <!-- Detect ARM vs x64 on macOS -->
+      <RuntimeIdentifier Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' == 'Arm64'">osx-arm64</RuntimeIdentifier>
+      <RuntimeIdentifier Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)' != 'Arm64'">osx-x64</RuntimeIdentifier>
+    </PropertyGroup>
+
+    <PropertyGroup>
+      <NativeLibSource>$(NativeTargetDir)/$(NativeLibName)</NativeLibSource>
+      <NativeLibRuntimesDir>$(MSBuildProjectDirectory)/runtimes/$(RuntimeIdentifier)/native</NativeLibRuntimesDir>
+    </PropertyGroup>
+
+    <!-- Create runtimes directory if not exists -->
+    <MakeDir Directories="$(NativeLibRuntimesDir)" />
+
+    <!-- Copy to runtimes folder (for NuGet packaging) -->
+    <Copy SourceFiles="$(NativeLibSource)"
+          DestinationFolder="$(NativeLibRuntimesDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(NativeLibSource)')" />
+
+    <Message Importance="High" Text="Copied $(NativeLibName) to $(RuntimeIdentifier)" />
+  </Target>
+
+  <!-- Copy native lib directly to output for projects referencing this library -->
+  <Target Name="CopyNativeToOutput" AfterTargets="Build">
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+      <NativeLibNameLocal>libtentaflow_client_native.so</NativeLibNameLocal>
+    </PropertyGroup>
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+      <NativeLibNameLocal>tentaflow_client_native.dll</NativeLibNameLocal>
+    </PropertyGroup>
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+      <NativeLibNameLocal>libtentaflow_client_native.dylib</NativeLibNameLocal>
+    </PropertyGroup>
+
+    <Copy SourceFiles="$(NativeTargetDir)/$(NativeLibNameLocal)"
+          DestinationFolder="$(OutputPath)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(NativeTargetDir)/$(NativeLibNameLocal)')" />
+  </Target>
+
+  <!-- ========================================================================= -->
+  <!-- NATIVE LIBRARY CONTENT                                                    -->
+  <!-- Include native libraries in package and copy to referencing projects     -->
+  <!-- ========================================================================= -->
+
+  <ItemGroup>
+    <!-- Native library loading from runtimes folder (for NuGet package) -->
+    <Content Include="runtimes/**/*.*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <PackagePath>runtimes/</PackagePath>
+    </Content>
+  </ItemGroup>
+
+  <!-- Copy native lib to output of referencing projects -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+    <None Include="$(NativeTargetDir)/libtentaflow_client_native.so"
+          Condition="Exists('$(NativeTargetDir)/libtentaflow_client_native.so')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libtentaflow_client_native.so</Link>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <None Include="$(NativeTargetDir)/tentaflow_client_native.dll"
+          Condition="Exists('$(NativeTargetDir)/tentaflow_client_native.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>tentaflow_client_native.dll</Link>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <None Include="$(NativeTargetDir)/libtentaflow_client_native.dylib"
+          Condition="Exists('$(NativeTargetDir)/libtentaflow_client_native.dylib')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libtentaflow_client_native.dylib</Link>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,23 @@
+{
+    "blocks": [
+        {
+            "type": "template.hello",
+            "category": "utility",
+            "label": "Powitanie",
+            "description": "Zwraca przykladowe powitanie z Template Addon",
+            "icon": "hand-wave",
+            "config_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "title": "Imie",
+                        "description": "Imie osoby do powitania (opcjonalne)"
+                    }
+                }
+            },
+            "input_ports": ["trigger"],
+            "output_ports": ["message"]
+        }
+    ]
+}

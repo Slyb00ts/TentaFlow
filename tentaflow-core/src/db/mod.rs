@@ -1,0 +1,52 @@
+// =============================================================================
+// Plik: db/mod.rs
+// Opis: Modul bazy danych SQLite - inicjalizacja, pool, migracje.
+// =============================================================================
+
+pub mod migrations;
+pub mod models;
+pub mod repository;
+pub mod seed;
+
+use anyhow::Result;
+use rusqlite::Connection;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use tracing::info;
+
+/// Pool polaczen SQLite (single-writer, multi-reader)
+pub type DbPool = Arc<Mutex<Connection>>;
+
+/// Inicjalizuje baze danych SQLite.
+/// Tworzy plik jesli nie istnieje, uruchamia migracje i seed.
+pub fn init(db_path: &Path) -> Result<DbPool> {
+    info!("Inicjalizacja bazy danych: {:?}", db_path);
+
+    let conn = Connection::open(db_path)?;
+
+    // Pragmy wydajnosciowe SQLite
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA foreign_keys=ON;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA cache_size=-8000;\
+         PRAGMA mmap_size=268435456;\
+         PRAGMA temp_store=MEMORY;",
+    )?;
+
+    // Uruchom migracje
+    migrations::run(&conn)?;
+
+    // Seed domyslnych danych
+    seed::seed_defaults(&conn)?;
+
+    // Migracja: zaktualizuj connection_type na 'quic' dla serwisow zarejestrowanych przez mesh
+    conn.execute_batch(
+        "UPDATE model_registry SET connection_type = 'quic' WHERE service_id IS NOT NULL AND connection_type IN ('openai_api', 'http_api');"
+    )?;
+
+    let pool = Arc::new(Mutex::new(conn));
+    info!("Baza danych zainicjalizowana pomyslnie");
+
+    Ok(pool)
+}

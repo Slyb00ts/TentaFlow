@@ -1,0 +1,91 @@
+[addon]
+id = "embeddings-chunker"
+name = "Embeddings Chunker"
+version = "0.1.0"
+description = "Intelligent text chunking and embedding generation with Jina v5"
+category = "ai"
+keywords = ["embedding", "embeddings", "chunking", "chunk", "vector", "text", "Jina", "LoRA", "semantic"]
+author = "TentaFlow"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+[permissions]
+required = ["storage", "log", "events"]
+optional = ["llm"]
+
+[permissions.llm]
+models = ["*"]
+
+[[addon_permissions]]
+id = "embed_read"
+name = "Generowanie embeddingów"
+description = "Pozwala na generowanie wektorów embeddingów z tekstu"
+category = "Embeddings"
+
+[[addon_permissions]]
+id = "embed_batch"
+name = "Batch embeddingów"
+description = "Pozwala na przetwarzanie wielu dokumentów jednocześnie"
+category = "Embeddings"
+
+[lifecycle]
+background = false
+auto_start = true
+
+[config]
+[config.schema]
+embedding_model = { type = "string", label = "Model embeddingów (nazwa lub alias)", default = "jina-embeddings-v5-text-small" }
+chunk_size = { type = "number", label = "Rozmiar chunka (tokeny)", default = 512 }
+chunk_overlap = { type = "number", label = "Overlap między chunkami (tokeny)", default = 50 }
+embedding_dimensions = { type = "number", label = "Wymiary wektora (1024/512/256/128/64/32)", default = 1024 }
+task_adapter = { type = "string", label = "Adapter LoRA (retrieval/text-matching/clustering/classification)", default = "retrieval" }
+batch_size = { type = "number", label = "Ile chunków na raz", default = 32 }
+
+[tools]
+[tools.embed_text]
+description = "Generate embedding for text. Automatically adds Document: or Query: prefix based on mode."
+keywords = ["embedding", "vector", "text", "generate", "encode", "represent"]
+[tools.embed_text.parameters]
+type = "object"
+required = ["text"]
+[tools.embed_text.parameters.properties.text]
+type = "string"
+description = "Text to generate embedding for"
+[tools.embed_text.parameters.properties.mode]
+type = "string"
+description = "Mode: 'query' (prefix Query:) or 'document' (prefix Document:). Default: 'document'."
+[tools.embed_text.parameters.properties.task]
+type = "string"
+description = "LoRA adapter: retrieval, text-matching, clustering, classification. Default from settings."
+
+[tools.embed_chunks]
+description = "Split text into chunks and generate embeddings for each. Returns array of {chunk_text, vector, chunk_index}."
+keywords = ["chunk", "chunking", "split", "embedding", "vector", "segment"]
+[tools.embed_chunks.parameters]
+type = "object"
+required = ["text"]
+[tools.embed_chunks.parameters.properties.text]
+type = "string"
+description = "Text to split into chunks and generate embeddings for"
+[tools.embed_chunks.parameters.properties.mode]
+type = "string"
+description = "Mode: 'query' or 'document'. Default: 'document'."
+[tools.embed_chunks.parameters.properties.chunk_size]
+type = "number"
+description = "Override chunk size (optional)"
+[tools.embed_chunks.parameters.properties.chunk_overlap]
+type = "number"
+description = "Override overlap (optional)"
+
+[tools.embed_batch]
+description = "Generate embeddings for an array of texts (no chunking). Each text = one vector."
+keywords = ["batch", "many", "embedding", "embeddings", "vector", "bulk"]
+[tools.embed_batch.parameters]
+type = "object"
+required = ["texts"]
+[tools.embed_batch.parameters.properties.texts]
+type = "array"
+description = "Array of texts to generate embeddings for"
+[tools.embed_batch.parameters.properties.mode]
+type = "string"
+description = "Mode: 'query' or 'document'. Default: 'document'."

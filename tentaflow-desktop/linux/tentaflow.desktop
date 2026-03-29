@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=TentaFlow
+Comment=Local AI with mesh networking
+Exec=tentaflow-desktop
+Icon=tentaflow
+Terminal=false
+Type=Application
+Categories=Utility;Science;
+StartupNotify=true
+Keywords=AI;LLM;chat;

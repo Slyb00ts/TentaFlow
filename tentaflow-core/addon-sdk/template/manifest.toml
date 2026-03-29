@@ -1,0 +1,97 @@
+[addon]
+id = "template"
+name = "Template Addon"
+version = "0.1.0"
+description = "Demo addon — shows how to create addons for TentaFlow"
+author = "TentaFlow"
+license = "MIT"
+min_core_version = "0.1.0"
+category = "demo"
+keywords = ["template", "demo", "test", "example", "greeting"]
+
+[platforms]
+targets = ["linux_x86_64", "linux_aarch64", "macos_x86_64", "macos_aarch64", "windows_x86_64", "android", "ios"]
+
+[permissions]
+# Wymagane uprawnienia — bez nich addon nie zadziala
+
+[[permissions.required]]
+type = "storage"
+access = "rw"
+reason = "Przechowywanie stanu addonu"
+
+[[permissions.required]]
+type = "log"
+access = "ro"
+reason = "Logowanie diagnostyczne"
+
+# Opcjonalne uprawnienia — admin moze przyznac lub odmowic
+
+[[permissions.optional]]
+type = "llm"
+resource = "*"
+access = "ro"
+reason = "Generowanie tekstu przez LLM (opcjonalne)"
+
+[[permissions.optional]]
+type = "http"
+resource = "*"
+access = "rw"
+reason = "Wykonywanie requestow HTTP (opcjonalne)"
+
+[[permissions.optional]]
+type = "ui"
+access = "rw"
+reason = "Renderowanie panelu konfiguracji"
+
+[[permissions.optional]]
+type = "notifications"
+access = "rw"
+reason = "Wyswietlanie powiadomien uzytkownikowi"
+
+[resources]
+max_instances = 5
+cpu_millicores = 100
+ram_mb = 64
+storage_mb = 10
+rate_limit_rps = 10
+
+[config_schema]
+type = "object"
+properties.greeting = { type = "string", title = "Powitanie", description = "Tekst powitania (domyslnie 'Czesc')", default = "Czesc" }
+properties.language = { type = "string", title = "Jezyk", enum = ["pl", "en"], default = "pl" }
+
+[tools]
+# Narzedzia zdefiniowane w manifescie (alternatywnie rejestrowane w on_start)
+[[tools.list]]
+name = "hello"
+description = "Returns a greeting message"
+keywords = ["hello", "greeting", "demo", "test", "welcome"]
+parameters = '{"type":"object","properties":{"name":{"type":"string","description":"Name of the person to greet"}}}'
+
+# Reguly sieciowe — deklaracja polaczen wymaganych przez addon
+# Admin musi zatwierdzic kazda regule przed uzyciem
+# [[network_rules]]
+# id = "my_database"
+# protocol = "tcp"
+# host = "db-server.local"
+# port = 5432
+# description = "Baza PostgreSQL"
+# required = true
+#
+# [[network_rules]]
+# id = "cache_server"
+# protocol = "tcp"
+# host = "redis.local"
+# port = 6379
+# description = "Serwer cache Redis"
+# required = false
+
+[lifecycle]
+install_timeout_ms = 10000
+start_timeout_ms = 5000
+stop_timeout_ms = 3000
+
+[ui]
+has_settings_panel = true
+has_dashboard_widget = false
