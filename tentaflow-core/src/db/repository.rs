@@ -3007,3 +3007,48 @@ pub fn create_default_addon_resource_limits(pool: &DbPool, addon_id: &str) -> Re
     )?;
     Ok(())
 }
+
+// =============================================================================
+// Revoked nodes — cofniete zaufanie z persistencja
+// =============================================================================
+
+/// Dodaje node do listy revoked
+pub fn add_revoked_node(pool: &DbPool, node_id: &str, revoked_by: Option<&str>) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO revoked_nodes (node_id, revoked_by) VALUES (?1, ?2)",
+        rusqlite::params![node_id, revoked_by],
+    )?;
+    Ok(())
+}
+
+/// Sprawdza czy node jest revoked
+pub fn is_node_revoked(pool: &DbPool, node_id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM revoked_nodes WHERE node_id = ?1",
+        rusqlite::params![node_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Usuwa node z listy revoked (admin re-trust)
+pub fn remove_revoked_node(pool: &DbPool, node_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM revoked_nodes WHERE node_id = ?1",
+        rusqlite::params![node_id],
+    )?;
+    Ok(())
+}
+
+/// Lista wszystkich revoked nodow
+pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<String>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare("SELECT node_id FROM revoked_nodes ORDER BY revoked_at DESC")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}

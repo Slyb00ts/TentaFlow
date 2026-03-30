@@ -1544,7 +1544,19 @@ async fn route_mesh_api(
         if let Some(ref sec) = mesh_security {
             let node_id = &path["/api/mesh/trust/".len()..].trim_matches('/');
             if !node_id.is_empty() {
-                return handle_result(api_mesh::handle_revoke_trust(sec, node_id), 500);
+                return handle_result(api_mesh::handle_revoke_trust(sec, node_id, quic_mesh, local_node_id), 500);
+            }
+        }
+        return (503, serde_json::json!({"error": "MeshSecurity niedostepny"}).to_string());
+    }
+
+    // POST /api/mesh/retrust/:node_id — przywroc zaufanie (admin)
+    if path.starts_with("/api/mesh/retrust/") && *method == Method::POST {
+        if let Some(err) = require_admin(claims, db) { return err; }
+        if let Some(ref sec) = mesh_security {
+            let node_id = &path["/api/mesh/retrust/".len()..].trim_matches('/');
+            if !node_id.is_empty() {
+                return handle_result(api_mesh::handle_retrust(sec, node_id), 500);
             }
         }
         return (503, serde_json::json!({"error": "MeshSecurity niedostepny"}).to_string());

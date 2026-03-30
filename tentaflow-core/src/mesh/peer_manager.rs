@@ -698,7 +698,12 @@ impl PeerManager {
             | QuicMeshEvent::MeshLogChunkReceived { .. }
             | QuicMeshEvent::ServiceAnnounceReceived { .. }
             | QuicMeshEvent::ServiceQueryAllReceived { .. }
-            | QuicMeshEvent::ServiceResponseAllReceived { .. } => {
+            | QuicMeshEvent::ServiceResponseAllReceived { .. }
+            | QuicMeshEvent::TrustRevokedReceived { .. }
+            | QuicMeshEvent::KeyRotationReceived { .. }
+            | QuicMeshEvent::KeyRotationResponseReceived { .. }
+            | QuicMeshEvent::TrustedKeysSyncReceived { .. }
+            | QuicMeshEvent::NodeLeavingReceived { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }

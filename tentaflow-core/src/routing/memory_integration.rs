@@ -1703,7 +1703,14 @@ mod tests {
             let nodes_str: Vec<String> = context
                 .nodes
                 .iter()
-                .map(|n| format!("- {} ({})", n.name, n.node_type))
+                .map(|n| {
+                    let attrs: Vec<String> = n.attributes.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                    if attrs.is_empty() {
+                        format!("- {} ({})", n.name, n.node_type)
+                    } else {
+                        format!("- {} ({}) [{}]", n.name, n.node_type, attrs.join(", "))
+                    }
+                })
                 .collect();
             parts.push(format!("OSOBY/ENCJE:\n{}", nodes_str.join("\n")));
         }

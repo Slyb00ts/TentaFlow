@@ -530,6 +530,7 @@ pub struct TrustedNode {
 pub struct PendingPairing {
     pub id: i64,
     pub remote_node_id: String,
+    #[serde(skip_serializing)]
     pub pin_code: String,
     pub direction: String,
     pub expires_at: String,
