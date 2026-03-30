@@ -1,0 +1,63 @@
+services = []
+service_aliases = []
+node_role = "router"
+
+[server]
+max_total_connections = 100
+max_concurrent_requests = 10
+max_queued_requests = 10
+worker_threads = 2
+cpu_affinity = false
+log_level = "info"
+log_format = "json"
+
+[protocols.openai_api]
+enabled = true
+bind = "0.0.0.0:18092"
+max_connections = 50
+request_timeout_ms = 30000
+body_limit_bytes = 1048576
+
+[protocols.quic]
+enabled = true
+bind = "0.0.0.0:18092"
+max_connections = 10
+max_streams_per_connection = 10
+idle_timeout_ms = 30000
+
+[middleware]
+request_validation_enabled = false
+response_filtering_enabled = false
+rate_limiting_enabled = false
+audit_logging_enabled = false
+
+[rate_limiting]
+default_requests_per_second = 100
+default_burst = 200
+
+[load_balancing]
+health_check_interval_ms = 5000
+health_check_timeout_ms = 2000
+unhealthy_threshold = 3
+healthy_threshold = 2
+queue_timeout_ms = 30000
+circuit_breaker_enabled = false
+circuit_breaker_threshold = 5
+circuit_breaker_timeout_ms = 60000
+
+[monitoring]
+prometheus_enabled = false
+prometheus_bind = "0.0.0.0:19092"
+health_check_enabled = false
+health_check_bind = "0.0.0.0:19882"
+health_check_path = "/health"
+tracing_enabled = false
+
+[mesh]
+enabled = true
+port = 18092
+static_peers = ["127.0.0.1:18091"]
+mdns_enabled = false
+heartbeat_interval_ms = 1000
+peer_timeout_ms = 5000
+cluster_name = "tentaflow-e2e-test"

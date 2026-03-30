@@ -9,6 +9,7 @@ const Mesh = (() => {
   'use strict';
 
   let nodes = [];
+  let pendingPairings = [];
   let refreshInterval = null;
 
   // Ikony platform
@@ -24,10 +25,15 @@ const Mesh = (() => {
   // Pobranie nodow z API
   async function loadNodes() {
     try {
-      const response = await ApiClient.get('/api/mesh/nodes');
-      nodes = response || [];
+      const [nodesResponse, pendingResponse] = await Promise.all([
+        ApiClient.get('/api/mesh/nodes'),
+        ApiClient.get('/api/mesh/pending').catch(() => [])
+      ]);
+      nodes = nodesResponse || [];
+      pendingPairings = pendingResponse || [];
     } catch (e) {
       nodes = [];
+      pendingPairings = [];
     }
   }
 
@@ -83,6 +89,7 @@ const Mesh = (() => {
       container.removeEventListener('click', handleCardClick);
     }
     nodes = [];
+    pendingPairings = [];
     if (refreshInterval) {
       clearInterval(refreshInterval);
       refreshInterval = null;
@@ -124,6 +131,11 @@ const Mesh = (() => {
     // Sekcja: Sparowane nody
     if (trusted.length > 0) {
       html += renderSection(I18n.t('mesh.paired_nodes'), trusted, 'trusted');
+    }
+
+    // Sekcja: Oczekujace parowania
+    if (pendingPairings.length > 0) {
+      html += renderPendingSection();
     }
 
     // Sekcja: Wykryte nody
@@ -263,8 +275,120 @@ const Mesh = (() => {
     `;
   }
 
+  // Renderowanie sekcji oczekujacych parowan
+  function renderPendingSection() {
+    const cards = pendingPairings.map(p => {
+      const nodeId = p.node_id || '';
+      const shortId = nodeId.length > 12 ? nodeId.slice(0, 12) + '...' : nodeId;
+      return `
+        <div class="mesh-node-card">
+          <div class="mesh-node-header">
+            <span class="mesh-node-icon">\uD83D\uDD17</span>
+            <span class="mesh-node-name">${Utils.escapeHtml(shortId)}</span>
+            <span class="mesh-trust-badge mesh-trust-discovered">${I18n.t('mesh.pairing')}</span>
+          </div>
+          <div style="display:flex;gap:var(--spacing-sm);margin-top:var(--spacing-sm);">
+            <button class="btn btn-sm btn-primary" data-pairing-confirm="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.confirm_pairing')}</button>
+            <button class="btn btn-sm btn-secondary" data-pairing-reject="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.reject_pairing')}</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    return `
+      <div class="mesh-section">
+        <div class="mesh-section-title">${Utils.escapeHtml(I18n.t('mesh.pending_pairings'))}</div>
+        <div class="mesh-nodes-grid">${cards}</div>
+      </div>
+    `;
+  }
+
+  // Modal potwierdzenia parowania z polem PIN
+  function openConfirmPinModal(nodeId) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-header">
+          <h3>${I18n.t('mesh.confirm_pin_title')}</h3>
+          <button class="modal-close" id="confirm-pin-modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="confirm-pin-input">${I18n.t('mesh.pin_label')}</label>
+            <input type="text" id="confirm-pin-input" maxlength="6" placeholder="000000" style="text-align:center;font-size:var(--font-size-xl);letter-spacing:0.15em;">
+            <div class="form-hint">${I18n.t('mesh.confirm_pin_hint')}</div>
+          </div>
+          <div id="confirm-pin-error" class="form-error" hidden></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="confirm-pin-cancel">${I18n.t('common.cancel')}</button>
+          <button class="btn btn-primary" id="confirm-pin-ok">${I18n.t('mesh.confirm_pairing')}</button>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    const closeModal = () => {
+      if (overlay.parentNode) overlay.remove();
+    };
+
+    overlay.querySelector('#confirm-pin-modal-close').addEventListener('click', closeModal);
+    overlay.querySelector('#confirm-pin-cancel').addEventListener('click', closeModal);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) closeModal();
+    });
+
+    overlay.querySelector('#confirm-pin-ok').addEventListener('click', async () => {
+      const pinValue = overlay.querySelector('#confirm-pin-input').value.trim();
+      const errorEl = overlay.querySelector('#confirm-pin-error');
+      if (!pinValue) {
+        if (errorEl) { errorEl.textContent = I18n.t('common.required'); errorEl.hidden = false; }
+        return;
+      }
+      try {
+        await ApiClient.post(`/api/mesh/pair/${encodeURIComponent(nodeId)}/confirm`, { pin: pinValue });
+        App.showToast(I18n.t('mesh.pair_confirm_success'), 'success');
+        closeModal();
+        await loadNodes();
+        renderSections();
+      } catch (err) {
+        if (errorEl) { errorEl.textContent = err.message || I18n.t('common.error'); errorEl.hidden = false; }
+      }
+    });
+  }
+
+  // Odrzucenie oczekujacego parowania
+  async function rejectPairing(nodeId) {
+    try {
+      await ApiClient.post(`/api/mesh/pair/${encodeURIComponent(nodeId)}/reject`);
+      App.showToast(I18n.t('mesh.pairing_rejected'), 'success');
+      await loadNodes();
+      renderSections();
+    } catch (err) {
+      App.showToast(err.message || I18n.t('common.error'), 'error');
+    }
+  }
+
   // Obsluga klikniec na kartach nodow
   function handleCardClick(e) {
+    // Potwierdzenie oczekujacego parowania
+    const confirmBtn = e.target.closest('[data-pairing-confirm]');
+    if (confirmBtn) {
+      const nodeId = confirmBtn.dataset.pairingConfirm;
+      openConfirmPinModal(nodeId);
+      return;
+    }
+
+    // Odrzucenie oczekujacego parowania
+    const rejectBtn = e.target.closest('[data-pairing-reject]');
+    if (rejectBtn) {
+      const nodeId = rejectBtn.dataset.pairingReject;
+      rejectPairing(nodeId);
+      return;
+    }
+
     // Parowanie
     const pairBtn = e.target.closest('[data-node-pair]');
     if (pairBtn) {
@@ -309,7 +433,8 @@ const Mesh = (() => {
     }
   }
 
-  // Modal z PIN-em do potwierdzenia parowania
+  // Modal z PIN-em — wyswietla PIN wygenerowany na tym nodzie (inicjator)
+  // Uzytkownik musi wpisac ten PIN na drugim nodzie aby potwierdzic parowanie
   function openPinModal(nodeId, pairResult) {
     const pin = pairResult?.pin || '';
     const overlay = document.createElement('div');
@@ -321,17 +446,11 @@ const Mesh = (() => {
           <button class="modal-close" id="pin-modal-close">&times;</button>
         </div>
         <div class="modal-body">
-          ${pin ? `<p style="text-align:center;font-size:var(--font-size-2xl);font-weight:700;letter-spacing:0.2em;margin:var(--spacing-md) 0;">${Utils.escapeHtml(pin)}</p>` : ''}
-          <div class="form-group">
-            <label for="pin-input">${I18n.t('mesh.pin_label')}</label>
-            <input type="text" id="pin-input" maxlength="6" placeholder="000000" style="text-align:center;font-size:var(--font-size-xl);letter-spacing:0.15em;">
-            <div class="form-hint">${I18n.t('mesh.pair_pin_hint')}</div>
-          </div>
-          <div id="pin-form-error" class="form-error" hidden></div>
+          <p style="text-align:center;font-size:var(--font-size-2xl);font-weight:700;letter-spacing:0.2em;margin:var(--spacing-md) 0;">${Utils.escapeHtml(pin)}</p>
+          <div class="form-hint" style="text-align:center;">${I18n.t('mesh.pair_pin_display_hint')}</div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-secondary" id="pin-modal-cancel">${I18n.t('common.cancel')}</button>
-          <button class="btn btn-primary" id="pin-modal-confirm">${I18n.t('mesh.confirm_pairing')}</button>
+          <button class="btn btn-primary" id="pin-modal-close-btn">${I18n.t('common.close')}</button>
         </div>
       </div>
     `;
@@ -343,27 +462,9 @@ const Mesh = (() => {
     };
 
     overlay.querySelector('#pin-modal-close').addEventListener('click', closeModal);
-    overlay.querySelector('#pin-modal-cancel').addEventListener('click', closeModal);
+    overlay.querySelector('#pin-modal-close-btn').addEventListener('click', closeModal);
     overlay.addEventListener('click', (e) => {
       if (e.target === overlay) closeModal();
-    });
-
-    overlay.querySelector('#pin-modal-confirm').addEventListener('click', async () => {
-      const pinValue = overlay.querySelector('#pin-input').value.trim();
-      const errorEl = overlay.querySelector('#pin-form-error');
-      if (!pinValue) {
-        if (errorEl) { errorEl.textContent = I18n.t('common.required'); errorEl.hidden = false; }
-        return;
-      }
-      try {
-        await ApiClient.post(`/api/mesh/pair/${encodeURIComponent(nodeId)}/confirm`, { pin: pinValue });
-        App.showToast(I18n.t('mesh.pair_confirm_success'), 'success');
-        closeModal();
-        await loadNodes();
-        renderSections();
-      } catch (err) {
-        if (errorEl) { errorEl.textContent = err.message || I18n.t('common.error'); errorEl.hidden = false; }
-      }
     });
   }
 
