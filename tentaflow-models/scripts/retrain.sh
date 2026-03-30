@@ -16,6 +16,9 @@ TASK="all"
 FRESH=false
 METHOD="qlora"
 GPUS=1
+FRACTION="1.0"
+BALANCE=false
+QUANT_LEVELS="Q8_0 Q6_K Q5_K_M Q4_K_M Q3_K_M Q2_K"
 
 # Parsuj argumenty
 for arg in "$@"; do
@@ -23,6 +26,8 @@ for arg in "$@"; do
         --fresh) FRESH=true ;;
         --method=*) METHOD="${arg#--method=}" ;;
         --gpus=*) GPUS="${arg#--gpus=}" ;;
+        --fraction=*) FRACTION="${arg#--fraction=}" ;;
+        --balance) BALANCE=true ;;
         qlora|lora|full|dora) METHOD="$arg" ;;
         help|--help|-h)
             echo "Pelny pipeline: convert → train → merge LoRA → GGUF → kwantyzacje."
@@ -40,6 +45,7 @@ for arg in "$@"; do
             echo "  toolcalling    — Qwen tool calling only"
             echo "  memory         — Qwen memory only"
             echo "  llama-guard    — Llama-Prompt-Guard-2-86M na guard (short only)"
+            echo "  batch          — Trenuj 8 modeli testowych (guard low/med/high + llama + all x4 metody)"
             echo ""
             echo "Strategie 2-modelowe:"
             echo "  ./scripts/retrain.sh guard --fresh            # guard QLoRA"
@@ -62,6 +68,8 @@ for arg in "$@"; do
             echo "  --fresh      — trening od zera (usun stara LoRA)"
             echo "               Bez --fresh: kontynuuj z ostatniego checkpointu"
             echo "  --gpus=N     — ile GPU uzyc (domyslnie: 1, >1 = DeepSpeed)"
+            echo "  --fraction=N — Frakcja danych treningowych (0.0-1.0, domyslnie 1.0)"
+            echo "  --balance    — Zrownowaz datasety (cap do mediany)"
             echo ""
             echo "Wynikowe modele (output/):"
             echo "  qwen-all-*           — jeden model ze wszystkim"
@@ -74,6 +82,147 @@ for arg in "$@"; do
 done
 
 source "$VENV"
+
+# =============================================================================
+# Funkcja: merge_and_export
+# Opis: Merge LoRA + konwersja GGUF + kwantyzacja. Wspolna logika dla
+#        pojedynczego i batch trybu.
+# =============================================================================
+merge_and_export() {
+    local lora_name="$1"
+    local method="$2"
+    local quant_level="${3:-Q5_K_M}"
+
+    local lora_dir="$ROOT/output/$lora_name"
+    local merged_dir="$ROOT/output/${lora_name}-merged"
+    local f16_gguf="$ROOT/output/${lora_name}-f16.gguf"
+
+    # Sprawdz czy GGUF juz istnieje i fingerprint pasuje (skip)
+    local all_exist=true
+    for quant in $quant_level; do
+        if [ ! -f "$ROOT/output/${lora_name}-${quant}.gguf" ]; then
+            all_exist=false
+            break
+        fi
+    done
+    if $all_exist && [ -f "$lora_dir/.data_fingerprint" ]; then
+        echo "  SKIP merge_and_export: GGUF juz istnieje dla $lora_name"
+        return 0
+    fi
+
+    # Merge (pomijamy dla full fine-tune — model juz jest kompletny)
+    if [ "$method" = "full" ]; then
+        echo "  Full fine-tune — model juz jest kompletny, pomijam merge."
+        merged_dir="$lora_dir"
+    else
+        echo "  Merge LoRA/DoRA z bazowym modelem..."
+        python3 -c "
+from peft import PeftModel
+from transformers import Qwen3_5ForConditionalGeneration, AutoTokenizer
+import torch
+
+model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    '$ROOT/models/qwen3.5-0.8b-base', trust_remote_code=True, dtype=torch.float16)
+tokenizer = AutoTokenizer.from_pretrained('$lora_dir', trust_remote_code=True)
+model.resize_token_embeddings(len(tokenizer))
+model = PeftModel.from_pretrained(model, '$lora_dir')
+model = model.merge_and_unload()
+model.save_pretrained('$merged_dir')
+tokenizer.save_pretrained('$merged_dir')
+print('Merge OK: $merged_dir')
+"
+    fi
+
+    # Konwersja do GGUF F16
+    echo "  Konwersja do GGUF F16..."
+    python3 "$CONVERT" "$merged_dir" --outfile "$f16_gguf" --outtype f16
+
+    # Kwantyzacja
+    for quant in $quant_level; do
+        local out_gguf="$ROOT/output/${lora_name}-${quant}.gguf"
+        echo "  Kwantyzacja $quant..."
+        $QUANTIZE "$f16_gguf" "$out_gguf" "$quant" 2>&1 | tail -1
+        echo "  Output: $out_gguf ($(du -h "$out_gguf" | cut -f1))"
+    done
+
+    # Posprzataj F16
+    rm -f "$f16_gguf"
+}
+
+# =============================================================================
+# Tryb batch: 8 modeli sekwencyjnie
+# =============================================================================
+if [ "$TASK" = "batch" ]; then
+    echo "=========================================="
+    echo "  BATCH: 8 modeli treningowych"
+    echo "  GPU: $GPUS"
+    echo "=========================================="
+
+    BATCH_QUANT="Q5_K_M"
+
+    # Konwersja danych — raz na poczatku
+    echo ""
+    echo "[BATCH] Konwersja danych guard..."
+    python3 "$SCRIPT_DIR/convert.py" guard
+
+    # --- 1. Qwen guard LOW (1/3 danych, qlora) ---
+    echo ""
+    echo "[1/8] Qwen guard LOW (fraction=0.33, qlora)..."
+    python3 "$SCRIPT_DIR/train.py" guard --method qlora --fraction 0.33 --gpus "$GPUS"
+    merge_and_export "qwen-guard-qlora-low" "qlora" "$BATCH_QUANT"
+
+    # --- 2. Qwen guard MEDIUM (2/3 danych, qlora) ---
+    echo ""
+    echo "[2/8] Qwen guard MEDIUM (fraction=0.66, qlora)..."
+    python3 "$SCRIPT_DIR/train.py" guard --method qlora --fraction 0.66 --gpus "$GPUS"
+    merge_and_export "qwen-guard-qlora-medium" "qlora" "$BATCH_QUANT"
+
+    # --- 3. Qwen guard HIGH (pelny dataset, qlora) ---
+    echo ""
+    echo "[3/8] Qwen guard HIGH (fraction=1.0, qlora)..."
+    python3 "$SCRIPT_DIR/train.py" guard --method qlora --gpus "$GPUS"
+    # train.py zapisuje do qwen-guard-qlora (bez suffixu bo fraction=1.0)
+    # Rename dla spojnej nazwy z low/medium
+    if [ -d "$ROOT/output/qwen-guard-qlora" ]; then
+        mv "$ROOT/output/qwen-guard-qlora" "$ROOT/output/qwen-guard-qlora-high"
+    fi
+    merge_and_export "qwen-guard-qlora-high" "qlora" "$BATCH_QUANT"
+
+    # --- 4. Llama guard (caly dataset guard short) ---
+    echo ""
+    echo "[4/8] Llama guard..."
+    python3 "$SCRIPT_DIR/train.py" guard --model llama
+
+    # Konwersja danych all — raz przed 4 treningami
+    echo ""
+    echo "[BATCH] Konwersja danych all..."
+    python3 "$SCRIPT_DIR/convert.py" intent
+    python3 "$SCRIPT_DIR/convert.py" guard
+    python3 "$SCRIPT_DIR/convert.py" model
+    python3 "$SCRIPT_DIR/convert.py" plan
+    python3 "$SCRIPT_DIR/convert.py" check
+    python3 "$SCRIPT_DIR/convert.py" toolcalling
+    python3 "$SCRIPT_DIR/convert.py" memory
+
+    # --- 5-8. Qwen all (balanced) z 4 metodami ---
+    BATCH_IDX=5
+    for method in lora qlora dora full; do
+        echo ""
+        echo "[$BATCH_IDX/8] Qwen all ($method, balanced)..."
+        python3 "$SCRIPT_DIR/train.py" all --method "$method" --balance --gpus "$GPUS"
+        merge_and_export "qwen-all-${method}" "$method" "$BATCH_QUANT"
+        BATCH_IDX=$((BATCH_IDX + 1))
+    done
+
+    # Podsumowanie batch
+    echo ""
+    echo "=========================================="
+    echo "  BATCH ZAKONCZONE - 8 modeli"
+    echo "=========================================="
+    ls -lh "$ROOT/output/"*-Q5_K_M.gguf 2>/dev/null | awk '{print "  " $NF ": " $5}'
+
+    exit 0
+fi
 
 # --- Llama Guard: osobna sciezka ---
 if [ "$TASK" = "llama-guard" ]; then
@@ -105,12 +254,21 @@ if [ "$TASK" = "llama-guard" ]; then
 fi
 
 # --- Qwen: glowna sciezka ---
-case "$TASK" in
-    all)          LORA_NAME="qwen-all-lora" ;;
-    guard)        LORA_NAME="qwen-guard-lora" ;;
-    orchestrator) LORA_NAME="qwen-orchestrator-lora" ;;
-    *)            LORA_NAME="qwen-${TASK}-lora" ;;
-esac
+
+# Budowanie nazwy LoRA: qwen-{task}-{method}[-fraction_suffix]
+LORA_NAME="qwen-${TASK}-${METHOD}"
+
+# Dodaj suffix frakcji jesli jawnie ustawiona (nie domyslna)
+if [ "$FRACTION" != "1.0" ]; then
+    # train.py uzywa tych samych progow: <=0.34 = low, <=0.67 = medium, >0.67 = high
+    if (( $(echo "$FRACTION <= 0.34" | bc -l) )); then
+        LORA_NAME="${LORA_NAME}-low"
+    elif (( $(echo "$FRACTION <= 0.67" | bc -l) )); then
+        LORA_NAME="${LORA_NAME}-medium"
+    else
+        LORA_NAME="${LORA_NAME}-high"
+    fi
+fi
 
 LORA_DIR="$ROOT/output/$LORA_NAME"
 MERGED_DIR="$ROOT/output/${LORA_NAME}-merged"
@@ -122,6 +280,8 @@ echo "  Method:  $METHOD"
 echo "  GPUs:    $GPUS"
 echo "  Model:   $LORA_NAME"
 echo "  Fresh:   $FRESH"
+echo "  Fraction: $FRACTION"
+echo "  Balance: $BALANCE"
 echo "=========================================="
 
 # 0. Fresh
@@ -167,52 +327,27 @@ if [ -d "$LORA_DIR" ] && [ "$FRESH" = false ]; then
     LAST_CKPT=$(ls -d "$LORA_DIR"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1 || echo "")
 fi
 
+# Zbuduj komende treningowa z opcjonalnymi flagami
+TRAIN_CMD="python3 $SCRIPT_DIR/train.py $TRAIN_TASK --method $METHOD --gpus $GPUS"
+if [ "$FRACTION" != "1.0" ]; then
+    TRAIN_CMD="$TRAIN_CMD --fraction $FRACTION"
+fi
+if [ "$BALANCE" = true ]; then
+    TRAIN_CMD="$TRAIN_CMD --balance"
+fi
+
 if [ -n "$LAST_CKPT" ]; then
     echo "[2/5] Kontynuacja treningu (checkpoint: $(basename $LAST_CKPT))..."
-    python3 "$SCRIPT_DIR/train.py" "$TRAIN_TASK" --method "$METHOD" --gpus "$GPUS" --gpus "$GPUS" --resume "$LAST_CKPT"
+    $TRAIN_CMD --resume "$LAST_CKPT"
 else
     echo "[2/5] Trening od zera..."
-    python3 "$SCRIPT_DIR/train.py" "$TRAIN_TASK" --method "$METHOD" --gpus "$GPUS"
+    $TRAIN_CMD
 fi
 
-# 3. Merge LoRA (lub kopiuj dla full fine-tune)
+# 3-5. Merge + GGUF + kwantyzacja
 echo ""
-if [ "$METHOD" = "full" ]; then
-    echo "[3/5] Full fine-tune — model juz jest kompletny, kopiuje..."
-    MERGED_DIR="$LORA_DIR"
-else
-    echo "[3/5] Merge LoRA/DoRA z bazowym modelem..."
-    python3 -c "
-from peft import PeftModel
-from transformers import Qwen3_5ForConditionalGeneration, AutoTokenizer
-import torch
-
-model = Qwen3_5ForConditionalGeneration.from_pretrained(
-    '$ROOT/models/qwen3.5-0.8b-base', trust_remote_code=True, dtype=torch.float16)
-tokenizer = AutoTokenizer.from_pretrained('$LORA_DIR', trust_remote_code=True)
-model.resize_token_embeddings(len(tokenizer))
-model = PeftModel.from_pretrained(model, '$LORA_DIR')
-model = model.merge_and_unload()
-model.save_pretrained('$MERGED_DIR')
-tokenizer.save_pretrained('$MERGED_DIR')
-print('Merge OK: $MERGED_DIR')
-"
-fi
-
-# 4. Konwersja do GGUF F16
-echo ""
-echo "[4/5] Konwersja do GGUF F16..."
-python3 "$CONVERT" "$MERGED_DIR" --outfile "$F16_GGUF" --outtype f16
-
-# 5. Kwantyzacje
-echo ""
-echo "[5/5] Kwantyzacje..."
-for QUANT in Q8_0 Q6_K Q5_K_M Q4_K_M Q3_K_M Q2_K; do
-    OUT="$ROOT/output/${LORA_NAME}-${QUANT}.gguf"
-    $QUANTIZE "$F16_GGUF" "$OUT" "$QUANT" 2>&1 | tail -1
-    SIZE=$(du -h "$OUT" | cut -f1)
-    echo "  $QUANT: $SIZE"
-done
+echo "[3-5/5] Merge, konwersja GGUF i kwantyzacja..."
+merge_and_export "$LORA_NAME" "$METHOD" "$QUANT_LEVELS"
 
 # Podsumowanie
 echo ""
