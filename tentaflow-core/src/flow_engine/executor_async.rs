@@ -316,7 +316,7 @@ impl FlowExecutorAsync {
             .execution_log
             .iter()
             .any(|s| s.status == "error");
-        let final_status = if has_errors { "error" } else { "success" };
+        let final_status = if has_errors { "error" } else { "completed" };
 
         let execution_result = FlowExecutionResult {
             status: final_status.to_string(),
