@@ -805,6 +805,7 @@
     "pair_success": "Parowanie zainicjowane",
     "pair_pin_title": "Wprowadz PIN",
     "pair_pin_hint": "Wprowadz 6-cyfrowy PIN wyswietlony na zdalnym nodzie",
+    "pair_pin_display_hint": "Wpisz ten PIN na drugim nodzie aby potwierdzic parowanie",
     "pair_confirm_success": "Node sparowany pomyslnie",
     "services_on": "Serwisy na {name}",
     "cpu": "CPU",
@@ -829,7 +830,11 @@
     "logs": "Logi",
     "add_service": "Dodaj serwis",
     "cpu_cores": "rdzeni",
-    "docker_version": "Docker"
+    "docker_version": "Docker",
+    "pending_pairings": "Oczekujące parowania",
+    "confirm_pin_title": "Potwierdź parowanie",
+    "confirm_pin_hint": "Wpisz PIN wyświetlony na nodzie, który wysłał żądanie",
+    "pairing_rejected": "Parowanie odrzucone"
   },
   "clusters": {
     "title": "Clusters",

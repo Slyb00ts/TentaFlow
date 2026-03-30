@@ -497,6 +497,17 @@ impl CrdtStore {
                     params![node_id],
                 )?;
             }
+
+            CrdtOperation::RevokeTrustedNode { node_id, .. } => {
+                conn.execute(
+                    "DELETE FROM trusted_nodes WHERE node_id = ?1",
+                    params![node_id],
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO revoked_nodes (node_id, revoked_by) VALUES (?1, ?2)",
+                    params![node_id, "crdt-sync"],
+                )?;
+            }
         }
 
         Ok(())
@@ -642,6 +653,9 @@ impl CrdtStore {
             }
             CrdtOperation::RemoveTrustedNode { node_id, .. } => {
                 ("remove_trusted_node", format!("trusted_node:{node_id}"))
+            }
+            CrdtOperation::RevokeTrustedNode { node_id, .. } => {
+                ("revoke_trusted_node", format!("trusted_node:{node_id}"))
             }
         }
     }

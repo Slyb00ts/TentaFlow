@@ -800,6 +800,7 @@
     "pair_success": "Pairing initiated",
     "pair_pin_title": "Enter PIN",
     "pair_pin_hint": "Enter the 6-digit PIN shown on the remote node",
+    "pair_pin_display_hint": "Enter this PIN on the remote node to complete pairing",
     "pair_confirm_success": "Node paired successfully",
     "services_on": "Services on {name}",
     "cpu": "CPU",
@@ -824,7 +825,11 @@
     "logs": "Logs",
     "add_service": "Add service",
     "cpu_cores": "cores",
-    "docker_version": "Docker"
+    "docker_version": "Docker",
+    "pending_pairings": "Pending Pairings",
+    "confirm_pin_title": "Confirm Pairing",
+    "confirm_pin_hint": "Enter the PIN displayed on the requesting node",
+    "pairing_rejected": "Pairing rejected"
   },
   "clusters": {
     "title": "Clusters",
