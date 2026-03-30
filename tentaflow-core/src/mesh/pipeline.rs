@@ -45,6 +45,7 @@ impl MeshPipelineHandles {
     /// BEZ tego porty UDP zostaja zajete jako zombie.
     pub async fn shutdown(mut self) {
         if let Some(ref qm) = self.quic_mesh {
+            qm.send_node_leaving().await;
             qm.shutdown().await;
         }
         // mDNS dropowany automatycznie — wyrejestruje serwis
@@ -162,6 +163,7 @@ pub async fn start_mesh_pipeline(
                         mesh_peer_store.clone(),
                         local_node_info.clone(),
                         mesh_security.clone(),
+                        node_id.clone(),
                     );
 
                     // Docker container cache — co 5s
@@ -184,6 +186,11 @@ pub async fn start_mesh_pipeline(
                     // [CR-011] Task 5: Czyszczenie wygaslych parowan — co 30s
                     if let Some(ref sec) = mesh_security {
                         spawn_pairing_cleanup(sec.clone());
+                    }
+
+                    // Task 6: Rotacja kluczy szyfrowania — co 24h
+                    if let Some(ref sec) = mesh_security {
+                        spawn_key_rotation_task(quic_mesh.clone(), sec.clone());
                     }
 
                     info!("Mesh networking uruchomiony (QUIC mesh + mDNS)");
@@ -326,6 +333,7 @@ fn spawn_quic_event_handler(
     peer_store: MeshPeerStore,
     local_node_info: NodeInfo,
     mesh_security: Option<Arc<MeshSecurity>>,
+    local_node_id: String,
 ) {
     let qm_events = quic_mesh.clone();
     let mut event_rx = quic_mesh.subscribe();
@@ -438,20 +446,49 @@ fn spawn_quic_event_handler(
                                 let from_node_id = val["from_node_id"].as_str().unwrap_or(&peer_id);
                                 let public_key = val["public_key"].as_str().unwrap_or("");
                                 let hostname = val["hostname"].as_str().unwrap_or("");
+                                let received_pin = val["pin"].as_str().unwrap_or("");
+
+                                // Weryfikuj PIN — inicjator sprawdza czy receiver podal poprawny PIN
+                                if let Ok(Some(expected_pin)) = sec.get_pending_pin(from_node_id) {
+                                    if !received_pin.is_empty() && received_pin != expected_pin {
+                                        warn!("PairingConfirm od {} — nieprawidlowy PIN", from_node_id);
+                                        continue;
+                                    }
+                                }
+
                                 if let Err(e) = sec.confirm_pairing(from_node_id, public_key, hostname, "mesh-quic") {
                                     warn!("Blad potwierdzenia parowania od {}: {}", peer_id, e);
                                 } else {
                                     info!("Otrzymano PairingConfirm od {} — node zaufany", peer_id);
 
-                                    // Po sparowaniu — wyslij NodeInfo do nowo zaufanego peera.
-                                    // W momencie PeerConnected peer nie byl jeszcze trusted,
-                                    // wiec NodeInfo nie zostal wyslany. Teraz nadrabiamy.
+                                    // Po sparowaniu — wyslij NodeInfo do nowo zaufanego peera
                                     let target_node_id = from_node_id.to_string();
                                     if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_node_info) {
                                         if let Err(e) = qm_events.send_node_info(&target_node_id, &info_bytes).await {
                                             warn!("Blad wysylania NodeInfo po sparowaniu do {}: {}", target_node_id, e);
                                         } else {
                                             info!(peer_id = %target_node_id, "Wyslano NodeInfo do nowo zaufanego peera");
+                                        }
+                                    }
+
+                                    // Wyslij TrustedKeysSync z naszymi zaufanymi kluczami
+                                    let all_keys = sec.get_all_trusted_keys();
+                                    if !all_keys.is_empty() {
+                                        let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+                                            .iter()
+                                            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                                node_id: nid.clone(),
+                                                public_key_hex: pk.clone(),
+                                            })
+                                            .collect();
+                                        let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                                        let sync_data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                            .map(|v| v.to_vec())
+                                            .unwrap_or_default();
+                                        if let Err(e) = qm_events.send_trusted_keys_sync(&target_node_id, &sync_data).await {
+                                            warn!("Blad wysylania TrustedKeysSync do {}: {}", target_node_id, e);
+                                        } else {
+                                            info!(peer_id = %target_node_id, count = all_keys.len(), "Wyslano TrustedKeysSync");
                                         }
                                     }
                                 }
@@ -477,6 +514,132 @@ fn spawn_quic_event_handler(
                             Err(e) => {
                                 warn!(peer_id = %peer_id, "Blad parsowania PairingReject JSON: {}", e);
                             }
+                        }
+                    }
+                }
+                Ok(QuicMeshEvent::TrustRevokedReceived { node_id, revoked_node_id }) => {
+                    let sender_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&node_id),
+                        None => false,
+                    };
+                    if !sender_trusted {
+                        warn!("Odrzucono TrustRevoked od niezaufanego noda {}", node_id);
+                        continue;
+                    }
+
+                    if let Some(ref sec) = mesh_security {
+                        if sec.is_trusted(&revoked_node_id) {
+                            let _ = sec.revoke_trust(&revoked_node_id);
+                            info!("Usunieto zaufanie dla {} (propagacja od {})", revoked_node_id, node_id);
+                            qm_events.disconnect_peer(&revoked_node_id).await;
+
+                            // Audit log
+                            let details = format!("Revoke {} propagowany od {}", revoked_node_id, node_id);
+                            let _ = crate::db::repository::log_audit(
+                                &sec.db, None, None, "trust_revoked_propagation", None,
+                                Some(&details), None, Some(&revoked_node_id),
+                            );
+                        }
+                    }
+                }
+                Ok(QuicMeshEvent::NodeLeavingReceived { node_id }) => {
+                    let sender_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&node_id),
+                        None => false,
+                    };
+                    if !sender_trusted {
+                        warn!("NodeLeaving od niezaufanego noda {}", node_id);
+                        continue;
+                    }
+
+                    info!("Node {} opuszcza mesh (graceful leave)", node_id);
+                    qm_events.disconnect_peer(&node_id).await;
+                }
+                Ok(QuicMeshEvent::KeyRotationReceived { node_id, ephemeral_public_key_hex }) => {
+                    if let Some(ref sec) = mesh_security {
+                        if !sec.is_trusted(&node_id) {
+                            warn!("KeyRotation od niezaufanego noda {}", node_id);
+                            continue;
+                        }
+                        if let Ok(their_pub_bytes) = hex::decode(&ephemeral_public_key_hex) {
+                            if their_pub_bytes.len() == 32 {
+                                let mut key = [0u8; 32];
+                                key.copy_from_slice(&their_pub_bytes);
+                                match sec.respond_to_key_rotation(&node_id, &key) {
+                                    Ok((our_pub, epoch)) => {
+                                        info!(peer_id = %node_id, epoch, "Rotacja klucza — wyslanie odpowiedzi");
+                                        let payload = tentaflow_protocol::mesh::KeyRotationResponsePayload {
+                                            from_node_id: local_node_id.to_string(),
+                                            ephemeral_public_key: hex::encode(our_pub),
+                                        };
+                                        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                            .map(|v| v.to_vec())
+                                            .unwrap_or_default();
+                                        if let Err(e) = qm_events.send_key_rotation_response(&node_id, &data).await {
+                                            warn!("Blad wysylania KeyRotationResponse do {}: {}", node_id, e);
+                                        }
+                                    }
+                                    Err(e) => warn!("Blad rotacji klucza dla {}: {}", node_id, e),
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(QuicMeshEvent::KeyRotationResponseReceived { node_id, ephemeral_public_key_hex }) => {
+                    if let Some(ref sec) = mesh_security {
+                        if !sec.is_trusted(&node_id) {
+                            warn!("KeyRotationResponse od niezaufanego noda {}", node_id);
+                            continue;
+                        }
+                        if let Ok(their_pub_bytes) = hex::decode(&ephemeral_public_key_hex) {
+                            if their_pub_bytes.len() == 32 {
+                                let mut key = [0u8; 32];
+                                key.copy_from_slice(&their_pub_bytes);
+                                match sec.finalize_key_rotation(&node_id, &key) {
+                                    Ok(epoch) => {
+                                        info!(peer_id = %node_id, epoch, "Rotacja klucza sfinalizowana");
+                                    }
+                                    Err(e) => warn!("Blad finalizacji rotacji dla {}: {}", node_id, e),
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(QuicMeshEvent::TrustedKeysSyncReceived { node_id, keys }) => {
+                    // Akceptuj sync TYLKO od trusted peera
+                    let sender_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&node_id),
+                        None => false,
+                    };
+                    if !sender_trusted {
+                        warn!("Odrzucono TrustedKeysSync od niezaufanego noda {}", node_id);
+                        continue;
+                    }
+
+                    if let Some(ref sec) = mesh_security {
+                        let mut added = 0u32;
+                        for (remote_node_id, public_key_hex) in &keys {
+                            if sec.is_trusted(remote_node_id) {
+                                continue;
+                            }
+                            match sec.add_trusted_key(remote_node_id, public_key_hex, "") {
+                                Ok(()) => {
+                                    added += 1;
+                                    info!(node_id = %remote_node_id, "Dodano zaufany klucz z TrustedKeysSync od {}", node_id);
+                                }
+                                Err(e) => {
+                                    warn!(node_id = %remote_node_id, "Blad dodawania klucza z TrustedKeysSync: {}", e);
+                                }
+                            }
+                        }
+                        if added > 0 {
+                            info!(from = %node_id, added, "TrustedKeysSync przetworzony");
+                            // Audit log
+                            let details = format!("Dodano {} kluczy z TrustedKeysSync od {}", added, node_id);
+                            let _ = crate::db::repository::log_audit(
+                                &sec.db, None, None, "trusted_keys_sync", None,
+                                Some(&details), None, Some(&node_id),
+                            );
                         }
                     }
                 }
@@ -616,6 +779,50 @@ fn spawn_slow_refresh(
             }
         }
     });
+}
+
+/// Periodyczna rotacja kluczy szyfrowania — co 24h
+fn spawn_key_rotation_task(
+    quic_mesh: Arc<QuicMeshManager>,
+    security: Arc<MeshSecurity>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crate::mesh::security::KEY_ROTATION_INTERVAL);
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            info!("Rozpoczynam rotacje kluczy");
+            rotate_all_keys(&quic_mesh, &security).await;
+        }
+    });
+}
+
+async fn rotate_all_keys(quic_mesh: &QuicMeshManager, security: &MeshSecurity) {
+    let trusted_ids = security.trusted_node_ids_snapshot();
+
+    // Wyczysc wygasle pending rotacje
+    security.cleanup_pending_rotations();
+
+    for peer_id in trusted_ids.iter() {
+        let ephemeral_public = security.initiate_key_rotation(peer_id);
+        let payload = tentaflow_protocol::mesh::KeyRotationPayload {
+            from_node_id: quic_mesh.node_id().to_string(),
+            ephemeral_public_key: hex::encode(ephemeral_public),
+        };
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+
+        match quic_mesh.send_key_rotation(peer_id, &data).await {
+            Ok(_) => {
+                info!(peer_id = %peer_id, "Wyslano KeyRotation request");
+            }
+            Err(e) => {
+                warn!(peer_id = %peer_id, "Blad wysylania KeyRotation: {}", e);
+            }
+        }
+    }
 }
 
 /// [CR-011] Periodyczne czyszczenie wygaslych parowan — co 30 sekund
