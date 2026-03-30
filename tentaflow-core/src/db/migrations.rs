@@ -821,5 +821,18 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE addons ADD COLUMN disambiguation_json TEXT NOT NULL DEFAULT '[]';
         ",
     ),
+    (
+        27,
+        "revoked_nodes_table",
+        "
+            CREATE TABLE IF NOT EXISTS revoked_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL UNIQUE,
+                revoked_at TEXT NOT NULL DEFAULT (datetime('now')),
+                revoked_by TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_revoked_nodes_node_id ON revoked_nodes(node_id);
+        ",
+    ),
 ]
 }
