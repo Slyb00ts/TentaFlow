@@ -70,7 +70,6 @@ pub fn handle_initiate_pairing(
     if let Some(ref qm) = quic_mesh {
         let payload = serde_json::json!({
             "from_node_id": local_node_id,
-            "pin": &pin,
             "public_key": security.public_key_hex(),
         });
         let qm = qm.clone();
@@ -100,7 +99,7 @@ pub fn handle_initiate_pairing(
 
 #[derive(Deserialize)]
 pub struct ConfirmPairingRequest {
-    pub public_key: String,
+    pub pin: Option<String>,
     pub hostname: Option<String>,
 }
 
@@ -118,6 +117,26 @@ pub fn handle_confirm_pairing(
 
     let hostname = req.hostname.as_deref().unwrap_or("");
 
+    // Rate limit: max 3 proby PIN w 60s
+    if !security.check_pin_rate_limit(remote_node_id) {
+        return Ok((429, json_error("Zbyt wiele prob — poczekaj 60 sekund")));
+    }
+
+    // Weryfikuj PIN — jesli mamy go lokalnie (inicjator), sprawdz.
+    // Jesli nie mamy (receiver — PIN nie przyszedl przez wire), przepusc.
+    // PIN od user-a jest wysylany w PairingConfirm do inicjatora, ktory go zweryfikuje.
+    let stored_pin = security.get_pending_pin(remote_node_id)
+        .ok()
+        .flatten();
+    if let Some(ref expected) = stored_pin {
+        match &req.pin {
+            Some(provided) if provided == expected => {}
+            _ => {
+                return Ok((403, json_error("Nieprawidlowy PIN")));
+            }
+        }
+    }
+
     // Pobierz klucz publiczny inicjatora zapisany w receive_pairing_request
     let remote_public_key = db::repository::get_setting(&security.db, &format!("pending_pubkey:{}", remote_node_id))
         .ok()
@@ -132,10 +151,12 @@ pub fn handle_confirm_pairing(
         Ok(()) => {
             // Wyslij PairingConfirm + NodeInfo przez QUIC w tle
             if let Some(ref qm) = quic_mesh {
+                let pin_for_confirm = req.pin.clone().unwrap_or_default();
                 let payload = serde_json::json!({
                     "from_node_id": local_node_id,
                     "public_key": security.public_key_hex(),
                     "hostname": hostname,
+                    "pin": pin_for_confirm,
                 });
                 let qm = qm.clone();
                 let node_id = remote_node_id.to_string();
@@ -198,12 +219,41 @@ pub fn handle_reject_pairing(
     Ok((200, json))
 }
 
-/// DELETE /api/mesh/trust/:node_id — cofnij zaufanie
+/// DELETE /api/mesh/trust/:node_id — cofnij zaufanie i broadcast do mesh
 pub fn handle_revoke_trust(
     security: &Arc<MeshSecurity>,
     node_id: &str,
+    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    local_node_id: &str,
 ) -> Result<(u16, String)> {
     security.revoke_trust(node_id)?;
+
+    // Audit log
+    let _ = crate::db::repository::log_audit(
+        &security.db, None, None, "trust_revoked", None,
+        Some(&format!("Cofnieto zaufanie dla {} przez admina", node_id)), None, Some(node_id),
+    );
+
+    if let Some(ref qm) = quic_mesh {
+        let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
+            revoked_node_id: node_id.to_string(),
+            from_node_id: local_node_id.to_string(),
+        };
+        let qm = qm.clone();
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        let revoked_id = node_id.to_string();
+        tokio::spawn(async move {
+            qm.broadcast_to_trusted(
+                tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
+                &data,
+                Some(&revoked_id),
+            ).await;
+            qm.disconnect_peer(&revoked_id).await;
+        });
+    }
+
     let json = serde_json::json!({"ok": true}).to_string();
     Ok((200, json))
 }
@@ -536,6 +586,16 @@ pub async fn handle_send_command(
         }
         Err(e) => Ok((502, json_error(&format!("Blad wykonania komendy: {}", e)))),
     }
+}
+
+/// POST /api/mesh/retrust/:node_id — przywroc zaufanie (admin)
+pub fn handle_retrust(
+    security: &Arc<MeshSecurity>,
+    node_id: &str,
+) -> Result<(u16, String)> {
+    security.admin_retrust(node_id)?;
+    let json = serde_json::json!({"ok": true}).to_string();
+    Ok((200, json))
 }
 
 /// GET /api/mesh/services — wszystkie serwisy w mesh
