@@ -10,8 +10,10 @@
 #   python3 train.py guard --model llama  — trenuj Llama Prompt Guard na guard short
 # =============================================================================
 import argparse
+import hashlib
 import json
 import os
+import random as _random
 import sys
 
 import torch
@@ -56,7 +58,78 @@ def load_jsonl(path):
     return records
 
 
-def get_qwen_datasets(task):
+# ---------------------------------------------------------------------------
+# Fingerprinting danych — wykrywanie zmian w datasetach
+# ---------------------------------------------------------------------------
+
+FINGERPRINT_FILE = ".data_fingerprint"
+
+def compute_data_fingerprint(file_paths):
+    """Oblicza SHA256 z zawartosci plikow treningowych."""
+    h = hashlib.sha256()
+    for path in sorted(file_paths):
+        if os.path.exists(path):
+            h.update(path.encode())
+            h.update(str(os.path.getsize(path)).encode())
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+    return h.hexdigest()
+
+
+def save_fingerprint(output_dir, fingerprint):
+    """Zapisuje fingerprint danych do katalogu modelu."""
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, FINGERPRINT_FILE), "w") as f:
+        f.write(fingerprint)
+
+
+def load_fingerprint(output_dir):
+    """Wczytuje zapisany fingerprint. Zwraca None jesli brak."""
+    path = os.path.join(output_dir, FINGERPRINT_FILE)
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return f.read().strip()
+    return None
+
+
+def find_last_checkpoint(output_dir):
+    """Znajduje ostatni checkpoint w katalogu."""
+    if not os.path.isdir(output_dir):
+        return None
+    checkpoints = [d for d in os.listdir(output_dir)
+                   if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))]
+    if not checkpoints:
+        return None
+    checkpoints.sort(key=lambda x: int(x.split("-")[1]))
+    return os.path.join(output_dir, checkpoints[-1])
+
+
+def check_training_status(output_dir, current_fingerprint):
+    """Sprawdza status treningu. Zwraca: 'skip', 'resume', 'fresh'."""
+    saved_fp = load_fingerprint(output_dir)
+
+    if saved_fp is None:
+        # Brak fingerprinta — ale moze byc stary output bez fingerprinta
+        if os.path.isdir(output_dir) and find_last_checkpoint(output_dir):
+            return "resume"  # stary trening bez fingerprinta — resume
+        return "fresh"
+
+    if saved_fp == current_fingerprint:
+        # Dane sie nie zmienily
+        # Sprawdz czy trening byl ukonczony (final model istnieje)
+        has_final = (os.path.exists(os.path.join(output_dir, "adapter_config.json"))
+                     or os.path.exists(os.path.join(output_dir, "config.json")))
+        if has_final:
+            return "skip"
+        # Fingerprint pasuje ale brak finalnego modelu — resume z checkpointu
+        return "resume"
+
+    # Dane sie zmienily — dotrenuj z ostatniego checkpointu
+    return "resume"
+
+
+def get_qwen_datasets(task, fraction=1.0, balance=False):
     """Zwraca (train_dataset, eval_dataset) dla Qwen."""
     train_files = []
     eval_files = []
@@ -74,6 +147,7 @@ def get_qwen_datasets(task):
     # orchestrator = all BEZ guard
     orchestrator_tasks = {"intent", "model", "plan", "check", "toolcalling", "memory"}
 
+    ds_names_for_files = []
     for ds_name, ds_dir in datasets.items():
         include = False
         if task == "all":
@@ -89,14 +163,48 @@ def get_qwen_datasets(task):
             if os.path.exists(t):
                 train_files.append(t)
                 eval_files.append(e)
+                ds_names_for_files.append(ds_name)
 
-    train_records = []
-    eval_records = []
-    for f in train_files:
+    # Zbierz rekordy per dataset (potrzebne do balansowania)
+    per_dataset_records = {}
+    for f, ds_name in zip(train_files, ds_names_for_files):
         records = load_jsonl(f)
         if records:
-            train_records.extend(records)
+            per_dataset_records[ds_name] = records
             print(f"  {f}: {len(records)} rekordow")
+
+    # Balansowanie — najwiekszy dataset cappowany do max 30% calego zbioru
+    # Reszta zostaje bez zmian (male datasety zachowane w calosci)
+    if balance and len(per_dataset_records) > 1:
+        max_pct = 0.30
+        rng = _random.Random(42)
+        largest_name = max(per_dataset_records, key=lambda k: len(per_dataset_records[k]))
+        rest_total = sum(len(r) for name, r in per_dataset_records.items()
+                         if name != largest_name)
+        max_for_largest = int(rest_total * max_pct / (1.0 - max_pct))
+        if len(per_dataset_records[largest_name]) > max_for_largest:
+            original_len = len(per_dataset_records[largest_name])
+            recs = per_dataset_records[largest_name]
+            rng.shuffle(recs)
+            per_dataset_records[largest_name] = recs[:max_for_largest]
+            total = rest_total + max_for_largest
+            print(f"  Balance: {largest_name} capped {original_len} -> {max_for_largest} ({max_for_largest*100//total}% of {total})")
+
+    # Zlacz wszystkie rekordy treningowe
+    train_records = []
+    for recs in per_dataset_records.values():
+        train_records.extend(recs)
+
+    # Fraction — weź podzbiór danych treningowych
+    if fraction < 1.0:
+        train_records_original_len = len(train_records)
+        rng = _random.Random(42)
+        rng.shuffle(train_records)
+        n = max(1, int(train_records_original_len * fraction))
+        train_records = train_records[:n]
+        print(f"  Fraction {fraction:.2f}: {n}/{train_records_original_len} rekordow")
+
+    eval_records = []
     for f in eval_files:
         records = load_jsonl(f)
         if records:
@@ -116,13 +224,51 @@ def get_llama_datasets():
 # Trening Qwen (QLoRA)
 # ---------------------------------------------------------------------------
 
-def train_qwen(task, resume_from=None, method="qlora"):
+def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=False):
     """Trening Qwen3.5-0.8B — qlora, lora, full, dora."""
     print("=" * 60)
     print(f"Trening Qwen3.5-0.8B | task: {task} | method: {method}")
     print("=" * 60)
 
-    output_dir = os.path.join(ROOT, "output", f"qwen-{task}-lora")
+    # Nazwa katalogu wyjsciowego: qwen-{task}-{method} + opcjonalny suffix fraction
+    dir_name = f"qwen-{task}-{method}"
+    if fraction < 1.0:
+        if fraction <= 0.34:
+            dir_name += "-low"
+        elif fraction <= 0.67:
+            dir_name += "-medium"
+        else:
+            dir_name += "-high"
+    output_dir = os.path.join(ROOT, "output", dir_name)
+
+    # Fingerprint danych — wykryj czy dane sie zmienily
+    datasets_map = {
+        "intent": "intent", "guard": "guard", "model": "model",
+        "plan": "plan", "check": "check", "toolcalling": "toolcalling",
+        "memory": "memory",
+    }
+    orchestrator_tasks = {"intent", "model", "plan", "check", "toolcalling", "memory"}
+    fp_files = []
+    for ds_name, ds_dir in datasets_map.items():
+        include = (task == "all" or task == ds_name
+                   or (task == "orchestrator" and ds_name in orchestrator_tasks))
+        if include:
+            fp_files.append(os.path.join(ROOT, "data", ds_dir, "qwen_train.jsonl"))
+    current_fp = compute_data_fingerprint(fp_files)
+
+    # Sprawdz status: skip / resume / fresh
+    if resume_from is None:
+        status = check_training_status(output_dir, current_fp)
+        if status == "skip":
+            print(f"\n  SKIP: dane nie zmienione, model juz wytrenowany ({output_dir})")
+            return
+        elif status == "resume":
+            resume_from = find_last_checkpoint(output_dir)
+            if resume_from:
+                print(f"\n  RESUME: dane zmienione lub trening niedokonczony")
+                print(f"  Checkpoint: {resume_from}")
+            else:
+                print(f"\n  FRESH: brak checkpointu, trening od zera")
 
     # Tokenizer
     print("\nTokenizer...")
@@ -138,12 +284,19 @@ def train_qwen(task, resume_from=None, method="qlora"):
     num_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     print(f"  Special tokeny: +{num_added}")
 
+    # Multi-GPU (DeepSpeed) nie moze uzyc device_map="auto" — model ladowany na CPU,
+    # DeepSpeed sam rozdziela na karty. Single-GPU uzywa device_map="auto".
+    is_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    dm = None if is_distributed else "auto"
+    if is_distributed:
+        print(f"  Multi-GPU: device_map=None (DeepSpeed zarzadza dystrybucja)")
+
     if method == "full":
         # Full fine-tune — caly model, bez quantyzacji, bez LoRA
         print("Model (full fine-tune, bf16)...")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             QWEN_MODEL,
-            device_map="auto",
+            device_map=dm,
             trust_remote_code=True,
             dtype=torch.bfloat16,
         )
@@ -157,7 +310,7 @@ def train_qwen(task, resume_from=None, method="qlora"):
         print("Model (bf16 + LoRA)...")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             QWEN_MODEL,
-            device_map="auto",
+            device_map=dm,
             trust_remote_code=True,
             dtype=torch.bfloat16,
         )
@@ -181,7 +334,7 @@ def train_qwen(task, resume_from=None, method="qlora"):
         print("Model (bf16 + DoRA)...")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             QWEN_MODEL,
-            device_map="auto",
+            device_map=dm,
             trust_remote_code=True,
             dtype=torch.bfloat16,
         )
@@ -213,7 +366,7 @@ def train_qwen(task, resume_from=None, method="qlora"):
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             QWEN_MODEL,
             quantization_config=bnb_config,
-            device_map="auto",
+            device_map=dm,
             trust_remote_code=True,
             dtype=torch.bfloat16,
         )
@@ -235,7 +388,7 @@ def train_qwen(task, resume_from=None, method="qlora"):
 
     # Dane
     print("\nDane...")
-    train_records, eval_records = get_qwen_datasets(task)
+    train_records, eval_records = get_qwen_datasets(task, fraction=fraction, balance=balance)
     if not train_records:
         print("BLAD: Brak danych! Uruchom convert.py najpierw.")
         return
@@ -259,18 +412,18 @@ def train_qwen(task, resume_from=None, method="qlora"):
 
     if method == "full":
         lr = 5e-5
-        batch = 8 if is_multi_gpu else 2   # multi-gpu: duzy batch per karta
-        grad_accum = 4 if is_multi_gpu else 16
+        batch = 2 if is_multi_gpu else 2
+        grad_accum = 16 if is_multi_gpu else 16
         epochs = 3
     elif method in ("lora", "dora"):
         lr = 1e-4
-        batch = 8 if is_multi_gpu else 4
-        grad_accum = 4 if is_multi_gpu else 8
+        batch = 2 if is_multi_gpu else 4
+        grad_accum = 16 if is_multi_gpu else 8
         epochs = 5
     else:  # qlora
         lr = 2e-4
-        batch = 4 if is_multi_gpu else 2
-        grad_accum = 8 if is_multi_gpu else 16
+        batch = 1 if is_multi_gpu else 2
+        grad_accum = 32 if is_multi_gpu else 16
         epochs = 5
 
     eff_batch = batch * grad_accum * num_gpus
@@ -288,6 +441,7 @@ def train_qwen(task, resume_from=None, method="qlora"):
         warmup_steps=50,
         weight_decay=0.01,
         bf16=True,
+        gradient_checkpointing=True,
         logging_steps=10,
         eval_strategy="epoch" if eval_dataset else "no",
         save_strategy="epoch",
@@ -324,6 +478,7 @@ def train_qwen(task, resume_from=None, method="qlora"):
         trainer.save_model(output_dir)
         print(f"  Zapisano adapter ({method})")
     tokenizer.save_pretrained(output_dir)
+    save_fingerprint(output_dir, current_fp)
     print(f"Qwen trening zakonczony! (method={method})")
 
 
@@ -341,10 +496,34 @@ def train_llama():
 
     output_dir = os.path.join(ROOT, "output", "llama-guard")
 
+    # Fingerprint danych llama guard
+    fp_files = [
+        os.path.join(ROOT, "data", "guard", "llama_train.jsonl"),
+        os.path.join(ROOT, "data", "guard", "llama_eval.jsonl"),
+    ]
+    current_fp = compute_data_fingerprint(fp_files)
+
+    status = check_training_status(output_dir, current_fp)
+    if status == "skip":
+        print(f"\n  SKIP: dane nie zmienione, model juz wytrenowany ({output_dir})")
+        return
+
+    resume_from = None
+    if status == "resume":
+        resume_from = find_last_checkpoint(output_dir)
+        if resume_from:
+            print(f"\n  RESUME: checkpoint {resume_from}")
+
     # Tokenizer + model
     print("\nModel...")
     tokenizer = AutoTokenizer.from_pretrained(LLAMA_MODEL)
-    model = AutoModelForSequenceClassification.from_pretrained(LLAMA_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        LLAMA_MODEL,
+        num_labels=3,
+        id2label={0: "SAFE", 1: "INJECTION", 2: "JAILBREAK"},
+        label2id={"SAFE": 0, "INJECTION": 1, "JAILBREAK": 2},
+        ignore_mismatched_sizes=True,
+    )
 
     # Dane
     print("Dane...")
@@ -391,11 +570,16 @@ def train_llama():
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
     )
 
-    trainer.train()
+    if resume_from:
+        print(f"  Resume from: {resume_from}")
+        trainer.train(resume_from_checkpoint=resume_from)
+    else:
+        trainer.train()
 
     print(f"\nZapis do {output_dir}...")
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    save_fingerprint(output_dir, current_fp)
     print("Llama Guard trening zakonczony!")
 
 
@@ -456,6 +640,10 @@ Przyklady:
                         help="Ile GPU uzyc (>1 = DeepSpeed, domyslnie: 1)")
     parser.add_argument("--resume", default=None,
                         help="Sciezka do checkpointu do kontynuacji treningu")
+    parser.add_argument("--fraction", type=float, default=1.0,
+                        help="Frakcja danych treningowych (0.0-1.0, domyslnie 1.0)")
+    parser.add_argument("--balance", action="store_true",
+                        help="Zrownowaz datasety (cap do mediany)")
     args = parser.parse_args()
 
     if args.model == "llama":
@@ -479,11 +667,16 @@ Przyklady:
         ]
         if args.resume:
             cmd.extend(["--resume", args.resume])
+        if args.fraction < 1.0:
+            cmd.extend(["--fraction", str(args.fraction)])
+        if args.balance:
+            cmd.append("--balance")
         print(f"Multi-GPU: {args.gpus} kart, DeepSpeed {'ZeRO-3' if args.method == 'full' else 'ZeRO-2'}")
         print(f"Komenda: {' '.join(cmd)}")
         os.execvp(cmd[0], cmd)
     else:
-        train_qwen(args.task, resume_from=args.resume, method=args.method)
+        train_qwen(args.task, resume_from=args.resume, method=args.method,
+                   fraction=args.fraction, balance=args.balance)
 
 
 if __name__ == "__main__":
