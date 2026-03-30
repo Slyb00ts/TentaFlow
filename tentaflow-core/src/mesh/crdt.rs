@@ -367,6 +367,11 @@ pub enum CrdtOperation {
         node_id: String,
         clock: LamportClock,
     },
+    RevokeTrustedNode {
+        node_id: String,
+        revoked_by: String,
+        clock: LamportClock,
+    },
 }
 
 impl CrdtOperation {
@@ -401,7 +406,8 @@ impl CrdtOperation {
             | Self::SetSyncExclusion { clock, .. }
             | Self::DeleteSyncExclusion { clock, .. }
             | Self::AddTrustedNode { clock, .. }
-            | Self::RemoveTrustedNode { clock, .. } => clock,
+            | Self::RemoveTrustedNode { clock, .. }
+            | Self::RevokeTrustedNode { clock, .. } => clock,
         }
     }
 
@@ -456,7 +462,8 @@ impl CrdtOperation {
                 format!("sync_excl:{group_name}:{resource_type}")
             }
             Self::AddTrustedNode { node_id, .. }
-            | Self::RemoveTrustedNode { node_id, .. } => {
+            | Self::RemoveTrustedNode { node_id, .. }
+            | Self::RevokeTrustedNode { node_id, .. } => {
                 format!("trusted_node:{node_id}")
             }
         }
