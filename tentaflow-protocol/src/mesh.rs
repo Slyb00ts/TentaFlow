@@ -224,6 +224,23 @@ pub enum MeshMessage {
         keys: Vec<(String, Vec<u8>)>,
     },
 
+    /// Rotacja klucza szyfrowania — wymiana ephemeral X25519 public key
+    KeyRotation {
+        from_node_id: String,
+        ephemeral_public_key: String,
+    },
+
+    /// Odpowiedz na rotacje klucza — zawiera ephemeral public key drugiej strony
+    KeyRotationResponse {
+        from_node_id: String,
+        ephemeral_public_key: String,
+    },
+
+    /// Graceful leave — node opuszcza mesh (nie revoke, chwilowe odlaczenie)
+    NodeLeaving {
+        node_id: String,
+    },
+
     // -- Komendy zarzadzania --
 
     /// Komenda zarzadzania wyslana do sparowanego noda
@@ -601,6 +618,53 @@ pub const MESH_MSG_LOG_CHUNK: u8 = 0x33;
 pub const MESH_MSG_SERVICE_QUERY_ALL: u8 = 0x34;
 pub const MESH_MSG_SERVICE_RESPONSE_ALL: u8 = 0x35;
 pub const MESH_MSG_CLUSTER_INFO: u8 = 0x36;
+pub const MESH_MSG_KEY_ROTATION: u8 = 0x25;
+pub const MESH_MSG_KEY_ROTATION_RESPONSE: u8 = 0x26;
+pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
+
+// =============================================================================
+// Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
+// =============================================================================
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct TrustRevokedPayload {
+    pub revoked_node_id: String,
+    pub from_node_id: String,
+}
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct KeyRotationPayload {
+    pub from_node_id: String,
+    pub ephemeral_public_key: String,
+}
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct KeyRotationResponsePayload {
+    pub from_node_id: String,
+    pub ephemeral_public_key: String,
+}
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct TrustedKeyEntry {
+    pub node_id: String,
+    pub public_key_hex: String,
+}
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct TrustedKeysSyncPayload {
+    pub keys: Vec<TrustedKeyEntry>,
+}
+
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct NodeLeavingPayload {
+    pub node_id: String,
+}
 
 // =============================================================================
 // Helpery serializacji
