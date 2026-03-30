@@ -28,6 +28,10 @@ use tentaflow_protocol::mesh::{
     MESH_MSG_LOG_CHUNK, MESH_MSG_MODEL_LIST, MESH_MSG_NODE_INFO, MESH_MSG_PAIRING_CONFIRM,
     MESH_MSG_PAIRING_REJECT, MESH_MSG_PAIRING_REQUEST, MESH_MSG_CLUSTER_INFO,
     MESH_MSG_SERVICE_ANNOUNCE, MESH_MSG_SERVICE_QUERY_ALL, MESH_MSG_SERVICE_RESPONSE_ALL,
+    MESH_MSG_TRUST_REVOKED, MESH_MSG_KEY_ROTATION, MESH_MSG_TRUSTED_KEYS_SYNC,
+    MESH_MSG_KEY_ROTATION_RESPONSE, MESH_MSG_NODE_LEAVING,
+    TrustRevokedPayload, KeyRotationPayload, KeyRotationResponsePayload,
+    TrustedKeysSyncPayload, NodeLeavingPayload,
 };
 
 // =============================================================================
@@ -81,6 +85,8 @@ pub enum QuicMeshEvent {
     PairingRejectReceived { peer_id: String, data: Vec<u8> },
     /// Otrzymano komende zarzadzania od peera (command_id jest w payloadzie)
     MeshCommandReceived { from_node_id: String, command: Vec<u8> },
+    /// Otrzymano cofniecie zaufania od peera
+    TrustRevokedReceived { node_id: String, revoked_node_id: String },
     /// Otrzymano odpowiedz na komende zarzadzania
     MeshCommandResponseReceived { from_node_id: String, data: Vec<u8> },
     /// Otrzymano postep deploy od peera
@@ -93,6 +99,14 @@ pub enum QuicMeshEvent {
     ServiceQueryAllReceived { from_node_id: String, data: Vec<u8> },
     /// Otrzymano odpowiedz z lista serwisow
     ServiceResponseAllReceived { from_node_id: String, data: Vec<u8> },
+    /// Otrzymano zadanie rotacji klucza od peera
+    KeyRotationReceived { node_id: String, ephemeral_public_key_hex: String },
+    /// Otrzymano synchronizacje zaufanych kluczy po sparowaniu
+    TrustedKeysSyncReceived { node_id: String, keys: Vec<(String, String)> },
+    /// Otrzymano odpowiedz na rotacje klucza od peera
+    KeyRotationResponseReceived { node_id: String, ephemeral_public_key_hex: String },
+    /// Otrzymano informacje o opuszczeniu mesh przez peera
+    NodeLeavingReceived { node_id: String },
 }
 
 /// Typ callbacka do obslugi forward requestow
@@ -220,6 +234,11 @@ impl QuicMeshManager {
         handles
     }
 
+    /// Identyfikator tego noda
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     /// Subskrypcja zdarzen mesh QUIC
     pub fn subscribe(&self) -> broadcast::Receiver<QuicMeshEvent> {
         self.event_tx.subscribe()
@@ -233,6 +252,22 @@ impl QuicMeshManager {
     /// Ustawia handler dla forward requestow — wywolywany gdy peer wysyla komende
     pub async fn set_forward_handler(&self, handler: ForwardHandler) {
         *self.forward_handler.write().await = Some(handler);
+    }
+
+    /// Wysyla NodeLeaving do wszystkich trusted peerow i zamyka polaczenia
+    pub async fn send_node_leaving(&self) {
+        let payload = NodeLeavingPayload {
+            node_id: self.node_id.clone(),
+        };
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        self.broadcast_to_trusted(MESH_MSG_NODE_LEAVING, &data, None).await;
+
+        let mut conns = self.connections.write().await;
+        for (_, conn) in conns.drain() {
+            conn.connection.close(0u32.into(), b"leaving");
+        }
     }
 
     /// Zamyka endpoint i wszystkie polaczenia
@@ -493,6 +528,29 @@ impl QuicMeshManager {
             return;
         }
 
+        // Odrzuc polaczenie od revoked noda
+        if let Some(ref sec) = security {
+            if sec.is_revoked(&peer_node_id) {
+                info!(peer_id = %peer_node_id, "Odrzucam polaczenie od revoked noda");
+                let payload = TrustRevokedPayload {
+                    revoked_node_id: peer_node_id.clone(),
+                    from_node_id: self_node_id.clone(),
+                };
+                if let Ok((mut send_s, _)) = connection.open_bi().await {
+                    let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                        .map(|v| v.to_vec())
+                        .unwrap_or_default();
+                    let _ = send_s.write_all(&[MESH_MSG_TRUST_REVOKED]).await;
+                    let len = (data.len() as u32).to_be_bytes();
+                    let _ = send_s.write_all(&len).await;
+                    let _ = send_s.write_all(&data).await;
+                    let _ = send_s.finish();
+                }
+                connection.close(2u32.into(), b"revoked");
+                return;
+            }
+        }
+
         // Wyslij swoj FullState jako odpowiedz — TYLKO jesli peer jest trusted
         // Brak security → zero trust — odrzuc polaczenie
         let peer_is_trusted = match &security {
@@ -656,7 +714,10 @@ impl QuicMeshManager {
         let max_size = match discriminant {
             MESH_MSG_HEARTBEAT | MESH_MSG_NODE_INFO => 64 * 1024,
             MESH_MSG_CRDT_DELTA | MESH_MSG_MODEL_LIST | MESH_MSG_CONTAINER_LIST => 1024 * 1024,
-            MESH_MSG_PAIRING_REQUEST | MESH_MSG_PAIRING_CONFIRM | MESH_MSG_PAIRING_REJECT => 4096,
+            MESH_MSG_PAIRING_REQUEST | MESH_MSG_PAIRING_CONFIRM | MESH_MSG_PAIRING_REJECT
+            | MESH_MSG_TRUST_REVOKED | MESH_MSG_KEY_ROTATION | MESH_MSG_KEY_ROTATION_RESPONSE
+            | MESH_MSG_NODE_LEAVING => 4096,
+            MESH_MSG_TRUSTED_KEYS_SYNC => 1024 * 1024,
             MESH_MSG_COMMAND | MESH_MSG_COMMAND_RESPONSE => 1024 * 1024,
             MESH_MSG_DEPLOY_PROGRESS | MESH_MSG_LOG_CHUNK => 256 * 1024,
             MESH_MSG_SERVICE_ANNOUNCE | MESH_MSG_SERVICE_QUERY_ALL | MESH_MSG_SERVICE_RESPONSE_ALL => 1024 * 1024,
@@ -674,6 +735,11 @@ impl QuicMeshManager {
         // Deszyfruj payload dla wiadomosci danych (0x10-0x18) od trusted peerow
         // Wiadomosci parowania (0x20-0x22) NIE sa szyfrowane — brak shared secret przed parowaniem
         let is_data_msg = (0x10..=0x18).contains(&discriminant)
+            || discriminant == MESH_MSG_TRUST_REVOKED
+            || discriminant == MESH_MSG_KEY_ROTATION
+            || discriminant == MESH_MSG_KEY_ROTATION_RESPONSE
+            || discriminant == MESH_MSG_TRUSTED_KEYS_SYNC
+            || discriminant == MESH_MSG_NODE_LEAVING
             || (0x30..=0x36).contains(&discriminant);
         let payload = if is_data_msg {
             if let Some(ref sec) = security {
@@ -763,6 +829,95 @@ impl QuicMeshManager {
                 from_node_id: peer_node_id,
                 data: payload,
             },
+            MESH_MSG_TRUST_REVOKED => {
+                match rkyv::from_bytes::<TrustRevokedPayload, rkyv::rancor::Error>(&payload) {
+                    Ok(msg) => {
+                        if msg.revoked_node_id.is_empty() {
+                            warn!(peer_id = %peer_node_id, "TrustRevoked bez revoked_node_id");
+                            return;
+                        }
+                        QuicMeshEvent::TrustRevokedReceived {
+                            node_id: peer_node_id,
+                            revoked_node_id: msg.revoked_node_id,
+                        }
+                    }
+                    Err(e) => {
+                        warn!(peer_id = %peer_node_id, "Blad deserializacji TrustRevoked rkyv: {}", e);
+                        return;
+                    }
+                }
+            }
+            MESH_MSG_KEY_ROTATION => {
+                match rkyv::from_bytes::<KeyRotationPayload, rkyv::rancor::Error>(&payload) {
+                    Ok(msg) => {
+                        if msg.from_node_id != peer_node_id {
+                            warn!(peer_id = %peer_node_id, claimed = %msg.from_node_id, "KeyRotation: from_node_id nie zgadza sie z peer transport ID");
+                            return;
+                        }
+                        if msg.ephemeral_public_key.is_empty() {
+                            warn!(peer_id = %peer_node_id, "KeyRotation bez ephemeral_public_key");
+                            return;
+                        }
+                        QuicMeshEvent::KeyRotationReceived {
+                            node_id: peer_node_id,
+                            ephemeral_public_key_hex: msg.ephemeral_public_key,
+                        }
+                    }
+                    Err(e) => {
+                        warn!(peer_id = %peer_node_id, "Blad deserializacji KeyRotation rkyv: {}", e);
+                        return;
+                    }
+                }
+            }
+            MESH_MSG_TRUSTED_KEYS_SYNC => {
+                match rkyv::from_bytes::<TrustedKeysSyncPayload, rkyv::rancor::Error>(&payload) {
+                    Ok(msg) => {
+                        let keys: Vec<(String, String)> = msg.keys
+                            .into_iter()
+                            .map(|entry| (entry.node_id, entry.public_key_hex))
+                            .collect();
+                        if keys.is_empty() {
+                            debug!(peer_id = %peer_node_id, "TrustedKeysSync — pusta lista kluczy");
+                            return;
+                        }
+                        QuicMeshEvent::TrustedKeysSyncReceived {
+                            node_id: peer_node_id,
+                            keys,
+                        }
+                    }
+                    Err(e) => {
+                        warn!(peer_id = %peer_node_id, "Blad deserializacji TrustedKeysSync rkyv: {}", e);
+                        return;
+                    }
+                }
+            }
+            MESH_MSG_KEY_ROTATION_RESPONSE => {
+                match rkyv::from_bytes::<KeyRotationResponsePayload, rkyv::rancor::Error>(&payload) {
+                    Ok(msg) => {
+                        if msg.from_node_id != peer_node_id {
+                            warn!(peer_id = %peer_node_id, claimed = %msg.from_node_id, "KeyRotationResponse: from_node_id nie zgadza sie z peer transport ID");
+                            return;
+                        }
+                        if msg.ephemeral_public_key.is_empty() {
+                            warn!(peer_id = %peer_node_id, "KeyRotationResponse bez ephemeral_public_key");
+                            return;
+                        }
+                        QuicMeshEvent::KeyRotationResponseReceived {
+                            node_id: peer_node_id,
+                            ephemeral_public_key_hex: msg.ephemeral_public_key,
+                        }
+                    }
+                    Err(e) => {
+                        warn!(peer_id = %peer_node_id, "Blad deserializacji KeyRotationResponse rkyv: {}", e);
+                        return;
+                    }
+                }
+            }
+            MESH_MSG_NODE_LEAVING => {
+                QuicMeshEvent::NodeLeavingReceived {
+                    node_id: peer_node_id,
+                }
+            }
             MESH_MSG_CLUSTER_INFO => {
                 debug!(peer_id = %peer_node_id, "ClusterInfo otrzymany, obsluga w przyszlej wersji");
                 return;
@@ -1019,6 +1174,70 @@ impl QuicMeshManager {
                 .ok_or_else(|| anyhow::anyhow!("Brak polaczenia z peerem: {}", node_id))?
         };
         Self::send_uni_message(&conn, MESH_MSG_PAIRING_REJECT, data).await
+    }
+
+    /// Wysyla wiadomosc do konkretnego peera — szyfruje jesli dostepny shared secret
+    async fn send_to_peer(&self, target_node_id: &str, discriminant: u8, data: &[u8]) -> Result<()> {
+        let conn = {
+            let conns = self.connections.read().await;
+            conns
+                .get(target_node_id)
+                .map(|mc| mc.connection.clone())
+                .ok_or_else(|| anyhow::anyhow!("Brak polaczenia z peerem: {}", target_node_id))?
+        };
+        if let Some(ref sec) = self.security {
+            Self::send_uni_message_encrypted(&conn, discriminant, data, target_node_id, sec).await
+        } else {
+            Self::send_uni_message(&conn, discriminant, data).await
+        }
+    }
+
+    /// Wysyla TrustRevoked do konkretnego peera (0x23)
+    pub async fn send_trust_revoked(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(target_node_id, MESH_MSG_TRUST_REVOKED, data).await
+    }
+
+    /// Wysyla KeyRotation do konkretnego peera (0x25)
+    pub async fn send_key_rotation(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(target_node_id, MESH_MSG_KEY_ROTATION, data).await
+    }
+
+    /// Wysyla TrustedKeysSync do konkretnego peera (0x24)
+    pub async fn send_trusted_keys_sync(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(target_node_id, MESH_MSG_TRUSTED_KEYS_SYNC, data).await
+    }
+
+    /// Wysyla KeyRotationResponse do konkretnego peera (0x26)
+    pub async fn send_key_rotation_response(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(target_node_id, MESH_MSG_KEY_ROTATION_RESPONSE, data).await
+    }
+
+    /// Broadcast wiadomosci do wszystkich polaczonych i zaufanych peerow.
+    /// Pomija peera podanego w `exclude_node_id`. Zwraca wyniki per peer.
+    pub async fn broadcast_to_trusted(
+        &self,
+        discriminant: u8,
+        data: &[u8],
+        exclude_node_id: Option<&str>,
+    ) -> Vec<(String, Result<()>)> {
+        let trusted_connections = self.collect_trusted_connections().await;
+        let mut results = Vec::with_capacity(trusted_connections.len());
+
+        for (peer_id, conn) in trusted_connections {
+            if let Some(excl) = exclude_node_id {
+                if peer_id == excl {
+                    continue;
+                }
+            }
+            let result = if let Some(ref sec) = self.security {
+                Self::send_uni_message_encrypted(&conn, discriminant, data, &peer_id, sec).await
+            } else {
+                Self::send_uni_message(&conn, discriminant, data).await
+            };
+            results.push((peer_id, result));
+        }
+
+        results
     }
 
     /// Wysyla NodeInfo do wszystkich polaczonych i zaufanych peerow.
