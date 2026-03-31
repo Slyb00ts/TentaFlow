@@ -610,30 +610,34 @@ fn spawn_quic_event_handler(
                         let sender_trusted = sec.is_trusted(&node_id);
                         let i_am_revoked = revoked_node_id == local_node_id;
 
-                        // Przypadek 1: ja zostalam revokowany — usun nadawce z moich trusted
+                        // Przypadek 1: ja zostalam odlaczony z mesh — usun WSZYSTKIE klucze
                         if i_am_revoked && sender_trusted {
-                            let _ = sec.unpair(&node_id);
-                            info!("Zostalismy odparowani przez {} — usuwam z zaufanych", node_id);
-                            // NIE disconnectuj — connection umrze po idle timeout.
-                            // Disconnect powodowal kaskadowe zrywanie polaczen i failujace broadcasty.
+                            let all_trusted = sec.get_all_trusted_keys();
+                            for (trusted_id, _) in &all_trusted {
+                                let _ = sec.unpair(trusted_id);
+                            }
+                            info!(
+                                "Odlaczony z mesh przez {} — usunieto {} kluczy",
+                                node_id, all_trusted.len()
+                            );
 
-                            let details = format!("Odparowany przez {}", node_id);
+                            let details = format!("Odlaczony z mesh przez {} — {} kluczy usunietych", node_id, all_trusted.len());
                             let _ = crate::db::repository::log_audit(
-                                &sec.db, None, None, "trust_revoked_by_peer", None,
+                                &sec.db, None, None, "removed_from_mesh", None,
                                 Some(&details), None, Some(&node_id),
                             );
                             continue;
                         }
 
-                        // Przypadek 2: ktos inny zostal revokowany — usun go z moich trusted
+                        // Przypadek 2: ktos inny zostal odlaczony — usun TYLKO jego klucz
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
                             let _ = sec.unpair(&revoked_node_id);
-                            info!("Usunieto zaufanie dla {} (propagacja od {})", revoked_node_id, node_id);
+                            info!("Usunieto {} z mesh (propagacja od {})", revoked_node_id, node_id);
 
-                            let details = format!("Revoke {} propagowany od {}", revoked_node_id, node_id);
                             let _ = crate::db::repository::log_audit(
                                 &sec.db, None, None, "trust_revoked_propagation", None,
-                                Some(&details), None, Some(&revoked_node_id),
+                                Some(&format!("Usunieto {} propagacja od {}", revoked_node_id, node_id)),
+                                None, Some(&revoked_node_id),
                             );
                         } else if !sender_trusted && !i_am_revoked {
                             warn!("Odrzucono TrustRevoked od niezaufanego noda {}", node_id);
