@@ -565,6 +565,8 @@ impl PeerManager {
                             vram_used_mb: g.vram_used_mb.into(),
                             vram_total_mb: g.vram_total_mb.into(),
                             temperature_c: f32::from(g.temperature_c) as u32,
+                            power_draw_w: None,
+                            power_limit_w: None,
                         })
                         .collect();
 
@@ -1162,6 +1164,8 @@ mod tests {
             vram_used_mb: 20000,
             vram_total_mb: 24000,
             temperature_c: 70,
+            power_draw_w: None,
+            power_limit_w: None,
         }];
 
         mgr.update_peer_metrics("peer-1", 45.0, 8000, 16000, gpus, 2.5, 10);
@@ -1296,8 +1300,8 @@ mod tests {
         mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
 
         let gpus = vec![
-            PeerGpuInfo { name: "GPU 0".to_string(), usage_percent: 50.0, vram_used_mb: 10000, vram_total_mb: 24000, temperature_c: 60 },
-            PeerGpuInfo { name: "GPU 1".to_string(), usage_percent: 70.0, vram_used_mb: 15000, vram_total_mb: 24000, temperature_c: 65 },
+            PeerGpuInfo { name: "GPU 0".to_string(), usage_percent: 50.0, vram_used_mb: 10000, vram_total_mb: 24000, temperature_c: 60, power_draw_w: None, power_limit_w: None },
+            PeerGpuInfo { name: "GPU 1".to_string(), usage_percent: 70.0, vram_used_mb: 15000, vram_total_mb: 24000, temperature_c: 65, power_draw_w: None, power_limit_w: None },
         ];
         mgr.update_peer_metrics("peer-1", 30.0, 8000, 16000, gpus, 2.0, 5);
 
