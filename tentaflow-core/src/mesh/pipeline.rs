@@ -273,7 +273,7 @@ fn spawn_mdns_handler(
                         status: "discovered".to_string(),
                         quic_connected: false,
                         discovered_at: chrono::Utc::now().to_rfc3339(),
-                        hostname: String::new(),
+                        hostname: peer.properties.get("hostname").cloned().unwrap_or_default(),
                         os_info: String::new(),
                         cpu_count: 0,
                         ram_total_mb: 0,
