@@ -97,24 +97,39 @@ pub async fn handle_initiate_pairing(
             sent = true;
         }
 
-        // Brak polaczenia — nawiaz QUIC i probuj ponownie
+        // Brak polaczenia — nawiaz QUIC probujac kazdy adres IP peera
         if !sent {
             if let Some(peer) = peer_store.get(&node_id) {
-                if !peer.addresses.is_empty() {
-                    let addr = std::net::SocketAddr::new(peer.addresses[0], peer.port);
-                    for attempt in 1..=3 {
-                        match qm.connect_to_peer(&node_id, addr).await {
-                            Ok(_) => {
-                                if qm.send_pairing_request(&node_id, &data).await.is_ok() {
-                                    sent = true;
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("connect_to_peer {} proba {}/3: {}", node_id, attempt, e);
+                // Preferuj IPv4, nie-loopback, nie-Docker-bridge
+                let mut addrs: Vec<std::net::IpAddr> = peer.addresses.iter()
+                    .filter(|a| {
+                        if let std::net::IpAddr::V4(v4) = a {
+                            !v4.is_loopback()
+                                && !(v4.octets()[0] == 172 && v4.octets()[1] >= 16 && v4.octets()[1] <= 31)
+                                && !v4.is_link_local()
+                        } else {
+                            false
+                        }
+                    })
+                    .copied()
+                    .collect();
+                // Fallback: jakikolwiek IPv4
+                if addrs.is_empty() {
+                    addrs = peer.addresses.iter().filter(|a| a.is_ipv4()).copied().collect();
+                }
+                // Probuj kazdy adres
+                for ip in &addrs {
+                    let addr = std::net::SocketAddr::new(*ip, peer.port);
+                    match qm.connect_to_peer(&node_id, addr).await {
+                        Ok(_) => {
+                            if qm.send_pairing_request(&node_id, &data).await.is_ok() {
+                                sent = true;
+                                break;
                             }
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        Err(e) => {
+                            warn!("connect_to_peer {} na {}: {}", node_id, addr, e);
+                        }
                     }
                 }
             }
