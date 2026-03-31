@@ -308,8 +308,9 @@ fn build_netplan_command(
     };
 
     Ok(format!(
-        "printf '{}' > /etc/netplan/99-tentaflow.yaml && netplan apply",
-        shell_escape(&yaml)
+        "printf '{}' > /etc/netplan/99-tentaflow-{}.yaml && netplan apply",
+        shell_escape(&yaml),
+        interface
     ))
 }
 
