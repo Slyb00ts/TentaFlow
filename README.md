@@ -189,6 +189,8 @@ WASM addons require the WASI target:
 rustup target add wasm32-wasip1
 ```
 
+**TLS certificates** are generated automatically during build (self-signed, EC P-256, valid 10 years) if `certs/cert.pem` and `certs/key.pem` are not present. No external tools required — generation uses pure Rust (`rcgen`). To use custom certificates, place them in `certs/cert.pem` and `certs/key.pem` before building.
+
 ### Building
 
 ```bash
