@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # =============================================================================
 # Plik: benchmark.py
-# Opis: Porownuje skutecznosc guard: Qwen (HF + GGUF), Claude (haiku/sonnet/opus).
+# Opis: Porownuje skutecznosc guard: Qwen (HF + GGUF), Llama Guard, Claude.
 # Uzycie:
-#   python3 benchmark.py                                   — ft + gguf-q4
-#   python3 benchmark.py --models base ft gguf-f16 gguf-q8 gguf-q4 gguf-q2
+#   python3 benchmark.py                                   — wszystkie dostepne
+#   python3 benchmark.py --models base ft-guard-low guard-low llama-guard
 #   python3 benchmark.py --models haiku sonnet opus
 #   python3 benchmark.py --models all                      — WSZYSTKO
 # =============================================================================
@@ -18,16 +18,27 @@ from collections import Counter
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 TEST_FILE = os.path.join(ROOT, "data", "guard", "test_benchmark.jsonl")
 QWEN_BASE = os.path.join(ROOT, "models", "qwen3.5-0.8b-base")
-QWEN_LORA = os.path.join(ROOT, "output", "qwen-guard-lora")
 
+# Sciezki do adapterow / modeli fine-tuned (HuggingFace)
+QWEN_LORA_MODELS = {
+    "ft-guard-low": os.path.join(ROOT, "output", "qwen-guard-qlora-low"),
+    "ft-guard-medium": os.path.join(ROOT, "output", "qwen-guard-qlora-medium"),
+    "ft-guard-high": os.path.join(ROOT, "output", "qwen-guard-qlora-high"),
+    "ft-all-lora": os.path.join(ROOT, "output", "qwen-all-lora"),
+    "ft-all-qlora": os.path.join(ROOT, "output", "qwen-all-qlora"),
+    "ft-all-dora": os.path.join(ROOT, "output", "qwen-all-dora"),
+    "ft-all-full": os.path.join(ROOT, "output", "qwen-all-full"),
+}
+
+# Sciezki do modeli GGUF (kwantyzowane Q5_K_M)
 GGUF_MODELS = {
-    "gguf-f16": os.path.join(ROOT, "output", "qwen-guard-f16.gguf"),
-    "gguf-q8": os.path.join(ROOT, "output", "qwen-guard-Q8_0.gguf"),
-    "gguf-q6": os.path.join(ROOT, "output", "qwen-guard-Q6_K.gguf"),
-    "gguf-q5": os.path.join(ROOT, "output", "qwen-guard-Q5_K_M.gguf"),
-    "gguf-q4": os.path.join(ROOT, "output", "qwen-guard-Q4_K_M.gguf"),
-    "gguf-q3": os.path.join(ROOT, "output", "qwen-guard-Q3_K_M.gguf"),
-    "gguf-q2": os.path.join(ROOT, "output", "qwen-guard-Q2_K.gguf"),
+    "guard-low": os.path.join(ROOT, "output", "qwen-guard-qlora-low-Q5_K_M.gguf"),
+    "guard-medium": os.path.join(ROOT, "output", "qwen-guard-qlora-medium-Q5_K_M.gguf"),
+    "guard-high": os.path.join(ROOT, "output", "qwen-guard-qlora-high-Q5_K_M.gguf"),
+    "all-lora": os.path.join(ROOT, "output", "qwen-all-lora-Q5_K_M.gguf"),
+    "all-qlora": os.path.join(ROOT, "output", "qwen-all-qlora-Q5_K_M.gguf"),
+    "all-dora": os.path.join(ROOT, "output", "qwen-all-dora-Q5_K_M.gguf"),
+    "all-full": os.path.join(ROOT, "output", "qwen-all-full-Q5_K_M.gguf"),
 }
 
 GUARD_SYSTEM = (
@@ -59,7 +70,7 @@ def parse_label(text):
 
 
 # ---------------------------------------------------------------------------
-# Qwen HuggingFace inference (bazowy i fine-tuned)
+# Qwen HuggingFace inference (bazowy i fine-tuned z adapterami)
 # ---------------------------------------------------------------------------
 
 _qwen_model = None
@@ -67,26 +78,33 @@ _qwen_tokenizer = None
 _qwen_is_finetuned = None
 
 
-def load_qwen(finetuned=False):
+def load_qwen(model_key=None):
+    """model_key=None → bazowy, inaczej klucz z QWEN_LORA_MODELS."""
     global _qwen_model, _qwen_tokenizer, _qwen_is_finetuned
     import torch
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
-    if _qwen_model is not None and _qwen_is_finetuned == finetuned:
+    if _qwen_model is not None and _qwen_is_finetuned == model_key:
         return _qwen_model, _qwen_tokenizer
 
+    # Zwolnij stary model
     if _qwen_model is not None:
         del _qwen_model
         torch.cuda.empty_cache()
 
-    print(f"  Ladowanie {'fine-tuned' if finetuned else 'bazowy'} Qwen (HuggingFace)...")
+    lora_path = QWEN_LORA_MODELS.get(model_key) if model_key else None
+    label = model_key or "bazowy"
+    print(f"  Ladowanie Qwen ({label})...")
+
     tokenizer = AutoTokenizer.from_pretrained(
-        QWEN_LORA if finetuned else QWEN_BASE, trust_remote_code=True,
+        lora_path or QWEN_BASE, trust_remote_code=True,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_special_tokens({
-        "additional_special_tokens": ["<|guard|>", "<|intent|>", "<|tools|>", "<|query|>"],
+        "additional_special_tokens": ["<|guard|>", "<|intent|>", "<|tools|>", "<|query|>",
+                                       "<|memory|>", "<|summary|>", "<|feedback|>", "<|recall|>",
+                                       "<|extract|>", "<|model|>", "<|plan|>", "<|check|>"],
     })
 
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
@@ -94,15 +112,15 @@ def load_qwen(finetuned=False):
     )
     model.resize_token_embeddings(len(tokenizer))
 
-    if finetuned:
+    if lora_path and os.path.exists(lora_path):
         from peft import PeftModel
-        model = PeftModel.from_pretrained(model, QWEN_LORA)
+        model = PeftModel.from_pretrained(model, lora_path)
         model = model.merge_and_unload()
 
     model.eval()
     _qwen_model = model
     _qwen_tokenizer = tokenizer
-    _qwen_is_finetuned = finetuned
+    _qwen_is_finetuned = model_key
     return model, tokenizer
 
 
@@ -118,9 +136,10 @@ def unload_qwen():
         torch.cuda.empty_cache()
 
 
-def predict_qwen(text, finetuned=False):
+def predict_qwen(text, model_key=None):
+    """model_key=None → bazowy Qwen, inaczej klucz z QWEN_LORA_MODELS."""
     import torch
-    model, tokenizer = load_qwen(finetuned)
+    model, tokenizer = load_qwen(model_key)
 
     messages = [
         {"role": "system", "content": GUARD_SYSTEM},
@@ -140,12 +159,92 @@ def predict_qwen(text, finetuned=False):
 
 
 # ---------------------------------------------------------------------------
-# GGUF inference (llama-cpp-python)
+# Llama Guard inference (klasyfikator DeBERTa-based, max 512 tokenow)
 # ---------------------------------------------------------------------------
 
-_gguf_llm = None
-_gguf_path = None
+_llama_model = None
+_llama_tokenizer = None
+_llama_is_base = None
 
+
+def load_llama_guard(use_base=False):
+    """Laduje Llama Guard. use_base=True → oryginalny model (2 klasy), False → fine-tuned (3 klasy)."""
+    global _llama_model, _llama_tokenizer, _llama_is_base
+    if _llama_model is not None and _llama_is_base == use_base:
+        return _llama_model, _llama_tokenizer
+
+    # Zwolnij stary
+    unload_llama_guard()
+
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    import torch
+
+    if use_base:
+        llama_dir = os.path.join(ROOT, "models", "llama-prompt-guard-86m")
+        print(f"  Ladowanie Llama Guard BASE z {llama_dir}...")
+    else:
+        llama_dir = os.path.join(ROOT, "output", "llama-guard")
+        print(f"  Ladowanie Llama Guard FT z {llama_dir}...")
+
+    _llama_tokenizer = AutoTokenizer.from_pretrained(llama_dir)
+    _llama_model = AutoModelForSequenceClassification.from_pretrained(llama_dir)
+    _llama_model.eval()
+    _llama_model.to("cuda" if torch.cuda.is_available() else "cpu")
+    _llama_is_base = use_base
+    return _llama_model, _llama_tokenizer
+
+
+def unload_llama_guard():
+    """Zwalnia pamiec GPU po testach Llama Guard."""
+    global _llama_model, _llama_tokenizer, _llama_is_base
+    if _llama_model is not None:
+        import torch
+        del _llama_model
+        _llama_model = None
+        _llama_tokenizer = None
+        _llama_is_base = None
+        torch.cuda.empty_cache()
+
+
+def predict_llama_guard(text):
+    """Inference Llama Guard fine-tuned (3 klasy: safe/injection/jailbreak)."""
+    import torch
+    model, tokenizer = load_llama_guard(use_base=False)
+
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        outputs = model(**inputs)
+    elapsed = time.perf_counter() - start
+
+    prediction = outputs.logits.argmax(dim=-1).item()
+    return prediction, elapsed, f"logits={outputs.logits[0].tolist()}"
+
+
+def predict_llama_guard_base(text):
+    """Inference Llama Guard bazowy (2 klasy: 0=benign, 1=unsafe).
+    Mapujemy: 0→0 (safe), 1→1 (injection) — baz model nie rozroznia injection/jailbreak."""
+    import torch
+    model, tokenizer = load_llama_guard(use_base=True)
+
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        outputs = model(**inputs)
+    elapsed = time.perf_counter() - start
+
+    prediction = outputs.logits.argmax(dim=-1).item()
+    # Bazowy: 0=benign, 1=unsafe (nie rozroznia injection/jailbreak)
+    return prediction, elapsed, f"logits={outputs.logits[0].tolist()}"
+
+
+# ---------------------------------------------------------------------------
+# GGUF inference (llama-cpp-python)
+# ---------------------------------------------------------------------------
 
 _gguf_llm = None
 _gguf_cache_key = None
@@ -386,9 +485,10 @@ def run_benchmark(model_name, predict_fn, test_data):
 # ---------------------------------------------------------------------------
 
 ALL_MODELS = [
-    "base", "ft",
-    "gguf-f16", "gguf-q8", "gguf-q6", "gguf-q5", "gguf-q4", "gguf-q3", "gguf-q2",
-    "cpu-f16", "cpu-q8", "cpu-q6", "cpu-q5", "cpu-q4", "cpu-q3", "cpu-q2",
+    "base",
+    "llama-guard-base", "llama-guard",
+    "guard-low", "guard-medium", "guard-high",
+    "all-lora", "all-qlora", "all-dora", "all-full",
     "haiku", "sonnet", "opus",
 ]
 
@@ -412,53 +512,58 @@ def main():
 
     all_results = []
 
-    # Najpierw HuggingFace modele (wymagaja GPU)
-    hf_models = [m for m in models if m in ("base", "ft")]
-    for model_key in hf_models:
-        if model_key == "base":
-            r = run_benchmark("Qwen3.5-0.8B (bazowy)", lambda t: predict_qwen(t, finetuned=False), test_data)
-        else:
-            r = run_benchmark("Qwen3.5-0.8B (fine-tuned HF)", lambda t: predict_qwen(t, finetuned=True), test_data)
+    # --- HuggingFace Qwen bazowy ---
+    if "base" in models:
+        r = run_benchmark("Qwen3.5-0.8B (bazowy)",
+                          lambda t: predict_qwen(t, model_key=None), test_data)
         all_results.append(r)
-
-    # Zwolnij GPU przed GGUF
-    if hf_models:
         unload_qwen()
 
-    # GGUF modele (GPU + CPU)
-    quant_labels = {
-        "f16": ("F16", "qwen-guard-f16.gguf"),
-        "q8": ("Q8_0", "qwen-guard-Q8_0.gguf"),
-        "q6": ("Q6_K", "qwen-guard-Q6_K.gguf"),
-        "q5": ("Q5_K_M", "qwen-guard-Q5_K_M.gguf"),
-        "q4": ("Q4_K_M", "qwen-guard-Q4_K_M.gguf"),
-        "q3": ("Q3_K_M", "qwen-guard-Q3_K_M.gguf"),
-        "q2": ("Q2_K", "qwen-guard-Q2_K.gguf"),
-    }
+    # --- Llama Guard (klasyfikator DeBERTa, max 512 tokenow) ---
+    llama_test_data = [r for r in test_data if len(r["text"]) <= 2048]
+    llama_filtered = len(llama_test_data) < len(test_data)
 
-    gguf_to_run = [m for m in models if m.startswith("gguf-") or m.startswith("cpu-")]
+    # Llama Guard bazowy (oryginalny, 2 klasy)
+    if "llama-guard-base" in models:
+        llama_base_dir = os.path.join(ROOT, "models", "llama-prompt-guard-86m")
+        if os.path.exists(llama_base_dir):
+            if llama_filtered:
+                print(f"  Llama: {len(llama_test_data)}/{len(test_data)} rekordow (odfiltrowano dlugie)")
+            r = run_benchmark("Llama Guard 86M (bazowy)", predict_llama_guard_base, llama_test_data)
+            all_results.append(r)
+        else:
+            print(f"\n  SKIP llama-guard-base: brak modelu bazowego")
+
+    # Llama Guard fine-tuned (3 klasy)
+    if "llama-guard" in models:
+        llama_ft_dir = os.path.join(ROOT, "output", "llama-guard")
+        if os.path.exists(llama_ft_dir):
+            if llama_filtered:
+                print(f"  Llama: {len(llama_test_data)}/{len(test_data)} rekordow (odfiltrowano dlugie)")
+            r = run_benchmark("Llama Guard 86M (fine-tuned)", predict_llama_guard, llama_test_data)
+            all_results.append(r)
+        else:
+            print(f"\n  SKIP llama-guard: brak modelu")
+
+    unload_llama_guard()
+
+    # --- GGUF modele (kwantyzowane Q5_K_M) ---
+    gguf_to_run = [m for m in models if m in GGUF_MODELS]
     for model_key in gguf_to_run:
-        use_gpu = model_key.startswith("gguf-")
-        quant_key = model_key.split("-", 1)[1]
-        if quant_key not in quant_labels:
-            print(f"\n  SKIP {model_key}: nieznana kwantyzacja")
-            continue
-        label, filename = quant_labels[quant_key]
-        path = os.path.join(ROOT, "output", filename)
+        path = GGUF_MODELS[model_key]
         if not os.path.exists(path):
-            print(f"\n  SKIP {model_key}: brak pliku {path}")
+            print(f"\n  SKIP {model_key}: brak pliku {os.path.basename(path)}")
             continue
         size_mb = os.path.getsize(path) / 1024**2
-        device = "GPU" if use_gpu else "CPU"
-        name = f"{device} {label} ({size_mb:.0f}MB)"
-        r = run_benchmark(name, lambda t, p=path, g=use_gpu: predict_gguf(t, p, g), test_data)
+        name = f"GGUF {model_key} Q5_K_M ({size_mb:.0f}MB)"
+        r = run_benchmark(name, lambda t, p=path: predict_gguf(t, p, use_gpu=True), test_data)
         all_results.append(r)
 
     # Zwolnij GGUF przed Claude
     if gguf_to_run:
         unload_gguf()
 
-    # Claude modele
+    # --- Claude modele ---
     claude_map = {
         "haiku": ("Claude Haiku 4.5", lambda t: predict_claude(t, "haiku")),
         "sonnet": ("Claude Sonnet 4.6", lambda t: predict_claude(t, "sonnet")),
