@@ -185,8 +185,13 @@ const MeshNetworkConfig = (() => {
       });
     });
 
-    // Zamykanie modala
+    // Zamykanie modala — wyczysc haslo przed usunieciem DOM
     const closeModal = () => {
+      const sudoInput = overlay.querySelector('#net-cfg-sudo');
+      if (sudoInput) {
+        sudoInput.value = '';
+        sudoInput.setAttribute('value', '');
+      }
       if (overlay.parentNode) overlay.remove();
     };
     overlay.querySelectorAll('[data-action="close"]').forEach(btn => {
@@ -196,13 +201,20 @@ const MeshNetworkConfig = (() => {
       if (e.target === overlay) closeModal();
     });
 
+    // Wyczysc pole hasla i wszystkie referencje
+    function clearSensitiveData(sudoInput) {
+      sudoInput.value = '';
+      sudoInput.setAttribute('value', '');
+    }
+
     // Wyslanie konfiguracji
     const applyBtn = overlay.querySelector('#net-cfg-apply');
     applyBtn.addEventListener('click', async () => {
+      const sudoInput = overlay.querySelector('#net-cfg-sudo');
       const ipv4 = overlay.querySelector('#net-cfg-ipv4').value;
       const netmaskRaw = overlay.querySelector('#net-cfg-netmask').value;
       const gateway = overlay.querySelector('#net-cfg-gateway').value;
-      const sudoPassword = overlay.querySelector('#net-cfg-sudo').value;
+      const sudoPassword = sudoInput.value;
 
       const errors = validateFields(isDhcp, ipv4, netmaskRaw, gateway, sudoPassword);
       showFieldErrors(overlay, errors);
@@ -222,6 +234,9 @@ const MeshNetworkConfig = (() => {
         sudo_password: sudoPassword
       };
 
+      // Wyczysc haslo z DOM natychmiast po skopiowaniu do payloadu
+      clearSensitiveData(sudoInput);
+
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), APPLY_TIMEOUT_MS);
 
@@ -232,6 +247,8 @@ const MeshNetworkConfig = (() => {
           { signal: controller.signal }
         );
         clearTimeout(timeout);
+        // Wyczysc payload z haslem
+        payload.sudo_password = '';
 
         if (!isDhcp && currentIp && ipv4.trim() !== currentIp) {
           App.showToast(I18n.t('mesh.network_ip_changed_warning'), 'info');
@@ -240,6 +257,7 @@ const MeshNetworkConfig = (() => {
         closeModal();
       } catch (err) {
         clearTimeout(timeout);
+        payload.sudo_password = '';
         applyBtn.disabled = false;
         applyBtn.textContent = I18n.t('mesh.network_apply');
 
