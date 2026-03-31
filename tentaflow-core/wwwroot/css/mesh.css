@@ -657,7 +657,8 @@
 
 /* --- Network interface row --- */
 .mesh-network-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1rem auto 130px 1fr auto auto;
   align-items: center;
   gap: var(--spacing-sm);
   padding: var(--spacing-xs) 0;
@@ -689,12 +690,16 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  min-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mesh-network-ip {
   color: var(--color-text-secondary);
-  min-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mesh-network-throughput {
@@ -818,16 +823,13 @@
 /* --- Responsive: network rows two-line on small screens --- */
 @media (max-width: 640px) {
   .mesh-network-row {
-    flex-wrap: wrap;
-  }
-
-  .mesh-network-ip {
-    min-width: auto;
+    grid-template-columns: 1rem auto 1fr auto;
+    grid-template-rows: auto auto;
   }
 
   .mesh-network-throughput {
-    width: 100%;
-    padding-left: calc(0.75rem + var(--spacing-sm));
+    grid-column: 2 / -2;
+    padding-left: 0;
   }
 
   .mesh-detail-gpu-metrics {
