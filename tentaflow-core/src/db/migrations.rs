@@ -834,5 +834,10 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX IF NOT EXISTS idx_revoked_nodes_node_id ON revoked_nodes(node_id);
         ",
     ),
+    (
+        28,
+        "add_trusted_nodes_addresses",
+        "ALTER TABLE trusted_nodes ADD COLUMN last_addresses TEXT NOT NULL DEFAULT '';",
+    ),
 ]
 }

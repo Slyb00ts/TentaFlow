@@ -230,7 +230,11 @@ async fn browse_loop(
                     continue;
                 }
 
-                // Emituj Discovered tylko raz per node_id
+                // Nie blokuj re-discovery dla peerow bez adresow
+                if peer.addresses.is_empty() {
+                    let _ = tx.send(PeerEvent::Discovered(peer));
+                    continue;
+                }
                 if !discovered_peers.insert(peer.node_id.clone()) {
                     debug!(node_id = %peer.node_id, "mDNS: peer juz odkryty, pomijam duplikat");
                     continue;

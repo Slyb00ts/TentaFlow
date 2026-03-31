@@ -523,6 +523,7 @@ pub struct TrustedNode {
     pub approved_by: String,
     pub approved_at: String,
     pub is_active: bool,
+    pub last_addresses: String,
 }
 
 /// Oczekujace parowanie z innym nodem

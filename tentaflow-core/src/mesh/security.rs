@@ -958,7 +958,8 @@ mod tests {
                 hostname TEXT DEFAULT '',
                 approved_by TEXT DEFAULT '',
                 approved_at TEXT NOT NULL DEFAULT (datetime('now')),
-                is_active INTEGER NOT NULL DEFAULT 1
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_addresses TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS pending_pairings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
