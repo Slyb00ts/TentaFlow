@@ -260,7 +260,7 @@ fn spawn_mdns_handler(
                         }
                     }
 
-                    info!(
+                    debug!(
                         node_id = %peer.node_id,
                         port = peer.port,
                         "Odkryto nowego peera przez mDNS"
@@ -332,7 +332,7 @@ fn spawn_mdns_handler(
                     }
                 }
                 PeerEvent::Removed { fullname } => {
-                    info!(fullname = %fullname, "Peer usuniety z mDNS");
+                    debug!(fullname = %fullname, "Peer usuniety z mDNS");
                 }
             }
         }
@@ -935,7 +935,7 @@ fn spawn_pairing_cleanup(mesh_security: Arc<MeshSecurity>) {
             match mesh_security.cleanup_expired() {
                 Ok(count) => {
                     if count > 0 {
-                        info!("Wyczyszczono {} wygaslych parowan", count);
+                        debug!("Wyczyszczono {} wygaslych parowan", count);
                     }
                 }
                 Err(e) => {
