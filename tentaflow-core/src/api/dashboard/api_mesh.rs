@@ -273,8 +273,6 @@ pub fn handle_revoke_trust(
     quic_mesh: &Option<Arc<QuicMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
-    security.revoke_trust(node_id)?;
-
     // Audit log
     let _ = crate::db::repository::log_audit(
         &security.db, None, None, "trust_revoked", None,
@@ -287,23 +285,31 @@ pub fn handle_revoke_trust(
             from_node_id: local_node_id.to_string(),
         };
         let qm = qm.clone();
+        let sec = security.clone();
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
             .map(|v| v.to_vec())
             .unwrap_or_default();
         let revoked_id = node_id.to_string();
         tokio::spawn(async move {
-            // Wyslij TrustRevoked do revokowanego noda PRZED revoke (jeszcze ma polaczenie)
+            // Wyslij PRZED revoke — klucze szyfrowania jeszcze istnieja
             if let Err(e) = qm.send_to_peer(&revoked_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, &data).await {
                 warn!("Blad wysylania TrustRevoked do revokowanego {}: {}", revoked_id, e);
             }
-            // Broadcast do pozostalych trusted peerow
             qm.broadcast_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
                 &data,
                 Some(&revoked_id),
             ).await;
+
+            // Revoke PO wyslaniu — teraz mozna usunac klucze
+            if let Err(e) = sec.revoke_trust(&revoked_id) {
+                warn!("Blad revoke_trust dla {}: {}", revoked_id, e);
+            }
             qm.disconnect_peer(&revoked_id).await;
         });
+    } else {
+        // Brak QUIC — revoke lokalnie
+        security.revoke_trust(node_id)?;
     }
 
     let json = serde_json::json!({"ok": true}).to_string();
