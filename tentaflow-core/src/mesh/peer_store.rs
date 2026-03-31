@@ -106,6 +106,16 @@ pub struct HeartbeatMetrics {
     pub cpu_temperature_c: Option<f32>,
     pub swap_total_mb: u64,
     pub swap_used_mb: u64,
+    /// Lista polaczonych peer_ids — do propagacji topologii mesh
+    pub connected_peers: Vec<String>,
+}
+
+/// Wpis w tabeli routingu — jak dotrzec do danego noda
+#[derive(Debug, Clone)]
+pub struct RoutingEntry {
+    pub next_hop: String,
+    pub hops: u8,
+    pub direct: bool,
 }
 
 /// Wspoldzielony store peerow — bezpieczny miedzy watkami.
@@ -123,6 +133,10 @@ pub struct MeshPeerStore {
     list_cache: Arc<RwLock<Arc<Vec<MeshPeerInfo>>>>,
     /// [OPT] Flaga dirty — czy cache trzeba odswiezyc
     dirty: Arc<AtomicBool>,
+    /// Topologia mesh — node_id -> lista bezposrednio polaczonych peerow
+    topology: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// Tabela routingu — obliczana z topologii BFS
+    routing_table: Arc<RwLock<HashMap<String, RoutingEntry>>>,
 }
 
 impl MeshPeerStore {
@@ -131,6 +145,8 @@ impl MeshPeerStore {
             peers: Arc::new(RwLock::new(HashMap::new())),
             list_cache: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             dirty: Arc::new(AtomicBool::new(false)),
+            topology: Arc::new(RwLock::new(HashMap::new())),
+            routing_table: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -317,6 +333,72 @@ impl MeshPeerStore {
         }
         drop(peers);
         self.mark_dirty();
+    }
+
+    /// Aktualizuje topologie mesh — zapisuje liste bezposrednich peerow danego noda
+    pub fn update_topology(&self, node_id: &str, connected_peers: Vec<String>) {
+        self.topology.write().insert(node_id.to_string(), connected_peers);
+    }
+
+    /// Zwraca kopie calej topologii mesh
+    pub fn get_topology(&self) -> HashMap<String, Vec<String>> {
+        self.topology.read().clone()
+    }
+
+    /// Pobierz routing entry dla noda — None jesli nieosiagalny
+    pub fn get_route(&self, node_id: &str) -> Option<RoutingEntry> {
+        self.routing_table.read().get(node_id).cloned()
+    }
+
+    /// Przelicz tabele routingu z topologii (BFS od local_node_id, max 4 hopy)
+    pub fn recalculate_routes(&self, local_node_id: &str) {
+        let topology = self.topology.read().clone();
+        let mut routes: HashMap<String, RoutingEntry> = HashMap::new();
+
+        // BFS od lokalnego noda
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<(String, String, u8)> = std::collections::VecDeque::new();
+        // (node_id, next_hop, hops)
+
+        visited.insert(local_node_id.to_string());
+
+        // Bezposredni sasiedzi (hop 1)
+        if let Some(direct_peers) = topology.get(local_node_id) {
+            for peer in direct_peers {
+                if visited.insert(peer.clone()) {
+                    routes.insert(peer.clone(), RoutingEntry {
+                        next_hop: peer.clone(),
+                        hops: 1,
+                        direct: true,
+                    });
+                    queue.push_back((peer.clone(), peer.clone(), 1));
+                }
+            }
+        }
+
+        // BFS — max 4 hopy
+        while let Some((current, first_hop, depth)) = queue.pop_front() {
+            if depth >= 4 { continue; }
+            if let Some(peers) = topology.get(&current) {
+                for peer in peers {
+                    if visited.insert(peer.clone()) {
+                        routes.insert(peer.clone(), RoutingEntry {
+                            next_hop: first_hop.clone(),
+                            hops: depth + 1,
+                            direct: false,
+                        });
+                        queue.push_back((peer.clone(), first_hop.clone(), depth + 1));
+                    }
+                }
+            }
+        }
+
+        *self.routing_table.write() = routes;
+    }
+
+    /// Pelna tabela routingu (do debugowania/API)
+    pub fn get_routing_table(&self) -> HashMap<String, RoutingEntry> {
+        self.routing_table.read().clone()
     }
 
     /// Tworzy pusty wpis peera — uzywany gdy QUIC polaczyl sie przed mDNS discovery
