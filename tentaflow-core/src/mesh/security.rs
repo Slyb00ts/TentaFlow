@@ -169,6 +169,8 @@ pub struct MeshSecurity {
     inbound_windows: Arc<DashMap<String, ReplayWindow>>,
     /// Lista revoked node IDs — wypelniana przy revoke_trust()
     revoked_nodes: RwLock<HashSet<String>>,
+    /// Nody w trakcie revoke/unpair — synchronicznie ustawiane przed async broadcast
+    revoking_nodes: RwLock<HashSet<String>>,
     /// Oczekujace rotacje kluczy: peer_id -> PendingKeyRotation
     pending_rotations: RwLock<HashMap<String, PendingKeyRotation>>,
     /// Licznik prób weryfikacji PIN per pairing: node_id -> (count, last_attempt)
@@ -197,6 +199,7 @@ impl MeshSecurity {
             outbound_nonces: Arc::new(RwLock::new(HashMap::new())),
             inbound_windows: Arc::new(DashMap::new()),
             revoked_nodes: RwLock::new(HashSet::new()),
+            revoking_nodes: RwLock::new(HashSet::new()),
             pending_rotations: RwLock::new(HashMap::new()),
             pin_attempts: RwLock::new(HashMap::new()),
             db,
@@ -370,8 +373,11 @@ impl MeshSecurity {
         hex::encode(self.x25519_public.to_bytes())
     }
 
-    /// Czy node jest zaufany?
+    /// Czy node jest zaufany? Sprawdza tez czy nie jest w trakcie revoke/unpair.
     pub fn is_trusted(&self, node_id: &str) -> bool {
+        if self.revoking_nodes.read().contains(node_id) {
+            return false;
+        }
         self.trusted_keys.read().contains_key(node_id)
     }
 
@@ -385,7 +391,7 @@ impl MeshSecurity {
 
     /// Generuj losowy 6-cyfrowy PIN do parowania
     pub fn generate_pin() -> String {
-        let pin: u32 = OsRng.gen_range(100_000..999_999);
+        let pin: u32 = OsRng.gen_range(100_000..=999_999);
         format!("{:06}", pin)
     }
 
@@ -398,9 +404,8 @@ impl MeshSecurity {
             bail!("Zbyt wiele oczekujacych parowan (max 10). Usun lub zatwierdz istniejace.");
         }
 
-        // Usun z revoked jesli byl wczesniej odparowany — pozwol na ponowne parowanie
         if self.is_revoked(remote_node_id) {
-            let _ = self.admin_retrust(remote_node_id);
+            bail!("Node {} jest na liscie revoked — uzyj retrust przed ponownym parowaniem", remote_node_id);
         }
 
         // Resetuj rate limit PIN — nowe parowanie = nowe proby
@@ -431,9 +436,8 @@ impl MeshSecurity {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
         let expires_str = expires.format("%Y-%m-%d %H:%M:%S").to_string();
 
-        // Usun z revoked jesli byl wczesniej odparowany — pozwol na ponowne parowanie
         if self.is_revoked(remote_node_id) {
-            let _ = self.admin_retrust(remote_node_id);
+            bail!("Node {} jest na liscie revoked — uzyj retrust przed ponownym parowaniem", remote_node_id);
         }
 
         // Resetuj rate limit PIN dla tego noda — nowe parowanie = nowe proby
@@ -555,9 +559,30 @@ impl MeshSecurity {
         Ok(())
     }
 
+    /// Unpair — usun zaufanie BEZ dodawania do revoked.
+    /// Uzywane przy przyjaznym odparowaniu z UI (nie security revoke).
+    pub fn unpair(&self, node_id: &str) -> Result<()> {
+        db::repository::remove_trusted_node(&self.db, node_id)?;
+        self.trusted_keys.write().remove(node_id);
+        self.epoch_keys.write().remove(node_id);
+        self.rebuild_trusted_snapshot();
+        info!(node_id = %node_id, "Odparowano node (friendly unpair)");
+        Ok(())
+    }
+
     /// Czy node zostal aktywnie revoked (byl trusted i utracil zaufanie)
     pub fn is_revoked(&self, node_id: &str) -> bool {
         self.revoked_nodes.read().contains(node_id)
+    }
+
+    /// Oznacz node jako w trakcie odparowywania (synchroniczne, przed async broadcast)
+    pub fn mark_revoking(&self, node_id: &str) {
+        self.revoking_nodes.write().insert(node_id.to_string());
+    }
+
+    /// Zdejmij oznaczenie revoking po zakonczeniu operacji
+    pub fn clear_revoking(&self, node_id: &str) {
+        self.revoking_nodes.write().remove(node_id);
     }
 
     /// Lista revokowanych node IDs — do synchronizacji przy reconnect
@@ -1623,5 +1648,65 @@ mod tests {
         // Admin re-trust
         sec.admin_retrust("node-x").unwrap();
         assert!(!sec.is_revoked("node-x"));
+    }
+
+    #[test]
+    fn unpair_does_not_add_to_revoked() {
+        let sec_a = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
+
+        // Sparuj
+        sec_a.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
+        assert!(sec_a.is_trusted("node-b"));
+
+        // Unpair (przyjazne rozparowanie)
+        sec_a.unpair("node-b").unwrap();
+        assert!(!sec_a.is_trusted("node-b"));
+        assert!(!sec_a.is_revoked("node-b")); // NIE jest revoked
+    }
+
+    #[test]
+    fn revoked_node_cannot_initiate_pairing() {
+        let sec = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
+
+        // Sparuj i revokuj (cofniecie zaufania)
+        sec.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
+        sec.revoke_trust("node-b").unwrap();
+        assert!(sec.is_revoked("node-b"));
+
+        // Proba parowania z revoked nodem — powinna zawiesc
+        let result = sec.initiate_pairing("node-b");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("revoked"));
+    }
+
+    #[test]
+    fn revoking_state_blocks_is_trusted() {
+        let sec = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
+
+        sec.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
+        assert!(sec.is_trusted("node-b"));
+
+        // Oznacz jako revoking
+        sec.mark_revoking("node-b");
+        assert!(!sec.is_trusted("node-b")); // is_trusted zwraca false
+
+        // Zdejmij revoking
+        sec.clear_revoking("node-b");
+        assert!(sec.is_trusted("node-b")); // Znowu trusted
+    }
+
+    #[test]
+    fn pin_range_inclusive_999999() {
+        // Generuj duzo PINow i sprawdz zakres
+        for _ in 0..10_000 {
+            let pin = MeshSecurity::generate_pin();
+            let val: u32 = pin.parse().unwrap();
+            assert!(val >= 100_000, "PIN {} < 100000", val);
+            assert!(val <= 999_999, "PIN {} > 999999", val);
+            assert_eq!(pin.len(), 6, "PIN {} nie ma 6 znakow", pin);
+        }
     }
 }

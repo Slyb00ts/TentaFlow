@@ -56,7 +56,7 @@ tracing_enabled = false
 [mesh]
 enabled = true
 port = 18091
-static_peers = ["127.0.0.1:18092"]
+static_peers = ["127.0.0.1:18092", "127.0.0.1:18093", "127.0.0.1:18094"]
 mdns_enabled = false
 heartbeat_interval_ms = 1000
 peer_timeout_ms = 5000
