@@ -567,12 +567,15 @@ fn spawn_quic_event_handler(
                                         let broadcast_data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
                                             .map(|v| v.to_vec())
                                             .unwrap_or_default();
-                                        for (peer_id, _) in &updated_keys {
-                                            if peer_id == &target_node_id {
-                                                continue; // juz wyslano wyzej
-                                            }
-                                            if let Err(e) = qm_events.send_trusted_keys_sync(peer_id, &broadcast_data).await {
-                                                warn!("Blad broadcast TrustedKeysSync do {}: {}", peer_id, e);
+                                        // Broadcast do wszystkich trusted — pomija nowo sparowanego (juz dostal wyzej)
+                                        let results = qm_events.broadcast_to_trusted(
+                                            tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
+                                            &broadcast_data,
+                                            Some(&target_node_id),
+                                        ).await;
+                                        for (pid, res) in &results {
+                                            if let Err(e) = res {
+                                                warn!("Blad broadcast TrustedKeysSync do {}: {}", pid, e);
                                             }
                                         }
                                     }
