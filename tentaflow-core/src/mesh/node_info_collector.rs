@@ -118,6 +118,8 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
                         vram_used_mb: 0,
                         usage_percent: 0.0,
                         temperature_c: 0,
+                        power_draw_w: None,
+                        power_limit_w: None,
                     }
                 })
                 .collect()
@@ -245,18 +247,27 @@ pub struct CurrentMetrics {
     pub gpus: Vec<PeerGpuInfo>,
     pub containers: Vec<PeerContainerInfo>,
     pub networks: Vec<PeerNetworkInfo>,
+    pub cpu_temperature_c: Option<f32>,
+    pub swap_total_mb: u64,
+    pub swap_used_mb: u64,
 }
 
 /// Szybkie metryki (CPU/RAM/GPU/sieci) — bezpieczne do wywolywania co 500ms
 pub fn collect_fast_metrics() -> CurrentMetrics {
-    // KROTKO lockuj SYS — tylko na refresh CPU/RAM, potem zwolnij
-    let (cpu_usage, ram_used_mb) = {
+    // KROTKO lockuj SYS — tylko na refresh CPU/RAM/swap, potem zwolnij
+    let (cpu_usage, ram_used_mb, swap_total_mb, swap_used_mb) = {
         let mut sys = SYS.lock();
         sys.refresh_cpu_usage();
         sys.refresh_memory();
-        (sys.global_cpu_usage(), sys.used_memory() / (1024 * 1024))
+        (
+            sys.global_cpu_usage(),
+            sys.used_memory() / (1024 * 1024),
+            sys.total_swap() / (1024 * 1024),
+            sys.used_swap() / (1024 * 1024),
+        )
     };
 
+    let cpu_temperature_c = detect_cpu_temperature();
     let gpus = detect_gpus_cached();
     let networks = detect_networks();
 
@@ -266,6 +277,9 @@ pub fn collect_fast_metrics() -> CurrentMetrics {
         gpus,
         containers: vec![],
         networks,
+        cpu_temperature_c,
+        swap_total_mb,
+        swap_used_mb,
     }
 }
 
@@ -351,7 +365,7 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
 fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
     let output = match std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,power.limit",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -361,18 +375,31 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let nvidia_entries: Vec<(&str, u64, u64, f32, u32)> = stdout
+
+    struct NvidiaEntry<'a> {
+        name: &'a str,
+        vram_total: u64,
+        vram_used: u64,
+        usage: f32,
+        temp: u32,
+        power_draw: Option<f32>,
+        power_limit: Option<f32>,
+    }
+
+    let nvidia_entries: Vec<NvidiaEntry> = stdout
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
             if parts.len() >= 5 {
-                Some((
-                    parts[0],
-                    parts[1].parse().unwrap_or(0),
-                    parts[2].parse().unwrap_or(0),
-                    parts[3].parse().unwrap_or(0.0),
-                    parts[4].parse().unwrap_or(0),
-                ))
+                Some(NvidiaEntry {
+                    name: parts[0],
+                    vram_total: parts[1].parse().unwrap_or(0),
+                    vram_used: parts[2].parse().unwrap_or(0),
+                    usage: parts[3].parse().unwrap_or(0.0),
+                    temp: parts[4].parse().unwrap_or(0),
+                    power_draw: parts.get(5).and_then(|s| s.parse().ok()),
+                    power_limit: parts.get(6).and_then(|s| s.parse().ok()),
+                })
             } else {
                 None
             }
@@ -380,13 +407,15 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
         .collect();
 
     for gpu in gpus.iter_mut() {
-        if let Some(nv) = nvidia_entries.iter().find(|(name, ..)| {
-            gpu.name.contains(name) || name.contains(&gpu.name.as_str())
+        if let Some(nv) = nvidia_entries.iter().find(|e| {
+            gpu.name.contains(e.name) || e.name.contains(&gpu.name.as_str())
         }) {
-            gpu.vram_total_mb = nv.1;
-            gpu.vram_used_mb = nv.2;
-            gpu.usage_percent = nv.3;
-            gpu.temperature_c = nv.4;
+            gpu.vram_total_mb = nv.vram_total;
+            gpu.vram_used_mb = nv.vram_used;
+            gpu.usage_percent = nv.usage;
+            gpu.temperature_c = nv.temp;
+            gpu.power_draw_w = nv.power_draw;
+            gpu.power_limit_w = nv.power_limit;
         }
     }
 }
@@ -565,6 +594,179 @@ fn parse_mem_value(s: &str) -> u64 {
 }
 
 // =============================================================================
+// Temperatura CPU — sysinfo::Components
+// =============================================================================
+
+/// Odczytuje temperature CPU z sensorow systemowych.
+/// Zwraca srednia temperature sensorow CPU lub None jesli brak danych.
+fn detect_cpu_temperature() -> Option<f32> {
+    let components = sysinfo::Components::new_with_refreshed_list();
+    let mut sum = 0.0f32;
+    let mut count = 0u32;
+    for c in &components {
+        let label = c.label().to_lowercase();
+        if label.contains("cpu") || label.contains("core") || label.contains("package") || label.contains("tctl") || label.contains("tdie") {
+            if let Some(temp) = c.temperature() {
+                if temp > 0.0 {
+                    sum += temp;
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count > 0 {
+        Some(sum / count as f32)
+    } else {
+        None
+    }
+}
+
+// =============================================================================
+// Informacje o interfejsach sieciowych — Linux-specific
+// =============================================================================
+
+/// Odczytuje stan linku interfejsu sieciowego (Linux: /sys/class/net/{name}/operstate)
+fn detect_link_up(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/sys/class/net/{}/operstate", name);
+        std::fs::read_to_string(&path)
+            .map(|s| s.trim() == "up")
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// Odczytuje adres MAC interfejsu (Linux: /sys/class/net/{name}/address)
+fn detect_mac_address(name: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/sys/class/net/{}/address", name);
+        std::fs::read_to_string(&path)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        String::new()
+    }
+}
+
+/// Wykrywa typ interfejsu sieciowego
+fn detect_interface_type(name: &str) -> String {
+    if name.starts_with("lo") {
+        return "loopback".to_string();
+    }
+    if name.starts_with("docker") || name.starts_with("br-") || name.starts_with("veth") {
+        return "virtual".to_string();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Thunderbolt
+        let subsystem_path = format!("/sys/class/net/{}/device/subsystem", name);
+        if let Ok(target) = std::fs::read_link(&subsystem_path) {
+            if let Some(s) = target.to_str() {
+                if s.contains("thunderbolt") {
+                    return "thunderbolt".to_string();
+                }
+            }
+        }
+
+        // Wi-Fi
+        let wireless_path = format!("/sys/class/net/{}/wireless", name);
+        if std::path::Path::new(&wireless_path).exists() {
+            return "wifi".to_string();
+        }
+    }
+
+    "ethernet".to_string()
+}
+
+/// Sprawdza czy RDMA jest dostepne dla interfejsu (Linux: /sys/class/infiniband/)
+fn detect_rdma_available(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/sys/class/infiniband/{}", name);
+        std::path::Path::new(&path).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// Pobiera adres IPv4 i maske interfejsu z sysinfo::Networks
+fn detect_ipv4_info(name: &str, nets: &Networks) -> (String, String) {
+    for (iface_name, data) in nets.iter() {
+        if iface_name == name {
+            for net in data.ip_networks() {
+                if let IpAddr::V4(v4) = net.addr {
+                    let prefix = net.prefix;
+                    let mask = if prefix >= 32 {
+                        u32::MAX
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    };
+                    let netmask = std::net::Ipv4Addr::from(mask);
+                    return (v4.to_string(), netmask.to_string());
+                }
+            }
+        }
+    }
+    (String::new(), String::new())
+}
+
+// Cache bramek domyslnych per interfejs (parsowane z `ip route show`)
+lazy_static::lazy_static! {
+    static ref GATEWAY_CACHE: Mutex<(Instant, HashMap<String, String>)> = {
+        Mutex::new((Instant::now() - Duration::from_secs(120), HashMap::new()))
+    };
+}
+
+/// Pobiera bramke domyslna dla interfejsu
+fn detect_gateway(name: &str) -> String {
+    let mut cache = GATEWAY_CACHE.lock();
+    // Odswiezaj co 30s
+    if cache.0.elapsed() > Duration::from_secs(30) {
+        let mut gateways = HashMap::new();
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(output) = std::process::Command::new("ip")
+                .args(["route", "show"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        // "default via 192.168.1.1 dev eth0 ..."
+                        if line.starts_with("default") {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if let (Some(via_idx), Some(dev_idx)) = (
+                                parts.iter().position(|&p| p == "via"),
+                                parts.iter().position(|&p| p == "dev"),
+                            ) {
+                                if let (Some(gw), Some(dev)) = (parts.get(via_idx + 1), parts.get(dev_idx + 1)) {
+                                    gateways.insert(dev.to_string(), gw.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        *cache = (Instant::now(), gateways);
+    }
+    cache.1.get(name).cloned().unwrap_or_default()
+}
+
+// =============================================================================
 // Sieci — cross-platform przez sysinfo::Networks
 // =============================================================================
 
@@ -606,12 +808,27 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
                 (0, 0)
             };
 
+            let iface_name = name.to_string();
+            let link_up = detect_link_up(&iface_name);
+            let (ipv4_address, ipv4_netmask) = detect_ipv4_info(&iface_name, &nets);
+            let ipv4_gateway = detect_gateway(&iface_name);
+            let mac_address = detect_mac_address(&iface_name);
+            let interface_type = detect_interface_type(&iface_name);
+            let rdma_available = detect_rdma_available(&iface_name);
+
             Some(PeerNetworkInfo {
-                name: name.to_string(),
+                name: iface_name,
                 rx_bytes: rx,
                 tx_bytes: tx,
                 rx_bytes_per_sec: rx_per_sec,
                 tx_bytes_per_sec: tx_per_sec,
+                link_up,
+                ipv4_address,
+                ipv4_netmask,
+                ipv4_gateway,
+                mac_address,
+                interface_type,
+                rdma_available,
             })
         })
         .collect();

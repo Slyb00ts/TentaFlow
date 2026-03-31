@@ -4,8 +4,10 @@
 //       Wysyla wiadomosci parowania przez QUIC do zdalnych peerow.
 // =============================================================================
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use crate::db::{self, DbPool};
 use crate::mesh::node_info_collector;
@@ -15,6 +17,10 @@ use crate::mesh::security::MeshSecurity;
 use anyhow::Result;
 use serde::Deserialize;
 use tracing::{info, warn};
+
+/// Ograniczenie czestotliwosci zmian konfiguracji sieci: max 1 na 30s per node
+static NETWORK_CONFIG_RATE_LIMIT: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn json_error(message: &str) -> String {
     serde_json::json!({"error": message}).to_string()
@@ -442,6 +448,21 @@ pub fn handle_get_node(
             let ip = first_non_loopback_ip(&p.addresses);
             let ip_addresses = addresses_to_strings(&p.addresses);
             let (gpu_count, gpu_names) = gpu_summary(&p.gpu_info);
+            let network_interfaces: Vec<serde_json::Value> = p.networks.iter().map(|n| {
+                serde_json::json!({
+                    "name": n.name,
+                    "rx_bytes_per_sec": n.rx_bytes_per_sec,
+                    "tx_bytes_per_sec": n.tx_bytes_per_sec,
+                    "link_up": n.link_up,
+                    "ipv4_address": n.ipv4_address,
+                    "ipv4_netmask": n.ipv4_netmask,
+                    "ipv4_gateway": n.ipv4_gateway,
+                    "mac_address": n.mac_address,
+                    "interface_type": n.interface_type,
+                    "rdma_available": n.rdma_available,
+                })
+            }).collect();
+
             let json = serde_json::json!({
                 "node_id": p.node_id,
                 "hostname": p.hostname,
@@ -459,11 +480,15 @@ pub fn handle_get_node(
                 "ram_total_mb": p.ram_total_mb,
                 "cpu_usage_percent": p.cpu_usage_percent,
                 "ram_used_mb": p.ram_used_mb,
+                "cpu_temperature_c": p.cpu_temperature_c,
+                "swap_total_mb": p.swap_total_mb,
+                "swap_used_mb": p.swap_used_mb,
                 "gpu_info": p.gpu_info,
                 "gpu_count": gpu_count,
                 "gpu_names": gpu_names,
                 "containers": p.containers,
                 "networks": p.networks,
+                "network_interfaces": network_interfaces,
                 "services": services,
                 "is_local": is_local,
                 "is_trusted": is_trusted,
@@ -552,6 +577,9 @@ pub async fn handle_send_command(
         }
     }
 
+    // Dane do audytu konfiguracji sieci (wypelniane w galezi "network_config")
+    let mut net_config_audit: Option<(String, bool, Option<String>)> = None;
+
     // Mapuj command_type na MeshCommandType
     let command = match req.command_type.as_str() {
         "list_containers" => tentaflow_protocol::mesh::MeshCommandType::ListContainers,
@@ -572,11 +600,149 @@ pub async fn handle_send_command(
             let volumes = params.get("volumes").and_then(|v| v.as_bool()).unwrap_or(false);
             tentaflow_protocol::mesh::MeshCommandType::SystemPrune { volumes }
         }
+        "network_config" => {
+            // Rate limit: max 1 zmiana konfiguracji sieci na 30s per node
+            {
+                let mut rate_map = NETWORK_CONFIG_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(last) = rate_map.get(node_id) {
+                    if last.elapsed() < std::time::Duration::from_secs(30) {
+                        return Ok((429, json_error("Zbyt czeste zmiany konfiguracji sieci — odczekaj 30s")));
+                    }
+                }
+                rate_map.insert(node_id.to_string(), Instant::now());
+            }
+
+            let interface = params.get("interface").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let ipv4 = params.get("ipv4").and_then(|v| v.as_str()).map(String::from);
+            let netmask = params.get("netmask").and_then(|v| v.as_str()).map(String::from);
+            let gateway = params.get("gateway").and_then(|v| v.as_str()).map(String::from);
+            let dhcp = params.get("dhcp").and_then(|v| v.as_bool()).unwrap_or(false);
+            let sudo_password = params.get("sudo_password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            if interface.is_empty() {
+                return Ok((400, json_error("Pole 'interface' jest wymagane")));
+            }
+            if sudo_password.is_empty() {
+                return Ok((400, json_error("Pole 'sudo_password' jest wymagane")));
+            }
+
+            net_config_audit = Some((interface.clone(), dhcp, ipv4.clone()));
+
+            tentaflow_protocol::mesh::MeshCommandType::NetworkConfig {
+                interface,
+                ipv4,
+                netmask,
+                gateway,
+                dhcp,
+                sudo_password,
+            }
+        }
         other => return Ok((400, json_error(&format!("Nieznany typ komendy: {}", other)))),
     };
 
     match qm.send_command(node_id, command).await {
         Ok(response) => {
+            if let Some((ref iface, dhcp, ref ipv4)) = net_config_audit {
+                info!(
+                    node_id = %node_id,
+                    interface = %iface,
+                    dhcp = dhcp,
+                    ipv4 = ?ipv4,
+                    success = response.success,
+                    "Konfiguracja sieci wykonana"
+                );
+            }
+            let json = serde_json::json!({
+                "success": response.success,
+                "output": response.output,
+                "error": response.error,
+            });
+            Ok((200, json.to_string()))
+        }
+        Err(e) => Ok((502, json_error(&format!("Blad wykonania komendy: {}", e)))),
+    }
+}
+
+#[derive(Deserialize)]
+struct NetworkConfigRequest {
+    pub interface: String,
+    pub ipv4: Option<String>,
+    pub netmask: Option<String>,
+    pub gateway: Option<String>,
+    #[serde(default)]
+    pub dhcp: bool,
+    pub sudo_password: String,
+}
+
+/// POST /api/mesh/nodes/:id/network-config — zmiana konfiguracji sieciowej na zdalnym nodzie
+pub async fn handle_network_config(
+    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    mesh_security: &Option<Arc<MeshSecurity>>,
+    node_id: &str,
+    body: &[u8],
+) -> Result<(u16, String)> {
+    if !is_valid_id(node_id) {
+        return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
+    // Rate limit: max 1 zmiana konfiguracji sieci na 30s per node
+    {
+        let mut rate_map = NETWORK_CONFIG_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = rate_map.get(node_id) {
+            if last.elapsed() < std::time::Duration::from_secs(30) {
+                return Ok((429, json_error("Zbyt czeste zmiany konfiguracji sieci — odczekaj 30s")));
+            }
+        }
+        rate_map.insert(node_id.to_string(), Instant::now());
+    }
+
+    // Sprawdz trust PRZED wyslaniem hasla sudo do zdalnego noda
+    let is_trusted = mesh_security
+        .as_ref()
+        .map_or(false, |s| s.is_trusted(node_id));
+    if !is_trusted {
+        return Ok((403, json_error("Node nie jest zaufany — nie mozna wyslac konfiguracji sieci")));
+    }
+
+    let req: NetworkConfigRequest = serde_json::from_slice(body)
+        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+
+    if req.interface.is_empty() {
+        return Ok((400, json_error("Pole 'interface' jest wymagane")));
+    }
+    if req.sudo_password.is_empty() {
+        return Ok((400, json_error("Pole 'sudo_password' jest wymagane")));
+    }
+
+    let qm = match quic_mesh {
+        Some(ref qm) => qm,
+        None => return Ok((503, json_error("Mesh manager niedostepny"))),
+    };
+
+    // Zachowaj dane do audytu przed przeniesieniem do command
+    let log_interface = req.interface.clone();
+    let log_dhcp = req.dhcp;
+    let log_ipv4 = req.ipv4.clone();
+
+    let command = tentaflow_protocol::mesh::MeshCommandType::NetworkConfig {
+        interface: req.interface,
+        ipv4: req.ipv4,
+        netmask: req.netmask,
+        gateway: req.gateway,
+        dhcp: req.dhcp,
+        sudo_password: req.sudo_password,
+    };
+
+    match qm.send_command(node_id, command).await {
+        Ok(response) => {
+            info!(
+                node_id = %node_id,
+                interface = %log_interface,
+                dhcp = log_dhcp,
+                ipv4 = ?log_ipv4,
+                success = response.success,
+                "Konfiguracja sieci wykonana"
+            );
             let json = serde_json::json!({
                 "success": response.success,
                 "output": response.output,

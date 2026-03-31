@@ -1493,6 +1493,18 @@ async fn route_mesh_api(
         return handle_result(api_mesh::handle_connect(quic_mesh, body).await, 500);
     }
 
+    // POST /api/mesh/nodes/:id/network-config — konfiguracja sieci na nodzie (admin only)
+    if path.starts_with("/api/mesh/nodes/") && path.ends_with("/network-config") && *method == Method::POST {
+        if let Some(err) = require_admin(claims, db) { return err; }
+        let node_id = path
+            .strip_prefix("/api/mesh/nodes/")
+            .and_then(|rest| rest.strip_suffix("/network-config"))
+            .unwrap_or("");
+        if !node_id.is_empty() {
+            return handle_result(api_mesh::handle_network_config(quic_mesh, mesh_security, node_id, body).await, 500);
+        }
+    }
+
     // POST /api/mesh/nodes/:id/command — komenda do noda (admin only)
     if path.starts_with("/api/mesh/nodes/") && path.ends_with("/command") && *method == Method::POST {
         if let Some(err) = require_admin(claims, db) { return err; }
