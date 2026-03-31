@@ -783,7 +783,7 @@
     "pairing_request": "Pairing request",
     "pairing_success": "Host paired successfully",
     "pairing_rejected": "Pairing rejected",
-    "unpair_confirm": "Are you sure you want to unpair this host?",
+    "unpair_confirm": "Are you sure you want to unpair this host? It will be removed from all nodes in the mesh.",
     "not_trusted": "Host is not paired",
     "role": "Role",
     "unknown_host": "Unknown host",
