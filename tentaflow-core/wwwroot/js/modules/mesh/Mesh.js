@@ -12,15 +12,15 @@ const Mesh = (() => {
   let pendingPairings = [];
   let refreshInterval = null;
 
-  // Ikony platform
-  const platformIcons = {
-    linux: '\uD83D\uDC27',
-    macos: '\uD83C\uDF4E',
-    windows: '\uD83E\uDE9F',
-    android: '\uD83D\uDCF1',
-    ios: '\uD83D\uDCF1',
-    unknown: '\uD83D\uDDA5\uFE0F'
-  };
+  // Ikony platform — SVG inline (z MeshNodeDetail.MeshIcons)
+  function getPlatformIcon(platform) {
+    const key = (platform || 'unknown').toLowerCase();
+    if (typeof MeshNodeDetail !== 'undefined' && MeshNodeDetail.MeshIcons) {
+      const fn = MeshNodeDetail.MeshIcons[key] || MeshNodeDetail.MeshIcons.desktop;
+      return fn ? fn(16) : '';
+    }
+    return '';
+  }
 
   // Pobranie nodow z API
   async function loadNodes() {
@@ -191,7 +191,7 @@ const Mesh = (() => {
   // Renderowanie jednego kafelka noda
   function renderNodeCard(node, type) {
     const platform = (node.platform || node.os || 'unknown').toLowerCase();
-    const icon = platformIcons[platform] || platformIcons.unknown;
+    const icon = getPlatformIcon(platform);
     const nodeId = node.node_id || node.id || '';
     const hostname = node.hostname || node.name || nodeId || I18n.t('mesh.unknown_host');
 

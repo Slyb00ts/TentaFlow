@@ -126,6 +126,9 @@ pub async fn start_mesh_pipeline(
         containers: vec![],
         networks: vec![],
         platform: node_info_collector::detect_platform(),
+        cpu_temperature_c: None,
+        swap_total_mb: 0,
+        swap_used_mb: 0,
         docker_available,
         docker_version,
     });
@@ -280,6 +283,9 @@ fn spawn_mdns_handler(
                         containers: vec![],
                         networks: vec![],
                         platform: String::new(),
+                        cpu_temperature_c: None,
+                        swap_total_mb: 0,
+                        swap_used_mb: 0,
                         docker_available: false,
                         docker_version: String::new(),
                     });
@@ -415,6 +421,9 @@ fn spawn_quic_event_handler(
                             metrics.containers,
                             metrics.networks,
                             metrics.platform,
+                            metrics.cpu_temperature_c,
+                            metrics.swap_total_mb,
+                            metrics.swap_used_mb,
                         );
                     }
                 }
@@ -728,6 +737,9 @@ fn spawn_heartbeat_sender(
                     containers,
                     networks: m.networks,
                     platform: node_info_collector::detect_platform(),
+                    cpu_temperature_c: m.cpu_temperature_c,
+                    swap_total_mb: m.swap_total_mb,
+                    swap_used_mb: m.swap_used_mb,
                 };
 
                 // Aktualizuj metryki lokalnego noda w store (klonowanie z hb)
@@ -739,6 +751,9 @@ fn spawn_heartbeat_sender(
                     hb.containers.clone(),
                     hb.networks.clone(),
                     hb.platform.clone(),
+                    hb.cpu_temperature_c,
+                    hb.swap_total_mb,
+                    hb.swap_used_mb,
                 );
 
                 // Serializuj RAZ — broadcast do wszystkich peerow uzywa tych samych bajtow
