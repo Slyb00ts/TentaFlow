@@ -134,6 +134,9 @@ wasmtime-wasi = "29"
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 wasmi = "0.44"
 
+[build-dependencies]
+rcgen = "0.13"
+
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 wasmtime = "29"
