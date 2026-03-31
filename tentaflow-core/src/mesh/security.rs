@@ -398,6 +398,9 @@ impl MeshSecurity {
             bail!("Zbyt wiele oczekujacych parowan (max 10). Usun lub zatwierdz istniejace.");
         }
 
+        // Resetuj rate limit PIN — nowe parowanie = nowe proby
+        self.pin_attempts.write().remove(remote_node_id);
+
         let pin = Self::generate_pin();
         let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
         let expires_str = expires.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -422,6 +425,9 @@ impl MeshSecurity {
     pub fn receive_pairing_request(&self, remote_node_id: &str, pin: &str, remote_public_key: &str) -> Result<()> {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
         let expires_str = expires.format("%Y-%m-%d %H:%M:%S").to_string();
+
+        // Resetuj rate limit PIN dla tego noda — nowe parowanie = nowe proby
+        self.pin_attempts.write().remove(remote_node_id);
 
         db::repository::create_pending_pairing(
             &self.db,
