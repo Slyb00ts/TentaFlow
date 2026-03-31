@@ -476,7 +476,7 @@ const MeshNodeDetail = (() => {
         const rx = iface.rx_bytes_per_sec != null ? Utils.formatBytes(iface.rx_bytes_per_sec) : (iface.rx_bytes != null ? Utils.formatBytes(iface.rx_bytes) : '0 B/s');
         const tx = iface.tx_bytes_per_sec != null ? Utils.formatBytes(iface.tx_bytes_per_sec) : (iface.tx_bytes != null ? Utils.formatBytes(iface.tx_bytes) : '0 B/s');
         const typeIcon = iface.interface_type === 'thunderbolt' ? MeshIcons.bolt(14) : '';
-        const rdmaBadge = iface.rdma_available ? '<span class="mesh-network-rdma-badge">RDMA</span>' : '';
+        const rdmaBadge = iface.rdma_available ? 'RDMA' : '';
 
         networkCardContent += `
           <div class="mesh-network-row">
@@ -484,7 +484,7 @@ const MeshNodeDetail = (() => {
             <span class="mesh-network-name">${typeIcon} ${Utils.escapeHtml(name)}</span>
             <span class="mesh-network-ip">${Utils.escapeHtml(ipv4)}</span>
             <span class="mesh-network-throughput">\u2193 ${rx} \u2191 ${tx}</span>
-            ${rdmaBadge}
+            <span class="mesh-network-rdma-badge">${rdmaBadge}</span>
             <button aria-label="${I18n.t('mesh.configure_network').replace('{name}', name)}" class="btn btn-ghost btn-xs mesh-network-config-btn" data-interface="${Utils.escapeAttr(name)}">${MeshIcons.gear(14)}</button>
           </div>
         `;
