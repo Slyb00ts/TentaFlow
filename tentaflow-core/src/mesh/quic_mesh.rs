@@ -378,7 +378,7 @@ impl QuicMeshManager {
             node_id: node_id.to_string(),
         });
 
-        info!(peer_id = %node_id, "Polaczenie mesh nawiazane (initiator)");
+        debug!(peer_id = %node_id, "Polaczenie mesh nawiazane (initiator)");
 
         // Spawn handler dla przychodzacych streamow
         let peer_id = node_id.to_string();
@@ -595,7 +595,7 @@ impl QuicMeshManager {
             node_id: peer_node_id.clone(),
         });
 
-        info!(peer_id = %peer_node_id, "Polaczenie mesh przyjete (acceptor)");
+        debug!(peer_id = %peer_node_id, "Polaczenie mesh przyjete (acceptor)");
 
         // Obsluguj streamy peera
         Self::handle_peer_streams(
