@@ -645,11 +645,20 @@ struct NetworkConfigRequest {
 /// POST /api/mesh/nodes/:id/network-config — zmiana konfiguracji sieciowej na zdalnym nodzie
 pub async fn handle_network_config(
     quic_mesh: &Option<Arc<QuicMeshManager>>,
+    mesh_security: &Option<Arc<MeshSecurity>>,
     node_id: &str,
     body: &[u8],
 ) -> Result<(u16, String)> {
     if !is_valid_id(node_id) {
         return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
+    // Sprawdz trust PRZED wyslaniem hasla sudo do zdalnego noda
+    let is_trusted = mesh_security
+        .as_ref()
+        .map_or(false, |s| s.is_trusted(node_id));
+    if !is_trusted {
+        return Ok((403, json_error("Node nie jest zaufany — nie mozna wyslac konfiguracji sieci")));
     }
 
     let req: NetworkConfigRequest = serde_json::from_slice(body)
