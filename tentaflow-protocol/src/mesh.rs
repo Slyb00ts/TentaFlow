@@ -640,6 +640,7 @@ pub const MESH_MSG_CLUSTER_INFO: u8 = 0x36;
 pub const MESH_MSG_KEY_ROTATION: u8 = 0x25;
 pub const MESH_MSG_KEY_ROTATION_RESPONSE: u8 = 0x26;
 pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
+pub const MESH_MSG_RELAY_FRAME: u8 = 0x37;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
@@ -683,6 +684,19 @@ pub struct TrustedKeysSyncPayload {
 #[rkyv(derive(Debug))]
 pub struct NodeLeavingPayload {
     pub node_id: String,
+}
+
+/// Ramka relay do multi-hop routingu — payload zaszyfrowany end-to-end kluczem docelowego noda.
+/// `discriminant` informuje odbiorce jaki typ wiadomosci jest w srodku.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshRelayFrame {
+    pub request_id: String,
+    pub source_node_id: String,
+    pub destination_node_id: String,
+    pub ttl: u8,
+    pub discriminant: u8,
+    pub payload: Vec<u8>,
 }
 
 // =============================================================================

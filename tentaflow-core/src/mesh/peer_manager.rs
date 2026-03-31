@@ -705,7 +705,8 @@ impl PeerManager {
             | QuicMeshEvent::KeyRotationReceived { .. }
             | QuicMeshEvent::KeyRotationResponseReceived { .. }
             | QuicMeshEvent::TrustedKeysSyncReceived { .. }
-            | QuicMeshEvent::NodeLeavingReceived { .. } => {
+            | QuicMeshEvent::NodeLeavingReceived { .. }
+            | QuicMeshEvent::RelayFrameReceived { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }
