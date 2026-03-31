@@ -214,14 +214,14 @@ pub fn handle_confirm_pairing(
                         warn!("Blad wysylania PairingConfirm przez QUIC: {}", e);
                     }
 
-                    // Po potwierdzeniu parowania — wyslij NodeInfo do nowo zaufanego peera.
-                    // Node B (ten ktory zatwierdza) musi tez wyslac swoje dane systemowe.
+                    // Poczekaj az PairingConfirm dotrze — QUIC nie gwarantuje kolejnosci miedzy streamami
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                    // Wyslij NodeInfo do nowo zaufanego peera
                     let local_info = node_info_collector::collect_node_info(&local_nid);
                     if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_info) {
                         if let Err(e) = qm.send_node_info(&node_id, &info_bytes).await {
                             warn!("Blad wysylania NodeInfo po sparowaniu do {}: {}", node_id, e);
-                        } else {
-                            info!(peer_id = %node_id, "Wyslano NodeInfo po sparowaniu (strona zatwierdzajaca)");
                         }
                     }
 
@@ -237,11 +237,16 @@ pub fn handle_confirm_pairing(
                             .collect();
                         let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
                         if let Ok(sync_data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                            // Wyslij do nowego peera
                             if let Err(e) = qm.send_trusted_keys_sync(&node_id, &sync_data).await {
                                 warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
-                            } else {
-                                info!(peer_id = %node_id, count = all_keys.len(), "Wyslano TrustedKeysSync (strona zatwierdzajaca)");
                             }
+                            // Broadcast do WSZYSTKICH pozostalych trusted peerow
+                            qm.broadcast_to_trusted(
+                                tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
+                                &sync_data,
+                                Some(&node_id),
+                            ).await;
                         }
                     }
                 });
