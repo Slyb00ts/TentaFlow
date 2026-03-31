@@ -236,6 +236,16 @@ impl MeshPeerStore {
     /// Aktualizuje dane systemowe peera po otrzymaniu NodeInfo przez QUIC.
     /// Dodatkowo deduplikuje po hostname+port — jesli istnieje disconnected peer
     /// o tej samej nazwie hosta i porcie, stary wpis jest usuwany.
+    /// Zaktualizuj hostname peera (np. z mDNS TXT records)
+    pub fn update_hostname(&self, node_id: &str, hostname: &str) {
+        let mut peers = self.peers.write();
+        if let Some(p) = peers.get_mut(node_id) {
+            p.hostname = hostname.to_string();
+        }
+        drop(peers);
+        self.mark_dirty();
+    }
+
     pub fn update_node_info(&self, node_id: &str, info: &NodeInfo) {
         let mut peers = self.peers.write();
         let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
