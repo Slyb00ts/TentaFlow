@@ -1401,6 +1401,11 @@ impl QuicMeshManager {
         conns.keys().cloned().collect()
     }
 
+    /// Lista polaczonych peer_ids — do propagacji topologii w heartbeat
+    pub async fn connected_peer_ids(&self) -> Vec<String> {
+        self.connections.read().await.keys().cloned().collect()
+    }
+
     /// Czy peer o danym node_id jest polaczony
     pub async fn is_connected(&self, node_id: &str) -> bool {
         let conns = self.connections.read().await;
