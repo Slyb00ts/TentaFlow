@@ -153,6 +153,42 @@ A fine-tuned **Qwen 3.5-0.8B** model that acts as the routing brain:
 
 ## Getting Started
 
+### Prerequisites
+
+Install build dependencies before compiling from source.
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install build-essential pkg-config libssl-dev
+```
+
+**Fedora / RHEL:**
+```bash
+sudo dnf install gcc pkg-config openssl-devel
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S base-devel pkg-config openssl
+```
+
+**macOS:**
+```bash
+brew install openssl pkg-config
+```
+
+**Windows:**
+```powershell
+vcpkg install openssl:x64-windows
+# or install via choco:
+choco install openssl
+```
+
+WASM addons require the WASI target:
+```bash
+rustup target add wasm32-wasip1
+```
+
 ### Building
 
 ```bash
