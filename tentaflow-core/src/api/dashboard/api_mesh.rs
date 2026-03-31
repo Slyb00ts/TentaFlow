@@ -185,6 +185,7 @@ pub fn handle_confirm_pairing(
                     "pin": pin_for_confirm,
                 });
                 let qm = qm.clone();
+                let sec_clone = security.clone();
                 let node_id = remote_node_id.to_string();
                 let local_nid = local_node_id.to_string();
                 let data = payload.to_string().into_bytes();
@@ -201,6 +202,26 @@ pub fn handle_confirm_pairing(
                             warn!("Blad wysylania NodeInfo po sparowaniu do {}: {}", node_id, e);
                         } else {
                             info!(peer_id = %node_id, "Wyslano NodeInfo po sparowaniu (strona zatwierdzajaca)");
+                        }
+                    }
+
+                    // Wyslij TrustedKeysSync do inicjatora
+                    let all_keys = sec_clone.get_all_trusted_keys();
+                    if !all_keys.is_empty() {
+                        let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+                            .iter()
+                            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                node_id: nid.clone(),
+                                public_key_hex: pk.clone(),
+                            })
+                            .collect();
+                        let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                        if let Ok(sync_data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                            if let Err(e) = qm.send_trusted_keys_sync(&node_id, &sync_data).await {
+                                warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
+                            } else {
+                                info!(peer_id = %node_id, count = all_keys.len(), "Wyslano TrustedKeysSync (strona zatwierdzajaca)");
+                            }
                         }
                     }
                 });

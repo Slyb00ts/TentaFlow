@@ -505,6 +505,30 @@ fn spawn_quic_event_handler(
                                             info!(peer_id = %target_node_id, count = all_keys.len(), "Wyslano TrustedKeysSync");
                                         }
                                     }
+
+                                    // Rozglosz zaktualizowana liste kluczy do WSZYSTKICH zaufanych peerow
+                                    let updated_keys = sec.get_all_trusted_keys();
+                                    if updated_keys.len() > 1 {
+                                        let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = updated_keys
+                                            .iter()
+                                            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                                node_id: nid.clone(),
+                                                public_key_hex: pk.clone(),
+                                            })
+                                            .collect();
+                                        let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                                        let broadcast_data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                            .map(|v| v.to_vec())
+                                            .unwrap_or_default();
+                                        for (peer_id, _) in &updated_keys {
+                                            if peer_id == &target_node_id {
+                                                continue; // juz wyslano wyzej
+                                            }
+                                            if let Err(e) = qm_events.send_trusted_keys_sync(peer_id, &broadcast_data).await {
+                                                warn!("Blad broadcast TrustedKeysSync do {}: {}", peer_id, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
