@@ -1544,7 +1544,7 @@ async fn route_mesh_api(
             // POST /api/mesh/pair/:node_id — initiate
             let node_id = rest.trim_matches('/');
             if !node_id.is_empty() {
-                return handle_result(api_mesh::handle_initiate_pairing(db, sec, node_id, quic_mesh, local_node_id, mesh_peer_store), 500);
+                return handle_result(api_mesh::handle_initiate_pairing(db, sec, node_id, quic_mesh, local_node_id, mesh_peer_store).await, 500);
             }
         }
         return (503, serde_json::json!({"error": "MeshSecurity niedostepny"}).to_string());
