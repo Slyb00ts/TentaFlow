@@ -214,7 +214,6 @@ const MeshNetworkConfig = (() => {
       applyBtn.textContent = I18n.t('mesh.network_applying');
 
       const payload = {
-        command: 'NetworkConfig',
         interface: interfaceName,
         dhcp: isDhcp,
         ipv4: isDhcp ? null : ipv4.trim(),
@@ -228,7 +227,7 @@ const MeshNetworkConfig = (() => {
 
       try {
         await ApiClient.post(
-          `/api/mesh/nodes/${encodeURIComponent(nodeId)}/command`,
+          `/api/mesh/nodes/${encodeURIComponent(nodeId)}/network-config`,
           payload,
           { signal: controller.signal }
         );
