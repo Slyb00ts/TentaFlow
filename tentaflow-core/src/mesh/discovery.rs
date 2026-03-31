@@ -289,9 +289,17 @@ async fn browse_loop(
 
 /// Konwertuje ServiceInfo z mDNS na DiscoveredPeer.
 fn service_info_to_peer(info: &ServiceInfo) -> DiscoveredPeer {
-    // Tylko IPv4, bez loopback — IPv6 powoduje duplikaty nodow, loopback tworzy fałszywe wpisy
+    // IPv4, bez loopback/Docker-bridge/link-local — unikamy falszywych adresow
     let addresses: Vec<IpAddr> = info.get_addresses().iter()
-        .filter(|a| a.is_ipv4() && !a.is_loopback())
+        .filter(|a| {
+            if let IpAddr::V4(v4) = a {
+                !v4.is_loopback()
+                    && !v4.is_link_local()
+                    && !(v4.octets()[0] == 172 && v4.octets()[1] >= 16 && v4.octets()[1] <= 31)
+            } else {
+                false
+            }
+        })
         .copied()
         .collect();
     let port = info.get_port();
