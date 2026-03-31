@@ -480,6 +480,11 @@ fn spawn_quic_event_handler(
                         match serde_json::from_slice::<serde_json::Value>(&data) {
                             Ok(val) => {
                                 let from_node_id = val["from_node_id"].as_str().unwrap_or(&peer_id);
+                                // Odrzuc PairingRequest od samego siebie (bledne mapowanie QUIC)
+                                if from_node_id == local_node_id {
+                                    warn!("Odrzucono PairingRequest od samego siebie (from_node_id == local_node_id)");
+                                    continue;
+                                }
                                 let pin = val["pin"].as_str().unwrap_or("");
                                 let public_key = val["public_key"].as_str().unwrap_or("");
                                 if let Err(e) = sec.receive_pairing_request(from_node_id, pin, public_key) {
