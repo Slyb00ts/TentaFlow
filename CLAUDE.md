@@ -118,7 +118,7 @@ mlx-models (Apple MLX inference bindings)
 
 - Comments in code: Polish only
 - Variable/function names: English
-- Commit messages: Polish, format `[typ]: opis`
+- Commit messages: English, format `[type]: description`
 - Rust: `rustfmt` defaults, `snake_case` functions, `PascalCase` types
 - JS/HTML/CSS: 2-space indent, `camelCase` JS, `kebab-case` CSS
 - C#: 4-space indent, `PascalCase` public, `_camelCase` private fields
