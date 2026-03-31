@@ -171,7 +171,7 @@ class SparklineChart {
     }
   }
 
-  // Czyszczenie zasobow
+  // Czyszczenie zasobow — zwolnij referencje do canvas i kontekstu 2D
   destroy() {
     this.buffer = [];
     this.bufferB = [];
@@ -179,5 +179,7 @@ class SparklineChart {
     if (this.ctx) {
       this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     }
+    this.ctx = null;
+    this.canvas = null;
   }
 }

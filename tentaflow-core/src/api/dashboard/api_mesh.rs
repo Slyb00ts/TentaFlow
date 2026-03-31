@@ -4,8 +4,10 @@
 //       Wysyla wiadomosci parowania przez QUIC do zdalnych peerow.
 // =============================================================================
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use crate::db::{self, DbPool};
 use crate::mesh::node_info_collector;
@@ -15,6 +17,10 @@ use crate::mesh::security::MeshSecurity;
 use anyhow::Result;
 use serde::Deserialize;
 use tracing::{info, warn};
+
+/// Ograniczenie czestotliwosci zmian konfiguracji sieci: max 1 na 30s per node
+static NETWORK_CONFIG_RATE_LIMIT: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn json_error(message: &str) -> String {
     serde_json::json!({"error": message}).to_string()
@@ -571,6 +577,9 @@ pub async fn handle_send_command(
         }
     }
 
+    // Dane do audytu konfiguracji sieci (wypelniane w galezi "network_config")
+    let mut net_config_audit: Option<(String, bool, Option<String>)> = None;
+
     // Mapuj command_type na MeshCommandType
     let command = match req.command_type.as_str() {
         "list_containers" => tentaflow_protocol::mesh::MeshCommandType::ListContainers,
@@ -592,6 +601,17 @@ pub async fn handle_send_command(
             tentaflow_protocol::mesh::MeshCommandType::SystemPrune { volumes }
         }
         "network_config" => {
+            // Rate limit: max 1 zmiana konfiguracji sieci na 30s per node
+            {
+                let mut rate_map = NETWORK_CONFIG_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(last) = rate_map.get(node_id) {
+                    if last.elapsed() < std::time::Duration::from_secs(30) {
+                        return Ok((429, json_error("Zbyt czeste zmiany konfiguracji sieci — odczekaj 30s")));
+                    }
+                }
+                rate_map.insert(node_id.to_string(), Instant::now());
+            }
+
             let interface = params.get("interface").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let ipv4 = params.get("ipv4").and_then(|v| v.as_str()).map(String::from);
             let netmask = params.get("netmask").and_then(|v| v.as_str()).map(String::from);
@@ -605,6 +625,8 @@ pub async fn handle_send_command(
             if sudo_password.is_empty() {
                 return Ok((400, json_error("Pole 'sudo_password' jest wymagane")));
             }
+
+            net_config_audit = Some((interface.clone(), dhcp, ipv4.clone()));
 
             tentaflow_protocol::mesh::MeshCommandType::NetworkConfig {
                 interface,
@@ -620,6 +642,16 @@ pub async fn handle_send_command(
 
     match qm.send_command(node_id, command).await {
         Ok(response) => {
+            if let Some((ref iface, dhcp, ref ipv4)) = net_config_audit {
+                info!(
+                    node_id = %node_id,
+                    interface = %iface,
+                    dhcp = dhcp,
+                    ipv4 = ?ipv4,
+                    success = response.success,
+                    "Konfiguracja sieci wykonana"
+                );
+            }
             let json = serde_json::json!({
                 "success": response.success,
                 "output": response.output,
@@ -653,6 +685,17 @@ pub async fn handle_network_config(
         return Ok((400, json_error("Niepoprawny node_id")));
     }
 
+    // Rate limit: max 1 zmiana konfiguracji sieci na 30s per node
+    {
+        let mut rate_map = NETWORK_CONFIG_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = rate_map.get(node_id) {
+            if last.elapsed() < std::time::Duration::from_secs(30) {
+                return Ok((429, json_error("Zbyt czeste zmiany konfiguracji sieci — odczekaj 30s")));
+            }
+        }
+        rate_map.insert(node_id.to_string(), Instant::now());
+    }
+
     // Sprawdz trust PRZED wyslaniem hasla sudo do zdalnego noda
     let is_trusted = mesh_security
         .as_ref()
@@ -676,6 +719,11 @@ pub async fn handle_network_config(
         None => return Ok((503, json_error("Mesh manager niedostepny"))),
     };
 
+    // Zachowaj dane do audytu przed przeniesieniem do command
+    let log_interface = req.interface.clone();
+    let log_dhcp = req.dhcp;
+    let log_ipv4 = req.ipv4.clone();
+
     let command = tentaflow_protocol::mesh::MeshCommandType::NetworkConfig {
         interface: req.interface,
         ipv4: req.ipv4,
@@ -687,6 +735,14 @@ pub async fn handle_network_config(
 
     match qm.send_command(node_id, command).await {
         Ok(response) => {
+            info!(
+                node_id = %node_id,
+                interface = %log_interface,
+                dhcp = log_dhcp,
+                ipv4 = ?log_ipv4,
+                success = response.success,
+                "Konfiguracja sieci wykonana"
+            );
             let json = serde_json::json!({
                 "success": response.success,
                 "output": response.output,
