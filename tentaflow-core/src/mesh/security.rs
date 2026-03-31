@@ -404,8 +404,9 @@ impl MeshSecurity {
             bail!("Zbyt wiele oczekujacych parowan (max 10). Usun lub zatwierdz istniejace.");
         }
 
+        // Automatycznie usun z revoked jesli user inicjuje parowanie z UI
         if self.is_revoked(remote_node_id) {
-            bail!("Node {} jest na liscie revoked — uzyj retrust przed ponownym parowaniem", remote_node_id);
+            let _ = self.admin_retrust(remote_node_id);
         }
 
         // Resetuj rate limit PIN — nowe parowanie = nowe proby
@@ -436,8 +437,9 @@ impl MeshSecurity {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
         let expires_str = expires.format("%Y-%m-%d %H:%M:%S").to_string();
 
+        // Automatycznie usun z revoked jesli przychodzi nowy PairingRequest
         if self.is_revoked(remote_node_id) {
-            bail!("Node {} jest na liscie revoked — uzyj retrust przed ponownym parowaniem", remote_node_id);
+            let _ = self.admin_retrust(remote_node_id);
         }
 
         // Resetuj rate limit PIN dla tego noda — nowe parowanie = nowe proby
@@ -1666,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn revoked_node_cannot_initiate_pairing() {
+    fn revoked_node_auto_retrust_on_pairing() {
         let sec = MeshSecurity::new(setup_test_db()).unwrap();
         let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
 
@@ -1675,10 +1677,10 @@ mod tests {
         sec.revoke_trust("node-b").unwrap();
         assert!(sec.is_revoked("node-b"));
 
-        // Proba parowania z revoked nodem — powinna zawiesc
+        // Ponowne parowanie automatycznie czysci revoked
         let result = sec.initiate_pairing("node-b");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("revoked"));
+        assert!(result.is_ok());
+        assert!(!sec.is_revoked("node-b"));
     }
 
     #[test]
