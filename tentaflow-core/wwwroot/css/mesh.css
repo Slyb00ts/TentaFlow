@@ -646,6 +646,14 @@
 .mesh-detail-gpu-info svg {
   color: var(--color-text-muted);
   flex-shrink: 0;
+  vertical-align: middle;
+}
+
+.mesh-detail-gpu-info-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: var(--spacing-md);
 }
 
 .mesh-detail-gpu-sparklines {

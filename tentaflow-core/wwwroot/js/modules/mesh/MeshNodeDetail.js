@@ -446,7 +446,7 @@ const MeshNodeDetail = (() => {
 
       let row2 = '<div class="mesh-detail-gpu-info">';
       row2 += `${MeshIcons.thermometer()} <span>${gpu.temperature_c != null ? gpu.temperature_c + '\u00B0C' : 'N/A'}</span> ${thresholdLabel(gpu.temperature_c, gpuTempThresholds)}`;
-      row2 += `<span style="margin-left:var(--spacing-md);">${MeshIcons.bolt()} <span>${gpu.power_draw_w != null ? Math.round(gpu.power_draw_w) + 'W' : 'N/A'}${gpu.power_limit_w != null ? ' / ' + Math.round(gpu.power_limit_w) + 'W' : ''}</span></span>`;
+      row2 += `<span class="mesh-detail-gpu-info-item">${MeshIcons.bolt()} ${gpu.power_draw_w != null ? Math.round(gpu.power_draw_w) + 'W' : 'N/A'}${gpu.power_limit_w != null ? ' / ' + Math.round(gpu.power_limit_w) + 'W' : ''}</span>`;
       row2 += '</div>';
 
       let row3 = `<div class="mesh-detail-gpu-sparklines">
