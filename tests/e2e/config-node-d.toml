@@ -13,14 +13,14 @@ log_format = "json"
 
 [protocols.openai_api]
 enabled = true
-bind = "0.0.0.0:18092"
+bind = "0.0.0.0:18094"
 max_connections = 50
 request_timeout_ms = 30000
 body_limit_bytes = 1048576
 
 [protocols.quic]
 enabled = true
-bind = "0.0.0.0:18092"
+bind = "0.0.0.0:18094"
 max_connections = 10
 max_streams_per_connection = 10
 idle_timeout_ms = 30000
@@ -47,16 +47,16 @@ circuit_breaker_timeout_ms = 60000
 
 [monitoring]
 prometheus_enabled = false
-prometheus_bind = "0.0.0.0:19092"
+prometheus_bind = "0.0.0.0:19094"
 health_check_enabled = false
-health_check_bind = "0.0.0.0:19882"
+health_check_bind = "0.0.0.0:19884"
 health_check_path = "/health"
 tracing_enabled = false
 
 [mesh]
 enabled = true
-port = 18092
-static_peers = ["127.0.0.1:18091", "127.0.0.1:18093", "127.0.0.1:18094"]
+port = 18094
+static_peers = ["127.0.0.1:18091", "127.0.0.1:18092", "127.0.0.1:18093"]
 mdns_enabled = false
 heartbeat_interval_ms = 1000
 peer_timeout_ms = 5000
