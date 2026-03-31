@@ -614,7 +614,8 @@ fn spawn_quic_event_handler(
                         if i_am_revoked && sender_trusted {
                             let _ = sec.unpair(&node_id);
                             info!("Zostalismy odparowani przez {} — usuwam z zaufanych", node_id);
-                            qm_events.disconnect_peer(&node_id).await;
+                            // NIE disconnectuj — connection umrze po idle timeout.
+                            // Disconnect powodowal kaskadowe zrywanie polaczen i failujace broadcasty.
 
                             let details = format!("Odparowany przez {}", node_id);
                             let _ = crate::db::repository::log_audit(
@@ -628,7 +629,6 @@ fn spawn_quic_event_handler(
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
                             let _ = sec.unpair(&revoked_node_id);
                             info!("Usunieto zaufanie dla {} (propagacja od {})", revoked_node_id, node_id);
-                            qm_events.disconnect_peer(&revoked_node_id).await;
 
                             let details = format!("Revoke {} propagowany od {}", revoked_node_id, node_id);
                             let _ = crate::db::repository::log_audit(
