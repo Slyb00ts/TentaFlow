@@ -77,10 +77,12 @@ const MeshNetworkConfig = (() => {
       errors.netmask = I18n.t('mesh.network_invalid_mask');
     }
 
-    if (!gateway || !isValidIpv4(gateway.trim())) {
-      errors.gateway = I18n.t('mesh.network_invalid_gateway');
-    } else if (parsedMask && ipv4 && isValidIpv4(ipv4.trim()) && !isInSameSubnet(ipv4.trim(), gateway.trim(), parsedMask)) {
-      errors.gateway = I18n.t('mesh.network_gateway_subnet');
+    if (gateway && gateway.trim()) {
+      if (!isValidIpv4(gateway.trim())) {
+        errors.gateway = I18n.t('mesh.network_invalid_gateway');
+      } else if (parsedMask && ipv4 && isValidIpv4(ipv4.trim()) && !isInSameSubnet(ipv4.trim(), gateway.trim(), parsedMask)) {
+        errors.gateway = I18n.t('mesh.network_gateway_subnet');
+      }
     }
 
     return errors;
@@ -154,8 +156,8 @@ const MeshNetworkConfig = (() => {
           </div>
 
           <div class="form-group mesh-network-static-field mesh-network-field-disabled">
-            <label>${I18n.t('mesh.network_gateway')}</label>
-            <input type="text" id="net-cfg-gateway" placeholder="192.168.1.1" value="${Utils.escapeAttr(currentGateway)}" disabled>
+            <label>${I18n.t('mesh.network_gateway')} <span style="font-weight:400;color:var(--color-text-muted);">(${I18n.t('common.optional')})</span></label>
+            <input type="text" id="net-cfg-gateway" placeholder="" value="${Utils.escapeAttr(currentGateway)}" disabled>
             <div class="mesh-network-field-error" data-error-for="gateway"></div>
           </div>
 
