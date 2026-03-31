@@ -292,6 +292,11 @@ pub fn handle_revoke_trust(
             .unwrap_or_default();
         let revoked_id = node_id.to_string();
         tokio::spawn(async move {
+            // Wyslij TrustRevoked do revokowanego noda PRZED revoke (jeszcze ma polaczenie)
+            if let Err(e) = qm.send_to_peer(&revoked_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, &data).await {
+                warn!("Blad wysylania TrustRevoked do revokowanego {}: {}", revoked_id, e);
+            }
+            // Broadcast do pozostalych trusted peerow
             qm.broadcast_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
                 &data,

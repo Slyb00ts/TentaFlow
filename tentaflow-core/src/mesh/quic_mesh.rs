@@ -1177,7 +1177,7 @@ impl QuicMeshManager {
     }
 
     /// Wysyla wiadomosc do konkretnego peera — szyfruje jesli dostepny shared secret
-    async fn send_to_peer(&self, target_node_id: &str, discriminant: u8, data: &[u8]) -> Result<()> {
+    pub async fn send_to_peer(&self, target_node_id: &str, discriminant: u8, data: &[u8]) -> Result<()> {
         let conn = {
             let conns = self.connections.read().await;
             conns
