@@ -539,12 +539,12 @@ impl PeerManager {
                 if should_reconnect {
                     let qm = self.quic_mesh.read();
                     if let Some(qm) = qm.as_ref() {
-                        let addr = {
+                        let addrs: Vec<SocketAddr> = {
                             let peers = self.known_peers.read();
-                            peers.get(&node_id).and_then(|p| p.addresses.first().copied())
+                            peers.get(&node_id).map_or_else(Vec::new, |p| p.addresses.clone())
                         };
-                        if let Some(addr) = addr {
-                            qm.spawn_reconnect_loop(node_id, addr);
+                        if !addrs.is_empty() {
+                            qm.spawn_reconnect_loop(node_id, addrs);
                         }
                     }
                 }
