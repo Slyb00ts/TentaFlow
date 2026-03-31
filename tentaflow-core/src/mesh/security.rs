@@ -560,6 +560,11 @@ impl MeshSecurity {
         self.revoked_nodes.read().contains(node_id)
     }
 
+    /// Lista revokowanych node IDs — do synchronizacji przy reconnect
+    pub fn get_revoked_node_ids(&self) -> Vec<String> {
+        self.revoked_nodes.read().iter().cloned().collect()
+    }
+
     /// Usuwa node z listy revoked — admin re-trust
     pub fn admin_retrust(&self, node_id: &str) -> Result<()> {
         self.revoked_nodes.write().remove(node_id);

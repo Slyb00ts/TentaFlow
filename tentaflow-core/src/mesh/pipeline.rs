@@ -396,6 +396,38 @@ fn spawn_quic_event_handler(
                                 warn!("Blad wysylania NodeInfo do {}: {}", node_id, e);
                             }
                         }
+
+                        // Synchronizacja zaufanych kluczy przy reconnect
+                        if let Some(ref sec) = mesh_security {
+                            let all_keys = sec.get_all_trusted_keys();
+                            if !all_keys.is_empty() {
+                                let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+                                    .iter()
+                                    .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                        node_id: nid.clone(),
+                                        public_key_hex: pk.clone(),
+                                    })
+                                    .collect();
+                                let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                                if let Ok(sync_data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                                    if let Err(e) = qm_events.send_trusted_keys_sync(&node_id, &sync_data).await {
+                                        warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
+                                    }
+                                }
+                            }
+
+                            // Wyslij revokowane nody — peer moze nie wiedziec o revoke jesli byl offline
+                            let revoked = sec.get_revoked_node_ids();
+                            for revoked_id in &revoked {
+                                let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
+                                    revoked_node_id: revoked_id.clone(),
+                                    from_node_id: local_node_id.clone(),
+                                };
+                                if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                                    let _ = qm_events.send_to_peer(&node_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, &data).await;
+                                }
+                            }
+                        }
                     } else {
                         info!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
                     }
