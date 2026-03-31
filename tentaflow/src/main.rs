@@ -236,9 +236,9 @@ fn setup_logging(verbose: bool) -> Result<()> {
     use tracing_subscriber::{fmt, EnvFilter};
 
     let filter = if verbose {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug,mdns_sd=off"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug,mdns_sd=off,wgpu_hal=warn,wgpu_core=warn"))
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=off"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=off,wgpu_hal=warn,wgpu_core=warn"))
     };
 
     fmt()

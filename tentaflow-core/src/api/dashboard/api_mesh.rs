@@ -340,7 +340,8 @@ pub fn handle_revoke_trust(
                 warn!("Blad unpair dla {}: {}", revoked_id, e);
             }
             sec.clear_revoking(&revoked_id);
-            qm.disconnect_peer(&revoked_id).await;
+            // NIE disconnectuj — kaskadowe disconnect powodowaly failujace broadcasty.
+            // Connection umrze po QUIC idle timeout (60s).
         });
     } else {
         // Brak QUIC — unpair lokalnie
