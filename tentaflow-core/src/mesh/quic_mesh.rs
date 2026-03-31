@@ -29,9 +29,9 @@ use tentaflow_protocol::mesh::{
     MESH_MSG_PAIRING_REJECT, MESH_MSG_PAIRING_REQUEST, MESH_MSG_CLUSTER_INFO,
     MESH_MSG_SERVICE_ANNOUNCE, MESH_MSG_SERVICE_QUERY_ALL, MESH_MSG_SERVICE_RESPONSE_ALL,
     MESH_MSG_TRUST_REVOKED, MESH_MSG_KEY_ROTATION, MESH_MSG_TRUSTED_KEYS_SYNC,
-    MESH_MSG_KEY_ROTATION_RESPONSE, MESH_MSG_NODE_LEAVING,
+    MESH_MSG_KEY_ROTATION_RESPONSE, MESH_MSG_NODE_LEAVING, MESH_MSG_RELAY_FRAME,
     TrustRevokedPayload, KeyRotationPayload, KeyRotationResponsePayload,
-    TrustedKeysSyncPayload, NodeLeavingPayload,
+    TrustedKeysSyncPayload, NodeLeavingPayload, MeshRelayFrame,
 };
 
 // =============================================================================
@@ -107,6 +107,8 @@ pub enum QuicMeshEvent {
     KeyRotationResponseReceived { node_id: String, ephemeral_public_key_hex: String },
     /// Otrzymano informacje o opuszczeniu mesh przez peera
     NodeLeavingReceived { node_id: String },
+    /// Otrzymano relay frame (multi-hop routing)
+    RelayFrameReceived { from_node_id: String, frame: MeshRelayFrame },
 }
 
 /// Typ callbacka do obslugi forward requestow
@@ -704,6 +706,7 @@ impl QuicMeshManager {
             MESH_MSG_COMMAND | MESH_MSG_COMMAND_RESPONSE => 1024 * 1024,
             MESH_MSG_DEPLOY_PROGRESS | MESH_MSG_LOG_CHUNK => 256 * 1024,
             MESH_MSG_SERVICE_ANNOUNCE | MESH_MSG_SERVICE_QUERY_ALL | MESH_MSG_SERVICE_RESPONSE_ALL => 1024 * 1024,
+            MESH_MSG_RELAY_FRAME => 2 * 1024 * 1024,
             _ => 64 * 1024,
         };
 
@@ -723,7 +726,7 @@ impl QuicMeshManager {
             || discriminant == MESH_MSG_KEY_ROTATION_RESPONSE
             || discriminant == MESH_MSG_TRUSTED_KEYS_SYNC
             || discriminant == MESH_MSG_NODE_LEAVING
-            || (0x30..=0x36).contains(&discriminant);
+            || (0x30..=0x37).contains(&discriminant);
         let payload = if is_data_msg {
             if let Some(ref sec) = security {
                 if sec.has_shared_secret(&peer_node_id) {
@@ -899,6 +902,20 @@ impl QuicMeshManager {
             MESH_MSG_NODE_LEAVING => {
                 QuicMeshEvent::NodeLeavingReceived {
                     node_id: peer_node_id,
+                }
+            }
+            MESH_MSG_RELAY_FRAME => {
+                match rkyv::from_bytes::<MeshRelayFrame, rkyv::rancor::Error>(&payload) {
+                    Ok(frame) => {
+                        QuicMeshEvent::RelayFrameReceived {
+                            from_node_id: peer_node_id,
+                            frame,
+                        }
+                    }
+                    Err(e) => {
+                        warn!(peer_id = %peer_node_id, "Blad deserializacji MeshRelayFrame: {}", e);
+                        return;
+                    }
                 }
             }
             MESH_MSG_CLUSTER_INFO => {
@@ -1193,6 +1210,40 @@ impl QuicMeshManager {
     /// Wysyla KeyRotationResponse do konkretnego peera (0x26)
     pub async fn send_key_rotation_response(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
         self.send_to_peer(target_node_id, MESH_MSG_KEY_ROTATION_RESPONSE, data).await
+    }
+
+    /// Wyslij relay frame do next-hop peera
+    pub async fn send_relay_frame(&self, next_hop_id: &str, frame_bytes: &[u8]) -> Result<()> {
+        self.send_to_peer(next_hop_id, MESH_MSG_RELAY_FRAME, frame_bytes).await
+    }
+
+    /// Wyslij wiadomosc do noda przez relay (multi-hop)
+    pub async fn send_via_relay(
+        &self,
+        destination_node_id: &str,
+        discriminant: u8,
+        payload: &[u8],
+        source_node_id: &str,
+        peer_store: &crate::mesh::peer_store::MeshPeerStore,
+    ) -> Result<()> {
+        let route = peer_store.get_route(destination_node_id)
+            .ok_or_else(|| anyhow::anyhow!("Brak route do {}", destination_node_id))?;
+
+        // Payload jest juz zaszyfrowany end-to-end kluczem destination przez callera
+        let frame = MeshRelayFrame {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            source_node_id: source_node_id.to_string(),
+            destination_node_id: destination_node_id.to_string(),
+            ttl: 4,
+            discriminant,
+            payload: payload.to_vec(),
+        };
+
+        let frame_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&frame)
+            .map(|v| v.to_vec())
+            .context("Blad serializacji MeshRelayFrame")?;
+
+        self.send_to_peer(&route.next_hop, MESH_MSG_RELAY_FRAME, &frame_bytes).await
     }
 
     /// Broadcast wiadomosci do wszystkich polaczonych i zaufanych peerow.

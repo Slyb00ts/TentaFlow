@@ -225,6 +225,72 @@ pub async fn start_mesh_pipeline(
                         spawn_key_rotation_task(quic_mesh.clone(), sec.clone());
                     }
 
+                    // Task 7: Okresowe proby bezposredniego polaczenia z relay-only peerami
+                    {
+                        let qm = quic_mesh.clone();
+                        let ps = mesh_peer_store.clone();
+                        let sec = mesh_security.clone();
+                        tokio::spawn(async move {
+                            let mut interval = tokio::time::interval(Duration::from_secs(300));
+                            interval.tick().await;
+                            loop {
+                                interval.tick().await;
+
+                                let routing_table = ps.get_routing_table();
+                                let sec_ref = match &sec {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+
+                                for (peer_id, entry) in &routing_table {
+                                    // Pomijaj bezposrednio polaczone
+                                    if entry.direct { continue; }
+
+                                    // Tylko trusted peery
+                                    if !sec_ref.is_trusted(peer_id) { continue; }
+
+                                    // Moze juz nawiazano polaczenie od ostatniego recalc
+                                    if qm.is_connected(peer_id).await { continue; }
+
+                                    // Pobierz adresy z peer_store
+                                    let mut addrs: Vec<std::net::SocketAddr> = Vec::new();
+                                    if let Some(peer_info) = ps.get(peer_id) {
+                                        for ip in &peer_info.addresses {
+                                            if peer_info.port > 0 {
+                                                addrs.push(std::net::SocketAddr::new(*ip, peer_info.port));
+                                            }
+                                        }
+                                    }
+                                    // Fallback: adresy z bazy danych
+                                    if addrs.is_empty() {
+                                        if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec_ref.db) {
+                                            if let Some(tn) = trusted.iter().find(|t| t.node_id == *peer_id) {
+                                                for part in tn.last_addresses.split(',') {
+                                                    if let Ok(addr) = part.trim().parse::<std::net::SocketAddr>() {
+                                                        addrs.push(addr);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if addrs.is_empty() { continue; }
+
+                                    // Probuj kazdy adres po kolei
+                                    for addr in &addrs {
+                                        match qm.connect_to_peer(peer_id, *addr).await {
+                                            Ok(()) => {
+                                                info!(peer_id = %peer_id, addr = %addr, "Bezposrednie polaczenie nawiazane (bylo relay)");
+                                                break;
+                                            }
+                                            Err(_) => continue,
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
                     info!("Mesh networking uruchomiony (QUIC mesh + mDNS)");
 
                     return Ok(MeshPipelineHandles {
@@ -843,6 +909,60 @@ fn spawn_quic_event_handler(
                                 &sec.db, None, None, "trusted_keys_sync", None,
                                 Some(&details), None, Some(&node_id),
                             );
+                        }
+                    }
+                }
+                Ok(QuicMeshEvent::RelayFrameReceived { from_node_id: _, frame }) => {
+                    // Sprawdz TTL
+                    if frame.ttl == 0 {
+                        warn!(source = %frame.source_node_id, dest = %frame.destination_node_id, "Relay frame TTL wyczerpany — odrzucam");
+                        continue;
+                    }
+
+                    // Czy ja jestem odbiorca koncowym?
+                    if frame.destination_node_id == local_node_id {
+                        // Deszyfruj payload kluczem nadawcy (end-to-end)
+                        if let Some(ref sec) = mesh_security {
+                            match sec.decrypt_from_node(&frame.source_node_id, &frame.payload) {
+                                Ok(_decrypted) => {
+                                    info!(
+                                        source = %frame.source_node_id,
+                                        disc = frame.discriminant,
+                                        hops = 4u8.saturating_sub(frame.ttl) + 1,
+                                        "Otrzymano relay frame (multi-hop)"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(source = %frame.source_node_id, "Blad deszyfrowania relay payload: {}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        // Forward do next-hop
+                        let mut forwarded_frame = frame;
+                        forwarded_frame.ttl -= 1;
+
+                        if let Some(route) = peer_store.get_route(&forwarded_frame.destination_node_id) {
+                            let frame_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&forwarded_frame)
+                                .map(|v| v.to_vec())
+                                .unwrap_or_default();
+                            if let Err(e) = qm_events.send_relay_frame(&route.next_hop, &frame_bytes).await {
+                                warn!(
+                                    dest = %forwarded_frame.destination_node_id,
+                                    next_hop = %route.next_hop,
+                                    "Blad forwarding relay frame: {}", e
+                                );
+                            } else {
+                                debug!(
+                                    source = %forwarded_frame.source_node_id,
+                                    dest = %forwarded_frame.destination_node_id,
+                                    next_hop = %route.next_hop,
+                                    ttl = forwarded_frame.ttl,
+                                    "Relay frame forwarded"
+                                );
+                            }
+                        } else {
+                            warn!(dest = %forwarded_frame.destination_node_id, "Brak route — nie moge forwardowac relay frame");
                         }
                     }
                 }
