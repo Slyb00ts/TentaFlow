@@ -4,7 +4,8 @@
 //       sieci. Cross-platform: Linux, macOS, Windows, iOS, Android.
 //       GPU detection WYLACZNIE przez wgpu (Metal, Vulkan, DX12, GL) —
 //       jedna metoda, zero duplikatow. Live metryki GPU: nvidia-smi (NVIDIA),
-//       ioreg (macOS Apple Silicon).
+//       ioreg (macOS Apple Silicon), amd-smi/sysfs (AMD), sysfs hwmon (Intel),
+//       sysfs kgsl/mali (Android), Metal (iOS).
 //       Wyniki uzywane do wymiany NodeInfo z peerami przez QUIC.
 // =============================================================================
 
@@ -344,6 +345,8 @@ fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
 
 /// Bazowa lista GPU z wgpu + live metryki z platform-specific narzedzi.
 /// wgpu daje nazwy GPU (bez duplikatow), nvidia-smi/ioreg daja live metryki.
+/// Kolejnosc enrichmentu: NVIDIA -> AMD -> Intel -> macOS -> Android -> iOS.
+/// Kazda funkcja wzbogaca tylko GPU ktore jeszcze nie maja metryk (vram_total_mb == 0 && usage_percent == 0.0).
 fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
     let mut gpus = get_wgpu_gpus().unwrap_or_default();
 
@@ -351,12 +354,30 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
         return gpus;
     }
 
-    // Live metryki — nvidia-smi (NVIDIA GPU)
+    // NVIDIA — nvidia-smi (Linux, Windows)
     enrich_nvidia_live(&mut gpus);
 
-    // Live metryki — ioreg (macOS Apple Silicon)
+    // AMD — amd-smi / sysfs (Linux)
+    #[cfg(target_os = "linux")]
+    enrich_amd_live(&mut gpus);
+
+    // Intel — sysfs hwmon (Linux)
+    #[cfg(target_os = "linux")]
+    enrich_intel_live(&mut gpus);
+
+    // macOS — ioreg (Apple Silicon)
     #[cfg(target_os = "macos")]
     enrich_macos_live(&mut gpus);
+
+    // Android — sysfs kgsl/mali/thermal
+    #[cfg(target_os = "linux")]
+    if detect_platform() == "android" {
+        enrich_android_live(&mut gpus);
+    }
+
+    // iOS — unified memory
+    #[cfg(target_os = "ios")]
+    enrich_ios_live(&mut gpus);
 
     gpus
 }
@@ -406,10 +427,9 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
         })
         .collect();
 
-    for gpu in gpus.iter_mut() {
-        if let Some(nv) = nvidia_entries.iter().find(|e| {
-            gpu.name.contains(e.name) || e.name.contains(&gpu.name.as_str())
-        }) {
+    // Dopasowanie po indeksie — nvidia-smi zwraca GPU w kolejności 0, 1, 2...
+    for (i, gpu) in gpus.iter_mut().enumerate() {
+        if let Some(nv) = nvidia_entries.get(i) {
             gpu.vram_total_mb = nv.vram_total;
             gpu.vram_used_mb = nv.vram_used;
             gpu.usage_percent = nv.usage;
@@ -498,6 +518,375 @@ fn enrich_macos_live(gpus: &mut [PeerGpuInfo]) {
         }
 
         break;
+    }
+}
+
+// =============================================================================
+// GPU enrichment — AMD (Linux: amd-smi / sysfs)
+// =============================================================================
+
+/// Pomocnik do odczytu wartosci z sysfs — zwraca None jesli plik nie istnieje lub parse sie nie uda
+#[cfg(target_os = "linux")]
+fn read_sysfs_value<T: std::str::FromStr>(path: &str) -> Option<T> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// AMD live metryki — amd-smi CLI (modern) z fallbackiem na sysfs.
+/// Wzbogaca tylko GPU ktore jeszcze nie maja metryk (nie wzbogacone przez nvidia-smi).
+#[cfg(target_os = "linux")]
+fn enrich_amd_live(gpus: &mut [PeerGpuInfo]) {
+    // Zbierz indeksy GPU AMD ktore jeszcze nie maja metryk
+    let amd_indices: Vec<usize> = gpus
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.vram_total_mb == 0 && g.usage_percent == 0.0)
+        .filter(|(_, g)| {
+            let name = g.name.to_lowercase();
+            name.contains("amd") || name.contains("radeon") || name.contains("navi") || name.contains("vega")
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if amd_indices.is_empty() {
+        return;
+    }
+
+    // Probuj amd-smi (modern CLI)
+    if enrich_amd_from_amdsmi(gpus, &amd_indices) {
+        return;
+    }
+
+    // Fallback — sysfs
+    enrich_amd_from_sysfs(gpus, &amd_indices);
+}
+
+/// Probuje wzbogacic AMD GPU przez amd-smi CLI. Zwraca true jesli udalo sie odczytac dane.
+#[cfg(target_os = "linux")]
+fn enrich_amd_from_amdsmi(gpus: &mut [PeerGpuInfo], amd_indices: &[usize]) -> bool {
+    let output = match std::process::Command::new("amd-smi")
+        .args(["monitor", "--json"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("amd-smi JSON parse error: {}", e);
+            return false;
+        }
+    };
+
+    // amd-smi monitor --json zwraca tablice GPU
+    let gpu_array = match json.as_array() {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    for (entry_idx, gpu_idx) in amd_indices.iter().enumerate() {
+        let entry = match gpu_array.get(entry_idx) {
+            Some(e) => e,
+            None => break,
+        };
+
+        let gpu = &mut gpus[*gpu_idx];
+
+        if let Some(usage) = entry.get("GFX_ACTIVITY").and_then(|v| v.as_f64()) {
+            gpu.usage_percent = usage as f32;
+        }
+        if let Some(vram_total) = entry.get("VRAM_TOTAL").and_then(|v| v.as_u64()) {
+            gpu.vram_total_mb = vram_total;
+        }
+        if let Some(vram_used) = entry.get("VRAM_USED").and_then(|v| v.as_u64()) {
+            gpu.vram_used_mb = vram_used;
+        }
+        if let Some(temp) = entry.get("TEMPERATURE_HOTSPOT").and_then(|v| v.as_u64())
+            .or_else(|| entry.get("TEMPERATURE_EDGE").and_then(|v| v.as_u64()))
+        {
+            gpu.temperature_c = temp as u32;
+        }
+        if let Some(power) = entry.get("POWER").and_then(|v| v.as_f64()) {
+            gpu.power_draw_w = Some(power as f32);
+        }
+    }
+
+    true
+}
+
+/// Wzbogaca AMD GPU przez sysfs — /sys/class/drm/card*/device/
+#[cfg(target_os = "linux")]
+fn enrich_amd_from_sysfs(gpus: &mut [PeerGpuInfo], amd_indices: &[usize]) {
+    // Znajdz karty DRM z vendorem AMD (0x1002)
+    let mut amd_cards: Vec<String> = Vec::new();
+    let drm_dir = match std::fs::read_dir("/sys/class/drm") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    for entry in drm_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Tylko card0, card1, ... (nie card0-HDMI-A-1 itp.)
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device_path = format!("/sys/class/drm/{}/device", name);
+        let vendor_path = format!("{}/vendor", device_path);
+        if let Some(vendor) = read_sysfs_value::<String>(&vendor_path) {
+            if vendor.trim() == "0x1002" {
+                amd_cards.push(device_path);
+            }
+        }
+    }
+
+    amd_cards.sort();
+
+    // Dopasowanie po indeksie — sysfs karty AMD w kolejnosci odpowiadaja GPU AMD w liscie
+    for (card_idx, gpu_idx) in amd_indices.iter().enumerate() {
+        let device_path = match amd_cards.get(card_idx) {
+            Some(p) => p,
+            None => break,
+        };
+
+        let gpu = &mut gpus[*gpu_idx];
+
+        // Usage %
+        if let Some(usage) = read_sysfs_value::<f32>(&format!("{}/gpu_busy_percent", device_path)) {
+            gpu.usage_percent = usage;
+        }
+
+        // VRAM total/used (bajty -> MB)
+        if let Some(vram_total) = read_sysfs_value::<u64>(&format!("{}/mem_info_vram_total", device_path)) {
+            gpu.vram_total_mb = vram_total / (1024 * 1024);
+        }
+        if let Some(vram_used) = read_sysfs_value::<u64>(&format!("{}/mem_info_vram_used", device_path)) {
+            gpu.vram_used_mb = vram_used / (1024 * 1024);
+        }
+
+        // Temperatura — hwmon/hwmon*/temp1_input (mili-stopnie Celsjusza)
+        if let Some(temp) = find_hwmon_value::<u64>(device_path, "temp1_input") {
+            gpu.temperature_c = (temp / 1000) as u32;
+        }
+
+        // Moc — hwmon/hwmon*/power1_average (mikrowaty)
+        if let Some(power_uw) = find_hwmon_value::<u64>(device_path, "power1_average") {
+            gpu.power_draw_w = Some(power_uw as f32 / 1_000_000.0);
+        }
+    }
+}
+
+/// Szuka wartosci w hwmon danego urzadzenia — iteruje hwmon*/plik
+#[cfg(target_os = "linux")]
+fn find_hwmon_value<T: std::str::FromStr>(device_path: &str, filename: &str) -> Option<T> {
+    let hwmon_dir = format!("{}/hwmon", device_path);
+    let entries = std::fs::read_dir(&hwmon_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = format!("{}/{}", entry.path().display(), filename);
+        if let Some(val) = read_sysfs_value::<T>(&path) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+// =============================================================================
+// GPU enrichment — Intel (Linux: sysfs hwmon)
+// =============================================================================
+
+/// Intel live metryki — sysfs hwmon. Intel GPU rzadko udostepnia usage% przez sysfs,
+/// wiec wzbogacamy tylko temperature i moc (jesli dostepne).
+#[cfg(target_os = "linux")]
+fn enrich_intel_live(gpus: &mut [PeerGpuInfo]) {
+    // Zbierz indeksy GPU Intel ktore jeszcze nie maja metryk
+    let intel_indices: Vec<usize> = gpus
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.vram_total_mb == 0 && g.usage_percent == 0.0)
+        .filter(|(_, g)| {
+            let name = g.name.to_lowercase();
+            name.contains("intel") || name.contains("iris") || name.contains("uhd") || name.contains("arc")
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if intel_indices.is_empty() {
+        return;
+    }
+
+    // Znajdz karty DRM z vendorem Intel (0x8086)
+    let mut intel_cards: Vec<String> = Vec::new();
+    let drm_dir = match std::fs::read_dir("/sys/class/drm") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    for entry in drm_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device_path = format!("/sys/class/drm/{}/device", name);
+        let vendor_path = format!("{}/vendor", device_path);
+        if let Some(vendor) = read_sysfs_value::<String>(&vendor_path) {
+            if vendor.trim() == "0x8086" {
+                intel_cards.push(device_path);
+            }
+        }
+    }
+
+    intel_cards.sort();
+
+    for (card_idx, gpu_idx) in intel_indices.iter().enumerate() {
+        let device_path = match intel_cards.get(card_idx) {
+            Some(p) => p,
+            None => break,
+        };
+
+        let gpu = &mut gpus[*gpu_idx];
+
+        // Temperatura — hwmon/hwmon*/temp1_input (mili-stopnie)
+        if let Some(temp) = find_hwmon_value::<u64>(device_path, "temp1_input") {
+            gpu.temperature_c = (temp / 1000) as u32;
+        }
+
+        // Moc — hwmon/hwmon*/power1_average (mikrowaty, jesli eksponowane)
+        if let Some(power_uw) = find_hwmon_value::<u64>(device_path, "power1_average") {
+            gpu.power_draw_w = Some(power_uw as f32 / 1_000_000.0);
+        }
+    }
+}
+
+// =============================================================================
+// GPU enrichment — Android (sysfs: Adreno kgsl, Mali, thermal)
+// =============================================================================
+
+/// Android live metryki — sysfs dla Qualcomm Adreno i ARM Mali.
+/// Sciezki sysfs czesto blokowane przez SELinux na nowszych wersjach Androida.
+#[cfg(target_os = "linux")]
+fn enrich_android_live(gpus: &mut [PeerGpuInfo]) {
+    // Wzbogacaj tylko GPU bez metryk
+    let unenriched: Vec<usize> = gpus
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.vram_total_mb == 0 && g.usage_percent == 0.0)
+        .map(|(i, _)| i)
+        .collect();
+
+    if unenriched.is_empty() {
+        return;
+    }
+
+    // Adreno (Qualcomm) — /sys/class/kgsl/kgsl-3d0/
+    let adreno_path = "/sys/class/kgsl/kgsl-3d0";
+    let has_adreno = std::path::Path::new(adreno_path).exists();
+
+    if has_adreno {
+        if let Some(&gpu_idx) = unenriched.first() {
+            let gpu = &mut gpus[gpu_idx];
+
+            // GPU busy — format "X Y", usage = X/Y * 100
+            if let Ok(content) = std::fs::read_to_string(format!("{}/gpubusy", adreno_path)) {
+                let parts: Vec<&str> = content.trim().split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let (Ok(busy), Ok(total)) = (
+                        parts[0].parse::<f64>(),
+                        parts[1].parse::<f64>(),
+                    ) {
+                        if total > 0.0 {
+                            gpu.usage_percent = (busy / total * 100.0) as f32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Mali (ARM) — rozne sciezki w zaleznosci od SoC
+    if !has_adreno {
+        // Probuj mali utilization
+        let mali_paths = [
+            "/sys/kernel/gpu/gpu_clock",
+            "/sys/devices/platform/mali.0/utilization",
+        ];
+
+        if let Some(&gpu_idx) = unenriched.first() {
+            let gpu = &mut gpus[gpu_idx];
+
+            for path in &mali_paths {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if path.contains("utilization") {
+                        if let Ok(usage) = content.trim().parse::<f32>() {
+                            gpu.usage_percent = usage;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Temperatura GPU — skanuj thermal_zone szukajac typu "gpu"
+    let gpu_temp = detect_android_gpu_temperature();
+    if let Some(temp) = gpu_temp {
+        for &gpu_idx in &unenriched {
+            if gpus[gpu_idx].temperature_c == 0 {
+                gpus[gpu_idx].temperature_c = temp;
+            }
+        }
+    }
+}
+
+/// Szuka temperatury GPU w thermal_zone na Androidzie
+#[cfg(target_os = "linux")]
+fn detect_android_gpu_temperature() -> Option<u32> {
+    let thermal_dir = match std::fs::read_dir("/sys/class/thermal") {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+
+    for entry in thermal_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("thermal_zone") {
+            continue;
+        }
+
+        let type_path = format!("/sys/class/thermal/{}/type", name);
+        if let Ok(zone_type) = std::fs::read_to_string(&type_path) {
+            if zone_type.trim().to_lowercase().contains("gpu") {
+                let temp_path = format!("/sys/class/thermal/{}/temp", name);
+                if let Some(temp_millideg) = read_sysfs_value::<u64>(&temp_path) {
+                    return Some((temp_millideg / 1000) as u32);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// =============================================================================
+// GPU enrichment — iOS (unified memory)
+// =============================================================================
+
+/// iOS live metryki — bardzo ograniczone. iOS nie udostepnia GPU usage/temp/power.
+/// VRAM = RAM systemowy (unified memory, jak Apple Silicon Mac).
+#[cfg(target_os = "ios")]
+fn enrich_ios_live(gpus: &mut [PeerGpuInfo]) {
+    if gpus.is_empty() {
+        return;
+    }
+
+    let total_ram_mb = {
+        let sys = SYS.lock();
+        sys.total_memory() / (1024 * 1024)
+    };
+
+    for gpu in gpus.iter_mut() {
+        if gpu.vram_total_mb == 0 && gpu.usage_percent == 0.0 {
+            gpu.vram_total_mb = total_ram_mb;
+        }
     }
 }
 

@@ -278,7 +278,7 @@ const MeshNodeDetail = (() => {
     const gpuCount = container.children.length;
     if (gpuCount <= 1) { container.style.gridTemplateColumns = '1fr'; return; }
     const width = container.clientWidth;
-    const minCard = 320;
+    const minCard = 400;
     const maxCols = Math.min(Math.floor(width / minCard), 4, gpuCount);
     for (let cols = maxCols; cols >= 1; cols--) {
       const remainder = gpuCount % cols;

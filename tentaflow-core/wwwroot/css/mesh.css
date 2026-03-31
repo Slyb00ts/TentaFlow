@@ -107,6 +107,8 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .gauge-label {
@@ -121,6 +123,7 @@
   font-size: var(--font-size-xs);
   font-weight: 500;
   color: var(--color-text-secondary);
+  flex-shrink: 0;
 }
 
 .gauge-bar {
