@@ -299,11 +299,12 @@ impl QuicMeshManager {
         {
             let conns = self.connections.read().await;
             if conns.contains_key(node_id) {
+                debug!(peer_id = %node_id, "Juz polaczony — pomijam connect");
                 return Ok(());
             }
         }
 
-        debug!(peer_id = %node_id, addr = %addr, "Inicjowanie polaczenia mesh");
+        info!(peer_id = %node_id, addr = %addr, "QUIC connect_to_peer START");
 
         let connection = self
             .endpoint

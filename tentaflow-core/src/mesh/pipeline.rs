@@ -475,12 +475,18 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(QuicMeshEvent::PairingRequestReceived { peer_id, data }) => {
-                    // Parsuj JSON i zapisz zadanie parowania w bazie
+                    info!(peer_id = %peer_id, data_len = data.len(), "Odebrano PairingRequest przez QUIC");
                     if let Some(ref sec) = mesh_security {
                         match serde_json::from_slice::<serde_json::Value>(&data) {
                             Ok(val) => {
                                 let from_node_id = val["from_node_id"].as_str().unwrap_or(&peer_id);
-                                // Odrzuc PairingRequest od samego siebie (bledne mapowanie QUIC)
+                                info!(
+                                    from_node_id = %from_node_id,
+                                    peer_id = %peer_id,
+                                    has_pin = !val["pin"].as_str().unwrap_or("").is_empty(),
+                                    has_pubkey = !val["public_key"].as_str().unwrap_or("").is_empty(),
+                                    "PairingRequest szczegoly"
+                                );
                                 if from_node_id == local_node_id {
                                     warn!("Odrzucono PairingRequest od samego siebie (from_node_id == local_node_id)");
                                     continue;
@@ -490,7 +496,7 @@ fn spawn_quic_event_handler(
                                 if let Err(e) = sec.receive_pairing_request(from_node_id, pin, public_key) {
                                     warn!("Blad zapisu PairingRequest od {}: {}", peer_id, e);
                                 } else {
-                                    info!("Otrzymano PairingRequest od {}", peer_id);
+                                    info!("PairingRequest od {} zapisany — oczekuje na potwierdzenie PIN", from_node_id);
                                 }
                             }
                             Err(e) => {
