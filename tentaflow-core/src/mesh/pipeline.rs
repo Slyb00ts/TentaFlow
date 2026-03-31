@@ -495,11 +495,17 @@ fn spawn_quic_event_handler(
                             }
                         }
                     }
+
+                    // Przelicz routing po polaczeniu nowego peera
+                    peer_store.recalculate_routes(&local_node_id);
                 }
                 Ok(QuicMeshEvent::PeerDisconnected { node_id }) => {
                     info!(peer_id = %node_id, "QUIC peer rozlaczony");
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "disconnected");
+
+                    // Przelicz routing po rozlaczeniu peera
+                    peer_store.recalculate_routes(&local_node_id);
 
                     // Auto-reconnect dla trusted peerow
                     let should_reconnect = match &mesh_security {
@@ -558,6 +564,9 @@ fn spawn_quic_event_handler(
                             metrics.swap_total_mb,
                             metrics.swap_used_mb,
                         );
+
+                        // Aktualizuj topologie peera na podstawie jego connected_peers
+                        peer_store.update_topology(&node_id, metrics.connected_peers);
                     }
                 }
                 Ok(QuicMeshEvent::PairingRequestReceived { peer_id, data }) => {
@@ -904,6 +913,7 @@ fn spawn_heartbeat_sender(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut heartbeat_count: u64 = 0;
         loop {
             interval.tick().await;
             let metrics = tokio::task::spawn_blocking(|| {
@@ -912,6 +922,7 @@ fn spawn_heartbeat_sender(
             .await;
             if let Ok(m) = metrics {
                 let containers = docker_cache.read().await.clone();
+                let connected_peers = quic_mesh.connected_peer_ids().await;
 
                 // [OPT] Buduj HeartbeatMetrics najpierw, potem aktualizuj store
                 // z referencji — unika podwojnego klonowania gpus/containers/networks
@@ -925,6 +936,7 @@ fn spawn_heartbeat_sender(
                     cpu_temperature_c: m.cpu_temperature_c,
                     swap_total_mb: m.swap_total_mb,
                     swap_used_mb: m.swap_used_mb,
+                    connected_peers: connected_peers.clone(),
                 };
 
                 // Aktualizuj metryki lokalnego noda w store (klonowanie z hb)
@@ -941,9 +953,18 @@ fn spawn_heartbeat_sender(
                     hb.swap_used_mb,
                 );
 
+                // Aktualizuj topologie lokalnego noda
+                peer_store.update_topology(&local_node_id, connected_peers);
+
                 // Serializuj RAZ — broadcast do wszystkich peerow uzywa tych samych bajtow
                 if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&hb) {
                     quic_mesh.send_heartbeat_data(&data).await;
+                }
+
+                // Przelicz routing co 10 heartbeatow (~5s)
+                heartbeat_count += 1;
+                if heartbeat_count % 10 == 0 {
+                    peer_store.recalculate_routes(&local_node_id);
                 }
             }
         }
