@@ -248,9 +248,14 @@ fn spawn_mdns_handler(
                         continue;
                     }
 
-                    // Pomijaj jesli peer jest juz polaczony przez QUIC
+                    // Jesli peer juz jest w store — zaktualizuj hostname jesli pusty, pomijaj reszte
                     if let Some(existing) = peer_store.get(&peer.node_id) {
                         if existing.quic_connected {
+                            // Zaktualizuj hostname jesli brakowal przy pierwszym discovery
+                            let new_hostname = peer.properties.get("hostname").cloned().unwrap_or_default();
+                            if !new_hostname.is_empty() && existing.hostname.is_empty() {
+                                peer_store.update_hostname(&peer.node_id, &new_hostname);
+                            }
                             continue;
                         }
                     }
