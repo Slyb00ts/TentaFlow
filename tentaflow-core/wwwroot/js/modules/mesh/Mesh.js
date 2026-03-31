@@ -259,9 +259,9 @@ const Mesh = (() => {
     const localClass = type === 'local' ? ' mesh-node-local' : '';
     let actionBtn = '';
     if (type === 'trusted') {
-      actionBtn = `<button class="btn btn-sm btn-secondary" data-node-revoke="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.unpair')}</button>`;
+      actionBtn = `<button class="btn btn-sm btn-secondary" style="margin-top:auto" data-node-revoke="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.unpair')}</button>`;
     } else if (type !== 'local') {
-      actionBtn = `<button class="btn btn-sm btn-primary" data-node-pair="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.pair')}</button>`;
+      actionBtn = `<button class="btn btn-sm btn-primary" style="margin-top:auto" data-node-pair="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.pair')}</button>`;
     }
 
     return `
