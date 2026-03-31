@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing::{info, warn};
+use zeroize::Zeroize;
 
 use crate::mesh::security::MeshSecurity;
 use tentaflow_protocol::mesh::MeshCommandType;
@@ -84,24 +85,28 @@ impl MeshCommandExecutor {
                 netmask,
                 gateway,
                 dhcp,
-                sudo_password,
+                mut sudo_password,
             } => {
                 // Blokujaca operacja sudo — przenies na oddzielny watek
                 let iface = interface.clone();
                 let ip = ipv4.clone();
                 let mask = netmask.clone();
                 let gw = gateway.clone();
-                let pwd = sudo_password.clone();
-                match tokio::task::spawn_blocking(move || {
-                    crate::mesh::network_config::apply_network_config(
+                let mut pwd = sudo_password.clone();
+                sudo_password.zeroize();
+                let result = tokio::task::spawn_blocking(move || {
+                    let r = crate::mesh::network_config::apply_network_config(
                         &iface,
                         ip.as_deref(),
                         mask.as_deref(),
                         gw.as_deref(),
                         dhcp,
                         &pwd,
-                    )
-                }).await {
+                    );
+                    pwd.zeroize();
+                    r
+                }).await;
+                match result {
                     Ok(Ok(output)) => CommandResponse {
                         success: true,
                         output,
