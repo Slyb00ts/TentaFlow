@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // Generuj certyfikaty TLS jesli nie istnieja
+    generate_self_signed_certs();
+
     let out_dir_env = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // Generuj wwwroot_embed.rs — pliki statyczne wbudowane w binarie
@@ -164,6 +167,60 @@ fn main() {
 
     // Generuj plik Rust z osadzonymi danymi addonow
     generate_bundled_rs(&out_dir, &bundled_addons);
+}
+
+// =============================================================================
+// Automatyczne generowanie certyfikatow TLS (self-signed)
+// =============================================================================
+
+/// Sprawdza czy certyfikaty TLS istnieja w ../certs/ — jesli nie, generuje
+/// self-signed certyfikat EC (prime256r1) wazny 10 lat za pomoca openssl CLI.
+fn generate_self_signed_certs() {
+    let certs_dir = Path::new("../certs");
+    let cert_path = certs_dir.join("cert.pem");
+    let key_path = certs_dir.join("key.pem");
+
+    // Przebuduj jesli certyfikat zostanie usuniety
+    println!("cargo:rerun-if-changed=../certs/cert.pem");
+
+    if cert_path.exists() && key_path.exists() {
+        return;
+    }
+
+    println!("cargo:warning=Certyfikaty TLS nie znalezione — generuje self-signed (rcgen, pure Rust)...");
+
+    // Utworz katalog certs/ jesli nie istnieje
+    if let Err(e) = std::fs::create_dir_all(certs_dir) {
+        println!(
+            "cargo:warning=Nie udalo sie utworzyc katalogu certs/: {}. \
+             Utworz go recznie i uruchom build ponownie.",
+            e
+        );
+        return;
+    }
+
+    // Generuj self-signed cert z rcgen — EC P-256, wazny 10 lat
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("Blad generowania klucza EC P-256");
+
+    let mut params = rcgen::CertificateParams::new(vec!["tentaflow".to_string()])
+        .expect("Blad tworzenia CertificateParams");
+    params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+
+    let cert = params.self_signed(&key_pair)
+        .expect("Blad generowania certyfikatu self-signed");
+
+    if let Err(e) = std::fs::write(&cert_path, cert.pem()) {
+        println!("cargo:warning=Nie udalo sie zapisac cert.pem: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::write(&key_path, key_pair.serialize_pem()) {
+        println!("cargo:warning=Nie udalo sie zapisac key.pem: {}", e);
+        return;
+    }
+
+    println!("cargo:warning=Certyfikaty TLS wygenerowane pomyslnie w certs/ (EC P-256, 10 lat)");
 }
 
 // =============================================================================
