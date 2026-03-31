@@ -86,14 +86,38 @@ impl MeshCommandExecutor {
                 dhcp,
                 sudo_password,
             } => {
-                self.handle_network_config(
-                    &interface,
-                    ipv4.as_deref(),
-                    netmask.as_deref(),
-                    gateway.as_deref(),
-                    dhcp,
-                    &sudo_password,
-                )
+                // Blokujaca operacja sudo — przenies na oddzielny watek
+                let iface = interface.clone();
+                let ip = ipv4.clone();
+                let mask = netmask.clone();
+                let gw = gateway.clone();
+                let pwd = sudo_password.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::mesh::network_config::apply_network_config(
+                        &iface,
+                        ip.as_deref(),
+                        mask.as_deref(),
+                        gw.as_deref(),
+                        dhcp,
+                        &pwd,
+                    )
+                }).await {
+                    Ok(Ok(output)) => CommandResponse {
+                        success: true,
+                        output,
+                        error: None,
+                    },
+                    Ok(Err(e)) => CommandResponse {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    },
+                    Err(e) => CommandResponse {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Blad watku: {}", e)),
+                    },
+                }
             }
 
             MeshCommandType::PullImage { .. }
@@ -108,37 +132,6 @@ impl MeshCommandExecutor {
                 success: false,
                 output: String::new(),
                 error: Some("Docker commands not yet implemented".to_string()),
-            },
-        }
-    }
-
-    /// Wykonuje zmiane konfiguracji sieciowej na lokalnym systemie
-    fn handle_network_config(
-        &self,
-        interface: &str,
-        ipv4: Option<&str>,
-        netmask: Option<&str>,
-        gateway: Option<&str>,
-        dhcp: bool,
-        sudo_password: &str,
-    ) -> CommandResponse {
-        match crate::mesh::network_config::apply_network_config(
-            interface,
-            ipv4,
-            netmask,
-            gateway,
-            dhcp,
-            sudo_password,
-        ) {
-            Ok(output) => CommandResponse {
-                success: true,
-                output,
-                error: None,
-            },
-            Err(e) => CommandResponse {
-                success: false,
-                output: String::new(),
-                error: Some(e.to_string()),
             },
         }
     }

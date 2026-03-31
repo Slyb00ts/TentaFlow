@@ -1501,7 +1501,7 @@ async fn route_mesh_api(
             .and_then(|rest| rest.strip_suffix("/network-config"))
             .unwrap_or("");
         if !node_id.is_empty() {
-            return handle_result(api_mesh::handle_network_config(quic_mesh, node_id, body).await, 500);
+            return handle_result(api_mesh::handle_network_config(quic_mesh, mesh_security, node_id, body).await, 500);
         }
     }
 
