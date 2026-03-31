@@ -262,7 +262,7 @@ async fn browse_loop(
                     discovered_peers.remove(node_id);
                 }
 
-                info!(
+                debug!(
                     fullname = %fullname,
                     "Peer zniknal z sieci"
                 );

@@ -528,29 +528,6 @@ impl QuicMeshManager {
             return;
         }
 
-        // Odrzuc polaczenie od revoked noda
-        if let Some(ref sec) = security {
-            if sec.is_revoked(&peer_node_id) {
-                info!(peer_id = %peer_node_id, "Odrzucam polaczenie od revoked noda");
-                let payload = TrustRevokedPayload {
-                    revoked_node_id: peer_node_id.clone(),
-                    from_node_id: self_node_id.clone(),
-                };
-                if let Ok((mut send_s, _)) = connection.open_bi().await {
-                    let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                        .map(|v| v.to_vec())
-                        .unwrap_or_default();
-                    let _ = send_s.write_all(&[MESH_MSG_TRUST_REVOKED]).await;
-                    let len = (data.len() as u32).to_be_bytes();
-                    let _ = send_s.write_all(&len).await;
-                    let _ = send_s.write_all(&data).await;
-                    let _ = send_s.finish();
-                }
-                connection.close(2u32.into(), b"revoked");
-                return;
-            }
-        }
-
         // Wyslij swoj FullState jako odpowiedz — TYLKO jesli peer jest trusted
         // Brak security → zero trust — odrzuc polaczenie
         let peer_is_trusted = match &security {
