@@ -786,7 +786,7 @@ impl MeshSecurity {
     /// Zwraca PIN z oczekujacego parowania (do wyswietlenia na UI)
     pub fn get_pending_pin(&self, remote_node_id: &str) -> Result<Option<String>> {
         let pairing = db::repository::get_pending_pairing(&self.db, remote_node_id)?;
-        Ok(pairing.map(|p| p.pin_code))
+        Ok(pairing.map(|p| p.pin_code).filter(|pin| !pin.is_empty()))
     }
 
     /// Sprawdza czy parowanie nie przekroczyło limitu prób PIN (max 3)
