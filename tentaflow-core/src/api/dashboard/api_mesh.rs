@@ -60,7 +60,7 @@ pub fn handle_list_pending(pool: &DbPool) -> Result<(u16, String)> {
 /// POST /api/mesh/pair/:node_id — rozpocznij parowanie (generuje PIN)
 /// Po wygenerowaniu PIN wysyla PairingRequest przez QUIC do zdalnego peera.
 /// VULN-021: Sprawdza czy istnieje juz oczekujace parowanie dla tego node_id.
-pub fn handle_initiate_pairing(
+pub async fn handle_initiate_pairing(
     pool: &DbPool,
     security: &Arc<MeshSecurity>,
     remote_node_id: &str,
@@ -79,47 +79,51 @@ pub fn handle_initiate_pairing(
 
     let pin = security.initiate_pairing(remote_node_id)?;
 
-    // Wyslij PairingRequest przez QUIC w tle
-    // Jesli brak polaczenia QUIC — sprobuj polaczyc z adresem z peer_store
+    // Wyslij PairingRequest przez QUIC — synchronicznie, z informacja o bledzie
     if let Some(ref qm) = quic_mesh {
         let payload = serde_json::json!({
             "from_node_id": local_node_id,
             "public_key": security.public_key_hex(),
             "pin": &pin,
         });
-        let qm = qm.clone();
-        let node_id = remote_node_id.to_string();
         let data = payload.to_string().into_bytes();
-        let peer_store_clone = peer_store.clone();
-        tokio::spawn(async move {
-            // Proba 1: wyslij bezposrednio
-            if qm.send_pairing_request(&node_id, &data).await.is_ok() {
-                return;
-            }
+        let node_id = remote_node_id.to_string();
 
-            // Brak polaczenia — sprobuj nawiazac QUIC z adresem z peer_store
-            if let Some(peer) = peer_store_clone.get(&node_id) {
+        // Proba 1: wyslij bezposrednio
+        let mut sent = false;
+
+        // Proba 1: wyslij bezposrednio jesli jest polaczenie
+        if qm.send_pairing_request(&node_id, &data).await.is_ok() {
+            sent = true;
+        }
+
+        // Brak polaczenia — nawiaz QUIC i probuj ponownie
+        if !sent {
+            if let Some(peer) = peer_store.get(&node_id) {
                 if !peer.addresses.is_empty() {
                     let addr = std::net::SocketAddr::new(peer.addresses[0], peer.port);
-                    let _ = qm.connect_to_peer(&node_id, addr).await;
+                    for attempt in 1..=3 {
+                        match qm.connect_to_peer(&node_id, addr).await {
+                            Ok(_) => {
+                                if qm.send_pairing_request(&node_id, &data).await.is_ok() {
+                                    sent = true;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("connect_to_peer {} proba {}/3: {}", node_id, attempt, e);
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
                 }
             }
+        }
 
-            // Proby 2-4 z opoznieniem
-            for attempt in 2..=4 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                match qm.send_pairing_request(&node_id, &data).await {
-                    Ok(_) => {
-                        info!("PairingRequest wyslany po {} probie", attempt);
-                        return;
-                    }
-                    Err(e) => {
-                        warn!("PairingRequest proba {}/4: {}", attempt, e);
-                    }
-                }
-            }
-            warn!("PairingRequest do {} nie powiodl sie po 4 probach", node_id);
-        });
+        if !sent {
+            let _ = db::repository::delete_pending_pairing(&security.db, remote_node_id);
+            return Ok((502, json_error("Nie udalo sie wyslac PairingRequest — node moze nie byc osiagalny")));
+        }
     }
 
     let json = serde_json::json!({
