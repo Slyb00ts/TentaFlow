@@ -166,8 +166,8 @@
 /* --- Stopka kafelka (kontenery + siec) --- */
 .mesh-node-footer {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--spacing-sm);
+  flex-direction: column;
+  gap: 2px;
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
   padding-top: var(--spacing-xs);
