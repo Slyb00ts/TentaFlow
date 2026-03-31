@@ -788,7 +788,7 @@
     "pairing_request": "Żądanie parowania",
     "pairing_success": "Host sparowany pomyślnie",
     "pairing_rejected": "Parowanie odrzucone",
-    "unpair_confirm": "Czy na pewno chcesz rozłączyć tego hosta?",
+    "unpair_confirm": "Czy na pewno chcesz rozłączyć tego hosta? Zostanie usunięty ze wszystkich nodów w sieci.",
     "not_trusted": "Host nie jest sparowany",
     "role": "Rola",
     "unknown_host": "Nieznany host",
