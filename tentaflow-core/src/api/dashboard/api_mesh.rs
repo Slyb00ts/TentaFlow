@@ -63,6 +63,7 @@ pub fn handle_initiate_pairing(
     remote_node_id: &str,
     quic_mesh: &Option<Arc<QuicMeshManager>>,
     local_node_id: &str,
+    peer_store: &MeshPeerStore,
 ) -> Result<(u16, String)> {
     // VULN-021: Sprawdz czy juz istnieje oczekujace parowanie dla tego node_id
     if let Ok(Some(_)) = db::repository::get_pending_pairing(pool, remote_node_id) {
@@ -72,7 +73,7 @@ pub fn handle_initiate_pairing(
     let pin = security.initiate_pairing(remote_node_id)?;
 
     // Wyslij PairingRequest przez QUIC w tle
-    // Jesli brak polaczenia QUIC — sprobuj polaczyc najpierw (peer moze byc discovered ale nie connected)
+    // Jesli brak polaczenia QUIC — sprobuj polaczyc z adresem z peer_store
     if let Some(ref qm) = quic_mesh {
         let payload = serde_json::json!({
             "from_node_id": local_node_id,
@@ -81,16 +82,35 @@ pub fn handle_initiate_pairing(
         let qm = qm.clone();
         let node_id = remote_node_id.to_string();
         let data = payload.to_string().into_bytes();
+        let peer_store_clone = peer_store.clone();
         tokio::spawn(async move {
-            // Sprobuj wyslac — jesli brak polaczenia, QUIC nie jest nawiazany
-            if let Err(e) = qm.send_pairing_request(&node_id, &data).await {
-                warn!("Blad wysylania PairingRequest przez QUIC: {} — peer moze nie byc polaczony", e);
-                // Poczekaj chwile i sprobuj ponownie (QUIC moze byc w trakcie nawiazywania)
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                if let Err(e2) = qm.send_pairing_request(&node_id, &data).await {
-                    warn!("Ponowna proba wysylania PairingRequest tez nie powiodla sie: {}", e2);
+            // Proba 1: wyslij bezposrednio
+            if qm.send_pairing_request(&node_id, &data).await.is_ok() {
+                return;
+            }
+
+            // Brak polaczenia — sprobuj nawiazac QUIC z adresem z peer_store
+            if let Some(peer) = peer_store_clone.get(&node_id) {
+                if !peer.addresses.is_empty() {
+                    let addr = std::net::SocketAddr::new(peer.addresses[0], peer.port);
+                    let _ = qm.connect_to_peer(&node_id, addr).await;
                 }
             }
+
+            // Proby 2-4 z opoznieniem
+            for attempt in 2..=4 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                match qm.send_pairing_request(&node_id, &data).await {
+                    Ok(_) => {
+                        info!("PairingRequest wyslany po {} probie", attempt);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!("PairingRequest proba {}/4: {}", attempt, e);
+                    }
+                }
+            }
+            warn!("PairingRequest do {} nie powiodl sie po 4 probach", node_id);
         });
     }
 
