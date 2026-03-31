@@ -350,6 +350,9 @@ fn spawn_quic_event_handler(
     let mut event_rx = quic_mesh.subscribe();
 
     tokio::spawn(async move {
+        let mut last_sync_sent: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+        const SYNC_COOLDOWN_SECS: u64 = 30;
+
         loop {
             match event_rx.recv().await {
                 Ok(QuicMeshEvent::NodeInfoReceived { node_id, data }) => {
@@ -397,35 +400,42 @@ fn spawn_quic_event_handler(
                             }
                         }
 
-                        // Synchronizacja zaufanych kluczy przy reconnect
+                        // Synchronizacja zaufanych kluczy przy reconnect (z cooldownem)
                         if let Some(ref sec) = mesh_security {
-                            let all_keys = sec.get_all_trusted_keys();
-                            if !all_keys.is_empty() {
-                                let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
-                                    .iter()
-                                    .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                                        node_id: nid.clone(),
-                                        public_key_hex: pk.clone(),
-                                    })
-                                    .collect();
-                                let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
-                                if let Ok(sync_data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
-                                    if let Err(e) = qm_events.send_trusted_keys_sync(&node_id, &sync_data).await {
-                                        warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
+                            let should_sync = last_sync_sent.get(&node_id)
+                                .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(SYNC_COOLDOWN_SECS));
+
+                            if should_sync {
+                                let all_keys = sec.get_all_trusted_keys();
+                                if !all_keys.is_empty() {
+                                    let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+                                        .iter()
+                                        .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                            node_id: nid.clone(),
+                                            public_key_hex: pk.clone(),
+                                        })
+                                        .collect();
+                                    let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                                    if let Ok(sync_data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                                        if let Err(e) = qm_events.send_trusted_keys_sync(&node_id, &sync_data).await {
+                                            warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
+                                        }
                                     }
                                 }
-                            }
 
-                            // Wyslij revokowane nody — peer moze nie wiedziec o revoke jesli byl offline
-                            let revoked = sec.get_revoked_node_ids();
-                            for revoked_id in &revoked {
-                                let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
-                                    revoked_node_id: revoked_id.clone(),
-                                    from_node_id: local_node_id.clone(),
-                                };
-                                if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
-                                    let _ = qm_events.send_to_peer(&node_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, &data).await;
+                                // Wyslij revokowane nody — peer moze nie wiedziec o revoke jesli byl offline
+                                let revoked = sec.get_revoked_node_ids();
+                                for revoked_id in &revoked {
+                                    let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
+                                        revoked_node_id: revoked_id.clone(),
+                                        from_node_id: local_node_id.clone(),
+                                    };
+                                    if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
+                                        let _ = qm_events.send_to_peer(&node_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, &data).await;
+                                    }
                                 }
+
+                                last_sync_sent.insert(node_id.clone(), std::time::Instant::now());
                             }
                         }
                     } else {
@@ -594,7 +604,7 @@ fn spawn_quic_event_handler(
 
                         // Przypadek 1: ja zostalam revokowany — usun nadawce z moich trusted
                         if i_am_revoked && sender_trusted {
-                            let _ = sec.revoke_trust(&node_id);
+                            let _ = sec.unpair(&node_id);
                             info!("Zostalismy odparowani przez {} — usuwam z zaufanych", node_id);
                             qm_events.disconnect_peer(&node_id).await;
 
@@ -608,7 +618,7 @@ fn spawn_quic_event_handler(
 
                         // Przypadek 2: ktos inny zostal revokowany — usun go z moich trusted
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
-                            let _ = sec.revoke_trust(&revoked_node_id);
+                            let _ = sec.unpair(&revoked_node_id);
                             info!("Usunieto zaufanie dla {} (propagacja od {})", revoked_node_id, node_id);
                             qm_events.disconnect_peer(&revoked_node_id).await;
 

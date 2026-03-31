@@ -22,6 +22,9 @@ use tracing::{info, warn};
 static NETWORK_CONFIG_RATE_LIMIT: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Maksymalny rozmiar body dla endpointow mesh (64 KiB)
+const MAX_MESH_BODY_SIZE: usize = 64 * 1024;
+
 fn json_error(message: &str) -> String {
     serde_json::json!({"error": message}).to_string()
 }
@@ -65,6 +68,10 @@ pub fn handle_initiate_pairing(
     local_node_id: &str,
     peer_store: &MeshPeerStore,
 ) -> Result<(u16, String)> {
+    if !is_valid_id(remote_node_id) {
+        return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
     // VULN-021: Sprawdz czy juz istnieje oczekujace parowanie dla tego node_id
     if let Ok(Some(_)) = db::repository::get_pending_pairing(pool, remote_node_id) {
         return Ok((429, json_error("Parowanie dla tego noda juz trwa — poczekaj na wygasniecie lub odrzuc")));
@@ -78,6 +85,7 @@ pub fn handle_initiate_pairing(
         let payload = serde_json::json!({
             "from_node_id": local_node_id,
             "public_key": security.public_key_hex(),
+            "pin": &pin,
         });
         let qm = qm.clone();
         let node_id = remote_node_id.to_string();
@@ -138,6 +146,14 @@ pub fn handle_confirm_pairing(
     quic_mesh: &Option<Arc<QuicMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
+    if !is_valid_id(remote_node_id) {
+        return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
+    if body.len() > MAX_MESH_BODY_SIZE {
+        return Ok((413, json_error("Zbyt duzy request body")));
+    }
+
     let req: ConfirmPairingRequest = serde_json::from_slice(body)
         .map_err(|e| anyhow::anyhow!("Blad parsowania: {}", e))?;
 
@@ -245,6 +261,10 @@ pub fn handle_reject_pairing(
     quic_mesh: &Option<Arc<QuicMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
+    if !is_valid_id(remote_node_id) {
+        return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
     security.reject_pairing(remote_node_id)?;
 
     // Wyslij PairingReject przez QUIC w tle
@@ -273,6 +293,10 @@ pub fn handle_revoke_trust(
     quic_mesh: &Option<Arc<QuicMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
+    if !is_valid_id(node_id) {
+        return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
     // Audit log
     let _ = crate::db::repository::log_audit(
         &security.db, None, None, "trust_revoked", None,
@@ -290,6 +314,7 @@ pub fn handle_revoke_trust(
             .map(|v| v.to_vec())
             .unwrap_or_default();
         let revoked_id = node_id.to_string();
+        security.mark_revoking(node_id);
         tokio::spawn(async move {
             // Wyslij PRZED revoke — klucze szyfrowania jeszcze istnieja
             if let Err(e) = qm.send_to_peer(&revoked_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, &data).await {
@@ -301,15 +326,18 @@ pub fn handle_revoke_trust(
                 Some(&revoked_id),
             ).await;
 
-            // Revoke PO wyslaniu — teraz mozna usunac klucze
-            if let Err(e) = sec.revoke_trust(&revoked_id) {
-                warn!("Blad revoke_trust dla {}: {}", revoked_id, e);
+            // Unpair PO wyslaniu — teraz mozna usunac klucze
+            if let Err(e) = sec.unpair(&revoked_id) {
+                warn!("Blad unpair dla {}: {}", revoked_id, e);
             }
+            sec.clear_revoking(&revoked_id);
             qm.disconnect_peer(&revoked_id).await;
         });
     } else {
-        // Brak QUIC — revoke lokalnie
-        security.revoke_trust(node_id)?;
+        // Brak QUIC — unpair lokalnie
+        security.mark_revoking(node_id);
+        security.unpair(node_id)?;
+        security.clear_revoking(node_id);
     }
 
     let json = serde_json::json!({"ok": true}).to_string();
@@ -564,6 +592,10 @@ pub async fn handle_connect(
     quic_mesh: &Option<Arc<QuicMeshManager>>,
     body: &[u8],
 ) -> Result<(u16, String)> {
+    if body.len() > MAX_MESH_BODY_SIZE {
+        return Ok((413, json_error("Zbyt duzy request body")));
+    }
+
     let req: ConnectRequest = serde_json::from_slice(body)
         .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
@@ -604,12 +636,22 @@ pub struct CommandRequest {
 /// POST /api/mesh/nodes/:id/command — wyslij komende do noda
 pub async fn handle_send_command(
     quic_mesh: &Option<Arc<QuicMeshManager>>,
+    mesh_security: &Option<Arc<MeshSecurity>>,
     node_id: &str,
     body: &[u8],
 ) -> Result<(u16, String)> {
     // Waliduj node_id z URL
     if !is_valid_id(node_id) {
         return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
+    let is_trusted = mesh_security.as_ref().map_or(false, |s| s.is_trusted(node_id));
+    if !is_trusted {
+        return Ok((403, json_error("Node nie jest zaufany — nie mozna wyslac komendy")));
+    }
+
+    if body.len() > MAX_MESH_BODY_SIZE {
+        return Ok((413, json_error("Zbyt duzy request body")));
     }
 
     let req: CommandRequest = serde_json::from_slice(body)
@@ -737,6 +779,10 @@ pub async fn handle_network_config(
         return Ok((400, json_error("Niepoprawny node_id")));
     }
 
+    if body.len() > MAX_MESH_BODY_SIZE {
+        return Ok((413, json_error("Zbyt duzy request body")));
+    }
+
     // Rate limit: max 1 zmiana konfiguracji sieci na 30s per node
     {
         let mut rate_map = NETWORK_CONFIG_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
@@ -811,6 +857,10 @@ pub fn handle_retrust(
     security: &Arc<MeshSecurity>,
     node_id: &str,
 ) -> Result<(u16, String)> {
+    if !is_valid_id(node_id) {
+        return Ok((400, json_error("Niepoprawny node_id")));
+    }
+
     security.admin_retrust(node_id)?;
     let json = serde_json::json!({"ok": true}).to_string();
     Ok((200, json))
