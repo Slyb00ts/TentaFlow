@@ -71,6 +71,7 @@ impl MdnsDiscovery {
             ("node_id".to_string(), node_id.to_string()),
             ("version".to_string(), PROTOCOL_VERSION.to_string()),
             ("role".to_string(), "router".to_string()),
+            ("hostname".to_string(), local_hostname.clone()),
         ]
         .into();
 
