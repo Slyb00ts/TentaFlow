@@ -879,6 +879,7 @@ pub async fn handle_network_config(
         sudo_password: req.sudo_password,
     };
 
+    info!(node_id = %node_id, interface = %log_interface, "Wysylam NetworkConfig do noda");
     match qm.send_command(node_id, command).await {
         Ok(response) => {
             info!(
