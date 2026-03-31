@@ -89,17 +89,33 @@ pub async fn handle_initiate_pairing(
         let data = payload.to_string().into_bytes();
         let node_id = remote_node_id.to_string();
 
-        // Proba 1: wyslij bezposrednio
         let mut sent = false;
 
-        // Proba 1: wyslij bezposrednio jesli jest polaczenie
-        if qm.send_pairing_request(&node_id, &data).await.is_ok() {
-            sent = true;
+        info!(
+            target_node = %node_id,
+            "Parowanie: wysylam PairingRequest"
+        );
+
+        // Proba 1: wyslij bezposrednio jesli jest polaczenie QUIC
+        match qm.send_pairing_request(&node_id, &data).await {
+            Ok(_) => {
+                info!(target_node = %node_id, "PairingRequest wyslany (istniejace polaczenie)");
+                sent = true;
+            }
+            Err(e) => {
+                info!(target_node = %node_id, error = %e, "Brak istniejacego polaczenia — probuje nawiazac QUIC");
+            }
         }
 
         // Brak polaczenia — nawiaz QUIC probujac kazdy adres IP peera
         if !sent {
             if let Some(peer) = peer_store.get(&node_id) {
+                info!(
+                    target_node = %node_id,
+                    all_addresses = ?peer.addresses,
+                    port = peer.port,
+                    "Adresy peera z peer_store"
+                );
                 // Preferuj IPv4, nie-loopback, nie-Docker-bridge
                 let mut addrs: Vec<std::net::IpAddr> = peer.addresses.iter()
                     .filter(|a| {
@@ -117,11 +133,18 @@ pub async fn handle_initiate_pairing(
                 if addrs.is_empty() {
                     addrs = peer.addresses.iter().filter(|a| a.is_ipv4()).copied().collect();
                 }
+                info!(
+                    target_node = %node_id,
+                    filtered_addresses = ?addrs,
+                    "Adresy po filtracji (bez loopback/docker/link-local)"
+                );
                 // Probuj kazdy adres
                 for ip in &addrs {
                     let addr = std::net::SocketAddr::new(*ip, peer.port);
+                    info!(target_node = %node_id, address = %addr, "Probuje connect_to_peer");
                     match qm.connect_to_peer(&node_id, addr).await {
                         Ok(_) => {
+                            info!(target_node = %node_id, address = %addr, "QUIC polaczony — wysylam PairingRequest");
                             if qm.send_pairing_request(&node_id, &data).await.is_ok() {
                                 sent = true;
                                 break;
