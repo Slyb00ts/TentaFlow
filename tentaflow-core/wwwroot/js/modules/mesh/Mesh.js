@@ -278,7 +278,7 @@ const Mesh = (() => {
   // Renderowanie sekcji oczekujacych parowan
   function renderPendingSection() {
     const cards = pendingPairings.map(p => {
-      const nodeId = p.node_id || '';
+      const nodeId = p.remote_node_id || '';
       const shortId = nodeId.length > 12 ? nodeId.slice(0, 12) + '...' : nodeId;
       return `
         <div class="mesh-node-card">

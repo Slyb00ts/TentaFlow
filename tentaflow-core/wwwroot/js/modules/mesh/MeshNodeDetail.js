@@ -153,6 +153,7 @@ const MeshNodeDetail = (() => {
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     setupRefreshInterval();
+    window.addEventListener('resize', balanceGpuGrid);
   }
 
   // Zamkniecie widoku
@@ -168,6 +169,7 @@ const MeshNodeDetail = (() => {
       refreshInterval = null;
     }
     document.removeEventListener('visibilitychange', handleVisibilityChange);
+    window.removeEventListener('resize', balanceGpuGrid);
     destroySparklines();
     const content = document.getElementById('content');
     if (content && boundHandleAction) {
@@ -194,24 +196,6 @@ const MeshNodeDetail = (() => {
       const type = canvas.dataset.sparkline;
       let opts = {};
       switch (type) {
-        case 'cpu':
-          opts = { maxValue: 100, thresholds: { medium: 60, high: 85 } };
-          break;
-        case 'ram':
-          opts = { maxValue: 100, thresholds: { medium: 70, high: 90 } };
-          break;
-        case 'gpu-usage':
-          opts = { maxValue: 100, thresholds: { medium: 70, high: 90 } };
-          break;
-        case 'gpu-vram':
-          opts = { maxValue: 100, thresholds: { medium: 70, high: 90 } };
-          break;
-        case 'cpu-temp':
-          opts = { maxValue: 110, thresholds: { medium: 65, high: 80 } };
-          break;
-        case 'gpu-temp':
-          opts = { maxValue: 110, thresholds: { medium: 70, high: 85 } };
-          break;
         case 'network':
           opts = { dualLine: true, color: '#3b82f6' };
           break;
@@ -230,43 +214,6 @@ const MeshNodeDetail = (() => {
 
     sparklines.forEach(s => {
       switch (s._type) {
-        case 'cpu': {
-          const v = node.cpu_usage != null ? node.cpu_usage : (node.cpu_percent != null ? node.cpu_percent : null);
-          if (v != null) s.push(v);
-          break;
-        }
-        case 'ram': {
-          if (node.ram_used_mb != null && node.ram_total_mb > 0) {
-            s.push((node.ram_used_mb / node.ram_total_mb) * 100);
-          }
-          break;
-        }
-        case 'cpu-temp': {
-          if (node.cpu_temperature_c != null) s.push(node.cpu_temperature_c);
-          break;
-        }
-        case 'gpu-usage': {
-          const gpus = Array.isArray(node.gpu_info) ? node.gpu_info : [];
-          if (s._gpuIdx != null && gpus[s._gpuIdx]) {
-            s.push(gpus[s._gpuIdx].usage_percent || 0);
-          }
-          break;
-        }
-        case 'gpu-vram': {
-          const gpus = Array.isArray(node.gpu_info) ? node.gpu_info : [];
-          if (s._gpuIdx != null && gpus[s._gpuIdx]) {
-            const g = gpus[s._gpuIdx];
-            if (g.vram_total_mb > 0) s.push((g.vram_used_mb / g.vram_total_mb) * 100);
-          }
-          break;
-        }
-        case 'gpu-temp': {
-          const gpus = Array.isArray(node.gpu_info) ? node.gpu_info : [];
-          if (s._gpuIdx != null && gpus[s._gpuIdx]) {
-            s.push(gpus[s._gpuIdx].temperature_c || 0);
-          }
-          break;
-        }
         case 'network': {
           const ifaces = Array.isArray(node.network_interfaces) ? node.network_interfaces : [];
           const totalRx = ifaces.reduce((sum, i) => sum + (i.rx_bytes_per_sec || i.rx_bytes || 0), 0);
@@ -322,6 +269,25 @@ const MeshNodeDetail = (() => {
         <div class="mesh-detail-section"><div class="skeleton" style="width:100%;height:100px;border-radius:var(--radius-sm);"></div></div>
       </div>
     `;
+  }
+
+  // Oblicz optymalna liczbe kolumn GPU grid — rownomierne rozlozenie wierszy
+  function balanceGpuGrid() {
+    const container = document.querySelector('.mesh-detail-gpu-grid');
+    if (!container) return;
+    const gpuCount = container.children.length;
+    if (gpuCount <= 1) { container.style.gridTemplateColumns = '1fr'; return; }
+    const width = container.clientWidth;
+    const minCard = 320;
+    const maxCols = Math.min(Math.floor(width / minCard), 4, gpuCount);
+    for (let cols = maxCols; cols >= 1; cols--) {
+      const remainder = gpuCount % cols;
+      if (remainder === 0 || remainder >= Math.ceil(cols / 2)) {
+        container.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+        return;
+      }
+    }
+    container.style.gridTemplateColumns = '1fr';
   }
 
   // Renderowanie widoku szczegolow
@@ -414,7 +380,6 @@ const MeshNodeDetail = (() => {
     if (cpuTemp != null) {
       cpuCardContent += `<div class="mesh-detail-gpu-info">${MeshIcons.thermometer()} <span>${Math.round(cpuTemp)}\u00B0C</span> ${thresholdLabel(cpuTemp, cpuThresholds)}</div>`;
     }
-    cpuCardContent += `<div class="mesh-sparkline-container"><canvas data-sparkline="cpu" aria-label="CPU usage" role="img"></canvas></div>`;
 
     // Karta Memory
     let memCardContent = '';
@@ -427,7 +392,6 @@ const MeshNodeDetail = (() => {
       const swapPct = Math.round((node.swap_used_mb / node.swap_total_mb) * 100);
       memCardContent += renderGaugeLg(I18n.t('mesh.swap'), `${Utils.formatMb(node.swap_used_mb || 0)} / ${Utils.formatMb(node.swap_total_mb)}`, swapPct);
     }
-    memCardContent += `<div class="mesh-sparkline-container"><canvas data-sparkline="ram" aria-label="RAM usage" role="img"></canvas></div>`;
 
     // Karty GPU
     let gpuCardsHtml = '';
@@ -449,17 +413,10 @@ const MeshNodeDetail = (() => {
       row2 += `<span class="mesh-detail-gpu-info-item">${MeshIcons.bolt()} ${gpu.power_draw_w != null ? Math.round(gpu.power_draw_w) + 'W' : 'N/A'}${gpu.power_limit_w != null ? ' / ' + Math.round(gpu.power_limit_w) + 'W' : ''}</span>`;
       row2 += '</div>';
 
-      let row3 = `<div class="mesh-detail-gpu-sparklines">
-        <div class="mesh-sparkline-container"><canvas data-sparkline="gpu-usage" data-gpu-idx="${idx}" aria-label="GPU ${idx} usage" role="img"></canvas></div>
-        <div class="mesh-sparkline-container"><canvas data-sparkline="gpu-vram" data-gpu-idx="${idx}" aria-label="GPU ${idx} VRAM" role="img"></canvas></div>
-      </div>`;
-
       gpuCardsHtml += `
         <div class="mesh-detail-section${freshnessClass()}">
           <div class="mesh-detail-section-title">GPU ${idx}: ${Utils.escapeHtml(gpuName)}</div>
-          ${row1}${row2}${row3}
-          ${getDataFreshness() === 'disconnected' ? renderDisconnectedOverlay() : ''}
-          ${getDataFreshness() === 'stale' ? renderStaleBadge() : ''}
+          ${row1}${row2}
         </div>
       `;
     });
@@ -547,25 +504,19 @@ const MeshNodeDetail = (() => {
           <div class="mesh-detail-section${freshnessClass()}">
             <div class="mesh-detail-section-title">CPU</div>
             ${cpuCardContent}
-            ${freshness === 'disconnected' ? renderDisconnectedOverlay() : ''}
-            ${freshness === 'stale' ? renderStaleBadge() : ''}
           </div>
           <div class="mesh-detail-section${freshnessClass()}">
             <div class="mesh-detail-section-title">Memory</div>
             ${memCardContent}
-            ${freshness === 'disconnected' ? renderDisconnectedOverlay() : ''}
-            ${freshness === 'stale' ? renderStaleBadge() : ''}
           </div>
         </div>
 
-        ${gpuCardsHtml}
+        ${gpuCardsHtml ? `<div class="mesh-detail-gpu-grid">${gpuCardsHtml}</div>` : ''}
 
         ${(netIfaces.length > 0 || node.network_rx_bytes != null) ? `
         <div class="mesh-detail-section${freshnessClass()}">
           <div class="mesh-detail-section-title">Network</div>
           ${networkCardContent}
-          ${freshness === 'disconnected' ? renderDisconnectedOverlay() : ''}
-          ${freshness === 'stale' ? renderStaleBadge() : ''}
         </div>
         ` : ''}
 
@@ -575,6 +526,8 @@ const MeshNodeDetail = (() => {
         </div>
       </div>
     `;
+
+    balanceGpuGrid();
 
     // Ponowne tworzenie sparklines po przerysowaniu DOM
     createSparklines();

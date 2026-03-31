@@ -22,9 +22,9 @@ class SparklineChart {
     this.bufferB = [];
     this.sampleCount = 0;
 
-    // Wymiary logiczne
-    this.logicalWidth = 120;
-    this.logicalHeight = 30;
+    // Wymiary logiczne — szerokosc dopasowana do kontenera
+    this.logicalWidth = (canvas.parentElement ? canvas.parentElement.clientWidth : 120) || 120;
+    this.logicalHeight = 20;
 
     this._setupCanvas();
     this.render();

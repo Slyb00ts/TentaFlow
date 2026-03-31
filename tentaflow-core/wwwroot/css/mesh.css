@@ -421,14 +421,14 @@
   background: var(--color-bg-card);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
-  padding: var(--spacing-md) var(--spacing-lg);
+  padding: var(--spacing-xs) var(--spacing-md) var(--spacing-sm);
 }
 
 .mesh-detail-section-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: var(--spacing-sm);
+  margin-bottom: var(--spacing-xs);
 }
 
 .mesh-detail-section-title {
@@ -437,7 +437,7 @@
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--color-text-muted);
-  margin-bottom: var(--spacing-sm);
+  margin-bottom: var(--spacing-xs);
 }
 
 .mesh-detail-section-header .mesh-detail-section-title {
@@ -627,11 +627,18 @@
   gap: var(--spacing-md);
 }
 
+/* --- GPU cards grid — kolumny ustawiane dynamicznie przez JS --- */
+.mesh-detail-gpu-grid {
+  display: grid;
+  gap: var(--spacing-md);
+  align-items: start;
+}
+
 /* --- GPU card layout --- */
 .mesh-detail-gpu-metrics {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: var(--spacing-md);
+  gap: var(--spacing-sm);
 }
 
 .mesh-detail-gpu-info {
@@ -640,7 +647,7 @@
   gap: var(--spacing-sm);
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
-  margin-top: var(--spacing-sm);
+  margin-top: var(--spacing-xs);
 }
 
 .mesh-detail-gpu-info svg {
@@ -654,13 +661,6 @@
   align-items: center;
   gap: 4px;
   margin-left: var(--spacing-md);
-}
-
-.mesh-detail-gpu-sparklines {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--spacing-md);
-  margin-top: var(--spacing-sm);
 }
 
 /* --- Network interface row --- */
@@ -745,6 +745,7 @@
 
 .mesh-sparkline-container canvas {
   display: block;
+  width: 100% !important;
 }
 
 /* --- Stale/disconnected states --- */
@@ -818,6 +819,10 @@
     grid-template-columns: 1fr;
   }
 
+  .mesh-detail-gpu-grid {
+    grid-template-columns: 1fr !important;
+  }
+
   .mesh-detail-topbar-line1 {
     flex-direction: column;
     align-items: flex-start;
@@ -841,10 +846,6 @@
   }
 
   .mesh-detail-gpu-metrics {
-    grid-template-columns: 1fr;
-  }
-
-  .mesh-detail-gpu-sparklines {
     grid-template-columns: 1fr;
   }
 }
