@@ -33,6 +33,9 @@ pub struct MeshPeerInfo {
     pub containers: Vec<PeerContainerInfo>,
     pub networks: Vec<PeerNetworkInfo>,
     pub platform: String,
+    pub cpu_temperature_c: Option<f32>,
+    pub swap_total_mb: u64,
+    pub swap_used_mb: u64,
     /// Czy Docker jest dostepny na tym nodzie
     pub docker_available: bool,
     /// Wersja Docker serwera (np. "27.5.1")
@@ -47,6 +50,8 @@ pub struct PeerGpuInfo {
     pub vram_used_mb: u64,
     pub usage_percent: f32,
     pub temperature_c: u32,
+    pub power_draw_w: Option<f32>,
+    pub power_limit_w: Option<f32>,
 }
 
 /// Informacje o nodzie — wymieniane przez QUIC po polaczeniu
@@ -80,6 +85,13 @@ pub struct PeerNetworkInfo {
     pub tx_bytes: u64,
     pub rx_bytes_per_sec: u64,
     pub tx_bytes_per_sec: u64,
+    pub link_up: bool,
+    pub ipv4_address: String,
+    pub ipv4_netmask: String,
+    pub ipv4_gateway: String,
+    pub mac_address: String,
+    pub interface_type: String,
+    pub rdma_available: bool,
 }
 
 /// Metryki wysylane w heartbeatach do peerow mesh
@@ -91,6 +103,9 @@ pub struct HeartbeatMetrics {
     pub containers: Vec<PeerContainerInfo>,
     pub networks: Vec<PeerNetworkInfo>,
     pub platform: String,
+    pub cpu_temperature_c: Option<f32>,
+    pub swap_total_mb: u64,
+    pub swap_used_mb: u64,
 }
 
 /// Wspoldzielony store peerow — bezpieczny miedzy watkami.
@@ -261,7 +276,7 @@ impl MeshPeerStore {
     }
 
     /// Aktualizuje biezace metryki peera (z heartbeatu)
-    pub fn update_metrics(&self, node_id: &str, cpu_usage: f32, ram_used: u64, gpus: Vec<PeerGpuInfo>, containers: Vec<PeerContainerInfo>, networks: Vec<PeerNetworkInfo>, platform: String) {
+    pub fn update_metrics(&self, node_id: &str, cpu_usage: f32, ram_used: u64, gpus: Vec<PeerGpuInfo>, containers: Vec<PeerContainerInfo>, networks: Vec<PeerNetworkInfo>, platform: String, cpu_temperature_c: Option<f32>, swap_total_mb: u64, swap_used_mb: u64) {
         let mut peers = self.peers.write();
         let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
         p.cpu_usage_percent = cpu_usage;
@@ -269,6 +284,9 @@ impl MeshPeerStore {
         p.gpu_info = gpus;
         p.containers = containers;
         p.networks = networks;
+        p.cpu_temperature_c = cpu_temperature_c;
+        p.swap_total_mb = swap_total_mb;
+        p.swap_used_mb = swap_used_mb;
         if !platform.is_empty() {
             p.platform = platform;
         }
@@ -311,6 +329,9 @@ impl MeshPeerStore {
             containers: vec![],
             networks: vec![],
             platform: String::new(),
+            cpu_temperature_c: None,
+            swap_total_mb: 0,
+            swap_used_mb: 0,
             docker_available: false,
             docker_version: String::new(),
         }

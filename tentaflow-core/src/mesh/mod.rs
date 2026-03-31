@@ -15,3 +15,4 @@ pub mod pipeline;
 pub mod security;
 pub mod command_executor;
 pub mod service_registry;
+pub mod network_config;

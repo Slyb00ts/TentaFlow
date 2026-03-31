@@ -78,6 +78,24 @@ impl MeshCommandExecutor {
                 error: None,
             },
 
+            MeshCommandType::NetworkConfig {
+                interface,
+                ipv4,
+                netmask,
+                gateway,
+                dhcp,
+                sudo_password,
+            } => {
+                self.handle_network_config(
+                    &interface,
+                    ipv4.as_deref(),
+                    netmask.as_deref(),
+                    gateway.as_deref(),
+                    dhcp,
+                    &sudo_password,
+                )
+            }
+
             MeshCommandType::PullImage { .. }
             | MeshCommandType::DeployStack { .. }
             | MeshCommandType::RemoveStack { .. }
@@ -90,6 +108,37 @@ impl MeshCommandExecutor {
                 success: false,
                 output: String::new(),
                 error: Some("Docker commands not yet implemented".to_string()),
+            },
+        }
+    }
+
+    /// Wykonuje zmiane konfiguracji sieciowej na lokalnym systemie
+    fn handle_network_config(
+        &self,
+        interface: &str,
+        ipv4: Option<&str>,
+        netmask: Option<&str>,
+        gateway: Option<&str>,
+        dhcp: bool,
+        sudo_password: &str,
+    ) -> CommandResponse {
+        match crate::mesh::network_config::apply_network_config(
+            interface,
+            ipv4,
+            netmask,
+            gateway,
+            dhcp,
+            sudo_password,
+        ) {
+            Ok(output) => CommandResponse {
+                success: true,
+                output,
+                error: None,
+            },
+            Err(e) => CommandResponse {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
             },
         }
     }

@@ -580,3 +580,319 @@
     gap: 2px;
   }
 }
+
+/* --- Skeleton shimmer --- */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, var(--color-bg-tertiary) 0%, var(--color-bg-hover) 50%, var(--color-bg-tertiary) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease infinite;
+  border-radius: inherit;
+}
+
+/* --- Topbar linia 1 i meta --- */
+.mesh-detail-topbar-line1 {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+.mesh-detail-topbar-meta {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  padding-left: var(--spacing-xs);
+}
+
+/* --- VRAM summary bar --- */
+.mesh-detail-vram-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.mesh-detail-vram-summary .gauge {
+  flex: 1;
+}
+
+/* --- Resource cards grid (CPU + Memory side by side) --- */
+.mesh-detail-resource-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-md);
+}
+
+/* --- GPU card layout --- */
+.mesh-detail-gpu-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-md);
+}
+
+.mesh-detail-gpu-info {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  margin-top: var(--spacing-sm);
+}
+
+.mesh-detail-gpu-info svg {
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.mesh-detail-gpu-sparklines {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-sm);
+}
+
+/* --- Network interface row --- */
+.mesh-network-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-xs) 0;
+  font-size: var(--font-size-sm);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.mesh-network-row:last-of-type {
+  border-bottom: none;
+}
+
+.mesh-network-link-dot {
+  font-size: 0.75rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.mesh-network-link-dot--up {
+  color: var(--color-success);
+}
+
+.mesh-network-link-dot--down {
+  color: var(--color-text-muted);
+}
+
+.mesh-network-name {
+  font-weight: 600;
+  color: var(--color-text-primary);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 80px;
+}
+
+.mesh-network-ip {
+  color: var(--color-text-secondary);
+  min-width: 120px;
+}
+
+.mesh-network-throughput {
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.mesh-network-rdma-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--color-success-light);
+  color: var(--color-success);
+}
+
+.mesh-network-config-btn {
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* --- Sparkline canvas container --- */
+.mesh-sparkline-container {
+  margin-top: var(--spacing-xs);
+}
+
+.mesh-sparkline-container canvas {
+  display: block;
+}
+
+/* --- Stale/disconnected states --- */
+.mesh-detail-section.stale .gauge-fill {
+  opacity: 0.5;
+}
+
+.mesh-detail-section.disconnected {
+  opacity: 0.3;
+  position: relative;
+}
+
+.mesh-disconnected-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 17, 23, 0.6);
+  border-radius: var(--radius-lg);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  z-index: 2;
+}
+
+.mesh-stale-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  background: var(--color-warning-light);
+  color: var(--color-warning);
+}
+
+.mesh-stale-badge--error {
+  background: var(--color-error-light);
+  color: var(--color-error);
+}
+
+/* --- Threshold labels --- */
+.mesh-threshold-label {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.mesh-threshold-ok {
+  color: var(--color-success);
+}
+
+.mesh-threshold-high {
+  color: var(--color-warning);
+}
+
+.mesh-threshold-crit {
+  color: var(--color-error);
+}
+
+/* --- Tabular nums for metric values --- */
+.gauge-value,
+.mesh-detail-gpu-info,
+.mesh-network-throughput {
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Responsive: resource grid --- */
+@media (max-width: 768px) {
+  .mesh-detail-resource-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mesh-detail-topbar-line1 {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .mesh-detail-topbar-actions {
+    margin-left: 0;
+  }
+}
+
+/* --- Responsive: network rows two-line on small screens --- */
+@media (max-width: 640px) {
+  .mesh-network-row {
+    flex-wrap: wrap;
+  }
+
+  .mesh-network-ip {
+    min-width: auto;
+  }
+
+  .mesh-network-throughput {
+    width: 100%;
+    padding-left: calc(0.75rem + var(--spacing-sm));
+  }
+
+  .mesh-detail-gpu-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .mesh-detail-gpu-sparklines {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* --- Modal konfiguracji sieci --- */
+.mesh-network-mode-toggle {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--color-bg-tertiary);
+  border-radius: var(--radius-md);
+  padding: 2px;
+}
+
+.mesh-network-mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-xs) var(--spacing-md);
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.mesh-network-mode-btn.active {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+.mesh-network-field-error {
+  color: var(--color-error);
+  font-size: var(--font-size-xs);
+  margin-top: 2px;
+  min-height: 0;
+}
+
+.mesh-network-field-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.mesh-network-config-btn {
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 2px;
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-md);
+  line-height: 1;
+  transition: color var(--transition-fast);
+}
+
+.mesh-network-config-btn:hover {
+  color: var(--color-text-primary);
+}

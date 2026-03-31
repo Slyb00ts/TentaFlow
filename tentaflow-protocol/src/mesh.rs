@@ -488,6 +488,15 @@ pub enum MeshCommandType {
     },
     /// Dodanie serwisu na nodzie
     AddService { service_config: String },
+    /// Zmiana konfiguracji sieciowej na zdalnym nodzie
+    NetworkConfig {
+        interface: String,
+        ipv4: Option<String>,
+        netmask: Option<String>,
+        gateway: Option<String>,
+        dhcp: bool,
+        sudo_password: String,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -562,6 +571,16 @@ impl std::fmt::Debug for MeshCommandType {
             Self::AddService { service_config } => {
                 f.debug_struct("AddService")
                     .field("service_config", service_config)
+                    .finish()
+            }
+            Self::NetworkConfig { interface, ipv4, netmask, gateway, dhcp, sudo_password: _ } => {
+                f.debug_struct("NetworkConfig")
+                    .field("interface", interface)
+                    .field("ipv4", ipv4)
+                    .field("netmask", netmask)
+                    .field("gateway", gateway)
+                    .field("dhcp", dhcp)
+                    .field("sudo_password", &"***")
                     .finish()
             }
         }
