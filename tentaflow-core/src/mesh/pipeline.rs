@@ -556,27 +556,37 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(QuicMeshEvent::TrustRevokedReceived { node_id, revoked_node_id }) => {
-                    let sender_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&node_id),
-                        None => false,
-                    };
-                    if !sender_trusted {
-                        warn!("Odrzucono TrustRevoked od niezaufanego noda {}", node_id);
-                        continue;
-                    }
-
                     if let Some(ref sec) = mesh_security {
-                        if sec.is_trusted(&revoked_node_id) {
+                        let sender_trusted = sec.is_trusted(&node_id);
+                        let i_am_revoked = revoked_node_id == local_node_id;
+
+                        // Przypadek 1: ja zostalam revokowany — usun nadawce z moich trusted
+                        if i_am_revoked && sender_trusted {
+                            let _ = sec.revoke_trust(&node_id);
+                            info!("Zostalismy odparowani przez {} — usuwam z zaufanych", node_id);
+                            qm_events.disconnect_peer(&node_id).await;
+
+                            let details = format!("Odparowany przez {}", node_id);
+                            let _ = crate::db::repository::log_audit(
+                                &sec.db, None, None, "trust_revoked_by_peer", None,
+                                Some(&details), None, Some(&node_id),
+                            );
+                            continue;
+                        }
+
+                        // Przypadek 2: ktos inny zostal revokowany — usun go z moich trusted
+                        if sender_trusted && sec.is_trusted(&revoked_node_id) {
                             let _ = sec.revoke_trust(&revoked_node_id);
                             info!("Usunieto zaufanie dla {} (propagacja od {})", revoked_node_id, node_id);
                             qm_events.disconnect_peer(&revoked_node_id).await;
 
-                            // Audit log
                             let details = format!("Revoke {} propagowany od {}", revoked_node_id, node_id);
                             let _ = crate::db::repository::log_audit(
                                 &sec.db, None, None, "trust_revoked_propagation", None,
                                 Some(&details), None, Some(&revoked_node_id),
                             );
+                        } else if !sender_trusted && !i_am_revoked {
+                            warn!("Odrzucono TrustRevoked od niezaufanego noda {}", node_id);
                         }
                     }
                 }
