@@ -658,7 +658,7 @@
 /* --- Network interface row --- */
 .mesh-network-row {
   display: grid;
-  grid-template-columns: 1rem auto 130px 1fr auto auto;
+  grid-template-columns: 1rem 110px 120px 1fr auto 44px;
   align-items: center;
   gap: var(--spacing-sm);
   padding: var(--spacing-xs) 0;
