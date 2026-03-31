@@ -134,7 +134,7 @@ const Mesh = (() => {
     }
 
     // Sekcja: Oczekujace parowania
-    if (pendingPairings.length > 0) {
+    if (pendingPairings.some(p => p.direction === 'incoming')) {
       html += renderPendingSection();
     }
 
@@ -278,9 +278,10 @@ const Mesh = (() => {
     `;
   }
 
-  // Renderowanie sekcji oczekujacych parowan
+  // Renderowanie sekcji oczekujacych parowan (TYLKO incoming — outgoing to nasze wlasne)
   function renderPendingSection() {
-    const cards = pendingPairings.map(p => {
+    const incoming = pendingPairings.filter(p => p.direction === 'incoming');
+    const cards = incoming.map(p => {
       const nodeId = p.remote_node_id || '';
       const shortId = nodeId.length > 12 ? nodeId.slice(0, 12) + '...' : nodeId;
       return `

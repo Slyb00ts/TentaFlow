@@ -130,9 +130,18 @@ async function getPendingPairings(node) {
 
 // Paruj dwa nody: initiator wywoluje pair, responder potwierdza PIN
 async function pairNodes(initiator, responder, responderNodeId) {
-  // Inicjuj parowanie
-  const initResp = await apiCall(initiator, 'POST', `/api/mesh/pair/${responderNodeId}`);
-  console.log(`[pair] ${initiator}->${responder} initiate: status=${initResp.status} body=${JSON.stringify(initResp.body)}`);
+  // Inicjuj parowanie — retry jesli QUIC nie jest jeszcze gotowy (502)
+  let initResp;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    initResp = await apiCall(initiator, 'POST', `/api/mesh/pair/${responderNodeId}`);
+    console.log(`[pair] ${initiator}->${responder} initiate (${attempt+1}): status=${initResp.status}`);
+    if (initResp.status === 200) break;
+    if (initResp.status === 502) {
+      await new Promise(r => setTimeout(r, 2000));
+      continue;
+    }
+    return false;
+  }
   if (initResp.status !== 200) return false;
   const pin = initResp.body.pin;
 
