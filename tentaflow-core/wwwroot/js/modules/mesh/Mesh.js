@@ -257,9 +257,12 @@ const Mesh = (() => {
     }
 
     const localClass = type === 'local' ? ' mesh-node-local' : '';
-    const pairBtn = (type !== 'local' && type !== 'trusted')
-      ? `<button class="btn btn-sm btn-primary" data-node-pair="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.pair')}</button>`
-      : '';
+    let actionBtn = '';
+    if (type === 'trusted') {
+      actionBtn = `<button class="btn btn-sm btn-secondary" data-node-revoke="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.unpair')}</button>`;
+    } else if (type !== 'local') {
+      actionBtn = `<button class="btn btn-sm btn-primary" data-node-pair="${Utils.escapeAttr(nodeId)}">${I18n.t('mesh.pair')}</button>`;
+    }
 
     return `
       <div class="mesh-node-card${localClass}" data-node-detail="${Utils.escapeAttr(nodeId)}">
@@ -270,7 +273,7 @@ const Mesh = (() => {
         </div>
         ${gauges.length > 0 ? `<div class="mesh-node-gauges">${gauges.join('')}</div>` : ''}
         ${footerParts.length > 0 ? `<div class="mesh-node-footer">${footerParts.join('')}</div>` : ''}
-        ${pairBtn}
+        ${actionBtn}
       </div>
     `;
   }
@@ -470,7 +473,7 @@ const Mesh = (() => {
 
   // Cofniecie zaufania — DELETE /api/mesh/trust/:id
   async function revokeTrust(nodeId) {
-    if (!confirm(I18n.t('mesh.revoke_confirm'))) return;
+    if (!confirm(I18n.t('mesh.unpair_confirm'))) return;
     try {
       await ApiClient.delete(`/api/mesh/trust/${encodeURIComponent(nodeId)}`);
       App.showToast(I18n.t('mesh.revoke_success'), 'success');
