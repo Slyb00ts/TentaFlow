@@ -295,40 +295,44 @@ fn spawn_mdns_handler(
                         docker_version: String::new(),
                     });
 
-                    // Preferuj IPv4 niebedacy Docker bridge ani loopback
-                    let preferred_addr = peer
-                        .addresses
-                        .iter()
-                        .find(|a| {
+                    // Filtruj adresy: IPv4, nie-loopback, nie-Docker-bridge, nie-link-local
+                    let mut addrs: Vec<IpAddr> = peer.addresses.iter()
+                        .filter(|a| {
                             if let IpAddr::V4(v4) = a {
                                 !v4.is_loopback()
-                                    && !(v4.octets()[0] == 172
-                                        && v4.octets()[1] >= 16
-                                        && v4.octets()[1] <= 31)
+                                    && !(v4.octets()[0] == 172 && v4.octets()[1] >= 16 && v4.octets()[1] <= 31)
+                                    && !v4.is_link_local()
                             } else {
                                 false
                             }
                         })
-                        .or_else(|| peer.addresses.iter().find(|a| a.is_ipv4()))
-                        .or(peer.addresses.first());
+                        .copied()
+                        .collect();
+                    if addrs.is_empty() {
+                        addrs = peer.addresses.iter().filter(|a| a.is_ipv4()).copied().collect();
+                    }
 
-                    if let Some(addr) = preferred_addr {
-                        let sock_addr = SocketAddr::new(*addr, peer.port);
+                    // Probuj kazdy adres az sie polacz
+                    let mut connected = false;
+                    for ip in &addrs {
+                        let sock_addr = SocketAddr::new(*ip, peer.port);
                         match quic_mesh.connect_to_peer(&peer.node_id, sock_addr).await {
                             Ok(_) => {
-                                info!(
-                                    peer_id = %peer.node_id,
-                                    "connect_to_peer zakonczony (moze byc skip jesli wyzszy node_id)"
-                                );
+                                connected = true;
+                                break;
                             }
                             Err(e) => {
-                                warn!(
-                                    "Nie udalo sie polaczyc z peerem {} ({}): {}",
-                                    peer.node_id, sock_addr, e
+                                debug!(
+                                    peer_id = %peer.node_id,
+                                    addr = %sock_addr,
+                                    error = %e,
+                                    "connect_to_peer nieudany — probuje nastepny adres"
                                 );
-                                peer_store.set_status(&peer.node_id, "connecting");
                             }
                         }
+                    }
+                    if !connected && !addrs.is_empty() {
+                        peer_store.set_status(&peer.node_id, "connecting");
                     }
                 }
                 PeerEvent::Removed { fullname } => {
