@@ -471,17 +471,49 @@ const Mesh = (() => {
     });
   }
 
-  // Cofniecie zaufania — DELETE /api/mesh/trust/:id
-  async function revokeTrust(nodeId) {
-    if (!confirm(I18n.t('mesh.unpair_confirm'))) return;
-    try {
-      await ApiClient.delete(`/api/mesh/trust/${encodeURIComponent(nodeId)}`);
-      App.showToast(I18n.t('mesh.revoke_success'), 'success');
-      await loadNodes();
-      renderSections();
-    } catch (err) {
-      App.showToast(err.message || I18n.t('common.error'), 'error');
-    }
+  // Cofniecie zaufania — modal potwierdzenia + DELETE /api/mesh/trust/:id
+  function revokeTrust(nodeId) {
+    const peer = nodes.find(n => (n.node_id || n.id) === nodeId);
+    const name = (peer && peer.hostname) || nodeId;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-header">
+          <h3>${I18n.t('mesh.unpair')}</h3>
+          <button class="modal-close" id="unpair-modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p>${I18n.t('mesh.unpair_confirm')}</p>
+          <p style="text-align:center;font-size:var(--font-size-lg);font-weight:700;margin:var(--spacing-sm) 0;">${Utils.escapeHtml(name)}</p>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="unpair-cancel">${I18n.t('common.cancel')}</button>
+          <button class="btn btn-primary" id="unpair-ok" style="background:var(--color-error);border-color:var(--color-error);">${I18n.t('mesh.unpair')}</button>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+    const closeModal = () => { if (overlay.parentNode) overlay.remove(); };
+
+    overlay.querySelector('#unpair-modal-close').addEventListener('click', closeModal);
+    overlay.querySelector('#unpair-cancel').addEventListener('click', closeModal);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
+
+    overlay.querySelector('#unpair-ok').addEventListener('click', async () => {
+      try {
+        await ApiClient.delete(`/api/mesh/trust/${encodeURIComponent(nodeId)}`);
+        App.showToast(I18n.t('mesh.revoke_success'), 'success');
+        closeModal();
+        await loadNodes();
+        renderSections();
+      } catch (err) {
+        App.showToast(err.message || I18n.t('common.error'), 'error');
+        closeModal();
+      }
+    });
   }
 
   // Pokaz serwisy na nodzie
