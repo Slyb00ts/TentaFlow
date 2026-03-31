@@ -232,7 +232,7 @@ const MeshNetworkConfig = (() => {
         dhcp: isDhcp,
         ipv4: isDhcp ? null : ipv4.trim(),
         netmask: isDhcp ? null : parsedMask,
-        gateway: isDhcp ? null : gateway.trim(),
+        gateway: isDhcp ? null : (gateway.trim() || null),
         sudo_password: sudoPassword
       };
 
