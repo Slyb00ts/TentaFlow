@@ -2755,7 +2755,7 @@ pub fn add_trusted_node(
 pub fn list_trusted_nodes(pool: &DbPool) -> Result<Vec<TrustedNode>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(
-        "SELECT id, node_id, public_key, hostname, approved_by, approved_at, is_active \
+        "SELECT id, node_id, public_key, hostname, approved_by, approved_at, is_active, last_addresses \
          FROM trusted_nodes WHERE is_active = 1 ORDER BY approved_at DESC",
     )?;
     let rows = stmt
@@ -2768,10 +2768,21 @@ pub fn list_trusted_nodes(pool: &DbPool) -> Result<Vec<TrustedNode>> {
                 approved_by: row.get(4)?,
                 approved_at: row.get(5)?,
                 is_active: row.get(6)?,
+                last_addresses: row.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Aktualizuje ostatnie znane adresy trusted noda
+pub fn update_trusted_node_addresses(pool: &DbPool, node_id: &str, addresses: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE trusted_nodes SET last_addresses = ?2 WHERE node_id = ?1 AND is_active = 1",
+        rusqlite::params![node_id, addresses],
+    )?;
+    Ok(())
 }
 
 /// Usuwa zaufany node z bazy

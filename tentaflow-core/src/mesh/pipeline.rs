@@ -157,6 +157,35 @@ pub async fn start_mesh_pipeline(
                         qm.start();
                     });
 
+                    // Reconnect do trusted peerow z zapisanych adresow w DB (przed mDNS)
+                    if let Some(ref sec) = mesh_security {
+                        if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
+                            for node in &trusted {
+                                if node.last_addresses.is_empty() { continue; }
+                                let addrs: Vec<std::net::SocketAddr> = node.last_addresses
+                                    .split(',')
+                                    .filter_map(|s| s.trim().parse().ok())
+                                    .collect();
+                                if addrs.is_empty() { continue; }
+                                let qm = quic_mesh.clone();
+                                let nid = node.node_id.clone();
+                                tokio::spawn(async move {
+                                    for addr in &addrs {
+                                        match qm.connect_to_peer(&nid, *addr).await {
+                                            Ok(()) => {
+                                                info!(peer_id = %nid, addr = %addr, "Reconnect z DB udany");
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                debug!(peer_id = %nid, addr = %addr, "Reconnect z DB: {}", e);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+
                     // Task 1: mDNS discovery → add to peer store → connect via QUIC
                     spawn_mdns_handler(rx, quic_mesh.clone(), mesh_peer_store.clone(), node_id.clone());
 
@@ -260,6 +289,29 @@ fn spawn_mdns_handler(
                         }
                     }
 
+                    // Filtruj adresy: IPv4, nie-loopback, nie-Docker-bridge, nie-link-local
+                    let mut addrs: Vec<IpAddr> = peer.addresses.iter()
+                        .filter(|a| {
+                            if let IpAddr::V4(v4) = a {
+                                !v4.is_loopback()
+                                    && !(v4.octets()[0] == 172 && v4.octets()[1] >= 16 && v4.octets()[1] <= 31)
+                                    && !v4.is_link_local()
+                            } else {
+                                false
+                            }
+                        })
+                        .copied()
+                        .collect();
+                    if addrs.is_empty() {
+                        addrs = peer.addresses.iter().filter(|a| a.is_ipv4()).copied().collect();
+                    }
+
+                    // Pomijaj peery bez adresow — czekaj na re-announce z adresami
+                    if addrs.is_empty() {
+                        debug!(node_id = %peer.node_id, "mDNS peer bez adresow — czekam na re-announce");
+                        continue;
+                    }
+
                     debug!(
                         node_id = %peer.node_id,
                         port = peer.port,
@@ -268,7 +320,7 @@ fn spawn_mdns_handler(
 
                     peer_store.add_or_update(MeshPeerInfo {
                         node_id: peer.node_id.clone(),
-                        addresses: peer.addresses.clone(),
+                        addresses: addrs.clone(),
                         port: peer.port,
                         role: peer
                             .properties
@@ -294,23 +346,6 @@ fn spawn_mdns_handler(
                         docker_available: false,
                         docker_version: String::new(),
                     });
-
-                    // Filtruj adresy: IPv4, nie-loopback, nie-Docker-bridge, nie-link-local
-                    let mut addrs: Vec<IpAddr> = peer.addresses.iter()
-                        .filter(|a| {
-                            if let IpAddr::V4(v4) = a {
-                                !v4.is_loopback()
-                                    && !(v4.octets()[0] == 172 && v4.octets()[1] >= 16 && v4.octets()[1] <= 31)
-                                    && !v4.is_link_local()
-                            } else {
-                                false
-                            }
-                        })
-                        .copied()
-                        .collect();
-                    if addrs.is_empty() {
-                        addrs = peer.addresses.iter().filter(|a| a.is_ipv4()).copied().collect();
-                    }
 
                     // Probuj kazdy adres az sie polacz
                     let mut connected = false;
@@ -445,11 +480,58 @@ fn spawn_quic_event_handler(
                     } else {
                         info!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
                     }
+
+                    // Persist adresy trusted peera do DB (do reconnectu po restarcie)
+                    if let Some(ref sec) = mesh_security {
+                        if sec.is_trusted(&node_id) {
+                            if let Some(peer_info) = peer_store.get(&node_id) {
+                                if !peer_info.addresses.is_empty() && peer_info.port > 0 {
+                                    let addr_str = peer_info.addresses.iter()
+                                        .map(|ip| format!("{}:{}", ip, peer_info.port))
+                                        .collect::<Vec<_>>()
+                                        .join(",");
+                                    let _ = crate::db::repository::update_trusted_node_addresses(&sec.db, &node_id, &addr_str);
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(QuicMeshEvent::PeerDisconnected { node_id }) => {
                     info!(peer_id = %node_id, "QUIC peer rozlaczony");
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "disconnected");
+
+                    // Auto-reconnect dla trusted peerow
+                    let should_reconnect = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&node_id),
+                        None => false,
+                    };
+                    if should_reconnect {
+                        let mut addrs: Vec<std::net::SocketAddr> = Vec::new();
+                        // Adresy z peer_store
+                        if let Some(peer_info) = peer_store.get(&node_id) {
+                            for ip in &peer_info.addresses {
+                                addrs.push(std::net::SocketAddr::new(*ip, peer_info.port));
+                            }
+                        }
+                        // Fallback: adresy z DB
+                        if addrs.is_empty() {
+                            if let Some(ref sec) = mesh_security {
+                                if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
+                                    if let Some(tn) = trusted.iter().find(|t| t.node_id == node_id) {
+                                        for part in tn.last_addresses.split(',') {
+                                            if let Ok(addr) = part.trim().parse::<std::net::SocketAddr>() {
+                                                addrs.push(addr);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !addrs.is_empty() {
+                            qm_events.spawn_reconnect_loop(node_id.clone(), addrs);
+                        }
+                    }
                 }
                 Ok(QuicMeshEvent::HeartbeatReceived { node_id, heartbeat }) => {
                     // Safety net — przetwarzaj heartbeat TYLKO od trusted peerow

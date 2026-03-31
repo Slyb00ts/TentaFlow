@@ -143,6 +143,8 @@ pub struct QuicMeshManager {
     pending_commands: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandResponse>>>>,
     /// Mapowanie command_id -> target_node_id (do czyszczenia przy disconnect)
     command_to_node: Arc<RwLock<HashMap<String, String>>>,
+    /// Zbior node_id dla ktorych juz dziala reconnect loop (deduplikacja)
+    reconnecting: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl QuicMeshManager {
@@ -216,6 +218,7 @@ impl QuicMeshManager {
             service_registry,
             pending_commands: Arc::new(RwLock::new(HashMap::new())),
             command_to_node: Arc::new(RwLock::new(HashMap::new())),
+            reconnecting: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }))
     }
 
@@ -306,11 +309,13 @@ impl QuicMeshManager {
 
         info!(peer_id = %node_id, addr = %addr, "QUIC connect_to_peer START");
 
-        let connection = self
-            .endpoint
-            .connect(addr, "tentaflow-mesh")
-            .context("Nie udalo sie zainicjowac QUIC connect")?
-            .await
+        let connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.endpoint
+                .connect(addr, "tentaflow-mesh")
+                .context("Nie udalo sie zainicjowac QUIC connect")?
+        ).await
+            .map_err(|_| anyhow::anyhow!("QUIC connect timeout (5s) do {}", addr))?
             .context("QUIC handshake nieudany")?;
 
         // Sprawdz czy peer jest trusted — jesli nie, wyslij tylko node_id bez danych
@@ -1406,15 +1411,28 @@ impl QuicMeshManager {
     // Reconnect z exponential backoff
     // =========================================================================
 
-    /// Uruchamia petla reconnect z exponential backoff + jitter
-    pub fn spawn_reconnect_loop(self: &Arc<Self>, node_id: String, addr: SocketAddr) {
+    /// Uruchamia petla reconnect z exponential backoff + jitter.
+    /// Przyjmuje liste adresow — probuje kazdy w kazdej rundzie.
+    /// Deduplikacja: nie spawnuje drugiej petli dla tego samego node_id.
+    pub fn spawn_reconnect_loop(self: &Arc<Self>, node_id: String, addrs: Vec<SocketAddr>) {
+        if addrs.is_empty() { return; }
         let this = Arc::clone(self);
+        let reconnecting = self.reconnecting.clone();
+
+        // Nie spawnuj duplikatu
+        {
+            let mut set = reconnecting.blocking_write();
+            if set.contains(&node_id) { return; }
+            set.insert(node_id.clone());
+        }
+
         tokio::spawn(async move {
-            this.reconnect_loop(node_id, addr).await;
+            this.reconnect_loop(&node_id, &addrs).await;
+            reconnecting.write().await.remove(&node_id);
         });
     }
 
-    async fn reconnect_loop(&self, node_id: String, addr: SocketAddr) {
+    async fn reconnect_loop(&self, node_id: &str, addrs: &[SocketAddr]) {
         let mut delay = self.config.reconnect_base;
 
         loop {
@@ -1423,8 +1441,9 @@ impl QuicMeshManager {
             }
 
             // Sprawdz czy juz polaczony
-            if self.is_connected(&node_id).await {
-                break;
+            {
+                let conns = self.connections.read().await;
+                if conns.contains_key(node_id) { break; }
             }
 
             // Jitter: 0..500ms
@@ -1442,15 +1461,20 @@ impl QuicMeshManager {
                 _ = tokio::time::sleep(total_delay) => {}
             }
 
-            match self.connect_to_peer(&node_id, addr).await {
-                Ok(()) => {
-                    if self.is_connected(&node_id).await {
-                        info!(peer_id = %node_id, "Reconnect udany");
-                        break;
+            // Probuj kazdy adres
+            for addr in addrs {
+                if self.shutdown.is_cancelled() { return; }
+                match self.connect_to_peer(node_id, *addr).await {
+                    Ok(()) => {
+                        let conns = self.connections.read().await;
+                        if conns.contains_key(node_id) {
+                            info!(peer_id = %node_id, addr = %addr, "Reconnect udany");
+                            return;
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!(peer_id = %node_id, "Reconnect nieudany: {}", e);
+                    Err(e) => {
+                        debug!(peer_id = %node_id, addr = %addr, "Reconnect proba: {}", e);
+                    }
                 }
             }
 
