@@ -31,6 +31,20 @@ from trl import SFTTrainer, SFTConfig
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # ---------------------------------------------------------------------------
+# Optymalizacje GPU — Ampere (RTX 3090): TF32 + NCCL tuning
+# ---------------------------------------------------------------------------
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+# NCCL — optymalizacja komunikacji multi-GPU przez PCIe (bez NVLink)
+os.environ.setdefault("NCCL_P2P_LEVEL", "PHB")
+os.environ.setdefault("NCCL_IB_DISABLE", "1")
+os.environ.setdefault("NCCL_TREE_THRESHOLD", "0")
+
+# Mniej fragmentacji pamieci CUDA
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# ---------------------------------------------------------------------------
 # Sciezki modeli
 # ---------------------------------------------------------------------------
 QWEN_MODEL = os.path.join(ROOT, "models", "qwen3.5-0.8b-base")
@@ -291,14 +305,29 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
     if is_distributed:
         print(f"  Multi-GPU: device_map=None (DeepSpeed zarzadza dystrybucja)")
 
+    # Attention — flash_attention_2 > sdpa > eager (fallback)
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+        print("  Attention: flash_attention_2")
+    except ImportError:
+        attn_impl = "sdpa"  # PyTorch native, ~1.5x szybszy niz eager
+        print("  Attention: sdpa (PyTorch native)")
+
+    # Wspolne parametry ladowania modelu
+    load_kwargs = dict(
+        device_map=dm,
+        trust_remote_code=True,
+        dtype=torch.bfloat16,
+    )
+    if attn_impl:
+        load_kwargs["attn_implementation"] = attn_impl
+
     if method == "full":
         # Full fine-tune — caly model, bez quantyzacji, bez LoRA
         print("Model (full fine-tune, bf16)...")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL,
-            device_map=dm,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
+            QWEN_MODEL, **load_kwargs,
         )
         model.resize_token_embeddings(len(tokenizer))
         total = sum(p.numel() for p in model.parameters())
@@ -309,10 +338,7 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
         # LoRA bez quantyzacji (bf16 + adapter)
         print("Model (bf16 + LoRA)...")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL,
-            device_map=dm,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
+            QWEN_MODEL, **load_kwargs,
         )
         model.resize_token_embeddings(len(tokenizer))
 
@@ -333,10 +359,7 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
         # DoRA — Weight-Decomposed Low-Rank Adaptation
         print("Model (bf16 + DoRA)...")
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL,
-            device_map=dm,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
+            QWEN_MODEL, **load_kwargs,
         )
         model.resize_token_embeddings(len(tokenizer))
 
@@ -363,12 +386,10 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
         )
+        qlora_kwargs = dict(load_kwargs)
+        qlora_kwargs["quantization_config"] = bnb_config
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            QWEN_MODEL,
-            quantization_config=bnb_config,
-            device_map=dm,
-            trust_remote_code=True,
-            dtype=torch.bfloat16,
+            QWEN_MODEL, **qlora_kwargs,
         )
         model.resize_token_embeddings(len(tokenizer))
         model = prepare_model_for_kbit_training(model)
@@ -410,20 +431,24 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
     is_multi_gpu = int(os.environ.get("WORLD_SIZE", "1")) > 1
     num_gpus = int(os.environ.get("WORLD_SIZE", "1"))
 
+    # Hiperparametry — model 0.8B na 1 GPU (24GB RTX 3090)
+    # bf16 model (~1.6GB) + optimizer + gradienty + aktywacje
+    # QLoRA: 4-bit model (~0.5GB) — wiekszy batch
+    # LoRA/DoRA/Full: bf16 model — mniejszy batch (cross_entropy na vocab 150k zjada duzo)
     if method == "full":
         lr = 5e-5
-        batch = 2 if is_multi_gpu else 2
-        grad_accum = 16 if is_multi_gpu else 16
+        batch = 2
+        grad_accum = 16
         epochs = 3
     elif method in ("lora", "dora"):
         lr = 1e-4
-        batch = 2 if is_multi_gpu else 4
-        grad_accum = 16 if is_multi_gpu else 8
+        batch = 2
+        grad_accum = 16
         epochs = 5
     else:  # qlora
         lr = 2e-4
-        batch = 1 if is_multi_gpu else 2
-        grad_accum = 32 if is_multi_gpu else 16
+        batch = 2
+        grad_accum = 16
         epochs = 5
 
     eff_batch = batch * grad_accum * num_gpus
@@ -441,12 +466,15 @@ def train_qwen(task, resume_from=None, method="qlora", fraction=1.0, balance=Fal
         warmup_steps=50,
         weight_decay=0.01,
         bf16=True,
+        tf32=True,
         gradient_checkpointing=True,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
         logging_steps=10,
-        eval_strategy="epoch" if eval_dataset else "no",
-        save_strategy="epoch",
-        save_total_limit=3,
-        load_best_model_at_end=True if eval_dataset else False,
+        eval_strategy="no",
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=2,
         report_to="none",
         max_grad_norm=1.0,
         max_length=2048,

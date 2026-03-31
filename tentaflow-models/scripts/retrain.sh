@@ -150,76 +150,150 @@ print('Merge OK: $merged_dir')
 }
 
 # =============================================================================
-# Tryb batch: 8 modeli sekwencyjnie
+# Tryb batch: 8 modeli — rownolegle na osobnych GPU (1 GPU per model)
 # =============================================================================
 if [ "$TASK" = "batch" ]; then
     echo "=========================================="
-    echo "  BATCH: 8 modeli treningowych"
-    echo "  GPU: $GPUS"
+    echo "  BATCH: 8 modeli (rownolegle, 1 GPU per model)"
     echo "=========================================="
 
     BATCH_QUANT="Q5_K_M"
 
-    # Konwersja danych — raz na poczatku
+    # Konwersja danych — raz na poczatku (wszystkie)
     echo ""
-    echo "[BATCH] Konwersja danych guard..."
-    python3 "$SCRIPT_DIR/convert.py" guard
+    echo "[BATCH] Konwersja danych..."
+    python3 "$SCRIPT_DIR/convert.py"
 
-    # --- 1. Qwen guard LOW (1/3 danych, qlora) ---
+    # --- 1-4. Guard modele ROWNOLEGLE ---
     echo ""
-    echo "[1/8] Qwen guard LOW (fraction=0.33, qlora)..."
-    python3 "$SCRIPT_DIR/train.py" guard --method qlora --fraction 0.33 --gpus "$GPUS"
-    merge_and_export "qwen-guard-qlora-low" "qlora" "$BATCH_QUANT"
+    echo "[1-4/8] Guard modele — rownolegle (1 GPU per model)..."
 
-    # --- 2. Qwen guard MEDIUM (2/3 danych, qlora) ---
-    echo ""
-    echo "[2/8] Qwen guard MEDIUM (fraction=0.66, qlora)..."
-    python3 "$SCRIPT_DIR/train.py" guard --method qlora --fraction 0.66 --gpus "$GPUS"
-    merge_and_export "qwen-guard-qlora-medium" "qlora" "$BATCH_QUANT"
+    GUARD_PIDS=()
+    GUARD_NAMES=()
+    GPU_IDX=0
 
-    # --- 3. Qwen guard HIGH (pelny dataset, qlora) ---
-    echo ""
-    echo "[3/8] Qwen guard HIGH (fraction=1.0, qlora)..."
-    python3 "$SCRIPT_DIR/train.py" guard --method qlora --gpus "$GPUS"
-    # train.py zapisuje do qwen-guard-qlora (bez suffixu bo fraction=1.0)
-    # Rename dla spojnej nazwy z low/medium
-    if [ -d "$ROOT/output/qwen-guard-qlora" ]; then
-        mv "$ROOT/output/qwen-guard-qlora" "$ROOT/output/qwen-guard-qlora-high"
+    # 1. guard LOW
+    if [ -f "$ROOT/output/qwen-guard-qlora-low-Q5_K_M.gguf" ] && [ -f "$ROOT/output/qwen-guard-qlora-low/.data_fingerprint" ]; then
+        echo "  SKIP: qwen-guard-qlora-low"
+    else
+        echo "  START: qwen-guard-qlora-low na GPU $GPU_IDX"
+        (
+            export CUDA_VISIBLE_DEVICES=$GPU_IDX
+            python3 "$SCRIPT_DIR/train.py" guard --method qlora --fraction 0.33
+            merge_and_export "qwen-guard-qlora-low" "qlora" "$BATCH_QUANT"
+        ) > "$ROOT/output/qwen-guard-qlora-low.log" 2>&1 &
+        GUARD_PIDS+=($!)
+        GUARD_NAMES+=("qwen-guard-qlora-low")
+        GPU_IDX=$((GPU_IDX + 1))
     fi
-    merge_and_export "qwen-guard-qlora-high" "qlora" "$BATCH_QUANT"
 
-    # --- 4. Llama guard (caly dataset guard short) ---
+    # 2. guard MEDIUM
+    if [ -f "$ROOT/output/qwen-guard-qlora-medium-Q5_K_M.gguf" ] && [ -f "$ROOT/output/qwen-guard-qlora-medium/.data_fingerprint" ]; then
+        echo "  SKIP: qwen-guard-qlora-medium"
+    else
+        echo "  START: qwen-guard-qlora-medium na GPU $GPU_IDX"
+        (
+            export CUDA_VISIBLE_DEVICES=$GPU_IDX
+            python3 "$SCRIPT_DIR/train.py" guard --method qlora --fraction 0.66
+            merge_and_export "qwen-guard-qlora-medium" "qlora" "$BATCH_QUANT"
+        ) > "$ROOT/output/qwen-guard-qlora-medium.log" 2>&1 &
+        GUARD_PIDS+=($!)
+        GUARD_NAMES+=("qwen-guard-qlora-medium")
+        GPU_IDX=$((GPU_IDX + 1))
+    fi
+
+    # 3. guard HIGH
+    if [ -f "$ROOT/output/qwen-guard-qlora-high-Q5_K_M.gguf" ] && [ -f "$ROOT/output/qwen-guard-qlora-high/.data_fingerprint" ]; then
+        echo "  SKIP: qwen-guard-qlora-high"
+    else
+        echo "  START: qwen-guard-qlora-high na GPU $GPU_IDX"
+        (
+            export CUDA_VISIBLE_DEVICES=$GPU_IDX
+            python3 "$SCRIPT_DIR/train.py" guard --method qlora
+            if [ -d "$ROOT/output/qwen-guard-qlora" ]; then
+                mv "$ROOT/output/qwen-guard-qlora" "$ROOT/output/qwen-guard-qlora-high"
+            fi
+            merge_and_export "qwen-guard-qlora-high" "qlora" "$BATCH_QUANT"
+        ) > "$ROOT/output/qwen-guard-qlora-high.log" 2>&1 &
+        GUARD_PIDS+=($!)
+        GUARD_NAMES+=("qwen-guard-qlora-high")
+        GPU_IDX=$((GPU_IDX + 1))
+    fi
+
+    # 4. Llama guard
+    if [ -f "$ROOT/output/llama-guard/.data_fingerprint" ] && [ -f "$ROOT/output/llama-guard/config.json" ]; then
+        echo "  SKIP: llama-guard"
+    else
+        echo "  START: llama-guard na GPU $GPU_IDX"
+        (
+            export CUDA_VISIBLE_DEVICES=$GPU_IDX
+            python3 "$SCRIPT_DIR/train.py" guard --model llama
+        ) > "$ROOT/output/llama-guard.log" 2>&1 &
+        GUARD_PIDS+=($!)
+        GUARD_NAMES+=("llama-guard")
+        GPU_IDX=$((GPU_IDX + 1))
+    fi
+
+    # Czekaj na guard modele
+    if [ ${#GUARD_PIDS[@]} -gt 0 ]; then
+        echo "  Czekam na ${#GUARD_PIDS[@]} guard trening(ow)..."
+        for i in "${!GUARD_PIDS[@]}"; do
+            if wait "${GUARD_PIDS[$i]}"; then
+                echo "  OK: ${GUARD_NAMES[$i]}"
+            else
+                echo "  BLAD: ${GUARD_NAMES[$i]} — sprawdz output/${GUARD_NAMES[$i]}.log"
+            fi
+        done
+    fi
+
+    # --- 5-8. Qwen all (balanced) z 4 metodami ROWNOLEGLE ---
     echo ""
-    echo "[4/8] Llama guard..."
-    python3 "$SCRIPT_DIR/train.py" guard --model llama
+    echo "[5-8/8] Qwen all — 4 metody rownolegle (1 GPU per model)..."
 
-    # Konwersja danych all — raz przed 4 treningami
-    echo ""
-    echo "[BATCH] Konwersja danych all..."
-    python3 "$SCRIPT_DIR/convert.py" intent
-    python3 "$SCRIPT_DIR/convert.py" guard
-    python3 "$SCRIPT_DIR/convert.py" model
-    python3 "$SCRIPT_DIR/convert.py" plan
-    python3 "$SCRIPT_DIR/convert.py" check
-    python3 "$SCRIPT_DIR/convert.py" toolcalling
-    python3 "$SCRIPT_DIR/convert.py" memory
+    ALL_PIDS=()
+    ALL_NAMES=()
+    METHODS=(lora qlora dora full)
+    GPU_IDX=0
 
-    # --- 5-8. Qwen all (balanced) z 4 metodami ---
-    BATCH_IDX=5
-    for method in lora qlora dora full; do
-        echo ""
-        echo "[$BATCH_IDX/8] Qwen all ($method, balanced)..."
-        python3 "$SCRIPT_DIR/train.py" all --method "$method" --balance --gpus "$GPUS"
-        merge_and_export "qwen-all-${method}" "$method" "$BATCH_QUANT"
-        BATCH_IDX=$((BATCH_IDX + 1))
+    for method in "${METHODS[@]}"; do
+        name="qwen-all-${method}"
+        if [ -f "$ROOT/output/${name}-Q5_K_M.gguf" ] && [ -f "$ROOT/output/${name}/.data_fingerprint" ]; then
+            echo "  SKIP: ${name}"
+            continue
+        fi
+
+        echo "  START: ${name} na GPU $GPU_IDX"
+        (
+            export CUDA_VISIBLE_DEVICES=$GPU_IDX
+            python3 "$SCRIPT_DIR/train.py" all --method "$method" --balance
+            merge_and_export "$name" "$method" "$BATCH_QUANT"
+        ) > "$ROOT/output/${name}.log" 2>&1 &
+        ALL_PIDS+=($!)
+        ALL_NAMES+=("$name")
+        GPU_IDX=$((GPU_IDX + 1))
     done
+
+    # Czekaj na all modele
+    if [ ${#ALL_PIDS[@]} -gt 0 ]; then
+        echo "  Czekam na ${#ALL_PIDS[@]} all trening(ow)..."
+        for i in "${!ALL_PIDS[@]}"; do
+            if wait "${ALL_PIDS[$i]}"; then
+                echo "  OK: ${ALL_NAMES[$i]}"
+            else
+                echo "  BLAD: ${ALL_NAMES[$i]} — sprawdz output/${ALL_NAMES[$i]}.log"
+            fi
+        done
+    fi
 
     # Podsumowanie batch
     echo ""
     echo "=========================================="
-    echo "  BATCH ZAKONCZONE - 8 modeli"
+    echo "  BATCH ZAKONCZONE"
     echo "=========================================="
     ls -lh "$ROOT/output/"*-Q5_K_M.gguf 2>/dev/null | awk '{print "  " $NF ": " $5}'
+    echo ""
+    echo "  Logi:"
+    ls -lh "$ROOT/output/"*.log 2>/dev/null | awk '{print "  " $NF ": " $5}'
 
     exit 0
 fi
@@ -358,4 +432,4 @@ echo "  Model: $LORA_NAME"
 echo "=========================================="
 ls -lh "$ROOT/output/${LORA_NAME}-"*.gguf | awk '{print "  " $NF ": " $5}'
 echo ""
-echo "Benchmark: python3 scripts/benchmark_all.py --gguf output/${LORA_NAME}-Q5_K_M.gguf"
+echo "Benchmark: python3 scripts/benchmark.py --models all"
