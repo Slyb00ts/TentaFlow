@@ -427,6 +427,12 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
         })
         .collect();
 
+    // RAM systemowy — potrzebny dla unified memory GPU (GB10, przyszle Blackwell)
+    let system_ram_mb = {
+        let sys = SYS.lock();
+        sys.total_memory() / (1024 * 1024)
+    };
+
     // Dopasowanie po indeksie — nvidia-smi zwraca GPU w kolejności 0, 1, 2...
     for (i, gpu) in gpus.iter_mut().enumerate() {
         if let Some(nv) = nvidia_entries.get(i) {
@@ -436,6 +442,12 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
             gpu.temperature_c = nv.temp;
             gpu.power_draw_w = nv.power_draw;
             gpu.power_limit_w = nv.power_limit;
+
+            // Unified memory GPU (np. DGX Spark GB10) — nvidia-smi zwraca [N/A] dla VRAM
+            // Wtedy VRAM = RAM systemowy (wspoldzielona pamiec CPU/GPU)
+            if gpu.vram_total_mb == 0 {
+                gpu.vram_total_mb = system_ram_mb;
+            }
         }
     }
 }
@@ -1018,8 +1030,14 @@ fn detect_cpu_temperature() -> Option<f32> {
 fn detect_link_up(name: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let path = format!("/sys/class/net/{}/operstate", name);
-        std::fs::read_to_string(&path)
+        // carrier = fizyczny kabel wpiety (1/0), niezalezny od konfiguracji IP
+        let carrier_path = format!("/sys/class/net/{}/carrier", name);
+        if let Ok(val) = std::fs::read_to_string(&carrier_path) {
+            return val.trim() == "1";
+        }
+        // Fallback na operstate jesli carrier nie dostepny (np. WiFi)
+        let operstate_path = format!("/sys/class/net/{}/operstate", name);
+        std::fs::read_to_string(&operstate_path)
             .map(|s| s.trim() == "up")
             .unwrap_or(false)
     }
@@ -1172,16 +1190,13 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
     let results: Vec<PeerNetworkInfo> = nets
         .iter()
         .filter_map(|(name, data)| {
-            if name == "lo" || name == "lo0" {
+            // Pomijaj loopback i Docker bridge
+            if name == "lo" || name == "lo0" || name.starts_with("docker") || name.starts_with("br-") || name.starts_with("veth") {
                 return None;
             }
 
             let rx = data.total_received();
             let tx = data.total_transmitted();
-
-            if rx == 0 && tx == 0 {
-                return None;
-            }
 
             current_values.insert(name.to_string(), (rx, tx));
 
