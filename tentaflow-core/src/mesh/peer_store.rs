@@ -93,6 +93,7 @@ pub struct PeerNetworkInfo {
     pub interface_type: String,
     pub rdma_available: bool,
     pub speed_mbps: Option<u64>,
+    pub numa_node: Option<i32>,
 }
 
 /// Metryki wysylane w heartbeatach do peerow mesh
