@@ -435,8 +435,13 @@ const MeshNodeDetail = (() => {
         const typeIcon = iface.interface_type === 'thunderbolt' ? MeshIcons.bolt(14) : '';
         let badges = '';
         if (iface.rdma_available) badges += '<span class="mesh-network-rdma-badge">RoCE</span> ';
-        if (iface.numa_node != null && iface.numa_node > 0) badges += '<span class="mesh-network-path-badge mesh-network-path-gpu" title="NVLink-C2C / GPU bridge path">C2C</span>';
-        else if (iface.numa_node != null && iface.numa_node === 0) badges += '<span class="mesh-network-path-badge mesh-network-path-cpu" title="CPU PCIe path">PCIe</span>';
+        if (iface.interface_type === 'thunderbolt') {
+          badges += '<span class="mesh-network-path-badge mesh-network-path-tb" title="Thunderbolt 5">TB5</span>';
+        } else if (iface.numa_node != null && iface.numa_node > 0) {
+          badges += '<span class="mesh-network-path-badge mesh-network-path-gpu" title="NVLink-C2C / GPU bridge path">C2C</span>';
+        } else if (iface.numa_node != null && iface.numa_node === 0) {
+          badges += '<span class="mesh-network-path-badge mesh-network-path-cpu" title="CPU PCIe path">PCIe</span>';
+        }
         let speedText = '';
         if (iface.speed_mbps != null && iface.speed_mbps > 0) {
           speedText = iface.speed_mbps >= 1000 ? `${Math.round(iface.speed_mbps / 1000)}G` : `${iface.speed_mbps}M`;

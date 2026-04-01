@@ -758,6 +758,11 @@
   color: #818cf8;
 }
 
+.mesh-network-path-tb {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--color-warning);
+}
+
 .mesh-network-rdma-badge {
   display: inline-flex;
   align-items: center;
