@@ -1109,18 +1109,24 @@ fn detect_numa_node(name: &str) -> Option<i32> {
                 return Some(numa);
             }
         }
-        // Metoda 2: PCIe domain — domain > 0 = GPU bridge path
-        let device_link = format!("/sys/class/net/{}/device", name);
-        if let Ok(target) = std::fs::read_link(&device_link) {
-            let target_str = target.to_string_lossy();
-            // Format: ../../../DDDD:BB:DD.F — domain to pierwsze 4 znaki po ostatnim /
-            if let Some(pci_addr) = target_str.rsplit('/').next() {
-                if let Some(domain_str) = pci_addr.split(':').next() {
-                    if let Ok(domain) = u32::from_str_radix(domain_str, 16) {
-                        if domain > 0 {
-                            return Some(1); // GPU path
-                        } else {
-                            return Some(0); // CPU path
+        // Metoda 2: PCIe domain — TYLKO dla kart z driverem mlx5_core (ConnectX)
+        // Domain 0000 = CPU path, domain > 0000 = GPU bridge path
+        let driver_link = format!("/sys/class/net/{}/device/driver", name);
+        let is_mlx5 = std::fs::read_link(&driver_link)
+            .map(|p| p.to_string_lossy().contains("mlx5_core"))
+            .unwrap_or(false);
+        if is_mlx5 {
+            let device_link = format!("/sys/class/net/{}/device", name);
+            if let Ok(target) = std::fs::read_link(&device_link) {
+                let target_str = target.to_string_lossy();
+                if let Some(pci_addr) = target_str.rsplit('/').next() {
+                    if let Some(domain_str) = pci_addr.split(':').next() {
+                        if let Ok(domain) = u32::from_str_radix(domain_str, 16) {
+                            if domain > 0 {
+                                return Some(1); // GPU path
+                            } else {
+                                return Some(0); // CPU path
+                            }
                         }
                     }
                 }
