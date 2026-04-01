@@ -497,6 +497,18 @@ pub enum MeshCommandType {
         dhcp: bool,
         sudo_password: String,
     },
+    /// Probe przepustowosci sieci miedzy nodami (TCP multi-stream lub RDMA)
+    BandwidthProbe {
+        target_ip: String,
+        target_port: u16,
+        bind_interface: String,
+        duration_ms: u32,
+        mode: String,
+        nonce: Vec<u8>,
+        num_streams: u8,
+    },
+    /// Anulowanie probing sesji
+    BandwidthProbeCancel,
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -583,6 +595,13 @@ impl std::fmt::Debug for MeshCommandType {
                     .field("sudo_password", &"***")
                     .finish()
             }
+            Self::BandwidthProbe { target_ip, mode, .. } => {
+                f.debug_struct("BandwidthProbe")
+                    .field("target_ip", target_ip)
+                    .field("mode", mode)
+                    .finish()
+            }
+            Self::BandwidthProbeCancel => write!(f, "BandwidthProbeCancel"),
         }
     }
 }
