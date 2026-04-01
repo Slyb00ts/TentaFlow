@@ -337,6 +337,7 @@ async fn probe_pair(
     let server_cmd = MeshCommandType::BandwidthProbe {
         target_ip: iface_b.ip.clone(),
         target_port: 0,
+        rdma_port: 0,
         bind_interface: iface_b.name.clone(),
         duration_ms: 2000,
         mode: "server".to_string(),
@@ -361,20 +362,23 @@ async fn probe_pair(
         });
     }
 
-    // Parsuj port z odpowiedzi serwera
-    let port: u16 = serde_json::from_str::<serde_json::Value>(&server_response.output)
-        .ok()
-        .and_then(|v| v["port"].as_u64())
-        .unwrap_or(0) as u16;
+    // Parsuj porty z odpowiedzi serwera (TCP + opcjonalnie RDMA)
+    let server_json = serde_json::from_str::<serde_json::Value>(&server_response.output)
+        .unwrap_or_default();
+    let port: u16 = server_json["port"].as_u64().unwrap_or(0) as u16;
+    let rdma_port: u16 = server_json["rdma_port"].as_u64().unwrap_or(0) as u16;
 
     if port == 0 {
-        return Err(anyhow::anyhow!("Serwer nie zwrocil portu"));
+        return Err(anyhow::anyhow!("Serwer nie zwrocil portu TCP"));
     }
 
-    // Wyslij BandwidthProbe{mode:client} do node_a
+    tracing::info!("  Serwer zwrocil tcp_port={} rdma_port={}", port, rdma_port);
+
+    // Wyslij BandwidthProbe{mode:client} do node_a z oboma portami
     let client_cmd = MeshCommandType::BandwidthProbe {
         target_ip: iface_b.ip.clone(),
         target_port: port,
+        rdma_port,
         bind_interface: iface_a.name.clone(),
         duration_ms: 2000,
         mode: "client".to_string(),
