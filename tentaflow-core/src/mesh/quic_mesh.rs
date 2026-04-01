@@ -1477,9 +1477,13 @@ impl QuicMeshManager {
 
         // Nie spawnuj duplikatu
         {
-            let mut set = reconnecting.blocking_write();
-            if set.contains(&node_id) { return; }
-            set.insert(node_id.clone());
+            match reconnecting.try_write() {
+                Ok(mut set) => {
+                    if set.contains(&node_id) { return; }
+                    set.insert(node_id.clone());
+                }
+                Err(_) => return,
+            }
         }
 
         tokio::spawn(async move {
