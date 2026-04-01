@@ -300,12 +300,16 @@ impl QuicMeshManager {
             return Ok(());
         }
 
-        // Sprawdz czy juz polaczony
+        // Sprawdz czy juz polaczony — jesli connection martwe, usun i polacz ponownie
         {
-            let conns = self.connections.read().await;
-            if conns.contains_key(node_id) {
-                debug!(peer_id = %node_id, "Juz polaczony — pomijam connect");
-                return Ok(());
+            let mut conns = self.connections.write().await;
+            if let Some(mc) = conns.get(node_id) {
+                if mc.connection.close_reason().is_some() {
+                    info!(peer_id = %node_id, "Stare martwe polaczenie — usuwam, probuje nowe");
+                    conns.remove(node_id);
+                } else {
+                    return Ok(());
+                }
             }
         }
 
