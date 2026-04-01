@@ -191,6 +191,14 @@ pub async fn handle_start_probe(
     let req: ProbeRequest = serde_json::from_slice(body)
         .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
+    tracing::info!("Probe request: {} nodow", req.nodes.len());
+    for n in &req.nodes {
+        tracing::info!("  Node {}: {} interfejsow", n.node_id, n.interfaces.len());
+        for i in &n.interfaces {
+            tracing::info!("    {} ip={} mask={} speed={}", i.name, i.ip, i.netmask, i.speed_mbps);
+        }
+    }
+
     if req.nodes.len() < 2 {
         return Ok((400, r#"{"error":"Minimum 2 nody wymagane"}"#.to_string()));
     }
@@ -211,7 +219,9 @@ pub async fn handle_start_probe(
 
     // Pre-filter subnetow + smart probe (najszybszy per para)
     let reachable = filter_reachable_pairs(&node_interfaces);
+    tracing::info!("Probe: {} osiagalnych par po filtrze subnetow", reachable.len());
     let to_probe = select_fastest_per_pair(&reachable);
+    tracing::info!("Probe: {} par do probing (najszybsze per para)", to_probe.len());
 
     let total = to_probe.len();
 
