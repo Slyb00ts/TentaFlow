@@ -205,6 +205,16 @@ const Mesh = (() => {
       trustBadge = `<span class="mesh-trust-badge mesh-trust-discovered">${I18n.t('mesh.discovered')}</span>`;
     }
 
+    // Relay badge — jesli node jest osiagalny przez relay (nie bezposrednio)
+    let relayBadge = '';
+    const route = node.route;
+    if (route && !route.direct && route.hops != null && route.next_hop) {
+      const nextHopNode = nodes.find(n => (n.node_id || n.id) === route.next_hop);
+      const nextHopName = (nextHopNode && nextHopNode.hostname) || route.next_hop.substring(0, 8) + '...';
+      const tooltip = `${route.hops} hop${route.hops > 1 ? 's' : ''} via ${nextHopName}`;
+      relayBadge = `<span class="mesh-trust-badge mesh-trust-relay" title="${Utils.escapeAttr(tooltip)}">Relay</span>`;
+    }
+
     // Gauges
     const gauges = [];
 
@@ -269,7 +279,7 @@ const Mesh = (() => {
         <div class="mesh-node-header">
           <span class="mesh-node-icon">${icon}</span>
           <span class="mesh-node-name">${Utils.escapeHtml(hostname)}</span>
-          ${trustBadge}
+          ${trustBadge}${relayBadge}
         </div>
         ${gauges.length > 0 ? `<div class="mesh-node-gauges">${gauges.join('')}</div>` : ''}
         ${footerParts.length > 0 ? `<div class="mesh-node-footer">${footerParts.join('')}</div>` : ''}
