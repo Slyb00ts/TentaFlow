@@ -603,6 +603,7 @@ pub fn handle_get_node(
                     "interface_type": n.interface_type,
                     "rdma_available": n.rdma_available,
                     "speed_mbps": n.speed_mbps,
+                    "numa_node": n.numa_node,
                 })
             }).collect();
 

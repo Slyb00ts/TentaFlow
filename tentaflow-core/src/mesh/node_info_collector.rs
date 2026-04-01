@@ -1095,6 +1095,24 @@ fn detect_interface_type(name: &str) -> String {
     "ethernet".to_string()
 }
 
+/// Odczytuje NUMA node interfejsu (Linux: /sys/class/net/{name}/device/numa_node)
+/// NUMA 0 = CPU path, NUMA 1+ = GPU path (np. DGX Spark: 0=Grace, 1=Blackwell)
+fn detect_numa_node(name: &str) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/sys/class/net/{}/device/numa_node", name);
+        if let Ok(val) = std::fs::read_to_string(&path) {
+            return val.trim().parse().ok();
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
 /// Odczytuje predkosc linku w Mbps (Linux: /sys/class/net/{name}/speed)
 fn detect_link_speed(name: &str) -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -1240,6 +1258,7 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
             let interface_type = detect_interface_type(&iface_name);
             let rdma_available = detect_rdma_available(&iface_name);
             let speed_mbps = detect_link_speed(&iface_name);
+            let numa_node = detect_numa_node(&iface_name);
 
             Some(PeerNetworkInfo {
                 name: iface_name,
@@ -1255,6 +1274,7 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
                 interface_type,
                 rdma_available,
                 speed_mbps,
+                numa_node,
             })
         })
         .collect();
