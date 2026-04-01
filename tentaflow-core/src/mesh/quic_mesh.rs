@@ -468,7 +468,7 @@ impl QuicMeshManager {
         let connection = match incoming.await {
             Ok(c) => c,
             Err(e) => {
-                error!("Polaczenie przychodzace nieudane: {}", e);
+                debug!("Polaczenie przychodzace nieudane: {}", e);
                 return;
             }
         };
