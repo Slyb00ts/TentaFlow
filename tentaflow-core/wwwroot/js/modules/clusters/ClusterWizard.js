@@ -24,7 +24,8 @@ const ClusterWizard = (() => {
       const all = await ApiClient.get('/api/mesh/nodes');
       allNodes = (all || []).filter(n => {
         const trust = (n.trust || '').toLowerCase();
-        return trust === 'trusted' || trust === 'paired' || trust === 'local';
+        const isTrusted = trust === 'trusted' || trust === 'paired' || trust === 'local';
+        return isTrusted && n.quic_connected;
       });
       allNodes.sort((a, b) => {
         if (a.is_local && !b.is_local) return -1;
