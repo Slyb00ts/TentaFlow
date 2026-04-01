@@ -231,6 +231,8 @@ pub async fn handle_start_probe(
     let probe_id_clone = probe_id.clone();
     let qm = quic_mesh.clone();
     tokio::spawn(async move {
+        // Daj frontendowi czas na polaczenie z SSE
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         run_probe_orchestration(qm, to_probe, tx, probe_id_clone).await;
     });
 
