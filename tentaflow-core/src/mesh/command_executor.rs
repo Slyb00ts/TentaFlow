@@ -152,27 +152,11 @@ impl MeshCommandExecutor {
 
                 match mode.as_str() {
                     "server" => {
-                        // Probuj RDMA jesli feature wlaczony i urzadzenie dostepne
-                        #[cfg(feature = "rdma-probe")]
-                        if let Some(rdma_dev) = crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface) {
-                            match crate::mesh::rdma_probe::start_rdma_probe_server(
-                                &target_ip, &rdma_dev, &nonce_arr, duration_ms,
-                            ).await {
-                                Ok((port, handle)) => {
-                                    tokio::spawn(async move { let _ = handle.await; });
-                                    return CommandResponse {
-                                        success: true,
-                                        output: serde_json::json!({"port": port, "rdma": true}).to_string(),
-                                        error: None,
-                                    };
-                                }
-                                Err(e) => {
-                                    tracing::warn!("RDMA server probe failed, fallback TCP: {}", e);
-                                }
-                            }
-                        }
+                        // RDMA probe wymaga dopracowania konfiguracji QP (GID/PSN).
+                        // Na razie uzywamy TCP multi-stream dla wszystkich interfejsow.
+                        // TODO: wlaczyc RDMA probe po przetestowaniu na real hardware
 
-                        // Fallback: TCP multi-stream
+                        // TCP multi-stream
                         match crate::mesh::bandwidth_probe::start_probe_server(
                             &target_ip, &nonce_arr, num_streams, duration_ms,
                         ).await {
@@ -192,32 +176,8 @@ impl MeshCommandExecutor {
                         }
                     }
                     "client" => {
-                        // Probuj RDMA jesli feature wlaczony i urzadzenie dostepne
-                        #[cfg(feature = "rdma-probe")]
-                        if let Some(rdma_dev) = crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface) {
-                            match crate::mesh::rdma_probe::start_rdma_probe_client(
-                                &target_ip, target_port, &rdma_dev, &nonce_arr, duration_ms,
-                            ).await {
-                                Ok(result) => {
-                                    let output = serde_json::json!({
-                                        "bandwidth_mbps": result.bandwidth_mbps,
-                                        "bytes_transferred": result.bytes_transferred,
-                                        "duration_ms": result.duration_ms,
-                                        "streams_completed": 1,
-                                        "rdma": true,
-                                        "rdma_device": result.rdma_device,
-                                    }).to_string();
-                                    return CommandResponse {
-                                        success: true,
-                                        output,
-                                        error: None,
-                                    };
-                                }
-                                Err(e) => {
-                                    tracing::warn!("RDMA client probe failed, fallback TCP: {}", e);
-                                }
-                            }
-                        }
+                        // RDMA probe tymczasowo wylaczony (wymaga konfiguracji QP)
+                        // TODO: wlaczyc po przetestowaniu na real hardware
 
                         // Fallback: TCP multi-stream
                         match crate::mesh::bandwidth_probe::start_probe_client(
