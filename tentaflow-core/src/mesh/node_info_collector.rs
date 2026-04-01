@@ -1095,6 +1095,26 @@ fn detect_interface_type(name: &str) -> String {
     "ethernet".to_string()
 }
 
+/// Odczytuje predkosc linku w Mbps (Linux: /sys/class/net/{name}/speed)
+fn detect_link_speed(name: &str) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/sys/class/net/{}/speed", name);
+        if let Ok(val) = std::fs::read_to_string(&path) {
+            let speed: i64 = val.trim().parse().unwrap_or(-1);
+            if speed > 0 {
+                return Some(speed as u64);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
 /// Sprawdza czy RDMA jest dostepne dla interfejsu (Linux: /sys/class/infiniband/)
 fn detect_rdma_available(name: &str) -> bool {
     #[cfg(target_os = "linux")]
@@ -1219,6 +1239,7 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
             let mac_address = detect_mac_address(&iface_name);
             let interface_type = detect_interface_type(&iface_name);
             let rdma_available = detect_rdma_available(&iface_name);
+            let speed_mbps = detect_link_speed(&iface_name);
 
             Some(PeerNetworkInfo {
                 name: iface_name,
@@ -1233,6 +1254,7 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
                 mac_address,
                 interface_type,
                 rdma_available,
+                speed_mbps,
             })
         })
         .collect();

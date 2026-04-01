@@ -602,6 +602,7 @@ pub fn handle_get_node(
                     "mac_address": n.mac_address,
                     "interface_type": n.interface_type,
                     "rdma_available": n.rdma_available,
+                    "speed_mbps": n.speed_mbps,
                 })
             }).collect();
 
