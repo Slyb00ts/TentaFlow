@@ -501,6 +501,7 @@ pub enum MeshCommandType {
     BandwidthProbe {
         target_ip: String,
         target_port: u16,
+        rdma_port: u16,
         bind_interface: String,
         duration_ms: u32,
         mode: String,

@@ -142,6 +142,7 @@ impl MeshCommandExecutor {
             MeshCommandType::BandwidthProbe {
                 target_ip,
                 target_port,
+                rdma_port,
                 bind_interface,
                 duration_ms,
                 mode,
@@ -152,34 +153,84 @@ impl MeshCommandExecutor {
 
                 match mode.as_str() {
                     "server" => {
-                        // RDMA probe wymaga dopracowania konfiguracji QP (GID/PSN).
-                        // Na razie uzywamy TCP multi-stream dla wszystkich interfejsow.
-                        // TODO: wlaczyc RDMA probe po przetestowaniu na real hardware
-
-                        // TCP multi-stream
-                        match crate::mesh::bandwidth_probe::start_probe_server(
+                        // Startuj TCP server ZAWSZE (fallback)
+                        let tcp_result = crate::mesh::bandwidth_probe::start_probe_server(
                             &target_ip, &nonce_arr, num_streams, duration_ms,
-                        ).await {
-                            Ok((port, handle)) => {
-                                tokio::spawn(async move { let _ = handle.await; });
-                                CommandResponse {
-                                    success: true,
-                                    output: serde_json::json!({"port": port}).to_string(),
-                                    error: None,
+                        ).await;
+
+                        let (tcp_port, tcp_handle) = match tcp_result {
+                            Ok((port, handle)) => (port, Some(handle)),
+                            Err(e) => {
+                                return CommandResponse {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!("TCP server failed: {}", e)),
+                                };
+                            }
+                        };
+
+                        // Probuj RDMA server na osobnym porcie (jesli dostepne)
+                        let mut rdma_port: u16 = 0;
+                        #[cfg(feature = "rdma-probe")]
+                        if let Some(rdma_dev) = crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface) {
+                            match crate::mesh::rdma_probe::start_rdma_probe_server(
+                                &target_ip, &rdma_dev, &nonce_arr, duration_ms,
+                            ).await {
+                                Ok((port, handle)) => {
+                                    rdma_port = port;
+                                    tokio::spawn(async move { let _ = handle.await; });
+                                    tracing::info!("RDMA server na porcie {}", port);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("RDMA server probe failed: {}", e);
                                 }
                             }
-                            Err(e) => CommandResponse {
-                                success: false,
-                                output: String::new(),
-                                error: Some(e.to_string()),
-                            },
+                        }
+
+                        // Spawn TCP handle w tle
+                        if let Some(handle) = tcp_handle {
+                            tokio::spawn(async move { let _ = handle.await; });
+                        }
+
+                        // Zwroc OBA porty — klient sprobuje RDMA, jesli fail uzyje TCP
+                        CommandResponse {
+                            success: true,
+                            output: serde_json::json!({
+                                "port": tcp_port,
+                                "rdma_port": rdma_port,
+                            }).to_string(),
+                            error: None,
                         }
                     }
                     "client" => {
-                        // RDMA probe tymczasowo wylaczony (wymaga konfiguracji QP)
-                        // TODO: wlaczyc po przetestowaniu na real hardware
+                        // Probuj RDMA jesli serwer zwrocil rdma_port > 0
+                        #[cfg(feature = "rdma-probe")]
+                        if rdma_port > 0 {
+                            if let Some(rdma_dev) = crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface) {
+                                match crate::mesh::rdma_probe::start_rdma_probe_client(
+                                    &target_ip, rdma_port, &rdma_dev, &nonce_arr, duration_ms,
+                                ).await {
+                                    Ok(result) => {
+                                        return CommandResponse {
+                                            success: true,
+                                            output: serde_json::json!({
+                                                "bandwidth_mbps": result.bandwidth_mbps,
+                                                "bytes_transferred": result.bytes_transferred,
+                                                "duration_ms": result.duration_ms,
+                                                "streams_completed": 1,
+                                                "rdma": true,
+                                            }).to_string(),
+                                            error: None,
+                                        };
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("RDMA client failed, fallback TCP: {}", e);
+                                    }
+                                }
+                            }
+                        }
 
-                        // Fallback: TCP multi-stream
+                        // TCP multi-stream (fallback lub jedyny tryb)
                         match crate::mesh::bandwidth_probe::start_probe_client(
                             &target_ip, target_port, &bind_interface, &nonce_arr, num_streams, duration_ms,
                         ).await {
