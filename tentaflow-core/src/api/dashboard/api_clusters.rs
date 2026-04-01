@@ -342,7 +342,7 @@ async fn probe_pair(
         duration_ms: 2000,
         mode: "server".to_string(),
         nonce: nonce.to_vec(),
-        num_streams: 4,
+        num_streams: 16,
     };
 
     tracing::info!("  Wysylam server cmd do {}", iface_b.node_id);
@@ -383,7 +383,7 @@ async fn probe_pair(
         duration_ms: 2000,
         mode: "client".to_string(),
         nonce: nonce.to_vec(),
-        num_streams: 4,
+        num_streams: 16,
     };
 
     tracing::info!("  Wysylam client cmd do {} -> {}:{}", iface_a.node_id, iface_b.ip, port);
