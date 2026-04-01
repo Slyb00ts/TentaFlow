@@ -966,6 +966,13 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
+                Ok(QuicMeshEvent::MeshCommandReceived { from_node_id, command }) => {
+                    info!(from = %from_node_id, "Otrzymano MeshCommand — przekazuje do executora");
+                    qm_events.handle_command_received(&from_node_id, &command).await;
+                }
+                Ok(QuicMeshEvent::MeshCommandResponseReceived { from_node_id, data }) => {
+                    qm_events.handle_command_response_received(&from_node_id, &data).await;
+                }
                 Ok(QuicMeshEvent::CrdtDeltaReceived { node_id, .. }) => {
                     // Safety net — przetwarzaj CRDT delta TYLKO od trusted peerow
                     let is_trusted = match &mesh_security {

@@ -681,6 +681,7 @@ impl QuicMeshManager {
             return;
         }
         let discriminant = disc_buf[0];
+        info!(peer_id = %peer_node_id, disc = format!("0x{:02X}", discriminant), "Odebrano uni-stream");
 
         // Sprawdz zaufanie peera — wiadomosci parowania (0x20-0x22) zawsze przepuszczaj
         let is_pairing_msg = matches!(
@@ -1636,7 +1637,6 @@ impl QuicMeshManager {
                 .open_uni()
                 .await
                 .context("Nie udalo sie otworzyc uni-stream")?;
-            // [OPT] Dwa write_all zamiast alokacji Vec na frame — QUIC buforuje
             send.write_all(&[discriminant])
                 .await
                 .context("Blad wysylania discriminant uni-stream")?;
@@ -1644,6 +1644,9 @@ impl QuicMeshManager {
                 .await
                 .context("Blad wysylania encrypted payload uni-stream")?;
             send.finish().context("Blad zamykania uni-stream")?;
+            if discriminant >= 0x30 {
+                info!(peer_id = %peer_id, disc = format!("0x{:02X}", discriminant), encrypted_len = encrypted.len(), "Wyslano zaszyfrowana wiadomosc (command/data)");
+            }
             Ok(())
         } else {
             Err(anyhow::anyhow!("Brak shared secret dla peera {} — odmowa wyslania wiadomosci", peer_id))
@@ -1719,57 +1722,40 @@ impl QuicMeshManager {
             let conns = self.connections.read().await;
             match conns.get(target_node_id) {
                 Some(mc) => {
-                    let close_reason = mc.connection.close_reason();
                     info!(
                         target = %target_node_id,
                         command_id = %command_id,
                         remote_addr = %mc.connection.remote_address(),
-                        closed = close_reason.is_some(),
-                        "send_command: polaczenie znalezione, wysylam"
+                        "send_command: wysylam"
                     );
                     mc.connection.clone()
                 }
                 None => {
-                    warn!(target = %target_node_id, "send_command: BRAK polaczenia z peerem");
                     return Err(anyhow::anyhow!("Brak polaczenia z peerem: {}", target_node_id));
                 }
             }
         };
 
-        match Self::send_uni_message_encrypted(
+        Self::send_uni_message_encrypted(
             &conn,
             MESH_MSG_COMMAND,
             &payload,
             target_node_id,
             security,
         )
-        .await {
-            Ok(()) => {
-                info!(target = %target_node_id, command_id = %command_id, "send_command: wyslano, czekam na odpowiedz");
-            }
-            Err(e) => {
-                warn!(target = %target_node_id, command_id = %command_id, error = %e, "send_command: blad wysylania");
-                return Err(e);
-            }
-        }
+        .await?;
 
         // Czekaj na odpowiedz z timeoutem 120s
         match tokio::time::timeout(Duration::from_secs(120), rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(anyhow::anyhow!(
-                "Kanal odpowiedzi zamkniety (command_id={})",
-                command_id
-            )),
+            Ok(Ok(response)) => {
+                info!(target = %target_node_id, command_id = %command_id, success = response.success, "send_command: odpowiedz");
+                Ok(response)
+            }
+            Ok(Err(_)) => Err(anyhow::anyhow!("Kanal odpowiedzi zamkniety")),
             Err(_) => {
-                let mut pending = self.pending_commands.write().await;
-                pending.remove(&command_id);
-                drop(pending);
-                let mut cmd_map = self.command_to_node.write().await;
-                cmd_map.remove(&command_id);
-                Err(anyhow::anyhow!(
-                    "Timeout oczekiwania na odpowiedz komendy (120s, command_id={})",
-                    command_id
-                ))
+                self.pending_commands.write().await.remove(&command_id);
+                self.command_to_node.write().await.remove(&command_id);
+                Err(anyhow::anyhow!("Timeout (120s)"))
             }
         }
     }
