@@ -18,6 +18,15 @@ const ClusterWizard = (() => {
   let probeEventSource = null;
   let isDetecting = false;
 
+  // Zaokraglij GB RAM do najblizszej standardowej wartosci (8,16,32,64,128,256,512,1024)
+  function roundToNearestStick(gb) {
+    const sticks = [8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
+    for (const s of sticks) {
+      if (gb <= s * 0.97) return s;
+    }
+    return Math.round(gb);
+  }
+
   // Zaladuj dostepne nody z API
   async function loadNodes() {
     try {
@@ -145,7 +154,7 @@ const ClusterWizard = (() => {
       const isSelected = selectedNodes.some(n => n.node_id === node.node_id);
       const gpuInfo = (node.gpu_info || []).map(g => g.name || '').filter(Boolean).join(', ');
       const vram = (node.gpu_info || []).reduce((sum, g) => sum + (g.vram_total_mb || 0), 0);
-      const vramGB = (vram / 1024).toFixed(0);
+      const vramGB = roundToNearestStick(vram / 1024);
 
       return `
         <div class="mesh-node-card wizard-node-card ${isSelected ? 'wizard-node-selected' : ''}"
@@ -156,7 +165,7 @@ const ClusterWizard = (() => {
           </div>
           <div class="wizard-node-stats">
             <span>${node.cpu_count || '?'} CPU</span>
-            <span>${node.ram_total_mb ? Math.round(node.ram_total_mb / 1024) + ' GB RAM' : ''}</span>
+            <span>${node.ram_total_mb ? roundToNearestStick(node.ram_total_mb / 1024) + ' GB RAM' : ''}</span>
             ${vram > 0 ? `<span>${vramGB} GB VRAM</span>` : ''}
           </div>
           ${gpuInfo ? `<div class="wizard-node-gpu">${Utils.escapeHtml(gpuInfo)}</div>` : ''}
@@ -409,11 +418,11 @@ const ClusterWizard = (() => {
         <div class="stats-grid">
           <div class="stat-card">
             <div class="stat-label">VRAM</div>
-            <div class="stat-value">${(totalVram / 1024).toFixed(0)} <span class="stat-unit">GB</span></div>
+            <div class="stat-value">${roundToNearestStick(totalVram / 1024)} <span class="stat-unit">GB</span></div>
           </div>
           <div class="stat-card">
             <div class="stat-label">RAM</div>
-            <div class="stat-value">${Math.round(totalRam / 1024)} <span class="stat-unit">GB</span></div>
+            <div class="stat-value">${roundToNearestStick(totalRam / 1024)} <span class="stat-unit">GB</span></div>
           </div>
           <div class="stat-card">
             <div class="stat-label">CPU</div>
