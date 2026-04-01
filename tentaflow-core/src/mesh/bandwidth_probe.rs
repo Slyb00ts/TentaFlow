@@ -11,9 +11,9 @@ use std::net::SocketAddr;
 use anyhow::{Result, anyhow};
 
 const NONCE_SIZE: usize = 32;
-const CHUNK_SIZE: usize = 1024 * 1024;
-const SERVER_TIMEOUT_SECS: u64 = 10;
-const CLIENT_TIMEOUT_SECS: u64 = 5;
+const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const SERVER_TIMEOUT_SECS: u64 = 15;
+const CLIENT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
@@ -37,8 +37,8 @@ pub async fn start_probe_server(
     let addr: SocketAddr = format!("{}:0", bind_ip).parse()?;
 
     let socket = TcpSocket::new_v4()?;
-    socket.set_recv_buffer_size(16 * 1024 * 1024)?;
-    socket.set_send_buffer_size(16 * 1024 * 1024)?;
+    socket.set_recv_buffer_size(64 * 1024 * 1024)?;
+    socket.set_send_buffer_size(64 * 1024 * 1024)?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     let listener = socket.listen(num_streams as u32 + 1)?;
@@ -221,8 +221,8 @@ async fn send_stream(
     duration_ms: u32,
 ) -> Result<u64> {
     let socket = TcpSocket::new_v4()?;
-    socket.set_send_buffer_size(16 * 1024 * 1024)?;
-    socket.set_recv_buffer_size(16 * 1024 * 1024)?;
+    socket.set_send_buffer_size(64 * 1024 * 1024)?;
+    socket.set_recv_buffer_size(64 * 1024 * 1024)?;
 
     // Bindowanie do interfejsu sieciowego (tylko Linux — SO_BINDTODEVICE)
     #[cfg(target_os = "linux")]
