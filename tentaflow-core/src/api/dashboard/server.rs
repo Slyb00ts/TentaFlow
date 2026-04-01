@@ -445,6 +445,46 @@ pub async fn handle_request(
         return Ok(make_response_with_origin(status, content_type, body, cors_origin.as_deref()));
     }
 
+    // Probe SSE stream — PRZED auth check bo EventSource nie moze slac headerow
+    // Token walidowany z query param ?token=
+    if path.starts_with("/api/clusters/probe/") && method == Method::GET {
+        // Waliduj token z query param
+        let jwt_secret = db::repository::get_setting(&db, "jwt_secret").ok().flatten().unwrap_or_default();
+        let sse_token = query_string.split('&')
+            .find(|p| p.starts_with("token="))
+            .and_then(|p| p.strip_prefix("token="))
+            .unwrap_or("");
+        if sse_token.is_empty() || auth::validate_jwt(sse_token, &jwt_secret).is_err() {
+            return Ok(json_error_cors(401, "Niepoprawny token SSE", cors_origin.as_deref()));
+        }
+
+        let probe_id = path.strip_prefix("/api/clusters/probe/").unwrap_or("").trim_matches('/');
+        if !probe_id.is_empty() {
+            if let Some(rx) = super::api_clusters::handle_probe_stream(probe_id).await {
+                let sse_stream = futures::stream::unfold(rx, |mut rx| async {
+                    let msg = rx.recv().await?;
+                    Some((Ok(Frame::data(Bytes::from(msg))), rx))
+                });
+                let boxed_stream: SseStream = Box::pin(sse_stream);
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/event-stream")
+                    .header("Cache-Control", "no-cache")
+                    .header("Connection", "keep-alive");
+                if let Some(ref origin) = cors_origin {
+                    builder = builder
+                        .header("Access-Control-Allow-Origin", origin.as_str())
+                        .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+                        .header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                }
+                return Ok(builder
+                    .body(Either::Right(StreamBody::new(boxed_stream)))
+                    .unwrap());
+            }
+            return Ok(json_error_cors(404, "Probe stream nie istnieje", cors_origin.as_deref()));
+        }
+    }
+
     // Wszystkie /api/* (oprocz login) wymagaja JWT
     let claims = if path.starts_with("/api/") {
         let jwt_secret = match db::repository::get_setting(&db, "jwt_secret") {
@@ -482,35 +522,6 @@ pub async fn handle_request(
             Bytes::new()
         };
         return Ok(super::api_chat::route_chat_api(&method, &path, &router, body_bytes, &db, &metrics, cors_origin.as_deref()).await);
-    }
-
-    // Probe SSE stream — GET /api/clusters/probe/:id (przed walidacja Content-Type)
-    if path.starts_with("/api/clusters/probe/") && method == Method::GET {
-        let probe_id = path.strip_prefix("/api/clusters/probe/").unwrap_or("").trim_matches('/');
-        if !probe_id.is_empty() {
-            if let Some(rx) = super::api_clusters::handle_probe_stream(probe_id).await {
-                let sse_stream = futures::stream::unfold(rx, |mut rx| async {
-                    let msg = rx.recv().await?;
-                    Some((Ok(Frame::data(Bytes::from(msg))), rx))
-                });
-                let boxed_stream: SseStream = Box::pin(sse_stream);
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "text/event-stream")
-                    .header("Cache-Control", "no-cache")
-                    .header("Connection", "keep-alive");
-                if let Some(ref origin) = cors_origin {
-                    builder = builder
-                        .header("Access-Control-Allow-Origin", origin.as_str())
-                        .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-                        .header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-                }
-                return Ok(builder
-                    .body(Either::Right(StreamBody::new(boxed_stream)))
-                    .unwrap());
-            }
-            return Ok(json_error_cors(404, "Probe stream nie istnieje", cors_origin.as_deref()));
-        }
     }
 
     // Walidacja Content-Type dla POST/PUT
