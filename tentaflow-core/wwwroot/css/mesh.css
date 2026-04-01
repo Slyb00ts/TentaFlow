@@ -676,7 +676,7 @@
 /* --- Network interface row --- */
 .mesh-network-row {
   display: grid;
-  grid-template-columns: 1rem 120px 50px 120px 1fr auto 44px;
+  grid-template-columns: 1rem 130px 50px 120px 1fr 80px 28px;
   align-items: center;
   gap: var(--spacing-sm);
   padding: var(--spacing-xs) 0;
