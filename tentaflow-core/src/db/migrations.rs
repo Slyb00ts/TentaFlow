@@ -839,5 +839,21 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
         "add_trusted_nodes_addresses",
         "ALTER TABLE trusted_nodes ADD COLUMN last_addresses TEXT NOT NULL DEFAULT '';",
     ),
+    (
+        29,
+        "cluster_network_configuration",
+        "
+            ALTER TABLE cluster_members ADD COLUMN interface_name TEXT DEFAULT '';
+            ALTER TABLE cluster_members ADD COLUMN interface_ip TEXT DEFAULT '';
+            ALTER TABLE cluster_members ADD COLUMN interface_speed_mbps INTEGER DEFAULT 0;
+            ALTER TABLE cluster_members ADD COLUMN interface_type TEXT DEFAULT '';
+
+            ALTER TABLE clusters ADD COLUMN total_vram_mb INTEGER DEFAULT 0;
+            ALTER TABLE clusters ADD COLUMN total_ram_mb INTEGER DEFAULT 0;
+            ALTER TABLE clusters ADD COLUMN total_cpu_cores INTEGER DEFAULT 0;
+            ALTER TABLE clusters ADD COLUMN bottleneck_speed_mbps INTEGER DEFAULT 0;
+            ALTER TABLE clusters ADD COLUMN interconnect_type TEXT DEFAULT '';
+        ",
+    ),
 ]
 }

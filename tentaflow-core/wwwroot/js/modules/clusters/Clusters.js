@@ -53,7 +53,7 @@ const Clusters = (() => {
   async function mount() {
     const addBtn = document.getElementById('btn-add-cluster');
     if (addBtn) {
-      addBtn.addEventListener('click', () => openClusterModal(null));
+      addBtn.addEventListener('click', () => ClusterWizard.open(null));
     }
 
     const container = document.getElementById('clusters-list-container');
@@ -97,41 +97,61 @@ const Clusters = (() => {
     `;
   }
 
-  // Renderowanie karty clustera
+  // Renderowanie karty clustera z agregatami (VRAM, RAM, CPU, Link)
   function renderClusterCard(cluster) {
     const members = cluster.members || cluster.nodes || [];
-    const strategy = cluster.strategy || 'distributed';
-    const strategyLabel = I18n.t(`clusters.strategy_${strategy}`, strategy);
     const memberCount = members.length;
 
-    // Badge strategii
-    const strategyBadge = `<span class="badge badge-strategy badge-strategy-${Utils.escapeAttr(strategy)}">${Utils.escapeHtml(strategyLabel)}</span>`;
+    const totalVram = cluster.total_vram_mb ? (cluster.total_vram_mb / 1024).toFixed(0) : '0';
+    const totalRam = cluster.total_ram_mb ? Math.round(cluster.total_ram_mb / 1024) : '0';
+    const totalCpu = cluster.total_cpu_cores || '0';
+    const bottleneck = cluster.bottleneck_speed_mbps || 0;
+    const bottleneckLabel = bottleneck >= 1000
+      ? (bottleneck / 1000).toFixed(1) + ' Gbps'
+      : bottleneck > 0 ? bottleneck + ' Mbps' : '\u2014';
+    const interconnect = cluster.interconnect_type || '';
+    const isWarning = interconnect === 'mixed' || bottleneck < 10000;
 
-    // Tagi czlonkow
     const memberTags = members.map(m => {
       const name = m.hostname || m.node_name || m.node_id || '-';
-      const role = m.role || 'worker';
-      return `<span class="cluster-member-tag">${Utils.escapeHtml(name)} <span style="color:var(--color-text-muted);">(${Utils.escapeHtml(role)})</span></span>`;
+      return `<span class="cluster-member-tag">${Utils.escapeHtml(name)}</span>`;
     }).join('');
-
-    const nodesCountLabel = I18n.t('clusters.nodes_count').replace('{count}', memberCount);
 
     return `
       <div class="cluster-card">
         <div class="cluster-card-header">
           <span class="cluster-card-title">${Utils.escapeHtml(cluster.name || cluster.id)}</span>
-          <div class="cluster-card-meta">
-            ${strategyBadge}
-            <span class="badge badge-info">${Utils.escapeHtml(nodesCountLabel)}</span>
+          <span class="cluster-card-count">${memberCount} ${I18n.t('clusters.nodes')}</span>
+        </div>
+        ${cluster.description ? `<p class="cluster-card-desc">${Utils.escapeHtml(cluster.description)}</p>` : ''}
+
+        <div class="cluster-card-stats">
+          <div class="mini-stat">
+            <div class="mini-stat-label">VRAM</div>
+            <div class="mini-stat-value">${totalVram} GB</div>
+          </div>
+          <div class="mini-stat">
+            <div class="mini-stat-label">RAM</div>
+            <div class="mini-stat-value">${totalRam} GB</div>
+          </div>
+          <div class="mini-stat">
+            <div class="mini-stat-label">CPU</div>
+            <div class="mini-stat-value">${totalCpu}</div>
+          </div>
+          <div class="mini-stat">
+            <div class="mini-stat-label">Link</div>
+            <div class="mini-stat-value ${isWarning ? 'stat-warning' : ''}">${bottleneckLabel}</div>
           </div>
         </div>
-        ${cluster.description ? `<p style="font-size:var(--font-size-sm);color:var(--color-text-secondary);margin-bottom:var(--spacing-sm);">${Utils.escapeHtml(cluster.description)}</p>` : ''}
+
         <div class="cluster-card-members">
-          ${memberTags || `<span style="color:var(--color-text-muted);">${I18n.t('clusters.no_members')}</span>`}
+          ${memberTags || '<span style="color:var(--color-text-muted);">' + I18n.t('clusters.no_members') + '</span>'}
+          ${interconnect ? `<span class="badge badge-${interconnect === 'rdma' ? 'roce' : interconnect === 'mixed' ? 'warn' : 'eth'}">${Utils.escapeHtml(interconnect)}</span>` : ''}
         </div>
+
         <div class="cluster-card-actions">
-          <button class="btn btn-ghost btn-sm" data-edit-cluster="${Utils.escapeAttr(cluster.id)}" title="${I18n.t('common.edit')}">&#9998; ${I18n.t('common.edit')}</button>
-          <button class="btn btn-ghost btn-sm" data-delete-cluster="${Utils.escapeAttr(cluster.id)}" title="${I18n.t('common.delete')}">&#10005; ${I18n.t('common.delete')}</button>
+          <button class="btn btn-ghost btn-sm" data-edit-cluster="${Utils.escapeAttr(cluster.id)}">&#9998; ${I18n.t('common.edit')}</button>
+          <button class="btn btn-ghost btn-sm" data-delete-cluster="${Utils.escapeAttr(cluster.id)}">&#10005; ${I18n.t('common.delete')}</button>
         </div>
       </div>
     `;
@@ -143,7 +163,7 @@ const Clusters = (() => {
     if (editBtn) {
       const id = editBtn.dataset.editCluster;
       const cluster = clusters.find(c => String(c.id) === id);
-      if (cluster) openClusterModal(cluster);
+      if (cluster) ClusterWizard.open(cluster);
       return;
     }
 
