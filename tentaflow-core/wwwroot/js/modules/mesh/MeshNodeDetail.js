@@ -434,16 +434,18 @@ const MeshNodeDetail = (() => {
         const tx = iface.tx_bytes_per_sec != null ? Utils.formatBytes(iface.tx_bytes_per_sec) : (iface.tx_bytes != null ? Utils.formatBytes(iface.tx_bytes) : '0 B/s');
         const typeIcon = iface.interface_type === 'thunderbolt' ? MeshIcons.bolt(14) : '';
         const rdmaBadge = iface.rdma_available ? 'RDMA' : '';
-        let speedBadge = '';
+        let speedText = '';
         if (iface.speed_mbps != null && iface.speed_mbps > 0) {
-          const spd = iface.speed_mbps >= 1000 ? `${Math.round(iface.speed_mbps / 1000)}G` : `${iface.speed_mbps}M`;
-          speedBadge = `<span class="mesh-network-speed-badge">${spd}</span>`;
+          speedText = iface.speed_mbps >= 1000 ? `${Math.round(iface.speed_mbps / 1000)}G` : `${iface.speed_mbps}M`;
+        } else if (!linkUp) {
+          speedText = '';
         }
 
         networkCardContent += `
           <div class="mesh-network-row">
             <span class="mesh-network-link-dot ${dotClass}">${linkUp ? '\u25CF' : '\u25CB'}</span>
-            <span class="mesh-network-name">${typeIcon} ${Utils.escapeHtml(name)} ${speedBadge}</span>
+            <span class="mesh-network-name">${typeIcon} ${Utils.escapeHtml(name)}</span>
+            <span class="mesh-network-speed">${speedText}</span>
             <span class="mesh-network-ip">${Utils.escapeHtml(ipv4)}</span>
             <span class="mesh-network-throughput">\u2193 ${rx} \u2191 ${tx}</span>
             <span class="mesh-network-rdma-badge">${rdmaBadge}</span>
