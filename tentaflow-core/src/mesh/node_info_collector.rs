@@ -1310,7 +1310,9 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
     prev.0 = now;
     prev.1 = current_values;
 
-    results
+    let mut sorted = results;
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    sorted
 }
 
 // =============================================================================
