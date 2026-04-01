@@ -525,7 +525,7 @@ const ClusterWizard = (() => {
       const response = await ApiClient.post('/api/clusters/probe', { nodes });
       const probeId = response.probe_id;
 
-      const token = localStorage.getItem('auth_token') || '';
+      const token = localStorage.getItem('tentaflow_jwt') || '';
       probeEventSource = new EventSource(`/api/clusters/probe/${probeId}?token=${token}`);
 
       probeEventSource.addEventListener('probe_result', (e) => {
