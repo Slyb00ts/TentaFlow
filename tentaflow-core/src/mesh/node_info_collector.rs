@@ -1095,14 +1095,36 @@ fn detect_interface_type(name: &str) -> String {
     "ethernet".to_string()
 }
 
-/// Odczytuje NUMA node interfejsu (Linux: /sys/class/net/{name}/device/numa_node)
-/// NUMA 0 = CPU path, NUMA 1+ = GPU path (np. DGX Spark: 0=Grace, 1=Blackwell)
+/// Wykrywa sciezke PCIe interfejsu: 0 = CPU path, 1 = GPU path
+/// Metoda 1: NUMA node (standardowe serwery z wieloma CPU/GPU)
+/// Metoda 2: PCIe domain (Grace-Blackwell SoC: domain 0000=CPU, >0000=GPU)
 fn detect_numa_node(name: &str) -> Option<i32> {
     #[cfg(target_os = "linux")]
     {
-        let path = format!("/sys/class/net/{}/device/numa_node", name);
-        if let Ok(val) = std::fs::read_to_string(&path) {
-            return val.trim().parse().ok();
+        // Metoda 1: NUMA node
+        let numa_path = format!("/sys/class/net/{}/device/numa_node", name);
+        if let Ok(val) = std::fs::read_to_string(&numa_path) {
+            let numa: i32 = val.trim().parse().unwrap_or(-1);
+            if numa >= 0 {
+                return Some(numa);
+            }
+        }
+        // Metoda 2: PCIe domain — domain > 0 = GPU bridge path
+        let device_link = format!("/sys/class/net/{}/device", name);
+        if let Ok(target) = std::fs::read_link(&device_link) {
+            let target_str = target.to_string_lossy();
+            // Format: ../../../DDDD:BB:DD.F — domain to pierwsze 4 znaki po ostatnim /
+            if let Some(pci_addr) = target_str.rsplit('/').next() {
+                if let Some(domain_str) = pci_addr.split(':').next() {
+                    if let Ok(domain) = u32::from_str_radix(domain_str, 16) {
+                        if domain > 0 {
+                            return Some(1); // GPU path
+                        } else {
+                            return Some(0); // CPU path
+                        }
+                    }
+                }
+            }
         }
         None
     }
