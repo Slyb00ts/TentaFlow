@@ -1712,22 +1712,41 @@ impl QuicMeshManager {
 
         let conn = {
             let conns = self.connections.read().await;
-            conns
-                .get(target_node_id)
-                .map(|mc| mc.connection.clone())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Brak polaczenia z peerem: {}", target_node_id)
-                })?
+            match conns.get(target_node_id) {
+                Some(mc) => {
+                    let close_reason = mc.connection.close_reason();
+                    info!(
+                        target = %target_node_id,
+                        command_id = %command_id,
+                        remote_addr = %mc.connection.remote_address(),
+                        closed = close_reason.is_some(),
+                        "send_command: polaczenie znalezione, wysylam"
+                    );
+                    mc.connection.clone()
+                }
+                None => {
+                    warn!(target = %target_node_id, "send_command: BRAK polaczenia z peerem");
+                    return Err(anyhow::anyhow!("Brak polaczenia z peerem: {}", target_node_id));
+                }
+            }
         };
 
-        Self::send_uni_message_encrypted(
+        match Self::send_uni_message_encrypted(
             &conn,
             MESH_MSG_COMMAND,
             &payload,
             target_node_id,
             security,
         )
-        .await?;
+        .await {
+            Ok(()) => {
+                info!(target = %target_node_id, command_id = %command_id, "send_command: wyslano, czekam na odpowiedz");
+            }
+            Err(e) => {
+                warn!(target = %target_node_id, command_id = %command_id, error = %e, "send_command: blad wysylania");
+                return Err(e);
+            }
+        }
 
         // Czekaj na odpowiedz z timeoutem 120s
         match tokio::time::timeout(Duration::from_secs(120), rx).await {
