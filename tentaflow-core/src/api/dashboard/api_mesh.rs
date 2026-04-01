@@ -486,6 +486,20 @@ pub fn handle_list_nodes(
         let network_rx: u64 = p.networks.iter().map(|n| n.rx_bytes_per_sec).sum();
         let network_tx: u64 = p.networks.iter().map(|n| n.tx_bytes_per_sec).sum();
 
+        // Interfejsy sieciowe per-node (potrzebne w cluster wizard)
+        let network_interfaces: Vec<serde_json::Value> = p.networks.iter().map(|n| {
+            serde_json::json!({
+                "name": n.name,
+                "ipv4_address": n.ipv4_address,
+                "ipv4_netmask": n.ipv4_netmask,
+                "speed_mbps": n.speed_mbps,
+                "rdma_available": n.rdma_available,
+                "numa_node": n.numa_node,
+                "link_up": n.link_up,
+                "interface_type": n.interface_type,
+            })
+        }).collect();
+
         // Routing info — relay/direct, hops, next_hop
         let route_info = if is_local {
             serde_json::json!({"direct": true, "hops": 0})
@@ -523,6 +537,7 @@ pub fn handle_list_nodes(
             "containers_total": containers_total,
             "network_rx_bytes": network_rx,
             "network_tx_bytes": network_tx,
+            "network_interfaces": network_interfaces,
             "is_trusted": is_trusted,
             "is_local": is_local,
             "source": source,
