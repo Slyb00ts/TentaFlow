@@ -1109,13 +1109,13 @@ fn detect_numa_node(name: &str) -> Option<i32> {
                 return Some(numa);
             }
         }
-        // Metoda 2: PCIe domain — TYLKO dla kart z driverem mlx5_core (ConnectX)
+        // Metoda 2: PCIe domain — TYLKO dla kart Mellanox/NVIDIA (vendor 0x15b3)
         // Domain 0000 = CPU path, domain > 0000 = GPU bridge path
-        let driver_link = format!("/sys/class/net/{}/device/driver", name);
-        let is_mlx5 = std::fs::read_link(&driver_link)
-            .map(|p| p.to_string_lossy().contains("mlx5_core"))
+        let vendor_path = format!("/sys/class/net/{}/device/vendor", name);
+        let is_mellanox = std::fs::read_to_string(&vendor_path)
+            .map(|v| v.trim() == "0x15b3")
             .unwrap_or(false);
-        if is_mlx5 {
+        if is_mellanox {
             let device_link = format!("/sys/class/net/{}/device", name);
             if let Ok(target) = std::fs::read_link(&device_link) {
                 let target_str = target.to_string_lossy();
