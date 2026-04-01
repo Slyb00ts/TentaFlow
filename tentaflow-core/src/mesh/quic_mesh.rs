@@ -621,6 +621,7 @@ impl QuicMeshManager {
         shutdown: CancellationToken,
         security: Option<Arc<MeshSecurity>>,
     ) {
+        info!(peer_id = %peer_node_id, remote = %conn.remote_address(), "handle_peer_streams START");
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
