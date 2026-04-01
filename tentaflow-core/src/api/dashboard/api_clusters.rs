@@ -289,11 +289,23 @@ async fn run_probe_orchestration(
         }
 
         for h in handles {
-            if let Ok(Ok(result)) = h.await {
-                results.push(result);
+            match h.await {
+                Ok(Ok(result)) => {
+                    tracing::info!("Probe wynik: {} <-> {} = {:.0} Mbps (reachable={})",
+                        result.node_a, result.node_b, result.bandwidth_mbps, result.reachable);
+                    results.push(result);
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Probe para failed: {}", e);
+                }
+                Err(e) => {
+                    tracing::error!("Probe task panic: {}", e);
+                }
             }
         }
     }
+
+    tracing::info!("Probe zakonczony: {} wynikow z {} par", results.len(), total);
 
     // Optymalny algorytm przypisania
     let detection = optimal_assignment(&results);
@@ -316,6 +328,9 @@ async fn probe_pair(
 ) -> Result<PairProbeResult> {
     use tentaflow_protocol::mesh::MeshCommandType;
 
+    tracing::info!("Probe para: {} ({}) <-> {} ({})",
+        iface_a.node_id, iface_a.name, iface_b.node_id, iface_b.name);
+
     // Wyslij BandwidthProbe{mode:server} do node_b
     let server_cmd = MeshCommandType::BandwidthProbe {
         target_ip: iface_b.ip.clone(),
@@ -327,7 +342,9 @@ async fn probe_pair(
         num_streams: 4,
     };
 
-    let server_response = qm.send_command_and_wait(&iface_b.node_id, server_cmd, 5).await?;
+    tracing::info!("  Wysylam server cmd do {}", iface_b.node_id);
+    let server_response = qm.send_command_and_wait(&iface_b.node_id, server_cmd, 10).await?;
+    tracing::info!("  Server response: success={} output={}", server_response.success, server_response.output);
 
     if !server_response.success {
         return Ok(PairProbeResult {
@@ -363,7 +380,9 @@ async fn probe_pair(
         num_streams: 4,
     };
 
-    let client_response = qm.send_command_and_wait(&iface_a.node_id, client_cmd, 5).await?;
+    tracing::info!("  Wysylam client cmd do {} -> {}:{}", iface_a.node_id, iface_b.ip, port);
+    let client_response = qm.send_command_and_wait(&iface_a.node_id, client_cmd, 10).await?;
+    tracing::info!("  Client response: success={} output={}", client_response.success, client_response.output);
 
     let bandwidth_mbps = serde_json::from_str::<serde_json::Value>(&client_response.output)
         .ok()
