@@ -436,7 +436,7 @@ const MeshNodeDetail = (() => {
         let badges = '';
         if (iface.rdma_available) badges += '<span class="mesh-network-rdma-badge">RDMA</span> ';
         if (iface.numa_node != null && iface.numa_node > 0) badges += '<span class="mesh-network-path-badge mesh-network-path-gpu">GPU</span>';
-        else if (iface.numa_node != null && iface.numa_node === 0 && iface.speed_mbps != null && iface.speed_mbps >= 10000) badges += '<span class="mesh-network-path-badge mesh-network-path-cpu">CPU</span>';
+        else if (iface.numa_node != null && iface.numa_node === 0) badges += '<span class="mesh-network-path-badge mesh-network-path-cpu">CPU</span>';
         let speedText = '';
         if (iface.speed_mbps != null && iface.speed_mbps > 0) {
           speedText = iface.speed_mbps >= 1000 ? `${Math.round(iface.speed_mbps / 1000)}G` : `${iface.speed_mbps}M`;
