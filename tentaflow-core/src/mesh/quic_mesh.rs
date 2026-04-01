@@ -681,7 +681,10 @@ impl QuicMeshManager {
             return;
         }
         let discriminant = disc_buf[0];
-        info!(peer_id = %peer_node_id, disc = format!("0x{:02X}", discriminant), "Odebrano uni-stream");
+        // Loguj tylko komendy i nie-heartbeat wiadomosci (heartbeat 0x10 jest co 500ms)
+        if discriminant != MESH_MSG_HEARTBEAT {
+            debug!(peer_id = %peer_node_id, disc = format!("0x{:02X}", discriminant), "Odebrano uni-stream");
+        }
 
         // Sprawdz zaufanie peera — wiadomosci parowania (0x20-0x22) zawsze przepuszczaj
         let is_pairing_msg = matches!(
