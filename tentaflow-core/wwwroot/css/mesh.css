@@ -96,6 +96,13 @@
   color: var(--color-warning);
 }
 
+.mesh-trust-relay {
+  background: rgba(99, 102, 241, 0.15);
+  color: #818cf8;
+  cursor: help;
+  margin-left: 4px;
+}
+
 /* --- Gauge bars (kafelki + detail) --- */
 .gauge {
   display: flex;

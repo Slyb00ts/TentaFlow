@@ -486,6 +486,19 @@ pub fn handle_list_nodes(
         let network_rx: u64 = p.networks.iter().map(|n| n.rx_bytes_per_sec).sum();
         let network_tx: u64 = p.networks.iter().map(|n| n.tx_bytes_per_sec).sum();
 
+        // Routing info — relay/direct, hops, next_hop
+        let route_info = if is_local {
+            serde_json::json!({"direct": true, "hops": 0})
+        } else if let Some(route) = store.get_route(&p.node_id) {
+            serde_json::json!({
+                "direct": route.direct,
+                "hops": route.hops,
+                "next_hop": if route.direct { serde_json::Value::Null } else { serde_json::Value::String(route.next_hop.clone()) },
+            })
+        } else {
+            serde_json::json!({"direct": false, "hops": null})
+        };
+
         serde_json::json!({
             "node_id": p.node_id,
             "hostname": p.hostname,
@@ -514,6 +527,7 @@ pub fn handle_list_nodes(
             "is_local": is_local,
             "source": source,
             "trust": trust,
+            "route": route_info,
         })
     }).collect();
 
