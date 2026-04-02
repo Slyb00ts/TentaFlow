@@ -454,6 +454,40 @@ mod linux_rdma {
     use super::RdmaProbeResult;
     use crate::mesh::ibverbs_ffi::*;
 
+    /// Znajdz GID index dla RoCE v2 z IPv4-mapped adresem.
+    /// Iteruje po sysfs i szuka wpisu z typem "RoCE v2" i GID zawierajacym "ffff:" (IPv4-mapped).
+    /// Zwraca None jesli nie znaleziono pasujacego GID.
+    fn find_rocev2_gid_index(device_name: &str) -> Option<u8> {
+        for i in 0..16u8 {
+            let type_path = format!(
+                "/sys/class/infiniband/{}/ports/1/gid_attrs/types/{}",
+                device_name, i
+            );
+            let gid_path = format!(
+                "/sys/class/infiniband/{}/ports/1/gids/{}",
+                device_name, i
+            );
+
+            let gid_type = match std::fs::read_to_string(&type_path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !gid_type.trim().contains("RoCE v2") {
+                continue;
+            }
+
+            let gid = match std::fs::read_to_string(&gid_path) {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            // IPv4-mapped GID: 0000:0000:0000:0000:0000:ffff:XXXX:XXXX
+            if gid.contains("ffff:") {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Informacje o QP potrzebne do nawiazania polaczenia RC
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct QpInfo {
@@ -474,6 +508,8 @@ mod linux_rdma {
         mr: *mut ibv_mr,
         buf: Vec<u8>,
         local_psn: u32,
+        gid_index: u8,
+        active_mtu: u32,
     }
 
     // Surowe wskazniki nie sa Send domyslnie.
@@ -747,6 +783,18 @@ mod linux_rdma {
                 // Losowy PSN (24-bit)
                 let local_psn = rand::random::<u32>() & 0x00FF_FFFF;
 
+                // Wykryj GID index dla RoCE v2 (fallback na 0 dla IB)
+                let gid_index = find_rocev2_gid_index(device_name).unwrap_or(0);
+
+                // Odczytaj aktywne MTU z portu
+                let mut port_attr: ibv_port_attr = std::mem::zeroed();
+                let ret = ibv_query_port(ctx, 1, &mut port_attr);
+                let active_mtu = if ret == 0 && port_attr.active_mtu >= IBV_MTU_256 && port_attr.active_mtu <= IBV_MTU_4096 {
+                    port_attr.active_mtu
+                } else {
+                    IBV_MTU_1024
+                };
+
                 Ok(RdmaContext {
                     device_name: device_name.to_string(),
                     ctx,
@@ -756,6 +804,8 @@ mod linux_rdma {
                     mr,
                     buf,
                     local_psn,
+                    gid_index,
+                    active_mtu,
                 })
             }
         }
@@ -769,9 +819,9 @@ mod linux_rdma {
                     return Err(anyhow!("ibv_query_port failed: {}", ret));
                 }
 
-                // Pobierz GID (potrzebne dla RoCE)
+                // Pobierz GID (potrzebne dla RoCE) — uzywamy wykrytego indeksu
                 let mut gid: ibv_gid = std::mem::zeroed();
-                ibv_query_gid(self.ctx, 1, 0, &mut gid);
+                ibv_query_gid(self.ctx, 1, self.gid_index as i32, &mut gid);
 
                 Ok(QpInfo {
                     lid: port_attr.lid,
@@ -788,7 +838,7 @@ mod linux_rdma {
                 // RTR (Ready to Receive)
                 let mut attr: ibv_qp_attr = std::mem::zeroed();
                 attr.qp_state = IBV_QPS_RTR;
-                attr.path_mtu = IBV_MTU_4096;
+                attr.path_mtu = self.active_mtu;
                 attr.dest_qp_num = remote.qpn;
                 attr.rq_psn = remote.psn;
                 attr.max_dest_rd_atomic = 1;
@@ -803,7 +853,7 @@ mod linux_rdma {
                 if remote.lid == 0 {
                     attr.ah_attr.is_global = 1;
                     attr.ah_attr.grh.dgid.raw = remote.gid;
-                    attr.ah_attr.grh.sgid_index = 0;
+                    attr.ah_attr.grh.sgid_index = self.gid_index;
                     attr.ah_attr.grh.hop_limit = 64;
                 }
 

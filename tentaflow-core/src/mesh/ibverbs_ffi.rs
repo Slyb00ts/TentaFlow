@@ -396,6 +396,10 @@ pub const IBV_QPS_RTR: c_uint = 2;
 pub const IBV_QPS_RTS: c_uint = 3;
 
 // ibv_mtu
+pub const IBV_MTU_256: c_uint = 1;
+pub const IBV_MTU_512: c_uint = 2;
+pub const IBV_MTU_1024: c_uint = 3;
+pub const IBV_MTU_2048: c_uint = 4;
 pub const IBV_MTU_4096: c_uint = 5;
 
 // ibv_access_flags
