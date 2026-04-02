@@ -179,8 +179,8 @@ async fn run_client(
     num_streams: u8,
     duration_ms: u32,
 ) -> Result<ProbeResult> {
-    // Pomiar latency — TCP connect + 1 bajt round-trip przed bulk transfer
-    let latency_us = measure_tcp_rtt(addr).await.unwrap_or(0);
+    // Pomiar latency — mierzymy czas pierwszego stream connect (nie oddzielne polaczenie)
+    let latency_us = 0u64; // TODO: mierzyc w ramach pierwszego streamu
 
     let start = Instant::now();
     let mut handles = Vec::new();
@@ -269,7 +269,13 @@ async fn send_stream(
     #[cfg(not(target_os = "linux"))]
     let _ = bind_interface;
 
-    let mut stream = socket.connect(addr).await?;
+    let mut stream = match socket.connect(addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("TCP connect failed {}: {}", addr, e);
+            return Err(anyhow!("TCP connect failed {}: {}", addr, e));
+        }
+    };
     stream.set_nodelay(true)?;
 
     // Wyslij nonce jako autoryzacje
