@@ -260,38 +260,47 @@ const ClusterWizard = (() => {
     `;
   }
 
-  // Selektory interfejsow
+  // Selektory interfejsow — per-pair (kazda para moze uzywac innego interfejsu)
   function renderInterfaceSelectors(locked) {
+    // Generuj per-pair: ktory interfejs jest uzywany dla kazdej pary
+    const pairRows = [];
+    for (let i = 0; i < selectedNodes.length; i++) {
+      for (let j = i + 1; j < selectedNodes.length; j++) {
+        const nodeA = selectedNodes[i];
+        const nodeB = selectedNodes[j];
+        const result = findProbeResult(nodeA.node_id, nodeB.node_id);
+
+        const ifaceA = result ? result.interface_a : '';
+        const ifaceB = result ? result.interface_b : '';
+        const bw = result && result.reachable ? result.bandwidth_mbps : 0;
+        const bwLabel = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw > 0 ? bw.toFixed(0) + ' Mbps' : '';
+        const hostA = nodeA.hostname || nodeA.node_id;
+        const hostB = nodeB.hostname || nodeB.node_id;
+
+        const ifaceAData = (nodeA.network_interfaces || []).find(i => i.name === ifaceA);
+        const ifaceBData = (nodeB.network_interfaces || []).find(i => i.name === ifaceB);
+
+        pairRows.push(`
+          <div class="interface-row" style="grid-template-columns: 1fr auto auto auto;">
+            <div class="interface-hostname">${Utils.escapeHtml(hostA)} \u2194 ${Utils.escapeHtml(hostB)}</div>
+            <div style="font-size:var(--font-size-sm);color:var(--color-text-secondary);">
+              ${ifaceA ? Utils.escapeHtml(ifaceA) : '...'} \u2194 ${ifaceB ? Utils.escapeHtml(ifaceB) : '...'}
+            </div>
+            <div style="font-weight:600;font-size:var(--font-size-sm);${bw > 40000 ? 'color:var(--color-success);' : bw > 0 ? 'color:var(--color-warning);' : 'color:var(--color-text-muted);'}">
+              ${bwLabel || (result ? 'unreachable' : I18n.t('clusters.probing'))}
+            </div>
+            <div class="interface-badges">
+              ${ifaceAData ? renderInterfaceBadges(ifaceAData) : ''}
+            </div>
+          </div>
+        `);
+      }
+    }
+
     return `
       <div class="interface-section ${locked ? 'interface-locked' : ''}">
         <div class="matrix-label">${I18n.t('clusters.interface_assignment')}</div>
-        ${selectedNodes.map(node => {
-          const interfaces = node.network_interfaces || [];
-          const currentIface = interfaceOverrides[node.node_id] ||
-            (detectionResult?.per_node?.[node.node_id]?.interface) || '';
-
-          return `
-            <div class="interface-row">
-              <div class="interface-hostname">${Utils.escapeHtml(node.hostname || node.node_id)}</div>
-              <select class="interface-select" data-node-iface="${Utils.escapeAttr(node.node_id)}"
-                      ${locked ? 'disabled' : ''}>
-                ${interfaces.map(iface => {
-                  const isSelected = iface.name === currentIface;
-                  const speedLabel = iface.speed_mbps >= 1000
-                    ? (iface.speed_mbps / 1000).toFixed(0) + ' Gbps'
-                    : iface.speed_mbps + ' Mbps';
-                  const reachInfo = getReachabilityInfo(node.node_id, iface.name);
-                  return `<option value="${Utils.escapeAttr(iface.name)}" ${isSelected ? 'selected' : ''}>
-                    ${Utils.escapeHtml(iface.name)} \u2014 ${speedLabel} ${reachInfo}
-                  </option>`;
-                }).join('')}
-              </select>
-              <div class="interface-badges">
-                ${renderInterfaceBadges(interfaces.find(i => i.name === currentIface))}
-              </div>
-            </div>
-          `;
-        }).join('')}
+        ${pairRows.join('')}
       </div>
     `;
   }
