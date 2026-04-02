@@ -490,6 +490,7 @@ extern "C" {
 // =============================================================================
 
 /// ibv_post_send — wywoluje context->ops.post_send(qp, wr, bad_wr)
+/// Zwraca -1 jesli function pointer nie jest ustawiony w vtable.
 ///
 /// # Safety
 /// Wymaga poprawnych wskaznikow do zainicjalizowanych zasobow RDMA.
@@ -499,11 +500,14 @@ pub unsafe fn ibv_post_send(
     bad_wr: *mut *mut ibv_send_wr,
 ) -> c_int {
     let ctx = (*qp).context;
-    let f = (*ctx).ops.post_send.expect("post_send nie jest ustawiony w ibv_context_ops");
-    f(qp, wr, bad_wr)
+    match (*ctx).ops.post_send {
+        Some(f) => f(qp, wr, bad_wr),
+        None => -1,
+    }
 }
 
 /// ibv_post_recv — wywoluje context->ops.post_recv(qp, wr, bad_wr)
+/// Zwraca -1 jesli function pointer nie jest ustawiony w vtable.
 ///
 /// # Safety
 /// Wymaga poprawnych wskaznikow do zainicjalizowanych zasobow RDMA.
@@ -513,18 +517,23 @@ pub unsafe fn ibv_post_recv(
     bad_wr: *mut *mut ibv_recv_wr,
 ) -> c_int {
     let ctx = (*qp).context;
-    let f = (*ctx).ops.post_recv.expect("post_recv nie jest ustawiony w ibv_context_ops");
-    f(qp, wr, bad_wr)
+    match (*ctx).ops.post_recv {
+        Some(f) => f(qp, wr, bad_wr),
+        None => -1,
+    }
 }
 
 /// ibv_poll_cq — wywoluje cq->context->ops.poll_cq(cq, num_entries, wc)
+/// Zwraca -1 jesli function pointer nie jest ustawiony w vtable.
 ///
 /// # Safety
 /// Wymaga poprawnych wskaznikow do zainicjalizowanych zasobow RDMA.
 pub unsafe fn ibv_poll_cq(cq: *mut ibv_cq, num_entries: c_int, wc: *mut ibv_wc) -> c_int {
     let ctx = (*cq).context;
-    let f = (*ctx).ops.poll_cq.expect("poll_cq nie jest ustawiony w ibv_context_ops");
-    f(cq, num_entries, wc)
+    match (*ctx).ops.poll_cq {
+        Some(f) => f(cq, num_entries, wc),
+        None => -1,
+    }
 }
 
 // =============================================================================

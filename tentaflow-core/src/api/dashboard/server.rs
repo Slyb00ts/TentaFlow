@@ -446,21 +446,19 @@ pub async fn handle_request(
     }
 
     // Probe SSE stream — PRZED auth check bo EventSource nie moze slac headerow
-    // Token walidowany z query param ?token=
+    // Walidacja jednorazowym tokenem SSE (nie JWT) — token zwrocony z POST /api/clusters/probe
     if path.starts_with("/api/clusters/probe/") && method == Method::GET {
-        // Waliduj token z query param
-        let jwt_secret = db::repository::get_setting(&db, "jwt_secret").ok().flatten().unwrap_or_default();
         let sse_token = query_string.split('&')
             .find(|p| p.starts_with("token="))
             .and_then(|p| p.strip_prefix("token="))
             .unwrap_or("");
-        if sse_token.is_empty() || auth::validate_jwt(sse_token, &jwt_secret).is_err() {
-            return Ok(json_error_cors(401, "Niepoprawny token SSE", cors_origin.as_deref()));
+        if sse_token.is_empty() {
+            return Ok(json_error_cors(401, "Brak tokenu SSE", cors_origin.as_deref()));
         }
 
         let probe_id = path.strip_prefix("/api/clusters/probe/").unwrap_or("").trim_matches('/');
         if !probe_id.is_empty() {
-            if let Some(rx) = super::api_clusters::handle_probe_stream(probe_id).await {
+            if let Some(rx) = super::api_clusters::handle_probe_stream_with_token(probe_id, sse_token).await {
                 let sse_stream = futures::stream::unfold(rx, |mut rx| async {
                     let msg = rx.recv().await?;
                     Some((Ok(Frame::data(Bytes::from(msg))), rx))

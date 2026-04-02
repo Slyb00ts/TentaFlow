@@ -404,13 +404,23 @@ mod macos_rdma {
 
     /// Callback dla synchronicznego kanalu (std::sync::mpsc).
     /// Uzywany w spawn_blocking — nie wymaga tokio runtime.
+    /// Kontrakt: callback wolany dokladnie raz przez Swift — Box::from_raw zwalnia pamiec.
+    /// Zabezpieczenie: AtomicBool zapobiega podwojnemu wywolaniu (double-free).
     extern "C" fn rdma_result_callback_sync(
         bytes_transferred: u64,
         duration_ms: u64,
         bandwidth_mbps: f64,
         callback_ctx: *mut c_void,
     ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CALLBACK_FIRED: AtomicBool = AtomicBool::new(false);
+
         if callback_ctx.is_null() {
+            return;
+        }
+
+        // Atomicznie ustaw flage — jesli juz byla true, ktos nas ubiegl
+        if CALLBACK_FIRED.swap(true, Ordering::SeqCst) {
             return;
         }
 
@@ -429,6 +439,9 @@ mod macos_rdma {
             latency_us: 0.0,
             rdma_device: "thunderbolt5-nw".to_string(),
         });
+
+        // Zresetuj flage dla nastepnego uzycia
+        CALLBACK_FIRED.store(false, Ordering::SeqCst);
     }
 
     // =========================================================================
