@@ -820,7 +820,7 @@ pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
 
 // --- Clusters ---
 
-const CLUSTER_COLS: &str = "id, cluster_id, name, description, strategy, created_at, updated_at";
+const CLUSTER_COLS: &str = "id, cluster_id, name, description, strategy, created_at, updated_at, total_vram_mb, total_ram_mb, total_cpu_cores, bottleneck_speed_mbps, interconnect_type";
 
 fn row_to_cluster(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbCluster> {
     Ok(DbCluster {
@@ -831,10 +831,15 @@ fn row_to_cluster(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbCluster> {
         strategy: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+        total_vram_mb: row.get(7)?,
+        total_ram_mb: row.get(8)?,
+        total_cpu_cores: row.get(9)?,
+        bottleneck_speed_mbps: row.get(10)?,
+        interconnect_type: row.get(11)?,
     })
 }
 
-const CLUSTER_MEMBER_COLS: &str = "id, cluster_id, node_id, role, joined_at";
+const CLUSTER_MEMBER_COLS: &str = "id, cluster_id, node_id, role, joined_at, interface_name, interface_ip, interface_speed_mbps, interface_type";
 
 fn row_to_cluster_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClusterMember> {
     Ok(DbClusterMember {
@@ -843,6 +848,10 @@ fn row_to_cluster_member(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClusterM
         node_id: row.get(2)?,
         role: row.get(3)?,
         joined_at: row.get(4)?,
+        interface_name: row.get(5)?,
+        interface_ip: row.get(6)?,
+        interface_speed_mbps: row.get(7)?,
+        interface_type: row.get(8)?,
     })
 }
 
@@ -855,7 +864,7 @@ pub fn create_cluster(
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "INSERT INTO clusters (cluster_id, name, description, strategy) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO clusters (cluster_id, name, description, strategy, total_vram_mb, total_ram_mb, total_cpu_cores, bottleneck_speed_mbps, interconnect_type) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, '')",
         rusqlite::params![cluster_id, name, description, strategy],
     )?;
     Ok(())
@@ -904,16 +913,38 @@ pub fn delete_cluster(pool: &DbPool, cluster_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Aktualizuje zagregowane zasoby klastra (VRAM, RAM, CPU, przepustowosc)
+pub fn update_cluster_aggregates(
+    pool: &DbPool,
+    cluster_id: &str,
+    total_vram_mb: i64,
+    total_ram_mb: i64,
+    total_cpu_cores: i64,
+    bottleneck_speed_mbps: i64,
+    interconnect_type: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE clusters SET total_vram_mb = ?2, total_ram_mb = ?3, total_cpu_cores = ?4, bottleneck_speed_mbps = ?5, interconnect_type = ?6, updated_at = datetime('now') WHERE cluster_id = ?1",
+        rusqlite::params![cluster_id, total_vram_mb, total_ram_mb, total_cpu_cores, bottleneck_speed_mbps, interconnect_type],
+    )?;
+    Ok(())
+}
+
 pub fn add_cluster_member(
     pool: &DbPool,
     cluster_id: &str,
     node_id: &str,
     role: &str,
+    interface_name: &str,
+    interface_ip: &str,
+    interface_speed_mbps: i64,
+    interface_type: &str,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "INSERT OR REPLACE INTO cluster_members (cluster_id, node_id, role) VALUES (?1, ?2, ?3)",
-        rusqlite::params![cluster_id, node_id, role],
+        "INSERT OR REPLACE INTO cluster_members (cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type],
     )?;
     Ok(())
 }

@@ -147,6 +147,11 @@ pub struct DbCluster {
     pub strategy: String,
     pub created_at: String,
     pub updated_at: String,
+    pub total_vram_mb: i64,
+    pub total_ram_mb: i64,
+    pub total_cpu_cores: i64,
+    pub bottleneck_speed_mbps: i64,
+    pub interconnect_type: String,
 }
 
 /// Czlonek klastra (node przypisany do klastra)
@@ -157,6 +162,10 @@ pub struct DbClusterMember {
     pub node_id: String,
     pub role: String,
     pub joined_at: String,
+    pub interface_name: String,
+    pub interface_ip: String,
+    pub interface_speed_mbps: i64,
+    pub interface_type: String,
 }
 
 /// Definicja flow (przeplyw przetwarzania)

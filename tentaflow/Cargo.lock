@@ -4908,6 +4908,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "lazy_static",
+ "libc",
  "mdns-sd",
  "mlx-models",
  "mlx-rs",

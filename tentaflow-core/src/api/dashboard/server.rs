@@ -445,6 +445,44 @@ pub async fn handle_request(
         return Ok(make_response_with_origin(status, content_type, body, cors_origin.as_deref()));
     }
 
+    // Probe SSE stream — PRZED auth check bo EventSource nie moze slac headerow
+    // Walidacja jednorazowym tokenem SSE (nie JWT) — token zwrocony z POST /api/clusters/probe
+    if path.starts_with("/api/clusters/probe/") && method == Method::GET {
+        let sse_token = query_string.split('&')
+            .find(|p| p.starts_with("token="))
+            .and_then(|p| p.strip_prefix("token="))
+            .unwrap_or("");
+        if sse_token.is_empty() {
+            return Ok(json_error_cors(401, "Brak tokenu SSE", cors_origin.as_deref()));
+        }
+
+        let probe_id = path.strip_prefix("/api/clusters/probe/").unwrap_or("").trim_matches('/');
+        if !probe_id.is_empty() {
+            if let Some(rx) = super::api_clusters::handle_probe_stream_with_token(probe_id, sse_token).await {
+                let sse_stream = futures::stream::unfold(rx, |mut rx| async {
+                    let msg = rx.recv().await?;
+                    Some((Ok(Frame::data(Bytes::from(msg))), rx))
+                });
+                let boxed_stream: SseStream = Box::pin(sse_stream);
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/event-stream")
+                    .header("Cache-Control", "no-cache")
+                    .header("Connection", "keep-alive");
+                if let Some(ref origin) = cors_origin {
+                    builder = builder
+                        .header("Access-Control-Allow-Origin", origin.as_str())
+                        .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+                        .header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                }
+                return Ok(builder
+                    .body(Either::Right(StreamBody::new(boxed_stream)))
+                    .unwrap());
+            }
+            return Ok(json_error_cors(404, "Probe stream nie istnieje", cors_origin.as_deref()));
+        }
+    }
+
     // Wszystkie /api/* (oprocz login) wymagaja JWT
     let claims = if path.starts_with("/api/") {
         let jwt_secret = match db::repository::get_setting(&db, "jwt_secret") {
@@ -519,7 +557,7 @@ pub async fn handle_request(
 
     // Clusters API — CRUD clusterow i czlonkostwa
     if path.starts_with("/api/clusters") {
-        let (status, response_body) = route_clusters_api(&method, &path, &db, &body_bytes, &claims);
+        let (status, response_body) = route_clusters_api(&method, &path, &db, &body_bytes, &claims, &quic_mesh).await;
         return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
     }
 
@@ -1577,13 +1615,14 @@ async fn route_mesh_api(
     (404, serde_json::json!({"error": "Nieznany endpoint mesh"}).to_string())
 }
 
-/// Routing endpointow clusters — CRUD clusterow i czlonkostwa nodow
-fn route_clusters_api(
+/// Routing endpointow clusters — CRUD clusterow, czlonkostwa nodow, probing
+async fn route_clusters_api(
     method: &Method,
     path: &str,
     db: &DbPool,
     body: &[u8],
     claims: &auth::Claims,
+    quic_mesh: &Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>,
 ) -> (u16, String) {
     // GET /api/clusters
     if path == "/api/clusters" && *method == Method::GET {
@@ -1594,6 +1633,24 @@ fn route_clusters_api(
     if path == "/api/clusters" && *method == Method::POST {
         if let Some(err) = require_admin(claims, db) { return err; }
         return handle_result(api_clusters::handle_create(db, body), 400);
+    }
+
+    // POST /api/clusters/probe — rozpocznij probing (admin only)
+    if path == "/api/clusters/probe" && *method == Method::POST {
+        if let Some(err) = require_admin(claims, db) { return err; }
+        let qm = match quic_mesh {
+            Some(qm) => qm.clone(),
+            None => return (503, r#"{"error":"QuicMesh niedostepny"}"#.to_string()),
+        };
+        return handle_result(api_clusters::handle_start_probe(body, qm).await, 500);
+    }
+
+    // DELETE /api/clusters/probe/:probe_id — anuluj probing
+    if path.starts_with("/api/clusters/probe/") && *method == Method::DELETE {
+        let probe_id = path.strip_prefix("/api/clusters/probe/").unwrap_or("").trim_matches('/');
+        if !probe_id.is_empty() {
+            return handle_result(api_clusters::handle_delete_probe(probe_id).await, 500);
+        }
     }
 
     // Sciezki z :id

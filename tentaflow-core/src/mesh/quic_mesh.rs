@@ -38,6 +38,14 @@ use tentaflow_protocol::mesh::{
 // Typy publiczne
 // =============================================================================
 
+/// Odpowiedz na MeshCommand oczekiwana przez send_command_and_wait
+#[derive(Debug, Clone)]
+pub struct CommandWaitResponse {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
+}
+
 /// Konfiguracja polaczen QUIC mesh
 #[derive(Debug, Clone)]
 pub struct QuicMeshConfig {
@@ -147,6 +155,8 @@ pub struct QuicMeshManager {
     command_to_node: Arc<RwLock<HashMap<String, String>>>,
     /// Zbior node_id dla ktorych juz dziala reconnect loop (deduplikacja)
     reconnecting: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Mapa oczekujacych na odpowiedz na MeshCommand (command_id -> sender)
+    command_waiters: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>>>,
 }
 
 impl QuicMeshManager {
@@ -221,6 +231,7 @@ impl QuicMeshManager {
             pending_commands: Arc::new(RwLock::new(HashMap::new())),
             command_to_node: Arc::new(RwLock::new(HashMap::new())),
             reconnecting: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            command_waiters: Arc::new(RwLock::new(HashMap::new())),
         }))
     }
 
@@ -242,6 +253,12 @@ impl QuicMeshManager {
     /// Identyfikator tego noda
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// QUIC RTT do peera (smoothed, z istniejacego polaczenia)
+    pub async fn get_peer_rtt_us(&self, peer_id: &str) -> Option<u64> {
+        let conns = self.connections.read().await;
+        conns.get(peer_id).map(|c| c.connection.rtt().as_micros() as u64)
     }
 
     /// Subskrypcja zdarzen mesh QUIC
@@ -1763,6 +1780,104 @@ impl QuicMeshManager {
         }
     }
 
+    /// Wysyla MeshCommand i czeka na odpowiedz (z timeoutem).
+    /// Rejestruje oneshot waiter na command_id, wysyla komende, czeka na response.
+    pub async fn send_command_and_wait(
+        &self,
+        target_node_id: &str,
+        command: MeshCommandType,
+        timeout_secs: u64,
+    ) -> Result<CommandWaitResponse> {
+        let security = self.security.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Komendy zarzadzania wymagaja aktywnego modulu bezpieczenstwa"))?;
+
+        if !security.is_trusted(target_node_id) {
+            return Err(anyhow::anyhow!(
+                "Node {} nie jest zaufany",
+                target_node_id
+            ));
+        }
+
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Zarejestruj waiter
+        {
+            let mut waiters = self.command_waiters.write().await;
+            waiters.insert(command_id.clone(), tx);
+        }
+
+        let msg = MeshMessage::MeshCommand {
+            command_id: command_id.clone(),
+            from_node_id: self.node_id.clone(),
+            command,
+        };
+
+        let payload = match msg.serialize_rkyv() {
+            Ok(p) => p,
+            Err(e) => {
+                let mut waiters = self.command_waiters.write().await;
+                waiters.remove(&command_id);
+                return Err(anyhow::anyhow!("Blad serializacji MeshCommand: {}", e));
+            }
+        };
+
+        let conn = {
+            let conns = self.connections.read().await;
+            match conns.get(target_node_id) {
+                Some(mc) => mc.connection.clone(),
+                None => {
+                    let mut waiters = self.command_waiters.write().await;
+                    waiters.remove(&command_id);
+                    return Err(anyhow::anyhow!("Brak polaczenia z peerem: {}", target_node_id));
+                }
+            }
+        };
+
+        if let Err(e) = Self::send_uni_message_encrypted(
+            &conn,
+            MESH_MSG_COMMAND,
+            &payload,
+            target_node_id,
+            security,
+        ).await {
+            let mut waiters = self.command_waiters.write().await;
+            waiters.remove(&command_id);
+            return Err(e);
+        }
+
+        // Czekaj na odpowiedz z timeoutem
+        match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            rx,
+        ).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                Err(anyhow::anyhow!("Waiter anulowany"))
+            }
+            Err(_) => {
+                let mut waiters = self.command_waiters.write().await;
+                waiters.remove(&command_id);
+                Err(anyhow::anyhow!("Timeout czekania na odpowiedz ({}s)", timeout_secs))
+            }
+        }
+    }
+
+    /// Sprawdz czy ktos czeka na odpowiedz na ta komende i rozwiaz
+    pub async fn resolve_command_waiter(&self, command_id: &str, success: bool, output: &str, error: Option<&str>) -> bool {
+        let mut waiters = self.command_waiters.write().await;
+        if let Some(tx) = waiters.remove(command_id) {
+            let _ = tx.send(CommandWaitResponse {
+                success,
+                output: output.to_string(),
+                error: error.map(|e| e.to_string()),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     /// Zwraca referencje do rejestru serwisow
     pub fn service_registry(&self) -> &Arc<MeshServiceRegistry> {
         &self.service_registry
@@ -1892,6 +2007,9 @@ impl QuicMeshManager {
                 return;
             }
         };
+
+        // Rozwiaz waiter jesli ktos czeka (send_command_and_wait)
+        self.resolve_command_waiter(&command_id, success, &output, error.as_deref()).await;
 
         let tx = {
             let mut pending = self.pending_commands.write().await;

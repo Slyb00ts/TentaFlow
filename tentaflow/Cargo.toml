@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "TentaFlow — API Gateway i mesh node"
 
+[features]
+rdma-probe = ["tentaflow-core/rdma-probe"]
+
 [dependencies]
 tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "metrics-prometheus"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
