@@ -252,14 +252,28 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
         bottleneck = 0.0;
     }
 
-    // Sprawdz czy sa pary unreachable
-    let has_unreachable = probe_results.iter().any(|r| !r.reachable);
-    let all_unreachable = probe_results.iter().all(|r| !r.reachable);
+    // Sprawdz czy kazda para NODOW ma przynajmniej jeden reachable interfejs
+    let mut node_pairs_reachable: HashMap<(String, String), bool> = HashMap::new();
+    for r in probe_results {
+        let key = if r.node_a < r.node_b {
+            (r.node_a.clone(), r.node_b.clone())
+        } else {
+            (r.node_b.clone(), r.node_a.clone())
+        };
+        let entry = node_pairs_reachable.entry(key).or_insert(false);
+        if r.reachable { *entry = true; }
+    }
+    let all_node_pairs_reachable = !node_pairs_reachable.is_empty() && node_pairs_reachable.values().all(|v| *v);
+    let has_unreachable_node_pair = node_pairs_reachable.values().any(|v| !*v);
+    let all_unreachable = node_pairs_reachable.is_empty() || node_pairs_reachable.values().all(|v| !*v);
 
     // Message jako kod — frontend tlumacza
+    // "optimal" = kazda para nodow ma reachable link
+    // "partial" = nie kazda para nodow ma reachable link
+    // "mixed" = rozne typy interfejsow (rdma + ethernet)
     let message = if all_unreachable || probe_results.is_empty() {
         "no_connections".to_string()
-    } else if has_unreachable {
+    } else if has_unreachable_node_pair {
         "partial".to_string()
     } else if is_mixed {
         "mixed".to_string()
