@@ -920,6 +920,7 @@
     "select_nodes_label": "Wybierz nody do clustera",
     "select_min_nodes": "Wybierz co najmniej 2 nody",
     "detection_optimal": "Optymalna konfiguracja: {speed} (wszystkie nody osiagalne)",
+    "detection_partial": "Czesciowa lacznosc: niektore nody nieosiagalne. Najlepszy link: {speed}",
     "detection_mixed": "Konfiguracja mieszana: bottleneck {speed}",
     "detection_no_connections": "Brak polaczen miedzy nodami",
     "bottleneck": "Waskie gardlo",

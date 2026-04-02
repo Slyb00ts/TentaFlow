@@ -222,10 +222,15 @@ const ClusterWizard = (() => {
            <span class="probe-progress">${probeResults.length} / ?</span>
          </div>`
       : detectionResult
-        ? `<div class="probe-banner ${detectionResult.is_mixed ? 'probe-banner-warning' : 'probe-banner-success'}">
-             <span>${detectionResult.is_mixed ? '&#9888;' : '&#10003;'}</span>
-             <span>${formatDetectionMessage(detectionResult)}</span>
-           </div>`
+        ? (() => {
+            const isWarning = detectionResult.is_mixed || detectionResult.message === 'partial' || detectionResult.message === 'no_connections';
+            const bannerClass = isWarning ? 'probe-banner-warning' : 'probe-banner-success';
+            const icon = isWarning ? '&#9888;' : '&#10003;';
+            return `<div class="probe-banner ${bannerClass}">
+              <span>${icon}</span>
+              <span>${formatDetectionMessage(detectionResult)}</span>
+            </div>`;
+          })()
         : '';
 
     const totalPairs = selectedNodes.length > 1 ? (selectedNodes.length * (selectedNodes.length - 1)) / 2 : 0;
@@ -510,7 +515,9 @@ const ClusterWizard = (() => {
   function formatDetectionMessage(det) {
     const bw = det.bottleneck_mbps || 0;
     const bwLabel = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw.toFixed(0) + ' Mbps';
-    if (det.message === 'mixed') {
+    if (det.message === 'partial') {
+      return I18n.t('clusters.detection_partial').replace('{speed}', bwLabel);
+    } else if (det.message === 'mixed') {
       return I18n.t('clusters.detection_mixed').replace('{speed}', bwLabel);
     } else if (det.message === 'optimal') {
       return I18n.t('clusters.detection_optimal').replace('{speed}', bwLabel);
