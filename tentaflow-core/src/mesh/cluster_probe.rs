@@ -229,21 +229,60 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
         }
     }
 
-    // Per-node assignment: interfejs z najwyzsza suma bandwidth
+    // Per-node assignment: interfejs na ktorym node widzi WSZYSTKIE inne nody
+    // Jesli nie ma takiego — interfejs z najwyzsza suma bandwidth
+    let all_node_ids: Vec<String> = {
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in probe_results {
+            ids.insert(r.node_a.clone());
+            ids.insert(r.node_b.clone());
+        }
+        ids.into_iter().collect()
+    };
+
     let mut per_node: HashMap<String, NodeAssignment> = HashMap::new();
-    for (node_id, iface_bw) in &node_bandwidth {
-        if let Some((best_iface, _)) = iface_bw
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        {
-            per_node.insert(
-                node_id.clone(),
-                NodeAssignment {
-                    interface: best_iface.clone(),
-                    ip: String::new(),
-                    speed_mbps: 0,
-                },
-            );
+    for node_id in &all_node_ids {
+        let other_nodes: Vec<&String> = all_node_ids.iter().filter(|id| *id != node_id).collect();
+
+        // Zbierz interfejsy tego noda z reachable wynikami
+        let mut iface_reaches: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        let mut iface_bandwidth: HashMap<String, f64> = HashMap::new();
+
+        for r in probe_results.iter().filter(|r| r.reachable) {
+            if r.node_a == *node_id {
+                iface_reaches.entry(r.interface_a.clone()).or_default().insert(r.node_b.clone());
+                *iface_bandwidth.entry(r.interface_a.clone()).or_insert(0.0) += r.bandwidth_mbps;
+            } else if r.node_b == *node_id {
+                iface_reaches.entry(r.interface_b.clone()).or_default().insert(r.node_a.clone());
+                *iface_bandwidth.entry(r.interface_b.clone()).or_insert(0.0) += r.bandwidth_mbps;
+            }
+        }
+
+        // Znajdz interfejs ktory widzi WSZYSTKIE inne nody
+        let full_reach: Vec<(&String, &f64)> = iface_bandwidth.iter()
+            .filter(|(iface, _)| {
+                let reaches = iface_reaches.get(*iface);
+                reaches.map_or(false, |r| other_nodes.iter().all(|n| r.contains(*n)))
+            })
+            .collect();
+
+        let best_iface = if !full_reach.is_empty() {
+            // Sposrod interfejsow ktore widza wszystkie, wybierz najszybszy
+            full_reach.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(iface, _)| (*iface).clone())
+        } else {
+            // Brak interfejsu widocznego dla wszystkich — wybierz z najwyzsza suma bandwidth
+            iface_bandwidth.iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(iface, _)| iface.clone())
+        };
+
+        if let Some(iface) = best_iface {
+            per_node.insert(node_id.clone(), NodeAssignment {
+                interface: iface,
+                ip: String::new(),
+                speed_mbps: 0,
+            });
         }
     }
 
