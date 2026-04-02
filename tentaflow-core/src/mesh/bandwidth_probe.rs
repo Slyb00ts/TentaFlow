@@ -20,6 +20,7 @@ pub struct ProbeResult {
     pub bytes_transferred: u64,
     pub duration_ms: u64,
     pub bandwidth_mbps: f64,
+    pub latency_us: u64,
     pub streams_completed: u8,
     pub streams_total: u8,
 }
@@ -59,6 +60,7 @@ pub async fn start_probe_server(
                 bytes_transferred: 0,
                 duration_ms: 0,
                 bandwidth_mbps: 0.0,
+                latency_us: 0,
                 streams_completed: 0,
                 streams_total: num_streams,
             }),
@@ -117,10 +119,13 @@ async fn run_server(
         bytes_transferred: total_bytes,
         duration_ms: elapsed,
         bandwidth_mbps,
+        latency_us: 0,
         streams_completed: completed,
         streams_total: num_streams,
     })
 }
+
+// Ponizej jest run_client ktory mierzy latency
 
 async fn handle_stream(
     mut stream: TcpStream,
@@ -174,6 +179,9 @@ async fn run_client(
     num_streams: u8,
     duration_ms: u32,
 ) -> Result<ProbeResult> {
+    // Pomiar latency — TCP connect + 1 bajt round-trip przed bulk transfer
+    let latency_us = measure_tcp_rtt(addr).await.unwrap_or(0);
+
     let start = Instant::now();
     let mut handles = Vec::new();
 
@@ -209,9 +217,19 @@ async fn run_client(
         bytes_transferred: total_bytes,
         duration_ms: elapsed,
         bandwidth_mbps,
+        latency_us,
         streams_completed: completed,
         streams_total: num_streams,
     })
+}
+
+/// Pomiar TCP RTT — czas polaczenia TCP do serwera (SYN-SYNACK-ACK)
+async fn measure_tcp_rtt(addr: SocketAddr) -> Result<u64> {
+    let start = Instant::now();
+    let stream = TcpStream::connect(addr).await?;
+    let connect_us = start.elapsed().as_micros() as u64;
+    drop(stream);
+    Ok(connect_us)
 }
 
 async fn send_stream(

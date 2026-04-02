@@ -390,10 +390,10 @@ async fn probe_pair(
     let client_response = qm.send_command_and_wait(&iface_a.node_id, client_cmd, 10).await?;
     tracing::info!("  Client response: success={} output={}", client_response.success, client_response.output);
 
-    let bandwidth_mbps = serde_json::from_str::<serde_json::Value>(&client_response.output)
-        .ok()
-        .and_then(|v| v["bandwidth_mbps"].as_f64())
-        .unwrap_or(0.0);
+    let client_json = serde_json::from_str::<serde_json::Value>(&client_response.output)
+        .unwrap_or_default();
+    let bandwidth_mbps = client_json["bandwidth_mbps"].as_f64().unwrap_or(0.0);
+    let latency_us = client_json["latency_us"].as_u64().unwrap_or(0);
 
     let result = PairProbeResult {
         node_a: iface_a.node_id.clone(),
@@ -401,7 +401,7 @@ async fn probe_pair(
         interface_a: iface_a.name.clone(),
         interface_b: iface_b.name.clone(),
         bandwidth_mbps,
-        latency_us: 0,
+        latency_us,
         reachable: client_response.success && bandwidth_mbps > 0.0,
         rdma: iface_a.rdma_available && iface_b.rdma_available,
     };
@@ -413,6 +413,7 @@ async fn probe_pair(
         "interface_a": result.interface_a,
         "interface_b": result.interface_b,
         "bandwidth_mbps": result.bandwidth_mbps,
+        "latency_us": result.latency_us,
         "reachable": result.reachable,
         "rdma": result.rdma,
         "progress": progress,

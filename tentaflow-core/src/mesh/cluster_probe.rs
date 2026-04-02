@@ -226,16 +226,16 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
         bottleneck = 0.0;
     }
 
+    let bw_label = if bottleneck >= 1000.0 {
+        format!("{:.1} Gbps", bottleneck / 1000.0)
+    } else {
+        format!("{:.0} Mbps", bottleneck)
+    };
+
     let message = if is_mixed {
-        format!(
-            "Konfiguracja mieszana: bottleneck {:.0} Mbps",
-            bottleneck
-        )
+        format!("Konfiguracja mieszana: bottleneck {}", bw_label)
     } else if bottleneck > 0.0 {
-        format!(
-            "Optymalna konfiguracja: {:.0} Mbps (wszystkie nody osiagalne)",
-            bottleneck
-        )
+        format!("Optymalna konfiguracja: {} (wszystkie nody osiagalne)", bw_label)
     } else {
         "Brak polaczen miedzy nodami".to_string()
     };
