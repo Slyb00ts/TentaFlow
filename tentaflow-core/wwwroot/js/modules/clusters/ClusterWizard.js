@@ -300,10 +300,16 @@ const ClusterWizard = (() => {
   function renderInterfaceBadges(iface) {
     if (!iface) return '';
     const badges = [];
-    if (iface.rdma_available) badges.push('<span class="badge badge-roce">ROCE</span>');
-    if (iface.numa_node !== undefined && iface.numa_node >= 0) badges.push('<span class="badge badge-c2c">C2C</span>');
-    if (iface.is_wifi) badges.push('<span class="badge badge-warn">&#9888; WIFI</span>');
-    if (!iface.rdma_available && !iface.is_wifi) badges.push('<span class="badge badge-eth">ETHERNET</span>');
+    if (iface.rdma_available) {
+      badges.push('<span class="badge badge-roce">ROCE</span>');
+      // C2C tylko jesli RDMA i numa_node wskazuje na GPU path (nie zwykly ethernet)
+      if (iface.numa_node !== undefined && iface.numa_node >= 0) {
+        badges.push('<span class="badge badge-c2c">C2C</span>');
+      }
+    }
+    if (!iface.rdma_available) {
+      badges.push('<span class="badge badge-eth">ETHERNET</span>');
+    }
     const speedLabel = iface.speed_mbps >= 1000
       ? (iface.speed_mbps / 1000).toFixed(0) + ' GBPS'
       : iface.speed_mbps + ' MBPS';
@@ -399,11 +405,19 @@ const ClusterWizard = (() => {
     `;
   }
 
+  // Znajdz NAJLEPSZY wynik probing dla pary (reachable > unreachable, wyzszy bandwidth)
   function findProbeResult(nodeA, nodeB) {
-    return probeResults.find(r =>
+    const matches = probeResults.filter(r =>
       (r.node_a === nodeA && r.node_b === nodeB) ||
       (r.node_a === nodeB && r.node_b === nodeA)
     );
+    if (matches.length === 0) return null;
+    // Preferuj reachable, potem najwyzszy bandwidth
+    const reachable = matches.filter(r => r.reachable);
+    if (reachable.length > 0) {
+      return reachable.reduce((best, r) => r.bandwidth_mbps > best.bandwidth_mbps ? r : best);
+    }
+    return matches[matches.length - 1];
   }
 
   // --- Krok 3: Podsumowanie ---
