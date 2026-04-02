@@ -1175,8 +1175,15 @@ fn detect_rdma_available(name: &str) -> bool {
     }
 }
 
-/// Pobiera adres IPv4 i maske interfejsu z sysinfo::Networks
+/// Pobiera PIERWSZY adres IPv4 i maske interfejsu z sysinfo::Networks
 fn detect_ipv4_info(name: &str, nets: &Networks) -> (String, String) {
+    let all = detect_all_ipv4_info(name, nets);
+    all.into_iter().next().unwrap_or((String::new(), String::new()))
+}
+
+/// Pobiera WSZYSTKIE adresy IPv4 interfejsu (bridge moze miec wiele adresow)
+fn detect_all_ipv4_info(name: &str, nets: &Networks) -> Vec<(String, String)> {
+    let mut result = Vec::new();
     for (iface_name, data) in nets.iter() {
         if iface_name == name {
             for net in data.ip_networks() {
@@ -1188,12 +1195,12 @@ fn detect_ipv4_info(name: &str, nets: &Networks) -> (String, String) {
                         u32::MAX << (32 - prefix)
                     };
                     let netmask = std::net::Ipv4Addr::from(mask);
-                    return (v4.to_string(), netmask.to_string());
+                    result.push((v4.to_string(), netmask.to_string()));
                 }
             }
         }
     }
-    (String::new(), String::new())
+    result
 }
 
 // Cache bramek domyslnych per interfejs (parsowane z `ip route show`)
@@ -1255,7 +1262,7 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
 
     let results: Vec<PeerNetworkInfo> = nets
         .iter()
-        .filter_map(|(name, data)| {
+        .filter_map(|(name, data)| -> Option<Vec<PeerNetworkInfo>> {
             // Pomijaj loopback i Docker bridge
             if name == "lo" || name == "lo0" || name.starts_with("docker") || name.starts_with("br-") || name.starts_with("veth") {
                 return None;
@@ -1280,7 +1287,7 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
 
             let iface_name = name.to_string();
             let link_up = detect_link_up(&iface_name);
-            let (ipv4_address, ipv4_netmask) = detect_ipv4_info(&iface_name, &nets);
+            let all_ips = detect_all_ipv4_info(&iface_name, &nets);
             let ipv4_gateway = detect_gateway(&iface_name);
             let mac_address = detect_mac_address(&iface_name);
             let interface_type = detect_interface_type(&iface_name);
@@ -1288,23 +1295,48 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
             let speed_mbps = detect_link_speed(&iface_name);
             let numa_node = detect_numa_node(&iface_name);
 
-            Some(PeerNetworkInfo {
-                name: iface_name,
-                rx_bytes: rx,
-                tx_bytes: tx,
-                rx_bytes_per_sec: rx_per_sec,
-                tx_bytes_per_sec: tx_per_sec,
-                link_up,
-                ipv4_address,
-                ipv4_netmask,
-                ipv4_gateway,
-                mac_address,
-                interface_type,
-                rdma_available,
-                speed_mbps,
-                numa_node,
-            })
+            // Jesli interfejs ma wiele IP (np. bridge), tworz osobny wpis per IP
+            if all_ips.len() <= 1 {
+                let (ipv4_address, ipv4_netmask) = all_ips.into_iter().next()
+                    .unwrap_or((String::new(), String::new()));
+                Some(vec![PeerNetworkInfo {
+                    name: iface_name,
+                    rx_bytes: rx,
+                    tx_bytes: tx,
+                    rx_bytes_per_sec: rx_per_sec,
+                    tx_bytes_per_sec: tx_per_sec,
+                    link_up,
+                    ipv4_address,
+                    ipv4_netmask,
+                    ipv4_gateway,
+                    mac_address,
+                    interface_type,
+                    rdma_available,
+                    speed_mbps,
+                    numa_node,
+                }])
+            } else {
+                Some(all_ips.into_iter().map(|(ip, mask)| {
+                    PeerNetworkInfo {
+                        name: iface_name.clone(),
+                        rx_bytes: rx,
+                        tx_bytes: tx,
+                        rx_bytes_per_sec: rx_per_sec,
+                        tx_bytes_per_sec: tx_per_sec,
+                        link_up,
+                        ipv4_address: ip,
+                        ipv4_netmask: mask,
+                        ipv4_gateway: ipv4_gateway.clone(),
+                        mac_address: mac_address.clone(),
+                        interface_type: interface_type.clone(),
+                        rdma_available,
+                        speed_mbps,
+                        numa_node,
+                    }
+                }).collect())
+            }
         })
+        .flatten()
         .collect();
 
     prev.0 = now;

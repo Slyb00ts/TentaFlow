@@ -12,6 +12,7 @@ inference-mlx = ["dep:mlx-rs", "dep:mlx-models", "dep:tokenizers"]
 dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
 inference-mlx-swift = []  # bridge do Swift MLX na iOS — implementacja w Fazie 3
 metrics-prometheus = ["dep:prometheus"]
+rdma-probe = []
 
 [dependencies]
 # Protocol (zawsze)
@@ -126,6 +127,10 @@ prometheus = { version = "0.13", optional = true }
 
 # WASM runtime — wasmtime na Desktop/Router, wasmi na Mobile (iOS/Android)
 # Target-specific dependencies ponizej
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 wasmtime = "29"
