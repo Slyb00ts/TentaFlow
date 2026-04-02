@@ -158,8 +158,8 @@ pub fn handle_remove_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> R
 // Bandwidth probe API
 // =============================================================================
 
-/// Globalny stan aktywnych probe streamow (receiver + czas utworzenia)
-static PROBE_STREAMS: LazyLock<Mutex<HashMap<String, (mpsc::Receiver<String>, std::time::Instant)>>> =
+/// Globalny stan aktywnych probe streamow (receiver + czas utworzenia + jednorazowy token SSE)
+static PROBE_STREAMS: LazyLock<Mutex<HashMap<String, (mpsc::Receiver<String>, std::time::Instant, String)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Deserialize)]
@@ -209,7 +209,7 @@ pub async fn handle_start_probe(
     {
         let mut streams = PROBE_STREAMS.lock().await;
         let now = std::time::Instant::now();
-        streams.retain(|_, (_, created)| now.duration_since(*created).as_secs() < 60);
+        streams.retain(|_, (_, created, _)| now.duration_since(*created).as_secs() < 60);
         if streams.len() >= 5 {
             return Ok((429, r#"{"error":"Za duzo aktywnych probow. Sprobuj pozniej."}"#.to_string()));
         }
@@ -227,7 +227,15 @@ pub async fn handle_start_probe(
         return Ok((400, r#"{"error":"Minimum 2 nody wymagane"}"#.to_string()));
     }
 
+    // Waliduj ze kazdy node jest znany i polaczony
+    for n in &req.nodes {
+        if !quic_mesh.is_connected(&n.node_id).await && n.node_id != quic_mesh.node_id() {
+            return Ok((400, serde_json::json!({"error": format!("Node {} nie jest polaczony", n.node_id)}).to_string()));
+        }
+    }
+
     let probe_id = uuid::Uuid::new_v4().to_string();
+    let sse_token: String = (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
 
     // Konwersja na NodeInterface
     let node_interfaces: Vec<Vec<NodeInterface>> = req.nodes.iter().map(|n| {
@@ -262,25 +270,31 @@ pub async fn handle_start_probe(
 
     {
         let mut streams = PROBE_STREAMS.lock().await;
-        streams.insert(probe_id.clone(), (rx, std::time::Instant::now()));
+        streams.insert(probe_id.clone(), (rx, std::time::Instant::now(), sse_token.clone()));
     }
 
     Ok((200, serde_json::json!({
         "probe_id": probe_id,
         "total_pairs": total,
+        "sse_token": sse_token,
     }).to_string()))
 }
 
-/// GET /api/clusters/probe/:probe_id — pobierz receiver SSE wynikow probing
-pub async fn handle_probe_stream(probe_id: &str) -> Option<mpsc::Receiver<String>> {
+/// GET /api/clusters/probe/:probe_id — pobierz receiver SSE wynikow probing (z walidacja tokenu)
+pub async fn handle_probe_stream_with_token(probe_id: &str, token: &str) -> Option<mpsc::Receiver<String>> {
     let mut streams = PROBE_STREAMS.lock().await;
-    streams.remove(probe_id).map(|(rx, _)| rx)
+    if let Some((_, _, stored_token)) = streams.get(probe_id) {
+        if stored_token == token {
+            return streams.remove(probe_id).map(|(rx, _, _)| rx);
+        }
+    }
+    None
 }
 
 /// DELETE /api/clusters/probe/:probe_id — anuluj probing
 pub async fn handle_delete_probe(probe_id: &str) -> Result<(u16, String)> {
     let mut streams = PROBE_STREAMS.lock().await;
-    drop(streams.remove(probe_id));
+    let _ = streams.remove(probe_id);
     Ok((200, r#"{"ok":true}"#.to_string()))
 }
 
