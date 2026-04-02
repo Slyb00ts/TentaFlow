@@ -512,7 +512,15 @@ async fn probe_pair(
     let client_json = serde_json::from_str::<serde_json::Value>(&client_response.output)
         .unwrap_or_default();
     let bandwidth_mbps = client_json["bandwidth_mbps"].as_f64().unwrap_or(0.0);
-    let latency_us = client_json["latency_us"].as_f64().unwrap_or(0.0) as u64;
+    let mut latency_us = client_json["latency_us"].as_f64().unwrap_or(0.0) as u64;
+    let is_rdma = client_json["rdma"].as_bool().unwrap_or(false);
+
+    // Fallback: uzyj QUIC RTT jesli probe nie zmierzyl latency
+    if latency_us == 0 {
+        let rtt_a = qm.get_peer_rtt_us(&iface_a.node_id).await;
+        let rtt_b = qm.get_peer_rtt_us(&iface_b.node_id).await;
+        latency_us = rtt_a.or(rtt_b).unwrap_or(0) / 2;
+    }
 
     let result = PairProbeResult {
         node_a: iface_a.node_id.clone(),
@@ -522,7 +530,7 @@ async fn probe_pair(
         bandwidth_mbps,
         latency_us,
         reachable: client_response.success && bandwidth_mbps > 0.0,
-        rdma: iface_a.rdma_available && iface_b.rdma_available,
+        rdma: iface_a.rdma_available && iface_b.rdma_available || is_rdma,
     };
 
     // Wyslij SSE event z postepem

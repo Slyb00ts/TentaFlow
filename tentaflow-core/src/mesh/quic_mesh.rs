@@ -255,6 +255,12 @@ impl QuicMeshManager {
         &self.node_id
     }
 
+    /// QUIC RTT do peera (smoothed, z istniejacego polaczenia)
+    pub async fn get_peer_rtt_us(&self, peer_id: &str) -> Option<u64> {
+        let conns = self.connections.read().await;
+        conns.get(peer_id).map(|c| c.connection.rtt().as_micros() as u64)
+    }
+
     /// Subskrypcja zdarzen mesh QUIC
     pub fn subscribe(&self) -> broadcast::Receiver<QuicMeshEvent> {
         self.event_tx.subscribe()
