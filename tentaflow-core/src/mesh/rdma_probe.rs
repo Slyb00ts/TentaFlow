@@ -906,44 +906,18 @@ mod linux_rdma {
         ) -> Result<RdmaProbeResult> {
             self.connect_qp(remote)?;
 
-            let mut latency_us: f64 = 0.0;
             let start = std::time::Instant::now();
             let deadline = start + std::time::Duration::from_millis(duration_ms as u64);
             let mut total_bytes: u64 = 0;
+
+            // RDMA latency jest mierzone inaczej niz TCP — tu mierzymy
+            // czas pierwszego pelnego SEND+completion (wliczajac RDMA setup overhead).
+            // Realny RDMA hardware latency (~1.7us) mierzy ib_send_lat.
+            // Nasz pomiar bedzie wyzszy bo zawiera overhead Rust + tokio + QP warmup.
+            let mut latency_us: f64 = 0.0;
             let mut first_send = true;
 
             unsafe {
-                // Pomiar latency: SEND 2 bajtow (maly ping) + poll completion
-                if first_send {
-                    let mut sge_lat: ibv_sge = std::mem::zeroed();
-                    sge_lat.addr = self.buf.as_ptr() as u64;
-                    sge_lat.length = 2;
-                    sge_lat.lkey = (*self.mr).lkey;
-
-                    let mut wr_lat: ibv_send_wr = std::mem::zeroed();
-                    wr_lat.sg_list = &mut sge_lat;
-                    wr_lat.num_sge = 1;
-                    wr_lat.opcode = IBV_WR_SEND;
-                    wr_lat.send_flags = IBV_SEND_SIGNALED;
-
-                    let lat_start = std::time::Instant::now();
-                    let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-                    if ibv_post_send(self.qp, &mut wr_lat, &mut bad_wr) == 0 {
-                        let mut wc: ibv_wc = std::mem::zeroed();
-                        loop {
-                            let n = ibv_poll_cq(self.cq, 1, &mut wc);
-                            if n > 0 {
-                                if wc.status == IBV_WC_SUCCESS {
-                                    latency_us = lat_start.elapsed().as_nanos() as f64 / 1000.0;
-                                }
-                                break;
-                            }
-                            if n < 0 { break; }
-                        }
-                    }
-                    first_send = false;
-                }
-
                 // Glowna petla: wysylaj pelne 64MB bufory
                 while std::time::Instant::now() < deadline {
                     let mut sge: ibv_sge = std::mem::zeroed();
@@ -958,6 +932,8 @@ mod linux_rdma {
                     wr.opcode = IBV_WR_SEND;
                     wr.send_flags = IBV_SEND_SIGNALED;
 
+                    let lat_start = if first_send { Some(std::time::Instant::now()) } else { None };
+
                     let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
                     let ret = ibv_post_send(self.qp, &mut wr, &mut bad_wr);
                     if ret != 0 { break; }
@@ -970,6 +946,11 @@ mod linux_rdma {
                                 return Err(anyhow!("RDMA send WC error: status={}", wc.status));
                             }
                             total_bytes += RDMA_BUF_SIZE as u64;
+                            // Latency z pierwszego SEND (wlicza QP warmup)
+                            if let Some(t) = lat_start {
+                                latency_us = t.elapsed().as_nanos() as f64 / 1000.0;
+                                first_send = false;
+                            }
                             break;
                         }
                         if n < 0 { return Err(anyhow!("ibv_poll_cq failed")); }
