@@ -352,7 +352,7 @@ const ClusterWizard = (() => {
                   if (!result) return `<td class="cell-probing">${I18n.t('clusters.probing')}</td>`;
                   if (!result.reachable) return '<td class="cell-unreachable">unreachable</td>';
                   const bw = result.bandwidth_mbps;
-                  const cls = bw > 100000 ? 'cell-fast' : bw > 5000 ? 'cell-medium' : 'cell-slow';
+                  const cls = bw > 40000 ? 'cell-fast' : bw > 5000 ? 'cell-medium' : 'cell-slow';
                   const label = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw.toFixed(0) + ' Mbps';
                   return `<td class="${cls}" data-cell-pair="${Utils.escapeAttr(rowNode.node_id + ':' + colNode.node_id)}">${label}</td>`;
                 }).join('')}
@@ -368,8 +368,12 @@ const ClusterWizard = (() => {
   function findBottleneck() {
     if (probeResults.length === 0) return null;
     const reachable = probeResults.filter(r => r.reachable);
-    if (reachable.length === 0) return null;
-    return reachable.reduce((min, r) => (!min || r.bandwidth_mbps < min.bandwidth_mbps) ? r : min, null);
+    if (reachable.length < 2) return null;
+    const min = reachable.reduce((m, r) => (!m || r.bandwidth_mbps < m.bandwidth_mbps) ? r : m, null);
+    const max = reachable.reduce((m, r) => (!m || r.bandwidth_mbps > m.bandwidth_mbps) ? r : m, null);
+    // Pokaz bottleneck tylko jesli najwolniejszy link jest < 50% najszybszego
+    if (min && max && min.bandwidth_mbps < max.bandwidth_mbps * 0.5) return min;
+    return null;
   }
 
   function renderBottleneckBar(result) {
