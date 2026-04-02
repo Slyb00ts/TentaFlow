@@ -512,7 +512,7 @@ async fn probe_pair(
     let client_json = serde_json::from_str::<serde_json::Value>(&client_response.output)
         .unwrap_or_default();
     let bandwidth_mbps = client_json["bandwidth_mbps"].as_f64().unwrap_or(0.0);
-    let latency_us = client_json["latency_us"].as_u64().unwrap_or(0);
+    let latency_us = client_json["latency_us"].as_f64().unwrap_or(0.0) as u64;
 
     let result = PairProbeResult {
         node_a: iface_a.node_id.clone(),

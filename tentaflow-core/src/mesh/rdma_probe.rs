@@ -913,14 +913,44 @@ mod linux_rdma {
             let mut first_send = true;
 
             unsafe {
+                // Pomiar latency: SEND 2 bajtow (maly ping) + poll completion
+                if first_send {
+                    let mut sge_lat: ibv_sge = std::mem::zeroed();
+                    sge_lat.addr = self.buf.as_ptr() as u64;
+                    sge_lat.length = 2;
+                    sge_lat.lkey = (*self.mr).lkey;
+
+                    let mut wr_lat: ibv_send_wr = std::mem::zeroed();
+                    wr_lat.sg_list = &mut sge_lat;
+                    wr_lat.num_sge = 1;
+                    wr_lat.opcode = IBV_WR_SEND;
+                    wr_lat.send_flags = IBV_SEND_SIGNALED;
+
+                    let lat_start = std::time::Instant::now();
+                    let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
+                    if ibv_post_send(self.qp, &mut wr_lat, &mut bad_wr) == 0 {
+                        let mut wc: ibv_wc = std::mem::zeroed();
+                        loop {
+                            let n = ibv_poll_cq(self.cq, 1, &mut wc);
+                            if n > 0 {
+                                if wc.status == IBV_WC_SUCCESS {
+                                    latency_us = lat_start.elapsed().as_nanos() as f64 / 1000.0;
+                                }
+                                break;
+                            }
+                            if n < 0 { break; }
+                        }
+                    }
+                    first_send = false;
+                }
+
+                // Glowna petla: wysylaj pelne 64MB bufory
                 while std::time::Instant::now() < deadline {
-                    // Przygotuj scatter/gather element
                     let mut sge: ibv_sge = std::mem::zeroed();
                     sge.addr = self.buf.as_ptr() as u64;
                     sge.length = RDMA_BUF_SIZE as u32;
                     sge.lkey = (*self.mr).lkey;
 
-                    // Post SEND z sygnalizacja completion
                     let mut wr: ibv_send_wr = std::mem::zeroed();
                     wr.wr_id = 0;
                     wr.sg_list = &mut sge;
@@ -928,42 +958,21 @@ mod linux_rdma {
                     wr.opcode = IBV_WR_SEND;
                     wr.send_flags = IBV_SEND_SIGNALED;
 
-                    // Pomiar latencji pierwszego SEND + poll_cq round-trip
-                    let lat_start = if first_send {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-
                     let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
                     let ret = ibv_post_send(self.qp, &mut wr, &mut bad_wr);
-                    if ret != 0 {
-                        break;
-                    }
+                    if ret != 0 { break; }
 
-                    // Busy-poll completion queue (RDMA nie uzywa sleepow)
                     let mut wc: ibv_wc = std::mem::zeroed();
                     loop {
                         let n = ibv_poll_cq(self.cq, 1, &mut wc);
                         if n > 0 {
                             if wc.status != IBV_WC_SUCCESS {
-                                return Err(anyhow!(
-                                    "RDMA send WC error: status={}",
-                                    wc.status
-                                ));
+                                return Err(anyhow!("RDMA send WC error: status={}", wc.status));
                             }
                             total_bytes += RDMA_BUF_SIZE as u64;
-
-                            // Zapisz latencje pierwszego SEND+completion
-                            if let Some(t) = lat_start {
-                                latency_us = t.elapsed().as_nanos() as f64 / 1000.0;
-                                first_send = false;
-                            }
                             break;
                         }
-                        if n < 0 {
-                            return Err(anyhow!("ibv_poll_cq failed"));
-                        }
+                        if n < 0 { return Err(anyhow!("ibv_poll_cq failed")); }
                     }
                 }
             }
