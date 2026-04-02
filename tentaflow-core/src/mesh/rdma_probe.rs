@@ -15,6 +15,7 @@ pub struct RdmaProbeResult {
     pub bytes_transferred: u64,
     pub duration_ms: u64,
     pub bandwidth_mbps: f64,
+    pub latency_us: f64,
     pub rdma_device: String,
 }
 
@@ -425,6 +426,7 @@ mod macos_rdma {
             bytes_transferred,
             duration_ms,
             bandwidth_mbps,
+            latency_us: 0.0,
             rdma_device: "thunderbolt5-nw".to_string(),
         });
     }
@@ -547,6 +549,7 @@ mod linux_rdma {
                     bytes_transferred: 0,
                     duration_ms: 0,
                     bandwidth_mbps: 0.0,
+                    latency_us: 0.0,
                     rdma_device: device,
                 }),
             }
@@ -903,9 +906,11 @@ mod linux_rdma {
         ) -> Result<RdmaProbeResult> {
             self.connect_qp(remote)?;
 
+            let mut latency_us: f64 = 0.0;
             let start = std::time::Instant::now();
             let deadline = start + std::time::Duration::from_millis(duration_ms as u64);
             let mut total_bytes: u64 = 0;
+            let mut first_send = true;
 
             unsafe {
                 while std::time::Instant::now() < deadline {
@@ -922,6 +927,13 @@ mod linux_rdma {
                     wr.num_sge = 1;
                     wr.opcode = IBV_WR_SEND;
                     wr.send_flags = IBV_SEND_SIGNALED;
+
+                    // Pomiar latencji pierwszego SEND + poll_cq round-trip
+                    let lat_start = if first_send {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
 
                     let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
                     let ret = ibv_post_send(self.qp, &mut wr, &mut bad_wr);
@@ -941,6 +953,12 @@ mod linux_rdma {
                                 ));
                             }
                             total_bytes += RDMA_BUF_SIZE as u64;
+
+                            // Zapisz latencje pierwszego SEND+completion
+                            if let Some(t) = lat_start {
+                                latency_us = t.elapsed().as_nanos() as f64 / 1000.0;
+                                first_send = false;
+                            }
                             break;
                         }
                         if n < 0 {
@@ -961,6 +979,7 @@ mod linux_rdma {
                 bytes_transferred: total_bytes,
                 duration_ms: elapsed,
                 bandwidth_mbps,
+                latency_us,
                 rdma_device: self.device_name.clone(),
             })
         }
@@ -1039,6 +1058,7 @@ mod linux_rdma {
                 bytes_transferred: total_bytes,
                 duration_ms: elapsed,
                 bandwidth_mbps,
+                latency_us: 0.0,
                 rdma_device: self.device_name.clone(),
             })
         }

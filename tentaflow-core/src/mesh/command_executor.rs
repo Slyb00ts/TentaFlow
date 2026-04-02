@@ -217,6 +217,7 @@ impl MeshCommandExecutor {
                                                 "bandwidth_mbps": result.bandwidth_mbps,
                                                 "bytes_transferred": result.bytes_transferred,
                                                 "duration_ms": result.duration_ms,
+                                                "latency_us": result.latency_us,
                                                 "streams_completed": 1,
                                                 "rdma": true,
                                             }).to_string(),
