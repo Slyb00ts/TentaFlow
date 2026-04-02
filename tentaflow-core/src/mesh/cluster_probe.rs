@@ -106,8 +106,34 @@ pub fn filter_reachable_pairs(
 // Strategia probing — najszybszy interfejs per para
 // =============================================================================
 
+/// Dla kazdej pary nodow posortuj interfejsy od najszybszego.
+/// Zwraca HashMap: (node_a, node_b) -> Vec<(iface_a, iface_b)> posortowane desc.
+pub fn rank_pairs_by_speed(
+    reachable_pairs: &[(NodeInterface, NodeInterface)],
+) -> HashMap<(String, String), Vec<(NodeInterface, NodeInterface)>> {
+    let mut grouped: HashMap<(String, String), Vec<(NodeInterface, NodeInterface, u64)>> = HashMap::new();
+
+    for (a, b) in reachable_pairs {
+        let key = if a.node_id < b.node_id {
+            (a.node_id.clone(), b.node_id.clone())
+        } else {
+            (b.node_id.clone(), a.node_id.clone())
+        };
+
+        let speed = std::cmp::min(a.speed_mbps, b.speed_mbps);
+        grouped.entry(key).or_default().push((a.clone(), b.clone(), speed));
+    }
+
+    let mut result = HashMap::new();
+    for (key, mut pairs) in grouped {
+        pairs.sort_by(|a, b| b.2.cmp(&a.2));
+        result.insert(key, pairs.into_iter().map(|(a, b, _)| (a, b)).collect());
+    }
+    result
+}
+
 /// Dla kazdej pary nodow wybierz najszybszy interfejs (wg sysfs speed_mbps).
-/// Probuj tylko najszybsza kombinacje per node-pair.
+/// Probuj tylko najszybsza kombinacje per node-pair. Uzywane w testach.
 pub fn select_fastest_per_pair(
     reachable_pairs: &[(NodeInterface, NodeInterface)],
 ) -> Vec<(NodeInterface, NodeInterface)> {
