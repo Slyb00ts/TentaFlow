@@ -314,15 +314,18 @@ const ClusterWizard = (() => {
           const bw = r.reachable ? r.bandwidth_mbps : 0;
           const bwLabel = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw > 0 ? bw.toFixed(0) + ' Mbps' : 'unreachable';
           const bwColor = bw > 40000 ? 'var(--color-success)' : bw > 0 ? 'var(--color-warning)' : 'var(--color-text-muted)';
+          const lat = r.latency_us || 0;
+          const latLabel = lat > 0 ? (lat >= 1000 ? (lat / 1000).toFixed(1) + ' ms' : lat + ' \u00B5s') : '';
 
           pairRows.push(`
-            <div class="interface-row" style="grid-template-columns: 1fr auto auto;">
+            <div class="interface-row" style="grid-template-columns: 1fr auto auto auto auto;">
               <div style="font-size:var(--font-size-sm);">
                 ${Utils.escapeHtml(hostA)} <span style="color:var(--color-text-muted);">${Utils.escapeHtml(r.interface_a || '?')}</span>
                 \u2194
                 ${Utils.escapeHtml(hostB)} <span style="color:var(--color-text-muted);">${Utils.escapeHtml(r.interface_b || '?')}</span>
               </div>
               <div style="font-weight:600;font-size:var(--font-size-sm);color:${bwColor};">${bwLabel}</div>
+              <div style="font-size:var(--font-size-xs);color:var(--color-text-muted);">${latLabel}</div>
               <div class="interface-badges">
                 ${renderInterfaceBadges((nodeA.network_interfaces || []).find(x => x.name === r.interface_a))}
               </div>
@@ -410,13 +413,19 @@ const ClusterWizard = (() => {
                   const best = findProbeResult(rowNode.node_id, colNode.node_id);
                   if (!best || !best.reachable) return '<td class="cell-unreachable">unreachable</td>';
                   const bw = best.bandwidth_mbps;
+                  const lat = best.latency_us || 0;
                   const cls = bw > 40000 ? 'cell-fast' : bw > 5000 ? 'cell-medium' : 'cell-slow';
-                  const label = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw.toFixed(0) + ' Mbps';
-                  const tooltip = allResults.filter(r => r.reachable).map(r => {
-                    const rl = r.bandwidth_mbps >= 1000 ? (r.bandwidth_mbps / 1000).toFixed(1) + ' Gbps' : r.bandwidth_mbps.toFixed(0) + ' Mbps';
-                    return `${r.interface_a} ↔ ${r.interface_b}: ${rl}`;
+                  const bwLabel = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw.toFixed(0) + ' Mbps';
+                  const latLabel = lat > 0 ? (lat >= 1000 ? (lat / 1000).toFixed(1) + 'ms' : lat + 'μs') : '';
+                  const tooltip = allResults.map(r => {
+                    const rl = r.reachable ? (r.bandwidth_mbps >= 1000 ? (r.bandwidth_mbps / 1000).toFixed(1) + ' Gbps' : r.bandwidth_mbps.toFixed(0) + ' Mbps') : 'unreachable';
+                    const ll = r.latency_us ? ` (${r.latency_us}μs)` : '';
+                    return `${r.interface_a} ↔ ${r.interface_b}: ${rl}${ll}`;
                   }).join('&#10;');
-                  return `<td class="${cls}" title="${tooltip}" data-cell-pair="${Utils.escapeAttr(rowNode.node_id + ':' + colNode.node_id)}">${label}</td>`;
+                  return `<td class="${cls}" title="${tooltip}" data-cell-pair="${Utils.escapeAttr(rowNode.node_id + ':' + colNode.node_id)}">
+                    <div>${bwLabel}</div>
+                    ${latLabel ? `<div style="font-size:0.65rem;font-weight:400;opacity:0.7;">${latLabel}</div>` : ''}
+                  </td>`;
                 }).join('')}
               </tr>
             `).join('')}
