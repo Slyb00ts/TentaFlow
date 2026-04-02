@@ -388,8 +388,15 @@ async fn probe_pair(
 ) -> Result<PairProbeResult> {
     use tentaflow_protocol::mesh::MeshCommandType;
 
-    tracing::info!("Probe para: {} ({}) <-> {} ({})",
-        iface_a.node_id, iface_a.name, iface_b.node_id, iface_b.name);
+    // Dobierz ilosc streamow na podstawie predkosci linku
+    let link_speed = std::cmp::min(iface_a.speed_mbps, iface_b.speed_mbps);
+    let num_streams: u8 = if link_speed >= 100000 { 16 }      // 100G+ = 16 streamow
+        else if link_speed >= 10000 { 8 }                       // 10G = 8 streamow
+        else if link_speed >= 1000 { 2 }                        // 1G = 2 streamy
+        else { 1 };                                             // <1G = 1 stream
+
+    tracing::info!("Probe para: {} ({}) <-> {} ({}) streams={} link_speed={}",
+        iface_a.node_id, iface_a.name, iface_b.node_id, iface_b.name, num_streams, link_speed);
 
     // Wyslij BandwidthProbe{mode:server} do node_b
     let server_cmd = MeshCommandType::BandwidthProbe {
@@ -400,14 +407,14 @@ async fn probe_pair(
         duration_ms: 2000,
         mode: "server".to_string(),
         nonce: nonce.to_vec(),
-        num_streams: 16,
+        num_streams,
     };
 
     let local_node_id_srv = qm.node_id().to_string();
     let server_response = if iface_b.node_id == local_node_id_srv {
         tracing::info!("  Serwer jest lokalny, uruchamiam probe server bezposrednio na {}", iface_b.ip);
         match crate::mesh::bandwidth_probe::start_probe_server(
-            &iface_b.ip, nonce, 16, 2000,
+            &iface_b.ip, nonce, num_streams, 2000,
         ).await {
             Ok((port, handle)) => {
                 tokio::spawn(async move { let _ = handle.await; });
@@ -463,7 +470,7 @@ async fn probe_pair(
         duration_ms: 2000,
         mode: "client".to_string(),
         nonce: nonce.to_vec(),
-        num_streams: 16,
+        num_streams,
     };
 
     // Jesli klient jest lokalnym nodem, uruchom probe bezposrednio (nie przez MeshCommand)
@@ -471,7 +478,7 @@ async fn probe_pair(
     let client_response = if iface_a.node_id == local_node_id {
         tracing::info!("  Klient jest lokalny, uruchamiam probe bezposrednio -> {}:{}", iface_b.ip, port);
         match crate::mesh::bandwidth_probe::start_probe_client(
-            &iface_b.ip, port, &iface_a.name, nonce, 16, 2000,
+            &iface_b.ip, port, &iface_a.name, nonce, num_streams, 2000,
         ).await {
             Ok(result) => {
                 let output = serde_json::json!({
