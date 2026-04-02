@@ -260,40 +260,48 @@ const ClusterWizard = (() => {
     `;
   }
 
-  // Selektory interfejsow — per-pair (kazda para moze uzywac innego interfejsu)
+  // Selektory interfejsow — per-pair, WSZYSTKIE przetestowane interfejsy
   function renderInterfaceSelectors(locked) {
-    // Generuj per-pair: ktory interfejs jest uzywany dla kazdej pary
     const pairRows = [];
     for (let i = 0; i < selectedNodes.length; i++) {
       for (let j = i + 1; j < selectedNodes.length; j++) {
         const nodeA = selectedNodes[i];
         const nodeB = selectedNodes[j];
-        const result = findProbeResult(nodeA.node_id, nodeB.node_id);
-
-        const ifaceA = result ? result.interface_a : '';
-        const ifaceB = result ? result.interface_b : '';
-        const bw = result && result.reachable ? result.bandwidth_mbps : 0;
-        const bwLabel = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw > 0 ? bw.toFixed(0) + ' Mbps' : '';
+        const allResults = findAllProbeResults(nodeA.node_id, nodeB.node_id);
         const hostA = nodeA.hostname || nodeA.node_id;
         const hostB = nodeB.hostname || nodeB.node_id;
 
-        const ifaceAData = (nodeA.network_interfaces || []).find(i => i.name === ifaceA);
-        const ifaceBData = (nodeB.network_interfaces || []).find(i => i.name === ifaceB);
+        if (allResults.length === 0) {
+          pairRows.push(`
+            <div class="interface-row" style="grid-template-columns: 1fr auto;">
+              <div class="interface-hostname">${Utils.escapeHtml(hostA)} \u2194 ${Utils.escapeHtml(hostB)}</div>
+              <div style="color:var(--color-text-muted);font-size:var(--font-size-sm);">${I18n.t('clusters.probing')}</div>
+            </div>
+          `);
+          continue;
+        }
 
-        pairRows.push(`
-          <div class="interface-row" style="grid-template-columns: 1fr auto auto auto;">
-            <div class="interface-hostname">${Utils.escapeHtml(hostA)} \u2194 ${Utils.escapeHtml(hostB)}</div>
-            <div style="font-size:var(--font-size-sm);color:var(--color-text-secondary);">
-              ${ifaceA ? Utils.escapeHtml(ifaceA) : '...'} \u2194 ${ifaceB ? Utils.escapeHtml(ifaceB) : '...'}
+        // Pokaz kazdy przetestowany interfejs osobno
+        for (const r of allResults) {
+          const bw = r.reachable ? r.bandwidth_mbps : 0;
+          const bwLabel = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw > 0 ? bw.toFixed(0) + ' Mbps' : 'unreachable';
+          const bwColor = bw > 40000 ? 'var(--color-success)' : bw > 0 ? 'var(--color-warning)' : 'var(--color-text-muted)';
+
+          const ifaceAData = (nodeA.network_interfaces || []).find(x => x.name === r.interface_a);
+
+          pairRows.push(`
+            <div class="interface-row" style="grid-template-columns: 1fr auto auto auto;">
+              <div class="interface-hostname">${Utils.escapeHtml(hostA)} \u2194 ${Utils.escapeHtml(hostB)}</div>
+              <div style="font-size:var(--font-size-sm);color:var(--color-text-secondary);">
+                ${Utils.escapeHtml(r.interface_a || '?')} \u2194 ${Utils.escapeHtml(r.interface_b || '?')}
+              </div>
+              <div style="font-weight:600;font-size:var(--font-size-sm);color:${bwColor};">${bwLabel}</div>
+              <div class="interface-badges">
+                ${ifaceAData ? renderInterfaceBadges(ifaceAData) : ''}
+              </div>
             </div>
-            <div style="font-weight:600;font-size:var(--font-size-sm);${bw > 40000 ? 'color:var(--color-success);' : bw > 0 ? 'color:var(--color-warning);' : 'color:var(--color-text-muted);'}">
-              ${bwLabel || (result ? 'unreachable' : I18n.t('clusters.probing'))}
-            </div>
-            <div class="interface-badges">
-              ${ifaceAData ? renderInterfaceBadges(ifaceAData) : ''}
-            </div>
-          </div>
-        `);
+          `);
+        }
       }
     }
 
@@ -368,13 +376,18 @@ const ClusterWizard = (() => {
                 <th>${Utils.escapeHtml(rowNode.hostname || rowNode.node_id)}</th>
                 ${selectedNodes.map((colNode, j) => {
                   if (i === j) return '<td class="cell-self">&mdash;</td>';
-                  const result = findProbeResult(rowNode.node_id, colNode.node_id);
-                  if (!result) return `<td class="cell-probing">${I18n.t('clusters.probing')}</td>`;
-                  if (!result.reachable) return '<td class="cell-unreachable">unreachable</td>';
-                  const bw = result.bandwidth_mbps;
+                  const allResults = findAllProbeResults(rowNode.node_id, colNode.node_id);
+                  if (allResults.length === 0) return `<td class="cell-probing">${I18n.t('clusters.probing')}</td>`;
+                  const best = findProbeResult(rowNode.node_id, colNode.node_id);
+                  if (!best || !best.reachable) return '<td class="cell-unreachable">unreachable</td>';
+                  const bw = best.bandwidth_mbps;
                   const cls = bw > 40000 ? 'cell-fast' : bw > 5000 ? 'cell-medium' : 'cell-slow';
                   const label = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw.toFixed(0) + ' Mbps';
-                  return `<td class="${cls}" data-cell-pair="${Utils.escapeAttr(rowNode.node_id + ':' + colNode.node_id)}">${label}</td>`;
+                  const tooltip = allResults.filter(r => r.reachable).map(r => {
+                    const rl = r.bandwidth_mbps >= 1000 ? (r.bandwidth_mbps / 1000).toFixed(1) + ' Gbps' : r.bandwidth_mbps.toFixed(0) + ' Mbps';
+                    return `${r.interface_a} ↔ ${r.interface_b}: ${rl}`;
+                  }).join('&#10;');
+                  return `<td class="${cls}" title="${tooltip}" data-cell-pair="${Utils.escapeAttr(rowNode.node_id + ':' + colNode.node_id)}">${label}</td>`;
                 }).join('')}
               </tr>
             `).join('')}
@@ -412,6 +425,14 @@ const ClusterWizard = (() => {
         <span class="detail">${detail}</span>
       </div>
     `;
+  }
+
+  // Znajdz WSZYSTKIE wyniki probing dla pary nodow
+  function findAllProbeResults(nodeA, nodeB) {
+    return probeResults.filter(r =>
+      (r.node_a === nodeA && r.node_b === nodeB) ||
+      (r.node_a === nodeB && r.node_b === nodeA)
+    );
   }
 
   // Znajdz NAJLEPSZY wynik probing dla pary (reachable > unreachable, wyzszy bandwidth)
