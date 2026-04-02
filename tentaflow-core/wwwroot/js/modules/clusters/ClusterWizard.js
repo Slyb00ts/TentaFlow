@@ -18,11 +18,11 @@ const ClusterWizard = (() => {
   let probeEventSource = null;
   let isDetecting = false;
 
-  // Zaokraglij GB RAM do najblizszej standardowej wartosci (8,16,32,64,128,256,512,1024)
+  // Zaokraglij GB do najblizszej standardowej wartosci
   function roundToNearestStick(gb) {
-    const sticks = [8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
+    const sticks = [4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
     for (const s of sticks) {
-      if (gb <= s * 0.97) return s;
+      if (gb <= s * 1.05) return s;
     }
     return Math.round(gb);
   }
