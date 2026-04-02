@@ -252,13 +252,19 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
         bottleneck = 0.0;
     }
 
+    // Sprawdz czy sa pary unreachable
+    let has_unreachable = probe_results.iter().any(|r| !r.reachable);
+    let all_unreachable = probe_results.iter().all(|r| !r.reachable);
+
     // Message jako kod — frontend tlumacza
-    let message = if is_mixed {
-        "mixed".to_string()
-    } else if bottleneck > 0.0 {
-        "optimal".to_string()
-    } else {
+    let message = if all_unreachable || probe_results.is_empty() {
         "no_connections".to_string()
+    } else if has_unreachable {
+        "partial".to_string()
+    } else if is_mixed {
+        "mixed".to_string()
+    } else {
+        "optimal".to_string()
     };
 
     DetectionResult {
