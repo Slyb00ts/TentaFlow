@@ -55,7 +55,7 @@ pub async fn start_probe_server(
     socket.set_send_buffer_size(64 * 1024 * 1024)?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
-    let listener = socket.listen(num_streams as u32 + 1)?;
+    let listener = socket.listen(num_streams as u32 + 2)?; // +2: 1 latency + 1 zapas
     let port = listener.local_addr()?.port();
 
     let nonce_copy = *nonce;
@@ -87,27 +87,40 @@ async fn run_server(
     listener: TcpListener,
     nonce: &[u8; NONCE_SIZE],
     num_streams: u8,
-    duration_ms: u32,
+    _duration_ms: u32,
 ) -> Result<ProbeResult> {
+    let deadline = Instant::now() + Duration::from_secs(SERVER_TIMEOUT_SECS);
+
+    // 1. Latency: akceptuj PIERWSZE polaczenie — ping-pong
+    let mut latency_us: u64 = 0;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if let Ok(Ok((mut lat_stream, _))) = timeout(remaining, listener.accept()).await {
+        let mut nonce_buf = [0u8; NONCE_SIZE];
+        if lat_stream.read_exact(&mut nonce_buf).await.is_ok() && nonce_buf == *nonce {
+            let mut ping = [0u8; 1];
+            if lat_stream.read_exact(&mut ping).await.is_ok() && ping[0] == LATENCY_PING {
+                lat_stream.write_all(&[LATENCY_PONG]).await.ok();
+                lat_stream.flush().await.ok();
+                // Czekaj az klient zamknie latency stream
+                let mut discard = [0u8; 1];
+                let _ = lat_stream.read(&mut discard).await;
+            }
+        }
+    }
+
+    // 2. Dane: akceptuj num_streams polaczen na dane
     let start = Instant::now();
-    // Dodatkowe 3s na setup polaczen
-    let deadline = start + Duration::from_millis(duration_ms as u64 + 3000);
     let mut handles = Vec::new();
-    let mut first = true;
 
     for _ in 0..num_streams {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
+        if remaining.is_zero() { break; }
 
         match timeout(remaining, listener.accept()).await {
             Ok(Ok((stream, _addr))) => {
                 let expected_nonce = *nonce;
-                let is_first = first;
-                first = false;
                 handles.push(tokio::spawn(async move {
-                    handle_stream(stream, &expected_nonce, is_first).await
+                    handle_data_stream(stream, &expected_nonce).await
                 }));
             }
             _ => break,
@@ -135,35 +148,25 @@ async fn run_server(
         bytes_transferred: total_bytes,
         duration_ms: elapsed,
         bandwidth_mbps,
-        latency_us: 0,
+        latency_us,
         streams_completed: completed,
         streams_total: num_streams,
     })
 }
 
-async fn handle_stream(
+/// Obsluga streamu danych (bez latency handshake)
+async fn handle_data_stream(
     mut stream: TcpStream,
     expected_nonce: &[u8; NONCE_SIZE],
-    is_first_stream: bool,
 ) -> Result<u64> {
-    // Weryfikuj nonce (pierwsze 32 bajty)
+    // Weryfikuj nonce
     let mut nonce_buf = [0u8; NONCE_SIZE];
     stream.read_exact(&mut nonce_buf).await?;
     if nonce_buf != *expected_nonce {
         return Err(anyhow!("Niepoprawny nonce"));
     }
 
-    // Latency ping-pong na pierwszym strumieniu
-    if is_first_stream {
-        let mut ping = [0u8; 1];
-        stream.read_exact(&mut ping).await?;
-        if ping[0] == LATENCY_PING {
-            stream.write_all(&[LATENCY_PONG]).await?;
-            stream.flush().await?;
-        }
-    }
-
-    // Odbieraj dane az klient zamknie polaczenie
+    // Odbieraj dane
     let mut buf = vec![0u8; CHUNK_SIZE];
     let mut total: u64 = 0;
     loop {
@@ -204,33 +207,32 @@ async fn run_client(
     num_streams: u8,
     duration_ms: u32,
 ) -> Result<ProbeResult> {
+    // 1. Latency: ODDZIELNE polaczenie PRZED data streamami (sekwencyjnie)
+    let latency_us = measure_latency(addr, nonce).await.unwrap_or(0);
+
+    // 2. Data streamy — rownolegle
     let mut handles = Vec::new();
 
-    for i in 0..num_streams {
+    for _i in 0..num_streams {
         let nonce_copy = *nonce;
         let iface = bind_interface.to_string();
         let target = addr;
         let dur_ms = duration_ms;
-        let is_first = i == 0;
 
         handles.push(tokio::spawn(async move {
-            send_stream(target, &iface, &nonce_copy, dur_ms, is_first).await
+            send_data_stream(target, &iface, &nonce_copy, dur_ms).await
         }));
     }
 
     let mut total_bytes: u64 = 0;
     let mut total_elapsed = Duration::ZERO;
     let mut completed: u8 = 0;
-    let mut latency_us: u64 = 0;
 
     for h in handles {
         if let Ok(Ok(result)) = h.await {
             total_bytes += result.bytes_sent;
             if result.elapsed > total_elapsed {
                 total_elapsed = result.elapsed;
-            }
-            if result.latency_us > 0 {
-                latency_us = result.latency_us;
             }
             completed += 1;
         }
@@ -253,18 +255,35 @@ async fn run_client(
     })
 }
 
-async fn send_stream(
+/// Pomiar latency jako ODDZIELNE polaczenie (przed data streamami)
+async fn measure_latency(addr: SocketAddr, nonce: &[u8; NONCE_SIZE]) -> Result<u64> {
+    let mut stream = TcpStream::connect(addr).await?;
+    // Wyslij nonce
+    stream.write_all(nonce).await?;
+    // Ping
+    let ping_start = Instant::now();
+    stream.write_all(&[LATENCY_PING]).await?;
+    stream.flush().await?;
+    // Czekaj na pong
+    let mut pong = [0u8; 1];
+    stream.read_exact(&mut pong).await?;
+    let rtt = ping_start.elapsed().as_micros() as u64;
+    // Zamknij latency stream
+    drop(stream);
+    Ok(rtt / 2)
+}
+
+/// Data stream — wysyla dane przez duration_ms (bez latency handshake)
+async fn send_data_stream(
     addr: SocketAddr,
     bind_interface: &str,
     nonce: &[u8; NONCE_SIZE],
     duration_ms: u32,
-    is_first_stream: bool,
 ) -> Result<StreamResult> {
     let socket = TcpSocket::new_v4()?;
     socket.set_send_buffer_size(64 * 1024 * 1024)?;
     socket.set_recv_buffer_size(64 * 1024 * 1024)?;
 
-    // Bindowanie do interfejsu sieciowego (tylko Linux — SO_BINDTODEVICE)
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -300,23 +319,10 @@ async fn send_stream(
     };
     stream.set_nodelay(true)?;
 
-    // Wyslij nonce jako autoryzacje
+    // Wyslij nonce
     stream.write_all(nonce).await?;
 
-    // Pomiar latency na pierwszym strumieniu (ping-pong)
-    let mut latency_us: u64 = 0;
-    if is_first_stream {
-        let ping_start = Instant::now();
-        stream.write_all(&[LATENCY_PING]).await?;
-        stream.flush().await?;
-        let mut pong = [0u8; 1];
-        stream.read_exact(&mut pong).await?;
-        if pong[0] == LATENCY_PONG {
-            latency_us = ping_start.elapsed().as_micros() as u64 / 2;
-        }
-    }
-
-    // Wysylaj dane az minie deadline
+    // Wysylaj dane
     let data = vec![0xABu8; CHUNK_SIZE];
     let start = Instant::now();
     let deadline = start + Duration::from_millis(duration_ms as u64);
@@ -329,7 +335,7 @@ async fn send_stream(
         }
     }
 
-    // Flush i shutdown — czekamy az TCP dostarczy wszystkie buforowane dane
+    // Flush i shutdown — czekaj az TCP dostarczy dane
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
 
@@ -338,6 +344,6 @@ async fn send_stream(
     Ok(StreamResult {
         bytes_sent: total,
         elapsed,
-        latency_us,
+        latency_us: 0,
     })
 }
