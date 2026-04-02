@@ -12,8 +12,8 @@ use anyhow::{Result, anyhow};
 
 const NONCE_SIZE: usize = 32;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-const SERVER_TIMEOUT_SECS: u64 = 15;
-const CLIENT_TIMEOUT_SECS: u64 = 10;
+const SERVER_TIMEOUT_SECS: u64 = 30;
+const CLIENT_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
