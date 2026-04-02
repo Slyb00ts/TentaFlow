@@ -224,7 +224,7 @@ const ClusterWizard = (() => {
       : detectionResult
         ? `<div class="probe-banner ${detectionResult.is_mixed ? 'probe-banner-warning' : 'probe-banner-success'}">
              <span>${detectionResult.is_mixed ? '&#9888;' : '&#10003;'}</span>
-             <span>${Utils.escapeHtml(detectionResult.message)}</span>
+             <span>${formatDetectionMessage(detectionResult)}</span>
            </div>`
         : '';
 
@@ -504,6 +504,19 @@ const ClusterWizard = (() => {
   function getHostname(nodeId) {
     const node = selectedNodes.find(n => n.node_id === nodeId);
     return node?.hostname || nodeId;
+  }
+
+  // Formatuj wiadomosc detekcji z tlumaczeniem
+  function formatDetectionMessage(det) {
+    const bw = det.bottleneck_mbps || 0;
+    const bwLabel = bw >= 1000 ? (bw / 1000).toFixed(1) + ' Gbps' : bw.toFixed(0) + ' Mbps';
+    if (det.message === 'mixed') {
+      return I18n.t('clusters.detection_mixed').replace('{speed}', bwLabel);
+    } else if (det.message === 'optimal') {
+      return I18n.t('clusters.detection_optimal').replace('{speed}', bwLabel);
+    } else {
+      return I18n.t('clusters.detection_no_connections');
+    }
   }
 
   // --- Probe SSE ---

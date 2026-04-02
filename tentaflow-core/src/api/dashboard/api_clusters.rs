@@ -345,8 +345,30 @@ async fn probe_pair(
         num_streams: 16,
     };
 
-    tracing::info!("  Wysylam server cmd do {}", iface_b.node_id);
-    let server_response = qm.send_command_and_wait(&iface_b.node_id, server_cmd, 10).await?;
+    let local_node_id_srv = qm.node_id().to_string();
+    let server_response = if iface_b.node_id == local_node_id_srv {
+        tracing::info!("  Serwer jest lokalny, uruchamiam probe server bezposrednio na {}", iface_b.ip);
+        match crate::mesh::bandwidth_probe::start_probe_server(
+            &iface_b.ip, nonce, 16, 2000,
+        ).await {
+            Ok((port, handle)) => {
+                tokio::spawn(async move { let _ = handle.await; });
+                crate::mesh::quic_mesh::CommandWaitResponse {
+                    success: true,
+                    output: serde_json::json!({"port": port}).to_string(),
+                    error: None,
+                }
+            }
+            Err(e) => crate::mesh::quic_mesh::CommandWaitResponse {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            },
+        }
+    } else {
+        tracing::info!("  Wysylam server cmd do {}", iface_b.node_id);
+        qm.send_command_and_wait(&iface_b.node_id, server_cmd, 10).await?
+    };
     tracing::info!("  Server response: success={} output={}", server_response.success, server_response.output);
 
     if !server_response.success {
@@ -386,8 +408,37 @@ async fn probe_pair(
         num_streams: 16,
     };
 
-    tracing::info!("  Wysylam client cmd do {} -> {}:{}", iface_a.node_id, iface_b.ip, port);
-    let client_response = qm.send_command_and_wait(&iface_a.node_id, client_cmd, 10).await?;
+    // Jesli klient jest lokalnym nodem, uruchom probe bezposrednio (nie przez MeshCommand)
+    let local_node_id = qm.node_id().to_string();
+    let client_response = if iface_a.node_id == local_node_id {
+        tracing::info!("  Klient jest lokalny, uruchamiam probe bezposrednio -> {}:{}", iface_b.ip, port);
+        match crate::mesh::bandwidth_probe::start_probe_client(
+            &iface_b.ip, port, &iface_a.name, nonce, 16, 2000,
+        ).await {
+            Ok(result) => {
+                let output = serde_json::json!({
+                    "bandwidth_mbps": result.bandwidth_mbps,
+                    "bytes_transferred": result.bytes_transferred,
+                    "duration_ms": result.duration_ms,
+                    "latency_us": result.latency_us,
+                    "streams_completed": result.streams_completed,
+                }).to_string();
+                crate::mesh::quic_mesh::CommandWaitResponse {
+                    success: true,
+                    output,
+                    error: None,
+                }
+            }
+            Err(e) => crate::mesh::quic_mesh::CommandWaitResponse {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            },
+        }
+    } else {
+        tracing::info!("  Wysylam client cmd do {} -> {}:{}", iface_a.node_id, iface_b.ip, port);
+        qm.send_command_and_wait(&iface_a.node_id, client_cmd, 10).await?
+    };
     tracing::info!("  Client response: success={} output={}", client_response.success, client_response.output);
 
     let client_json = serde_json::from_str::<serde_json::Value>(&client_response.output)
