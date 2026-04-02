@@ -457,11 +457,14 @@ async fn probe_pair(
                     error: None,
                 }
             }
-            Err(e) => crate::mesh::quic_mesh::CommandWaitResponse {
-                success: false,
-                output: String::new(),
-                error: Some(e.to_string()),
-            },
+            Err(e) => {
+                tracing::error!("  Lokalny probe client failed: {}", e);
+                crate::mesh::quic_mesh::CommandWaitResponse {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                }
+            }
         }
     } else {
         tracing::info!("  Wysylam client cmd do {} -> {}:{}", iface_a.node_id, iface_b.ip, port);
