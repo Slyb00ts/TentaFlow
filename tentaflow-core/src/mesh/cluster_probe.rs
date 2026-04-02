@@ -247,7 +247,6 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
         }
     }
 
-    let is_mixed = interface_types.len() > 1;
     if bottleneck == f64::MAX {
         bottleneck = 0.0;
     }
@@ -264,22 +263,19 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
         if r.reachable { *entry = true; }
     }
     let all_node_pairs_reachable = !node_pairs_reachable.is_empty() && node_pairs_reachable.values().all(|v| *v);
-    let has_unreachable_node_pair = node_pairs_reachable.values().any(|v| !*v);
-    let all_unreachable = node_pairs_reachable.is_empty() || node_pairs_reachable.values().all(|v| !*v);
 
-    // Message jako kod — frontend tlumacza
-    // "optimal" = kazda para nodow ma reachable link
-    // "partial" = nie kazda para nodow ma reachable link
-    // "mixed" = rozne typy interfejsow (rdma + ethernet)
-    let message = if all_unreachable || probe_results.is_empty() {
+    // "optimal" = kazda para nodow ma reachable link (najszybsza wspolna konfiguracja)
+    // "partial" = jakas para nodow nie ma reachable linku
+    // "no_connections" = zaden node nie widzi drugiego
+    let message = if probe_results.is_empty() || node_pairs_reachable.values().all(|v| !*v) {
         "no_connections".to_string()
-    } else if has_unreachable_node_pair {
-        "partial".to_string()
-    } else if is_mixed {
-        "mixed".to_string()
-    } else {
+    } else if all_node_pairs_reachable {
         "optimal".to_string()
+    } else {
+        "partial".to_string()
     };
+
+    let is_mixed = false; // Nie uzywamy mixed — jest jedna konfiguracja
 
     DetectionResult {
         assignments,
