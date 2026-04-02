@@ -6,7 +6,7 @@
 use crate::db::{self, DbPool};
 use crate::mesh::cluster_probe::{
     NodeInterface, PairProbeResult, DetectionResult,
-    filter_reachable_pairs, select_fastest_per_pair, optimal_assignment,
+    filter_reachable_pairs, rank_pairs_by_speed, optimal_assignment,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -217,13 +217,13 @@ pub async fn handle_start_probe(
         }).collect()
     }).collect();
 
-    // Pre-filter subnetow + smart probe (najszybszy per para)
+    // Pre-filter subnetow + ranking par od najszybszej
     let reachable = filter_reachable_pairs(&node_interfaces);
     tracing::info!("Probe: {} osiagalnych par po filtrze subnetow", reachable.len());
-    let to_probe = select_fastest_per_pair(&reachable);
-    tracing::info!("Probe: {} par do probing (najszybsze per para)", to_probe.len());
+    let ranked = rank_pairs_by_speed(&reachable);
+    tracing::info!("Probe: {} unikalnych par nodow do probing", ranked.len());
 
-    let total = to_probe.len();
+    let total = ranked.len();
 
     // Kanal SSE
     let (tx, rx) = mpsc::channel::<String>(64);
@@ -233,7 +233,7 @@ pub async fn handle_start_probe(
     tokio::spawn(async move {
         // Daj frontendowi czas na polaczenie z SSE
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        run_probe_orchestration(qm, to_probe, tx, probe_id_clone).await;
+        run_probe_orchestration(qm, ranked, tx, probe_id_clone).await;
     });
 
     {
@@ -263,7 +263,7 @@ pub async fn handle_delete_probe(probe_id: &str) -> Result<(u16, String)> {
 /// Orkiestracja probing par — wysyla komendy BandwidthProbe do nodow
 async fn run_probe_orchestration(
     qm: Arc<crate::mesh::quic_mesh::QuicMeshManager>,
-    pairs: Vec<(NodeInterface, NodeInterface)>,
+    pairs: std::collections::HashMap<(String, String), Vec<(NodeInterface, NodeInterface)>>,
     tx: mpsc::Sender<String>,
     _probe_id: String,
 ) {
@@ -273,28 +273,56 @@ async fn run_probe_orchestration(
     let mut results: Vec<PairProbeResult> = Vec::new();
     let nonce: [u8; 32] = rand::random();
 
-    // Probuj po 4 rownolegle
-    for chunk in pairs.chunks(4) {
-        let mut handles = Vec::new();
+    // Probuj kazda pare nodow — od najszybszego interfejsu, fallback na wolniejszy
+    let pair_keys: Vec<_> = pairs.keys().cloned().collect();
+    for chunk in pair_keys.chunks(4) {
+        let mut handles: Vec<tokio::task::JoinHandle<Result<PairProbeResult>>> = Vec::new();
 
-        for (iface_a, iface_b) in chunk {
+        for key in chunk {
+            let candidates = pairs.get(key).cloned().unwrap_or_default();
             let qm = qm.clone();
             let nonce = nonce;
-            let a = iface_a.clone();
-            let b = iface_b.clone();
             let tx = tx.clone();
             let progress = results.len() + handles.len() + 1;
+            let total_pairs = total;
 
             handles.push(tokio::spawn(async move {
-                probe_pair(&qm, &a, &b, &nonce, progress, total, &tx).await
+                // Probuj od najszybszego, jesli unreachable — nastepny
+                for (iface_a, iface_b) in &candidates {
+                    match probe_pair(&qm, iface_a, iface_b, &nonce, progress, total_pairs, &tx).await {
+                        Ok(result) if result.reachable => {
+                            tracing::info!("Probe wynik: {} ({}) <-> {} ({}) = {:.0} Mbps",
+                                result.node_a, iface_a.name, result.node_b, iface_b.name, result.bandwidth_mbps);
+                            return Ok(result);
+                        }
+                        Ok(result) => {
+                            tracing::warn!("Probe unreachable: {} ({}) <-> {} ({}), probuje nastepny interfejs",
+                                result.node_a, iface_a.name, result.node_b, iface_b.name);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Probe error: {} <-> {}: {}, probuje nastepny interfejs",
+                                iface_a.node_id, iface_b.node_id, e);
+                        }
+                    }
+                }
+                // Wszystkie interfejsy unreachable
+                let first = candidates.first();
+                Ok(PairProbeResult {
+                    node_a: first.map(|(a, _)| a.node_id.clone()).unwrap_or_default(),
+                    node_b: first.map(|(_, b)| b.node_id.clone()).unwrap_or_default(),
+                    interface_a: String::new(),
+                    interface_b: String::new(),
+                    bandwidth_mbps: 0.0,
+                    latency_us: 0,
+                    reachable: false,
+                    rdma: false,
+                })
             }));
         }
 
         for h in handles {
             match h.await {
                 Ok(Ok(result)) => {
-                    tracing::info!("Probe wynik: {} <-> {} = {:.0} Mbps (reachable={})",
-                        result.node_a, result.node_b, result.bandwidth_mbps, result.reachable);
                     results.push(result);
                 }
                 Ok(Err(e)) => {
