@@ -266,6 +266,11 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
             })
             .collect();
 
+        tracing::info!("Per-node {}: interfejsy={:?}, full_reach={:?}",
+            node_id,
+            iface_bandwidth.keys().collect::<Vec<_>>(),
+            full_reach.iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>());
+
         let best_iface = if !full_reach.is_empty() {
             // Sposrod interfejsow ktore widza wszystkie, wybierz najszybszy
             full_reach.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
