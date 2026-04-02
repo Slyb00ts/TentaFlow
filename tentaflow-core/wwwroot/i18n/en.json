@@ -918,6 +918,7 @@
     "detection_partial": "Partial connectivity: some nodes unreachable. Best link: {speed}",
     "detection_mixed": "Mixed configuration: bottleneck {speed}",
     "detection_no_connections": "No connections between nodes",
+    "probe_details": "Probe details (all tested interfaces)",
     "bottleneck": "Bottleneck",
     "network_configuration": "Network Configuration",
     "probing_subtitle": "Probing bandwidth between {nodes} selected nodes... {done} of {total} pairs complete",

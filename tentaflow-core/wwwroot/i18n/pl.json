@@ -923,6 +923,7 @@
     "detection_partial": "Czesciowa lacznosc: niektore nody nieosiagalne. Najlepszy link: {speed}",
     "detection_mixed": "Konfiguracja mieszana: bottleneck {speed}",
     "detection_no_connections": "Brak polaczen miedzy nodami",
+    "probe_details": "Szczegoly probing (wszystkie przetestowane interfejsy)",
     "bottleneck": "Waskie gardlo",
     "network_configuration": "Konfiguracja sieci",
     "probing_subtitle": "Pomiar przepustowosci miedzy {nodes} wybranymi nodami... {done} z {total} par gotowych",
