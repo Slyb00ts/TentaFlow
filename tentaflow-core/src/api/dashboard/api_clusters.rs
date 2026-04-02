@@ -260,56 +260,120 @@ pub async fn handle_delete_probe(probe_id: &str) -> Result<(u16, String)> {
     Ok((200, r#"{"ok":true}"#.to_string()))
 }
 
-/// Orkiestracja probing par — wysyla komendy BandwidthProbe do nodow
+/// Orkiestracja probing par — scheduler z matryca zajetosci interfejsow.
+/// Testuje po jednym polaczeniu na raz per interfejs, bez kolizji.
+/// Po kazdym tescie wysyla SSE event do GUI.
 async fn run_probe_orchestration(
     qm: Arc<crate::mesh::quic_mesh::QuicMeshManager>,
     pairs: std::collections::HashMap<(String, String), Vec<(NodeInterface, NodeInterface)>>,
     tx: mpsc::Sender<String>,
     _probe_id: String,
 ) {
-    use tentaflow_protocol::mesh::MeshCommandType;
-
     let total = pairs.len();
     let mut results: Vec<PairProbeResult> = Vec::new();
     let nonce: [u8; 32] = rand::random();
 
-    // Probuj kazda pare nodow — od najszybszego interfejsu, fallback na wolniejszy
-    let pair_keys: Vec<_> = pairs.keys().cloned().collect();
-    for chunk in pair_keys.chunks(4) {
-        let mut handles: Vec<tokio::task::JoinHandle<Result<PairProbeResult>>> = Vec::new();
+    // Zbuduj kolejke zadan: (node_pair_key, candidates)
+    let mut queue: Vec<((String, String), Vec<(NodeInterface, NodeInterface)>)> =
+        pairs.into_iter().collect();
+    // Sortuj: pary z najszybszymi interfejsami najpierw
+    queue.sort_by(|a, b| {
+        let speed_a = a.1.first().map(|(x, y)| std::cmp::min(x.speed_mbps, y.speed_mbps)).unwrap_or(0);
+        let speed_b = b.1.first().map(|(x, y)| std::cmp::min(x.speed_mbps, y.speed_mbps)).unwrap_or(0);
+        speed_b.cmp(&speed_a)
+    });
 
-        for key in chunk {
-            let candidates = pairs.get(key).cloned().unwrap_or_default();
+    // Matryca zajetosci: (node_id, interface_name) -> czy jest w trakcie testu
+    let busy: Arc<tokio::sync::RwLock<std::collections::HashSet<(String, String)>>> =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
+
+    let mut completed = 0;
+
+    while completed < queue.len() {
+        let mut launched = false;
+
+        for i in 0..queue.len() {
+            let (_, ref candidates) = queue[i];
+            if candidates.is_empty() { continue; }
+
+            // Sprawdz pierwszy (najszybszy) kandydat
+            let (ref iface_a, ref iface_b) = candidates[0];
+            let key_a = (iface_a.node_id.clone(), iface_a.name.clone());
+            let key_b = (iface_b.node_id.clone(), iface_b.name.clone());
+
+            // Sprawdz czy interfejsy sa wolne
+            let is_busy = {
+                let b = busy.read().await;
+                b.contains(&key_a) || b.contains(&key_b)
+            };
+
+            if is_busy { continue; }
+
+            // Oznacz interfejsy jako zajete
+            {
+                let mut b = busy.write().await;
+                b.insert(key_a.clone());
+                b.insert(key_b.clone());
+            }
+
+            // Wez cala liste kandydatow (do fallback)
+            let candidates_owned = queue[i].1.clone();
             let qm = qm.clone();
-            let nonce = nonce;
-            let tx = tx.clone();
-            let progress = results.len() + handles.len() + 1;
+            let nonce_copy = nonce;
+            let tx_clone = tx.clone();
+            let busy_clone = busy.clone();
+            let progress = completed + 1;
             let total_pairs = total;
 
-            handles.push(tokio::spawn(async move {
-                // Probuj od najszybszego, jesli unreachable — nastepny
-                for (iface_a, iface_b) in &candidates {
-                    match probe_pair(&qm, iface_a, iface_b, &nonce, progress, total_pairs, &tx).await {
-                        Ok(result) if result.reachable => {
+            // Spawn probe task
+            let handle = tokio::spawn(async move {
+                let mut result = None;
+
+                for (iface_a, iface_b) in &candidates_owned {
+                    // Oznacz nowe interfejsy jako zajete (fallback moze miec inne)
+                    {
+                        let mut b = busy_clone.write().await;
+                        b.insert((iface_a.node_id.clone(), iface_a.name.clone()));
+                        b.insert((iface_b.node_id.clone(), iface_b.name.clone()));
+                    }
+
+                    match probe_pair(&qm, iface_a, iface_b, &nonce_copy, progress, total_pairs, &tx_clone).await {
+                        Ok(r) if r.reachable => {
                             tracing::info!("Probe wynik: {} ({}) <-> {} ({}) = {:.0} Mbps",
-                                result.node_a, iface_a.name, result.node_b, iface_b.name, result.bandwidth_mbps);
-                            return Ok(result);
+                                r.node_a, iface_a.name, r.node_b, iface_b.name, r.bandwidth_mbps);
+                            result = Some(r);
+                            break;
                         }
-                        Ok(result) => {
-                            tracing::warn!("Probe unreachable: {} ({}) <-> {} ({}), probuje nastepny interfejs",
-                                result.node_a, iface_a.name, result.node_b, iface_b.name);
+                        Ok(r) => {
+                            tracing::warn!("Probe unreachable: {} ({}) <-> {} ({}), probuje nastepny",
+                                r.node_a, iface_a.name, r.node_b, iface_b.name);
+                            if result.is_none() { result = Some(r); }
                         }
                         Err(e) => {
-                            tracing::warn!("Probe error: {} <-> {}: {}, probuje nastepny interfejs",
-                                iface_a.node_id, iface_b.node_id, e);
+                            tracing::warn!("Probe error: {} <-> {}: {}", iface_a.node_id, iface_b.node_id, e);
                         }
                     }
+
+                    // Zwolnij interfejsy po probe
+                    {
+                        let mut b = busy_clone.write().await;
+                        b.remove(&(iface_a.node_id.clone(), iface_a.name.clone()));
+                        b.remove(&(iface_b.node_id.clone(), iface_b.name.clone()));
+                    }
                 }
-                // Wszystkie interfejsy unreachable
-                let first = candidates.first();
-                Ok(PairProbeResult {
-                    node_a: first.map(|(a, _)| a.node_id.clone()).unwrap_or_default(),
-                    node_b: first.map(|(_, b)| b.node_id.clone()).unwrap_or_default(),
+
+                // Zwolnij wszystkie interfejsy z kandydatow
+                {
+                    let mut b = busy_clone.write().await;
+                    for (a, bb) in &candidates_owned {
+                        b.remove(&(a.node_id.clone(), a.name.clone()));
+                        b.remove(&(bb.node_id.clone(), bb.name.clone()));
+                    }
+                }
+
+                result.unwrap_or(PairProbeResult {
+                    node_a: candidates_owned.first().map(|(a, _)| a.node_id.clone()).unwrap_or_default(),
+                    node_b: candidates_owned.first().map(|(_, b)| b.node_id.clone()).unwrap_or_default(),
                     interface_a: String::new(),
                     interface_b: String::new(),
                     bandwidth_mbps: 0.0,
@@ -317,20 +381,31 @@ async fn run_probe_orchestration(
                     reachable: false,
                     rdma: false,
                 })
-            }));
-        }
+            });
 
-        for h in handles {
-            match h.await {
-                Ok(Ok(result)) => {
-                    results.push(result);
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Probe para failed: {}", e);
+            // Oznacz jako uruchomione (usun z kolejki)
+            queue[i].1.clear();
+            launched = true;
+
+            // Czekaj na wynik (sekwencyjnie per interfejs)
+            match handle.await {
+                Ok(r) => {
+                    results.push(r);
+                    completed += 1;
                 }
                 Err(e) => {
                     tracing::error!("Probe task panic: {}", e);
+                    completed += 1;
                 }
+            }
+
+            break; // Wroc do poczatku petli — moze cos sie zwolnilo
+        }
+
+        if !launched {
+            // Wszystkie pary sa zajete lub skonczone — poczekaj chwile
+            if completed < queue.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
