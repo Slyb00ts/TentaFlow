@@ -664,6 +664,15 @@ mod linux_rdma {
 
     impl RdmaContext {
         fn new(device_name: &str) -> Result<Self> {
+            // Walidacja rozmiaru ibv_send_wr na runtime — jesli jest zly, RDMA probe nie zadziala poprawnie
+            let wr_size = std::mem::size_of::<ibv_send_wr>();
+            if wr_size < 100 || wr_size > 300 {
+                tracing::warn!(
+                    "ibv_send_wr size = {} — moze byc niepoprawny dla tej wersji libibverbs",
+                    wr_size
+                );
+            }
+
             unsafe {
                 // Pobierz liste urzadzen RDMA
                 let mut num_devices: i32 = 0;

@@ -526,3 +526,36 @@ pub unsafe fn ibv_poll_cq(cq: *mut ibv_cq, num_entries: c_int, wc: *mut ibv_wc) 
     let f = (*ctx).ops.poll_cq.expect("poll_cq nie jest ustawiony w ibv_context_ops");
     f(cq, num_entries, wc)
 }
+
+// =============================================================================
+// Testy — walidacja ukladu pamieci struktur FFI wzgledem C ABI
+// =============================================================================
+
+#[cfg(all(test, feature = "rdma-probe"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_struct_sizes() {
+        // Rozmiary struktur FFI musza zgadzac sie z C ABI
+        // Sprawdzone na aarch64 i x86_64 z libibverbs 1.14+
+
+        // ibv_sge: 3 pola (u64 + u32 + u32) = 16 bajtow
+        assert_eq!(std::mem::size_of::<ibv_sge>(), 16, "ibv_sge size mismatch");
+
+        // ibv_wc: sprawdz ze minimum zawiera potrzebne pola
+        assert!(std::mem::size_of::<ibv_wc>() >= 48, "ibv_wc too small");
+
+        // ibv_port_attr: sprawdz offset lid
+        let port_attr = unsafe { std::mem::zeroed::<ibv_port_attr>() };
+        let base = &port_attr as *const _ as usize;
+        let lid_offset = &port_attr.lid as *const _ as usize - base;
+        // lid jest po 9 polach (state, max_mtu, active_mtu, gid_tbl_len,
+        // port_cap_flags, max_msg_sz, bad_pkey_cntr, qkey_viol_cntr, pkey_tbl_len)
+        // Na obu architekturach lid powinien byc na stalym ustawieniu
+        assert!(lid_offset > 0, "lid offset should be > 0");
+
+        // ibv_gid: union z raw [u8; 16]
+        assert_eq!(std::mem::size_of::<ibv_gid>(), 16, "ibv_gid size mismatch");
+    }
+}

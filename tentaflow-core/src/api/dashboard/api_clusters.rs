@@ -158,8 +158,8 @@ pub fn handle_remove_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> R
 // Bandwidth probe API
 // =============================================================================
 
-/// Globalny stan aktywnych probe streamow
-static PROBE_STREAMS: LazyLock<Mutex<HashMap<String, mpsc::Receiver<String>>>> =
+/// Globalny stan aktywnych probe streamow (receiver + czas utworzenia)
+static PROBE_STREAMS: LazyLock<Mutex<HashMap<String, (mpsc::Receiver<String>, std::time::Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Deserialize)]
@@ -188,8 +188,32 @@ pub async fn handle_start_probe(
     body: &[u8],
     quic_mesh: Arc<crate::mesh::quic_mesh::QuicMeshManager>,
 ) -> Result<(u16, String)> {
+    // Limit rozmiaru body (max 64KB)
+    if body.len() > 65536 {
+        return Ok((413, r#"{"error":"Body za duze (max 64KB)"}"#.to_string()));
+    }
+
     let req: ProbeRequest = serde_json::from_slice(body)
         .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+
+    // Walidacja rozmiaru requestu
+    if req.nodes.len() > 32 {
+        return Ok((400, r#"{"error":"Max 32 nody"}"#.to_string()));
+    }
+    let total_interfaces: usize = req.nodes.iter().map(|n| n.interfaces.len()).sum();
+    if total_interfaces > 256 {
+        return Ok((400, r#"{"error":"Za duzo interfejsow (max 256)"}"#.to_string()));
+    }
+
+    // Czyszczenie przeterminowanych wpisow i limit rownoleglych probow
+    {
+        let mut streams = PROBE_STREAMS.lock().await;
+        let now = std::time::Instant::now();
+        streams.retain(|_, (_, created)| now.duration_since(*created).as_secs() < 60);
+        if streams.len() >= 5 {
+            return Ok((429, r#"{"error":"Za duzo aktywnych probow. Sprobuj pozniej."}"#.to_string()));
+        }
+    }
 
     tracing::info!("Probe request: {} nodow", req.nodes.len());
     for n in &req.nodes {
@@ -238,7 +262,7 @@ pub async fn handle_start_probe(
 
     {
         let mut streams = PROBE_STREAMS.lock().await;
-        streams.insert(probe_id.clone(), rx);
+        streams.insert(probe_id.clone(), (rx, std::time::Instant::now()));
     }
 
     Ok((200, serde_json::json!({
@@ -250,13 +274,13 @@ pub async fn handle_start_probe(
 /// GET /api/clusters/probe/:probe_id — pobierz receiver SSE wynikow probing
 pub async fn handle_probe_stream(probe_id: &str) -> Option<mpsc::Receiver<String>> {
     let mut streams = PROBE_STREAMS.lock().await;
-    streams.remove(probe_id)
+    streams.remove(probe_id).map(|(rx, _)| rx)
 }
 
 /// DELETE /api/clusters/probe/:probe_id — anuluj probing
 pub async fn handle_delete_probe(probe_id: &str) -> Result<(u16, String)> {
     let mut streams = PROBE_STREAMS.lock().await;
-    streams.remove(probe_id);
+    drop(streams.remove(probe_id));
     Ok((200, r#"{"ok":true}"#.to_string()))
 }
 
