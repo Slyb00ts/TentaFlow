@@ -5524,6 +5524,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "lazy_static",
+ "libc",
  "llama-cpp-2",
  "mdns-sd",
  "multer",
