@@ -38,8 +38,8 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         .window_size(1920, 1080)
         .user_data_dir(user_data_dir)
         .arg("--use-fake-ui-for-media-stream")
-        .arg("--use-fake-device-for-media-stream")
         .arg("--autoplay-policy=no-user-gesture-required")
+        .arg("--enable-features=PulseaudioLoopbackForCast")
         .arg("--disable-gpu")
         .build()
         .map_err(|e| anyhow::anyhow!("Blad konfiguracji Chromium: {}", e))?;
@@ -88,6 +88,11 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
                         || el.textContent.includes('Zezwalaj')
                         || el.textContent.includes('Allow while visiting'));
                 if (allow) { allow.click(); return true; }
+                // Teams dialog "Continue without audio or video"
+                let continueBtn = Array.from(document.querySelectorAll('button, a'))
+                    .find(el => el.textContent.includes('Continue without audio')
+                        || el.textContent.includes('Kontynuuj bez'));
+                if (continueBtn) { continueBtn.click(); return true; }
                 // Teams wlasny dialog — "Allow" / zamknij
                 let close = document.querySelector('.ms-Dialog-button--close, [aria-label="Close"], [data-tid="close-button"]');
                 if (close) { close.click(); return true; }
