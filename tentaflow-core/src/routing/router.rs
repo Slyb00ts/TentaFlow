@@ -405,22 +405,27 @@ impl Router {
                         }
                         let config: serde_json::Value =
                             serde_json::from_str(&backend.config_json).unwrap_or_default();
-                        let url = config["url"].as_str().unwrap_or("");
-                        if url.is_empty() {
-                            continue;
-                        }
 
-                        let host = url
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .split(':')
-                            .next()
-                            .unwrap_or("127.0.0.1");
-                        let quic_port = svc_config["quic_port"].as_u64().unwrap_or(5010);
-                        let quic_url = format!("quic://{}:{}", host, quic_port);
-                        let tls_ca = crate::db::repository::get_setting(db, "tls_cert_pem")
-                            .ok()
-                            .flatten();
+                        // QUIC backendy maja "quic_url", HTTP maja "url"
+                        let quic_url = if let Some(qurl) = config["quic_url"].as_str() {
+                            qurl.to_string()
+                        } else {
+                            let url = config["url"].as_str().unwrap_or("");
+                            if url.is_empty() {
+                                continue;
+                            }
+                            let host = url
+                                .trim_start_matches("http://")
+                                .trim_start_matches("https://")
+                                .split(':')
+                                .next()
+                                .unwrap_or("127.0.0.1");
+                            let quic_port = svc_config["quic_port"].as_u64().unwrap_or(5010);
+                            format!("quic://{}:{}", host, quic_port)
+                        };
+
+                        let tls_ca = config["tls_ca"].as_str().map(|s| s.to_string())
+                            .or_else(|| crate::db::repository::get_setting(db, "tls_cert_pem").ok().flatten());
                         let server_name = svc_config["agent_domain"]
                             .as_str()
                             .map(|s| s.to_string());
