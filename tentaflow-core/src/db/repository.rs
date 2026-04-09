@@ -262,6 +262,7 @@ pub fn update_service(
     pool: &DbPool,
     id: i64,
     name: &str,
+    service_type: &str,
     strategy: &str,
     model_category: Option<&str>,
     status: &str,
@@ -269,8 +270,8 @@ pub fn update_service(
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "UPDATE services SET name = ?2, strategy = ?3, model_category = ?4, status = ?5, config_json = ?6, updated_at = datetime('now') WHERE id = ?1",
-        rusqlite::params![id, name, strategy, model_category, status, config_json],
+        "UPDATE services SET name = ?2, service_type = ?3, strategy = ?4, model_category = ?5, status = ?6, config_json = ?7, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, name, service_type, strategy, model_category, status, config_json],
     )?;
     Ok(())
 }
@@ -515,6 +516,36 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
         rusqlite::params![key, value],
     )?;
     Ok(())
+}
+
+/// Odczytuje setting z automatycznym deszyfrowaniem (jesli klucz jest wrazliwy)
+pub fn get_setting_secure(
+    pool: &DbPool,
+    key: &str,
+    cipher: &crate::crypto::SettingsCipher,
+) -> Result<Option<String>> {
+    let raw = get_setting(pool, key)?;
+    match raw {
+        Some(val) if crate::crypto::SettingsCipher::should_encrypt(key) => {
+            Ok(Some(cipher.decrypt(&val).map_err(|e| anyhow::anyhow!("{}", e))?))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Zapisuje setting z automatycznym szyfrowaniem (jesli klucz jest wrazliwy)
+pub fn set_setting_secure(
+    pool: &DbPool,
+    key: &str,
+    value: &str,
+    cipher: &crate::crypto::SettingsCipher,
+) -> Result<()> {
+    if crate::crypto::SettingsCipher::should_encrypt(key) {
+        let encrypted = cipher.encrypt(value).map_err(|e| anyhow::anyhow!("{}", e))?;
+        set_setting(pool, key, &encrypted)
+    } else {
+        set_setting(pool, key, value)
+    }
 }
 
 /// Usuwa ustawienie po kluczu (CR-016: jednorazowe tokeny SSO state)
@@ -768,14 +799,13 @@ pub fn get_model_alias(pool: &DbPool, id: i64) -> Result<Option<DbModelAlias>> {
     Ok(result)
 }
 
-pub fn resolve_model_alias(pool: &DbPool, alias: &str) -> Result<Option<String>> {
+pub fn resolve_model_alias(pool: &DbPool, alias: &str) -> Result<Option<DbModelAlias>> {
     let conn = acquire(pool)?;
-    let result = conn
-        .query_row(
-            "SELECT target_model FROM model_aliases WHERE alias = ?1 AND is_active = 1",
-            rusqlite::params![alias],
-            |row| row.get(0),
-        )
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM model_aliases WHERE alias = ?1 AND is_active = 1", MODEL_ALIAS_COLS
+    ))?;
+    let result = stmt
+        .query_row(rusqlite::params![alias], row_to_model_alias)
         .optional()?;
     Ok(result)
 }
@@ -815,6 +845,45 @@ pub fn update_model_alias(
 pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute("DELETE FROM model_aliases WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+/// Tworzy alias jesli nie istnieje, lub reaktywuje istniejacy (bez zmiany target_model).
+/// Uzywane przez cykl zycia addonow do automatycznego zarzadzania aliasami.
+pub fn create_or_reactivate_model_alias(
+    pool: &DbPool,
+    alias: &str,
+    default_target_model: &str,
+    strategy: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    // Jesli alias juz istnieje — reaktywuj go (zachowuj target_model ustawiony przez uzytkownika)
+    let existing: Option<i64> = conn
+        .prepare("SELECT id FROM model_aliases WHERE alias = ?1")?
+        .query_row(rusqlite::params![alias], |row| row.get(0))
+        .optional()?;
+
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE model_aliases SET is_active = 1 WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, 1, ?3)",
+            rusqlite::params![alias, default_target_model, strategy],
+        )?;
+    }
+    Ok(())
+}
+
+/// Ustawia flage is_active aliasu po nazwie.
+pub fn set_model_alias_active(pool: &DbPool, alias: &str, is_active: bool) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE model_aliases SET is_active = ?1 WHERE alias = ?2",
+        rusqlite::params![is_active, alias],
+    )?;
     Ok(())
 }
 
@@ -3093,4 +3162,198 @@ pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<String>> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod alias_resolve_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Tworzy in-memory DB z pelnym schematem (migracje + seed)
+    fn create_test_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("Nie udalo sie utworzyc test DB")
+    }
+
+    #[test]
+    fn resolve_alias_exists() {
+        // Arrange
+        let db = create_test_db();
+        create_model_alias(&db, "gpt-4", "bielik-11b", Some("mistral-7b,llama-8b"), Some("round_robin"))
+            .expect("Nie udalo sie utworzyc aliasu");
+
+        // Act
+        let result = resolve_model_alias(&db, "gpt-4").expect("Blad zapytania");
+
+        // Assert
+        let alias = result.expect("Alias powinien istniec");
+        assert_eq!(alias.alias, "gpt-4");
+        assert_eq!(alias.target_model, "bielik-11b");
+        assert!(alias.is_active);
+        assert_eq!(alias.fallback_targets.as_deref(), Some("mistral-7b,llama-8b"));
+        assert_eq!(alias.strategy.as_deref(), Some("round_robin"));
+    }
+
+    #[test]
+    fn resolve_alias_not_found() {
+        // Arrange
+        let db = create_test_db();
+
+        // Act
+        let result = resolve_model_alias(&db, "nieistniejacy-alias").expect("Blad zapytania");
+
+        // Assert
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_alias_inactive() {
+        // Arrange
+        let db = create_test_db();
+        let id = create_model_alias(&db, "stary-alias", "model-x", None, None)
+            .expect("Nie udalo sie utworzyc aliasu");
+        // Dezaktywuj alias
+        update_model_alias(&db, id, "stary-alias", "model-x", false, None, None)
+            .expect("Nie udalo sie zaktualizowac aliasu");
+
+        // Act
+        let result = resolve_model_alias(&db, "stary-alias").expect("Blad zapytania");
+
+        // Assert — nieaktywny alias nie powinien byc zwracany
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_alias_default_strategy() {
+        // Arrange — bez podania strategii, powinna byc domyslna
+        let db = create_test_db();
+        create_model_alias(&db, "test-alias", "target-model", None, None)
+            .expect("Nie udalo sie utworzyc aliasu");
+
+        // Act
+        let result = resolve_model_alias(&db, "test-alias")
+            .expect("Blad zapytania")
+            .expect("Alias powinien istniec");
+
+        // Assert
+        assert_eq!(result.strategy.as_deref(), Some("first_available"));
+    }
+
+    #[test]
+    fn resolve_alias_no_fallbacks() {
+        // Arrange
+        let db = create_test_db();
+        create_model_alias(&db, "simple", "jedyny-model", None, Some("least_loaded"))
+            .expect("Nie udalo sie utworzyc aliasu");
+
+        // Act
+        let result = resolve_model_alias(&db, "simple")
+            .expect("Blad zapytania")
+            .expect("Alias powinien istniec");
+
+        // Assert
+        assert!(result.fallback_targets.is_none());
+        assert_eq!(result.strategy.as_deref(), Some("least_loaded"));
+    }
+
+    #[test]
+    fn teams_alias_lifecycle_create_deactivate_reactivate() {
+        // Pelny cykl zycia aliasow teams-bot: tworzenie, dezaktywacja, reaktywacja
+
+        // Arrange
+        let db = create_test_db();
+
+        // Act 1 — tworzenie aliasow (symulacja instalacji teams-bot)
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+            .expect("Utworzenie aliasu teams-stt powinno sie udac");
+        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
+            .expect("Utworzenie aliasu teams-tts powinno sie udac");
+
+        // Assert 1 — aliasy istnieja i sa aktywne
+        let stt = resolve_model_alias(&db, "teams-stt").unwrap();
+        assert!(stt.is_some(), "Alias teams-stt powinien istniec");
+        let stt = stt.unwrap();
+        assert_eq!(stt.target_model, "whisper-1");
+        assert!(stt.is_active);
+
+        let tts = resolve_model_alias(&db, "teams-tts").unwrap();
+        assert!(tts.is_some(), "Alias teams-tts powinien istniec");
+        let tts = tts.unwrap();
+        assert_eq!(tts.target_model, "tts-1");
+        assert!(tts.is_active);
+
+        // Act 2 — dezaktywacja (symulacja zatrzymania addonu)
+        set_model_alias_active(&db, "teams-stt", false)
+            .expect("Dezaktywacja teams-stt powinna sie udac");
+        set_model_alias_active(&db, "teams-tts", false)
+            .expect("Dezaktywacja teams-tts powinna sie udac");
+
+        // Assert 2 — resolve nie znajduje nieaktywnych aliasow
+        assert!(resolve_model_alias(&db, "teams-stt").unwrap().is_none(),
+            "Nieaktywny alias teams-stt nie powinien byc rozwiazywany");
+        assert!(resolve_model_alias(&db, "teams-tts").unwrap().is_none(),
+            "Nieaktywny alias teams-tts nie powinien byc rozwiazywany");
+
+        // Act 3 — reaktywacja (symulacja ponownego uruchomienia)
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+            .expect("Reaktywacja teams-stt powinna sie udac");
+        create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
+            .expect("Reaktywacja teams-tts powinna sie udac");
+
+        // Assert 3 — aliasy ponownie aktywne
+        let stt = resolve_model_alias(&db, "teams-stt").unwrap()
+            .expect("Alias teams-stt powinien byc reaktywowany");
+        assert!(stt.is_active);
+        assert_eq!(stt.target_model, "whisper-1");
+
+        let tts = resolve_model_alias(&db, "teams-tts").unwrap()
+            .expect("Alias teams-tts powinien byc reaktywowany");
+        assert!(tts.is_active);
+    }
+
+    #[test]
+    fn teams_alias_preserves_user_target_model_on_reactivation() {
+        // Reaktywacja aliasu NIE nadpisuje target_model ustawionego przez uzytkownika
+
+        // Arrange
+        let db = create_test_db();
+
+        // Tworzenie z domyslnym target_model
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+            .expect("Utworzenie aliasu powinno sie udac");
+
+        // Uzytkownik zmienia target_model na inny
+        let alias = resolve_model_alias(&db, "teams-stt").unwrap().unwrap();
+        update_model_alias(&db, alias.id, "teams-stt", "whisper-large-v3", true, None, Some("first_available"))
+            .expect("Aktualizacja target_model powinna sie udac");
+
+        // Dezaktywacja
+        set_model_alias_active(&db, "teams-stt", false).unwrap();
+
+        // Act — reaktywacja z domyslnym target_model
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available")
+            .expect("Reaktywacja powinna sie udac");
+
+        // Assert — target_model ustawiony przez uzytkownika jest zachowany
+        let alias = resolve_model_alias(&db, "teams-stt").unwrap()
+            .expect("Alias powinien byc aktywny");
+        assert_eq!(alias.target_model, "whisper-large-v3",
+            "Reaktywacja nie powinna nadpisywac target_model ustawionego przez uzytkownika");
+        assert!(alias.is_active);
+    }
+
+    #[test]
+    fn teams_alias_double_deactivation_is_idempotent() {
+        // Dwukrotna dezaktywacja nie powoduje bledu
+
+        // Arrange
+        let db = create_test_db();
+        create_or_reactivate_model_alias(&db, "teams-stt", "whisper-1", "first_available").unwrap();
+        set_model_alias_active(&db, "teams-stt", false).unwrap();
+
+        // Act — ponowna dezaktywacja
+        let result = set_model_alias_active(&db, "teams-stt", false);
+
+        // Assert — brak bledu
+        assert!(result.is_ok());
+    }
 }

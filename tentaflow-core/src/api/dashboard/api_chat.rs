@@ -30,18 +30,22 @@ pub async fn route_chat_api(
     db: &DbPool,
     metrics: &Arc<RouterMetrics>,
     cors_origin: Option<&str>,
+    debug_route: bool,
 ) -> Response<DashboardBody> {
     match (method, path) {
-        (&Method::POST, "/api/chat/completions") => handle_completions(router, body, db, metrics, cors_origin).await,
-        (&Method::POST, "/api/chat/tts") => handle_tts(router, body, cors_origin).await,
-        (&Method::POST, "/api/chat/stt") => handle_stt(router, body, cors_origin).await,
+        (&Method::POST, "/api/chat/completions") => handle_completions(router, body, db, metrics, cors_origin, debug_route).await,
+        (&Method::POST, "/api/chat/tts") => handle_tts(router, body, cors_origin, debug_route).await,
+        (&Method::POST, "/api/chat/stt") => handle_stt(router, body, cors_origin, debug_route).await,
+        (&Method::POST, "/api/chat/stt/load") => handle_stt_load(router, body, db, cors_origin).await,
+        (&Method::POST, "/api/chat/stt/unload") => handle_stt_unload(router, db, cors_origin).await,
+        (&Method::GET, "/api/chat/stt/models") => handle_stt_models(cors_origin).await,
         (&Method::GET, "/api/chat/capabilities") => handle_capabilities(router, db, cors_origin).await,
         _ => json_err(404, "Nieznany endpoint chat", cors_origin),
     }
 }
 
 /// POST /api/chat/completions - chat completion (streaming lub nie)
-async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, metrics: &Arc<RouterMetrics>, cors_origin: Option<&str>) -> Response<DashboardBody> {
+async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, metrics: &Arc<RouterMetrics>, cors_origin: Option<&str>, debug_route: bool) -> Response<DashboardBody> {
     let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return json_err(400, &format!("Blad parsowania requestu: {}", e), cors_origin),
@@ -59,10 +63,28 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
 
     if stream {
         match router.route_chat_completion_stream(request).await {
-            Ok(chunk_stream) => {
+            Ok(route_result) => {
+                let metadata = route_result.metadata;
+                let chunk_stream = route_result.response;
                 let metrics_done = metrics.clone();
                 let metrics_stream = metrics.clone();
-                let sse_stream = chunk_stream.map(move |chunk_result| {
+
+                // SSE event route_info przed pierwszym chunkiem (tylko w trybie debug)
+                let route_info_event = if debug_route {
+                    serde_json::to_string(&metadata).ok().map(|json| {
+                        format!("event: route_info\ndata: {}\n\n", json)
+                    })
+                } else {
+                    None
+                };
+
+                let prefix_stream = futures::stream::iter(
+                    route_info_event.into_iter().map(|event| {
+                        Ok(Frame::data(Bytes::from(event)))
+                    })
+                );
+
+                let sse_stream = prefix_stream.chain(chunk_stream.map(move |chunk_result| {
                     match chunk_result {
                         Ok(chunk) => {
                             let content_len = chunk.choices.first()
@@ -82,7 +104,7 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
                             Ok(Frame::data(Bytes::from(error_chunk)))
                         }
                     }
-                }).chain(futures::stream::once(async move {
+                })).chain(futures::stream::once(async move {
                     metrics_done.record_request_done();
                     Ok(Frame::data(Bytes::from("data: [DONE]\n\n")))
                 }));
@@ -112,16 +134,25 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
         }
     } else {
         match router.route_chat_completion(request).await {
-            Ok(response) => {
+            Ok(route_result) => {
                 metrics.record_request_done();
-                let json = match serde_json::to_string(&response) {
+                let json = match serde_json::to_string(&route_result.response) {
                     Ok(j) => j,
                     Err(e) => return json_err(500, &format!("Blad serializacji odpowiedzi: {}", e), cors_origin),
                 };
                 // Estymacja tokenow wyjsciowych z odpowiedzi
                 let out_estimate = (json.len() / 4).max(1) as u64;
                 metrics.record_tokens(0, out_estimate);
-                json_resp(200, json, cors_origin)
+                let mut resp = json_resp(200, json, cors_origin);
+                if debug_route {
+                    if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
+                        resp.headers_mut().insert(
+                            "X-TentaFlow-Route",
+                            meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                        );
+                    }
+                }
+                resp
             }
             Err(e) => {
                 metrics.record_request_done();
@@ -134,7 +165,7 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
 }
 
 /// POST /api/chat/tts - synteza mowy
-async fn handle_tts(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>) -> Response<DashboardBody> {
+async fn handle_tts(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>, debug_route: bool) -> Response<DashboardBody> {
     let request: TTSRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return json_err(400, &format!("Blad parsowania requestu TTS: {}", e), cors_origin),
@@ -151,7 +182,22 @@ async fn handle_tts(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
     };
 
     match router.synthesize_speech(&request).await {
-        Ok(audio_bytes) => binary_resp(200, content_type, audio_bytes, cors_origin),
+        Ok(route_result) => {
+            let mut resp = binary_resp(200, content_type, route_result.response, cors_origin);
+            if debug_route {
+                if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
+                    resp.headers_mut().insert(
+                        "X-TentaFlow-Route",
+                        meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                    );
+                    resp.headers_mut().insert(
+                        "Access-Control-Expose-Headers",
+                        "X-TentaFlow-Route".parse().unwrap(),
+                    );
+                }
+            }
+            resp
+        }
         Err(e) => {
             error!("Blad syntezy mowy: {}", e);
             json_err(500, &format!("Blad TTS: {}", e), cors_origin)
@@ -160,7 +206,7 @@ async fn handle_tts(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
 }
 
 /// POST /api/chat/stt - transkrypcja mowy na tekst
-async fn handle_stt(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>) -> Response<DashboardBody> {
+async fn handle_stt(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>, debug_route: bool) -> Response<DashboardBody> {
     // Deserializacja JSON z danymi audio w base64
     #[derive(serde::Deserialize)]
     struct SttPayload {
@@ -201,18 +247,122 @@ async fn handle_stt(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
     };
 
     match router.route_audio_transcription(request).await {
-        Ok(transcription) => {
-            let json = match serde_json::to_string(&transcription) {
+        Ok(route_result) => {
+            let json = match serde_json::to_string(&route_result.response) {
                 Ok(j) => j,
                 Err(e) => return json_err(500, &format!("Blad serializacji transkrypcji: {}", e), cors_origin),
             };
-            json_resp(200, json, cors_origin)
+            let mut resp = json_resp(200, json, cors_origin);
+            if debug_route {
+                if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
+                    resp.headers_mut().insert(
+                        "X-TentaFlow-Route",
+                        meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                    );
+                    resp.headers_mut().insert(
+                        "Access-Control-Expose-Headers",
+                        "X-TentaFlow-Route".parse().unwrap(),
+                    );
+                }
+            }
+            resp
         }
         Err(e) => {
             error!("Blad transkrypcji audio: {}", e);
             json_err(500, &format!("Blad STT: {}", e), cors_origin)
         }
     }
+}
+
+/// POST /api/chat/stt/load - pobierz (jesli potrzeba) i zaladuj Whisper large-v3-turbo
+async fn handle_stt_load(router: &Arc<Router>, body: Bytes, db: &DbPool, cors_origin: Option<&str>) -> Response<DashboardBody> {
+    #[derive(serde::Deserialize)]
+    struct LoadPayload {
+        device: Option<String>,
+    }
+
+    let payload: LoadPayload = serde_json::from_slice(&body).unwrap_or(LoadPayload { device: None });
+
+    info!("Ladowanie modelu Whisper large-v3-turbo");
+
+    let stt = crate::stt::shared_stt_manager();
+    let mut mgr = stt.write().await;
+    match mgr.ensure_and_load(payload.device.as_deref()).await {
+        Ok(model_info) => {
+            // Persystuj serwis STT w bazie danych
+            let config = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "whisper",
+                "deployed_model": "whisper-large-v3-turbo",
+                "model_path": model_info.path,
+                "service_type": "stt",
+            });
+            let existing = db::repository::list_services(db)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|s| s.name == "whisper-stt-native");
+            if let Some(svc) = existing {
+                let _ = db::repository::update_service(
+                    db, svc.id, "whisper-stt-native", "stt", "single", None, "running", &config.to_string(),
+                );
+            } else {
+                let _ = db::repository::create_service(
+                    db, "whisper-stt-native", "stt", "single", None, &config.to_string(),
+                );
+            }
+
+            router.register_native_service_in_mesh(
+                "whisper-stt-native",
+                "stt",
+                vec!["whisper-large-v3-turbo".to_string()],
+            );
+
+            let json = serde_json::to_string(&model_info).unwrap_or_default();
+            json_resp(200, json, cors_origin)
+        }
+        Err(e) => {
+            error!("Blad ladowania modelu Whisper: {}", e);
+            json_err(500, &format!("Blad ladowania modelu: {}", e), cors_origin)
+        }
+    }
+}
+
+/// POST /api/chat/stt/unload - wyladuj model Whisper z pamieci
+async fn handle_stt_unload(router: &Arc<Router>, db: &DbPool, cors_origin: Option<&str>) -> Response<DashboardBody> {
+    let stt = crate::stt::shared_stt_manager();
+    let mut mgr = stt.write().await;
+    match mgr.unload_model().await {
+        Ok(()) => {
+            // Oznacz serwis STT jako zatrzymany w bazie
+            let existing = db::repository::list_services(db)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|s| s.name == "whisper-stt-native");
+            if let Some(svc) = existing {
+                let _ = db::repository::update_service(
+                    db, svc.id, "whisper-stt-native", "stt", "single", None, "stopped", &svc.config_json,
+                );
+            }
+
+            // Wyrejestruj z mesh
+            router.unregister_native_service_from_mesh("native-stt-whisper-stt-native");
+
+            json_resp(200, r#"{"ok":true}"#.to_string(), cors_origin)
+        }
+        Err(e) => {
+            error!("Blad wyladowania modelu STT: {}", e);
+            json_err(500, &format!("Blad wyladowania modelu: {}", e), cors_origin)
+        }
+    }
+}
+
+/// GET /api/chat/stt/status - status modelu Whisper
+async fn handle_stt_models(cors_origin: Option<&str>) -> Response<DashboardBody> {
+    let stt = crate::stt::shared_stt_manager();
+    let mgr = stt.read().await;
+    let status = mgr.whisper_model_status();
+    let json = serde_json::to_string(&status).unwrap_or_default();
+    json_resp(200, json, cors_origin)
 }
 
 /// GET /api/chat/capabilities - dostepne uslugi i modele
@@ -259,10 +409,24 @@ async fn handle_capabilities(router: &Arc<Router>, db: &DbPool, cors_origin: Opt
         }
     };
 
+    // Status lokalnego modelu STT (Whisper)
+    let stt_mgr = crate::stt::shared_stt_manager();
+    let stt_reader = stt_mgr.read().await;
+    let stt_local_info = stt_reader
+        .active_engine()
+        .and_then(|e| e.model_info());
+    let has_stt_local = stt_local_info.is_some();
+    let stt_model_json = stt_local_info
+        .map(|info| serde_json::to_value(&info).unwrap_or(serde_json::Value::Null))
+        .unwrap_or(serde_json::Value::Null);
+    drop(stt_reader);
+
     let capabilities = serde_json::json!({
         "llm": has_llm,
         "tts": has_tts,
         "stt": has_stt,
+        "stt_local": has_stt_local,
+        "stt_model": stt_model_json,
         "vision": true,
         "models": models,
         "services": services,

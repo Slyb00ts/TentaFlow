@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use tracing::info;
 
-use super::{AddonManifest, AddonDeclaredPermission, DisambiguationRule, ManifestPermission, ManifestTool, ManifestNetworkRule};
+use super::{AddonManifest, AddonDeclaredPermission, DisambiguationRule, ManifestPermission, ManifestTool, ManifestNetworkRule, ResourceRequirements};
 use crate::db::DbPool;
 
 // =============================================================================
@@ -115,14 +115,31 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     // Uprawnienia, narzedzia i limity sa przechowywane w manifest_json
     // (tabela addons.manifest_json zawiera pelny manifest)
 
-    // Domyslne limity zasobow (0 = bez limitu / unlimited)
-    conn.execute(
-        "INSERT OR IGNORE INTO addon_resource_limits \
-         (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
-          vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
-         VALUES (?1, 0, 0, 0, 1, 0, 0, 0, 0)",
-        rusqlite::params![&manifest.addon_id],
-    ).ok(); // Ignoruj blad jesli tabela nie istnieje jeszcze (stara wersja DB)
+    // Limity zasobow — jesli manifest deklaruje [resources], uzyj ich; inaczej domyslne (0 = bez limitu)
+    if let Some(ref res) = manifest.resources {
+        conn.execute(
+            "INSERT OR REPLACE INTO addon_resource_limits \
+             (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
+              vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min, fuel_limit) \
+             VALUES (?1, 0, 0, ?2, 1, 0, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &manifest.addon_id,
+                res.memory_mb.unwrap_or(0) as i64,
+                res.storage_total_mb.unwrap_or(0) as i64,
+                res.http_requests_per_minute.unwrap_or(0) as i64,
+                res.llm_tokens_per_minute.unwrap_or(0) as i64,
+                res.fuel_limit.unwrap_or(0) as i64,
+            ],
+        ).ok();
+    } else {
+        conn.execute(
+            "INSERT OR IGNORE INTO addon_resource_limits \
+             (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
+              vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
+             VALUES (?1, 0, 0, 0, 1, 0, 0, 0, 0)",
+            rusqlite::params![&manifest.addon_id],
+        ).ok();
+    }
 
     // Zapisz reguly sieciowe z manifestu (TCP/UDP + HTTP domains)
     // Reguly required=true sa domyslnie approved (addon jawnie ich potrzebuje)
@@ -331,14 +348,31 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
         ],
     )?;
 
-    // Domyslne limity zasobow — nie nadpisuj jesli admin juz ustawil
-    conn.execute(
-        "INSERT OR IGNORE INTO addon_resource_limits \
-         (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
-          vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
-         VALUES (?1, 0, 0, 0, 1, 0, 0, 0, 0)",
-        rusqlite::params![addon_id],
-    ).ok();
+    // Limity zasobow — jesli nowy manifest deklaruje [resources], zaktualizuj; inaczej zachowaj istniejace
+    if let Some(ref res) = new_manifest.resources {
+        conn.execute(
+            "INSERT OR REPLACE INTO addon_resource_limits \
+             (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
+              vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min, fuel_limit) \
+             VALUES (?1, 0, 0, ?2, 1, 0, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                addon_id,
+                res.memory_mb.unwrap_or(0) as i64,
+                res.storage_total_mb.unwrap_or(0) as i64,
+                res.http_requests_per_minute.unwrap_or(0) as i64,
+                res.llm_tokens_per_minute.unwrap_or(0) as i64,
+                res.fuel_limit.unwrap_or(0) as i64,
+            ],
+        ).ok();
+    } else {
+        conn.execute(
+            "INSERT OR IGNORE INTO addon_resource_limits \
+             (addon_id, max_instances, cpu_limit_ms_per_min, ram_limit_mb, gpu_enabled, \
+              vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
+             VALUES (?1, 0, 0, 0, 1, 0, 0, 0, 0)",
+            rusqlite::params![addon_id],
+        ).ok();
+    }
 
     // Synchronizacja regul sieciowych:
     // - Zachowaj approved status istniejacych regul (juz zatwierdzonych przez admina)
@@ -609,6 +643,18 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         })
         .unwrap_or_default();
 
+    // Parsuj sekcje [resources] — wymagania zasobow deklarowane przez addon
+    let resources = parsed.get("resources").map(|res| {
+        ResourceRequirements {
+            storage_total_mb: res.get("storage_total_mb").and_then(|v| v.as_integer()).map(|v| v as u64),
+            storage_value_mb: res.get("storage_value_mb").and_then(|v| v.as_integer()).map(|v| v as u64),
+            llm_tokens_per_minute: res.get("llm_tokens_per_minute").and_then(|v| v.as_integer()).map(|v| v as u64),
+            http_requests_per_minute: res.get("http_requests_per_minute").and_then(|v| v.as_integer()).map(|v| v as u64),
+            memory_mb: res.get("memory_mb").and_then(|v| v.as_integer()).map(|v| v as u64),
+            fuel_limit: res.get("fuel_limit").and_then(|v| v.as_integer()).map(|v| v as u64),
+        }
+    });
+
     Ok(AddonManifest {
         addon_id: addon_id.to_string(),
         version: version.to_string(),
@@ -628,6 +674,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         declared_permissions,
         network_rules,
         disambiguation,
+        resources,
     })
 }
 

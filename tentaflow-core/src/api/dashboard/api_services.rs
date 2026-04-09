@@ -19,6 +19,7 @@ pub struct CreateServiceRequest {
 #[derive(Deserialize)]
 pub struct UpdateServiceRequest {
     pub name: String,
+    pub service_type: String,
     pub strategy: String,
     pub model_category: Option<String>,
     pub status: String,
@@ -88,6 +89,7 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
         pool,
         id,
         &req.name,
+        &req.service_type,
         &req.strategy,
         req.model_category.as_deref(),
         &req.status,

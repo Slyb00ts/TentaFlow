@@ -14,10 +14,52 @@ use tentaflow_protocol::*;
 
 use anyhow::Context;
 use quinn::{ClientConfig, Connection, Endpoint};
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
+
+/// Weryfikator TLS pomijajacy walidacje certyfikatu serwera.
+/// Uzywany dla self-signed kontenerow (teams-bot, itp.).
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
 use tracing::{debug, error, info, warn};
 
 /// Konfiguracja QUIC polaczenia
@@ -49,6 +91,9 @@ pub struct QuicConfig {
 
     /// Interwal keepalive (ms)
     pub keepalive_interval_ms: u64,
+
+    /// Pomin walidacje certyfikatu serwera (dla self-signed kontenerow)
+    pub skip_tls_verify: bool,
 }
 
 /// Uniwersalny QUIC client dla TentaFlow services.
@@ -257,31 +302,37 @@ impl QuicClient {
         let alpn = &config.alpn;
         use rustls::RootCertStore;
 
-        let root_store = if ca_certs.is_empty() {
-            // Uzyj systemowych certyfikatow CA
-            let mut store = RootCertStore::empty();
-            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            debug!("Uzywam systemowych certyfikatow CA ({} certyfikatow)", store.len());
-            store
+        let mut client_crypto = if config.skip_tls_verify {
+            // Pomin walidacje certyfikatu serwera (self-signed kontenery)
+            debug!("TLS: pomijam walidacje certyfikatu serwera (skip_tls_verify=true)");
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+                .with_no_client_auth()
         } else {
-            // Uzyj podanych certyfikatow CA
-            let mut store = RootCertStore::empty();
-            for ca_cert in ca_certs {
+            let root_store = if ca_certs.is_empty() {
+                let mut store = RootCertStore::empty();
+                store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                debug!("Uzywam systemowych certyfikatow CA ({} certyfikatow)", store.len());
                 store
-                    .add(ca_cert)
-                    .context("Failed to add CA cert to root store")
-                    .map_err(|e| CoreError::ConfigError {
-                        message: "Invalid CA certificate".to_string(),
-                        source: e,
-                    })?;
-            }
-            store
-        };
+            } else {
+                let mut store = RootCertStore::empty();
+                for ca_cert in ca_certs {
+                    store
+                        .add(ca_cert)
+                        .context("Failed to add CA cert to root store")
+                        .map_err(|e| CoreError::ConfigError {
+                            message: "Invalid CA certificate".to_string(),
+                            source: e,
+                        })?;
+                }
+                store
+            };
 
-        // One-way TLS: klient NIE wysyla certyfikatu (with_no_client_auth)
-        let mut client_crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
 
         // ALPN protocol — musi zgadzac sie z serwerem
         client_crypto.alpn_protocols = vec![alpn.as_bytes().to_vec()];

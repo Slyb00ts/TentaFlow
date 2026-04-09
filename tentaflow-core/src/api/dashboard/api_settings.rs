@@ -49,7 +49,7 @@ pub fn handle_list(pool: &DbPool, claims: &Claims) -> Result<(u16, String)> {
 }
 
 /// PUT /api/settings - aktualizuj ustawienie
-pub fn handle_update(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
+pub fn handle_update(pool: &DbPool, body: &[u8], settings_cipher: &crate::crypto::SettingsCipher) -> Result<(u16, String)> {
     let req: UpdateSettingRequest = serde_json::from_slice(body)
         .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
@@ -57,7 +57,7 @@ pub fn handle_update(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
         return Ok((403, serde_json::json!({"error": "Zmiana tego ustawienia jest zabroniona"}).to_string()));
     }
 
-    db::repository::set_setting(pool, &req.key, &req.value)?;
+    db::repository::set_setting_secure(pool, &req.key, &req.value, settings_cipher)?;
 
     // VULN-033: Maskuj wartosc w odpowiedzi jesli klucz jest wrazliwy (analogicznie do handle_list)
     let key_lower = req.key.to_lowercase();
