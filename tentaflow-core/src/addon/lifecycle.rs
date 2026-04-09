@@ -426,7 +426,7 @@ fn validate_manifest(manifest: &AddonManifest) -> Result<()> {
         "camera", "notifications", "background",
         "secrets", "user_info", "timer",
         "addon_communicate", "log",
-        "network",
+        "network", "service",
     ];
 
     for perm in &manifest.permissions {
