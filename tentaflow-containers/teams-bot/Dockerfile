@@ -12,6 +12,7 @@ FROM rust:1.94-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libasound2-dev \
+        libpulse-dev \
         libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -46,6 +47,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         chromium \
         pulseaudio \
+        libpulse0 \
         xvfb \
         ca-certificates \
         dbus \
