@@ -28,6 +28,9 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         .window_size(1920, 1080)
         .arg("--use-fake-ui-for-media-stream")
         .arg("--use-fake-device-for-media-stream")
+        .arg("--auto-accept-camera-and-microphone-capture")
+        .arg("--autoplay-policy=no-user-gesture-required")
+        .arg("--disable-features=PermissionChip")
         .arg("--disable-gpu")
         .build()
         .map_err(|e| anyhow::anyhow!("Blad konfiguracji Chromium: {}", e))?;
@@ -62,8 +65,39 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
 
     tracing::info!(url = url, "Nawigacja do spotkania Teams");
 
-    // Czekamy na zaladowanie strony pre-join
+    // Czekamy na zaladowanie strony i zamykamy dialogi uprawnien
     tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Auto-klik na dialogi uprawnien Teams (mikrofon, kamera)
+    // Teams wyswietla wlasne dialogi "Allow while visiting the site"
+    for _ in 0..5 {
+        let clicked = page.evaluate(
+            r#"(function() {
+                // Chromium permission prompt
+                let allow = Array.from(document.querySelectorAll('button'))
+                    .find(el => el.textContent.includes('Allow')
+                        || el.textContent.includes('Zezwalaj')
+                        || el.textContent.includes('Allow while visiting'));
+                if (allow) { allow.click(); return true; }
+                // Teams wlasny dialog — "Allow" / zamknij
+                let close = document.querySelector('.ms-Dialog-button--close, [aria-label="Close"], [data-tid="close-button"]');
+                if (close) { close.click(); return true; }
+                return false;
+            })()"#,
+        )
+        .await
+        .map(|v| v.into_value::<bool>().unwrap_or(false))
+        .unwrap_or(false);
+
+        if clicked {
+            tracing::info!("Zamknieto dialog uprawnien");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        } else {
+            break;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Sprawdzamy czy dostepna jest opcja dolaczenia jako gosc
     // TODO: selektory wymagaja weryfikacji z aktualnym klientem Teams
