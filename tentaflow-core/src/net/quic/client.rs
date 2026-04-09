@@ -357,6 +357,8 @@ impl QuicClient {
             })?;
         transport.max_idle_timeout(Some(idle_timeout));
         transport.keep_alive_interval(Some(Duration::from_millis(config.keepalive_interval_ms)));
+        // Pozwol serwerowi otwierac streamy do klienta (reverse QUIC — kontenery wysylaja STT/TTS requesty)
+        transport.max_concurrent_bidi_streams(64u32.into());
 
         client_config.transport_config(Arc::new(transport));
 
