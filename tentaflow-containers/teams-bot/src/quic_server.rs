@@ -14,8 +14,22 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tentaflow_protocol::*;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
+
+/// Komenda sterujaca spotkaniem — wysylana z QUIC do glownej petli w main.rs
+pub enum MeetingCommand {
+    JoinMeeting {
+        meeting_url: String,
+        response_tx: oneshot::Sender<String>,
+    },
+    LeaveMeeting {
+        response_tx: oneshot::Sender<String>,
+    },
+    GetStatus {
+        response_tx: oneshot::Sender<String>,
+    },
+}
 
 /// Klient do wysylania requestow z sidecara do routera
 /// na istniejacym polaczeniu QUIC (reverse direction).
@@ -180,16 +194,22 @@ pub struct MeetingQuicServer {
     transcript_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, String, u64)>>>,
     /// Klient do routera — ustawiany gdy router sie polacy
     router_client: Arc<tokio::sync::Mutex<Option<Arc<RouterClient>>>>,
+    /// Kanal komend sterujacych spotkaniem (QUIC -> main.rs)
+    command_tx: mpsc::UnboundedSender<MeetingCommand>,
+    command_rx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<MeetingCommand>>>>,
 }
 
 impl MeetingQuicServer {
     pub fn new(config: ContainerQuicConfig) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         Self {
             config,
             transcript_tx: tx,
             transcript_rx: Arc::new(tokio::sync::Mutex::new(rx)),
             router_client: Arc::new(tokio::sync::Mutex::new(None)),
+            command_tx: cmd_tx,
+            command_rx: Arc::new(tokio::sync::Mutex::new(Some(cmd_rx))),
         }
     }
 
@@ -197,6 +217,13 @@ impl MeetingQuicServer {
     /// ktore serwer przekaze do routera w streamingu
     pub fn transcript_sender(&self) -> mpsc::UnboundedSender<(String, String, u64)> {
         self.transcript_tx.clone()
+    }
+
+    /// Zwraca odbiorce komend sterujacych — main.rs konsumuje komendy
+    /// i wykonuje akcje na przegladarce (join/leave/status).
+    /// Mozna wywolac tylko raz — drugie wywolanie zwroci None.
+    pub async fn command_receiver(&self) -> Option<mpsc::UnboundedReceiver<MeetingCommand>> {
+        self.command_rx.lock().await.take()
     }
 
     /// Zwraca klienta do routera (jesli router jest polaczony).
@@ -228,6 +255,7 @@ impl MeetingQuicServer {
                         Some(incoming) => {
                             let transcript_rx = self.transcript_rx.clone();
                             let router_client_slot = self.router_client.clone();
+                            let command_tx = self.command_tx.clone();
                             tokio::spawn(async move {
                                 match incoming.await {
                                     Ok(connection) => {
@@ -239,6 +267,7 @@ impl MeetingQuicServer {
                                             connection,
                                             transcript_rx,
                                             router_client_slot,
+                                            command_tx,
                                         ).await;
                                     }
                                     Err(e) => {
@@ -274,6 +303,7 @@ impl MeetingQuicServer {
         connection: quinn::Connection,
         transcript_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, String, u64)>>>,
         router_client_slot: Arc<tokio::sync::Mutex<Option<Arc<RouterClient>>>>,
+        command_tx: mpsc::UnboundedSender<MeetingCommand>,
     ) {
         let remote = connection.remote_address();
         debug!(remote = %remote, "handle_connection: start");
@@ -291,8 +321,9 @@ impl MeetingQuicServer {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
                     let transcript_rx = transcript_rx.clone();
+                    let command_tx = command_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_stream(send, recv, transcript_rx).await {
+                        if let Err(e) = Self::handle_stream(send, recv, transcript_rx, command_tx).await {
                             error!("Blad obslugi strumienia: {}", e);
                         }
                     });
@@ -321,6 +352,7 @@ impl MeetingQuicServer {
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
         transcript_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, String, u64)>>>,
+        command_tx: mpsc::UnboundedSender<MeetingCommand>,
     ) -> Result<()> {
         // Odczytaj request (max 10MB)
         let request_bytes = recv
@@ -352,8 +384,13 @@ impl MeetingQuicServer {
             // Tryb strumieniowy — wysylaj chunki z transkrypcja na zywo
             Self::handle_streaming_request(&request, &mut send, transcript_rx).await?;
         } else {
-            // Tryb jednorazowy — przetworz i wyslij odpowiedz
-            let response = Self::process_request(&request);
+            // Sprawdz czy Completion zawiera komende narzedzia w polu prompt
+            let response = if let Some(cmd_response) = Self::try_handle_tool_command(&request, &command_tx).await {
+                cmd_response
+            } else {
+                Self::process_request(&request)
+            };
+
             let response_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response)
                 .map_err(|e| anyhow::anyhow!("Blad serializacji rkyv ModelResponse: {}", e))?;
 
@@ -362,6 +399,112 @@ impl MeetingQuicServer {
         }
 
         Ok(())
+    }
+
+    /// Sprawdza czy request zawiera komende narzedzia w polu prompt.
+    /// Jesli tak — wysyla komende przez kanal i czeka na odpowiedz.
+    /// Zwraca None jesli prompt nie zawiera komendy narzedzia.
+    async fn try_handle_tool_command(
+        request: &ModelRequest,
+        command_tx: &mpsc::UnboundedSender<MeetingCommand>,
+    ) -> Option<ModelResponse> {
+        let payload = match &request.payload {
+            ModelPayload::Completion(p) => p,
+            _ => return None,
+        };
+
+        let prompt = payload.prompt.as_deref()?;
+
+        // Parsuj JSON z pola prompt
+        let json: serde_json::Value = serde_json::from_str(prompt).ok()?;
+        let tool = json.get("tool")?.as_str()?;
+
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let cmd = match tool {
+            "teams-bot.join_meeting" => {
+                let meeting_url = json
+                    .get("params")
+                    .and_then(|p| p.get("meeting_url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+
+                if meeting_url.is_empty() {
+                    return Some(ModelResponse {
+                        request_id: request.request_id.clone(),
+                        result: ModelResult::Error(ErrorInfo {
+                            error_type: ErrorType::InvalidRequest,
+                            message: "Brak meeting_url w parametrach join_meeting".to_string(),
+                            details: None,
+                        }),
+                        metrics: None,
+                    });
+                }
+
+                info!(meeting_url = %meeting_url, "Komenda: join_meeting");
+                MeetingCommand::JoinMeeting { meeting_url, response_tx }
+            }
+            "teams-bot.leave_meeting" => {
+                info!("Komenda: leave_meeting");
+                MeetingCommand::LeaveMeeting { response_tx }
+            }
+            "teams-bot.get_status" => {
+                debug!("Komenda: get_status");
+                MeetingCommand::GetStatus { response_tx }
+            }
+            _ => {
+                warn!(tool = tool, "Nieznana komenda narzedzia");
+                return Some(ModelResponse {
+                    request_id: request.request_id.clone(),
+                    result: ModelResult::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: format!("Nieznana komenda: {}", tool),
+                        details: None,
+                    }),
+                    metrics: None,
+                });
+            }
+        };
+
+        if command_tx.send(cmd).is_err() {
+            return Some(ModelResponse {
+                request_id: request.request_id.clone(),
+                result: ModelResult::Error(ErrorInfo {
+                    error_type: ErrorType::InternalError,
+                    message: "Kanal komend zamkniety — sidecar konczy prace".to_string(),
+                    details: None,
+                }),
+                metrics: None,
+            });
+        }
+
+        // Czekaj na odpowiedz z glownej petli (max 5 minut — join moze trwac)
+        let result_text = match tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            response_rx,
+        ).await {
+            Ok(Ok(text)) => text,
+            Ok(Err(_)) => "Blad: kanal odpowiedzi zamkniety".to_string(),
+            Err(_) => "Blad: timeout oczekiwania na wykonanie komendy".to_string(),
+        };
+
+        Some(ModelResponse {
+            request_id: request.request_id.clone(),
+            result: ModelResult::Completion(CompletionResult {
+                text: result_text,
+                reasoning_content: None,
+                model: "meeting-bot".to_string(),
+                finish_reason: Some("stop".to_string()),
+                tool_calls: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+            }),
+            metrics: None,
+        })
     }
 
     /// Przetwarza jednorazowy ModelRequest i zwraca ModelResponse.
@@ -681,6 +824,7 @@ mod tests {
         tokio::spawn(async move {
             let transcript_rx = server_clone.transcript_rx.clone();
             let router_client_slot = server_clone.router_client.clone();
+            let command_tx = server_clone.command_tx.clone();
             let mut shutdown_rx = shutdown_rx;
 
             loop {
@@ -690,6 +834,7 @@ mod tests {
                             Some(incoming) => {
                                 let transcript_rx = transcript_rx.clone();
                                 let router_client_slot = router_client_slot.clone();
+                                let command_tx = command_tx.clone();
                                 tokio::spawn(async move {
                                     match incoming.await {
                                         Ok(connection) => {
@@ -697,6 +842,7 @@ mod tests {
                                                 connection,
                                                 transcript_rx,
                                                 router_client_slot,
+                                                command_tx,
                                             ).await;
                                         }
                                         Err(_) => {}
