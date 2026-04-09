@@ -1982,3 +1982,96 @@ pub fn handle_revoke_network_rule(
         "approved": false,
     }).to_string()))
 }
+
+/// Wywoluje narzedzie addonu — dla meeting-bot wysyla komende QUIC do kontenera
+pub fn handle_invoke_addon_tool(
+    pool: &DbPool,
+    addon_id: &str,
+    tool_name: &str,
+    body: &str,
+    router: Option<&Arc<crate::routing::router::Router>>,
+) -> Result<(u16, String)> {
+    // Sprawdz czy addon istnieje
+    let conn = pool.lock().map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = ?1",
+        rusqlite::params![addon_id],
+        |row| row.get(0),
+    ).unwrap_or(false);
+    drop(conn);
+
+    if !exists {
+        return Ok((404, json_error("Addon nie znaleziony")));
+    }
+
+    let params: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+
+    // Dla meeting-bot wysylamy komende przez QUIC do kontenera
+    if addon_id == "teams-bot" {
+        let router = match router {
+            Some(r) => r,
+            None => return Ok((500, json_error("Router nie dostepny"))),
+        };
+
+        let command = serde_json::json!({
+            "tool": format!("{}.{}", addon_id, tool_name),
+            "params": params,
+        });
+
+        // Wyslij przez service_request do kontenera
+        let service_name = "tentaflow-meeting-bot";
+        let request = tentaflow_protocol::ModelRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            payload: tentaflow_protocol::ModelPayload::Completion(tentaflow_protocol::CompletionPayload {
+                model: service_name.to_string(),
+                prompt: Some(command.to_string()),
+                ..Default::default()
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        // Znajdz QUIC handle i wyslij
+        let quic_services = router.service_manager.quic_llm_services.read();
+        if let Some(handle) = quic_services.get(service_name) {
+            let handle = handle.clone();
+            drop(quic_services);
+
+            // Async → sync bridge (ten handler jest wolany z sync kontekstu)
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let client = handle.get_client().await;
+                    match client {
+                        Some(c) => c.send_request(request).await.map_err(|e| format!("{}", e)),
+                        None => Err("Klient QUIC nie polaczony".to_string()),
+                    }
+                })
+            });
+
+            match result {
+                Ok(response) => {
+                    match response.result {
+                        tentaflow_protocol::ModelResult::Completion(c) => {
+                            Ok((200, serde_json::json!({
+                                "ok": true,
+                                "result": c.text,
+                            }).to_string()))
+                        }
+                        tentaflow_protocol::ModelResult::Error(e) => {
+                            Ok((500, json_error(&e.message)))
+                        }
+                        _ => Ok((200, serde_json::json!({"ok": true}).to_string()))
+                    }
+                }
+                Err(e) => {
+                    Ok((503, json_error(&format!("Kontener niedostepny: {}", e))))
+                }
+            }
+        } else {
+            Ok((503, json_error("Serwis meeting-bot nie jest polaczony. Zdeplojuj kontener z Service Catalog.")))
+        }
+    } else {
+        Ok((501, json_error("Wywolywanie narzedzi addonow nie jest jeszcze zaimplementowane dla tego addonu")))
+    }
+}
