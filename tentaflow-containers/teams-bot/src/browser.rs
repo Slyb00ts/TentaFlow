@@ -21,16 +21,25 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Uruchamia headless Chromium z wczytanymi cookies sesji
 pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
+    // Ustawienie preferencji Chromium — auto-grant mikrofon i kamera
+    let user_data_dir = "/tmp/chromium-meeting-bot";
+    let prefs_dir = format!("{}/Default", user_data_dir);
+    std::fs::create_dir_all(&prefs_dir).ok();
+    // content_settings: 1 = allow, pattern "*" = wszystkie strony
+    std::fs::write(
+        format!("{}/Preferences", prefs_dir),
+        r#"{"profile":{"content_settings":{"exceptions":{"media_stream_mic":{"*,*":{"setting":1}},"media_stream_camera":{"*,*":{"setting":1}},"notifications":{"*,*":{"setting":2}}}}}}"#,
+    ).ok();
+
     let browser_config = BrowserConfig::builder()
         .chrome_executable("/usr/bin/chromium")
         .with_head()
         .no_sandbox()
         .window_size(1920, 1080)
+        .user_data_dir(user_data_dir)
         .arg("--use-fake-ui-for-media-stream")
         .arg("--use-fake-device-for-media-stream")
-        .arg("--auto-accept-camera-and-microphone-capture")
         .arg("--autoplay-policy=no-user-gesture-required")
-        .arg("--disable-features=PermissionChip")
         .arg("--disable-gpu")
         .build()
         .map_err(|e| anyhow::anyhow!("Blad konfiguracji Chromium: {}", e))?;
