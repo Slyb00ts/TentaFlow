@@ -40,52 +40,48 @@ pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCa
     let (tx, rx) = mpsc::channel::<Vec<i16>>(32);
 
     let handle = std::thread::spawn(move || {
-        let source = device.as_deref();
+        let source = device.as_deref().unwrap_or("meeting_output.monitor");
 
-        let simple = match psimple::Simple::new(
-            None,
-            "tentaflow-meeting",
-            pulse::stream::Direction::Record,
-            source,
-            "meeting-capture",
-            &spec,
-            None,
-            None,
-        ) {
-            Ok(s) => s,
+        // Uzywamy parec jako subprocess — Simple API nie czyta z monitora poprawnie
+        let mut child = match std::process::Command::new("parec")
+            .args(&[
+                "-d", source,
+                "--format=s16le",
+                "--channels=1",
+                "--rate=16000",
+                "--raw",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
             Err(e) => {
-                tracing::error!("Nie udalo sie otworzyc PulseAudio source: {:?}", e);
+                tracing::error!("Nie udalo sie uruchomic parec: {:?}", e);
                 return;
             }
         };
 
         tracing::info!(
-            source = source.unwrap_or("default (meeting_output.monitor)"),
-            sample_rate = sample_rate,
+            source = source,
+            sample_rate = 16000,
             chunk_ms = chunk_ms,
             samples = samples_per_chunk,
-            "PulseAudio capture uruchomiony"
+            "PulseAudio capture uruchomiony (parec)"
         );
 
-        // 4 bajty per sample (float32), 2 kanaly
-        let mut buf = vec![0u8; samples_per_chunk * 4];
+        let stdout = child.stdout.take().expect("brak stdout parec");
+        let mut reader = std::io::BufReader::new(stdout);
+        // 2 bajty per sample (s16le), 1 kanal
+        let mut buf = vec![0u8; samples_per_chunk * 2];
 
         loop {
-            match simple.read(&mut buf) {
+            use std::io::Read;
+            match reader.read_exact(&mut buf) {
                 Ok(()) => {
-                    // float32le stereo -> i16 mono (srednia kanalow)
-                    let floats: Vec<f32> = buf
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect();
-
-                    // Downmix stereo -> mono i konwersja float -> i16
-                    let samples: Vec<i16> = floats
+                    let samples: Vec<i16> = buf
                         .chunks_exact(2)
-                        .map(|pair| {
-                            let mono = (pair[0] + pair[1]) * 0.5;
-                            (mono * 32767.0).clamp(-32768.0, 32767.0) as i16
-                        })
+                        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                         .collect();
 
                     if tx.blocking_send(samples).is_err() {
@@ -93,11 +89,13 @@ pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCa
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Blad odczytu PulseAudio: {:?}", e);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    tracing::error!("Blad odczytu parec: {:?}", e);
+                    break;
                 }
             }
         }
+
+        let _ = child.kill();
     });
 
     tracing::info!(device = device_name.unwrap_or("default"), "Urzadzenie audio do przechwytywania");
