@@ -369,6 +369,13 @@ pub enum ServiceType {
 
     /// Memory Engine (graf wiedzy, entity storage, semantic search)
     Memory,
+
+    /// Reranker (rerankowanie wynikow wyszukiwania)
+    Reranker,
+
+    /// Meeting Bot (sidecar do spotkan Teams/Zoom/Meet)
+    #[serde(rename = "meeting-bot")]
+    MeetingBot,
 }
 
 /// Typ polaczenia do backendu AI

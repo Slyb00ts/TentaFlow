@@ -591,6 +591,58 @@ impl ServiceManager {
                         }
                     }
                 }
+
+                // ===== Meeting Bot - QUIC only (sidecar do spotkan) =====
+                ServiceType::MeetingBot => {
+                    for backend in &service.backends {
+                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                            let quic_config = crate::net::quic::QuicConfig {
+                                name: service.name.clone(),
+                                url: quic_url.clone(),
+                                tls_ca: tls_ca.clone(),
+                                server_name: None,
+                                alpn: "tentaflow".to_string(),
+                                timeout_ms: backend.timeout_ms,
+                                auto_reconnect: *auto_reconnect,
+                                reconnect_interval_ms: *reconnect_interval_ms,
+                                keepalive_interval_ms: *keepalive_interval_ms,
+                                skip_tls_verify: tls_ca.is_none(),
+                            };
+
+                            let handle = Arc::new(QuicServiceHandle::new(quic_config));
+                            quic_llm_services.insert(service.name.clone(), handle);
+
+                            info!("  {} (Meeting Bot QUIC) - connecting in background...", service.name);
+                            break;
+                        }
+                    }
+                }
+
+                // ===== Reranker =====
+                ServiceType::Reranker => {
+                    for backend in &service.backends {
+                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                            let quic_config = crate::net::quic::QuicConfig {
+                                name: service.name.clone(),
+                                url: quic_url.clone(),
+                                tls_ca: tls_ca.clone(),
+                                server_name: None,
+                                alpn: "h3".to_string(),
+                                timeout_ms: backend.timeout_ms,
+                                auto_reconnect: *auto_reconnect,
+                                reconnect_interval_ms: *reconnect_interval_ms,
+                                keepalive_interval_ms: *keepalive_interval_ms,
+                                skip_tls_verify: false,
+                            };
+
+                            let handle = Arc::new(QuicServiceHandle::new(quic_config));
+                            quic_embedding_services.insert(service.name.clone(), handle);
+
+                            info!("  {} (Reranker QUIC) - connecting in background...", service.name);
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -662,17 +714,25 @@ impl ServiceManager {
             });
         }
 
-        // Spawn QUIC LLM connection tasks (z wysylaniem prefix cache)
+        // Spawn QUIC LLM + Meeting Bot connection tasks
         let llm_entries: Vec<_> = self.quic_llm_services.read().iter()
             .map(|(n, h)| (n.clone(), h.clone())).collect();
         for (name, handle) in llm_entries {
             let shutdown_rx = self.shutdown_rx.clone();
-            let prompt_registry = self.prompt_registry.clone();
-            let model_category = self.llm_model_categories.read().get(&name).copied().unwrap_or_default();
 
-            tokio::spawn(async move {
-                Self::quic_llm_connection_loop(name, handle, shutdown_rx, prompt_registry, model_category).await;
-            });
+            // Meeting bot ma dedykowany loop z transcript subscriberem
+            if name.contains("meeting") || name.contains("teams-bot") {
+                let event_bus = self.event_bus.read().clone();
+                tokio::spawn(async move {
+                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus).await;
+                });
+            } else {
+                let prompt_registry = self.prompt_registry.clone();
+                let model_category = self.llm_model_categories.read().get(&name).copied().unwrap_or_default();
+                tokio::spawn(async move {
+                    Self::quic_llm_connection_loop(name, handle, shutdown_rx, prompt_registry, model_category).await;
+                });
+            }
         }
 
         // Spawn QUIC STT connection tasks
