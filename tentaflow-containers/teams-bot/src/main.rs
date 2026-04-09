@@ -60,6 +60,8 @@ async fn main() -> Result<()> {
     let quic = quic_server::MeetingQuicServer::new(quic_config);
     let transcript_tx = quic.transcript_sender();
     let router_client_handle = quic.router_client_handle();
+    let mut command_rx = quic.command_receiver().await
+        .expect("command_receiver powinien byc dostepny przy pierwszym wywolaniu");
 
     tokio::spawn(async move {
         if let Err(e) = quic.run(shutdown_rx).await {
@@ -82,9 +84,11 @@ async fn main() -> Result<()> {
     tracing::info!("Router polaczony — STT/TTS dostepne");
 
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
-    let page = if !config.meeting_url.is_empty() {
-        let chromium = browser::launch_chromium(&config).await?;
-        let p = browser::join_meeting(&chromium, &config.meeting_url, &config).await?;
+    let mut _chromium: Option<chromiumoxide::browser::Browser> = None;
+    let mut page = if !config.meeting_url.is_empty() {
+        let browser = browser::launch_chromium(&config).await?;
+        let p = browser::join_meeting(&browser, &config.meeting_url, &config).await?;
+        _chromium = Some(browser);
         tracing::info!("Dolaczono do spotkania");
         Some(p)
     } else {
@@ -166,6 +170,44 @@ async fn main() -> Result<()> {
                         }
                     }
                     VadResult::Silence => {}
+                }
+            }
+            cmd = command_rx.recv() => {
+                match cmd {
+                    Some(quic_server::MeetingCommand::JoinMeeting { meeting_url, response_tx }) => {
+                        tracing::info!(meeting_url = %meeting_url, "Komenda QUIC: dolaczanie do spotkania");
+                        match browser::launch_chromium(&config).await {
+                            Ok(browser) => {
+                                match browser::join_meeting(&browser, &meeting_url, &config).await {
+                                    Ok(p) => {
+                                        _chromium = Some(browser);
+                                        page = Some(p);
+                                        let _ = response_tx.send("OK: dolaczono do spotkania".to_string());
+                                    }
+                                    Err(e) => {
+                                        let _ = response_tx.send(format!("BLAD: {}", e));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = response_tx.send(format!("BLAD: nie udalo sie uruchomic przegladarki: {}", e));
+                            }
+                        }
+                    }
+                    Some(quic_server::MeetingCommand::LeaveMeeting { response_tx }) => {
+                        tracing::info!("Komenda QUIC: opuszczanie spotkania");
+                        page = None;
+                        _chromium = None;
+                        let _ = response_tx.send("OK: opuszczono spotkanie".to_string());
+                    }
+                    Some(quic_server::MeetingCommand::GetStatus { response_tx }) => {
+                        let status = if page.is_some() { "connected" } else { "idle" };
+                        let _ = response_tx.send(status.to_string());
+                    }
+                    None => {
+                        tracing::warn!("Kanal komend zamkniety");
+                        break;
+                    }
                 }
             }
         }
