@@ -17,7 +17,7 @@ rkyv = { version = "0.8", features = ["unaligned"] }
 tokio = { version = "1", features = ["full"] }
 
 # Automatyzacja przegladarki
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+chromiumoxide = "0.9"
 futures = "0.3"
 
 # Audio
