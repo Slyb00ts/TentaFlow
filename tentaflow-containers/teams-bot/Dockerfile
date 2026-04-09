@@ -38,13 +38,13 @@ RUN cargo build --release --manifest-path tentaflow-containers/teams-bot/Cargo.t
 # ---------------------------------------------------------------------------
 # Etap 2: obraz runtime
 # ---------------------------------------------------------------------------
-FROM ubuntu:24.04
+FROM debian:bookworm-slim
 
 # Unikamy interaktywnych promptow apt
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromium-browser \
+        chromium \
         pulseaudio \
         xvfb \
         ca-certificates \

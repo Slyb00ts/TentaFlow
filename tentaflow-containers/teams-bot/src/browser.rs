@@ -22,11 +22,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Uruchamia headless Chromium z wczytanymi cookies sesji
 pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     let browser_config = BrowserConfig::builder()
+        .chrome_executable("/usr/bin/chromium")
         .no_sandbox()
         .arg("--use-fake-ui-for-media-stream")
         .arg("--use-fake-device-for-media-stream")
         .arg("--disable-gpu")
-        .arg("--headless=new")
         .build()
         .map_err(|e| anyhow::anyhow!("Blad konfiguracji Chromium: {}", e))?;
 
