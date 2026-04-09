@@ -76,13 +76,15 @@ USER sidecar
 
 # DISPLAY dla Xvfb — Chromium uzywa tego do renderowania na wirtualnym ekranie
 ENV DISPLAY=:99
+# XDG_RUNTIME_DIR — PulseAudio i Chromium szukaja socketow tutaj
+ENV XDG_RUNTIME_DIR=/tmp/runtime
 
 # Skrypt startowy — PulseAudio + Xvfb + sidecar
 ENTRYPOINT ["/bin/bash", "-c", "\
     rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; \
+    mkdir -p /tmp/runtime && \
     pulseaudio --start --exit-idle-time=-1 --log-level=error 2>/dev/null; \
     Xvfb :99 -screen 0 1920x1080x24 -ac &\
-    export DISPLAY=:99 && \
     sleep 1 && \
     x11vnc -display :99 -forever -nopw -shared -rfbport 5900 & \
     websockify --web /usr/share/novnc 6080 localhost:5900 & \
