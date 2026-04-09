@@ -25,7 +25,8 @@
     "logout": "Logout",
     "addons": "Applications",
     "users": "Users",
-    "audit": "Audit Log"
+    "audit": "Audit Log",
+    "meeting": "Meeting Bot"
   },
   "topbar": {
     "connected": "Connected",
@@ -994,5 +995,32 @@
     "not_supported": "NVIDIA GPU required",
     "not_supported_hint": "NVIDIA NIM containers require an NVIDIA GPU on the target node. Select a node with an NVIDIA GPU to deploy NIM containers.",
     "no_gpu_detected": "No GPU detected"
+  },
+  "meeting": {
+    "title": "Meeting Bot",
+    "url_label": "Teams Meeting URL",
+    "url_placeholder": "https://teams.microsoft.com/l/meetup-join/...",
+    "url_hint": "Paste the full Teams meeting URL. The bot will join as a participant.",
+    "url_required": "Meeting URL is required",
+    "join": "Join Meeting",
+    "leave": "Leave Meeting",
+    "join_success": "Bot is joining the meeting...",
+    "join_error": "Failed to join meeting",
+    "leave_success": "Bot left the meeting",
+    "leave_error": "Failed to leave meeting",
+    "status_idle": "Idle",
+    "status_joining": "Joining...",
+    "status_connected": "Connected",
+    "status_error": "Error",
+    "vnc_title": "Teams Login",
+    "vnc_open": "Open browser preview",
+    "vnc_hint": "Opens a browser preview of the bot's Teams session via VNC. Use this for initial login and debugging.",
+    "info_title": "Bot Status",
+    "state": "Meeting state",
+    "bot_name": "Bot name",
+    "stt_alias": "STT alias",
+    "tts_alias": "TTS alias",
+    "llm_alias": "LLM alias",
+    "status_unavailable": "Meeting Bot status unavailable"
   }
 }

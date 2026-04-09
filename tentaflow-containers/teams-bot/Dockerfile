@@ -49,6 +49,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         ca-certificates \
         dbus \
+        x11vnc \
+        novnc \
+        websockify \
     && rm -rf /var/lib/apt/lists/*
 
 # Uzytkownik bez uprawnien root
@@ -62,6 +65,10 @@ COPY --from=builder /build/tentaflow-containers/teams-bot/target/release/tentafl
 
 # Port QUIC (UDP)
 EXPOSE 5000/udp
+# VNC bezposredni
+EXPOSE 5900
+# noVNC interfejs webowy
+EXPOSE 6080
 
 # Katalog roboczy
 WORKDIR /home/sidecar
@@ -74,4 +81,6 @@ ENTRYPOINT ["/bin/bash", "-c", "\
     Xvfb :99 -screen 0 1920x1080x24 -ac &\
     export DISPLAY=:99 && \
     sleep 1 && \
+    x11vnc -display :99 -forever -nopw -shared -rfbport 5900 & \
+    websockify --web /usr/share/novnc 6080 localhost:5900 & \
     exec /usr/local/bin/tentaflow-meeting \"$@\""]

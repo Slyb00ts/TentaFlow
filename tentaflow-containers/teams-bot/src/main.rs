@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
     let page = if !config.meeting_url.is_empty() {
         let chromium = browser::launch_chromium(&config).await?;
-        let p = browser::join_meeting(&chromium, &config.meeting_url).await?;
+        let p = browser::join_meeting(&chromium, &config.meeting_url, &config).await?;
         tracing::info!("Dolaczono do spotkania");
         Some(p)
     } else {

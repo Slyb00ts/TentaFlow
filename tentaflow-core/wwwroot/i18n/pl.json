@@ -25,7 +25,8 @@
     "logout": "Wyloguj",
     "addons": "Aplikacje",
     "users": "Użytkownicy",
-    "audit": "Audit Log"
+    "audit": "Audit Log",
+    "meeting": "Meeting Bot"
   },
   "topbar": {
     "connected": "Połączony",
@@ -999,5 +1000,32 @@
     "not_supported": "Wymagana karta NVIDIA GPU",
     "not_supported_hint": "Kontenery NVIDIA NIM wymagaja karty NVIDIA GPU na docelowym nodzie. Wybierz node z karta NVIDIA GPU aby deployowac kontenery NIM.",
     "no_gpu_detected": "Nie wykryto GPU"
+  },
+  "meeting": {
+    "title": "Meeting Bot",
+    "url_label": "URL spotkania Teams",
+    "url_placeholder": "https://teams.microsoft.com/l/meetup-join/...",
+    "url_hint": "Wklej pelny URL spotkania Teams. Bot dolacza jako uczestnik.",
+    "url_required": "URL spotkania jest wymagany",
+    "join": "Dolacz do spotkania",
+    "leave": "Opusc spotkanie",
+    "join_success": "Bot dolacza do spotkania...",
+    "join_error": "Nie udalo sie dolaczyc do spotkania",
+    "leave_success": "Bot opuscil spotkanie",
+    "leave_error": "Nie udalo sie opuscic spotkania",
+    "status_idle": "Bezczynny",
+    "status_joining": "Dolaczanie...",
+    "status_connected": "Polaczony",
+    "status_error": "Blad",
+    "vnc_title": "Logowanie do Teams",
+    "vnc_open": "Otworz podglad przegladarki",
+    "vnc_hint": "Otwiera podglad przegladarki sesji Teams bota przez VNC. Uzywane do pierwszego logowania i debugowania.",
+    "info_title": "Status bota",
+    "state": "Stan spotkania",
+    "bot_name": "Nazwa bota",
+    "stt_alias": "Alias STT",
+    "tts_alias": "Alias TTS",
+    "llm_alias": "Alias LLM",
+    "status_unavailable": "Status Meeting Bota niedostepny"
   }
 }
