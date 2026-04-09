@@ -25,12 +25,12 @@ impl AudioCapture {
 /// Uruchamia przechwytywanie audio z domyslnego PulseAudio source.
 /// Domyslne source to meeting_output.monitor (ustawione w pulseaudio.conf).
 pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCapture> {
-    let sample_rate = 16000u32;
-    let channels = 1u8;
-    let samples_per_chunk = (sample_rate * chunk_ms as u32 / 1000) as usize;
+    let sample_rate = 44100u32;
+    let channels = 2u8;
+    let samples_per_chunk = (sample_rate * chunk_ms as u32 / 1000) as usize * channels as usize;
 
     let spec = pulse::sample::Spec {
-        format: pulse::sample::Format::S16le,
+        format: pulse::sample::Format::F32le,
         channels,
         rate: sample_rate,
     };
@@ -67,14 +67,25 @@ pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCa
             "PulseAudio capture uruchomiony"
         );
 
-        let mut buf = vec![0u8; samples_per_chunk * 2];
+        // 4 bajty per sample (float32), 2 kanaly
+        let mut buf = vec![0u8; samples_per_chunk * 4];
 
         loop {
             match simple.read(&mut buf) {
                 Ok(()) => {
-                    let samples: Vec<i16> = buf
+                    // float32le stereo -> i16 mono (srednia kanalow)
+                    let floats: Vec<f32> = buf
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .collect();
+
+                    // Downmix stereo -> mono i konwersja float -> i16
+                    let samples: Vec<i16> = floats
                         .chunks_exact(2)
-                        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                        .map(|pair| {
+                            let mono = (pair[0] + pair[1]) * 0.5;
+                            (mono * 32767.0).clamp(-32768.0, 32767.0) as i16
+                        })
                         .collect();
 
                     if tx.blocking_send(samples).is_err() {
