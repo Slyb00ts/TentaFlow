@@ -59,9 +59,6 @@ const MeetingBot = (() => {
           </div>
           <div class="card-body">
             <p class="form-hint" data-i18n="meeting.vnc_hint">${I18n.t('meeting.vnc_hint')}</p>
-            <div id="vnc-container" class="vnc-container" hidden>
-              <iframe id="vnc-iframe" class="vnc-iframe" allowfullscreen></iframe>
-            </div>
           </div>
         </div>
 
@@ -161,21 +158,11 @@ const MeetingBot = (() => {
     }
   }
 
-  // Otwarcie podgladu VNC
+  // Otwarcie podgladu VNC w nowym oknie (unika problemu mixed content HTTPS/HTTP)
   function handleOpenVnc() {
-    const container = document.getElementById('vnc-container');
-    const iframe = document.getElementById('vnc-iframe');
-    if (!container || !iframe) return;
-
-    if (container.hidden) {
-      // TODO: dynamiczne wykrywanie hosta z rejestru uslug
-      const vncUrl = 'http://localhost:6080/vnc.html?autoconnect=true';
-      iframe.src = vncUrl;
-      container.hidden = false;
-    } else {
-      iframe.src = '';
-      container.hidden = true;
-    }
+    // TODO: dynamiczne wykrywanie hosta/portu z rejestru uslug
+    const vncUrl = 'http://localhost:6080/vnc.html?autoconnect=true';
+    window.open(vncUrl, 'tentaflow-vnc', 'width=1024,height=768,menubar=no,toolbar=no');
   }
 
   // Ladowanie statusu bota
