@@ -118,6 +118,8 @@ async fn main() -> Result<()> {
 
     tracing::info!("Pipeline audio uruchomiony (STT: {}, TTS: {})", stt_model, tts_model);
 
+    let mut chunk_count: u64 = 0;
+
     loop {
         tokio::select! {
             chunk = audio_capture.next_chunk() => {
@@ -125,6 +127,14 @@ async fn main() -> Result<()> {
                     tracing::warn!("Strumien audio zakonczony");
                     break;
                 };
+
+                chunk_count += 1;
+
+                // Debug: loguj RMS co 20 chunkow (~10s)
+                if chunk_count % 20 == 0 {
+                    let rms = (chunk.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / chunk.len() as f64).sqrt();
+                    tracing::debug!(chunk_count, rms = format!("{:.1}", rms), "Audio RMS");
+                }
 
                 let vad_result = vad_detector.process_chunk(&chunk);
 

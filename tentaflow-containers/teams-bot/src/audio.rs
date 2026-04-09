@@ -35,7 +35,8 @@ pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCa
         rate: sample_rate,
     };
 
-    let device = device_name.map(|s| s.to_string());
+    // Domyslne source: meeting_output.monitor (audio od uczestnikow spotkania)
+    let device = Some(device_name.unwrap_or("meeting_output.monitor").to_string());
     let (tx, rx) = mpsc::channel::<Vec<i16>>(32);
 
     let handle = std::thread::spawn(move || {
