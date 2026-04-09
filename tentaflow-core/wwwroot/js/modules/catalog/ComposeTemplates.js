@@ -175,6 +175,7 @@ const ComposeTemplates = (() => {
       '    restart: unless-stopped',
       '    ports:',
       `      - "${port}:${INTERNAL_PORTS['meeting-bot']}/udp"`,
+      `      - "${port + 1080}:6080"`,
       '    environment:',
       '      - RUST_LOG=info',
       `      - MEETING_URL=${meetingUrl}`,

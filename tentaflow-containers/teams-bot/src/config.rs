@@ -41,6 +41,10 @@ pub struct MeetingConfig {
     /// Glos TTS (np. "alloy")
     pub tts_voice: Option<String>,
 
+    /// Nazwa bota wyswietlana w spotkaniu Teams
+    #[serde(default = "default_bot_name")]
+    pub bot_name: String,
+
     /// Czas trwania chunka audio w milisekundach
     #[serde(default = "default_chunk_duration")]
     pub chunk_duration_ms: u32,
@@ -60,6 +64,10 @@ fn default_chunk_duration() -> u32 {
 
 fn default_silence_threshold() -> u32 {
     2000
+}
+
+fn default_bot_name() -> String {
+    "TentaFlow AI".to_string()
 }
 
 impl MeetingConfig {
@@ -94,6 +102,8 @@ impl MeetingConfig {
             stt_model: std::env::var("STT_MODEL").ok(),
             tts_model: std::env::var("TTS_MODEL").ok(),
             tts_voice: std::env::var("TTS_VOICE").ok(),
+            bot_name: std::env::var("BOT_NAME")
+                .unwrap_or_else(|_| "TentaFlow AI".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             silence_threshold_ms: std::env::var("SILENCE_THRESHOLD_MS")
@@ -138,9 +148,11 @@ mod tests {
             tts_voice = "nova"
             tls_cert = "/certs/cert.pem"
             tls_key = "/certs/key.pem"
+            bot_name = "Testowy Bot"
         "#;
 
         let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.bot_name, "Testowy Bot");
         assert_eq!(config.quic_port, 6000);
         assert_eq!(config.chunk_duration_ms, 300);
         assert_eq!(config.silence_threshold_ms, 3000);

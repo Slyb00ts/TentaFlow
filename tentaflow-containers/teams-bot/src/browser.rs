@@ -4,12 +4,20 @@
 //       wykrywanie aktywnego mowcy i stanu autoryzacji.
 // =============================================================================
 
+use std::time::Duration;
+
 use anyhow::Result;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 
 use crate::config::MeetingConfig;
+
+/// Maksymalny czas oczekiwania na dolaczenie do spotkania (5 minut)
+const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Interwal pollingu stanu spotkania
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Uruchamia headless Chromium z wczytanymi cookies sesji
 pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
@@ -45,25 +53,127 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     Ok(browser)
 }
 
-/// Nawiguje do URL spotkania Teams i dolacza klikajac "Join Now"
-pub async fn join_meeting(browser: &Browser, url: &str) -> Result<Page> {
+/// Nawiguje do URL spotkania Teams i dolacza jako gosc lub czeka na logowanie VNC
+pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) -> Result<Page> {
     let page = browser.new_page(url).await?;
     page.wait_for_navigation().await?;
 
-    // TODO: Pelna automatyzacja dolaczania do spotkania:
-    // 1. Poczekaj na zaladowanie strony Teams
-    // 2. Kliknij "Continue on this browser" jesli pojawi sie prompt
-    // 3. Wylacz kamera i mikrofon w pre-join lobby
-    // 4. Kliknij "Join now"
-    //
-    // Selektory CSS Teams czesto sie zmieniaja — wymagaja utrzymania.
-    // Przykladowe selektory (moga byc nieaktualne):
-    //   - Przycisk "Join now": [data-tid="prejoin-join-button"]
-    //   - Przycisk mikrofonu: [data-tid="toggle-mute"]
+    tracing::info!(url = url, "Nawigacja do spotkania Teams");
 
-    tracing::info!(url = url, "Dolaczanie do spotkania (TODO: pelna automatyzacja)");
+    // Czekamy na zaladowanie strony pre-join
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    Ok(page)
+    // Sprawdzamy czy dostepna jest opcja dolaczenia jako gosc
+    // TODO: selektory wymagaja weryfikacji z aktualnym klientem Teams
+    let guest_button_exists = page
+        .evaluate(
+            r#"!!document.querySelector('[data-tid="prejoin-join-button-as-guest"]')
+               || !!Array.from(document.querySelectorAll('button, a'))
+                    .find(el => el.textContent.includes('Continue without signing in'))"#,
+        )
+        .await
+        .map(|v| v.into_value::<bool>().unwrap_or(false))
+        .unwrap_or(false);
+
+    if guest_button_exists {
+        tracing::info!(bot_name = %config.bot_name, "Opcja goscia dostepna — dolaczanie anonimowo");
+
+        // Klikamy przycisk "Join as guest" / "Continue without signing in"
+        // TODO: selektory do weryfikacji na zywo
+        page.evaluate(
+            r#"(function() {
+                let btn = document.querySelector('[data-tid="prejoin-join-button-as-guest"]');
+                if (!btn) {
+                    btn = Array.from(document.querySelectorAll('button, a'))
+                        .find(el => el.textContent.includes('Continue without signing in'));
+                }
+                if (btn) btn.click();
+            })()"#,
+        )
+        .await?;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Wpisujemy nazwe bota w pole imienia
+        // TODO: selektory do weryfikacji na zywo
+        let name_js = format!(
+            r#"(function() {{
+                let input = document.querySelector('[data-tid="prejoin-display-name-input"]')
+                    || document.querySelector('input[name="displayName"]');
+                if (input) {{
+                    input.value = '';
+                    input.focus();
+                    const nativeSet = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value').set;
+                    nativeSet.call(input, "{}");
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+            }})()"#,
+            config.bot_name.replace('"', r#"\""#)
+        );
+        page.evaluate(name_js).await?;
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Klikamy "Join now"
+        // TODO: selektor do weryfikacji na zywo
+        page.evaluate(
+            r#"(function() {
+                let btn = document.querySelector('[data-tid="prejoin-join-button"]');
+                if (btn) btn.click();
+            })()"#,
+        )
+        .await?;
+    } else {
+        // Logowanie wymagane — uzytkownik musi zalogowac sie przez VNC
+        tracing::warn!(
+            "Logowanie wymagane — uzyj VNC na porcie 5900 zeby zalogowac sie recznie"
+        );
+
+        // Czekamy az uzytkownik zaloguje sie i dolaczyl do spotkania przez VNC
+        let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("Timeout — uzytkownik nie zalogowal sie w ciagu 5 minut");
+            }
+
+            if is_in_meeting(&page).await? {
+                tracing::info!("Wykryto dolaczenie do spotkania po logowaniu VNC");
+                break;
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    // Czekamy na potwierdzenie ze jestesmy w spotkaniu
+    let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if is_in_meeting(&page).await? {
+            tracing::info!("Pomyslnie dolaczono do spotkania");
+            return Ok(page);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    anyhow::bail!("Timeout — nie udalo sie dolaczyc do spotkania w ciagu 5 minut")
+}
+
+/// Sprawdza czy jestesmy w aktywnym spotkaniu (wykrywanie elementow UI)
+async fn is_in_meeting(page: &Page) -> Result<bool> {
+    // TODO: selektory do weryfikacji z aktualnym klientem Teams
+    let in_meeting = page
+        .evaluate(
+            r#"!!document.querySelector('[data-tid="calling-bar"]')
+               || !!document.querySelector('[data-tid="toggle-mute"]')
+               || !!document.querySelector('[data-tid="hangup-button"]')"#,
+        )
+        .await
+        .map(|v| v.into_value::<bool>().unwrap_or(false))
+        .unwrap_or(false);
+
+    Ok(in_meeting)
 }
 
 /// Pobiera nazwe aktywnego mowcy z DOM strony Teams
