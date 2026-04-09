@@ -247,6 +247,14 @@
       "provision_no_agents": "Brak połączonych agentów",
       "status_loaded": "Certyfikaty załadowane"
     },
+    "nvidia_title": "NVIDIA",
+    "ngc_api_key": "Klucz NGC API",
+    "ngc_api_key_hint": "Wymagany do katalogu kontenerow NVIDIA NIM. Pobierz klucz z build.nvidia.com",
+    "ngc_configured": "Skonfigurowany",
+    "ngc_not_configured": "Nie skonfigurowany",
+    "ngc_test": "Testuj polaczenie",
+    "ngc_test_success": "Polaczenie z NGC udane",
+    "ngc_test_failed": "Polaczenie z NGC nieudane",
     "oauth_redirect_url": "OAuth Redirect URL",
     "oauth_redirect_hint": "Adres URL tego serwera widoczny z przeglądarki. Domyślnie localhost, zmień na publiczny adres jeśli serwer jest dostępny z internetu.",
     "sso_title": "Single Sign-On (SSO)",
@@ -298,6 +306,10 @@
       "comfyui": {
         "name": "Image Generation",
         "desc": "Generowanie i edycja obrazów przez ComfyUI. Stable Diffusion."
+      },
+      "meeting-bot": {
+        "name": "Meeting Bot",
+        "desc": "Bot AI do spotkań Teams — dołącza jako uczestnik, transkrybuje, odpowiada."
       },
       "tentaflow": {
         "name": "TentaFlow",
@@ -397,6 +409,11 @@
     "fallback_targets": "Cele zastępcze",
     "alias": "Alias",
     "fallback_hint": "Rozdzielone przecinkami, w kolejności priorytetu",
+    "add_fallback": "Dodaj model zapasowy",
+    "strategy_first_available": "Pierwszy dostepny (po kolei)",
+    "strategy_round_robin": "Round Robin (rownomiernie)",
+    "strategy_least_loaded": "Najmniej obciazony (preferuj wolne)",
+    "fallback_count": "Zapasowe",
     "form": {
       "name": "Nazwa modelu",
       "display_name": "Nazwa wyświetlana",
@@ -959,5 +976,28 @@
     "validation": {
       "service_required": "Nazwa usługi jest wymagana"
     }
+  },
+  "chat": {
+    "route_badge": "Trasa: {node} | {strategy}",
+    "routing_failed": "Routing nieudany dla \"{model}\"",
+    "targets_tried": "Przetestowane cele:",
+    "configure_alias": "Konfiguruj alias"
+  },
+  "nim": {
+    "title": "NVIDIA NIM",
+    "search": "Szukaj kontenerow NIM...",
+    "no_api_key": "NVIDIA NIM wymaga klucza NGC API",
+    "no_api_key_hint": "Dodaj klucz NGC API w Ustawieniach aby przegladac dostepne kontenery NIM",
+    "go_to_settings": "Przejdz do Ustawien",
+    "auth_failed": "Autentykacja NGC nie powiodla sie",
+    "auth_failed_hint": "Sprawdz klucz API w Ustawieniach",
+    "deploy": "Deploy",
+    "vram": "VRAM",
+    "no_results": "Brak kontenerow pasujacych do wyszukiwania",
+    "category_all": "Wszystkie",
+    "loading_catalog": "Ladowanie katalogu NIM...",
+    "not_supported": "Wymagana karta NVIDIA GPU",
+    "not_supported_hint": "Kontenery NVIDIA NIM wymagaja karty NVIDIA GPU na docelowym nodzie. Wybierz node z karta NVIDIA GPU aby deployowac kontenery NIM.",
+    "no_gpu_detected": "Nie wykryto GPU"
   }
 }

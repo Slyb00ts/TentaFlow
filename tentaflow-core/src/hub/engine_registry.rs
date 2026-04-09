@@ -1,12 +1,12 @@
 // =============================================================================
 // Plik: hub/engine_registry.rs
-// Opis: Centralny rejestr silnikow LLM z kompatybilnoscia per platforma/OS.
+// Opis: Centralny rejestr silnikow (LLM, STT) z kompatybilnoscia per platforma/OS.
 //       Okresla dostepne silniki, tryb wdrazania (Docker/Native) i formaty modeli.
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
 
-/// Definicja silnika LLM
+/// Definicja silnika (LLM lub STT)
 #[derive(Debug, Clone)]
 pub struct EngineDefinition {
     pub id: &'static str,
@@ -17,6 +17,7 @@ pub struct EngineDefinition {
     pub hf_filter_tags: &'static [&'static str],
     pub default_port: u16,
     pub shared_model_formats: &'static [&'static str],
+    pub engine_type: &'static str,
 }
 
 /// Platforma docelowa
@@ -47,6 +48,7 @@ static ENGINES: &[EngineDefinition] = &[
         hf_filter_tags: &["text-generation"],
         default_port: 5010,
         shared_model_formats: &["safetensors"],
+        engine_type: "llm",
     },
     EngineDefinition {
         id: "vllm",
@@ -57,6 +59,7 @@ static ENGINES: &[EngineDefinition] = &[
         hf_filter_tags: &["text-generation"],
         default_port: 5010,
         shared_model_formats: &["safetensors"],
+        engine_type: "llm",
     },
     EngineDefinition {
         id: "ollama",
@@ -67,6 +70,7 @@ static ENGINES: &[EngineDefinition] = &[
         hf_filter_tags: &[],
         default_port: 11434,
         shared_model_formats: &["gguf"],
+        engine_type: "llm",
     },
     EngineDefinition {
         id: "llamacpp",
@@ -77,6 +81,7 @@ static ENGINES: &[EngineDefinition] = &[
         hf_filter_tags: &["gguf"],
         default_port: 5010,
         shared_model_formats: &["gguf"],
+        engine_type: "llm",
     },
     EngineDefinition {
         id: "mlx",
@@ -87,6 +92,29 @@ static ENGINES: &[EngineDefinition] = &[
         hf_filter_tags: &["mlx"],
         default_port: 5010,
         shared_model_formats: &["mlx", "safetensors"],
+        engine_type: "llm",
+    },
+    EngineDefinition {
+        id: "whisper",
+        name: "Whisper",
+        description: "OpenAI Whisper large-v3-turbo via whisper.cpp — on-device speech recognition",
+        supported_platforms: &[Platform::Linux, Platform::MacOS, Platform::Windows, Platform::IOS, Platform::Android],
+        model_format: "ggml",
+        hf_filter_tags: &[],
+        default_port: 0,
+        shared_model_formats: &["ggml"],
+        engine_type: "stt",
+    },
+    EngineDefinition {
+        id: "faster-whisper",
+        name: "Faster Whisper",
+        description: "CTranslate2-based Whisper — GPU-accelerated Docker container",
+        supported_platforms: &[Platform::Linux, Platform::Windows],
+        model_format: "ct2",
+        hf_filter_tags: &[],
+        default_port: 5030,
+        shared_model_formats: &["ct2"],
+        engine_type: "stt",
     },
 ];
 
@@ -106,6 +134,14 @@ pub fn engines_for_platform(platform: &Platform) -> Vec<&'static EngineDefinitio
 /// Zwraca silnik po ID
 pub fn engine_by_id(id: &str) -> Option<&'static EngineDefinition> {
     ENGINES.iter().find(|e| e.id == id)
+}
+
+/// Zwraca silniki dostepne na danej platformie i o danym typie ("llm", "stt")
+pub fn engines_for_platform_and_type(platform: &Platform, engine_type: &str) -> Vec<&'static EngineDefinition> {
+    ENGINES
+        .iter()
+        .filter(|e| e.supported_platforms.contains(platform) && e.engine_type == engine_type)
+        .collect()
 }
 
 /// Parsuje string OS na Platform
@@ -133,6 +169,8 @@ pub fn deploy_mode_for(engine_id: &str, platform: &Platform) -> DeployMode {
         ("vllm", Platform::Linux) => DeployMode::Docker,
         ("ollama", Platform::Linux) => DeployMode::Docker,
         ("llamacpp", Platform::Linux) => DeployMode::Docker,
+        ("whisper", _) => DeployMode::Native,
+        ("faster-whisper", _) => DeployMode::Docker,
         _ => DeployMode::Native,
     }
 }
@@ -164,6 +202,7 @@ pub struct EngineInfo {
     pub default_port: u16,
     pub deploy_mode: String,
     pub supported_platforms: Vec<String>,
+    pub engine_type: String,
 }
 
 impl EngineDefinition {
@@ -182,6 +221,7 @@ impl EngineDefinition {
                 DeployMode::Native => "native".to_string(),
             },
             supported_platforms: self.supported_platforms.iter().map(|p| format!("{:?}", p)).collect(),
+            engine_type: self.engine_type.to_string(),
         }
     }
 }

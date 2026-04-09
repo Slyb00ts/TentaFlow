@@ -101,6 +101,18 @@ async fn main() -> Result<()> {
 
     log_config_summary(&config, &args.db_path);
 
+    // Ladowanie master key z pliku i inicjalizacja SettingsCipher
+    let file_master_key = tentaflow_core::crypto::load_or_create_master_key()
+        .expect("Nie udalo sie zaladowac master key z pliku");
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(&file_master_key));
+
+    // Migracja istniejacych plaintextowych sekretow
+    match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {
+        Ok(n) if n > 0 => info!("Zaszyfrowano {} plaintextowych sekretow w bazie", n),
+        Err(e) => error!("Blad migracji sekretow: {}", e),
+        _ => {}
+    }
+
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
 
@@ -119,6 +131,14 @@ async fn main() -> Result<()> {
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);
     }
+
+    // Inicjalizacja AddonManager z dostepem do routera (host function llm_generate)
+    let addon_manager = Arc::new(
+        tentaflow_core::addon::AddonManager::new(db.clone(), settings_cipher.clone())
+            .expect("Blad inicjalizacji AddonManager"),
+    );
+    addon_manager.set_router(router.clone());
+    router.service_manager().set_event_bus(addon_manager.event_bus().clone());
 
     // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
     let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::quic_mesh::QuicMeshManager>> = None;
@@ -146,7 +166,7 @@ async fn main() -> Result<()> {
                 mesh_config: mesh_config.clone(),
             };
 
-            match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone())).await {
+            match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone()), settings_cipher.clone()).await {
                 Ok(handles) => {
                     quic_mesh_for_server = handles.quic_mesh.clone();
                     mesh_security_for_server = handles.security.clone();
@@ -183,6 +203,32 @@ async fn main() -> Result<()> {
                                 }
                             })
                         })).await;
+
+                        // Obsluga przychodzacych alias sync od zdalnych nodow
+                        let router_for_alias = router.clone();
+                        let mut alias_rx = mesh_mgr.subscribe();
+                        tokio::spawn(async move {
+                            loop {
+                                match alias_rx.recv().await {
+                                    Ok(tentaflow_core::mesh::quic_mesh::QuicMeshEvent::AliasSyncReceived { from_node_id, data }) => {
+                                        match serde_json::from_slice::<Vec<tentaflow_core::db::models::DbModelAlias>>(&data) {
+                                            Ok(aliases) => {
+                                                tracing::debug!(from = %from_node_id, count = aliases.len(), "Alias cache zsynchronizowany z peera");
+                                                router_for_alias.update_alias_cache_from_sync(aliases);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(from = %from_node_id, "Blad deserializacji AliasSync: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!("Alias sync listener opuscil {} wiadomosci", n);
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
 
                         info!("Mesh routing podlaczony do routera");
                     }

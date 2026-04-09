@@ -30,6 +30,7 @@ const Chat = (() => {
   let topP = 1.0;
   let ttsVoice = 'nova';
   let sttLanguage = 'pl';
+  let sttModelLoaded = false;
 
   const STORAGE_KEY = 'tentaflow_chat_conversations';
 
@@ -123,6 +124,15 @@ const Chat = (() => {
                   <option value="zh"${sttLanguage === 'zh' ? ' selected' : ''}>zh</option>
                 </select>
               </div>
+              <div class="chat-params-field chat-params-full" id="chat-stt-model-panel">
+                <label>Whisper large-v3-turbo (1.6 GB)</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <button id="chat-stt-load-btn" class="btn-sm" style="white-space:nowrap">
+                    <span id="chat-stt-load-text">${I18n.t('playground.stt_load', 'Load')}</span>
+                  </button>
+                  <span id="chat-stt-status" style="font-size:12px;color:var(--text-muted)"></span>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -196,6 +206,7 @@ const Chat = (() => {
 
     // Parametry - aktualizacja wartości
     bindParamListeners();
+    checkSttModelStatus();
 
     // TTS / STT checkboxy
     const ttsToggle = document.getElementById('chat-tts-toggle');
@@ -211,6 +222,11 @@ const Chat = (() => {
     const micBtn = document.getElementById('chat-mic-btn');
     if (micBtn) {
       micBtn.addEventListener('click', handleSTT);
+    }
+
+    const sttLoadBtn = document.getElementById('chat-stt-load-btn');
+    if (sttLoadBtn) {
+      sttLoadBtn.addEventListener('click', handleSttLoadModel);
     }
 
     // Załączniki
@@ -488,12 +504,17 @@ const Chat = (() => {
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
+        if (err.route_metadata) {
+          appendRoutingErrorCard(msgEl, err);
+          return;
+        }
         throw new Error(err.error || `${I18n.t('playground.error_server')}: ${response.status}`);
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let currentEvent = '';
 
       while (true) {
         const { done, value } = await reader.read();
@@ -504,9 +525,25 @@ const Chat = (() => {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+            continue;
+          }
           if (!line.startsWith('data: ')) continue;
           const data = line.slice(6).trim();
-          if (data === '[DONE]') continue;
+          if (data === '[DONE]') { currentEvent = ''; continue; }
+
+          // Obsluga route_info — badge z metadanymi trasy
+          if (currentEvent === 'route_info') {
+            try {
+              const routeData = JSON.parse(data);
+              appendRouteBadge(msgEl, routeData);
+            } catch (_e) { /* ignoruj */ }
+            currentEvent = '';
+            continue;
+          }
+          currentEvent = '';
+
           try {
             const chunk = JSON.parse(data);
             const delta = chunk.choices?.[0]?.delta;
@@ -607,13 +644,141 @@ const Chat = (() => {
   }
 
   // ---------------------------------------------------------------------------
+  // STT - konwersja audio do WAV (16kHz mono) po stronie klienta
+  // ---------------------------------------------------------------------------
+
+  async function convertToWav(blob) {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+    const offlineCtx = new OfflineAudioContext(1, audioBuffer.duration * 16000, 16000);
+    const source = offlineCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offlineCtx.destination);
+    source.start(0);
+    const rendered = await offlineCtx.startRendering();
+
+    const pcm = rendered.getChannelData(0);
+    const wavBuffer = encodeWav(pcm, 16000);
+
+    const uint8 = new Uint8Array(wavBuffer);
+    let binary = '';
+    for (let i = 0; i < uint8.length; i++) {
+      binary += String.fromCharCode(uint8[i]);
+    }
+    audioCtx.close();
+    return btoa(binary);
+  }
+
+  function encodeWav(samples, sampleRate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeString(view, 8, 'WAVE');
+
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+
+    writeString(view, 36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+
+    return buffer;
+  }
+
+  function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // STT - wybor i ladowanie modelu Whisper
+  // ---------------------------------------------------------------------------
+
+  async function checkSttModelStatus() {
+    try {
+      const resp = await fetch('/api/chat/capabilities', {
+        headers: { 'Authorization': `Bearer ${ApiClient.getToken()}` }
+      });
+      const data = await resp.json();
+      if (data.stt_local && data.stt_model) {
+        sttModelLoaded = true;
+        const status = document.getElementById('chat-stt-status');
+        const loadText = document.getElementById('chat-stt-load-text');
+        if (status) status.textContent = `✓ ${data.stt_model.name} (${data.stt_model.device || 'cpu'})`;
+        if (loadText) loadText.textContent = I18n.t('playground.stt_unload', 'Unload');
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function handleSttLoadModel() {
+    const btn = document.getElementById('chat-stt-load-btn');
+    const status = document.getElementById('chat-stt-status');
+    const loadText = document.getElementById('chat-stt-load-text');
+
+    if (btn) btn.disabled = true;
+
+    if (sttModelLoaded) {
+      if (status) status.textContent = I18n.t('playground.stt_unloading', 'Unloading...');
+      try {
+        await fetch('/api/chat/stt/unload', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${ApiClient.getToken()}` }
+        });
+        sttModelLoaded = false;
+        if (status) status.textContent = '';
+        if (loadText) loadText.textContent = I18n.t('playground.stt_load', 'Load');
+      } catch (e) {
+        if (status) status.textContent = `✗ ${e.message}`;
+      }
+    } else {
+      if (status) status.textContent = I18n.t('playground.stt_loading', 'Downloading & loading...');
+      try {
+        const resp = await fetch('/api/chat/stt/load', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${ApiClient.getToken()}`
+          },
+          body: JSON.stringify({})
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+          sttModelLoaded = true;
+          if (status) status.textContent = `✓ ${data.name || 'large-v3-turbo'} (${data.device || 'cpu'})`;
+          if (loadText) loadText.textContent = I18n.t('playground.stt_unload', 'Unload');
+        } else {
+          if (status) status.textContent = `✗ ${data.error || 'Error'}`;
+        }
+      } catch (e) {
+        if (status) status.textContent = `✗ ${e.message}`;
+      }
+    }
+    if (btn) btn.disabled = false;
+  }
+
+  // ---------------------------------------------------------------------------
   // STT - rozpoznawanie mowy
   // ---------------------------------------------------------------------------
 
   async function handleSTT() {
     const micBtn = document.getElementById('chat-mic-btn');
 
-    // Zatrzymaj nagrywanie jeśli aktywne
     if (mediaRecorder && mediaRecorder.state === 'recording') {
       mediaRecorder.stop();
       if (micBtn) micBtn.classList.remove('recording');
@@ -622,43 +787,40 @@ const Chat = (() => {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      mediaRecorder = new MediaRecorder(stream);
       audioChunks = [];
 
       mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
 
       mediaRecorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
-        const blob = new Blob(audioChunks, { type: 'audio/webm' });
-        const reader = new FileReader();
-        reader.onload = async () => {
-          const base64 = reader.result.split(',')[1];
-          try {
-            const resp = await fetch('/api/chat/stt', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${ApiClient.getToken()}`
-              },
-              body: JSON.stringify({
-                audio: base64,
-                model: 'whisper-1',
-                language: sttLanguage
-              })
-            });
-            const data = await resp.json();
-            if (data.text) {
-              const textarea = document.getElementById('chat-input');
-              if (textarea) {
-                textarea.value += data.text;
-                autoResize(textarea);
-              }
+        const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+
+        try {
+          const wavBase64 = await convertToWav(blob);
+          const resp = await fetch('/api/chat/stt', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${ApiClient.getToken()}`
+            },
+            body: JSON.stringify({
+              audio: wavBase64,
+              model: 'whisper-1',
+              language: sttLanguage
+            })
+          });
+          const data = await resp.json();
+          if (data.text) {
+            const textarea = document.getElementById('chat-input');
+            if (textarea) {
+              textarea.value += data.text;
+              autoResize(textarea);
             }
-          } catch (e) {
-            console.error('STT error:', e);
           }
-        };
-        reader.readAsDataURL(blob);
+        } catch (e) {
+          console.error('STT error:', e);
+        }
       };
 
       mediaRecorder.start();
@@ -1108,6 +1270,101 @@ const Chat = (() => {
     if (langSelect) {
       langSelect.addEventListener('change', () => { sttLanguage = langSelect.value; });
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Route badge — widoczny tylko gdy serwer wysle event route_info
+  // ---------------------------------------------------------------------------
+
+  function appendRouteBadge(bubbleEl, routeData) {
+    if (!bubbleEl || !routeData) return;
+    const nodeRaw = routeData.served_by_node || '-';
+    const nodeShort = nodeRaw.length > 12 ? nodeRaw.substring(0, 12) + '\u2026' : nodeRaw;
+    const strategy = routeData.strategy_used || '-';
+    const stratLabel = I18n.t('models.strategy_' + strategy) || strategy;
+    const fallbackCount = (routeData.fallbacks_tried || []).length;
+
+    const badge = document.createElement('div');
+    badge.className = 'route-badge';
+    badge.setAttribute('role', 'status');
+    badge.setAttribute('tabindex', '0');
+    badge.style.cssText = 'background:var(--color-info-light);color:var(--color-info);border-radius:var(--radius-sm);padding:2px 8px;font-size:var(--font-size-xs);cursor:pointer;min-height:44px;display:inline-flex;align-items:center;margin-top:4px;';
+    if (nodeRaw.length > 12) badge.title = nodeRaw;
+
+    const summaryText = `${nodeShort} | ${stratLabel} | ${fallbackCount} fallbacks`;
+    badge.textContent = summaryText;
+
+    // Szczegoly — rozwijane po kliknieciu
+    const details = document.createElement('div');
+    details.hidden = true;
+    details.style.cssText = 'font-family:monospace;font-size:var(--font-size-xs);margin-top:4px;white-space:pre-wrap;';
+
+    const detailLines = [
+      `served_by_node: ${routeData.served_by_node || '-'}`,
+      `backend_type: ${routeData.backend_type || '-'}`,
+      `strategy_used: ${strategy}`,
+      `fallbacks_tried: ${(routeData.fallbacks_tried || []).join(', ') || '-'}`,
+      `hop_count: ${routeData.hop_count ?? '-'}`,
+      `latency_ms: ${routeData.latency_ms ?? '-'}`
+    ];
+    details.textContent = detailLines.join('\n');
+
+    const toggle = () => { details.hidden = !details.hidden; };
+    badge.addEventListener('click', toggle);
+    badge.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+
+    const wrapper = document.createElement('div');
+    wrapper.appendChild(badge);
+    wrapper.appendChild(details);
+    bubbleEl.appendChild(wrapper);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Routing error card — blad routingu z metadanymi
+  // ---------------------------------------------------------------------------
+
+  function appendRoutingErrorCard(bubbleEl, errData) {
+    if (!bubbleEl) return;
+    const meta = errData.route_metadata || {};
+    const modelName = errData.model || meta.model || '-';
+    const strategy = meta.strategy_used || '-';
+    const stratLabel = I18n.t('models.strategy_' + strategy) || strategy;
+    const targets = meta.targets_tried || [];
+
+    const card = document.createElement('div');
+    card.className = 'route-error-card';
+    card.style.cssText = 'background:var(--color-error-light);border:1px solid var(--color-error);border-radius:var(--radius-md);padding:12px 16px;margin-top:4px;width:100%;';
+
+    let html = `<div style="font-weight:bold;margin-bottom:8px;">\u26A0 ${Utils.escapeHtml(I18n.t('chat.routing_failed').replace('{model}', modelName))}</div>`;
+
+    if (targets.length > 0) {
+      html += `<div style="margin-bottom:8px;">${Utils.escapeHtml(I18n.t('chat.targets_tried'))}</div>`;
+      html += '<div style="margin-left:8px;">';
+      for (const t of targets) {
+        const name = typeof t === 'string' ? t : (t.name || t.target || '-');
+        const reason = typeof t === 'object' ? (t.reason || '') : '';
+        html += `<div>\u2717 ${Utils.escapeHtml(name)}${reason ? ' (' + Utils.escapeHtml(reason) + ')' : ''}</div>`;
+      }
+      html += '</div>';
+    }
+
+    html += `<div style="margin-top:8px;">${I18n.t('common.strategy')}: ${Utils.escapeHtml(stratLabel)}</div>`;
+    html += `<div style="margin-top:8px;"><a href="#" class="route-error-configure" style="color:var(--color-primary);text-decoration:underline;">${Utils.escapeHtml(I18n.t('chat.configure_alias'))} \u2192</a></div>`;
+
+    card.innerHTML = html;
+
+    // Nawigacja do modeli
+    const link = card.querySelector('.route-error-configure');
+    if (link) {
+      link.addEventListener('click', (e) => {
+        e.preventDefault();
+        ViewRouter.navigate('models');
+      });
+    }
+
+    bubbleEl.appendChild(card);
   }
 
   // ---------------------------------------------------------------------------

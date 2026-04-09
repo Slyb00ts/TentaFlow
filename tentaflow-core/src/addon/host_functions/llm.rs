@@ -4,13 +4,16 @@
 //       Addon wywoluje te funkcje aby korzystac z modeli LLM dostepnych w Core.
 // =============================================================================
 
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 use super::{
-    AddonState, ABI_ERR_PERMISSION, ABI_ERR_OPERATION,
+    AddonState, ABI_ERR_PERMISSION, ABI_ERR_OPERATION, ABI_ERR_RATE_LIMIT,
     get_memory, read_guest_string, write_guest_output, audit_log, check_permission,
     WasmCaller,
 };
+
+use crate::addon::rate_limiter::ResourceType;
+use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
 
 // =============================================================================
 // llm_generate — synchroniczne generowanie tekstu
@@ -85,15 +88,98 @@ pub fn llm_generate(
     let addon_id = caller.data().addon_id.clone();
     info!("llm_generate: addon='{}', model={:?}, prompt_len={}", addon_id, model_name, prompt.len());
 
-    // Wywolaj LLM przez router — synchronicznie
-    // W produkcji to przejdzie przez crate::routing::router
-    // Na razie symulujemy odpowiedz (integracja z routerem w nastepnej fazie)
-    let result_text = format!(
-        "[LLM response placeholder — addon='{}', model={:?}, prompt_len={}]",
-        addon_id,
-        model_name.as_deref().unwrap_or("default"),
-        prompt.len()
-    );
+    // Sprawdz rate limit LLM przez in-memory rate limiter
+    if let Some(ref rate_limiter) = caller.data().rate_limiter {
+        if rate_limiter.check(&addon_id, ResourceType::LlmTokens).is_err() {
+            audit_log(caller.data(), "llm.generate", Some("llm"), model_name.as_deref(), "error", Some("rate limit exceeded"));
+            return ABI_ERR_RATE_LIMIT;
+        }
+    }
+
+    // Pobierz router z AddonState
+    let router = match caller.data().router.as_ref() {
+        Some(r) => r.clone(),
+        None => {
+            warn!("llm_generate: router niedostepny dla addon='{}'", addon_id);
+            audit_log(caller.data(), "llm.generate", Some("llm"), model_name.as_deref(), "error", Some("router unavailable"));
+            return ABI_ERR_OPERATION;
+        }
+    };
+
+    // Parsuj opcje z JSON
+    let temperature = _options_json.as_ref().and_then(|o| o.get("temperature")).and_then(|v| v.as_f64()).map(|v| v as f32);
+    let max_tokens = _options_json.as_ref().and_then(|o| o.get("max_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
+    let top_p = _options_json.as_ref().and_then(|o| o.get("top_p")).and_then(|v| v.as_f64()).map(|v| v as f32);
+
+    // Zbuduj ChatCompletionRequest
+    let request = ChatCompletionRequest {
+        model: model_name.unwrap_or_else(|| "default".to_string()),
+        messages: vec![
+            Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text(prompt)),
+                reasoning_content: None,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ],
+        temperature,
+        max_tokens,
+        top_p,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        stream: false,
+        user: Some(format!("addon:{}", addon_id)),
+        response_format: None,
+        tools: None,
+        tool_choice: None,
+        n: None,
+        rag_options: None,
+        memory_options: None,
+        audio_input: None,
+    };
+
+    // Most async→sync: host function jest synchroniczna, router jest async.
+    // Uzywamy tokio::task::block_in_place aby uniknac deadlocka w wielowatkowym runtime.
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(router.route_chat_completion(request))
+    });
+
+    let result_text = match result {
+        Ok(route_result) => {
+            // Wyciagnij tekst z pierwszego choice
+            let response = route_result.response;
+            response.choices.first()
+                .and_then(|choice| choice.message.content.as_ref())
+                .map(|content| match content {
+                    MessageContent::Text(text) => text.clone(),
+                    MessageContent::Parts(parts) => {
+                        // Sklej czesci tekstowe
+                        parts.iter().filter_map(|p| {
+                            if let crate::api::openai::types::ContentPart::Text { text } = p {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        }).collect::<Vec<_>>().join("")
+                    }
+                })
+                .unwrap_or_default()
+        }
+        Err(e) => {
+            error!("llm_generate: blad routera dla addon='{}': {}", addon_id, e);
+            audit_log(caller.data(), "llm.generate", Some("llm"), None, "error", Some(&e.to_string()));
+            return ABI_ERR_OPERATION;
+        }
+    };
+
+    // Zarejestruj zuzycie tokenow (przyblizone na podstawie dlugosci odpowiedzi)
+    if let Some(ref rate_limiter) = caller.data().rate_limiter {
+        let estimated_tokens = (result_text.len() / 4).max(1) as u64;
+        rate_limiter.record_usage(&addon_id, ResourceType::LlmTokens, estimated_tokens);
+    }
 
     let result_bytes = result_text.as_bytes();
 
@@ -102,7 +188,7 @@ pub fn llm_generate(
         caller.data(),
         "llm.generate",
         Some("llm"),
-        model_name.as_deref(),
+        None,
         "ok",
         None,
     );

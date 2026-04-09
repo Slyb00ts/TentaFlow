@@ -15,7 +15,11 @@ pub mod backend;
 pub mod loadbalancer;
 pub mod service_manager;
 pub mod local_inference;
+pub mod local_stt;
 pub mod chat_template;
+pub mod middleware;
+pub mod meeting_transcript;
+pub(crate) mod reverse_request;
 
 // Re-eksporty publicznych typow
 pub use router::{
@@ -29,6 +33,7 @@ pub use router::{
     RouterMetrics,
 };
 pub use memory_integration::MemoryIntegration;
+pub use middleware::{ResolvedRoute, BackendHandle, RouteMetadata, RouteResult};
 
 use crate::api::openai::types::{
     ChatCompletionRequest, ChatCompletionResponse, MessageContent,

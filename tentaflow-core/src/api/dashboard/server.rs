@@ -6,7 +6,7 @@
 use crate::db::{self, DbPool};
 use crate::metrics::RouterMetrics;
 use crate::routing::service_manager::ServiceManager;
-use super::{auth, api_auth, api_services, api_dashboard, api_apikeys, api_settings, api_portainer, api_prompts, api_models, api_flows, api_pii_rules, api_fast_path, api_tts_rules, static_files, api_registries, api_mesh, api_hub, api_addon_system, api_clusters};
+use super::{auth, api_auth, api_services, api_dashboard, api_apikeys, api_settings, api_portainer, api_prompts, api_models, api_flows, api_pii_rules, api_fast_path, api_tts_rules, static_files, api_registries, api_mesh, api_hub, api_addon_system, api_clusters, api_nim};
 use crate::mesh::peer_store::MeshPeerStore;
 use std::sync::Arc;
 
@@ -32,6 +32,7 @@ pub struct DashboardServer {
     bind: String,
     metrics: Arc<RouterMetrics>,
     cipher: Arc<crate::crypto::SecretsCipher>,
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
     service_manager: Arc<ServiceManager>,
     router: Arc<Router>,
     mesh_peer_store: MeshPeerStore,
@@ -42,12 +43,13 @@ pub struct DashboardServer {
 }
 
 impl DashboardServer {
-    pub fn new(db: DbPool, bind: &str, metrics: Arc<RouterMetrics>, cipher: Arc<crate::crypto::SecretsCipher>, service_manager: Arc<ServiceManager>, router: Arc<Router>, mesh_peer_store: MeshPeerStore) -> Self {
+    pub fn new(db: DbPool, bind: &str, metrics: Arc<RouterMetrics>, cipher: Arc<crate::crypto::SecretsCipher>, settings_cipher: Arc<crate::crypto::SettingsCipher>, service_manager: Arc<ServiceManager>, router: Arc<Router>, mesh_peer_store: MeshPeerStore) -> Self {
         Self {
             db,
             bind: bind.to_string(),
             metrics,
             cipher,
+            settings_cipher,
             service_manager,
             router,
             mesh_peer_store,
@@ -85,6 +87,7 @@ impl DashboardServer {
         let db = self.db.clone();
         let metrics = self.metrics.clone();
         let cipher = self.cipher.clone();
+        let settings_cipher = self.settings_cipher.clone();
         let service_manager = self.service_manager.clone();
         let router = self.router.clone();
         let mesh_peer_store = self.mesh_peer_store.clone();
@@ -107,6 +110,7 @@ impl DashboardServer {
             let db_clone = db.clone();
             let metrics_clone = metrics.clone();
             let cipher_clone = cipher.clone();
+            let sc_clone = settings_cipher.clone();
             let sm_clone = service_manager.clone();
             let router_clone = router.clone();
             let mps_clone = mesh_peer_store.clone();
@@ -124,6 +128,7 @@ impl DashboardServer {
                     let db = db_clone.clone();
                     let metrics = metrics_clone.clone();
                     let cipher = cipher_clone.clone();
+                    let sc = sc_clone.clone();
                     let sm = sm_clone.clone();
                     let router = router_clone.clone();
                     let mps = mps_clone.clone();
@@ -132,7 +137,7 @@ impl DashboardServer {
                     let msec = msec_clone.clone();
                     let pc = pc_clone.clone();
                     let ra = remote_addr_str.clone();
-                    async move { handle_request(req, db, metrics, cipher, sm, router, mps, qm, lni, msec, pc, ra).await }
+                    async move { handle_request(req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, ra).await }
                 });
 
                 if let Err(e) = http1::Builder::new()
@@ -224,6 +229,7 @@ pub async fn handle_request(
     db: DbPool,
     metrics: Arc<RouterMetrics>,
     cipher: Arc<crate::crypto::SecretsCipher>,
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
     service_manager: Arc<ServiceManager>,
     router: Arc<Router>,
     mesh_peer_store: MeshPeerStore,
@@ -283,7 +289,7 @@ pub async fn handle_request(
 
     // WebSocket upgrade /ws/metrics
     if method == Method::GET && path == "/ws/metrics" {
-        let (_ws_key, accept, ws_subprotocol) = match validate_ws_upgrade(&req, &db, &query_string, cors_origin.as_deref()) {
+        let (_ws_key, accept, ws_subprotocol) = match validate_ws_upgrade(&req, &db, &query_string, cors_origin.as_deref(), &settings_cipher) {
             Ok(v) => v,
             Err(resp) => return Ok(resp),
         };
@@ -319,12 +325,51 @@ pub async fn handle_request(
         return Ok(response);
     }
 
+    // WebSocket upgrade /ws/deploy
+    if method == Method::GET && path == "/ws/deploy" {
+        let (_ws_key, accept, ws_subprotocol) = match validate_ws_upgrade(&req, &db, &query_string, cors_origin.as_deref(), &settings_cipher) {
+            Ok(v) => v,
+            Err(resp) => return Ok(resp),
+        };
+
+        let upgrade = hyper::upgrade::on(&mut req);
+        let db_clone = db.clone();
+        let settings_cipher_clone = settings_cipher.clone();
+        let router_clone = router.clone();
+        let lni_clone = local_node_id.clone();
+
+        tokio::spawn(async move {
+            match upgrade.await {
+                Ok(upgraded) => {
+                    let io = TokioIo::new(upgraded);
+                    super::ws_deploy::handle_ws_connection(io, db_clone, settings_cipher_clone, router_clone, lni_clone).await;
+                }
+                Err(e) => {
+                    error!("Blad WebSocket upgrade (deploy): {}", e);
+                }
+            }
+        });
+
+        let mut ws_resp = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Accept", accept);
+        if let Some(ref proto) = ws_subprotocol {
+            ws_resp = ws_resp.header("Sec-WebSocket-Protocol", proto.as_str());
+        }
+        let response = ws_resp
+            .body(Either::Left(Full::new(Bytes::new())))
+            .unwrap();
+
+        return Ok(response);
+    }
 
     // Endpointy BEZ auth
     if method == Method::POST && path == "/api/auth/login" {
         let body_bytes = req.collect().await?.to_bytes();
         // VULN-035: Przekaz remote_addr do handle_login (dual rate limiting per IP)
-        let (status, body) = match api_auth::handle_login(&db, &body_bytes, &remote_addr) {
+        let (status, body) = match api_auth::handle_login(&db, &body_bytes, &remote_addr, &settings_cipher) {
             Ok(r) => r,
             Err(e) => {
                 warn!("Blad logowania: {}", e);
@@ -379,7 +424,7 @@ pub async fn handle_request(
             return Ok(json_error_cors(400, &format!("Blad SSO: {} — {}", error, error_desc), cors_origin.as_deref()));
         }
 
-        match api_addon_system::handle_sso_callback(&db, &cipher, &query_string, &redirect_base).await {
+        match api_addon_system::handle_sso_callback(&db, &cipher, &query_string, &redirect_base, &settings_cipher).await {
             Ok((_, body)) => {
                 // Parsuj odpowiedz zeby wyciagnac redirect_url
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -485,7 +530,7 @@ pub async fn handle_request(
 
     // Wszystkie /api/* (oprocz login) wymagaja JWT
     let claims = if path.starts_with("/api/") {
-        let jwt_secret = match db::repository::get_setting(&db, "jwt_secret") {
+        let jwt_secret = match db::repository::get_setting_secure(&db, "jwt_secret", &settings_cipher) {
             Ok(Some(s)) => s,
             _ => return Ok(json_error_cors(500, "Brak jwt_secret w konfiguracji", cors_origin.as_deref())),
         };
@@ -513,13 +558,14 @@ pub async fn handle_request(
 
     // Chat API - obsluga przed walidacja Content-Type (SSE streaming)
     if path.starts_with("/api/chat/") {
+        let debug_route = is_debug_route(req.headers(), &query_string);
         let body_bytes = if method == Method::POST {
             req.collect().await?.to_bytes()
         } else {
             let _ = req.collect().await?;
             Bytes::new()
         };
-        return Ok(super::api_chat::route_chat_api(&method, &path, &router, body_bytes, &db, &metrics, cors_origin.as_deref()).await);
+        return Ok(super::api_chat::route_chat_api(&method, &path, &router, body_bytes, &db, &metrics, cors_origin.as_deref(), debug_route).await);
     }
 
     // Walidacja Content-Type dla POST/PUT
@@ -577,11 +623,12 @@ pub async fn handle_request(
     // Model Pool API - podglad i zmiana strategii load-balancing per model
     if path == "/api/models/pool" && method == Method::GET {
         let pool_info = service_manager.get_model_pool_info();
-        let models: Vec<_> = pool_info.iter().map(|(name, services, strategy)| {
+        let models: Vec<_> = pool_info.iter().map(|(name, services, strategy, service_type)| {
             serde_json::json!({
                 "model_name": name,
                 "services": services,
                 "strategy": strategy,
+                "service_type": service_type,
             })
         }).collect();
         let resp_body = serde_json::json!({"models": models}).to_string();
@@ -645,6 +692,12 @@ pub async fn handle_request(
         return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
     }
 
+    // NIM catalog API — lista kontenerow NVIDIA NIM z NGC
+    if path == "/api/nim/catalog" && method == Method::GET {
+        let (status, response_body) = handle_result(api_nim::handle_list(&db, &settings_cipher).await, 500);
+        return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
+    }
+
     // Hub API — silniki, wyszukiwanie modeli HF, lokalne modele
     if path.starts_with("/api/hub/") {
         let (status, response_body) = route_hub_api(&method, &path, &query_string, &body_bytes, &mesh_peer_store, &claims, &db).await;
@@ -683,7 +736,26 @@ pub async fn handle_request(
         return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
     }
 
-    let (status, response_body) = route_api(&method, &path, &query_string, &db, &claims, &body_bytes);
+    let (status, response_body) = route_api(&method, &path, &query_string, &db, &claims, &body_bytes, &settings_cipher);
+
+    // Synchronizacja aliasow po udanej mutacji
+    let is_alias_mutation = path.starts_with("/api/model-aliases")
+        && matches!(method, Method::POST | Method::PUT | Method::DELETE)
+        && (200..300).contains(&status);
+
+    if is_alias_mutation {
+        router.reload_alias_cache();
+        if let Some(ref qm) = quic_mesh {
+            if let Ok(aliases) = crate::db::repository::list_model_aliases(&db) {
+                if let Ok(json) = serde_json::to_vec(&aliases) {
+                    let qm = Arc::clone(qm);
+                    tokio::spawn(async move {
+                        qm.broadcast_alias_sync(json).await;
+                    });
+                }
+            }
+        }
+    }
 
     Ok(json_response_cors(status, response_body, cors_origin.as_deref()))
 }
@@ -723,6 +795,7 @@ fn route_api(
     db: &DbPool,
     claims: &auth::Claims,
     body: &[u8],
+    settings_cipher: &Arc<crate::crypto::SettingsCipher>,
 ) -> (u16, String) {
     match (method, path) {
         // Auth
@@ -750,7 +823,7 @@ fn route_api(
         (&Method::GET, "/api/settings") => handle_result(api_settings::handle_list(db, claims), 500),
         (&Method::PUT, "/api/settings") => {
             if let Some(err) = require_admin(claims, db) { return err; }
-            handle_result(api_settings::handle_update(db, body), 400)
+            handle_result(api_settings::handle_update(db, body, settings_cipher), 400)
         }
 
         // Prompts
@@ -1436,6 +1509,7 @@ fn validate_ws_upgrade(
     db: &DbPool,
     _query_string: &str,
     cors_origin: Option<&str>,
+    settings_cipher: &crate::crypto::SettingsCipher,
 ) -> Result<(String, String, Option<String>), Response<DashboardBody>> {
     let is_upgrade = req.headers()
         .get("upgrade")
@@ -1447,7 +1521,7 @@ fn validate_ws_upgrade(
         return Err(json_error_cors(400, "Wymagany WebSocket upgrade", cors_origin));
     }
 
-    let jwt_secret = match db::repository::get_setting(db, "jwt_secret") {
+    let jwt_secret = match db::repository::get_setting_secure(db, "jwt_secret", settings_cipher) {
         Ok(Some(s)) => s,
         _ => return Err(json_error_cors(500, "Brak jwt_secret w konfiguracji", cors_origin)),
     };
@@ -1698,4 +1772,12 @@ async fn route_clusters_api(
     }
 
     (404, serde_json::json!({"error": "Nieznany endpoint clusters"}).to_string())
+}
+
+/// Sprawdza czy request ma wlaczony debug routing (header lub query param)
+pub(super) fn is_debug_route(headers: &hyper::header::HeaderMap, query: &str) -> bool {
+    headers.get("x-tentaflow-debug")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v == "true")
+        || query.contains("debug=route")
 }

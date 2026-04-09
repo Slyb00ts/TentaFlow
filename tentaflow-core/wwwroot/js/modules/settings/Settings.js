@@ -276,6 +276,26 @@ const Settings = (() => {
           </div>
         </div>
       </div>
+
+      <div class="card" style="margin-top: var(--spacing-lg);">
+        <div class="card-header">
+          <h3 data-i18n="settings.nvidia_title">${I18n.t('settings.nvidia_title')}</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-group">
+            <label for="setting-ngc-api-key" data-i18n="settings.ngc_api_key">${I18n.t('settings.ngc_api_key')}</label>
+            <div style="display: flex; gap: var(--spacing-sm); align-items: center;">
+              <input type="password" id="setting-ngc-api-key" placeholder="nvapi-..." style="flex: 1;">
+              <span id="ngc-status-badge" style="font-size: var(--font-size-sm); padding: 2px 8px; border-radius: 4px;"></span>
+            </div>
+            <div class="form-hint" data-i18n="settings.ngc_api_key_hint">${I18n.t('settings.ngc_api_key_hint')}</div>
+          </div>
+          <div style="display: flex; gap: var(--spacing-sm);">
+            <button class="btn btn-primary btn-sm" id="btn-save-ngc-key" data-i18n="common.save">${I18n.t('common.save')}</button>
+            <button class="btn btn-secondary btn-sm" id="btn-test-ngc" data-i18n="settings.ngc_test">${I18n.t('settings.ngc_test')}</button>
+          </div>
+        </div>
+      </div>
     `;
   }
 
@@ -335,6 +355,10 @@ const Settings = (() => {
 
     // Dystrybucja certyfikatow do agentow
     document.getElementById('btn-provision-certs')?.addEventListener('click', provisionCerts);
+
+    // NGC API Key
+    document.getElementById('btn-save-ngc-key')?.addEventListener('click', saveNgcApiKey);
+    document.getElementById('btn-test-ngc')?.addEventListener('click', testNgcConnection);
 
     // Zaladuj obecne certyfikaty
     loadTlsCerts();
@@ -480,6 +504,8 @@ const Settings = (() => {
     // OAuth redirect URL
     setInputValue('setting-oauth-redirect-url', map.oauth_redirect_base_url, 'https://localhost:8090');
 
+    // NGC API Key — pokaz status
+    updateNgcBadge(map.ngc_api_key);
   }
 
   // Pomocniki ustawiania wartosci
@@ -883,6 +909,50 @@ const Settings = (() => {
       }
     } catch (err) {
       App.showToast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+    }
+  }
+
+  // Status badge NGC
+  function updateNgcBadge(val) {
+    const badge = document.getElementById('ngc-status-badge');
+    if (!badge) return;
+    if (val && val !== '***') {
+      badge.textContent = I18n.t('settings.ngc_configured');
+      badge.style.background = 'var(--color-success, #22c55e)';
+      badge.style.color = '#fff';
+    } else {
+      badge.textContent = I18n.t('settings.ngc_not_configured');
+      badge.style.background = 'var(--color-border, #555)';
+      badge.style.color = 'var(--color-text-secondary, #aaa)';
+    }
+  }
+
+  // Zapis NGC API Key
+  async function saveNgcApiKey() {
+    const input = document.getElementById('setting-ngc-api-key');
+    const value = input?.value?.trim();
+    if (!value) return;
+    try {
+      await ApiClient.put('/api/settings', { key: 'ngc_api_key', value });
+      input.value = '';
+      App.showToast(I18n.t('settings.save_success').replace('{key}', 'ngc_api_key'), 'success');
+      loadSettings();
+    } catch (err) {
+      App.showToast(I18n.t('settings.save_error').replace('{error}', err.message), 'error');
+    }
+  }
+
+  // Test polaczenia NGC
+  async function testNgcConnection() {
+    const btn = document.getElementById('btn-test-ngc');
+    if (btn) btn.disabled = true;
+    try {
+      await ApiClient.get('/api/nim/catalog');
+      App.showToast(I18n.t('settings.ngc_test_success'), 'success');
+    } catch (err) {
+      App.showToast(I18n.t('settings.ngc_test_failed') + ': ' + err.message, 'error');
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 

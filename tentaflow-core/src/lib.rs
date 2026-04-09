@@ -18,6 +18,7 @@ pub mod intent_analyzer;
 pub mod memory_analyzer;
 pub mod mesh;
 pub mod inference;
+pub mod stt;
 pub mod hub;
 
 pub mod auth;

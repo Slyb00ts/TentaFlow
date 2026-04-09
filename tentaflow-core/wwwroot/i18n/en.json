@@ -247,6 +247,14 @@
       "provision_no_agents": "No connected agents",
       "status_loaded": "Certificates loaded"
     },
+    "nvidia_title": "NVIDIA",
+    "ngc_api_key": "NGC API Key",
+    "ngc_api_key_hint": "Required for NVIDIA NIM container catalog. Get your key at build.nvidia.com",
+    "ngc_configured": "Configured",
+    "ngc_not_configured": "Not configured",
+    "ngc_test": "Test connection",
+    "ngc_test_success": "NGC connection successful",
+    "ngc_test_failed": "NGC connection failed",
     "oauth_redirect_url": "OAuth Redirect URL",
     "oauth_redirect_hint": "URL of this server as seen from the browser. Default localhost, change to public address if accessible from internet.",
     "sso_title": "Single Sign-On (SSO)",
@@ -298,6 +306,10 @@
       "comfyui": {
         "name": "Image Generation",
         "desc": "Image generation and editing via ComfyUI. Stable Diffusion."
+      },
+      "meeting-bot": {
+        "name": "Meeting Bot",
+        "desc": "AI bot for Teams meetings — joins as participant, transcribes, responds."
       },
       "tentaflow": {
         "name": "TentaFlow",
@@ -397,6 +409,11 @@
     "fallback_targets": "Fallback targets",
     "alias": "Alias",
     "fallback_hint": "Comma separated, in priority order",
+    "add_fallback": "Add fallback model",
+    "strategy_first_available": "First Available (try in order)",
+    "strategy_round_robin": "Round Robin (distribute evenly)",
+    "strategy_least_loaded": "Least Loaded (prefer idle)",
+    "fallback_count": "Fallbacks",
     "form": {
       "name": "Model name",
       "display_name": "Display name",
@@ -954,5 +971,28 @@
     "validation": {
       "service_required": "Service name is required"
     }
+  },
+  "chat": {
+    "route_badge": "Route: {node} | {strategy}",
+    "routing_failed": "Routing failed for \"{model}\"",
+    "targets_tried": "Targets tried:",
+    "configure_alias": "Configure alias"
+  },
+  "nim": {
+    "title": "NVIDIA NIM",
+    "search": "Search NIM containers...",
+    "no_api_key": "NVIDIA NIM requires NGC API Key",
+    "no_api_key_hint": "Add your NGC API key in Settings to browse available NIM containers",
+    "go_to_settings": "Go to Settings",
+    "auth_failed": "NGC authentication failed",
+    "auth_failed_hint": "Check your API key in Settings",
+    "deploy": "Deploy",
+    "vram": "VRAM",
+    "no_results": "No containers match your search",
+    "category_all": "All",
+    "loading_catalog": "Loading NIM catalog...",
+    "not_supported": "NVIDIA GPU required",
+    "not_supported_hint": "NVIDIA NIM containers require an NVIDIA GPU on the target node. Select a node with an NVIDIA GPU to deploy NIM containers.",
+    "no_gpu_detected": "No GPU detected"
   }
 }

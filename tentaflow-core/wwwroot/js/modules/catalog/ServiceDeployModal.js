@@ -452,13 +452,13 @@ const ServiceDeployModal = (() => {
         stack_name: stackName,
         compose_yaml: generatedYaml,
         service_name: stackName,
-        config_json: JSON.stringify({
+        config_json: JSON.stringify(Object.assign({
           engine: serviceConfig.id,
           model_id: serviceConfig.id,
           port: parseInt(params.port, 10) || serviceConfig.defaultPort,
           container_name: stackName,
           service_type: serviceConfig.id
-        })
+        }, serviceConfig.id === 'meeting-bot' ? { protocol: 'quic', service_type: 'meeting-bot' } : {}))
       }));
     };
 

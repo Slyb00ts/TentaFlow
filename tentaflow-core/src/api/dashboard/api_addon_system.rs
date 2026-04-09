@@ -1133,6 +1133,7 @@ pub async fn handle_sso_callback(
     cipher: &crate::crypto::SecretsCipher,
     query: &str,
     redirect_base_url: &str,
+    settings_cipher: &crate::crypto::SettingsCipher,
 ) -> Result<(u16, String)> {
     let code = parse_query_opt_string(query, "code")
         .ok_or_else(|| anyhow::anyhow!("Brak parametru 'code' w callback"))?;
@@ -1184,7 +1185,7 @@ pub async fn handle_sso_callback(
         .map_err(|e| anyhow::anyhow!("Blad OIDC discovery: {}", e))?;
 
     // Pelny flow: exchange code -> get user info -> find/create user -> JWT
-    let result = crate::auth::sso::handle_sso_callback(pool, &config, &discovery, &code).await?;
+    let result = crate::auth::sso::handle_sso_callback(pool, &config, &discovery, &code, settings_cipher).await?;
 
     // Redirect do dashboardu z tokenem JWT w query param
     let redirect_url = format!("{}/?token={}", base_url.trim_end_matches('/'), urlencoding::encode(&result.token));

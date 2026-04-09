@@ -177,14 +177,16 @@ pub struct MeshSecurity {
     pin_attempts: RwLock<HashMap<String, (u32, Instant)>>,
     /// Pool bazy danych
     pub db: DbPool,
+    /// Cipher do szyfrowania kluczy prywatnych w DB
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
 }
 
 impl MeshSecurity {
     /// Tworzy lub wczytuje keypair z bazy danych.
     /// Klucz prywatny Ed25519 zapisany jako hex w settings pod kluczem "node_private_key".
     /// Klucz prywatny X25519 pod kluczem "node_x25519_private_key".
-    pub fn new(db: DbPool) -> Result<Self> {
-        let (signing_key, x25519_secret) = Self::load_or_generate_keys(&db)?;
+    pub fn new(db: DbPool, settings_cipher: Arc<crate::crypto::SettingsCipher>) -> Result<Self> {
+        let (signing_key, x25519_secret) = Self::load_or_generate_keys(&db, &settings_cipher)?;
         let verifying_key = signing_key.verifying_key();
         let x25519_public = X25519PublicKey::from(&x25519_secret);
 
@@ -203,6 +205,7 @@ impl MeshSecurity {
             pending_rotations: RwLock::new(HashMap::new()),
             pin_attempts: RwLock::new(HashMap::new()),
             db,
+            settings_cipher,
         };
 
         // Wczytaj zaufane nody z bazy
@@ -226,19 +229,13 @@ impl MeshSecurity {
     }
 
     /// Wczytuje lub generuje klucze Ed25519 i X25519
-    fn load_or_generate_keys(db: &DbPool) -> Result<(SigningKey, StaticSecret)> {
-        let conn = db.lock().map_err(|e| anyhow::anyhow!("Blad locka DB: {}", e))?;
-
+    fn load_or_generate_keys(db: &DbPool, settings_cipher: &crate::crypto::SettingsCipher) -> Result<(SigningKey, StaticSecret)> {
         // Ed25519
-        let ed_key_hex: Option<String> = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'node_private_key'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
+        let ed_raw = db::repository::get_setting(db, "node_private_key")?;
 
-        let signing_key = if let Some(hex_str) = ed_key_hex {
+        let signing_key = if let Some(stored) = ed_raw {
+            let hex_str = settings_cipher.decrypt(&stored)
+                .context("Blad deszyfrowania klucza Ed25519")?;
             let bytes = hex::decode(&hex_str).context("Nieprawidlowy hex klucza Ed25519")?;
             let key_bytes: [u8; 32] = bytes
                 .try_into()
@@ -247,24 +244,17 @@ impl MeshSecurity {
         } else {
             let key = SigningKey::generate(&mut OsRng);
             let hex_str = hex::encode(key.to_bytes());
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('node_private_key', ?1, datetime('now'))",
-                rusqlite::params![hex_str],
-            )?;
+            db::repository::set_setting_secure(db, "node_private_key", &hex_str, settings_cipher)?;
             info!("Wygenerowano nowy klucz Ed25519 dla tego noda");
             key
         };
 
         // X25519
-        let x_key_hex: Option<String> = conn
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'node_x25519_private_key'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
+        let x_raw = db::repository::get_setting(db, "node_x25519_private_key")?;
 
-        let x25519_secret = if let Some(hex_str) = x_key_hex {
+        let x25519_secret = if let Some(stored) = x_raw {
+            let hex_str = settings_cipher.decrypt(&stored)
+                .context("Blad deszyfrowania klucza X25519")?;
             let bytes = hex::decode(&hex_str).context("Nieprawidlowy hex klucza X25519")?;
             let key_bytes: [u8; 32] = bytes
                 .try_into()
@@ -273,10 +263,7 @@ impl MeshSecurity {
         } else {
             let secret = StaticSecret::random_from_rng(OsRng);
             let hex_str = hex::encode(secret.to_bytes());
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('node_x25519_private_key', ?1, datetime('now'))",
-                rusqlite::params![hex_str],
-            )?;
+            db::repository::set_setting_secure(db, "node_x25519_private_key", &hex_str, settings_cipher)?;
             info!("Wygenerowano nowy klucz X25519 dla tego noda");
             secret
         };
@@ -981,16 +968,20 @@ mod tests {
         Arc::new(Mutex::new(conn))
     }
 
+    fn test_settings_cipher() -> Arc<crate::crypto::SettingsCipher> {
+        Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]))
+    }
+
     #[test]
     fn generowanie_klucza_i_zapis_do_db() {
         let db = setup_test_db();
-        let security = MeshSecurity::new(db.clone()).unwrap();
+        let security = MeshSecurity::new(db.clone(), test_settings_cipher()).unwrap();
 
         // Klucz publiczny powinien miec 128 hex znakow (64 ed25519 + 64 x25519)
         assert_eq!(security.public_key_hex().len(), 128);
 
         // Ponowne utworzenie powinno wczytac ten sam klucz
-        let security2 = MeshSecurity::new(db).unwrap();
+        let security2 = MeshSecurity::new(db, test_settings_cipher()).unwrap();
         assert_eq!(security.public_key_hex(), security2.public_key_hex());
     }
 
@@ -1006,8 +997,8 @@ mod tests {
     fn podpisywanie_i_weryfikacja() {
         let db_a = setup_test_db();
         let db_b = setup_test_db();
-        let sec_a = MeshSecurity::new(db_a).unwrap();
-        let sec_b = MeshSecurity::new(db_b).unwrap();
+        let sec_a = MeshSecurity::new(db_a, test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
         // Dodaj klucz A do zaufanych w B
         sec_b
@@ -1030,8 +1021,8 @@ mod tests {
     fn szyfrowanie_i_deszyfrowanie() {
         let db_a = setup_test_db();
         let db_b = setup_test_db();
-        let sec_a = MeshSecurity::new(db_a).unwrap();
-        let sec_b = MeshSecurity::new(db_b).unwrap();
+        let sec_a = MeshSecurity::new(db_a, test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
         // Wzajemne dodanie kluczy
         sec_a
@@ -1057,8 +1048,8 @@ mod tests {
     fn szyfrowanie_encrypt_into_reuse_bufora() {
         let db_a = setup_test_db();
         let db_b = setup_test_db();
-        let sec_a = MeshSecurity::new(db_a).unwrap();
-        let sec_b = MeshSecurity::new(db_b).unwrap();
+        let sec_a = MeshSecurity::new(db_a, test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
         sec_a
             .add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b")
@@ -1088,8 +1079,8 @@ mod tests {
     #[test]
     fn trusted_snapshot() {
         let db = setup_test_db();
-        let sec_a = MeshSecurity::new(db.clone()).unwrap();
-        let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec_a = MeshSecurity::new(db.clone(), test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Poczatkowo pusty
         assert!(sec_a.trusted_node_ids_snapshot().is_empty());
@@ -1109,7 +1100,7 @@ mod tests {
     #[test]
     fn cofanie_zaufania() {
         let db = setup_test_db();
-        let sec = MeshSecurity::new(db).unwrap();
+        let sec = MeshSecurity::new(db, test_settings_cipher()).unwrap();
 
         sec.add_trusted_key("node-x", &"aa".repeat(64), "host-x")
             .unwrap_or_default();
@@ -1175,8 +1166,8 @@ mod tests {
     fn replay_protection_encrypt_decrypt() {
         let db_a = setup_test_db();
         let db_b = setup_test_db();
-        let sec_a = MeshSecurity::new(db_a).unwrap();
-        let sec_b = MeshSecurity::new(db_b).unwrap();
+        let sec_a = MeshSecurity::new(db_a, test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
         sec_a.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
         sec_b.add_trusted_key("node-a", &sec_a.public_key_hex(), "host-a").unwrap();
@@ -1202,8 +1193,8 @@ mod tests {
     fn nowy_format_ma_poprawna_strukture() {
         let db_a = setup_test_db();
         let db_b = setup_test_db();
-        let sec_a = MeshSecurity::new(db_a).unwrap();
-        let sec_b = MeshSecurity::new(db_b).unwrap();
+        let sec_a = MeshSecurity::new(db_a, test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
         sec_a.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
 
@@ -1230,8 +1221,8 @@ mod tests {
     fn encrypt_into_replay_protection() {
         let db_a = setup_test_db();
         let db_b = setup_test_db();
-        let sec_a = MeshSecurity::new(db_a).unwrap();
-        let sec_b = MeshSecurity::new(db_b).unwrap();
+        let sec_a = MeshSecurity::new(db_a, test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(db_b, test_settings_cipher()).unwrap();
 
         sec_a.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
         sec_b.add_trusted_key("node-a", &sec_a.public_key_hex(), "host-a").unwrap();
@@ -1255,7 +1246,7 @@ mod tests {
     #[test]
     fn dane_za_krotkie_odrzucone() {
         let db = setup_test_db();
-        let sec = MeshSecurity::new(db).unwrap();
+        let sec = MeshSecurity::new(db, test_settings_cipher()).unwrap();
         let result = sec.decrypt_from_node("node-x", &[0u8; 39]);
         assert!(result.is_err());
     }
@@ -1288,8 +1279,8 @@ mod tests {
 
     #[test]
     fn pair_two_nodes_full_flow() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Parowanie: A inicjuje, B odbiera, obaj potwierdzaja
         let pin = node_a.initiate_pairing("node-b").unwrap();
@@ -1326,8 +1317,8 @@ mod tests {
 
     #[test]
     fn key_rotation_between_nodes() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Sparuj nody
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
@@ -1363,8 +1354,8 @@ mod tests {
 
     #[test]
     fn decrypt_old_epoch_in_grace_period() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
 
@@ -1404,8 +1395,8 @@ mod tests {
 
     #[test]
     fn revoke_blocks_communication() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
 
@@ -1432,8 +1423,8 @@ mod tests {
 
     #[test]
     fn replay_attack_detected_between_nodes() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
 
@@ -1458,9 +1449,9 @@ mod tests {
 
     #[test]
     fn trusted_keys_sync_propagation() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_c = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_c = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Sparuj A z B i A z C
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
@@ -1483,9 +1474,9 @@ mod tests {
 
     #[test]
     fn three_nodes_revoke_propagation() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_c = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_c = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Sparuj A<->B, A<->C, B<->C
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
@@ -1517,8 +1508,8 @@ mod tests {
 
     #[test]
     fn multiple_key_rotations() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
 
@@ -1556,8 +1547,8 @@ mod tests {
 
     #[test]
     fn decrypt_unknown_epoch_fails() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
 
@@ -1577,9 +1568,9 @@ mod tests {
     #[test]
     fn concurrent_nonces_are_unique() {
         let db = setup_test_db();
-        let sec = Arc::new(MeshSecurity::new(db).unwrap());
+        let sec = Arc::new(MeshSecurity::new(db, test_settings_cipher()).unwrap());
 
-        let sec2 = Arc::new(MeshSecurity::new(setup_test_db()).unwrap());
+        let sec2 = Arc::new(MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap());
         sec.add_trusted_key("peer-1", &sec2.public_key_hex(), "host").unwrap();
 
         let sec_clone = sec.clone();
@@ -1598,8 +1589,8 @@ mod tests {
 
     #[test]
     fn two_phase_key_rotation() {
-        let node_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let node_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let node_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let node_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         pair_two_nodes(&node_a, "node-a", &node_b, "node-b");
 
@@ -1631,7 +1622,7 @@ mod tests {
 
     #[test]
     fn pin_rate_limit_blocks_after_3_attempts() {
-        let sec = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
         assert!(sec.check_pin_rate_limit("node-x"));
         assert!(sec.check_pin_rate_limit("node-x"));
         assert!(sec.check_pin_rate_limit("node-x"));
@@ -1640,8 +1631,8 @@ mod tests {
 
     #[test]
     fn admin_retrust_removes_revoked() {
-        let sec = MeshSecurity::new(setup_test_db()).unwrap();
-        let sec2 = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let sec2 = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Dodaj i revokuj
         sec.add_trusted_key("node-x", &sec2.public_key_hex(), "host").unwrap();
@@ -1655,8 +1646,8 @@ mod tests {
 
     #[test]
     fn unpair_does_not_add_to_revoked() {
-        let sec_a = MeshSecurity::new(setup_test_db()).unwrap();
-        let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec_a = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Sparuj
         sec_a.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
@@ -1670,8 +1661,8 @@ mod tests {
 
     #[test]
     fn revoked_node_auto_retrust_on_pairing() {
-        let sec = MeshSecurity::new(setup_test_db()).unwrap();
-        let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         // Sparuj i revokuj (cofniecie zaufania)
         sec.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
@@ -1686,8 +1677,8 @@ mod tests {
 
     #[test]
     fn revoking_state_blocks_is_trusted() {
-        let sec = MeshSecurity::new(setup_test_db()).unwrap();
-        let sec_b = MeshSecurity::new(setup_test_db()).unwrap();
+        let sec = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
+        let sec_b = MeshSecurity::new(setup_test_db(), test_settings_cipher()).unwrap();
 
         sec.add_trusted_key("node-b", &sec_b.public_key_hex(), "host-b").unwrap();
         assert!(sec.is_trusted("node-b"));

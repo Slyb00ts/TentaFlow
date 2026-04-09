@@ -258,6 +258,7 @@ pub async fn handle_sso_callback(
     config: &OidcConfig,
     discovery: &OidcDiscovery,
     code: &str,
+    settings_cipher: &crate::crypto::SettingsCipher,
 ) -> Result<SsoCallbackResult> {
     // Krok 1: Wymiana code na token
     let token_response = exchange_code(config, discovery, code).await?;
@@ -319,7 +320,7 @@ pub async fn handle_sso_callback(
     };
 
     // Krok 4: Wygenerowanie JWT
-    let jwt_secret = db::repository::get_setting(db, "jwt_secret")?
+    let jwt_secret = db::repository::get_setting_secure(db, "jwt_secret", settings_cipher)?
         .ok_or_else(|| anyhow::anyhow!("Brak jwt_secret w ustawieniach"))?;
 
     let expiry_hours: i64 = db::repository::get_setting(db, "jwt_expiry_hours")?

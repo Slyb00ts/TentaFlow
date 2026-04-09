@@ -433,7 +433,8 @@ mod tests {
 
     fn create_test_executor() -> MeshCommandExecutor {
         let db = create_test_db();
-        let security = Arc::new(MeshSecurity::new(db).unwrap());
+        let settings_cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+        let security = Arc::new(MeshSecurity::new(db, settings_cipher).unwrap());
         MeshCommandExecutor::new(security)
     }
 
@@ -454,7 +455,8 @@ mod tests {
                 hostname TEXT DEFAULT '',
                 approved_by TEXT DEFAULT '',
                 approved_at TEXT NOT NULL DEFAULT (datetime('now')),
-                is_active INTEGER NOT NULL DEFAULT 1
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_addresses TEXT DEFAULT NULL
             );
             CREATE TABLE IF NOT EXISTS pending_pairings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
