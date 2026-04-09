@@ -25,32 +25,19 @@ impl AudioCapture {
 /// Uruchamia przechwytywanie audio z domyslnego PulseAudio source.
 /// Domyslne source to meeting_output.monitor (ustawione w pulseaudio.conf).
 pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCapture> {
-    let sample_rate = 44100u32;
-    let channels = 2u8;
-    let samples_per_chunk = (sample_rate * chunk_ms as u32 / 1000) as usize * channels as usize;
+    let sample_rate = 16000u32;
+    let samples_per_chunk = (sample_rate * chunk_ms as u32 / 1000) as usize;
 
-    let spec = pulse::sample::Spec {
-        format: pulse::sample::Format::F32le,
-        channels,
-        rate: sample_rate,
-    };
-
-    // Domyslne source: meeting_output.monitor (audio od uczestnikow spotkania)
-    let device = Some(device_name.unwrap_or("meeting_output.monitor").to_string());
+    // PulseAudio monitor sinku — parec subprocess
+    let device = Some(device_name.unwrap_or("speaker.monitor").to_string());
     let (tx, rx) = mpsc::channel::<Vec<i16>>(32);
 
     let handle = std::thread::spawn(move || {
-        let source = device.as_deref().unwrap_or("meeting_output.monitor");
+        let source = device.as_deref().unwrap_or("speaker.monitor");
 
-        // Uzywamy parec jako subprocess — Simple API nie czyta z monitora poprawnie
+        // parec resampluje audio z monitora (float32le stereo 48kHz -> s16le mono 16kHz)
         let mut child = match std::process::Command::new("parec")
-            .args(&[
-                "-d", source,
-                "--format=s16le",
-                "--channels=1",
-                "--rate=16000",
-                "--raw",
-            ])
+            .args(&["-d", source, "--format=s16le", "--channels=1", "--rate=16000", "--raw"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -62,17 +49,10 @@ pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCa
             }
         };
 
-        tracing::info!(
-            source = source,
-            sample_rate = 16000,
-            chunk_ms = chunk_ms,
-            samples = samples_per_chunk,
-            "PulseAudio capture uruchomiony (parec)"
-        );
+        tracing::info!(source = source, "parec uruchomiony — przechwytywanie audio");
 
         let stdout = child.stdout.take().expect("brak stdout parec");
         let mut reader = std::io::BufReader::new(stdout);
-        // 2 bajty per sample (s16le), 1 kanal
         let mut buf = vec![0u8; samples_per_chunk * 2];
 
         loop {
@@ -94,7 +74,6 @@ pub fn start_capture(device_name: Option<&str>, chunk_ms: u32) -> Result<AudioCa
                 }
             }
         }
-
         let _ = child.kill();
     });
 
