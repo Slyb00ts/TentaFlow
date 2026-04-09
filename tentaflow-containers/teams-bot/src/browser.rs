@@ -23,7 +23,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     let browser_config = BrowserConfig::builder()
         .chrome_executable("/usr/bin/chromium")
+        .with_head()
         .no_sandbox()
+        .window_size(1920, 1080)
         .arg("--use-fake-ui-for-media-stream")
         .arg("--use-fake-device-for-media-stream")
         .arg("--disable-gpu")
