@@ -391,8 +391,10 @@ impl Router {
         let sm = &self.service_manager;
         match crate::db::repository::list_services(db) {
             Ok(services) => {
+                info!("load_db_services: znaleziono {} serwisow w DB", services.len());
                 let mut loaded = 0;
                 for svc in &services {
+                    info!("load_db_services: przetwarzam '{}' (typ={})", svc.name, svc.service_type);
                     let svc_config: serde_json::Value =
                         serde_json::from_str(&svc.config_json).unwrap_or_default();
                     let backends =
