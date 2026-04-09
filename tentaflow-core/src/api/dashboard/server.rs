@@ -732,7 +732,7 @@ pub async fn handle_request(
 
     // Addon system API (users, groups, addons, audit, sso management)
     if path.starts_with("/api/users") || path.starts_with("/api/groups") || path.starts_with("/api/addons") || path.starts_with("/api/audit") || path == "/api/tools" || (path.starts_with("/api/sso/providers") && (method == Method::POST || method == Method::DELETE)) {
-        let (status, response_body) = route_addon_system_api(&method, &path, &query_string, &db, &claims, &cipher, &body_bytes, &permission_checker);
+        let (status, response_body) = route_addon_system_api(&method, &path, &query_string, &db, &claims, &cipher, &body_bytes, &permission_checker, Some(&router));
         return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
     }
 
@@ -1348,6 +1348,7 @@ fn route_addon_system_api(
     cipher: &Arc<crate::crypto::SecretsCipher>,
     body: &[u8],
     permission_checker: &Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    router: Option<&Arc<Router>>,
 ) -> (u16, String) {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
@@ -1415,6 +1416,9 @@ fn route_addon_system_api(
         }
         (&Method::GET, ["api", "addons", addon_id, "tools"]) => {
             handle_result(api_addon_system::handle_get_addon_tools(db, addon_id), 500)
+        }
+        (&Method::POST, ["api", "addons", addon_id, "tools", tool_name]) => {
+            handle_result(api_addon_system::handle_invoke_addon_tool(db, addon_id, tool_name, &String::from_utf8_lossy(body), router), 500)
         }
         (&Method::GET, ["api", "addons", addon_id, "ui"]) => {
             handle_result(api_addon_system::handle_get_addon_ui(db, addon_id), 500)
