@@ -74,6 +74,9 @@ EXPOSE 6080
 WORKDIR /home/sidecar
 USER sidecar
 
+# DISPLAY dla Xvfb — Chromium uzywa tego do renderowania na wirtualnym ekranie
+ENV DISPLAY=:99
+
 # Skrypt startowy — PulseAudio + Xvfb + sidecar
 ENTRYPOINT ["/bin/bash", "-c", "\
     rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; \
