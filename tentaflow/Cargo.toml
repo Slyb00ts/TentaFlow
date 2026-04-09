@@ -6,6 +6,9 @@ description = "TentaFlow — API Gateway i mesh node"
 
 [features]
 rdma-probe = ["tentaflow-core/rdma-probe"]
+gpu-cuda = ["tentaflow-core/gpu-cuda"]
+gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
+gpu-rocm = ["tentaflow-core/gpu-rocm"]
 
 [dependencies]
 tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "metrics-prometheus"] }

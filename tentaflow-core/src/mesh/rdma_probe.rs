@@ -7,7 +7,7 @@
 //       mlx_swift_bridge.rs (macOS FFI pattern).
 // =============================================================================
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 /// Wynik probing RDMA
 #[derive(Debug, Clone)]

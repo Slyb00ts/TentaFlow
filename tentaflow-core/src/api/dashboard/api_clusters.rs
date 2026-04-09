@@ -5,7 +5,7 @@
 
 use crate::db::{self, DbPool};
 use crate::mesh::cluster_probe::{
-    NodeInterface, PairProbeResult, DetectionResult,
+    NodeInterface, PairProbeResult,
     filter_reachable_pairs, optimal_assignment,
 };
 use anyhow::Result;

@@ -66,6 +66,7 @@ pub async fn start_mesh_pipeline(
     config: MeshPipelineConfig,
     mesh_peer_store: &MeshPeerStore,
     db_pool: Option<crate::db::DbPool>,
+    settings_cipher: std::sync::Arc<crate::crypto::SettingsCipher>,
 ) -> Result<MeshPipelineHandles> {
     let node_id = &config.node_id;
     let mesh_config = &config.mesh_config;
@@ -79,7 +80,7 @@ pub async fn start_mesh_pipeline(
 
     // Inicjalizacja MeshSecurity (jesli dostepna baza danych)
     let mesh_security: Option<Arc<MeshSecurity>> = if let Some(ref pool) = db_pool {
-        match MeshSecurity::new(pool.clone()) {
+        match MeshSecurity::new(pool.clone(), settings_cipher.clone()) {
             Ok(sec) => {
                 info!("MeshSecurity zainicjalizowany (klucz publiczny: {}...)", &sec.public_key_hex()[..16]);
                 Some(Arc::new(sec))

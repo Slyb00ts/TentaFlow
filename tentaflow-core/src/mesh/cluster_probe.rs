@@ -466,7 +466,7 @@ mod tests {
         let result = optimal_assignment(&[]);
         assert!(result.assignments.is_empty());
         assert_eq!(result.bottleneck_mbps, 0.0);
-        assert_eq!(result.message, "Brak polaczen miedzy nodami");
+        assert_eq!(result.message, "no_connections");
     }
 
     #[test]

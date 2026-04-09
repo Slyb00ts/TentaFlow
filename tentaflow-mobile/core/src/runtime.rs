@@ -82,6 +82,18 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
             id
         });
 
+    // Ladowanie master key z pliku i inicjalizacja SettingsCipher
+    let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
+        .expect("Nie udalo sie zaladowac master key z pliku");
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(&file_master_key));
+
+    // Migracja istniejacych plaintextowych sekretow
+    match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {
+        Ok(n) if n > 0 => info!("Zaszyfrowano {} plaintextowych sekretow w bazie", n),
+        Err(e) => error!("Blad migracji sekretow: {}", e),
+        _ => {}
+    }
+
     // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard
     let mesh_peer_store = MeshPeerStore::new();
 
@@ -96,7 +108,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
             mesh_config: config.mesh.as_ref().unwrap().clone(),
         };
 
-        match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone())).await {
+        match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone()), settings_cipher.clone()).await {
             Ok(handles) => {
                 info!("Mesh pipeline uruchomiony");
                 mesh_handles = Some(handles);

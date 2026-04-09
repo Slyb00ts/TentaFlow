@@ -14,6 +14,7 @@ pub mod user;
 pub mod secrets;
 pub mod log;
 pub mod network;
+pub mod service;
 
 use anyhow::{Context, Result};
 
@@ -175,6 +176,12 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         "tentaflow", "net_close",
         network::host_net_close,
     ).context("Rejestracja net_close")?;
+
+    // --- Service API (QUIC proxy do zarejestrowanych serwisow) ---
+    linker.func_wrap(
+        "tentaflow", "service_request",
+        service::service_request,
+    ).context("Rejestracja service_request")?;
 
     Ok(())
 }

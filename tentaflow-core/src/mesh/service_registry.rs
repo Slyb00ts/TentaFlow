@@ -180,6 +180,20 @@ impl MeshServiceRegistry {
             .collect()
     }
 
+    /// Znajdz dowolny node ktory ma serwis danego typu (bez konkretnego modelu)
+    pub fn find_service_by_type(&self, service_type: &str) -> Option<String> {
+        let all_services = self.visible_services();
+
+        all_services
+            .iter()
+            .find(|svc| {
+                svc.node_id != self.local_node_id
+                    && svc.service_type == service_type
+                    && svc.status == "running"
+            })
+            .map(|svc| svc.node_id.clone())
+    }
+
     /// Znajdz node ktory ma dany serwis (typ + model)
     pub fn find_service_node(&self, service_type: &str, model_name: &str) -> Option<String> {
         let all_services = self.visible_services();

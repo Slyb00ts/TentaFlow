@@ -34,7 +34,12 @@ impl Router {
     pub async fn route_chat_completion_stream(
         &self,
         mut request: ChatCompletionRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
+    ) -> Result<crate::routing::RouteResult<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>>> {
+        let stream_start = std::time::Instant::now();
+        let stream_node_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let ctx = crate::routing::build_flow_context(&request, true);
@@ -76,7 +81,15 @@ impl Router {
                     };
 
                     let stream = futures::stream::once(async move { Ok(chunk) });
-                    return Ok(Box::pin(stream));
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: stream_node_name.clone(),
+                        backend_type: "flow_engine".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: 0,
+                        hop_count: 0,
+                        latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                    };
+                    return Ok(crate::routing::RouteResult { response: Box::pin(stream), metadata });
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -86,7 +99,8 @@ impl Router {
         }
 
         let mut metrics = RequestMetrics::new();
-        let model_name = self.resolve_to_service_name(&request.model);
+        let route = self.resolve_route(&request.model);
+        let model_name = route.targets.first().cloned().unwrap_or_else(|| request.model.clone());
         metrics.model_name = Some(model_name.clone());
 
         debug!("Routing streaming request dla modelu: {}", model_name);
@@ -437,7 +451,18 @@ impl Router {
                         });
                     }
                 } else {
-                    return Ok(Box::pin(futures::stream::empty()));
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: stream_node_name.clone(),
+                        backend_type: "local_stt".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: 0,
+                        hop_count: 0,
+                        latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                    };
+                    return Ok(crate::routing::RouteResult {
+                        response: Box::pin(futures::stream::empty()),
+                        metadata,
+                    });
                 }
 
                 request.audio_input = None;
@@ -455,62 +480,102 @@ impl Router {
         metrics.query_analysis_ms = mem_timings.query_analysis_ms;
         metrics.memory_query_ms = mem_timings.memory_query_ms;
 
-        // Lokalna inferencja in-process (MLX, llama.cpp) — bez sieci
-        if self.is_local_inference_model(&model_name) {
-            let sse_rx = match self.local_inference.handle_chat_completion_stream(&request).await {
-                Ok(rx) => rx,
-                Err(e) => return Err(e),
-            };
-            let stream = futures::stream::unfold(sse_rx, |mut rx| async move {
-                loop {
-                    let sse_line = rx.recv().await?;
-                    let trimmed = sse_line.trim().to_string();
-                    if trimmed == "data: [DONE]" || trimmed.is_empty() {
-                        continue;
+        // === DISPATCH: iteruj backendy wg strategii, zwroc stream ===
+        {
+            use crate::routing::middleware::BackendHandle;
+            let backends = self.get_backends(&model_name);
+            let ordered = self.apply_strategy(&backends, &route.strategy);
+
+            for handle in &ordered {
+                match handle {
+                    BackendHandle::LocalLlm => {
+                        let sse_rx = match self.local_inference.handle_chat_completion_stream(&request).await {
+                            Ok(rx) => rx,
+                            Err(e) => {
+                                debug!("Lokalna inferencja stream error: {}", e);
+                                continue;
+                            }
+                        };
+                        let stream = futures::stream::unfold(sse_rx, |mut rx| async move {
+                            loop {
+                                let sse_line = rx.recv().await?;
+                                let trimmed = sse_line.trim().to_string();
+                                if trimmed == "data: [DONE]" || trimmed.is_empty() {
+                                    continue;
+                                }
+                                if let Some(json_str) = trimmed.strip_prefix("data: ") {
+                                    match serde_json::from_str::<ChatCompletionChunk>(json_str) {
+                                        Ok(chunk) => return Some((Ok(chunk), rx)),
+                                        Err(_) => continue,
+                                    }
+                                }
+                            }
+                        });
+                        let metadata = crate::routing::RouteMetadata {
+                            served_by_node: stream_node_name.clone(),
+                            backend_type: "local_llm".to_string(),
+                            strategy_used: route.strategy.to_string(),
+                            fallbacks_tried: 0,
+                            hop_count: 0,
+                            latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                        };
+                        return Ok(crate::routing::RouteResult { response: Box::pin(stream), metadata });
                     }
-                    if let Some(json_str) = trimmed.strip_prefix("data: ") {
-                        match serde_json::from_str::<ChatCompletionChunk>(json_str) {
-                            Ok(chunk) => return Some((Ok(chunk), rx)),
-                            Err(_) => continue,
+                    BackendHandle::Rag(_name) => {
+                        match self.route_to_rag_stream(request.clone()).await {
+                            Ok(stream) => {
+                                let metadata = crate::routing::RouteMetadata {
+                                    served_by_node: stream_node_name.clone(),
+                                    backend_type: "rag".to_string(),
+                                    strategy_used: route.strategy.to_string(),
+                                    fallbacks_tried: 0,
+                                    hop_count: 0,
+                                    latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                                };
+                                return Ok(crate::routing::RouteResult { response: stream, metadata });
+                            }
+                            Err(e) => {
+                                debug!("RAG stream error: {}", e);
+                                continue;
+                            }
                         }
                     }
+                    BackendHandle::QuicLlm(name) => {
+                        match self.route_to_quic_llm_stream(name.clone(), request.clone(), metrics.clone()).await {
+                            Ok(stream) => {
+                                let metadata = crate::routing::RouteMetadata {
+                                    served_by_node: stream_node_name.clone(),
+                                    backend_type: "quic_llm".to_string(),
+                                    strategy_used: route.strategy.to_string(),
+                                    fallbacks_tried: 0,
+                                    hop_count: 0,
+                                    latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                                };
+                                return Ok(crate::routing::RouteResult { response: stream, metadata });
+                            }
+                            Err(e) => {
+                                debug!("QUIC LLM stream error: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    BackendHandle::Http(_) => {
+                        break;
+                    }
+                    _ => continue,
                 }
-            });
-            return Ok(Box::pin(stream));
+            }
         }
 
-        if self.is_rag_model(&model_name) {
-            return self.route_to_rag_stream(request).await;
-        }
-
-        // Sprawdz czy to QUIC LLM model
-        if self.is_quic_llm_model(&model_name) {
-            return self.route_to_quic_llm_stream(model_name, request, metrics).await;
-        }
-
-        // Standard LLM backend streaming
-        let backends = self.get_service_backends(&model_name)
+        // HTTP backend streaming z PII filtering i memory store
+        let backend = self.select_http_backend(&model_name)
             .ok_or_else(|| CoreError::ModelNotFound {
                 model_name: model_name.clone(),
             })?;
-
-        if backends.is_empty() {
-            return Err(CoreError::AllBackendsUnavailable {
-                model_name: model_name.clone(),
-            }.into());
-        }
-
-        let strategy = self.get_strategy(&model_name)
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
-
-        let backend_idx = strategy.select_backend(backends)?;
-        let backend = &backends[backend_idx];
 
         debug!(
-            "Wybrany backend streaming ({}): {} [{}]",
-            strategy.name(), backend.url(), backend_idx
+            "Wybrany backend streaming: {}",
+            backend.url()
         );
 
         use std::sync::{Arc as StdArc, Mutex};
@@ -627,7 +692,15 @@ impl Router {
             }
         }));
 
-        Ok(Box::pin(stream))
+        let metadata = crate::routing::RouteMetadata {
+            served_by_node: stream_node_name,
+            backend_type: "http".to_string(),
+            strategy_used: "single".to_string(),
+            fallbacks_tried: 0,
+            hop_count: 0,
+            latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+        };
+        Ok(crate::routing::RouteResult { response: Box::pin(stream), metadata })
     }
 
     /// Routuje request do RAG engine (STREAMING MODE).
@@ -637,7 +710,8 @@ impl Router {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>> {
         use futures::stream::{self, StreamExt};
 
-        let model_name = self.resolve_to_service_name(&request.model);
+        let route = self.resolve_route(&request.model);
+        let model_name = route.targets.first().cloned().unwrap_or_else(|| request.model.clone());
 
         let rag_handle = { self.service_manager.rag_services.read().get(&model_name).cloned() }
             .ok_or_else(|| CoreError::ModelNotFound {
@@ -706,24 +780,10 @@ impl Router {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("RAG result requires_llm_processing=true ale llm_model=None"))?;
 
-            let llm_backends = self.get_service_backends(&llm_model_name)
+            let llm_backend = self.select_http_backend(&llm_model_name)
                 .ok_or_else(|| CoreError::ModelNotFound {
                     model_name: llm_model_name.clone(),
                 })?;
-
-            if llm_backends.is_empty() {
-                return Err(CoreError::AllBackendsUnavailable {
-                    model_name: llm_model_name.clone(),
-                }.into());
-            }
-
-            let strategy = self.get_strategy(&llm_model_name)
-                .ok_or_else(|| CoreError::ModelNotFound {
-                    model_name: llm_model_name.clone(),
-                })?;
-
-            let backend_idx = strategy.select_backend(llm_backends)?;
-            let llm_backend = &llm_backends[backend_idx];
 
             let llm_request = ChatCompletionRequest {
                 model: llm_model_name.clone(),
@@ -774,7 +834,7 @@ impl Router {
                                 response_format: Some("wav".to_string()),
                                 speed: Some(speed),
                             };
-                            router.synthesize_speech(&request).await
+                            router.synthesize_speech(&request).await.map(|r| r.response)
                         })
                     });
 
