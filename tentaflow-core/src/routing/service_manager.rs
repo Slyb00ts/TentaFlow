@@ -677,6 +677,54 @@ impl ServiceManager {
 
     /// Uruchamia wszystkie background taski dla polaczen QUIC.
     /// Wywolaj to PO utworzeniu ServiceManager.
+    /// Laduje serwisy QUIC z bazy danych i rejestruje je w service_manager.
+    /// Wywolywane przy starcie routera — uzupelnia serwisy deployowane z GUI.
+    pub fn load_quic_services_from_db(&self, db: &crate::db::DbPool) {
+        let services = match crate::db::repository::list_services(db) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Nie udalo sie zaladowac serwisow z DB: {}", e);
+                return;
+            }
+        };
+
+        for service in &services {
+            // Pomijaj serwisy ktore nie sa QUIC
+            let backends = match crate::db::repository::list_backends_for_service(db, service.id) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            for backend in &backends {
+                if backend.connection_type != "quic" {
+                    continue;
+                }
+
+                // Parsuj config_json backendu
+                let config: serde_json::Value = serde_json::from_str(&backend.config_json).unwrap_or_default();
+                let quic_url = match config.get("quic_url").and_then(|v| v.as_str()) {
+                    Some(u) => u.to_string(),
+                    None => continue,
+                };
+
+                // Sprawdz czy juz zarejestrowany (z config.toml)
+                if self.quic_llm_services.read().contains_key(&service.name) {
+                    continue;
+                }
+
+                info!("Ladowanie serwisu QUIC z DB: '{}' (typ={}, url={})", service.name, service.service_type, quic_url);
+
+                self.register_quic_service(
+                    service.name.clone(),
+                    &service.service_type,
+                    quic_url,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
     pub fn spawn_connection_tasks(&self) {
         info!("Spawning background connection tasks...");
 
