@@ -1049,15 +1049,9 @@ impl ServiceManager {
                     let client = Arc::new(client);
                     handle.set_connected(client.clone()).await;
 
-                    // Uruchom subskrypcje transkrypcji jesli EventBus jest dostepny
-                    let transcript_task = event_bus.as_ref().map(|bus| {
-                        info!("MeetingBot QUIC '{}': Uruchamiam subskrypcje transkrypcji", name);
-                        crate::routing::meeting_transcript::spawn_transcript_subscriber(
-                            client,
-                            bus.clone(),
-                            shutdown_rx.clone(),
-                        )
-                    });
+                    // TODO: subskrypcja transkrypcji — wylaczona do czasu stabilizacji QUIC
+                    // Transcript subscriber otwiera streaming request ktory destabilizuje polaczenie
+                    let transcript_task: Option<tokio::task::JoinHandle<()>> = None;
 
                     let should_return = loop {
                         tokio::select! {

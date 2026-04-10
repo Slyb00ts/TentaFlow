@@ -1,10 +1,12 @@
 // =============================================================================
 // Plik: vad.rs
-// Opis: Detekcja aktywnosci glosowej (VAD). Prosty detektor RMS z opcja
-//       przejscia na model Silero VAD (ONNX) w przyszlosci.
+// Opis: Detekcja aktywnosci glosowej (VAD). Detektor RMS z opcjonalnym
+//       modelem Silero VAD (ONNX Runtime) dla wyzszej dokladnosci.
 // =============================================================================
 
 use anyhow::Result;
+use ort::session::Session;
+use ort::value::Tensor;
 
 /// Wynik detekcji VAD dla jednego chunka audio
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +17,22 @@ pub enum VadResult {
     Silence,
     /// Przejscie z mowy do ciszy (koniec wypowiedzi)
     Transition,
+}
+
+/// Stan wewnetrzny modelu Silero VAD (tensory h i c)
+struct SileroState {
+    h: Vec<f32>,
+    c: Vec<f32>,
+}
+
+impl SileroState {
+    fn new() -> Self {
+        // Silero VAD wymaga tensorow [2, 1, 64] zainicjalizowanych zerami
+        Self {
+            h: vec![0.0f32; 2 * 1 * 64],
+            c: vec![0.0f32; 2 * 1 * 64],
+        }
+    }
 }
 
 /// Detektor aktywnosci glosowej
@@ -30,42 +48,67 @@ pub struct VadDetector {
 
     /// Czy poprzedni chunk byl mowa
     was_speech: bool,
+
+    /// Sesja ONNX Runtime dla Silero VAD
+    silero_session: Option<Session>,
+
+    /// Stan wewnetrzny modelu Silero (tensory h/c)
+    silero_state: Option<SileroState>,
 }
 
 impl VadDetector {
     /// Tworzy nowy detektor VAD
     ///
-    /// `model_path` — sciezka do modelu ONNX Silero VAD (na razie ignorowana,
-    /// uzywany jest prosty detektor RMS)
+    /// `model_path` — sciezka do modelu ONNX Silero VAD (None = detektor RMS)
     ///
     /// `chunk_duration_ms` — czas trwania chunka w ms (do obliczenia progu ciszy)
     ///
     /// `silence_threshold_ms` — prog ciszy w ms po ktorym uznajemy koniec wypowiedzi
+    ///
+    /// `rms_threshold` — prog RMS powyzej ktorego uznajemy za mowe (uzywany gdy brak modelu ONNX)
     pub fn new(
-        _model_path: Option<&str>,
+        model_path: Option<&str>,
         chunk_duration_ms: u32,
         silence_threshold_ms: u32,
+        rms_threshold: f32,
     ) -> Result<Self> {
-        // TODO: Jesli model_path jest podany, zaladuj Silero VAD przez ort (ONNX Runtime)
-        // Na razie uzywamy prostego detektora RMS
-        if _model_path.is_some() {
-            tracing::warn!("Silero VAD ONNX nie jest jeszcze zaimplementowany — uzywam RMS");
-        }
-
         let silence_chunks_threshold = silence_threshold_ms / chunk_duration_ms;
 
+        let (silero_session, silero_state) = if let Some(path) = model_path {
+            match Session::builder()
+                .and_then(|mut b| b.commit_from_file(path))
+            {
+                Ok(session) => {
+                    tracing::info!(path, "Silero VAD ONNX zaladowany");
+                    (Some(session), Some(SileroState::new()))
+                }
+                Err(e) => {
+                    tracing::warn!("Nie udalo sie zaladowac Silero VAD: {} — uzywam RMS", e);
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
-            rms_threshold: 500.0,
+            rms_threshold,
             silence_chunks: 0,
             silence_chunks_threshold,
             was_speech: false,
+            silero_session,
+            silero_state,
         })
     }
 
     /// Przetwarza chunk audio i zwraca wynik VAD
     pub fn process_chunk(&mut self, samples: &[i16]) -> VadResult {
-        let rms = calculate_rms(samples);
-        let is_speech = rms > self.rms_threshold;
+        let is_speech = if self.silero_session.is_some() {
+            self.run_silero_inference(samples)
+        } else {
+            let rms = calculate_rms(samples);
+            rms > self.rms_threshold
+        };
 
         let result = if is_speech {
             self.silence_chunks = 0;
@@ -92,6 +135,99 @@ impl VadDetector {
     pub fn reset(&mut self) {
         self.silence_chunks = 0;
         self.was_speech = false;
+        if self.silero_state.is_some() {
+            self.silero_state = Some(SileroState::new());
+        }
+    }
+
+    /// Uruchamia inferencje Silero VAD na probkach audio
+    fn run_silero_inference(&mut self, samples: &[i16]) -> bool {
+        // Borrow split — session i state to rozne pola, ale kompilator
+        // wymaga jawnego destructuringu
+        let (session, state) = match (&mut self.silero_session, &mut self.silero_state) {
+            (Some(s), Some(st)) => (s, st),
+            _ => return false,
+        };
+
+        // Konwersja i16 -> f32 (normalizacja do [-1.0, 1.0])
+        let audio: Vec<f32> = samples.iter()
+            .map(|&s| s as f32 / 32768.0)
+            .collect();
+
+        let audio_len = audio.len();
+
+        // Przygotuj tensory wejsciowe
+        let input = match Tensor::from_array(([1usize, audio_len], audio)) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Blad tworzenia tensora audio: {}", e);
+                return false;
+            }
+        };
+
+        let h = match Tensor::from_array(([2usize, 1usize, 64usize], state.h.clone())) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Blad tworzenia tensora h: {}", e);
+                return false;
+            }
+        };
+
+        let c = match Tensor::from_array(([2usize, 1usize, 64usize], state.c.clone())) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Blad tworzenia tensora c: {}", e);
+                return false;
+            }
+        };
+
+        let sr = match Tensor::from_array(([1usize], vec![16000i64])) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Blad tworzenia tensora sr: {}", e);
+                return false;
+            }
+        };
+
+        let inputs = ort::inputs![
+            "input" => input,
+            "h" => h,
+            "c" => c,
+            "sr" => sr,
+        ];
+
+        let outputs = match session.run(inputs) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("Blad inferencji Silero VAD: {}", e);
+                return false;
+            }
+        };
+
+        // Odczytaj prawdopodobienstwo mowy
+        let probability = match outputs.get("output") {
+            Some(val) => {
+                match val.try_extract_tensor::<f32>() {
+                    Ok((_shape, data)) => data[0],
+                    Err(_) => return false,
+                }
+            }
+            None => return false,
+        };
+
+        // Zaktualizuj stan h/c
+        if let Some(hn) = outputs.get("hn") {
+            if let Ok((_shape, data)) = hn.try_extract_tensor::<f32>() {
+                state.h = data.to_vec();
+            }
+        }
+        if let Some(cn) = outputs.get("cn") {
+            if let Ok((_shape, data)) = cn.try_extract_tensor::<f32>() {
+                state.c = data.to_vec();
+            }
+        }
+
+        probability > 0.5
     }
 }
 
@@ -128,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_vad_speech_detection() {
-        let mut vad = VadDetector::new(None, 500, 2000).unwrap();
+        let mut vad = VadDetector::new(None, 500, 2000, 100.0).unwrap();
 
         // Glosny sygnal — mowa
         let loud = vec![5000i16; 8000];
@@ -142,7 +278,7 @@ mod tests {
     #[test]
     fn test_vad_transition() {
         // 500ms chunk, 1000ms prog ciszy = 2 chunki ciszy na przejscie
-        let mut vad = VadDetector::new(None, 500, 1000).unwrap();
+        let mut vad = VadDetector::new(None, 500, 1000, 100.0).unwrap();
 
         let loud = vec![5000i16; 8000];
         let quiet = vec![0i16; 8000];
@@ -181,7 +317,7 @@ mod tests {
     #[test]
     fn test_vad_silence_without_prior_speech() {
         // Cisza bez poprzedzajacej mowy — nie powinno byc Transition
-        let mut vad = VadDetector::new(None, 500, 1000).unwrap();
+        let mut vad = VadDetector::new(None, 500, 1000, 100.0).unwrap();
         let quiet = vec![0i16; 8000];
 
         // Wiele chunkow ciszy bez uprzedniej mowy
@@ -193,7 +329,7 @@ mod tests {
     #[test]
     fn test_vad_multiple_transitions() {
         // Wiele cykli mowa->cisza->transition
-        let mut vad = VadDetector::new(None, 500, 500).unwrap();
+        let mut vad = VadDetector::new(None, 500, 500, 100.0).unwrap();
 
         let loud = vec![5000i16; 8000];
         let quiet = vec![0i16; 8000];
@@ -214,7 +350,7 @@ mod tests {
     #[test]
     fn test_vad_speech_resets_silence_counter() {
         // Mowa w trakcie odliczania ciszy resetuje licznik
-        let mut vad = VadDetector::new(None, 500, 1500).unwrap();
+        let mut vad = VadDetector::new(None, 500, 1500, 100.0).unwrap();
 
         let loud = vec![5000i16; 8000];
         let quiet = vec![0i16; 8000];
@@ -240,7 +376,7 @@ mod tests {
     #[test]
     fn test_vad_reset() {
         // Reset stanu detektora
-        let mut vad = VadDetector::new(None, 500, 500).unwrap();
+        let mut vad = VadDetector::new(None, 500, 500, 100.0).unwrap();
 
         let loud = vec![5000i16; 8000];
         let quiet = vec![0i16; 8000];
@@ -259,7 +395,7 @@ mod tests {
     fn test_vad_threshold_boundary() {
         // Sygnal dokladnie na progu RMS (500.0) — nie powinien byc uznany za mowe
         // RMS = 500.0 -> is_speech = rms > 500.0 -> false
-        let mut vad = VadDetector::new(None, 500, 1000).unwrap();
+        let mut vad = VadDetector::new(None, 500, 1000, 500.0).unwrap();
         let at_threshold = vec![500i16; 8000];
         assert_eq!(vad.process_chunk(&at_threshold), VadResult::Silence);
     }

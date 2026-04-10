@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pulseaudio \
         pulseaudio-utils \
         libpulse0 \
+        ffmpeg \
         xvfb \
         ca-certificates \
         dbus \
@@ -56,6 +57,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         novnc \
         websockify \
     && rm -rf /var/lib/apt/lists/*
+
+# ONNX Runtime dla Silero VAD (load-dynamic)
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    curl -sSL https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
+    | tar xz -C /usr/local --strip-components=1 onnxruntime-linux-x64-1.22.0/lib && \
+    ldconfig && \
+    apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # Uzytkownik bez uprawnien root
 RUN useradd -m -s /bin/bash sidecar
@@ -87,6 +95,9 @@ ENTRYPOINT ["/bin/bash", "-c", "\
     rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; \
     mkdir -p /tmp/runtime && \
     pulseaudio --start --exit-idle-time=-1 --log-level=error 2>/dev/null; \
+    sleep 0.5 && \
+    LB_INPUT=$(pactl list short sink-inputs 2>/dev/null | grep loopback | awk '{print $1}') && \
+    [ -n \"$LB_INPUT\" ] && pactl set-sink-input-volume $LB_INPUT 5% 2>/dev/null; \
     Xvfb :99 -screen 0 1920x1080x24 -ac &\
     sleep 1 && \
     x11vnc -display :99 -forever -nopw -shared -rfbport 5900 & \
