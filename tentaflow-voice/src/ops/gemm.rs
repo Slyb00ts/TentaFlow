@@ -20,6 +20,25 @@
 use rayon::prelude::*;
 use wide::f32x8;
 
+/// Runtime CPU feature detection — sprawdzane raz, wynik cache'owany.
+/// Pozwala na jeden binarny artefakt ktory na CPU z AVX-512 leci 16-wide,
+/// a na starszych (np. AVX2 only) spada na 8-wide f32x8.
+#[cfg(target_arch = "x86_64")]
+fn has_avx512f() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let has = is_x86_feature_detected!("avx512f");
+        tracing::info!(avx512f = has, "GEMM backend selected");
+        has
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn has_avx512f() -> bool {
+    false
+}
+
 /// Ladowanie 8 kolejnych f32 do f32x8 — jedna vmovups/ldp instrukcja.
 /// Bounds check jest eliminowany przez kompilator jesli caller zapewnia
 /// `src.len() >= 8`.
@@ -34,6 +53,266 @@ fn load8(src: &[f32]) -> f32x8 {
 fn store8(dst: &mut [f32], v: f32x8) {
     let arr = v.to_array();
     dst[..8].copy_from_slice(&arr);
+}
+
+// =============================================================================
+// AVX-512 microkernel — 16-wide f32, 2x wider than AVX2.
+// Kompilowane zawsze na x86_64 (funkcje maja #[target_feature(enable=...)]
+// wiec LLVM emituje AVX-512 niezaleznie od global target features). Runtime
+// dispatch ponizej wybiera AVX-512 tylko jesli CPU go ma.
+// =============================================================================
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use std::arch::x86_64::*;
+
+    /// Microkernel: oblicza jeden wiersz C (n kolumn) = a_row * B + bias.
+    /// Przetwarza 64 kolumny naraz trzymajac 4 zmm accumulatory w rejestrach
+    /// przez cala petle K. 4 FMA per K step × 16 lanes = 64 FLOPs/cycle
+    /// per rdzen przy IPC 1 (AVX-512 FMA ma throughput 1 cycle na Zen4).
+    ///
+    /// # Safety
+    /// Wymaga CPU z AVX-512F. Caller gwarantuje `a_row.len() >= k`,
+    /// `b.len() >= k*n`, `c_row.len() >= n`.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn gemm_one_row_avx512(
+        a_row: &[f32],
+        b: &[f32],
+        c_row: &mut [f32],
+        n: usize,
+        k: usize,
+        bias_val: f32,
+    ) {
+        let bias_v = _mm512_set1_ps(bias_val);
+        let n64 = n - (n % 64);
+        let n16 = n - (n % 16);
+
+        let mut j = 0;
+        while j < n64 {
+            let mut acc0 = bias_v;
+            let mut acc1 = bias_v;
+            let mut acc2 = bias_v;
+            let mut acc3 = bias_v;
+
+            for kk in 0..k {
+                let a_s = _mm512_set1_ps(*a_row.get_unchecked(kk));
+                let b_base = kk * n + j;
+
+                // 4x contiguous 512-bit loads (4x 64B cache lines)
+                let b0 = _mm512_loadu_ps(b.as_ptr().add(b_base));
+                let b1 = _mm512_loadu_ps(b.as_ptr().add(b_base + 16));
+                let b2 = _mm512_loadu_ps(b.as_ptr().add(b_base + 32));
+                let b3 = _mm512_loadu_ps(b.as_ptr().add(b_base + 48));
+
+                // 4x vfmadd231ps — 64 FMAs = 128 FLOPs per K iteration
+                acc0 = _mm512_fmadd_ps(a_s, b0, acc0);
+                acc1 = _mm512_fmadd_ps(a_s, b1, acc1);
+                acc2 = _mm512_fmadd_ps(a_s, b2, acc2);
+                acc3 = _mm512_fmadd_ps(a_s, b3, acc3);
+            }
+
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j), acc0);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 16), acc1);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 32), acc2);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 48), acc3);
+
+            j += 64;
+        }
+
+        // Tail 16: pojedynczy zmm
+        while j < n16 {
+            let mut acc = bias_v;
+            for kk in 0..k {
+                let a_s = _mm512_set1_ps(*a_row.get_unchecked(kk));
+                let b_vec = _mm512_loadu_ps(b.as_ptr().add(kk * n + j));
+                acc = _mm512_fmadd_ps(a_s, b_vec, acc);
+            }
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j), acc);
+            j += 16;
+        }
+
+        // Tail skalarny
+        while j < n {
+            let mut sum = bias_val;
+            for kk in 0..k {
+                sum += *a_row.get_unchecked(kk) * *b.get_unchecked(kk * n + j);
+            }
+            *c_row.get_unchecked_mut(j) = sum;
+            j += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn gemm_one_row_accumulate_avx512(
+        a_row: &[f32],
+        b: &[f32],
+        c_row: &mut [f32],
+        n: usize,
+        k: usize,
+    ) {
+        let n64 = n - (n % 64);
+        let n16 = n - (n % 16);
+
+        let mut j = 0;
+        while j < n64 {
+            let mut acc0 = _mm512_loadu_ps(c_row.as_ptr().add(j));
+            let mut acc1 = _mm512_loadu_ps(c_row.as_ptr().add(j + 16));
+            let mut acc2 = _mm512_loadu_ps(c_row.as_ptr().add(j + 32));
+            let mut acc3 = _mm512_loadu_ps(c_row.as_ptr().add(j + 48));
+
+            for kk in 0..k {
+                let a_s = _mm512_set1_ps(*a_row.get_unchecked(kk));
+                let b_base = kk * n + j;
+                let b0 = _mm512_loadu_ps(b.as_ptr().add(b_base));
+                let b1 = _mm512_loadu_ps(b.as_ptr().add(b_base + 16));
+                let b2 = _mm512_loadu_ps(b.as_ptr().add(b_base + 32));
+                let b3 = _mm512_loadu_ps(b.as_ptr().add(b_base + 48));
+
+                acc0 = _mm512_fmadd_ps(a_s, b0, acc0);
+                acc1 = _mm512_fmadd_ps(a_s, b1, acc1);
+                acc2 = _mm512_fmadd_ps(a_s, b2, acc2);
+                acc3 = _mm512_fmadd_ps(a_s, b3, acc3);
+            }
+
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j), acc0);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 16), acc1);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 32), acc2);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 48), acc3);
+
+            j += 64;
+        }
+
+        while j < n16 {
+            let mut acc = _mm512_loadu_ps(c_row.as_ptr().add(j));
+            for kk in 0..k {
+                let a_s = _mm512_set1_ps(*a_row.get_unchecked(kk));
+                let b_vec = _mm512_loadu_ps(b.as_ptr().add(kk * n + j));
+                acc = _mm512_fmadd_ps(a_s, b_vec, acc);
+            }
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j), acc);
+            j += 16;
+        }
+
+        while j < n {
+            let mut sum = *c_row.get_unchecked(j);
+            for kk in 0..k {
+                sum += *a_row.get_unchecked(kk) * *b.get_unchecked(kk * n + j);
+            }
+            *c_row.get_unchecked_mut(j) = sum;
+            j += 1;
+        }
+    }
+
+    /// Strided accumulate AVX-512 — czyta B z row stride != n (dla conv1d k>1)
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn gemm_one_row_accumulate_strided_avx512(
+        a_row: &[f32],
+        b: &[f32],
+        b_row_stride: usize,
+        c_row: &mut [f32],
+        n: usize,
+        k: usize,
+    ) {
+        let n64 = n - (n % 64);
+        let n16 = n - (n % 16);
+
+        let mut j = 0;
+        while j < n64 {
+            let mut acc0 = _mm512_loadu_ps(c_row.as_ptr().add(j));
+            let mut acc1 = _mm512_loadu_ps(c_row.as_ptr().add(j + 16));
+            let mut acc2 = _mm512_loadu_ps(c_row.as_ptr().add(j + 32));
+            let mut acc3 = _mm512_loadu_ps(c_row.as_ptr().add(j + 48));
+
+            for kk in 0..k {
+                let a_s = _mm512_set1_ps(*a_row.get_unchecked(kk));
+                let b_base = kk * b_row_stride + j;
+                let b0 = _mm512_loadu_ps(b.as_ptr().add(b_base));
+                let b1 = _mm512_loadu_ps(b.as_ptr().add(b_base + 16));
+                let b2 = _mm512_loadu_ps(b.as_ptr().add(b_base + 32));
+                let b3 = _mm512_loadu_ps(b.as_ptr().add(b_base + 48));
+
+                acc0 = _mm512_fmadd_ps(a_s, b0, acc0);
+                acc1 = _mm512_fmadd_ps(a_s, b1, acc1);
+                acc2 = _mm512_fmadd_ps(a_s, b2, acc2);
+                acc3 = _mm512_fmadd_ps(a_s, b3, acc3);
+            }
+
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j), acc0);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 16), acc1);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 32), acc2);
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j + 48), acc3);
+
+            j += 64;
+        }
+
+        while j < n16 {
+            let mut acc = _mm512_loadu_ps(c_row.as_ptr().add(j));
+            for kk in 0..k {
+                let a_s = _mm512_set1_ps(*a_row.get_unchecked(kk));
+                let b_vec = _mm512_loadu_ps(b.as_ptr().add(kk * b_row_stride + j));
+                acc = _mm512_fmadd_ps(a_s, b_vec, acc);
+            }
+            _mm512_storeu_ps(c_row.as_mut_ptr().add(j), acc);
+            j += 16;
+        }
+
+        while j < n {
+            let mut sum = *c_row.get_unchecked(j);
+            for kk in 0..k {
+                sum += *a_row.get_unchecked(kk) * *b.get_unchecked(kk * b_row_stride + j);
+            }
+            *c_row.get_unchecked_mut(j) = sum;
+            j += 1;
+        }
+    }
+
+    /// Dot product 4-way unrolled AVX-512 — hiding FMA latency z 4 niezaleznymi
+    /// akumulatorami. Zwraca sum(row[i] * x[i] for i in 0..k).
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn dot_product_avx512(row: &[f32], x: &[f32], k: usize) -> f32 {
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+
+        let k64 = k - (k % 64);
+        let k16 = k - (k % 16);
+
+        let mut i = 0;
+        while i < k64 {
+            let r0 = _mm512_loadu_ps(row.as_ptr().add(i));
+            let r1 = _mm512_loadu_ps(row.as_ptr().add(i + 16));
+            let r2 = _mm512_loadu_ps(row.as_ptr().add(i + 32));
+            let r3 = _mm512_loadu_ps(row.as_ptr().add(i + 48));
+
+            let x0 = _mm512_loadu_ps(x.as_ptr().add(i));
+            let x1 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
+            let x2 = _mm512_loadu_ps(x.as_ptr().add(i + 32));
+            let x3 = _mm512_loadu_ps(x.as_ptr().add(i + 48));
+
+            acc0 = _mm512_fmadd_ps(r0, x0, acc0);
+            acc1 = _mm512_fmadd_ps(r1, x1, acc1);
+            acc2 = _mm512_fmadd_ps(r2, x2, acc2);
+            acc3 = _mm512_fmadd_ps(r3, x3, acc3);
+
+            i += 64;
+        }
+
+        while i < k16 {
+            let r = _mm512_loadu_ps(row.as_ptr().add(i));
+            let x_v = _mm512_loadu_ps(x.as_ptr().add(i));
+            acc0 = _mm512_fmadd_ps(r, x_v, acc0);
+            i += 16;
+        }
+
+        let combined = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+        let mut sum = _mm512_reduce_add_ps(combined);
+
+        while i < k {
+            sum += *row.get_unchecked(i) * *x.get_unchecked(i);
+            i += 1;
+        }
+        sum
+    }
 }
 
 /// GEMM: C = A * B + bias (per-row), gdzie
@@ -86,11 +365,25 @@ pub fn gemm(
 
 /// Microkernel: oblicza jeden wiersz C (N kolumn) = a_row * B + bias.
 ///
-/// Strategia: przetwarzamy 32 kolumny naraz trzymajac 4 ymm accumulatory w
-/// rejestrach przez cala petle K. Arithmetic intensity = 4 FMAs per iteracja
-/// K, tylko 4 f32x8 loads z B (cache-friendly sekwencyjnie) + 1 scalar z A.
+/// Dispatch:
+///  - AVX-512 (zmm, 16-wide): 64 kolumny naraz, 4 zmm akumulatory
+///  - AVX2 (ymm, 8-wide):     32 kolumny naraz, 4 ymm akumulatory
+/// Oba trzymaja akumulatory w rejestrach przez cala petle K.
 #[inline]
 fn gemm_one_row(a_row: &[f32], b: &[f32], c_row: &mut [f32], n: usize, k: usize, bias_val: f32) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512f() {
+        unsafe { avx512::gemm_one_row_avx512(a_row, b, c_row, n, k, bias_val); }
+        return;
+    }
+    gemm_one_row_f32x8(a_row, b, c_row, n, k, bias_val);
+}
+
+/// Portable AVX2/NEON microkernel (wide::f32x8 8-wide). Dziala wszedzie gdzie
+/// LLVM dostarcza 256-bit SIMD — aarch64 NEON (2x 128-bit), x86_64 AVX/AVX2,
+/// wasm32 SIMD128 (2x 128-bit).
+#[inline]
+fn gemm_one_row_f32x8(a_row: &[f32], b: &[f32], c_row: &mut [f32], n: usize, k: usize, bias_val: f32) {
     let bias_v = f32x8::splat(bias_val);
     let n32 = n - (n % 32); // grupa 32 kolumn
     let n8 = n - (n % 8); // grupa 8 kolumn (tail 1)
@@ -186,6 +479,16 @@ pub fn gemm_accumulate(
 
 #[inline]
 fn gemm_one_row_accumulate(a_row: &[f32], b: &[f32], c_row: &mut [f32], n: usize, k: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512f() {
+        unsafe { avx512::gemm_one_row_accumulate_avx512(a_row, b, c_row, n, k); }
+        return;
+    }
+    gemm_one_row_accumulate_f32x8(a_row, b, c_row, n, k);
+}
+
+#[inline]
+fn gemm_one_row_accumulate_f32x8(a_row: &[f32], b: &[f32], c_row: &mut [f32], n: usize, k: usize) {
     let n32 = n - (n % 32);
     let n8 = n - (n % 8);
 
@@ -240,6 +543,117 @@ fn gemm_one_row_accumulate(a_row: &[f32], b: &[f32], c_row: &mut [f32], n: usize
     }
 }
 
+/// GEMM accumulate z stride'ami — C[:, :n] += A * B[:, :n], gdzie B ma row
+/// stride `b_row_stride` (zwykle >= n) a C ma row stride `c_row_stride`.
+///
+/// Kluczowe zastosowanie: Conv1D k>1 bez alokacji. Zamiast pakowac input
+/// slice do contiguous temp, podajemy input bezposrednio z row_stride=in_length
+/// i uzywamy tylko valid_n kolumn zaczynajac od t_in_start.
+pub fn gemm_accumulate_strided(
+    a: &[f32],
+    b: &[f32],
+    b_row_stride: usize,
+    c: &mut [f32],
+    c_row_stride: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    debug_assert!(b_row_stride >= n);
+    debug_assert!(c_row_stride >= n);
+    debug_assert_eq!(a.len(), m * k);
+
+    // Single-threaded — kazdy conv k>1 jest maly (np. 64x64), rayon overhead
+    // bylby wiekszy niz benefit. Parallelizm i tak dostajemy z k=1 GEMMu.
+    for m_idx in 0..m {
+        let a_row = &a[m_idx * k..(m_idx + 1) * k];
+        let c_start = m_idx * c_row_stride;
+        let c_row = &mut c[c_start..c_start + n];
+        gemm_one_row_accumulate_strided(a_row, b, b_row_stride, c_row, n, k);
+    }
+}
+
+#[inline]
+fn gemm_one_row_accumulate_strided(
+    a_row: &[f32],
+    b: &[f32],
+    b_row_stride: usize,
+    c_row: &mut [f32],
+    n: usize,
+    k: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512f() {
+        unsafe {
+            avx512::gemm_one_row_accumulate_strided_avx512(a_row, b, b_row_stride, c_row, n, k);
+        }
+        return;
+    }
+    gemm_one_row_accumulate_strided_f32x8(a_row, b, b_row_stride, c_row, n, k);
+}
+
+#[inline]
+fn gemm_one_row_accumulate_strided_f32x8(
+    a_row: &[f32],
+    b: &[f32],
+    b_row_stride: usize,
+    c_row: &mut [f32],
+    n: usize,
+    k: usize,
+) {
+    let n32 = n - (n % 32);
+    let n8 = n - (n % 8);
+
+    let mut j = 0;
+    while j < n32 {
+        let mut acc0 = load8(&c_row[j..j + 8]);
+        let mut acc1 = load8(&c_row[j + 8..j + 16]);
+        let mut acc2 = load8(&c_row[j + 16..j + 24]);
+        let mut acc3 = load8(&c_row[j + 24..j + 32]);
+
+        for kk in 0..k {
+            let a_s = f32x8::splat(a_row[kk]);
+            let b_base = kk * b_row_stride + j;
+            let b0 = load8(&b[b_base..b_base + 8]);
+            let b1 = load8(&b[b_base + 8..b_base + 16]);
+            let b2 = load8(&b[b_base + 16..b_base + 24]);
+            let b3 = load8(&b[b_base + 24..b_base + 32]);
+
+            acc0 = a_s.mul_add(b0, acc0);
+            acc1 = a_s.mul_add(b1, acc1);
+            acc2 = a_s.mul_add(b2, acc2);
+            acc3 = a_s.mul_add(b3, acc3);
+        }
+
+        store8(&mut c_row[j..j + 8], acc0);
+        store8(&mut c_row[j + 8..j + 16], acc1);
+        store8(&mut c_row[j + 16..j + 24], acc2);
+        store8(&mut c_row[j + 24..j + 32], acc3);
+
+        j += 32;
+    }
+
+    while j < n8 {
+        let mut acc = load8(&c_row[j..j + 8]);
+        for kk in 0..k {
+            let a_s = f32x8::splat(a_row[kk]);
+            let b_vec = load8(&b[kk * b_row_stride + j..kk * b_row_stride + j + 8]);
+            acc = a_s.mul_add(b_vec, acc);
+        }
+        store8(&mut c_row[j..j + 8], acc);
+        j += 8;
+    }
+
+    while j < n {
+        let mut sum = c_row[j];
+        for kk in 0..k {
+            sum += a_row[kk] * b[kk * b_row_stride + j];
+        }
+        c_row[j] = sum;
+        j += 1;
+    }
+}
+
 /// Matrix-vector: y[M] = W[M, K] * x[K] + bias[M]
 /// Dla linear layers na koniec pipeline'u (SE blocks, final embedding).
 pub fn gemv(weights: &[f32], x: &[f32], bias: Option<&[f32]>, m: usize, k: usize, y: &mut [f32]) {
@@ -268,6 +682,16 @@ pub fn gemv(weights: &[f32], x: &[f32], bias: Option<&[f32]>, m: usize, k: usize
 
 #[inline]
 fn dot_product(row: &[f32], x: &[f32], k8: usize, k: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512f() {
+        let _ = k8;
+        return unsafe { avx512::dot_product_avx512(row, x, k) };
+    }
+    dot_product_f32x8(row, x, k8, k)
+}
+
+#[inline]
+fn dot_product_f32x8(row: &[f32], x: &[f32], k8: usize, k: usize) -> f32 {
     let mut acc0 = f32x8::splat(0.0);
     let mut acc1 = f32x8::splat(0.0);
     let mut acc2 = f32x8::splat(0.0);

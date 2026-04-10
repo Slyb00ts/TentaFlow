@@ -36,17 +36,31 @@ pub fn sum_axis_last(data: &[f32], num_channels: usize, length: usize) -> Vec<f3
 /// Weighted mean axis=last z wagami [C, T] * w[T] (broadcasted)
 /// out[c] = sum_t (data[c, t] * w[t])
 pub fn weighted_mean(data: &[f32], weights: &[f32], num_channels: usize, length: usize) -> Vec<f32> {
-    debug_assert_eq!(data.len(), num_channels * length);
-    debug_assert_eq!(weights.len(), num_channels * length); // same shape jak data dla per-channel attention
     let mut out = vec![0.0_f32; num_channels];
+    weighted_mean_into(data, weights, num_channels, length, &mut out);
+    out
+}
+
+/// Zero-alloc wariant — pisze do pre-alokowanego bufora.
+pub fn weighted_mean_into(
+    data: &[f32],
+    weights: &[f32],
+    num_channels: usize,
+    length: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(data.len(), num_channels * length);
+    debug_assert_eq!(weights.len(), num_channels * length);
+    debug_assert!(out.len() >= num_channels);
     for c in 0..num_channels {
         let mut sum = 0.0;
-        for t in 0..length {
-            sum += data[c * length + t] * weights[c * length + t];
+        let data_row = &data[c * length..(c + 1) * length];
+        let w_row = &weights[c * length..(c + 1) * length];
+        for i in 0..length {
+            sum += data_row[i] * w_row[i];
         }
         out[c] = sum;
     }
-    out
 }
 
 /// Weighted std axis=last — zgodnie z WeSpeaker ONNX: clip(var, min=eps) → sqrt
@@ -59,20 +73,36 @@ pub fn weighted_std(
     length: usize,
     eps: f32,
 ) -> Vec<f32> {
+    let mut out = vec![0.0_f32; num_channels];
+    weighted_std_into(data, weights, means, num_channels, length, eps, &mut out);
+    out
+}
+
+/// Zero-alloc wariant — pisze do pre-alokowanego bufora.
+pub fn weighted_std_into(
+    data: &[f32],
+    weights: &[f32],
+    means: &[f32],
+    num_channels: usize,
+    length: usize,
+    eps: f32,
+    out: &mut [f32],
+) {
     debug_assert_eq!(data.len(), num_channels * length);
     debug_assert_eq!(weights.len(), num_channels * length);
     debug_assert_eq!(means.len(), num_channels);
-    let mut out = vec![0.0_f32; num_channels];
+    debug_assert!(out.len() >= num_channels);
     for c in 0..num_channels {
+        let data_row = &data[c * length..(c + 1) * length];
+        let w_row = &weights[c * length..(c + 1) * length];
         let mut sum_sq = 0.0;
-        for t in 0..length {
-            let v = data[c * length + t];
-            sum_sq += v * v * weights[c * length + t];
+        for i in 0..length {
+            let v = data_row[i];
+            sum_sq += v * v * w_row[i];
         }
         let var = sum_sq - means[c] * means[c];
         out[c] = var.max(eps).sqrt();
     }
-    out
 }
 
 #[cfg(test)]
