@@ -11,7 +11,7 @@ gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
 gpu-rocm = ["tentaflow-core/gpu-rocm"]
 
 [dependencies]
-tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "metrics-prometheus"] }
+tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "metrics-prometheus", "inference-diarization"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"

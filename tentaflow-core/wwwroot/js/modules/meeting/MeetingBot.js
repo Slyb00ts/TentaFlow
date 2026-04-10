@@ -105,6 +105,9 @@ const MeetingBot = (() => {
     }
 
     loadStatus();
+    // Auto-polling transkrypcji co 2s (niezaleznie od stanu — transkrypcje moga przychodzic
+    // gdy bot jest w meetingu)
+    startPolling();
   }
 
   // Odmontowanie
@@ -165,13 +168,16 @@ const MeetingBot = (() => {
     window.open(vncUrl, 'tentaflow-vnc', 'width=1024,height=768,menubar=no,toolbar=no');
   }
 
-  // Ladowanie statusu bota
+  // Ladowanie statusu bota + transkrypcji
   async function loadStatus() {
     const infoContent = document.getElementById('meeting-info-content');
     if (!infoContent) return;
 
     try {
-      const data = await ApiClient.get('/api/addons/teams-bot/ui');
+      const [data, transcripts] = await Promise.all([
+        ApiClient.get('/api/addons/teams-bot/ui'),
+        ApiClient.get('/api/meeting-bot/transcripts?limit=50').catch(() => []),
+      ]);
       const config = data.config_values || {};
       const state = config.meeting_state || 'idle';
 
@@ -190,8 +196,11 @@ const MeetingBot = (() => {
       if (config.llm_alias) {
         html += renderInfoRow(I18n.t('meeting.llm_alias'), config.llm_alias);
       }
-
       html += '</div>';
+
+      // Sekcja transkrypcji na zywo
+      html += renderTranscripts(Array.isArray(transcripts) ? transcripts : []);
+
       infoContent.innerHTML = html;
     } catch (err) {
       infoContent.innerHTML = `
@@ -201,6 +210,46 @@ const MeetingBot = (() => {
         </div>
       `;
     }
+  }
+
+  // Renderowanie listy transkrypcji
+  function renderTranscripts(entries) {
+    const title = I18n.t('meeting.transcripts') || 'Transcripts';
+    if (!entries || entries.length === 0) {
+      return `
+        <div class="meeting-transcripts">
+          <h4 class="meeting-transcripts-title">${escapeHtml(title)}</h4>
+          <div class="empty-state" style="padding: var(--spacing-md);">
+            <div class="empty-state-hint">${escapeHtml(I18n.t('meeting.no_transcripts') || 'No transcripts yet')}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    // Entries przychodza od najnowszej — renderujemy w tej kolejnosci
+    const rows = entries.map((e) => {
+      const time = new Date(e.timestamp_ms || Date.now()).toLocaleTimeString();
+      const speaker = escapeHtml(e.speaker || 'Unknown');
+      const text = escapeHtml(e.text || '');
+      const model = escapeHtml(e.model || '');
+      return `
+        <div class="meeting-transcript-row">
+          <div class="meeting-transcript-meta">
+            <span class="meeting-transcript-time">${time}</span>
+            <span class="meeting-transcript-speaker">${speaker}</span>
+            ${model ? `<span class="meeting-transcript-model">${model}</span>` : ''}
+          </div>
+          <div class="meeting-transcript-text">${text}</div>
+        </div>
+      `;
+    }).join('');
+
+    return `
+      <div class="meeting-transcripts">
+        <h4 class="meeting-transcripts-title">${escapeHtml(title)} (${entries.length})</h4>
+        <div class="meeting-transcript-list">${rows}</div>
+      </div>
+    `;
   }
 
   // Renderowanie wiersza informacyjnego
@@ -229,10 +278,10 @@ const MeetingBot = (() => {
     if (leaveBtn) leaveBtn.disabled = (state !== 'connected' && state !== 'joining');
   }
 
-  // Polling statusu spotkania
+  // Polling statusu spotkania + transkrypcji (2s dla dobrej responsywnosci)
   function startPolling() {
     stopPolling();
-    pollingInterval = setInterval(loadStatus, 5000);
+    pollingInterval = setInterval(loadStatus, 2000);
   }
 
   function stopPolling() {

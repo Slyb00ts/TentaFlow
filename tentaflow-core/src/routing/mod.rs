@@ -19,6 +19,7 @@ pub mod local_stt;
 pub mod chat_template;
 pub mod middleware;
 pub mod meeting_transcript;
+pub mod transcript_store;
 pub(crate) mod reverse_request;
 
 // Re-eksporty publicznych typow

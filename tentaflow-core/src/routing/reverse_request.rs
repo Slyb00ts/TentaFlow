@@ -171,8 +171,38 @@ async fn dispatch_reverse_request(
 
     match request.payload {
         ModelPayload::Audio(audio_payload) => {
+            // Przed STT: jesli diarization skompilowane, wyciagnij audio_data i
+            // zidentyfikuj speakera. Labelem bedzie SPEAKER_00/01/... lub None.
+            #[cfg(feature = "inference-diarization")]
+            let speaker_label: Option<String> = match &audio_payload.operation {
+                AudioOperation::STT { audio_data, .. } => {
+                    crate::diarization::identify_speaker(audio_data)
+                }
+                _ => None,
+            };
+            #[cfg(not(feature = "inference-diarization"))]
+            let speaker_label: Option<String> = None;
+
             match router.route_audio_via_protocol(&audio_payload.operation).await {
-                Ok(response) => response,
+                Ok(response) => {
+                    // Jesli to STT (Text result), zapisz do transcript_store dla GUI Bot Status
+                    if let ModelResult::Audio(ref audio_result) = response.result {
+                        if let AudioResultData::Text(ref text) = audio_result.data {
+                            if !text.trim().is_empty() {
+                                let speaker = speaker_label
+                                    .clone()
+                                    .unwrap_or_else(|| "Nieznany".to_string());
+                                crate::routing::transcript_store::push(
+                                    speaker.clone(),
+                                    text.clone(),
+                                    audio_result.model.clone(),
+                                );
+                                info!("Transcript [{}][{}]: {}", speaker, audio_result.model, text);
+                            }
+                        }
+                    }
+                    response
+                }
                 Err(e) => make_error_response(request_id, &format!("Blad routingu audio: {}", e)),
             }
         }

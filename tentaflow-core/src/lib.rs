@@ -21,6 +21,9 @@ pub mod inference;
 pub mod stt;
 pub mod hub;
 
+#[cfg(feature = "inference-diarization")]
+pub mod diarization;
+
 pub mod auth;
 pub mod api;
 pub mod audit;
