@@ -4,8 +4,6 @@
 //       Uzywane przez linear layers w LSTM i wyjsciowych.
 // =============================================================================
 
-use wide::f32x8;
-
 /// Naiwna implementacja — dla referencji i malych rozmiarow.
 /// out[m] = sum_k matrix[m*k..m*k+k] * vec[k]
 /// matrix shape: [m_rows, k_cols]
@@ -25,11 +23,9 @@ pub fn matvec_f32(matrix: &[f32], vec: &[f32], m_rows: usize, k_cols: usize, out
     }
 }
 
-/// SIMD version — f32x8 (256-bit) dot product, portable przez `wide`.
-/// Dziala na x86_64 (SSE/AVX), aarch64 (NEON), wasm32 (SIMD128) itd.
-///
-/// Dla m_rows iteracji liczymy dot product row*vec przez chunks po 8 elementow,
-/// ze scalar tail gdy k_cols nie jest wielokrotnoscia 8.
+/// SIMD matvec — deleguje do zoptymalizowanego gemv w ops::gemm. Zachowane dla
+/// kompatybilnosci API. Wewnetrznie: 4-way unrolled FMA loop, contiguous loads,
+/// rayon parallelizm dla >32 wierszy.
 pub fn matvec_f32_simd(
     matrix: &[f32],
     vec: &[f32],
@@ -37,44 +33,7 @@ pub fn matvec_f32_simd(
     k_cols: usize,
     out: &mut [f32],
 ) {
-    debug_assert_eq!(matrix.len(), m_rows * k_cols);
-    debug_assert_eq!(vec.len(), k_cols);
-    debug_assert_eq!(out.len(), m_rows);
-
-    let simd_width = 8;
-    let simd_chunks = k_cols / simd_width;
-    let tail_start = simd_chunks * simd_width;
-
-    for m in 0..m_rows {
-        let row = &matrix[m * k_cols..(m + 1) * k_cols];
-        let mut acc = f32x8::splat(0.0);
-
-        // SIMD hot loop — 8 mnozen + 8 dodawan per iteracja
-        for c in 0..simd_chunks {
-            let offset = c * simd_width;
-            let a = f32x8::from([
-                row[offset], row[offset + 1], row[offset + 2], row[offset + 3],
-                row[offset + 4], row[offset + 5], row[offset + 6], row[offset + 7],
-            ]);
-            let b = f32x8::from([
-                vec[offset], vec[offset + 1], vec[offset + 2], vec[offset + 3],
-                vec[offset + 4], vec[offset + 5], vec[offset + 6], vec[offset + 7],
-            ]);
-            acc += a * b;
-        }
-
-        // Horizontal sum lanes
-        let lanes = acc.to_array();
-        let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3]
-                    + lanes[4] + lanes[5] + lanes[6] + lanes[7];
-
-        // Scalar tail dla pozostalych elementow
-        for k in tail_start..k_cols {
-            sum += row[k] * vec[k];
-        }
-
-        out[m] = sum;
-    }
+    super::gemm::gemv(matrix, vec, None, m_rows, k_cols, out);
 }
 
 #[cfg(test)]

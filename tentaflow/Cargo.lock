@@ -5264,6 +5264,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "prost-build",
+ "rayon",
  "rustfft",
  "thiserror 2.0.18",
  "tracing",
