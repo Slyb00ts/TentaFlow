@@ -63,11 +63,11 @@ fn default_quic_port() -> u16 {
 }
 
 fn default_chunk_duration() -> u32 {
-    500
+    250
 }
 
 fn default_silence_threshold() -> u32 {
-    2000
+    500
 }
 
 fn default_vad_rms_threshold() -> f32 {
@@ -75,7 +75,7 @@ fn default_vad_rms_threshold() -> f32 {
 }
 
 fn default_bot_name() -> String {
-    "TentaFlow AI".to_string()
+    "TentaFlow Jarvis".to_string()
 }
 
 impl MeetingConfig {
@@ -106,16 +106,18 @@ impl MeetingConfig {
             tls_cert: std::env::var("TLS_CERT").ok(),
             tls_key: std::env::var("TLS_KEY").ok(),
             audio_device: std::env::var("AUDIO_DEVICE").ok(),
-            vad_model_path: std::env::var("VAD_MODEL_PATH").ok(),
+            vad_model_path: std::env::var("VAD_MODEL_PATH")
+                .ok()
+                .or_else(|| Some("/opt/models/silero_vad.onnx".to_string())),
             stt_model: std::env::var("STT_MODEL").ok(),
             tts_model: std::env::var("TTS_MODEL").ok(),
             tts_voice: std::env::var("TTS_VOICE").ok(),
             bot_name: std::env::var("BOT_NAME")
-                .unwrap_or_else(|_| "TentaFlow AI".to_string()),
+                .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(250),
             silence_threshold_ms: std::env::var("SILENCE_THRESHOLD_MS")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(2000),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             vad_rms_threshold: std::env::var("VAD_RMS_THRESHOLD")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(100.0),
         };
@@ -185,8 +187,8 @@ mod tests {
 
         let config: MeetingConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.quic_port, 5000);
-        assert_eq!(config.chunk_duration_ms, 500);
-        assert_eq!(config.silence_threshold_ms, 2000);
+        assert_eq!(config.chunk_duration_ms, 250);
+        assert_eq!(config.silence_threshold_ms, 500);
         assert!(config.audio_device.is_none());
         assert!(config.vad_model_path.is_none());
         assert!(config.stt_model.is_none());
