@@ -30,8 +30,7 @@ const ServiceForm = (() => {
         ApiClient.get('/api/clusters').catch(() => [])
       ]);
       meshNodes = (nodesData || []).filter(n => {
-        const trust = (n.trust_status || n.status || '').toLowerCase();
-        return trust === 'trusted' || trust === 'paired';
+        return n.is_trusted === true && n.is_local !== true;
       });
       clustersList = clustersData || [];
     } catch {
@@ -105,12 +104,12 @@ const ServiceForm = (() => {
               <select id="svc-deploy-target">
                 <option value="local" ${!currentService?.node_id && !currentService?.cluster_id ? 'selected' : ''}>${I18n.t('services.deploy_local')}</option>
                 ${meshNodes.map(n => {
-                  const sel = currentService?.node_id === n.id ? 'selected' : '';
-                  return `<option value="node:${Utils.escapeAttr(n.id)}" ${sel}>${Utils.escapeHtml(n.hostname || n.name || n.id)}</option>`;
+                  const sel = currentService?.node_id === n.node_id ? 'selected' : '';
+                  return `<option value="node:${Utils.escapeAttr(n.node_id)}" ${sel}>${Utils.escapeHtml(n.hostname || n.node_id)}</option>`;
                 }).join('')}
                 ${clustersList.map(c => {
-                  const sel = currentService?.cluster_id === c.id ? 'selected' : '';
-                  return `<option value="cluster:${Utils.escapeAttr(c.id)}" ${sel}>[Cluster] ${Utils.escapeHtml(c.name || c.id)}</option>`;
+                  const sel = currentService?.cluster_id === c.cluster_id ? 'selected' : '';
+                  return `<option value="cluster:${Utils.escapeAttr(c.cluster_id)}" ${sel}>[Cluster] ${Utils.escapeHtml(c.name || c.cluster_id)}</option>`;
                 }).join('')}
               </select>
             </div>

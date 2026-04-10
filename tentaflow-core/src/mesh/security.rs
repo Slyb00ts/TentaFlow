@@ -720,6 +720,17 @@ impl MeshSecurity {
         window.check_and_update(nonce)
     }
 
+    /// Resetuj stan replay (inbound window + outbound counter) dla danego peera.
+    /// Wywolywane po rozlaczeniu QUIC — po rekonnekcie peer startuje nonce od zera,
+    /// wiec stare okno odrzucaloby nowe wiadomosci jako "za stare".
+    pub fn reset_replay_state(&self, node_id: &str) {
+        self.inbound_windows.remove(node_id);
+        let mut nonces = self.outbound_nonces.write();
+        if let Some(counter) = nonces.get(node_id) {
+            counter.store(0, Ordering::SeqCst);
+        }
+    }
+
     /// Podpisz dane kluczem prywatnym Ed25519
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
         self.signing_key.sign(data).to_bytes().to_vec()

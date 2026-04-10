@@ -418,8 +418,20 @@ const ComposeTemplates = (() => {
     }, null, 2);
   }
 
+  // Zaslepka TensorRT-LLM — Docker compose jeszcze niedostepny
+  function tensorrt_llm(params) {
+    return JSON.stringify({
+      engine: 'tensorrt-llm',
+      deploy_mode: 'docker',
+      status: 'not_implemented',
+      model_id: params.modelId || '',
+      port: params.port || INTERNAL_PORTS.llm,
+      container_name: params.containerName || 'tentaflow-llm',
+    }, null, 2);
+  }
+
   // Generatory per silnik LLM
-  const LLM_ENGINES = { sglang, vllm, ollama, llamacpp, mlx };
+  const LLM_ENGINES = { sglang, vllm, ollama, llamacpp, mlx, 'tensorrt-llm': tensorrt_llm };
 
   // Generowanie compose dla standardowej uslugi po ID
   function generate(serviceId, params = {}) {
