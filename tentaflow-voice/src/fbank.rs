@@ -18,6 +18,53 @@
 
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::sync::OnceLock;
+use wide::f32x8;
+
+/// SIMD dot product f32x8 4-way unrolled — dla mel filterbank × power spectrum.
+#[inline]
+fn simd_dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let n32 = n - (n % 32);
+    let n8 = n - (n % 8);
+
+    let mut acc0 = f32x8::splat(0.0);
+    let mut acc1 = f32x8::splat(0.0);
+    let mut acc2 = f32x8::splat(0.0);
+    let mut acc3 = f32x8::splat(0.0);
+
+    let mut i = 0;
+    while i < n32 {
+        let a0: [f32; 8] = a[i..i + 8].try_into().unwrap();
+        let a1: [f32; 8] = a[i + 8..i + 16].try_into().unwrap();
+        let a2: [f32; 8] = a[i + 16..i + 24].try_into().unwrap();
+        let a3: [f32; 8] = a[i + 24..i + 32].try_into().unwrap();
+        let b0: [f32; 8] = b[i..i + 8].try_into().unwrap();
+        let b1: [f32; 8] = b[i + 8..i + 16].try_into().unwrap();
+        let b2: [f32; 8] = b[i + 16..i + 24].try_into().unwrap();
+        let b3: [f32; 8] = b[i + 24..i + 32].try_into().unwrap();
+        acc0 = f32x8::from(a0).mul_add(f32x8::from(b0), acc0);
+        acc1 = f32x8::from(a1).mul_add(f32x8::from(b1), acc1);
+        acc2 = f32x8::from(a2).mul_add(f32x8::from(b2), acc2);
+        acc3 = f32x8::from(a3).mul_add(f32x8::from(b3), acc3);
+        i += 32;
+    }
+    while i < n8 {
+        let a: [f32; 8] = a[i..i + 8].try_into().unwrap();
+        let b: [f32; 8] = b[i..i + 8].try_into().unwrap();
+        acc0 = f32x8::from(a).mul_add(f32x8::from(b), acc0);
+        i += 8;
+    }
+    let combined = (acc0 + acc1) + (acc2 + acc3);
+    let lanes = combined.to_array();
+    let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3]
+                + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+    while i < n {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
+}
 
 pub const SAMPLE_RATE: f32 = 16000.0;
 pub const N_MELS: usize = 80;
@@ -178,13 +225,12 @@ pub fn compute_fbank_into(samples: &[f32], out: &mut Vec<f32>) -> usize {
                 power[i] = re * re + im * im;
             }
 
-            // 6+7. Mel filterbank + log — piszemy od razu do out[mel, frame]
+            // 6+7. Mel filterbank + log — SIMD dot product per mel bin.
+            //    fb_row × power = 257 MACs per bin × 80 bins = 20.5K MACs/frame.
+            //    Z f32x8 4-way unroll powinno byc ~3us per frame.
             for m in 0..N_MELS {
                 let fb_row = &cache.mel_fb[m * n_freqs..(m + 1) * n_freqs];
-                let mut acc = 0.0_f32;
-                for f in 0..n_freqs {
-                    acc += fb_row[f] * power[f];
-                }
+                let acc = simd_dot(fb_row, power);
                 out[m * n_frames + frame_idx] = acc.max(ENERGY_FLOOR).ln();
             }
         }
