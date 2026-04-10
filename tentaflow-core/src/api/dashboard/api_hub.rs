@@ -7,10 +7,11 @@
 use crate::hub::{engine_registry, hf_search, model_store};
 use crate::mesh::peer_store::MeshPeerStore;
 
-/// GET /api/hub/engines — lista silnikow (opcjonalnie filtrowana po os_info lub node_id)
+/// GET /api/hub/engines — lista silnikow (opcjonalnie filtrowana po os_info, node_id lub type)
 pub fn handle_list_engines(query: &str, mesh_peer_store: &MeshPeerStore) -> Result<String, String> {
     let os_info = parse_query_value(query, "os_info");
     let node_id_param = parse_query_value(query, "node_id");
+    let type_filter = parse_query_value(query, "type");
 
     let platform = if let Some(ref os) = os_info {
         engine_registry::parse_platform(os)
@@ -39,10 +40,17 @@ pub fn handle_list_engines(query: &str, mesh_peer_store: &MeshPeerStore) -> Resu
         engine_registry::current_platform()
     };
 
-    let engines: Vec<_> = engine_registry::engines_for_platform(&platform)
-        .iter()
-        .map(|e| e.to_info(&platform))
-        .collect();
+    let engines: Vec<_> = if let Some(ref et) = type_filter {
+        engine_registry::engines_for_platform_and_type(&platform, et)
+            .iter()
+            .map(|e| e.to_info(&platform))
+            .collect()
+    } else {
+        engine_registry::engines_for_platform(&platform)
+            .iter()
+            .map(|e| e.to_info(&platform))
+            .collect()
+    };
 
     serde_json::to_string(&engines).map_err(|e| format!("Serializacja: {}", e))
 }

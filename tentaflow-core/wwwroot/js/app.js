@@ -121,6 +121,7 @@ const App = (() => {
     ViewRouter.register('flows', FlowList);
     ViewRouter.register('chat', Chat);
     ViewRouter.register('addons', Addons);
+    ViewRouter.register('meeting', MeetingBot);
     ViewRouter.register('users', Users);
     ViewRouter.register('audit', AuditLog);
 

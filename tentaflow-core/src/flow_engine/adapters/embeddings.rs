@@ -158,15 +158,10 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
         }
 
         // HTTP backend jako fallback
-        let backends = self.service_manager.get_service_backends(&model_name);
-        if let Some(backends) = backends {
+        let backends = self.service_manager.get_service_backends_cloned(&model_name);
+        if let Some(ref backends) = backends {
             if !backends.is_empty() {
-                let strategy = self.service_manager.get_strategy(&model_name);
-                let backend_idx = match strategy {
-                    Some(s) => s.select_backend(backends)?,
-                    None => 0,
-                };
-                let backend = &backends[backend_idx];
+                let backend = &backends[0];
 
                 debug!("Embeddings adapter: uzywam HTTP backend: {}", backend.url());
 

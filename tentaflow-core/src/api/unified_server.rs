@@ -20,7 +20,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
 use crate::config::NodeConfig;
-use crate::crypto::{generate_master_key, SecretsCipher};
+use crate::crypto::{generate_master_key, SecretsCipher, SettingsCipher};
 use crate::db;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::quic_mesh::QuicMeshManager;
@@ -80,12 +80,25 @@ pub fn start_unified_server_with_permissions(
 
     let bind_addr = config.protocols.openai_api.bind.clone();
 
-    let master_key = db::repository::get_setting(db, "encryption_master_key")
+    // Ladowanie master key z pliku na dysku i inicjalizacja SettingsCipher
+    let file_master_key = crate::crypto::load_or_create_master_key()
+        .expect("Nie udalo sie zaladowac master key z pliku");
+    let settings_cipher = Arc::new(SettingsCipher::new(&file_master_key));
+
+    // Migracja istniejacych plaintextowych sekretow
+    match crate::crypto::migrate_plaintext_secrets(db, &settings_cipher) {
+        Ok(n) if n > 0 => info!("Zaszyfrowano {} plaintextowych sekretow w bazie", n),
+        Err(e) => error!("Blad migracji sekretow: {}", e),
+        _ => {}
+    }
+
+    // SecretsCipher (dla addonow) — encryption_master_key z bazy odszyfrowany przez SettingsCipher
+    let master_key = db::repository::get_setting_secure(db, "encryption_master_key", &settings_cipher)
         .ok()
         .flatten()
         .unwrap_or_else(|| {
             let key = generate_master_key();
-            let _ = db::repository::set_setting(db, "encryption_master_key", &key);
+            let _ = db::repository::set_setting_secure(db, "encryption_master_key", &key, &settings_cipher);
             info!("Wygenerowano nowy encryption_master_key i zapisano w bazie");
             key
         });
@@ -151,6 +164,7 @@ pub fn start_unified_server_with_permissions(
             let db = db.clone();
             let metrics = metrics.clone();
             let cipher = cipher.clone();
+            let sc = settings_cipher.clone();
             let sm = service_manager.clone();
             let mps = mesh_peer_store.clone();
             let qm = quic_mesh.clone();
@@ -177,6 +191,7 @@ pub fn start_unified_server_with_permissions(
                     let db = db.clone();
                     let metrics = metrics.clone();
                     let cipher = cipher.clone();
+                    let sc = sc.clone();
                     let sm = sm.clone();
                     let mps = mps.clone();
                     let qm = qm.clone();
@@ -230,7 +245,7 @@ pub fn start_unified_server_with_permissions(
                             });
                             Ok::<_, hyper::Error>(resp)
                         } else {
-                            let resp = crate::api::dashboard::server::handle_request(req, db, metrics, cipher, sm, router, mps, qm, lni, msec, pc, ra).await?;
+                            let resp = crate::api::dashboard::server::handle_request(req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, ra).await?;
                             let resp = resp.map(|body| {
                                 UnsyncBoxBody::new(body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() }))
                             });

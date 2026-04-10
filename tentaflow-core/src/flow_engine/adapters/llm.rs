@@ -337,20 +337,14 @@ impl NodeAdapter for LlmNodeAdapter {
         }
 
         // HTTP backend
-        let backends = self.service_manager.get_service_backends(&model_name);
-        match backends {
+        let backend = self.service_manager.get_service_backends_cloned(&model_name);
+        match backend {
             Some(backends) if !backends.is_empty() => {
-                let strategy = self.service_manager.get_strategy(&model_name);
-                let backend_idx = match strategy {
-                    Some(s) => s.select_backend(backends)?,
-                    None => 0,
-                };
-                let backend = &backends[backend_idx];
+                let backend = &backends[0];
 
                 debug!(
-                    "LLM adapter: HTTP backend {} [{}]",
+                    "LLM adapter: HTTP backend {}",
                     backend.url(),
-                    backend_idx
                 );
 
                 let response = backend.chat_completion(request).await?;

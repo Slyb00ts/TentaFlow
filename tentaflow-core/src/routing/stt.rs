@@ -5,11 +5,11 @@
 //       route_speaker_operation, route_speaker_link_to_memory.
 // =============================================================================
 
-use crate::error::{Result, CoreError};
+use crate::error::Result;
 use crate::api::openai::types::{TranscriptionRequest, TranscriptionResponse};
 use crate::routing::router::Router;
 
-use tracing::{debug, warn, error};
+use tracing::{debug, error};
 
 impl Router {
     /// Routuje audio transcription request do odpowiedniego backendu.
@@ -19,158 +19,124 @@ impl Router {
     pub async fn route_audio_transcription(
         &self,
         request: TranscriptionRequest,
-    ) -> Result<TranscriptionResponse> {
+    ) -> Result<crate::routing::RouteResult<TranscriptionResponse>> {
         use tentaflow_protocol::*;
-
-        // === KROK 1: ALIAS RETENTAFLOWN ===
-        let model_name = self.resolve_to_service_name(&request.model);
+        use crate::routing::middleware::BackendHandle;
 
         debug!(
             "Routing audio transcription dla modelu: {}, plik: {}, rozmiar: {} bajtow",
-            model_name,
+            request.model,
             request.filename,
             request.file.len()
         );
 
-        // === KROK 2: SPRAWDZ QUIC STT (preferowany) ===
-        if self.service_manager.has_quic_stt_service(&model_name) {
-            if let Some(quic_client) = self.service_manager.get_quic_stt_client(&model_name).await {
-                debug!("Using QUIC STT backend: {}", model_name);
+        let route_result = {
+            let this = self.clone();
+            let req = request.clone();
+            self.dispatch_with_fallback(&request.model, 0, |handle| {
+                let this = this.clone();
+                let req = req.clone();
+                let handle = handle.clone();
+                async move {
+                    match &handle {
+                        BackendHandle::LocalStt => {
+                            debug!("Probuje lokalne STT (Whisper in-process)");
+                            this.local_stt.transcribe(&req).await
+                        }
+                        BackendHandle::QuicStt(name) => {
+                            let quic_client = this.service_manager.get_quic_stt_client(name).await
+                                .ok_or_else(|| anyhow::anyhow!("QUIC STT service {} nie polaczony", name))?;
 
-                let request_id = uuid::Uuid::new_v4().to_string();
-                let model_request = ModelRequest {
-                    request_id: request_id.clone(),
-                    payload: ModelPayload::Audio(AudioPayload {
-                        operation: AudioOperation::STT {
-                            model: model_name.clone(),
-                            audio_data: request.file.clone(),
-                            language: request.language.clone(),
-                            response_format: request.response_format.clone(),
-                            prompt: request.prompt.clone(),
-                            temperature: request.temperature,
-                            timestamp_granularities: request.timestamp_granularities.clone(),
-                            no_speech_threshold: None,
-                            avg_logprob_threshold: None,
-                            compression_ratio_threshold: None,
-                        },
-                    }),
-                    stream: false,
-                    metadata: None,
-                    session_id: None,
-                };
+                            debug!("Using QUIC STT backend: {}", name);
+                            let request_id = uuid::Uuid::new_v4().to_string();
+                            let model_request = ModelRequest {
+                                request_id: request_id.clone(),
+                                payload: ModelPayload::Audio(AudioPayload {
+                                    operation: AudioOperation::STT {
+                                        model: name.clone(),
+                                        audio_data: req.file.clone(),
+                                        language: req.language.clone(),
+                                        response_format: req.response_format.clone(),
+                                        prompt: req.prompt.clone(),
+                                        temperature: req.temperature,
+                                        timestamp_granularities: req.timestamp_granularities.clone(),
+                                        no_speech_threshold: None,
+                                        avg_logprob_threshold: None,
+                                        compression_ratio_threshold: None,
+                                    },
+                                }),
+                                stream: false,
+                                metadata: None,
+                                session_id: None,
+                            };
 
-                match quic_client.send_request(model_request).await {
-                    Ok(response) => {
-                        match response.result {
-                            ModelResult::Audio(audio_result) => {
-                                match audio_result.data {
-                                    AudioResultData::Text(text) => {
-                                        debug!("QUIC STT success: {} chars", text.len());
-                                        return Ok(TranscriptionResponse {
-                                            text,
-                                            task: Some("transcribe".to_string()),
-                                            language: None,
-                                            duration: None,
-                                            segments: None,
-                                        });
-                                    }
-                                    AudioResultData::Detailed { text, segments, language, duration, filtered_segments_count: _ } => {
-                                        debug!("QUIC STT success (detailed): {} chars, {} segments", text.len(), segments.len());
-                                        // Konwertuj segmenty z protocol na openai types
-                                        let openai_segments: Vec<crate::api::openai::types::TranscriptionSegment> = segments.iter()
-                                            .map(|seg| crate::api::openai::types::TranscriptionSegment {
-                                                id: seg.id,
-                                                seek: seg.seek,
-                                                start: seg.start,
-                                                end: seg.end,
-                                                text: seg.text.clone(),
-                                                tokens: seg.tokens.clone().unwrap_or_default(),
-                                                temperature: seg.temperature,
-                                                avg_logprob: seg.avg_logprob,
-                                                compression_ratio: seg.compression_ratio,
-                                                no_speech_prob: seg.no_speech_prob,
-                                                speaker_label: seg.speaker_label.clone(),
-                                                speaker_similarity: seg.speaker_similarity,
-                                                is_known_speaker: seg.is_known_speaker,
+                            let response = quic_client.send_request(model_request).await
+                                .map_err(|e| anyhow::anyhow!("QUIC STT request failed: {}", e))?;
+
+                            match response.result {
+                                ModelResult::Audio(audio_result) => {
+                                    match audio_result.data {
+                                        AudioResultData::Text(text) => {
+                                            debug!("QUIC STT success: {} chars", text.len());
+                                            Ok(TranscriptionResponse {
+                                                text,
+                                                task: Some("transcribe".to_string()),
+                                                language: None,
+                                                duration: None,
+                                                segments: None,
                                             })
-                                            .collect();
-                                        return Ok(TranscriptionResponse {
-                                            text,
-                                            task: Some("transcribe".to_string()),
-                                            language: Some(language),
-                                            duration: Some(duration),
-                                            segments: Some(openai_segments),
-                                        });
-                                    }
-                                    _ => {
-                                        warn!("QUIC STT returned unexpected result type (Audio bytes instead of text)");
+                                        }
+                                        AudioResultData::Detailed { text, segments, language, duration, filtered_segments_count: _ } => {
+                                            debug!("QUIC STT success (detailed): {} chars, {} segments", text.len(), segments.len());
+                                            let openai_segments: Vec<crate::api::openai::types::TranscriptionSegment> = segments.iter()
+                                                .map(|seg| crate::api::openai::types::TranscriptionSegment {
+                                                    id: seg.id,
+                                                    seek: seg.seek,
+                                                    start: seg.start,
+                                                    end: seg.end,
+                                                    text: seg.text.clone(),
+                                                    tokens: seg.tokens.clone().unwrap_or_default(),
+                                                    temperature: seg.temperature,
+                                                    avg_logprob: seg.avg_logprob,
+                                                    compression_ratio: seg.compression_ratio,
+                                                    no_speech_prob: seg.no_speech_prob,
+                                                    speaker_label: seg.speaker_label.clone(),
+                                                    speaker_similarity: seg.speaker_similarity,
+                                                    is_known_speaker: seg.is_known_speaker,
+                                                })
+                                                .collect();
+                                            Ok(TranscriptionResponse {
+                                                text,
+                                                task: Some("transcribe".to_string()),
+                                                language: Some(language),
+                                                duration: Some(duration),
+                                                segments: Some(openai_segments),
+                                            })
+                                        }
+                                        _ => Err(anyhow::anyhow!("QUIC STT zwrocil nieoczekiwany typ wyniku")),
                                     }
                                 }
-                            }
-                            ModelResult::Error(err) => {
-                                return Err(CoreError::BackendError {
-                                    backend_url: format!("quic://{}", model_name),
-                                    message: format!("QUIC STT error: {}", err.message),
-                                    source: None,
-                                }.into());
-                            }
-                            _ => {
-                                warn!("QUIC STT returned unexpected result type");
+                                ModelResult::Error(err) => {
+                                    Err(anyhow::anyhow!("QUIC STT error: {}", err.message))
+                                }
+                                _ => Err(anyhow::anyhow!("QUIC STT zwrocil nieoczekiwany typ odpowiedzi")),
                             }
                         }
-                    }
-                    Err(e) => {
-                        return Err(CoreError::BackendError {
-                            backend_url: format!("quic://{}", model_name),
-                            message: format!("QUIC STT request failed: {}", e),
-                            source: Some(anyhow::Error::from(e)),
-                        }.into());
+                        BackendHandle::Http(name) => {
+                            let backend = this.select_http_backend(name)
+                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
+                            debug!("Wybrany backend dla audio transcription: {}", backend.url());
+                            let response = backend.audio_transcription(req).await?;
+                            debug!("Audio transcription zakonczona: {} znakow tekstu", response.text.len());
+                            Ok(response)
+                        }
+                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla STT")),
                     }
                 }
-            } else {
-                warn!("QUIC STT service {} configured but not connected", model_name);
-            }
-        }
+            }).await?
+        };
 
-        // === KROK 3: FALLBACK NA OPENAI API BACKEND ===
-        let backends = self.get_service_backends(&model_name)
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
-
-        if backends.is_empty() {
-            return Err(CoreError::AllBackendsUnavailable {
-                model_name: model_name.clone(),
-            }
-            .into());
-        }
-
-        // === KROK 4: BACKEND SELECTION (LOAD BALANCING) ===
-        // Uzyj strategii load balancing dla tego model pool
-        let strategy = self.get_strategy(&model_name)
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
-
-        let backend_idx = strategy.select_backend(backends)?;
-        let backend = &backends[backend_idx];
-
-        debug!(
-            "Wybrany backend dla audio transcription ({}): {} [{}]",
-            strategy.name(),
-            backend.url(),
-            backend_idx
-        );
-
-        // === KROK 5: REQUEST FORWARDING ===
-        let response = backend.audio_transcription(request).await?;
-
-        debug!(
-            "Audio transcription zakonczona: {} znakow tekstu",
-            response.text.len()
-        );
-
-        Ok(response)
+        Ok(route_result)
     }
 
     /// Routuje audio request przez protocol-native interface.
@@ -199,7 +165,8 @@ impl Router {
                 };
 
                 match self.synthesize_speech(&tts_request).await {
-                    Ok(audio_bytes) => {
+                    Ok(tts_result) => {
+                        let audio_bytes = tts_result.response;
                         let response = ModelResponse {
                             request_id,
                             result: ModelResult::Audio(AudioResult {
@@ -267,7 +234,8 @@ impl Router {
                 };
 
                 match self.route_audio_transcription(request).await {
-                    Ok(transcription) => {
+                    Ok(route_result) => {
+                        let transcription = route_result.response;
                         // Sprawdz czy mamy segmenty i czy trzeba filtrowac
                         let is_verbose = effective_format.as_deref() == Some("verbose_json");
 

@@ -215,7 +215,7 @@ fn derive_key(addon_id: &str, state: &AddonState) -> Option<[u8; 32]> {
     use hkdf::Hkdf;
 
     // VULN-022: Brak fallbacku — jesli nie ma master key, zwracamy None
-    let master_key = match db::repository::get_setting(&state.db, "encryption_master_key") {
+    let master_key = match db::repository::get_setting_secure(&state.db, "encryption_master_key", &state.settings_cipher) {
         Ok(Some(key)) if !key.is_empty() => key,
         _ => {
             tracing::error!(

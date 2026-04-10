@@ -13,7 +13,7 @@ use crate::routing::router::Router;
 
 use tentaflow_protocol::*;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 impl Router {
     /// Routuje embeddings request do odpowiedniego backendu.
@@ -23,52 +23,43 @@ impl Router {
     pub async fn route_embeddings(
         &self,
         request: EmbeddingRequest,
-    ) -> Result<EmbeddingResponse> {
-        let model_name = self.resolve_to_service_name(&request.model);
+    ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
+        debug!("Routing embeddings dla modelu: {}", request.model);
 
-        debug!("Routing embeddings dla modelu: {}", model_name);
+        let route_result = {
+            use crate::routing::middleware::BackendHandle;
+            let this = self.clone();
+            let req = request.clone();
+            self.dispatch_with_fallback(&request.model, 0, |handle| {
+                let this = this.clone();
+                let req = req.clone();
+                let handle = handle.clone();
+                async move {
+                    match &handle {
+                        BackendHandle::QuicEmbedding(name) => {
+                            let quic_handle = {
+                                this.service_manager.quic_embedding_services.read().get(name).cloned()
+                            }.ok_or_else(|| anyhow::anyhow!("QUIC embedding serwis '{}' nie znaleziony", name))?;
+                            let quic_client = quic_handle.get_client().await
+                                .ok_or_else(|| anyhow::anyhow!("QUIC embedding serwis '{}' nie polaczony", name))?;
+                            debug!("Routing embeddings przez QUIC: {}", name);
+                            this.route_embeddings_quic(quic_client, req, name.clone()).await
+                        }
+                        BackendHandle::Http(name) => {
+                            let backend = this.select_http_backend(name)
+                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
+                            debug!("Wybrany backend dla embeddings: {}", backend.url());
+                            let response = backend.embeddings_request(req).await?;
+                            debug!("Embeddings zakonczone: {} embeddingow wygenerowanych", response.data.len());
+                            Ok(response)
+                        }
+                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla embeddings")),
+                    }
+                }
+            }).await?
+        };
 
-        // Sprawdz QUIC client (TentaFlow.Embeddings)
-        let quic_emb_handle = { self.service_manager.quic_embedding_services.read().get(&model_name).cloned() };
-        if let Some(quic_handle) = quic_emb_handle {
-            if let Some(quic_client) = quic_handle.get_client().await {
-                debug!("Routing embeddings przez QUIC: {}", model_name);
-                return self.route_embeddings_quic(quic_client, request, model_name).await;
-            } else {
-                warn!("QUIC embedding serwis '{}' nie jest polaczony", model_name);
-            }
-        }
-
-        // Fallback do HTTP backend (OpenAI API)
-        let backends = self.get_service_backends(&model_name)
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
-
-        if backends.is_empty() {
-            return Err(CoreError::AllBackendsUnavailable {
-                model_name: model_name.clone(),
-            }.into());
-        }
-
-        let strategy = self.get_strategy(&model_name)
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
-
-        let backend_idx = strategy.select_backend(backends)?;
-        let backend = &backends[backend_idx];
-
-        debug!(
-            "Wybrany backend dla embeddings ({}): {} [{}]",
-            strategy.name(), backend.url(), backend_idx
-        );
-
-        let response = backend.embeddings_request(request).await?;
-
-        debug!("Embeddings zakonczone: {} embeddingow wygenerowanych", response.data.len());
-
-        Ok(response)
+        Ok(route_result)
     }
 
     /// Routuje embeddings request przez QUIC (TentaFlow.Embeddings).

@@ -342,4 +342,153 @@ mod tests {
         bus.unsubscribe("test.addon", "test_event");
         assert_eq!(bus.get_subscribers("test_event").len(), 0);
     }
+
+    #[test]
+    fn test_event_bus_meeting_transcript_flow() {
+        // Pelny przepyw: subskrypcja meeting.transcript, publikacja, odbiór
+
+        // Arrange
+        let bus = EventBus::new();
+
+        let sub = EventSubscriber {
+            addon_id: "meeting-recorder".to_string(),
+            instance_id: "recorder-inst-1".to_string(),
+            callback_name: "on_transcript".to_string(),
+        };
+
+        bus.subscribe("meeting.transcript", sub);
+
+        // Act — publikacja eventu transkrypcji
+        let now = chrono::Utc::now();
+        bus.publish(Event {
+            event_type: "meeting.transcript".to_string(),
+            source_addon: None,
+            source_user: None,
+            payload: serde_json::json!({
+                "speaker": "Jan Kowalski",
+                "text": "Dzien dobry wszystkim",
+                "timestamp_ms": 1_710_000_000_000u64,
+            }),
+            timestamp: now,
+        });
+
+        // Assert — subskrybent jest na liscie
+        let subs = bus.get_subscribers("meeting.transcript");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].addon_id, "meeting-recorder");
+        assert_eq!(subs[0].callback_name, "on_transcript");
+
+        // Assert — event w historii z poprawnymi danymi
+        let events = bus.recent_events(1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "meeting.transcript");
+        assert_eq!(events[0].payload["speaker"], "Jan Kowalski");
+        assert_eq!(events[0].payload["text"], "Dzien dobry wszystkim");
+        assert_eq!(events[0].payload["timestamp_ms"], 1_710_000_000_000u64);
+
+        // Assert — statystyki
+        let stats = bus.stats();
+        assert_eq!(stats.total_subscribers, 1);
+        assert_eq!(stats.published_count, 1);
+        assert_eq!(stats.history_size, 1);
+    }
+
+    #[test]
+    fn test_event_bus_meeting_transcript_multiple_speakers() {
+        // Wielu mowcow — kazdy event trafia do historii w kolejnosci
+
+        // Arrange
+        let bus = EventBus::new();
+
+        let sub = EventSubscriber {
+            addon_id: "summary-addon".to_string(),
+            instance_id: "summary-1".to_string(),
+            callback_name: "on_event".to_string(),
+        };
+
+        bus.subscribe("meeting.transcript", sub);
+
+        // Act — 3 rozne wypowiedzi
+        let speakers = [
+            ("Jan", "Zaczynamy spotkanie"),
+            ("Anna", "Mam aktualizacje projektu"),
+            ("Piotr", "Jakie sa priorytety?"),
+        ];
+
+        let now = chrono::Utc::now();
+        for (speaker, text) in &speakers {
+            bus.publish(Event {
+                event_type: "meeting.transcript".to_string(),
+                source_addon: None,
+                source_user: None,
+                payload: serde_json::json!({
+                    "speaker": speaker,
+                    "text": text,
+                }),
+                timestamp: now,
+            });
+        }
+
+        // Assert — 3 eventy w historii, najnowszy pierwszy
+        let events = bus.recent_events(3);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].payload["speaker"], "Piotr");
+        assert_eq!(events[1].payload["speaker"], "Anna");
+        assert_eq!(events[2].payload["speaker"], "Jan");
+
+        assert_eq!(bus.stats().published_count, 3);
+    }
+
+    #[test]
+    fn test_event_bus_prefix_pattern_meeting_events() {
+        // Subskrypcja z prefix pattern "meeting.*" matchuje "meeting.transcript"
+
+        // Arrange
+        let bus = EventBus::new();
+
+        let sub = EventSubscriber {
+            addon_id: "meeting-monitor".to_string(),
+            instance_id: "monitor-1".to_string(),
+            callback_name: "on_event".to_string(),
+        };
+
+        bus.subscribe("meeting.*", sub);
+
+        // Act & Assert
+        let subs = bus.get_subscribers("meeting.transcript");
+        assert_eq!(subs.len(), 1);
+
+        let subs = bus.get_subscribers("meeting.control");
+        assert_eq!(subs.len(), 1);
+
+        // Nie matchuje innego prefixu
+        let subs = bus.get_subscribers("addon.started");
+        assert_eq!(subs.len(), 0);
+    }
+
+    #[test]
+    fn test_event_bus_unsubscribe_all_removes_meeting_subscriptions() {
+        // Odsubskrybowanie addonu usuwa go ze wszystkich eventow meeting.*
+
+        // Arrange
+        let bus = EventBus::new();
+
+        let sub = EventSubscriber {
+            addon_id: "teams-bot".to_string(),
+            instance_id: "teams-1".to_string(),
+            callback_name: "on_event".to_string(),
+        };
+
+        bus.subscribe("meeting.transcript", sub.clone());
+        bus.subscribe("meeting.control", sub);
+        assert_eq!(bus.get_subscribers("meeting.transcript").len(), 1);
+        assert_eq!(bus.get_subscribers("meeting.control").len(), 1);
+
+        // Act
+        bus.unsubscribe_all("teams-bot");
+
+        // Assert
+        assert_eq!(bus.get_subscribers("meeting.transcript").len(), 0);
+        assert_eq!(bus.get_subscribers("meeting.control").len(), 0);
+    }
 }
