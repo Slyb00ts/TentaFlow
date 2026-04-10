@@ -14,22 +14,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2-dev \
         libpulse-dev \
         libssl-dev \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
 # Kopiujemy manifesty crate'ow osobno — cache warstw cargo fetch
 COPY tentaflow-protocol/Cargo.toml tentaflow-protocol/Cargo.toml
+COPY tentaflow-voice/Cargo.toml tentaflow-voice/Cargo.toml
+COPY tentaflow-voice/build.rs tentaflow-voice/build.rs
+COPY tentaflow-voice/proto/ tentaflow-voice/proto/
 COPY tentaflow-containers/teams-bot/Cargo.toml tentaflow-containers/teams-bot/Cargo.toml
 
 # Tymczasowe puste src zeby cargo fetch zadzialalal
 RUN mkdir -p tentaflow-protocol/src && echo "" > tentaflow-protocol/src/lib.rs \
+    && mkdir -p tentaflow-voice/src/generated && echo "" > tentaflow-voice/src/lib.rs \
     && mkdir -p tentaflow-containers/teams-bot/src && echo "fn main() {}" > tentaflow-containers/teams-bot/src/main.rs
 
 RUN cargo fetch --manifest-path tentaflow-containers/teams-bot/Cargo.toml
 
 # Kopiujemy wlasciwy kod zrodlowy
 COPY tentaflow-protocol/ tentaflow-protocol/
+COPY tentaflow-voice/ tentaflow-voice/
 COPY tentaflow-containers/teams-bot/ tentaflow-containers/teams-bot/
 
 # Kompilacja release
@@ -47,9 +53,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         chromium \
         pulseaudio \
-        pulseaudio-utils \
         libpulse0 \
-        ffmpeg \
         xvfb \
         ca-certificates \
         dbus \
@@ -58,18 +62,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         websockify \
     && rm -rf /var/lib/apt/lists/*
 
-# ONNX Runtime dla Silero VAD (load-dynamic)
-RUN apt-get update && apt-get install -y --no-install-recommends curl && \
-    curl -sSL https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz \
-    | tar xz -C /usr/local --strip-components=1 onnxruntime-linux-x64-1.22.0/lib && \
-    ldconfig && \
-    apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+# Silero VAD uruchamiany przez pure Rust (tentaflow-voice) — brak onnxruntime.so
 
 # Uzytkownik bez uprawnien root
 RUN useradd -m -s /bin/bash sidecar
 
 # Konfiguracja PulseAudio
 COPY tentaflow-containers/teams-bot/pulseaudio.conf /etc/pulse/default.pa
+
+# Model Silero VAD (diarization jest w routerze, nie w bocie)
+RUN mkdir -p /opt/models
+COPY tentaflow-containers/teams-bot/models/silero_vad.onnx /opt/models/silero_vad.onnx
 
 # Binary z etapu budowania
 COPY --from=builder /build/tentaflow-containers/teams-bot/target/release/tentaflow-meeting /usr/local/bin/tentaflow-meeting
@@ -90,15 +93,13 @@ ENV DISPLAY=:99
 # XDG_RUNTIME_DIR — PulseAudio i Chromium szukaja socketow tutaj
 ENV XDG_RUNTIME_DIR=/tmp/runtime
 
-# Skrypt startowy — PulseAudio + Xvfb + sidecar
+# Skrypt startowy — PulseAudio (minimal) + Xvfb + VNC + sidecar
+# Audio przechwytywane w Chromium przez JS (browser_inject.js), nie przez PulseAudio.
 ENTRYPOINT ["/bin/bash", "-c", "\
     rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; \
     mkdir -p /tmp/runtime && \
     pulseaudio --start --exit-idle-time=-1 --log-level=error 2>/dev/null; \
-    sleep 0.5 && \
-    LB_INPUT=$(pactl list short sink-inputs 2>/dev/null | grep loopback | awk '{print $1}') && \
-    [ -n \"$LB_INPUT\" ] && pactl set-sink-input-volume $LB_INPUT 5% 2>/dev/null; \
-    Xvfb :99 -screen 0 1920x1080x24 -ac &\
+    Xvfb :99 -screen 0 1920x1080x24 -ac & \
     sleep 1 && \
     x11vnc -display :99 -forever -nopw -shared -rfbport 5900 & \
     websockify --web /usr/share/novnc 6080 localhost:5900 & \

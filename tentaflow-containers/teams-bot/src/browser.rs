@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: browser.rs
 // Opis: Automatyzacja przegladarki Chromium — dolaczanie do spotkan Teams,
-//       wykrywanie aktywnego mowcy i stanu autoryzacji.
+//       wykrywanie aktywnego mowcy, injekcja mostu audio (browser_inject.js).
 // =============================================================================
 
 use std::time::Duration;
@@ -19,12 +19,21 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Interwal pollingu stanu spotkania
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Uruchamia headless Chromium z wczytanymi cookies sesji
+/// Skrypt wstrzykiwany do strony Teams — przechwytuje audio przez captureStream()
+/// i wysyla PCM do Rust przez WebSocket ws://127.0.0.1:9999/bridge. Obsluguje tez
+/// mic injection przez monkey-patch getUserMedia + MediaStreamTrackGenerator.
+const AUDIO_BRIDGE_JS: &str = include_str!("browser_inject.js");
+
+/// Uruchamia headless Chromium z wczytanymi cookies sesji.
+/// Kazde uruchomienie tworzy UNIKALNY user_data_dir — bez tego Chromium
+/// przy drugim launch'u blokuje sie na "profile locked".
 pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
-    // Ustawienie preferencji Chromium — auto-grant mikrofon i kamera
-    let user_data_dir = "/tmp/chromium-meeting-bot";
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let user_data_dir = format!("/tmp/chromium-meeting-bot-{}", &instance_id[..8]);
+    let user_data_dir = user_data_dir.as_str();
     let prefs_dir = format!("{}/Default", user_data_dir);
     std::fs::create_dir_all(&prefs_dir).ok();
+    tracing::info!(user_data_dir, "Uruchamianie Chromium z unikalnym profilem");
     // content_settings: 1 = allow, 2 = block
     // Mikrofon dozwolony (bot musi mowic), kamera zablokowana (bot nie potrzebuje video)
     std::fs::write(
@@ -40,7 +49,7 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         .user_data_dir(user_data_dir)
         .arg("use-fake-ui-for-media-stream")
         .arg("autoplay-policy=no-user-gesture-required")
-        .arg("enable-features=PulseaudioLoopbackForCast")
+        .arg("enable-features=MediaStreamTrackGenerator")
         .arg("disable-gpu")
         .arg("disable-blink-features=AutomationControlled")
         .arg("ignore-certificate-errors")
@@ -72,135 +81,117 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
 
 /// Nawiguje do URL spotkania Teams i dolacza jako gosc lub czeka na logowanie VNC
 pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) -> Result<Page> {
-    let page = browser.new_page(url).await?;
-    page.wait_for_navigation().await?;
+    use chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams;
 
-    tracing::info!(url = url, "Nawigacja do spotkania Teams");
+    // Otworz pusta strone, zainstaluj init script PRZED nawigacja do Teams.
+    // Dzieki temu monkey-patch getUserMedia jest aktywny zanim Teams go wywola.
+    let page = browser.new_page("about:blank").await?;
 
-    // Czekamy na zaladowanie strony i zamykamy dialogi uprawnien
+    // Wylacz Content Security Policy dla tej strony — Teams ma strict CSP
+    // ktore blokuje WebSocket do ws://127.0.0.1:9999. setBypassCSP to CDP
+    // method przeznaczony dla debuggerow, calkowicie pomija CSP dla target.
+    page.execute(SetBypassCspParams { enabled: true }).await
+        .map_err(|e| anyhow::anyhow!("Blad setBypassCSP: {}", e))?;
+    tracing::info!("CSP wylaczone dla strony (setBypassCSP=true)");
+
+    page.evaluate_on_new_document(AUDIO_BRIDGE_JS).await
+        .map_err(|e| anyhow::anyhow!("Blad evaluate_on_new_document: {}", e))?;
+    tracing::info!("Zarejestrowano init script (audio bridge) dla wszystkich dokumentow");
+
+    // Forward JS console messages z Chromium do naszych logow Rust
+    // Dzieki temu bledy ze wstrzyknietego browser_inject.js widac w docker logs
+    spawn_console_forwarder(&page).await;
+
+    // NIE wywolujemy wait_for_navigation — Teams robi chain redirectow
+    // (launcher.html → v2 → light-meetings) i event 'navigation done' nigdy
+    // nie przychodzi. Nasz polling click_when_present sam poczeka na DOM.
+    page.goto(url).await?;
+    tracing::info!(url = url, "Nawigacja do spotkania Teams rozpoczeta");
+
+    // Czekamy na zaladowanie strony light-meetings
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Auto-klik na dialogi uprawnien Teams (mikrofon, kamera)
-    // Teams wyswietla wlasne dialogi "Allow while visiting the site"
-    for _ in 0..5 {
-        let clicked = page.evaluate(
-            r#"(function() {
-                // Chromium permission prompt
-                let allow = Array.from(document.querySelectorAll('button'))
-                    .find(el => el.textContent.includes('Allow')
-                        || el.textContent.includes('Zezwalaj')
-                        || el.textContent.includes('Allow while visiting'));
-                if (allow) { allow.click(); return true; }
-                // Teams dialog "Continue without audio or video"
-                let continueBtn = Array.from(document.querySelectorAll('button, a'))
-                    .find(el => el.textContent.includes('Continue without audio')
-                        || el.textContent.includes('Kontynuuj bez'));
-                if (continueBtn) { continueBtn.click(); return true; }
-                // Teams wlasny dialog — "Allow" / zamknij
-                let close = document.querySelector('.ms-Dialog-button--close, [aria-label="Close"], [data-tid="close-button"]');
-                if (close) { close.click(); return true; }
-                return false;
-            })()"#,
-        )
-        .await
-        .map(|v| v.into_value::<bool>().unwrap_or(false))
-        .unwrap_or(false);
+    // KROK 1: Dialog "Are you sure you don't want audio or video?"
+    // Button: "Continue without audio or video"
+    tracing::info!("Sprawdzanie dialogu audio/video");
+    let _ = click_when_present(
+        &page,
+        r#"
+        (function() {
+            const btn = Array.from(document.querySelectorAll('button'))
+                .find(el => el.textContent && el.textContent.trim() === 'Continue without audio or video');
+            if (btn) { btn.click(); return true; }
+            return false;
+        })()
+        "#,
+        Duration::from_secs(10),
+        "dialog 'Continue without audio or video'",
+    ).await;
 
-        if clicked {
-            tracing::info!("Zamknieto dialog uprawnien");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        } else {
-            break;
-        }
-    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // KROK 2: Wpisanie nazwy bota w polu "Type your name"
+    tracing::info!(bot_name = %config.bot_name, "Wpisywanie nazwy bota w polu prejoin");
+    let name_js = format!(
+        r#"
+        (function() {{
+            const input = document.querySelector('input[placeholder="Type your name"]')
+                || document.querySelector('[data-tid="prejoin-display-name-input"]')
+                || document.querySelector('input[name="displayName"]');
+            if (!input) return false;
+            input.focus();
+            const setter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, 'value').set;
+            setter.call(input, "{}");
+            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return true;
+        }})()
+        "#,
+        config.bot_name.replace('"', r#"\""#)
+    );
+    let _ = click_when_present(
+        &page,
+        &name_js,
+        Duration::from_secs(15),
+        "pole 'Type your name'",
+    ).await;
 
-    // Sprawdzamy czy dostepna jest opcja dolaczenia jako gosc
-    // TODO: selektory wymagaja weryfikacji z aktualnym klientem Teams
-    let guest_button_exists = page
-        .evaluate(
-            r#"!!document.querySelector('[data-tid="prejoin-join-button-as-guest"]')
-               || !!Array.from(document.querySelectorAll('button, a'))
-                    .find(el => el.textContent.includes('Continue without signing in'))"#,
-        )
-        .await
-        .map(|v| v.into_value::<bool>().unwrap_or(false))
-        .unwrap_or(false);
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    if guest_button_exists {
-        tracing::info!(bot_name = %config.bot_name, "Opcja goscia dostepna — dolaczanie anonimowo");
+    // KROK 3: Klikniecie "Join now"
+    tracing::info!("Klikanie przycisku 'Join now'");
+    let joined = click_when_present(
+        &page,
+        r#"
+        (function() {
+            // Najpierw szukamy po tekscie bo Teams zmienia data-tid
+            const btn = Array.from(document.querySelectorAll('button'))
+                .find(el => {
+                    if (el.disabled) return false;
+                    const t = (el.textContent || '').trim();
+                    return t === 'Join now' || t === 'Dolacz teraz';
+                });
+            if (btn) { btn.click(); return true; }
+            // Fallback data-tid
+            const byTid = document.querySelector('[data-tid="prejoin-join-button"]');
+            if (byTid && !byTid.disabled) { byTid.click(); return true; }
+            return false;
+        })()
+        "#,
+        Duration::from_secs(15),
+        "przycisk 'Join now'",
+    ).await.is_ok();
 
-        // Klikamy przycisk "Join as guest" / "Continue without signing in"
-        // TODO: selektory do weryfikacji na zywo
-        page.evaluate(
-            r#"(function() {
-                let btn = document.querySelector('[data-tid="prejoin-join-button-as-guest"]');
-                if (!btn) {
-                    btn = Array.from(document.querySelectorAll('button, a'))
-                        .find(el => el.textContent.includes('Continue without signing in'));
-                }
-                if (btn) btn.click();
-            })()"#,
-        )
-        .await?;
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Wpisujemy nazwe bota w pole imienia
-        // TODO: selektory do weryfikacji na zywo
-        let name_js = format!(
-            r#"(function() {{
-                let input = document.querySelector('[data-tid="prejoin-display-name-input"]')
-                    || document.querySelector('input[name="displayName"]');
-                if (input) {{
-                    input.value = '';
-                    input.focus();
-                    const nativeSet = Object.getOwnPropertyDescriptor(
-                        HTMLInputElement.prototype, 'value').set;
-                    nativeSet.call(input, "{}");
-                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }}
-            }})()"#,
-            config.bot_name.replace('"', r#"\""#)
-        );
-        page.evaluate(name_js).await?;
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Klikamy "Join now"
-        // TODO: selektor do weryfikacji na zywo
-        page.evaluate(
-            r#"(function() {
-                let btn = document.querySelector('[data-tid="prejoin-join-button"]');
-                if (btn) btn.click();
-            })()"#,
-        )
-        .await?;
+    if joined {
+        tracing::info!("Dialog prejoin zaakceptowany — oczekiwanie na wejscie do meetingu");
     } else {
-        // Logowanie wymagane — uzytkownik musi zalogowac sie przez VNC
         tracing::warn!(
-            "Logowanie wymagane — uzyj VNC na porcie 5900 zeby zalogowac sie recznie"
+            "Auto-join nie udal sie — wymagana interwencja VNC na porcie 5900"
         );
-
-        // Czekamy az uzytkownik zaloguje sie i dolaczyl do spotkania przez VNC
-        let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("Timeout — uzytkownik nie zalogowal sie w ciagu 5 minut");
-            }
-
-            if is_in_meeting(&page).await? {
-                tracing::info!("Wykryto dolaczenie do spotkania po logowaniu VNC");
-                break;
-            }
-
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
     }
 
-    // Czekamy na potwierdzenie ze jestesmy w spotkaniu
+    // Czekamy na potwierdzenie ze jestesmy w spotkaniu (po auto-join lub manualnym VNC)
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if is_in_meeting(&page).await? {
@@ -213,14 +204,53 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
     anyhow::bail!("Timeout — nie udalo sie dolaczyc do spotkania w ciagu 5 minut")
 }
 
-/// Sprawdza czy jestesmy w aktywnym spotkaniu (wykrywanie elementow UI)
+/// Polluje wywolanie JS co 500ms az zwroci `true` albo minie timeout.
+/// Zwraca Ok(()) jesli się powiodło, Err z timeout opisem w przeciwnym razie.
+async fn click_when_present(
+    page: &Page,
+    js_expr: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let ok = page.evaluate(js_expr)
+            .await
+            .map(|v| v.into_value::<bool>().unwrap_or(false))
+            .unwrap_or(false);
+        if ok {
+            tracing::info!(selector = label, "Element znaleziony i klikniety");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    anyhow::bail!("Timeout czekajac na element: {}", label)
+}
+
+/// Sprawdza czy jestesmy w aktywnym spotkaniu (wykrywanie elementow UI).
+/// Dziala zarowno dla klasycznego Teams jak i light-meetings experience.
 async fn is_in_meeting(page: &Page) -> Result<bool> {
-    // TODO: selektory do weryfikacji z aktualnym klientem Teams
     let in_meeting = page
         .evaluate(
-            r#"!!document.querySelector('[data-tid="calling-bar"]')
-               || !!document.querySelector('[data-tid="toggle-mute"]')
-               || !!document.querySelector('[data-tid="hangup-button"]')"#,
+            r#"
+            (function() {
+                // Light-meetings experience — po dolaczeniu sa przyciski mic/camera/hangup
+                if (document.querySelector('[data-tid="call-end"]')) return true;
+                if (document.querySelector('[data-tid="toggle-mute"]')) return true;
+                if (document.querySelector('[data-tid="toggle-video"]')) return true;
+                // Klasyczny Teams
+                if (document.querySelector('[data-tid="calling-bar"]')) return true;
+                if (document.querySelector('[data-tid="hangup-button"]')) return true;
+                // Fallback po aria-label
+                if (document.querySelector('[aria-label="Leave"], [aria-label="Hang up"], [aria-label="Leave call"]')) return true;
+                // Obecnosc elementu audio z active stream (WebRTC peer connection ustanowiony)
+                const audios = document.querySelectorAll('audio');
+                for (const a of audios) {
+                    if (a.srcObject && a.srcObject.getAudioTracks && a.srcObject.getAudioTracks().length > 0) return true;
+                }
+                return false;
+            })()
+            "#,
         )
         .await
         .map(|v| v.into_value::<bool>().unwrap_or(false))
@@ -262,4 +292,45 @@ pub async fn detect_auth_expired(page: &Page) -> Result<bool> {
     }
 
     Ok(expired)
+}
+
+/// Uruchamia w tle task forwardujacy komunikaty z Chromium DevTools Console
+/// do naszych logow Rust. Pozwala widziec bledy wstrzyknietego JS bez potrzeby
+/// otwierania DevTools przez VNC.
+async fn spawn_console_forwarder(page: &Page) {
+    use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+
+    match page.event_listener::<EventConsoleApiCalled>().await {
+        Ok(mut stream) => {
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    let level = format!("{:?}", event.r#type);
+                    let args_text: Vec<String> = event
+                        .args
+                        .iter()
+                        .map(|arg| {
+                            arg.value
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .or_else(|| arg.description.clone())
+                                .unwrap_or_else(|| format!("{:?}", arg.r#type))
+                        })
+                        .collect();
+                    let msg = args_text.join(" ");
+                    // Filtruj szum (wiadomosci z naszego bridge maja prefix "[tentaflow]")
+                    if msg.contains("[tentaflow]") {
+                        tracing::info!(target: "js_console", level = %level, "{}", msg);
+                    } else if level.to_lowercase().contains("error") {
+                        tracing::warn!(target: "js_console", level = %level, "{}", msg);
+                    } else {
+                        tracing::debug!(target: "js_console", level = %level, "{}", msg);
+                    }
+                }
+            });
+            tracing::info!("Forwarder konsoli Chromium uruchomiony");
+        }
+        Err(e) => {
+            tracing::warn!("Nie udalo sie uruchomic forwardera konsoli: {}", e);
+        }
+    }
 }

@@ -36,6 +36,7 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("Blad instalacji CryptoProvider");
 
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -96,11 +97,11 @@ async fn main() -> Result<()> {
         None
     };
 
-    // 5. Uruchom przechwytywanie audio
-    let mut audio_capture = audio::start_capture(
-        config.chunk_duration_ms,
-    )?;
-    tracing::info!("Przechwytywanie audio uruchomione");
+    // 5. Uruchom most audio WebSocket (wstrzykniety JS w Chromium <-> Rust)
+    // Zastepuje wczesniejsze parec/pacat — audio przechwytywane na poziomie
+    // HTMLMediaElement w Chromium przez captureStream(), bez PulseAudio monitor.
+    let (mut audio_capture, _audio_playback) = audio::start_bridge().await?;
+    tracing::info!("Most audio WebSocket uruchomiony na 127.0.0.1:9999");
 
     // 6. Inicjalizacja VAD
     let mut vad_detector = vad::VadDetector::new(
@@ -109,6 +110,10 @@ async fn main() -> Result<()> {
         config.silence_threshold_ms,
         config.vad_rms_threshold,
     )?;
+
+    // Diarization jest wykonywana po stronie routera (tentaflow-core) razem ze STT.
+    // Bot otrzymuje juz etykiete speakera w ModelResponse. Jesli router nie zwroci
+    // speaker_label, uzywamy fallback "Nieznany".
 
     // 7. Glowna petla: audio -> VAD -> STT (QUIC) -> streaming transcript -> TTS (QUIC)
     let mut speech_buffer: Vec<i16> = Vec::new();
@@ -130,71 +135,103 @@ async fn main() -> Result<()> {
 
                 chunk_count += 1;
 
-                // Debug: loguj RMS co 20 chunkow (~10s)
-                if chunk_count % 20 == 0 {
-                    let rms = (chunk.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / chunk.len() as f64).sqrt();
-                    tracing::debug!(chunk_count, rms = format!("{:.1}", rms), "Audio RMS");
-                }
-
+                let rms = (chunk.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / chunk.len() as f64).sqrt();
                 let vad_result = vad_detector.process_chunk(&chunk);
+
+                // Loguj kazdy chunk z wynikiem VAD (przy chunk_duration 500ms = 2x/s)
+                tracing::info!(
+                    chunk = chunk_count,
+                    rms = format!("{:.0}", rms),
+                    buf = speech_buffer.len(),
+                    "{:?}",
+                    vad_result
+                );
+
+                // Maksymalny bufor mowy: 15s @ 16kHz = 240000 sampli.
+                // Gdy uczestnik mowi non-stop, wymuszamy wyslanie aby nie czekac w nieskonczonosc
+                // i nie przekraczac optymalnego okna Whisper (30s).
+                const MAX_SPEECH_SAMPLES: usize = 240_000;
+
+                let mut should_send = matches!(vad_result, VadResult::Transition);
 
                 match vad_result {
                     VadResult::Speech => {
                         speech_buffer.extend_from_slice(&chunk);
+                        if speech_buffer.len() >= MAX_SPEECH_SAMPLES {
+                            tracing::info!(buf_samples = speech_buffer.len(), "Max speech buffer — force STT");
+                            should_send = true;
+                        }
                     }
                     VadResult::Transition => {
                         speech_buffer.extend_from_slice(&chunk);
-
-                        if !speech_buffer.is_empty() {
-                            let speaker = if let Some(ref p) = page {
-                                browser::get_active_speaker(p)
-                                    .await
-                                    .unwrap_or(None)
-                                    .unwrap_or_else(|| "Nieznany".to_string())
-                            } else {
-                                "Nieznany".to_string()
-                            };
-
-                            let timestamp_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-
-                            // Wyslij audio do STT przez router (reverse QUIC)
-                            // Pobierz AKTUALNY RouterClient (moze sie zmienic po reconnect)
-                            let current_client = router_client_handle.lock().await.clone();
-                            let stt_result = match current_client {
-                                Some(client) => client.transcribe(&speech_buffer, stt_model, None).await,
-                                None => {
-                                    tracing::warn!("Router nie polaczony — pomijam STT");
-                                    Err(anyhow::anyhow!("brak RouterClient"))
-                                }
-                            };
-                            match stt_result {
-                                Ok(text) if !text.is_empty() => {
-                                    tracing::info!(speaker = %speaker, "[{}]: {}", speaker, text);
-
-                                    // Wyslij transkrypcje do streaming QUIC (router subskrybuje)
-                                    let _ = transcript_tx.send((speaker, text, timestamp_ms));
-                                }
-                                Ok(_) => {
-                                    tracing::debug!("STT zwrocil pusty tekst — pomijam");
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Blad STT: {} — pomijam segment", e);
-                                }
-                            }
-
-                            speech_buffer.clear();
-                        }
+                        tracing::info!(buf_samples = speech_buffer.len(), "VAD Transition — wysylam do STT");
                     }
                     VadResult::Silence => {}
+                }
+
+                if should_send && !speech_buffer.is_empty() {
+                    // Speaker diarization jest wykonywana po stronie routera.
+                    // Na razie uzywamy fallback — speaker zostanie nadpisany przez
+                    // wartosc z ModelResponse gdy router zwroci etykiete.
+                    let speaker = "Nieznany".to_string();
+
+                    let timestamp_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    // Wyslij audio do STT przez router (reverse QUIC) z timeoutem
+                    let current_client = router_client_handle.lock().await.clone();
+                    let stt_result = match current_client {
+                        Some(client) => {
+                            tracing::info!(samples = speech_buffer.len(), model = stt_model, "Wysylam request STT do routera");
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                client.transcribe(&speech_buffer, stt_model, Some("pl".to_string())),
+                            ).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    tracing::warn!("STT timeout po 30s — router nie odpowiada");
+                                    Err(anyhow::anyhow!("STT timeout"))
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::warn!("Router nie polaczony — pomijam STT");
+                            Err(anyhow::anyhow!("brak RouterClient"))
+                        }
+                    };
+                    match stt_result {
+                        Ok(text) if !text.is_empty() => {
+                            tracing::info!(speaker = %speaker, "[{}]: {}", speaker, text);
+                            let _ = transcript_tx.send((speaker, text, timestamp_ms));
+                        }
+                        Ok(_) => {
+                            tracing::debug!("STT zwrocil pusty tekst — pomijam");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Blad STT: {} — pomijam segment", e);
+                        }
+                    }
+                    speech_buffer.clear();
                 }
             }
             cmd = command_rx.recv() => {
                 match cmd {
                     Some(quic_server::MeetingCommand::JoinMeeting { meeting_url, response_tx }) => {
                         tracing::info!(meeting_url = %meeting_url, "Komenda QUIC: dolaczanie do spotkania");
+
+                        // Zamknij stara przegladarke przed uruchomieniem nowej —
+                        // inaczej zablokowany user_data_dir lub stare procesy wisza
+                        if let Some(mut old_browser) = _chromium.take() {
+                            tracing::info!("Zamykam poprzednia instancje Chromium");
+                            page = None;
+                            let _ = old_browser.close().await;
+                            let _ = old_browser.wait().await;
+                        }
+                        speech_buffer.clear();
+                        vad_detector.reset();
+
                         match browser::launch_chromium(&config).await {
                             Ok(browser) => {
                                 match browser::join_meeting(&browser, &meeting_url, &config).await {
@@ -216,7 +253,12 @@ async fn main() -> Result<()> {
                     Some(quic_server::MeetingCommand::LeaveMeeting { response_tx }) => {
                         tracing::info!("Komenda QUIC: opuszczanie spotkania");
                         page = None;
-                        _chromium = None;
+                        if let Some(mut old_browser) = _chromium.take() {
+                            let _ = old_browser.close().await;
+                            let _ = old_browser.wait().await;
+                        }
+                        speech_buffer.clear();
+                        vad_detector.reset();
                         let _ = response_tx.send("OK: opuszczono spotkanie".to_string());
                     }
                     Some(quic_server::MeetingCommand::GetStatus { response_tx }) => {
