@@ -17,7 +17,153 @@
 // linears), wiec efektywny GEMM daje >5x speedup w calym modelu.
 // =============================================================================
 
-use super::gemm::{gemm, gemm_accumulate};
+use super::gemm::{gemm, gemm_accumulate, gemm_accumulate_strided};
+
+/// Pre-permutowana reprezentacja wag Conv1D — jedna matryca [OC, IC] na kazda
+/// pozycje kernela. Dzieki temu forward pass nie wymaga zadnej alokacji ani
+/// kopiowania: dla kazdego k wywolujemy GEMM bezposrednio z slice'em input'u.
+///
+/// Layout ONNX to [OC, IC, K]. Permutujemy do [K, OC, IC] ktore jest idealne
+/// dla iteracji po kernel positions w conv1d forward.
+#[derive(Debug, Clone)]
+pub struct PackedConv1dWeight {
+    /// Jedna matryca [OC * IC] na pozycje kernela, laczne K wektorow
+    pub per_k: Vec<Vec<f32>>,
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: usize,
+}
+
+impl PackedConv1dWeight {
+    /// Konwertuje wagi z ONNX layout [OC, IC, K] row-major do [K][OC*IC].
+    pub fn from_onnx(weight: &[f32], out_channels: usize, in_channels: usize, kernel_size: usize) -> Self {
+        debug_assert_eq!(weight.len(), out_channels * in_channels * kernel_size);
+        let mut per_k = Vec::with_capacity(kernel_size);
+        for k in 0..kernel_size {
+            let mut m = vec![0.0_f32; out_channels * in_channels];
+            for oc in 0..out_channels {
+                for ic in 0..in_channels {
+                    // weight[oc, ic, k] = weight[oc * IC * K + ic * K + k]
+                    m[oc * in_channels + ic] = weight[oc * in_channels * kernel_size + ic * kernel_size + k];
+                }
+            }
+            per_k.push(m);
+        }
+        Self {
+            per_k,
+            in_channels,
+            out_channels,
+            kernel_size,
+        }
+    }
+}
+
+/// Zero-allocation Conv1D — uzywa pre-permutowanych wag i strided GEMM.
+/// Dla kazdej pozycji kernela czyta input bezposrednio (bez kopiowania) przez
+/// gemm_accumulate_strided.
+pub fn conv1d_prepacked(
+    packed: &PackedConv1dWeight,
+    input: &[f32],
+    bias: Option<&[f32]>,
+    params: &Conv1dParams,
+    in_length: usize,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(packed.in_channels, params.in_channels);
+    debug_assert_eq!(packed.out_channels, params.out_channels);
+    debug_assert_eq!(packed.kernel_size, params.kernel_size);
+    debug_assert_eq!(input.len(), params.in_channels * in_length);
+
+    let out_length = params.output_length(in_length);
+    if out_length == 0 {
+        return;
+    }
+    let m = params.out_channels;
+    let k_ic = params.in_channels;
+    let ks = params.kernel_size;
+
+    // k=1 fast path: bezposredni GEMM
+    if ks == 1 && params.stride == 1 && params.padding == 0 {
+        gemm(&packed.per_k[0], input, output, m, in_length, k_ic, bias);
+        return;
+    }
+
+    // Initialize output z bias'em lub zerami — single pass
+    match bias {
+        Some(b) => {
+            for oc in 0..m {
+                let row = &mut output[oc * out_length..(oc + 1) * out_length];
+                let bv = b[oc];
+                for v in row.iter_mut() {
+                    *v = bv;
+                }
+            }
+        }
+        None => {
+            for v in output.iter_mut() {
+                *v = 0.0;
+            }
+        }
+    }
+
+    // Stride != 1: fallback na scalar loop (rzadko uzywane w WeSpeaker/Silero).
+    if params.stride != 1 {
+        let w_flat = &packed.per_k;
+        for k in 0..ks {
+            let shift = k as i64 * params.dilation as i64 - params.padding as i64;
+            for t_out in 0..out_length {
+                let t_in = (t_out * params.stride) as i64 + shift;
+                if t_in < 0 || t_in >= in_length as i64 {
+                    continue;
+                }
+                let t_in = t_in as usize;
+                for oc in 0..m {
+                    let mut sum = 0.0_f32;
+                    for ic in 0..k_ic {
+                        sum += w_flat[k][oc * k_ic + ic] * input[ic * in_length + t_in];
+                    }
+                    output[oc * out_length + t_out] += sum;
+                }
+            }
+        }
+        return;
+    }
+
+    // Stride=1 glowna sciezka: zero-alloc strided GEMM dla kazdej pozycji kernela
+    for k in 0..ks {
+        let shift = k as i64 * params.dilation as i64 - params.padding as i64;
+
+        // Walidny zakres wyjsciowy dla tego k: t_in in [0, in_length)
+        let t_out_min_i = (-shift).max(0) as usize;
+        let t_out_max_i = ((in_length as i64 - 1 - shift) + 1).max(0) as usize;
+        let t_out_min = t_out_min_i.min(out_length);
+        let t_out_max = t_out_max_i.min(out_length);
+
+        if t_out_min >= t_out_max {
+            continue;
+        }
+        let valid_n = t_out_max - t_out_min;
+        let t_in_start = (t_out_min as i64 + shift) as usize;
+
+        // GEMM: C[:, t_out_min..t_out_min+valid_n] += W[k] * B[:, t_in_start..t_in_start+valid_n]
+        // W[k]: [M=OC, K=IC] contiguous
+        // B: input, row_stride = in_length, starts at offset t_in_start per row
+        // C: output, row_stride = out_length, starts at offset t_out_min per row
+        let b_view = &input[t_in_start..];
+        let c_view = &mut output[t_out_min..];
+
+        gemm_accumulate_strided(
+            &packed.per_k[k],
+            b_view,
+            in_length,
+            c_view,
+            out_length,
+            m,
+            valid_n,
+            k_ic,
+        );
+    }
+}
 
 /// Parametry Conv1D
 #[derive(Debug, Clone, Copy)]

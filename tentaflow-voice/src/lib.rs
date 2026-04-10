@@ -17,6 +17,7 @@ mod generated {
 }
 
 pub use error::{VoiceError, VoiceResult};
+pub use fbank::compute_fbank;
 pub use onnx_loader::OnnxWeights;
 pub use silero_vad::{SileroVad, SileroVadStreaming};
-pub use wespeaker::{cosine_similarity, WeSpeaker};
+pub use wespeaker::{cosine_similarity, LayerTimings, WeSpeaker};
