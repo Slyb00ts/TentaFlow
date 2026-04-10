@@ -493,6 +493,11 @@ fn spawn_quic_event_handler(
                     info!(peer_id = %node_id, "QUIC peer polaczony");
                     peer_store.set_quic_connected(&node_id, true);
                     peer_store.set_status(&node_id, "connected");
+
+                    // Resetuj stan replay — nowe polaczenie = peer startuje nonce od zera
+                    if let Some(ref sec) = mesh_security {
+                        sec.reset_replay_state(&node_id);
+                    }
                     // Wyslij swoje NodeInfo do nowego peera — TYLKO jesli zaufany
                     let should_send = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
@@ -570,6 +575,11 @@ fn spawn_quic_event_handler(
                     info!(peer_id = %node_id, "QUIC peer rozlaczony");
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "disconnected");
+
+                    // Resetuj stan replay — po rekonnekcie peer startuje nonce od zera
+                    if let Some(ref sec) = mesh_security {
+                        sec.reset_replay_state(&node_id);
+                    }
 
                     // Przelicz routing po rozlaczeniu peera
                     peer_store.recalculate_routes(&local_node_id);

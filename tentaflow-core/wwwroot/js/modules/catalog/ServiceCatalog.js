@@ -85,8 +85,7 @@ const ServiceCatalog = (() => {
         ApiClient.get('/api/clusters').catch(() => []),
       ]);
       nodes = (nodesResp || []).filter(n => {
-        const trust = (n.trust_status || n.status || '').toLowerCase();
-        return trust === 'trusted' || trust === 'paired' || trust === 'local' || n.is_local;
+        return n.is_trusted === true || n.is_local === true;
       });
       cachedNodes = nodes;
       clusters = clustersResp || [];
@@ -107,8 +106,7 @@ const ServiceCatalog = (() => {
       nodes.forEach(n => {
         const nid = n.node_id || n.id;
         const label = n.hostname || n.name || nid;
-        const localTag = n.is_local ? ' (local)' : '';
-        optionsHtml += `<option value="node:${Utils.escapeAttr(nid)}">${Utils.escapeHtml(label)}${localTag}</option>`;
+        optionsHtml += `<option value="node:${Utils.escapeAttr(nid)}">${Utils.escapeHtml(label)}</option>`;
       });
       optionsHtml += '</optgroup>';
     }
@@ -528,8 +526,7 @@ const ServiceCatalog = (() => {
     try {
       const nodesResp = await ApiClient.get('/api/mesh/nodes');
       nodes = (nodesResp || []).filter(n => {
-        const trust = (n.trust_status || n.status || '').toLowerCase();
-        return trust === 'trusted' || trust === 'paired' || trust === 'local' || n.is_local;
+        return n.is_trusted === true || n.is_local === true;
       });
     } catch {}
 
@@ -565,9 +562,8 @@ const ServiceCatalog = (() => {
                 ${nodes.map(n => {
                   const nid = n.node_id || n.id;
                   const label = n.hostname || n.name || nid;
-                  const localTag = n.is_local ? ' (local)' : '';
                   const selected = nid === preselectedNode ? 'selected' : '';
-                  return `<option value="${Utils.escapeAttr(nid)}" ${selected}>${Utils.escapeHtml(label)}${localTag}</option>`;
+                  return `<option value="${Utils.escapeAttr(nid)}" ${selected}>${Utils.escapeHtml(label)}</option>`;
                 }).join('')}
               </select>
             </div>
