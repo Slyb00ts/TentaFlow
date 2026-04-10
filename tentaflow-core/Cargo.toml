@@ -9,6 +9,7 @@ default = []
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
 inference-mlx = ["dep:mlx-rs", "dep:mlx-models", "dep:tokenizers"]
+inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
 inference-mlx-swift = []  # bridge do Swift MLX na iOS — implementacja w Fazie 3
 metrics-prometheus = ["dep:prometheus"]
@@ -109,6 +110,10 @@ tokenizers = { version = "0.21", optional = true }
 whisper-rs = "0.16"
 hound = "3.5"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm"] }
+
+# Speaker diarization — pure Rust forward pass przez tentaflow-voice
+# Cross-platform (Linux/macOS/Windows/iOS/Android), bez ort/onnxruntime ABI hell
+tentaflow-voice = { path = "../tentaflow-voice", optional = true }
 
 # Embedded static files — generowane przez build.rs (bez include_dir!)
 # MIME detection jest w build.rs

@@ -1,0 +1,38 @@
+[package]
+name = "tentaflow-voice"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust VAD + Speaker Embedding — Silero + WeSpeaker forward pass bez ort/onnxruntime"
+
+[lib]
+name = "tentaflow_voice"
+path = "src/lib.rs"
+
+[dependencies]
+# ONNX protobuf parser — tylko do wyciagania tensorow po nazwach z pliku modelu
+prost = "0.13"
+
+# SIMD portable — SSE/AVX/NEON dla conv1d, matmul, batch norm hot loops
+wide = "0.7"
+
+# FFT dla fbank features (pure Rust, no C deps)
+rustfft = "6.2"
+
+# Error handling
+thiserror = "2"
+
+# Logowanie (opcjonalne, leightweight)
+tracing = "0.1"
+
+[build-dependencies]
+# Generuje struct Rust z .proto schemy ONNX
+prost-build = "0.13"
+
+[dev-dependencies]
+# Benchmarki
+criterion = { version = "0.5", features = ["html_reports"] }
+anyhow = "1"
+
+[[bench]]
+name = "silero_vad_bench"
+harness = false

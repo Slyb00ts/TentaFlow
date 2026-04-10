@@ -736,6 +736,16 @@ pub async fn handle_request(
         return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
     }
 
+    // Meeting bot transcripts — lista transkrypcji do GUI Bot Status
+    if path == "/api/meeting-bot/transcripts" && method == Method::GET {
+        let limit = query_string.split('&')
+            .find_map(|kv| kv.strip_prefix("limit=").and_then(|v| v.parse::<usize>().ok()))
+            .unwrap_or(50);
+        let entries = crate::routing::transcript_store::list(limit);
+        let body = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+        return Ok(json_response_cors(200, body, cors_origin.as_deref()));
+    }
+
     let (status, response_body) = route_api(&method, &path, &query_string, &db, &claims, &body_bytes, &settings_cipher);
 
     // Synchronizacja aliasow po udanej mutacji

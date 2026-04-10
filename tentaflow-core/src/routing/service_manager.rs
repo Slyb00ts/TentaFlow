@@ -745,9 +745,10 @@ impl ServiceManager {
             .map(|(n, h)| (n.clone(), h.clone())).collect();
         for (name, handle) in embedding_entries {
             let shutdown_rx = self.shutdown_rx.clone();
+            let reverse_router = self.reverse_router.read().clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding", None).await;
+                Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding", reverse_router).await;
             });
         }
 
@@ -756,9 +757,10 @@ impl ServiceManager {
             .map(|(n, h)| (n.clone(), h.clone())).collect();
         for (name, handle) in tts_entries {
             let shutdown_rx = self.shutdown_rx.clone();
+            let reverse_router = self.reverse_router.read().clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS", None).await;
+                Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS", reverse_router).await;
             });
         }
 
@@ -768,11 +770,12 @@ impl ServiceManager {
         for (name, handle) in llm_entries {
             let shutdown_rx = self.shutdown_rx.clone();
 
-            // Meeting bot ma dedykowany loop z transcript subscriberem
+            // Meeting bot ma dedykowany loop z reverse listenerem + transcript subscriberem
             if name.contains("meeting") || name.contains("teams-bot") {
                 let event_bus = self.event_bus.read().clone();
+                let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus).await;
+                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus, reverse_router).await;
                 });
             } else {
                 let prompt_registry = self.prompt_registry.clone();
@@ -788,9 +791,10 @@ impl ServiceManager {
             .map(|(n, h)| (n.clone(), h.clone())).collect();
         for (name, handle) in stt_entries {
             let shutdown_rx = self.shutdown_rx.clone();
+            let reverse_router = self.reverse_router.read().clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT", None).await;
+                Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT", reverse_router).await;
             });
         }
 
@@ -1022,13 +1026,16 @@ impl ServiceManager {
         }
     }
 
-    /// Background loop dla meeting bot QUIC — po polaczeniu uruchamia subskrypcje transkrypcji.
+    /// Background loop dla meeting bot QUIC — po polaczeniu uruchamia reverse listener
+    /// (bot wysyla requesty STT/TTS) i (opcjonalnie) subskrypcje transkrypcji.
     async fn meeting_bot_connection_loop(
         name: String,
         handle: Arc<QuicServiceHandle>,
         mut shutdown_rx: watch::Receiver<bool>,
         event_bus: Option<Arc<crate::addon::event_bus::EventBus>>,
+        reverse_router: Option<crate::routing::Router>,
     ) {
+        let _ = event_bus;
         let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
         let mut per_service_rx = handle.shutdown_rx.clone();
 
@@ -1048,6 +1055,18 @@ impl ServiceManager {
                     info!("MeetingBot QUIC '{}': Connected successfully!", name);
                     let client = Arc::new(client);
                     handle.set_connected(client.clone()).await;
+
+                    // Uruchom reverse listener — bot otwiera bidi streams do STT/TTS przez router.
+                    // Bez tego ModelRequest od bota wisi bez accept_bi po stronie routera.
+                    let reverse_task = reverse_router.as_ref().map(|router| {
+                        info!("MeetingBot QUIC '{}': Uruchamiam reverse listener", name);
+                        crate::routing::reverse_request::spawn_reverse_listener(
+                            client.clone(),
+                            router.clone(),
+                            name.clone(),
+                            shutdown_rx.clone(),
+                        )
+                    });
 
                     // TODO: subskrypcja transkrypcji — wylaczona do czasu stabilizacji QUIC
                     // Transcript subscriber otwiera streaming request ktory destabilizuje polaczenie
@@ -1079,6 +1098,7 @@ impl ServiceManager {
                     };
 
                     if let Some(task) = transcript_task { task.abort(); }
+                    if let Some(task) = reverse_task { task.abort(); }
                     if should_return { return; }
                 }
                 Err(e) => {
@@ -1872,8 +1892,9 @@ impl ServiceManager {
             "meeting-bot" => {
                 self.quic_llm_services.write().insert(name.clone(), handle.clone());
                 let event_bus = self.event_bus.read().clone();
+                let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus).await;
+                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus, reverse_router).await;
                 });
             }
             _ => {

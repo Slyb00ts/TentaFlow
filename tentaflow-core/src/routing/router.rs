@@ -283,7 +283,9 @@ impl Router {
         }
 
         // === KROK 3: SPAWN BACKGROUND CONNECTION TASKS ===
-        service_manager.spawn_connection_tasks();
+        // UWAGA: spawn_connection_tasks przeniesione do Router::start() zeby reverse_router
+        // byl ustawiony PRZED uruchomieniem petli (inaczej meeting-bot nie dostanie listenera).
+        // service_manager.spawn_connection_tasks();
 
         // === KROK 3: INICJALIZUJ RESPONSE MIDDLEWARE ===
         let response_middleware = Arc::new(ResponseMiddleware::new(
@@ -365,10 +367,17 @@ impl Router {
         self.spawn_callback_handler();
         info!("Router: Callback handler started");
 
-        // Ustaw router dla odwrotnych requestow od kontenerow
+        // Ustaw router dla odwrotnych requestow od kontenerow — MUSI byc przed
+        // spawn_connection_tasks, inaczej petle serwisow dostana None zamiast routera
+        // i reverse listener dla meeting-bot nie bedzie uruchomiony.
         info!("Router: Registering reverse router for container requests...");
         self.service_manager.set_reverse_router(self.clone());
         info!("Router: Reverse router registered");
+
+        // Dopiero teraz spawnujemy tasks polaczen QUIC — reverse_router jest juz ustawiony
+        info!("Router: Spawning QUIC connection tasks...");
+        self.service_manager.spawn_connection_tasks();
+        info!("Router: QUIC connection tasks spawned");
     }
 
     /// Wysyla sygnal shutdown do wszystkich komponentow routera.

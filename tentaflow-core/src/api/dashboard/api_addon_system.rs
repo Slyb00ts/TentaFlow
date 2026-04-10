@@ -2008,6 +2008,15 @@ pub fn handle_invoke_addon_tool(
 
     // Dla meeting-bot wysylamy komende przez QUIC do kontenera
     if addon_id == "teams-bot" {
+        // Reset stanu diarization i transcript store przy zmianie meetingu,
+        // zeby nowi speakerzy byli numerowani od SPEAKER_00 a nie kontynuowali
+        // z poprzedniego meetingu.
+        if tool_name == "join_meeting" || tool_name == "leave_meeting" {
+            crate::routing::transcript_store::clear();
+            #[cfg(feature = "inference-diarization")]
+            crate::diarization::reset_tracker();
+        }
+
         let router = match router {
             Some(r) => r,
             None => return Ok((500, json_error("Router nie dostepny"))),
