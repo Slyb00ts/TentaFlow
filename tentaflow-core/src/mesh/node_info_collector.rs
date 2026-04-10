@@ -108,7 +108,7 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
             wgpu::Backend::Gl,
         ].iter().find(|&&b| all_adapters.iter().any(|a| a.backend == b)).copied();
 
-        let gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
+        let mut gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
             all_adapters.iter()
                 .filter(|a| a.backend == backend)
                 .map(|info| {
