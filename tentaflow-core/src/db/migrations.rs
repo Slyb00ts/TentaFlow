@@ -855,5 +855,51 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE clusters ADD COLUMN interconnect_type TEXT DEFAULT '';
         ",
     ),
+    (
+        30,
+        "add_meeting_bot_service_type",
+        "
+            PRAGMA foreign_keys=OFF;
+
+            CREATE TABLE services_tmp (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                service_type TEXT NOT NULL CHECK(service_type IN ('llm','embedding','rag','vision','stt','tts','memory','reranker','meeting-bot')),
+                strategy TEXT NOT NULL DEFAULT 'single' CHECK(strategy IN ('single','least_loaded','round_robin','weighted')),
+                model_category TEXT DEFAULT 'main',
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','maintenance')),
+                config_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                service_uuid TEXT DEFAULT NULL,
+                node_id TEXT DEFAULT NULL
+            );
+            INSERT INTO services_tmp SELECT * FROM services;
+            DROP TABLE services;
+            ALTER TABLE services_tmp RENAME TO services;
+            CREATE INDEX idx_services_type ON services(service_type);
+
+            CREATE TABLE model_registry_tmp (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_name TEXT UNIQUE NOT NULL,
+                display_name TEXT,
+                service_type TEXT NOT NULL CHECK(service_type IN ('llm','embedding','stt','tts','rag','memory','reranker','meeting-bot')),
+                connection_type TEXT NOT NULL CHECK(connection_type IN ('quic','openai_api','internal')),
+                service_id INTEGER REFERENCES services(id) ON DELETE SET NULL,
+                flow_id INTEGER REFERENCES flows(id) ON DELETE SET NULL,
+                is_public INTEGER NOT NULL DEFAULT 1,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                config_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO model_registry_tmp SELECT * FROM model_registry;
+            DROP TABLE model_registry;
+            ALTER TABLE model_registry_tmp RENAME TO model_registry;
+            CREATE INDEX idx_model_registry_name ON model_registry(model_name);
+            CREATE INDEX idx_model_registry_service_type ON model_registry(service_type);
+
+            PRAGMA foreign_keys=ON;
+        ",
+    ),
 ]
 }

@@ -299,7 +299,7 @@ impl MemoryAnalyzer {
         // Fallback: HTTP backend
         let backends = self
             .service_manager
-            .get_service_backends(&self.config.model_name)
+            .get_service_backends_cloned(&self.config.model_name)
             .ok_or_else(|| {
                 warn!(
                     "Model {} not found for Memory Analyzer",
@@ -314,7 +314,7 @@ impl MemoryAnalyzer {
             ));
         }
 
-        // Wybierz backend (pierwszy dostępny - dla małego modelu wystarczy)
+        // Wybierz backend (pierwszy dostepny — dla malego modelu wystarczy)
         let backend = &backends[0];
 
         // Przygotuj request w formacie OpenAI

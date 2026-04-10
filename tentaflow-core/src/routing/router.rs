@@ -64,8 +64,17 @@ pub struct Router {
     /// Lokalna inferencja in-process (MLX, llama.cpp) — bez HTTP/QUIC
     pub(crate) local_inference: Arc<super::local_inference::LocalInferenceHandler>,
 
+    /// Lokalna transkrypcja in-process (Whisper) — bez HTTP/QUIC
+    pub(crate) local_stt: Arc<super::local_stt::LocalSttHandler>,
+
     /// Mesh manager — do forwardowania requestow do zdalnych nodow
     pub(crate) mesh_manager: Arc<parking_lot::RwLock<Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>>>,
+
+    /// Cache aliasow modeli z DB (alias -> DbModelAlias)
+    pub(crate) alias_cache: Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::db::models::DbModelAlias>>>,
+
+    /// Globalny counter do round-robin w middleware routing
+    pub(crate) route_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
@@ -268,7 +277,12 @@ impl Router {
             ServiceManager::new(config.clone(), db.clone())?
         );
 
-        // === KROK 2: SPAWN BACKGROUND CONNECTION TASKS ===
+        // === KROK 2: INICJALIZUJ MODEL POOL Z DB ===
+        if let Some(ref pool) = db {
+            service_manager.init_model_pool(pool);
+        }
+
+        // === KROK 3: SPAWN BACKGROUND CONNECTION TASKS ===
         service_manager.spawn_connection_tasks();
 
         // === KROK 3: INICJALIZUJ RESPONSE MIDDLEWARE ===
@@ -305,9 +319,18 @@ impl Router {
             )
         );
 
+        // === KROK 8: INICJALIZUJ LOKALNE STT ===
+        let local_stt = Arc::new(
+            super::local_stt::LocalSttHandler::new(
+                crate::stt::shared_stt_manager()
+            )
+        );
+
         info!("Router: Inicjalizacja zakonczona (QUIC connections spawning in background)");
 
-        Ok(Self {
+        let alias_cache = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+        let router = Self {
             config,
             service_manager,
             response_middleware,
@@ -317,8 +340,15 @@ impl Router {
             flow_dispatcher,
             db: db_clone,
             local_inference,
+            local_stt,
             mesh_manager: Arc::new(parking_lot::RwLock::new(None)),
-        })
+            alias_cache,
+            route_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        router.reload_alias_cache();
+
+        Ok(router)
     }
 
     // ========================================================================
@@ -334,6 +364,11 @@ impl Router {
         info!("Router: Starting callback handler...");
         self.spawn_callback_handler();
         info!("Router: Callback handler started");
+
+        // Ustaw router dla odwrotnych requestow od kontenerow
+        info!("Router: Registering reverse router for container requests...");
+        self.service_manager.set_reverse_router(self.clone());
+        info!("Router: Reverse router registered");
     }
 
     /// Wysyla sygnal shutdown do wszystkich komponentow routera.
@@ -356,8 +391,10 @@ impl Router {
         let sm = &self.service_manager;
         match crate::db::repository::list_services(db) {
             Ok(services) => {
+                info!("load_db_services: znaleziono {} serwisow w DB", services.len());
                 let mut loaded = 0;
                 for svc in &services {
+                    info!("load_db_services: przetwarzam '{}' (typ={})", svc.name, svc.service_type);
                     let svc_config: serde_json::Value =
                         serde_json::from_str(&svc.config_json).unwrap_or_default();
                     let backends =
@@ -370,22 +407,27 @@ impl Router {
                         }
                         let config: serde_json::Value =
                             serde_json::from_str(&backend.config_json).unwrap_or_default();
-                        let url = config["url"].as_str().unwrap_or("");
-                        if url.is_empty() {
-                            continue;
-                        }
 
-                        let host = url
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .split(':')
-                            .next()
-                            .unwrap_or("127.0.0.1");
-                        let quic_port = svc_config["quic_port"].as_u64().unwrap_or(5010);
-                        let quic_url = format!("quic://{}:{}", host, quic_port);
-                        let tls_ca = crate::db::repository::get_setting(db, "tls_cert_pem")
-                            .ok()
-                            .flatten();
+                        // QUIC backendy maja "quic_url", HTTP maja "url"
+                        let quic_url = if let Some(qurl) = config["quic_url"].as_str() {
+                            qurl.to_string()
+                        } else {
+                            let url = config["url"].as_str().unwrap_or("");
+                            if url.is_empty() {
+                                continue;
+                            }
+                            let host = url
+                                .trim_start_matches("http://")
+                                .trim_start_matches("https://")
+                                .split(':')
+                                .next()
+                                .unwrap_or("127.0.0.1");
+                            let quic_port = svc_config["quic_port"].as_u64().unwrap_or(5010);
+                            format!("quic://{}:{}", host, quic_port)
+                        };
+
+                        let tls_ca = config["tls_ca"].as_str().map(|s| s.to_string())
+                            .or_else(|| crate::db::repository::get_setting(db, "tls_cert_pem").ok().flatten());
                         let server_name = svc_config["agent_domain"]
                             .as_str()
                             .map(|s| s.to_string());
@@ -453,6 +495,56 @@ impl Router {
                 continue;
             }
 
+            // Pomijaj serwisy oznaczone jako stopped
+            if svc.status == "stopped" {
+                debug!("Pomijam zatrzymany serwis '{}' (stopped)", svc.name);
+                continue;
+            }
+
+            // Natywny STT (Whisper)
+            if svc.service_type == "stt" {
+                if config["engine"].as_str() != Some("whisper") {
+                    continue;
+                }
+                let model_path_str = config["model_path"].as_str().unwrap_or("");
+                let model_path = std::path::PathBuf::from(model_path_str);
+
+                if !model_path.exists() {
+                    warn!("Natywny STT '{}': sciezka modelu nie istnieje: {}", svc.name, model_path.display());
+                    continue;
+                }
+
+                info!("Przywracanie natywnego STT '{}': model={}", svc.name, model_path.display());
+
+                let shared_stt = crate::stt::shared_stt_manager();
+                let mp = model_path.clone();
+                let load_result = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        let mut mgr = shared_stt.write().await;
+                        mgr.load_model(&mp, None, None).await
+                    })
+                }).await;
+
+                match load_result {
+                    Ok(Ok(stt_info)) => {
+                        info!("Przywrocono STT '{}' ({})", stt_info.name, stt_info.device);
+                        self.register_native_service_in_mesh(
+                            &svc.name,
+                            "stt",
+                            vec!["whisper-large-v3-turbo".to_string()],
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Blad ladowania STT '{}': {}", svc.name, e);
+                    }
+                    Err(e) => {
+                        warn!("Blad tasku STT '{}': {}", svc.name, e);
+                    }
+                }
+                continue;
+            }
+
             let model_id = match config["deployed_model"].as_str() {
                 Some(m) if !m.is_empty() => m.to_string(),
                 _ => continue,
@@ -513,6 +605,11 @@ impl Router {
                         model_info.name, model_info.backend,
                         model_info.vram_used_mb, model_info.context_length
                     );
+                    self.register_native_service_in_mesh(
+                        &svc.name,
+                        "llm",
+                        vec![model_id.clone()],
+                    );
                 }
                 Ok(Err(e)) => {
                     warn!("Blad ladowania modelu '{}': {}", model_id, e);
@@ -532,9 +629,88 @@ impl Router {
         }
     }
 
-    /// Pobierz backend clients dla serwisu (HTTP backends)
+    /// Rejestruje natywny serwis in-process w mesh registry,
+    /// zeby inne nody widzialy go i mogly forwardowac requesty.
+    pub fn register_native_service_in_mesh(
+        &self,
+        service_name: &str,
+        service_type: &str,
+        models: Vec<String>,
+    ) {
+        let mesh_guard = self.mesh_manager.read();
+        let mesh = match mesh_guard.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+
+        let node_id = mesh.node_id().to_string();
+        let quic_port = self.config.mesh.as_ref().map(|m| m.port).unwrap_or(8090);
+
+        let service_info = tentaflow_protocol::MeshServiceInfo {
+            service_id: format!("native-{}-{}", service_type, service_name),
+            service_name: service_name.to_string(),
+            service_type: service_type.to_string(),
+            node_id,
+            quic_port,
+            quic_url: format!("quic://0.0.0.0:{}", quic_port),
+            status: "running".to_string(),
+            models,
+            load_percent: 0,
+        };
+
+        mesh.service_registry().register_local(service_info);
+        info!("Zarejestrowano natywny serwis '{}' ({}) w mesh", service_name, service_type);
+    }
+
+    /// Wyrejestrowuje natywny serwis z mesh registry.
+    pub fn unregister_native_service_from_mesh(&self, service_id: &str) {
+        let mesh_guard = self.mesh_manager.read();
+        if let Some(mesh) = mesh_guard.as_ref() {
+            mesh.service_registry().unregister_local(service_id);
+            info!("Wyrejestrowano natywny serwis '{}' z mesh", service_id);
+        }
+    }
+
+    /// Pobierz backend clients dla serwisu (HTTP backends — statyczne lub dynamiczne)
     pub(crate) fn get_service_backends(&self, service_name: &str) -> Option<&Vec<Arc<BackendClient>>> {
         self.service_manager.get_service_backends(service_name)
+    }
+
+    /// Pobierz backend clients (statyczne lub dynamiczne) — klonuje Arc referencje
+    pub(crate) fn get_service_backends_cloned(&self, service_name: &str) -> Option<Vec<Arc<BackendClient>>> {
+        self.service_manager.get_service_backends_cloned(service_name)
+    }
+
+    /// Sprawdza czy serwis ma HTTP backends (statyczne lub dynamiczne)
+    pub(crate) fn has_http_backends(&self, service_name: &str) -> bool {
+        self.service_manager.has_http_backends(service_name)
+    }
+
+    /// Wybiera backend HTTP (statyczny lub dynamiczny) i wykonuje na nim operacje.
+    /// Obsluguje oba typy rejestrow transparentnie.
+    pub(crate) fn select_http_backend(&self, service_name: &str) -> Option<Arc<BackendClient>> {
+        // Statyczny rejestr
+        if let Some(backends) = self.service_manager.get_service_backends(service_name) {
+            if !backends.is_empty() {
+                if let Some(strategy) = self.service_manager.get_strategy(service_name) {
+                    if let Ok(idx) = strategy.select_backend(backends) {
+                        return Some(backends[idx].clone());
+                    }
+                }
+                return Some(backends[0].clone());
+            }
+        }
+        // Dynamiczny rejestr
+        let dyn_map = self.service_manager.dynamic_backends.read();
+        if let Some((backends, strategy)) = dyn_map.get(service_name) {
+            if !backends.is_empty() {
+                if let Ok(idx) = strategy.select_backend(backends) {
+                    return Some(backends[idx].clone());
+                }
+                return Some(backends[0].clone());
+            }
+        }
+        None
     }
 
     /// Pobierz load balancing strategy dla serwisu
@@ -613,42 +789,90 @@ impl Router {
         Ok(response)
     }
 
+    /// Probuje forwardowac ModelRequest do innego noda w mesh.
+    /// Szuka noda ktory ma serwis danego typu i model, serializuje request
+    /// przez rkyv i wysyla przez mesh forward. Zwraca zdeserializowana odpowiedz.
+    pub(crate) async fn route_via_mesh(
+        &self,
+        service_type: &str,
+        model_name: Option<&str>,
+        request: &tentaflow_protocol::ModelRequest,
+    ) -> Option<tentaflow_protocol::ModelResponse> {
+        use crate::routing::service_manager::ServiceLocation;
+
+        let target_node_id = if let Some(model) = model_name {
+            match self.service_manager.find_service(service_type, model) {
+                Some(ServiceLocation::MeshNode { node_id }) => node_id,
+                _ => {
+                    match self.service_manager.find_service_by_type(service_type) {
+                        Some(ServiceLocation::MeshNode { node_id }) => node_id,
+                        _ => return None,
+                    }
+                }
+            }
+        } else {
+            match self.service_manager.find_service_by_type(service_type) {
+                Some(ServiceLocation::MeshNode { node_id }) => node_id,
+                _ => return None,
+            }
+        };
+
+        let request_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(request) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Mesh forward: blad serializacji ModelRequest: {}", e);
+                return None;
+            }
+        };
+
+        debug!(
+            "Mesh forward: typ='{}' model={:?} -> node '{}'",
+            service_type, model_name, target_node_id
+        );
+
+        match self.route_through_mesh(&target_node_id, &request_bytes).await {
+            Ok(response_bytes) => {
+                match rkyv::access::<tentaflow_protocol::ArchivedModelResponse, rkyv::rancor::Error>(
+                    &response_bytes,
+                ) {
+                    Ok(archived_resp) => {
+                        match rkyv::deserialize::<tentaflow_protocol::ModelResponse, rkyv::rancor::Error>(
+                            archived_resp,
+                        ) {
+                            Ok(response) => {
+                                debug!("Mesh forward: odpowiedz z noda '{}' odebrana", target_node_id);
+                                Some(response)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Mesh forward: blad deserializacji odpowiedzi z noda '{}': {}",
+                                    target_node_id, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Mesh forward: blad dostepu do archived odpowiedzi z noda '{}': {}",
+                            target_node_id, e
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Mesh forward: blad forwardowania do noda '{}': {}", target_node_id, e);
+                None
+            }
+        }
+    }
+
     // ========================================================================
     // ALIAS RETENTAFLOWN
     // ========================================================================
 
-    /// Rozwiazuje nazwe modelu na nazwe serwisu.
-    /// 1. Config.toml aliasy (szybkie, in-memory)
-    /// 2. Jesli rozwiazana nazwa to istniejacy serwis -> uzyj
-    /// 3. DB model_aliases (fallback)
-    /// 4. model_pool: model_name -> wybierz serwis (round-robin)
-    pub(crate) fn resolve_to_service_name(&self, model: &str) -> String {
-        let resolved = self.resolve_model_alias(model);
-
-        if self.service_manager.has_quic_llm_service(&resolved)
-            || self.service_manager.get_service_backends(&resolved).is_some()
-            || self.service_manager.has_rag_service(&resolved)
-            || self.service_manager.has_local_inference_service(&resolved)
-        {
-            return resolved;
-        }
-
-        if let Some(ref db) = self.db {
-            if let Ok(Some(target)) = crate::db::repository::resolve_model_alias(db, &resolved) {
-                debug!("DB alias resolved: {} -> {}", resolved, target);
-                return target;
-            }
-        }
-
-        if let Some(service_name) = self.service_manager.select_service_for_model(&resolved) {
-            debug!("ModelPool resolved: {} -> {}", resolved, service_name);
-            return service_name;
-        }
-
-        resolved
-    }
-
-    /// Rozwiazuje alias modelu na canonical name.
+    /// Rozwiazuje alias modelu na canonical name (config.toml aliasy).
     pub(crate) fn resolve_model_alias(&self, model: &str) -> String {
         for alias in &self.config.service_aliases {
             if alias.alias == model {
@@ -657,21 +881,6 @@ impl Router {
             }
         }
         model.to_string()
-    }
-
-    /// Sprawdza czy model jest RAG engine.
-    pub(crate) fn is_rag_model(&self, model_name: &str) -> bool {
-        self.service_manager.has_rag_service(model_name)
-    }
-
-    /// Sprawdza czy model jest QUIC LLM
-    pub(crate) fn is_quic_llm_model(&self, model_name: &str) -> bool {
-        self.service_manager.has_quic_llm_service(model_name)
-    }
-
-    /// Sprawdza czy model jest obslugiwany przez lokalna inferencje in-process
-    pub(crate) fn is_local_inference_model(&self, model_name: &str) -> bool {
-        self.service_manager.has_local_inference_service(model_name)
     }
 
     // ========================================================================

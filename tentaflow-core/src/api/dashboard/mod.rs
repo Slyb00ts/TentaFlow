@@ -25,6 +25,9 @@ pub mod api_mesh;
 pub mod api_hub;
 pub mod api_addon_system;
 pub mod api_clusters;
+pub mod api_nim;
+pub mod auto_register;
+pub mod ws_deploy;
 
 /// Escapowanie znakow specjalnych JSON w stringu
 fn escape_json_string(s: &str) -> String {

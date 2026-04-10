@@ -24,6 +24,7 @@ const ComposeTemplates = (() => {
     tools: 5000,
     memory: 5002,
     reranker: 5000,
+    'meeting-bot': 5000,
     llm: 5010,
     llm_quic: 5000,
     tentaflow: 8443,
@@ -40,6 +41,7 @@ const ComposeTemplates = (() => {
     tools: false,
     memory: false,
     reranker: true,
+    'meeting-bot': false,
     tentaflow: false,
     bms: false,
   };
@@ -149,9 +151,46 @@ const ComposeTemplates = (() => {
     tools: (params) => generateService('tools', params),
     memory: (params) => generateService('memory', params),
     reranker: (params) => generateService('reranker', params),
+    'meeting-bot': (params) => generateMeetingBot(params),
     tentaflow: (params) => generateTentaFlow(params),
     bms: (params) => generateBms(params),
   };
+
+  // Generator compose dla Meeting Bot (sidecar Teams)
+  function generateMeetingBot(params) {
+    const port = params.port || INTERNAL_PORTS['meeting-bot'];
+    const cname = params.containerName || 'tentaflow-meeting-bot';
+    const configDir = params.configDir || `${BASE_PATHS.config}/meeting-bot`;
+
+    const meetingUrl = params.meetingUrl || '';
+    const sttModel = params.sttModel || 'teams-stt';
+    const ttsModel = params.ttsModel || 'teams-tts';
+    const ttsVoice = params.ttsVoice || 'alloy';
+
+    let yaml = [
+      'services:',
+      `  ${cname}:`,
+      '    image: tentaflow-meeting-sidecar:dev',
+      `    container_name: ${cname}`,
+      '    restart: unless-stopped',
+      '    ports:',
+      `      - "${port}:${INTERNAL_PORTS['meeting-bot']}/udp"`,
+      `      - "${port + 1080}:6080"`,
+      '    environment:',
+      '      - RUST_LOG=info',
+      `      - MEETING_URL=${meetingUrl}`,
+      `      - AUTH_COOKIES_PATH=/tmp/cookies.json`,
+      `      - QUIC_PORT=${INTERNAL_PORTS['meeting-bot']}`,
+      `      - STT_MODEL=${sttModel}`,
+      `      - TTS_MODEL=${ttsModel}`,
+      `      - TTS_VOICE=${ttsVoice}`,
+      '    networks:',
+      `      - ${BASE_PATHS.network}`,
+      networksSection(),
+    ];
+
+    return yaml.join('\n');
+  }
 
   // Generator compose dla TentaFlow (NextApp)
   function generateTentaFlow(params) {
@@ -379,8 +418,20 @@ const ComposeTemplates = (() => {
     }, null, 2);
   }
 
+  // Zaslepka TensorRT-LLM — Docker compose jeszcze niedostepny
+  function tensorrt_llm(params) {
+    return JSON.stringify({
+      engine: 'tensorrt-llm',
+      deploy_mode: 'docker',
+      status: 'not_implemented',
+      model_id: params.modelId || '',
+      port: params.port || INTERNAL_PORTS.llm,
+      container_name: params.containerName || 'tentaflow-llm',
+    }, null, 2);
+  }
+
   // Generatory per silnik LLM
-  const LLM_ENGINES = { sglang, vllm, ollama, llamacpp, mlx };
+  const LLM_ENGINES = { sglang, vllm, ollama, llamacpp, mlx, 'tensorrt-llm': tensorrt_llm };
 
   // Generowanie compose dla standardowej uslugi po ID
   function generate(serviceId, params = {}) {

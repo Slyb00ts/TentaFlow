@@ -38,7 +38,7 @@ impl Router {
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse> {
+    ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
         let mut metrics = RequestMetrics::new();
 
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
@@ -49,7 +49,17 @@ impl Router {
                 Ok(Some(result)) => {
                     let response = flow_result_to_chat_response(result, &request.model);
                     self.process_memory_store_async(&request, &response, None);
-                    return Ok(response);
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: hostname::get()
+                            .map(|h| h.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "unknown".to_string()),
+                        backend_type: "flow_engine".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: 0,
+                        hop_count: 0,
+                        latency_ms: None,
+                    };
+                    return Ok(crate::routing::RouteResult { response, metadata });
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -70,31 +80,44 @@ impl Router {
         metrics.query_analysis_ms = mem_timings.query_analysis_ms;
         metrics.memory_query_ms = mem_timings.memory_query_ms;
 
-        // === ALIAS RETENTAFLOWN ===
-        let model_name = self.resolve_to_service_name(&request.model);
-        metrics.model_name = Some(model_name.clone());
-
         // === ROUTE TO APPROPRIATE BACKEND ===
         let t2 = std::time::Instant::now();
-        let mut response = if self.is_local_inference_model(&model_name) {
-            // Lokalna inferencja in-process (MLX, llama.cpp) — bez sieci
-            debug!("Routing '{}' do lokalnej inferencji in-process", model_name);
-            self.local_inference.handle_chat_completion(&request).await?
-        } else if self.is_rag_model(&model_name) {
-            self.route_to_rag(model_name.clone(), request.clone()).await?
-        } else if self.is_quic_llm_model(&model_name) {
-            self.route_to_quic_llm(model_name.clone(), request.clone(), None, None).await?
-        } else {
-            let backends = self.get_service_backends(&model_name)
-                .ok_or_else(|| CoreError::ModelNotFound { model_name: model_name.clone() })?;
-            if backends.is_empty() {
-                return Err(CoreError::AllBackendsUnavailable { model_name: model_name.clone() }.into());
-            }
-            let strategy = self.get_strategy(&model_name)
-                .ok_or_else(|| CoreError::ModelNotFound { model_name: model_name.clone() })?;
-            let backend_idx = strategy.select_backend(backends)?;
-            backends[backend_idx].chat_completion(request.clone()).await?
+        let route_result = {
+            use crate::routing::middleware::BackendHandle;
+            let this = self.clone();
+            let req = request.clone();
+            self.dispatch_with_fallback(&request.model, 0, |handle| {
+                let this = this.clone();
+                let req = req.clone();
+                let handle = handle.clone();
+                async move {
+                    match &handle {
+                        BackendHandle::LocalLlm => {
+                            debug!("Routing do lokalnej inferencji in-process");
+                            this.local_inference.handle_chat_completion(&req).await
+                        }
+                        BackendHandle::Rag(name) => {
+                            this.route_to_rag(name.clone(), req).await
+                        }
+                        BackendHandle::QuicLlm(name) => {
+                            this.route_to_quic_llm(name.clone(), req, None, None).await
+                        }
+                        BackendHandle::Http(name) => {
+                            let backend = this.select_http_backend(name)
+                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
+                            Ok(backend.chat_completion(req).await?)
+                        }
+                        BackendHandle::MeshForward(_node_id, _svc) => {
+                            Err(anyhow::anyhow!("Mesh forward nie zaimplementowany"))
+                        }
+                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla chat")),
+                    }
+                }
+            }).await?
         };
+        let mut response = route_result.response;
+        let route_metadata = route_result.metadata;
+        metrics.model_name = Some(route_metadata.backend_type.clone());
         metrics.llm_inference_ms = Some(t2.elapsed().as_millis() as u64);
 
         // === MEMORY STORE (async) ===
@@ -111,7 +134,7 @@ impl Router {
         // === LOG TIMING TABLE ===
         info!("\n{}", metrics.format_table());
 
-        Ok(response)
+        Ok(crate::routing::RouteResult { response, metadata: route_metadata })
     }
 
     /// Helper do asynchronicznego zapisu do Memory po odpowiedzi modelu
@@ -590,28 +613,14 @@ impl Router {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("RAG result requires_llm_processing=true ale llm_model=None"))?;
 
-            let llm_backends = self.get_service_backends(&llm_model_name)
+            let llm_backend = self.select_http_backend(&llm_model_name)
                 .ok_or_else(|| CoreError::ModelNotFound {
                     model_name: llm_model_name.clone(),
                 })?;
-
-            if llm_backends.is_empty() {
-                return Err(CoreError::AllBackendsUnavailable {
-                    model_name: llm_model_name.clone(),
-                }.into());
-            }
-
-            let strategy = self.get_strategy(&llm_model_name)
-                .ok_or_else(|| CoreError::ModelNotFound {
-                    model_name: llm_model_name.clone(),
-                })?;
-
-            let backend_idx = strategy.select_backend(llm_backends)?;
-            let llm_backend = &llm_backends[backend_idx];
 
             debug!(
-                "Wybrany LLM backend ({}): {} [{}]",
-                strategy.name(), llm_backend.url(), backend_idx
+                "Wybrany LLM backend: {}",
+                llm_backend.url()
             );
 
             let llm_request = ChatCompletionRequest {
@@ -1713,7 +1722,8 @@ impl Router {
     ) -> Result<tentaflow_protocol::ModelResponse> {
         use tentaflow_protocol::*;
 
-        let model_name = self.resolve_to_service_name(model);
+        let route = self.resolve_route(model);
+        let model_name = route.targets.first().cloned().unwrap_or_else(|| model.to_string());
 
         debug!("route_completion_via_protocol: model={}, messages={}, prompt_len={:?}",
                model_name, messages.len(), prompt.as_ref().map(|p| p.len()));
@@ -1749,10 +1759,39 @@ impl Router {
             audio_input: None,
         };
 
-        let response = if self.is_quic_llm_model(&model_name) {
-            self.route_to_quic_llm(model_name.clone(), request, prompt, stop).await?
-        } else {
-            self.route_chat_completion(request).await?
+        let response = {
+            use crate::routing::middleware::BackendHandle;
+            let this = self.clone();
+            let req = request.clone();
+            let prompt_c = prompt.clone();
+            let stop_c = stop.clone();
+            let route_result = self.dispatch_with_fallback(model, 0, |handle| {
+                let this = this.clone();
+                let req = req.clone();
+                let prompt_c = prompt_c.clone();
+                let stop_c = stop_c.clone();
+                let handle = handle.clone();
+                async move {
+                    match &handle {
+                        BackendHandle::QuicLlm(name) => {
+                            this.route_to_quic_llm(name.clone(), req, prompt_c, stop_c).await
+                        }
+                        BackendHandle::LocalLlm => {
+                            this.local_inference.handle_chat_completion(&req).await
+                        }
+                        BackendHandle::Rag(name) => {
+                            this.route_to_rag(name.clone(), req).await
+                        }
+                        BackendHandle::Http(name) => {
+                            let backend = this.select_http_backend(name)
+                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
+                            Ok(backend.chat_completion(req).await?)
+                        }
+                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla completion")),
+                    }
+                }
+            }).await?;
+            route_result.response
         };
 
         let content = crate::routing::extract_response_text(&response);
@@ -1875,7 +1914,8 @@ impl Router {
         use tentaflow_protocol::*;
 
         let request_id = uuid::Uuid::new_v4().to_string();
-        let model_name = self.resolve_to_service_name(&payload.model);
+        let route = self.resolve_route(&payload.model);
+        let model_name = route.targets.first().cloned().unwrap_or_else(|| payload.model.clone());
 
         debug!("Vision: model={}, liczba_wiadomosci={}", model_name, payload.messages.len());
 
@@ -1910,7 +1950,7 @@ impl Router {
             .collect();
 
         let request = crate::api::openai::types::ChatCompletionRequest {
-            model: model_name.clone(),
+            model: payload.model.clone(),
             messages: openai_messages,
             temperature: payload.temperature,
             max_tokens: payload.max_tokens,
@@ -1930,7 +1970,8 @@ impl Router {
         };
 
         match self.route_chat_completion(request).await {
-            Ok(response) => {
+            Ok(route_result) => {
+                let response = route_result.response;
                 let content = crate::routing::extract_response_text(&response);
 
                 let cleaned_content = self.response_middleware.clean_text(&content)?;

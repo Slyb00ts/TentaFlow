@@ -7,7 +7,7 @@
 use crate::error::{Result, CoreError};
 use crate::routing::router::Router;
 
-use tracing::{debug, warn, error};
+use tracing::debug;
 
 impl Router {
     /// Syntezuje mowe z tekstu uzywajac QUIC TTS lub HTTP TTS.
@@ -22,8 +22,9 @@ impl Router {
     pub async fn synthesize_speech(
         &self,
         request: &crate::api::openai::types::TTSRequest,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<crate::routing::RouteResult<Vec<u8>>> {
         use tentaflow_protocol::*;
+        use crate::routing::middleware::BackendHandle;
 
         let model = &request.model;
         let input = &request.input;
@@ -33,106 +34,74 @@ impl Router {
 
         debug!("synthesize_speech: model={}, voice={}, format={}, input_len={}", model, voice, format, input.len());
 
-        // === KROK 1: Sprobuj QUIC TTS (preferowany) ===
-        // Szukaj po nazwie modelu lub uzyj pierwszego dostepnego QUIC TTS
-        let quic_tts_service_name = self.service_manager.get_first_tts_service_name();
+        let tts_model = model.clone();
+        let route_result = {
+            let this = self.clone();
+            let model_c = model.clone();
+            let input_c = input.clone();
+            let voice_c = voice.clone();
+            let format_c = format.to_string();
+            self.dispatch_with_fallback(model, 0, |handle| {
+                let this = this.clone();
+                let model_c = model_c.clone();
+                let input_c = input_c.clone();
+                let voice_c = voice_c.clone();
+                let format_c = format_c.clone();
+                let handle = handle.clone();
+                async move {
+                    match &handle {
+                        BackendHandle::QuicTts(name) => {
+                            let quic_client = this.service_manager.get_quic_tts_client(name).await
+                                .ok_or_else(|| anyhow::anyhow!("QUIC TTS service {} nie polaczony", name))?;
 
-        if let Some(ref service_name) = quic_tts_service_name {
-            if self.service_manager.has_quic_tts_service(service_name) {
-                if let Some(quic_client) = self.service_manager.get_quic_tts_client(service_name).await {
-                    debug!("Using QUIC TTS backend: {}", service_name);
+                            debug!("Using QUIC TTS backend: {}", name);
+                            let request_id = uuid::Uuid::new_v4().to_string();
+                            let model_request = ModelRequest {
+                                request_id: request_id.clone(),
+                                payload: ModelPayload::Audio(AudioPayload {
+                                    operation: AudioOperation::TTS {
+                                        model: model_c,
+                                        input: input_c,
+                                        voice: voice_c,
+                                        format: Some(format_c),
+                                        speed: Some(speed),
+                                    },
+                                }),
+                                stream: false,
+                                metadata: None,
+                                session_id: None,
+                            };
 
-                    // Utworz ModelRequest z AudioPayload
-                    let request_id = uuid::Uuid::new_v4().to_string();
-                    let model_request = ModelRequest {
-                        request_id: request_id.clone(),
-                        payload: ModelPayload::Audio(AudioPayload {
-                            operation: AudioOperation::TTS {
-                                model: model.clone(),
-                                input: input.clone(),
-                                voice: voice.clone(),
-                                format: Some(format.to_string()),
-                                speed: Some(speed),
-                            },
-                        }),
-                        stream: false,
-                        metadata: None,
-                        session_id: None,
-                    };
+                            let response = quic_client.send_request(model_request).await
+                                .map_err(|e| anyhow::anyhow!("QUIC TTS request failed: {}", e))?;
 
-                    // Wyslij przez QUIC
-                    match quic_client.send_request(model_request).await {
-                        Ok(response) => {
                             match response.result {
                                 ModelResult::Audio(audio_result) => {
                                     match audio_result.data {
                                         AudioResultData::Audio(audio_bytes) => {
                                             debug!("QUIC TTS success: {} bytes", audio_bytes.len());
-                                            return Ok(audio_bytes);
+                                            Ok(audio_bytes)
                                         }
-                                        _ => {
-                                            warn!("QUIC TTS returned unexpected result type");
-                                        }
+                                        _ => Err(anyhow::anyhow!("QUIC TTS zwrocil nieoczekiwany typ wyniku")),
                                     }
                                 }
                                 ModelResult::Error(err) => {
-                                    warn!("QUIC TTS error: {:?} - {}", err.error_type, err.message);
+                                    Err(anyhow::anyhow!("QUIC TTS error: {:?} - {}", err.error_type, err.message))
                                 }
-                                _ => {
-                                    warn!("QUIC TTS returned unexpected result type");
-                                }
+                                _ => Err(anyhow::anyhow!("QUIC TTS zwrocil nieoczekiwany typ odpowiedzi")),
                             }
                         }
-                        Err(e) => {
-                            warn!("QUIC TTS request failed: {}", e);
-                        }
+                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla TTS")),
                     }
                 }
-            }
+            }).await
+        };
+
+        match route_result {
+            Ok(result) => Ok(result),
+            Err(_) => Err(CoreError::ModelNotFound {
+                model_name: format!("TTS nie znaleziono backendow dla modelu '{}'", tts_model),
+            }.into()),
         }
-
-        // === KROK 2: Fallback na jarvis (lokalny Sherpa) ===
-        if voice != "jarvis" {
-            warn!("Voice '{}' failed, falling back to 'jarvis'", voice);
-
-            if let Some(ref service_name) = quic_tts_service_name {
-                if let Some(quic_client) = self.service_manager.get_quic_tts_client(service_name).await {
-                    let request_id = uuid::Uuid::new_v4().to_string();
-                    let model_request = ModelRequest {
-                        request_id: request_id.clone(),
-                        payload: ModelPayload::Audio(AudioPayload {
-                            operation: AudioOperation::TTS {
-                                model: model.clone(),
-                                input: input.clone(),
-                                voice: "jarvis".to_string(), // Fallback voice
-                                format: Some(format.to_string()),
-                                speed: Some(speed),
-                            },
-                        }),
-                        stream: false,
-                        metadata: None,
-                        session_id: None,
-                    };
-
-                    match quic_client.send_request(model_request).await {
-                        Ok(response) => {
-                            if let ModelResult::Audio(audio_result) = response.result {
-                                if let AudioResultData::Audio(audio_bytes) = audio_result.data {
-                                    debug!("Fallback to jarvis success: {} bytes", audio_bytes.len());
-                                    return Ok(audio_bytes);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Fallback to jarvis also failed: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(CoreError::ModelNotFound {
-            model_name: format!("TTS failed for voice '{}' and fallback 'jarvis'", voice),
-        }.into())
     }
 }

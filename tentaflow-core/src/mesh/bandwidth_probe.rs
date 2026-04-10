@@ -92,7 +92,7 @@ async fn run_server(
     let deadline = Instant::now() + Duration::from_secs(SERVER_TIMEOUT_SECS);
 
     // 1. Latency: akceptuj PIERWSZE polaczenie — ping-pong
-    let mut latency_us: u64 = 0;
+    let latency_us: u64 = 0;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if let Ok(Ok((mut lat_stream, _))) = timeout(remaining, listener.accept()).await {
         let mut nonce_buf = [0u8; NONCE_SIZE];

@@ -26,8 +26,7 @@ const Clusters = (() => {
     try {
       const allNodes = await ApiClient.get('/api/mesh/nodes');
       trustedNodes = (allNodes || []).filter(n => {
-        const trust = (n.trust_status || n.status || '').toLowerCase();
-        return trust === 'trusted' || trust === 'paired' || trust === 'local' || n.is_local;
+        return n.is_trusted === true || n.is_local === true;
       });
     } catch (e) {
       trustedNodes = [];

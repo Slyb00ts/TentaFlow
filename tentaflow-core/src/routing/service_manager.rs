@@ -180,14 +180,38 @@ impl QuicServiceHandle {
 /// Strategia wyboru serwisu z puli modelu
 #[derive(Debug, Clone, Copy)]
 pub enum PoolStrategy {
+    FirstAvailable,
     RoundRobin,
     LeastLoaded,
+}
+
+impl std::fmt::Display for PoolStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PoolStrategy::FirstAvailable => write!(f, "first_available"),
+            PoolStrategy::RoundRobin => write!(f, "round_robin"),
+            PoolStrategy::LeastLoaded => write!(f, "least_loaded"),
+        }
+    }
+}
+
+impl PoolStrategy {
+    /// Parsuje string na strategie. Domyslnie: FirstAvailable.
+    pub fn parse(s: &str) -> PoolStrategy {
+        match s {
+            "round_robin" => PoolStrategy::RoundRobin,
+            "least_loaded" => PoolStrategy::LeastLoaded,
+            "first_available" => PoolStrategy::FirstAvailable,
+            _ => PoolStrategy::FirstAvailable,
+        }
+    }
 }
 
 /// Wpis puli serwisow obslugujacych dany model
 pub struct ModelPoolEntry {
     pub service_names: Vec<String>,
     pub strategy: PoolStrategy,
+    pub service_type: String,
     counter: std::sync::atomic::AtomicUsize,
 }
 
@@ -196,6 +220,7 @@ impl ModelPoolEntry {
         Self {
             service_names: Vec::new(),
             strategy: PoolStrategy::RoundRobin,
+            service_type: "llm".to_string(),
             counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -227,6 +252,9 @@ pub struct ServiceManager {
 
     /// OpenAI API backends (LLM, Vision, STT, Embedding) - synchroniczne, nie wymagaja polaczenia
     pub service_backends: HashMap<String, Vec<Arc<BackendClient>>>,
+
+    /// Dynamicznie rejestrowane HTTP backends (po deploy kontenera)
+    pub dynamic_backends: parking_lot::RwLock<HashMap<String, (Vec<Arc<BackendClient>>, Box<dyn LoadBalancingStrategy>)>>,
 
     /// Load balancing strategies
     pub load_balancing_strategies: HashMap<String, Box<dyn LoadBalancingStrategy>>,
@@ -271,6 +299,12 @@ pub struct ServiceManager {
 
     /// Rejestr serwisow mesh — do wyszukiwania serwisow na zdalnych nodach
     pub mesh_registry: parking_lot::RwLock<Option<Arc<MeshServiceRegistry>>>,
+
+    /// Router dla odwrotnych requestow od kontenerow (ustawiany po konstrukcji Routera)
+    pub(crate) reverse_router: parking_lot::RwLock<Option<crate::routing::Router>>,
+
+    /// EventBus addonow — ustawiany po konstrukcji AddonManager (jak reverse_router)
+    pub(crate) event_bus: parking_lot::RwLock<Option<Arc<crate::addon::event_bus::EventBus>>>,
 }
 
 impl ServiceManager {
@@ -345,6 +379,7 @@ impl ServiceManager {
                                     auto_reconnect: *auto_reconnect,
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
+                                    skip_tls_verify: false,
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -390,6 +425,7 @@ impl ServiceManager {
                                     auto_reconnect: *auto_reconnect,
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
+                                    skip_tls_verify: false,
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -458,6 +494,7 @@ impl ServiceManager {
                                     auto_reconnect: *auto_reconnect,
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
+                                    skip_tls_verify: false,
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -516,6 +553,7 @@ impl ServiceManager {
                                     auto_reconnect: *auto_reconnect,
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
+                                    skip_tls_verify: false,
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -542,12 +580,65 @@ impl ServiceManager {
                                 auto_reconnect: *auto_reconnect,
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
+                                    skip_tls_verify: false,
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
                             quic_memory_services.insert(service.name.clone(), handle);
 
                             info!("  {} (Memory QUIC) - connecting in background...", service.name);
+                            break;
+                        }
+                    }
+                }
+
+                // ===== Meeting Bot - QUIC only (sidecar do spotkan) =====
+                ServiceType::MeetingBot => {
+                    for backend in &service.backends {
+                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                            let quic_config = crate::net::quic::QuicConfig {
+                                name: service.name.clone(),
+                                url: quic_url.clone(),
+                                tls_ca: tls_ca.clone(),
+                                server_name: None,
+                                alpn: "tentaflow".to_string(),
+                                timeout_ms: backend.timeout_ms,
+                                auto_reconnect: *auto_reconnect,
+                                reconnect_interval_ms: *reconnect_interval_ms,
+                                keepalive_interval_ms: *keepalive_interval_ms,
+                                skip_tls_verify: tls_ca.is_none(),
+                            };
+
+                            let handle = Arc::new(QuicServiceHandle::new(quic_config));
+                            quic_llm_services.insert(service.name.clone(), handle);
+
+                            info!("  {} (Meeting Bot QUIC) - connecting in background...", service.name);
+                            break;
+                        }
+                    }
+                }
+
+                // ===== Reranker =====
+                ServiceType::Reranker => {
+                    for backend in &service.backends {
+                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                            let quic_config = crate::net::quic::QuicConfig {
+                                name: service.name.clone(),
+                                url: quic_url.clone(),
+                                tls_ca: tls_ca.clone(),
+                                server_name: None,
+                                alpn: "h3".to_string(),
+                                timeout_ms: backend.timeout_ms,
+                                auto_reconnect: *auto_reconnect,
+                                reconnect_interval_ms: *reconnect_interval_ms,
+                                keepalive_interval_ms: *keepalive_interval_ms,
+                                skip_tls_verify: false,
+                            };
+
+                            let handle = Arc::new(QuicServiceHandle::new(quic_config));
+                            quic_embedding_services.insert(service.name.clone(), handle);
+
+                            info!("  {} (Reranker QUIC) - connecting in background...", service.name);
                             break;
                         }
                     }
@@ -562,6 +653,7 @@ impl ServiceManager {
             rag_services: parking_lot::RwLock::new(rag_services),
             quic_embedding_services: parking_lot::RwLock::new(quic_embedding_services),
             service_backends,
+            dynamic_backends: parking_lot::RwLock::new(HashMap::new()),
             load_balancing_strategies,
             tts_clients,
             quic_tts_services: parking_lot::RwLock::new(quic_tts_services),
@@ -578,11 +670,61 @@ impl ServiceManager {
             prompt_registry,
             conversation_cache,
             mesh_registry: parking_lot::RwLock::new(None),
+            reverse_router: parking_lot::RwLock::new(None),
+            event_bus: parking_lot::RwLock::new(None),
         })
     }
 
     /// Uruchamia wszystkie background taski dla polaczen QUIC.
     /// Wywolaj to PO utworzeniu ServiceManager.
+    /// Laduje serwisy QUIC z bazy danych i rejestruje je w service_manager.
+    /// Wywolywane przy starcie routera — uzupelnia serwisy deployowane z GUI.
+    pub fn load_quic_services_from_db(&self, db: &crate::db::DbPool) {
+        let services = match crate::db::repository::list_services(db) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Nie udalo sie zaladowac serwisow z DB: {}", e);
+                return;
+            }
+        };
+
+        for service in &services {
+            // Pomijaj serwisy ktore nie sa QUIC
+            let backends = match crate::db::repository::list_backends_for_service(db, service.id) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            for backend in &backends {
+                if backend.connection_type != "quic" {
+                    continue;
+                }
+
+                // Parsuj config_json backendu
+                let config: serde_json::Value = serde_json::from_str(&backend.config_json).unwrap_or_default();
+                let quic_url = match config.get("quic_url").and_then(|v| v.as_str()) {
+                    Some(u) => u.to_string(),
+                    None => continue,
+                };
+
+                // Sprawdz czy juz zarejestrowany (z config.toml)
+                if self.quic_llm_services.read().contains_key(&service.name) {
+                    continue;
+                }
+
+                info!("Ladowanie serwisu QUIC z DB: '{}' (typ={}, url={})", service.name, service.service_type, quic_url);
+
+                self.register_quic_service(
+                    service.name.clone(),
+                    &service.service_type,
+                    quic_url,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
     pub fn spawn_connection_tasks(&self) {
         info!("Spawning background connection tasks...");
 
@@ -605,7 +747,7 @@ impl ServiceManager {
             let shutdown_rx = self.shutdown_rx.clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding").await;
+                Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding", None).await;
             });
         }
 
@@ -616,21 +758,29 @@ impl ServiceManager {
             let shutdown_rx = self.shutdown_rx.clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS").await;
+                Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS", None).await;
             });
         }
 
-        // Spawn QUIC LLM connection tasks (z wysylaniem prefix cache)
+        // Spawn QUIC LLM + Meeting Bot connection tasks
         let llm_entries: Vec<_> = self.quic_llm_services.read().iter()
             .map(|(n, h)| (n.clone(), h.clone())).collect();
         for (name, handle) in llm_entries {
             let shutdown_rx = self.shutdown_rx.clone();
-            let prompt_registry = self.prompt_registry.clone();
-            let model_category = self.llm_model_categories.read().get(&name).copied().unwrap_or_default();
 
-            tokio::spawn(async move {
-                Self::quic_llm_connection_loop(name, handle, shutdown_rx, prompt_registry, model_category).await;
-            });
+            // Meeting bot ma dedykowany loop z transcript subscriberem
+            if name.contains("meeting") || name.contains("teams-bot") {
+                let event_bus = self.event_bus.read().clone();
+                tokio::spawn(async move {
+                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus).await;
+                });
+            } else {
+                let prompt_registry = self.prompt_registry.clone();
+                let model_category = self.llm_model_categories.read().get(&name).copied().unwrap_or_default();
+                tokio::spawn(async move {
+                    Self::quic_llm_connection_loop(name, handle, shutdown_rx, prompt_registry, model_category).await;
+                });
+            }
         }
 
         // Spawn QUIC STT connection tasks
@@ -640,7 +790,7 @@ impl ServiceManager {
             let shutdown_rx = self.shutdown_rx.clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT").await;
+                Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT", None).await;
             });
         }
 
@@ -655,6 +805,55 @@ impl ServiceManager {
                 Self::memory_connection_loop(name, handle, callback_tx, shutdown_rx).await;
             });
         }
+    }
+
+    /// Ustawia router dla odwrotnych requestow od kontenerow.
+    /// Wywolaj po utworzeniu Routera, zeby kontenery mogly wysylac requesty do routera.
+    pub fn set_reverse_router(&self, router: crate::routing::Router) {
+        *self.reverse_router.write() = Some(router.clone());
+
+        // Uruchom reverse listenery na istniejacych polaczeniach
+        let shutdown_rx = self.shutdown_rx.clone();
+
+        let all_services: Vec<(String, Arc<QuicServiceHandle>)> = {
+            let mut entries = Vec::new();
+            for (n, h) in self.quic_tts_services.read().iter() {
+                entries.push((n.clone(), h.clone()));
+            }
+            for (n, h) in self.quic_stt_services.read().iter() {
+                entries.push((n.clone(), h.clone()));
+            }
+            for (n, h) in self.quic_llm_services.read().iter() {
+                entries.push((n.clone(), h.clone()));
+            }
+            for (n, h) in self.quic_embedding_services.read().iter() {
+                entries.push((n.clone(), h.clone()));
+            }
+            entries
+        };
+
+        for (name, handle) in all_services {
+            if let Ok(guard) = handle.client.try_read() {
+                if let Some(ref client) = *guard {
+                    let srv_shutdown = shutdown_rx.clone();
+                    let router_clone = router.clone();
+                    crate::routing::reverse_request::spawn_reverse_listener(
+                        client.clone(),
+                        router_clone,
+                        name.clone(),
+                        srv_shutdown,
+                    );
+                    info!("Reverse listener uruchomiony dla istniejacego serwisu: {}", name);
+                }
+            }
+        }
+    }
+
+    /// Ustawia EventBus addonow — wywolaj po utworzeniu AddonManager.
+    /// Potrzebny do uruchomienia subskrypcji transkrypcji z meeting bot.
+    pub fn set_event_bus(&self, event_bus: Arc<crate::addon::event_bus::EventBus>) {
+        *self.event_bus.write() = Some(event_bus);
+        info!("ServiceManager: EventBus ustawiony");
     }
 
     /// Background loop dla RAG connection z auto-reconnect
@@ -734,11 +933,13 @@ impl ServiceManager {
 
     /// Background loop dla QUIC service connection z auto-reconnect.
     /// Uzywany dla: Embeddings, TTS, i innych serwisow QUIC.
+    /// Opcjonalny `reverse_router` uruchamia nasluchiwanie na odwrotne requesty od kontenera.
     async fn quic_service_connection_loop(
         name: String,
         handle: Arc<QuicServiceHandle>,
         mut shutdown_rx: watch::Receiver<bool>,
         service_type: &'static str,
+        reverse_router: Option<crate::routing::Router>,
     ) {
         let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
         let mut per_service_rx = handle.shutdown_rx.clone();
@@ -757,35 +958,131 @@ impl ServiceManager {
             match crate::net::quic::QuicClient::connect(config, shutdown_rx_clone).await {
                 Ok(client) => {
                     info!("{} QUIC '{}': Connected successfully!", service_type, name);
-                    handle.set_connected(Arc::new(client)).await;
+                    let client = Arc::new(client);
+                    handle.set_connected(client.clone()).await;
 
-                    loop {
+                    // Uruchom reverse listener jesli router jest dostepny
+                    let reverse_task = reverse_router.as_ref().map(|router| {
+                        info!("{} QUIC '{}': Uruchamiam reverse listener", service_type, name);
+                        crate::routing::reverse_request::spawn_reverse_listener(
+                            client,
+                            router.clone(),
+                            name.clone(),
+                            shutdown_rx.clone(),
+                        )
+                    });
+
+                    let should_return = loop {
                         tokio::select! {
                             _ = shutdown_rx.changed() => {
                                 if *shutdown_rx.borrow() {
                                     info!("{} QUIC '{}': Shutdown signal", service_type, name);
                                     handle.set_disconnected("shutdown".to_string()).await;
-                                    return;
+                                    break true;
                                 }
                             }
                             _ = per_service_rx.changed() => {
                                 if *per_service_rx.borrow() {
                                     info!("{} QUIC '{}': Per-service shutdown signal", service_type, name);
                                     handle.set_disconnected("removed".to_string()).await;
-                                    return;
+                                    break true;
                                 }
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                                 if !handle.is_available().await {
                                     warn!("{} QUIC '{}': Connection lost, will reconnect", service_type, name);
-                                    break;
+                                    break false;
                                 }
                             }
                         }
-                    }
+                    };
+
+                    if let Some(task) = reverse_task { task.abort(); }
+                    if should_return { return; }
                 }
                 Err(e) => {
                     warn!("{} QUIC '{}': Connection failed: {}. Retrying in {:?}...", service_type, name, e, reconnect_interval);
+                    handle.set_disconnected(e.to_string()).await;
+                }
+            }
+
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+                _ = per_service_rx.changed() => {
+                    if *per_service_rx.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(reconnect_interval) => {}
+            }
+        }
+    }
+
+    /// Background loop dla meeting bot QUIC — po polaczeniu uruchamia subskrypcje transkrypcji.
+    async fn meeting_bot_connection_loop(
+        name: String,
+        handle: Arc<QuicServiceHandle>,
+        mut shutdown_rx: watch::Receiver<bool>,
+        event_bus: Option<Arc<crate::addon::event_bus::EventBus>>,
+    ) {
+        let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
+        let mut per_service_rx = handle.shutdown_rx.clone();
+
+        loop {
+            if *shutdown_rx.borrow() || *per_service_rx.borrow() {
+                info!("MeetingBot QUIC '{}': Shutdown signal received", name);
+                break;
+            }
+
+            info!("MeetingBot QUIC '{}': Attempting connection to {}...", name, handle.config.url);
+
+            let config = handle.config.clone();
+            let shutdown_rx_clone = shutdown_rx.clone();
+
+            match crate::net::quic::QuicClient::connect(config, shutdown_rx_clone).await {
+                Ok(client) => {
+                    info!("MeetingBot QUIC '{}': Connected successfully!", name);
+                    let client = Arc::new(client);
+                    handle.set_connected(client.clone()).await;
+
+                    // TODO: subskrypcja transkrypcji — wylaczona do czasu stabilizacji QUIC
+                    // Transcript subscriber otwiera streaming request ktory destabilizuje polaczenie
+                    let transcript_task: Option<tokio::task::JoinHandle<()>> = None;
+
+                    let should_return = loop {
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    info!("MeetingBot QUIC '{}': Shutdown signal", name);
+                                    handle.set_disconnected("shutdown".to_string()).await;
+                                    break true;
+                                }
+                            }
+                            _ = per_service_rx.changed() => {
+                                if *per_service_rx.borrow() {
+                                    info!("MeetingBot QUIC '{}': Per-service shutdown signal", name);
+                                    handle.set_disconnected("removed".to_string()).await;
+                                    break true;
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                                if !handle.is_available().await {
+                                    warn!("MeetingBot QUIC '{}': Connection lost, will reconnect", name);
+                                    break false;
+                                }
+                            }
+                        }
+                    };
+
+                    if let Some(task) = transcript_task { task.abort(); }
+                    if should_return { return; }
+                }
+                Err(e) => {
+                    warn!("MeetingBot QUIC '{}': Connection failed: {}. Retrying in {:?}...", name, e, reconnect_interval);
                     handle.set_disconnected(e.to_string()).await;
                 }
             }
@@ -1168,12 +1465,48 @@ impl ServiceManager {
 
     /// Pobierz backend clients dla serwisu (zawsze dostepne - HTTP)
     pub fn get_service_backends(&self, service_name: &str) -> Option<&Vec<Arc<BackendClient>>> {
-        self.service_backends.get(service_name)
+        if let Some(v) = self.service_backends.get(service_name) {
+            return Some(v);
+        }
+        None
+    }
+
+    /// Sprawdza czy serwis ma HTTP backends (statyczne lub dynamiczne)
+    pub fn has_http_backends(&self, service_name: &str) -> bool {
+        self.service_backends.contains_key(service_name)
+            || self.dynamic_backends.read().contains_key(service_name)
+    }
+
+    /// Pobierz backend clients (statyczne lub dynamiczne) — klonuje Arc referencje
+    pub fn get_service_backends_cloned(&self, service_name: &str) -> Option<Vec<Arc<BackendClient>>> {
+        if let Some(v) = self.service_backends.get(service_name) {
+            return Some(v.clone());
+        }
+        let dyn_map = self.dynamic_backends.read();
+        dyn_map.get(service_name).map(|(backends, _)| backends.clone())
     }
 
     /// Pobierz load balancing strategy
     pub fn get_strategy(&self, service_name: &str) -> Option<&Box<dyn LoadBalancingStrategy>> {
         self.load_balancing_strategies.get(service_name)
+    }
+
+    /// Dynamicznie rejestruje HTTP backend (po deploy kontenera)
+    pub fn register_dynamic_http_backend(
+        &self,
+        service_name: &str,
+        backend: Arc<BackendClient>,
+    ) {
+        let strategy = create_strategy("single", &[backend.clone()], vec![1])
+            .unwrap_or_else(|_| create_strategy("round_robin", &[backend.clone()], vec![1]).unwrap());
+
+        let mut dyn_map = self.dynamic_backends.write();
+        let entry = dyn_map.entry(service_name.to_string())
+            .or_insert_with(|| (Vec::new(), strategy));
+        if !entry.0.iter().any(|b| std::ptr::eq(b.as_ref(), backend.as_ref())) {
+            entry.0.push(backend);
+        }
+        info!("Zarejestrowano dynamiczny HTTP backend dla '{}'", service_name);
     }
 
     /// Pobierz TTS client
@@ -1459,6 +1792,17 @@ impl ServiceManager {
         None
     }
 
+    /// Szuka dowolnego noda w mesh z serwisem danego typu (bez konkretnego modelu).
+    pub fn find_service_by_type(&self, service_type: &str) -> Option<ServiceLocation> {
+        let registry = self.mesh_registry.read();
+        if let Some(ref reg) = *registry {
+            if let Some(node_id) = reg.find_service_by_type(service_type) {
+                return Some(ServiceLocation::MeshNode { node_id });
+            }
+        }
+        None
+    }
+
     /// Dynamicznie rejestruje serwis QUIC i uruchamia background connection task.
     /// Wywolywane po deploy uslugi lub przy starcie Routera (z DB).
     pub fn register_quic_service(
@@ -1469,16 +1813,18 @@ impl ServiceManager {
         tls_ca: Option<String>,
         server_name: Option<String>,
     ) {
+        let is_self_signed = tls_ca.is_none();
         let quic_config = crate::net::quic::QuicConfig {
             name: name.clone(),
             url: quic_url,
             tls_ca,
             server_name,
-            alpn: "h3".to_string(),
+            alpn: "tentaflow".to_string(),
             timeout_ms: 120000,
             auto_reconnect: true,
             reconnect_interval_ms: 5000,
             keepalive_interval_ms: 30000,
+            skip_tls_verify: is_self_signed,
         };
 
         info!("Zarejestrowano dynamiczny serwis QUIC: {} (typ={}, SNI={:?})", name, service_type, quic_config.server_name);
@@ -1497,20 +1843,23 @@ impl ServiceManager {
             }
             "tts" => {
                 self.quic_tts_services.write().insert(name.clone(), handle.clone());
+                let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS").await;
+                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS", reverse_router).await;
                 });
             }
             "stt" => {
                 self.quic_stt_services.write().insert(name.clone(), handle.clone());
+                let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT").await;
+                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT", reverse_router).await;
                 });
             }
             "embedding" => {
                 self.quic_embedding_services.write().insert(name.clone(), handle.clone());
+                let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding").await;
+                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding", reverse_router).await;
                 });
             }
             "memory" => {
@@ -1518,6 +1867,13 @@ impl ServiceManager {
                 let callback_tx = self.callback_tx.clone();
                 tokio::spawn(async move {
                     Self::memory_connection_loop(name, handle, callback_tx, shutdown_rx).await;
+                });
+            }
+            "meeting-bot" => {
+                self.quic_llm_services.write().insert(name.clone(), handle.clone());
+                let event_bus = self.event_bus.read().clone();
+                tokio::spawn(async move {
+                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus).await;
                 });
             }
             _ => {
@@ -1557,6 +1913,11 @@ impl ServiceManager {
             }
             "memory" => {
                 if let Some(h) = self.quic_memory_services.write().remove(name) {
+                    h.shutdown();
+                }
+            }
+            "meeting-bot" => {
+                if let Some(h) = self.quic_llm_services.write().remove(name) {
                     h.shutdown();
                 }
             }
@@ -1633,14 +1994,11 @@ impl ServiceManager {
     }
 
     /// Zwraca informacje o model_pool (do diagnostyki/API)
-    pub fn get_model_pool_info(&self) -> Vec<(String, Vec<String>, String)> {
+    pub fn get_model_pool_info(&self) -> Vec<(String, Vec<String>, String, String)> {
         let pool = self.model_pool.read();
         pool.iter().map(|(name, entry)| {
-            let strategy = match entry.strategy {
-                PoolStrategy::RoundRobin => "round_robin".to_string(),
-                PoolStrategy::LeastLoaded => "least_loaded".to_string(),
-            };
-            (name.clone(), entry.service_names.clone(), strategy)
+            let strategy = entry.strategy.to_string();
+            (name.clone(), entry.service_names.clone(), strategy, entry.service_type.clone())
         }).collect()
     }
 
@@ -1652,6 +2010,10 @@ impl ServiceManager {
                     if let Some(model_name) = config.get("deployed_model").and_then(|v| v.as_str()) {
                         if !model_name.is_empty() {
                             self.register_model_mapping(model_name, &svc.name);
+                            let mut pool = self.model_pool.write();
+                            if let Some(entry) = pool.get_mut(model_name) {
+                                entry.service_type = svc.service_type.clone();
+                            }
                         }
                     }
                 }
@@ -1659,5 +2021,70 @@ impl ServiceManager {
         }
         let pool = self.model_pool.read();
         info!("ModelPool: Zaladowano {} modeli z DB", pool.len());
+    }
+}
+
+#[cfg(test)]
+mod strategy_tests {
+    use super::PoolStrategy;
+
+    #[test]
+    fn parse_first_available() {
+        assert!(matches!(
+            PoolStrategy::parse("first_available"),
+            PoolStrategy::FirstAvailable
+        ));
+    }
+
+    #[test]
+    fn parse_round_robin() {
+        assert!(matches!(
+            PoolStrategy::parse("round_robin"),
+            PoolStrategy::RoundRobin
+        ));
+    }
+
+    #[test]
+    fn parse_least_loaded() {
+        assert!(matches!(
+            PoolStrategy::parse("least_loaded"),
+            PoolStrategy::LeastLoaded
+        ));
+    }
+
+    #[test]
+    fn parse_unknown_defaults_to_first_available() {
+        assert!(matches!(
+            PoolStrategy::parse("garbage"),
+            PoolStrategy::FirstAvailable
+        ));
+    }
+
+    #[test]
+    fn parse_empty_defaults_to_first_available() {
+        assert!(matches!(
+            PoolStrategy::parse(""),
+            PoolStrategy::FirstAvailable
+        ));
+    }
+
+    #[test]
+    fn display_round_trip() {
+        // Sprawdza ze Display i parse sa sprojne
+        let strategies = [
+            PoolStrategy::FirstAvailable,
+            PoolStrategy::RoundRobin,
+            PoolStrategy::LeastLoaded,
+        ];
+        for s in &strategies {
+            let text = s.to_string();
+            let parsed = PoolStrategy::parse(&text);
+            assert_eq!(
+                std::mem::discriminant(s),
+                std::mem::discriminant(&parsed),
+                "Round-trip nie powiodl sie dla {:?}",
+                s
+            );
+        }
     }
 }

@@ -1,0 +1,47 @@
+[package]
+name = "tentaflow-teams-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Sidecar do spotkan Teams — automatyzacja przegladarki + audio pipeline"
+
+[[bin]]
+name = "tentaflow-meeting"
+path = "src/main.rs"
+
+[dependencies]
+# Protokol i serializacja
+tentaflow-protocol = { path = "../../tentaflow-protocol" }
+rkyv = { version = "0.8", features = ["unaligned"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Automatyzacja przegladarki
+chromiumoxide = "0.9"
+futures = "0.3"
+
+# ONNX Runtime (Silero VAD)
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
+
+# QUIC serwer
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+
+# Konfiguracja
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Inne
+anyhow = "1"
+byteorder = "1"
+uuid = { version = "1", features = ["v4"] }

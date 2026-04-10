@@ -661,6 +661,8 @@ pub const MESH_MSG_KEY_ROTATION: u8 = 0x25;
 pub const MESH_MSG_KEY_ROTATION_RESPONSE: u8 = 0x26;
 pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
 pub const MESH_MSG_RELAY_FRAME: u8 = 0x37;
+pub const MESH_MSG_FORWARD_STREAM_REQ: u8 = 0x38;
+pub const MESH_MSG_ALIAS_SYNC: u8 = 0x39;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
@@ -717,6 +719,68 @@ pub struct MeshRelayFrame {
     pub ttl: u8,
     pub discriminant: u8,
     pub payload: Vec<u8>,
+}
+
+// =============================================================================
+// Typy protokolu meeting bot sidecar
+// =============================================================================
+
+/// Wiadomosc transkrypcji z sidecara meeting bot
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[rkyv(derive(Debug))]
+pub struct MeetingTranscript {
+    /// Nazwa mowcy
+    pub speaker: String,
+    /// Tekst transkrypcji
+    pub text: String,
+    /// Timestamp w milisekundach (unix epoch)
+    pub timestamp_ms: u64,
+}
+
+/// Komenda mowienia wysylana do sidecara meeting bot (TTS)
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[rkyv(derive(Debug))]
+pub struct MeetingSpeakCommand {
+    /// Tekst do wypowiedzenia
+    pub text: String,
+    /// Identyfikator glosu TTS
+    pub voice: String,
+    /// Model TTS do uzycia
+    pub model: String,
+}
+
+/// Kontrola spotkania — komendy i zdarzenia miedzy addonem a sidecarem
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[rkyv(derive(Debug))]
+pub enum MeetingControl {
+    /// Dolacz do spotkania pod podanym URL
+    Join { meeting_url: String },
+    /// Opusc spotkanie
+    Leave,
+    /// Wycisz/odcisz mikrofon
+    Mute { muted: bool },
+    /// Zmiana stanu spotkania (zdarzenie z sidecara)
+    StateChanged { state: MeetingState },
+    /// Healthcheck sidecara
+    SidecarHealth { healthy: bool, uptime_s: u64 },
+}
+
+/// Stan spotkania raportowany przez sidecar
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+#[rkyv(derive(Debug))]
+pub enum MeetingState {
+    /// Laczenie ze spotkaniem
+    Joining,
+    /// Polaczony
+    Connected,
+    /// Ponowne laczenie po utracie polaczenia
+    Reconnecting,
+    /// Spotkanie zakonczone
+    Ended { reason: String },
+    /// Autoryzacja wygasla
+    AuthExpired,
+    /// Wyrzucony ze spotkania
+    Kicked { reason: String },
 }
 
 // =============================================================================
@@ -876,6 +940,321 @@ mod tests {
                 assert_eq!(archived_payload.as_slice(), &[1, 2, 3, 4, 5]);
             }
             _ => panic!("Oczekiwano wariantu ForwardRequest"),
+        }
+    }
+
+    // =========================================================================
+    // Testy typow meeting bot
+    // =========================================================================
+
+    /// Pomocnicza makra do roundtrip testow rkyv dla typow meeting bot.
+    /// Serializuje do bajtow i deserializuje z archived — zwraca &Archived.
+    macro_rules! rkyv_serialize {
+        ($value:expr) => {
+            rkyv::to_bytes::<rkyv::rancor::Error>($value)
+                .expect("Serializacja rkyv powinna sie udac")
+        };
+    }
+
+    #[test]
+    fn test_meeting_transcript_roundtrip() {
+        // Serializacja i deserializacja transkrypcji spotkania
+        let transcript = MeetingTranscript {
+            speaker: "Jan Kowalski".to_string(),
+            text: "Dzien dobry, zaczynamy spotkanie.".to_string(),
+            timestamp_ms: 1_710_000_000_000,
+        };
+
+        let bytes = rkyv_serialize!(&transcript);
+        let archived = rkyv::access::<ArchivedMeetingTranscript, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        assert_eq!(archived.speaker.as_str(), "Jan Kowalski");
+        assert_eq!(archived.text.as_str(), "Dzien dobry, zaczynamy spotkanie.");
+        assert_eq!(archived.timestamp_ms, 1_710_000_000_000);
+    }
+
+    #[test]
+    fn test_meeting_transcript_empty_fields() {
+        // Transkrypcja z pustymi polami
+        let transcript = MeetingTranscript {
+            speaker: "".to_string(),
+            text: "".to_string(),
+            timestamp_ms: 0,
+        };
+
+        let bytes = rkyv_serialize!(&transcript);
+        let archived = rkyv::access::<ArchivedMeetingTranscript, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        assert_eq!(archived.speaker.as_str(), "");
+        assert_eq!(archived.text.as_str(), "");
+        assert_eq!(archived.timestamp_ms, 0);
+    }
+
+    #[test]
+    fn test_meeting_speak_command_roundtrip() {
+        // Serializacja komendy mowienia TTS
+        let cmd = MeetingSpeakCommand {
+            text: "Prosze o ciszę.".to_string(),
+            voice: "alloy".to_string(),
+            model: "tts-1".to_string(),
+        };
+
+        let bytes = rkyv_serialize!(&cmd);
+        let archived = rkyv::access::<ArchivedMeetingSpeakCommand, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        assert_eq!(archived.text.as_str(), "Prosze o ciszę.");
+        assert_eq!(archived.voice.as_str(), "alloy");
+        assert_eq!(archived.model.as_str(), "tts-1");
+    }
+
+    #[test]
+    fn test_meeting_control_join_roundtrip() {
+        let ctrl = MeetingControl::Join {
+            meeting_url: "https://teams.microsoft.com/l/meetup-join/abc".to_string(),
+        };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::Join { meeting_url } => {
+                assert_eq!(meeting_url.as_str(), "https://teams.microsoft.com/l/meetup-join/abc");
+            }
+            _ => panic!("Oczekiwano wariantu Join"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_leave_roundtrip() {
+        let ctrl = MeetingControl::Leave;
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        assert!(matches!(archived, ArchivedMeetingControl::Leave));
+    }
+
+    #[test]
+    fn test_meeting_control_mute_roundtrip() {
+        // Mute i unmute
+        for muted_val in [true, false] {
+            let ctrl = MeetingControl::Mute { muted: muted_val };
+
+            let bytes = rkyv_serialize!(&ctrl);
+            let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+                .expect("Dostep do archived powinna sie udac");
+
+            match archived {
+                ArchivedMeetingControl::Mute { muted } => assert_eq!(*muted, muted_val),
+                _ => panic!("Oczekiwano wariantu Mute"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_state_changed_joining() {
+        let ctrl = MeetingControl::StateChanged { state: MeetingState::Joining };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::StateChanged { state } => {
+                assert!(matches!(state, ArchivedMeetingState::Joining));
+            }
+            _ => panic!("Oczekiwano wariantu StateChanged"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_state_changed_connected() {
+        let ctrl = MeetingControl::StateChanged { state: MeetingState::Connected };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::StateChanged { state } => {
+                assert!(matches!(state, ArchivedMeetingState::Connected));
+            }
+            _ => panic!("Oczekiwano wariantu StateChanged"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_state_changed_reconnecting() {
+        let ctrl = MeetingControl::StateChanged { state: MeetingState::Reconnecting };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::StateChanged { state } => {
+                assert!(matches!(state, ArchivedMeetingState::Reconnecting));
+            }
+            _ => panic!("Oczekiwano wariantu StateChanged"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_state_changed_ended() {
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Ended { reason: "host ended".to_string() },
+        };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::StateChanged { state } => {
+                match state {
+                    ArchivedMeetingState::Ended { reason } => {
+                        assert_eq!(reason.as_str(), "host ended");
+                    }
+                    _ => panic!("Oczekiwano MeetingState::Ended"),
+                }
+            }
+            _ => panic!("Oczekiwano wariantu StateChanged"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_state_changed_auth_expired() {
+        let ctrl = MeetingControl::StateChanged { state: MeetingState::AuthExpired };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::StateChanged { state } => {
+                assert!(matches!(state, ArchivedMeetingState::AuthExpired));
+            }
+            _ => panic!("Oczekiwano wariantu StateChanged"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_state_changed_kicked() {
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Kicked { reason: "disruption".to_string() },
+        };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::StateChanged { state } => {
+                match state {
+                    ArchivedMeetingState::Kicked { reason } => {
+                        assert_eq!(reason.as_str(), "disruption");
+                    }
+                    _ => panic!("Oczekiwano MeetingState::Kicked"),
+                }
+            }
+            _ => panic!("Oczekiwano wariantu StateChanged"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_control_sidecar_health_roundtrip() {
+        let ctrl = MeetingControl::SidecarHealth {
+            healthy: true,
+            uptime_s: 3600,
+        };
+
+        let bytes = rkyv_serialize!(&ctrl);
+        let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingControl::SidecarHealth { healthy, uptime_s } => {
+                assert!(*healthy);
+                assert_eq!(*uptime_s, 3600);
+            }
+            _ => panic!("Oczekiwano wariantu SidecarHealth"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_state_ended_with_reason() {
+        let state = MeetingState::Ended {
+            reason: "Meeting ended by host".to_string(),
+        };
+
+        let bytes = rkyv_serialize!(&state);
+        let archived = rkyv::access::<ArchivedMeetingState, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingState::Ended { reason } => {
+                assert_eq!(reason.as_str(), "Meeting ended by host");
+            }
+            _ => panic!("Oczekiwano wariantu Ended"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_state_kicked_with_reason() {
+        let state = MeetingState::Kicked {
+            reason: "Removed by moderator".to_string(),
+        };
+
+        let bytes = rkyv_serialize!(&state);
+        let archived = rkyv::access::<ArchivedMeetingState, rkyv::rancor::Error>(&bytes)
+            .expect("Dostep do archived powinna sie udac");
+
+        match archived {
+            ArchivedMeetingState::Kicked { reason } => {
+                assert_eq!(reason.as_str(), "Removed by moderator");
+            }
+            _ => panic!("Oczekiwano wariantu Kicked"),
+        }
+    }
+
+    #[test]
+    fn test_meeting_transcript_serde_json_roundtrip() {
+        // Serializacja/deserializacja JSON transkrypcji
+        let transcript = MeetingTranscript {
+            speaker: "Anna Nowak".to_string(),
+            text: "Test JSON roundtrip".to_string(),
+            timestamp_ms: 999,
+        };
+
+        let json = serde_json::to_string(&transcript).unwrap();
+        let result: MeetingTranscript = serde_json::from_str(&json).unwrap();
+        assert_eq!(result.speaker, "Anna Nowak");
+        assert_eq!(result.text, "Test JSON roundtrip");
+        assert_eq!(result.timestamp_ms, 999);
+    }
+
+    #[test]
+    fn test_meeting_control_serde_json_roundtrip() {
+        // JSON roundtrip dla kazdego wariantu MeetingControl
+        let controls = vec![
+            MeetingControl::Join { meeting_url: "https://test".to_string() },
+            MeetingControl::Leave,
+            MeetingControl::Mute { muted: true },
+            MeetingControl::SidecarHealth { healthy: false, uptime_s: 0 },
+        ];
+
+        for ctrl in &controls {
+            let json = serde_json::to_string(ctrl).unwrap();
+            let result: MeetingControl = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&result),
+                std::mem::discriminant(ctrl)
+            );
         }
     }
 

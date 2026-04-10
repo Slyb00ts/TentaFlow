@@ -13,6 +13,9 @@ dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
 inference-mlx-swift = []  # bridge do Swift MLX na iOS — implementacja w Fazie 3
 metrics-prometheus = ["dep:prometheus"]
 rdma-probe = []
+gpu-cuda = ["inference-llamacpp", "llama-cpp-2/cuda", "whisper-rs/cuda"]
+gpu-vulkan = ["inference-llamacpp", "llama-cpp-2/vulkan", "whisper-rs/vulkan"]
+gpu-rocm = ["inference-llamacpp", "llama-cpp-2/rocm", "whisper-rs/hipblas"]
 
 [dependencies]
 # Protocol (zawsze)
@@ -101,6 +104,11 @@ encoding_rs = { version = "0.8", optional = true }
 mlx-rs = { version = "0.25", features = ["metal", "accelerate"], optional = true }
 mlx-models = { path = "../mlx-models", optional = true }
 tokenizers = { version = "0.21", optional = true }
+
+# STT — Whisper (optional)
+whisper-rs = "0.16"
+hound = "3.5"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm"] }
 
 # Embedded static files — generowane przez build.rs (bez include_dir!)
 # MIME detection jest w build.rs

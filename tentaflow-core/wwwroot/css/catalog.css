@@ -106,6 +106,9 @@
   font-size: var(--font-size-lg);
   font-weight: 600;
   color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* --- Opis kafelka --- */
@@ -270,10 +273,136 @@
   background: var(--color-success);
 }
 
-/* --- Placeholder NVIDIA NIM --- */
-/* .catalog-nim-placeholder dziedziczy po .empty-state z components.css */
-.catalog-nim-placeholder {
-  font-size: var(--font-size-lg);
+/* --- NVIDIA NIM toolbar --- */
+.nim-toolbar {
+  display: flex;
+  gap: var(--spacing-md);
+  align-items: center;
+  margin-bottom: var(--spacing-lg);
+  flex-wrap: wrap;
+}
+
+.nim-search {
+  flex: 1;
+  min-width: 200px;
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--color-bg-input);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-md);
+  font-family: var(--font-family);
+}
+
+.nim-search:focus {
+  border-color: var(--color-accent);
+  outline: none;
+}
+
+.nim-search::placeholder {
+  color: var(--color-text-muted);
+}
+
+.nim-filters {
+  display: flex;
+  gap: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
+.nim-filter {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: var(--font-size-sm);
+  font-family: var(--font-family);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.nim-filter:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.nim-filter.active {
+  background: var(--color-accent-light);
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+/* --- NVIDIA NIM karta --- */
+.nim-card {
+  overflow: hidden;
+}
+
+.nim-card .catalog-card-header {
+  min-width: 0;
+}
+
+.nim-card .catalog-card-header > div {
+  min-width: 0;
+}
+
+.nim-card .nim-card-icon {
+  background: rgba(118, 185, 0, 0.12);
+}
+
+.nim-card:hover {
+  border-color: #76b900;
+}
+
+.nim-card-desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.nim-publisher-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  margin-top: 2px;
+}
+
+.nim-badge-category {
+  background: rgba(118, 185, 0, 0.15);
+  color: #76b900;
+}
+
+.nim-badge-vram {
+  background: var(--color-warning-light);
+  color: var(--color-warning);
+}
+
+.nim-badge-version {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-muted);
+}
+
+.nim-warning-icon svg {
+  width: 48px;
+  height: 48px;
+}
+
+/* --- NIM responsive --- */
+@media (max-width: 640px) {
+  .nim-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .nim-search {
+    min-width: auto;
+  }
+
+  .nim-filters {
+    overflow-x: auto;
+  }
 }
 
 /* --- Grid parametrow deploy --- */

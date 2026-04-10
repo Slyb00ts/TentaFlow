@@ -83,6 +83,8 @@ pub struct AddonManifest {
     /// Reguly disambiguation — rozstrzyganie niejednoznacznych zapytan
     #[serde(default)]
     pub disambiguation: Vec<DisambiguationRule>,
+    /// Wymagania zasobow deklarowane w sekcji [resources] manifestu
+    pub resources: Option<ResourceRequirements>,
 }
 
 impl Default for AddonManifest {
@@ -106,6 +108,7 @@ impl Default for AddonManifest {
             declared_permissions: Vec::new(),
             network_rules: Vec::new(),
             disambiguation: Vec::new(),
+            resources: None,
         }
     }
 }
@@ -127,6 +130,24 @@ pub struct ManifestResourceLimits {
     pub cpu_limit_millicores: Option<i64>,
     pub ram_limit_mb: Option<i64>,
     pub storage_limit_mb: Option<i64>,
+}
+
+/// Wymagania zasobow deklarowane w sekcji [resources] manifestu addonu.
+/// Jesli podane, nadpisuja domyslne limity z tabeli addon_resource_limits przy instalacji.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceRequirements {
+    /// Calkowity limit storage w MB
+    pub storage_total_mb: Option<u64>,
+    /// Limit pojedynczej wartosci storage w MB
+    pub storage_value_mb: Option<u64>,
+    /// Limit tokenow LLM na minute
+    pub llm_tokens_per_minute: Option<u64>,
+    /// Limit requestow HTTP na minute
+    pub http_requests_per_minute: Option<u64>,
+    /// Limit pamieci RAM w MB
+    pub memory_mb: Option<u64>,
+    /// Limit paliwa WASM per wywolanie (0 = domyslny 10M instrukcji)
+    pub fuel_limit: Option<u64>,
 }
 
 /// Definicja narzedzia z manifestu
@@ -216,10 +237,14 @@ pub struct AddonState {
     pub rate_limiter: Option<Arc<rate_limiter::AddonRateLimiter>>,
     /// Menedzer polaczen sieciowych TCP/UDP (proxy dla addonow)
     pub net_manager: Arc<Mutex<host_functions::network::NetworkConnectionManager>>,
+    /// Cipher do szyfrowania/deszyfrowania sekretow w settings DB
+    pub settings_cipher: Arc<crate::crypto::SettingsCipher>,
     /// Manifest addonu — potrzebny do walidacji regul sieciowych
     pub manifest: Arc<AddonManifest>,
     /// Limit pamieci WASM w bajtach
     pub memory_limit: usize,
+    /// Router do routowania requestow LLM (ustawiany po inicjalizacji)
+    pub router: Option<Arc<crate::routing::router::Router>>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -249,15 +274,18 @@ pub struct AddonManager {
     event_bus: Arc<EventBus>,
     engine: WasmEngine,
     permission_checker: Arc<PermissionChecker>,
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
     /// Skompilowane moduly WASM — cache po addon_id
     compiled_modules: Arc<RwLock<HashMap<String, WasmModule>>>,
     /// Zarejestrowane narzedzia ze wszystkich addonow
     registered_tools: Arc<RwLock<Vec<ToolDefinition>>>,
+    /// Router do routowania requestow LLM z addonow
+    router: Arc<RwLock<Option<Arc<crate::routing::router::Router>>>>,
 }
 
 impl AddonManager {
     /// Tworzy nowy AddonManager z podana baza danych
-    pub fn new(db: DbPool) -> Result<Self> {
+    pub fn new(db: DbPool, settings_cipher: Arc<crate::crypto::SettingsCipher>) -> Result<Self> {
         let engine = runtime::create_engine()?;
 
         let event_bus = Arc::new(EventBus::new());
@@ -285,9 +313,17 @@ impl AddonManager {
             event_bus,
             engine,
             permission_checker,
+            settings_cipher,
             compiled_modules: Arc::new(RwLock::new(HashMap::new())),
             registered_tools: Arc::new(RwLock::new(Vec::new())),
+            router: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Ustawia router do routowania requestow LLM z addonow
+    pub fn set_router(&self, router: Arc<crate::routing::router::Router>) {
+        *self.router.write() = Some(router);
+        info!("AddonManager: router ustawiony dla host functions LLM");
     }
 
     /// Instaluje addon z podanego katalogu — czyta manifest.toml, waliduje,
@@ -300,6 +336,11 @@ impl AddonManager {
 
         // Zarejestruj narzedzia z manifestu
         self.register_tools_from_manifest(&manifest)?;
+
+        // Automatyczne aliasy modeli dla teams-bot
+        if manifest.addon_id == "teams-bot" {
+            self.activate_teams_aliases();
+        }
 
         info!("Addon '{}' v{} zainstalowany pomyslnie", manifest.addon_id, manifest.version);
         Ok(())
@@ -335,6 +376,11 @@ impl AddonManager {
         // Odsubskrybuj z event bus
         self.event_bus.unsubscribe_all(addon_id);
 
+        // Dezaktywuj aliasy modeli dla teams-bot
+        if addon_id == "teams-bot" {
+            self.deactivate_teams_aliases();
+        }
+
         info!("Addon '{}' odinstalowany pomyslnie", addon_id);
         Ok(())
     }
@@ -367,8 +413,10 @@ impl AddonManager {
             is_system_call: user_id.is_none(),
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(host_functions::network::NetworkConnectionManager::new())),
+            settings_cipher: self.settings_cipher.clone(),
             manifest: Arc::new(manifest),
             memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
+            router: self.router.read().clone(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             store_limits: wasmi::StoreLimitsBuilder::new()
                 .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
@@ -433,6 +481,11 @@ impl AddonManager {
             }),
             timestamp: chrono::Utc::now(),
         });
+
+        // Reaktywuj aliasy modeli dla teams-bot
+        if addon_id == "teams-bot" {
+            self.activate_teams_aliases();
+        }
 
         info!("Addon '{}' uruchomiony, instance_id={}", addon_id, instance_id);
         Ok(instance_id)
@@ -502,8 +555,14 @@ impl AddonManager {
         });
 
         // Usun pusta liste jesli brak instancji
-        if instances.get(&addon_id).map_or(false, |v| v.is_empty()) {
+        let no_instances_left = instances.get(&addon_id).map_or(true, |v| v.is_empty());
+        if no_instances_left {
             instances.remove(&addon_id);
+        }
+
+        // Dezaktywuj aliasy gdy ostatnia instancja teams-bot zostala zatrzymana
+        if addon_id == "teams-bot" && no_instances_left {
+            self.deactivate_teams_aliases();
         }
 
         info!("Instancja '{}' zatrzymana", instance_id);
@@ -870,9 +929,153 @@ impl AddonManager {
             );
         }
     }
+
+    /// Aliasy STT/TTS powiazane z addonem teams-bot
+    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 2] = [
+        ("teams-stt", "whisper-1"),
+        ("teams-tts", "tts-1"),
+    ];
+
+    /// Tworzy lub reaktywuje aliasy teams-stt / teams-tts i odswieza cache routera
+    fn activate_teams_aliases(&self) {
+        for (alias, default_target) in &Self::TEAMS_BOT_ALIASES {
+            if let Err(e) = crate::db::repository::create_or_reactivate_model_alias(
+                &self.db, alias, default_target, "first_available",
+            ) {
+                warn!("Nie udalo sie utworzyc/reaktywowac aliasu '{}': {}", alias, e);
+            }
+        }
+        self.reload_router_alias_cache();
+        info!("Aliasy teams-stt/teams-tts aktywowane");
+    }
+
+    /// Dezaktywuje aliasy teams-stt / teams-tts i odswieza cache routera
+    fn deactivate_teams_aliases(&self) {
+        for (alias, _) in &Self::TEAMS_BOT_ALIASES {
+            if let Err(e) = crate::db::repository::set_model_alias_active(&self.db, alias, false) {
+                warn!("Nie udalo sie dezaktywowac aliasu '{}': {}", alias, e);
+            }
+        }
+        self.reload_router_alias_cache();
+        info!("Aliasy teams-stt/teams-tts dezaktywowane");
+    }
+
+    /// Odswieza alias cache w routerze (jesli router jest ustawiony)
+    fn reload_router_alias_cache(&self) {
+        if let Some(router) = self.router.read().as_ref() {
+            router.reload_alias_cache();
+        }
+    }
 }
 
 /// D5: Reuzywany hash FNV-1a z utils
 fn fnv1a_hash(s: &str) -> i64 {
     utils::fnv1a_hash(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_requirements_full_toml() {
+        // Pelna sekcja [resources] z wszystkimi polami
+        let toml_str = r#"
+            [resources]
+            storage_total_mb = 1024
+            storage_value_mb = 50
+            llm_tokens_per_minute = 10000
+            http_requests_per_minute = 300
+            memory_mb = 512
+            fuel_limit = 20000000
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            resources: ResourceRequirements,
+        }
+
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.resources.storage_total_mb, Some(1024));
+        assert_eq!(w.resources.storage_value_mb, Some(50));
+        assert_eq!(w.resources.llm_tokens_per_minute, Some(10000));
+        assert_eq!(w.resources.http_requests_per_minute, Some(300));
+        assert_eq!(w.resources.memory_mb, Some(512));
+        assert_eq!(w.resources.fuel_limit, Some(20_000_000));
+    }
+
+    #[test]
+    fn resource_requirements_partial_toml() {
+        // Czesciowa sekcja — tylko niektore pola
+        let toml_str = r#"
+            [resources]
+            memory_mb = 256
+            fuel_limit = 5000000
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            resources: ResourceRequirements,
+        }
+
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.resources.memory_mb, Some(256));
+        assert_eq!(w.resources.fuel_limit, Some(5_000_000));
+        assert!(w.resources.storage_total_mb.is_none());
+        assert!(w.resources.storage_value_mb.is_none());
+        assert!(w.resources.llm_tokens_per_minute.is_none());
+        assert!(w.resources.http_requests_per_minute.is_none());
+    }
+
+    #[test]
+    fn resource_requirements_empty_section() {
+        // Pusta sekcja [resources] — wszystkie pola None
+        let toml_str = r#"
+            [resources]
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            resources: ResourceRequirements,
+        }
+
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(w.resources.storage_total_mb.is_none());
+        assert!(w.resources.memory_mb.is_none());
+        assert!(w.resources.fuel_limit.is_none());
+    }
+
+    #[test]
+    fn resource_requirements_missing_section() {
+        // Brak sekcji [resources] — Option<ResourceRequirements> = None
+        let toml_str = r#"
+            addon_id = "test-addon"
+            version = "1.0.0"
+            display_name = "Test"
+            permissions = []
+            platforms = []
+            wasm_file = "test.wasm"
+            tools = []
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct MinManifest {
+            resources: Option<ResourceRequirements>,
+        }
+
+        let m: MinManifest = toml::from_str(toml_str).unwrap();
+        assert!(m.resources.is_none());
+    }
+
+    #[test]
+    fn resource_requirements_default() {
+        // Default trait — wszystkie pola None
+        let req = ResourceRequirements::default();
+        assert!(req.storage_total_mb.is_none());
+        assert!(req.storage_value_mb.is_none());
+        assert!(req.llm_tokens_per_minute.is_none());
+        assert!(req.http_requests_per_minute.is_none());
+        assert!(req.memory_mb.is_none());
+        assert!(req.fuel_limit.is_none());
+    }
 }
