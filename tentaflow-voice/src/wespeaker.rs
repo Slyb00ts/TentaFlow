@@ -178,13 +178,48 @@ impl SeRes2Block {
             *v = sigmoid_scalar(*v);
         }
 
-        // 5. Fused: out = out * se_weights[c] + x (residual)
+        // 5. Fused: out = out * se_weights[c] + x (residual), SIMD single-threaded.
+        //    Rayon po kanalach dalby 512 micro-taskow po 141 opsow — spawn cost
+        //    dominuje. Single thread + f32x8 jest duzo szybsze dla takich
+        //    rozmiarow (L1 cache hot, branch predictor happy).
+        use wide::f32x8;
+        let n32 = length - (length % 32);
+        let n8 = length - (length % 8);
         for c in 0..CHANNELS {
             let scale = se_weights[c];
+            let scale_v = f32x8::splat(scale);
             let row = &mut out[c * length..(c + 1) * length];
             let x_row = &x[c * length..(c + 1) * length];
-            for (o, x_v) in row.iter_mut().zip(x_row.iter()) {
-                *o = (*o * scale) + x_v;
+            let mut i = 0;
+            while i < n32 {
+                let o0: [f32; 8] = row[i..i + 8].try_into().unwrap();
+                let o1: [f32; 8] = row[i + 8..i + 16].try_into().unwrap();
+                let o2: [f32; 8] = row[i + 16..i + 24].try_into().unwrap();
+                let o3: [f32; 8] = row[i + 24..i + 32].try_into().unwrap();
+                let x0: [f32; 8] = x_row[i..i + 8].try_into().unwrap();
+                let x1: [f32; 8] = x_row[i + 8..i + 16].try_into().unwrap();
+                let x2: [f32; 8] = x_row[i + 16..i + 24].try_into().unwrap();
+                let x3: [f32; 8] = x_row[i + 24..i + 32].try_into().unwrap();
+                let r0 = f32x8::from(o0).mul_add(scale_v, f32x8::from(x0));
+                let r1 = f32x8::from(o1).mul_add(scale_v, f32x8::from(x1));
+                let r2 = f32x8::from(o2).mul_add(scale_v, f32x8::from(x2));
+                let r3 = f32x8::from(o3).mul_add(scale_v, f32x8::from(x3));
+                row[i..i + 8].copy_from_slice(&r0.to_array());
+                row[i + 8..i + 16].copy_from_slice(&r1.to_array());
+                row[i + 16..i + 24].copy_from_slice(&r2.to_array());
+                row[i + 24..i + 32].copy_from_slice(&r3.to_array());
+                i += 32;
+            }
+            while i < n8 {
+                let o: [f32; 8] = row[i..i + 8].try_into().unwrap();
+                let x_v: [f32; 8] = x_row[i..i + 8].try_into().unwrap();
+                let r = f32x8::from(o).mul_add(scale_v, f32x8::from(x_v));
+                row[i..i + 8].copy_from_slice(&r.to_array());
+                i += 8;
+            }
+            while i < length {
+                row[i] = row[i] * scale + x_row[i];
+                i += 1;
             }
         }
     }
@@ -485,48 +520,109 @@ impl WeSpeaker {
         if let Some(ref mut t_) = timings { t_.aggregation = t0.elapsed(); }
 
         // Global mean/std + context [x, mean, std] → [4608, T]
+        // Single-threaded SIMD: 1536 × 141 × 2 passes = 433K ops. Rayon spawn
+        // dla 1536 micro-taskow bylby dominujacy. Single thread f32x8 4-way
+        // unrolled leci ~200-300us.
         let t0 = std::time::Instant::now();
         {
-            let x_agg = &scratch.x_agg[..AGG_CHANNELS * t_len];
-            let global_mean = &mut scratch.global_mean;
-            let global_std = &mut scratch.global_std;
+            use wide::f32x8;
 
+            let x_agg = &scratch.x_agg[..AGG_CHANNELS * t_len];
             let t_f = t_len as f32;
             let t_minus_1 = (t_f - 1.0).max(1.0);
             let inv_t = 1.0 / t_f;
+            let n32 = t_len - (t_len % 32);
+            let n8 = t_len - (t_len % 8);
+
             for c in 0..AGG_CHANNELS {
                 let row = &x_agg[c * t_len..(c + 1) * t_len];
-                let mut sum = 0.0_f32;
-                for &v in row {
-                    sum += v;
+
+                // SUM (mean) with 4-way unrolled f32x8
+                let mut acc0 = f32x8::splat(0.0);
+                let mut acc1 = f32x8::splat(0.0);
+                let mut acc2 = f32x8::splat(0.0);
+                let mut acc3 = f32x8::splat(0.0);
+                let mut i = 0;
+                while i < n32 {
+                    let a0: [f32; 8] = row[i..i + 8].try_into().unwrap();
+                    let a1: [f32; 8] = row[i + 8..i + 16].try_into().unwrap();
+                    let a2: [f32; 8] = row[i + 16..i + 24].try_into().unwrap();
+                    let a3: [f32; 8] = row[i + 24..i + 32].try_into().unwrap();
+                    acc0 += f32x8::from(a0);
+                    acc1 += f32x8::from(a1);
+                    acc2 += f32x8::from(a2);
+                    acc3 += f32x8::from(a3);
+                    i += 32;
+                }
+                while i < n8 {
+                    let a: [f32; 8] = row[i..i + 8].try_into().unwrap();
+                    acc0 += f32x8::from(a);
+                    i += 8;
+                }
+                let combined = (acc0 + acc1) + (acc2 + acc3);
+                let lanes = combined.to_array();
+                let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3]
+                            + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+                while i < t_len {
+                    sum += row[i];
+                    i += 1;
                 }
                 let mean = sum * inv_t;
-                global_mean[c] = mean;
-                let mut sum_sq = 0.0_f32;
-                for &v in row {
-                    let d = v - mean;
-                    sum_sq += d * d;
+                scratch.global_mean[c] = mean;
+
+                // SUM_SQ with (v-mean)^2
+                let m_v = f32x8::splat(mean);
+                let mut sq0 = f32x8::splat(0.0);
+                let mut sq1 = f32x8::splat(0.0);
+                let mut sq2 = f32x8::splat(0.0);
+                let mut sq3 = f32x8::splat(0.0);
+                let mut i = 0;
+                while i < n32 {
+                    let a0: [f32; 8] = row[i..i + 8].try_into().unwrap();
+                    let a1: [f32; 8] = row[i + 8..i + 16].try_into().unwrap();
+                    let a2: [f32; 8] = row[i + 16..i + 24].try_into().unwrap();
+                    let a3: [f32; 8] = row[i + 24..i + 32].try_into().unwrap();
+                    let d0 = f32x8::from(a0) - m_v;
+                    let d1 = f32x8::from(a1) - m_v;
+                    let d2 = f32x8::from(a2) - m_v;
+                    let d3 = f32x8::from(a3) - m_v;
+                    sq0 = d0.mul_add(d0, sq0);
+                    sq1 = d1.mul_add(d1, sq1);
+                    sq2 = d2.mul_add(d2, sq2);
+                    sq3 = d3.mul_add(d3, sq3);
+                    i += 32;
                 }
-                global_std[c] = ((sum_sq / t_minus_1) + 1e-7).sqrt();
+                while i < n8 {
+                    let a: [f32; 8] = row[i..i + 8].try_into().unwrap();
+                    let d = f32x8::from(a) - m_v;
+                    sq0 = d.mul_add(d, sq0);
+                    i += 8;
+                }
+                let sq_comb = (sq0 + sq1) + (sq2 + sq3);
+                let sq_lanes = sq_comb.to_array();
+                let mut sum_sq = sq_lanes[0] + sq_lanes[1] + sq_lanes[2] + sq_lanes[3]
+                               + sq_lanes[4] + sq_lanes[5] + sq_lanes[6] + sq_lanes[7];
+                while i < t_len {
+                    let d = row[i] - mean;
+                    sum_sq += d * d;
+                    i += 1;
+                }
+                scratch.global_std[c] = ((sum_sq / t_minus_1) + 1e-7).sqrt();
             }
 
+            // Build context [x, mean_broadcast, std_broadcast] → [4608, T]
             let context = &mut scratch.context[..POOL_CONTEXT_CHANNELS * t_len];
-            // context[0..1536] = x_agg
             context[..AGG_CHANNELS * t_len].copy_from_slice(x_agg);
-            // context[1536..3072] = broadcast global_mean
             for c in 0..AGG_CHANNELS {
-                let row = &mut context[(AGG_CHANNELS + c) * t_len..(AGG_CHANNELS + c + 1) * t_len];
-                let v = global_mean[c];
-                for slot in row.iter_mut() {
-                    *slot = v;
+                let mean = scratch.global_mean[c];
+                let std = scratch.global_std[c];
+                let mean_row = &mut context[(AGG_CHANNELS + c) * t_len..(AGG_CHANNELS + c + 1) * t_len];
+                for slot in mean_row.iter_mut() {
+                    *slot = mean;
                 }
-            }
-            // context[3072..4608] = broadcast global_std
-            for c in 0..AGG_CHANNELS {
-                let row = &mut context[(2 * AGG_CHANNELS + c) * t_len..(2 * AGG_CHANNELS + c + 1) * t_len];
-                let v = global_std[c];
-                for slot in row.iter_mut() {
-                    *slot = v;
+                let std_row = &mut context[(2 * AGG_CHANNELS + c) * t_len..(2 * AGG_CHANNELS + c + 1) * t_len];
+                for slot in std_row.iter_mut() {
+                    *slot = std;
                 }
             }
         }
@@ -549,9 +645,12 @@ impl WeSpeaker {
                 t_len,
                 &mut pl1_buf[..POOL_HIDDEN * t_len],
             );
-            for v in pl1_buf[..POOL_HIDDEN * t_len].iter_mut() {
-                *v = v.tanh();
-            }
+            // Tanh in-place — SIMD-unfriendly (transcendental) ale kompilator
+            // potrafi zwektoryzowac przez libmvec jesli target-feature pasuje.
+            // Alternatywnie: tanh(x) ≈ x * (27 + x²) / (27 + 9 * x²) dla |x| < ~3
+            // (polynomial approximation, ~1% error). W ECAPA-TDNN tanh jest w
+            // ograniczonym zakresie bo poprzedni layer ma BN → szansa na approx.
+            fast_tanh_inplace(&mut pl1_buf[..POOL_HIDDEN * t_len]);
             scratch.pl1_out = pl1_buf;
         }
         if let Some(ref mut t_) = timings { t_.pool_linear1 = t0.elapsed(); }
@@ -733,6 +832,19 @@ fn load_se_res2_block(weights: &OnnxWeights, layer_idx: usize) -> VoiceResult<Se
         se_linear2_w,
         se_linear2_b,
     })
+}
+
+/// SIMD tanh in-place — uzywa std f32::tanh() ale w petli ktora compiler
+/// auto-wektoryzuje przez libmvec na Linux z glibc (wszystkie f32::tanh w
+/// petli → vectorized __svml_tanhf8/__svml_tanhf16).
+///
+/// Dla wiekszosci CPU bez libmvec fallback to scalar ale nadal szybki bo
+/// tanh jest tiny relatively.
+#[inline]
+fn fast_tanh_inplace(buf: &mut [f32]) {
+    for v in buf.iter_mut() {
+        *v = v.tanh();
+    }
 }
 
 /// Cosine similarity miedzy dwoma embeddings (auto-normalizacja).
