@@ -113,3 +113,67 @@
     gap: 2px;
   }
 }
+
+/* Sekcja transkrypcji w Bot Status */
+.meeting-transcripts {
+  margin-top: var(--spacing-lg);
+  border-top: 1px solid var(--border-color);
+  padding-top: var(--spacing-md);
+}
+
+.meeting-transcripts-title {
+  margin: 0 0 var(--spacing-sm) 0;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.meeting-transcript-list {
+  max-height: 420px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  padding-right: var(--spacing-xs);
+}
+
+.meeting-transcript-row {
+  padding: var(--spacing-sm);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--accent-primary);
+}
+
+.meeting-transcript-meta {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: center;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.meeting-transcript-time {
+  font-family: var(--font-mono);
+}
+
+.meeting-transcript-speaker {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.meeting-transcript-model {
+  padding: 1px 6px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.meeting-transcript-text {
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  word-break: break-word;
+}

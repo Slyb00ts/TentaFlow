@@ -254,8 +254,10 @@ const Models = (() => {
         ? `<span class="badge badge-success"><span class="status-dot status-dot-green"></span>${I18n.t('common.active')}</span>`
         : `<span class="badge badge-error"><span class="status-dot status-dot-red"></span>${I18n.t('common.inactive')}</span>`;
 
-      // Fallback targets — liczba
-      const fallbacks = a.fallback_targets || [];
+      // Fallback targets — backend zwraca CSV string, parsujemy do tablicy
+      const fallbacks = a.fallback_targets
+        ? a.fallback_targets.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
       const fallbackCount = fallbacks.length > 0
         ? `<span class="badge badge-info" title="${fallbacks.map(f => Utils.escapeAttr(f)).join(', ')}">${fallbacks.length}</span>`
         : '-';
@@ -314,8 +316,10 @@ const Models = (() => {
     const modalTitle = isEdit ? (I18n.t('models.edit_alias') || 'Edit Alias') : I18n.t('models.new_alias');
     const saveBtnLabel = isEdit ? I18n.t('common.save') : I18n.t('common.add');
 
-    // Stan wybranych fallback targets
-    let selectedFallbacks = isEdit ? [...(existingAlias.fallback_targets || [])] : [];
+    // Stan wybranych fallback targets (backend zwraca CSV string)
+    let selectedFallbacks = isEdit && existingAlias.fallback_targets
+      ? existingAlias.fallback_targets.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
 
     const modalOverlay = document.createElement('div');
     modalOverlay.className = 'modal-overlay active';
@@ -444,7 +448,7 @@ const Models = (() => {
         const payload = {
           alias: aliasName,
           target_model: targetModel,
-          fallback_targets: selectedFallbacks,
+          fallback_targets: selectedFallbacks.length > 0 ? selectedFallbacks.join(',') : null,
           strategy: aliasStrategy,
         };
 

@@ -40,10 +40,11 @@ impl LocalSttHandler {
         &self,
         request: &TranscriptionRequest,
     ) -> anyhow::Result<TranscriptionResponse> {
-        // Zbuduj TranscribeParams z TranscriptionRequest
+        // Zbuduj TranscribeParams z TranscriptionRequest.
+        // Domyslny jezyk: polski (jesli request.language nie jest ustawiony)
         let params = TranscribeParams {
             audio_data: request.file.clone(),
-            language: request.language.clone(),
+            language: request.language.clone().or_else(|| Some("pl".to_string())),
             translate: false,
             word_timestamps: request
                 .timestamp_granularities

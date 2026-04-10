@@ -1026,6 +1026,8 @@
     "stt_alias": "Alias STT",
     "tts_alias": "Alias TTS",
     "llm_alias": "Alias LLM",
-    "status_unavailable": "Status Meeting Bota niedostepny"
+    "status_unavailable": "Status Meeting Bota niedostepny",
+    "transcripts": "Transkrypcje",
+    "no_transcripts": "Brak transkrypcji — zacznij mowic w spotkaniu"
   }
 }

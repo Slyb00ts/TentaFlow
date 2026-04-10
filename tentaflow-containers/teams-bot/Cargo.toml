@@ -20,8 +20,13 @@ tokio = { version = "1", features = ["full"] }
 chromiumoxide = "0.9"
 futures = "0.3"
 
-# ONNX Runtime (Silero VAD)
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-24"] }
+# WebSocket serwer localhost — most audio miedzy Chromium (JS) a Rust
+tokio-tungstenite = "0.24"
+
+# Silero VAD — pure Rust implementation z tentaflow-voice
+# Zastepuje wczesniejsza implementacje przez ort/onnxruntime.
+tentaflow-voice = { path = "../../tentaflow-voice" }
+parking_lot = "0.12"
 
 # QUIC serwer
 quinn = "0.11"
