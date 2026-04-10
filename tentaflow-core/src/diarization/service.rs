@@ -23,10 +23,11 @@ const DEFAULT_MAX_SPEAKERS: usize = 20;
 /// segmenty daja szumne wyniki (w testach cos ~0.45-0.55 sam-do-siebie).
 const MIN_AUDIO_SAMPLES: usize = 16000; // 1.0s @ 16kHz
 
-/// Maksymalna dlugosc audio podawana do WeSpeaker. Embedding stabilizuje sie
-/// okolo 2-3s, a koszt ekstrakcji rosnie liniowo w dlugosci audio, wiec dla
-/// dluzszych segmentow bierzemy *srodkowe* MAX_AUDIO_SAMPLES probek.
-const MAX_AUDIO_SAMPLES: usize = 48000; // 3.0s @ 16kHz
+/// Maksymalna dlugosc audio podawana do WeSpeaker. Embedding ECAPA-TDNN
+/// stabilizuje sie okolo 1-1.5s (cos vs reference plateau'uje), a koszt
+/// ekstrakcji rosnie liniowo w dlugosci audio. Bierzemy *srodkowe*
+/// MAX_AUDIO_SAMPLES probek zeby trzymac latencje per-segment w ~8-10ms.
+const MAX_AUDIO_SAMPLES: usize = 24000; // 1.5s @ 16kHz
 
 /// Sciezka do modelu WeSpeaker ONNX — env var DIARIZATION_MODEL_PATH lub fallback
 fn default_model_path() -> String {

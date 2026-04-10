@@ -100,110 +100,153 @@ fn build_mel_filterbank(n_fft: usize, sample_rate: f32, n_mels: usize) -> Vec<f3
     fb
 }
 
-/// Kaldi-compatible Fbank features: audio 16kHz mono f32 → [num_frames][80]
-pub fn compute_fbank(samples: &[f32]) -> Vec<Vec<f32>> {
+/// Kaldi-compatible Fbank features: audio 16kHz mono f32 → flat [N_MELS, T]
+/// Format wyjscia jest od razu gotowy dla Conv1d — [mel_bin, time_frame] row-major.
+///
+/// Per-thread scratch: planner FFT, fft_buffer, frame_buf, power_buf, mel_buf,
+/// means. Wszystkie zyja w thread_local i rosna lazy. Hot path nie alokuje.
+pub fn compute_fbank_into(samples: &[f32], out: &mut Vec<f32>) -> usize {
     if samples.len() < FRAME_LENGTH {
-        return Vec::new();
+        out.clear();
+        return 0;
     }
 
     let cache = get_cache();
     let n_freqs = N_FFT / 2 + 1;
-
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(N_FFT);
-
     let n_frames = (samples.len() - FRAME_LENGTH) / FRAME_SHIFT + 1;
-    let mut frames_out = Vec::with_capacity(n_frames);
 
-    // Per-frame buffer do FFT (alokowany raz, reuse)
-    let mut fft_buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); N_FFT];
+    // out bedzie [N_MELS, n_frames] — rosniemy w razie potrzeby
+    let total = N_MELS * n_frames;
+    if out.len() < total {
+        out.resize(total, 0.0);
+    }
 
-    for frame_idx in 0..n_frames {
-        let start = frame_idx * FRAME_SHIFT;
-        let raw = &samples[start..start + FRAME_LENGTH];
-
-        // 1. Pre-emphasis: y[0] = x[0] - 0.97 * x[0], y[t] = x[t] - 0.97 * x[t-1]
-        // W kaldi dla pierwszej probki uzywa sie x[0] (jako "prev") co daje y[0] = 0.03 * x[0]
-        let mut frame = vec![0.0_f32; FRAME_LENGTH];
-        frame[0] = raw[0] - PREEMPHASIS * raw[0];
-        for t in 1..FRAME_LENGTH {
-            frame[t] = raw[t] - PREEMPHASIS * raw[t - 1];
+    FBANK_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        if s.fft.is_none() {
+            let mut planner = FftPlanner::<f32>::new();
+            s.fft = Some(planner.plan_fft_forward(N_FFT));
+        }
+        if s.fft_buffer.len() < N_FFT {
+            s.fft_buffer.resize(N_FFT, Complex::new(0.0, 0.0));
+        }
+        if s.frame.len() < FRAME_LENGTH {
+            s.frame.resize(FRAME_LENGTH, 0.0);
+        }
+        if s.power.len() < n_freqs {
+            s.power.resize(n_freqs, 0.0);
         }
 
-        // 2. Remove DC offset (subtract mean)
-        let mean: f32 = frame.iter().sum::<f32>() / FRAME_LENGTH as f32;
-        for v in frame.iter_mut() {
+        // Destructure s raz — osobne &mut refs
+        let FbankScratch { fft, fft_buffer, frame, power } = &mut *s;
+        let fft = fft.as_ref().unwrap().clone();
+        let frame = &mut frame[..FRAME_LENGTH];
+        let fft_buffer = &mut fft_buffer[..N_FFT];
+        let power = &mut power[..n_freqs];
+
+        for frame_idx in 0..n_frames {
+            let start = frame_idx * FRAME_SHIFT;
+            let raw = &samples[start..start + FRAME_LENGTH];
+
+            // 1+2+3. Pre-emphasis + DC + Hamming w jednej petli
+            frame[0] = raw[0] - PREEMPHASIS * raw[0];
+            let mut sum_f: f32 = frame[0];
+            for t in 1..FRAME_LENGTH {
+                let v = raw[t] - PREEMPHASIS * raw[t - 1];
+                frame[t] = v;
+                sum_f += v;
+            }
+            let mean = sum_f / FRAME_LENGTH as f32;
+            let window = &cache.window[..];
+            for t in 0..FRAME_LENGTH {
+                frame[t] = (frame[t] - mean) * window[t];
+            }
+
+            // 4. Zero-pad do N_FFT i FFT
+            for i in 0..FRAME_LENGTH {
+                fft_buffer[i] = Complex::new(frame[i], 0.0);
+            }
+            for i in FRAME_LENGTH..N_FFT {
+                fft_buffer[i] = Complex::new(0.0, 0.0);
+            }
+            fft.process(fft_buffer);
+
+            // 5. Power spectrum
+            for i in 0..n_freqs {
+                let re = fft_buffer[i].re;
+                let im = fft_buffer[i].im;
+                power[i] = re * re + im * im;
+            }
+
+            // 6+7. Mel filterbank + log — piszemy od razu do out[mel, frame]
+            for m in 0..N_MELS {
+                let fb_row = &cache.mel_fb[m * n_freqs..(m + 1) * n_freqs];
+                let mut acc = 0.0_f32;
+                for f in 0..n_freqs {
+                    acc += fb_row[f] * power[f];
+                }
+                out[m * n_frames + frame_idx] = acc.max(ENERGY_FLOOR).ln();
+            }
+        }
+    });
+
+    // 8. Mean subtraction per mel bin across frames (kluczowe dla WeSpeaker!)
+    //    Mean liczony per wiersz mel (ciagle w pamieci → friendly do SIMD autovec)
+    let inv_n = 1.0 / n_frames as f32;
+    for m in 0..N_MELS {
+        let row = &mut out[m * n_frames..(m + 1) * n_frames];
+        let mut sum = 0.0_f32;
+        for &v in row.iter() {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        for v in row.iter_mut() {
             *v -= mean;
         }
-
-        // 3. Hamming window
-        for (t, v) in frame.iter_mut().enumerate() {
-            *v *= cache.window[t];
-        }
-
-        // 4. Zero-pad do N_FFT i FFT
-        for i in 0..FRAME_LENGTH {
-            fft_buffer[i] = Complex::new(frame[i], 0.0);
-        }
-        for i in FRAME_LENGTH..N_FFT {
-            fft_buffer[i] = Complex::new(0.0, 0.0);
-        }
-        fft.process(&mut fft_buffer);
-
-        // 5. Power spectrum |X|^2 (pierwsze n_freqs binow)
-        let mut power = vec![0.0_f32; n_freqs];
-        for i in 0..n_freqs {
-            let re = fft_buffer[i].re;
-            let im = fft_buffer[i].im;
-            power[i] = re * re + im * im;
-        }
-
-        // 6. Mel filterbank
-        let mut mel = vec![0.0_f32; N_MELS];
-        for m in 0..N_MELS {
-            let mut sum = 0.0_f32;
-            let fb_row = &cache.mel_fb[m * n_freqs..(m + 1) * n_freqs];
-            for f in 0..n_freqs {
-                sum += fb_row[f] * power[f];
-            }
-            mel[m] = sum;
-        }
-
-        // 7. log(max(mel, energy_floor))
-        for v in mel.iter_mut() {
-            *v = v.max(ENERGY_FLOOR).ln();
-        }
-
-        frames_out.push(mel);
     }
 
-    // 8. Mean subtraction (NIE std normalization — to klucz dla WeSpeaker!)
-    subtract_mean(&mut frames_out);
-    frames_out
+    n_frames
 }
 
-/// Odejmuje sredni wektor z kazdej ramki (per mel bin across frames)
-fn subtract_mean(frames: &mut [Vec<f32>]) {
-    if frames.is_empty() {
-        return;
+/// Wariant z alokacja (backwards compat dla testow / bench).
+pub fn compute_fbank(samples: &[f32]) -> Vec<Vec<f32>> {
+    if samples.len() < FRAME_LENGTH {
+        return Vec::new();
     }
-    let num_frames = frames.len();
-    let num_mels = frames[0].len();
-    let mut means = vec![0.0_f32; num_mels];
-    for frame in frames.iter() {
-        for (i, &v) in frame.iter().enumerate() {
-            means[i] += v;
+    let mut flat = Vec::new();
+    let n_frames = compute_fbank_into(samples, &mut flat);
+    // Konwersja [N_MELS, n_frames] → Vec<[N_MELS]> × n_frames
+    let mut out = Vec::with_capacity(n_frames);
+    for t in 0..n_frames {
+        let mut row = Vec::with_capacity(N_MELS);
+        for m in 0..N_MELS {
+            row.push(flat[m * n_frames + t]);
+        }
+        out.push(row);
+    }
+    out
+}
+
+struct FbankScratch {
+    fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>>,
+    fft_buffer: Vec<Complex<f32>>,
+    frame: Vec<f32>,
+    power: Vec<f32>,
+}
+
+impl FbankScratch {
+    fn new() -> Self {
+        Self {
+            fft: None,
+            fft_buffer: Vec::new(),
+            frame: Vec::new(),
+            power: Vec::new(),
         }
     }
-    let inv_n = 1.0 / num_frames as f32;
-    for m in &mut means {
-        *m *= inv_n;
-    }
-    for frame in frames.iter_mut() {
-        for (i, v) in frame.iter_mut().enumerate() {
-            *v -= means[i];
-        }
-    }
+}
+
+thread_local! {
+    static FBANK_SCRATCH: std::cell::RefCell<FbankScratch> = std::cell::RefCell::new(FbankScratch::new());
 }
 
 /// Konwertuje [num_frames][N_MELS] -> flat [N_MELS, num_frames] (transposed dla Conv1d)
