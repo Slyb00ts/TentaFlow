@@ -18,6 +18,9 @@ wide = "0.7"
 # FFT dla fbank features (pure Rust, no C deps)
 rustfft = "6.2"
 
+# Parallelizacja hot loops (Conv1D po out_channels) — CPU multi-core
+rayon = "1.10"
+
 # Error handling
 thiserror = "2"
 

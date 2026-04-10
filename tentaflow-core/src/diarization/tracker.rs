@@ -1,29 +1,32 @@
 // =============================================================================
 // Plik: diarization/tracker.rs
-// Opis: Incremental speaker clustering — dla kazdego nowego embeddingu
-//       sprawdza czy pasuje do istniejacego centroidu (cosine similarity),
-//       jesli tak: update centroid moving average; jesli nie: stworz nowego
-//       SPEAKER_XX. Stan resetowany przy zmianie meetingu.
+// Opis: Online speaker clustering. Per mowca przechowujemy okno N ostatnich
+//       embeddingow (L2-znormalizowanych) zamiast pojedynczego centroidu —
+//       nowy embedding jest dopasowywany do *maksymalnej* similarity po
+//       wszystkich embeddingach w oknach wszystkich mowcow. To jest znacznie
+//       bardziej odporne na wariancje akustyczna tego samego glosu (glosno
+//       vs cicho, rozna energia, zmiana mikrofonu) niz klasyczny centroid.
 // =============================================================================
 
 use super::embedding::cosine_similarity;
+use std::collections::VecDeque;
 
-/// Jeden zidentyfikowany mowca
+/// Maksymalna liczba ostatnich embeddingow przechowywanych per mowca.
+/// Wiecej = wiecej pamieci i wiecej porownan, ale lepsza odpornosc.
+const EMBEDDINGS_PER_SPEAKER: usize = 8;
+
 struct Speaker {
-    /// Etykieta (np. "SPEAKER_00")
     label: String,
-    /// Sredni embedding (centroid) po wszystkich wypowiedziach
-    centroid: Vec<f32>,
-    /// Liczba wypowiedzi przypisanych do tego speakera (do running average)
+    /// Okno ostatnich embeddingow (L2-znormalizowane). Nowe dodawane na koniec,
+    /// najstarsze usuwane gdy rozmiar > EMBEDDINGS_PER_SPEAKER.
+    recent: VecDeque<Vec<f32>>,
+    /// Calkowita liczba przypisanych wypowiedzi (dla statystyk)
     count: usize,
 }
 
-/// Incremental speaker tracker
 pub struct SpeakerTracker {
     speakers: Vec<Speaker>,
-    /// Prog similarity ponizej ktorego zakladamy ze to nowy mowca
     similarity_threshold: f32,
-    /// Maksymalna liczba mowcow (dalej przypisujemy do najblizszego)
     max_speakers: usize,
 }
 
@@ -36,52 +39,55 @@ impl SpeakerTracker {
         }
     }
 
-    /// Resetuje stan — nowy meeting, nowi speakerzy od SPEAKER_00
     pub fn reset(&mut self) {
         self.speakers.clear();
     }
 
     /// Dopasowuje embedding do istniejacego speakera albo tworzy nowego.
-    /// Zwraca etykiete speakera (np. "SPEAKER_00").
+    /// Uzywa max-similarity po wszystkich embeddingach w oknie kazdego mowcy.
     pub fn track(&mut self, embedding: &[f32]) -> String {
-        // Znajdz najblizszego speakera
+        let normalized = l2_normalize(embedding);
+
+        // Znajdz speakera z NAJWIEKSZA max-similarity do jego okna
         let mut best_idx: Option<usize> = None;
         let mut best_sim: f32 = -1.0;
 
         for (i, spk) in self.speakers.iter().enumerate() {
-            let sim = cosine_similarity(embedding, &spk.centroid);
-            if sim > best_sim {
-                best_sim = sim;
+            let max_sim_for_speaker = spk
+                .recent
+                .iter()
+                .map(|e| cosine_similarity(&normalized, e))
+                .fold(f32::NEG_INFINITY, f32::max);
+            if max_sim_for_speaker > best_sim {
+                best_sim = max_sim_for_speaker;
                 best_idx = Some(i);
             }
         }
 
-        // Dopasowanie
         match best_idx {
             Some(idx) if best_sim >= self.similarity_threshold => {
-                // Aktualizuj centroid (running average w przestrzeni raw embeddingow,
-                // bez L2 renormalizacji — cosine_similarity i tak auto-normalizuje,
-                // a mieszanie znormalizowanego centroidu z raw embeddingiem psuje srednia).
                 let spk = &mut self.speakers[idx];
-                let n = spk.count as f32;
-                for (i, v) in spk.centroid.iter_mut().enumerate() {
-                    *v = (*v * n + embedding[i]) / (n + 1.0);
+                spk.recent.push_back(normalized);
+                while spk.recent.len() > EMBEDDINGS_PER_SPEAKER {
+                    spk.recent.pop_front();
                 }
                 spk.count += 1;
                 tracing::debug!(
                     speaker = %spk.label,
                     similarity = best_sim,
                     count = spk.count,
+                    window = spk.recent.len(),
                     "Speaker matched"
                 );
                 spk.label.clone()
             }
             _ if self.speakers.len() < self.max_speakers => {
-                // Nowy mowca
                 let label = format!("SPEAKER_{:02}", self.speakers.len());
+                let mut recent = VecDeque::with_capacity(EMBEDDINGS_PER_SPEAKER);
+                recent.push_back(normalized);
                 self.speakers.push(Speaker {
                     label: label.clone(),
-                    centroid: embedding.to_vec(),
+                    recent,
                     count: 1,
                 });
                 tracing::info!(
@@ -92,8 +98,11 @@ impl SpeakerTracker {
                 label
             }
             Some(idx) => {
-                // Limit osiagniety — przypisz do najblizszego mimo nizszej similarity
                 let spk = &mut self.speakers[idx];
+                spk.recent.push_back(normalized);
+                while spk.recent.len() > EMBEDDINGS_PER_SPEAKER {
+                    spk.recent.pop_front();
+                }
                 spk.count += 1;
                 tracing::debug!(
                     speaker = %spk.label,
@@ -102,10 +111,7 @@ impl SpeakerTracker {
                 );
                 spk.label.clone()
             }
-            None => {
-                // Pusty tracker + limit 0 — niemozliwe, ale dla bezpieczenstwa
-                "SPEAKER_UNKNOWN".to_string()
-            }
+            None => "SPEAKER_UNKNOWN".to_string(),
         }
     }
 
@@ -113,6 +119,14 @@ impl SpeakerTracker {
     pub fn count(&self) -> usize {
         self.speakers.len()
     }
+}
+
+fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm < 1e-12 {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / norm).collect()
 }
 
 #[cfg(test)]
@@ -166,8 +180,24 @@ mod tests {
         let emb3 = normalize(vec![0.0, 0.0, 1.0, 0.0]);
         assert_eq!(t.track(&emb1), "SPEAKER_00");
         assert_eq!(t.track(&emb2), "SPEAKER_01");
-        // Trzeci rozny ale limit 2 — dopasuj do najblizszego
         let label = t.track(&emb3);
         assert!(label == "SPEAKER_00" || label == "SPEAKER_01");
+    }
+
+    /// Regresja: ten sam glos z variancja akustyczna nie powinien byc
+    /// sklasyfikowany jako nowy mowca gdy jeden z historycznych embeddingow
+    /// jest mu bliski (max-similarity > threshold).
+    #[test]
+    fn test_acoustic_variance_stays_same_speaker() {
+        let mut t = SpeakerTracker::new(0.5, 10);
+        // Trzy warianty tego samego "glosu" — kazdy przesuniety ale zawsze
+        // blisko jednego z wczesniejszych embeddingow
+        let e1 = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+        let e2 = normalize(vec![0.9, 0.2, 0.0, 0.0]);
+        let e3 = normalize(vec![0.2, 0.9, 0.0, 0.0]); // daleko od e1 ale blisko e2
+        assert_eq!(t.track(&e1), "SPEAKER_00");
+        assert_eq!(t.track(&e2), "SPEAKER_00");
+        // e3 vs e1: ~0.2, e3 vs e2: ~0.88 → max 0.88 > 0.5 → ten sam speaker
+        assert_eq!(t.track(&e3), "SPEAKER_00");
     }
 }
