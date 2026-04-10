@@ -25,10 +25,11 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     let user_data_dir = "/tmp/chromium-meeting-bot";
     let prefs_dir = format!("{}/Default", user_data_dir);
     std::fs::create_dir_all(&prefs_dir).ok();
-    // content_settings: 1 = allow, pattern "*" = wszystkie strony
+    // content_settings: 1 = allow, 2 = block
+    // Mikrofon dozwolony (bot musi mowic), kamera zablokowana (bot nie potrzebuje video)
     std::fs::write(
         format!("{}/Preferences", prefs_dir),
-        r#"{"profile":{"content_settings":{"exceptions":{"media_stream_mic":{"*,*":{"setting":1}},"media_stream_camera":{"*,*":{"setting":1}},"notifications":{"*,*":{"setting":2}}}}}}"#,
+        r#"{"profile":{"content_settings":{"exceptions":{"media_stream_mic":{"*,*":{"setting":1}},"media_stream_camera":{"*,*":{"setting":2}},"notifications":{"*,*":{"setting":2}}}}}}"#,
     ).ok();
 
     let browser_config = BrowserConfig::builder()
@@ -37,10 +38,12 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         .no_sandbox()
         .window_size(1920, 1080)
         .user_data_dir(user_data_dir)
-        .arg("--use-fake-ui-for-media-stream")
-        .arg("--autoplay-policy=no-user-gesture-required")
-        .arg("--enable-features=PulseaudioLoopbackForCast")
-        .arg("--disable-gpu")
+        .arg("use-fake-ui-for-media-stream")
+        .arg("autoplay-policy=no-user-gesture-required")
+        .arg("enable-features=PulseaudioLoopbackForCast")
+        .arg("disable-gpu")
+        .arg("disable-blink-features=AutomationControlled")
+        .arg("ignore-certificate-errors")
         .build()
         .map_err(|e| anyhow::anyhow!("Blad konfiguracji Chromium: {}", e))?;
 

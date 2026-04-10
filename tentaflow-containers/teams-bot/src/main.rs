@@ -98,7 +98,6 @@ async fn main() -> Result<()> {
 
     // 5. Uruchom przechwytywanie audio
     let mut audio_capture = audio::start_capture(
-        config.audio_device.as_deref(),
         config.chunk_duration_ms,
     )?;
     tracing::info!("Przechwytywanie audio uruchomione");
@@ -108,6 +107,7 @@ async fn main() -> Result<()> {
         config.vad_model_path.as_deref(),
         config.chunk_duration_ms,
         config.silence_threshold_ms,
+        config.vad_rms_threshold,
     )?;
 
     // 7. Glowna petla: audio -> VAD -> STT (QUIC) -> streaming transcript -> TTS (QUIC)
@@ -161,7 +161,16 @@ async fn main() -> Result<()> {
                                 .as_millis() as u64;
 
                             // Wyslij audio do STT przez router (reverse QUIC)
-                            match router_client.transcribe(&speech_buffer, stt_model, None).await {
+                            // Pobierz AKTUALNY RouterClient (moze sie zmienic po reconnect)
+                            let current_client = router_client_handle.lock().await.clone();
+                            let stt_result = match current_client {
+                                Some(client) => client.transcribe(&speech_buffer, stt_model, None).await,
+                                None => {
+                                    tracing::warn!("Router nie polaczony — pomijam STT");
+                                    Err(anyhow::anyhow!("brak RouterClient"))
+                                }
+                            };
+                            match stt_result {
                                 Ok(text) if !text.is_empty() => {
                                     tracing::info!(speaker = %speaker, "[{}]: {}", speaker, text);
 

@@ -48,7 +48,7 @@ impl RouterClient {
     /// Otwiera nowy stream bidirektionalny na istniejacym polaczeniu.
     pub async fn send_request(&self, request: &ModelRequest) -> Result<ModelResponse> {
         let (mut send, mut recv) = self.connection.open_bi().await
-            .context("Nie udalo sie otworzyc streamu do routera")?;
+            .map_err(|e| anyhow::anyhow!("Nie udalo sie otworzyc streamu do routera: {}", e))?;
 
         let request_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(request)
             .map_err(|e| anyhow::anyhow!("Blad serializacji ModelRequest: {}", e))?;

@@ -52,6 +52,10 @@ pub struct MeetingConfig {
     /// Prog ciszy w milisekundach — po tym czasie VAD uznaje koniec wypowiedzi
     #[serde(default = "default_silence_threshold")]
     pub silence_threshold_ms: u32,
+
+    /// Prog RMS powyzej ktorego VAD uznaje za mowe (uzywany gdy brak modelu Silero)
+    #[serde(default = "default_vad_rms_threshold")]
+    pub vad_rms_threshold: f32,
 }
 
 fn default_quic_port() -> u16 {
@@ -64,6 +68,10 @@ fn default_chunk_duration() -> u32 {
 
 fn default_silence_threshold() -> u32 {
     2000
+}
+
+fn default_vad_rms_threshold() -> f32 {
+    100.0
 }
 
 fn default_bot_name() -> String {
@@ -108,6 +116,8 @@ impl MeetingConfig {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             silence_threshold_ms: std::env::var("SILENCE_THRESHOLD_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(2000),
+            vad_rms_threshold: std::env::var("VAD_RMS_THRESHOLD")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(100.0),
         };
 
         tracing::info!("Konfiguracja zaladowana ze zmiennych srodowiskowych");
