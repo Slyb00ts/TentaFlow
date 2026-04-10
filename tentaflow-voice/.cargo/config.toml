@@ -1,0 +1,19 @@
+# =============================================================================
+# Plik: .cargo/config.toml (tentaflow-voice)
+# Opis: Build-time flags wlaczajace wszystkie dostepne CPU features na tym hoscie.
+#       Kazdy ops::* uzywa wide::f32x8 ktore mapuje sie na AVX2/FMA na x86_64
+#       albo NEON na aarch64 — ale tylko jesli feature jest wlaczony w target.
+# =============================================================================
+
+[build]
+# target-cpu=native wlacza WSZYSTKO co ma lokalny CPU: AVX2, AVX-512 (jesli jest),
+# FMA, BMI2, NEON, SVE, itd. Dla dystrybucji binarnej uzyj target-cpu=x86-64-v3
+# (wymaga AVX2+FMA+BMI2, zgodne z wiekszoscia CPU >= 2015).
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+# Pelna LTO laczy wszystkie crate'y w jeden LLVM module — inlining pomiedzy
+# crate'ami jest krytyczny dla SIMD hot loopow (np. f32x8::mul_add musi byc
+# inline'owany do conv1d_simd zeby powstala jedna instrukcja vfmaddps).
+lto = "fat"
+codegen-units = 1

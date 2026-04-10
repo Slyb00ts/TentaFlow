@@ -171,19 +171,35 @@ async fn dispatch_reverse_request(
 
     match request.payload {
         ModelPayload::Audio(audio_payload) => {
-            // Przed STT: jesli diarization skompilowane, wyciagnij audio_data i
-            // zidentyfikuj speakera. Labelem bedzie SPEAKER_00/01/... lub None.
+            // Uruchamiamy diarization *rownolegle* ze STT (nie seryjnie). Diarization
+            // zjada kilkaset ms na CPU i bez tej paralelizacji dolozylaby sie wprost
+            // do latencji whispera. spawn_blocking bo WeSpeaker forward jest CPU-bound.
             #[cfg(feature = "inference-diarization")]
-            let speaker_label: Option<String> = match &audio_payload.operation {
+            let diarization_handle = match &audio_payload.operation {
                 AudioOperation::STT { audio_data, .. } => {
-                    crate::diarization::identify_speaker(audio_data)
+                    let audio_clone = audio_data.clone();
+                    Some(tokio::task::spawn_blocking(move || {
+                        crate::diarization::identify_speaker(&audio_clone)
+                    }))
                 }
                 _ => None,
             };
-            #[cfg(not(feature = "inference-diarization"))]
-            let speaker_label: Option<String> = None;
 
-            match router.route_audio_via_protocol(&audio_payload.operation).await {
+            let stt_future = router.route_audio_via_protocol(&audio_payload.operation);
+
+            #[cfg(feature = "inference-diarization")]
+            let (stt_result, speaker_label) = {
+                let stt_res = stt_future.await;
+                let label = match diarization_handle {
+                    Some(h) => h.await.ok().flatten(),
+                    None => None,
+                };
+                (stt_res, label)
+            };
+            #[cfg(not(feature = "inference-diarization"))]
+            let (stt_result, speaker_label): (_, Option<String>) = (stt_future.await, None);
+
+            match stt_result {
                 Ok(response) => {
                     // Jesli to STT (Text result), zapisz do transcript_store dla GUI Bot Status
                     if let ModelResult::Audio(ref audio_result) = response.result {

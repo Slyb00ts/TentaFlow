@@ -11,17 +11,22 @@ use std::sync::OnceLock;
 use tracing::{info, warn};
 
 /// Domyslne parametry clustering.
-/// Threshold 0.5 dobrany empirycznie — dla clean segmentow 2-3s in-speaker cos
-/// wynosi 0.8+, dla cross-speaker 0.15-0.30. Wartosc 0.5 obsluguje przypadek
-/// wariancji akustycznej w obrebie jednego mowcy (glosno vs cicho) bez laczenia
-/// roznych mowcow.
-const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.5;
+/// Threshold 0.4 dobrany empirycznie dla trackera z oknem N=8 embeddingow —
+/// porownujemy MAX similarity do *wszystkich* wczesniejszych embeddingow mowcy,
+/// wiec wystarczy ze nowa wypowiedz jest blizsza ktoremukolwiek z N ostatnich.
+/// Cross-speaker cos w naszych testach 0.15-0.30, wiec 0.4 jest bezpieczne.
+const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.4;
 const DEFAULT_MAX_SPEAKERS: usize = 20;
 
 /// Minimalna dlugosc audio do ekstrakcji wiarygodnego embeddingu.
 /// WeSpeaker ECAPA-TDNN potrzebuje ~1s+ do stabilnego embeddingu; krotsze
 /// segmenty daja szumne wyniki (w testach cos ~0.45-0.55 sam-do-siebie).
 const MIN_AUDIO_SAMPLES: usize = 16000; // 1.0s @ 16kHz
+
+/// Maksymalna dlugosc audio podawana do WeSpeaker. Embedding stabilizuje sie
+/// okolo 2-3s, a koszt ekstrakcji rosnie liniowo w dlugosci audio, wiec dla
+/// dluzszych segmentow bierzemy *srodkowe* MAX_AUDIO_SAMPLES probek.
+const MAX_AUDIO_SAMPLES: usize = 48000; // 3.0s @ 16kHz
 
 /// Sciezka do modelu WeSpeaker ONNX — env var DIARIZATION_MODEL_PATH lub fallback
 fn default_model_path() -> String {
@@ -85,7 +90,26 @@ pub fn identify_speaker(pcm_i16_le: &[u8]) -> Option<String> {
         return None;
     }
 
-    match ext.extract(&samples_f32) {
+    // Dla dlugich segmentow bierzemy srodkowe MAX_AUDIO_SAMPLES — WeSpeaker
+    // stabilizuje sie okolo 2-3s a koszt rosnie liniowo. Srodkowy wycinek
+    // unika ciszy/oddechu na brzegach i trzyma latencje w ryzach.
+    let clipped: &[f32] = if samples_f32.len() > MAX_AUDIO_SAMPLES {
+        let start = (samples_f32.len() - MAX_AUDIO_SAMPLES) / 2;
+        &samples_f32[start..start + MAX_AUDIO_SAMPLES]
+    } else {
+        &samples_f32[..]
+    };
+
+    let extract_start = std::time::Instant::now();
+    let extract_result = ext.extract(clipped);
+    let extract_ms = extract_start.elapsed().as_millis();
+    tracing::debug!(
+        samples_in = clipped.len(),
+        extract_ms,
+        "WeSpeaker embedding extracted"
+    );
+
+    match extract_result {
         Ok(embedding) => {
             let label = tracker().lock().track(&embedding);
             Some(label)
@@ -127,17 +151,40 @@ mod tests {
         let bytes1: Vec<u8> = seg1.iter().flat_map(|&s| s.to_le_bytes()).collect();
         let bytes2: Vec<u8> = seg2.iter().flat_map(|&s| s.to_le_bytes()).collect();
 
+        // Warm up — pierwsza inwokacja laduje model WeSpeaker (~50ms jednorazowo).
+        // Chcemy mierzyc koszt steady-state, nie cold start.
         reset_tracker();
+        let _ = identify_speaker(&bytes1);
+        reset_tracker();
+
+        // Steady state: mierzymy 4 wywolania (2 segmenty x 2 przebiegi)
+        let t0 = std::time::Instant::now();
         let label1 = identify_speaker(&bytes1).expect("speaker 1 not identified");
+        let t1 = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
         let label2 = identify_speaker(&bytes2).expect("speaker 2 not identified");
-        println!("Segment 1 label: {}", label1);
-        println!("Segment 2 label: {}", label2);
+        let t2 = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        let label1_again = identify_speaker(&bytes1).expect("failed");
+        let t1b = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        let label2_again = identify_speaker(&bytes2).expect("failed");
+        let t2b = t0.elapsed();
+
+        println!("\n=== Diarization timing (audio per segment ~4.5s) ===");
+        println!("  segment 1 ({}): {:?}", label1, t1);
+        println!("  segment 2 ({}): {:?}", label2, t2);
+        println!("  segment 1 again ({}): {:?}", label1_again, t1b);
+        println!("  segment 2 again ({}): {:?}", label2_again, t2b);
+        let avg = (t1 + t2 + t1b + t2b) / 4;
+        println!("  average: {:?}", avg);
+        println!();
+
         assert_eq!(label1, "SPEAKER_00", "pierwszy segment powinien byc SPEAKER_00");
         assert_eq!(label2, "SPEAKER_01", "drugi segment powinien byc innym mowca");
-
-        // Ponowne wywolanie powinno trafic do istniejacych speakerow
-        let label1_again = identify_speaker(&bytes1).expect("failed");
-        let label2_again = identify_speaker(&bytes2).expect("failed");
         assert_eq!(label1_again, "SPEAKER_00", "ponowny glos 1 powinien trafic do SPEAKER_00");
         assert_eq!(label2_again, "SPEAKER_01", "ponowny glos 2 powinien trafic do SPEAKER_01");
     }
