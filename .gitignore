@@ -85,6 +85,7 @@ Cargo.lock
 !tentaflow-desktop/macos/Cargo.lock
 !tentaflow-mobile/Cargo.lock
 !tentaflow-memory/Cargo.lock
+!tentaflow-containers/*/Cargo.lock
 
 # =============================================================================
 # WASM build artefakty (addony kompilowane lokalnie)
@@ -130,4 +131,7 @@ tests/e2e/node_modules/
 tests/e2e/package.json
 tests/e2e/package-lock.json
 tests/e2e/test-results/
+test-results/
+*.backup
 .gstack/
+notes/*.md

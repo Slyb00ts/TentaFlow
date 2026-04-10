@@ -9,26 +9,37 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use tracing::warn;
 
 use super::crdt::{CrdtOperation, LamportClock};
+use crate::crypto::SettingsCipher;
 
 /// Persystencja operacji CRDT w bazie SQLite
 pub struct CrdtStore {
     conn: Arc<Mutex<Connection>>,
+    settings_cipher: Option<Arc<SettingsCipher>>,
 }
 
 impl CrdtStore {
     /// Tworzy nowy CrdtStore z istniejacym polaczeniem
     pub fn new(conn: Arc<Mutex<Connection>>) -> Result<Self> {
-        Ok(Self { conn })
+        Ok(Self { conn, settings_cipher: None })
     }
 
-    /// Zapisuje operacje CRDT do tabeli crdt_operations
+    /// Tworzy CrdtStore z cipherem do szyfrowania/deszyfrowania sekretow
+    pub fn with_cipher(conn: Arc<Mutex<Connection>>, cipher: Arc<SettingsCipher>) -> Result<Self> {
+        Ok(Self { conn, settings_cipher: Some(cipher) })
+    }
+
+    /// Zapisuje operacje CRDT do tabeli crdt_operations.
+    /// Dla UpsertSetting z kluczem wrazliwym — deszyfruje wartosc przed zapisem,
+    /// tak aby peer z innym master key mogl odczytac plaintext.
     pub fn save_operation(&self, op: &CrdtOperation, clock: &LamportClock) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
 
-        let (op_type, op_key) = Self::operation_type_and_key(op);
-        let op_data = serde_json::to_string(op)
+        let op_to_save = self.decrypt_setting_for_sync(op);
+        let (op_type, op_key) = Self::operation_type_and_key(&op_to_save);
+        let op_data = serde_json::to_string(&op_to_save)
             .context("Serializacja operacji CRDT")?;
 
         conn.execute(
@@ -209,10 +220,12 @@ impl CrdtStore {
             }
 
             CrdtOperation::UpsertSetting { key, value, .. } => {
+                // Re-szyfruj wartosc lokalnym master key jesli klucz jest wrazliwy
+                let store_value = self.encrypt_setting_for_storage(key, value);
                 conn.execute(
                     "INSERT OR REPLACE INTO settings (key, value, updated_at) \
                      VALUES (?1, ?2, datetime('now'))",
-                    params![key, value],
+                    params![key, store_value],
                 )?;
             }
 
@@ -659,6 +672,49 @@ impl CrdtStore {
             }
         }
     }
+
+    /// Deszyfruje wartosc UpsertSetting przed wyslaniem do peerow.
+    /// Transport mesh jest szyfrowany (TLS + ChaCha20), wiec plaintext jest bezpieczny.
+    fn decrypt_setting_for_sync(&self, op: &CrdtOperation) -> CrdtOperation {
+        if let CrdtOperation::UpsertSetting { key, value, clock } = op {
+            if SettingsCipher::should_encrypt(key) {
+                if let Some(ref cipher) = self.settings_cipher {
+                    match cipher.decrypt(value) {
+                        Ok(plain) => {
+                            return CrdtOperation::UpsertSetting {
+                                key: key.clone(),
+                                value: plain,
+                                clock: *clock,
+                            };
+                        }
+                        Err(e) => {
+                            warn!(key = %key, "Nie udalo sie deszyfrowac setting przed sync: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        op.clone()
+    }
+
+    /// Re-szyfruje wartosc wrazliwego klucza lokalnym master key przed zapisem do DB.
+    fn encrypt_setting_for_storage(&self, key: &str, value: &str) -> String {
+        if SettingsCipher::should_encrypt(key) {
+            if let Some(ref cipher) = self.settings_cipher {
+                // Jesli wartosc juz jest zaszyfrowana — nie szyfruj ponownie
+                if value.starts_with("enc:") {
+                    return value.to_string();
+                }
+                match cipher.encrypt(value) {
+                    Ok(encrypted) => return encrypted,
+                    Err(e) => {
+                        warn!(key = %key, "Nie udalo sie zaszyfrowac setting po sync: {e}");
+                    }
+                }
+            }
+        }
+        value.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -868,5 +924,98 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM crdt_operations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn save_operation_decrypts_sensitive_setting() {
+        let pool = setup_test_db();
+        let cipher = Arc::new(SettingsCipher::new(&[42u8; 32]));
+        let store = CrdtStore::with_cipher(pool.clone(), cipher.clone()).unwrap();
+
+        let mut clock = LamportClock::new("test-node");
+        let t1 = clock.tick();
+
+        // Zaszyfruj wartosc jak robi to set_setting_secure
+        let encrypted = cipher.encrypt("super-tajny-klucz").unwrap();
+        assert!(encrypted.starts_with("enc:"));
+
+        let op = CrdtOperation::UpsertSetting {
+            key: "ngc_api_key".into(),
+            value: encrypted,
+            clock: t1,
+        };
+
+        store.save_operation(&op, &t1).unwrap();
+
+        // Sprawdz ze w crdt_operations wartosc jest PLAINTEXT (deszyfrowana)
+        let ops = store.get_operations_since(0).unwrap();
+        assert_eq!(ops.len(), 1);
+        if let CrdtOperation::UpsertSetting { value, .. } = &ops[0].1 {
+            assert_eq!(value, "super-tajny-klucz");
+            assert!(!value.starts_with("enc:"));
+        } else {
+            panic!("Oczekiwano UpsertSetting");
+        }
+    }
+
+    #[test]
+    fn apply_to_db_reencrypts_sensitive_setting() {
+        let pool = setup_test_db();
+        let cipher = Arc::new(SettingsCipher::new(&[99u8; 32]));
+        let store = CrdtStore::with_cipher(pool.clone(), cipher.clone()).unwrap();
+
+        let mut clock = LamportClock::new("test-node");
+        let t1 = clock.tick();
+
+        // Symuluj odbiorcze: wartosc przychodzi plaintext od peera
+        let op = CrdtOperation::UpsertSetting {
+            key: "ngc_api_key".into(),
+            value: "plaintext-od-peera".into(),
+            clock: t1,
+        };
+
+        store.apply_to_db(&op).unwrap();
+
+        // Sprawdz ze w tabeli settings wartosc jest ZASZYFROWANA
+        let conn = pool.lock().unwrap();
+        let stored: String = conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", params!["ngc_api_key"], |row| row.get(0))
+            .unwrap();
+        assert!(stored.starts_with("enc:"), "Wartosc powinna byc zaszyfrowana, ale: {stored}");
+
+        // Deszyfruj i sprawdz poprawnosc
+        let decrypted = cipher.decrypt(&stored).unwrap();
+        assert_eq!(decrypted, "plaintext-od-peera");
+    }
+
+    #[test]
+    fn nonsensitive_setting_passes_through() {
+        let pool = setup_test_db();
+        let cipher = Arc::new(SettingsCipher::new(&[1u8; 32]));
+        let store = CrdtStore::with_cipher(pool.clone(), cipher).unwrap();
+
+        let mut clock = LamportClock::new("test-node");
+        let t1 = clock.tick();
+
+        let op = CrdtOperation::UpsertSetting {
+            key: "flow_engine_enabled".into(),
+            value: "true".into(),
+            clock: t1,
+        };
+
+        // save_operation nie powinno zmieniac wartosci
+        store.save_operation(&op, &t1).unwrap();
+        let ops = store.get_operations_since(0).unwrap();
+        if let CrdtOperation::UpsertSetting { value, .. } = &ops[0].1 {
+            assert_eq!(value, "true");
+        }
+
+        // apply_to_db nie powinno szyfrowac
+        store.apply_to_db(&op).unwrap();
+        let conn = pool.lock().unwrap();
+        let stored: String = conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", params!["flow_engine_enabled"], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, "true");
     }
 }

@@ -78,6 +78,14 @@ extern "C" {
 
     /// Zamkniecie aktywnego polaczenia sieciowego
     fn net_close(conn_id: i32) -> i32;
+
+    /// Wyslanie requestu do zarejestrowanego serwisu QUIC przez router
+    /// ABI: (service_ptr, service_len, request_ptr, request_len, out_ptr, out_cap, out_len_ptr) -> i32
+    fn service_request(
+        service_ptr: i32, service_len: i32,
+        request_ptr: i32, request_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
 }
 
 // =============================================================================
@@ -616,6 +624,38 @@ pub fn network_close(conn_id: u32) -> Result<(), i32> {
 }
 
 // =============================================================================
+// Wysokopoziomowe wrappery — Service Request (QUIC przez router)
+// =============================================================================
+
+/// Wysyla request do zarejestrowanego serwisu QUIC przez router.
+/// Wymaga uprawnienia "service" w manifescie.
+/// service_name: nazwa serwisu (np. "teams-bot")
+/// request_json: JSON payload requestu
+/// Zwraca JSON odpowiedzi z serwisu.
+pub fn service_request_call(service_name: &str, request_json: &str) -> Result<String, i32> {
+    let svc_bytes = service_name.as_bytes();
+    let req_bytes = request_json.as_bytes();
+    let mut out_buf = vec![0u8; 65536];
+    let mut out_len: i32 = 0;
+
+    let result = unsafe {
+        service_request(
+            svc_bytes.as_ptr() as i32, svc_bytes.len() as i32,
+            req_bytes.as_ptr() as i32, req_bytes.len() as i32,
+            out_buf.as_mut_ptr() as i32, out_buf.len() as i32,
+            &mut out_len as *mut i32 as i32,
+        )
+    };
+
+    if result != 0 {
+        return Err(result);
+    }
+
+    let response = String::from_utf8_lossy(&out_buf[..out_len as usize]).to_string();
+    Ok(response)
+}
+
+// =============================================================================
 // Prelude — wygodny re-eksport dla autorow addonow
 // =============================================================================
 
@@ -632,6 +672,7 @@ pub mod prelude {
         get_current_user, CurrentUser,
         register_tool,
         network_connect, network_send, network_recv, network_close,
+        service_request_call,
         log,
     };
     pub use serde::{Deserialize, Serialize};

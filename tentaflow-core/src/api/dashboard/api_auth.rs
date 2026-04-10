@@ -99,7 +99,7 @@ pub struct MeResponse {
 /// POST /api/auth/login - logowanie, zwraca token JWT.
 /// VULN-002: Rate limiting — max 10 prob na 60 sekund per username.
 /// VULN-035: Dual rate limiting — dodatkowy limit 30/min per IP.
-pub fn handle_login(pool: &DbPool, body: &[u8], remote_addr: &str) -> Result<(u16, String)> {
+pub fn handle_login(pool: &DbPool, body: &[u8], remote_addr: &str, settings_cipher: &crate::crypto::SettingsCipher) -> Result<(u16, String)> {
     let req: LoginRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => return Ok((400, json_error("Niepoprawny format danych logowania"))),
@@ -133,14 +133,14 @@ pub fn handle_login(pool: &DbPool, body: &[u8], remote_addr: &str) -> Result<(u1
     info!("Uzytkownik zalogowany: username={}, user_id={}", username, user_id);
 
     // Pobierz jwt_secret z ustawien; jesli brak — wygeneruj i zapisz
-    let jwt_secret = match db::repository::get_setting(pool, "jwt_secret")? {
+    let jwt_secret = match db::repository::get_setting_secure(pool, "jwt_secret", settings_cipher)? {
         Some(s) if !s.is_empty() => s,
         _ => {
             // VULN-009: Kryptograficznie bezpieczny secret z OsRng
             let mut key = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut key);
             let generated = hex::encode(key);
-            db::repository::set_setting(pool, "jwt_secret", &generated)?;
+            db::repository::set_setting_secure(pool, "jwt_secret", &generated, settings_cipher)?;
             generated
         }
     };

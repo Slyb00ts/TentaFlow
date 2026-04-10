@@ -31,11 +31,17 @@ const DeployUtils = (() => {
 
   // Renderuje pasek postepu deploy z logami
   function renderDeployProgress(phase, message, data, logs, startTime) {
-    const phases = ['certs', 'deploying', 'progress', 'registering', 'done'];
+    const phases = ['certs', 'deploying', 'deployed', 'health_check_waiting', 'health_check_ready', 'discovering_models', 'registering_service', 'progress', 'registering', 'done'];
     const phaseLabels = {
       connecting: I18n.t('topbar.connected').replace('Connected', 'Connecting...'),
       certs: I18n.t('settings.tls.title'),
       deploying: I18n.t('deploy.progress.deploying'),
+      deployed: 'Container deployed',
+      health_check_waiting: 'Waiting for container health...',
+      health_check_ready: 'Container ready',
+      discovering_models: 'Discovering models...',
+      registering_service: 'Registering service...',
+      service_registered: 'Service registered',
       progress: 'Docker Compose',
       registering: I18n.t('models.registry'),
       done: I18n.t('common.success'),

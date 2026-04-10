@@ -238,6 +238,8 @@ async fn handle_chat_completions(
     req: Request<Incoming>,
     router: Arc<Router>,
 ) -> std::result::Result<Response<StreamBody<std::pin::Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>>>, hyper::Error> {
+    let debug_route = is_debug_route_openai(req.headers(), req.uri());
+
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
 
@@ -260,9 +262,27 @@ async fn handle_chat_completions(
     if is_streaming {
         // === STREAMING MODE: SSE ===
         match router.route_chat_completion_stream(request).await {
-            Ok(chunk_stream) => {
+            Ok(route_result) => {
+                let metadata = route_result.metadata;
+                let chunk_stream = route_result.response;
+
+                // SSE event route_info przed pierwszym chunkiem (tylko w trybie debug)
+                let route_info_event = if debug_route {
+                    serde_json::to_string(&metadata).ok().map(|json| {
+                        format!("event: route_info\ndata: {}\n\n", json)
+                    })
+                } else {
+                    None
+                };
+
+                let prefix_stream = futures::stream::iter(
+                    route_info_event.into_iter().map(|event| {
+                        Ok(Frame::data(Bytes::from(event)))
+                    })
+                );
+
                 // Konwertuj Stream<Result<ChatCompletionChunk>> -> Stream SSE
-                let sse_stream = chunk_stream.map(|chunk_result| {
+                let sse_stream = prefix_stream.chain(chunk_stream.map(|chunk_result| {
                     match chunk_result {
                         Ok(mut chunk) => {
                             // Normalizuj reasoning_content -> content dla kompatybilnosci z OpenAI API
@@ -282,7 +302,7 @@ async fn handle_chat_completions(
                             Ok(Frame::data(Bytes::from(error_chunk)))
                         }
                     }
-                })
+                }))
                 .chain(futures::stream::once(async {
                     Ok(Frame::data(Bytes::from("data: [DONE]\n\n")))
                 }));
@@ -308,9 +328,18 @@ async fn handle_chat_completions(
     } else {
         // === NON-STREAMING MODE: JSON ===
         match router.route_chat_completion(request).await {
-            Ok(response) => {
-                let body = serde_json::to_vec(&response).unwrap();
-                Ok(json_response(StatusCode::OK, body))
+            Ok(route_result) => {
+                let body = serde_json::to_vec(&route_result.response).unwrap();
+                let mut resp = json_response(StatusCode::OK, body);
+                if debug_route {
+                    if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
+                        resp.headers_mut().insert(
+                            "X-TentaFlow-Route",
+                            meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                        );
+                    }
+                }
+                Ok(resp)
             }
             Err(e) => {
                 error!("Blad routing: {}", e);
@@ -340,6 +369,8 @@ async fn handle_audio_tts(
     req: Request<Incoming>,
     router: Arc<Router>,
 ) -> std::result::Result<Response<StreamBody<std::pin::Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>>>, hyper::Error> {
+    let debug_route = is_debug_route_openai(req.headers(), req.uri());
+
     // Parsuj body jako JSON
     let body_bytes = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -372,7 +403,8 @@ async fn handle_audio_tts(
 
     // Wywolaj Router.synthesize_speech()
     match router.synthesize_speech(&tts_request).await {
-        Ok(audio_bytes) => {
+        Ok(route_result) => {
+            let audio_bytes = route_result.response;
             // Okresl content type na podstawie formatu
             let content_type = match tts_request.response_format.as_deref() {
                 Some("mp3") => "audio/mpeg",
@@ -393,11 +425,24 @@ async fn handle_audio_tts(
             });
             let boxed_stream: Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>> = Box::pin(stream);
 
-            Ok(Response::builder()
+            let mut resp = Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", content_type)
                 .body(StreamBody::new(boxed_stream))
-                .unwrap())
+                .unwrap();
+            if debug_route {
+                if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
+                    resp.headers_mut().insert(
+                        "X-TentaFlow-Route",
+                        meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                    );
+                    resp.headers_mut().insert(
+                        "Access-Control-Expose-Headers",
+                        "X-TentaFlow-Route".parse().unwrap(),
+                    );
+                }
+            }
+            Ok(resp)
         }
         Err(e) => {
             error!("TTS error: {}", e);
@@ -418,6 +463,8 @@ async fn handle_audio_transcriptions(
     req: Request<Incoming>,
     router: Arc<Router>,
 ) -> std::result::Result<Response<StreamBody<std::pin::Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>>>, hyper::Error> {
+    let debug_route = is_debug_route_openai(req.headers(), req.uri());
+
     // Wyciagnij Content-Type header aby sprawdzic boundary
     let content_type = match req.headers().get("content-type") {
         Some(ct) => match ct.to_str() {
@@ -576,9 +623,9 @@ async fn handle_audio_transcriptions(
 
     // Routuj do odpowiedniego backendu
     match router.route_audio_transcription(transcription_request).await {
-        Ok(transcription_response) => {
+        Ok(route_result) => {
             // Zwroc odpowiedz jako JSON
-            let response_json = match serde_json::to_vec(&transcription_response) {
+            let response_json = match serde_json::to_vec(&route_result.response) {
                 Ok(json) => json,
                 Err(e) => {
                     error!("Blad serializacji odpowiedzi: {}", e);
@@ -590,7 +637,20 @@ async fn handle_audio_transcriptions(
                 }
             };
 
-            Ok(json_response(StatusCode::OK, response_json))
+            let mut resp = json_response(StatusCode::OK, response_json);
+            if debug_route {
+                if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
+                    resp.headers_mut().insert(
+                        "X-TentaFlow-Route",
+                        meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                    );
+                    resp.headers_mut().insert(
+                        "Access-Control-Expose-Headers",
+                        "X-TentaFlow-Route".parse().unwrap(),
+                    );
+                }
+            }
+            Ok(resp)
         }
         Err(e) => {
             error!("Blad routingu audio transcription: {}", e);
@@ -608,6 +668,8 @@ async fn handle_embeddings(
     req: Request<Incoming>,
     router: Arc<Router>,
 ) -> std::result::Result<Response<StreamBody<std::pin::Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>>>, hyper::Error> {
+    let debug_route = is_debug_route_openai(req.headers(), req.uri());
+
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
 
@@ -628,9 +690,22 @@ async fn handle_embeddings(
 
     // Routuj do odpowiedniego backendu
     match router.route_embeddings(request).await {
-        Ok(response) => {
-            let body = serde_json::to_vec(&response).unwrap();
-            Ok(json_response(StatusCode::OK, body))
+        Ok(route_result) => {
+            let body = serde_json::to_vec(&route_result.response).unwrap();
+            let mut resp = json_response(StatusCode::OK, body);
+            if debug_route {
+                if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
+                    resp.headers_mut().insert(
+                        "X-TentaFlow-Route",
+                        meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                    );
+                    resp.headers_mut().insert(
+                        "Access-Control-Expose-Headers",
+                        "X-TentaFlow-Route".parse().unwrap(),
+                    );
+                }
+            }
+            Ok(resp)
         }
         Err(e) => {
             error!("Blad routing embeddings: {}", e);
@@ -1004,4 +1079,13 @@ async fn handle_metrics(
         .header("Content-Type", "text/plain; version=0.0.4")
         .body(StreamBody::new(boxed_stream))
         .unwrap())
+}
+
+/// Sprawdza czy request ma wlaczony debug routing (header lub query param)
+fn is_debug_route_openai(headers: &hyper::header::HeaderMap, uri: &hyper::Uri) -> bool {
+    let has_header = headers.get("x-tentaflow-debug")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v == "true");
+    let has_query = uri.query().map_or(false, |q| q.contains("debug=route"));
+    has_header || has_query
 }

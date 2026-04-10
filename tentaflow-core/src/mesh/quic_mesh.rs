@@ -7,10 +7,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::Stream;
 use quinn::{ClientConfig, Endpoint, ServerConfig as QuinnServerConfig};
 use rustls::pki_types::CertificateDer;
 use tokio::sync::{broadcast, RwLock};
@@ -30,6 +33,7 @@ use tentaflow_protocol::mesh::{
     MESH_MSG_SERVICE_ANNOUNCE, MESH_MSG_SERVICE_QUERY_ALL, MESH_MSG_SERVICE_RESPONSE_ALL,
     MESH_MSG_TRUST_REVOKED, MESH_MSG_KEY_ROTATION, MESH_MSG_TRUSTED_KEYS_SYNC,
     MESH_MSG_KEY_ROTATION_RESPONSE, MESH_MSG_NODE_LEAVING, MESH_MSG_RELAY_FRAME,
+    MESH_MSG_FORWARD_STREAM_REQ, MESH_MSG_ALIAS_SYNC,
     TrustRevokedPayload, KeyRotationPayload, KeyRotationResponsePayload,
     TrustedKeysSyncPayload, NodeLeavingPayload, MeshRelayFrame,
 };
@@ -117,6 +121,8 @@ pub enum QuicMeshEvent {
     NodeLeavingReceived { node_id: String },
     /// Otrzymano relay frame (multi-hop routing)
     RelayFrameReceived { from_node_id: String, frame: MeshRelayFrame },
+    /// Otrzymano synchronizacje aliasow modeli od peera
+    AliasSyncReceived { from_node_id: String, data: Vec<u8> },
 }
 
 /// Typ callbacka do obslugi forward requestow
@@ -733,6 +739,7 @@ impl QuicMeshManager {
             MESH_MSG_DEPLOY_PROGRESS | MESH_MSG_LOG_CHUNK => 256 * 1024,
             MESH_MSG_SERVICE_ANNOUNCE | MESH_MSG_SERVICE_QUERY_ALL | MESH_MSG_SERVICE_RESPONSE_ALL => 1024 * 1024,
             MESH_MSG_RELAY_FRAME => 2 * 1024 * 1024,
+            MESH_MSG_ALIAS_SYNC => 512 * 1024,
             _ => 64 * 1024,
         };
 
@@ -752,7 +759,7 @@ impl QuicMeshManager {
             || discriminant == MESH_MSG_KEY_ROTATION_RESPONSE
             || discriminant == MESH_MSG_TRUSTED_KEYS_SYNC
             || discriminant == MESH_MSG_NODE_LEAVING
-            || (0x30..=0x37).contains(&discriminant);
+            || (0x30..=0x39).contains(&discriminant);
         let payload = if is_data_msg {
             if let Some(ref sec) = security {
                 if sec.has_shared_secret(&peer_node_id) {
@@ -944,6 +951,10 @@ impl QuicMeshManager {
                     }
                 }
             }
+            MESH_MSG_ALIAS_SYNC => QuicMeshEvent::AliasSyncReceived {
+                from_node_id: peer_node_id,
+                data: payload,
+            },
             MESH_MSG_CLUSTER_INFO => {
                 debug!(peer_id = %peer_node_id, "ClusterInfo otrzymany, obsluga w przyszlej wersji");
                 return;
@@ -1066,6 +1077,64 @@ impl QuicMeshManager {
                         }
                     } else {
                         warn!(peer_id = %peer_node_id, "Brak shared secret — nie wysylam odpowiedzi forward");
+                        return;
+                    }
+                } else {
+                    response
+                };
+
+                let _ = send.write_all(&response_data).await;
+                let _ = send.finish();
+            }
+            MESH_MSG_FORWARD_STREAM_REQ => {
+                // Format: req_id_len(4) + req_id(N) + hop_count(1) + payload
+                if payload.len() < 5 {
+                    warn!(peer_id = %peer_node_id, "ForwardStreamReq za krotki");
+                    return;
+                }
+                let req_id_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                if payload.len() < 4 + req_id_len + 1 {
+                    warn!(peer_id = %peer_node_id, "ForwardStreamReq: nieprawidlowa dlugosc");
+                    return;
+                }
+                let _request_id = match String::from_utf8(payload[4..4 + req_id_len].to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!(peer_id = %peer_node_id, "ForwardStreamReq: nieprawidlowy request_id");
+                        return;
+                    }
+                };
+                let _hop_count = payload[4 + req_id_len];
+                let req_payload = payload[4 + req_id_len + 1..].to_vec();
+
+                let handler = {
+                    let guard = forward_handler.read().await;
+                    guard.clone()
+                };
+
+                let response = if let Some(h) = handler {
+                    match tokio::time::timeout(Duration::from_secs(600), h(req_payload)).await {
+                        Ok(resp) => resp,
+                        Err(_) => {
+                            warn!(peer_id = %peer_node_id, "Timeout forward stream (600s)");
+                            br#"{"error":"Timeout wykonywania komendy (600s)"}"#.to_vec()
+                        }
+                    }
+                } else {
+                    vec![]
+                };
+
+                let response_data = if let Some(ref sec) = security {
+                    if sec.has_shared_secret(&peer_node_id) {
+                        match sec.encrypt_for_node(&peer_node_id, &response) {
+                            Ok(encrypted) => encrypted,
+                            Err(e) => {
+                                warn!(peer_id = %peer_node_id, "Blad szyfrowania odpowiedzi forward stream: {} — ODRZUCAM", e);
+                                return;
+                            }
+                        }
+                    } else {
+                        warn!(peer_id = %peer_node_id, "Brak shared secret — nie wysylam odpowiedzi forward stream");
                         return;
                     }
                 } else {
@@ -1435,6 +1504,141 @@ impl QuicMeshManager {
         };
 
         Ok(response)
+    }
+
+    /// Wysyla forward request do peera i zwraca stream chunkow odpowiedzi.
+    /// Uzywa osobnego discriminantu MESH_MSG_FORWARD_STREAM_REQ z hop_count.
+    pub async fn forward_request_stream(
+        &self,
+        target_node_id: &str,
+        request_id: &str,
+        hop_count: u8,
+        payload: Vec<u8>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>>> + Send>>> {
+        if let Some(ref sec) = self.security {
+            if !sec.is_trusted(target_node_id) {
+                return Err(anyhow::anyhow!("Peer {} nie jest zaufany — odmowa forward stream", target_node_id));
+            }
+        }
+
+        let conn = {
+            let conns = self.connections.read().await;
+            conns
+                .get(target_node_id)
+                .map(|mc| mc.connection.clone())
+                .ok_or_else(|| anyhow::anyhow!("Brak polaczenia z peerem: {}", target_node_id))?
+        };
+
+        let (mut send, recv) = conn
+            .open_bi()
+            .await
+            .context("Nie udalo sie otworzyc bidi-stream do forward stream")?;
+
+        // Format: discriminant(1) + req_id_len(4) + req_id(N) + hop_count(1) + payload
+        let req_id_bytes = request_id.as_bytes();
+        let req_id_len = (req_id_bytes.len() as u32).to_be_bytes();
+
+        let mut frame = Vec::with_capacity(1 + 4 + req_id_bytes.len() + 1 + payload.len());
+        frame.push(MESH_MSG_FORWARD_STREAM_REQ);
+        frame.extend_from_slice(&req_id_len);
+        frame.extend_from_slice(req_id_bytes);
+        frame.push(hop_count);
+        frame.extend_from_slice(&payload);
+
+        let send_data = if let Some(ref sec) = self.security {
+            if sec.has_shared_secret(target_node_id) {
+                sec.encrypt_for_node(target_node_id, &frame)
+                    .context("Blad szyfrowania forward stream request")?
+            } else {
+                return Err(anyhow::anyhow!("Brak shared secret dla peera {} — odmowa wyslania forward stream", target_node_id));
+            }
+        } else {
+            frame
+        };
+
+        send.write_all(&send_data)
+            .await
+            .context("Blad wysylania forward stream request")?;
+        send.finish().context("Blad zamykania send stream")?;
+
+        let security = self.security.clone();
+        let node_id = target_node_id.to_string();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(32);
+
+        tokio::spawn(async move {
+            let mut recv = recv;
+            let mut buf = vec![0u8; 64 * 1024];
+
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_secs(300),
+                    recv.read(&mut buf),
+                ).await {
+                    Ok(Ok(Some(n))) => {
+                        let chunk = buf[..n].to_vec();
+                        let decrypted = if let Some(ref sec) = security {
+                            if sec.has_shared_secret(&node_id) {
+                                match sec.decrypt_from_node(&node_id, &chunk) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(anyhow::anyhow!("Blad deszyfrowania chunka: {}", e))).await;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let _ = tx.send(Err(anyhow::anyhow!("Brak shared secret"))).await;
+                                break;
+                            }
+                        } else {
+                            chunk
+                        };
+                        if tx.send(Ok(decrypted)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Err(anyhow::anyhow!("Blad odczytu stream: {}", e))).await;
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = tx.send(Err(anyhow::anyhow!("Timeout forward stream (300s)"))).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(MpscReceiverStream { rx }))
+    }
+
+    /// Broadcast synchronizacji aliasow do wszystkich trusted peerow
+    pub async fn broadcast_alias_sync(&self, aliases_json: Vec<u8>) {
+        let trusted_connections = self.collect_trusted_connections().await;
+        if trusted_connections.is_empty() {
+            return;
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        let data_arc: Arc<[u8]> = Arc::from(aliases_json.as_slice());
+
+        for (peer_id, conn) in trusted_connections {
+            let sec = self.security.clone();
+            let payload = Arc::clone(&data_arc);
+            join_set.spawn(async move {
+                let result = if let Some(ref sec) = sec {
+                    Self::send_uni_message_encrypted(&conn, MESH_MSG_ALIAS_SYNC, &payload, &peer_id, sec).await
+                } else {
+                    Self::send_uni_message(&conn, MESH_MSG_ALIAS_SYNC, &payload).await
+                };
+                if let Err(e) = result {
+                    warn!(peer_id = %peer_id, "Blad wysylania AliasSync: {}", e);
+                }
+            });
+        }
+
+        while join_set.join_next().await.is_some() {}
     }
 
     /// Rozlacza peera i usuwa z mapy polaczen
@@ -2132,5 +2336,21 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             rustls::SignatureScheme::RSA_PSS_SHA384,
             rustls::SignatureScheme::RSA_PSS_SHA512,
         ]
+    }
+}
+
+// =============================================================================
+// Wrapper Stream nad mpsc::Receiver — do forward_request_stream
+// =============================================================================
+
+struct MpscReceiverStream {
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>>>,
+}
+
+impl Stream for MpscReceiverStream {
+    type Item = Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
     }
 }

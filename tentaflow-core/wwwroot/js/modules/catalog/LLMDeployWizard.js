@@ -66,6 +66,13 @@ const LLMDeployWizard = (() => {
       icon: () => CatalogIcons.llamacpp(),
       deploy_mode: 'native',
     },
+    {
+      id: 'tensorrt-llm',
+      name: 'TensorRT-LLM',
+      desc: 'NVIDIA TensorRT-LLM — zoptymalizowany inference GPU z kwantyzacja FP8/INT4',
+      icon: () => CatalogIcons.nvidia(),
+      deploy_mode: 'docker',
+    },
   ];
 
   let ENGINES = [...FALLBACK_ENGINES];
@@ -97,7 +104,7 @@ const LLMDeployWizard = (() => {
     const [settings, nodeData, engines] = await Promise.all([
       ApiClient.get('/api/settings').catch(() => null),
       ApiClient.get(`/api/mesh/nodes/${encodeURIComponent(nodeId)}`).catch(() => null),
-      ApiClient.get(`/api/hub/engines?node_id=${encodeURIComponent(nodeId)}`).catch(() => null),
+      ApiClient.get(`/api/hub/engines?node_id=${encodeURIComponent(nodeId)}&type=llm`).catch(() => null),
     ]);
 
     if (Array.isArray(settings)) {
@@ -665,6 +672,11 @@ const LLMDeployWizard = (() => {
   // Wykonanie wdrozenia przez mesh API
   async function executeDeploy() {
     isProcessing = true;
+    if (selectedEngine === 'tensorrt-llm') {
+      App.showToast('TensorRT-LLM — wdrazanie jeszcze niedostepne', 'warning');
+      isProcessing = false;
+      return;
+    }
     const deployLogs = [];
     const deployStartTime = Date.now();
     let deployTimerInterval = null;

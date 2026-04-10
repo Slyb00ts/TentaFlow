@@ -34,8 +34,11 @@ pub struct InstancePool {
     db: DbPool,
     event_bus: Arc<EventBus>,
     permission_checker: Arc<PermissionChecker>,
+    settings_cipher: Arc<crate::crypto::SettingsCipher>,
     /// Deklarowane uprawnienia addonu (zaladowane raz)
     declared_permissions: Vec<String>,
+    /// Router do routowania requestow LLM
+    router: Option<Arc<crate::routing::router::Router>>,
 }
 
 /// Wpis w puli — gotowa instancja WASM
@@ -64,7 +67,9 @@ impl InstancePool {
         db: DbPool,
         event_bus: Arc<EventBus>,
         permission_checker: Arc<PermissionChecker>,
+        settings_cipher: Arc<crate::crypto::SettingsCipher>,
         declared_permissions: Vec<String>,
+        router: Option<Arc<crate::routing::router::Router>>,
     ) -> Result<Self> {
         let pool = InstancePool {
             engine,
@@ -75,7 +80,9 @@ impl InstancePool {
             db,
             event_bus,
             permission_checker,
+            settings_cipher,
             declared_permissions,
+            router,
         };
 
         // Pre-warm instancje
@@ -243,6 +250,7 @@ impl InstancePool {
                     declared_permissions: Vec::new(),
                     network_rules: Vec::new(),
                     disambiguation: Vec::new(),
+                    resources: None,
                 })
         };
 
@@ -260,8 +268,10 @@ impl InstancePool {
             net_manager: Arc::new(parking_lot::Mutex::new(
                 host_functions::network::NetworkConnectionManager::new(),
             )),
+            settings_cipher: self.settings_cipher.clone(),
             manifest: Arc::new(manifest),
             memory_limit: super::DEFAULT_MEMORY_LIMIT_BYTES,
+            router: self.router.clone(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             store_limits: wasmi::StoreLimitsBuilder::new()
                 .memory_size(super::DEFAULT_MEMORY_LIMIT_BYTES)

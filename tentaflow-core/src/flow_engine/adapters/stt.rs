@@ -139,8 +139,8 @@ impl NodeAdapter for SttNodeAdapter {
                 }
 
                 // HTTP backend jako fallback
-                let backends = self.service_manager.get_service_backends(&model_name);
-                if let Some(backends) = backends {
+                let backends = self.service_manager.get_service_backends_cloned(&model_name);
+                if let Some(ref backends) = backends {
                     if !backends.is_empty() {
                         debug!("STT adapter: uzywam HTTP backend (fallback)");
                         // TODO: Implementacja HTTP STT - wymaga TranscriptionRequest
