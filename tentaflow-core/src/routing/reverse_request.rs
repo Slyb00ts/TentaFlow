@@ -171,33 +171,58 @@ async fn dispatch_reverse_request(
 
     match request.payload {
         ModelPayload::Audio(audio_payload) => {
+            // Meeting context — bot dopisuje "meeting_id" do ModelRequest.metadata
+            // przy kazdym STT requescie. Router uzywa go jako klucza do
+            // voice_temp_speakers i transcript_store.
+            let meeting_id: Option<String> = request
+                .metadata
+                .as_ref()
+                .and_then(|kv| {
+                    kv.iter()
+                        .find(|(k, _)| k == "meeting_id")
+                        .map(|(_, v)| v.clone())
+                });
+
             // Uruchamiamy diarization *rownolegle* ze STT (nie seryjnie). Diarization
             // zjada kilkaset ms na CPU i bez tej paralelizacji dolozylaby sie wprost
             // do latencji whispera. spawn_blocking bo WeSpeaker forward jest CPU-bound.
             #[cfg(feature = "inference-diarization")]
-            let diarization_handle = match &audio_payload.operation {
-                AudioOperation::STT { audio_data, .. } => {
+            let diarization_handle = {
+                if let (AudioOperation::STT { audio_data, .. }, Some(ref mid), Some(pool)) = (
+                    &audio_payload.operation,
+                    &meeting_id,
+                    router.db.clone(),
+                ) {
                     let audio_clone = audio_data.clone();
+                    let mid_clone = mid.clone();
                     Some(tokio::task::spawn_blocking(move || {
-                        crate::diarization::identify_speaker(&audio_clone)
+                        crate::diarization::identify_speaker_with_profiles(
+                            &pool,
+                            &audio_clone,
+                            &mid_clone,
+                        )
                     }))
+                } else {
+                    None
                 }
-                _ => None,
             };
 
             let stt_future = router.route_audio_via_protocol(&audio_payload.operation);
 
             #[cfg(feature = "inference-diarization")]
-            let (stt_result, speaker_label) = {
+            let (stt_result, identify_result) = {
                 let stt_res = stt_future.await;
-                let label = match diarization_handle {
+                let ident = match diarization_handle {
                     Some(h) => h.await.ok().flatten(),
                     None => None,
                 };
-                (stt_res, label)
+                (stt_res, ident)
             };
             #[cfg(not(feature = "inference-diarization"))]
-            let (stt_result, speaker_label): (_, Option<String>) = (stt_future.await, None);
+            let (stt_result, identify_result): (
+                _,
+                Option<crate::diarization::service::IdentifyResult>,
+            ) = (stt_future.await, None);
 
             match stt_result {
                 Ok(response) => {
@@ -205,15 +230,28 @@ async fn dispatch_reverse_request(
                     if let ModelResult::Audio(ref audio_result) = response.result {
                         if let AudioResultData::Text(ref text) = audio_result.data {
                             if !text.trim().is_empty() {
-                                let speaker = speaker_label
-                                    .clone()
-                                    .unwrap_or_else(|| "Nieznany".to_string());
-                                crate::routing::transcript_store::push(
-                                    speaker.clone(),
+                                let mut builder = crate::routing::transcript_store::TranscriptBuilder::new(
                                     text.clone(),
                                     audio_result.model.clone(),
                                 );
-                                info!("Transcript [{}][{}]: {}", speaker, audio_result.model, text);
+                                if let Some(ref mid) = meeting_id {
+                                    builder = builder.meeting_id(mid.clone());
+                                }
+                                #[cfg(feature = "inference-diarization")]
+                                {
+                                    if let Some(ref ident) = identify_result {
+                                        builder = builder.speaker(ident.label.clone());
+                                        if let Some(pid) = ident.profile_id {
+                                            builder = builder.profile_id(pid);
+                                        }
+                                        if let Some(c) = ident.confidence {
+                                            builder = builder.confidence(c);
+                                        }
+                                    }
+                                }
+                                let display_speaker = builder.speaker.clone();
+                                crate::routing::transcript_store::push(builder);
+                                info!("Transcript [{}][{}]: {}", display_speaker, audio_result.model, text);
                             }
                         }
                     }

@@ -35,13 +35,37 @@ pub enum MeetingCommand {
 /// na istniejacym polaczeniu QUIC (reverse direction).
 /// Router polaczyl sie jako klient, ale QUIC jest bidirektionalny —
 /// serwer moze otworzyc nowy stream do klienta.
+///
+/// RouterClient trzyma `current_meeting_id` — UUID generowany przy
+/// JoinMeeting i czyszczony przy LeaveMeeting. Kazdy STT request
+/// dopina to w ModelRequest.metadata zeby router wiedzial do ktorego
+/// meetingu przypisac diarization/transcript.
 pub struct RouterClient {
     connection: quinn::Connection,
+    current_meeting_id: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl RouterClient {
     pub fn new(connection: quinn::Connection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            current_meeting_id: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// Ustawia aktywny meeting_id (wolane po JoinMeeting).
+    pub fn set_meeting_id(&self, meeting_id: String) {
+        *self.current_meeting_id.lock() = Some(meeting_id);
+    }
+
+    /// Czysci aktywny meeting_id (wolane po LeaveMeeting).
+    pub fn clear_meeting_id(&self) {
+        *self.current_meeting_id.lock() = None;
+    }
+
+    /// Pobiera aktualny meeting_id (jesli jest w meetingu)
+    pub fn current_meeting_id(&self) -> Option<String> {
+        self.current_meeting_id.lock().clone()
     }
 
     /// Wysyla ModelRequest do routera i czeka na ModelResponse.
@@ -80,6 +104,12 @@ impl RouterClient {
             .flat_map(|s| s.to_le_bytes())
             .collect();
 
+        // Dopiety meeting_id jesli jestesmy w meetingu — router uzywa tego
+        // jako klucz do voice_temp_speakers i transcript_store.
+        let metadata = self.current_meeting_id().map(|mid| {
+            vec![("meeting_id".to_string(), mid)]
+        });
+
         let request = ModelRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload: ModelPayload::Audio(AudioPayload {
@@ -97,7 +127,7 @@ impl RouterClient {
                 },
             }),
             stream: false,
-            metadata: None,
+            metadata,
             session_id: None,
         };
 

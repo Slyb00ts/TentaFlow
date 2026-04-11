@@ -2008,13 +2008,19 @@ pub fn handle_invoke_addon_tool(
 
     // Dla meeting-bot wysylamy komende przez QUIC do kontenera
     if addon_id == "teams-bot" {
-        // Reset stanu diarization i transcript store przy zmianie meetingu,
-        // zeby nowi speakerzy byli numerowani od SPEAKER_00 a nie kontynuowali
-        // z poprzedniego meetingu.
+        // Reset transcript store przy kazdej zmianie meetingu zeby GUI Bot Status
+        // nie mieszal danych z poprzednich. Diarization trackery sa per-meeting
+        // z persistence — nie ma tu nic do resetowania, new meeting_id dostaje
+        // swoj tracker automatycznie w identify_speaker_with_profiles.
+        //
+        // Teams-bot sam generuje meeting_id przy JoinMeeting i wysyla go jako
+        // metadata.meeting_id w kazdym STT request → router wie ktory tracker
+        // wziac z mapy active_trackers.
+        //
+        // Przy leave_meeting kontener czysci swoje current_meeting_id, wiec
+        // kolejne STT requesty nie trafia juz do tego trackera.
         if tool_name == "join_meeting" || tool_name == "leave_meeting" {
             crate::routing::transcript_store::clear();
-            #[cfg(feature = "inference-diarization")]
-            crate::diarization::reset_tracker();
         }
 
         let router = match router {
