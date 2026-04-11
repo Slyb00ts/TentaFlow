@@ -3173,10 +3173,14 @@ pub fn create_voice_profile(pool: &DbPool, params: &NewVoiceProfile<'_>) -> Resu
     let conn = acquire(pool)?;
     conn.execute(
         "INSERT INTO voice_profiles
-            (name, centroid, sample_count, reliability_score, source, metadata_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (name, first_name, last_name, nickname,
+             centroid, sample_count, reliability_score, source, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             params.name,
+            params.first_name,
+            params.last_name,
+            params.nickname,
             params.centroid,
             params.sample_count,
             params.reliability_score,
@@ -3187,29 +3191,39 @@ pub fn create_voice_profile(pool: &DbPool, params: &NewVoiceProfile<'_>) -> Resu
     Ok(conn.last_insert_rowid())
 }
 
+fn row_to_voice_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbVoiceProfile> {
+    Ok(DbVoiceProfile {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        first_name: row.get(2)?,
+        last_name: row.get(3)?,
+        nickname: row.get(4)?,
+        centroid: row.get(5)?,
+        sample_count: row.get(6)?,
+        reliability_score: row.get(7)?,
+        source: row.get(8)?,
+        metadata_json: row.get(9)?,
+        enrolled_at: row.get(10)?,
+        last_seen_at: row.get(11)?,
+        total_utterances: row.get(12)?,
+    })
+}
+
+const VOICE_PROFILE_COLUMNS: &str =
+    "id, name, first_name, last_name, nickname, centroid, sample_count,
+     reliability_score, source, metadata_json, enrolled_at, last_seen_at,
+     total_utterances";
+
 /// Lista wszystkich profili (posortowana po last_seen malejaco, null na koncu)
 pub fn list_voice_profiles(pool: &DbPool) -> Result<Vec<DbVoiceProfile>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, centroid, sample_count, reliability_score, source,
-                metadata_json, enrolled_at, last_seen_at, total_utterances
-         FROM voice_profiles
+    let sql = format!(
+        "SELECT {} FROM voice_profiles
          ORDER BY COALESCE(last_seen_at, '0') DESC, name ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(DbVoiceProfile {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            centroid: row.get(2)?,
-            sample_count: row.get(3)?,
-            reliability_score: row.get(4)?,
-            source: row.get(5)?,
-            metadata_json: row.get(6)?,
-            enrolled_at: row.get(7)?,
-            last_seen_at: row.get(8)?,
-            total_utterances: row.get(9)?,
-        })
-    })?;
+        VOICE_PROFILE_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_voice_profile)?;
     let mut result = Vec::new();
     for row in rows {
         result.push(row?);
@@ -3220,26 +3234,13 @@ pub fn list_voice_profiles(pool: &DbPool) -> Result<Vec<DbVoiceProfile>> {
 /// Pobiera profil po id
 pub fn get_voice_profile(pool: &DbPool, id: i64) -> Result<Option<DbVoiceProfile>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, centroid, sample_count, reliability_score, source,
-                metadata_json, enrolled_at, last_seen_at, total_utterances
-         FROM voice_profiles WHERE id = ?1",
-    )?;
+    let sql = format!(
+        "SELECT {} FROM voice_profiles WHERE id = ?1",
+        VOICE_PROFILE_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let row = stmt
-        .query_row(rusqlite::params![id], |row| {
-            Ok(DbVoiceProfile {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                centroid: row.get(2)?,
-                sample_count: row.get(3)?,
-                reliability_score: row.get(4)?,
-                source: row.get(5)?,
-                metadata_json: row.get(6)?,
-                enrolled_at: row.get(7)?,
-                last_seen_at: row.get(8)?,
-                total_utterances: row.get(9)?,
-            })
-        })
+        .query_row(rusqlite::params![id], row_to_voice_profile)
         .optional()?;
     Ok(row)
 }
@@ -3247,26 +3248,13 @@ pub fn get_voice_profile(pool: &DbPool, id: i64) -> Result<Option<DbVoiceProfile
 /// Pobiera profil po nazwie (unique constraint)
 pub fn get_voice_profile_by_name(pool: &DbPool, name: &str) -> Result<Option<DbVoiceProfile>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, centroid, sample_count, reliability_score, source,
-                metadata_json, enrolled_at, last_seen_at, total_utterances
-         FROM voice_profiles WHERE name = ?1",
-    )?;
+    let sql = format!(
+        "SELECT {} FROM voice_profiles WHERE name = ?1",
+        VOICE_PROFILE_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let row = stmt
-        .query_row(rusqlite::params![name], |row| {
-            Ok(DbVoiceProfile {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                centroid: row.get(2)?,
-                sample_count: row.get(3)?,
-                reliability_score: row.get(4)?,
-                source: row.get(5)?,
-                metadata_json: row.get(6)?,
-                enrolled_at: row.get(7)?,
-                last_seen_at: row.get(8)?,
-                total_utterances: row.get(9)?,
-            })
-        })
+        .query_row(rusqlite::params![name], row_to_voice_profile)
         .optional()?;
     Ok(row)
 }
@@ -3312,7 +3300,27 @@ pub fn delete_voice_profile(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Zmiana nazwy profilu
+/// Zmiana czesci osobowych + display name profilu.
+/// Caller ma obowiazek wyliczyc `name` z first/last/nickname (lub podac explicit).
+pub fn update_voice_profile_identity(
+    pool: &DbPool,
+    id: i64,
+    name: &str,
+    first_name: &str,
+    last_name: Option<&str>,
+    nickname: Option<&str>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE voice_profiles
+         SET name = ?2, first_name = ?3, last_name = ?4, nickname = ?5
+         WHERE id = ?1",
+        rusqlite::params![id, name, first_name, last_name, nickname],
+    )?;
+    Ok(())
+}
+
+/// Zmiana samego display-name (rzadko uzywane; preferowany update_voice_profile_identity)
 pub fn rename_voice_profile(pool: &DbPool, id: i64, new_name: &str) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(

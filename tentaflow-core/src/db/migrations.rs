@@ -972,5 +972,26 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX idx_voice_temp_assigned ON voice_temp_speakers(assigned_profile_id);
         ",
     ),
+    (
+        32,
+        "voice_profiles_person_fields",
+        "
+            -- Rozbicie 'name' na czesci osobowe. 'name' zostaje jako unikalny
+            -- display-name (computed z first_name/last_name/nickname) dla
+            -- kompatybilnosci oraz szybkiego lookup'u; nowe kolumny pozwalaja
+            -- wyszukiwanie po imieniu/nazwisku/nicku osobno.
+            --
+            -- first_name jest wymagane (NOT NULL) — kazdy profil musi mieć
+            -- chociaz imie. last_name i nickname sa opcjonalne — profil moze
+            -- byc zapisany tylko jako 'Jan' albo 'Jan Kowalski' albo
+            -- 'Jan Kowalski (janek)'.
+            ALTER TABLE voice_profiles ADD COLUMN first_name TEXT NOT NULL DEFAULT '';
+            ALTER TABLE voice_profiles ADD COLUMN last_name TEXT;
+            ALTER TABLE voice_profiles ADD COLUMN nickname TEXT;
+
+            CREATE INDEX idx_voice_profiles_first_last ON voice_profiles(first_name, last_name);
+            CREATE INDEX idx_voice_profiles_nickname ON voice_profiles(nickname);
+        ",
+    ),
 ]
 }

@@ -100,10 +100,61 @@ pub struct EnrollmentSample {
     pub rms: f32,
 }
 
+/// Dane identyfikacyjne osoby — przekazywane do enrollment.
+#[derive(Debug, Clone)]
+pub struct PersonIdentity<'a> {
+    pub first_name: &'a str,
+    pub last_name: Option<&'a str>,
+    pub nickname: Option<&'a str>,
+}
+
+impl<'a> PersonIdentity<'a> {
+    pub fn new(first_name: &'a str) -> Self {
+        Self {
+            first_name,
+            last_name: None,
+            nickname: None,
+        }
+    }
+
+    pub fn with_last_name(mut self, last_name: &'a str) -> Self {
+        self.last_name = Some(last_name);
+        self
+    }
+
+    pub fn with_nickname(mut self, nickname: &'a str) -> Self {
+        self.nickname = Some(nickname);
+        self
+    }
+
+    /// Wylicza display name — unique identifier profilu.
+    /// "Jan Kowalski (janek)" | "Jan Kowalski" | "Jan (janek)" | "Jan"
+    pub fn display_name(&self) -> String {
+        let first = self.first_name.trim();
+        let last = self.last_name.map(str::trim).filter(|s| !s.is_empty());
+        let nick = self.nickname.map(str::trim).filter(|s| !s.is_empty());
+        match (last, nick) {
+            (Some(l), Some(n)) => format!("{} {} ({})", first, l, n),
+            (Some(l), None) => format!("{} {}", first, l),
+            (None, Some(n)) => format!("{} ({})", first, n),
+            (None, None) => first.to_string(),
+        }
+    }
+
+    /// Walidacja: imie musi byc niepuste po trim
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.first_name.trim().is_empty() {
+            return Err("first_name cannot be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Wynik enrollment — utworzony/zaktualizowany profil
 #[derive(Debug, Clone)]
 pub struct EnrollmentResult {
     pub profile_id: i64,
+    pub name: String,
     pub samples_accepted: usize,
     pub samples_rejected: usize,
     pub reliability_score: f32,
@@ -362,22 +413,28 @@ pub fn build_profile_from_samples(
 }
 
 /// Enrollment z pre-policzonymi embeddingami — zapisuje do DB.
-/// `pre_extracted_samples` to embeddings + metadata z slidingu przez caller'a
-/// (caller uzywa tentaflow_voice::WeSpeaker::extract).
+/// `samples` to embeddings + metadata z slidingu (caller uzywa
+/// tentaflow_voice::WeSpeaker::extract).
 pub fn enroll_profile(
     pool: &DbPool,
-    name: &str,
+    identity: &PersonIdentity<'_>,
     samples: &[EnrollmentSample],
     source: &str,
 ) -> Result<EnrollmentResult> {
+    identity
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid identity: {}", e))?;
+
     let (centroid, reliability_score, selected_indices) = build_profile_from_samples(samples)
         .map_err(|e| anyhow::anyhow!("enrollment rejected: {}", e))?;
 
+    let display_name = identity.display_name();
+
     // Sprawdz czy profil o tej nazwie juz istnieje
-    if let Some(existing) = repo::get_voice_profile_by_name(pool, name)? {
+    if let Some(existing) = repo::get_voice_profile_by_name(pool, &display_name)? {
         bail!(
             "profil o nazwie '{}' juz istnieje (id={}), uzyj add_samples_to_profile",
-            name,
+            display_name,
             existing.id
         );
     }
@@ -403,7 +460,10 @@ pub fn enroll_profile(
     let profile_id = repo::create_voice_profile(
         pool,
         &NewVoiceProfile {
-            name,
+            name: &display_name,
+            first_name: identity.first_name.trim(),
+            last_name: identity.last_name.map(str::trim).filter(|s| !s.is_empty()),
+            nickname: identity.nickname.map(str::trim).filter(|s| !s.is_empty()),
             centroid: &centroid_bytes,
             sample_count: selected_indices.len() as i64,
             reliability_score,
@@ -444,7 +504,8 @@ pub fn enroll_profile(
 
     info!(
         profile_id,
-        name = %name,
+        name = %display_name,
+        first_name = %identity.first_name,
         samples = selected_indices.len(),
         reliability = reliability_score,
         "Voice profile enrolled"
@@ -452,6 +513,7 @@ pub fn enroll_profile(
 
     Ok(EnrollmentResult {
         profile_id,
+        name: display_name,
         samples_accepted: selected_indices.len(),
         samples_rejected: samples.len() - selected_indices.len(),
         reliability_score,
@@ -650,26 +712,35 @@ pub fn on_confident_match(
 /// Lista wszystkich profili w formacie API-friendly
 pub fn list_profiles(pool: &DbPool) -> Result<Vec<ProfileInfo>> {
     let profiles = repo::list_voice_profiles(pool)?;
-    Ok(profiles
-        .into_iter()
-        .map(|p| ProfileInfo {
-            id: p.id,
-            name: p.name,
-            sample_count: p.sample_count as usize,
-            reliability_score: p.reliability_score,
-            source: p.source,
-            enrolled_at: p.enrolled_at,
-            last_seen_at: p.last_seen_at,
-            total_utterances: p.total_utterances as usize,
-        })
-        .collect())
+    Ok(profiles.into_iter().map(profile_to_info).collect())
+}
+
+/// Helper: konwersja DbVoiceProfile → ProfileInfo
+pub fn profile_to_info(p: crate::db::models::DbVoiceProfile) -> ProfileInfo {
+    ProfileInfo {
+        id: p.id,
+        name: p.name,
+        first_name: p.first_name,
+        last_name: p.last_name,
+        nickname: p.nickname,
+        sample_count: p.sample_count as usize,
+        reliability_score: p.reliability_score,
+        source: p.source,
+        enrolled_at: p.enrolled_at,
+        last_seen_at: p.last_seen_at,
+        total_utterances: p.total_utterances as usize,
+    }
 }
 
 /// Lekki DTO dla API / LLM
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProfileInfo {
     pub id: i64,
+    /// Computed display name — "Jan Kowalski (janek)"
     pub name: String,
+    pub first_name: String,
+    pub last_name: Option<String>,
+    pub nickname: Option<String>,
     pub sample_count: usize,
     pub reliability_score: f32,
     pub source: String,
@@ -790,6 +861,36 @@ mod tests {
     }
 
     #[test]
+    fn person_identity_display_name_variants() {
+        let full = PersonIdentity::new("Jan")
+            .with_last_name("Kowalski")
+            .with_nickname("janek");
+        assert_eq!(full.display_name(), "Jan Kowalski (janek)");
+
+        let last_only = PersonIdentity::new("Jan").with_last_name("Kowalski");
+        assert_eq!(last_only.display_name(), "Jan Kowalski");
+
+        let nick_only = PersonIdentity::new("Jan").with_nickname("janek");
+        assert_eq!(nick_only.display_name(), "Jan (janek)");
+
+        let first_only = PersonIdentity::new("Jan");
+        assert_eq!(first_only.display_name(), "Jan");
+
+        // Empty last/nick traktowane jako brak
+        let empty_extras = PersonIdentity::new("Jan")
+            .with_last_name("")
+            .with_nickname("   ");
+        assert_eq!(empty_extras.display_name(), "Jan");
+    }
+
+    #[test]
+    fn person_identity_validation() {
+        assert!(PersonIdentity::new("Jan").validate().is_ok());
+        assert!(PersonIdentity::new("   ").validate().is_err());
+        assert!(PersonIdentity::new("").validate().is_err());
+    }
+
+    #[test]
     fn match_confidence_thresholds() {
         assert_eq!(MatchConfidence::from_score(0.70), MatchConfidence::VeryConfident);
         assert_eq!(MatchConfidence::from_score(0.60), MatchConfidence::Confident);
@@ -843,14 +944,18 @@ mod tests {
         let pcm1: Vec<u8> = glos1_i16.iter().flat_map(|&s| s.to_le_bytes()).collect();
         let pcm2: Vec<u8> = glos2_i16.iter().flat_map(|&s| s.to_le_bytes()).collect();
 
-        // 3. Enrollment głosu 1 jako "Jan Kowalski"
+        // 3. Enrollment głosu 1 jako "Jan Kowalski (janek)"
+        let identity1 = PersonIdentity::new("Jan")
+            .with_last_name("Kowalski")
+            .with_nickname("janek");
         let result = crate::diarization::service::enroll_profile_from_pcm(
-            &pool, "Jan Kowalski", &pcm1, "test",
+            &pool, &identity1, &pcm1, "test",
         );
         println!("Enrollment result: {:?}", result);
         let enrollment = result.expect("enrollment should succeed");
         assert!(enrollment.samples_accepted >= 3);
         assert!(enrollment.reliability_score > 0.5);
+        assert_eq!(enrollment.name, "Jan Kowalski (janek)");
 
         // 4. Identification głosu 1 → powinien match Jan Kowalski
         let samples_f32_1 = pcm_i16_le_to_f32(&pcm1);
@@ -864,7 +969,7 @@ mod tests {
         let match1 = match_to_profiles(&pool, &emb1).expect("match");
         assert!(match1.is_some(), "glos 1 powinien sie dopasowac");
         let m1 = match1.unwrap();
-        assert_eq!(m1.profile_name, "Jan Kowalski");
+        assert_eq!(m1.profile_name, "Jan Kowalski (janek)");
         assert!(m1.confidence.is_match());
         println!("Glos 1 → {} (score {:.3})", m1.profile_name, m1.score);
 
@@ -891,25 +996,37 @@ mod tests {
             println!("Glos 2 → brak match (correctly rejected)");
         }
 
-        // 6. Enrollment głosu 2 jako "Anna Nowak"
+        // 6. Enrollment głosu 2 jako "Anna Nowak" (bez nick)
+        let identity2 = PersonIdentity::new("Anna").with_last_name("Nowak");
         let result2 = crate::diarization::service::enroll_profile_from_pcm(
-            &pool, "Anna Nowak", &pcm2, "test",
+            &pool, &identity2, &pcm2, "test",
         );
         println!("Enrollment result 2: {:?}", result2);
-        assert!(result2.is_ok(), "drugi enrollment powinien sie udac");
+        let e2 = result2.expect("drugi enrollment powinien sie udac");
+        assert_eq!(e2.name, "Anna Nowak");
 
         // 7. Teraz oba glosy powinny sie dopasowac do swoich profili
         let match1b = match_to_profiles(&pool, &emb1).expect("match").unwrap();
-        assert_eq!(match1b.profile_name, "Jan Kowalski");
+        assert_eq!(match1b.profile_name, "Jan Kowalski (janek)");
         assert!(match1b.confidence.is_match());
 
         let match2b = match_to_profiles(&pool, &emb2).expect("match").unwrap();
         assert_eq!(match2b.profile_name, "Anna Nowak");
         assert!(match2b.confidence.is_match());
 
+        // 8. Sprawdz ze profile maja poprawnie rozbite pola first/last/nickname
+        let profiles = list_profiles(&pool).expect("list");
+        let jan = profiles.iter().find(|p| p.first_name == "Jan").expect("Jan");
+        assert_eq!(jan.first_name, "Jan");
+        assert_eq!(jan.last_name.as_deref(), Some("Kowalski"));
+        assert_eq!(jan.nickname.as_deref(), Some("janek"));
+        let anna = profiles.iter().find(|p| p.first_name == "Anna").expect("Anna");
+        assert_eq!(anna.last_name.as_deref(), Some("Nowak"));
+        assert_eq!(anna.nickname, None);
+
         println!("=== Enrollment flow OK ===");
-        println!("  Jan Kowalski → score {:.3}", match1b.score);
-        println!("  Anna Nowak  → score {:.3}", match2b.score);
+        println!("  Jan Kowalski (janek) → score {:.3}", match1b.score);
+        println!("  Anna Nowak           → score {:.3}", match2b.score);
     }
 
     fn read_wav_s16_mono_16k_priv(path: &str) -> Result<Vec<i16>, String> {
