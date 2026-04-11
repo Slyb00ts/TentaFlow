@@ -564,7 +564,15 @@ pub struct AuditLogFilters {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbVoiceProfile {
     pub id: i64,
+    /// Display name (computed z first/last/nickname lub podany explicit).
+    /// Unikalny — sluzy jako main lookup key dla prostych wyszukiwan.
     pub name: String,
+    /// Imie — wymagane, NOT NULL w DB.
+    pub first_name: String,
+    /// Nazwisko — opcjonalne.
+    pub last_name: Option<String>,
+    /// Nick (pseudonim) — opcjonalny.
+    pub nickname: Option<String>,
     /// L2-znormalizowany centroid [192 × f32] = 768 bajtow
     pub centroid: Vec<u8>,
     pub sample_count: i64,
@@ -580,6 +588,9 @@ pub struct DbVoiceProfile {
 #[derive(Debug, Clone)]
 pub struct NewVoiceProfile<'a> {
     pub name: &'a str,
+    pub first_name: &'a str,
+    pub last_name: Option<&'a str>,
+    pub nickname: Option<&'a str>,
     pub centroid: &'a [u8],
     pub sample_count: i64,
     pub reliability_score: f32,
