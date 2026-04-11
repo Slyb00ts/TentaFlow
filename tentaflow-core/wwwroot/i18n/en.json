@@ -1023,6 +1023,10 @@
     "llm_alias": "LLM alias",
     "status_unavailable": "Meeting Bot status unavailable",
     "transcripts": "Transcripts",
-    "no_transcripts": "No transcripts yet — start talking in the meeting"
+    "no_transcripts": "No transcripts yet — start talking in the meeting",
+    "enrolled_profile": "Known voice profile — recognised from database",
+    "temp_speaker": "Temporary speaker — not yet linked to a profile",
+    "badge_enrolled": "known",
+    "badge_temp": "temp"
   }
 }

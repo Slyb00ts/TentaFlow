@@ -212,6 +212,25 @@ const MeetingBot = (() => {
     }
   }
 
+  // Deterministyczny kolor per speakera — hash stringa do HSL
+  // Zapewnia ze ten sam mowca (imie lub SPEAKER_XX) zawsze ma ten sam kolor
+  // miedzy renderami.
+  function speakerColor(name) {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) {
+      hash = (hash << 5) - hash + name.charCodeAt(i);
+      hash |= 0;
+    }
+    const hue = Math.abs(hash) % 360;
+    return `hsl(${hue}, 55%, 55%)`;
+  }
+
+  // Formatowanie confidence score 0.91 → "91%"
+  function formatConfidence(score) {
+    if (score == null) return '';
+    return `${Math.round(score * 100)}%`;
+  }
+
   // Renderowanie listy transkrypcji
   function renderTranscripts(entries) {
     const title = I18n.t('meeting.transcripts') || 'Transcripts';
@@ -229,14 +248,36 @@ const MeetingBot = (() => {
     // Entries przychodza od najnowszej — renderujemy w tej kolejnosci
     const rows = entries.map((e) => {
       const time = new Date(e.timestamp_ms || Date.now()).toLocaleTimeString();
-      const speaker = escapeHtml(e.speaker || 'Unknown');
+      const speakerName = e.speaker || 'Unknown';
+      const speaker = escapeHtml(speakerName);
       const text = escapeHtml(e.text || '');
       const model = escapeHtml(e.model || '');
+      const color = speakerColor(speakerName);
+      const isEnrolled = e.is_enrolled === true;
+      const confidence = formatConfidence(e.confidence);
+
+      // Badge wskazujacy status identyfikacji:
+      //   - "✓ enrolled" (zielony) gdy voice profile match
+      //   - "temp" (szary) gdy SPEAKER_XX z online trackera
+      //   - brak badge gdy brak danych diarization
+      let statusBadge = '';
+      if (isEnrolled) {
+        statusBadge = `<span class="meeting-transcript-badge meeting-transcript-badge-enrolled" title="${escapeHtml(I18n.t('meeting.enrolled_profile') || 'Enrolled voice profile')}">✓ ${escapeHtml(I18n.t('meeting.badge_enrolled') || 'known')}</span>`;
+      } else if (speakerName.startsWith('SPEAKER_')) {
+        statusBadge = `<span class="meeting-transcript-badge meeting-transcript-badge-temp" title="${escapeHtml(I18n.t('meeting.temp_speaker') || 'Temporary — not yet enrolled')}">${escapeHtml(I18n.t('meeting.badge_temp') || 'temp')}</span>`;
+      }
+
+      const confidenceHtml = confidence
+        ? `<span class="meeting-transcript-confidence">${confidence}</span>`
+        : '';
+
       return `
-        <div class="meeting-transcript-row">
+        <div class="meeting-transcript-row${isEnrolled ? ' meeting-transcript-row-enrolled' : ''}">
           <div class="meeting-transcript-meta">
             <span class="meeting-transcript-time">${time}</span>
-            <span class="meeting-transcript-speaker">${speaker}</span>
+            <span class="meeting-transcript-speaker" style="color: ${color};">${speaker}</span>
+            ${statusBadge}
+            ${confidenceHtml}
             ${model ? `<span class="meeting-transcript-model">${model}</span>` : ''}
           </div>
           <div class="meeting-transcript-text">${text}</div>
