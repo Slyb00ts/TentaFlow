@@ -17,7 +17,7 @@
 //         <  0.45 no match
 // =============================================================================
 
-use crate::db::models::{DbVoiceProfile, DbVoiceProfileSample, NewVoiceProfile, NewVoiceProfileSample};
+use crate::db::models::{NewVoiceProfile, NewVoiceProfileSample};
 use crate::db::{repository as repo, DbPool};
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info, warn};
