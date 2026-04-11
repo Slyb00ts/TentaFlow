@@ -901,5 +901,76 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             PRAGMA foreign_keys=ON;
         ",
     ),
+    (
+        31,
+        "voice_profiles",
+        "
+            -- Voice profile: profil glosowy jednej osoby (Jan Kowalski).
+            -- Kazdy profil ma centroid + wiele samples dla odpornosci na wariancje akustyczna.
+            CREATE TABLE IF NOT EXISTS voice_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                -- L2-znormalizowany centroid embeddingow [192 × f32] = 768 bajtow
+                centroid BLOB NOT NULL,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                -- Srednia wewnetrznej cos similarity miedzy samples — wysoka = dobry profil
+                reliability_score REAL NOT NULL DEFAULT 0.0,
+                -- Zrodlo: 'explicit' (LLM po przedstawieniu sie), 'merged' (ze scalania temp speakers),
+                -- 'manual' (przez API/endpoint)
+                source TEXT NOT NULL DEFAULT 'manual',
+                -- Dodatkowe metadane JSON (np. language_hint, meeting_count)
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                enrolled_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at TEXT,
+                total_utterances INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_voice_profiles_name ON voice_profiles(name);
+            CREATE INDEX idx_voice_profiles_last_seen ON voice_profiles(last_seen_at);
+
+            -- Pojedyncze samples glosu per profil. Trzymamy je osobno zeby multi-sample
+            -- matching dzialal — porownujemy nowy embedding z wszystkimi samples i bierzemy
+            -- top-K srednia (odporne na outliery).
+            CREATE TABLE IF NOT EXISTS voice_profile_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL REFERENCES voice_profiles(id) ON DELETE CASCADE,
+                -- Raw embedding [192 × f32] = 768 bajtow (NIE znormalizowany)
+                embedding BLOB NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                -- Signal-to-noise ratio estimate w dB (wiecej = czystsze audio)
+                snr_db REAL NOT NULL DEFAULT 0.0,
+                -- Srednia cos similarity z pozostalymi samples tego profilu (spojnosc)
+                intra_similarity REAL NOT NULL DEFAULT 0.0,
+                -- Z ktorego meetingu pochodzi sample (opcjonalne)
+                meeting_id TEXT,
+                -- Zrodlo: 'enrollment' (explicit enrollment przez LLM),
+                -- 'incremental' (dodane podczas meetingu gdy confidence byla wysoka),
+                -- 'merged' (ze scalonego temp speaker)
+                source TEXT NOT NULL DEFAULT 'enrollment',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_voice_samples_profile ON voice_profile_samples(profile_id);
+            CREATE INDEX idx_voice_samples_created ON voice_profile_samples(created_at);
+
+            -- Tymczasowi mowcy per meeting — zanim LLM ich przypisze do profilu.
+            -- Pozwala po meetingu zrobic 'assign SPEAKER_01 → Jan Kowalski' i przeniesc
+            -- embeddingi do voice_profile_samples.
+            CREATE TABLE IF NOT EXISTS voice_temp_speakers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meeting_id TEXT NOT NULL,
+                temp_label TEXT NOT NULL,  -- np. 'SPEAKER_00'
+                -- Wszystkie embeddingi z tego meetingu dla tego temp speakera (JSON array
+                -- of base64-encoded f32 arrays — maly overhead, elastyczne)
+                embeddings_blob BLOB NOT NULL,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                -- Jesli LLM/user przypisal do profilu, tu jest ref
+                assigned_profile_id INTEGER REFERENCES voice_profiles(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(meeting_id, temp_label)
+            );
+            CREATE INDEX idx_voice_temp_meeting ON voice_temp_speakers(meeting_id);
+            CREATE INDEX idx_voice_temp_assigned ON voice_temp_speakers(assigned_profile_id);
+        ",
+    ),
 ]
 }

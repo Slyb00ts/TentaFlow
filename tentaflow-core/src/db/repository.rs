@@ -3164,6 +3164,318 @@ pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+// =============================================================================
+// Voice profiles — CRUD dla speaker recognition (bulletproof identification)
+// =============================================================================
+
+/// Tworzy nowy profil glosowy. Zwraca id utworzonego profilu.
+pub fn create_voice_profile(pool: &DbPool, params: &NewVoiceProfile<'_>) -> Result<i64> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO voice_profiles
+            (name, centroid, sample_count, reliability_score, source, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            params.name,
+            params.centroid,
+            params.sample_count,
+            params.reliability_score,
+            params.source,
+            params.metadata_json,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Lista wszystkich profili (posortowana po last_seen malejaco, null na koncu)
+pub fn list_voice_profiles(pool: &DbPool) -> Result<Vec<DbVoiceProfile>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, centroid, sample_count, reliability_score, source,
+                metadata_json, enrolled_at, last_seen_at, total_utterances
+         FROM voice_profiles
+         ORDER BY COALESCE(last_seen_at, '0') DESC, name ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(DbVoiceProfile {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            centroid: row.get(2)?,
+            sample_count: row.get(3)?,
+            reliability_score: row.get(4)?,
+            source: row.get(5)?,
+            metadata_json: row.get(6)?,
+            enrolled_at: row.get(7)?,
+            last_seen_at: row.get(8)?,
+            total_utterances: row.get(9)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Pobiera profil po id
+pub fn get_voice_profile(pool: &DbPool, id: i64) -> Result<Option<DbVoiceProfile>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, centroid, sample_count, reliability_score, source,
+                metadata_json, enrolled_at, last_seen_at, total_utterances
+         FROM voice_profiles WHERE id = ?1",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![id], |row| {
+            Ok(DbVoiceProfile {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                centroid: row.get(2)?,
+                sample_count: row.get(3)?,
+                reliability_score: row.get(4)?,
+                source: row.get(5)?,
+                metadata_json: row.get(6)?,
+                enrolled_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                total_utterances: row.get(9)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+/// Pobiera profil po nazwie (unique constraint)
+pub fn get_voice_profile_by_name(pool: &DbPool, name: &str) -> Result<Option<DbVoiceProfile>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, centroid, sample_count, reliability_score, source,
+                metadata_json, enrolled_at, last_seen_at, total_utterances
+         FROM voice_profiles WHERE name = ?1",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![name], |row| {
+            Ok(DbVoiceProfile {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                centroid: row.get(2)?,
+                sample_count: row.get(3)?,
+                reliability_score: row.get(4)?,
+                source: row.get(5)?,
+                metadata_json: row.get(6)?,
+                enrolled_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                total_utterances: row.get(9)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+/// Aktualizuje centroid + sample_count + reliability po dodaniu/usunieciu sample
+pub fn update_voice_profile_stats(
+    pool: &DbPool,
+    id: i64,
+    centroid: &[u8],
+    sample_count: i64,
+    reliability_score: f32,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE voice_profiles
+         SET centroid = ?2, sample_count = ?3, reliability_score = ?4
+         WHERE id = ?1",
+        rusqlite::params![id, centroid, sample_count, reliability_score],
+    )?;
+    Ok(())
+}
+
+/// Oznacza profil jako aktywny (last_seen, +1 utterance). Wolane przy kazdym match.
+pub fn touch_voice_profile(pool: &DbPool, id: i64) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE voice_profiles
+         SET last_seen_at = datetime('now'),
+             total_utterances = total_utterances + 1
+         WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Usuwa profil (cascade usuwa samples przez FK ON DELETE CASCADE).
+pub fn delete_voice_profile(pool: &DbPool, id: i64) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM voice_profiles WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Zmiana nazwy profilu
+pub fn rename_voice_profile(pool: &DbPool, id: i64, new_name: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE voice_profiles SET name = ?2 WHERE id = ?1",
+        rusqlite::params![id, new_name],
+    )?;
+    Ok(())
+}
+
+/// Dodaje sample do profilu. Caller powinien potem przeliczyc centroid.
+pub fn add_voice_profile_sample(
+    pool: &DbPool,
+    params: &NewVoiceProfileSample<'_>,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO voice_profile_samples
+            (profile_id, embedding, duration_ms, snr_db, intra_similarity, meeting_id, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            params.profile_id,
+            params.embedding,
+            params.duration_ms,
+            params.snr_db,
+            params.intra_similarity,
+            params.meeting_id,
+            params.source,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Lista samples dla profilu — wszystkie, do multi-sample matchingu
+pub fn list_voice_profile_samples(
+    pool: &DbPool,
+    profile_id: i64,
+) -> Result<Vec<DbVoiceProfileSample>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, profile_id, embedding, duration_ms, snr_db, intra_similarity,
+                meeting_id, source, created_at
+         FROM voice_profile_samples
+         WHERE profile_id = ?1
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![profile_id], |row| {
+        Ok(DbVoiceProfileSample {
+            id: row.get(0)?,
+            profile_id: row.get(1)?,
+            embedding: row.get(2)?,
+            duration_ms: row.get(3)?,
+            snr_db: row.get(4)?,
+            intra_similarity: row.get(5)?,
+            meeting_id: row.get(6)?,
+            source: row.get(7)?,
+            created_at: row.get(8)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Usuwa pojedynczy sample (np. odrzucony po spadku reliability)
+pub fn delete_voice_profile_sample(pool: &DbPool, sample_id: i64) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM voice_profile_samples WHERE id = ?1",
+        rusqlite::params![sample_id],
+    )?;
+    Ok(())
+}
+
+/// Tworzy nowy temp speaker dla meetingu (lub zwraca istniejacy przez UNIQUE constraint)
+pub fn upsert_voice_temp_speaker(
+    pool: &DbPool,
+    meeting_id: &str,
+    temp_label: &str,
+    embeddings_blob: &[u8],
+    sample_count: i64,
+    total_duration_ms: i64,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO voice_temp_speakers
+            (meeting_id, temp_label, embeddings_blob, sample_count, total_duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(meeting_id, temp_label) DO UPDATE SET
+            embeddings_blob = excluded.embeddings_blob,
+            sample_count = excluded.sample_count,
+            total_duration_ms = excluded.total_duration_ms",
+        rusqlite::params![
+            meeting_id,
+            temp_label,
+            embeddings_blob,
+            sample_count,
+            total_duration_ms
+        ],
+    )?;
+    let id = conn.query_row(
+        "SELECT id FROM voice_temp_speakers WHERE meeting_id = ?1 AND temp_label = ?2",
+        rusqlite::params![meeting_id, temp_label],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
+/// Lista temp speakers dla meetingu (do post-meeting LLM assignment)
+pub fn list_voice_temp_speakers(pool: &DbPool, meeting_id: &str) -> Result<Vec<DbVoiceTempSpeaker>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, meeting_id, temp_label, embeddings_blob, sample_count,
+                total_duration_ms, assigned_profile_id, created_at
+         FROM voice_temp_speakers
+         WHERE meeting_id = ?1
+         ORDER BY temp_label ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![meeting_id], |row| {
+        Ok(DbVoiceTempSpeaker {
+            id: row.get(0)?,
+            meeting_id: row.get(1)?,
+            temp_label: row.get(2)?,
+            embeddings_blob: row.get(3)?,
+            sample_count: row.get(4)?,
+            total_duration_ms: row.get(5)?,
+            assigned_profile_id: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Przypisuje temp speakera do profilu (np. po LLM detection "Cześć, tu Jan")
+pub fn assign_temp_speaker_to_profile(
+    pool: &DbPool,
+    temp_speaker_id: i64,
+    profile_id: i64,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE voice_temp_speakers SET assigned_profile_id = ?2 WHERE id = ?1",
+        rusqlite::params![temp_speaker_id, profile_id],
+    )?;
+    Ok(())
+}
+
+/// Czysci temp speakers starsze niz X dni (housekeeping)
+pub fn cleanup_old_voice_temp_speakers(pool: &DbPool, older_than_days: i64) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "DELETE FROM voice_temp_speakers
+         WHERE created_at < datetime('now', ?1)",
+        rusqlite::params![format!("-{} days", older_than_days)],
+    )?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod alias_resolve_tests {
     use super::*;

@@ -5,10 +5,16 @@
 //       po otrzymaniu audio od meeting-bota, przed/po STT.
 // =============================================================================
 
+use super::voice_profile::{
+    self, EnrollmentError, EnrollmentResult, EnrollmentSample, MatchConfidence, MatchResult,
+    ENROLL_HOP_SAMPLES, ENROLL_WINDOW_SAMPLES, INCREMENTAL_LEARN_THRESHOLD, MATCH_MIN_AUDIO_SAMPLES,
+};
 use super::{EmbeddingExtractor, SpeakerTracker};
+use crate::db::DbPool;
+use anyhow::Result;
 use parking_lot::Mutex;
 use std::sync::OnceLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Domyslne parametry clustering.
 /// Threshold 0.4 dobrany empirycznie dla trackera z oknem N=8 embeddingow —
@@ -127,6 +133,202 @@ pub fn identify_speaker(pcm_i16_le: &[u8]) -> Option<String> {
 pub fn reset_tracker() {
     tracker().lock().reset();
     info!("Speaker tracker zresetowany");
+}
+
+// =============================================================================
+// Voice profile integration — bulletproof speaker recognition
+// =============================================================================
+
+/// Identyfikuje mowce z *baza enrolled profiles* jako pierwszeństwo,
+/// fallback na online tracker gdy profil nie pasuje.
+///
+/// Zwraca tuple (label, confidence_optional):
+/// - `("Jan Kowalski", Some(0.72))` — enrolled profile match (high conf)
+/// - `("SPEAKER_00", None)`         — online tracker label (brak enrolled match)
+/// - `None`                          — audio za krotkie / model niedostepny
+///
+/// Jesli match jest very-confident (score >= 0.7) i SNR jest dobry, embedding
+/// jest auto-dodawany do profilu (incremental learning).
+pub fn identify_speaker_with_profiles(
+    pool: &DbPool,
+    pcm_i16_le: &[u8],
+    meeting_id: Option<&str>,
+) -> Option<(String, Option<f32>)> {
+    let ext = extractor()?;
+
+    // Konwersja i16 LE → f32
+    let samples_f32 = voice_profile::pcm_i16_le_to_f32(pcm_i16_le);
+
+    if samples_f32.len() < MATCH_MIN_AUDIO_SAMPLES {
+        debug!(
+            samples = samples_f32.len(),
+            min_required = MATCH_MIN_AUDIO_SAMPLES,
+            "identify_speaker_with_profiles — audio za krotkie"
+        );
+        return None;
+    }
+
+    // Clipping do MAX_AUDIO_SAMPLES dla stabilnego embeddingu + low latency
+    let clipped: &[f32] = if samples_f32.len() > MAX_AUDIO_SAMPLES {
+        let start = (samples_f32.len() - MAX_AUDIO_SAMPLES) / 2;
+        &samples_f32[start..start + MAX_AUDIO_SAMPLES]
+    } else {
+        &samples_f32[..]
+    };
+
+    let embedding = match ext.extract(clipped) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("WeSpeaker extract error: {}", e);
+            return None;
+        }
+    };
+
+    // 1. Sprawdz enrolled profiles
+    match voice_profile::match_to_profiles(pool, &embedding) {
+        Ok(Some(result)) if result.confidence.is_match() => {
+            let snr_db = voice_profile::estimate_snr_db(&samples_f32);
+            let duration_ms = (samples_f32.len() * 1000 / 16000) as u64;
+
+            // Incremental learning (profil uczy sie z czasem)
+            if result.score >= INCREMENTAL_LEARN_THRESHOLD {
+                if let Err(e) = voice_profile::on_confident_match(
+                    pool,
+                    &result,
+                    &embedding,
+                    duration_ms,
+                    snr_db,
+                    meeting_id,
+                ) {
+                    warn!("Incremental learn failed: {}", e);
+                }
+            } else {
+                // Still touch last_seen
+                if let Err(e) = crate::db::repository::touch_voice_profile(pool, result.profile_id) {
+                    warn!("touch_voice_profile failed: {}", e);
+                }
+            }
+
+            debug!(
+                profile = %result.profile_name,
+                score = result.score,
+                confidence = ?result.confidence,
+                "Matched to enrolled profile"
+            );
+            return Some((result.profile_name, Some(result.score)));
+        }
+        Ok(_) => {
+            // Brak confident match — fallback na online tracker
+        }
+        Err(e) => {
+            warn!("match_to_profiles error: {}", e);
+        }
+    }
+
+    // 2. Fallback: online tracker (tymczasowe SPEAKER_XX per meeting)
+    let label = tracker().lock().track(&embedding);
+    Some((label, None))
+}
+
+/// Enrolment z raw PCM i16 LE. Dzieli audio na slidingowe okna 3s hop 1.5s,
+/// wylicza embeddingi WeSpeakera, SNR per okno, buduje profil.
+///
+/// Wolane przez API endpoint (ktory wola LLM po detekcji "Cześć, tu Jan").
+/// Nie wymaga VAD na wejsciu — zaklada ze caller podal czyste speech audio
+/// (LLM robi decyzje ze wyslac na podstawie wykrycia introduction w tekscie).
+pub fn enroll_profile_from_pcm(
+    pool: &DbPool,
+    name: &str,
+    pcm_i16_le: &[u8],
+    source: &str,
+) -> Result<EnrollmentResult, String> {
+    let ext = extractor().ok_or_else(|| "WeSpeaker model nie zaladowany".to_string())?;
+
+    let samples_f32 = voice_profile::pcm_i16_le_to_f32(pcm_i16_le);
+    let total_duration_ms = (samples_f32.len() * 1000 / 16000) as u64;
+
+    if samples_f32.len() < ENROLL_WINDOW_SAMPLES {
+        return Err(format!(
+            "audio za krotkie: {} probek ({:.2}s), wymagane minimum {:.1}s",
+            samples_f32.len(),
+            total_duration_ms as f32 / 1000.0,
+            ENROLL_WINDOW_SAMPLES as f32 / 16000.0
+        ));
+    }
+
+    // Sliding window 3s hop 1.5s → extract embeddings + SNR per window
+    let mut enrollment_samples: Vec<EnrollmentSample> = Vec::new();
+    let mut pos = 0;
+    while pos + ENROLL_WINDOW_SAMPLES <= samples_f32.len() {
+        let window = &samples_f32[pos..pos + ENROLL_WINDOW_SAMPLES];
+        let embedding = match ext.extract(window) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(window_pos = pos, "extract error: {}", e);
+                pos += ENROLL_HOP_SAMPLES;
+                continue;
+            }
+        };
+        let snr = voice_profile::estimate_snr_db(window);
+        let rms: f32 =
+            (window.iter().map(|x| x * x).sum::<f32>() / window.len() as f32).sqrt();
+        let window_duration_ms = (ENROLL_WINDOW_SAMPLES * 1000 / 16000) as u64;
+        enrollment_samples.push(EnrollmentSample {
+            embedding,
+            duration_ms: window_duration_ms,
+            snr_db: snr,
+            rms,
+        });
+        pos += ENROLL_HOP_SAMPLES;
+    }
+
+    if enrollment_samples.is_empty() {
+        return Err("nie udalo sie wyciagnac zadnego embeddingu".to_string());
+    }
+
+    // Zapisz do DB
+    voice_profile::enroll_profile(pool, name, &enrollment_samples, source)
+        .map_err(|e| format!("enrollment failed: {}", e))
+}
+
+/// Dopisuje sample do istniejacego profilu (incremental z PCM).
+/// Uzywane gdy LLM po raz drugi wykryje usera i chce "rozszerzyc" profil.
+pub fn append_to_profile_from_pcm(
+    pool: &DbPool,
+    profile_id: i64,
+    pcm_i16_le: &[u8],
+    meeting_id: Option<&str>,
+) -> Result<usize, String> {
+    let ext = extractor().ok_or_else(|| "WeSpeaker model nie zaladowany".to_string())?;
+
+    let samples_f32 = voice_profile::pcm_i16_le_to_f32(pcm_i16_le);
+    if samples_f32.len() < ENROLL_WINDOW_SAMPLES {
+        return Err("audio za krotkie do wzbogacenia profilu".to_string());
+    }
+
+    let mut added = 0;
+    let mut pos = 0;
+    while pos + ENROLL_WINDOW_SAMPLES <= samples_f32.len() {
+        let window = &samples_f32[pos..pos + ENROLL_WINDOW_SAMPLES];
+        if let Ok(embedding) = ext.extract(window) {
+            let snr = voice_profile::estimate_snr_db(window);
+            let duration_ms = (ENROLL_WINDOW_SAMPLES * 1000 / 16000) as u64;
+            if let Ok(()) = voice_profile::add_sample_to_profile(
+                pool,
+                profile_id,
+                &embedding,
+                duration_ms,
+                snr,
+                meeting_id,
+                "append",
+            ) {
+                added += 1;
+            }
+        }
+        pos += ENROLL_HOP_SAMPLES;
+    }
+
+    Ok(added)
 }
 
 #[cfg(test)]

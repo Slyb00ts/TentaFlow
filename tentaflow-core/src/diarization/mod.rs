@@ -9,8 +9,15 @@ pub mod embedding;
 pub mod error;
 pub mod service;
 pub mod tracker;
+pub mod voice_profile;
 
 pub use embedding::{cosine_similarity, EmbeddingExtractor};
 pub use error::DiarizationError;
 pub use service::{identify_speaker, reset_tracker};
 pub use tracker::SpeakerTracker;
+pub use voice_profile::{
+    add_sample_to_profile, bytes_to_embedding, embedding_to_bytes, enroll_profile,
+    estimate_snr_db, list_profiles, match_to_profiles, on_confident_match, pcm_i16_le_to_f32,
+    EnrollmentError, EnrollmentResult, EnrollmentSample, MatchConfidence, MatchResult,
+    ProfileInfo,
+};
