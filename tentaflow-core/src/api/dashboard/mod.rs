@@ -29,6 +29,9 @@ pub mod api_nim;
 pub mod auto_register;
 pub mod ws_deploy;
 
+#[cfg(feature = "inference-diarization")]
+pub mod api_voice_profiles;
+
 /// Escapowanie znakow specjalnych JSON w stringu
 fn escape_json_string(s: &str) -> String {
     s.replace('\\', "\\\\")

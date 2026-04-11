@@ -186,18 +186,20 @@ mod tests {
 
     /// Regresja: ten sam glos z variancja akustyczna nie powinien byc
     /// sklasyfikowany jako nowy mowca gdy jeden z historycznych embeddingow
-    /// jest mu bliski (max-similarity > threshold).
+    /// jest mu bliski (max-similarity > threshold dzieki sliding window).
     #[test]
     fn test_acoustic_variance_stays_same_speaker() {
         let mut t = SpeakerTracker::new(0.5, 10);
-        // Trzy warianty tego samego "glosu" — kazdy przesuniety ale zawsze
-        // blisko jednego z wczesniejszych embeddingow
+        // Trzy warianty tego samego glosu, przesuwajace sie w feature space,
+        // ale zawsze co najmniej jeden poprzedni ma cos > 0.5 z nowym:
+        //   cos(e1, e2) = 0.8
+        //   cos(e1, e3) ~ 0.33 (bezposrednio za daleko)
+        //   cos(e2, e3) ~ 0.72 (ale e2 jest w oknie → match)
         let e1 = normalize(vec![1.0, 0.0, 0.0, 0.0]);
-        let e2 = normalize(vec![0.9, 0.2, 0.0, 0.0]);
-        let e3 = normalize(vec![0.2, 0.9, 0.0, 0.0]); // daleko od e1 ale blisko e2
+        let e2 = normalize(vec![0.8, 0.6, 0.0, 0.0]);
+        let e3 = normalize(vec![0.3, 0.7, 0.5, 0.0]);
         assert_eq!(t.track(&e1), "SPEAKER_00");
         assert_eq!(t.track(&e2), "SPEAKER_00");
-        // e3 vs e1: ~0.2, e3 vs e2: ~0.88 → max 0.88 > 0.5 → ten sam speaker
         assert_eq!(t.track(&e3), "SPEAKER_00");
     }
 }
