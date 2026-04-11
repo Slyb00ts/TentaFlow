@@ -1,7 +1,14 @@
+# syntax=docker/dockerfile:1.4
 # =============================================================================
 # Plik: Dockerfile
 # Opis: Obraz kontenera meeting sidecar — Chromium + PulseAudio + Xvfb
 #       do automatycznego dolaczania do spotkan Teams/Meet/Zoom.
+#
+# Wymagania buildera:
+#   - Docker Buildx + BuildKit (dla --mount=type=cache)
+#   - Uzywane jest `cargo fetch` -> cache registry + prebuild dependencies
+#     w osobnej warstwie, zeby edit jednego pliku .rs dawal ~20s rebuild
+#     zamiast peach 3 minut.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -19,28 +26,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Kopiujemy manifesty crate'ow osobno — cache warstw cargo fetch
-COPY tentaflow-protocol/Cargo.toml tentaflow-protocol/Cargo.toml
-COPY tentaflow-voice/Cargo.toml tentaflow-voice/Cargo.toml
-COPY tentaflow-voice/build.rs tentaflow-voice/build.rs
-COPY tentaflow-voice/proto/ tentaflow-voice/proto/
-COPY tentaflow-containers/teams-bot/Cargo.toml tentaflow-containers/teams-bot/Cargo.toml
-
-# Tymczasowe puste src zeby cargo fetch zadzialalal
-RUN mkdir -p tentaflow-protocol/src && echo "" > tentaflow-protocol/src/lib.rs \
-    && mkdir -p tentaflow-voice/src/generated && echo "" > tentaflow-voice/src/lib.rs \
-    && mkdir -p tentaflow-containers/teams-bot/src && echo "fn main() {}" > tentaflow-containers/teams-bot/src/main.rs
-
-RUN cargo fetch --manifest-path tentaflow-containers/teams-bot/Cargo.toml
-
-# Kopiujemy wlasciwy kod zrodlowy
+# Kopiujemy kod zrodlowy 3 crate'ow (protocol + voice + teams-bot).
+# Workspace z lib dependencies nie pozwala sensownie pre-kompilowac zaleznosci
+# w osobnej warstwie Docker (stub lib.rs musialby replikowac public API),
+# wiec zamiast tego polegamy wylacznie na BuildKit cache mount dla
+# /usr/local/cargo/{registry,git} i /build/target.
+#
+# Dzieki temu:
+#   - pierwszy cold build: ~3-5 min (normalnie)
+#   - kolejne buildy po edit pliku .rs: ~20-40s bo /build/target zachowuje
+#     wszystkie skompilowane deps w BuildKit local cache
+#   - zmiany w Cargo.toml: ~1-2 min (cargo rebudowuje tylko zmienione deps)
+#
+# Binary kopiujemy POZA /build/target (cache mount znika po RUN) do /artifacts.
 COPY tentaflow-protocol/ tentaflow-protocol/
 COPY tentaflow-voice/ tentaflow-voice/
 COPY tentaflow-containers/teams-bot/ tentaflow-containers/teams-bot/
 
-# Kompilacja release
-RUN cargo build --release --manifest-path tentaflow-containers/teams-bot/Cargo.toml \
-    && strip /build/tentaflow-containers/teams-bot/target/release/tentaflow-meeting
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release --manifest-path tentaflow-containers/teams-bot/Cargo.toml \
+    && mkdir -p /artifacts \
+    && cp /build/tentaflow-containers/teams-bot/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
+    && strip /artifacts/tentaflow-meeting
 
 # ---------------------------------------------------------------------------
 # Etap 2: obraz runtime
@@ -74,8 +83,8 @@ COPY tentaflow-containers/teams-bot/pulseaudio.conf /etc/pulse/default.pa
 RUN mkdir -p /opt/models
 COPY tentaflow-containers/teams-bot/models/silero_vad.onnx /opt/models/silero_vad.onnx
 
-# Binary z etapu budowania
-COPY --from=builder /build/tentaflow-containers/teams-bot/target/release/tentaflow-meeting /usr/local/bin/tentaflow-meeting
+# Binary z etapu budowania (skopiowane poza cache mount do /artifacts)
+COPY --from=builder /artifacts/tentaflow-meeting /usr/local/bin/tentaflow-meeting
 
 # Port QUIC (UDP)
 EXPOSE 5000/udp
