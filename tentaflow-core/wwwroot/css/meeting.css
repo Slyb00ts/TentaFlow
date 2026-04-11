@@ -142,7 +142,12 @@
   padding: var(--spacing-sm);
   background: var(--bg-elevated);
   border-radius: var(--radius-sm);
-  border-left: 3px solid var(--accent-primary);
+  border-left: 3px solid var(--border-primary);
+}
+
+/* Enrolled voice profiles dostaja zielony accent border */
+.meeting-transcript-row-enrolled {
+  border-left-color: #10b981;
 }
 
 .meeting-transcript-meta {
@@ -152,6 +157,7 @@
   font-size: var(--font-size-xs);
   color: var(--text-secondary);
   margin-bottom: 4px;
+  flex-wrap: wrap;
 }
 
 .meeting-transcript-time {
@@ -160,7 +166,37 @@
 
 .meeting-transcript-speaker {
   font-weight: 600;
-  color: var(--text-primary);
+  /* color ustawiane inline z hashu speaker name */
+}
+
+.meeting-transcript-badge {
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+
+.meeting-transcript-badge-enrolled {
+  background: rgba(16, 185, 129, 0.18);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.meeting-transcript-badge-temp {
+  background: rgba(148, 163, 184, 0.15);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.meeting-transcript-confidence {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
 }
 
 .meeting-transcript-model {
