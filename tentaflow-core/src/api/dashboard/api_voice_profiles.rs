@@ -36,7 +36,14 @@ fn json_ok<T: Serialize>(value: T) -> String {
 
 #[derive(Debug, Deserialize)]
 struct EnrollRequest {
-    name: String,
+    /// Imie osoby (wymagane).
+    first_name: String,
+    /// Nazwisko (opcjonalne).
+    #[serde(default)]
+    last_name: Option<String>,
+    /// Nick (opcjonalny).
+    #[serde(default)]
+    nickname: Option<String>,
     /// PCM 16-bit LE mono 16kHz, base64-encoded. Preferowane 15-60s czystej mowy.
     #[serde(rename = "audio_pcm_base64")]
     audio_pcm_base64: String,
@@ -61,9 +68,16 @@ struct IdentifyRequest {
     meeting_id: Option<String>,
 }
 
+/// PATCH body — pozwala zmienic czesci osobowe (first_name, last_name, nickname).
+/// Wszystkie pola opcjonalne; display name (`name`) jest przeliczany.
 #[derive(Debug, Deserialize)]
-struct RenameRequest {
-    name: String,
+struct UpdateIdentityRequest {
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<Option<String>>, // double-option: pominiete vs explicit null
+    #[serde(default)]
+    nickname: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +90,7 @@ struct AssignTempSpeakerRequest {
 #[derive(Debug, Serialize)]
 struct EnrollResponse {
     profile_id: i64,
+    name: String,
     samples_accepted: usize,
     samples_rejected: usize,
     reliability_score: f32,
@@ -173,17 +188,8 @@ fn handle_list(db: &DbPool) -> (u16, String) {
 fn handle_get(db: &DbPool, id: i64) -> (u16, String) {
     match crate::db::repository::get_voice_profile(db, id) {
         Ok(Some(p)) => {
-            let profile = crate::diarization::ProfileInfo {
-                id: p.id,
-                name: p.name,
-                sample_count: p.sample_count as usize,
-                reliability_score: p.reliability_score,
-                source: p.source,
-                enrolled_at: p.enrolled_at,
-                last_seen_at: p.last_seen_at,
-                total_utterances: p.total_utterances as usize,
-            };
-            (200, json_ok(profile))
+            let info = crate::diarization::voice_profile::profile_to_info(p);
+            (200, json_ok(info))
         }
         Ok(None) => (404, json_error("profile not found")),
         Err(e) => (500, json_error(&format!("db error: {}", e))),
@@ -196,8 +202,8 @@ fn handle_enroll(db: &DbPool, body: &[u8]) -> (u16, String) {
         Err(e) => return (400, json_error(&format!("invalid JSON: {}", e))),
     };
 
-    if req.name.trim().is_empty() {
-        return (400, json_error("name cannot be empty"));
+    if req.first_name.trim().is_empty() {
+        return (400, json_error("first_name cannot be empty"));
     }
 
     let pcm_bytes = match BASE64.decode(req.audio_pcm_base64.as_bytes()) {
@@ -207,10 +213,19 @@ fn handle_enroll(db: &DbPool, body: &[u8]) -> (u16, String) {
 
     let source = req.source.as_deref().unwrap_or("api");
 
-    match crate::diarization::service::enroll_profile_from_pcm(db, &req.name, &pcm_bytes, source) {
+    let mut identity = crate::diarization::voice_profile::PersonIdentity::new(&req.first_name);
+    if let Some(ref last) = req.last_name {
+        identity = identity.with_last_name(last);
+    }
+    if let Some(ref nick) = req.nickname {
+        identity = identity.with_nickname(nick);
+    }
+
+    match crate::diarization::service::enroll_profile_from_pcm(db, &identity, &pcm_bytes, source) {
         Ok(result) => {
             let resp = EnrollResponse {
                 profile_id: result.profile_id,
+                name: result.name,
                 samples_accepted: result.samples_accepted,
                 samples_rejected: result.samples_rejected,
                 reliability_score: result.reliability_score,
@@ -323,16 +338,77 @@ fn handle_identify(db: &DbPool, body: &[u8]) -> (u16, String) {
 }
 
 fn handle_rename(db: &DbPool, id: i64, body: &[u8]) -> (u16, String) {
-    let req: RenameRequest = match serde_json::from_slice(body) {
+    let req: UpdateIdentityRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return (400, json_error(&format!("invalid JSON: {}", e))),
     };
-    if req.name.trim().is_empty() {
-        return (400, json_error("name cannot be empty"));
+
+    let existing = match crate::db::repository::get_voice_profile(db, id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return (404, json_error("profile not found")),
+        Err(e) => return (500, json_error(&format!("db error: {}", e))),
+    };
+
+    // Merge incoming changes nad istniejacym profilem
+    let new_first = req.first_name.as_deref().map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&existing.first_name)
+        .to_string();
+
+    let new_last: Option<String> = match req.last_name {
+        Some(Some(v)) => {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }
+        Some(None) => None, // explicit null → clear
+        None => existing.last_name.clone(),
+    };
+
+    let new_nick: Option<String> = match req.nickname {
+        Some(Some(v)) => {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }
+        Some(None) => None,
+        None => existing.nickname.clone(),
+    };
+
+    if new_first.is_empty() {
+        return (400, json_error("first_name cannot be empty"));
     }
-    match crate::db::repository::rename_voice_profile(db, id, &req.name) {
-        Ok(()) => (200, json_ok(serde_json::json!({"ok": true}))),
-        Err(e) => (500, json_error(&format!("rename failed: {}", e))),
+
+    // Recompute display name
+    let identity = {
+        let mut i = crate::diarization::voice_profile::PersonIdentity::new(&new_first);
+        if let Some(ref l) = new_last {
+            i = i.with_last_name(l);
+        }
+        if let Some(ref n) = new_nick {
+            i = i.with_nickname(n);
+        }
+        i
+    };
+    let new_display_name = identity.display_name();
+
+    match crate::db::repository::update_voice_profile_identity(
+        db,
+        id,
+        &new_display_name,
+        &new_first,
+        new_last.as_deref(),
+        new_nick.as_deref(),
+    ) {
+        Ok(()) => (
+            200,
+            json_ok(serde_json::json!({
+                "ok": true,
+                "name": new_display_name,
+                "first_name": new_first,
+                "last_name": new_last,
+                "nickname": new_nick,
+            })),
+        ),
+        Err(e) => (500, json_error(&format!("update failed: {}", e))),
     }
 }
 

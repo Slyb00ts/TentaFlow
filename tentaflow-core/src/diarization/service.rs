@@ -7,7 +7,8 @@
 
 use super::voice_profile::{
     self, EnrollmentError, EnrollmentResult, EnrollmentSample, MatchConfidence, MatchResult,
-    ENROLL_HOP_SAMPLES, ENROLL_WINDOW_SAMPLES, INCREMENTAL_LEARN_THRESHOLD, MATCH_MIN_AUDIO_SAMPLES,
+    PersonIdentity, ENROLL_HOP_SAMPLES, ENROLL_WINDOW_SAMPLES, INCREMENTAL_LEARN_THRESHOLD,
+    MATCH_MIN_AUDIO_SAMPLES,
 };
 use super::{EmbeddingExtractor, SpeakerTracker};
 use crate::db::DbPool;
@@ -230,15 +231,14 @@ pub fn identify_speaker_with_profiles(
     Some((label, None))
 }
 
-/// Enrolment z raw PCM i16 LE. Dzieli audio na slidingowe okna 3s hop 1.5s,
-/// wylicza embeddingi WeSpeakera, SNR per okno, buduje profil.
+/// Enrolment z raw PCM i16 LE. Dzieli audio na slidingowe okna, wylicza
+/// embeddingi WeSpeakera, SNR per okno, buduje profil dla osoby
+/// identyfikowanej przez `identity` (imie + opcjonalne nazwisko + nick).
 ///
 /// Wolane przez API endpoint (ktory wola LLM po detekcji "Cześć, tu Jan").
-/// Nie wymaga VAD na wejsciu — zaklada ze caller podal czyste speech audio
-/// (LLM robi decyzje ze wyslac na podstawie wykrycia introduction w tekscie).
 pub fn enroll_profile_from_pcm(
     pool: &DbPool,
-    name: &str,
+    identity: &PersonIdentity<'_>,
     pcm_i16_le: &[u8],
     source: &str,
 ) -> Result<EnrollmentResult, String> {
@@ -256,7 +256,7 @@ pub fn enroll_profile_from_pcm(
         ));
     }
 
-    // Sliding window 3s hop 1.5s → extract embeddings + SNR per window
+    // Sliding window 3s hop 0.75s → extract embeddings + SNR per window
     let mut enrollment_samples: Vec<EnrollmentSample> = Vec::new();
     let mut pos = 0;
     while pos + ENROLL_WINDOW_SAMPLES <= samples_f32.len() {
@@ -286,8 +286,7 @@ pub fn enroll_profile_from_pcm(
         return Err("nie udalo sie wyciagnac zadnego embeddingu".to_string());
     }
 
-    // Zapisz do DB
-    voice_profile::enroll_profile(pool, name, &enrollment_samples, source)
+    voice_profile::enroll_profile(pool, identity, &enrollment_samples, source)
         .map_err(|e| format!("enrollment failed: {}", e))
 }
 
