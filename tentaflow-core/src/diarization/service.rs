@@ -230,40 +230,71 @@ pub fn identify_speaker_with_profiles(
         }
     }
 
-    // 2. Fallback: per-meeting tracker z DB persistence
-    let mut map = active_trackers().lock();
-    let tracker = match map.get_mut(meeting_id) {
-        Some(t) => t,
-        None => {
-            // Auto-start meetingu — bezpieczny default gdy start_meeting nie byl
-            // wolany explicitly (np. bot odrazu wysyla audio bez join command).
-            drop(map);
-            if let Err(e) = start_meeting(pool, meeting_id) {
-                warn!("auto-start meeting failed: {}", e);
+    // 2. Fallback: per-meeting tracker z DB persistence + auto-promotion
+    let snr_db = voice_profile::estimate_snr_db(&samples_f32);
+
+    let track_result = {
+        let mut map = active_trackers().lock();
+        let tracker = match map.get_mut(meeting_id) {
+            Some(t) => t,
+            None => {
+                drop(map);
+                if let Err(e) = start_meeting(pool, meeting_id) {
+                    warn!("auto-start meeting failed: {}", e);
+                    return None;
+                }
+                map = active_trackers().lock();
+                map.get_mut(meeting_id)?
+            }
+        };
+
+        match tracker.track(pool, &embedding, audio_duration_ms, snr_db) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("tracker.track failed: {}", e);
                 return None;
             }
-            map = active_trackers().lock();
-            map.get_mut(meeting_id)?
         }
     };
 
-    match tracker.track(pool, &embedding, audio_duration_ms) {
-        Ok(TrackResult {
-            label,
-            is_new_speaker,
-            similarity,
-        }) => Some(IdentifyResult {
-            label,
-            profile_id: None,
-            confidence: Some(similarity),
-            is_enrolled: false,
-            is_new_temp_speaker: is_new_speaker,
-        }),
-        Err(e) => {
-            warn!("tracker.track failed: {}", e);
-            None
+    // 3. Jesli doszlo do auto-promocji podczas track() — ten sam embedding
+    //    teraz istnieje jako voice_profile. Re-matchujemy zeby zwrocic nowa
+    //    etykiete (KNOWN_SPEAKER_XX) juz dla BIEZACEJ wypowiedzi, zamiast
+    //    czekac do nastepnego meetingu.
+    if track_result.promoted {
+        match voice_profile::match_to_profiles(pool, &embedding) {
+            Ok(Some(promoted_match)) => {
+                info!(
+                    previous_label = %track_result.label,
+                    new_label = %promoted_match.profile_name,
+                    profile_id = promoted_match.profile_id,
+                    score = promoted_match.score,
+                    "Re-matched after auto-promotion"
+                );
+                return Some(IdentifyResult {
+                    label: promoted_match.profile_name,
+                    profile_id: Some(promoted_match.profile_id),
+                    confidence: Some(promoted_match.score),
+                    is_enrolled: true,
+                    is_new_temp_speaker: false,
+                });
+            }
+            Ok(None) => {
+                warn!("Promotion succeeded but re-match returned no profile — using old label");
+            }
+            Err(e) => {
+                warn!("Re-match after promotion failed: {}", e);
+            }
         }
     }
+
+    Some(IdentifyResult {
+        label: track_result.label,
+        profile_id: None,
+        confidence: Some(track_result.similarity),
+        is_enrolled: false,
+        is_new_temp_speaker: track_result.is_new_speaker,
+    })
 }
 
 /// Enrolment z raw PCM i16 LE. Dzieli audio na slidingowe okna, wylicza

@@ -3473,6 +3473,24 @@ pub fn assign_temp_speaker_to_profile(
     Ok(())
 }
 
+/// Zwraca nastepny wolny numer dla auto-promocji KNOWN_SPEAKER_XX.
+/// Szuka w voice_profiles najwyzszego uzytego numeru gdzie first_name pasuje
+/// wzorcowi 'KNOWN_SPEAKER_%' i zwraca max+1 (albo 0 gdy brak).
+pub fn next_known_speaker_number(pool: &DbPool) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let max_num: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(CAST(SUBSTR(first_name, 15) AS INTEGER))
+             FROM voice_profiles
+             WHERE first_name LIKE 'KNOWN_SPEAKER_%'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(max_num.map(|n| n + 1).unwrap_or(0))
+}
+
 /// Czysci temp speakers starsze niz X dni (housekeeping)
 pub fn cleanup_old_voice_temp_speakers(pool: &DbPool, older_than_days: i64) -> Result<usize> {
     let conn = acquire(pool)?;

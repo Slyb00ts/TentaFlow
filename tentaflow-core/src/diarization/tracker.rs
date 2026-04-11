@@ -24,6 +24,46 @@ use std::collections::VecDeque;
 /// w pamieci trackera. Wszystkie embeddingi sa jednak zapisywane do DB.
 pub const EMBEDDINGS_PER_SPEAKER: usize = 8;
 
+// =============================================================================
+// Kryteria auto-promocji temp speaker → KNOWN_SPEAKER voice_profile
+// =============================================================================
+
+/// Minimalna dlugosc sample zeby zakwalifikowal sie do promocji (ms).
+/// Krotsze wypowiedzi (<2s) daja niestabilne embeddingi.
+pub const PROMOTION_SAMPLE_MIN_DURATION_MS: u64 = 2000;
+
+/// Minimalny SNR sample (dB) — filtruje szum, oddechy, krzyki.
+pub const PROMOTION_SAMPLE_MIN_SNR_DB: f32 = 12.0;
+
+/// Minimalna liczba kwalifikujacych sie sample (>= min_duration, >= min_snr).
+pub const PROMOTION_MIN_QUALITY_SAMPLES: usize = 5;
+
+/// Minimalna suma duration kwalifikujacych sie sample (ms).
+pub const PROMOTION_MIN_TOTAL_DURATION_MS: u64 = 15_000;
+
+/// Minimalna wewnetrzna cos similarity miedzy kwalifikujacymi sie sample.
+/// Zabezpieczenie przed false-positive clustering w obrebie temp speakera.
+pub const PROMOTION_MIN_INTRA_SIMILARITY: f32 = 0.50;
+
+/// Sample w trackerze — embedding + metadata uzywane do decyzji promocyjnej.
+#[derive(Debug, Clone)]
+pub struct TrackedSample {
+    /// L2-znormalizowany embedding [192 × f32]
+    pub embedding: Vec<f32>,
+    /// Dlugosc oryginalnego audio z ktorego wyciagniety (ms)
+    pub duration_ms: u64,
+    /// Szacowane SNR (dB) — wyzsze = czystszy sygnal
+    pub snr_db: f32,
+}
+
+impl TrackedSample {
+    /// Czy sample spelnia kryteria quality dla promocji
+    fn is_quality(&self) -> bool {
+        self.duration_ms >= PROMOTION_SAMPLE_MIN_DURATION_MS
+            && self.snr_db >= PROMOTION_SAMPLE_MIN_SNR_DB
+    }
+}
+
 /// Struktura jednego temp speakera w pamieci.
 #[derive(Debug, Clone)]
 struct MeetingSpeaker {
@@ -31,46 +71,164 @@ struct MeetingSpeaker {
     db_id: Option<i64>,
     /// Label typu "SPEAKER_00"
     label: String,
-    /// Okno ostatnich embeddingow (L2-znormalizowane)
+    /// Okno ostatnich embeddingow (L2-znormalizowane) — szybki matching
     recent: VecDeque<Vec<f32>>,
-    /// WSZYSTKIE embeddingi uzyskane dla tego speakera w tym meetingu —
-    /// sa flushowane do DB przy flush_to_db() zeby LLM mogl ich uzyc
-    /// do post-meetingowego enrollment.
-    all_embeddings: Vec<Vec<f32>>,
+    /// WSZYSTKIE samples uzyskane dla tego speakera w tym meetingu (z metadata).
+    /// Persystowane do DB, uzywane przy promocji jako zrodlo voice_profile_samples.
+    all_samples: Vec<TrackedSample>,
     /// Total duration wszystkich utterance tego speakera (ms)
     total_duration_ms: u64,
     /// Liczba matchow
     count: usize,
 }
 
-/// Format BLOB dla voice_temp_speakers.embeddings_blob:
-/// [u32 count (LE)][count * 192 * f32 LE bytes]
-/// Prosty, szybki, deterministyczny.
-fn encode_embeddings_blob(embeddings: &[Vec<f32>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + embeddings.len() * 192 * 4);
-    out.extend_from_slice(&(embeddings.len() as u32).to_le_bytes());
-    for emb in embeddings {
-        out.extend_from_slice(&embedding_to_bytes(emb));
+impl MeetingSpeaker {
+    /// Zwraca liste indeksow kwalifikujacych sie sample (quality gates)
+    fn quality_sample_indices(&self) -> Vec<usize> {
+        self.all_samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_quality())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Sprawdza czy speaker jest gotowy do auto-promocji do voice_profile.
+    /// Zwraca indeksy quality samples jesli tak, None w przeciwnym wypadku.
+    fn promotion_candidates(&self) -> Option<Vec<usize>> {
+        let quality = self.quality_sample_indices();
+        if quality.len() < PROMOTION_MIN_QUALITY_SAMPLES {
+            return None;
+        }
+        let total_quality_duration: u64 = quality
+            .iter()
+            .map(|&i| self.all_samples[i].duration_ms)
+            .sum();
+        if total_quality_duration < PROMOTION_MIN_TOTAL_DURATION_MS {
+            return None;
+        }
+        // Sprawdz wewnetrzna spojnosc
+        let embeddings: Vec<&Vec<f32>> = quality
+            .iter()
+            .map(|&i| &self.all_samples[i].embedding)
+            .collect();
+        let intra = intra_similarity_refs(&embeddings);
+        if intra < PROMOTION_MIN_INTRA_SIMILARITY {
+            return None;
+        }
+        Some(quality)
+    }
+}
+
+/// Helper: liczy srednia cos similarity miedzy samples (dla refs — zero-copy).
+fn intra_similarity_refs(samples: &[&Vec<f32>]) -> f32 {
+    if samples.len() < 2 {
+        return 1.0;
+    }
+    let mut sum = 0.0_f32;
+    let mut count = 0;
+    for i in 0..samples.len() {
+        for j in (i + 1)..samples.len() {
+            sum += cosine_similarity(samples[i], samples[j]);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        1.0
+    } else {
+        sum / count as f32
+    }
+}
+
+/// Format BLOB voice_temp_speakers.embeddings_blob — wersja 2.
+///
+///   [u32 magic = 0xFFFFFFFF][u32 version = 2][u32 count]
+///   [count × {192 × f32 LE embedding + u32 LE duration_ms + f32 LE snr_db}]
+///
+/// Magic 0xFFFFFFFF odrozniamy od starej wersji (v1 pierwszy u32 to count,
+/// ktory nigdy nie byl 0xFFFFFFFF). Przy odczycie wykrywamy wersje automatycznie.
+const BLOB_MAGIC_V2: u32 = 0xFFFFFFFF;
+const SAMPLE_SIZE_V2: usize = 192 * 4 + 4 + 4; // embedding + duration + snr
+
+fn encode_samples_blob(samples: &[TrackedSample]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + samples.len() * SAMPLE_SIZE_V2);
+    out.extend_from_slice(&BLOB_MAGIC_V2.to_le_bytes());
+    out.extend_from_slice(&2_u32.to_le_bytes());
+    out.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&embedding_to_bytes(&s.embedding));
+        out.extend_from_slice(&(s.duration_ms as u32).to_le_bytes());
+        out.extend_from_slice(&s.snr_db.to_le_bytes());
     }
     out
 }
 
-fn decode_embeddings_blob(blob: &[u8]) -> Vec<Vec<f32>> {
+fn decode_samples_blob(blob: &[u8]) -> Vec<TrackedSample> {
     if blob.len() < 4 {
         return Vec::new();
     }
-    let count = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
-    let expected = 4 + count * 192 * 4;
-    if blob.len() < expected {
-        return Vec::new();
+    let first = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+    if first == BLOB_MAGIC_V2 {
+        // v2 format
+        if blob.len() < 12 {
+            return Vec::new();
+        }
+        let version = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
+        if version != 2 {
+            tracing::warn!(version, "Unsupported blob version, treating as empty");
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
+        let expected = 12 + count * SAMPLE_SIZE_V2;
+        if blob.len() < expected {
+            tracing::warn!(blob_len = blob.len(), expected, "Blob too short");
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = 12 + i * SAMPLE_SIZE_V2;
+            let emb = bytes_to_embedding(&blob[base..base + 192 * 4]);
+            let dur = u32::from_le_bytes([
+                blob[base + 192 * 4],
+                blob[base + 192 * 4 + 1],
+                blob[base + 192 * 4 + 2],
+                blob[base + 192 * 4 + 3],
+            ]) as u64;
+            let snr = f32::from_le_bytes([
+                blob[base + 192 * 4 + 4],
+                blob[base + 192 * 4 + 5],
+                blob[base + 192 * 4 + 6],
+                blob[base + 192 * 4 + 7],
+            ]);
+            out.push(TrackedSample {
+                embedding: emb,
+                duration_ms: dur,
+                snr_db: snr,
+            });
+        }
+        out
+    } else {
+        // Legacy v1 format: [u32 count][count × 192 × f32]
+        // (Nie ma tu metadata, wiec wrappujemy z zero SNR/duration — te samples
+        // NIE sa kwalifikowalne do promocji, co jest OK — user robiac meeting
+        // po upgrade mial juz upgradowany kod).
+        let count = first as usize;
+        let expected = 4 + count * 192 * 4;
+        if blob.len() < expected {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = 4 + i * 192 * 4;
+            let emb = bytes_to_embedding(&blob[start..start + 192 * 4]);
+            out.push(TrackedSample {
+                embedding: emb,
+                duration_ms: 0,
+                snr_db: 0.0,
+            });
+        }
+        out
     }
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let start = 4 + i * 192 * 4;
-        let end = start + 192 * 4;
-        out.push(bytes_to_embedding(&blob[start..end]));
-    }
-    out
 }
 
 /// Per-meeting speaker tracker. Kazdy meeting ma swoj instancje.
@@ -81,12 +239,16 @@ pub struct MeetingSpeakerTracker {
     max_speakers: usize,
 }
 
-/// Wynik track — label + czy to nowy speaker
+/// Wynik track — label + czy to nowy speaker + czy nastapila promocja
 #[derive(Debug, Clone)]
 pub struct TrackResult {
     pub label: String,
     pub is_new_speaker: bool,
     pub similarity: f32,
+    /// True jesli w ramach tego track() temp speaker zostal auto-promowany
+    /// do voice_profile (KNOWN_SPEAKER_XX). Caller powinien re-matchnac przez
+    /// enrolled profiles zeby uzyskac nowa etykiete juz dla tej wypowiedzi.
+    pub promoted: bool,
 }
 
 impl MeetingSpeakerTracker {
@@ -101,20 +263,21 @@ impl MeetingSpeakerTracker {
         let existing: Vec<DbVoiceTempSpeaker> = repo::list_voice_temp_speakers(pool, meeting_id)?;
         let speakers: Vec<MeetingSpeaker> = existing
             .into_iter()
+            .filter(|row| row.assigned_profile_id.is_none()) // pomin juz promowanych
             .map(|row| {
-                let all_embeddings = decode_embeddings_blob(&row.embeddings_blob);
-                let recent: VecDeque<Vec<f32>> = all_embeddings
+                let all_samples = decode_samples_blob(&row.embeddings_blob);
+                let recent: VecDeque<Vec<f32>> = all_samples
                     .iter()
                     .rev()
                     .take(EMBEDDINGS_PER_SPEAKER)
                     .rev()
-                    .cloned()
+                    .map(|s| s.embedding.clone())
                     .collect();
                 MeetingSpeaker {
                     db_id: Some(row.id),
                     label: row.temp_label,
                     recent,
-                    all_embeddings,
+                    all_samples,
                     total_duration_ms: row.total_duration_ms as u64,
                     count: row.sample_count as usize,
                 }
@@ -145,11 +308,16 @@ impl MeetingSpeakerTracker {
 
     /// Dopasowuje embedding do istniejacego speakera albo tworzy nowego.
     /// Zapisuje zmianę do DB natychmiast (nie trzeba wołać flush).
+    ///
+    /// Zwraca TrackResult ze informacja czy nastapila promocja — wtedy caller
+    /// moze re-matchnac przez match_to_profiles zeby uzyskac nowa etykiete
+    /// (np. "KNOWN_SPEAKER_01") juz dla tej samej wypowiedzi.
     pub fn track(
         &mut self,
         pool: &DbPool,
         embedding: &[f32],
         duration_ms: u64,
+        snr_db: f32,
     ) -> Result<TrackResult> {
         let normalized = l2_normalize(embedding);
 
@@ -168,14 +336,20 @@ impl MeetingSpeakerTracker {
             }
         }
 
+        let sample = TrackedSample {
+            embedding: normalized.clone(),
+            duration_ms,
+            snr_db,
+        };
+
         let (label, is_new_speaker, idx) = match best_idx {
             Some(idx) if best_sim >= self.similarity_threshold => {
                 let spk = &mut self.speakers[idx];
-                spk.recent.push_back(normalized.clone());
+                spk.recent.push_back(normalized);
                 while spk.recent.len() > EMBEDDINGS_PER_SPEAKER {
                     spk.recent.pop_front();
                 }
-                spk.all_embeddings.push(normalized);
+                spk.all_samples.push(sample);
                 spk.count += 1;
                 spk.total_duration_ms += duration_ms;
                 tracing::debug!(
@@ -183,19 +357,20 @@ impl MeetingSpeakerTracker {
                     speaker = %spk.label,
                     similarity = best_sim,
                     count = spk.count,
+                    quality_samples = spk.quality_sample_indices().len(),
                     "Speaker matched"
                 );
                 (spk.label.clone(), false, idx)
             }
             _ if self.speakers.len() < self.max_speakers => {
-                let label = format!("SPEAKER_{:02}", self.speakers.len());
+                let label = self.next_speaker_label();
                 let mut recent = VecDeque::with_capacity(EMBEDDINGS_PER_SPEAKER);
-                recent.push_back(normalized.clone());
+                recent.push_back(normalized);
                 self.speakers.push(MeetingSpeaker {
                     db_id: None,
                     label: label.clone(),
                     recent,
-                    all_embeddings: vec![normalized],
+                    all_samples: vec![sample],
                     total_duration_ms: duration_ms,
                     count: 1,
                 });
@@ -210,11 +385,11 @@ impl MeetingSpeakerTracker {
             Some(idx) => {
                 // Limit osiagniety — forced match do najblizszego
                 let spk = &mut self.speakers[idx];
-                spk.recent.push_back(normalized.clone());
+                spk.recent.push_back(normalized);
                 while spk.recent.len() > EMBEDDINGS_PER_SPEAKER {
                     spk.recent.pop_front();
                 }
-                spk.all_embeddings.push(normalized);
+                spk.all_samples.push(sample);
                 spk.count += 1;
                 spk.total_duration_ms += duration_ms;
                 tracing::debug!(
@@ -226,29 +401,125 @@ impl MeetingSpeakerTracker {
                 (spk.label.clone(), false, idx)
             }
             None => {
-                // Pusty tracker + limit 0 — szybki fallback
                 return Ok(TrackResult {
                     label: "SPEAKER_UNKNOWN".to_string(),
                     is_new_speaker: false,
                     similarity: 0.0,
+                    promoted: false,
                 });
             }
         };
 
-        // Zapisz do DB natychmiast (upsert)
         self.persist_speaker(pool, idx)?;
+
+        // Po persist — sprawdz czy ten speaker dorobil sie na promocje
+        let mut promoted = false;
+        if let Some(quality_idx_list) = self.speakers[idx].promotion_candidates() {
+            match self.promote_speaker(pool, idx, &quality_idx_list) {
+                Ok(Some(profile_id)) => {
+                    tracing::info!(
+                        meeting_id = %self.meeting_id,
+                        profile_id,
+                        previous_label = %label,
+                        "Temp speaker promoted to KNOWN_SPEAKER voice_profile"
+                    );
+                    promoted = true;
+                    // Usun z local trackera — dalsze matche pojda przez enrolled
+                    self.speakers.remove(idx);
+                }
+                Ok(None) => {
+                    // Nie udalo sie (np. uszkodzone samples) — zostawiamy jak jest
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Promotion failed");
+                }
+            }
+        }
 
         Ok(TrackResult {
             label,
             is_new_speaker,
             similarity: best_sim.max(0.0),
+            promoted,
         })
+    }
+
+    /// Zwraca nastepny wolny label dla temp speakera — omija te
+    /// ktore juz zostaly promowane (zeby nie dostac SPEAKER_00 dwa razy).
+    fn next_speaker_label(&self) -> String {
+        let mut used: Vec<usize> = self
+            .speakers
+            .iter()
+            .filter_map(|s| {
+                s.label
+                    .strip_prefix("SPEAKER_")
+                    .and_then(|n| n.parse::<usize>().ok())
+            })
+            .collect();
+        used.sort_unstable();
+        let mut next = 0;
+        for u in &used {
+            if *u == next {
+                next += 1;
+            } else {
+                break;
+            }
+        }
+        format!("SPEAKER_{:02}", next)
+    }
+
+    /// Promuje temp speakera do voice_profile jako "KNOWN_SPEAKER_XX".
+    /// Zwraca id utworzonego profilu albo None jesli promocja sie nie udala.
+    fn promote_speaker(
+        &self,
+        pool: &DbPool,
+        spk_idx: usize,
+        quality_indices: &[usize],
+    ) -> Result<Option<i64>> {
+        let spk = &self.speakers[spk_idx];
+        let quality_samples: Vec<crate::diarization::voice_profile::EnrollmentSample> =
+            quality_indices
+                .iter()
+                .map(|&i| {
+                    let s = &spk.all_samples[i];
+                    crate::diarization::voice_profile::EnrollmentSample {
+                        embedding: s.embedding.clone(),
+                        duration_ms: s.duration_ms,
+                        snr_db: s.snr_db,
+                        rms: 0.0,
+                    }
+                })
+                .collect();
+
+        // Wylicz nowy numer KNOWN_SPEAKER
+        let next_num = repo::next_known_speaker_number(pool)?;
+        let name = format!("KNOWN_SPEAKER_{:02}", next_num);
+        let identity = crate::diarization::voice_profile::PersonIdentity::new(&name);
+
+        match crate::diarization::voice_profile::enroll_profile(
+            pool,
+            &identity,
+            &quality_samples,
+            "auto_promoted",
+        ) {
+            Ok(result) => {
+                // Oznacz temp speakera jako przypisanego do profilu (audit trail)
+                if let Some(temp_id) = spk.db_id {
+                    repo::assign_temp_speaker_to_profile(pool, temp_id, result.profile_id).ok();
+                }
+                Ok(Some(result.profile_id))
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "enroll_profile failed during promotion");
+                Ok(None)
+            }
+        }
     }
 
     /// Zapisuje (albo aktualizuje) pojedynczego speakera do DB.
     fn persist_speaker(&mut self, pool: &DbPool, idx: usize) -> Result<()> {
         let spk = &self.speakers[idx];
-        let blob = encode_embeddings_blob(&spk.all_embeddings);
+        let blob = encode_samples_blob(&spk.all_samples);
         let id = repo::upsert_voice_temp_speaker(
             pool,
             &self.meeting_id,
@@ -278,6 +549,7 @@ impl MeetingSpeakerTracker {
                 sample_count: s.count,
                 total_duration_ms: s.total_duration_ms,
                 db_id: s.db_id,
+                quality_samples: s.quality_sample_indices().len(),
             })
             .collect()
     }
@@ -290,6 +562,9 @@ pub struct TempSpeakerSnapshot {
     pub sample_count: usize,
     pub total_duration_ms: u64,
     pub db_id: Option<i64>,
+    /// Ile z `sample_count` spelnia kryteria quality dla promocji.
+    /// Gdy >= PROMOTION_MIN_QUALITY_SAMPLES → gotowy do auto-promocji.
+    pub quality_samples: usize,
 }
 
 fn l2_normalize(v: &[f32]) -> Vec<f32> {
@@ -329,7 +604,7 @@ mod tests {
         let pool = test_pool();
         let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-1", 0.5, 10).unwrap();
 
-        let result = tracker.track(&pool, &dummy_emb(0.0), 3000).unwrap();
+        let result = tracker.track(&pool, &dummy_emb(0.0), 3000, 20.0).unwrap();
         assert_eq!(result.label, "SPEAKER_00");
         assert!(result.is_new_speaker);
 
@@ -346,8 +621,8 @@ mod tests {
         let pool = test_pool();
         let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-1", 0.5, 10).unwrap();
 
-        tracker.track(&pool, &dummy_emb(0.0), 3000).unwrap();
-        let r2 = tracker.track(&pool, &dummy_emb(0.0), 3000).unwrap();
+        tracker.track(&pool, &dummy_emb(0.0), 3000, 20.0).unwrap();
+        let r2 = tracker.track(&pool, &dummy_emb(0.0), 3000, 20.0).unwrap();
         assert_eq!(r2.label, "SPEAKER_00");
         assert!(!r2.is_new_speaker);
 
@@ -359,7 +634,7 @@ mod tests {
         let pool = test_pool();
         let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-1", 0.9, 10).unwrap();
 
-        let r1 = tracker.track(&pool, &vec![1.0, 0.0, 0.0], 3000).unwrap();
+        let r1 = tracker.track(&pool, &vec![1.0, 0.0, 0.0], 3000, 20.0).unwrap();
         assert_eq!(r1.label, "SPEAKER_00");
         // Wymus niski cos similarity
         let emb_diff: Vec<f32> = {
@@ -367,7 +642,7 @@ mod tests {
             v[100] = 1.0;
             v
         };
-        let r2 = tracker.track(&pool, &emb_diff, 3000).unwrap();
+        let r2 = tracker.track(&pool, &emb_diff, 3000, 20.0).unwrap();
         assert_eq!(r2.label, "SPEAKER_01");
 
         assert_eq!(tracker.speaker_count(), 2);
@@ -391,9 +666,9 @@ mod tests {
         {
             let mut tracker =
                 MeetingSpeakerTracker::load_or_new(&pool, "meet-2", 0.5, 10).unwrap();
-            tracker.track(&pool, &emb_a, 3000).unwrap();
-            tracker.track(&pool, &emb_a, 2000).unwrap();
-            tracker.track(&pool, &emb_b, 3000).unwrap();
+            tracker.track(&pool, &emb_a, 3000, 20.0).unwrap();
+            tracker.track(&pool, &emb_a, 2000, 20.0).unwrap();
+            tracker.track(&pool, &emb_b, 3000, 20.0).unwrap();
             tracker.flush_all(&pool).unwrap();
         }
 
@@ -409,16 +684,148 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_blob_roundtrip() {
-        let embs = vec![dummy_emb(0.0), dummy_emb(1.0), dummy_emb(2.0)];
-        let blob = encode_embeddings_blob(&embs);
-        let decoded = decode_embeddings_blob(&blob);
+    fn encode_decode_blob_v2_roundtrip() {
+        let samples = vec![
+            TrackedSample { embedding: dummy_emb(0.0), duration_ms: 3000, snr_db: 18.5 },
+            TrackedSample { embedding: dummy_emb(1.0), duration_ms: 2500, snr_db: 22.1 },
+            TrackedSample { embedding: dummy_emb(2.0), duration_ms: 4000, snr_db: 15.0 },
+        ];
+        let blob = encode_samples_blob(&samples);
+        let decoded = decode_samples_blob(&blob);
         assert_eq!(decoded.len(), 3);
-        for (a, b) in embs.iter().zip(decoded.iter()) {
-            for (x, y) in a.iter().zip(b.iter()) {
+        for (a, b) in samples.iter().zip(decoded.iter()) {
+            assert_eq!(a.duration_ms, b.duration_ms);
+            assert!((a.snr_db - b.snr_db).abs() < 1e-5);
+            for (x, y) in a.embedding.iter().zip(b.embedding.iter()) {
                 assert!((x - y).abs() < 1e-6);
             }
         }
+    }
+
+    #[test]
+    fn decode_blob_v1_legacy_format() {
+        // v1: [u32 count][count × 192 × f32] — bez metadata
+        let count: u32 = 2;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&count.to_le_bytes());
+        for s in &[dummy_emb(0.0), dummy_emb(1.0)] {
+            for v in s {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let decoded = decode_samples_blob(&blob);
+        assert_eq!(decoded.len(), 2);
+        // Brak metadata → 0 (samples nie sa kwalifikowalne do promocji)
+        assert_eq!(decoded[0].duration_ms, 0);
+        assert_eq!(decoded[0].snr_db, 0.0);
+    }
+
+    #[test]
+    fn auto_promotion_after_quality_samples() {
+        let pool = test_pool();
+        let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-promo", 0.5, 10).unwrap();
+
+        // Sample which always matches itself (constant embedding) — symuluje
+        // ten sam mowca w 6 dluzszych wypowiedziach.
+        let same_voice = dummy_emb(0.0);
+
+        // 5 samples — kazdy 3s, SNR 18 → quality. Po 5 powinno byc gotowe do promocji.
+        for i in 0..5 {
+            let r = tracker.track(&pool, &same_voice, 3000, 18.0).unwrap();
+            // Pierwsze 4 — bez promocji
+            if i < 4 {
+                assert!(!r.promoted, "iter {i}: promoted too early: {:?}", r);
+                assert_eq!(r.label, "SPEAKER_00");
+            }
+        }
+
+        // Po 5 quality samples — total 15s, intra=1.0 → spelnia kryteria.
+        // Piate wywolanie powinno juz wygenerowac promocje.
+        // (Sprawdzimy na 5tym wywolaniu)
+        // Reset i sprawdz 5te dokladnie:
+        let pool2 = test_pool();
+        let mut tracker2 =
+            MeetingSpeakerTracker::load_or_new(&pool2, "meet-promo-2", 0.5, 10).unwrap();
+        let mut last_result = None;
+        for _ in 0..5 {
+            last_result = Some(tracker2.track(&pool2, &same_voice, 3000, 18.0).unwrap());
+        }
+        let r5 = last_result.unwrap();
+        assert!(r5.promoted, "should promote on 5th quality sample, got: {:?}", r5);
+
+        // Po promocji speaker zostal usuniety z trackera
+        assert_eq!(tracker2.speaker_count(), 0);
+
+        // Profile w voice_profiles
+        let profiles = repo::list_voice_profiles(&pool2).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0].name.starts_with("KNOWN_SPEAKER_"));
+        assert_eq!(profiles[0].source, "auto_promoted");
+        // Numer od 0
+        assert_eq!(profiles[0].name, "KNOWN_SPEAKER_00");
+    }
+
+    #[test]
+    fn promotion_skips_short_samples() {
+        let pool = test_pool();
+        let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-short", 0.5, 10).unwrap();
+        let voice = dummy_emb(0.0);
+
+        // 10 samples ale kazdy tylko 1s → ponizej PROMOTION_SAMPLE_MIN_DURATION_MS
+        for _ in 0..10 {
+            let r = tracker.track(&pool, &voice, 1000, 18.0).unwrap();
+            assert!(!r.promoted);
+        }
+        assert_eq!(tracker.speaker_count(), 1);
+        let profiles = repo::list_voice_profiles(&pool).unwrap();
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn promotion_skips_low_snr() {
+        let pool = test_pool();
+        let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-noise", 0.5, 10).unwrap();
+        let voice = dummy_emb(0.0);
+
+        // 6 samples, dlugich, ale SNR 5 → ponizej PROMOTION_SAMPLE_MIN_SNR_DB
+        for _ in 0..6 {
+            let r = tracker.track(&pool, &voice, 3000, 5.0).unwrap();
+            assert!(!r.promoted);
+        }
+        let profiles = repo::list_voice_profiles(&pool).unwrap();
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn promotion_numbering_increments() {
+        let pool = test_pool();
+
+        // Pierwszy meeting → KNOWN_SPEAKER_00
+        {
+            let mut t = MeetingSpeakerTracker::load_or_new(&pool, "meet-A", 0.5, 10).unwrap();
+            for _ in 0..5 {
+                t.track(&pool, &dummy_emb(0.0), 3000, 18.0).unwrap();
+            }
+        }
+
+        // Drugi meeting, inny glos → KNOWN_SPEAKER_01
+        {
+            let mut t = MeetingSpeakerTracker::load_or_new(&pool, "meet-B", 0.5, 10).unwrap();
+            let other_voice: Vec<f32> = {
+                let mut v = vec![0.0_f32; 192];
+                v[100] = 1.0;
+                v
+            };
+            for _ in 0..5 {
+                t.track(&pool, &other_voice, 3000, 18.0).unwrap();
+            }
+        }
+
+        let profiles = repo::list_voice_profiles(&pool).unwrap();
+        assert_eq!(profiles.len(), 2);
+        let names: std::collections::HashSet<_> = profiles.iter().map(|p| p.name.clone()).collect();
+        assert!(names.contains("KNOWN_SPEAKER_00"));
+        assert!(names.contains("KNOWN_SPEAKER_01"));
     }
 
     #[test]
@@ -430,17 +837,17 @@ mod tests {
             let mut v = vec![0.0_f32; 192];
             v[0] = 1.0;
             v
-        }, 3000).unwrap();
+        }, 3000, 20.0).unwrap();
         let r2 = tracker.track(&pool, &{
             let mut v = vec![0.0_f32; 192];
             v[50] = 1.0;
             v
-        }, 3000).unwrap();
+        }, 3000, 20.0).unwrap();
         let r3 = tracker.track(&pool, &{
             let mut v = vec![0.0_f32; 192];
             v[100] = 1.0;
             v
-        }, 3000).unwrap();
+        }, 3000, 20.0).unwrap();
 
         assert_eq!(r1.label, "SPEAKER_00");
         assert_eq!(r2.label, "SPEAKER_01");
