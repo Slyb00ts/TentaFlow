@@ -1028,6 +1028,10 @@
     "llm_alias": "Alias LLM",
     "status_unavailable": "Status Meeting Bota niedostepny",
     "transcripts": "Transkrypcje",
-    "no_transcripts": "Brak transkrypcji — zacznij mowic w spotkaniu"
+    "no_transcripts": "Brak transkrypcji — zacznij mowic w spotkaniu",
+    "enrolled_profile": "Znany profil glosu — rozpoznany z bazy",
+    "temp_speaker": "Tymczasowy mowca — jeszcze nie przypisany do profilu",
+    "badge_enrolled": "znany",
+    "badge_temp": "tymczasowy"
   }
 }
