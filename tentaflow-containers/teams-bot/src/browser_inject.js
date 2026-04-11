@@ -43,7 +43,11 @@
   // Audio capture context (resample do 16kHz mono)
   let captureCtx = null;
   let scriptProcessor = null;
-  const capturedElements = new WeakSet();
+  // UWAGA: NIE uzywamy WeakSet — potrzebujemy jawnej kontroli, zeby po
+  // ended track zwolnic element i pozwolic go ponownie podlaczyc przy
+  // renegocjacji RTCPeerConnection (Teams rotuje track'i gdy ktos dolacza/
+  // opuszcza rozmowe).
+  const capturedElements = new Set();
 
   // Playback — MediaStreamTrackGenerator dla mic injection
   let micGenerator = null;
@@ -177,38 +181,53 @@
       'srcRate:', srcRate, 'targetRate:', TARGET_RATE, 'chunkSize:', CHUNK_SIZE);
   }
 
-  // Podlacza stream (z elementu lub RTCPeerConnection) bezposrednio do procesora
-  const attachedTracks = new WeakSet();
-  const attachedSources = new Map(); // track.id -> MediaStreamAudioSourceNode
-  function attachStream(stream, source) {
+  // Podlacza stream (z elementu lub RTCPeerConnection) bezposrednio do procesora.
+  // attachedSources: track.id -> { node, element? } — element jest przypisany
+  // gdy stream pochodzi z HTMLAudioElement, zeby po ended umiec go zdjac z
+  // capturedElements i pozwolic ponownie podlaczyc.
+  const attachedTracks = new Set();
+  const attachedSources = new Map();
+  function attachStream(stream, source, element) {
     if (!stream || stream.getAudioTracks().length === 0) return;
     ensureCaptureContext();
     try {
       const tracks = stream.getAudioTracks();
       const t0 = tracks[0];
-      // Deduplikacja po track id — ten sam track moze przyjsc z ontrack i elementu
+      // Ignoruj martwe track'i
+      if (t0.readyState === 'ended') {
+        console.log('[tentaflow] Track juz ended, nie podlaczam', t0.id, 'z', source);
+        return;
+      }
+      // Deduplikacja po track id
       if (attachedSources.has(t0.id)) {
-        console.log('[tentaflow] Track juz podlaczony, pomijam', t0.id, 'z', source);
         return;
       }
       tracks.forEach((track) => {
-        if (attachedTracks.has(track)) return;
-        attachedTracks.add(track);
+        if (attachedTracks.has(track.id)) return;
+        attachedTracks.add(track.id);
         track.addEventListener('mute', () => console.log('[tentaflow] track MUTE', source, track.id));
         track.addEventListener('unmute', () => console.log('[tentaflow] track UNMUTE', source, track.id));
         track.addEventListener('ended', () => {
-          console.log('[tentaflow] track ENDED', source, track.id);
-          // Rozlacz source node — stary track nie bedzie juz dostarczal danych
-          const node = attachedSources.get(track.id);
-          if (node) {
-            try { node.disconnect(); } catch (_) {}
+          console.log('[tentaflow] track ENDED', source, track.id, '— zwalniam element i wymuszam rescan');
+          const entry = attachedSources.get(track.id);
+          if (entry) {
+            try { entry.node.disconnect(); } catch (_) {}
+            // Zwolnij element zeby mogl byc ponownie przeskanowany
+            if (entry.element) {
+              capturedElements.delete(entry.element);
+            }
             attachedSources.delete(track.id);
           }
+          attachedTracks.delete(track.id);
+          // Natychmiastowy rescan — Teams moze juz miec nowy track
+          setTimeout(scanAndAttach, 100);
+          setTimeout(scanAndAttach, 500);
+          setTimeout(scanAndAttach, 1500);
         });
       });
       const src = captureCtx.createMediaStreamSource(stream);
       src.connect(scriptProcessor);
-      attachedSources.set(t0.id, src);
+      attachedSources.set(t0.id, { node: src, element });
       console.log('[tentaflow] Podlaczono stream z', source,
         'tracks:', tracks.length,
         'readyState:', t0 && t0.readyState,
@@ -233,13 +252,18 @@
       return;
     }
     if (!stream || stream.getAudioTracks().length === 0) return;
+    const tracks = stream.getAudioTracks();
+    // Jesli wszystkie track'i w tym streamie sa ended, pomijamy (nie ma sensu)
+    if (tracks.every(t => t.readyState === 'ended')) {
+      return;
+    }
     capturedElements.add(el);
     try {
       if (el.muted) el.muted = false;
       if (el.volume === 0) el.volume = 1;
       if (el.paused && el.play) el.play().catch(() => {});
     } catch (_) {}
-    attachStream(stream, 'element:' + el.tagName);
+    attachStream(stream, 'element:' + el.tagName, el);
   }
 
   // Hook RTCPeerConnection — lapie remote audio tracks od razu gdy Teams je otrzyma.
@@ -276,17 +300,52 @@
     els.forEach(attachElementStream);
   }
 
+  // Health check — jesli ZADEN z podlaczonych sources nie ma live track'ow,
+  // zwolnij wszystkie i zrob pelny rescan. Pomaga gdy Teams zmienia pipeline
+  // audio w sposob ktory omija nasze event handlery.
+  function healthCheck() {
+    // Sprawdz ile attachedSources ma live tracks
+    let liveCount = 0;
+    let deadIds = [];
+    for (const [trackId, entry] of attachedSources.entries()) {
+      // Nie znamy bezposrednio track obiektu z id po fakcie — sprawdzamy
+      // czy source node'a w AudioContext jest dalej podlaczone. Proxy: jesli
+      // ma ended event juz przeszedl, to entry bylo juz usuniete, wiec
+      // wszystko co jest w mapie jest "zywe" z nasza perspektywa.
+      liveCount++;
+    }
+
+    // Alternatywny check: przejrzyj wszystkie audio/video i ich srcObject
+    const els = document.querySelectorAll('audio, video');
+    let liveElementTracks = 0;
+    els.forEach((el) => {
+      if (el.srcObject instanceof MediaStream) {
+        el.srcObject.getAudioTracks().forEach((t) => {
+          if (t.readyState === 'live' && !t.muted) liveElementTracks++;
+        });
+      }
+    });
+
+    if (liveCount === 0 && liveElementTracks > 0) {
+      console.log('[tentaflow] Health check: 0 podlaczone, ale', liveElementTracks,
+        'live element tracks — force rescan');
+      // Reset capturedElements zeby rescan ich znow zlapal
+      capturedElements.clear();
+      scanAndAttach();
+    }
+  }
+
   // MutationObserver — wykrywa nowe elementy audio/video dodawane dynamicznie
+  // ORAZ zmiany atrybutow na istniejacych (srcObject moze byc podmieniony bez
+  // usuniecia elementu, np. gdy Teams rotuje audio pipeline).
   function installObserver() {
     const obs = new MutationObserver((muts) => {
       for (const m of muts) {
         m.addedNodes.forEach((node) => {
           if (!(node instanceof Element)) return;
           if (node.tagName === 'AUDIO' || node.tagName === 'VIDEO') {
-            // Poczekaj chwile zeby srcObject zostalo ustawione
             setTimeout(() => attachElementStream(node), 100);
           }
-          // Rekursywnie
           node.querySelectorAll && node.querySelectorAll('audio, video').forEach((el) => {
             setTimeout(() => attachElementStream(el), 100);
           });
@@ -295,8 +354,10 @@
     });
     obs.observe(document.documentElement, { childList: true, subtree: true });
 
-    // Re-skan co 3s na wszelki wypadek (Teams moze wymieniac strumienie)
-    setInterval(scanAndAttach, 3000);
+    // Re-scan co 1s — szybsza reakcja na podmiany srcObject (Teams renegocjacja).
+    setInterval(scanAndAttach, 1000);
+    // Health check co 2s — jesli wszystkie sources umarly, force recover.
+    setInterval(healthCheck, 2000);
   }
 
   // --------------------------------------------------------------------------
