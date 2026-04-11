@@ -555,3 +555,76 @@ pub struct AuditLogFilters {
     pub from_date: Option<String>,
     pub to_date: Option<String>,
 }
+
+// =============================================================================
+// Voice Profile — profil glosowy osoby zapamietany do bulletproof rozpoznawania
+// =============================================================================
+
+/// Profil glosowy z bazy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbVoiceProfile {
+    pub id: i64,
+    pub name: String,
+    /// L2-znormalizowany centroid [192 × f32] = 768 bajtow
+    pub centroid: Vec<u8>,
+    pub sample_count: i64,
+    pub reliability_score: f32,
+    pub source: String,
+    pub metadata_json: String,
+    pub enrolled_at: String,
+    pub last_seen_at: Option<String>,
+    pub total_utterances: i64,
+}
+
+/// Parametry utworzenia nowego profilu
+#[derive(Debug, Clone)]
+pub struct NewVoiceProfile<'a> {
+    pub name: &'a str,
+    pub centroid: &'a [u8],
+    pub sample_count: i64,
+    pub reliability_score: f32,
+    pub source: &'a str,
+    pub metadata_json: &'a str,
+}
+
+/// Pojedynczy sample glosu dla profilu
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbVoiceProfileSample {
+    pub id: i64,
+    pub profile_id: i64,
+    /// Raw (nieznormalizowany) embedding [192 × f32]
+    pub embedding: Vec<u8>,
+    pub duration_ms: i64,
+    pub snr_db: f32,
+    pub intra_similarity: f32,
+    pub meeting_id: Option<String>,
+    pub source: String,
+    pub created_at: String,
+}
+
+/// Parametry dodania nowego sample do profilu
+#[derive(Debug, Clone)]
+pub struct NewVoiceProfileSample<'a> {
+    pub profile_id: i64,
+    pub embedding: &'a [u8],
+    pub duration_ms: i64,
+    pub snr_db: f32,
+    pub intra_similarity: f32,
+    pub meeting_id: Option<&'a str>,
+    pub source: &'a str,
+}
+
+/// Tymczasowy mowca w trakcie meetingu (przed przypisaniem do profilu przez LLM)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbVoiceTempSpeaker {
+    pub id: i64,
+    pub meeting_id: String,
+    pub temp_label: String,
+    /// JSON array of base64-encoded f32 arrays — elastyczne dopisywanie embeddingow
+    pub embeddings_blob: Vec<u8>,
+    pub sample_count: i64,
+    pub total_duration_ms: i64,
+    pub assigned_profile_id: Option<i64>,
+    pub created_at: String,
+}
+

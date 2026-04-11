@@ -746,6 +746,18 @@ pub async fn handle_request(
         return Ok(json_response_cors(200, body, cors_origin.as_deref()));
     }
 
+    // Voice profiles API — bulletproof speaker recognition.
+    // Wolane przez LLM po detekcji introducji ("Cześć, tu Jan") albo przez
+    // wewnetrzne toole. Na razie bez UI, fundament pod pozniejsze enrollment-by-LLM.
+    #[cfg(feature = "inference-diarization")]
+    if path.starts_with("/api/voice-profiles") {
+        let (status, response_body) =
+            crate::api::dashboard::api_voice_profiles::route_voice_profiles_api(
+                &method, &path, &query_string, &db, &body_bytes,
+            );
+        return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
+    }
+
     let (status, response_body) = route_api(&method, &path, &query_string, &db, &claims, &body_bytes, &settings_cipher);
 
     // Synchronizacja aliasow po udanej mutacji
