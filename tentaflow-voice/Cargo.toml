@@ -30,6 +30,9 @@ tracing = "0.1"
 [build-dependencies]
 # Generuje struct Rust z .proto schemy ONNX
 prost-build = "0.13"
+# Dostarcza skompilowany protoc z crate'a — nie wymaga instalacji
+# protobuf-compiler w systemie (np. na nowych nodach).
+protobuf-src = "2"
 
 [dev-dependencies]
 # Benchmarki
