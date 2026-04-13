@@ -1032,6 +1032,7 @@
     "enrolled_profile": "Znany profil glosu — rozpoznany z bazy",
     "temp_speaker": "Tymczasowy mowca — jeszcze nie przypisany do profilu",
     "badge_enrolled": "znany",
-    "badge_temp": "tymczasowy"
+    "badge_temp": "tymczasowy",
+    "download_transcripts": "Pobierz transkrypcje"
   }
 }

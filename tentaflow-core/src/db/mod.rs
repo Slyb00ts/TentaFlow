@@ -11,11 +11,26 @@ pub mod seed;
 use anyhow::Result;
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::info;
 
 /// Pool polaczen SQLite (single-writer, multi-reader)
 pub type DbPool = Arc<Mutex<Connection>>;
+
+/// Globalny uchwyt do poola — ustawiony w `init()`. Pozwala modulom ktore nie
+/// dostaja DbPool przez argumenty (np. transcript_store wolany z reverse_request)
+/// na zapis trwaly do SQLite bez przekazywania referencji przez polowe stacku.
+static GLOBAL_POOL: OnceLock<DbPool> = OnceLock::new();
+
+/// Ustawia globalny pool — wolane raz, w `init()`. Kolejne wywolania ignorowane.
+fn set_global_pool(pool: DbPool) {
+    let _ = GLOBAL_POOL.set(pool);
+}
+
+/// Zwraca globalny pool jesli `init()` zostal wywolany. None w testach bez DB.
+pub fn global_pool() -> Option<DbPool> {
+    GLOBAL_POOL.get().cloned()
+}
 
 /// Inicjalizuje baze danych SQLite.
 /// Tworzy plik jesli nie istnieje, uruchamia migracje i seed.
@@ -46,6 +61,7 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     )?;
 
     let pool = Arc::new(Mutex::new(conn));
+    set_global_pool(pool.clone());
     info!("Baza danych zainicjalizowana pomyslnie");
 
     Ok(pool)

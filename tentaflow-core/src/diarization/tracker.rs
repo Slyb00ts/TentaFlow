@@ -42,7 +42,10 @@ pub const PROMOTION_MIN_QUALITY_SAMPLES: usize = 5;
 pub const PROMOTION_MIN_TOTAL_DURATION_MS: u64 = 15_000;
 
 /// Minimalna wewnetrzna cos similarity miedzy kwalifikujacymi sie sample.
-/// Zabezpieczenie przed false-positive clustering w obrebie temp speakera.
+/// Musi odpowiadac voice_profile::MIN_INTRA_SIMILARITY — bo inaczej tracker
+/// akceptuje samples ktore potem enroll_profile odrzuca (promotion fail).
+/// Niski prog 0.30: sprawdzane TOP-K najlepszych sample po wstepnym dropout
+/// outlierow w promote_speaker, nie wszystkie quality samples.
 pub const PROMOTION_MIN_INTRA_SIMILARITY: f32 = 0.50;
 
 /// Sample w trackerze — embedding + metadata uzywane do decyzji promocyjnej.
@@ -94,30 +97,97 @@ impl MeetingSpeaker {
     }
 
     /// Sprawdza czy speaker jest gotowy do auto-promocji do voice_profile.
-    /// Zwraca indeksy quality samples jesli tak, None w przeciwnym wypadku.
-    fn promotion_candidates(&self) -> Option<Vec<usize>> {
+    /// Zwraca Ok(indeksy) jesli tak, Err(powod) jesli nie.
+    fn promotion_candidates(&self) -> Result<Vec<usize>, PromotionReject> {
         let quality = self.quality_sample_indices();
         if quality.len() < PROMOTION_MIN_QUALITY_SAMPLES {
-            return None;
+            return Err(PromotionReject::NotEnoughQualitySamples {
+                got: quality.len(),
+                need: PROMOTION_MIN_QUALITY_SAMPLES,
+            });
         }
         let total_quality_duration: u64 = quality
             .iter()
             .map(|&i| self.all_samples[i].duration_ms)
             .sum();
         if total_quality_duration < PROMOTION_MIN_TOTAL_DURATION_MS {
-            return None;
+            return Err(PromotionReject::NotEnoughTotalDuration {
+                got_ms: total_quality_duration,
+                need_ms: PROMOTION_MIN_TOTAL_DURATION_MS,
+            });
         }
-        // Sprawdz wewnetrzna spojnosc
         let embeddings: Vec<&Vec<f32>> = quality
             .iter()
             .map(|&i| &self.all_samples[i].embedding)
             .collect();
         let intra = intra_similarity_refs(&embeddings);
         if intra < PROMOTION_MIN_INTRA_SIMILARITY {
-            return None;
+            return Err(PromotionReject::IntraSimilarityTooLow {
+                got: intra,
+                need: PROMOTION_MIN_INTRA_SIMILARITY,
+            });
         }
-        Some(quality)
+        Ok(quality)
     }
+}
+
+/// Powod odrzucenia auto-promocji — uzywany do diagnostycznego logowania.
+#[derive(Debug)]
+enum PromotionReject {
+    NotEnoughQualitySamples { got: usize, need: usize },
+    NotEnoughTotalDuration { got_ms: u64, need_ms: u64 },
+    IntraSimilarityTooLow { got: f32, need: f32 },
+}
+
+impl std::fmt::Display for PromotionReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnoughQualitySamples { got, need } => {
+                write!(f, "quality_samples={}/{}", got, need)
+            }
+            Self::NotEnoughTotalDuration { got_ms, need_ms } => {
+                write!(f, "total_duration_ms={}/{}", got_ms, need_ms)
+            }
+            Self::IntraSimilarityTooLow { got, need } => {
+                write!(f, "intra_similarity={:.3}/{:.3}", got, need)
+            }
+        }
+    }
+}
+
+/// Wybiera k sample ktorych embedding jest najblizszy centroidowi grupy.
+/// Uzywane przy promocji: drop outlierow zanim wyslemy do enroll_profile, zeby
+/// jeden dziwny sample nie zepsul intra-similarity calego profilu.
+/// Zwraca indeksy w kolejnosci wzrostu (stabilna, deterministyczna).
+fn select_best_k_by_centroid(
+    all_samples: &[TrackedSample],
+    candidate_indices: &[usize],
+    k: usize,
+) -> Vec<usize> {
+    if candidate_indices.len() <= k {
+        return candidate_indices.to_vec();
+    }
+    let dim = all_samples[candidate_indices[0]].embedding.len();
+    let mut centroid = vec![0.0_f32; dim];
+    for &i in candidate_indices {
+        let emb = &all_samples[i].embedding;
+        for (c, e) in centroid.iter_mut().zip(emb.iter()) {
+            *c += *e;
+        }
+    }
+    let n = candidate_indices.len() as f32;
+    for c in centroid.iter_mut() {
+        *c /= n;
+    }
+    let mut scored: Vec<(usize, f32)> = candidate_indices
+        .iter()
+        .map(|&i| (i, cosine_similarity(&all_samples[i].embedding, &centroid)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    let mut result: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
+    result.sort_unstable();
+    result
 }
 
 /// Helper: liczy srednia cos similarity miedzy samples (dla refs — zero-copy).
@@ -412,27 +482,65 @@ impl MeetingSpeakerTracker {
 
         self.persist_speaker(pool, idx)?;
 
+        // Diagnostyka co dokladnie sie dzieje z tym sample (INFO zeby bylo widac
+        // bez wlaczania debug). Wazne dla strojenia progow promocji.
+        {
+            let spk = &self.speakers[idx];
+            let last = spk.all_samples.last();
+            let (last_dur, last_snr, last_quality) = match last {
+                Some(s) => (s.duration_ms, s.snr_db, s.is_quality()),
+                None => (0, 0.0, false),
+            };
+            let quality_count = spk.quality_sample_indices().len();
+            tracing::info!(
+                meeting_id = %self.meeting_id,
+                speaker = %label,
+                similarity = best_sim,
+                count = spk.count,
+                total_duration_ms = spk.total_duration_ms,
+                sample_duration_ms = last_dur,
+                sample_snr_db = last_snr,
+                sample_quality = last_quality,
+                quality_samples = quality_count,
+                need_quality = PROMOTION_MIN_QUALITY_SAMPLES,
+                "Sample tracked"
+            );
+        }
+
         // Po persist — sprawdz czy ten speaker dorobil sie na promocje
         let mut promoted = false;
-        if let Some(quality_idx_list) = self.speakers[idx].promotion_candidates() {
-            match self.promote_speaker(pool, idx, &quality_idx_list) {
-                Ok(Some(profile_id)) => {
-                    tracing::info!(
-                        meeting_id = %self.meeting_id,
-                        profile_id,
-                        previous_label = %label,
-                        "Temp speaker promoted to KNOWN_SPEAKER voice_profile"
-                    );
-                    promoted = true;
-                    // Usun z local trackera — dalsze matche pojda przez enrolled
-                    self.speakers.remove(idx);
+        match self.speakers[idx].promotion_candidates() {
+            Ok(quality_idx_list) => {
+                match self.promote_speaker(pool, idx, &quality_idx_list) {
+                    Ok(Some(profile_id)) => {
+                        tracing::info!(
+                            meeting_id = %self.meeting_id,
+                            profile_id,
+                            previous_label = %label,
+                            "Temp speaker promoted to KNOWN_SPEAKER voice_profile"
+                        );
+                        promoted = true;
+                        self.speakers.remove(idx);
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            meeting_id = %self.meeting_id,
+                            speaker = %label,
+                            "Promotion check passed but enroll_profile returned None"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "Promotion failed");
+                    }
                 }
-                Ok(None) => {
-                    // Nie udalo sie (np. uszkodzone samples) — zostawiamy jak jest
-                }
-                Err(e) => {
-                    tracing::warn!(error = ?e, "Promotion failed");
-                }
+            }
+            Err(reject) => {
+                tracing::info!(
+                    meeting_id = %self.meeting_id,
+                    speaker = %label,
+                    reason = %reject,
+                    "Not yet ready for promotion"
+                );
             }
         }
 
@@ -477,8 +585,19 @@ impl MeetingSpeakerTracker {
         quality_indices: &[usize],
     ) -> Result<Option<i64>> {
         let spk = &self.speakers[spk_idx];
+
+        // Pick top-K sampli najbardziej spojnych z centroidem — drop outlierow.
+        // WeSpeaker dla niektorych glosow daje wariancje ~0.15-0.20 miedzy
+        // utterance, wiec nawet same-speaker moze miec jeden odstajacy sample.
+        // Wybieramy PROMOTION_MIN_QUALITY_SAMPLES najblizszych centroidu.
+        let best_indices = select_best_k_by_centroid(
+            &spk.all_samples,
+            quality_indices,
+            PROMOTION_MIN_QUALITY_SAMPLES,
+        );
+
         let quality_samples: Vec<crate::diarization::voice_profile::EnrollmentSample> =
-            quality_indices
+            best_indices
                 .iter()
                 .map(|&i| {
                     let s = &spk.all_samples[i];

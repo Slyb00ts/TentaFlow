@@ -35,10 +35,16 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     std::fs::create_dir_all(&prefs_dir).ok();
     tracing::info!(user_data_dir, "Uruchamianie Chromium z unikalnym profilem");
     // content_settings: 1 = allow, 2 = block
-    // Mikrofon dozwolony (bot musi mowic), kamera zablokowana (bot nie potrzebuje video)
+    // - media_stream_mic: allow (bot musi mowic przez Teams)
+    // - media_stream_camera: block (bot nie wysyla video)
+    // - notifications: block (nie chcemy w ogole)
+    // - loopback_network: allow TYLKO dla Teams — od Chrome 147 pojawil sie
+    //   popup "Access other apps and services on this device" przy starcie
+    //   Teams meeting (LAN access dla STUN/connectivity probes). Pre-allow
+    //   DLA KONKRETNEJ DOMENY omija popup bez nadawania permissji globalnie.
     std::fs::write(
         format!("{}/Preferences", prefs_dir),
-        r#"{"profile":{"content_settings":{"exceptions":{"media_stream_mic":{"*,*":{"setting":1}},"media_stream_camera":{"*,*":{"setting":2}},"notifications":{"*,*":{"setting":2}}}}}}"#,
+        r#"{"profile":{"content_settings":{"exceptions":{"media_stream_mic":{"*,*":{"setting":1}},"media_stream_camera":{"*,*":{"setting":2}},"notifications":{"*,*":{"setting":2}},"loopback_network":{"https://teams.microsoft.com:443,*":{"setting":1},"https://teams.live.com:443,*":{"setting":1}}}}}}"#,
     ).ok();
 
     let browser_config = BrowserConfig::builder()
