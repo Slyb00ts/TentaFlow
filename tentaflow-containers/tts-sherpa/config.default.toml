@@ -1,0 +1,11 @@
+service_name = "tts-sherpa"
+model_aliases = ["jarvis", "justyna"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8084"
+timeout_ms = 60000
+api = "sherpa"

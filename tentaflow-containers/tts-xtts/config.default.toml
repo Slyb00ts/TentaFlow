@@ -1,0 +1,11 @@
+service_name = "tts-xtts"
+model_aliases = ["xtts"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8085"
+timeout_ms = 120000
+api = "raw_http"
