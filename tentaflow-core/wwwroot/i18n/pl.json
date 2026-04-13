@@ -1034,5 +1034,20 @@
     "badge_enrolled": "znany",
     "badge_temp": "tymczasowy",
     "download_transcripts": "Pobierz transkrypcje"
+  },
+  "containers": {
+    "tab": "Kontenery TentaFlow",
+    "empty": "Brak embedowanych kontenerow w binarce (sprawdz build)",
+    "deploy_title": "Deploy kontenera",
+    "use_gpu": "Uzyj GPU (--gpus all)",
+    "cat_all": "Wszystkie",
+    "cat_llm": "LLM",
+    "cat_stt": "STT",
+    "cat_tts": "TTS",
+    "cat_embeddings": "Embeddings",
+    "cat_reranker": "Reranker",
+    "cat_image": "Obrazy",
+    "cat_meeting": "Meeting",
+    "cat_other": "Inne"
   }
 }
