@@ -1,0 +1,11 @@
+service_name = "llm-sglang"
+model_aliases = ["default"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:30000"
+timeout_ms = 300000
+api = "open_ai"

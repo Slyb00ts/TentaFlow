@@ -1,0 +1,11 @@
+service_name = "comfyui"
+model_aliases = ["sd", "flux"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8188"
+timeout_ms = 600000
+api = "raw_http"
