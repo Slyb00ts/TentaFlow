@@ -252,7 +252,7 @@ async fn main() -> Result<()> {
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
-    collector.start().await;
+    collector.start(router.service_manager().shutdown_rx.clone()).await;
 
     // Uruchom serwer HTTPS (OpenAI API + Dashboard na jednym porcie) — z Core
     tentaflow_core::api::unified_server::start_unified_server(&config, &db, &metrics, &router, &mesh_peer_store, quic_mesh_for_server, local_node_id_for_server, mesh_security_for_server)?;
