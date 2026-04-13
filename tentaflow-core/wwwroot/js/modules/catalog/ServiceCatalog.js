@@ -152,6 +152,7 @@ const ServiceCatalog = (() => {
 
         <div class="catalog-tabs">
           <button class="catalog-tab${activeTab === 'tentaflow' ? ' active' : ''}" data-tab="tentaflow">TentaFlow</button>
+          <button class="catalog-tab${activeTab === 'containers' ? ' active' : ''}" data-tab="containers">${I18n.t('containers.tab') || 'TentaFlow Containers'}</button>
           <button class="catalog-tab${activeTab === 'nim' ? ' active' : ''}" data-tab="nim">NVIDIA NIM</button>
         </div>
 
@@ -168,6 +169,7 @@ const ServiceCatalog = (() => {
   function renderTabContent() {
     switch (activeTab) {
       case 'tentaflow': return renderTentaFlowTab();
+      case 'containers': return renderContainersTab();
       case 'nim': return renderNimTab();
       default: return '';
     }
@@ -858,6 +860,10 @@ ${envBlock ? '\n' + envBlock : ''}
       loadNimCatalog();
       return;
     }
+    if (activeTab === 'containers') {
+      loadContainersCatalog();
+      return;
+    }
     if (activeTab === 'tentaflow') {
       const cards = document.querySelectorAll('.catalog-card[data-service-id]');
       cards.forEach(card => {
@@ -914,6 +920,179 @@ ${envBlock ? '\n' + envBlock : ''}
       backBtn.removeEventListener('click', boundBackHandler);
     }
     boundBackHandler = null;
+  }
+
+  // ===========================================================================
+  // ZAKLADKA: TentaFlow Containers — embedowane kontenery z bundle binarki
+  // ===========================================================================
+
+  let containersList = [];
+  let containersLoaded = false;
+  let containersError = null;
+  let containersCategory = 'all';
+
+  function renderContainersTab() {
+    const loading = !containersLoaded;
+    const empty = containersLoaded && containersList.length === 0;
+    const cats = ['all', 'llm', 'stt', 'tts', 'embeddings', 'reranker', 'image', 'meeting', 'other'];
+
+    const filterButtons = cats
+      .map(c => `
+        <button class="btn btn-ghost btn-sm catalog-cat-btn${containersCategory === c ? ' active' : ''}"
+                data-cat="${c}">${(I18n.t('containers.cat_' + c)) || c}</button>
+      `).join('');
+
+    const filtered = containersCategory === 'all'
+      ? containersList
+      : containersList.filter(c => c.category === containersCategory);
+
+    const cards = filtered.map(c => `
+      <div class="catalog-card" data-container-name="${Utils.escapeAttr(c.name)}">
+        <div class="catalog-card-header">
+          <div class="catalog-card-icon">${CatalogIcons.get(c.category) || CatalogIcons.get(c.name) || ''}</div>
+          <div>
+            <div class="catalog-card-title">${Utils.escapeHtml(c.name)}</div>
+            <div class="catalog-card-port">${Utils.escapeHtml(c.category)}</div>
+          </div>
+        </div>
+        <div class="catalog-card-desc">${Utils.escapeHtml(c.description)}</div>
+        <div class="catalog-card-footer">
+          <div class="catalog-card-badges">
+            <span class="badge catalog-badge catalog-badge-gpu">GPU</span>
+          </div>
+          <button class="btn btn-primary btn-sm catalog-deploy-container-btn">${I18n.t('catalog.deploy') || 'Deploy'}</button>
+        </div>
+      </div>
+    `).join('');
+
+    return `
+      <div class="nim-toolbar">
+        <div class="nim-filters">${filterButtons}</div>
+      </div>
+      ${loading ? `<div class="empty-state"><div class="empty-state-text">${I18n.t('common.loading')}</div></div>` : ''}
+      ${empty ? `<div class="empty-state"><div class="empty-state-text">${I18n.t('containers.empty') || 'Brak embedowanych kontenerow'}</div></div>` : ''}
+      ${containersError ? `<div class="empty-state"><div class="empty-state-text">${Utils.escapeHtml(containersError)}</div></div>` : ''}
+      <div class="catalog-grid">${cards}</div>
+    `;
+  }
+
+  async function loadContainersCatalog() {
+    // Filter buttons
+    document.querySelectorAll('.catalog-cat-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        containersCategory = btn.dataset.cat;
+        updateContent();
+      });
+    });
+    // Deploy buttons
+    document.querySelectorAll('.catalog-card[data-container-name]').forEach(card => {
+      const btn = card.querySelector('.catalog-deploy-container-btn');
+      const handler = () => openContainerDeploy(card.dataset.containerName);
+      if (btn) btn.addEventListener('click', e => { e.stopPropagation(); handler(); });
+      card.addEventListener('click', handler);
+    });
+
+    if (containersLoaded) return;
+    try {
+      const data = await ApiClient.get('/api/deploy/containers');
+      containersList = Array.isArray(data) ? data : [];
+      containersLoaded = true;
+      updateContent();
+    } catch (err) {
+      containersError = err.message || 'blad';
+      containersLoaded = true;
+      updateContent();
+    }
+  }
+
+  function openContainerDeploy(name) {
+    const container = containersList.find(c => c.name === name);
+    if (!container) return;
+
+    const portsHint = container.category === 'meeting' ? '5000:5000/udp,5900:5900,6080:6080' : '5000:5000/udp';
+    const html = `
+      <div class="modal-backdrop" id="container-deploy-backdrop">
+        <div class="modal" style="max-width: 560px;">
+          <div class="modal-header">
+            <h3>${I18n.t('containers.deploy_title') || 'Deploy kontenera'}: ${Utils.escapeHtml(name)}</h3>
+            <button class="btn btn-ghost btn-sm" id="cd-close">&times;</button>
+          </div>
+          <div class="modal-body">
+            <div class="form-group">
+              <label>Instance name</label>
+              <input id="cd-name" class="form-input" value="tentaflow-${Utils.escapeAttr(name)}">
+            </div>
+            <div class="form-group">
+              <label>Ports (host:container/proto, comma)</label>
+              <input id="cd-ports" class="form-input" value="${portsHint}">
+            </div>
+            <div class="form-group">
+              <label>Volumes (host:container, comma)</label>
+              <input id="cd-volumes" class="form-input" placeholder="/data/models:/data/models">
+            </div>
+            <div class="form-group">
+              <label>Env (KEY=VAL, comma)</label>
+              <textarea id="cd-env" class="form-input" rows="3" placeholder="MODEL=speakleash/Bielik-11B-v2.6-Instruct-AWQ"></textarea>
+            </div>
+            <div class="form-group">
+              <label><input type="checkbox" id="cd-gpu" checked> ${I18n.t('containers.use_gpu') || 'Uzyj GPU'}</label>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" id="cd-cancel">${I18n.t('common.cancel') || 'Anuluj'}</button>
+            <button class="btn btn-primary" id="cd-deploy">${I18n.t('catalog.deploy') || 'Deploy'}</button>
+          </div>
+        </div>
+      </div>
+    `;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = html;
+    document.body.appendChild(wrap);
+
+    const close = () => wrap.remove();
+    document.getElementById('cd-close').onclick = close;
+    document.getElementById('cd-cancel').onclick = close;
+
+    document.getElementById('cd-deploy').onclick = async () => {
+      const ports = parsePairs(document.getElementById('cd-ports').value, ':');
+      const volumes = parsePairs(document.getElementById('cd-volumes').value, ':');
+      const env = parseEnv(document.getElementById('cd-env').value);
+      const body = {
+        instance_name: document.getElementById('cd-name').value.trim() || null,
+        ports,
+        volumes,
+        env,
+        gpu: document.getElementById('cd-gpu').checked,
+      };
+      try {
+        const resp = await ApiClient.post(`/api/deploy/${encodeURIComponent(name)}`, body);
+        App.showToast(`${name}: ${resp.container || 'deployed'}`, 'success');
+        close();
+      } catch (err) {
+        App.showToast(`Deploy nieudany: ${err.message}`, 'error');
+      }
+    };
+  }
+
+  function parsePairs(value, sep) {
+    return value.split(',')
+      .map(s => s.trim()).filter(Boolean)
+      .map(p => {
+        const idx = p.indexOf(sep);
+        if (idx < 0) return null;
+        return [p.slice(0, idx).trim(), p.slice(idx + 1).trim()];
+      })
+      .filter(Boolean);
+  }
+
+  function parseEnv(value) {
+    const out = {};
+    value.split(/[\n,]/).map(s => s.trim()).filter(Boolean).forEach(line => {
+      const eq = line.indexOf('=');
+      if (eq < 0) return;
+      out[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    });
+    return out;
   }
 
   return { show, cleanup };
