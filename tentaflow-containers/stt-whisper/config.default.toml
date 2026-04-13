@@ -1,0 +1,11 @@
+service_name = "stt-whisper"
+model_aliases = ["whisper"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8081"
+timeout_ms = 120000
+api = "open_ai"

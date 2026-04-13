@@ -1,0 +1,11 @@
+service_name = "llm-vllm"
+model_aliases = ["default"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8000"
+timeout_ms = 300000
+api = "open_ai"

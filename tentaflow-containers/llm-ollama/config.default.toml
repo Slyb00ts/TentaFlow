@@ -1,0 +1,12 @@
+service_name = "llm-ollama"
+model_aliases = ["default"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+# Ollama eksportuje OpenAI API pod /v1
+upstream_url = "http://127.0.0.1:11434/v1"
+timeout_ms = 300000
+api = "open_ai"

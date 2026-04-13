@@ -1,0 +1,11 @@
+service_name = "stt-qwen-asr"
+model_aliases = ["qwen-asr"]
+
+[quic]
+port = 5000
+
+[role]
+kind = "reverse_proxy"
+upstream_url = "http://127.0.0.1:8083"
+timeout_ms = 120000
+api = "open_ai"
