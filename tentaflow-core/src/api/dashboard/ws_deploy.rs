@@ -186,21 +186,115 @@ pub async fn handle_ws_connection<S>(
     }
 }
 
-/// Deployuje stack — Docker CLI (lokalnie) lub MeshCommand (zdalnie)
+/// Mapuje nazwe silnika z wizarda na nazwe embedowanego kontenera w bundle.
+/// Gdy zwraca Some — uzywamy build z embedded bundle (bollard) zamiast pull
+/// z registry. Gdy None — fallback do starego compose CLI z compose_yaml.
+fn engine_to_bundle_name(engine: &str, service_type: &str) -> Option<&'static str> {
+    match engine {
+        "sglang" => Some("llm-sglang"),
+        "vllm" => Some("llm-vllm"),
+        "ollama" => Some("llm-ollama"),
+        "llamacpp" => Some("llm-llamacpp"),
+        "whisper" | "faster-whisper" => Some("stt-whisper"),
+        "parakeet" => Some("stt-parakeet"),
+        "qwen-asr" => Some("stt-qwen-asr"),
+        "sherpa" => Some("tts-sherpa"),
+        "xtts" => Some("tts-xtts"),
+        "voxcpm" => Some("tts-voxcpm"),
+        "comfyui" => Some("comfyui"),
+        _ => match service_type {
+            "embeddings" | "embedding" => Some("embeddings"),
+            "reranker" | "rerank" => Some("reranker"),
+            "tts" => Some("tts-sherpa"),
+            "stt" => Some("stt-whisper"),
+            _ => None,
+        },
+    }
+}
+
+/// Deployuje stack — Docker CLI (lokalnie) lub MeshCommand (zdalnie).
+/// Jesli silnik ma odpowiednik w embedowanym bundle, builduje obraz z bundle
+/// zamiast pullowac z registry.
 async fn deploy_stack(
     db: &DbPool,
     cipher: &Arc<SettingsCipher>,
     req: &DeployRequest,
-    _config: &DeployConfig,
+    config: &DeployConfig,
     local_node_id: &str,
 ) -> Result<(), anyhow::Error> {
     if req.node_id == local_node_id || req.node_id.is_empty() {
+        // Sprobuj uzyc embedowanego bundle dla znanych silnikow
+        if let Some(bundle_name) = engine_to_bundle_name(&config.engine, &config.service_type) {
+            info!(
+                engine = %config.engine,
+                bundle = bundle_name,
+                "Deploy z embedowanego bundle (zamiast registry)"
+            );
+            return deploy_bundled_container(bundle_name, req, config).await;
+        }
+
+        // Fallback: stary flow z compose_yaml + registry pull
         deploy_with_docker_cli(&req.stack_name, &req.compose_yaml, db, cipher).await?;
         return Ok(());
     }
 
     // TODO: deploy na zdalny node przez MeshCommand
     Err(anyhow::anyhow!("Deploy na zdalnym nodzie wymaga MeshCommand (jeszcze niezaimplementowane)"))
+}
+
+/// Buduje obraz z embedowanego kontekstu Dockera i uruchamia kontener.
+/// Korzysta z `crate::deploy::docker::deploy()` (bollard).
+#[cfg(feature = "docker")]
+async fn deploy_bundled_container(
+    bundle_name: &str,
+    req: &DeployRequest,
+    config: &DeployConfig,
+) -> Result<(), anyhow::Error> {
+    use std::collections::HashMap;
+
+    let port = if config.port > 0 { config.port } else { 5000 };
+    let proto_suffix = if config.protocol == "quic" { "/udp" } else { "/tcp" };
+    let ports = vec![(format!("{}", port), format!("5000{}", proto_suffix))];
+
+    // Domyslny env: model_id przekazany jako MODEL (vllm/sglang/ollama/whisper itd.
+    // wszystkie ich entrypointy go czytaja).
+    let mut env: HashMap<String, String> = HashMap::new();
+    if !config.model_id.is_empty() {
+        env.insert("MODEL".to_string(), config.model_id.clone());
+        env.insert("MODEL_ID".to_string(), config.model_id.clone());
+    }
+
+    let instance_name = if !req.stack_name.is_empty() {
+        Some(req.stack_name.clone())
+    } else if !config.container_name.is_empty() {
+        Some(config.container_name.clone())
+    } else {
+        None
+    };
+
+    let deploy_req = crate::deploy::docker::DeployRequest {
+        container: bundle_name.to_string(),
+        image_tag: Some(format!("tentaflow/{}:latest", bundle_name)),
+        instance_name,
+        ports,
+        volumes: Vec::new(),
+        env,
+        gpu: true,
+    };
+
+    let _ = crate::deploy::docker::deploy(&deploy_req).await?;
+    Ok(())
+}
+
+#[cfg(not(feature = "docker"))]
+async fn deploy_bundled_container(
+    _bundle_name: &str,
+    _req: &DeployRequest,
+    _config: &DeployConfig,
+) -> Result<(), anyhow::Error> {
+    Err(anyhow::anyhow!(
+        "feature 'docker' wylaczone — embed bundle deploy niedostepny"
+    ))
 }
 
 /// Deploy przez docker compose CLI (lokalnie)
