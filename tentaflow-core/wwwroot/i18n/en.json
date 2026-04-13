@@ -1029,20 +1029,5 @@
     "badge_enrolled": "known",
     "badge_temp": "temp",
     "download_transcripts": "Download transcripts"
-  },
-  "containers": {
-    "tab": "TentaFlow Containers",
-    "empty": "No embedded containers (check build)",
-    "deploy_title": "Deploy container",
-    "use_gpu": "Use GPU (--gpus all)",
-    "cat_all": "All",
-    "cat_llm": "LLM",
-    "cat_stt": "STT",
-    "cat_tts": "TTS",
-    "cat_embeddings": "Embeddings",
-    "cat_reranker": "Reranker",
-    "cat_image": "Image",
-    "cat_meeting": "Meeting",
-    "cat_other": "Other"
   }
 }
