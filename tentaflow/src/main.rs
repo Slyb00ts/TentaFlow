@@ -259,8 +259,10 @@ async fn main() -> Result<()> {
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");
 
-    // Czekaj na sygnal zakonczenia
-    tokio::signal::ctrl_c().await?;
+    // Czekaj na SIGINT (Ctrl+C) lub SIGTERM (docker stop / systemd). Oba sa
+    // obslugiwane identycznie — graceful shutdown. Bez SIGTERM docker stop
+    // wysyla SIGKILL po 10s a WAL SQLite moze zostac rozjechane.
+    wait_for_shutdown_signal().await?;
 
     info!("Otrzymano sygnal shutdown, zamykanie routera...");
     router.shutdown();
@@ -270,8 +272,34 @@ async fn main() -> Result<()> {
         mesh.shutdown().await;
     }
 
+    // Wymusz WAL checkpoint — bez tego baza moze zostac z niesfl ushowanym WAL
+    // (zwlaszcza po SIGKILL w docker stop)
+    if let Err(e) = tentaflow_core::db::checkpoint_wal(&db) {
+        tracing::warn!("Checkpoint WAL nieudany: {}", e);
+    }
+
     info!("Router zamkniety.");
     Ok(())
+}
+
+/// Czeka rownolegle na SIGINT (Ctrl+C) i SIGTERM. Pierwszy wygrywa.
+/// Na Windowsie (gdzie SIGTERM nie istnieje) czeka tylko na Ctrl+C.
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        tokio::select! {
+            _ = sigint.recv() => info!("SIGINT odebrany"),
+            _ = sigterm.recv() => info!("SIGTERM odebrany"),
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 // =============================================================================

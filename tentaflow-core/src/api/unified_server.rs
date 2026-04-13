@@ -139,6 +139,11 @@ pub fn start_unified_server_with_permissions(
 
     info!("Inicjalizacja unified HTTPS server na {}...", bind_addr);
 
+    // Subskrybuj shutdown signal z ServiceManager — przy shutdown zamykamy
+    // accept loop, dropping TcpListener i zwalniajac port TCP natychmiast
+    // (bez TIME_WAIT zombie).
+    let mut shutdown_rx = service_manager.shutdown_rx.clone();
+
     tokio::spawn(async move {
         let listener = match TcpListener::bind(&bind_addr).await {
             Ok(l) => l,
@@ -151,7 +156,18 @@ pub fn start_unified_server_with_permissions(
         info!("Unified HTTPS server nasluchuje na {} (OpenAI API + Dashboard)", bind_addr);
 
         loop {
-            let (stream, remote_addr) = match listener.accept().await {
+            let accept = tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("Unified server: shutdown — zamykam listener");
+                        return;
+                    }
+                    continue;
+                }
+                res = listener.accept() => res,
+            };
+            let (stream, remote_addr) = match accept {
                 Ok(conn) => conn,
                 Err(e) => {
                     error!("Blad akceptowania polaczenia: {}", e);

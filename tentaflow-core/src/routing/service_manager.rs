@@ -289,7 +289,9 @@ pub struct ServiceManager {
 
     /// Shutdown signal
     shutdown_tx: watch::Sender<bool>,
-    shutdown_rx: watch::Receiver<bool>,
+    /// Publiczny zeby zewnetrzne serwery (unified_server) mogly zasubskrybowac
+    /// shutdown i zamknac swoje loopy bez zostawiania otwartych portow.
+    pub shutdown_rx: watch::Receiver<bool>,
 
     /// Prompt Registry dla KV cache
     pub prompt_registry: SharedPromptRegistry,
