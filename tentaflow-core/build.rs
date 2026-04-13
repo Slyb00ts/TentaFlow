@@ -17,6 +17,11 @@ fn main() {
     // Generuj wwwroot_embed.rs — pliki statyczne wbudowane w binarie
     generate_wwwroot_embed(&out_dir_env);
 
+    // Pakuj kontekst dockerow (tentaflow-containers + tentaflow-protocol)
+    // jako tar.gz wbudowany w binarce — deploy module rozpakowuje to do tmpdir
+    // i robi `docker build` bez wymagania zewnetrznych zrodel.
+    pack_container_contexts(&out_dir_env);
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let bundle_dir = out_dir.join("addon_bundles");
     std::fs::create_dir_all(&bundle_dir).unwrap();
@@ -490,5 +495,63 @@ fn guess_mime(path: &str) -> &'static str {
         "txt" => "text/plain",
         "xml" => "application/xml",
         _ => "application/octet-stream",
+    }
+}
+
+// =============================================================================
+// Pakowanie kontekstu Docker (tentaflow-containers + tentaflow-protocol)
+// w tar.gz wbudowany w binarce. Pozwala na deploy bez zewnetrznych zrodel.
+// =============================================================================
+
+fn pack_container_contexts(out_dir: &Path) {
+    use std::process::Command;
+
+    let workspace_root = Path::new("..").canonicalize().unwrap_or_else(|_| PathBuf::from(".."));
+    let containers_dir = workspace_root.join("tentaflow-containers");
+    let protocol_dir = workspace_root.join("tentaflow-protocol");
+
+    if !containers_dir.exists() || !protocol_dir.exists() {
+        println!(
+            "cargo:warning=pack_container_contexts: brak {} albo {} — embed pominiety",
+            containers_dir.display(),
+            protocol_dir.display()
+        );
+        // Stworz pusty plik zeby include_bytes! nie padlo
+        std::fs::write(out_dir.join("container_bundle.tar.gz"), b"").ok();
+        return;
+    }
+
+    // Zmiany w kontekstach trigerują rebuild
+    println!("cargo:rerun-if-changed={}", containers_dir.display());
+    println!("cargo:rerun-if-changed={}", protocol_dir.display());
+
+    let bundle_path = out_dir.join("container_bundle.tar.gz");
+
+    // Wykluczamy `target/`, `node_modules/`, `.git/`, oraz tentaflow-containers/teams-bot/
+    // (stary, do migracji), zeby nie wciskac kilkudziesieciu MB binarek do binarki.
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&bundle_path)
+        .arg("--exclude=target")
+        .arg("--exclude=node_modules")
+        .arg("--exclude=.git")
+        .arg("-C")
+        .arg(&workspace_root)
+        .arg("tentaflow-containers")
+        .arg("tentaflow-protocol")
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            let size = std::fs::metadata(&bundle_path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "cargo:warning=container_bundle.tar.gz spakowany ({} KB)",
+                size / 1024
+            );
+        }
+        _ => {
+            println!("cargo:warning=tar nieudany — embed kontenerow nie zadzialal");
+            std::fs::write(&bundle_path, b"").ok();
+        }
     }
 }

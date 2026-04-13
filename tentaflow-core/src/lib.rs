@@ -29,3 +29,4 @@ pub mod api;
 pub mod audit;
 
 pub mod addon;
+pub mod deploy;

@@ -802,6 +802,54 @@ pub async fn handle_request(
         }
     }
 
+    // Deploy API — lista wbudowanych kontenerow do deployu.
+    if path == "/api/deploy/containers" && method == Method::GET {
+        let containers = crate::deploy::list_containers().unwrap_or_default();
+        let body = serde_json::to_string(&containers).unwrap_or_else(|_| "[]".into());
+        return Ok(json_response_cors(200, body, cors_origin.as_deref()));
+    }
+
+    // POST /api/deploy/<container> — buduje obraz z embedowanego kontekstu i uruchamia
+    #[cfg(feature = "docker")]
+    if let Some(container) = path.strip_prefix("/api/deploy/") {
+        if method == Method::POST && !container.is_empty() && !container.contains('/') {
+            #[derive(serde::Deserialize, Default)]
+            struct DeployBody {
+                #[serde(default)]
+                ports: Vec<(String, String)>,
+                #[serde(default)]
+                volumes: Vec<(String, String)>,
+                #[serde(default)]
+                env: std::collections::HashMap<String, String>,
+                #[serde(default)]
+                gpu: bool,
+                instance_name: Option<String>,
+            }
+            let body: DeployBody = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let req = crate::deploy::docker::DeployRequest {
+                container: container.to_string(),
+                image_tag: None,
+                instance_name: body.instance_name,
+                ports: body.ports,
+                volumes: body.volumes,
+                env: body.env,
+                gpu: body.gpu,
+            };
+            return match crate::deploy::docker::deploy(&req).await {
+                Ok(name) => Ok(json_response_cors(
+                    200,
+                    serde_json::json!({"status":"ok","container":name}).to_string(),
+                    cors_origin.as_deref(),
+                )),
+                Err(e) => Ok(json_response_cors(
+                    500,
+                    serde_json::json!({"status":"error","message":e.to_string()}).to_string(),
+                    cors_origin.as_deref(),
+                )),
+            };
+        }
+    }
+
     // Voice profiles API — bulletproof speaker recognition.
     // Wolane przez LLM po detekcji introducji ("Cześć, tu Jan") albo przez
     // wewnetrzne toole. Na razie bez UI, fundament pod pozniejsze enrollment-by-LLM.
