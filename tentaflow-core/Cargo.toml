@@ -158,3 +158,4 @@ rcgen = "0.13"
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 wasmtime = "29"
+tempfile = "3"

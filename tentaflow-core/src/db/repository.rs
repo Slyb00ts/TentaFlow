@@ -3502,6 +3502,168 @@ pub fn cleanup_old_voice_temp_speakers(pool: &DbPool, older_than_days: i64) -> R
     Ok(n)
 }
 
+/// Repository dla transkrypcji spotkan. Sesja = jedna rozmowa identyfikowana
+/// przez `meeting_key` (np. UUID z bota lub hash URL spotkania). Wpisy sa
+/// trwale zachowane w SQLite — przezywaja restart procesu.
+pub mod transcripts {
+    use super::DbPool;
+    use anyhow::Result;
+    use serde::Serialize;
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct SessionRow {
+        pub id: i64,
+        pub meeting_key: String,
+        pub meeting_url: Option<String>,
+        pub title: Option<String>,
+        pub started_at: String,
+        pub last_activity_at: String,
+        pub entry_count: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct TranscriptRow {
+        pub id: i64,
+        pub session_id: i64,
+        pub timestamp_ms: i64,
+        pub speaker: String,
+        pub profile_id: Option<i64>,
+        pub confidence: Option<f32>,
+        pub is_enrolled: bool,
+        pub text: String,
+        pub model: String,
+    }
+
+    /// Zwraca id istniejacej sesji o podanym meeting_key lub tworzy nowa.
+    pub fn get_or_create_session(
+        pool: &DbPool,
+        meeting_key: &str,
+        meeting_url: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<i64> {
+        let conn = pool.lock().unwrap();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM meeting_sessions WHERE meeting_key = ?1",
+                rusqlite::params![meeting_key],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        conn.execute(
+            "INSERT INTO meeting_sessions (meeting_key, meeting_url, title)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![meeting_key, meeting_url, title],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Wstawia jeden wpis transkrypcji i aktualizuje last_activity_at sesji.
+    pub fn insert_transcript(
+        pool: &DbPool,
+        session_id: i64,
+        entry: &crate::routing::transcript_store::TranscriptEntry,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meeting_transcripts
+             (session_id, timestamp_ms, speaker, profile_id, confidence, is_enrolled, text, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                session_id,
+                entry.timestamp_ms as i64,
+                entry.speaker,
+                entry.profile_id,
+                entry.confidence,
+                entry.is_enrolled as i64,
+                entry.text,
+                entry.model,
+            ],
+        )?;
+        conn.execute(
+            "UPDATE meeting_sessions SET last_activity_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Lista sesji posortowana po last_activity_at malejaco.
+    pub fn list_sessions(pool: &DbPool) -> Result<Vec<SessionRow>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.meeting_key, s.meeting_url, s.title, s.started_at, s.last_activity_at,
+                    (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id) AS entry_count
+             FROM meeting_sessions s
+             ORDER BY s.last_activity_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SessionRow {
+                id: row.get(0)?,
+                meeting_key: row.get(1)?,
+                meeting_url: row.get(2)?,
+                title: row.get(3)?,
+                started_at: row.get(4)?,
+                last_activity_at: row.get(5)?,
+                entry_count: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Wszystkie wpisy transkrypcji dla sesji w kolejnosci chronologicznej.
+    pub fn list_transcripts(pool: &DbPool, session_id: i64) -> Result<Vec<TranscriptRow>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp_ms, speaker, profile_id, confidence,
+                    is_enrolled, text, model
+             FROM meeting_transcripts
+             WHERE session_id = ?1
+             ORDER BY timestamp_ms ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok(TranscriptRow {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                timestamp_ms: row.get(2)?,
+                speaker: row.get(3)?,
+                profile_id: row.get(4)?,
+                confidence: row.get(5)?,
+                is_enrolled: row.get::<_, i64>(6)? != 0,
+                text: row.get(7)?,
+                model: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Pobiera pojedyncza sesje po id.
+    pub fn get_session(pool: &DbPool, id: i64) -> Result<Option<SessionRow>> {
+        let conn = pool.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT s.id, s.meeting_key, s.meeting_url, s.title, s.started_at, s.last_activity_at,
+                        (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id)
+                 FROM meeting_sessions s WHERE s.id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok(SessionRow {
+                        id: row.get(0)?,
+                        meeting_key: row.get(1)?,
+                        meeting_url: row.get(2)?,
+                        title: row.get(3)?,
+                        started_at: row.get(4)?,
+                        last_activity_at: row.get(5)?,
+                        entry_count: row.get(6)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+}
+
 #[cfg(test)]
 mod alias_resolve_tests {
     use super::*;

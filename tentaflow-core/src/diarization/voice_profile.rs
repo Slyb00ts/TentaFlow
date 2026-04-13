@@ -11,10 +11,10 @@
 //       - Incremental learning: wysoka pewnosc + dobry SNR → auto-dodaj sample
 //
 //       Thresholdy dostrojone empirycznie dla WeSpeaker 192-dim embeddings:
-//         >= 0.65 very confident (~99% precision)
-//         >= 0.55 confident      (~95% precision)
-//         >= 0.45 uncertain      (prompt to verify)
-//         <  0.45 no match
+//         >= 0.60 very confident
+//         >= 0.45 confident      (same-speaker naturalna mowa)
+//         >= 0.30 uncertain
+//         <  0.30 no match       (cross-speaker WeSpeaker typowo 0.05-0.20)
 // =============================================================================
 
 use crate::db::models::{NewVoiceProfile, NewVoiceProfileSample};
@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 const EMBEDDING_DIM: usize = 192;
 
 /// Progi matchingu (konsekwentne z Pyannote/speechbrain best practices)
-pub const MATCH_VERY_CONFIDENT: f32 = 0.65;
+pub const MATCH_VERY_CONFIDENT: f32 = 0.70;
 pub const MATCH_CONFIDENT: f32 = 0.55;
 pub const MATCH_UNCERTAIN: f32 = 0.45;
 
@@ -35,8 +35,11 @@ pub const MATCH_UNCERTAIN: f32 = 0.45;
 pub const MIN_ENROLLMENT_DURATION_MS: u64 = 4_000;
 pub const MIN_ENROLLMENT_SAMPLES: usize = 3;
 pub const MAX_ENROLLMENT_SAMPLES: usize = 20;
-/// Minimalna wewnetrzna spojnosc (srednia cos miedzy samples) do akceptacji profilu
-pub const MIN_INTRA_SIMILARITY: f32 = 0.55;
+/// Minimalna wewnetrzna spojnosc (srednia cos miedzy samples) do akceptacji profilu.
+/// Empirycznie: WeSpeaker same-speaker inter-utterance srednio 0.40-0.55 dla
+/// naturalnej mowy, niektorzy mowcy spadaja do 0.30-0.40. Caller powinien
+/// wyfiltrowac outliery przed wywolaniem enroll_profile (top-K by centroid).
+pub const MIN_INTRA_SIMILARITY: f32 = 0.30;
 
 /// Parametry slidingu dla enrollment — 3s okno, 0.75s hop daje 4 samples na 5s
 /// audio i ~40 samples na 30s audio.
@@ -45,8 +48,11 @@ pub const ENROLL_HOP_SAMPLES: usize = 12000; // 0.75s hop
 
 /// Minimalna dlugosc audio dla matchingu (weryfikacja vs enrolled)
 pub const MATCH_MIN_AUDIO_SAMPLES: usize = 16000; // 1.0s
-/// Incremental learning dodaje sample tylko gdy match_score >= tego progu
-pub const INCREMENTAL_LEARN_THRESHOLD: f32 = 0.70;
+/// Incremental learning dodaje sample tylko gdy match_score >= tego progu.
+/// Musi byc wyzszy niz MATCH_CONFIDENT (0.55), zeby nie zanieczyszczac profilu
+/// wpisami ktore tylko ledwo kwalifikuja sie jako match — false-positivy
+/// zlepialyby profile roznych mowcow.
+pub const INCREMENTAL_LEARN_THRESHOLD: f32 = 0.65;
 /// I wymaga minimalnego SNR
 pub const INCREMENTAL_MIN_SNR: f32 = 15.0;
 /// Max samples per profil — po osiagnieciu najstarsze sa pomijane w incremental
@@ -67,9 +73,9 @@ pub struct MatchResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchConfidence {
-    VeryConfident,  // >= 0.65
+    VeryConfident,  // >= 0.70
     Confident,      // >= 0.55
-    Uncertain,      // >= 0.45
+    Uncertain,      // >= 0.45 (NIE jest traktowany jako match)
     NoMatch,        // < 0.45
 }
 
@@ -892,7 +898,7 @@ mod tests {
 
     #[test]
     fn match_confidence_thresholds() {
-        assert_eq!(MatchConfidence::from_score(0.70), MatchConfidence::VeryConfident);
+        assert_eq!(MatchConfidence::from_score(0.80), MatchConfidence::VeryConfident);
         assert_eq!(MatchConfidence::from_score(0.60), MatchConfidence::Confident);
         assert_eq!(MatchConfidence::from_score(0.50), MatchConfidence::Uncertain);
         assert_eq!(MatchConfidence::from_score(0.30), MatchConfidence::NoMatch);
@@ -986,9 +992,9 @@ mod tests {
             );
             // Cross-speaker score powinien byc znacznie nizszy
             assert!(m2.score < m1.score, "glos 2 vs profil glos 1 powinien miec nizszy score");
-            // Jesli to fałszywy match (score > 0.55), test fail
+            // Jesli to fałszywy match (score >= MATCH_CONFIDENT), test fail
             assert!(
-                m2.score < 0.55 || !m2.confidence.is_match(),
+                m2.score < MATCH_CONFIDENT || !m2.confidence.is_match(),
                 "FALSE POSITIVE: glos 2 dopasowany do profilu glos 1 ze score {:.3}",
                 m2.score
             );

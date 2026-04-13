@@ -1027,6 +1027,7 @@
     "enrolled_profile": "Known voice profile — recognised from database",
     "temp_speaker": "Temporary speaker — not yet linked to a profile",
     "badge_enrolled": "known",
-    "badge_temp": "temp"
+    "badge_temp": "temp",
+    "download_transcripts": "Download transcripts"
   }
 }
