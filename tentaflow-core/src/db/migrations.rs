@@ -993,5 +993,49 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX idx_voice_profiles_nickname ON voice_profiles(nickname);
         ",
     ),
+    (
+        33,
+        "meeting_transcripts",
+        "
+            -- Sesje spotkan — jedna sesja na rozmowe (klucz np. meeting_id z bota
+            -- Teams lub hash URL). Trzymane na stale, do wygenerowania pelnego
+            -- transcriptu po fakcie nawet po restarcie tentaflow.
+            CREATE TABLE IF NOT EXISTS meeting_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meeting_key TEXT NOT NULL UNIQUE,
+                meeting_url TEXT,
+                title TEXT,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_activity_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_meeting_sessions_started ON meeting_sessions(started_at DESC);
+
+            -- Wpisy transkrypcji per sesja. Nie ma limitu — wszystkie wpisy STT
+            -- z bota lecą tutaj. Index po (session_id, timestamp_ms) dla szybkiego
+            -- pobrania pelnej historii w kolejnosci chronologicznej.
+            CREATE TABLE IF NOT EXISTS meeting_transcripts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES meeting_sessions(id) ON DELETE CASCADE,
+                timestamp_ms INTEGER NOT NULL,
+                speaker TEXT NOT NULL,
+                profile_id INTEGER,
+                confidence REAL,
+                is_enrolled INTEGER NOT NULL DEFAULT 0,
+                text TEXT NOT NULL,
+                model TEXT NOT NULL
+            );
+            CREATE INDEX idx_meeting_transcripts_session ON meeting_transcripts(session_id, timestamp_ms);
+        ",
+    ),
+    (
+        34,
+        "meeting_sessions_index_last_activity",
+        "
+            -- list_sessions sortuje po last_activity_at, wiec dodajemy pod to
+            -- dedykowany index. Stary (started_at) zostaje — nieszkodliwy.
+            CREATE INDEX IF NOT EXISTS idx_meeting_sessions_last_activity
+                ON meeting_sessions(last_activity_at DESC);
+        ",
+    ),
 ]
 }

@@ -169,9 +169,15 @@
         if (bufferOffset >= CHUNK_SIZE) {
           sendCapturedPcm(sampleBuffer);
           bufferOffset = 0;
+          // Licznik chunkow z cisza — dla healthCheck auto-rebuild
+          if (lastMaxAbs < 0.0005) {
+            silentChunkCount++;
+          } else {
+            silentChunkCount = 0;
+          }
           if (processCallCount <= 5 || processCallCount % 200 === 0) {
             console.log('[tentaflow] Wyslano chunk 500ms, maxAbs od ostatniego:', lastMaxAbs.toFixed(4),
-              'srcRate:', srcRate);
+              'srcRate:', srcRate, 'silent:', silentChunkCount);
           }
           lastMaxAbs = 0;
         }
@@ -187,6 +193,14 @@
   // capturedElements i pozwolic ponownie podlaczyc.
   const attachedTracks = new Set();
   const attachedSources = new Map();
+  // knownStreams: wszystkie streamy z pc.ontrack — uzywane przez rebuild
+  // gdy healthCheck wykryje ze audio zamarlo. Klucz = track.id, wartosc =
+  // { stream, source: 'pc.ontrack', element? } — trzymamy tylko dopoki
+  // track jest live.
+  const knownStreams = new Map();
+  // Licznik chunkow z cisza — inkrementowany w onaudioprocess, sprawdzany
+  // w healthCheck. > 20 (= 5s) -> force rebuild capture pipeline.
+  let silentChunkCount = 0;
   function attachStream(stream, source, element) {
     if (!stream || stream.getAudioTracks().length === 0) return;
     ensureCaptureContext();
@@ -283,9 +297,18 @@
         if (track.kind !== 'audio') return;
         // Stworz dedykowany MediaStream tylko z tym trackiem
         const stream = new MediaStream([track]);
+        // Zapamietaj dla rebuild — usuwamy gdy track ended
+        knownStreams.set(track.id, stream);
+        track.addEventListener('ended', () => { knownStreams.delete(track.id); });
         attachStream(stream, 'pc.ontrack');
         // Takze dolacz wszystkie streamy z event (Teams moze miec wiele)
-        event.streams.forEach((s, i) => attachStream(s, 'pc.ontrack.streams[' + i + ']'));
+        event.streams.forEach((s, i) => {
+          s.getAudioTracks().forEach((t) => {
+            knownStreams.set(t.id, s);
+            t.addEventListener('ended', () => { knownStreams.delete(t.id); });
+          });
+          attachStream(s, 'pc.ontrack.streams[' + i + ']');
+        });
       });
       return pc;
     }
@@ -300,22 +323,68 @@
     els.forEach(attachElementStream);
   }
 
-  // Health check — jesli ZADEN z podlaczonych sources nie ma live track'ow,
-  // zwolnij wszystkie i zrob pelny rescan. Pomaga gdy Teams zmienia pipeline
-  // audio w sposob ktory omija nasze event handlery.
+  // Force rebuild capture pipeline — gdy dzwiek zamarl mimo ze track jest live.
+  // Chromium nie zawsze emituje mute/ended event gdy MediaStreamSource przestaje
+  // dostarczac data (np. po wewnetrznej renegocjacji transceivera). Jedyny
+  // sposob naprawy: zniszcz AudioContext i odbuduj od zera z zapamietanymi
+  // streamami + rescan DOM.
+  function rebuildCapturePipeline(reason) {
+    console.warn('[tentaflow] REBUILD capture pipeline, reason:', reason,
+      'knownStreams:', knownStreams.size,
+      'attachedSources:', attachedSources.size);
+    try {
+      // Disconnect wszystkich source nodes
+      for (const [_, entry] of attachedSources.entries()) {
+        try { entry.node.disconnect(); } catch (_) {}
+      }
+      attachedSources.clear();
+      attachedTracks.clear();
+      capturedElements.clear();
+      // Zamknij stary AudioContext
+      if (captureCtx) {
+        try {
+          if (scriptProcessor) scriptProcessor.disconnect();
+        } catch (_) {}
+        try { captureCtx.close(); } catch (_) {}
+        captureCtx = null;
+        scriptProcessor = null;
+      }
+    } catch (e) {
+      console.warn('[tentaflow] rebuild cleanup blad:', e);
+    }
+    // Reset licznika ciszy zeby kolejny rebuild nie wystartowal od razu
+    silentChunkCount = 0;
+    // Re-attach wszystkie znane streamy (filtruje live tracks)
+    const freshStreams = [];
+    for (const [trackId, stream] of knownStreams.entries()) {
+      const tracks = stream.getAudioTracks();
+      if (tracks.length === 0 || tracks.every(t => t.readyState === 'ended')) {
+        knownStreams.delete(trackId);
+        continue;
+      }
+      freshStreams.push({ trackId, stream });
+    }
+    console.log('[tentaflow] rebuild — re-attach', freshStreams.length, 'streamow');
+    freshStreams.forEach(({ stream }) => {
+      attachStream(stream, 'rebuild:pc.ontrack');
+    });
+    // I rescan DOM na wypadek nowych <audio>/<video>
+    scanAndAttach();
+  }
+
+  // Health check co 2s — dwa scenariusze:
+  // 1. maxAbs cisza przez >20 chunkow (~5s) przy zywych trackach → rebuild
+  // 2. Zadne attached sources, ale sa live elementy DOM → rescan (legacy)
   function healthCheck() {
-    // Sprawdz ile attachedSources ma live tracks
-    let liveCount = 0;
-    let deadIds = [];
-    for (const [trackId, entry] of attachedSources.entries()) {
-      // Nie znamy bezposrednio track obiektu z id po fakcie — sprawdzamy
-      // czy source node'a w AudioContext jest dalej podlaczone. Proxy: jesli
-      // ma ended event juz przeszedl, to entry bylo juz usuniete, wiec
-      // wszystko co jest w mapie jest "zywe" z nasza perspektywa.
-      liveCount++;
+    // Scenariusz 1: cisza przy zywych trackach
+    const hasLiveKnown = Array.from(knownStreams.values()).some(s =>
+      s.getAudioTracks().some(t => t.readyState === 'live'));
+    if (silentChunkCount > 20 && hasLiveKnown) {
+      rebuildCapturePipeline('silent_chunks=' + silentChunkCount);
+      return;
     }
 
-    // Alternatywny check: przejrzyj wszystkie audio/video i ich srcObject
+    // Scenariusz 2: brak attached sources przy obecnosci elementow DOM
     const els = document.querySelectorAll('audio, video');
     let liveElementTracks = 0;
     els.forEach((el) => {
@@ -325,11 +394,9 @@
         });
       }
     });
-
-    if (liveCount === 0 && liveElementTracks > 0) {
+    if (attachedSources.size === 0 && liveElementTracks > 0) {
       console.log('[tentaflow] Health check: 0 podlaczone, ale', liveElementTracks,
         'live element tracks — force rescan');
-      // Reset capturedElements zeby rescan ich znow zlapal
       capturedElements.clear();
       scanAndAttach();
     }

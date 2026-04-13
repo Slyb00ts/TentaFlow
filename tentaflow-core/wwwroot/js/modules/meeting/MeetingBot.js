@@ -12,6 +12,8 @@ const MeetingBot = (() => {
   let meetingState = 'idle';
   let meetingUrl = '';
   let pollingInterval = null;
+  let lastTranscripts = [];
+  let lastTranscriptsSignature = '';
 
   // Stany spotkania
   const STATES = {
@@ -120,6 +122,8 @@ const MeetingBot = (() => {
       clearInterval(pollingInterval);
       pollingInterval = null;
     }
+    lastTranscripts = [];
+    lastTranscriptsSignature = '';
   }
 
   // Dolaczenie do spotkania
@@ -176,32 +180,44 @@ const MeetingBot = (() => {
     try {
       const [data, transcripts] = await Promise.all([
         ApiClient.get('/api/addons/teams-bot/ui'),
-        ApiClient.get('/api/meeting-bot/transcripts?limit=50').catch(() => []),
+        ApiClient.get('/api/meeting-bot/transcripts?limit=2000').catch(() => []),
       ]);
       const config = data.config_values || {};
       const state = config.meeting_state || 'idle';
 
       updateState(state);
 
-      let html = '<div class="meeting-info-grid">';
-      html += renderInfoRow(I18n.t('meeting.state'), I18n.t('meeting.status_' + meetingState));
-      html += renderInfoRow(I18n.t('meeting.bot_name'), config.bot_display_name || config.bot_name || '-');
+      let infoHtml = '<div class="meeting-info-grid">';
+      infoHtml += renderInfoRow(I18n.t('meeting.state'), I18n.t('meeting.status_' + meetingState));
+      infoHtml += renderInfoRow(I18n.t('meeting.bot_name'), config.bot_display_name || config.bot_name || '-');
 
       if (config.stt_alias) {
-        html += renderInfoRow(I18n.t('meeting.stt_alias'), config.stt_alias);
+        infoHtml += renderInfoRow(I18n.t('meeting.stt_alias'), config.stt_alias);
       }
       if (config.tts_alias) {
-        html += renderInfoRow(I18n.t('meeting.tts_alias'), config.tts_alias);
+        infoHtml += renderInfoRow(I18n.t('meeting.tts_alias'), config.tts_alias);
       }
       if (config.llm_alias) {
-        html += renderInfoRow(I18n.t('meeting.llm_alias'), config.llm_alias);
+        infoHtml += renderInfoRow(I18n.t('meeting.llm_alias'), config.llm_alias);
       }
-      html += '</div>';
+      infoHtml += '</div>';
 
-      // Sekcja transkrypcji na zywo
-      html += renderTranscripts(Array.isArray(transcripts) ? transcripts : []);
+      const entries = Array.isArray(transcripts) ? transcripts : [];
 
-      infoContent.innerHTML = html;
+      // Pelna odbudowa tylko gdy kontener nie zawiera jeszcze sekcji transkrypcji
+      // (pierwszy render po mount). W kolejnych cyklach aktualizujemy osobno grid
+      // i liste transkrypcji — dzieki temu scroll nie resetuje sie co 2s.
+      let transcriptsSection = infoContent.querySelector('.meeting-transcripts');
+      if (!transcriptsSection) {
+        infoContent.innerHTML = infoHtml + renderTranscriptsContainer();
+        transcriptsSection = infoContent.querySelector('.meeting-transcripts');
+        bindTranscriptsDownload();
+      } else {
+        const grid = infoContent.querySelector('.meeting-info-grid');
+        if (grid) grid.outerHTML = infoHtml;
+      }
+
+      updateTranscripts(entries);
     } catch (err) {
       infoContent.innerHTML = `
         <div class="empty-state">
@@ -231,66 +247,175 @@ const MeetingBot = (() => {
     return `${Math.round(score * 100)}%`;
   }
 
-  // Renderowanie listy transkrypcji
-  function renderTranscripts(entries) {
+  // Szkielet sekcji transkrypcji (naglowek, przycisk pobierania, pusta lista).
+  // Renderowany raz po mount — scroll zachowuje sie miedzy cyklami pollingu.
+  function renderTranscriptsContainer() {
     const title = I18n.t('meeting.transcripts') || 'Transcripts';
-    if (!entries || entries.length === 0) {
-      return `
-        <div class="meeting-transcripts">
-          <h4 class="meeting-transcripts-title">${escapeHtml(title)}</h4>
+    const download = I18n.t('meeting.download_transcripts') || 'Pobierz';
+    return `
+      <div class="meeting-transcripts">
+        <div class="meeting-transcripts-header">
+          <h4 class="meeting-transcripts-title"><span class="meeting-transcripts-label">${escapeHtml(title)}</span> <span class="meeting-transcripts-count">(0)</span></h4>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-download-transcripts" disabled>${escapeHtml(download)}</button>
+        </div>
+        <div class="meeting-transcript-list"></div>
+      </div>
+    `;
+  }
+
+  // HTML pojedynczego wiersza transkrypcji
+  function renderTranscriptRow(e) {
+    const time = new Date(e.timestamp_ms || Date.now()).toLocaleTimeString();
+    const speakerName = e.speaker || 'Unknown';
+    const speaker = escapeHtml(speakerName);
+    const text = escapeHtml(e.text || '');
+    const model = escapeHtml(e.model || '');
+    const color = speakerColor(speakerName);
+    const isEnrolled = e.is_enrolled === true;
+    const confidence = formatConfidence(e.confidence);
+
+    let statusBadge = '';
+    if (isEnrolled) {
+      statusBadge = `<span class="meeting-transcript-badge meeting-transcript-badge-enrolled" title="${escapeHtml(I18n.t('meeting.enrolled_profile') || 'Enrolled voice profile')}">✓ ${escapeHtml(I18n.t('meeting.badge_enrolled') || 'known')}</span>`;
+    } else if (speakerName.startsWith('SPEAKER_')) {
+      statusBadge = `<span class="meeting-transcript-badge meeting-transcript-badge-temp" title="${escapeHtml(I18n.t('meeting.temp_speaker') || 'Temporary — not yet enrolled')}">${escapeHtml(I18n.t('meeting.badge_temp') || 'temp')}</span>`;
+    }
+
+    const confidenceHtml = confidence
+      ? `<span class="meeting-transcript-confidence">${confidence}</span>`
+      : '';
+
+    return `
+      <div class="meeting-transcript-row${isEnrolled ? ' meeting-transcript-row-enrolled' : ''}">
+        <div class="meeting-transcript-meta">
+          <span class="meeting-transcript-time">${time}</span>
+          <span class="meeting-transcript-speaker" style="color: ${color};">${speaker}</span>
+          ${statusBadge}
+          ${confidenceHtml}
+          ${model ? `<span class="meeting-transcript-model">${model}</span>` : ''}
+        </div>
+        <div class="meeting-transcript-text">${text}</div>
+      </div>
+    `;
+  }
+
+  // Sygnatura zbioru transkrypcji do wykrywania zmian — count + id pierwszego
+  // (najnowszego) wpisu. Backend zwraca najnowsze wpisy z przodu.
+  function transcriptsSignature(entries) {
+    if (!entries.length) return '0:';
+    const head = entries[0];
+    const key = head.id || head.timestamp_ms || head.text || '';
+    return `${entries.length}:${key}`;
+  }
+
+  // Aktualizacja listy transkrypcji BEZ resetowania scrolla.
+  // Kluczowa regula: pozycja scrolla jest zapisywana przed podmiana DOM
+  // i odtwarzana po niej. Gdy pojawil sie nowy wpis i uzytkownik byl juz
+  // na samej gorze (najnowsze wpisy), zostawiamy scrollTop = 0 zeby zobaczyl
+  // nowy komunikat. Gdy scroll byl ponizej, utrzymujemy jego wartosc.
+  function updateTranscripts(entries) {
+    const listEl = document.querySelector('.meeting-transcript-list');
+    const countEl = document.querySelector('.meeting-transcripts-count');
+    const downloadBtn = document.getElementById('btn-download-transcripts');
+    if (!listEl) return;
+
+    lastTranscripts = entries;
+    if (downloadBtn) downloadBtn.disabled = entries.length === 0;
+    if (countEl) countEl.textContent = `(${entries.length})`;
+
+    if (entries.length === 0) {
+      if (listEl.dataset.empty !== '1') {
+        listEl.innerHTML = `
           <div class="empty-state" style="padding: var(--spacing-md);">
             <div class="empty-state-hint">${escapeHtml(I18n.t('meeting.no_transcripts') || 'No transcripts yet')}</div>
           </div>
-        </div>
-      `;
+        `;
+        listEl.dataset.empty = '1';
+        lastTranscriptsSignature = '0:';
+      }
+      return;
     }
 
-    // Entries przychodza od najnowszej — renderujemy w tej kolejnosci
-    const rows = entries.map((e) => {
-      const time = new Date(e.timestamp_ms || Date.now()).toLocaleTimeString();
-      const speakerName = e.speaker || 'Unknown';
-      const speaker = escapeHtml(speakerName);
-      const text = escapeHtml(e.text || '');
-      const model = escapeHtml(e.model || '');
-      const color = speakerColor(speakerName);
-      const isEnrolled = e.is_enrolled === true;
-      const confidence = formatConfidence(e.confidence);
+    const signature = transcriptsSignature(entries);
+    if (signature === lastTranscriptsSignature && listEl.dataset.empty !== '1') {
+      return;
+    }
 
-      // Badge wskazujacy status identyfikacji:
-      //   - "✓ enrolled" (zielony) gdy voice profile match
-      //   - "temp" (szary) gdy SPEAKER_XX z online trackera
-      //   - brak badge gdy brak danych diarization
-      let statusBadge = '';
-      if (isEnrolled) {
-        statusBadge = `<span class="meeting-transcript-badge meeting-transcript-badge-enrolled" title="${escapeHtml(I18n.t('meeting.enrolled_profile') || 'Enrolled voice profile')}">✓ ${escapeHtml(I18n.t('meeting.badge_enrolled') || 'known')}</span>`;
-      } else if (speakerName.startsWith('SPEAKER_')) {
-        statusBadge = `<span class="meeting-transcript-badge meeting-transcript-badge-temp" title="${escapeHtml(I18n.t('meeting.temp_speaker') || 'Temporary — not yet enrolled')}">${escapeHtml(I18n.t('meeting.badge_temp') || 'temp')}</span>`;
+    const wasAtTop = listEl.scrollTop <= 4;
+    const prevScrollTop = listEl.scrollTop;
+    const prevScrollHeight = listEl.scrollHeight;
+
+    listEl.innerHTML = entries.map(renderTranscriptRow).join('');
+    listEl.dataset.empty = '0';
+    lastTranscriptsSignature = signature;
+
+    if (wasAtTop) {
+      listEl.scrollTop = 0;
+    } else {
+      const delta = listEl.scrollHeight - prevScrollHeight;
+      listEl.scrollTop = prevScrollTop + Math.max(0, delta);
+    }
+  }
+
+  // Podpiecie zdarzenia pobierania transkrypcji jako plik .txt
+  function bindTranscriptsDownload() {
+    const btn = document.getElementById('btn-download-transcripts');
+    if (!btn) return;
+    btn.addEventListener('click', handleDownloadTranscripts, {
+      signal: abortController ? abortController.signal : undefined,
+    });
+  }
+
+  // Eksport transkrypcji aktywnej sesji jako plik tekstowy.
+  // Backend serwuje gotowy text/plain z calej historii sesji w DB
+  // (bez limitu, przezywa restart procesu).
+  async function handleDownloadTranscripts() {
+    let activeId = null;
+    try {
+      const info = await ApiClient.get('/api/meeting-bot/sessions');
+      activeId = info && info.active_id;
+    } catch (err) {
+      // brak aktywnej sesji w DB
+    }
+
+    if (activeId) {
+      const token = (ApiClient.getToken && ApiClient.getToken()) || '';
+      const url = `/api/meeting-bot/sessions/${activeId}/download`;
+      try {
+        const resp = await fetch(url, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (resp.ok) {
+          const text = await resp.text();
+          downloadTextAs(`transcript-session-${activeId}.txt`, text);
+          return;
+        }
+      } catch (err) {
+        // fallback ponizej
       }
+    }
 
-      const confidenceHtml = confidence
-        ? `<span class="meeting-transcript-confidence">${confidence}</span>`
-        : '';
+    // Fallback — eksport ring-buffera (gdy sesji nie ma w DB)
+    if (!lastTranscripts.length) return;
+    const ordered = [...lastTranscripts].sort((a, b) => (a.timestamp_ms || 0) - (b.timestamp_ms || 0));
+    const lines = ordered.map((e) => {
+      const ts = new Date(e.timestamp_ms || Date.now()).toISOString();
+      return `[${ts}] ${e.speaker || 'Unknown'}: ${(e.text || '').trim()}`;
+    });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    downloadTextAs(`transcript-${stamp}.txt`, lines.join('\n') + '\n');
+  }
 
-      return `
-        <div class="meeting-transcript-row${isEnrolled ? ' meeting-transcript-row-enrolled' : ''}">
-          <div class="meeting-transcript-meta">
-            <span class="meeting-transcript-time">${time}</span>
-            <span class="meeting-transcript-speaker" style="color: ${color};">${speaker}</span>
-            ${statusBadge}
-            ${confidenceHtml}
-            ${model ? `<span class="meeting-transcript-model">${model}</span>` : ''}
-          </div>
-          <div class="meeting-transcript-text">${text}</div>
-        </div>
-      `;
-    }).join('');
-
-    return `
-      <div class="meeting-transcripts">
-        <h4 class="meeting-transcripts-title">${escapeHtml(title)} (${entries.length})</h4>
-        <div class="meeting-transcript-list">${rows}</div>
-      </div>
-    `;
+  function downloadTextAs(filename, text) {
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(objUrl);
   }
 
   // Renderowanie wiersza informacyjnego

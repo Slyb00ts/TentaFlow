@@ -121,6 +121,18 @@
   padding-top: var(--spacing-md);
 }
 
+.meeting-transcripts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-sm);
+}
+
+.meeting-transcripts-header .meeting-transcripts-title {
+  margin: 0;
+}
+
 .meeting-transcripts-title {
   margin: 0 0 var(--spacing-sm) 0;
   font-size: var(--font-size-sm);

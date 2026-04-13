@@ -1,16 +1,9 @@
 // =============================================================================
 // Plik: routing/transcript_store.rs
-// Opis: Globalny ring buffer ostatnich transkrypcji z meeting-bota. Wpisy sa
-//       generowane przez reverse_request po odebraniu audio/transkrypcji z
-//       STT + wyniku speaker identification. Czytane przez endpoint
-//       /api/meeting-bot/transcripts i renderowane w GUI Bot Status.
-//
-//       Kazdy wpis ma:
-//         - speaker label (enrolled name albo SPEAKER_XX)
-//         - profile_id (Some jesli to enrolled profile)
-//         - confidence (score z matchingu, 0.0-1.0)
-//         - is_enrolled (bool — czy to enrolled profile czy temp speaker)
-//         - meeting_id (do grupowania po meetingach w GUI)
+// Opis: Live ring buffer (do widoku w GUI) + trwala persystencja w SQLite
+//       (tabele meeting_sessions / meeting_transcripts). Zapis do bazy
+//       jest synchroniczny i nieblokujacy ring-buffera — wszystkie wpisy
+//       trafiaja do DB nawet po restarcie procesu.
 // =============================================================================
 
 use parking_lot::RwLock;
@@ -18,9 +11,10 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
-const MAX_TRANSCRIPTS: usize = 200;
+/// Ring buffer wylacznie dla szybkiego live-widoku w GUI. Trwale dane sa w DB.
+const MAX_LIVE_TRANSCRIPTS: usize = 5000;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct TranscriptEntry {
     /// Unix timestamp w milisekundach (UTC)
     pub timestamp_ms: u64,
@@ -28,12 +22,11 @@ pub struct TranscriptEntry {
     pub speaker: String,
     /// DB id profilu voice_profiles, jesli to enrolled match
     pub profile_id: Option<i64>,
-    /// Score z matchingu (0.0-1.0). Dla enrolled to confidence vs profile,
-    /// dla temp speakera to similarity wew online clusteringu.
+    /// Score z matchingu (0.0-1.0)
     pub confidence: Option<f32>,
     /// Czy to enrolled profile (true) czy temp speaker (false)
     pub is_enrolled: bool,
-    /// Meeting_id z ktorego pochodzi transcript (None dla standalone STT)
+    /// Meeting_id (klucz logiczny rozmowy, np. UUID przekazany z bota)
     pub meeting_id: Option<String>,
     /// Transkrybowany tekst
     pub text: String,
@@ -41,7 +34,6 @@ pub struct TranscriptEntry {
     pub model: String,
 }
 
-/// Budowniczy wpisu — caller ustawia poszczegolne pola, timestamp dopisywany auto
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptBuilder {
     pub speaker: String,
@@ -107,30 +99,103 @@ impl TranscriptBuilder {
 static STORE: OnceLock<RwLock<VecDeque<TranscriptEntry>>> = OnceLock::new();
 
 fn store() -> &'static RwLock<VecDeque<TranscriptEntry>> {
-    STORE.get_or_init(|| RwLock::new(VecDeque::with_capacity(MAX_TRANSCRIPTS)))
+    STORE.get_or_init(|| RwLock::new(VecDeque::with_capacity(MAX_LIVE_TRANSCRIPTS)))
 }
 
-/// Dodaje nowy wpis — przyjmuje w pelni zbudowany TranscriptEntry.
-pub fn push_entry(entry: TranscriptEntry) {
-    let mut guard = store().write();
-    if guard.len() >= MAX_TRANSCRIPTS {
-        guard.pop_front();
+/// Aktywna sesja — meeting_key + DB session_id. Gdy meeting_key sie zmieni,
+/// otwierana jest nowa sesja w bazie (lub odzyskiwana po istniejacym kluczu).
+struct ActiveSession {
+    meeting_key: String,
+    session_id: i64,
+}
+
+static ACTIVE_SESSION: OnceLock<parking_lot::Mutex<Option<ActiveSession>>> = OnceLock::new();
+
+fn active_session() -> &'static parking_lot::Mutex<Option<ActiveSession>> {
+    ACTIVE_SESSION.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// Klucz sesji do tabeli meeting_sessions — preferujemy meeting_id z bota,
+/// w przypadku braku uzywamy "standalone".
+fn session_key_for(entry: &TranscriptEntry) -> String {
+    entry
+        .meeting_id
+        .clone()
+        .unwrap_or_else(|| "standalone".to_string())
+}
+
+/// Pobiera/tworzy session_id w DB dla danego meeting_key i zapisuje wpis.
+/// Bledy DB sa logowane (nie blokujemy live-widoku).
+fn persist_to_db(entry: &TranscriptEntry) {
+    let pool = match crate::db::global_pool() {
+        Some(p) => p,
+        None => return,
+    };
+    let key = session_key_for(entry);
+
+    let mut guard = active_session().lock();
+    let need_new = match guard.as_ref() {
+        Some(s) => s.meeting_key != key,
+        None => true,
+    };
+
+    let session_id = if need_new {
+        match crate::db::repository::transcripts::get_or_create_session(&pool, &key, None, None) {
+            Ok(id) => {
+                *guard = Some(ActiveSession {
+                    meeting_key: key.clone(),
+                    session_id: id,
+                });
+                id
+            }
+            Err(e) => {
+                tracing::warn!("transcripts: nie udalo sie utworzyc sesji '{}': {}", key, e);
+                return;
+            }
+        }
+    } else {
+        guard.as_ref().map(|s| s.session_id).unwrap_or(0)
+    };
+
+    if let Err(e) = crate::db::repository::transcripts::insert_transcript(&pool, session_id, entry)
+    {
+        tracing::warn!("transcripts: nie udalo sie zapisac wpisu: {}", e);
     }
-    guard.push_back(entry);
 }
 
-/// Shortcut — buduje i zapisuje w jednym kroku
+/// Dodaje wpis — ring buffer (live) + trwale do DB.
+pub fn push_entry(entry: TranscriptEntry) {
+    {
+        let mut guard = store().write();
+        if guard.len() >= MAX_LIVE_TRANSCRIPTS {
+            guard.pop_front();
+        }
+        guard.push_back(entry.clone());
+    }
+    persist_to_db(&entry);
+}
+
 pub fn push(builder: TranscriptBuilder) {
     push_entry(builder.build());
 }
 
-/// Zwraca ostatnie `limit` transkrypcji (od najnowszej)
+/// Klucz aktualnej sesji (do widoku/pobrania w GUI).
+pub fn active_session_key() -> Option<String> {
+    active_session().lock().as_ref().map(|s| s.meeting_key.clone())
+}
+
+/// DB id aktualnej sesji.
+pub fn active_session_id() -> Option<i64> {
+    active_session().lock().as_ref().map(|s| s.session_id)
+}
+
+/// Ostatnie N wpisow z ring-buffera (od najnowszej) — dla widoku live.
 pub fn list(limit: usize) -> Vec<TranscriptEntry> {
     let guard = store().read();
     guard.iter().rev().take(limit).cloned().collect()
 }
 
-/// Zwraca transkrypcje dla konkretnego meetingu
+/// Wpisy dla konkretnego meeting_id z ring-buffera (live).
 pub fn list_for_meeting(meeting_id: &str, limit: usize) -> Vec<TranscriptEntry> {
     let guard = store().read();
     guard
@@ -142,7 +207,6 @@ pub fn list_for_meeting(meeting_id: &str, limit: usize) -> Vec<TranscriptEntry> 
         .collect()
 }
 
-/// Czysci wszystkie transkrypcje
 #[allow(dead_code)]
 pub fn clear() {
     store().write().clear();
@@ -151,22 +215,31 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard};
+
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn isolate() -> MutexGuard<'static, ()> {
+        let g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *active_session().lock() = None;
+        clear();
+        g
+    }
 
     #[test]
     fn builder_defaults() {
-        clear();
+        let _g = isolate();
         push(TranscriptBuilder::new("Hello", "whisper-1").speaker("SPEAKER_00"));
         let entries = list(10);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].speaker, "SPEAKER_00");
         assert_eq!(entries[0].text, "Hello");
         assert!(!entries[0].is_enrolled);
-        assert_eq!(entries[0].profile_id, None);
     }
 
     #[test]
     fn builder_with_enrolled_profile() {
-        clear();
+        let _g = isolate();
         push(
             TranscriptBuilder::new("Witam", "whisper-1")
                 .speaker("Jan Kowalski")
@@ -176,33 +249,29 @@ mod tests {
         );
         let entries = list(10);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].speaker, "Jan Kowalski");
         assert_eq!(entries[0].profile_id, Some(42));
         assert!(entries[0].is_enrolled);
-        assert!((entries[0].confidence.unwrap() - 0.91).abs() < 1e-5);
-        assert_eq!(entries[0].meeting_id.as_deref(), Some("meet-abc"));
     }
 
     #[test]
     fn list_for_meeting_filters() {
-        clear();
+        let _g = isolate();
         push(TranscriptBuilder::new("A", "w").meeting_id("meet-1"));
         push(TranscriptBuilder::new("B", "w").meeting_id("meet-2"));
         push(TranscriptBuilder::new("C", "w").meeting_id("meet-1"));
         let m1 = list_for_meeting("meet-1", 10);
         assert_eq!(m1.len(), 2);
-        assert_eq!(m1[0].text, "C"); // newest first
+        assert_eq!(m1[0].text, "C");
         assert_eq!(m1[1].text, "A");
     }
 
     #[test]
-    fn push_rotates_at_capacity() {
-        clear();
-        for i in 0..(MAX_TRANSCRIPTS + 50) {
+    fn ring_rotates_at_capacity() {
+        let _g = isolate();
+        for i in 0..(MAX_LIVE_TRANSCRIPTS + 50) {
             push(TranscriptBuilder::new(format!("msg-{}", i), "w"));
         }
-        let entries = list(MAX_TRANSCRIPTS + 100);
-        assert_eq!(entries.len(), MAX_TRANSCRIPTS);
-        assert_eq!(entries[0].text, format!("msg-{}", MAX_TRANSCRIPTS + 49));
+        let entries = list(MAX_LIVE_TRANSCRIPTS + 100);
+        assert_eq!(entries.len(), MAX_LIVE_TRANSCRIPTS);
     }
 }

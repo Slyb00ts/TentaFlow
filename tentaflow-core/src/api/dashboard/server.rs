@@ -746,6 +746,62 @@ pub async fn handle_request(
         return Ok(json_response_cors(200, body, cors_origin.as_deref()));
     }
 
+    // Lista sesji rozmow z DB (kazda sesja = jedna rozmowa).
+    if path == "/api/meeting-bot/sessions" && method == Method::GET {
+        let sessions = crate::db::repository::transcripts::list_sessions(&db)
+            .unwrap_or_default();
+        let active_id = crate::routing::transcript_store::active_session_id();
+        let payload = serde_json::json!({
+            "sessions": sessions,
+            "active_id": active_id,
+        });
+        return Ok(json_response_cors(200, payload.to_string(), cors_origin.as_deref()));
+    }
+
+    // Wszystkie wpisy transkrypcji dla sesji (bez limitu) — JSON.
+    if let Some(rest) = path.strip_prefix("/api/meeting-bot/sessions/") {
+        if let Some((id_str, suffix)) = rest.split_once('/') {
+            if method == Method::GET {
+                let session_id: i64 = match id_str.parse() {
+                    Ok(v) => v,
+                    Err(_) => return Ok(json_response_cors(400, "{\"error\":\"bad id\"}".into(), cors_origin.as_deref())),
+                };
+                if suffix == "transcripts" {
+                    match crate::db::repository::transcripts::list_transcripts(&db, session_id) {
+                        Ok(rows) => {
+                            let body = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+                            return Ok(json_response_cors(200, body, cors_origin.as_deref()));
+                        }
+                        Err(e) => {
+                            return Ok(json_response_cors(500, format!("{{\"error\":\"{}\"}}", e), cors_origin.as_deref()));
+                        }
+                    }
+                }
+                if suffix == "download" {
+                    let session = match crate::db::repository::transcripts::get_session(&db, session_id) {
+                        Ok(Some(s)) => s,
+                        Ok(None) => return Ok(json_response_cors(404, "{\"error\":\"not found\"}".into(), cors_origin.as_deref())),
+                        Err(e) => return Ok(json_response_cors(500, format!("{{\"error\":\"{}\"}}", e), cors_origin.as_deref())),
+                    };
+                    let rows = crate::db::repository::transcripts::list_transcripts(&db, session_id)
+                        .unwrap_or_default();
+                    let mut body = String::new();
+                    body.push_str(&format!("# Sesja: {}\n", session.meeting_key));
+                    if let Some(u) = &session.meeting_url {
+                        body.push_str(&format!("# URL: {}\n", u));
+                    }
+                    body.push_str(&format!("# Start: {}\n", session.started_at));
+                    body.push_str(&format!("# Wpisy: {}\n\n", rows.len()));
+                    for r in &rows {
+                        let secs = (r.timestamp_ms / 1000) as i64;
+                        body.push_str(&format!("[{}] {}: {}\n", secs, r.speaker, r.text));
+                    }
+                    return Ok(make_response_with_origin(200, "text/plain; charset=utf-8", body.into_bytes(), cors_origin.as_deref()));
+                }
+            }
+        }
+    }
+
     // Voice profiles API — bulletproof speaker recognition.
     // Wolane przez LLM po detekcji introducji ("Cześć, tu Jan") albo przez
     // wewnetrzne toole. Na razie bez UI, fundament pod pozniejsze enrollment-by-LLM.

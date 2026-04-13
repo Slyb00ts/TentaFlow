@@ -34,9 +34,10 @@ use tracing::{debug, info, warn};
 
 /// Domyslny prog online trackera — gdy embedding nie trafia do zadnego
 /// enrolled profilu, dopada do temp speakera z tym progiem cosine similarity.
-/// Dobrane empirycznie: cross-speaker cos 0.15-0.30, same-speaker z akustyczna
-/// wariancja 0.45+, wiec 0.4 jest bezpiecznym kompromisem.
-const DEFAULT_TRACKER_THRESHOLD: f32 = 0.4;
+/// WeSpeaker same-speaker inter-utterance 0.40-0.70, cross-speaker 0.05-0.25.
+/// 0.50 oddziela te rozklady — nizsze wartosci (0.30) zlepialy wszystkich
+/// mowcow w jednego temp speakera.
+const DEFAULT_TRACKER_THRESHOLD: f32 = 0.50;
 const DEFAULT_MAX_SPEAKERS: usize = 20;
 
 /// Minimalna dlugosc audio dla zadnego matchingu (embedding nie jest wiarygodny)
