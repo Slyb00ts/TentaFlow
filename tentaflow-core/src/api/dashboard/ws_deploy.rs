@@ -243,7 +243,9 @@ async fn deploy_stack(
 }
 
 /// Buduje obraz z embedowanego kontekstu Dockera i uruchamia kontener.
-/// Korzysta z `crate::deploy::docker::deploy()` (bollard).
+/// Wszystkie parametry (porty, env, volumes, GPU id, container_name) sa
+/// wyciagane z `compose_yaml` ktory wizard wygenerowal — dzieki temu wybor
+/// uzytkownika (gpuId, hfToken, modelId, shmSize, dataDir itp.) nie ginie.
 #[cfg(feature = "docker")]
 async fn deploy_bundled_container(
     bundle_name: &str,
@@ -252,19 +254,26 @@ async fn deploy_bundled_container(
 ) -> Result<(), anyhow::Error> {
     use std::collections::HashMap;
 
-    let port = if config.port > 0 { config.port } else { 5000 };
-    let proto_suffix = if config.protocol == "quic" { "/udp" } else { "/tcp" };
-    let ports = vec![(format!("{}", port), format!("5000{}", proto_suffix))];
+    let parsed = parse_compose_for_bundle(&req.compose_yaml).unwrap_or_default();
 
-    // Domyslny env: model_id przekazany jako MODEL (vllm/sglang/ollama/whisper itd.
-    // wszystkie ich entrypointy go czytaja).
-    let mut env: HashMap<String, String> = HashMap::new();
-    if !config.model_id.is_empty() {
-        env.insert("MODEL".to_string(), config.model_id.clone());
-        env.insert("MODEL_ID".to_string(), config.model_id.clone());
+    // Porty: priorytet z compose_yaml, fallback do config.port + 5000/udp
+    let mut ports = parsed.ports;
+    if ports.is_empty() {
+        let port = if config.port > 0 { config.port } else { 5000 };
+        let proto_suffix = if config.protocol == "quic" { "/udp" } else { "/tcp" };
+        ports.push((format!("{}", port), format!("5000{}", proto_suffix)));
     }
 
-    let instance_name = if !req.stack_name.is_empty() {
+    // Env: laczymy compose_yaml + MODEL/MODEL_ID z config.model_id
+    let mut env: HashMap<String, String> = parsed.env;
+    if !config.model_id.is_empty() {
+        env.entry("MODEL".to_string()).or_insert_with(|| config.model_id.clone());
+        env.entry("MODEL_ID".to_string()).or_insert_with(|| config.model_id.clone());
+    }
+
+    let instance_name = if !parsed.container_name.is_empty() {
+        Some(parsed.container_name)
+    } else if !req.stack_name.is_empty() {
         Some(req.stack_name.clone())
     } else if !config.container_name.is_empty() {
         Some(config.container_name.clone())
@@ -277,13 +286,199 @@ async fn deploy_bundled_container(
         image_tag: Some(format!("tentaflow/{}:latest", bundle_name)),
         instance_name,
         ports,
-        volumes: Vec::new(),
+        volumes: parsed.volumes,
         env,
-        gpu: true,
+        gpu: parsed.gpu,
     };
 
     let _ = crate::deploy::docker::deploy(&deploy_req).await?;
     Ok(())
+}
+
+/// Sparsowane parametry z compose_yaml (dla bundled deploy).
+#[cfg(feature = "docker")]
+#[derive(Default)]
+struct ComposeParsed {
+    container_name: String,
+    ports: Vec<(String, String)>,
+    volumes: Vec<(String, String)>,
+    env: std::collections::HashMap<String, String>,
+    gpu: bool,
+}
+
+/// Wyciaga z compose_yaml pierwszy serwis i czyta z niego porty/volumes/env/gpu.
+/// Compose generowany przez ComposeTemplates.js ma stala strukture.
+#[cfg(feature = "docker")]
+fn parse_compose_for_bundle(yaml: &str) -> Option<ComposeParsed> {
+    use serde_yaml::Value;
+    use std::collections::HashMap;
+
+    let root: Value = serde_yaml::from_str(yaml).ok()?;
+    let services = root.get("services")?.as_mapping()?;
+    let (_svc_name, svc) = services.iter().next()?;
+
+    let mut out = ComposeParsed::default();
+
+    if let Some(cn) = svc.get("container_name").and_then(|v| v.as_str()) {
+        out.container_name = cn.to_string();
+    }
+
+    if let Some(ports) = svc.get("ports").and_then(|v| v.as_sequence()) {
+        for p in ports {
+            let s = p.as_str().unwrap_or("").trim();
+            // format "HOST:CONTAINER" lub "HOST:CONTAINER/proto"
+            let (host, rest) = match s.split_once(':') {
+                Some((h, r)) => (h.trim().to_string(), r.trim().to_string()),
+                None => continue,
+            };
+            let container = if rest.contains('/') { rest } else { format!("{}/tcp", rest) };
+            out.ports.push((host, container));
+        }
+    }
+
+    if let Some(vols) = svc.get("volumes").and_then(|v| v.as_sequence()) {
+        for v in vols {
+            let s = v.as_str().unwrap_or("").trim();
+            // format "HOST:CONTAINER" lub "HOST:CONTAINER:ro"
+            let parts: Vec<&str> = s.splitn(3, ':').collect();
+            if parts.len() >= 2 {
+                out.volumes.push((parts[0].to_string(), parts[1].to_string()));
+            }
+        }
+    }
+
+    if let Some(envs) = svc.get("environment").and_then(|v| v.as_sequence()) {
+        let mut map = HashMap::new();
+        for e in envs {
+            let s = e.as_str().unwrap_or("").trim().trim_start_matches("- ").trim();
+            if let Some((k, v)) = s.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        out.env = map;
+    }
+
+    // GPU: szukamy deploy.resources.reservations.devices[].driver==nvidia
+    // Jesli jest device_ids: ['0'] przekazujemy je jako NVIDIA_VISIBLE_DEVICES
+    // (bollard --gpus all = wszystkie, env zawez do konkretnych kart).
+    if let Some(deploy) = svc.get("deploy") {
+        let devices_opt = deploy
+            .get("resources")
+            .and_then(|r| r.get("reservations"))
+            .and_then(|r| r.get("devices"))
+            .and_then(|d| d.as_sequence());
+        if let Some(devices) = devices_opt {
+            for d in devices {
+                if d.get("driver").and_then(|v| v.as_str()) == Some("nvidia") {
+                    out.gpu = true;
+                    if let Some(ids) = d.get("device_ids").and_then(|v| v.as_sequence()) {
+                        let ids_str: Vec<String> = ids
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
+                        if !ids_str.is_empty() {
+                            out.env
+                                .entry("NVIDIA_VISIBLE_DEVICES".to_string())
+                                .or_insert_with(|| ids_str.join(","));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // shm_size jako env (bollard nie ma osobnego pola, pass through dla referencji)
+    if let Some(shm) = svc.get("shm_size").and_then(|v| v.as_str()) {
+        out.env.entry("SHM_SIZE".to_string()).or_insert_with(|| shm.to_string());
+    }
+
+    Some(out)
+}
+
+#[cfg(all(test, feature = "docker"))]
+mod tests {
+    use super::*;
+
+    const SAMPLE_VLLM_YAML: &str = r#"
+services:
+  tentaflow-llm:
+    image: registry.nextapp.pl/tentaflow-llm-vllm:latest
+    container_name: tentaflow-llm
+    restart: unless-stopped
+    ports:
+      - "5010:5010"
+      - "5010:5000/udp"
+    environment:
+      - HF_TOKEN=hf_xxxxx
+      - MODEL_ID=meta-llama/Llama-3.1-8B
+      - GPU_MEMORY_UTILIZATION=0.9
+    volumes:
+      - /opt/tentaflow/llm/tentaflow-llm:/data
+      - /opt/tentaflow/certs:/data/certs:ro
+      - /opt/tentaflow/models:/app/models
+    shm_size: '16g'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+networks:
+  tentaflow-ai:
+    name: tentaflow-ai
+"#;
+
+    #[test]
+    fn parse_compose_extracts_all_wizard_fields() {
+        let p = parse_compose_for_bundle(SAMPLE_VLLM_YAML).expect("parse");
+        assert_eq!(p.container_name, "tentaflow-llm");
+        assert_eq!(p.ports.len(), 2);
+        let pair_a: (String, String) = ("5010".into(), "5010/tcp".into());
+        let pair_b: (String, String) = ("5010".into(), "5000/udp".into());
+        assert!(p.ports.contains(&pair_a));
+        assert!(p.ports.contains(&pair_b));
+        assert_eq!(p.volumes.len(), 3);
+        assert_eq!(p.env.get("HF_TOKEN").unwrap(), "hf_xxxxx");
+        assert_eq!(p.env.get("MODEL_ID").unwrap(), "meta-llama/Llama-3.1-8B");
+        assert_eq!(p.env.get("GPU_MEMORY_UTILIZATION").unwrap(), "0.9");
+        assert_eq!(p.env.get("NVIDIA_VISIBLE_DEVICES").unwrap(), "0");
+        assert_eq!(p.env.get("SHM_SIZE").unwrap(), "16g");
+        assert!(p.gpu);
+    }
+
+    #[test]
+    fn parse_compose_handles_gpu_all() {
+        let yaml = r#"
+services:
+  tts:
+    image: x
+    container_name: x
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+"#;
+        let p = parse_compose_for_bundle(yaml).expect("parse");
+        assert!(p.gpu);
+        assert!(!p.env.contains_key("NVIDIA_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn engine_to_bundle_covers_all_wizard_engines() {
+        assert_eq!(engine_to_bundle_name("vllm", ""), Some("llm-vllm"));
+        assert_eq!(engine_to_bundle_name("sglang", ""), Some("llm-sglang"));
+        assert_eq!(engine_to_bundle_name("ollama", ""), Some("llm-ollama"));
+        assert_eq!(engine_to_bundle_name("llamacpp", ""), Some("llm-llamacpp"));
+        assert_eq!(engine_to_bundle_name("whisper", ""), Some("stt-whisper"));
+        assert_eq!(engine_to_bundle_name("", "embeddings"), Some("embeddings"));
+        assert_eq!(engine_to_bundle_name("", "reranker"), Some("reranker"));
+        assert_eq!(engine_to_bundle_name("", "tts"), Some("tts-sherpa"));
+        assert_eq!(engine_to_bundle_name("mlx", ""), None); // native, nie z bundle
+    }
 }
 
 #[cfg(not(feature = "docker"))]

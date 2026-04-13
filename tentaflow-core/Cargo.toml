@@ -77,6 +77,8 @@ thiserror = "1.0"
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
+# Parsowanie compose_yaml z wizarda przy deploy bundled containers
+serde_yaml = "0.9"
 
 # Synchronizacja
 parking_lot = "0.12"
