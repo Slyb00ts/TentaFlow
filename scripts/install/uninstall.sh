@@ -1,15 +1,16 @@
 #!/usr/bin/env sh
 # =============================================================================
-# Plik: uninstall.sh
-# Opis: Deinstalacja TentaFlow (Linux/macOS).
+# File:        uninstall.sh
+# Description: Removes a TentaFlow installation from Linux or macOS.
 # =============================================================================
+
 set -eu
 
 PREFIX="${TENTAFLOW_PREFIX:-/opt/tentaflow}"
 [ ! -d "$PREFIX" ] && [ -d "$HOME/.local/share/tentaflow" ] && PREFIX="$HOME/.local/share/tentaflow"
 SUDO=$(command -v sudo >/dev/null 2>&1 && [ "$(id -u)" != "0" ] && echo sudo || echo "")
 
-echo "==> Usuwanie TentaFlow z $PREFIX"
+echo "==> Uninstalling TentaFlow from $PREFIX"
 
 case "$(uname -s)" in
   Linux*)
@@ -28,6 +29,6 @@ esac
 $SUDO rm -f /usr/local/bin/tentaflow "$HOME/.local/bin/tentaflow"
 $SUDO rm -rf "$PREFIX"
 
-echo "==> Cache uzytkownika (modele, venvy) NIE jest usuwany — usun recznie:"
-echo "    rm -rf ~/.cache/tentaflow"
-echo "==> Gotowe."
+echo "==> Per-user cache (downloaded Python, venvs, models) is NOT removed."
+echo "    Remove manually if desired: rm -rf ~/.cache/tentaflow"
+echo "==> Done."
