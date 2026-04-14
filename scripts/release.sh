@@ -16,6 +16,33 @@
 
 set -euo pipefail
 
+# ---- Preflight: required tools ----------------------------------------------
+install_hint() {
+  if   command -v apt-get >/dev/null 2>&1; then echo "sudo apt-get update && sudo apt-get install -y $1"
+  elif command -v dnf     >/dev/null 2>&1; then echo "sudo dnf install -y $1"
+  elif command -v pacman  >/dev/null 2>&1; then echo "sudo pacman -S --noconfirm $1"
+  elif command -v zypper  >/dev/null 2>&1; then echo "sudo zypper install -y $1"
+  elif command -v brew    >/dev/null 2>&1; then echo "brew install $1"
+  else echo "install $1 via your package manager"
+  fi
+}
+
+MISSING=0
+check_tool() {
+  local tool="$1" pkg="$2"
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "Missing required tool: $tool" >&2
+    echo "  Install with: $(install_hint "$pkg")" >&2
+    MISSING=1
+  fi
+}
+check_tool git  git
+check_tool awk  gawk
+check_tool sed  sed
+check_tool curl curl
+check_tool tar  tar
+[[ "$MISSING" == "1" ]] && exit 1
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARGO_TOML="$REPO_ROOT/tentaflow/Cargo.toml"
 CHANGELOG="$REPO_ROOT/CHANGELOG.md"
@@ -114,9 +141,9 @@ echo "==> Updating $CARGO_TOML"
 # Only the FIRST `version = "..."` (under [package]).
 # portable sed: write to tmp file
 tmp="$CARGO_TOML.tmp.$$"
-awk -v next="$NEXT" '
+awk -v new_ver="$NEXT" '
   !done && /^version[[:space:]]*=/ {
-    sub(/"[^"]+"/, "\"" next "\"")
+    sub(/"[^"]+"/, "\"" new_ver "\"")
     done = 1
   }
   { print }
