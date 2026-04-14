@@ -115,6 +115,51 @@ pub fn read_bundle_spec(extracted_root: &Path, engine: &str) -> Result<BundleSpe
     Ok(spec)
 }
 
+/// Wynik bootstrapu bez uruchamiania procesu silnika — sluzy do walidacji
+/// ze srodowisko (Python + venv + wheels) zostalo poprawnie przygotowane.
+pub struct BootstrappedEngine {
+    pub engine: String,
+    pub venv_dir: PathBuf,
+    pub python_bin: PathBuf,
+    pub internal_port: u16,
+}
+
+/// Wykonuje wszystkie kroki `deploy()` poza `spawn_engine`. Uzywane przez
+/// `cargo run --example bootstrap_python_bundle` do sprawdzenia czy
+/// pobieranie Pythona/uv + instalacja wheels dzialaja na danej maszynie.
+pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
+    let extracted = tempfile::tempdir()?;
+    super::bundle::extract_to(extracted.path())?;
+    let spec = read_bundle_spec(extracted.path(), engine)?;
+    check_platform_compat(&spec.requires)?;
+
+    let detected = crate::system_check::collect();
+    let backend_name = backend_to_str(&detected.gpu.preferred_backend);
+    let variant = pick_install_variant(&spec.install_variants, backend_name)?;
+    tracing::info!(engine=%engine, backend=%backend_name, "Bootstrap python bundle");
+
+    let cache = cache_root()?;
+    let python_bin = ensure_python(&cache, &spec.bundle.python_version)?;
+    let uv_bin = ensure_uv(&cache).ok();
+
+    let venv_dir = cache.join("envs").join(engine);
+    let bundle_src = extracted
+        .path()
+        .join("tentaflow-containers/python-bundles")
+        .join(engine);
+
+    create_venv(&python_bin, &venv_dir)?;
+    install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
+    copy_bundle_files(&bundle_src, &venv_dir)?;
+
+    Ok(BootstrappedEngine {
+        engine: engine.to_string(),
+        venv_dir,
+        python_bin,
+        internal_port: spec.launch.internal_port,
+    })
+}
+
 /// Glowna funkcja. Odpowiada tentaflow-core::deploy::docker::deploy() ale
 /// dla Pythona bez kontenera.
 pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
@@ -177,7 +222,11 @@ fn check_platform_compat(req: &Requires) -> Result<()> {
 
 /// Wersja python-build-standalone i uv jaka pobieramy. Aktualizacje recznie —
 /// ta wartosc sluzy jako lock, zeby cache byl deterministyczny.
-const PBS_DATE: &str = "20250918";   // ostatni release python-build-standalone
+/// Release tag python-build-standalone (aktualizujemy rocznie, nadpisywalny
+/// przez env TENTAFLOW_PBS_DATE). Lista:
+/// https://github.com/astral-sh/python-build-standalone/releases
+const PBS_DATE: &str = "20260408";
+/// uv release (env TENTAFLOW_UV_VERSION do override).
 const UV_VERSION: &str = "0.5.14";
 
 /// Zapewnia relokowalnego Pythona w `<cache>/python/<py_ver>/`. Jesli
@@ -193,9 +242,10 @@ fn ensure_python(cache: &Path, py_ver: &str) -> Result<PathBuf> {
     let triple = pbs_triple()
         .with_context(|| format!("nie znam PBS triple dla {}-{}", std::env::consts::OS, std::env::consts::ARCH))?;
     let full_ver = resolve_full_python_version(py_ver);
+    let date = pbs_date();
     let url = format!(
         "https://github.com/astral-sh/python-build-standalone/releases/download/{date}/cpython-{ver}+{date}-{triple}-install_only.tar.gz",
-        date = PBS_DATE, ver = full_ver, triple = triple
+        date = date, ver = full_ver, triple = triple
     );
 
     tracing::info!(url = %url, "Pobieram python-build-standalone");
@@ -285,15 +335,24 @@ fn python_bin_path(base: &Path) -> PathBuf {
     }
 }
 
-/// Rozwiaza "3.11" -> "3.11.10" (najnowszy patch dla date'a PBS).
-/// W razie watpliwosci akceptuj 3.11 jako dostateczne do URLa (PBS ma redirecty).
+/// Rozwiaza "3.12" -> "3.12.13" (aktualna dla PBS_DATE).
+/// Patche sa pinowane recznie z kazdym releasem PBS; gdy URL 404, uzytkownik
+/// moze nadpisac przez env TENTAFLOW_PYTHON_FULL_VERSION.
 fn resolve_full_python_version(v: &str) -> String {
+    if let Ok(override_full) = std::env::var("TENTAFLOW_PYTHON_FULL_VERSION") {
+        return override_full;
+    }
+    // Patche dla PBS_DATE = 20260408
     match v {
-        "3.11" => "3.11.10".into(),
-        "3.12" => "3.12.7".into(),
-        "3.13" => "3.13.0".into(),
+        "3.11" => "3.11.15".into(),
+        "3.12" => "3.12.13".into(),
+        "3.13" => "3.13.13".into(),
         other  => other.to_string(),
     }
+}
+
+fn pbs_date() -> String {
+    std::env::var("TENTAFLOW_PBS_DATE").unwrap_or_else(|_| PBS_DATE.to_string())
 }
 
 fn pbs_triple() -> Option<&'static str> {
