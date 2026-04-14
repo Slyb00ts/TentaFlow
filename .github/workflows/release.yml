@@ -133,9 +133,10 @@ jobs:
       # ---------------------------------------------------------------------
       # Vulkan SDK — Linux i Windows (macOS ma Metal, nie potrzebuje)
       # ---------------------------------------------------------------------
-      - name: Install Vulkan SDK (Linux)
-        if: runner.os == 'Linux' && contains(matrix.features, 'gpu-vulkan')
+      - name: Install Vulkan SDK (Linux x86_64)
+        if: runner.os == 'Linux' && contains(matrix.features, 'gpu-vulkan') && runner.arch == 'X64'
         run: |
+          # LunarG repo ma paczki vulkan-sdk tylko dla x86_64
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
             | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
           CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
@@ -143,6 +144,14 @@ jobs:
             "https://packages.lunarg.com/vulkan/lunarg-vulkan-${CODENAME}.list"
           sudo apt-get update
           sudo apt-get install -y vulkan-sdk
+          vulkaninfo --summary || true
+
+      - name: Install Vulkan (Linux aarch64)
+        if: runner.os == 'Linux' && contains(matrix.features, 'gpu-vulkan') && runner.arch == 'ARM64'
+        run: |
+          # LunarG nie ma paczek ARM; uzywamy Ubuntu-systemowych — GGML_VULKAN
+          # potrzebuje tylko headerow + loadera, nie pelnego SDK narzedziowego.
+          sudo apt-get install -y libvulkan-dev vulkan-tools glslang-tools spirv-tools
           vulkaninfo --summary || true
 
       - name: Install Vulkan SDK (Windows)
@@ -156,27 +165,42 @@ jobs:
       # ROCm — tylko Linux x86_64 (ARM Linux ROCm = tylko Instinct, pomijamy;
       # Windows ROCm jest w preview, SDK install w CI niestabilny).
       # ---------------------------------------------------------------------
-      - name: Install ROCm (latest)
+      - name: Install ROCm (latest stable)
         if: contains(matrix.features, 'gpu-rocm')
         run: |
           sudo apt-get install -y wget gnupg
           wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key \
             | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg
           CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          # `latest` wskazuje na najnowsza dostepna wersje ROCm u AMD. Dodatkowo
-          # zostaje ten sam symlink przy kazdym release AMD, wiec CI zawsze
-          # pobiera to co jest na dany dzien w repo (np. 7.2.1 w kwietniu 2026).
+          # `latest` AMD symlinkuje na najnowszy release, ale meta-paczki
+          # (`rocm-dev`, `rocm-utils`) bywaja uploadowane z opoznieniem —
+          # ich indeksy juz sa w Release ale pool/ ma 404. Zamiast polegac
+          # na meta-packageach, instalujemy konkretne biblioteki (wszystkie
+          # w pool/ zawsze sa — to ich index zostaje przy meta-upload flake).
           echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/latest ${CODENAME} main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list
           echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" \
             | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
-          sudo apt-get install -y rocm-dev rocm-libs hipblas rocblas
+          # Zestaw komponentow potrzebny do llama.cpp/whisper.cpp GGML_HIP build:
+          sudo apt-get install -y \
+            hipcc \
+            rocm-hip-runtime-dev \
+            rocm-llvm \
+            rocm-cmake \
+            hipblas hipblas-dev \
+            rocblas rocblas-dev \
+            rocrand rocrand-dev \
+            rocsolver rocsolver-dev \
+            rocsparse rocsparse-dev \
+            rocthrust-dev \
+            hipcub-dev
           ROCM_VERSION=$(ls -d /opt/rocm-* 2>/dev/null | sed 's|/opt/rocm-||' | sort -V | tail -n1)
           echo "Installed ROCm: ${ROCM_VERSION:-unknown}"
           echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
           sudo ldconfig
           echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "HIP_PATH=/opt/rocm" >> "$GITHUB_ENV"
           echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
       # ---------------------------------------------------------------------
@@ -197,7 +221,10 @@ jobs:
             ~/.cargo/git
             tentaflow/target
             tentaflow-core/target
-          key: cargo-${{ matrix.target }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
+          # Przecinki w matrix.features (np. "gpu-cuda,gpu-vulkan") sa
+          # niedozwolone w kluczu cache — zamieniamy na myslniki przez
+          # szablon GitHub Expressions replace().
+          key: cargo-${{ matrix.target }}-${{ replace(matrix.features, ',', '-') }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build tentaflow (all available GPU backends)
         working-directory: tentaflow
