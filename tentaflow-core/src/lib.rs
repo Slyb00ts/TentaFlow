@@ -30,4 +30,5 @@ pub mod audit;
 
 pub mod addon;
 pub mod deploy;
+pub mod paths;
 pub mod system_check;
