@@ -27,6 +27,9 @@ use tentaflow_core::routing::Router;
 #[command(about = "TentaFlow Router — API Gateway i mesh node")]
 #[command(version)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Subcommand>,
+
     /// Sciezka do pliku konfiguracji
     #[arg(short = 'c', long = "config", default_value = "config.toml")]
     config: PathBuf,
@@ -52,19 +55,44 @@ struct Args {
     verbose: bool,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Subcommand {
+    /// Sprawdza czy jest nowsza wersja na GitHub Releases i podmienia binarke
+    Update {
+        /// Tylko sprawdz, nie aktualizuj
+        #[arg(long)]
+        check: bool,
+        /// Wymus aktualizacje nawet jesli juz na najnowszej
+        #[arg(long)]
+        force: bool,
+    },
+    /// Wypisuje informacje o systemie + wykrytych GPU + dostepnych silnikach
+    SystemCheck,
+}
+
 use tentaflow_core::mesh::pipeline::{MeshPipelineConfig, start_mesh_pipeline};
 
 // =============================================================================
 // Punkt wejscia
 // =============================================================================
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Zainstaluj domyslny CryptoProvider dla rustls (wymagane przed uzyciem QUIC)
+// Sync entry point — zeby `tentaflow update` mogl spokojnie uruchomic axoupdater
+// (axoupdater::run_sync / is_update_needed_sync sa BLOCKING i panikuja w
+// srodku tokio runtime). Dla normalnego startu serwera tworzymy tokio runtime
+// recznie pod `run_server`.
+fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-
     let args = Args::parse();
 
+    if let Some(cmd) = &args.command {
+        return run_subcommand(cmd, args.verbose);
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(run_server(args))
+}
+
+async fn run_server(args: Args) -> Result<()> {
     // Inicjalizacja loggingu
     setup_logging(args.verbose)?;
 
@@ -383,5 +411,65 @@ fn log_config_summary(config: &NodeConfig, db_path: &PathBuf) {
         );
     }
     info!("   - Baza danych: {:?}", db_path);
+}
+
+// =============================================================================
+// Subkomendy CLI (update / system-check)
+// =============================================================================
+
+fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
+    setup_logging(verbose)?;
+    match cmd {
+        Subcommand::SystemCheck => {
+            let caps = tentaflow_core::system_check::collect();
+            println!("{}", serde_json::to_string_pretty(&caps)?);
+            Ok(())
+        }
+        Subcommand::Update { check, force } => run_update(*check, *force),
+    }
+}
+
+fn run_update(check_only: bool, force: bool) -> Result<()> {
+    use axoupdater::AxoUpdater;
+
+    let mut updater = AxoUpdater::new_for("tentaflow");
+    // Zrodlo: GitHub Releases tego repo (env override w razie potrzeby).
+    updater.set_release_source(axoupdater::ReleaseSource {
+        release_type: axoupdater::ReleaseSourceType::GitHub,
+        owner: std::env::var("TENTAFLOW_REPO_OWNER").unwrap_or_else(|_| "Slyb00ts".to_string()),
+        name: std::env::var("TENTAFLOW_REPO_NAME").unwrap_or_else(|_| "TentaFlow".to_string()),
+        app_name: "tentaflow".to_string(),
+    });
+
+    info!("Sprawdzam najnowsza wersje na GitHub Releases...");
+    let outcome = if check_only {
+        match updater.is_update_needed_sync()? {
+            true => {
+                println!("Dostepna nowa wersja TentaFlow (uruchom: `tentaflow update`)");
+                Ok::<_, anyhow::Error>(())
+            }
+            false => {
+                println!("Aktualna wersja jest najnowsza.");
+                Ok(())
+            }
+        }
+    } else {
+        if force {
+            updater.always_update(true);
+        }
+        match updater.run_sync()? {
+            Some(result) => {
+                let old = result.old_version.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+                println!("Zaktualizowano: {} -> {}", old, result.new_version);
+                println!("Restartuj usluge: systemctl restart tentaflow  (lub launchctl unload/load).");
+                Ok(())
+            }
+            None => {
+                println!("Brak nowej wersji do pobrania.");
+                Ok(())
+            }
+        }
+    };
+    outcome.map_err(|e| anyhow::anyhow!("Update nieudany: {}", e))
 }
 

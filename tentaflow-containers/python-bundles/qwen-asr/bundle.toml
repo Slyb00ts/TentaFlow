@@ -20,7 +20,11 @@ platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu124"
-extras = ["accelerate", "flash-attn"]
+extras = ["accelerate"]
+# Pakiety ktore wymagaja `torch` juz zainstalowanego (buduja kernele CUDA
+# z torch.utils.cpp_extension) — instalowane PO glownym pakiecie z flaga
+# --no-build-isolation.
+extras_no_build_isolation = ["flash-attn"]
 
 [[install_variants]]
 backend = "rocm"

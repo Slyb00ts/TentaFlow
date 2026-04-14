@@ -5,10 +5,13 @@ python_version = "3.12"
 source = "git"
 git_repo = "https://github.com/comfyanonymous/ComfyUI.git"
 git_ref = "master"
+# ComfyUI nie instaluje sie jako pakiet — tylko jego requirements.txt.
+install_mode = "requirements_txt"
 
 [launch]
 command = "python"
-args = ["${BUNDLE_DIR}/ComfyUI/main.py",
+# Clone lezy w venv/src/comfyui/ — stad main.py
+args = ["${VENV_DIR}/src/comfyui/main.py",
         "--listen", "127.0.0.1", "--port", "8188"]
 internal_port = 8188
 

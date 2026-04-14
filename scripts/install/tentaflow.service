@@ -1,0 +1,21 @@
+[Unit]
+Description=TentaFlow API Gateway + mesh node
+After=network.target
+Documentation=https://github.com/Slyb00ts/TentaFlow
+
+[Service]
+Type=simple
+ExecStart=/opt/tentaflow/tentaflow --config /opt/tentaflow/config.toml
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/opt/tentaflow
+
+# Sandboxing — minimalne uprawnienia
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/tentaflow /var/lib/tentaflow
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

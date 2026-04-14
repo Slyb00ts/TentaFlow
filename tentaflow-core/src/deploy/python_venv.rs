@@ -40,6 +40,11 @@ pub struct InstallVariant {
     pub extra_index: Option<String>,
     #[serde(default)]
     pub extras: Vec<String>,
+    /// Pakiety ktore buduja natywne kernele z torcha (flash-attn, xformers
+    /// bez prebuilt wheel itp.). Instalowane PO glownym pakiecie z flaga
+    /// `--no-build-isolation` zeby build mial dostep do zainstalowanego torcha.
+    #[serde(default)]
+    pub extras_no_build_isolation: Vec<String>,
     #[serde(default)]
     pub install_hint: Option<String>,
 }
@@ -56,6 +61,15 @@ pub struct BundleMeta {
     pub git_repo: Option<String>,
     #[serde(default)]
     pub git_ref: Option<String>,
+    /// Podkatalog w sklonowanym repo gdzie lezy pyproject/setup.py
+    /// (np. SGLang trzyma package w `python/`). Pusty = root.
+    #[serde(default)]
+    pub install_subdir: Option<String>,
+    /// "editable" (domyslne, pip install -e .) lub "requirements_txt"
+    /// (tylko pip install -r requirements.txt — dla ComfyUI co nie jest
+    /// package, uruchamia sie przez python main.py).
+    #[serde(default)]
+    pub install_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -433,6 +447,8 @@ fn install_deps(
 ) -> Result<()> {
     let extra_index = variant.and_then(|v| v.extra_index.clone());
     let installer = Installer::new(venv, uv.as_deref(), extra_index);
+    // setuptools>=77 wymagane zeby VoxCPM / niektore nowe pyproject.toml
+    // z `license = "MIT"` (string form, PEP 639) sie instalowaly.
     installer.upgrade_pip()?;
 
     let lock = bundle_src.join("requirements.lock");
@@ -440,7 +456,9 @@ fn install_deps(
         installer.install_requirements(&lock).context("install lock")?;
     }
 
-    // Dodatkowe pakiety z wariantu (vllm-metal, flash-attn, nemo_toolkit[asr]...)
+    // Extras (wymagajace tylko pypi — accelerate, vllm-metal, nemo_toolkit itp.).
+    // Pakiety z `extras_no_build_isolation` beda zainstalowane pozniej, juz po
+    // glownym pakiecie (kiedy torch jest obecny).
     if let Some(v) = variant {
         for extra in &v.extras {
             installer.install_package(extra)
@@ -469,10 +487,95 @@ fn install_deps(
                     .arg(&clone_dir))
                     .context("git clone")?;
             }
-            installer.install_editable(&clone_dir)
-                .context("install -e .")?;
+            // Podkatalog z pyproject/setup.py (np. SGLang -> python/)
+            let pkg_dir = match spec.bundle.install_subdir.as_deref() {
+                Some(sub) if !sub.is_empty() => clone_dir.join(sub),
+                _ => clone_dir.clone(),
+            };
+            // Fix upstream bugs znanych repo (np. VoxCPM 'license = "MIT"' w formie
+            // string ktora wymaga setuptools 77+; pomimo upgrade'u zdarza sie ze
+            // build backend cache uzywa starszej wersji. Zastepujemy na obiekt.)
+            patch_pyproject_if_needed(&pkg_dir)?;
+            // Tryb instalacji: editable (domyslne) vs requirements_txt (ComfyUI)
+            let mode = spec.bundle.install_mode.as_deref().unwrap_or("editable");
+            match mode {
+                "editable" => installer.install_editable(&pkg_dir).context("install -e .")?,
+                "requirements_txt" => {
+                    let req = pkg_dir.join("requirements.txt");
+                    if !req.exists() {
+                        anyhow::bail!("install_mode=requirements_txt a brak {}", req.display());
+                    }
+                    installer.install_requirements(&req).context("install -r requirements.txt")?;
+                }
+                other => anyhow::bail!("nieznany install_mode: {}", other),
+            }
         }
         other => anyhow::bail!("nieznane source: {}", other),
+    }
+
+    // Teraz torch jest zainstalowany (z glownego pakietu jego deps).
+    // Instalujemy extras ktore wymagaja torcha do buildu kerneli CUDA.
+    if let Some(v) = variant {
+        for extra in &v.extras_no_build_isolation {
+            installer.install_package_no_build_isolation(extra)
+                .with_context(|| format!("install {} (no-build-isolation)", extra))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Naprawia znane upstream problemy w pyproject.toml sklonowanych repo.
+///
+/// Problem: PEP 639 zmienil format pola `license` w `[project]` — stare
+/// setuptools (<77) wymagaja `{text = "MIT"}` / `{file = "LICENSE"}`, nowe
+/// setuptools (>=77) wymagaja string `"MIT"`, a czesc repo ma zle dla
+/// setuptools ktorego uv uzywa w build isolation. VoxCPM mial string gdy
+/// uv wzial stare setuptools (padalo), vLLM ma object gdy uv wzial nowe
+/// setuptools (padalo).
+///
+/// Bezpieczne rozwiazanie uniwersalne: **usunac** linie `license = ...` z
+/// sekcji `[project]`. Pole jest opcjonalne per PEP 621, wiec pyproject
+/// bez niego jest dalej valid. Nie dotykamy nic innego.
+fn patch_pyproject_if_needed(pkg_dir: &Path) -> Result<()> {
+    let pj = pkg_dir.join("pyproject.toml");
+    if !pj.exists() { return Ok(()); }
+    let content = std::fs::read_to_string(&pj)?;
+
+    let mut out = String::with_capacity(content.len());
+    let mut in_project_section = false;
+    let mut patched = false;
+    let mut iter = content.lines().peekable();
+    while let Some(line) = iter.next() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_project_section = trimmed == "[project]";
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_project_section {
+            // Usun wiersz zaczynajacy sie od `license =` (obie formy: string / object
+            // inline / object multi-line).
+            if trimmed.starts_with("license") && trimmed.contains('=') {
+                patched = true;
+                // Jesli object multi-line (np. `license = { ... }` → pominac az do zamykajacego `}`).
+                if trimmed.contains('{') && !trimmed.contains('}') {
+                    // Drop linie az zlapie zamykajacy `}`
+                    while let Some(inner) = iter.next() {
+                        if inner.contains('}') { break; }
+                    }
+                }
+                continue; // skip tej linii
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if patched {
+        std::fs::write(&pj, &out)?;
+        tracing::info!(path=%pj.display(), "Usunieto pole license z [project] (kompatybilnosc setuptools)");
     }
     Ok(())
 }
@@ -532,6 +635,16 @@ impl<'a> Installer<'a> {
             Command::new(pip)
         }
     }
+    /// Dopisuje flagi do `pip install` (po subkomendzie). Osobno bo uv
+    /// uzywa --index-strategy a pip nie zna tego flaga.
+    fn add_install_flags(&self, c: &mut Command) {
+        if self.uv.is_some() {
+            // unsafe-best-match: pozwol uv brac wheels z KAZDEGO index'a
+            // (domyslnie uv blokuje zeby nie bylo dependency confusion, ale
+            // dla torch+cu124 to normalne).
+            c.arg("--index-strategy").arg("unsafe-best-match");
+        }
+    }
     fn add_index(&self, c: &mut Command) {
         if let Some(idx) = &self.extra_index_url {
             c.arg("--extra-index-url").arg(idx);
@@ -539,13 +652,14 @@ impl<'a> Installer<'a> {
     }
     fn upgrade_pip(&self) -> Result<()> {
         let mut c = self.cmd();
-        c.arg("install").arg("--upgrade").arg("pip").arg("wheel");
+        c.arg("install").arg("--upgrade").arg("pip").arg("wheel").arg("setuptools>=77");
         run(&mut c)
     }
     fn install_requirements(&self, path: &Path) -> Result<()> {
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
+        self.add_install_flags(&mut c);
         c.arg("-r").arg(path);
         run(&mut c)
     }
@@ -553,6 +667,7 @@ impl<'a> Installer<'a> {
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
+        self.add_install_flags(&mut c);
         c.arg(pkg);
         run(&mut c)
     }
@@ -560,7 +675,19 @@ impl<'a> Installer<'a> {
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
+        self.add_install_flags(&mut c);
         c.arg("-e").arg(path);
+        run(&mut c)
+    }
+    /// Instalacja z wylaczona izolacja buildu (`--no-build-isolation`) —
+    /// pakiet ma dostep do zainstalowanego torcha podczas budowy natywnych
+    /// kerneli. Wymagane dla flash-attn, niektorych wariantow xformers itp.
+    fn install_package_no_build_isolation(&self, pkg: &str) -> Result<()> {
+        let mut c = self.cmd();
+        c.arg("install");
+        self.add_index(&mut c);
+        self.add_install_flags(&mut c);
+        c.arg("--no-build-isolation").arg(pkg);
         run(&mut c)
     }
 }
@@ -586,12 +713,13 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
 
     let mut cmd = Command::new(&exe);
     for arg in &spec.launch.args {
-        cmd.arg(substitute_vars(arg, &req.env, &bundle_dir));
+        cmd.arg(substitute_vars_full(arg, &req.env, &bundle_dir, venv));
     }
     for (k, v) in &req.env {
         cmd.env(k, v);
     }
     cmd.env("BUNDLE_DIR", &bundle_dir);
+    cmd.env("VENV_DIR", venv);
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
     let child = cmd.spawn()
@@ -601,7 +729,17 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
 
 /// Podstawia `${VAR}` i `${VAR:-default}` w stringu na wartosci z env+bundle_dir.
 fn substitute_vars(s: &str, env: &HashMap<String, String>, bundle_dir: &Path) -> String {
+    substitute_vars_full(s, env, bundle_dir, Path::new(""))
+}
+
+fn substitute_vars_full(
+    s: &str,
+    env: &HashMap<String, String>,
+    bundle_dir: &Path,
+    venv_dir: &Path,
+) -> String {
     let bundle_dir_str = bundle_dir.to_string_lossy().to_string();
+    let venv_dir_str = venv_dir.to_string_lossy().to_string();
     let mut out = s.to_string();
     loop {
         let Some(start) = out.find("${") else { break };
@@ -612,10 +750,10 @@ fn substitute_vars(s: &str, env: &HashMap<String, String>, bundle_dir: &Path) ->
             Some((n, d)) => (n, Some(d.to_string())),
             None => (inner, None),
         };
-        let value = if name == "BUNDLE_DIR" {
-            bundle_dir_str.clone()
-        } else {
-            env.get(name).cloned().unwrap_or_else(|| default.unwrap_or_default())
+        let value = match name {
+            "BUNDLE_DIR" => bundle_dir_str.clone(),
+            "VENV_DIR" => venv_dir_str.clone(),
+            _ => env.get(name).cloned().unwrap_or_else(|| default.unwrap_or_default()),
         };
         out.replace_range(start..=end, &value);
     }
