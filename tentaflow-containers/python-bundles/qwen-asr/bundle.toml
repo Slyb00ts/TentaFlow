@@ -1,9 +1,10 @@
 [bundle]
 engine = "qwen-asr"
-description = "Qwen3-ASR-1.7B (multimodal STT)"
-python_version = "3.11"
-source = "pypi"
-pypi_package = "transformers>=4.45"
+description = "Qwen3-ASR-1.7B (multimodal STT, transformers git HEAD)"
+python_version = "3.12"
+source = "git"
+git_repo = "https://github.com/huggingface/transformers.git"
+git_ref = "main"
 
 [launch]
 command = "uvicorn"
@@ -12,7 +13,20 @@ args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
 internal_port = 8083
 
 [requires]
-cuda = ">=12.1"
 gpu_memory_gb = 6
 disk_gb = 10
-platforms = ["linux-x86_64", "linux-aarch64"]
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu124"
+extras = ["accelerate", "flash-attn"]
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = ["accelerate"]
+
+[[install_variants]]
+backend = "metal"
+extras = ["accelerate"]

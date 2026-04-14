@@ -1,7 +1,7 @@
 [bundle]
 engine = "sglang"
-description = "SGLang serwer LLM z structured outputs"
-python_version = "3.11"
+description = "SGLang serwer LLM z structured outputs (git HEAD)"
+python_version = "3.12"
 source = "git"
 git_repo = "https://github.com/sgl-project/sglang.git"
 git_ref = "main"
@@ -19,7 +19,17 @@ args = [
 internal_port = 30000
 
 [requires]
-cuda = ">=12.1"
 gpu_memory_gb = 8
 disk_gb = 20
-platforms = ["linux-x86_64", "linux-aarch64"]
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu124"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+install_hint = "SGLANG_BACKEND=rocm"

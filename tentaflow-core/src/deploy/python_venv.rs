@@ -28,6 +28,20 @@ pub struct BundleSpec {
     pub launch: LaunchSpec,
     #[serde(default)]
     pub requires: Requires,
+    #[serde(default, rename = "install_variants")]
+    pub install_variants: Vec<InstallVariant>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallVariant {
+    /// "cuda" | "rocm" | "xpu" | "metal" | "cpu"
+    pub backend: String,
+    #[serde(default)]
+    pub extra_index: Option<String>,
+    #[serde(default)]
+    pub extras: Vec<String>,
+    #[serde(default)]
+    pub install_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +124,12 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
 
     check_platform_compat(&spec.requires)?;
 
+    // Wykryj backend (CUDA/ROCm/Metal/XPU) i wybierz odpowiedni variant.
+    let detected = crate::system_check::collect();
+    let backend_name = backend_to_str(&detected.gpu.preferred_backend);
+    let variant = pick_install_variant(&spec.install_variants, backend_name)?;
+    tracing::info!(engine=%req.engine, backend=%backend_name, "Wybrany wariant instalacji");
+
     let cache = cache_root()?;
     let python_bin = ensure_python(&cache, &spec.bundle.python_version)?;
     let uv_bin = ensure_uv(&cache).ok();
@@ -121,7 +141,7 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
         .join(&req.engine);
 
     create_venv(&python_bin, &venv_dir)?;
-    install_deps(&venv_dir, &uv_bin, &spec, &bundle_src)?;
+    install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
     copy_bundle_files(&bundle_src, &venv_dir)?;
 
     let child = spawn_engine(&venv_dir, &spec, req)?;
@@ -341,20 +361,32 @@ fn create_venv(python: &Path, venv: &Path) -> Result<()> {
         .context("tworzenie venv")
 }
 
-/// Instaluje zaleznosci przez `uv pip` (jesli dostepny, ~10x szybciej) albo
-/// klasyczny `pip`. uv korzysta z venv podanego przez `VIRTUAL_ENV`.
+/// Instaluje zaleznosci przez `uv pip` lub klasyczny `pip`. Parametr
+/// `variant` niesie konfiguracje specyficzna dla backendu GPU
+/// (extra_index -> PyTorch wheels per CUDA/ROCm/Metal, extras -> dodatkowe
+/// pakiety typu vllm-metal/flash-attn).
 fn install_deps(
     venv: &Path,
     uv: &Option<PathBuf>,
     spec: &BundleSpec,
+    variant: Option<&InstallVariant>,
     bundle_src: &Path,
 ) -> Result<()> {
-    let installer = Installer::new(venv, uv.as_deref());
+    let extra_index = variant.and_then(|v| v.extra_index.clone());
+    let installer = Installer::new(venv, uv.as_deref(), extra_index);
     installer.upgrade_pip()?;
 
     let lock = bundle_src.join("requirements.lock");
     if lock.exists() {
         installer.install_requirements(&lock).context("install lock")?;
+    }
+
+    // Dodatkowe pakiety z wariantu (vllm-metal, flash-attn, nemo_toolkit[asr]...)
+    if let Some(v) = variant {
+        for extra in &v.extras {
+            installer.install_package(extra)
+                .with_context(|| format!("install extra {}", extra))?;
+        }
     }
 
     match spec.bundle.source.as_str() {
@@ -386,15 +418,49 @@ fn install_deps(
     Ok(())
 }
 
+fn backend_to_str(b: &crate::system_check::GpuBackend) -> &'static str {
+    use crate::system_check::GpuBackend::*;
+    match b {
+        Cuda => "cuda",
+        Rocm => "rocm",
+        Xpu  => "xpu",
+        Metal => "metal",
+        Cpu  => "cpu",
+    }
+}
+
+/// Wybiera wariant instalacji pasujacy do backendu. Jesli brak wariantu
+/// dla danego backendu — fallback w kolejnosci cuda/rocm/metal/xpu/cpu.
+fn pick_install_variant<'a>(
+    variants: &'a [InstallVariant],
+    backend: &str,
+) -> Result<Option<&'a InstallVariant>> {
+    if variants.is_empty() {
+        return Ok(None);
+    }
+    if let Some(v) = variants.iter().find(|v| v.backend == backend) {
+        return Ok(Some(v));
+    }
+    // Fallback: spytaj pierwsze dostepne, ale ostrzez
+    tracing::warn!(
+        "brak wariantu dla backendu '{}', uzywam '{}' jako fallback",
+        backend, variants[0].backend
+    );
+    Ok(Some(&variants[0]))
+}
+
 /// Abstrakcja ponad `uv` i `pip` — ten sam interfejs instalacji.
+/// `extra_index_url` wstrzykuje `--extra-index-url <url>` do kazdej instalacji,
+/// co wybiera wariant torcha (cu124, rocm7.0, cpu, itd.).
 struct Installer<'a> {
     venv: PathBuf,
     uv: Option<&'a Path>,
+    extra_index_url: Option<String>,
 }
 
 impl<'a> Installer<'a> {
-    fn new(venv: &Path, uv: Option<&'a Path>) -> Self {
-        Self { venv: venv.to_path_buf(), uv }
+    fn new(venv: &Path, uv: Option<&'a Path>, extra_index_url: Option<String>) -> Self {
+        Self { venv: venv.to_path_buf(), uv, extra_index_url }
     }
     fn cmd(&self) -> Command {
         if let Some(uv) = self.uv {
@@ -407,25 +473,35 @@ impl<'a> Installer<'a> {
             Command::new(pip)
         }
     }
+    fn add_index(&self, c: &mut Command) {
+        if let Some(idx) = &self.extra_index_url {
+            c.arg("--extra-index-url").arg(idx);
+        }
+    }
     fn upgrade_pip(&self) -> Result<()> {
-        // uv nie uzywa pip internalnie, ale zawsze dobrze miec wheel na wypadek sdist
         let mut c = self.cmd();
         c.arg("install").arg("--upgrade").arg("pip").arg("wheel");
         run(&mut c)
     }
     fn install_requirements(&self, path: &Path) -> Result<()> {
         let mut c = self.cmd();
-        c.arg("install").arg("-r").arg(path);
+        c.arg("install");
+        self.add_index(&mut c);
+        c.arg("-r").arg(path);
         run(&mut c)
     }
     fn install_package(&self, pkg: &str) -> Result<()> {
         let mut c = self.cmd();
-        c.arg("install").arg(pkg);
+        c.arg("install");
+        self.add_index(&mut c);
+        c.arg(pkg);
         run(&mut c)
     }
     fn install_editable(&self, path: &Path) -> Result<()> {
         let mut c = self.cmd();
-        c.arg("install").arg("-e").arg(path);
+        c.arg("install");
+        self.add_index(&mut c);
+        c.arg("-e").arg(path);
         run(&mut c)
     }
 }
@@ -543,6 +619,22 @@ mod tests {
             assert_eq!(spec.bundle.engine, engine);
             assert!(spec.launch.internal_port > 0);
         }
+    }
+
+    #[test]
+    fn pick_variant_matches_backend() {
+        let variants = vec![
+            InstallVariant { backend: "cuda".into(), extra_index: Some("a".into()), extras: vec![], install_hint: None },
+            InstallVariant { backend: "rocm".into(), extra_index: Some("b".into()), extras: vec![], install_hint: None },
+            InstallVariant { backend: "metal".into(), extra_index: None, extras: vec!["vllm-metal".into()], install_hint: None },
+        ];
+        let v = pick_install_variant(&variants, "rocm").unwrap().unwrap();
+        assert_eq!(v.backend, "rocm");
+        let v = pick_install_variant(&variants, "metal").unwrap().unwrap();
+        assert_eq!(v.extras, vec!["vllm-metal".to_string()]);
+        // Fallback gdy brak pasujacego
+        let v = pick_install_variant(&variants, "xpu").unwrap().unwrap();
+        assert_eq!(v.backend, "cuda"); // pierwszy jako fallback
     }
 
     #[test]

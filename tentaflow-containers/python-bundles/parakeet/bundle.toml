@@ -1,9 +1,10 @@
 [bundle]
 engine = "parakeet"
-description = "NVIDIA NeMo Parakeet-TDT-0.6B-v3 (STT)"
-python_version = "3.11"
-source = "pypi"
-pypi_package = "nemo_toolkit[asr]"
+description = "NVIDIA NeMo Parakeet-TDT-0.6B-v3 (STT, git HEAD)"
+python_version = "3.12"
+source = "git"
+git_repo = "https://github.com/NVIDIA/NeMo.git"
+git_ref = "main"
 
 [launch]
 command = "uvicorn"
@@ -12,7 +13,18 @@ args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
 internal_port = 8082
 
 [requires]
-cuda = ">=12.1"
 gpu_memory_gb = 4
 disk_gb = 12
-platforms = ["linux-x86_64", "linux-aarch64"]
+# NeMo jest oficjalnie CUDA-only; ROCm ma ograniczone wsparcie eksperymentalne.
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu124"
+extras = ["nemo_toolkit[asr]"]
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = ["nemo_toolkit[asr]"]
+install_hint = "experimental"

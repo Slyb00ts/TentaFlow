@@ -1,7 +1,7 @@
 [bundle]
 engine = "voxcpm"
-description = "VoxCPM2 TTS"
-python_version = "3.11"
+description = "VoxCPM2 TTS (git HEAD)"
+python_version = "3.12"
 source = "git"
 git_repo = "https://github.com/OpenBMB/VoxCPM.git"
 git_ref = "main"
@@ -13,7 +13,20 @@ args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
 internal_port = 8086
 
 [requires]
-cuda = ">=12.1"
 gpu_memory_gb = 4
 disk_gb = 6
-platforms = ["linux-x86_64"]
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu124"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+
+[[install_variants]]
+backend = "metal"
+extras = []
