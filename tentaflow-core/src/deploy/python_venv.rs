@@ -721,18 +721,17 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     cmd.env("BUNDLE_DIR", &bundle_dir);
     cmd.env("VENV_DIR", venv);
 
-    // Ujednolicony katalog modeli — wymusza pobieranie z HF/torch do
-    // <tentaflow_home>/models/ zamiast domyslnego ~/.cache/huggingface.
-    // User nie ustawia tego w bundle.toml -> dostaje pre-set'y ponizej,
-    // ale moze nadpisac przez `req.env` (wtedy petla wyzej go wygra).
+    // Shared <tentaflow_home>/models/ — same root Docker uses, so a model
+    // pulled by Docker vLLM lives in the same hub/models--*/ directory that
+    // native Python vLLM (and every other engine on this host) sees.
     let _ = crate::paths::ensure_models_dirs();
-    let hf_cache = crate::paths::hf_cache_dir();
-    let torch_cache = crate::paths::torch_cache_dir();
+    let hf = crate::paths::hf_home();
+    let torch = crate::paths::torch_home();
     for (k, v) in [
-        ("HF_HOME", hf_cache.clone()),
-        ("HUGGINGFACE_HUB_CACHE", hf_cache.clone()),
-        ("TRANSFORMERS_CACHE", hf_cache.clone()),
-        ("TORCH_HOME", torch_cache.clone()),
+        ("HF_HOME", hf.clone()),
+        ("HUGGINGFACE_HUB_CACHE", hf.clone()),
+        ("TRANSFORMERS_CACHE", hf.clone()),
+        ("TORCH_HOME", torch.clone()),
     ] {
         if !req.env.contains_key(k) {
             cmd.env(k, &v);
