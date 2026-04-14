@@ -30,16 +30,20 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             features: "rdma-probe,gpu-cuda,gpu-vulkan,gpu-rocm"
+            cache_id: "linux-x64-all"
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             features: "gpu-cuda,gpu-vulkan"
+            cache_id: "linux-arm64-cuda-vulkan"
           - target: aarch64-apple-darwin
             runner: macos-latest
             # Metal + MLX są wciągane cfg-target na macOS; tutaj bez feature flag.
             features: ""
+            cache_id: "macos-arm64-default"
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             features: "gpu-cuda,gpu-vulkan"
+            cache_id: "windows-x64-cuda-vulkan"
 
     env:
       CARGO_INCREMENTAL: 0
@@ -221,10 +225,10 @@ jobs:
             ~/.cargo/git
             tentaflow/target
             tentaflow-core/target
-          # Przecinki w matrix.features (np. "gpu-cuda,gpu-vulkan") sa
-          # niedozwolone w kluczu cache — zamieniamy na myslniki przez
-          # szablon GitHub Expressions replace().
-          key: cargo-${{ matrix.target }}-${{ replace(matrix.features, ',', '-') }}-${{ hashFiles('**/Cargo.lock') }}
+          # matrix.features zawiera przecinki, a actions/cache ich nie przyjmuje.
+          # GitHub Expression language nie ma `replace()`, wiec podajemy gotowy
+          # cache_id z matrix.include (bez przecinkow, latwy do czytania).
+          key: cargo-${{ matrix.cache_id }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build tentaflow (all available GPU backends)
         working-directory: tentaflow
