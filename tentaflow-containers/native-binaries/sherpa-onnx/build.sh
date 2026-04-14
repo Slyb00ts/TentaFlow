@@ -37,12 +37,19 @@ CMAKE_ARGS=(-S "$SRC_DIR" -B "$SRC_DIR/build" -DCMAKE_BUILD_TYPE=Release \
 [[ "$BACKEND" == "cuda" ]] && CMAKE_ARGS+=(-DSHERPA_ONNX_ENABLE_GPU=ON)
 
 cmake "${CMAKE_ARGS[@]}"
-cmake --build "$SRC_DIR/build" --target sherpa-onnx-offline-tts-server -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu || echo 4)"
+# sherpa-onnx-offline-tts-server byl w starszych wersjach; aktualnie zostal zastapiony
+# przez offline-websocket-server + CLI sherpa-onnx-offline-tts. Sidecar doklada HTTP shim.
+cmake --build "$SRC_DIR/build" \
+  --target sherpa-onnx sherpa-onnx-offline-tts sherpa-onnx-offline-websocket-server \
+  -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu || echo 4)"
 
 STAGE="$BUILD_DIR/stage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "$SRC_DIR/build/bin/sherpa-onnx-offline-tts-server"* "$STAGE/" 2>/dev/null || true
+# Kopiujemy obie binarki + libs
+for bin in sherpa-onnx sherpa-onnx-offline-tts sherpa-onnx-offline-websocket-server; do
+  cp "$SRC_DIR/build/bin/$bin"* "$STAGE/" 2>/dev/null || true
+done
 find "$SRC_DIR/build" -maxdepth 3 -type f \( -name "libonnxruntime*" -o -name "*.dylib" -o -name "*.dll" \) \
   -exec cp {} "$STAGE/" \; 2>/dev/null || true
 
