@@ -1,0 +1,25 @@
+[bundle]
+engine = "sglang"
+description = "SGLang serwer LLM z structured outputs"
+python_version = "3.11"
+source = "git"
+git_repo = "https://github.com/sgl-project/sglang.git"
+git_ref = "main"
+
+[launch]
+command = "python"
+args = [
+    "-m", "sglang.launch_server",
+    "--model-path", "${MODEL}",
+    "--host", "127.0.0.1",
+    "--port", "30000",
+    "--tp", "${TP:-1}",
+    "--mem-fraction-static", "${MEM_FRACTION:-0.85}",
+]
+internal_port = 30000
+
+[requires]
+cuda = ">=12.1"
+gpu_memory_gb = 8
+disk_gb = 20
+platforms = ["linux-x86_64", "linux-aarch64"]

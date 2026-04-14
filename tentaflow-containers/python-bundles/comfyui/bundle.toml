@@ -1,0 +1,19 @@
+[bundle]
+engine = "comfyui"
+description = "ComfyUI (Stable Diffusion / Flux workflow engine)"
+python_version = "3.11"
+source = "git"
+git_repo = "https://github.com/comfyanonymous/ComfyUI.git"
+git_ref = "master"
+
+[launch]
+command = "python"
+args = ["${BUNDLE_DIR}/ComfyUI/main.py",
+        "--listen", "127.0.0.1", "--port", "8188"]
+internal_port = 8188
+
+[requires]
+cuda = ">=12.1"
+gpu_memory_gb = 6
+disk_gb = 15
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]

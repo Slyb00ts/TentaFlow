@@ -1,0 +1,21 @@
+# Pinowane wheels dla bundla vLLM.
+# Regenerujemy komenda:
+#   uv pip compile --python 3.11 --output-file requirements.lock pyproject.toml
+# (albo rownoznacznie: `uv pip install vllm; uv pip freeze`)
+#
+# Dla source = "git" ten plik jest fallbackiem — faktyczne rozwiazanie deps
+# odbywa sie przez `pip install -e .` z klona repo. Ta lock sluzy do
+# pre-cache'owania wheels torch/xformers/flash-attn przed bootstrapem.
+
+# Core
+torch==2.5.1+cu124           # --extra-index-url https://download.pytorch.org/whl/cu124
+torchvision==0.20.1+cu124
+torchaudio==2.5.1+cu124
+
+# vLLM deps (pobierane z https://github.com/vllm-project/vllm/blob/main/requirements-cuda.txt)
+# Sidecar python_venv pobiera je wprost z requirements-cuda.txt HEAD;
+# ten plik tylko aktualizuje kilka najciezszych wheels do wstepnego cache.
+
+# Runtime tooling
+uvicorn[standard]==0.32.0
+fastapi==0.115.5

@@ -1,0 +1,19 @@
+[bundle]
+engine = "xtts"
+description = "XTTS v2 (coqui-TTS) voice cloning"
+python_version = "3.11"
+source = "pypi"
+pypi_package = "TTS>=0.22"
+
+[launch]
+# FastAPI wrapper z server.py — kopiowany z repo do venv na bootstrapie
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "8085"]
+internal_port = 8085
+
+[requires]
+cuda = ">=11.8"
+gpu_memory_gb = 6
+disk_gb = 8
+platforms = ["linux-x86_64", "macos-aarch64"]   # CoquiTTS ma wsparcie MPS

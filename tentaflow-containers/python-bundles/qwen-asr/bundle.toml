@@ -1,0 +1,18 @@
+[bundle]
+engine = "qwen-asr"
+description = "Qwen3-ASR-1.7B (multimodal STT)"
+python_version = "3.11"
+source = "pypi"
+pypi_package = "transformers>=4.45"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "8083"]
+internal_port = 8083
+
+[requires]
+cuda = ">=12.1"
+gpu_memory_gb = 6
+disk_gb = 10
+platforms = ["linux-x86_64", "linux-aarch64"]

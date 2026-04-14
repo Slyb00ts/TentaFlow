@@ -130,6 +130,7 @@ mdns-sd = "0.12"
 hostname = "0.4"
 sysinfo = "0.33"
 num_cpus = "1"
+which = "6"
 rcgen = "0.13"
 
 # GPU detection — cross-platform (Metal, Vulkan, DX12, GL)
