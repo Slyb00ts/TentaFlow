@@ -59,6 +59,22 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install -y protoc cmake
 
+      - name: Export PROTOC env (skip protobuf-src build)
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            PROTOC_PATH=$(where.exe protoc 2>/dev/null | head -n1 | tr -d '\r')
+          else
+            PROTOC_PATH=$(which protoc)
+          fi
+          if [[ -z "$PROTOC_PATH" ]]; then
+            echo "protoc not found in PATH after install step" >&2
+            exit 1
+          fi
+          echo "PROTOC=$PROTOC_PATH" >> "$GITHUB_ENV"
+          echo "Using protoc: $PROTOC_PATH"
+          "$PROTOC_PATH" --version
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
