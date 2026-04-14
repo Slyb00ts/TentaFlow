@@ -45,6 +45,9 @@ struct DeployConfig {
     /// Protokol polaczenia: "http" (domyslny) lub "quic"
     #[serde(default)]
     protocol: String,
+    /// Tryb deployu wybrany przez wizard: "docker" (domyslny) lub "native"
+    #[serde(default)]
+    deploy_mode: String,
 }
 
 /// Obsluguje polaczenie WebSocket /ws/deploy
@@ -223,7 +226,12 @@ async fn deploy_stack(
     local_node_id: &str,
 ) -> Result<(), anyhow::Error> {
     if req.node_id == local_node_id || req.node_id.is_empty() {
-        // Sprobuj uzyc embedowanego bundle dla znanych silnikow
+        // Tryb native — Pythonowy bundle bez Dockera (vLLM/SGLang/XTTS/...)
+        if config.deploy_mode == "native" {
+            return deploy_native_python(req, config).await;
+        }
+
+        // Sprobuj uzyc embedowanego bundle dla znanych silnikow (Docker)
         if let Some(bundle_name) = engine_to_bundle_name(&config.engine, &config.service_type) {
             info!(
                 engine = %config.engine,
@@ -511,6 +519,79 @@ async fn deploy_bundled_container(
     Err(anyhow::anyhow!(
         "feature 'docker' wylaczone — embed bundle deploy niedostepny"
     ))
+}
+
+/// Mapuje silnik wizarda na nazwe bundla Pythona w `tentaflow-containers/python-bundles/`.
+fn engine_to_python_bundle(engine: &str) -> Option<&'static str> {
+    match engine {
+        "vllm"               => Some("vllm"),
+        "sglang"             => Some("sglang"),
+        "xtts"               => Some("xtts"),
+        "voxcpm"             => Some("voxcpm"),
+        "parakeet"           => Some("parakeet"),
+        "qwen-asr"           => Some("qwen-asr"),
+        "comfyui"            => Some("comfyui"),
+        _ => None,
+    }
+}
+
+/// Deploy pythonowego silnika na maszynie hosta (bez Dockera).
+/// Rozpakowuje bundle, pobiera python-build-standalone + uv, tworzy venv,
+/// instaluje wheels i startuje subprocess.
+async fn deploy_native_python(
+    req: &DeployRequest,
+    config: &DeployConfig,
+) -> Result<(), anyhow::Error> {
+    use std::collections::HashMap;
+
+    let bundle = engine_to_python_bundle(&config.engine)
+        .ok_or_else(|| anyhow::anyhow!("silnik '{}' nie ma Python bundle", config.engine))?;
+
+    // env przekazywane do procesu silnika — z wizarda (np. MODEL, GPU_MEMORY_UTILIZATION)
+    let mut env: HashMap<String, String> = HashMap::new();
+    if !config.model_id.is_empty() {
+        env.insert("MODEL".into(), config.model_id.clone());
+        env.insert("MODEL_ID".into(), config.model_id.clone());
+    }
+
+    // Parse compose_yaml zeby wyciagnac HF_TOKEN/GPU_MEMORY_UTILIZATION/itp.
+    // (#[cfg(feature = "docker")] branch ma to zaimplementowane — reuzyj)
+    #[cfg(feature = "docker")]
+    if let Some(parsed) = parse_compose_for_bundle(&req.compose_yaml) {
+        for (k, v) in parsed.env {
+            env.entry(k).or_insert(v);
+        }
+    }
+
+    let instance_name = if !req.stack_name.is_empty() {
+        Some(req.stack_name.clone())
+    } else if !config.container_name.is_empty() {
+        Some(config.container_name.clone())
+    } else {
+        None
+    };
+
+    let native_req = crate::deploy::python_venv::NativeDeployRequest {
+        engine: bundle.to_string(),
+        instance_name,
+        env,
+    };
+
+    // python_venv::deploy() jest blocking (spawnuje procesy, pobiera archiwa) —
+    // uruchamiamy na blocking threadpool zeby nie blokowac tokio runtime.
+    let handle = tokio::task::spawn_blocking(move || {
+        crate::deploy::python_venv::deploy(&native_req)
+    });
+    let running = handle.await??;
+    info!(
+        engine = %running.engine,
+        pid = running.child.id(),
+        port = running.internal_port,
+        venv = %running.venv_dir.display(),
+        "Python bundle wystartowal"
+    );
+    // TODO: zapisac RunningEngine w globalnym registry zeby mozna bylo zatrzymac
+    Ok(())
 }
 
 /// Deploy przez docker compose CLI (lokalnie)
