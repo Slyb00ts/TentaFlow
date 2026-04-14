@@ -1,0 +1,18 @@
+[bundle]
+engine = "parakeet"
+description = "NVIDIA NeMo Parakeet-TDT-0.6B-v3 (STT)"
+python_version = "3.11"
+source = "pypi"
+pypi_package = "nemo_toolkit[asr]"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "8082"]
+internal_port = 8082
+
+[requires]
+cuda = ">=12.1"
+gpu_memory_gb = 4
+disk_gb = 12
+platforms = ["linux-x86_64", "linux-aarch64"]

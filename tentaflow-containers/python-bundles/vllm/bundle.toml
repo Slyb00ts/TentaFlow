@@ -1,0 +1,33 @@
+# =============================================================================
+# Plik: python-bundles/vllm/bundle.toml
+# Opis: Meta bundla vLLM — odczytywane przez `deploy::python_venv::bootstrap`.
+# =============================================================================
+
+[bundle]
+engine = "vllm"
+description = "vLLM OpenAI-compatible LLM server (git HEAD)"
+python_version = "3.11"
+# Source: 'git' albo 'pypi'. Git builduje z main (latest features), pypi - stable.
+source = "git"
+git_repo = "https://github.com/vllm-project/vllm.git"
+git_ref = "main"
+
+[launch]
+# MODEL przychodzi z wizarda (deploy/ws_deploy.rs ustawia env przed startem).
+command = "python"
+args = [
+    "-m", "vllm.entrypoints.openai.api_server",
+    "--host", "127.0.0.1",
+    "--port", "8000",
+    "--model", "${MODEL}",
+    "--dtype", "auto",
+    "--gpu-memory-utilization", "${GPU_MEMORY_UTILIZATION:-0.9}",
+    "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+]
+internal_port = 8000
+
+[requires]
+cuda = ">=12.4"
+gpu_memory_gb = 8
+disk_gb = 20
+platforms = ["linux-x86_64", "linux-aarch64"]   # macOS/Windows -> Docker albo nie
