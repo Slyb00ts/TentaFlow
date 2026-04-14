@@ -30,8 +30,12 @@ tracing = "0.1"
 [build-dependencies]
 # Generuje struct Rust z .proto schemy ONNX
 prost-build = "0.13"
-# Dostarcza skompilowany protoc z crate'a — nie wymaga instalacji
-# protobuf-compiler w systemie (np. na nowych nodach).
+
+# protobuf-src fallback dostarcza protoc zbudowanego z sourca gdy system go
+# nie ma. NIE WLACZAMY na Windows — MSVC link ma problemy z UCRT vs CRT
+# i cmake build padnie. Na Windows uzytkownik musi miec `protoc` w PATH
+# (np. `choco install protoc`), wtedy build.rs go uzyje przez PROTOC env.
+[target.'cfg(not(target_os = "windows"))'.build-dependencies]
 protobuf-src = "2"
 
 [dev-dependencies]
