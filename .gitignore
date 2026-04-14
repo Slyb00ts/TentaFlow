@@ -105,6 +105,7 @@ tentaflow-core/addons/*/target/
 /models/
 /tentaflow-models/models/
 /mlx-models/models/
+tentaflow/models
 
 # =============================================================================
 # Thirdparty (lokalne projekty referencyjne)
