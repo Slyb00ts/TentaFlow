@@ -166,23 +166,24 @@ jobs:
         if: runner.os == 'Windows' && contains(matrix.features, 'gpu-vulkan')
         shell: pwsh
         run: |
-          # humbletim/install-vulkan-sdk wypakowuje do niestandardowego layoutu
-          # (Include/Lib nie tam gdzie FindVulkan.cmake szuka); LunarG oficjalny
-          # installer stawia SDK w C:\VulkanSDK\<ver>\ ze standardowymi subdirs.
-          $ver = "1.4.309.0"
-          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
-          Write-Host "Downloading $url"
-          Invoke-WebRequest $url -OutFile VulkanSDK-Installer.exe -UseBasicParsing
-          Write-Host "Installing Vulkan SDK $ver (silent)..."
-          Start-Process -Wait -FilePath ".\VulkanSDK-Installer.exe" `
-            -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install"
-          $sdk = "C:\VulkanSDK\$ver"
-          if (-not (Test-Path $sdk)) { throw "Vulkan SDK not found at $sdk after install" }
-          echo "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
-          echo "$sdk\Bin" >> $env:GITHUB_PATH
-          Write-Host "VULKAN_SDK=$sdk"
-          Get-ChildItem "$sdk\Include\vulkan" | Select-Object -First 3
-          Get-ChildItem "$sdk\Lib\vulkan-1.lib" | Format-List Name,Length
+          # Chocolatey's vulkan-sdk package runs LunarG's silent installer,
+          # tracks the latest version (URLs change), and lands in standard
+          # C:\VulkanSDK\<ver>\ layout that FindVulkan.cmake finds via VULKAN_SDK.
+          choco install vulkan-sdk -y --no-progress
+          # Choco doesn't always export VULKAN_SDK to GITHUB_ENV — find it.
+          $sdk = Get-ChildItem C:\VulkanSDK -Directory `
+                 | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { throw "No Vulkan SDK directory under C:\VulkanSDK after install" }
+          echo "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
+          echo "$($sdk.FullName)\Bin" >> $env:GITHUB_PATH
+          Write-Host "VULKAN_SDK=$($sdk.FullName)"
+          if (-not (Test-Path "$($sdk.FullName)\Include\vulkan\vulkan.h")) {
+            throw "vulkan.h missing under $($sdk.FullName)\Include\vulkan"
+          }
+          if (-not (Test-Path "$($sdk.FullName)\Lib\vulkan-1.lib")) {
+            throw "vulkan-1.lib missing under $($sdk.FullName)\Lib"
+          }
+          Write-Host "Vulkan headers + lib verified."
 
       # ---------------------------------------------------------------------
       # ROCm — tylko Linux x86_64 (ARM Linux ROCm = tylko Instinct, pomijamy;
