@@ -1,19 +1,17 @@
 # =============================================================================
 # Plik: python-bundles/vllm/bundle.toml
-# Opis: Meta bundla vLLM — odczytywane przez `deploy::python_venv::bootstrap`.
+# Opis: vLLM z git HEAD, wieloplatformowo (CUDA / ROCm 7 / Metal).
 # =============================================================================
 
 [bundle]
 engine = "vllm"
 description = "vLLM OpenAI-compatible LLM server (git HEAD)"
-python_version = "3.11"
-# Source: 'git' albo 'pypi'. Git builduje z main (latest features), pypi - stable.
+python_version = "3.12"
 source = "git"
 git_repo = "https://github.com/vllm-project/vllm.git"
 git_ref = "main"
 
 [launch]
-# MODEL przychodzi z wizarda (deploy/ws_deploy.rs ustawia env przed startem).
 command = "python"
 args = [
     "-m", "vllm.entrypoints.openai.api_server",
@@ -27,7 +25,22 @@ args = [
 internal_port = 8000
 
 [requires]
-cuda = ">=12.4"
 gpu_memory_gb = 8
 disk_gb = 20
-platforms = ["linux-x86_64", "linux-aarch64"]   # macOS/Windows -> Docker albo nie
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64", "macos-aarch64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu124"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+install_hint = "VLLM_TARGET_DEVICE=rocm"
+
+[[install_variants]]
+backend = "metal"
+extras = ["vllm-metal"]
+install_hint = "VLLM_TARGET_DEVICE=metal"
