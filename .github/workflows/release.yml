@@ -95,7 +95,6 @@ jobs:
         if: runner.os == 'Linux' && contains(matrix.features, 'gpu-cuda')
         run: |
           set -eux
-          # NVIDIA apt repo keyring (Ubuntu 24.04 / ARM odpowiednio)
           if [[ "$(dpkg --print-architecture)" == "arm64" ]]; then
             REPO_ARCH="sbsa"
           else
@@ -104,22 +103,24 @@ jobs:
           wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${REPO_ARCH}/cuda-keyring_1.1-1_all.deb"
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          # Caly toolkit 12.8 (pelny stack nvcc + cudart + cublas + curand + cusolver)
-          sudo apt-get install -y cuda-toolkit-12-8
-          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
-          echo "CUDACXX=/usr/local/cuda-12.8/bin/nvcc" >> "$GITHUB_ENV"
-          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          /usr/local/cuda-12.8/bin/nvcc --version
+          # Caly toolkit 12.6 (pelny stack — nvcc + cudart + cublas + curand + cusolver + ...).
+          # Ta sama wersja co Windows (Jimver v0.2.19 wspiera max 12.6.x).
+          sudo apt-get install -y cuda-toolkit-12-6
+          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
+          echo "CUDACXX=/usr/local/cuda-12.6/bin/nvcc" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          /usr/local/cuda-12.6/bin/nvcc --version
 
       - name: Install CUDA (Windows)
         if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda')
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: '12.8.0'
+          cuda: '12.6.2'
           method: 'network'
-          # Meta 'cuda' pobiera pelny toolkit — unikamy mapowania dev->_dev
-          # ktore w Jimver 0.2.19 jest sprzeczne z NVIDIA package names.
+          # Nazwy sub-packages zgodne z NVIDIA installer components (bez `_dev`
+          # suffix — Jimver 0.2.19 ich nie wspiera, fallback do pelnej kompilacji
+          # dziala i tak bez rozbicia dev/runtime).
           sub-packages: '["nvcc", "cudart", "cublas", "curand", "cusolver", "cusparse", "nvrtc", "visual_studio_integration"]'
 
       - name: Export CUDA env (Windows)
