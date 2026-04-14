@@ -20,6 +20,40 @@ pub struct SystemCapabilities {
     pub deploy_backends: Vec<DeployBackend>,
     /// Silniki ktore maszyna rzeczywiscie moze uruchomic, z uzasadnieniem.
     pub supported_engines: Vec<EngineSupport>,
+    /// Ujednolicone sciezki — wszyskie modele leza w <tentaflow_home>/models/.
+    pub paths: PathsSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PathsSnapshot {
+    pub tentaflow_home: String,
+    pub models_root: String,
+    pub llm: String,
+    pub stt: String,
+    pub tts: String,
+    pub embeddings: String,
+    pub reranker: String,
+    pub image: String,
+    pub diarization: String,
+    pub hf_cache: String,
+    pub torch_cache: String,
+}
+
+fn collect_paths() -> PathsSnapshot {
+    let _ = crate::paths::ensure_models_dirs();
+    PathsSnapshot {
+        tentaflow_home: crate::paths::tentaflow_home().display().to_string(),
+        models_root:    crate::paths::models_root().display().to_string(),
+        llm:            crate::paths::llm_dir().display().to_string(),
+        stt:            crate::paths::stt_dir().display().to_string(),
+        tts:            crate::paths::tts_dir().display().to_string(),
+        embeddings:     crate::paths::embeddings_dir().display().to_string(),
+        reranker:       crate::paths::reranker_dir().display().to_string(),
+        image:          crate::paths::image_dir().display().to_string(),
+        diarization:    crate::paths::diarization_dir().display().to_string(),
+        hf_cache:       crate::paths::hf_cache_dir().display().to_string(),
+        torch_cache:    crate::paths::torch_cache_dir().display().to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -133,6 +167,7 @@ pub fn collect() -> SystemCapabilities {
         runtimes,
         deploy_backends,
         supported_engines,
+        paths: collect_paths(),
     }
 }
 
