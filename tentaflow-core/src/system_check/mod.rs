@@ -27,32 +27,26 @@ pub struct SystemCapabilities {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct PathsSnapshot {
     pub tentaflow_home: String,
+    /// Shared root between Docker and native deploys.
     pub models_root: String,
-    pub llm: String,
-    pub stt: String,
-    pub tts: String,
-    pub embeddings: String,
-    pub reranker: String,
-    pub image: String,
-    pub diarization: String,
-    pub hf_cache: String,
-    pub torch_cache: String,
+    /// HF_HOME / HUGGINGFACE_HUB_CACHE / TRANSFORMERS_CACHE value. HF creates
+    /// `hub/models--*` under this automatically.
+    pub hf_home: String,
+    /// TORCH_HOME value (subdir of models_root so HF's and torch's `hub/`
+    /// directories do not collide).
+    pub torch_home: String,
+    /// Path inside a Docker container that models_root is mounted to.
+    pub container_models_path: String,
 }
 
 fn collect_paths() -> PathsSnapshot {
     let _ = crate::paths::ensure_models_dirs();
     PathsSnapshot {
-        tentaflow_home: crate::paths::tentaflow_home().display().to_string(),
-        models_root:    crate::paths::models_root().display().to_string(),
-        llm:            crate::paths::llm_dir().display().to_string(),
-        stt:            crate::paths::stt_dir().display().to_string(),
-        tts:            crate::paths::tts_dir().display().to_string(),
-        embeddings:     crate::paths::embeddings_dir().display().to_string(),
-        reranker:       crate::paths::reranker_dir().display().to_string(),
-        image:          crate::paths::image_dir().display().to_string(),
-        diarization:    crate::paths::diarization_dir().display().to_string(),
-        hf_cache:       crate::paths::hf_cache_dir().display().to_string(),
-        torch_cache:    crate::paths::torch_cache_dir().display().to_string(),
+        tentaflow_home:         crate::paths::tentaflow_home().display().to_string(),
+        models_root:            crate::paths::models_root().display().to_string(),
+        hf_home:                crate::paths::hf_home().display().to_string(),
+        torch_home:             crate::paths::torch_home().display().to_string(),
+        container_models_path:  crate::paths::CONTAINER_MODELS_PATH.to_string(),
     }
 }
 
