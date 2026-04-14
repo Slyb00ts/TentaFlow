@@ -112,7 +112,7 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
 
     let cache = cache_root()?;
     let python_bin = ensure_python(&cache, &spec.bundle.python_version)?;
-    let _ = ensure_uv(&cache)?;  // tentaflow poki co wola `uv` z PATH — patrz ensure_uv
+    let uv_bin = ensure_uv(&cache).ok();
 
     let venv_dir = cache.join("envs").join(&req.engine);
     let bundle_src = extracted
@@ -121,7 +121,7 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
         .join(&req.engine);
 
     create_venv(&python_bin, &venv_dir)?;
-    install_deps(&venv_dir, &spec, &bundle_src)?;
+    install_deps(&venv_dir, &uv_bin, &spec, &bundle_src)?;
     copy_bundle_files(&bundle_src, &venv_dir)?;
 
     let child = spawn_engine(&venv_dir, &spec, req)?;
@@ -155,27 +155,179 @@ fn check_platform_compat(req: &Requires) -> Result<()> {
     Ok(())
 }
 
-/// Zapewnia relokowalnego Pythona w cache. TYLKO szkielet — pobieranie
-/// python-build-standalone bedzie dopisane w kolejnej iteracji (wymaga
-/// tylko reqwest::get + tar unpack). Na razie zwraca sciezke do `python3`
-/// z systemu jako fallback.
-fn ensure_python(cache: &Path, _version: &str) -> Result<PathBuf> {
-    // TODO: pobrac python-build-standalone z
-    // https://github.com/astral-sh/python-build-standalone/releases
-    // Na razie fallback do systemowego Pythona, zeby przetestowac flow.
-    let system = which::which("python3")
-        .or_else(|_| which::which("python"))
-        .context("nie znalazlem Pythona w PATH — pobieranie relokowalnego Pythona jeszcze niezaimplementowane, zainstaluj Pythona 3.11+")?;
-    let _ = cache; // silence unused
-    Ok(system)
+/// Wersja python-build-standalone i uv jaka pobieramy. Aktualizacje recznie —
+/// ta wartosc sluzy jako lock, zeby cache byl deterministyczny.
+const PBS_DATE: &str = "20250918";   // ostatni release python-build-standalone
+const UV_VERSION: &str = "0.5.14";
+
+/// Zapewnia relokowalnego Pythona w `<cache>/python/<py_ver>/`. Jesli
+/// katalog istnieje -> reuse. W przeciwnym razie pobiera odpowiednie archiwum
+/// z github.com/astral-sh/python-build-standalone/releases.
+fn ensure_python(cache: &Path, py_ver: &str) -> Result<PathBuf> {
+    let target_dir = cache.join("python").join(py_ver);
+    let python_bin = python_bin_path(&target_dir);
+    if python_bin.exists() {
+        return Ok(python_bin);
+    }
+
+    let triple = pbs_triple()
+        .with_context(|| format!("nie znam PBS triple dla {}-{}", std::env::consts::OS, std::env::consts::ARCH))?;
+    let full_ver = resolve_full_python_version(py_ver);
+    let url = format!(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/{date}/cpython-{ver}+{date}-{triple}-install_only.tar.gz",
+        date = PBS_DATE, ver = full_ver, triple = triple
+    );
+
+    tracing::info!(url = %url, "Pobieram python-build-standalone");
+    std::fs::create_dir_all(&target_dir)?;
+    download_and_extract(&url, &target_dir)?;
+
+    if !python_bin.exists() {
+        anyhow::bail!(
+            "po wypakowaniu python-build-standalone nie znalazlem {:?}",
+            python_bin
+        );
+    }
+    Ok(python_bin)
 }
 
-/// Zapewnia `uv` w cache. Jak wyzej — TODO pobieranie z release.
-fn ensure_uv(_cache: &Path) -> Result<()> {
-    if which::which("uv").is_err() {
-        tracing::warn!(
-            "brak `uv` w PATH — spadek do `pip`. Zainstaluj uv (`curl -LsSf https://astral.sh/uv/install.sh | sh`) dla szybszego bootstrapu."
-        );
+/// Zapewnia binarke `uv` w `<cache>/bin/uv`. Reuse jesli juz jest.
+fn ensure_uv(cache: &Path) -> Result<PathBuf> {
+    let bin_dir = cache.join("bin");
+    let uv_name = if cfg!(windows) { "uv.exe" } else { "uv" };
+    let uv_path = bin_dir.join(uv_name);
+    if uv_path.exists() {
+        return Ok(uv_path);
+    }
+    std::fs::create_dir_all(&bin_dir)?;
+
+    let triple = uv_triple()
+        .context("nie znam uv target triple dla tej platformy")?;
+    let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+    let url = format!(
+        "https://github.com/astral-sh/uv/releases/download/{ver}/uv-{triple}.{ext}",
+        ver = UV_VERSION, triple = triple, ext = ext
+    );
+
+    tracing::info!(url = %url, "Pobieram uv");
+    download_and_extract(&url, &bin_dir)?;
+
+    // Po extract uv konczy jako `<bin_dir>/uv-<triple>/uv` — przenosimy wprost
+    let nested = bin_dir.join(format!("uv-{}", triple)).join(uv_name);
+    if nested.exists() && !uv_path.exists() {
+        std::fs::rename(&nested, &uv_path).ok();
+    }
+    if !uv_path.exists() {
+        // fallback: szukaj binarki w glebi
+        for entry in walkdir_shallow(&bin_dir) {
+            if entry.file_name().map(|f| f == uv_name).unwrap_or(false) {
+                std::fs::rename(&entry, &uv_path).ok();
+                break;
+            }
+        }
+    }
+    if !uv_path.exists() {
+        anyhow::bail!("nie udalo sie znalezc uv po wypakowaniu");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&uv_path)?.permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&uv_path, p)?;
+    }
+    Ok(uv_path)
+}
+
+/// Rekurencyjne (plytko, 2 poziomy) wyszukiwanie plikow do znalezienia uv po extract.
+fn walkdir_shallow(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Ok(inner) = std::fs::read_dir(&p) {
+                for ie in inner.flatten() { out.push(ie.path()); }
+            }
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn python_bin_path(base: &Path) -> PathBuf {
+    // python-build-standalone rozpakowuje do `python/` a binarka jest w bin/python3.
+    if cfg!(windows) {
+        base.join("python").join("python.exe")
+    } else {
+        base.join("python").join("bin").join("python3")
+    }
+}
+
+/// Rozwiaza "3.11" -> "3.11.10" (najnowszy patch dla date'a PBS).
+/// W razie watpliwosci akceptuj 3.11 jako dostateczne do URLa (PBS ma redirecty).
+fn resolve_full_python_version(v: &str) -> String {
+    match v {
+        "3.11" => "3.11.10".into(),
+        "3.12" => "3.12.7".into(),
+        "3.13" => "3.13.0".into(),
+        other  => other.to_string(),
+    }
+}
+
+fn pbs_triple() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux",  "x86_64")  => Some("x86_64-unknown-linux-gnu"),
+        ("linux",  "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("macos",  "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos",  "x86_64")  => Some("x86_64-apple-darwin"),
+        ("windows","x86_64")  => Some("x86_64-pc-windows-msvc-shared"),
+        _ => None,
+    }
+}
+
+fn uv_triple() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux",   "x86_64")  => Some("x86_64-unknown-linux-gnu"),
+        ("linux",   "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("macos",   "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos",   "x86_64")  => Some("x86_64-apple-darwin"),
+        ("windows", "x86_64")  => Some("x86_64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
+/// Pobiera i rozpakowuje archiwum tar.gz / zip do docelowego katalogu.
+/// Blocking; wolamy synchronicznie z thread pool (deploy to rzadka operacja).
+fn download_and_extract(url: &str, dst: &Path) -> Result<()> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(1800))
+        .build()?
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {}", url))?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP {} przy {}", response.status(), url);
+    }
+    let bytes = response.bytes()?;
+
+    if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(dst)?;
+    } else if url.ends_with(".tar.zst") {
+        let decoder = zstd::Decoder::new(&bytes[..])?;
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(dst)?;
+    } else if url.ends_with(".zip") {
+        // Dla Windows uv
+        let reader = std::io::Cursor::new(&bytes[..]);
+        let mut zip = zip::ZipArchive::new(reader)?;
+        zip.extract(dst)?;
+    } else {
+        anyhow::bail!("nieznany format archiwum w URL: {}", url);
     }
     Ok(())
 }
@@ -189,22 +341,27 @@ fn create_venv(python: &Path, venv: &Path) -> Result<()> {
         .context("tworzenie venv")
 }
 
-fn install_deps(venv: &Path, spec: &BundleSpec, bundle_src: &Path) -> Result<()> {
-    let pip = venv_bin(venv, "pip");
-    run(Command::new(&pip).args(["install", "--upgrade", "pip", "wheel"]))?;
+/// Instaluje zaleznosci przez `uv pip` (jesli dostepny, ~10x szybciej) albo
+/// klasyczny `pip`. uv korzysta z venv podanego przez `VIRTUAL_ENV`.
+fn install_deps(
+    venv: &Path,
+    uv: &Option<PathBuf>,
+    spec: &BundleSpec,
+    bundle_src: &Path,
+) -> Result<()> {
+    let installer = Installer::new(venv, uv.as_deref());
+    installer.upgrade_pip()?;
 
-    // requirements.lock jesli jest
     let lock = bundle_src.join("requirements.lock");
     if lock.exists() {
-        run(Command::new(&pip).arg("install").arg("-r").arg(&lock))
-            .context("instalacja requirements.lock")?;
+        installer.install_requirements(&lock).context("install lock")?;
     }
 
     match spec.bundle.source.as_str() {
         "pypi" => {
             let pkg = spec.bundle.pypi_package.as_deref().unwrap_or(&spec.bundle.engine);
-            run(Command::new(&pip).arg("install").arg(pkg))
-                .with_context(|| format!("pip install {}", pkg))?;
+            installer.install_package(pkg)
+                .with_context(|| format!("install {}", pkg))?;
         }
         "git" => {
             let repo = spec.bundle.git_repo.as_deref()
@@ -221,12 +378,56 @@ fn install_deps(venv: &Path, spec: &BundleSpec, bundle_src: &Path) -> Result<()>
                     .arg(&clone_dir))
                     .context("git clone")?;
             }
-            run(Command::new(&pip).arg("install").arg("-e").arg(&clone_dir))
-                .context("pip install -e .")?;
+            installer.install_editable(&clone_dir)
+                .context("install -e .")?;
         }
         other => anyhow::bail!("nieznane source: {}", other),
     }
     Ok(())
+}
+
+/// Abstrakcja ponad `uv` i `pip` — ten sam interfejs instalacji.
+struct Installer<'a> {
+    venv: PathBuf,
+    uv: Option<&'a Path>,
+}
+
+impl<'a> Installer<'a> {
+    fn new(venv: &Path, uv: Option<&'a Path>) -> Self {
+        Self { venv: venv.to_path_buf(), uv }
+    }
+    fn cmd(&self) -> Command {
+        if let Some(uv) = self.uv {
+            let mut c = Command::new(uv);
+            c.env("VIRTUAL_ENV", &self.venv);
+            c.arg("pip");
+            c
+        } else {
+            let pip = venv_bin(&self.venv, "pip");
+            Command::new(pip)
+        }
+    }
+    fn upgrade_pip(&self) -> Result<()> {
+        // uv nie uzywa pip internalnie, ale zawsze dobrze miec wheel na wypadek sdist
+        let mut c = self.cmd();
+        c.arg("install").arg("--upgrade").arg("pip").arg("wheel");
+        run(&mut c)
+    }
+    fn install_requirements(&self, path: &Path) -> Result<()> {
+        let mut c = self.cmd();
+        c.arg("install").arg("-r").arg(path);
+        run(&mut c)
+    }
+    fn install_package(&self, pkg: &str) -> Result<()> {
+        let mut c = self.cmd();
+        c.arg("install").arg(pkg);
+        run(&mut c)
+    }
+    fn install_editable(&self, path: &Path) -> Result<()> {
+        let mut c = self.cmd();
+        c.arg("install").arg("-e").arg(path);
+        run(&mut c)
+    }
 }
 
 /// Kopiuje dodatkowe pliki bundla (np. server.py) do venv app-dir.

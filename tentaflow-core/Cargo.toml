@@ -131,6 +131,9 @@ hostname = "0.4"
 sysinfo = "0.33"
 num_cpus = "1"
 which = "6"
+# python-build-standalone dystrybuuje archiwa .tar.zst (domyslnie) — zstd dekoder
+zstd = "0.13"
+zip = "2"
 rcgen = "0.13"
 
 # GPU detection — cross-platform (Metal, Vulkan, DX12, GL)
