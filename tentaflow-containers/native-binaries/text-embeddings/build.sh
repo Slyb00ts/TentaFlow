@@ -40,9 +40,11 @@ fi
 
 FEATURES=()
 case "$BACKEND" in
-  cuda)   FEATURES+=(--features "candle-cuda") ;;
-  metal)  FEATURES+=(--features "metal") ;;
-  cpu|*)  FEATURES+=() ;;
+  # candle-cuda zamiast candle-cuda-turing + flash-attn bo flash-attn
+  # na bleeding-edge CUDA 13+ nie buduje sie (stary cutlass w candle).
+  cuda)   FEATURES+=(--no-default-features --features "candle-cuda") ;;
+  metal)  FEATURES+=(--no-default-features --features "metal") ;;
+  cpu|*)  FEATURES+=(--no-default-features --features "candle") ;;
 esac
 
 (cd "$SRC_DIR" && cargo build --release --bin text-embeddings-router "${FEATURES[@]}")
