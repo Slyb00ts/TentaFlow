@@ -418,6 +418,70 @@
   }
 }
 
+/* --- Multi-checkbox dropdown dla wyboru GPU w wizardzie LLM --- */
+.llm-gpu-dropdown {
+  position: relative;
+}
+
+.llm-gpu-dropdown summary.llm-gpu-summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.llm-gpu-dropdown summary::-webkit-details-marker {
+  display: none;
+}
+
+.llm-gpu-dropdown summary.llm-gpu-summary::after {
+  content: " \25BE";
+  float: right;
+  color: var(--color-text-secondary);
+}
+
+.llm-gpu-dropdown[open] summary.llm-gpu-summary::after {
+  content: " \25B4";
+}
+
+.llm-gpu-options {
+  position: absolute;
+  z-index: 10;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  padding: var(--spacing-sm);
+  background: var(--color-bg-elevated, var(--color-bg-input));
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.llm-gpu-option {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.llm-gpu-option:hover {
+  background: var(--color-bg-hover, rgba(255, 255, 255, 0.05));
+}
+
+.llm-gpu-option input[type="checkbox"] {
+  margin: 0;
+}
+
+.llm-gpu-sep {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin: var(--spacing-xs) 0;
+}
+
 /* --- Podglad YAML --- */
 .yaml-preview {
   width: 100%;
