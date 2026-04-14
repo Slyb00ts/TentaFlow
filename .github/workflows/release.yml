@@ -153,17 +153,36 @@ jobs:
       - name: Install Vulkan (Linux aarch64)
         if: runner.os == 'Linux' && contains(matrix.features, 'gpu-vulkan') && runner.arch == 'ARM64'
         run: |
-          # LunarG nie ma paczek ARM; uzywamy Ubuntu-systemowych — GGML_VULKAN
-          # potrzebuje tylko headerow + loadera, nie pelnego SDK narzedziowego.
-          sudo apt-get install -y libvulkan-dev vulkan-tools glslang-tools spirv-tools
+          # LunarG nie ma paczek ARM; uzywamy Ubuntu-systemowych. ggml-vulkan
+          # wymaga `glslc` (shaderc, Google) do kompilacji shaderow — to OSOBNY
+          # binarka od `glslang-tools` ktory ma tylko glslangValidator.
+          sudo apt-get install -y \
+            libvulkan-dev vulkan-tools \
+            glslc glslang-tools spirv-tools
           vulkaninfo --summary || true
+          which glslc && glslc --version | head -2
 
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows' && contains(matrix.features, 'gpu-vulkan')
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: latest
-          cache: true
+        shell: pwsh
+        run: |
+          # humbletim/install-vulkan-sdk wypakowuje do niestandardowego layoutu
+          # (Include/Lib nie tam gdzie FindVulkan.cmake szuka); LunarG oficjalny
+          # installer stawia SDK w C:\VulkanSDK\<ver>\ ze standardowymi subdirs.
+          $ver = "1.4.309.0"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest $url -OutFile VulkanSDK-Installer.exe -UseBasicParsing
+          Write-Host "Installing Vulkan SDK $ver (silent)..."
+          Start-Process -Wait -FilePath ".\VulkanSDK-Installer.exe" `
+            -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install"
+          $sdk = "C:\VulkanSDK\$ver"
+          if (-not (Test-Path $sdk)) { throw "Vulkan SDK not found at $sdk after install" }
+          echo "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          echo "$sdk\Bin" >> $env:GITHUB_PATH
+          Write-Host "VULKAN_SDK=$sdk"
+          Get-ChildItem "$sdk\Include\vulkan" | Select-Object -First 3
+          Get-ChildItem "$sdk\Lib\vulkan-1.lib" | Format-List Name,Length
 
       # ---------------------------------------------------------------------
       # ROCm — tylko Linux x86_64 (ARM Linux ROCm = tylko Instinct, pomijamy;
@@ -186,19 +205,23 @@ jobs:
           echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" \
             | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
-          # Zestaw komponentow potrzebny do llama.cpp/whisper.cpp GGML_HIP build:
-          sudo apt-get install -y \
-            hipcc \
-            rocm-hip-runtime-dev \
-            rocm-llvm \
-            rocm-cmake \
-            hipblas hipblas-dev \
-            rocblas rocblas-dev \
-            rocrand rocrand-dev \
-            rocsolver rocsolver-dev \
-            rocsparse rocsparse-dev \
-            rocthrust-dev \
-            hipcub-dev
+          # Zestaw komponentow potrzebny do llama.cpp/whisper.cpp GGML_HIP build.
+          # AMD CDN (repo.radeon.com) zrywa polaczenia przy duzych pobieraniach
+          # — retry 3x + `--fix-missing` laduje brakujace deby z drugiej proby.
+          ROCM_PKGS="hipcc rocm-hip-runtime-dev rocm-llvm rocm-cmake \
+            hipblas hipblas-dev rocblas rocblas-dev \
+            rocrand rocrand-dev rocsolver rocsolver-dev \
+            rocsparse rocsparse-dev rocthrust-dev hipcub-dev"
+          for attempt in 1 2 3; do
+            if sudo apt-get install -y --fix-missing $ROCM_PKGS; then
+              break
+            fi
+            echo "ROCm install attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
+          # Weryfikacja — jesli ktorys krytyczny pakiet nadal nie ma, fail glosno.
+          dpkg -s hipcc hipblas-dev rocblas-dev >/dev/null 2>&1 \
+            || { echo "ROCm install still incomplete after 3 attempts"; exit 1; }
           ROCM_VERSION=$(ls -d /opt/rocm-* 2>/dev/null | sed 's|/opt/rocm-||' | sort -V | tail -n1)
           echo "Installed ROCm: ${ROCM_VERSION:-unknown}"
           echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
