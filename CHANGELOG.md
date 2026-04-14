@@ -8,6 +8,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [0.0.1-alpha] - 2026-04-14
 
+### Added
+- TBD — describe the changes before tagging.
+
+
+## [0.0.1-alpha] - 2026-04-14
+
 First public alpha. Everything listed below has been implemented,
 compiled on Linux x86_64 + RTX 4090, and test-bootstrapped.
 
