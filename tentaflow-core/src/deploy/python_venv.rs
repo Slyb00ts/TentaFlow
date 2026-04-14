@@ -720,6 +720,25 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     }
     cmd.env("BUNDLE_DIR", &bundle_dir);
     cmd.env("VENV_DIR", venv);
+
+    // Ujednolicony katalog modeli — wymusza pobieranie z HF/torch do
+    // <tentaflow_home>/models/ zamiast domyslnego ~/.cache/huggingface.
+    // User nie ustawia tego w bundle.toml -> dostaje pre-set'y ponizej,
+    // ale moze nadpisac przez `req.env` (wtedy petla wyzej go wygra).
+    let _ = crate::paths::ensure_models_dirs();
+    let hf_cache = crate::paths::hf_cache_dir();
+    let torch_cache = crate::paths::torch_cache_dir();
+    for (k, v) in [
+        ("HF_HOME", hf_cache.clone()),
+        ("HUGGINGFACE_HUB_CACHE", hf_cache.clone()),
+        ("TRANSFORMERS_CACHE", hf_cache.clone()),
+        ("TORCH_HOME", torch_cache.clone()),
+    ] {
+        if !req.env.contains_key(k) {
+            cmd.env(k, &v);
+        }
+    }
+
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
     let child = cmd.spawn()
@@ -821,9 +840,9 @@ mod tests {
     #[test]
     fn pick_variant_matches_backend() {
         let variants = vec![
-            InstallVariant { backend: "cuda".into(), extra_index: Some("a".into()), extras: vec![], install_hint: None },
-            InstallVariant { backend: "rocm".into(), extra_index: Some("b".into()), extras: vec![], install_hint: None },
-            InstallVariant { backend: "metal".into(), extra_index: None, extras: vec!["vllm-metal".into()], install_hint: None },
+            InstallVariant { backend: "cuda".into(), extra_index: Some("a".into()), extras: vec![], extras_no_build_isolation: vec![], install_hint: None },
+            InstallVariant { backend: "rocm".into(), extra_index: Some("b".into()), extras: vec![], extras_no_build_isolation: vec![], install_hint: None },
+            InstallVariant { backend: "metal".into(), extra_index: None, extras: vec!["vllm-metal".into()], extras_no_build_isolation: vec![], install_hint: None },
         ];
         let v = pick_install_variant(&variants, "rocm").unwrap().unwrap();
         assert_eq!(v.backend, "rocm");

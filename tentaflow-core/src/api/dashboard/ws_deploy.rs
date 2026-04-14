@@ -289,12 +289,28 @@ async fn deploy_bundled_container(
         None
     };
 
+    // Ujednolicony katalog modeli — <tentaflow_home>/models/ mountowany do
+    // kontenera jako /data/models. Kontener pobiera modele tam zamiast do
+    // HF cache, a uzytkownik widzi wszystko obok binarki tentaflow.
+    let _ = crate::paths::ensure_models_dirs();
+    let models_root = crate::paths::models_root();
+    let mut volumes = parsed.volumes;
+    let models_mount = (models_root.display().to_string(), "/data/models".to_string());
+    if !volumes.iter().any(|(_, c)| c == "/data/models") {
+        volumes.push(models_mount);
+    }
+    // HF cache inside container -> /data/models/hf-cache (persisted on host).
+    env.entry("HF_HOME".into()).or_insert_with(|| "/data/models/hf-cache".to_string());
+    env.entry("HUGGINGFACE_HUB_CACHE".into()).or_insert_with(|| "/data/models/hf-cache".to_string());
+    env.entry("TRANSFORMERS_CACHE".into()).or_insert_with(|| "/data/models/hf-cache".to_string());
+    env.entry("TORCH_HOME".into()).or_insert_with(|| "/data/models/torch-cache".to_string());
+
     let deploy_req = crate::deploy::docker::DeployRequest {
         container: bundle_name.to_string(),
         image_tag: Some(format!("tentaflow/{}:latest", bundle_name)),
         instance_name,
         ports,
-        volumes: parsed.volumes,
+        volumes,
         env,
         gpu: parsed.gpu,
     };
