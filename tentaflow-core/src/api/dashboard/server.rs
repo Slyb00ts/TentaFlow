@@ -802,6 +802,15 @@ pub async fn handle_request(
         }
     }
 
+    // System capabilities — wizard startowy GUI pyta co maszyna potrafi.
+    // Nie wymaga featury docker; jesli brak Dockera/Podmana to caps.deploy_backends
+    // bedzie zawieralo tylko Native.
+    if path == "/api/system/capabilities" && method == Method::GET {
+        let caps = crate::system_check::collect();
+        let body = serde_json::to_string(&caps).unwrap_or_else(|_| "{}".into());
+        return Ok(json_response_cors(200, body, cors_origin.as_deref()));
+    }
+
     // Deploy API — lista wbudowanych kontenerow do deployu.
     if path == "/api/deploy/containers" && method == Method::GET {
         let containers = crate::deploy::list_containers().unwrap_or_default();
