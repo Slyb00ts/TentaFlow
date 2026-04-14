@@ -122,10 +122,12 @@ jobs:
         with:
           cuda: '12.6.2'
           method: 'network'
-          # Nazwy sub-packages zgodne z NVIDIA installer components (bez `_dev`
-          # suffix — Jimver 0.2.19 ich nie wspiera, fallback do pelnej kompilacji
-          # dziala i tak bez rozbicia dev/runtime).
-          sub-packages: '["nvcc", "cudart", "cublas", "curand", "cusolver", "cusparse", "nvrtc", "visual_studio_integration"]'
+          # Windows: NVIDIA installer dzieli kazdy komponent na runtime (`cublas`)
+          # i dev (`cublas_dev` = headers + .lib). CMake target_link_libraries
+          # (CUDA::cublas) wymaga .lib-ow, wiec _dev MUSZA byc w liscie.
+          # Jimver 0.2.19 poprawnie mapuje podkreslniki do Windows installer
+          # component names (inaczej niz na Linux gdzie byl problem z apt).
+          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "cusparse_dev", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
 
       - name: Export CUDA env (Windows)
         if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda')
