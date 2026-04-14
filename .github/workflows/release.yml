@@ -1,8 +1,11 @@
 # =============================================================================
 # File:        .github/workflows/release.yml
-# Description: Builds tentaflow release binaries per target on every v* tag and
-#              publishes a GitHub Release. install.sh/install.ps1 (bundled in
-#              the release) fetch the matching archive.
+# Description: Builds one monolithic tentaflow binary per platform with every
+#              available GPU backend compiled in (CUDA + ROCm + Vulkan + RDMA
+#              on Linux x86_64, CUDA + Vulkan on Linux aarch64 and Windows,
+#              Metal + MLX on macOS). At runtime tentaflow / llama.cpp-style
+#              ggml pick the best backend that the host actually has — same
+#              binary works on NVIDIA, AMD, Intel, CPU-only without rebuild.
 # =============================================================================
 
 name: release
@@ -14,7 +17,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # tworzenie release + upload assetow
+  contents: write
 
 jobs:
   build:
@@ -26,16 +29,21 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            archive: tar.gz
+            features: "rdma-probe,gpu-cuda,gpu-vulkan,gpu-rocm"
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-            archive: tar.gz
+            features: "gpu-cuda,gpu-vulkan"
           - target: aarch64-apple-darwin
             runner: macos-latest
-            archive: tar.gz
+            # Metal + MLX są wciągane cfg-target na macOS; tutaj bez feature flag.
+            features: ""
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            archive: zip
+            features: "gpu-cuda,gpu-vulkan"
+
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -47,19 +55,26 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install protoc (Linux)
+      # ---------------------------------------------------------------------
+      # Base build tools + protoc
+      # ---------------------------------------------------------------------
+      - name: Install base tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler cmake build-essential pkg-config \
+            libssl-dev git curl ca-certificates
 
-      - name: Install protoc (macOS)
+      - name: Install base tools (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf cmake
 
-      - name: Install protoc (Windows)
+      - name: Install base tools (Windows)
         if: runner.os == 'Windows'
-        run: choco install -y protoc cmake
+        run: choco install -y protoc cmake --no-progress
 
-      - name: Export PROTOC env (skip protobuf-src build)
+      - name: Export PROTOC env
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
@@ -67,14 +82,82 @@ jobs:
           else
             PROTOC_PATH=$(which protoc)
           fi
-          if [[ -z "$PROTOC_PATH" ]]; then
-            echo "protoc not found in PATH after install step" >&2
-            exit 1
-          fi
           echo "PROTOC=$PROTOC_PATH" >> "$GITHUB_ENV"
-          echo "Using protoc: $PROTOC_PATH"
           "$PROTOC_PATH" --version
 
+      # ---------------------------------------------------------------------
+      # CUDA Toolkit — Linux x86_64, Linux aarch64, Windows
+      # ---------------------------------------------------------------------
+      - name: Install CUDA toolkit
+        if: contains(matrix.features, 'gpu-cuda')
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.6.0'
+          method: 'network'
+          # Tylko podzbior potrzebny do kompilacji — nie instalujemy pelnego 3 GB stacku.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cudart_dev", "curand_dev", "cusolver_dev"]'
+
+      - name: Export CUDA env
+        if: contains(matrix.features, 'gpu-cuda')
+        shell: bash
+        run: |
+          echo "CUDA_PATH=$CUDA_PATH" >> "$GITHUB_ENV"
+          echo "CUDACXX=$CUDA_PATH/bin/nvcc" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      # Vulkan SDK — Linux i Windows (macOS ma Metal, nie potrzebuje)
+      # ---------------------------------------------------------------------
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux' && contains(matrix.features, 'gpu-vulkan')
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan.list \
+            "https://packages.lunarg.com/vulkan/lunarg-vulkan-${CODENAME}.list"
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+          vulkaninfo --summary || true
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && contains(matrix.features, 'gpu-vulkan')
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
+
+      # ---------------------------------------------------------------------
+      # ROCm — tylko Linux x86_64 (ARM Linux ROCm = tylko Instinct, pomijamy;
+      # Windows ROCm jest w preview, SDK install w CI niestabilny).
+      # ---------------------------------------------------------------------
+      - name: Install ROCm 7
+        if: contains(matrix.features, 'gpu-rocm')
+        run: |
+          sudo apt-get install -y wget gnupg
+          wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg
+          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/7.0 ${CODENAME} main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update
+          sudo apt-get install -y rocm-dev rocm-libs hipblas rocblas
+          echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
+          sudo ldconfig
+          echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+
+      # ---------------------------------------------------------------------
+      # RDMA — Linux (x86_64 ma libibverbs w apt; aarch64 tez ale bez fabric)
+      # ---------------------------------------------------------------------
+      - name: Install RDMA headers
+        if: contains(matrix.features, 'rdma-probe')
+        run: sudo apt-get install -y libibverbs-dev librdmacm-dev
+
+      # ---------------------------------------------------------------------
+      # Cache + build
+      # ---------------------------------------------------------------------
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -83,12 +166,21 @@ jobs:
             ~/.cargo/git
             tentaflow/target
             tentaflow-core/target
-          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ matrix.target }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build tentaflow
+      - name: Build tentaflow (all available GPU backends)
         working-directory: tentaflow
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
+      # ---------------------------------------------------------------------
+      # Pack artifacts
+      # ---------------------------------------------------------------------
       - name: Stage artifacts (Unix)
         if: runner.os != 'Windows'
         shell: bash
