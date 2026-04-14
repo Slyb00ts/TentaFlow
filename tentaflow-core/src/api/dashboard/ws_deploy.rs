@@ -448,6 +448,27 @@ networks:
     }
 
     #[test]
+    fn parse_compose_handles_multiple_device_ids() {
+        // Wizard z multi-select: 2 z 6 GPU wybrane (0 i 4)
+        let yaml = r#"
+services:
+  llm:
+    image: x
+    container_name: x
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '4']
+              capabilities: [gpu]
+"#;
+        let p = parse_compose_for_bundle(yaml).expect("parse");
+        assert!(p.gpu);
+        assert_eq!(p.env.get("NVIDIA_VISIBLE_DEVICES").unwrap(), "0,4");
+    }
+
+    #[test]
     fn parse_compose_handles_gpu_all() {
         let yaml = r#"
 services:

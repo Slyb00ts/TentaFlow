@@ -80,6 +80,111 @@ const LLMDeployWizard = (() => {
   let deployMode = 'docker';
   let searchDebounceTimer = null;
 
+  // ---- GPU multi-select helpers -------------------------------------------
+
+  // Normalizuje wartosc do tablicy stringow ('all' albo ['0','2'])
+  function normalizeGpuIds(value) {
+    if (Array.isArray(value)) {
+      const cleaned = value.map(String).filter(Boolean);
+      return cleaned.length > 0 ? cleaned : ['all'];
+    }
+    if (!value || value === 'all') return ['all'];
+    return [String(value)];
+  }
+
+  // Etykieta summary dla aktualnego wyboru
+  function gpuSelectionLabel(gpuIds, hostGpus) {
+    const ids = normalizeGpuIds(gpuIds);
+    if (ids.includes('all')) return 'Wszystkie GPU';
+    if (ids.length === 0) return 'Wszystkie GPU';
+    if (ids.length === 1) {
+      const info = hostGpus.find(g => String(g.index) === ids[0]);
+      return info
+        ? `GPU ${info.index}: ${info.name} (${Math.round(info.vram_total_mb / 1024)} GB)`
+        : `GPU ${ids[0]}`;
+    }
+    return `${ids.length} x GPU (${ids.map(i => `GPU ${i}`).join(', ')})`;
+  }
+
+  // Podpiecie eventow do GPU dropdown (mount po kazdym re-renderze)
+  function mountGpuMultiSelect() {
+    const container = document.getElementById('llm-gpu-dropdown');
+    if (!container) return;
+
+    const summary = container.querySelector('.llm-gpu-summary');
+    const allCb = container.querySelector('.llm-gpu-cb-all');
+    const cbs = Array.from(container.querySelectorAll('.llm-gpu-cb'));
+
+    const updateState = () => {
+      const picked = cbs.filter(c => c.checked).map(c => c.value);
+      if (allCb && allCb.checked) {
+        params.gpuIds = ['all'];
+        cbs.forEach(c => { c.checked = false; c.disabled = true; });
+      } else if (picked.length === 0) {
+        // zadne wybrane -> traktuj jak "all"
+        params.gpuIds = ['all'];
+        if (allCb) allCb.checked = true;
+        cbs.forEach(c => { c.disabled = true; });
+      } else {
+        params.gpuIds = picked;
+        cbs.forEach(c => { c.disabled = false; });
+      }
+      params.gpuId = params.gpuIds.length === 1 ? params.gpuIds[0] : 'all';
+      if (summary) summary.textContent = gpuSelectionLabel(params.gpuIds, hostGpus);
+    };
+
+    if (allCb) {
+      allCb.addEventListener('change', () => {
+        if (allCb.checked) {
+          cbs.forEach(c => { c.checked = false; });
+        }
+        updateState();
+      });
+    }
+    cbs.forEach(cb => {
+      cb.addEventListener('change', () => {
+        if (cb.checked && allCb) allCb.checked = false;
+        updateState();
+      });
+    });
+    updateState();
+  }
+
+  // Renderuje dropdown z checkboxami (summary + details)
+  function renderGpuMultiSelect(hostGpus, gpuIds) {
+    const ids = normalizeGpuIds(gpuIds);
+    const isAll = ids.includes('all');
+    const items = hostGpus.length > 0
+      ? hostGpus
+      : [{ index: 0, name: 'GPU 0', vram_total_mb: 0 }];
+
+    const checkboxes = items.map(g => {
+      const idx = String(g.index);
+      const checked = !isAll && ids.includes(idx) ? 'checked' : '';
+      const vram = g.vram_total_mb > 0 ? ` (${Math.round(g.vram_total_mb / 1024)} GB)` : '';
+      return `
+        <label class="llm-gpu-option">
+          <input type="checkbox" class="llm-gpu-cb" value="${idx}" ${checked}>
+          GPU ${idx}: ${Utils.escapeHtml(g.name)}${vram}
+        </label>
+      `;
+    }).join('');
+
+    return `
+      <details id="llm-gpu-dropdown" class="llm-gpu-dropdown">
+        <summary class="form-input llm-gpu-summary">${Utils.escapeHtml(gpuSelectionLabel(ids, hostGpus))}</summary>
+        <div class="llm-gpu-options">
+          <label class="llm-gpu-option">
+            <input type="checkbox" class="llm-gpu-cb-all" ${isAll ? 'checked' : ''}>
+            <strong>Wszystkie GPU</strong>
+          </label>
+          <hr class="llm-gpu-sep">
+          ${checkboxes}
+        </div>
+      </details>
+    `;
+  }
+
   // Otwarcie wizarda
   async function open(nodeIdParam) {
     nodeId = nodeIdParam;
@@ -93,6 +198,7 @@ const LLMDeployWizard = (() => {
     params = {
       port: 5010,
       gpuId: 'all',
+      gpuIds: ['all'],
       shmSize: '16g',
       gpuMemoryUtilization: 0.9,
     };
@@ -298,14 +404,8 @@ const LLMDeployWizard = (() => {
           <input type="number" id="llm-port" value="${Utils.escapeAttr(params.port)}" min="1" max="65535">
         </div>
         <div class="form-group">
-          <label for="llm-gpu">GPU</label>
-          <select id="llm-gpu">
-            <option value="all" ${params.gpuId === 'all' ? 'selected' : ''}>All GPUs</option>
-            ${hostGpus.length > 0
-              ? hostGpus.map(g => `<option value="${g.index}" ${params.gpuId === String(g.index) ? 'selected' : ''}>GPU ${g.index}: ${Utils.escapeHtml(g.name)} (${Math.round(g.vram_total_mb / 1024)} GB)</option>`).join('')
-              : `<option value="0" ${params.gpuId === '0' ? 'selected' : ''}>GPU 0</option>`
-            }
-          </select>
+          <label>GPU</label>
+          ${renderGpuMultiSelect(hostGpus, params.gpuIds)}
         </div>
         <div class="form-group">
           <label for="llm-shm">SHM Size</label>
@@ -370,13 +470,7 @@ const LLMDeployWizard = (() => {
     const engineName = engineDef ? engineDef.name : selectedEngine;
     const modelDef = MODELS.find(m => m.id === selectedModel);
     const modelName = modelDef ? modelDef.name : selectedModel;
-    let gpuLabel = 'All GPUs';
-    if (params.gpuId !== 'all') {
-      const gpuInfo = hostGpus.find(g => String(g.index) === String(params.gpuId));
-      gpuLabel = gpuInfo
-        ? `GPU ${gpuInfo.index}: ${Utils.escapeHtml(gpuInfo.name)} (${Math.round(gpuInfo.vram_total_mb / 1024)} GB)`
-        : `GPU ${Utils.escapeHtml(params.gpuId)}`;
-    }
+    const gpuLabel = Utils.escapeHtml(gpuSelectionLabel(params.gpuIds || params.gpuId, hostGpus));
 
     const showGpuMem = selectedEngine === 'sglang' || selectedEngine === 'vllm';
 
@@ -552,12 +646,7 @@ const LLMDeployWizard = (() => {
       });
     }
 
-    const gpuSelect = document.getElementById('llm-gpu');
-    if (gpuSelect) {
-      gpuSelect.addEventListener('change', () => {
-        params.gpuId = gpuSelect.value;
-      });
-    }
+    mountGpuMultiSelect();
 
     const shmSelect = document.getElementById('llm-shm');
     if (shmSelect) {

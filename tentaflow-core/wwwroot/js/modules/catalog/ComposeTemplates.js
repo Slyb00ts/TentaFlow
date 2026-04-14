@@ -46,29 +46,32 @@ const ComposeTemplates = (() => {
     bms: false,
   };
 
-  // Generowanie sekcji GPU deploy
-  function gpuSection(gpuId, indent) {
+  // Generowanie sekcji GPU deploy.
+  // Akceptuje:
+  //   - string 'all'      -> count: all
+  //   - string '0'        -> device_ids: ['0']
+  //   - array ['0','2']   -> device_ids: ['0','2']
+  //   - array ['all']     -> count: all
+  function gpuSection(gpuSelection, indent) {
     const pad = ' '.repeat(indent);
-    if (gpuId === 'all') {
-      return [
-        `${pad}deploy:`,
-        `${pad}  resources:`,
-        `${pad}    reservations:`,
-        `${pad}      devices:`,
-        `${pad}        - driver: nvidia`,
-        `${pad}          count: all`,
-        `${pad}          capabilities: [gpu]`,
-      ].join('\n');
-    }
-    return [
+    const ids = Array.isArray(gpuSelection) ? gpuSelection : [gpuSelection];
+    const isAll = ids.length === 0 || ids.includes('all');
+
+    const header = [
       `${pad}deploy:`,
       `${pad}  resources:`,
       `${pad}    reservations:`,
       `${pad}      devices:`,
       `${pad}        - driver: nvidia`,
-      `${pad}          device_ids: ['${gpuId}']`,
-      `${pad}          capabilities: [gpu]`,
-    ].join('\n');
+    ];
+    if (isAll) {
+      header.push(`${pad}          count: all`);
+    } else {
+      const list = ids.map(i => `'${String(i)}'`).join(', ');
+      header.push(`${pad}          device_ids: [${list}]`);
+    }
+    header.push(`${pad}          capabilities: [gpu]`);
+    return header.join('\n');
   }
 
   // Sekcja networks na koncu pliku
@@ -91,7 +94,7 @@ const ComposeTemplates = (() => {
     const port = params.port || INTERNAL_PORTS[serviceId];
     const internalPort = INTERNAL_PORTS[serviceId];
     const configDir = params.configDir || defaultConfigDir(serviceId);
-    const gpuId = params.gpuId || '0';
+    const gpuId = params.gpuIds && params.gpuIds.length > 0 ? params.gpuIds : (params.gpuId || "0");
     const hasGpu = GPU_SERVICES[serviceId];
 
     // Wolumeny bazowe - TTS/STT maja wbudowane modele i config w obrazie
@@ -288,7 +291,7 @@ const ComposeTemplates = (() => {
   // Wspolny szablon compose dla silnikow GPU inference (SGLang, vLLM)
   function gpuInferenceTemplate(image, params) {
     const port = params.port || INTERNAL_PORTS.llm;
-    const gpuId = params.gpuId || '0';
+    const gpuId = params.gpuIds && params.gpuIds.length > 0 ? params.gpuIds : (params.gpuId || "0");
     const hfToken = params.hfToken || '';
     const modelId = params.modelId || '';
     const shmSize = params.shmSize || '16g';
@@ -336,7 +339,7 @@ const ComposeTemplates = (() => {
   // Generator compose dla Ollama
   function ollama(params) {
     const port = params.port || INTERNAL_PORTS.llm;
-    const gpuId = params.gpuId || '0';
+    const gpuId = params.gpuIds && params.gpuIds.length > 0 ? params.gpuIds : (params.gpuId || "0");
     const shmSize = params.shmSize || '16g';
     const cname = params.containerName || 'tentaflow-llm';
     const dataDir = `${BASE_PATHS.config}/llm/${cname}`;
@@ -368,7 +371,7 @@ const ComposeTemplates = (() => {
   // Generator compose dla LLama.cpp
   function llamacpp(params) {
     const port = params.port || INTERNAL_PORTS.llm;
-    const gpuId = params.gpuId || '0';
+    const gpuId = params.gpuIds && params.gpuIds.length > 0 ? params.gpuIds : (params.gpuId || "0");
     const ggufPath = params.ggufPath || '';
     const shmSize = params.shmSize || '16g';
     const cname = params.containerName || 'tentaflow-llm';
