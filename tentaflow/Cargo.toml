@@ -30,6 +30,10 @@ http-body = "1"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
+# Self-update — `tentaflow update` pobiera nowsza wersje z GitHub Releases
+# i podmienia biezaca binarke (external updater process — Windows nie blokuje
+# pliku w trakcie kopiowania).
+axoupdater = { version = "0.9", features = ["blocking"] }
 
 # MLX inference — tylko na macOS (mlx-rs wymaga Metal)
 [target.'cfg(target_os = "macos")'.dependencies]

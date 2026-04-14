@@ -5,6 +5,7 @@ python_version = "3.12"
 source = "git"
 git_repo = "https://github.com/sgl-project/sglang.git"
 git_ref = "main"
+install_subdir = "python"
 
 [launch]
 command = "python"
