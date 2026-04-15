@@ -324,12 +324,14 @@ jobs:
               runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
               ''
             }}
-          # cl.exe czyta CL env i applyuje flagi do KAZDEGO wywolania,
-          # lacznie z zagniezdzonymi try_compile w cmake ExternalProject
-          # (vulkan-shaders-gen). Bez /FS rownolegle cl.exe z MSBuild /m:4
-          # krasha sie o ten sam vc143.pdb (error C1041).
-          CL: /FS
+          # cl.exe czyta _CL_ (POST-append) i dodaje /FS do KAZDEGO wywolania.
+          # Uzywamy _CL_ a nie CL (pre-append) bo CL prependuje /FS przed
+          # `/?` ktore cmake wywoluje dla compiler version probe — psuje
+          # parsing i outer cmake w whisper-rs-sys failuje z "compiler unknown".
+          # CMAKE_BUILD_PARALLEL_LEVEL=1 serializuje MSBuild zeby zagniezdzone
+          # ExternalProject TryCompile (vulkan-shaders-gen) nie walczyly o PDB.
           _CL_: /FS
+          CMAKE_BUILD_PARALLEL_LEVEL: 1
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
