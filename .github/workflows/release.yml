@@ -381,15 +381,16 @@ jobs:
               runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
               ''
             }}
-          # MSBuild na Windows forkuje N cl.exe dla kazdego vcxproj w trybie
-          # rownoleglym. TryCompile cmake'a (Debug config -> /Zi -> PDB)
-          # wywoluje MSBuild w zagniezdzonym ExternalProject vulkan-shaders-gen
-          # - rownolegle cl.exe wpadaja na ten sam vc143.pdb -> C1041.
-          # MSBUILDMAXCPUCOUNT=1 jest czytany bezposrednio przez MSBuild
-          # (nie przez cmake-rs, nie propagowany jako -D cache var), wiec
-          # nie truje cmake compiler-id probe.
-          MSBUILDMAXCPUCOUNT: 1
-          UseMultiToolTask: "false"
+          # ExternalProject vulkan-shaders-gen (zagniezdzone cmake + MSBuild
+          # z TryCompile) dostaje rownolegle cl.exe z domyslnego /MP i wszystkie
+          # pisza do tego samego vc143.pdb -> C1041.
+          # CFLAGS/CXXFLAGS env sa czytane przez cmake jako CMAKE_*_FLAGS_INIT
+          # TYLKO dla projektow ktore nie ustawiaja flag jawnie (czyli wlasnie
+          # INNER ExternalProject). Outer whisper-rs-sys / llama-cpp-sys-2
+          # ustawiaja -DCMAKE_C_FLAGS jawnie → env jest ignorowane, wiec
+          # compiler-id probe (ktory byl wywolany przez CL=/FS) pozostaje czysty.
+          CFLAGS: /FS
+          CXXFLAGS: /FS
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
