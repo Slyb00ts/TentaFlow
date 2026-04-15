@@ -57,6 +57,41 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Free disk space (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # CUDA 13.2 (~8GB) + Vulkan + LLVM + cargo target przekraczaja
+          # domyslne ~14GB wolnego na C:. Kasujemy SDK ktorych nie uzywamy.
+          $before = (Get-PSDrive C).Free / 1GB
+          Write-Host ("Free before: {0:N1} GB" -f $before)
+          $paths = @(
+            "C:\Android",
+            "C:\Program Files\Android",
+            "C:\Program Files (x86)\Android",
+            "C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk",
+            "C:\Program Files\MySQL",
+            "C:\Program Files\MongoDB",
+            "C:\Program Files\R",
+            "C:\Program Files\Google",
+            "C:\Program Files (x86)\Google",
+            "C:\Program Files\Unity Hub",
+            "C:\tools\kotlinc",
+            "C:\cabal",
+            "C:\ghcup",
+            "C:\hostedtoolcache\windows\stack",
+            "C:\hostedtoolcache\windows\Ruby",
+            "C:\SeleniumWebDrivers"
+          )
+          foreach ($p in $paths) {
+            if (Test-Path $p) {
+              Write-Host "Removing $p"
+              Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $after = (Get-PSDrive C).Free / 1GB
+          Write-Host ("Free after: {0:N1} GB (freed {1:N1} GB)" -f $after, ($after - $before))
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
