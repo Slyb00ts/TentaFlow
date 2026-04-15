@@ -119,36 +119,38 @@ jobs:
           echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
           /usr/local/cuda-12.6/bin/nvcc --version
 
-      - name: Install CUDA (Windows) — attempt 1 (local installer)
-        id: cuda_win_1
+      - name: Install CUDA (Windows) via chocolatey
         if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda')
-        continue-on-error: true
-        uses: Jimver/cuda-toolkit@v0.2.19
-        with:
-          cuda: '12.6.2'
-          method: 'local'
-          # Full offline installer (~3 GB) — omija flaky per-component
-          # network download z ktorego wynikal exit 3772776473.
-          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "cusparse_dev", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
-          use-github-cache: false
-          use-local-cache: false
-
-      - name: Install CUDA (Windows) — attempt 2 (retry)
-        if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda') && steps.cuda_win_1.outcome == 'failure'
-        uses: Jimver/cuda-toolkit@v0.2.19
-        with:
-          cuda: '12.6.2'
-          method: 'local'
-          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "cusparse_dev", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
-          use-github-cache: false
-          use-local-cache: false
-
-      - name: Export CUDA env (Windows)
-        if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda')
-        shell: bash
+        shell: pwsh
         run: |
-          echo "CUDA_PATH=$CUDA_PATH" >> "$GITHUB_ENV"
-          echo "CUDACXX=$CUDA_PATH/bin/nvcc.exe" >> "$GITHUB_ENV"
+          # Jimver network + local method oba pada z exit 3772776473 na Azure
+          # Windows runners (NVIDIA installer flake od strony Microsoft IO).
+          # Chocolatey wraps ten sam installer ale ze swoim retry + tmp w
+          # C:\ProgramData\chocolatey\lib (nie D:\a\TentaFlow/...).
+          $MaxAttempts = 3
+          for ($i = 1; $i -le $MaxAttempts; $i++) {
+            Write-Host "Attempt $i/$MaxAttempts - choco install cuda"
+            choco install cuda --version=12.6.2.561 -y --no-progress `
+              --timeout=7200 --ignore-detected-reboot
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "CUDA install OK"
+              break
+            }
+            if ($i -lt $MaxAttempts) {
+              Write-Host "Attempt failed, waiting 30s..."
+              Start-Sleep -Seconds 30
+            }
+          }
+          if ($LASTEXITCODE -ne 0) { throw "CUDA install failed after $MaxAttempts attempts" }
+          # Choco instaluje do "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+          $cudaPath = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" `
+            -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending `
+            | Select-Object -First 1
+          if (-not $cudaPath) { throw "CUDA dir not found after install" }
+          echo "CUDA_PATH=$($cudaPath.FullName)" >> $env:GITHUB_ENV
+          echo "CUDACXX=$($cudaPath.FullName)\bin\nvcc.exe" >> $env:GITHUB_ENV
+          echo "$($cudaPath.FullName)\bin" >> $env:GITHUB_PATH
+          & "$($cudaPath.FullName)\bin\nvcc.exe" --version
 
       # ---------------------------------------------------------------------
       # Vulkan SDK — Linux i Windows (macOS ma Metal, nie potrzebuje)
@@ -212,33 +214,33 @@ jobs:
           wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key \
             | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg
           CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          # `latest` AMD symlinkuje na najnowszy release, ale meta-paczki
-          # (`rocm-dev`, `rocm-utils`) bywaja uploadowane z opoznieniem —
-          # ich indeksy juz sa w Release ale pool/ ma 404. Zamiast polegac
-          # na meta-packageach, instalujemy konkretne biblioteki (wszystkie
-          # w pool/ zawsze sa — to ich index zostaje przy meta-upload flake).
           echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/latest ${CODENAME} main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list
-          echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" \
-            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          # Bez agresywnego pinowania — pin=600 wczesniej forsowalo apt do
+          # preferowania ROCm wersji nawet dla libs ktore nie sa ROCm (libnl,
+          # librdmacm), psujac deps przy RDMA install. Pin=500 zrownuje nasz
+          # priorytet z default Debian/Ubuntu, apt sam wybierze najlepsze.
+          echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 500" \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-500
           sudo apt-get update
-          # Zestaw komponentow potrzebny do llama.cpp/whisper.cpp GGML_HIP build.
-          # AMD CDN (repo.radeon.com) zrywa polaczenia przy duzych pobieraniach
-          # — retry 3x + `--fix-missing` laduje brakujace deby z drugiej proby.
-          ROCM_PKGS="hipcc rocm-hip-runtime-dev rocm-llvm rocm-cmake \
-            hipblas hipblas-dev rocblas rocblas-dev \
-            rocrand rocrand-dev rocsolver rocsolver-dev \
-            rocsparse rocsparse-dev rocthrust-dev hipcub-dev"
+          # `rocm-hip-sdk` to oficjalny AMD meta-pakiet HIP SDK — wciaga
+          # wszystkie deps (hipcc + rocm-llvm + comgr + hipblaslt + rocblas +
+          # rocsolver + reszta) z zgodnymi wersjami. Omija cherry-picking
+          # ktory zostawial niezgodne zaleznosci. Plus dodatkowe dev headers
+          # ktorych ggml-hip CMake szuka.
+          ROCM_PKGS="rocm-hip-sdk rocm-hip-runtime-dev rocm-cmake \
+            rocthrust-dev hipcub-dev rocprim-dev"
           for attempt in 1 2 3; do
-            if sudo apt-get install -y --fix-missing $ROCM_PKGS; then
+            if sudo apt-get install -y $ROCM_PKGS; then
               break
             fi
-            echo "ROCm install attempt $attempt failed, retrying in 10s..."
-            sleep 10
+            echo "ROCm install attempt $attempt failed, retrying in 15s..."
+            sleep 15
+            sudo apt-get update
           done
-          # Weryfikacja — jesli ktorys krytyczny pakiet nadal nie ma, fail glosno.
+          # Sanity check — kluczowe biblioteki musza byc
           dpkg -s hipcc hipblas-dev rocblas-dev >/dev/null 2>&1 \
-            || { echo "ROCm install still incomplete after 3 attempts"; exit 1; }
+            || { echo "ROCm install incomplete after 3 attempts"; exit 1; }
           ROCM_VERSION=$(ls -d /opt/rocm-* 2>/dev/null | sed 's|/opt/rocm-||' | sort -V | tail -n1)
           echo "Installed ROCm: ${ROCM_VERSION:-unknown}"
           echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
