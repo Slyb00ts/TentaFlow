@@ -324,6 +324,12 @@ jobs:
               runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
               ''
             }}
+          # cl.exe czyta CL env i applyuje flagi do KAZDEGO wywolania,
+          # lacznie z zagniezdzonymi try_compile w cmake ExternalProject
+          # (vulkan-shaders-gen). Bez /FS rownolegle cl.exe z MSBuild /m:4
+          # krasha sie o ten sam vc143.pdb (error C1041).
+          CL: /FS
+          _CL_: /FS
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
