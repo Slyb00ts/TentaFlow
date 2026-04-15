@@ -79,7 +79,15 @@ jobs:
 
       - name: Install base tools (Windows)
         if: runner.os == 'Windows'
-        run: choco install -y protoc cmake --no-progress
+        shell: pwsh
+        run: |
+          # cmake 4.x (choco default) lamie ExternalProject + VS generator
+          # detekcje kompilatora -> whisper.cpp/ggml vulkan-shaders-gen
+          # sub-build failuje z "No CMAKE_C_COMPILER could be found".
+          # ggml supportuje cmake 3.x — pinujemy stabilne 3.31.x.
+          choco install -y protoc --no-progress
+          choco install -y cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' --no-progress
+          cmake --version
 
       - name: Export PROTOC env
         shell: bash
