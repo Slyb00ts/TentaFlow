@@ -130,7 +130,12 @@ jobs:
           $MaxAttempts = 3
           for ($i = 1; $i -le $MaxAttempts; $i++) {
             Write-Host "Attempt $i/$MaxAttempts - choco install cuda"
-            choco install cuda --version=12.6.2.561 -y --no-progress `
+            # Bez --version — chocolatey rebumpuje paczke co CUDA release,
+            # a wersje typu 12.6.2.561 znikaja z indexu po kolejnych bumpach.
+            # Bierzemy cokolwiek community.chocolatey.org aktualnie hostuje;
+            # ggml/llama.cpp linkuja przez CUDART 12 API (API-stable), wiec
+            # kazda 12.x (lub nowsze, 13.x) dziala.
+            choco install cuda -y --no-progress `
               --timeout=7200 --ignore-detected-reboot
             if ($LASTEXITCODE -eq 0) {
               Write-Host "CUDA install OK"
@@ -232,10 +237,17 @@ jobs:
           echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" \
             | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
-          # `rocm-hip-sdk` to oficjalny AMD meta-pakiet. Wciaga komplet deps:
-          # hipcc + rocm-llvm + comgr + hipblaslt + rocblas + rocsolver + ...
-          # wszystko w zgodnych wersjach. Plus extra dev headers dla ggml-hip.
-          ROCM_PKGS="rocm-hip-sdk rocm-hip-runtime-dev rocm-cmake \
+          # NIE uzywamy `rocm-hip-sdk` / `rocm-hip-runtime` meta-packageow —
+          # AMD CDN ma niekompletny pool dla tych meta .deb (7.2.1.70201
+          # zwraca 404 na rocm-hip-runtime_*.deb mimo obecnosci w Packages
+          # index). Zamiast tego instalujemy konkretne biblioteki ktorych
+          # ggml-hip / llama.cpp HIP backend faktycznie potrzebuje —
+          # omijamy brakujacy meta plik.
+          ROCM_PKGS="hipcc hip-dev hip-runtime-amd hsa-rocr-dev \
+            hipblas hipblas-dev rocblas rocblas-dev \
+            rocsolver rocsolver-dev rocsparse rocsparse-dev \
+            rocrand rocrand-dev hiprand-dev \
+            rocm-device-libs rocm-llvm rocm-cmake comgr \
             rocthrust-dev hipcub-dev rocprim-dev"
           for attempt in 1 2 3; do
             if sudo apt-get install -y $ROCM_PKGS; then
@@ -245,7 +257,7 @@ jobs:
             sleep 15
             sudo apt-get update
           done
-          dpkg -s hipcc hipblas-dev rocblas-dev >/dev/null 2>&1 \
+          dpkg -s hipcc hipblas-dev rocblas-dev hip-dev >/dev/null 2>&1 \
             || { echo "ROCm install incomplete after 3 attempts"; exit 1; }
           ROCM_VERSION=$(ls -d /opt/rocm-* 2>/dev/null | sed 's|/opt/rocm-||' | sort -V | tail -n1)
           echo "Installed ROCm: ${ROCM_VERSION:-unknown}"
