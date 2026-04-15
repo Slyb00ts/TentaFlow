@@ -324,13 +324,12 @@ jobs:
               runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
               ''
             }}
-          # cl.exe czyta _CL_ (POST-append) i dodaje /FS do KAZDEGO wywolania.
-          # Uzywamy _CL_ a nie CL (pre-append) bo CL prependuje /FS przed
-          # `/?` ktore cmake wywoluje dla compiler version probe — psuje
-          # parsing i outer cmake w whisper-rs-sys failuje z "compiler unknown".
-          # CMAKE_BUILD_PARALLEL_LEVEL=1 serializuje MSBuild zeby zagniezdzone
-          # ExternalProject TryCompile (vulkan-shaders-gen) nie walczyly o PDB.
-          _CL_: /FS
+          # CL=/FS ani _CL_=/FS nie dzialaja — cmake compiler probe kompiluje
+          # try_compile BEZ debug info, cl.exe wtedy warnuje na /FS, warning
+          # leci na stderr, cmake parser sie wywala ("compiler unknown").
+          # Zamiast tego serializujemy MSBuild globalnie: rownolegle cl.exe
+          # nie moga wtedy walczyc o ten sam vc143.pdb w zagniezdzonym
+          # ExternalProject TryCompile (vulkan-shaders-gen).
           CMAKE_BUILD_PARALLEL_LEVEL: 1
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
