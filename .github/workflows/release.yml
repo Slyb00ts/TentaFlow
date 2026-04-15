@@ -324,13 +324,15 @@ jobs:
               runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
               ''
             }}
-          # CL=/FS ani _CL_=/FS nie dzialaja — cmake compiler probe kompiluje
-          # try_compile BEZ debug info, cl.exe wtedy warnuje na /FS, warning
-          # leci na stderr, cmake parser sie wywala ("compiler unknown").
-          # Zamiast tego serializujemy MSBuild globalnie: rownolegle cl.exe
-          # nie moga wtedy walczyc o ten sam vc143.pdb w zagniezdzonym
-          # ExternalProject TryCompile (vulkan-shaders-gen).
-          CMAKE_BUILD_PARALLEL_LEVEL: 1
+          # MSBuild na Windows forkuje N cl.exe dla kazdego vcxproj w trybie
+          # rownoleglym. TryCompile cmake'a (Debug config -> /Zi -> PDB)
+          # wywoluje MSBuild w zagniezdzonym ExternalProject vulkan-shaders-gen
+          # - rownolegle cl.exe wpadaja na ten sam vc143.pdb -> C1041.
+          # MSBUILDMAXCPUCOUNT=1 jest czytany bezposrednio przez MSBuild
+          # (nie przez cmake-rs, nie propagowany jako -D cache var), wiec
+          # nie truje cmake compiler-id probe.
+          MSBUILDMAXCPUCOUNT: 1
+          UseMultiToolTask: "false"
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
