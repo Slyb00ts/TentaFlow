@@ -82,18 +82,34 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # cmake 4.x (choco default) lamie ExternalProject + VS generator
-          # detekcje kompilatora -> whisper.cpp/ggml vulkan-shaders-gen
-          # sub-build failuje z "No CMAKE_C_COMPILER could be found".
-          # ggml supportuje cmake 3.x — pinujemy stabilne 3.31.x.
+          # protoc z choco — stabilna paczka.
           choco install -y protoc --no-progress
           if ($LASTEXITCODE -ne 0) { throw "protoc install failed (exit $LASTEXITCODE)" }
-          choco install -y cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' --no-progress --force
-          if ($LASTEXITCODE -ne 0) { throw "cmake install failed (exit $LASTEXITCODE)" }
-          # Choco shims lezaw w C:\ProgramData\chocolatey\bin (juz w PATH na runner);
-          # weryfikujemy oba narzedzia zanim kolejne kroki ich uzyja.
+
+          # cmake 4.x (choco default) lamie ExternalProject VS generator
+          # compiler detection dla ggml/whisper. Pobieramy stabilne 3.31.6
+          # bezposrednio z cmake.org — choco mial 504 Gateway Timeout.
+          $cmakeVer = "3.31.6"
+          $zipUrl = "https://github.com/Kitware/CMake/releases/download/v$cmakeVer/cmake-$cmakeVer-windows-x86_64.zip"
+          $zipPath = "$env:RUNNER_TEMP\cmake.zip"
+          $extractDir = "$env:RUNNER_TEMP\cmake"
+          Write-Host "Downloading $zipUrl"
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+              break
+            } catch {
+              if ($i -eq 3) { throw }
+              Write-Host "Download attempt $i failed, retrying..."
+              Start-Sleep -Seconds 10
+            }
+          }
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+          $cmakeBin = (Get-ChildItem "$extractDir" -Directory | Select-Object -First 1).FullName + "\bin"
+          # Prepend zeby nasz cmake bil cmake'a z runner image.
+          echo $cmakeBin >> $env:GITHUB_PATH
+          & "$cmakeBin\cmake.exe" --version
           & "C:\ProgramData\chocolatey\bin\protoc.exe" --version
-          cmake --version
 
       - name: Export PROTOC env
         shell: bash
