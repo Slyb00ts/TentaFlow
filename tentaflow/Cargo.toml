@@ -9,6 +9,7 @@ rdma-probe = ["tentaflow-core/rdma-probe"]
 gpu-cuda = ["tentaflow-core/gpu-cuda"]
 gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
 gpu-rocm = ["tentaflow-core/gpu-rocm"]
+gpu-metal = ["tentaflow-core/gpu-metal"]
 
 [dependencies]
 tentaflow-core = { path = "../tentaflow-core", features = ["docker", "dashboard-api", "metrics-prometheus", "inference-diarization"] }
