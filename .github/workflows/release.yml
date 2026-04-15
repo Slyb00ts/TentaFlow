@@ -122,12 +122,12 @@ jobs:
         with:
           cuda: '12.6.2'
           method: 'network'
-          # Windows: NVIDIA installer dzieli kazdy komponent na runtime (`cublas`)
-          # i dev (`cublas_dev` = headers + .lib). CMake target_link_libraries
-          # (CUDA::cublas) wymaga .lib-ow, wiec _dev MUSZA byc w liscie.
-          # Jimver 0.2.19 poprawnie mapuje podkreslniki do Windows installer
-          # component names (inaczej niz na Linux gdzie byl problem z apt).
           sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "cusparse_dev", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
+          # Wylaczone cache — kiedy GH cache service ma 400/500, Jimver zapisuje
+          # uszkodzone artefakty i przy kolejnym restore CUDA installer pada
+          # z exit 3772776473. Pobierz za kazdym razem.
+          use-github-cache: false
+          use-local-cache: false
 
       - name: Export CUDA env (Windows)
         if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda')
@@ -259,6 +259,15 @@ jobs:
       - name: Build tentaflow (all available GPU backends)
         working-directory: tentaflow
         shell: bash
+        env:
+          # .cargo/config.toml ustawia to w workspace, ale kiedy cargo startuje
+          # z tentaflow/ i GH Actions ustawi RUSTFLAGS z innych powodow, config
+          # jest ignorowany (RUSTFLAGS env wygrywa). Eksplicytnie laczymy:
+          # whisper-rs-sys + llama-cpp-sys-2 bundluja kopie ggml -> linker
+          # dostaje multiple definition dla wszystkich quantize_* funkcji.
+          # --allow-multiple-definition bierze pierwsza definicje (ta sama
+          # binarnie, wiec bez roznicy).
+          RUSTFLAGS: ${{ runner.os != 'Windows' && '-C link-arg=-Wl,--allow-multiple-definition' || '' }}
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
