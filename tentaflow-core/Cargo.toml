@@ -17,6 +17,7 @@ rdma-probe = []
 gpu-cuda = ["inference-llamacpp", "llama-cpp-2/cuda", "whisper-rs/cuda"]
 gpu-vulkan = ["inference-llamacpp", "llama-cpp-2/vulkan", "whisper-rs/vulkan"]
 gpu-rocm = ["inference-llamacpp", "llama-cpp-2/rocm", "whisper-rs/hipblas"]
+gpu-metal = ["inference-llamacpp", "llama-cpp-2/metal", "whisper-rs/metal"]
 
 [dependencies]
 # Protocol (zawsze)

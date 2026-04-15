@@ -37,9 +37,12 @@ jobs:
             cache_id: "linux-arm64-cuda-vulkan"
           - target: aarch64-apple-darwin
             runner: macos-latest
-            # Metal + MLX są wciągane cfg-target na macOS; tutaj bez feature flag.
-            features: ""
-            cache_id: "macos-arm64-default"
+            # gpu-metal: wciaga llama-cpp-2/metal + whisper-rs/metal + inference-llamacpp.
+            # Bez tego llama.cpp nie wchodzi w binarke na Apple Silicon, a Metal
+            # jest NATYWNY backend dla tej platformy. MLX siedzi dodatkowo w
+            # cfg-target `macos` wpisie w tentaflow/Cargo.toml.
+            features: "gpu-metal"
+            cache_id: "macos-arm64-metal"
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             features: "gpu-cuda,gpu-vulkan"
@@ -116,16 +119,27 @@ jobs:
           echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
           /usr/local/cuda-12.6/bin/nvcc --version
 
-      - name: Install CUDA (Windows)
+      - name: Install CUDA (Windows) — attempt 1 (local installer)
+        id: cuda_win_1
         if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda')
+        continue-on-error: true
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
           cuda: '12.6.2'
-          method: 'network'
+          method: 'local'
+          # Full offline installer (~3 GB) — omija flaky per-component
+          # network download z ktorego wynikal exit 3772776473.
           sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "cusparse_dev", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
-          # Wylaczone cache — kiedy GH cache service ma 400/500, Jimver zapisuje
-          # uszkodzone artefakty i przy kolejnym restore CUDA installer pada
-          # z exit 3772776473. Pobierz za kazdym razem.
+          use-github-cache: false
+          use-local-cache: false
+
+      - name: Install CUDA (Windows) — attempt 2 (retry)
+        if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda') && steps.cuda_win_1.outcome == 'failure'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.6.2'
+          method: 'local'
+          sub-packages: '["nvcc", "cudart", "cudart_dev", "cublas", "cublas_dev", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "cusparse_dev", "nvrtc", "nvrtc_dev", "visual_studio_integration"]'
           use-github-cache: false
           use-local-cache: false
 
@@ -267,7 +281,19 @@ jobs:
           # dostaje multiple definition dla wszystkich quantize_* funkcji.
           # --allow-multiple-definition bierze pierwsza definicje (ta sama
           # binarnie, wiec bez roznicy).
-          RUSTFLAGS: ${{ runner.os != 'Windows' && '-C link-arg=-Wl,--allow-multiple-definition' || '' }}
+          # Kazda platforma ma inny linker → inna flaga na duplicate symbols:
+          #   - Linux (GNU ld / rust-lld): --allow-multiple-definition
+          #   - macOS (Apple ld64): -ld_classic wymusza stary linker ktory
+          #     akceptuje -multiply_defined,suppress. Nowy ld64 (od Xcode 15)
+          #     nie obsluguje tej flagi — ale ld_classic dalej jest dostepny.
+          #   - Windows (link.exe / lld-link): /FORCE:MULTIPLE
+          RUSTFLAGS: >-
+            ${{
+              runner.os == 'Linux' && '-C link-arg=-Wl,--allow-multiple-definition' ||
+              runner.os == 'macOS' && '-C link-arg=-Wl,-ld_classic -C link-arg=-Wl,-multiply_defined,suppress' ||
+              runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
+              ''
+            }}
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
