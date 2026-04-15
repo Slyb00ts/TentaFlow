@@ -152,9 +152,18 @@ jobs:
             -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending `
             | Select-Object -First 1
           if (-not $cudaPath) { throw "CUDA dir not found after install" }
+          # MSBuild `CUDA <X.Y>.targets` czyta CUDA_PATH_V<X>_<Y> (versioned),
+          # nie `CUDA_PATH`. Jak tego brak — CudaToolkitDir = '' → fail przy
+          # whisper-rs-sys / llama-cpp-sys-2 cmake. Installer ustawia ten var
+          # w machine scope, ale bieżąca pwsh sesja go nie widzi — eksportujemy
+          # recznie z wyciagnietej wersji folderu v13.2 -> 13_2.
+          $verTag = ($cudaPath.Name -replace '^v','') -replace '\.','_'
           echo "CUDA_PATH=$($cudaPath.FullName)" >> $env:GITHUB_ENV
+          echo "CUDA_PATH_V$verTag=$($cudaPath.FullName)" >> $env:GITHUB_ENV
           echo "CUDACXX=$($cudaPath.FullName)\bin\nvcc.exe" >> $env:GITHUB_ENV
+          echo "CudaToolkitDir=$($cudaPath.FullName)" >> $env:GITHUB_ENV
           echo "$($cudaPath.FullName)\bin" >> $env:GITHUB_PATH
+          Write-Host "CUDA_PATH_V$verTag = $($cudaPath.FullName)"
           & "$($cudaPath.FullName)\bin\nvcc.exe" --version
 
       # ---------------------------------------------------------------------
