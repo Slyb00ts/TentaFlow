@@ -9,6 +9,9 @@ mod registry;
 mod types;
 mod validate;
 
+#[cfg(test)]
+mod tests;
+
 pub use registry::{registry, ManifestRegistry};
 pub use types::*;
 pub use validate::{validate_engine, ValidationError};
