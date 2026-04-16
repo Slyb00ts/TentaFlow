@@ -274,6 +274,7 @@
     "configure_deploy": "Configure & Deploy",
     "back_to_mesh": "Back to mesh",
     "port": "Port",
+    "noEngines": "No engines in manifest",
     "empty_hint": "Integration with NVIDIA NIM catalog coming soon. Models optimized for NVIDIA GPUs.",
     "items": {
       "tts": {
@@ -1032,23 +1033,21 @@
   },
   "wizard": {
     "title": "Deploy engine",
-    "step1": "Select node",
-    "step2": "Select variant",
-    "step3": "Deploy method",
-    "step4": "Configure",
+    "step1": "Deployment method",
+    "step2": "Select model",
+    "step3": "Configure",
     "selectNode": "Select target node",
-    "selectVariant": "Select platform-compatible variant",
     "selectMethod": "Select deployment method",
+    "selectModel": "Select model",
     "configureRuntime": "Configure runtime",
-    "build": "Build locally",
-    "buildDescription": "Build container locally from Dockerfile (always available)",
-    "download": "Download prebuilt",
-    "downloadDescription": "Download prebuilt from our registry — faster, but requires TentaFlow Pro",
-    "proRequired": "Requires TentaFlow Pro — purchase a license to unlock Download",
-    "statusStable": "Stable",
-    "statusExperimental": "Experimental",
-    "statusPlanned": "Planned",
-    "statusDeprecated": "Deprecated",
+    "fromPreset": "From preset",
+    "searchHuggingface": "Search on HuggingFace",
+    "huggingfaceToken": "HuggingFace token (optional)",
+    "method": {
+      "docker": "Docker",
+      "native": "Native",
+      "external": "External"
+    },
     "startDeploy": "Start deploy",
     "cancel": "Cancel",
     "next": "Next",
@@ -1066,10 +1065,6 @@
     "music-gen": "Music Generation",
     "model-3d-gen": "3D Model Generation",
     "agents": "Agents",
-    "tools": "Tools",
-    "empty": "Coming soon — see category README"
-  },
-  "manifest": {
-    "noVariantsForPlatform": "No variants compatible with the selected node"
+    "tools": "Tools"
   }
 }
