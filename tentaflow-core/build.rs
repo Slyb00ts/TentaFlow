@@ -564,7 +564,7 @@ fn pack_container_contexts(out_dir: &Path) {
 
 // =============================================================================
 // Generator manifestu serwisow — skanuje tentaflow-containers/*/_services/*.toml,
-// waliduje semantycznie 9 regul ze SCHEMA.md i emituje:
+// waliduje semantycznie 4 reguly ze SCHEMA.md i emituje:
 //   - $OUT_DIR/services_generated.rs       (Rust const z embedded JSON)
 //   - wwwroot/js/generated/services-manifest.js  (ESM module dla GUI)
 //
@@ -575,13 +575,11 @@ fn pack_container_contexts(out_dir: &Path) {
 
 mod services_manifest_build {
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ServiceManifest {
         pub engine: Engine,
-        #[serde(default, rename = "variant")]
-        pub variants: Vec<Variant>,
+        pub deploy: DeploySection,
         #[serde(default, rename = "model_preset")]
         pub model_presets: Vec<ModelPreset>,
     }
@@ -595,17 +593,11 @@ mod services_manifest_build {
         pub description_en: String,
         pub homepage: String,
         pub license: String,
-        pub api: ApiKind,
-        pub default_port: u16,
-        pub version: String,
-        #[serde(default)]
-        pub tags: Vec<String>,
-        #[serde(default)]
-        pub also_serves: Vec<Category>,
-        #[serde(default)]
-        pub docs_url: Option<String>,
         #[serde(default)]
         pub icon: Option<String>,
+        pub default_port: u16,
+        pub api: ApiKind,
+        pub version: String,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -637,41 +629,55 @@ mod services_manifest_build {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Variant {
-        pub id: String,
-        pub deploy_mode: DeployMode,
-        pub target_os: OsList,
-        pub target_arch: ArchList,
-        pub gpu_backend: GpuBackendList,
-        pub status: Status,
+    pub struct DeploySection {
         #[serde(default)]
-        pub vram_gb_min: Option<u16>,
+        pub docker: Option<DockerDeploy>,
         #[serde(default)]
-        pub ram_gb_min: Option<u16>,
+        pub native: Option<NativeDeploy>,
         #[serde(default)]
-        pub disk_gb_min: Option<u16>,
+        pub external: Option<ExternalDeploy>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DockerDeploy {
+        pub context_path: String,
+        pub platforms: Vec<TargetOs>,
         #[serde(default)]
-        pub notes_pl: Option<String>,
+        pub download_image: Option<String>,
         #[serde(default)]
-        pub notes_en: Option<String>,
+        pub download_size_mb: Option<u64>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NativeDeploy {
+        pub platforms: Vec<TargetOs>,
+        pub runtime: NativeRuntime,
         #[serde(default)]
-        pub build: Option<BuildOption>,
+        pub feature_flag: Option<String>,
         #[serde(default)]
-        pub download: Option<DownloadOption>,
+        pub binary_path: Option<String>,
         #[serde(default)]
-        pub feature_flag: Option<FeatureFlagSpec>,
-        #[serde(default)]
-        pub detection: Option<DetectionSpec>,
+        pub bundle_path: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
-    pub enum DeployMode {
-        Native,
-        Docker,
-        PythonBundle,
+    pub enum NativeRuntime {
         Embedded,
-        External,
+        Binary,
+        PythonBundle,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ExternalDeploy {
+        pub platforms: Vec<TargetOs>,
+        pub detection_binary: String,
+        pub detection_endpoint: String,
+        #[serde(default = "default_health_path")]
+        pub detection_health_path: String,
+    }
+    fn default_health_path() -> String {
+        "/".to_string()
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -684,87 +690,6 @@ mod services_manifest_build {
         Android,
     }
 
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-    #[serde(rename_all = "lowercase")]
-    pub enum TargetArch {
-        X86_64,
-        Aarch64,
-        Any,
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-    #[serde(rename_all = "lowercase")]
-    pub enum GpuBackend {
-        Cpu,
-        Cuda,
-        Rocm,
-        Vulkan,
-        Metal,
-        Mlx,
-        Xpu,
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-    #[serde(rename_all = "lowercase")]
-    pub enum Status {
-        Stable,
-        Experimental,
-        Planned,
-        Deprecated,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct BuildOption {
-        pub context_path: String,
-        #[serde(default = "default_dockerfile")]
-        pub dockerfile: String,
-        #[serde(default)]
-        pub build_args: HashMap<String, String>,
-        #[serde(default)]
-        pub tags: Vec<String>,
-    }
-    fn default_dockerfile() -> String {
-        "Dockerfile".to_string()
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct DownloadOption {
-        pub image: String,
-        pub digest: String,
-        #[serde(default)]
-        pub size_mb: Option<u64>,
-        #[serde(default = "default_license_required")]
-        pub license_required: RequiredLicenseTier,
-        #[serde(default)]
-        pub enabled: bool,
-    }
-    fn default_license_required() -> RequiredLicenseTier {
-        RequiredLicenseTier::Pro
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-    #[serde(rename_all = "lowercase")]
-    pub enum RequiredLicenseTier {
-        Pro,
-        Enterprise,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct FeatureFlagSpec {
-        pub name: String,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct DetectionSpec {
-        pub binary: String,
-        pub endpoint: String,
-        #[serde(default = "default_health_path")]
-        pub health_path: String,
-    }
-    fn default_health_path() -> String {
-        "/".to_string()
-    }
-
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ModelPreset {
         pub id: String,
@@ -773,54 +698,7 @@ mod services_manifest_build {
         #[serde(default)]
         pub quantization: Option<String>,
         #[serde(default)]
-        pub vram_gb_min: Option<u16>,
-        #[serde(default)]
         pub recommended: bool,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(untagged)]
-    pub enum OsList {
-        Single(TargetOs),
-        Multi(Vec<TargetOs>),
-    }
-    impl OsList {
-        pub fn as_vec(&self) -> Vec<TargetOs> {
-            match self {
-                OsList::Single(o) => vec![*o],
-                OsList::Multi(v) => v.clone(),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(untagged)]
-    pub enum ArchList {
-        Single(TargetArch),
-        Multi(Vec<TargetArch>),
-    }
-    impl ArchList {
-        pub fn as_vec(&self) -> Vec<TargetArch> {
-            match self {
-                ArchList::Single(a) => vec![*a],
-                ArchList::Multi(v) => v.clone(),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    #[serde(untagged)]
-    pub enum GpuBackendList {
-        Single(GpuBackend),
-        Multi(Vec<GpuBackend>),
-    }
-    impl GpuBackendList {
-        pub fn as_vec(&self) -> Vec<GpuBackend> {
-            match self {
-                GpuBackendList::Single(b) => vec![*b],
-                GpuBackendList::Multi(v) => v.clone(),
-            }
-        }
     }
 
     /// Whitelist regex `^[a-z0-9][a-z0-9_-]{0,63}$` dla engine.id.
@@ -839,7 +717,7 @@ mod services_manifest_build {
             .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
     }
 
-    /// Walidacja semantyczna identyczna z runtime — 10 regul ze SCHEMA.md.
+    /// Walidacja semantyczna identyczna z runtime — 4 reguly ze SCHEMA.md.
     pub fn validate(
         manifest: &ServiceManifest,
         containers_root: &std::path::Path,
@@ -847,7 +725,7 @@ mod services_manifest_build {
         let mut errors: Vec<String> = Vec::new();
         let eid = &manifest.engine.id;
 
-        // Reguła 10: engine.id whitelist regex.
+        // Reguła 1: engine.id whitelist regex.
         if !is_valid_engine_id(eid) {
             errors.push(format!(
                 "engine id = '{}' nie spelnia wymaganego formatu \
@@ -856,129 +734,74 @@ mod services_manifest_build {
             ));
         }
 
-        let mut seen_variant_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        // Reguła 2: minimum jedna sekcja deploy.
+        let d = &manifest.deploy;
+        if d.docker.is_none() && d.native.is_none() && d.external.is_none() {
+            errors.push(format!(
+                "engine '{}': brak sekcji deploymentu — wymagana przynajmniej jedna z \
+                 [deploy.docker], [deploy.native], [deploy.external]",
+                eid
+            ));
+        }
 
-        for v in &manifest.variants {
-            if !seen_variant_ids.insert(v.id.clone()) {
-                errors.push(format!(
-                    "engine '{}' duplikat variant.id = '{}'",
-                    eid, v.id
-                ));
-            }
-            let os_list = v.target_os.as_vec();
-            let backend_list = v.gpu_backend.as_vec();
-
-            for &b in &backend_list {
-                let required: Vec<TargetOs> = match b {
-                    GpuBackend::Metal => vec![TargetOs::Macos, TargetOs::Ios],
-                    GpuBackend::Mlx => vec![TargetOs::Macos, TargetOs::Ios],
-                    GpuBackend::Cuda => vec![TargetOs::Linux, TargetOs::Windows],
-                    GpuBackend::Rocm => vec![TargetOs::Linux],
-                    GpuBackend::Xpu => vec![TargetOs::Linux, TargetOs::Windows],
-                    GpuBackend::Cpu | GpuBackend::Vulkan => continue,
-                };
-                if !os_list.iter().all(|o| required.contains(o)) {
-                    errors.push(format!(
-                        "engine '{}' wariant '{}': gpu_backend = {:?} wymaga \
-                         target_os in {:?}, ale jest {:?}",
-                        eid, v.id, b, required, os_list
-                    ));
-                }
-            }
-
-            if backend_list.contains(&GpuBackend::Mlx)
-                && v.deploy_mode != DeployMode::Embedded
-            {
-                errors.push(format!(
-                    "engine '{}' wariant '{}': gpu_backend = mlx wymaga \
-                     deploy_mode = embedded, jest {:?}",
-                    eid, v.id, v.deploy_mode
-                ));
-            }
-
-            if v.deploy_mode == DeployMode::Docker {
-                let invalid = os_list
-                    .iter()
-                    .any(|o| !matches!(o, TargetOs::Linux | TargetOs::Windows));
-                if invalid {
-                    errors.push(format!(
-                        "engine '{}' wariant '{}': deploy_mode = docker dziala \
-                         tylko na linux/windows, jest {:?}",
-                        eid, v.id, os_list
-                    ));
-                }
-            }
-
-            match v.deploy_mode {
-                DeployMode::Docker | DeployMode::Native | DeployMode::PythonBundle => {
-                    if v.build.is_none() {
+        // Reguła 3: deploy.native.runtime spojny z polami.
+        if let Some(n) = &d.native {
+            match n.runtime {
+                NativeRuntime::Embedded => {
+                    if n.feature_flag.is_none()
+                        || n.binary_path.is_some()
+                        || n.bundle_path.is_some()
+                    {
                         errors.push(format!(
-                            "engine '{}' wariant '{}': deploy_mode = {:?} wymaga \
-                             sekcji [variant.build]",
-                            eid, v.id, v.deploy_mode
+                            "engine '{}': deploy.native.runtime = embedded wymaga pola \
+                             feature_flag (i nie moze miec binary_path/bundle_path)",
+                            eid
                         ));
                     }
                 }
-                DeployMode::Embedded => {
-                    if v.feature_flag.is_none() {
+                NativeRuntime::Binary => {
+                    if n.binary_path.is_none()
+                        || n.feature_flag.is_some()
+                        || n.bundle_path.is_some()
+                    {
                         errors.push(format!(
-                            "engine '{}' wariant '{}': deploy_mode = embedded \
-                             wymaga sekcji [variant.feature_flag]",
-                            eid, v.id
+                            "engine '{}': deploy.native.runtime = binary wymaga pola \
+                             binary_path (i nie moze miec feature_flag/bundle_path)",
+                            eid
                         ));
                     }
                 }
-                DeployMode::External => {
-                    if v.detection.is_none() {
+                NativeRuntime::PythonBundle => {
+                    if n.bundle_path.is_none()
+                        || n.feature_flag.is_some()
+                        || n.binary_path.is_some()
+                    {
                         errors.push(format!(
-                            "engine '{}' wariant '{}': deploy_mode = external \
-                             wymaga sekcji [variant.detection]",
-                            eid, v.id
+                            "engine '{}': deploy.native.runtime = python-bundle wymaga \
+                             pola bundle_path (i nie moze miec feature_flag/binary_path)",
+                            eid
                         ));
                     }
                 }
             }
+        }
 
-            if let Some(b) = &v.build {
-                let full = containers_root.join(&b.context_path);
-                if !full.is_dir() {
-                    errors.push(format!(
-                        "engine '{}' wariant '{}': context_path '{}' nie istnieje \
-                         na dysku ({})",
-                        eid,
-                        v.id,
-                        b.context_path,
-                        full.display()
-                    ));
-                }
+        // Reguła 4: sciezki na dysku.
+        if let Some(docker) = &d.docker {
+            check_path(
+                containers_root,
+                &docker.context_path,
+                "deploy.docker.context_path",
+                eid,
+                &mut errors,
+            );
+        }
+        if let Some(n) = &d.native {
+            if let Some(p) = &n.binary_path {
+                check_path(containers_root, p, "deploy.native.binary_path", eid, &mut errors);
             }
-
-            if let Some(dl) = &v.download {
-                if dl.enabled {
-                    let valid = dl.digest.starts_with("sha256:")
-                        && dl.digest.len() == 71
-                        && dl.digest[7..].chars().all(|c| c.is_ascii_hexdigit());
-                    if !valid {
-                        errors.push(format!(
-                            "engine '{}' wariant '{}': download.enabled = true wymaga \
-                             digest sha256:<64 hex znakow>",
-                            eid, v.id
-                        ));
-                    } else {
-                        let is_zero = dl.digest.len() == 71
-                            && dl.digest.starts_with("sha256:")
-                            && dl.digest[7..].bytes().all(|b| b == b'0');
-                        if is_zero {
-                            errors.push(format!(
-                                "engine '{}' wariant '{}': download.enabled = true z \
-                                 placeholder digest sha256:00...00 — uzupelnij \
-                                 prawdziwy digest przed publikacja artefaktu",
-                                eid, v.id
-                            ));
-                        }
-                    }
-                }
+            if let Some(p) = &n.bundle_path {
+                check_path(containers_root, p, "deploy.native.bundle_path", eid, &mut errors);
             }
         }
 
@@ -986,6 +809,25 @@ mod services_manifest_build {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    fn check_path(
+        root: &std::path::Path,
+        rel: &str,
+        field: &str,
+        engine_id: &str,
+        errors: &mut Vec<String>,
+    ) {
+        let full = root.join(rel);
+        if !full.is_dir() {
+            errors.push(format!(
+                "engine '{}': sciezka {} = '{}' nie istnieje na dysku ({})",
+                engine_id,
+                field,
+                rel,
+                full.display()
+            ));
         }
     }
 }
@@ -1075,7 +917,7 @@ fn generate_services_manifest(out_dir: &Path) {
             ),
         };
 
-        // Walidacja semantyczna — 9 regul.
+        // Walidacja semantyczna — 4 reguly.
         if let Err(errs) = validate(&manifest, &containers_dir) {
             let joined = errs
                 .iter()
@@ -1089,7 +931,7 @@ fn generate_services_manifest(out_dir: &Path) {
             );
         }
 
-        // Reguła 9 (czesc globalna): unikalnosc engine.id cross-file.
+        // Globalna unikalnosc engine.id cross-file (poza 4 regulami per-file).
         if !seen_engine_ids.insert(manifest.engine.id.clone()) {
             panic!(
                 "Walidacja manifestu '{}' nieudana:\n  - duplikat engine.id = '{}' \
@@ -1147,7 +989,7 @@ fn write_js_module(path: &Path, json_pretty: &str) {
          //       Zrodlo: tentaflow-containers/*/_services/*.toml\n\
          // =============================================================================\n\
          \n\
-         export const SCHEMA_VERSION = 1;\n\
+         export const SCHEMA_VERSION = 2;\n\
          export const GENERATED_AT = \"{}\";\n\
          export const SERVICES = {};\n",
         now, json_pretty

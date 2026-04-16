@@ -1,8 +1,7 @@
 // =============================================================================
 // Plik: checker.rs
 // Opis: Trait LicenseChecker oraz typy LicenseTier i LicenseError. Definiuje
-//       abstrakcje sprawdzajaca aktualny tier licencji oraz wymagania licencyjne
-//       dla wariantow manifestu serwisow.
+//       abstrakcje sprawdzajaca aktualny tier licencji uzytkownika.
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
@@ -41,30 +40,5 @@ pub trait LicenseChecker: Send + Sync {
                 | (LicenseTier::Pro, LicenseTier::Pro | LicenseTier::Free)
                 | (LicenseTier::Free, LicenseTier::Free)
         )
-    }
-
-    /// Wygodna funkcja: sprawdza wariant manifestu, zwraca Err jezeli download
-    /// wymaga wyzszego tieru niz aktualny.
-    fn check_variant_download(
-        &self,
-        variant: &crate::services::manifest::Variant,
-        feature_name: &str,
-    ) -> Result<(), LicenseError> {
-        let Some(download) = &variant.download else {
-            return Ok(());
-        };
-        let required = match download.license_required {
-            crate::services::manifest::RequiredLicenseTier::Pro => LicenseTier::Pro,
-            crate::services::manifest::RequiredLicenseTier::Enterprise => LicenseTier::Enterprise,
-        };
-        if self.allows(required) {
-            Ok(())
-        } else {
-            Err(LicenseError::Insufficient {
-                feature: feature_name.to_string(),
-                required,
-                actual: self.tier(),
-            })
-        }
     }
 }

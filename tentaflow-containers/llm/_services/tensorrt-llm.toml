@@ -1,103 +1,24 @@
-# =============================================================================
-# Plik: llm/_services/tensorrt-llm.toml
-# Opis: Manifest silnika TensorRT-LLM (NVIDIA). Tryb deploymentu: docker
-#       (Linux x64 CUDA + Windows WSL2 ten sam obraz). Wymaga karty
-#       z FP8 (H100/L40S) albo mocnej karty FP16 (A100/A6000).
-# =============================================================================
+# Manifest serwisu TensorRT-LLM — silnik NVIDIA do produkcji LLM.
 
 [engine]
 id = "tensorrt-llm"
 category = "llm"
 name = "TensorRT-LLM"
-description_pl = "Silnik LLM od NVIDIA z optymalizacjami FP8/INT4 dla kart H100, L40S, A100. Najszybszy serwer inferencji na NVIDIA."
-description_en = "NVIDIA's optimized LLM engine with FP8/INT4 for H100, L40S, A100. Fastest NVIDIA inference."
+description_pl = "Silnik LLM NVIDIA z optymalizacja TensorRT. Najszybsze inference na GPU NVIDIA."
+description_en = "NVIDIA's LLM engine with TensorRT optimization. Fastest inference on NVIDIA GPUs."
 homepage = "https://github.com/NVIDIA/TensorRT-LLM"
-docs_url = "https://nvidia.github.io/TensorRT-LLM/"
 license = "Apache-2.0"
-api = "openai-compatible"
+icon = "nvidia"
 default_port = 8000
+api = "openai-compatible"
 version = "0.13.0"
-tags = ["nvidia", "fp8", "int4", "production", "high-throughput"]
-icon = "tensorrt-llm"
 
-# Wariant produkcyjny dla Linux x86_64 z CUDA. Status experimental, bo
-# wymaga konkretnych kart GPU (H100/L40S/A100) i obsluga konsumenckich
-# Ada/Ampere (RTX 30/40) jest mozliwa, ale niskooptymalna w porownaniu
-# do vLLM na tym samym sprzecie.
-[[variant]]
-id = "linux-x64-cuda"
-deploy_mode = "docker"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "experimental"
-vram_gb_min = 24
-ram_gb_min = 32
-disk_gb_min = 40
-notes_pl = "Wymaga NVIDIA H100 (FP8), L40S (FP8) lub A100/A6000 (FP16). Karty Ada/Ampere konsumenckie (RTX 30/40) dzialaja, ale preferuj vLLM."
-notes_en = "Requires NVIDIA H100 (FP8), L40S (FP8), or A100/A6000 (FP16). Consumer Ada/Ampere (RTX 30/40) work but vLLM is preferred there."
-
-[variant.build]
+[deploy.docker]
 context_path = "llm/docker/tensorrt-llm"
-dockerfile = "Dockerfile"
-tags = ["tentaflow/tensorrt-llm:cuda-x86_64"]
-
-[variant.build.build_args]
-BASE_IMAGE = "nvcr.io/nvidia/tritonserver:24.08-trtllm-python-py3"
-TRTLLM_VERSION = "0.13.0"
-
-[variant.download]
-image = "ghcr.io/slyb00ts/tentaflow-pro/tensorrt-llm:linux-x64-cuda-v0.13.0"
-digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-size_mb = 12000
-license_required = "pro"
-enabled = false
-
-# Wariant Windows: ten sam obraz Linux uruchamiany przez WSL2 z Docker
-# Desktop i NVIDIA Container Toolkit. Wymagania jak dla linux-x64-cuda.
-[[variant]]
-id = "windows-wsl-cuda"
-deploy_mode = "docker"
-target_os = "windows"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "experimental"
-vram_gb_min = 24
-ram_gb_min = 32
-disk_gb_min = 40
-notes_pl = "Wymaga Docker Desktop z integracja WSL2 i NVIDIA Container Toolkit. Karta jak dla wariantu linux-x64-cuda. Build dzieli kontekst z linux-x64-cuda - Dockerfile produkuje ten sam obraz."
-notes_en = "Requires Docker Desktop with WSL2 integration and NVIDIA Container Toolkit. GPU as for linux-x64-cuda. Build shares context with linux-x64-cuda - Dockerfile produces same image."
-
-[variant.build]
-context_path = "llm/docker/tensorrt-llm"
-dockerfile = "Dockerfile"
-tags = ["tentaflow/tensorrt-llm:cuda-x86_64"]
-
-[variant.build.build_args]
-BASE_IMAGE = "nvcr.io/nvidia/tritonserver:24.08-trtllm-python-py3"
-TRTLLM_VERSION = "0.13.0"
-
-[variant.download]
-image = "ghcr.io/slyb00ts/tentaflow-pro/tensorrt-llm:linux-x64-cuda-v0.13.0"
-digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-size_mb = 12000
-license_required = "pro"
-enabled = false
-
-# Rekomendowane modele dla TensorRT-LLM. FP8 wymaga H100/L40S; na A100/A6000
-# uzyj wariantow FP16 (TensorRT-LLM sam zbuduje engine pod karte).
+platforms = ["linux", "windows"]
 
 [[model_preset]]
-id = "qwen3-5-0-8b-fp8"
-display_name = "Qwen 3.5 0.8B (FP8)"
-repo = "Qwen/Qwen3.5-0.8B"
-quantization = "fp8"
-vram_gb_min = 4
-recommended = true
-
-[[model_preset]]
-id = "llama-3-1-8b-instruct-fp8"
-display_name = "Llama 3.1 8B Instruct (FP8)"
+id = "llama-3-1-8b-instruct"
+display_name = "Llama 3.1 8B Instruct"
 repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-quantization = "fp8"
-vram_gb_min = 16
+recommended = true

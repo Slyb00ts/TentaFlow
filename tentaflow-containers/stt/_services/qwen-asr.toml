@@ -1,52 +1,28 @@
-# =============================================================================
-# Plik: stt/_services/qwen-asr.toml
-# Opis: Manifest silnika Qwen3-ASR (multilingual ASR oparte na vLLM backend).
-#       Tryb deploymentu: docker (Linux x64 CUDA). Status: experimental.
-# =============================================================================
+# Manifest serwisu Qwen3-ASR — multijezykowy ASR oparty o vLLM backend.
 
 [engine]
 id = "qwen-asr"
 category = "stt"
 name = "Qwen3-ASR"
-description_pl = "Qwen3-ASR-1.7B — multimodalne ASR oparte na vLLM. Wsparcie wielu jezykow vs Whisper."
-description_en = "Qwen3-ASR-1.7B — multimodal ASR based on vLLM. Multilingual coverage vs Whisper."
-homepage = "https://huggingface.co/Qwen"
-docs_url = "https://qwenlm.github.io/"
+description_pl = "Multijezykowy ASR od Alibaba. Bardzo dobra jakosc dla chinskiego i angielskiego."
+description_en = "Alibaba's multilingual ASR. Excellent quality for Chinese and English."
+homepage = "https://github.com/QwenLM/Qwen-Audio"
 license = "Apache-2.0"
-api = "openai-compatible"
 default_port = 5030
+api = "openai-compatible"
 version = "1.0.0"
-tags = ["asr", "multilingual", "qwen", "multimodal"]
-icon = "qwen-asr"
 
-# Wariant Linux x64 CUDA - jedyny wspierany.
-[[variant]]
-id = "linux-x64-cuda"
-deploy_mode = "docker"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "experimental"
-vram_gb_min = 8
-ram_gb_min = 16
-disk_gb_min = 20
-notes_pl = "Wymaga nvidia-container-toolkit. Backend vLLM - mozliwe konflikty z innymi serwisami vLLM na tym samym GPU."
-notes_en = "Requires nvidia-container-toolkit. vLLM backend - possible conflicts with other vLLM services on same GPU."
-
-[variant.build]
+[deploy.docker]
 context_path = "stt/docker/qwen-asr"
-dockerfile = "Dockerfile"
-tags = ["tentaflow/qwen-asr:cuda-x86_64"]
+platforms = ["linux", "windows"]
 
-[variant.build.build_args]
-QWEN_ASR_VERSION = "1.0.0"
-
-# Rekomendowany model Qwen3-ASR.
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "stt/python/qwen-asr"
 
 [[model_preset]]
-id = "qwen3-asr-1-7b"
-display_name = "Qwen3-ASR 1.7B"
-repo = "Qwen/Qwen3-ASR-1.7B"
-quantization = "fp16"
-vram_gb_min = 8
+id = "qwen-audio-asr"
+display_name = "Qwen-Audio ASR"
+repo = "Qwen/Qwen-Audio"
 recommended = true

@@ -82,7 +82,7 @@ mlx-models (Apple MLX inference bindings)
 - **mesh/** — P2P networking: mDNS discovery, QUIC transport, CRDT state sync, gossip (SWIM), node pairing (PIN + Ed25519/X25519/ChaCha20-Poly1305), key rotation epochs, trust revocation broadcast
 - **addon/** — WASM plugins: Wasmtime (desktop) / wasmi (mobile), permission system, event bus, host functions, instance pooling, rate limiting
 - **routing/** — Request routing: load balancer with circuit breaker, chat/embeddings/TTS/STT handlers, local inference, mesh forwarding
-- **services/manifest/** — Service Manifest registry: ładowanie wygenerowanego rejestru z `services_generated.rs`, walidacja semantyczna (9 reguł), katalog silników udostępniany przez `/api/services/manifest`. Patrz sekcja `## Service Manifest`.
+- **services/manifest/** — Service Manifest registry: ładowanie wygenerowanego rejestru z `services_generated.rs`, walidacja semantyczna (4 reguły), katalog silników udostępniany przez `/api/services/manifest`. Patrz sekcja `## Service Manifest`.
 - **license/** — Sprawdzanie tieru licencji (Free/Pro/Enterprise), gating opcji `download` w manifestach
 - **api/** — HTTP: OpenAI-compatible `/v1/*`, Dashboard `/api/*` (JWT), WebSocket metrics
 - **flow_engine/** — DAG-based workflow execution with typed adapters
@@ -123,20 +123,17 @@ Pełna specyfikacja: `tentaflow-containers/_schema/SCHEMA.md`. Schema JSON: `ten
 
 ### Struktura katalogu
 
+Kategorie z ≥1 plikiem `*.toml` w `_services/` pokazują się w GUI; puste są ukryte.
+
 | Katalog | Kategoria | Przykładowe silniki |
 |---------|-----------|---------------------|
-| `tentaflow-containers/llm/_services/` | Large Language Models | llama-cpp, vllm, sglang, ollama |
+| `tentaflow-containers/llm/_services/` | Large Language Models | llama-cpp, mlx, vllm, sglang, ollama, tensorrt-llm |
 | `tentaflow-containers/stt/_services/` | Speech-to-Text | whisper, parakeet, qwen-asr |
 | `tentaflow-containers/tts/_services/` | Text-to-Speech | sherpa-onnx, xtts, voxcpm |
-| `tentaflow-containers/embeddings/_services/` | Wektoryzacja tekstu | hf-tei |
-| `tentaflow-containers/reranker/_services/` | Rerankowanie | bge-reranker |
-| `tentaflow-containers/vision/_services/` | OCR / detection / captioning | – |
 | `tentaflow-containers/image-gen/_services/` | Generowanie obrazów | comfyui, stable-diffusion-cpp |
-| `tentaflow-containers/video-gen/_services/` | Generowanie wideo | – |
-| `tentaflow-containers/music-gen/_services/` | Generowanie muzyki | – |
-| `tentaflow-containers/model-3d-gen/_services/` | Generowanie modeli 3D | – |
 | `tentaflow-containers/agents/_services/` | Autonomiczne agenty | teams-bot |
-| `tentaflow-containers/tools/_services/` | Function calling, MCP servers | – |
+
+Pozostałe katalogi (`vision`, `video-gen`, `music-gen`, `model-3d-gen`, `tools`) istnieją w drzewie, ale dopóki nie dodasz pliku TOML do ich `_services/`, GUI nie pokaże tej sekcji.
 
 ### Anatomia pliku TOML
 
@@ -145,56 +142,61 @@ Pełna specyfikacja: `tentaflow-containers/_schema/SCHEMA.md`. Schema JSON: `ten
 id = "vllm"
 category = "llm"
 name = "vLLM"
-api = "openai-compatible"
+description_pl = "..."
+description_en = "..."
+homepage = "https://github.com/vllm-project/vllm"
+license = "Apache-2.0"
+icon = "vllm"
 default_port = 8000
+api = "openai-compatible"
 version = "0.6.3"
 
-[[variant]]
-id = "linux-x64-cuda"
-deploy_mode = "docker"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "stable"
-vram_gb_min = 8
-
-[variant.build]
+[deploy.docker]
 context_path = "llm/docker/vllm"
+platforms = ["linux", "windows"]
 
-[variant.download]
-image = "ghcr.io/slyb00ts/tentaflow-pro/vllm:linux-x64-cuda-v0.6.3"
-digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-enabled = false
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "llm/python/vllm"
+
+# Opcjonalnie:
+# [deploy.external]
+# platforms = ["linux", "macos", "windows"]
+# detection_binary = "ollama"
+# detection_endpoint = "http://localhost:11434"
+# detection_health_path = "/api/tags"
 
 [[model_preset]]
-id = "qwen3-7b"
-display_name = "Qwen 3 7B"
-repo = "Qwen/Qwen3-7B"
+id = "qwen3-5-0-8b"
+display_name = "Qwen 3.5 0.8B"
+repo = "Qwen/Qwen3.5-0.8B"
 recommended = true
 ```
 
-Inne podsekcje wariantu wybierane wg `deploy_mode`: `[variant.feature_flag]` (embedded), `[variant.detection]` (external). Pełny opis pól, podsekcji i wartości enum w `tentaflow-containers/_schema/SCHEMA.md`.
+Pełny opis pól w `tentaflow-containers/_schema/SCHEMA.md`.
 
-### Tryby deploymentu (deploy_mode)
+### Tryby deploymentu
 
-| Tryb | Opis | Kiedy używać |
-|------|------|--------------|
-| `native` | Natywna binarka kompilowana przez `build-natives.sh`, artefakt `.tar.gz` w `tentaflow-containers/output/` | Lekki silnik bez Pythona (whisper.cpp, sherpa-onnx, llama.cpp CLI) |
-| `docker` | Obraz Docker budowany przez `build-containers.sh`, sidecar QUIC + silnik w jednym kontenerze | Silnik z ciężkimi zależnościami systemowymi (vLLM, sglang, comfyui) |
-| `python-bundle` | Bundle Pythona definiowany przez `bundle.toml`, uruchamiany przez `server.py` | Silnik czysto pythonowy bez Dockera (parakeet, xtts) |
-| `embedded` | Wkompilowany w binarkę `tentaflow` przez Cargo feature flag | Silnik z natywnymi bindingami Rust (llama.cpp, MLX) |
-| `external` | Zewnętrzny serwis wykrywany w `PATH` + health check | Procesy uruchamiane osobno przez użytkownika (ollama daemon) |
+Manifest ma do trzech sekcji deploy (każda renderuje przycisk w wizardzie):
 
-### Build vs Download
-
-Każdy `variant` typu `docker` ma DWIE opcje instalacji:
-
-- **Build** — lokalny `docker build` z `[variant.build].context_path`. Zawsze dostępne (Free).
-- **Download** — pull prebuilt image z `[variant.download].image` (registry). Wymaga TentaFlow Pro (sprawdzane przez `tentaflow-core/src/license/checker.rs`). W v1 wszystkie `download.enabled = false` — infrastruktura przygotowana pod Pro.
+- **`[deploy.docker]`** — obraz Docker budowany lokalnie z `context_path`. Opcjonalny `download_image` (Pro feature, prebuilt OCI).
+- **`[deploy.native]`** — natywne uruchomienie. Pole `runtime` decyduje:
+  - `embedded` — wkompilowane w binarkę `tentaflow` przez Cargo `feature_flag` (np. llama.cpp, MLX).
+  - `binary` — natywna binarka budowana skryptem `binary_path/build.sh` (np. sherpa-onnx, stable-diffusion-cpp).
+  - `python-bundle` — bundle Pythona w `bundle_path` (np. vllm, xtts, comfyui).
+- **`[deploy.external]`** — wykrycie zewnętrznego daemona w `PATH` z health-checkiem (np. ollama).
 
 ### Walidacja
 
-Build.rs waliduje 9 reguł semantycznych przy każdej kompilacji (np. `gpu_backend = "metal"` → `target_os ∈ {macos, ios}`, `deploy_mode = "docker"` → `target_os ∈ {linux, windows}` bo brak GPU passthrough w Docker macOS). Naruszenie reguły łamie build z czytelnym komunikatem `cargo build`. Reguły walidują iloczyn kartezjański: gdy `target_os = ["linux","macos"]` i `gpu_backend = ["cuda","metal"]`, KAŻDA para musi być dopuszczalna — inaczej build odrzucony.
+Build.rs sprawdza 4 reguły semantyczne przy każdym `cargo build`:
+
+1. `engine.id` pasuje do regex `^[a-z0-9][a-z0-9_-]{0,63}$` (chroni przed path-traversal).
+2. Manifest ma przynajmniej jedną sekcję deploy (`docker`, `native` lub `external`).
+3. `deploy.native.runtime` spójny z polami: `embedded` ⇒ `feature_flag`; `binary` ⇒ `binary_path`; `python-bundle` ⇒ `bundle_path` (i tylko jedno z trzech).
+4. Ścieżki `context_path` / `binary_path` / `bundle_path` istnieją na dysku.
+
+Globalna unikalność `engine.id` jest egzekwowana cross-file.
 
 ### API endpoints
 
@@ -203,7 +205,7 @@ Build.rs waliduje 9 reguł semantycznych przy każdej kompilacji (np. `gpu_backe
 | `GET /api/services/manifest` | Cały manifest jako JSON (lista silników) |
 | `GET /api/services/manifest/:engine_id` | Pojedynczy silnik |
 | `GET /api/license/info` | Tier licencji (`{tier, allows_pro, allows_enterprise}`) |
-| `POST /api/services/deploy` | Deploy silnika (body: `engine_id`, `variant_id`, `deploy_method`, `node_id`, `config`) |
+| `POST /api/services/deploy` | Deploy silnika (body: `engine_id`, `deploy_method` ∈ `docker`/`native`/`external`, `node_id`, `config`) |
 | `GET /api/services/deployed` | Lista uruchomionych deploymentów |
 
 Implementacja: `tentaflow-core/src/api/dashboard/api_services_manifest.rs`.
@@ -211,11 +213,11 @@ Implementacja: `tentaflow-core/src/api/dashboard/api_services_manifest.rs`.
 ### Jak dodać nowy silnik
 
 1. Wybierz kategorię (`llm`, `tts`, `stt`, ...) i utwórz `tentaflow-containers/<category>/_services/<engine-id>.toml` zgodnie z `_schema/SCHEMA.md`
-2. Dla wariantu docker: dodaj `<category>/docker/<engine-id>/{Dockerfile, entrypoint.sh, config.default.toml, build.sh}`
-3. Dla wariantu native: dodaj `<category>/native/<engine-id>/build.sh`
-4. Dla wariantu python-bundle: dodaj `<category>/python/<engine-id>/{bundle.toml, server.py}`
-5. Dla wariantu embedded: tylko TOML manifest (kod siedzi w `tentaflow-core/`, włączany Cargo featurem `feature_flag.name`)
-6. `cargo build` z `tentaflow-core/` — walidacja + auto-generacja Rust + JS rejestru
+2. Dla `[deploy.docker]`: dodaj `<category>/docker/<engine-id>/{Dockerfile, entrypoint.sh, ...}`
+3. Dla `[deploy.native]` runtime=`binary`: dodaj `<category>/native/<engine-id>/build.sh`
+4. Dla `[deploy.native]` runtime=`python-bundle`: dodaj `<category>/python/<engine-id>/{bundle.toml, server.py}`
+5. Dla `[deploy.native]` runtime=`embedded`: tylko TOML manifest + Cargo feature w `tentaflow-core/Cargo.toml`
+6. `cargo build` w `tentaflow-core/` — walidacja + auto-generacja Rust + JS rejestru
 7. Reload GUI — kafelek silnika pojawi się dynamicznie z manifestu
 
 ## Configuration
