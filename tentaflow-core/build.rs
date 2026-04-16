@@ -14,7 +14,13 @@ fn main() {
 
     let out_dir_env = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+    // Skanuj manifesty serwisow tentaflow-containers/*/_services/*.toml,
+    // waliduj semantycznie i wygeneruj services_generated.rs + services-manifest.js.
+    // To musi byc PRZED dlugim WASM-buildem, zeby blad walidacji wykryl sie szybko.
+    generate_services_manifest(&out_dir_env);
+
     // Generuj wwwroot_embed.rs — pliki statyczne wbudowane w binarie
+    // (po wygenerowaniu services-manifest.js, zeby trafil do embed).
     generate_wwwroot_embed(&out_dir_env);
 
     // Pakuj kontekst dockerow (tentaflow-containers + tentaflow-protocol)
@@ -554,4 +560,597 @@ fn pack_container_contexts(out_dir: &Path) {
             std::fs::write(&bundle_path, b"").ok();
         }
     }
+}
+
+// =============================================================================
+// Generator manifestu serwisow — skanuje tentaflow-containers/*/_services/*.toml,
+// waliduje semantycznie 9 regul ze SCHEMA.md i emituje:
+//   - $OUT_DIR/services_generated.rs       (Rust const z embedded JSON)
+//   - wwwroot/js/generated/services-manifest.js  (ESM module dla GUI)
+//
+// UWAGA: typy serde sa duplikatem z src/services/manifest/types.rs.
+// To wymuszone — build.rs i lib to osobne crates i nie moga dzielic kodu
+// bez wydzielania osobnego mini-crate.
+// =============================================================================
+
+mod services_manifest_build {
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ServiceManifest {
+        pub engine: Engine,
+        #[serde(default, rename = "variant")]
+        pub variants: Vec<Variant>,
+        #[serde(default, rename = "model_preset")]
+        pub model_presets: Vec<ModelPreset>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Engine {
+        pub id: String,
+        pub category: Category,
+        pub name: String,
+        pub description_pl: String,
+        pub description_en: String,
+        pub homepage: String,
+        pub license: String,
+        pub api: ApiKind,
+        pub default_port: u16,
+        pub version: String,
+        #[serde(default)]
+        pub tags: Vec<String>,
+        #[serde(default)]
+        pub also_serves: Vec<Category>,
+        #[serde(default)]
+        pub docs_url: Option<String>,
+        #[serde(default)]
+        pub icon: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum Category {
+        Llm,
+        Stt,
+        Tts,
+        Embeddings,
+        Reranker,
+        Vision,
+        ImageGen,
+        VideoGen,
+        MusicGen,
+        Model3dGen,
+        Agents,
+        Tools,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum ApiKind {
+        OpenaiCompatible,
+        OllamaNative,
+        SherpaTts,
+        SherpaStt,
+        Comfyui,
+        Custom,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Variant {
+        pub id: String,
+        pub deploy_mode: DeployMode,
+        pub target_os: OsList,
+        pub target_arch: ArchList,
+        pub gpu_backend: GpuBackendList,
+        pub status: Status,
+        #[serde(default)]
+        pub vram_gb_min: Option<u16>,
+        #[serde(default)]
+        pub ram_gb_min: Option<u16>,
+        #[serde(default)]
+        pub disk_gb_min: Option<u16>,
+        #[serde(default)]
+        pub notes_pl: Option<String>,
+        #[serde(default)]
+        pub notes_en: Option<String>,
+        #[serde(default)]
+        pub build: Option<BuildOption>,
+        #[serde(default)]
+        pub download: Option<DownloadOption>,
+        #[serde(default)]
+        pub feature_flag: Option<FeatureFlagSpec>,
+        #[serde(default)]
+        pub detection: Option<DetectionSpec>,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum DeployMode {
+        Native,
+        Docker,
+        PythonBundle,
+        Embedded,
+        External,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "lowercase")]
+    pub enum TargetOs {
+        Linux,
+        Macos,
+        Windows,
+        Ios,
+        Android,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "lowercase")]
+    pub enum TargetArch {
+        X86_64,
+        Aarch64,
+        Any,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "lowercase")]
+    pub enum GpuBackend {
+        Cpu,
+        Cuda,
+        Rocm,
+        Vulkan,
+        Metal,
+        Mlx,
+        Xpu,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Status {
+        Stable,
+        Experimental,
+        Planned,
+        Deprecated,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct BuildOption {
+        pub context_path: String,
+        #[serde(default = "default_dockerfile")]
+        pub dockerfile: String,
+        #[serde(default)]
+        pub build_args: HashMap<String, String>,
+        #[serde(default)]
+        pub tags: Vec<String>,
+    }
+    fn default_dockerfile() -> String {
+        "Dockerfile".to_string()
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DownloadOption {
+        pub image: String,
+        pub digest: String,
+        #[serde(default)]
+        pub size_mb: Option<u64>,
+        #[serde(default = "default_license_required")]
+        pub license_required: LicenseTier,
+        #[serde(default)]
+        pub enabled: bool,
+    }
+    fn default_license_required() -> LicenseTier {
+        LicenseTier::Pro
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    pub enum LicenseTier {
+        Pro,
+        Enterprise,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct FeatureFlagSpec {
+        pub name: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DetectionSpec {
+        pub binary: String,
+        pub endpoint: String,
+        #[serde(default = "default_health_path")]
+        pub health_path: String,
+    }
+    fn default_health_path() -> String {
+        "/".to_string()
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ModelPreset {
+        pub id: String,
+        pub display_name: String,
+        pub repo: String,
+        #[serde(default)]
+        pub quantization: Option<String>,
+        #[serde(default)]
+        pub vram_gb_min: Option<u16>,
+        #[serde(default)]
+        pub recommended: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum OsList {
+        Single(TargetOs),
+        Multi(Vec<TargetOs>),
+    }
+    impl OsList {
+        pub fn as_vec(&self) -> Vec<TargetOs> {
+            match self {
+                OsList::Single(o) => vec![*o],
+                OsList::Multi(v) => v.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum ArchList {
+        Single(TargetArch),
+        Multi(Vec<TargetArch>),
+    }
+    impl ArchList {
+        pub fn as_vec(&self) -> Vec<TargetArch> {
+            match self {
+                ArchList::Single(a) => vec![*a],
+                ArchList::Multi(v) => v.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum GpuBackendList {
+        Single(GpuBackend),
+        Multi(Vec<GpuBackend>),
+    }
+    impl GpuBackendList {
+        pub fn as_vec(&self) -> Vec<GpuBackend> {
+            match self {
+                GpuBackendList::Single(b) => vec![*b],
+                GpuBackendList::Multi(v) => v.clone(),
+            }
+        }
+    }
+
+    /// Walidacja semantyczna identyczna z runtime — 9 regul ze SCHEMA.md.
+    pub fn validate(
+        manifest: &ServiceManifest,
+        containers_root: &std::path::Path,
+    ) -> Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+        let eid = &manifest.engine.id;
+        let mut seen_variant_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for v in &manifest.variants {
+            if !seen_variant_ids.insert(v.id.clone()) {
+                errors.push(format!(
+                    "engine '{}' duplikat variant.id = '{}'",
+                    eid, v.id
+                ));
+            }
+            let os_list = v.target_os.as_vec();
+            let backend_list = v.gpu_backend.as_vec();
+
+            for &b in &backend_list {
+                let required: Vec<TargetOs> = match b {
+                    GpuBackend::Metal => vec![TargetOs::Macos, TargetOs::Ios],
+                    GpuBackend::Mlx => vec![TargetOs::Macos, TargetOs::Ios],
+                    GpuBackend::Cuda => vec![TargetOs::Linux, TargetOs::Windows],
+                    GpuBackend::Rocm => vec![TargetOs::Linux],
+                    GpuBackend::Xpu => vec![TargetOs::Linux, TargetOs::Windows],
+                    GpuBackend::Cpu | GpuBackend::Vulkan => continue,
+                };
+                if !os_list.iter().all(|o| required.contains(o)) {
+                    errors.push(format!(
+                        "engine '{}' wariant '{}': gpu_backend = {:?} wymaga \
+                         target_os in {:?}, ale jest {:?}",
+                        eid, v.id, b, required, os_list
+                    ));
+                }
+            }
+
+            if backend_list.contains(&GpuBackend::Mlx)
+                && v.deploy_mode != DeployMode::Embedded
+            {
+                errors.push(format!(
+                    "engine '{}' wariant '{}': gpu_backend = mlx wymaga \
+                     deploy_mode = embedded, jest {:?}",
+                    eid, v.id, v.deploy_mode
+                ));
+            }
+
+            if v.deploy_mode == DeployMode::Docker {
+                let invalid = os_list
+                    .iter()
+                    .any(|o| !matches!(o, TargetOs::Linux | TargetOs::Windows));
+                if invalid {
+                    errors.push(format!(
+                        "engine '{}' wariant '{}': deploy_mode = docker dziala \
+                         tylko na linux/windows, jest {:?}",
+                        eid, v.id, os_list
+                    ));
+                }
+            }
+
+            match v.deploy_mode {
+                DeployMode::Docker | DeployMode::Native | DeployMode::PythonBundle => {
+                    if v.build.is_none() {
+                        errors.push(format!(
+                            "engine '{}' wariant '{}': deploy_mode = {:?} wymaga \
+                             sekcji [variant.build]",
+                            eid, v.id, v.deploy_mode
+                        ));
+                    }
+                }
+                DeployMode::Embedded => {
+                    if v.feature_flag.is_none() {
+                        errors.push(format!(
+                            "engine '{}' wariant '{}': deploy_mode = embedded \
+                             wymaga sekcji [variant.feature_flag]",
+                            eid, v.id
+                        ));
+                    }
+                }
+                DeployMode::External => {
+                    if v.detection.is_none() {
+                        errors.push(format!(
+                            "engine '{}' wariant '{}': deploy_mode = external \
+                             wymaga sekcji [variant.detection]",
+                            eid, v.id
+                        ));
+                    }
+                }
+            }
+
+            if let Some(b) = &v.build {
+                let full = containers_root.join(&b.context_path);
+                if !full.is_dir() {
+                    errors.push(format!(
+                        "engine '{}' wariant '{}': context_path '{}' nie istnieje \
+                         na dysku ({})",
+                        eid,
+                        v.id,
+                        b.context_path,
+                        full.display()
+                    ));
+                }
+            }
+
+            if let Some(dl) = &v.download {
+                if dl.enabled {
+                    let valid = dl.digest.starts_with("sha256:")
+                        && dl.digest.len() == 71
+                        && dl.digest[7..].chars().all(|c| c.is_ascii_hexdigit());
+                    if !valid {
+                        errors.push(format!(
+                            "engine '{}' wariant '{}': download.enabled = true wymaga \
+                             digest sha256:<64 hex znakow>",
+                            eid, v.id
+                        ));
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+fn generate_services_manifest(out_dir: &Path) {
+    use services_manifest_build::{validate, ServiceManifest};
+    use std::collections::HashSet;
+
+    let workspace_root = Path::new("..")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(".."));
+    let containers_dir = workspace_root.join("tentaflow-containers");
+
+    if !containers_dir.is_dir() {
+        println!(
+            "cargo:warning=generate_services_manifest: brak {} — generuje pusty rejestr",
+            containers_dir.display()
+        );
+        write_generated(out_dir, "[]");
+        write_js_module(Path::new("wwwroot/js/generated/services-manifest.js"), "[]");
+        return;
+    }
+
+    // Skanuj wszystkie kategorie (top-level dirs w tentaflow-containers).
+    let mut manifest_files: Vec<PathBuf> = Vec::new();
+    let entries = match std::fs::read_dir(&containers_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            panic!(
+                "generate_services_manifest: nie mozna odczytac {}: {}",
+                containers_dir.display(),
+                e
+            );
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // Pomin podkatalogi techniczne (zaczynajace sie od '_', np. _schema).
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('_') {
+            continue;
+        }
+        let services_dir = path.join("_services");
+        if !services_dir.is_dir() {
+            continue;
+        }
+        // Rerun-if-changed dla calego katalogu kategorii _services.
+        println!("cargo:rerun-if-changed={}", services_dir.display());
+
+        let svc_entries = match std::fs::read_dir(&services_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for svc in svc_entries.flatten() {
+            let p = svc.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("toml") {
+                manifest_files.push(p);
+            }
+        }
+    }
+
+    // Stabilna kolejnosc — sortujemy alfabetycznie sciezki.
+    manifest_files.sort();
+
+    let mut loaded: Vec<ServiceManifest> = Vec::new();
+    let mut seen_engine_ids: HashSet<String> = HashSet::new();
+
+    for file in &manifest_files {
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => panic!(
+                "Nie mozna odczytac manifestu '{}': {}",
+                file.display(),
+                e
+            ),
+        };
+
+        let manifest: ServiceManifest = match toml::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => panic!(
+                "Bledny TOML w manifescie '{}':\n  {}",
+                file.display(),
+                e
+            ),
+        };
+
+        // Walidacja semantyczna — 9 regul.
+        if let Err(errs) = validate(&manifest, &containers_dir) {
+            let joined = errs
+                .iter()
+                .map(|s| format!("  - {}", s))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "Walidacja manifestu '{}' nieudana:\n{}",
+                file.display(),
+                joined
+            );
+        }
+
+        // Reguła 9 (czesc globalna): unikalnosc engine.id cross-file.
+        if !seen_engine_ids.insert(manifest.engine.id.clone()) {
+            panic!(
+                "Walidacja manifestu '{}' nieudana:\n  - duplikat engine.id = '{}' \
+                 (ten sam id w innym pliku _services)",
+                file.display(),
+                manifest.engine.id
+            );
+        }
+
+        loaded.push(manifest);
+    }
+
+    // Serializuj wszystko do JSON. pretty dla GUI, compact dla embed Rust (size).
+    let json_compact = serde_json::to_string(&loaded)
+        .expect("Bug: ServiceManifest powinien serializowac sie do JSON bez bledow");
+    let json_pretty = serde_json::to_string_pretty(&loaded)
+        .expect("Bug: ServiceManifest powinien serializowac sie do JSON bez bledow");
+
+    write_generated(out_dir, &json_compact);
+
+    // GUI module — zapisujemy do wwwroot, ale podajemy sciezke wzgledem build.rs CWD.
+    let js_path = Path::new("wwwroot/js/generated/services-manifest.js");
+    if let Some(parent) = js_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    write_js_module(js_path, &json_pretty);
+
+    println!(
+        "cargo:warning=Manifest serwisow: zaladowano {} silnikow z {} plikow TOML",
+        loaded.len(),
+        manifest_files.len()
+    );
+}
+
+fn write_generated(out_dir: &Path, json: &str) {
+    // Raw string z separatorem ###" ... "### — JSON nie zawiera tej sekwencji,
+    // wiec brak konfliktow nawet z escapowanymi cudzyslowami w stringach.
+    let code = format!(
+        "// Auto-generated by build.rs — NIE EDYTUJ RECZNIE.\n\
+         // Zawiera zserializowany JSON wszystkich manifestow z _services/.\n\
+         pub const GENERATED_MANIFEST_JSON: &str = r###\"{}\"###;\n",
+        json
+    );
+    let path = out_dir.join("services_generated.rs");
+    std::fs::write(&path, code)
+        .unwrap_or_else(|e| panic!("Nie mozna zapisac {}: {}", path.display(), e));
+}
+
+fn write_js_module(path: &Path, json_pretty: &str) {
+    let now = chrono_now_iso();
+    let content = format!(
+        "// =============================================================================\n\
+         // Plik: services-manifest.js\n\
+         // Opis: AUTO-GENERATED przez build.rs — nie edytuj recznie.\n\
+         //       Zrodlo: tentaflow-containers/*/_services/*.toml\n\
+         // =============================================================================\n\
+         \n\
+         export const SCHEMA_VERSION = 1;\n\
+         export const GENERATED_AT = \"{}\";\n\
+         export const SERVICES = {};\n",
+        now, json_pretty
+    );
+    if let Err(e) = std::fs::write(path, content) {
+        println!(
+            "cargo:warning=Nie udalo sie zapisac {}: {}",
+            path.display(),
+            e
+        );
+    }
+}
+
+/// Minimalna funkcja "now" bez dodawania chrono jako build-dep — uzywamy
+/// SystemTime + recznej konwersji do ISO-8601 UTC z dokladnoscia do sekundy.
+fn chrono_now_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Algorytm Howarda Hinnanta — konwersja days_from_civil → Y-M-D.
+    let days = (secs / 86_400) as i64;
+    let sod = (secs % 86_400) as u32;
+    let hour = sod / 3600;
+    let min = (sod / 60) % 60;
+    let sec = sod % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, m, d, hour, min, sec
+    )
 }
