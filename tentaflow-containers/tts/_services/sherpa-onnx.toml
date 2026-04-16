@@ -1,0 +1,142 @@
+# =============================================================================
+# Plik: tts/_services/sherpa-onnx.toml
+# Opis: Manifest silnika sherpa-onnx (TTS). Glowny tryb: native binarka
+#       buildowana per platforma; alternatywnie Docker dla CPU na Linuxie.
+# =============================================================================
+
+[engine]
+id = "sherpa-onnx"
+category = "tts"
+name = "Sherpa-ONNX"
+description_pl = "Lekki silnik TTS przez ONNX Runtime. Dziala na CPU i GPU, wsparcie wielu jezykow."
+description_en = "Lightweight TTS engine via ONNX Runtime. CPU/GPU support, multilingual."
+homepage = "https://github.com/k2-fsa/sherpa-onnx"
+docs_url = "https://k2-fsa.github.io/sherpa/onnx/"
+license = "Apache-2.0"
+api = "sherpa-tts"
+default_port = 5020
+version = "1.10.30"
+tags = ["tts", "onnx", "lightweight", "multilingual"]
+icon = "sherpa"
+
+# Glowny wariant produkcyjny - native binarka na Linux x86_64 CPU.
+[[variant]]
+id = "native-linux-x64-cpu"
+deploy_mode = "native"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cpu"
+status = "stable"
+ram_gb_min = 2
+disk_gb_min = 1
+notes_pl = "Domyslny wariant. Realny czas inferencji ~0.05 RTF na nowoczesnym CPU."
+notes_en = "Default variant. Real-time factor ~0.05 on modern CPU."
+
+[variant.build]
+context_path = "tts/native/sherpa-onnx"
+tags = ["sherpa-onnx-cpu-linux-x86_64"]
+
+[variant.build.build_args]
+SHERPA_ONNX_VERSION = "1.10.30"
+
+[variant.download]
+image = "ghcr.io/slyb00ts/tentaflow-pro/sherpa-onnx:native-linux-x64-cpu-v1.10.30"
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 95
+license_required = "pro"
+enabled = false
+
+# Wariant native dla Linux ARM64 (Raspberry Pi 5, serwery Ampere).
+[[variant]]
+id = "native-linux-arm64-cpu"
+deploy_mode = "native"
+target_os = "linux"
+target_arch = "aarch64"
+gpu_backend = "cpu"
+status = "planned"
+ram_gb_min = 2
+disk_gb_min = 1
+notes_pl = "W planach. RTF ~0.15 na Raspberry Pi 5 - akceptowalne dla jednego strumienia."
+notes_en = "Planned. RTF ~0.15 on Raspberry Pi 5 - acceptable for single stream."
+
+[variant.build]
+context_path = "tts/native/sherpa-onnx"
+tags = ["sherpa-onnx-cpu-linux-aarch64"]
+
+[variant.build.build_args]
+SHERPA_ONNX_VERSION = "1.10.30"
+
+# Wariant native dla macOS Apple Silicon z akceleracja Metal (CoreML provider).
+[[variant]]
+id = "native-macos-arm64-metal"
+deploy_mode = "native"
+target_os = "macos"
+target_arch = "aarch64"
+gpu_backend = "metal"
+status = "planned"
+vram_gb_min = 2
+ram_gb_min = 4
+disk_gb_min = 1
+notes_pl = "Wykorzystuje CoreML execution provider z ONNX Runtime."
+notes_en = "Uses CoreML execution provider from ONNX Runtime."
+
+[variant.build]
+context_path = "tts/native/sherpa-onnx"
+tags = ["sherpa-onnx-metal-macos-arm64"]
+
+[variant.build.build_args]
+SHERPA_ONNX_VERSION = "1.10.30"
+SHERPA_ONNX_ENABLE_COREML = "1"
+
+# Wariant native dla Windows x64 CPU.
+[[variant]]
+id = "native-windows-x64-cpu"
+deploy_mode = "native"
+target_os = "windows"
+target_arch = "x86_64"
+gpu_backend = "cpu"
+status = "planned"
+ram_gb_min = 2
+disk_gb_min = 1
+notes_pl = "Buildowane przez MSVC. Wymaga Visual Studio Build Tools."
+notes_en = "Built with MSVC. Requires Visual Studio Build Tools."
+
+[variant.build]
+context_path = "tts/native/sherpa-onnx"
+tags = ["sherpa-onnx-cpu-windows-x86_64"]
+
+[variant.build.build_args]
+SHERPA_ONNX_VERSION = "1.10.30"
+
+# Wariant Docker - alternatywa dla uzytkownikow ktorzy nie chca buildowac
+# binarki natywnie.
+[[variant]]
+id = "linux-x64-cpu-docker"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cpu"
+status = "stable"
+ram_gb_min = 2
+disk_gb_min = 3
+
+[variant.build]
+context_path = "tts/docker/sherpa-onnx"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/sherpa-onnx:cpu-x86_64"]
+
+[variant.build.build_args]
+SHERPA_ONNX_VERSION = "1.10.30"
+
+# Rekomendowane modele TTS.
+
+[[model_preset]]
+id = "vits-piper-en-us-amy-low"
+display_name = "Piper VITS - English US (Amy, low)"
+repo = "rhasspy/piper-voices/en/en_US/amy/low"
+recommended = true
+
+[[model_preset]]
+id = "vits-piper-pl-pl-darkman-medium"
+display_name = "Piper VITS - Polish (Darkman, medium)"
+repo = "rhasspy/piper-voices/pl/pl_PL/darkman/medium"

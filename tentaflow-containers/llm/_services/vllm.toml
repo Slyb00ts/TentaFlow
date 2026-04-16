@@ -1,0 +1,124 @@
+# =============================================================================
+# Plik: llm/_services/vllm.toml
+# Opis: Manifest silnika vLLM. Tryb deploymentu: docker (Linux/Windows-WSL2),
+#       z opcjonalnymi prebuilt obrazami Pro do pobrania z GHCR.
+# =============================================================================
+
+[engine]
+id = "vllm"
+category = "llm"
+name = "vLLM"
+description_pl = "Serwer LLM z PagedAttention i continuous batching. Wymaga osobnego buildu pod kazda architekture GPU."
+description_en = "Production LLM server with PagedAttention. Per-GPU builds required."
+homepage = "https://github.com/vllm-project/vllm"
+docs_url = "https://docs.vllm.ai"
+license = "Apache-2.0"
+api = "openai-compatible"
+default_port = 8000
+version = "0.6.3"
+tags = ["paged-attention", "continuous-batching", "production"]
+icon = "vllm"
+
+# Wariant produkcyjny dla Linux x86_64 z CUDA. Lokalny build z Dockerfile,
+# prebuilt obraz Pro do pobrania (infrastruktura, jeszcze nieaktywna).
+[[variant]]
+id = "linux-x64-cuda"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 8
+ram_gb_min = 16
+disk_gb_min = 30
+notes_pl = "Wymaga sterownika NVIDIA >= 535 i nvidia-container-toolkit."
+notes_en = "Requires NVIDIA driver >= 535 and nvidia-container-toolkit."
+
+[variant.build]
+context_path = "llm/docker/vllm"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/vllm:cuda-x86_64"]
+
+[variant.build.build_args]
+BASE_IMAGE = "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+VLLM_VERSION = "0.6.3"
+
+[variant.download]
+image = "ghcr.io/slyb00ts/tentaflow-pro/vllm:linux-x64-cuda-v0.6.3"
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 4200
+license_required = "pro"
+enabled = false
+
+# Wariant ROCm dla AMD GPU. Status planned - infrastruktura buildu gotowa,
+# brak jeszcze testow integracyjnych z realnymi GPU AMD.
+[[variant]]
+id = "linux-x64-rocm"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "rocm"
+status = "planned"
+vram_gb_min = 16
+ram_gb_min = 16
+disk_gb_min = 35
+notes_pl = "Tylko AMD MI200/MI300. Konsumenckie Radeony niewspierane przez vLLM."
+notes_en = "AMD MI200/MI300 only. Consumer Radeons not supported by vLLM."
+
+[variant.build]
+context_path = "llm/docker/vllm"
+dockerfile = "Dockerfile.rocm"
+tags = ["tentaflow/vllm:rocm-x86_64"]
+
+[variant.build.build_args]
+BASE_IMAGE = "rocm/dev-ubuntu-22.04:6.1"
+VLLM_VERSION = "0.6.3"
+
+# Wariant Windows: nie buildujemy lokalnie obrazu (vLLM nie ma natywnego
+# Windows containera), zamiast tego uzytkownik pobiera prebuilt Pro lub
+# uruchamia ten sam obraz Linux przez WSL2.
+[[variant]]
+id = "windows-wsl-cuda"
+deploy_mode = "docker"
+target_os = "windows"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 8
+ram_gb_min = 16
+disk_gb_min = 30
+notes_pl = "Wymaga WSL2 + Docker Desktop z integracja WSL i wsparcie NVIDIA CUDA-on-WSL. Build dzieli kontekst z linux-x64-cuda - Dockerfile produkuje ten sam obraz."
+notes_en = "Requires WSL2 + Docker Desktop with WSL integration and NVIDIA CUDA-on-WSL. Build shares context with linux-x64-cuda - Dockerfile produces same image."
+
+[variant.build]
+context_path = "llm/docker/vllm"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/vllm:cuda-x86_64"]
+
+[variant.build.build_args]
+BASE_IMAGE = "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+VLLM_VERSION = "0.6.3"
+
+[variant.download]
+image = "ghcr.io/slyb00ts/tentaflow-pro/vllm:linux-x64-cuda-v0.6.3"
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 4200
+license_required = "pro"
+enabled = false
+
+# Rekomendowane modele - kompaktowy preset domyslny i wieksze opcje produkcyjne.
+
+[[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen 3.5 0.8B (orchestrator)"
+repo = "Qwen/Qwen3.5-0.8B"
+quantization = "fp16"
+vram_gb_min = 4
+recommended = true
+
+[[model_preset]]
+id = "llama-3-1-8b-instruct"
+display_name = "Llama 3.1 8B Instruct"
+repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+quantization = "fp16"
+vram_gb_min = 20

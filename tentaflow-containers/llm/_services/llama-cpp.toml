@@ -1,0 +1,201 @@
+# =============================================================================
+# Plik: llm/_services/llama-cpp.toml
+# Opis: Manifest silnika llama.cpp. Najwiecej wariantow w katalogu - silnik
+#       kross-platformowy, dostepny zarowno embedded (przez Cargo feature),
+#       jako natywna binarka (llama-server), jak i w Dockerze.
+# =============================================================================
+
+[engine]
+id = "llama-cpp"
+category = "llm"
+name = "llama.cpp"
+description_pl = "Lekki silnik LLM w C/C++. Dziala wszedzie - od telefonu po klaster GPU. Obsluguje GGUF i embeddingi."
+description_en = "Lightweight C/C++ LLM engine. Runs anywhere - phones to GPU clusters. Supports GGUF and embeddings."
+homepage = "https://github.com/ggerganov/llama.cpp"
+docs_url = "https://github.com/ggerganov/llama.cpp/blob/master/README.md"
+license = "MIT"
+api = "openai-compatible"
+default_port = 8080
+version = "b3974"
+tags = ["gguf", "cpu", "lightweight", "cross-platform"]
+also_serves = ["embeddings"]
+icon = "llama-cpp"
+
+# Wariant embedded CPU - dziala wszedzie, nawet bez GPU. Domyslny fallback
+# dla maszyn bez akceleracji sprzetowej.
+[[variant]]
+id = "embedded-cpu"
+deploy_mode = "embedded"
+target_os = ["linux", "macos", "windows", "android"]
+target_arch = "any"
+gpu_backend = "cpu"
+status = "stable"
+ram_gb_min = 4
+disk_gb_min = 2
+notes_pl = "Najwolniejszy wariant, ale dziala wszedzie. Idealny do testow i malych modeli."
+notes_en = "Slowest variant, runs everywhere. Ideal for testing and small models."
+
+[variant.feature_flag]
+name = "inference-llamacpp"
+
+# Wariant embedded CUDA - desktop Linux/Windows z NVIDIA.
+[[variant]]
+id = "embedded-cuda"
+deploy_mode = "embedded"
+target_os = ["linux", "windows"]
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 4
+ram_gb_min = 8
+notes_pl = "Wymaga CUDA Toolkit 12.x w czasie buildu binarki TentaFlow."
+notes_en = "Requires CUDA Toolkit 12.x at TentaFlow build time."
+
+[variant.feature_flag]
+name = "inference-llamacpp"
+
+# Wariant embedded Metal - Apple Silicon (Mac, iPad, iPhone).
+[[variant]]
+id = "embedded-metal"
+deploy_mode = "embedded"
+target_os = ["macos", "ios"]
+target_arch = "aarch64"
+gpu_backend = "metal"
+status = "stable"
+vram_gb_min = 4
+ram_gb_min = 8
+notes_pl = "Najlepsza wydajnosc na Apple Silicon dzieki unified memory."
+notes_en = "Best performance on Apple Silicon thanks to unified memory."
+
+[variant.feature_flag]
+name = "inference-llamacpp"
+
+# Wariant embedded Vulkan - uniwersalny dla GPU bez CUDA/Metal (Intel ARC,
+# starsze AMD, Android Adreno/Mali).
+[[variant]]
+id = "embedded-vulkan"
+deploy_mode = "embedded"
+target_os = ["linux", "windows", "android"]
+target_arch = ["x86_64", "aarch64"]
+gpu_backend = "vulkan"
+status = "experimental"
+vram_gb_min = 4
+ram_gb_min = 8
+notes_pl = "Niestabilne na niektorych sterownikach mobile. Sprawdzaj wsparcie sterownika Vulkan 1.3."
+notes_en = "Unstable on some mobile drivers. Verify Vulkan 1.3 driver support."
+
+[variant.feature_flag]
+name = "inference-llamacpp"
+
+# Wariant embedded ROCm - AMD GPU pod Linuxem.
+[[variant]]
+id = "embedded-rocm"
+deploy_mode = "embedded"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "rocm"
+status = "experimental"
+vram_gb_min = 8
+ram_gb_min = 8
+notes_pl = "Wymaga ROCm 6.x i kompatybilnej karty (RDNA2/3 lub CDNA)."
+notes_en = "Requires ROCm 6.x and compatible card (RDNA2/3 or CDNA)."
+
+[variant.feature_flag]
+name = "inference-llamacpp"
+
+# Wariant native - osobna binarka llama-server na Linux x64 z CUDA.
+# Buildowana ze zrodel przez build-natives.sh.
+[[variant]]
+id = "native-linux-x64-cuda"
+deploy_mode = "native"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 4
+ram_gb_min = 8
+disk_gb_min = 5
+notes_pl = "Niezalezny proces llama-server. Latwiejszy debugging i restart bez zatrzymywania TentaFlow."
+notes_en = "Standalone llama-server process. Easier debugging and restart without stopping TentaFlow."
+
+[variant.build]
+context_path = "llm/native/llama-cpp"
+tags = ["llama-server-cuda-linux-x86_64"]
+
+[variant.build.build_args]
+LLAMA_CPP_VERSION = "b3974"
+GGML_CUDA = "1"
+
+[variant.download]
+image = "ghcr.io/slyb00ts/tentaflow-pro/llama-cpp:native-linux-x64-cuda-vb3974"
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 280
+license_required = "pro"
+enabled = false
+
+# Wariant native dla macOS Apple Silicon - llama-server z Metal.
+[[variant]]
+id = "native-macos-arm64-metal"
+deploy_mode = "native"
+target_os = "macos"
+target_arch = "aarch64"
+gpu_backend = "metal"
+status = "planned"
+vram_gb_min = 4
+ram_gb_min = 8
+disk_gb_min = 4
+notes_pl = "W planach v1.1 - na razie uzywaj wariantu embedded-metal."
+notes_en = "Planned for v1.1 - use embedded-metal variant for now."
+
+[variant.build]
+context_path = "llm/native/llama-cpp"
+tags = ["llama-server-metal-macos-arm64"]
+
+[variant.build.build_args]
+LLAMA_CPP_VERSION = "b3974"
+GGML_METAL = "1"
+
+# Wariant Docker dla uzytkownikow ktorzy preferuja kontenery i nie chca
+# rekompilowac binarki TentaFlow.
+[[variant]]
+id = "docker-linux-x64-cuda"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 4
+ram_gb_min = 8
+disk_gb_min = 10
+
+[variant.build]
+context_path = "llm/docker/llama-cpp"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/llama-cpp:cuda-x86_64"]
+
+[variant.build.build_args]
+LLAMA_CPP_VERSION = "b3974"
+
+# Rekomendowane modele - GGUF z HuggingFace.
+
+[[model_preset]]
+id = "qwen3-5-0-8b-q4"
+display_name = "Qwen 3.5 0.8B Q4_K_M"
+repo = "Qwen/Qwen3.5-0.8B-GGUF"
+quantization = "Q4_K_M"
+vram_gb_min = 2
+recommended = true
+
+[[model_preset]]
+id = "llama-3-1-8b-instruct-q4"
+display_name = "Llama 3.1 8B Instruct Q4_K_M"
+repo = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+quantization = "Q4_K_M"
+vram_gb_min = 6
+
+[[model_preset]]
+id = "nomic-embed-text-v1-5"
+display_name = "Nomic Embed Text v1.5 (embeddings)"
+repo = "nomic-ai/nomic-embed-text-v1.5-GGUF"
+quantization = "Q8_0"
+vram_gb_min = 1
