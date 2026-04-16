@@ -187,6 +187,8 @@ pub fn start_unified_server_with_permissions(
             let lni = local_node_id.clone();
             let msec = mesh_security.clone();
             let pc = permission_checker.clone();
+            let license: Arc<dyn crate::license::LicenseChecker> =
+                Arc::new(crate::license::StaticLicenseChecker::free());
 
             tokio::spawn(async move {
                 // TLS handshake
@@ -214,6 +216,7 @@ pub fn start_unified_server_with_permissions(
                     let lni = lni.clone();
                     let msec = msec.clone();
                     let pc = pc.clone();
+                    let lic = license.clone();
                     let ra = remote_addr_str.clone();
                     async move {
                         let path = req.uri().path().to_string();
@@ -261,7 +264,7 @@ pub fn start_unified_server_with_permissions(
                             });
                             Ok::<_, hyper::Error>(resp)
                         } else {
-                            let resp = crate::api::dashboard::server::handle_request(req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, ra).await?;
+                            let resp = crate::api::dashboard::server::handle_request(req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic, ra).await?;
                             let resp = resp.map(|body| {
                                 UnsyncBoxBody::new(body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() }))
                             });
