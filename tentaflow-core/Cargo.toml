@@ -167,6 +167,10 @@ wasmi = "0.44"
 
 [build-dependencies]
 rcgen = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+thiserror = "1.0"
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

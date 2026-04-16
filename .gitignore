@@ -12,6 +12,9 @@ bin/
 *.exe
 *.wasm
 
+# Wygenerowany manifest serwisow dla GUI (build.rs produkuje przy kompilacji)
+tentaflow-core/wwwroot/js/generated/
+
 # =============================================================================
 # Bazy danych
 # =============================================================================
