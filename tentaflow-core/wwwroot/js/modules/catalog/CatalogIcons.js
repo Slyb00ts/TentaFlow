@@ -139,11 +139,37 @@ const CatalogIcons = (() => {
     return `${svgOpen(size)}<rect x="4" y="2" width="16" height="20" rx="1"/><line x1="9" y1="22" x2="9" y2="16"/><line x1="15" y1="22" x2="15" y2="16"/><rect x="8" y="6" width="3" height="3"/><rect x="13" y="6" width="3" height="3"/><rect x="8" y="11" width="3" height="3"/><rect x="13" y="11" width="3" height="3"/></svg>`;
   }
 
+  // Kontener Docker — prostokat z modulami i fragmentem wieloryba.
+  function docker(size = 24) {
+    return `${svgOpen(size)}<rect x="2" y="9" width="20" height="11" rx="1"/><rect x="5" y="6" width="3" height="3"/><rect x="9" y="6" width="3" height="3"/><rect x="13" y="6" width="3" height="3"/><rect x="9" y="2" width="3" height="3"/><path d="M22 13s-1 2-3 2c-1 0-2-1-2-2"/></svg>`;
+  }
+
+  // Blyskawica — natywne uruchomienie (proces hosta).
+  function native(size = 24) {
+    return `${svgOpen(size)}<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`;
+  }
+
+  // Lancuch — zewnetrzne polaczenie (existing service).
+  function external(size = 24) {
+    return `${svgOpen(size)}<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>`;
+  }
+
+  // Pakiet/paczka — fallback dla nieznanego trybu deploy.
+  function pkg(size = 24) {
+    return `${svgOpen(size)}<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>`;
+  }
+
+  // Gwiazdka — wskaznik rekomendowanego presetu.
+  function star(size = 24) {
+    return `${svgOpen(size)}<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`;
+  }
+
   // Rejestr funkcji ikon.
   const ICONS = {
     speaker, mic, vector, search, wrench, brain, cpu, nvidia,
     sglang, vllm, ollama, llamacpp, mlx, whisper, sherpa, xtts,
-    image, grid, building, sort
+    image, grid, building, sort,
+    docker, native, external, pkg, star
   };
 
   // Pobranie ikony po identyfikatorze (klucz silnika lub kategorii).

@@ -257,10 +257,10 @@ const EngineDeployWizard = (() => {
   }
 
   function methodIcon(method) {
-    if (method === 'docker') return '\uD83D\uDC33';
-    if (method === 'native') return '\u26A1';
-    if (method === 'external') return '\uD83D\uDD17';
-    return '\uD83D\uDCE6';
+    if (method === 'docker') return CatalogIcons.docker(32);
+    if (method === 'native') return CatalogIcons.native(32);
+    if (method === 'external') return CatalogIcons.external(32);
+    return CatalogIcons.pkg(32);
   }
 
   // ---- Krok 2: wybor modelu (preset lub HuggingFace search) ---------------
@@ -295,12 +295,12 @@ const EngineDeployWizard = (() => {
       const display = p.display_name || p.repo || id;
       const repo = p.repo || '';
       const quant = p.quantization || '';
-      const star = p.recommended ? ' \u2B50' : '';
+      const starIcon = p.recommended ? ' <span class="preset-recommended" title="' + Utils.escapeAttr(I18n.t('wizard.recommended') || 'recommended') + '">' + CatalogIcons.star(14) + '</span>' : '';
       const sel = selection.modelPresetId === id ? ' selected' : '';
       const info = repo + (quant ? ' \u2022 ' + quant : '');
       return '<div class="model-item' + sel + '" data-preset-id="' + Utils.escapeAttr(id) + '">' +
         '<div style="flex:1;min-width:0;">' +
-          '<div class="model-item-name">' + Utils.escapeHtml(display) + star + '</div>' +
+          '<div class="model-item-name">' + Utils.escapeHtml(display) + starIcon + '</div>' +
           (info ? '<div class="model-item-info">' + Utils.escapeHtml(info) + '</div>' : '') +
         '</div>' +
       '</div>';
