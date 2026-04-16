@@ -1,0 +1,41 @@
+# =============================================================================
+# Plik: agents/_services/teams-bot.toml
+# Opis: Manifest agenta teams-bot. Tryb deploymentu: docker (Linux x64 CPU).
+#       Bot do Microsoft Teams - wymaga upstream LLM/STT/TTS.
+# =============================================================================
+
+[engine]
+id = "teams-bot"
+category = "agents"
+name = "Teams Bot"
+description_pl = "Bot do Microsoft Teams — laczy sie z meeting, transkrybuje, odpowiada przez TTS. Wymaga TTS+STT+LLM upstream."
+description_en = "Microsoft Teams bot — joins meetings, transcribes, responds via TTS. Requires TTS+STT+LLM upstream."
+homepage = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/what-are-bots"
+license = "MIT"
+api = "custom"
+default_port = 5000
+version = "0.1.0"
+tags = ["agent", "teams", "meeting-bot", "voice"]
+icon = "teams-bot"
+
+# Wariant Linux x64 CPU - jedyny wspierany. Bot agreguje upstream services,
+# nie potrzebuje GPU.
+[[variant]]
+id = "linux-x64-cpu"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cpu"
+status = "experimental"
+ram_gb_min = 4
+disk_gb_min = 5
+notes_pl = "Wymaga rejestracji aplikacji w Azure AD i kanalu Bot Framework. Patrz dokumentacja Teams."
+notes_en = "Requires Azure AD app registration and Bot Framework channel. See Teams docs."
+
+[variant.build]
+context_path = "agents/docker/teams-bot"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/teams-bot:latest"]
+
+[variant.build.build_args]
+TEAMS_BOT_VERSION = "0.1.0"
