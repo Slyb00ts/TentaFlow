@@ -36,8 +36,8 @@ WORKDIR /build/vllm
 RUN pip install --no-cache-dir -e . --extra-index-url https://download.pytorch.org/whl/cu126
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/llm-vllm/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/llm-vllm/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/llm/docker/vllm/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/llm/docker/vllm/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

@@ -34,8 +34,8 @@ RUN pip install --no-cache-dir --upgrade pip wheel \
  && pip install --no-cache-dir -r requirements.txt
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/comfyui/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/comfyui/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/image-gen/docker/comfyui/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/image-gen/docker/comfyui/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

@@ -34,9 +34,9 @@ RUN pip install --no-cache-dir --upgrade pip wheel \
       --extra-index-url https://download.pytorch.org/whl/cu124
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/stt-parakeet/server.py /app/server.py
-COPY tentaflow-containers/stt-parakeet/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/stt-parakeet/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/stt/docker/parakeet/server.py /app/server.py
+COPY tentaflow-containers/stt/docker/parakeet/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/stt/docker/parakeet/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

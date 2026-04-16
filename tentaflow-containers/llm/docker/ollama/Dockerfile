@@ -21,8 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/llm-ollama/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/llm-ollama/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/llm/docker/ollama/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/llm/docker/ollama/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

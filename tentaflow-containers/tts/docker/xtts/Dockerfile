@@ -32,9 +32,9 @@ RUN pip install --no-cache-dir --upgrade pip wheel \
       --extra-index-url https://download.pytorch.org/whl/cu124
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/tts-xtts/server.py /app/server.py
-COPY tentaflow-containers/tts-xtts/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/tts-xtts/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/tts/docker/xtts/server.py /app/server.py
+COPY tentaflow-containers/tts/docker/xtts/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/tts/docker/xtts/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

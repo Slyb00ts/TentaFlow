@@ -34,8 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=whisper-builder /build/whisper.cpp/build/bin/whisper-server /usr/local/bin/whisper-server
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/stt-whisper/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/stt-whisper/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/stt/docker/whisper/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/stt/docker/whisper/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

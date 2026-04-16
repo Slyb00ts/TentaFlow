@@ -22,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/reranker/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/reranker/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/reranker/docker/bge-reranker/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/reranker/docker/bge-reranker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp
