@@ -13,27 +13,6 @@ const ServiceCatalog = (() => {
   let boundBackHandler = null;
   let cachedNodes = [];
 
-  // Katalog uslug
-  const SERVICES = [
-    { id: 'tts', name: 'Text to Speech', desc: 'Synteza mowy z tekstu (Sherpa-ONNX)', gpu: true, defaultPort: 5020 },
-    { id: 'stt', name: 'Speech to Text', desc: 'Transkrypcja audio na tekst (Whisper)', gpu: true, defaultPort: 5030 },
-    { id: 'embeddings', name: 'Embeddings', desc: 'Generowanie wektorow z tekstu', gpu: true, defaultPort: 5050 },
-    { id: 'reranker', name: 'Reranker', desc: 'Rerankowanie wynikow wyszukiwania', gpu: true, defaultPort: 5055 },
-    { id: 'rag', name: 'RAG Engine', desc: 'Retrieval Augmented Generation', gpu: false, defaultPort: 5040 },
-    { id: 'tools', name: 'Tools', desc: 'Narzedzia i integracje zewnetrzne', gpu: false, defaultPort: 5060 },
-    { id: 'memory', name: 'Memory', desc: 'Pamiec konwersacji i kontekstu', gpu: false, defaultPort: 5002 },
-    { id: 'comfyui', name: 'Image Generation', desc: 'Generowanie obrazow (ComfyUI)', gpu: true, defaultPort: 5000 },
-    { id: 'meeting-bot', name: 'Meeting Bot', desc: 'Bot AI do spotkan Teams — dolacza jako uczestnik, transkrybuje, odpowiada', gpu: false, defaultPort: 5000 },
-  ];
-
-  const LLM_SERVICE = {
-    id: 'llm',
-    name: 'LLM Server',
-    desc: 'Serwer modeli jezykowych',
-    gpu: true,
-    defaultPort: 5010,
-  };
-
   // Otwarcie katalogu uslug
   function show(nodeId, context) {
     sourceContext = context || 'mesh';
@@ -173,49 +152,98 @@ const ServiceCatalog = (() => {
     }
   }
 
-  // Zakladka TentaFlow - grid wszystkich uslug (w tym LLM)
+  // Zakladka TentaFlow - dynamiczny render z manifestu (12 kategorii).
+  // Zwraca placeholder; wypelnienie nastepuje asynchronicznie w mountTentaFlowTab().
   function renderTentaFlowTab() {
-    const cards = SERVICES.map(s => `
-      <div class="catalog-card" data-service-id="${Utils.escapeAttr(s.id)}">
+    return `<div id="tentaflow-catalog-container"><div class="empty-state">${I18n.t('common.loading')}</div></div>`;
+  }
+
+  // Asynchroniczne wypelnienie zakladki TentaFlow z manifestu.
+  async function mountTentaFlowTab() {
+    const container = document.getElementById('tentaflow-catalog-container');
+    if (!container) return;
+
+    try {
+      await ManifestStore.init();
+    } catch (err) {
+      console.error('[ServiceCatalog] init manifest blad:', err);
+    }
+
+    const categories = ManifestStore.allCategories();
+    container.innerHTML = categories.map(cat => {
+      const engines = ManifestStore.byCategory(cat);
+      const titleKey = 'category.' + cat;
+      const title = Utils.escapeHtml(I18n.t(titleKey));
+
+      if (engines.length === 0) {
+        return `
+          <section class="catalog-section catalog-section-empty" style="margin-bottom: var(--spacing-lg);">
+            <h2 style="font-size: var(--font-size-md); margin-bottom: var(--spacing-sm);">${title}</h2>
+            <p class="empty-state-hint">${I18n.t('category.empty')}</p>
+          </section>
+        `;
+      }
+
+      const cards = engines.map(renderEngineCard).join('');
+      return `
+        <section class="catalog-section" style="margin-bottom: var(--spacing-lg);">
+          <h2 style="font-size: var(--font-size-md); margin-bottom: var(--spacing-sm);">${title}</h2>
+          <div class="catalog-grid">${cards}</div>
+        </section>
+      `;
+    }).join('');
+
+    // Podpiecie klikow na kafelki silnikow
+    const cards = container.querySelectorAll('.catalog-card[data-engine-id]');
+    cards.forEach(card => {
+      const handler = () => {
+        const engId = card.dataset.engineId;
+        if (!engId) return;
+        EngineDeployWizard.open(engId, { nodeId: currentNodeId });
+      };
+      const btn = card.querySelector('.catalog-deploy-btn');
+      if (btn) {
+        btn.addEventListener('click', (e) => { e.stopPropagation(); handler(); });
+      }
+      card.addEventListener('click', handler);
+    });
+  }
+
+  // Pojedynczy kafelek silnika z manifestu.
+  function renderEngineCard(manifest) {
+    const e = manifest.engine || {};
+    const variants = manifest.variant || [];
+    const stableCount = variants.filter(v => v.status === 'stable').length;
+    const expCount = variants.filter(v => v.status === 'experimental').length;
+    const plannedCount = variants.filter(v => v.status === 'planned').length;
+    const iconHtml = (typeof CatalogIcons !== 'undefined' && CatalogIcons.get)
+      ? CatalogIcons.get(e.icon || e.id || e.category)
+      : '';
+
+    let badges = '';
+    if (stableCount > 0) badges += `<span class="badge catalog-badge badge-stable">${stableCount} ${I18n.t('wizard.statusStable')}</span>`;
+    if (expCount > 0) badges += `<span class="badge catalog-badge badge-experimental">${expCount} ${I18n.t('wizard.statusExperimental')}</span>`;
+    if (plannedCount > 0 && stableCount === 0 && expCount === 0) {
+      badges += `<span class="badge catalog-badge badge-planned">${plannedCount} ${I18n.t('wizard.statusPlanned')}</span>`;
+    }
+    if (e.license) badges += `<span class="badge catalog-badge">${Utils.escapeHtml(e.license)}</span>`;
+
+    return `
+      <div class="catalog-card" data-engine-id="${Utils.escapeAttr(e.id)}">
         <div class="catalog-card-header">
-          <div class="catalog-card-icon">${CatalogIcons.get(s.id)}</div>
+          <div class="catalog-card-icon">${iconHtml}</div>
           <div>
-            <div class="catalog-card-title">${Utils.escapeHtml(s.name)}</div>
-            <div class="catalog-card-port">Port: ${Utils.escapeHtml(String(s.defaultPort))}</div>
+            <div class="catalog-card-title">${Utils.escapeHtml(e.name || e.id)}</div>
+            <div class="catalog-card-port">Port: ${Utils.escapeHtml(String(e.default_port || ''))}</div>
           </div>
         </div>
-        <div class="catalog-card-desc">${Utils.escapeHtml(s.desc)}</div>
+        <div class="catalog-card-desc">${Utils.escapeHtml(e.description_pl || e.description_en || '')}</div>
         <div class="catalog-card-footer">
-          <div class="catalog-card-badges">
-            ${s.gpu
-              ? '<span class="badge catalog-badge catalog-badge-gpu">GPU</span>'
-              : '<span class="badge catalog-badge catalog-badge-cpu">CPU</span>'}
-          </div>
+          <div class="catalog-card-badges">${badges}</div>
           <button class="btn btn-primary btn-sm catalog-deploy-btn">Deploy</button>
         </div>
       </div>
-    `).join('');
-
-    const llmCard = `
-      <div class="catalog-card" data-service-id="llm">
-        <div class="catalog-card-header">
-          <div class="catalog-card-icon">${CatalogIcons.get('llm')}</div>
-          <div>
-            <div class="catalog-card-title">${Utils.escapeHtml(LLM_SERVICE.name)}</div>
-            <div class="catalog-card-port">Port: ${LLM_SERVICE.defaultPort}</div>
-          </div>
-        </div>
-        <div class="catalog-card-desc">${Utils.escapeHtml(LLM_SERVICE.desc)}</div>
-        <div class="catalog-card-footer">
-          <div class="catalog-card-badges">
-            <span class="badge catalog-badge catalog-badge-gpu">GPU</span>
-          </div>
-          <button class="btn btn-primary btn-sm catalog-deploy-btn">Configure &amp; Deploy</button>
-        </div>
-      </div>
     `;
-
-    return `<div class="catalog-grid">${cards}${llmCard}</div>`;
   }
 
   // Stan katalogu NIM
@@ -859,30 +887,7 @@ ${envBlock ? '\n' + envBlock : ''}
       return;
     }
     if (activeTab === 'tentaflow') {
-      const cards = document.querySelectorAll('.catalog-card[data-service-id]');
-      cards.forEach(card => {
-        const btn = card.querySelector('.catalog-deploy-btn');
-        const handler = () => {
-          const serviceId = card.dataset.serviceId;
-          if (serviceId === 'llm') {
-            LLMDeployWizard.open(currentNodeId);
-          } else if (serviceId === 'stt') {
-            SttDeployWizard.open(currentNodeId);
-          } else {
-            const service = SERVICES.find(s => s.id === serviceId);
-            if (service) {
-              ServiceDeployModal.open(currentNodeId, service);
-            }
-          }
-        };
-        if (btn) {
-          btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            handler();
-          });
-        }
-        card.addEventListener('click', handler);
-      });
+      mountTentaFlowTab();
     }
   }
 

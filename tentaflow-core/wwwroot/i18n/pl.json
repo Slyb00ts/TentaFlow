@@ -1034,5 +1034,47 @@
     "badge_enrolled": "znany",
     "badge_temp": "tymczasowy",
     "download_transcripts": "Pobierz transkrypcje"
+  },
+  "wizard": {
+    "title": "Wdroz silnik",
+    "step1": "Wybor wezla",
+    "step2": "Wybor wariantu",
+    "step3": "Metoda deploy",
+    "step4": "Konfiguracja",
+    "selectNode": "Wybierz wezel docelowy",
+    "selectVariant": "Wybierz wariant kompatybilny z platforma",
+    "selectMethod": "Wybierz metode deploymentu",
+    "configureRuntime": "Skonfiguruj runtime",
+    "build": "Buduj lokalnie",
+    "buildDescription": "Buduj kontener lokalnie z Dockerfile (zawsze dostepne)",
+    "download": "Pobierz prebuilt",
+    "downloadDescription": "Pobierz prebuilt z naszego registry — szybciej, ale wymaga TentaFlow Pro",
+    "proRequired": "Wymaga TentaFlow Pro — kup licencje zeby odblokowac Download",
+    "statusStable": "Stabilny",
+    "statusExperimental": "Eksperymentalny",
+    "statusPlanned": "Planowany",
+    "statusDeprecated": "Wycofany",
+    "startDeploy": "Uruchom deploy",
+    "cancel": "Anuluj",
+    "next": "Dalej",
+    "back": "Wstecz"
+  },
+  "category": {
+    "llm": "Modele jezykowe (LLM)",
+    "stt": "Rozpoznawanie mowy (STT)",
+    "tts": "Synteza mowy (TTS)",
+    "embeddings": "Embeddingi",
+    "reranker": "Reranker",
+    "vision": "Wizja komputerowa",
+    "image-gen": "Generowanie obrazow",
+    "video-gen": "Generowanie wideo",
+    "music-gen": "Generowanie muzyki",
+    "model-3d-gen": "Generowanie modeli 3D",
+    "agents": "Agenty",
+    "tools": "Narzedzia",
+    "empty": "Wkrotce — patrz README kategorii"
+  },
+  "manifest": {
+    "noVariantsForPlatform": "Brak wariantow kompatybilnych z wybranym wezlem"
   }
 }
