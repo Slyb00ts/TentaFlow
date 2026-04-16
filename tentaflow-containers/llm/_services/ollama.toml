@@ -1,0 +1,128 @@
+# =============================================================================
+# Plik: llm/_services/ollama.toml
+# Opis: Manifest silnika Ollama. Glowny tryb: external (binarka instalowana
+#       niezaleznie przez uzytkownika), opcjonalnie docker dla zdalnego
+#       deploymentu na mesh node bez instalacji.
+# =============================================================================
+
+[engine]
+id = "ollama"
+category = "llm"
+name = "Ollama"
+description_pl = "Najprostszy lokalny runtime LLM. Dziala wszedzie, sam wykrywa GPU. Jeden install, duzo modeli."
+description_en = "Simplest local LLM runtime. Runs everywhere, auto-detects GPU. One install, many models."
+homepage = "https://ollama.com"
+docs_url = "https://github.com/ollama/ollama/tree/main/docs"
+license = "MIT"
+api = "ollama-native"
+default_port = 11434
+version = "0.4.0"
+tags = ["easy-install", "auto-gpu", "cross-platform"]
+icon = "ollama"
+
+# Wariant external Linux - uzytkownik instaluje binarke przez oficjalny
+# installer, Ollama sama wykrywa CUDA/ROCm/CPU.
+[[variant]]
+id = "external-linux"
+deploy_mode = "external"
+target_os = "linux"
+target_arch = ["x86_64", "aarch64"]
+gpu_backend = ["cpu", "cuda", "rocm"]
+status = "stable"
+ram_gb_min = 4
+disk_gb_min = 5
+notes_pl = "Zainstaluj Ollame z https://ollama.com/download. TentaFlow wykryje serwis automatycznie."
+notes_en = "Install Ollama from https://ollama.com/download. TentaFlow will detect the service automatically."
+
+[variant.detection]
+binary = "ollama"
+endpoint = "http://localhost:11434"
+health_path = "/api/tags"
+
+# Wariant external macOS - Ollama na Apple Silicon uzywa Metal automatycznie.
+[[variant]]
+id = "external-macos"
+deploy_mode = "external"
+target_os = "macos"
+target_arch = ["x86_64", "aarch64"]
+gpu_backend = ["cpu", "metal"]
+status = "stable"
+ram_gb_min = 4
+disk_gb_min = 5
+notes_pl = "Zainstaluj Ollame z https://ollama.com/download. Apple Silicon - Metal wykryty automatycznie."
+notes_en = "Install Ollama from https://ollama.com/download. Apple Silicon - Metal auto-detected."
+
+[variant.detection]
+binary = "ollama"
+endpoint = "http://localhost:11434"
+health_path = "/api/tags"
+
+# Wariant external Windows - Ollama na Windows uzywa CUDA jesli dostepne.
+[[variant]]
+id = "external-windows"
+deploy_mode = "external"
+target_os = "windows"
+target_arch = "x86_64"
+gpu_backend = ["cpu", "cuda"]
+status = "stable"
+ram_gb_min = 4
+disk_gb_min = 5
+notes_pl = "Zainstaluj Ollame z https://ollama.com/download. Wymaga sterownika NVIDIA dla GPU."
+notes_en = "Install Ollama from https://ollama.com/download. Requires NVIDIA driver for GPU."
+
+[variant.detection]
+binary = "ollama"
+endpoint = "http://localhost:11434"
+health_path = "/api/tags"
+
+# Wariant docker - dla deploymentu na zdalnym mesh node bez instalacji binarki.
+[[variant]]
+id = "linux-docker"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = ["x86_64", "aarch64"]
+gpu_backend = ["cuda", "cpu"]
+status = "stable"
+ram_gb_min = 4
+disk_gb_min = 10
+notes_pl = "Dla deploymentu na zdalnym mesh node bez instalacji Ollamy."
+notes_en = "For deployment on remote mesh node without installing Ollama."
+
+[variant.build]
+context_path = "llm/docker/ollama"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/ollama:latest"]
+
+[variant.build.build_args]
+OLLAMA_VERSION = "0.4.0"
+
+[variant.download]
+image = "ghcr.io/slyb00ts/tentaflow-pro/ollama:linux-v0.4.0"
+digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+size_mb = 1500
+license_required = "pro"
+enabled = false
+
+# Rekomendowane modele Ollama (referencja przez nazwy z biblioteki Ollama).
+
+[[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen 3.5 0.8B"
+repo = "qwen3.5:0.8b"
+quantization = "Q4_K_M"
+vram_gb_min = 1
+recommended = true
+
+[[model_preset]]
+id = "llama3-2-3b"
+display_name = "Llama 3.2 3B"
+repo = "llama3.2:3b"
+quantization = "Q4_K_M"
+vram_gb_min = 3
+
+[[model_preset]]
+id = "mistral-7b"
+display_name = "Mistral 7B Instruct"
+repo = "mistral:7b"
+quantization = "Q4_K_M"
+vram_gb_min = 5

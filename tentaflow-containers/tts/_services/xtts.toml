@@ -1,0 +1,75 @@
+# =============================================================================
+# Plik: tts/_services/xtts.toml
+# Opis: Manifest silnika XTTS v2 (Coqui). Tryb deploymentu: docker
+#       (Linux x64 CUDA + opcjonalnie CPU). Voice cloning z kilku sekund probki.
+#       UWAGA: licencja CPML - NIE jest open-source, ograniczenia komercyjne.
+# =============================================================================
+
+[engine]
+id = "xtts"
+category = "tts"
+name = "XTTS v2"
+description_pl = "XTTS v2 — voice cloning z kilku sekund probki. 17 jezykow, naturalna prozodia."
+description_en = "XTTS v2 — voice cloning from a few seconds sample. 17 languages, natural prosody."
+homepage = "https://github.com/coqui-ai/TTS"
+docs_url = "https://docs.coqui.ai/en/latest/models/xtts.html"
+license = "CPML"
+api = "openai-compatible"
+default_port = 5020
+version = "2.0.3"
+tags = ["tts", "voice-cloning", "multilingual", "coqui"]
+icon = "xtts"
+
+# Wariant Linux x64 CUDA - glowny i najlepiej przetestowany.
+[[variant]]
+id = "linux-x64-cuda"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 4
+ram_gb_min = 8
+disk_gb_min = 10
+notes_pl = "Wymaga nvidia-container-toolkit. Licencja CPML zabrania uzytku komercyjnego bez zgody Coqui."
+notes_en = "Requires nvidia-container-toolkit. CPML license forbids commercial use without Coqui consent."
+
+[variant.build]
+context_path = "tts/docker/xtts"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/xtts:cuda-x86_64"]
+
+[variant.build.build_args]
+XTTS_VERSION = "2.0.3"
+
+# Wariant Linux x64 CPU - eksperymentalny, ten sam image, CPU mode.
+[[variant]]
+id = "linux-x64-cpu"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cpu"
+status = "experimental"
+ram_gb_min = 8
+disk_gb_min = 10
+notes_pl = "Tryb CPU dziala, ale RTF ~3-5x - nie nadaje sie do real-time."
+notes_en = "CPU mode works but RTF ~3-5x - not suitable for real-time."
+
+[variant.build]
+context_path = "tts/docker/xtts"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/xtts:cpu-x86_64"]
+
+[variant.build.build_args]
+XTTS_VERSION = "2.0.3"
+XTTS_DEVICE = "cpu"
+
+# Rekomendowany model XTTS.
+
+[[model_preset]]
+id = "xtts-v2"
+display_name = "XTTS v2 (multilingual)"
+repo = "coqui/XTTS-v2"
+quantization = "fp16"
+vram_gb_min = 4
+recommended = true
