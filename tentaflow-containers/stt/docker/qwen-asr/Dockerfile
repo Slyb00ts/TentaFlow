@@ -37,9 +37,9 @@ RUN pip install --no-cache-dir flash-attn --no-build-isolation || \
     echo "[warn] flash-attn build failed — uzywam SDPA"
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/stt-qwen-asr/server.py /app/server.py
-COPY tentaflow-containers/stt-qwen-asr/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/stt-qwen-asr/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/stt/docker/qwen-asr/server.py /app/server.py
+COPY tentaflow-containers/stt/docker/qwen-asr/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/stt/docker/qwen-asr/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

@@ -537,7 +537,7 @@ async fn deploy_bundled_container(
     ))
 }
 
-/// Mapuje silnik wizarda na nazwe bundla Pythona w `tentaflow-containers/python-bundles/`.
+/// Mapuje silnik wizarda na nazwe bundla Pythona w `tentaflow-containers/<kategoria>/python/`.
 fn engine_to_python_bundle(engine: &str) -> Option<&'static str> {
     match engine {
         "vllm"               => Some("vllm"),

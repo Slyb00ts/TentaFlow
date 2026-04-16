@@ -36,8 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=sherpa-builder /build/sherpa-onnx/build/bin/sherpa-onnx-offline-tts-server /usr/local/bin/sherpa-tts
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/tts-sherpa/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/tts-sherpa/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/tts/docker/sherpa-onnx/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/tts/docker/sherpa-onnx/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

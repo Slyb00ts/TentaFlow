@@ -31,8 +31,8 @@ WORKDIR /build/sglang
 RUN pip install --no-cache-dir -e "python[all]" --extra-index-url https://download.pytorch.org/whl/cu126
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/llm-sglang/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/llm-sglang/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/llm/docker/sglang/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/llm/docker/sglang/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

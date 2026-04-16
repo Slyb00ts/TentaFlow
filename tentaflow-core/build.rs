@@ -527,8 +527,8 @@ fn pack_container_contexts(out_dir: &Path) {
 
     let bundle_path = out_dir.join("container_bundle.tar.gz");
 
-    // Wykluczamy `target/`, `node_modules/`, `.git/`, oraz tentaflow-containers/teams-bot/
-    // (stary, do migracji), zeby nie wciskac kilkudziesieciu MB binarek do binarki.
+    // Wykluczamy `target/`, `node_modules/`, `.git/`, zeby nie wciskac
+    // kilkudziesieciu MB binarek do binarki.
     let status = Command::new("tar")
         .arg("-czf")
         .arg(&bundle_path)

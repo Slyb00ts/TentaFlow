@@ -5,7 +5,7 @@
 //
 //       Flow:
 //        1. Rozpakuj embed bundle (deploy::bundle::extract_to) do tmpdir.
-//        2. Odczytaj tentaflow-containers/python-bundles/<engine>/bundle.toml.
+//        2. Odczytaj tentaflow-containers/<kategoria>/python/<engine>/bundle.toml.
 //        3. Zapewnij Pythona relokowalnego w ~/.cache/tentaflow/python/<ver>/
 //           (pobierz python-build-standalone dla platformy, jesli brak).
 //        4. Zapewnij `uv` binarke w ~/.cache/tentaflow/bin/ (pobierz z GitHub).
@@ -116,12 +116,34 @@ pub fn cache_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("nie mozna ustalic cache dir"))
 }
 
+/// Znajduje katalog bundla Pythona dla danego silnika.
+/// Skanuje wszystkie kategorie w tentaflow-containers/ szukajac
+/// <category>/python/<engine_id>/. Zwraca pierwsze trafienie (engine_id
+/// powinien byc unikalny w obrebie projektu).
+fn find_bundle_dir(workspace_root: &Path, engine_id: &str) -> Option<PathBuf> {
+    let containers = workspace_root.join("tentaflow-containers");
+    let categories = [
+        "llm", "stt", "tts", "embeddings", "reranker", "vision",
+        "image-gen", "video-gen", "music-gen", "model-3d-gen",
+        "agents", "tools",
+    ];
+    for category in categories {
+        let candidate = containers.join(category).join("python").join(engine_id);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Odczytuje bundle.toml z rozpakowanego kontekstu.
 pub fn read_bundle_spec(extracted_root: &Path, engine: &str) -> Result<BundleSpec> {
-    let path = extracted_root
-        .join("tentaflow-containers/python-bundles")
-        .join(engine)
-        .join("bundle.toml");
+    let bundle_dir = find_bundle_dir(extracted_root, engine)
+        .ok_or_else(|| anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            engine
+        ))?;
+    let path = bundle_dir.join("bundle.toml");
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("brak bundle.toml: {}", path.display()))?;
     let spec: BundleSpec = toml::from_str(&content)
@@ -157,10 +179,11 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
     let uv_bin = ensure_uv(&cache).ok();
 
     let venv_dir = cache.join("envs").join(engine);
-    let bundle_src = extracted
-        .path()
-        .join("tentaflow-containers/python-bundles")
-        .join(engine);
+    let bundle_src = find_bundle_dir(extracted.path(), engine)
+        .ok_or_else(|| anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            engine
+        ))?;
 
     create_venv(&python_bin, &venv_dir)?;
     install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
@@ -194,10 +217,11 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
     let uv_bin = ensure_uv(&cache).ok();
 
     let venv_dir = cache.join("envs").join(&req.engine);
-    let bundle_src = extracted
-        .path()
-        .join("tentaflow-containers/python-bundles")
-        .join(&req.engine);
+    let bundle_src = find_bundle_dir(extracted.path(), &req.engine)
+        .ok_or_else(|| anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            req.engine
+        ))?;
 
     create_venv(&python_bin, &venv_dir)?;
     install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
@@ -823,10 +847,11 @@ mod tests {
         // Sprawdzamy ze kazdy bundle.toml w repo jest poprawny
         let workspace = std::path::PathBuf::from("..");
         for engine in ["vllm", "sglang", "xtts", "voxcpm", "parakeet", "qwen-asr", "comfyui"] {
-            let path = workspace
-                .join("tentaflow-containers/python-bundles")
-                .join(engine)
-                .join("bundle.toml");
+            let bundle_dir = match find_bundle_dir(&workspace, engine) {
+                Some(d) => d,
+                None => continue,
+            };
+            let path = bundle_dir.join("bundle.toml");
             if !path.exists() { continue; }
             let content = std::fs::read_to_string(&path).unwrap();
             let spec: BundleSpec = toml::from_str(&content)

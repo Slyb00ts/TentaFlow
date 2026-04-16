@@ -44,8 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=llamacpp-builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/llm-llamacpp/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/llm-llamacpp/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/llm/docker/llama-cpp/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/llm/docker/llama-cpp/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # QUIC port dla routera (UDP), llama-server HTTP nasluchuje tylko na localhost.
