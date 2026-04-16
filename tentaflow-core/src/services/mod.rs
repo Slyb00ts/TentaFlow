@@ -8,6 +8,7 @@ pub mod rag;
 pub mod tts;
 pub mod embeddings;
 pub mod portainer;
+pub mod manifest;
 
 pub use rag::{RAGClient, RAGEngineConfigCompat};
 pub use tts::{TTSClient, TTSConfigCompat, SynthesizeCallback, TTSBufferingProcessor};
