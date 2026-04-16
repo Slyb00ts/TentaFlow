@@ -1029,5 +1029,47 @@
     "badge_enrolled": "known",
     "badge_temp": "temp",
     "download_transcripts": "Download transcripts"
+  },
+  "wizard": {
+    "title": "Deploy engine",
+    "step1": "Select node",
+    "step2": "Select variant",
+    "step3": "Deploy method",
+    "step4": "Configure",
+    "selectNode": "Select target node",
+    "selectVariant": "Select platform-compatible variant",
+    "selectMethod": "Select deployment method",
+    "configureRuntime": "Configure runtime",
+    "build": "Build locally",
+    "buildDescription": "Build container locally from Dockerfile (always available)",
+    "download": "Download prebuilt",
+    "downloadDescription": "Download prebuilt from our registry — faster, but requires TentaFlow Pro",
+    "proRequired": "Requires TentaFlow Pro — purchase a license to unlock Download",
+    "statusStable": "Stable",
+    "statusExperimental": "Experimental",
+    "statusPlanned": "Planned",
+    "statusDeprecated": "Deprecated",
+    "startDeploy": "Start deploy",
+    "cancel": "Cancel",
+    "next": "Next",
+    "back": "Back"
+  },
+  "category": {
+    "llm": "Language Models (LLM)",
+    "stt": "Speech to Text (STT)",
+    "tts": "Text to Speech (TTS)",
+    "embeddings": "Embeddings",
+    "reranker": "Reranker",
+    "vision": "Computer Vision",
+    "image-gen": "Image Generation",
+    "video-gen": "Video Generation",
+    "music-gen": "Music Generation",
+    "model-3d-gen": "3D Model Generation",
+    "agents": "Agents",
+    "tools": "Tools",
+    "empty": "Coming soon — see category README"
+  },
+  "manifest": {
+    "noVariantsForPlatform": "No variants compatible with the selected node"
   }
 }
