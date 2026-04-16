@@ -14,4 +14,4 @@ mod tests;
 
 pub use registry::{registry, ManifestRegistry};
 pub use types::*;
-pub use validate::{validate_engine, ValidationError};
+pub use validate::{validate_engine, validate_engine_id, ValidationError};

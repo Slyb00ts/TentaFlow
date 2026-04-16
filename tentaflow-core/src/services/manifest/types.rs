@@ -171,17 +171,21 @@ pub struct DownloadOption {
     #[serde(default)]
     pub size_mb: Option<u64>,
     #[serde(default = "default_license_required")]
-    pub license_required: LicenseTier,
+    pub license_required: RequiredLicenseTier,
     #[serde(default)]
     pub enabled: bool,
 }
-fn default_license_required() -> LicenseTier {
-    LicenseTier::Pro
+fn default_license_required() -> RequiredLicenseTier {
+    RequiredLicenseTier::Pro
 }
 
+/// Tier licencji wymagany przez wariant download w manifescie. Semantycznie
+/// oddzielny od `crate::license::LicenseTier` (ktory opisuje tier uzytkownika
+/// i ma dodatkowo wariant Free). Mapowanie do `LicenseTier` wykonuje
+/// `LicenseChecker::check_variant_download`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum LicenseTier {
+pub enum RequiredLicenseTier {
     Pro,
     Enterprise,
 }

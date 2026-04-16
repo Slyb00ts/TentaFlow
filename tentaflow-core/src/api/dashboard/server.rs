@@ -886,12 +886,17 @@ pub async fn handle_request(
 
     // Service Manifest API — manifest silnikow, info licencji, deploy z license-gating
     if path == "/api/services/manifest" && method == Method::GET {
-        let (status, response_body) = api_services_manifest::handle_get_manifest();
+        let (status, response_body) = api_services_manifest::handle_get_manifest(&license);
         return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
     }
     if let Some(rest) = path.strip_prefix("/api/services/manifest/") {
-        if method == Method::GET && !rest.is_empty() && !rest.contains('/') {
-            let (status, response_body) = api_services_manifest::handle_get_engine_manifest(rest);
+        if method == Method::GET && !rest.contains('/') {
+            // CR-001: whitelist regex chronia przed path-traversal/control chars/URL escape
+            if !crate::services::manifest::validate_engine_id(rest) {
+                let body = r#"{"error_code":"INVALID_ENGINE_ID","message":"engine_id musi spelniac '^[a-z0-9][a-z0-9_-]{0,63}$'"}"#.to_string();
+                return Ok(json_response_cors(400, body, cors_origin.as_deref()));
+            }
+            let (status, response_body) = api_services_manifest::handle_get_engine_manifest(&license, rest);
             return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
         }
     }

@@ -54,8 +54,8 @@ pub trait LicenseChecker: Send + Sync {
             return Ok(());
         };
         let required = match download.license_required {
-            crate::services::manifest::LicenseTier::Pro => LicenseTier::Pro,
-            crate::services::manifest::LicenseTier::Enterprise => LicenseTier::Enterprise,
+            crate::services::manifest::RequiredLicenseTier::Pro => LicenseTier::Pro,
+            crate::services::manifest::RequiredLicenseTier::Enterprise => LicenseTier::Enterprise,
         };
         if self.allows(required) {
             Ok(())
