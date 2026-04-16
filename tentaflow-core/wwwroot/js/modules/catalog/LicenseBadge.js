@@ -69,7 +69,13 @@ const LicenseBadge = (() => {
       Utils.escapeHtml(label) + '</span>';
   }
 
-  // Czysci cache (np. po zmianie licencji w Settings).
+  // Czysci cache info licencji. Powinno byc wywolane przy:
+  //   - zmianie licencji w Settings (gdy zostanie zaimplementowany endpoint)
+  //   - wylogowaniu i zalogowaniu (potencjalnie inny user / inna licencja)
+  //   - manualnym refresh przez admina
+  // TODO[License v2]: invalidate() musi byc wywolane po zmianie licencji w Settings
+  //   gdy zostanie zaimplementowany endpoint zmiany licencji (obecnie backend zwraca
+  //   stub Free i nie ma flow zmiany).
   function invalidate() {
     cachedInfo = null;
     cachedAt = 0;
