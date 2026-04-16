@@ -1,67 +1,29 @@
-# =============================================================================
-# Plik: llm/_services/sglang.toml
-# Opis: Manifest silnika SGLang. Tryb deploymentu: docker (Linux x64 CUDA).
-#       Konkurent vLLM z RadixAttention i lepsza obsluga structured outputs.
-# =============================================================================
+# Manifest serwisu SGLang — serwer LLM z RadixAttention (Linux/Windows GPU).
 
 [engine]
 id = "sglang"
 category = "llm"
 name = "SGLang"
-description_pl = "Serwer LLM z structured outputs i RadixAttention. Szybszy od vLLM dla zadan z function calling."
-description_en = "LLM server with structured outputs and RadixAttention. Faster than vLLM for function calling workloads."
+description_pl = "Serwer LLM z RadixAttention i strukturalnym output. Szybsze od vLLM dla zlozonych zapytan."
+description_en = "LLM server with RadixAttention and structured output. Faster than vLLM for complex prompts."
 homepage = "https://github.com/sgl-project/sglang"
-docs_url = "https://sgl-project.github.io/"
 license = "Apache-2.0"
-api = "openai-compatible"
-default_port = 30000
-version = "0.3.5"
-tags = ["radix-attention", "structured-outputs", "function-calling", "production"]
 icon = "sglang"
+default_port = 30000
+api = "openai-compatible"
+version = "0.3.5"
 
-# Wariant produkcyjny dla Linux x86_64 z CUDA.
-[[variant]]
-id = "linux-x64-cuda"
-deploy_mode = "docker"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "stable"
-vram_gb_min = 8
-ram_gb_min = 16
-disk_gb_min = 30
-notes_pl = "Wymaga sterownika NVIDIA >= 535 i nvidia-container-toolkit."
-notes_en = "Requires NVIDIA driver >= 535 and nvidia-container-toolkit."
-
-[variant.build]
+[deploy.docker]
 context_path = "llm/docker/sglang"
-dockerfile = "Dockerfile"
-tags = ["tentaflow/sglang:cuda-x86_64"]
+platforms = ["linux", "windows"]
 
-[variant.build.build_args]
-BASE_IMAGE = "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
-SGLANG_VERSION = "0.3.5"
-
-[variant.download]
-image = "ghcr.io/slyb00ts/tentaflow-pro/sglang:linux-x64-cuda-v0.3.5"
-digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-size_mb = 4500
-license_required = "pro"
-enabled = false
-
-# Rekomendowane modele dla SGLang.
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "llm/python/sglang"
 
 [[model_preset]]
 id = "qwen3-5-0-8b"
-display_name = "Qwen 3.5 0.8B (orchestrator)"
+display_name = "Qwen 3.5 0.8B"
 repo = "Qwen/Qwen3.5-0.8B"
-quantization = "fp16"
-vram_gb_min = 4
 recommended = true
-
-[[model_preset]]
-id = "llama-3-1-8b-instruct"
-display_name = "Llama 3.1 8B Instruct"
-repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-quantization = "fp16"
-vram_gb_min = 20

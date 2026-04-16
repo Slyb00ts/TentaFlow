@@ -1,12 +1,11 @@
 // =============================================================================
 // Plik: validate.rs
-// Opis: Walidacja semantyczna service manifestow — implementuje 10 regul ze
+// Opis: Walidacja semantyczna service manifestow — implementuje 4 reguly ze
 //       SCHEMA.md (sekcja "Reguly walidacji semantycznej") oraz walidacje
 //       engine.id chroniaca przed path-traversal/RCE w sciezkach runtime.
 // =============================================================================
 
 use super::types::*;
-use std::collections::HashSet;
 use std::path::Path;
 
 /// Waliduje `engine.id` (oraz inne identyfikatory uzywane w sciezkach FS i URL).
@@ -17,13 +16,10 @@ pub fn validate_engine_id(id: &str) -> bool {
     if bytes.is_empty() || bytes.len() > 64 {
         return false;
     }
-    // Pierwszy znak: a-z lub 0-9.
     let first = bytes[0];
-    let first_ok = first.is_ascii_lowercase() || first.is_ascii_digit();
-    if !first_ok {
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return false;
     }
-    // Pozostale znaki: a-z, 0-9, _ lub -.
     bytes[1..]
         .iter()
         .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
@@ -32,102 +28,49 @@ pub fn validate_engine_id(id: &str) -> bool {
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': gpu_backend = {backend:?} \
-         wymaga target_os in {required:?}, ale jest {actual:?}"
-    )]
-    InvalidGpuOsCombo {
-        engine_id: String,
-        variant_id: String,
-        backend: GpuBackend,
-        required: Vec<TargetOs>,
-        actual: Vec<TargetOs>,
-    },
-    #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': gpu_backend = mlx wymaga \
-         deploy_mode = embedded, jest {mode:?}"
-    )]
-    MlxRequiresEmbedded {
-        engine_id: String,
-        variant_id: String,
-        mode: DeployMode,
-    },
-    #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': deploy_mode = docker dziala \
-         tylko na linux/windows (macOS Docker brak GPU passthrough), jest {actual:?}"
-    )]
-    DockerInvalidOs {
-        engine_id: String,
-        variant_id: String,
-        actual: Vec<TargetOs>,
-    },
-    #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': context_path '{path}' \
-         nie istnieje na dysku"
-    )]
-    ContextPathMissing {
-        engine_id: String,
-        variant_id: String,
-        path: String,
-    },
-    #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': download.enabled = true wymaga \
-         digest sha256:... (64 hex znakow)"
-    )]
-    DownloadEnabledWithoutDigest {
-        engine_id: String,
-        variant_id: String,
-    },
-    #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': deploy_mode = embedded wymaga \
-         sekcji [variant.feature_flag]"
-    )]
-    EmbeddedRequiresFeatureFlag {
-        engine_id: String,
-        variant_id: String,
-    },
-    #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': deploy_mode = external wymaga \
-         sekcji [variant.detection]"
-    )]
-    ExternalRequiresDetection {
-        engine_id: String,
-        variant_id: String,
-    },
-    #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': deploy_mode = {mode:?} wymaga \
-         sekcji [variant.build]"
-    )]
-    BuildRequiredButMissing {
-        engine_id: String,
-        variant_id: String,
-        mode: DeployMode,
-    },
-    #[error("Engine '{engine_id}' ma duplikat variant.id = '{variant_id}'")]
-    DuplicateVariantId {
-        engine_id: String,
-        variant_id: String,
-    },
-    #[error(
         "Engine id = '{id}' nie spelnia wymaganego formatu \
          '^[a-z0-9][a-z0-9_-]{{0,63}}$' (1-64 znakow, kebab/snake_case)"
     )]
     InvalidEngineId { id: String },
+
     #[error(
-        "Engine '{engine_id}' wariant '{variant_id}': download.enabled = true z \
-         placeholder digest sha256:00...00 — uzupelnij prawdziwy digest przed \
-         publikacja artefaktu"
+        "Engine '{engine_id}': brak sekcji deploymentu — wymagana przynajmniej jedna z \
+         [deploy.docker], [deploy.native], [deploy.external]"
     )]
-    PlaceholderDigestEnabled {
+    NoDeploySection { engine_id: String },
+
+    #[error(
+        "Engine '{engine_id}': deploy.native.runtime = embedded wymaga pola feature_flag \
+         (i nie moze miec binary_path/bundle_path)"
+    )]
+    EmbeddedRequiresFeatureFlag { engine_id: String },
+
+    #[error(
+        "Engine '{engine_id}': deploy.native.runtime = binary wymaga pola binary_path \
+         (i nie moze miec feature_flag/bundle_path)"
+    )]
+    BinaryRequiresBinaryPath { engine_id: String },
+
+    #[error(
+        "Engine '{engine_id}': deploy.native.runtime = python-bundle wymaga pola bundle_path \
+         (i nie moze miec feature_flag/binary_path)"
+    )]
+    PythonBundleRequiresBundlePath { engine_id: String },
+
+    #[error(
+        "Engine '{engine_id}': sciezka {field} = '{path}' nie istnieje na dysku"
+    )]
+    PathMissing {
         engine_id: String,
-        variant_id: String,
+        field: &'static str,
+        path: String,
     },
 }
 
-/// Waliduje pojedynczy manifest. Reguly 1-9 z SCHEMA.md.
+/// Waliduje pojedynczy manifest. 4 reguly ze SCHEMA.md.
 ///
-/// Reguła 7 (`context_path` istnieje na dysku) jest sprawdzana tylko gdy
-/// `containers_root` jest podany — runtime moze nie miec dostepu do FS.
-/// Reguła 9 czesc dot. unikalnosci engine.id globalnie nalezy do build.rs/registry.
+/// Reguła 4 (sciezki istnieja na dysku) jest sprawdzana tylko gdy `containers_root`
+/// jest podany — runtime moze nie miec dostepu do FS containers/.
 pub fn validate_engine(
     manifest: &ServiceManifest,
     containers_root: Option<&Path>,
@@ -135,127 +78,66 @@ pub fn validate_engine(
     let mut errors = Vec::new();
     let eid = &manifest.engine.id;
 
-    // Reguła 10: engine.id musi spelniac whitelist regex.
+    // Reguła 1: engine.id musi spelniac whitelist regex.
     if !validate_engine_id(eid) {
         errors.push(ValidationError::InvalidEngineId { id: eid.clone() });
     }
 
-    let mut seen_variant_ids: HashSet<String> = HashSet::new();
+    // Reguła 2: minimum jedna sekcja deploy.
+    let deploy = &manifest.deploy;
+    if deploy.docker.is_none() && deploy.native.is_none() && deploy.external.is_none() {
+        errors.push(ValidationError::NoDeploySection {
+            engine_id: eid.clone(),
+        });
+    }
 
-    for variant in &manifest.variants {
-        // Reguła 9 (czesc lokalna): unikalnosc variant.id w obrebie engine.
-        if !seen_variant_ids.insert(variant.id.clone()) {
-            errors.push(ValidationError::DuplicateVariantId {
-                engine_id: eid.clone(),
-                variant_id: variant.id.clone(),
-            });
-        }
-
-        let os_list = variant.target_os.as_vec();
-        let backend_list = variant.gpu_backend.as_vec();
-
-        // Reguly 1, 3, 4, 5: gpu_backend → wymagany podzbior target_os.
-        for &backend in &backend_list {
-            let required: Vec<TargetOs> = match backend {
-                GpuBackend::Metal => vec![TargetOs::Macos, TargetOs::Ios],
-                GpuBackend::Mlx => vec![TargetOs::Macos, TargetOs::Ios],
-                GpuBackend::Cuda => vec![TargetOs::Linux, TargetOs::Windows],
-                GpuBackend::Rocm => vec![TargetOs::Linux],
-                GpuBackend::Xpu => vec![TargetOs::Linux, TargetOs::Windows],
-                // cpu i vulkan dzialaja na dowolnym OS — pomijamy.
-                GpuBackend::Cpu | GpuBackend::Vulkan => continue,
-            };
-            if !os_list.iter().all(|o| required.contains(o)) {
-                errors.push(ValidationError::InvalidGpuOsCombo {
-                    engine_id: eid.clone(),
-                    variant_id: variant.id.clone(),
-                    backend,
-                    required,
-                    actual: os_list.clone(),
-                });
-            }
-        }
-
-        // Reguła 2: mlx wymaga deploy_mode = embedded.
-        if backend_list.contains(&GpuBackend::Mlx) && variant.deploy_mode != DeployMode::Embedded {
-            errors.push(ValidationError::MlxRequiresEmbedded {
-                engine_id: eid.clone(),
-                variant_id: variant.id.clone(),
-                mode: variant.deploy_mode,
-            });
-        }
-
-        // Reguła 6: docker tylko na linux/windows.
-        if variant.deploy_mode == DeployMode::Docker {
-            let invalid = os_list
-                .iter()
-                .any(|os| !matches!(os, TargetOs::Linux | TargetOs::Windows));
-            if invalid {
-                errors.push(ValidationError::DockerInvalidOs {
-                    engine_id: eid.clone(),
-                    variant_id: variant.id.clone(),
-                    actual: os_list.clone(),
-                });
-            }
-        }
-
-        // Wymagane podsekcje wedlug deploy_mode.
-        match variant.deploy_mode {
-            DeployMode::Docker | DeployMode::Native | DeployMode::PythonBundle => {
-                if variant.build.is_none() {
-                    errors.push(ValidationError::BuildRequiredButMissing {
-                        engine_id: eid.clone(),
-                        variant_id: variant.id.clone(),
-                        mode: variant.deploy_mode,
-                    });
-                }
-            }
-            DeployMode::Embedded => {
-                if variant.feature_flag.is_none() {
+    // Reguła 3: deploy.native.runtime spojny z polami.
+    if let Some(native) = &deploy.native {
+        match native.runtime {
+            NativeRuntime::Embedded => {
+                if native.feature_flag.is_none()
+                    || native.binary_path.is_some()
+                    || native.bundle_path.is_some()
+                {
                     errors.push(ValidationError::EmbeddedRequiresFeatureFlag {
                         engine_id: eid.clone(),
-                        variant_id: variant.id.clone(),
                     });
                 }
             }
-            DeployMode::External => {
-                if variant.detection.is_none() {
-                    errors.push(ValidationError::ExternalRequiresDetection {
+            NativeRuntime::Binary => {
+                if native.binary_path.is_none()
+                    || native.feature_flag.is_some()
+                    || native.bundle_path.is_some()
+                {
+                    errors.push(ValidationError::BinaryRequiresBinaryPath {
                         engine_id: eid.clone(),
-                        variant_id: variant.id.clone(),
+                    });
+                }
+            }
+            NativeRuntime::PythonBundle => {
+                if native.bundle_path.is_none()
+                    || native.feature_flag.is_some()
+                    || native.binary_path.is_some()
+                {
+                    errors.push(ValidationError::PythonBundleRequiresBundlePath {
+                        engine_id: eid.clone(),
                     });
                 }
             }
         }
+    }
 
-        // Reguła 7: context_path musi istniec na dysku.
-        if let (Some(build), Some(root)) = (&variant.build, containers_root) {
-            let full = root.join(&build.context_path);
-            if !full.is_dir() {
-                errors.push(ValidationError::ContextPathMissing {
-                    engine_id: eid.clone(),
-                    variant_id: variant.id.clone(),
-                    path: build.context_path.clone(),
-                });
-            }
+    // Reguła 4: sciezki na dysku (sprawdzana tylko build-time).
+    if let Some(root) = containers_root {
+        if let Some(d) = &deploy.docker {
+            check_path(root, &d.context_path, "deploy.docker.context_path", eid, &mut errors);
         }
-
-        // Reguła 8: download.enabled = true wymaga poprawnego digest oraz nie
-        // moze byc placeholder z samych zer (chroni przed pull-by-fake-digest
-        // gdy ktos przelaczy enabled = true zapominajac zaktualizowac digest).
-        if let Some(dl) = &variant.download {
-            if dl.enabled {
-                if !is_valid_sha256_digest(&dl.digest) {
-                    errors.push(ValidationError::DownloadEnabledWithoutDigest {
-                        engine_id: eid.clone(),
-                        variant_id: variant.id.clone(),
-                    });
-                } else if is_placeholder_zero_digest(&dl.digest) {
-                    errors.push(ValidationError::PlaceholderDigestEnabled {
-                        engine_id: eid.clone(),
-                        variant_id: variant.id.clone(),
-                    });
-                }
+        if let Some(n) = &deploy.native {
+            if let Some(p) = &n.binary_path {
+                check_path(root, p, "deploy.native.binary_path", eid, &mut errors);
+            }
+            if let Some(p) = &n.bundle_path {
+                check_path(root, p, "deploy.native.bundle_path", eid, &mut errors);
             }
         }
     }
@@ -267,15 +149,19 @@ pub fn validate_engine(
     }
 }
 
-/// Sprawdza czy string ma format `sha256:<64 hex znakow>`.
-fn is_valid_sha256_digest(s: &str) -> bool {
-    s.starts_with("sha256:")
-        && s.len() == 71
-        && s[7..].chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Sprawdza czy digest jest placeholderem skladajacym sie z samych zer
-/// (`sha256:00...00`). Wymaga, aby format byl wczesniej zwalidowany.
-fn is_placeholder_zero_digest(s: &str) -> bool {
-    s.len() == 71 && s.starts_with("sha256:") && s[7..].bytes().all(|b| b == b'0')
+fn check_path(
+    root: &Path,
+    rel: &str,
+    field: &'static str,
+    engine_id: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let full = root.join(rel);
+    if !full.is_dir() {
+        errors.push(ValidationError::PathMissing {
+            engine_id: engine_id.to_string(),
+            field,
+            path: rel.to_string(),
+        });
+    }
 }

@@ -1,19 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tentaflow.dev/schemas/service-manifest-v1.json",
+  "$id": "https://tentaflow.dev/schemas/service-manifest-v2.json",
   "title": "TentaFlow Service Manifest",
-  "description": "Manifest TOML opisujacy jeden silnik wnioskowania (engine) i jego warianty deploymentu.",
+  "description": "Manifest TOML opisujacy jeden silnik wnioskowania (engine) i jego tryby deploymentu.",
   "type": "object",
-  "required": ["engine", "variant"],
+  "required": ["engine", "deploy"],
   "additionalProperties": false,
   "properties": {
     "engine": { "$ref": "#/$defs/engine" },
-    "variant": {
-      "type": "array",
-      "minItems": 1,
-      "description": "Lista wariantow deploymentu (TOML: [[variant]]).",
-      "items": { "$ref": "#/$defs/variant" }
-    },
+    "deploy": { "$ref": "#/$defs/deploy" },
     "model_preset": {
       "type": "array",
       "description": "Opcjonalna lista rekomendowanych modeli (TOML: [[model_preset]]).",
@@ -27,301 +22,146 @@
         "llm", "stt", "tts", "embeddings", "reranker",
         "vision", "image-gen", "video-gen", "music-gen",
         "model-3d-gen", "agents", "tools"
-      ],
-      "description": "Kategoria uslugi udostepnianej przez silnik."
+      ]
     },
     "api": {
       "type": "string",
       "enum": [
         "openai-compatible", "ollama-native",
         "sherpa-tts", "sherpa-stt", "comfyui", "custom"
-      ],
-      "description": "Protokol API udostepniany przez silnik."
-    },
-    "deploy_mode": {
-      "type": "string",
-      "enum": ["native", "docker", "python-bundle", "embedded", "external"],
-      "description": "Tryb deploymentu wariantu."
+      ]
     },
     "target_os": {
       "type": "string",
       "enum": ["linux", "macos", "windows", "ios", "android"]
     },
-    "target_os_value": {
-      "oneOf": [
-        { "$ref": "#/$defs/target_os" },
-        {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": { "$ref": "#/$defs/target_os" }
-        }
-      ],
-      "description": "Pojedynczy OS lub lista OS-ow."
+    "platforms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/target_os" }
     },
-    "target_arch": {
+    "engine_id": {
       "type": "string",
-      "enum": ["x86_64", "aarch64", "any"]
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "description": "Identyfikator: 1-64 znakow, kebab/snake_case, zaczyna sie od litery lub cyfry."
     },
-    "target_arch_value": {
-      "oneOf": [
-        { "$ref": "#/$defs/target_arch" },
-        {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": { "$ref": "#/$defs/target_arch" }
-        }
-      ]
-    },
-    "gpu_backend": {
+    "preset_id": {
       "type": "string",
-      "enum": ["cpu", "cuda", "rocm", "vulkan", "metal", "mlx", "xpu"]
-    },
-    "gpu_backend_value": {
-      "oneOf": [
-        { "$ref": "#/$defs/gpu_backend" },
-        {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": { "$ref": "#/$defs/gpu_backend" }
-        }
-      ]
-    },
-    "status": {
-      "type": "string",
-      "enum": ["stable", "experimental", "planned", "deprecated"]
-    },
-    "kebab_id": {
-      "type": "string",
-      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
-      "description": "Identyfikator kebab-case: tylko male litery, cyfry i pojedyncze myslniki."
+      "minLength": 1,
+      "maxLength": 64
     },
     "engine": {
       "type": "object",
       "required": [
         "id", "category", "name",
         "description_pl", "description_en",
-        "homepage", "license", "api",
-        "default_port", "version"
+        "homepage", "license",
+        "default_port", "api", "version"
       ],
       "additionalProperties": false,
       "properties": {
-        "id": { "$ref": "#/$defs/kebab_id", "description": "Unikalny ID silnika (kebab-case)." },
+        "id": { "$ref": "#/$defs/engine_id" },
         "category": { "$ref": "#/$defs/category" },
-        "name": { "type": "string", "minLength": 1, "description": "Nazwa wyswietlana w GUI." },
-        "description_pl": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Opis po polsku." },
-        "description_en": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Opis po angielsku." },
-        "homepage": { "type": "string", "format": "uri", "description": "Strona projektu." },
-        "license": { "type": "string", "minLength": 1, "description": "Identyfikator SPDX licencji." },
+        "name": { "type": "string", "minLength": 1 },
+        "description_pl": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "description_en": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "homepage": { "type": "string", "format": "uri" },
+        "license": { "type": "string", "minLength": 1 },
+        "icon": { "type": "string" },
+        "default_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "api": { "$ref": "#/$defs/api" },
-        "default_port": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535,
-          "description": "Domyslny port silnika."
-        },
-        "version": { "type": "string", "minLength": 1, "description": "Wersja referencyjna silnika." },
-        "tags": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Etykiety opisowe dla wyszukiwarki."
-        },
-        "also_serves": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/category" },
-          "description": "Inne kategorie obslugiwane przez ten sam silnik."
-        },
-        "docs_url": { "type": "string", "format": "uri", "description": "Adres dokumentacji." },
-        "icon": { "type": "string", "description": "Klucz ikony w katalogu wwwroot." }
+        "version": { "type": "string", "minLength": 1 }
       }
     },
-    "variant": {
+    "deploy": {
       "type": "object",
-      "required": ["id", "deploy_mode", "target_os", "target_arch", "gpu_backend", "status"],
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "docker": { "$ref": "#/$defs/deploy_docker" },
+        "native": { "$ref": "#/$defs/deploy_native" },
+        "external": { "$ref": "#/$defs/deploy_external" }
+      }
+    },
+    "deploy_docker": {
+      "type": "object",
+      "required": ["context_path", "platforms"],
       "additionalProperties": false,
       "properties": {
-        "id": { "$ref": "#/$defs/kebab_id" },
-        "deploy_mode": { "$ref": "#/$defs/deploy_mode" },
-        "target_os": { "$ref": "#/$defs/target_os_value" },
-        "target_arch": { "$ref": "#/$defs/target_arch_value" },
-        "gpu_backend": { "$ref": "#/$defs/gpu_backend_value" },
-        "status": { "$ref": "#/$defs/status" },
-        "vram_gb_min": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "ram_gb_min": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "disk_gb_min": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "notes_pl": { "type": "string" },
-        "notes_en": { "type": "string" },
-        "build": { "$ref": "#/$defs/variant_build" },
-        "download": { "$ref": "#/$defs/variant_download" },
-        "feature_flag": { "$ref": "#/$defs/variant_feature_flag" },
-        "detection": { "$ref": "#/$defs/variant_detection" }
+        "context_path": { "type": "string", "minLength": 1 },
+        "platforms": { "$ref": "#/$defs/platforms" },
+        "download_image": { "type": "string", "minLength": 1 },
+        "download_size_mb": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "deploy_native": {
+      "type": "object",
+      "required": ["platforms", "runtime"],
+      "additionalProperties": false,
+      "properties": {
+        "platforms": { "$ref": "#/$defs/platforms" },
+        "runtime": {
+          "type": "string",
+          "enum": ["embedded", "binary", "python-bundle"]
+        },
+        "feature_flag": { "type": "string", "minLength": 1 },
+        "binary_path": { "type": "string", "minLength": 1 },
+        "bundle_path": { "type": "string", "minLength": 1 }
       },
       "allOf": [
         {
-          "if": { "properties": { "deploy_mode": { "const": "docker" } } },
-          "then": { "required": ["build"] }
-        },
-        {
-          "if": { "properties": { "deploy_mode": { "const": "python-bundle" } } },
-          "then": {
-            "required": ["build"],
-            "not": { "anyOf": [
-              { "required": ["feature_flag"] },
-              { "required": ["detection"] }
-            ]}
-          }
-        },
-        {
-          "if": { "properties": { "deploy_mode": { "const": "native" } } },
-          "then": {
-            "required": ["build"],
-            "not": { "anyOf": [
-              { "required": ["feature_flag"] },
-              { "required": ["detection"] }
-            ]}
-          }
-        },
-        {
-          "if": { "properties": { "deploy_mode": { "const": "embedded" } } },
+          "if": { "properties": { "runtime": { "const": "embedded" } } },
           "then": {
             "required": ["feature_flag"],
             "not": { "anyOf": [
-              { "required": ["build"] },
-              { "required": ["download"] },
-              { "required": ["detection"] }
+              { "required": ["binary_path"] },
+              { "required": ["bundle_path"] }
             ]}
           }
         },
         {
-          "if": { "properties": { "deploy_mode": { "const": "external" } } },
+          "if": { "properties": { "runtime": { "const": "binary" } } },
           "then": {
-            "required": ["detection"],
+            "required": ["binary_path"],
             "not": { "anyOf": [
-              { "required": ["build"] },
-              { "required": ["download"] },
-              { "required": ["feature_flag"] }
+              { "required": ["feature_flag"] },
+              { "required": ["bundle_path"] }
+            ]}
+          }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "python-bundle" } } },
+          "then": {
+            "required": ["bundle_path"],
+            "not": { "anyOf": [
+              { "required": ["feature_flag"] },
+              { "required": ["binary_path"] }
             ]}
           }
         }
       ]
     },
-    "variant_build": {
+    "deploy_external": {
       "type": "object",
-      "required": ["context_path"],
+      "required": ["platforms", "detection_binary", "detection_endpoint"],
       "additionalProperties": false,
-      "description": "Definicja lokalnego buildu (Dockerfile, skrypt natywny, bundle Python).",
       "properties": {
-        "context_path": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Sciezka wzgledem tentaflow-containers/. Katalog musi istniec."
-        },
-        "dockerfile": {
-          "type": "string",
-          "default": "Dockerfile",
-          "description": "Nazwa Dockerfile (tylko dla deploy_mode = docker)."
-        },
-        "build_args": {
-          "type": "object",
-          "additionalProperties": { "type": "string" },
-          "description": "Argumenty --build-arg lub zmienne srodowiskowe."
-        },
-        "tags": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Lokalne tagi obrazu / artefaktu."
-        }
-      }
-    },
-    "variant_download": {
-      "type": "object",
-      "required": ["image"],
-      "additionalProperties": false,
-      "description": "Prebuilt artefakt do pobrania (typowo wariant Pro).",
-      "properties": {
-        "image": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Referencja OCI z tagiem."
-        },
-        "digest": {
-          "type": "string",
-          "pattern": "^sha256:[a-f0-9]{64}$",
-          "description": "Digest obrazu w formacie sha256:<64hex>."
-        },
-        "size_mb": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Rozmiar do pobrania w MB."
-        },
-        "license_required": {
-          "type": "string",
-          "enum": ["pro", "enterprise"],
-          "default": "pro",
-          "description": "Wymagana licencja do pobrania artefaktu."
-        },
-        "enabled": {
-          "type": "boolean",
-          "default": false,
-          "description": "Czy pobranie jest aktywne (false = infrastruktura tylko, brak realnego obrazu)."
-        }
-      },
-      "allOf": [
-        {
-          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
-          "then": { "required": ["digest"] }
-        }
-      ]
-    },
-    "variant_feature_flag": {
-      "type": "object",
-      "required": ["name"],
-      "additionalProperties": false,
-      "description": "Cargo feature aktywujacy silnik w binarce TentaFlow (deploy_mode = embedded).",
-      "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Nazwa Cargo feature, np. inference-llamacpp."
-        }
-      }
-    },
-    "variant_detection": {
-      "type": "object",
-      "required": ["binary", "endpoint"],
-      "additionalProperties": false,
-      "description": "Sposob wykrycia zewnetrznego serwisu (deploy_mode = external).",
-      "properties": {
-        "binary": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Nazwa binarki w PATH, np. ollama."
-        },
-        "endpoint": {
-          "type": "string",
-          "format": "uri",
-          "description": "Adres health check."
-        },
-        "health_path": {
-          "type": "string",
-          "default": "/",
-          "description": "Sciezka health check (default /)."
-        }
+        "platforms": { "$ref": "#/$defs/platforms" },
+        "detection_binary": { "type": "string", "minLength": 1 },
+        "detection_endpoint": { "type": "string", "format": "uri" },
+        "detection_health_path": { "type": "string", "minLength": 1, "default": "/" }
       }
     },
     "model_preset": {
       "type": "object",
       "required": ["id", "display_name", "repo"],
       "additionalProperties": false,
-      "description": "Rekomendowany model dla silnika.",
       "properties": {
-        "id": { "$ref": "#/$defs/kebab_id" },
+        "id": { "$ref": "#/$defs/preset_id" },
         "display_name": { "type": "string", "minLength": 1 },
-        "repo": { "type": "string", "minLength": 1, "description": "Repo HuggingFace, URL GGUF, repo MLX itp." },
-        "quantization": { "type": "string", "description": "Kwantyzacja, np. Q4_K_M, fp16, int4." },
-        "vram_gb_min": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "repo": { "type": "string", "minLength": 1 },
+        "quantization": { "type": "string" },
         "recommended": { "type": "boolean", "default": false }
       }
     }
