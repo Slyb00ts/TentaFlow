@@ -274,6 +274,7 @@
     "configure_deploy": "Konfiguruj i wdróż",
     "back_to_mesh": "Wróć do mesh",
     "port": "Port",
+    "noEngines": "Brak silnikow w manifescie",
     "empty_hint": "Integracja z katalogiem NVIDIA NIM wkrótce. Modele optymalizowane pod GPU NVIDIA.",
     "items": {
       "tts": {
@@ -1037,23 +1038,21 @@
   },
   "wizard": {
     "title": "Wdroz silnik",
-    "step1": "Wybor wezla",
-    "step2": "Wybor wariantu",
-    "step3": "Metoda deploy",
-    "step4": "Konfiguracja",
+    "step1": "Tryb deploymentu",
+    "step2": "Wybor modelu",
+    "step3": "Konfiguracja",
     "selectNode": "Wybierz wezel docelowy",
-    "selectVariant": "Wybierz wariant kompatybilny z platforma",
-    "selectMethod": "Wybierz metode deploymentu",
+    "selectMethod": "Wybierz tryb deploymentu",
+    "selectModel": "Wybierz model",
     "configureRuntime": "Skonfiguruj runtime",
-    "build": "Buduj lokalnie",
-    "buildDescription": "Buduj kontener lokalnie z Dockerfile (zawsze dostepne)",
-    "download": "Pobierz prebuilt",
-    "downloadDescription": "Pobierz prebuilt z naszego registry — szybciej, ale wymaga TentaFlow Pro",
-    "proRequired": "Wymaga TentaFlow Pro — kup licencje zeby odblokowac Download",
-    "statusStable": "Stabilny",
-    "statusExperimental": "Eksperymentalny",
-    "statusPlanned": "Planowany",
-    "statusDeprecated": "Wycofany",
+    "fromPreset": "Z presetu",
+    "searchHuggingface": "Wyszukaj na HuggingFace",
+    "huggingfaceToken": "Token HuggingFace (opcjonalny)",
+    "method": {
+      "docker": "Docker",
+      "native": "Natywnie",
+      "external": "Zewnetrznie"
+    },
     "startDeploy": "Uruchom deploy",
     "cancel": "Anuluj",
     "next": "Dalej",
@@ -1071,10 +1070,6 @@
     "music-gen": "Generowanie muzyki",
     "model-3d-gen": "Generowanie modeli 3D",
     "agents": "Agenty",
-    "tools": "Narzedzia",
-    "empty": "Wkrotce — patrz README kategorii"
-  },
-  "manifest": {
-    "noVariantsForPlatform": "Brak wariantow kompatybilnych z wybranym wezlem"
+    "tools": "Narzedzia"
   }
 }
