@@ -6,7 +6,9 @@
 // =============================================================================
 
 use crate::license::{LicenseChecker, LicenseTier};
-use crate::services::manifest::registry as manifest_registry;
+use crate::services::manifest::{
+    registry as manifest_registry, RequiredLicenseTier, ServiceManifest,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -73,21 +75,36 @@ fn api_error(code: &str, message: impl Into<String>) -> String {
 // =============================================================================
 
 /// GET /api/services/manifest — caly manifest jako JSON (lista silnikow).
-pub fn handle_get_manifest() -> (u16, String) {
-    let engines = manifest_registry().engines();
-    match serde_json::to_string(engines) {
+/// Pola wrazliwe (`download.image`, `download.digest`) sa redagowane jezeli
+/// aktualny tier nie pozwala na pobranie wariantu (OWASP A01 — IDOR/info leak).
+pub fn handle_get_manifest(license: &Arc<dyn LicenseChecker>) -> (u16, String) {
+    let tier = license.tier();
+    let redacted: Vec<serde_json::Value> = manifest_registry()
+        .engines()
+        .iter()
+        .map(|m| redact_for_tier(m, tier))
+        .collect();
+    match serde_json::to_string(&redacted) {
         Ok(body) => (200, body),
         Err(e) => (500, api_error("SERIALIZE_FAILED", e.to_string())),
     }
 }
 
 /// GET /api/services/manifest/:engine_id — pojedynczy silnik. 404 jesli brak.
-pub fn handle_get_engine_manifest(engine_id: &str) -> (u16, String) {
+/// Stosuje to samo redagowanie pol wrazliwych co `handle_get_manifest`.
+pub fn handle_get_engine_manifest(
+    license: &Arc<dyn LicenseChecker>,
+    engine_id: &str,
+) -> (u16, String) {
+    let tier = license.tier();
     match manifest_registry().by_id(engine_id) {
-        Some(m) => match serde_json::to_string(m) {
-            Ok(body) => (200, body),
-            Err(e) => (500, api_error("SERIALIZE_FAILED", e.to_string())),
-        },
+        Some(m) => {
+            let redacted = redact_for_tier(m, tier);
+            match serde_json::to_string(&redacted) {
+                Ok(body) => (200, body),
+                Err(e) => (500, api_error("SERIALIZE_FAILED", e.to_string())),
+            }
+        }
         None => (
             404,
             api_error(
@@ -96,6 +113,66 @@ pub fn handle_get_engine_manifest(engine_id: &str) -> (u16, String) {
             ),
         ),
     }
+}
+
+/// Mapuje wymagany przez wariant tier do tieru uzytkownika (Pro→Pro, Enterprise→Enterprise).
+fn map_required_tier(req: RequiredLicenseTier) -> LicenseTier {
+    match req {
+        RequiredLicenseTier::Pro => LicenseTier::Pro,
+        RequiredLicenseTier::Enterprise => LicenseTier::Enterprise,
+    }
+}
+
+/// Buduje JSON manifestu z polami `variant.download.image` i `variant.download.digest`
+/// wymazanymi dla wariantow, do ktorych aktualny tier nie ma uprawnien.
+/// Pozostawia `license_required`, `enabled` i `size_mb`, zeby GUI moglo pokazac
+/// "ta opcja istnieje, ale wymaga wyzszego tieru".
+fn redact_for_tier(manifest: &ServiceManifest, tier: LicenseTier) -> serde_json::Value {
+    let mut value = serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null);
+
+    let Some(variants) = value
+        .get_mut("variants")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return value;
+    };
+
+    for variant in variants.iter_mut() {
+        let Some(download) = variant
+            .get_mut("download")
+            .and_then(|d| if d.is_null() { None } else { Some(d) })
+        else {
+            continue;
+        };
+
+        // Odczytaj wymagany tier z pola `license_required` (default = pro).
+        let required_tier = download
+            .get("license_required")
+            .and_then(|v| v.as_str())
+            .and_then(|s| match s {
+                "pro" => Some(RequiredLicenseTier::Pro),
+                "enterprise" => Some(RequiredLicenseTier::Enterprise),
+                _ => None,
+            })
+            .unwrap_or(RequiredLicenseTier::Pro);
+
+        let user_required = map_required_tier(required_tier);
+        let allowed = matches!(
+            (tier, user_required),
+            (LicenseTier::Enterprise, _)
+                | (LicenseTier::Pro, LicenseTier::Pro | LicenseTier::Free)
+                | (LicenseTier::Free, LicenseTier::Free)
+        );
+
+        if !allowed {
+            if let Some(obj) = download.as_object_mut() {
+                obj.remove("image");
+                obj.remove("digest");
+            }
+        }
+    }
+
+    value
 }
 
 /// GET /api/license/info — aktualny tier licencji oraz uprawnienia.

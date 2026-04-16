@@ -734,17 +734,17 @@ mod services_manifest_build {
         #[serde(default)]
         pub size_mb: Option<u64>,
         #[serde(default = "default_license_required")]
-        pub license_required: LicenseTier,
+        pub license_required: RequiredLicenseTier,
         #[serde(default)]
         pub enabled: bool,
     }
-    fn default_license_required() -> LicenseTier {
-        LicenseTier::Pro
+    fn default_license_required() -> RequiredLicenseTier {
+        RequiredLicenseTier::Pro
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "lowercase")]
-    pub enum LicenseTier {
+    pub enum RequiredLicenseTier {
         Pro,
         Enterprise,
     }
@@ -823,13 +823,39 @@ mod services_manifest_build {
         }
     }
 
-    /// Walidacja semantyczna identyczna z runtime — 9 regul ze SCHEMA.md.
+    /// Whitelist regex `^[a-z0-9][a-z0-9_-]{0,63}$` dla engine.id.
+    /// MUSI byc identyczna z `validate_engine_id` w runtime.
+    fn is_valid_engine_id(id: &str) -> bool {
+        let bytes = id.as_bytes();
+        if bytes.is_empty() || bytes.len() > 64 {
+            return false;
+        }
+        let first = bytes[0];
+        if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+            return false;
+        }
+        bytes[1..]
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    }
+
+    /// Walidacja semantyczna identyczna z runtime — 10 regul ze SCHEMA.md.
     pub fn validate(
         manifest: &ServiceManifest,
         containers_root: &std::path::Path,
     ) -> Result<(), Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
         let eid = &manifest.engine.id;
+
+        // Reguła 10: engine.id whitelist regex.
+        if !is_valid_engine_id(eid) {
+            errors.push(format!(
+                "engine id = '{}' nie spelnia wymaganego formatu \
+                 '^[a-z0-9][a-z0-9_-]{{0,63}}$' (1-64 znakow, kebab/snake_case)",
+                eid
+            ));
+        }
+
         let mut seen_variant_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
@@ -939,6 +965,18 @@ mod services_manifest_build {
                              digest sha256:<64 hex znakow>",
                             eid, v.id
                         ));
+                    } else {
+                        let is_zero = dl.digest.len() == 71
+                            && dl.digest.starts_with("sha256:")
+                            && dl.digest[7..].bytes().all(|b| b == b'0');
+                        if is_zero {
+                            errors.push(format!(
+                                "engine '{}' wariant '{}': download.enabled = true z \
+                                 placeholder digest sha256:00...00 — uzupelnij \
+                                 prawdziwy digest przed publikacja artefaktu",
+                                eid, v.id
+                            ));
+                        }
                     }
                 }
             }
