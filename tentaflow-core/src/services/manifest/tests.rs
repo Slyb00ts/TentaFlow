@@ -7,7 +7,7 @@
 #![cfg(test)]
 
 use super::types::*;
-use super::validate::{validate_engine, ValidationError};
+use super::validate::{validate_engine, validate_engine_id, ValidationError};
 use crate::license::{LicenseChecker, LicenseError, StaticLicenseChecker};
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -738,7 +738,7 @@ fn validate_download_enabled_with_valid_digest_passes() {
         image: "ghcr.io/test/image".to_string(),
         digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
         size_mb: None,
-        license_required: LicenseTier::Pro,
+        license_required: RequiredLicenseTier::Pro,
         enabled: true,
     });
     let manifest = make_manifest(make_engine("e", Category::Llm), vec![variant]);
@@ -758,7 +758,7 @@ fn validate_download_enabled_with_invalid_digest_fails() {
         image: "ghcr.io/test/image".to_string(),
         digest: "not-a-digest".to_string(),
         size_mb: None,
-        license_required: LicenseTier::Pro,
+        license_required: RequiredLicenseTier::Pro,
         enabled: true,
     });
     let manifest = make_manifest(make_engine("e", Category::Llm), vec![variant]);
@@ -783,7 +783,7 @@ fn validate_download_disabled_with_invalid_digest_passes() {
         image: "ghcr.io/test/image".to_string(),
         digest: "not-a-digest".to_string(),
         size_mb: None,
-        license_required: LicenseTier::Pro,
+        license_required: RequiredLicenseTier::Pro,
         enabled: false,
     });
     let manifest = make_manifest(make_engine("e", Category::Llm), vec![variant]);
@@ -1043,7 +1043,7 @@ fn check_variant_download_pro_with_free_license_fails() {
         image: "ghcr.io/test/image".to_string(),
         digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
         size_mb: None,
-        license_required: LicenseTier::Pro,
+        license_required: RequiredLicenseTier::Pro,
         enabled: true,
     });
     let c = StaticLicenseChecker::free();
@@ -1064,7 +1064,7 @@ fn check_variant_download_pro_with_pro_license_passes() {
         image: "ghcr.io/test/image".to_string(),
         digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
         size_mb: None,
-        license_required: LicenseTier::Pro,
+        license_required: RequiredLicenseTier::Pro,
         enabled: true,
     });
     let c = StaticLicenseChecker::pro();
@@ -1099,7 +1099,7 @@ fn check_variant_download_enterprise_with_pro_license_fails() {
         image: "ghcr.io/test/image".to_string(),
         digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
         size_mb: None,
-        license_required: LicenseTier::Enterprise,
+        license_required: RequiredLicenseTier::Enterprise,
         enabled: true,
     });
     let c = StaticLicenseChecker::pro();
@@ -1137,4 +1137,146 @@ fn all_loaded_manifests_pass_validation() {
         failures.is_empty(),
         "Manifesty z bledami walidacji: {failures:?}"
     );
+}
+
+// =============================================================================
+// GRUPA F: Walidacja engine.id (CR-011 — Reguła 10)
+// =============================================================================
+
+/// F1: Poprawne identyfikatory zwracaja true.
+#[test]
+fn validate_engine_id_valid_passes() {
+    assert!(validate_engine_id("vllm"));
+    assert!(validate_engine_id("llama-cpp"));
+    assert!(validate_engine_id("stable-diffusion-cpp"));
+    assert!(validate_engine_id("a"));
+    assert!(validate_engine_id("0"));
+    assert!(validate_engine_id("foo_bar"));
+    assert!(validate_engine_id("a1b2c3"));
+}
+
+/// F2: Wielkie litery niedozwolone.
+#[test]
+fn validate_engine_id_invalid_uppercase_fails() {
+    assert!(!validate_engine_id("vLLM"));
+    assert!(!validate_engine_id("Llama-Cpp"));
+    assert!(!validate_engine_id("FOO"));
+}
+
+/// F3: Path traversal odrzucony.
+#[test]
+fn validate_engine_id_invalid_path_traversal_fails() {
+    assert!(!validate_engine_id("../../../etc/passwd"));
+    assert!(!validate_engine_id("../foo"));
+    assert!(!validate_engine_id("foo/bar"));
+    assert!(!validate_engine_id(".."));
+    assert!(!validate_engine_id("."));
+}
+
+/// F4: Znaki specjalne (separatory, kontrolne, nullbyte) odrzucone.
+#[test]
+fn validate_engine_id_invalid_special_chars_fails() {
+    assert!(!validate_engine_id("foo;bar"));
+    assert!(!validate_engine_id("foo bar"));
+    assert!(!validate_engine_id("foo\0bar"));
+    assert!(!validate_engine_id("foo\nbar"));
+    assert!(!validate_engine_id("foo$bar"));
+    assert!(!validate_engine_id("foo@bar"));
+    assert!(!validate_engine_id("foo.bar"));
+}
+
+/// F5: Identyfikator dluzszy niz 64 znaki odrzucony.
+#[test]
+fn validate_engine_id_too_long_fails() {
+    let id_64: String = "a".repeat(64);
+    assert!(validate_engine_id(&id_64), "64 znaki — granica dozwolona");
+    let id_65: String = "a".repeat(65);
+    assert!(!validate_engine_id(&id_65));
+    let id_long: String = "a".repeat(200);
+    assert!(!validate_engine_id(&id_long));
+}
+
+/// F6: Pusty identyfikator odrzucony.
+#[test]
+fn validate_engine_id_empty_fails() {
+    assert!(!validate_engine_id(""));
+}
+
+/// F7: Pierwszy znak musi byc a-z lub 0-9 — myslnik/podkreslnik na poczatku odrzucone.
+#[test]
+fn validate_engine_id_invalid_leading_char_fails() {
+    assert!(!validate_engine_id("-foo"));
+    assert!(!validate_engine_id("_foo"));
+}
+
+/// F8: validate_engine zwraca InvalidEngineId dla nieprawidlowego engine.id.
+#[test]
+fn validate_engine_with_invalid_id_returns_error() {
+    let manifest = make_manifest(
+        make_engine("Invalid Id!", Category::Llm),
+        vec![make_embedded_variant(
+            "v",
+            OsList::Single(TargetOs::Linux),
+            ArchList::Single(TargetArch::X86_64),
+            GpuBackendList::Single(GpuBackend::Cpu),
+        )],
+    );
+    let errs = validate_engine(&manifest, None).expect_err("oczekiwano bledu");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidEngineId { .. })),
+        "oczekiwano InvalidEngineId: {errs:?}"
+    );
+}
+
+// =============================================================================
+// GRUPA G: Placeholder zero-digest (CR-016)
+// =============================================================================
+
+/// G1: download.enabled = true z digest sha256:000...000 odrzucony.
+#[test]
+fn validate_download_enabled_with_placeholder_zero_digest_fails() {
+    let mut variant = make_docker_variant(
+        "v",
+        OsList::Single(TargetOs::Linux),
+        ArchList::Single(TargetArch::X86_64),
+        GpuBackendList::Single(GpuBackend::Cpu),
+    );
+    variant.download = Some(DownloadOption {
+        image: "ghcr.io/test/image".to_string(),
+        digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        size_mb: None,
+        license_required: RequiredLicenseTier::Pro,
+        enabled: true,
+    });
+    let manifest = make_manifest(make_engine("e", Category::Llm), vec![variant]);
+    let errs = validate_engine(&manifest, None).expect_err("oczekiwano bledu");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::PlaceholderDigestEnabled { .. })),
+        "oczekiwano PlaceholderDigestEnabled: {errs:?}"
+    );
+}
+
+/// G2: download.enabled = false z placeholder zero-digest przechodzi (gating
+/// nie aktywny dopoki ktos nie wlaczy enabled).
+#[test]
+fn validate_download_disabled_with_placeholder_zero_digest_passes() {
+    let mut variant = make_docker_variant(
+        "v",
+        OsList::Single(TargetOs::Linux),
+        ArchList::Single(TargetArch::X86_64),
+        GpuBackendList::Single(GpuBackend::Cpu),
+    );
+    variant.download = Some(DownloadOption {
+        image: "ghcr.io/test/image".to_string(),
+        digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        size_mb: None,
+        license_required: RequiredLicenseTier::Pro,
+        enabled: false,
+    });
+    let manifest = make_manifest(make_engine("e", Category::Llm), vec![variant]);
+    assert!(validate_engine(&manifest, None).is_ok());
 }
