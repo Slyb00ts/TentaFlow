@@ -1,0 +1,52 @@
+# =============================================================================
+# Plik: stt/_services/parakeet.toml
+# Opis: Manifest silnika NVIDIA NeMo Parakeet. Tryb deploymentu: docker
+#       (Linux x64 CUDA only). Najlepsze WER na angielskim w klasie 0.6B.
+# =============================================================================
+
+[engine]
+id = "parakeet"
+category = "stt"
+name = "Parakeet"
+description_pl = "NVIDIA NeMo Parakeet TDT 0.6B — szybki transformer ASR. Najlepsze WER na angielskim."
+description_en = "NVIDIA NeMo Parakeet TDT 0.6B — fast transformer ASR. Best WER on English."
+homepage = "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2"
+docs_url = "https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/asr/intro.html"
+license = "CC-BY-4.0"
+api = "openai-compatible"
+default_port = 5030
+version = "2.0.0"
+tags = ["asr", "english", "nvidia-nemo", "low-latency"]
+icon = "parakeet"
+
+# Wariant Linux x64 CUDA - jedyny wspierany.
+[[variant]]
+id = "linux-x64-cuda"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 4
+ram_gb_min = 8
+disk_gb_min = 15
+notes_pl = "Wymaga nvidia-container-toolkit i CUDA 12+."
+notes_en = "Requires nvidia-container-toolkit and CUDA 12+."
+
+[variant.build]
+context_path = "stt/docker/parakeet"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/parakeet:cuda-x86_64"]
+
+[variant.build.build_args]
+PARAKEET_VERSION = "2.0.0"
+
+# Rekomendowany model Parakeet.
+
+[[model_preset]]
+id = "parakeet-tdt-0-6b-v3"
+display_name = "Parakeet TDT 0.6B v3"
+repo = "nvidia/parakeet-tdt-0.6b-v2"
+quantization = "fp16"
+vram_gb_min = 4
+recommended = true

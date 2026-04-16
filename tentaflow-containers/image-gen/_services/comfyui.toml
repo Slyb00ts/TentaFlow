@@ -1,0 +1,42 @@
+# =============================================================================
+# Plik: image-gen/_services/comfyui.toml
+# Opis: Manifest silnika ComfyUI. Tryb deploymentu: docker (Linux x64 CUDA).
+#       Node-based workflow dla SD/SDXL/Flux. Najpotezniejszy generator obrazow.
+# =============================================================================
+
+[engine]
+id = "comfyui"
+category = "image-gen"
+name = "ComfyUI"
+description_pl = "ComfyUI — node-based workflow dla Stable Diffusion/Flux/SDXL. Najpotezniejszy generator obrazow."
+description_en = "ComfyUI — node-based workflow for Stable Diffusion/Flux/SDXL. Most powerful image generator."
+homepage = "https://github.com/comfyanonymous/ComfyUI"
+docs_url = "https://docs.comfy.org/"
+license = "GPL-3.0"
+api = "comfyui"
+default_port = 5000
+version = "0.3.10"
+tags = ["image-gen", "stable-diffusion", "flux", "sdxl", "node-graph"]
+icon = "comfyui"
+
+# Wariant Linux x64 CUDA - jedyny wspierany.
+[[variant]]
+id = "linux-x64-cuda"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "stable"
+vram_gb_min = 8
+ram_gb_min = 16
+disk_gb_min = 50
+notes_pl = "Wymaga nvidia-container-toolkit. SDXL/Flux potrzebuja >12GB VRAM dla pelnej rozdzielczosci."
+notes_en = "Requires nvidia-container-toolkit. SDXL/Flux need >12GB VRAM for full resolution."
+
+[variant.build]
+context_path = "image-gen/docker/comfyui"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/comfyui:cuda-x86_64"]
+
+[variant.build.build_args]
+COMFYUI_VERSION = "0.3.10"

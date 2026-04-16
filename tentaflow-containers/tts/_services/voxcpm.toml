@@ -1,0 +1,51 @@
+# =============================================================================
+# Plik: tts/_services/voxcpm.toml
+# Opis: Manifest silnika VoxCPM2 (OpenBMB). Tryb deploymentu: docker
+#       (Linux x64 CUDA). Status: experimental - mlody projekt.
+# =============================================================================
+
+[engine]
+id = "voxcpm"
+category = "tts"
+name = "VoxCPM2"
+description_pl = "VoxCPM2 — eksperymentalny TTS od OpenBMB. Mala pamiec, dobra jakosc."
+description_en = "VoxCPM2 — experimental TTS by OpenBMB. Small memory footprint, good quality."
+homepage = "https://github.com/OpenBMB/VoxCPM"
+license = "Apache-2.0"
+api = "openai-compatible"
+default_port = 5020
+version = "0.1.0"
+tags = ["tts", "experimental", "openbmb", "low-memory"]
+icon = "voxcpm"
+
+# Wariant Linux x64 CUDA - jedyny wspierany.
+[[variant]]
+id = "linux-x64-cuda"
+deploy_mode = "docker"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cuda"
+status = "experimental"
+vram_gb_min = 2
+ram_gb_min = 4
+disk_gb_min = 8
+notes_pl = "Wymaga nvidia-container-toolkit. Mlody projekt - oczekuj zmian API."
+notes_en = "Requires nvidia-container-toolkit. Young project - expect API changes."
+
+[variant.build]
+context_path = "tts/docker/voxcpm"
+dockerfile = "Dockerfile"
+tags = ["tentaflow/voxcpm:cuda-x86_64"]
+
+[variant.build.build_args]
+VOXCPM_VERSION = "0.1.0"
+
+# Rekomendowany model VoxCPM.
+
+[[model_preset]]
+id = "voxcpm-base"
+display_name = "VoxCPM2 Base"
+repo = "openbmb/VoxCPM"
+quantization = "fp16"
+vram_gb_min = 2
+recommended = true

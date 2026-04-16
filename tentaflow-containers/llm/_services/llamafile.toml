@@ -1,0 +1,82 @@
+# =============================================================================
+# Plik: llm/_services/llamafile.toml
+# Opis: Manifest silnika llamafile (Mozilla). Tryb deploymentu: native.
+#       Binarka samowystarczalna (cosmocc compile) - jeden plik, dziala
+#       bez instalacji na wielu platformach. Status: planned.
+# =============================================================================
+
+[engine]
+id = "llamafile"
+category = "llm"
+name = "llamafile"
+description_pl = "llama.cpp + cosmocc compile = jedna binarka, jeden plik, dziala bez instalacji. Idealne dla edge."
+description_en = "llama.cpp + cosmocc compile = single binary, single file, no install needed. Perfect for edge."
+homepage = "https://github.com/Mozilla-Ocho/llamafile"
+docs_url = "https://github.com/Mozilla-Ocho/llamafile/blob/main/README.md"
+license = "Apache-2.0"
+api = "openai-compatible"
+default_port = 8080
+version = "0.8.16"
+tags = ["edge", "single-binary", "cosmopolitan", "lightweight"]
+icon = "llamafile"
+
+# Wariant Linux x64 CPU - planowany.
+[[variant]]
+id = "native-linux-x64-cpu"
+deploy_mode = "native"
+target_os = "linux"
+target_arch = "x86_64"
+gpu_backend = "cpu"
+status = "planned"
+ram_gb_min = 4
+disk_gb_min = 2
+notes_pl = "Planowane: build cosmocc na Linux x86_64. Patrz llm/native/llamafile/README.md."
+notes_en = "Planned: cosmocc build for Linux x86_64. See llm/native/llamafile/README.md."
+
+[variant.build]
+context_path = "llm/native/llamafile"
+tags = ["llamafile-cpu-linux-x86_64"]
+
+[variant.build.build_args]
+LLAMAFILE_VERSION = "0.8.16"
+
+# Wariant macOS Apple Silicon Metal - planowany.
+[[variant]]
+id = "native-macos-arm64-metal"
+deploy_mode = "native"
+target_os = "macos"
+target_arch = "aarch64"
+gpu_backend = "metal"
+status = "planned"
+vram_gb_min = 4
+ram_gb_min = 8
+disk_gb_min = 2
+notes_pl = "Planowane: cosmocc z Metal backend dla Apple Silicon."
+notes_en = "Planned: cosmocc with Metal backend for Apple Silicon."
+
+[variant.build]
+context_path = "llm/native/llamafile"
+tags = ["llamafile-metal-macos-arm64"]
+
+[variant.build.build_args]
+LLAMAFILE_VERSION = "0.8.16"
+
+# Wariant Windows x64 CPU - planowany.
+[[variant]]
+id = "native-windows-x64-cpu"
+deploy_mode = "native"
+target_os = "windows"
+target_arch = "x86_64"
+gpu_backend = "cpu"
+status = "planned"
+ram_gb_min = 4
+disk_gb_min = 2
+notes_pl = "Planowane: cosmocc dla Windows x86_64."
+notes_en = "Planned: cosmocc for Windows x86_64."
+
+[variant.build]
+context_path = "llm/native/llamafile"
+tags = ["llamafile-cpu-windows-x86_64"]
+
+[variant.build.build_args]
+LLAMAFILE_VERSION = "0.8.16"
