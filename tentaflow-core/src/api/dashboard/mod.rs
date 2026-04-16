@@ -28,6 +28,7 @@ pub mod api_clusters;
 pub mod api_nim;
 pub mod auto_register;
 pub mod ws_deploy;
+pub mod api_services_manifest;
 
 #[cfg(feature = "inference-diarization")]
 pub mod api_voice_profiles;

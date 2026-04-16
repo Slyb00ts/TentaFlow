@@ -6,7 +6,8 @@
 use crate::db::{self, DbPool};
 use crate::metrics::RouterMetrics;
 use crate::routing::service_manager::ServiceManager;
-use super::{auth, api_auth, api_services, api_dashboard, api_apikeys, api_settings, api_portainer, api_prompts, api_models, api_flows, api_pii_rules, api_fast_path, api_tts_rules, static_files, api_registries, api_mesh, api_hub, api_addon_system, api_clusters, api_nim};
+use super::{auth, api_auth, api_services, api_dashboard, api_apikeys, api_settings, api_portainer, api_prompts, api_models, api_flows, api_pii_rules, api_fast_path, api_tts_rules, static_files, api_registries, api_mesh, api_hub, api_addon_system, api_clusters, api_nim, api_services_manifest};
+use crate::license::{LicenseChecker, StaticLicenseChecker};
 use crate::mesh::peer_store::MeshPeerStore;
 use std::sync::Arc;
 
@@ -40,6 +41,7 @@ pub struct DashboardServer {
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    license: Arc<dyn LicenseChecker>,
 }
 
 impl DashboardServer {
@@ -57,7 +59,14 @@ impl DashboardServer {
             local_node_id: Arc::from(""),
             mesh_security: None,
             permission_checker: None,
+            license: Arc::new(StaticLicenseChecker::free()),
         }
+    }
+
+    /// Ustawia LicenseChecker — sprawdzanie tieru licencji (Free/Pro/Enterprise)
+    pub fn with_license_checker(mut self, license: Arc<dyn LicenseChecker>) -> Self {
+        self.license = license;
+        self
     }
 
     /// Ustawia QUIC mesh manager i local node id — wymagane do forwardowania komend
@@ -95,6 +104,7 @@ impl DashboardServer {
         let local_node_id = self.local_node_id.clone();
         let mesh_security = self.mesh_security.clone();
         let permission_checker = self.permission_checker.clone();
+        let license = self.license.clone();
 
         loop {
             let (stream, remote_addr) = match listener.accept().await {
@@ -118,6 +128,7 @@ impl DashboardServer {
             let lni_clone = local_node_id.clone();
             let msec_clone = mesh_security.clone();
             let pc_clone = permission_checker.clone();
+            let lic_clone = license.clone();
             // VULN-035: Przekaz remote_addr do handle_request (dual rate limiting)
             let remote_addr_str = remote_addr.to_string();
 
@@ -136,8 +147,9 @@ impl DashboardServer {
                     let lni = lni_clone.clone();
                     let msec = msec_clone.clone();
                     let pc = pc_clone.clone();
+                    let lic = lic_clone.clone();
                     let ra = remote_addr_str.clone();
-                    async move { handle_request(req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, ra).await }
+                    async move { handle_request(req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic, ra).await }
                 });
 
                 if let Err(e) = http1::Builder::new()
@@ -237,6 +249,7 @@ pub async fn handle_request(
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    license: Arc<dyn LicenseChecker>,
     remote_addr: String,
 ) -> std::result::Result<Response<DashboardBody>, hyper::Error> {
     let method = req.method().clone();
@@ -868,6 +881,30 @@ pub async fn handle_request(
             crate::api::dashboard::api_voice_profiles::route_voice_profiles_api(
                 &method, &path, &query_string, &db, &body_bytes,
             );
+        return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
+    }
+
+    // Service Manifest API — manifest silnikow, info licencji, deploy z license-gating
+    if path == "/api/services/manifest" && method == Method::GET {
+        let (status, response_body) = api_services_manifest::handle_get_manifest();
+        return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
+    }
+    if let Some(rest) = path.strip_prefix("/api/services/manifest/") {
+        if method == Method::GET && !rest.is_empty() && !rest.contains('/') {
+            let (status, response_body) = api_services_manifest::handle_get_engine_manifest(rest);
+            return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
+        }
+    }
+    if path == "/api/services/deploy" && method == Method::POST {
+        let (status, response_body) = api_services_manifest::handle_post_deploy(&license, &body_bytes);
+        return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
+    }
+    if path == "/api/services/deployed" && method == Method::GET {
+        let (status, response_body) = api_services_manifest::handle_get_deployed();
+        return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
+    }
+    if path == "/api/license/info" && method == Method::GET {
+        let (status, response_body) = api_services_manifest::handle_get_license_info(&license);
         return Ok(json_response_cors(status, response_body, cors_origin.as_deref()));
     }
 
