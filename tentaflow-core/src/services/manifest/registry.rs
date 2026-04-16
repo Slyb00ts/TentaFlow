@@ -26,33 +26,38 @@ impl ManifestRegistry {
         self.engines.iter().find(|e| e.engine.id == id)
     }
 
-    /// Zwraca silniki z danej kategorii (uwzglednia takze `also_serves`).
+    /// Zwraca silniki z danej kategorii.
     pub fn by_category(&self, cat: Category) -> Vec<&ServiceManifest> {
         self.engines
             .iter()
-            .filter(|e| e.engine.category == cat || e.engine.also_serves.contains(&cat))
+            .filter(|e| e.engine.category == cat)
             .collect()
     }
 
-    /// Silniki, ktorych jakikolwiek wariant jest zgodny z platforma docelowa.
-    /// Wariant z `target_arch = any` pasuje do dowolnej architektury.
-    pub fn compatible_for(
-        &self,
-        os: TargetOs,
-        arch: TargetArch,
-        gpu: GpuBackend,
-    ) -> Vec<&ServiceManifest> {
+    /// Silniki, ktore maja chociaz jedna sekcje deploy z platforma `os` na liscie.
+    /// Bez sprawdzania architektury / GPU — silnik runtime sam wykrywa zasoby hosta.
+    pub fn compatible_for(&self, os: TargetOs) -> Vec<&ServiceManifest> {
         self.engines
             .iter()
             .filter(|m| {
-                m.variants.iter().any(|v| {
-                    let arch_list = v.target_arch.as_vec();
-                    v.target_os.as_vec().contains(&os)
-                        && (arch_list.contains(&arch) || arch_list.contains(&TargetArch::Any))
-                        && v.gpu_backend.as_vec().contains(&gpu)
-                })
+                let d = &m.deploy;
+                d.docker.as_ref().is_some_and(|x| x.platforms.contains(&os))
+                    || d.native.as_ref().is_some_and(|x| x.platforms.contains(&os))
+                    || d.external.as_ref().is_some_and(|x| x.platforms.contains(&os))
             })
             .collect()
+    }
+
+    /// Lista kategorii, ktore zawieraja przynajmniej jeden silnik. Sluzy do
+    /// auto-ukrywania pustych sekcji w GUI (kategoria bez plikow TOML = nie wyswietlana).
+    pub fn non_empty_categories(&self) -> Vec<Category> {
+        let mut seen: Vec<Category> = Vec::new();
+        for e in &self.engines {
+            if !seen.contains(&e.engine.category) {
+                seen.push(e.engine.category);
+            }
+        }
+        seen
     }
 }
 

@@ -3,11 +3,9 @@
 ## 1. Wstęp
 
 **Service Manifest** to plik `*.toml` opisujący jeden silnik wnioskowania (engine) udostępniany
-przez TentaFlow — np. vLLM, llama.cpp, sherpa-onnx. Manifest definiuje:
-
-- metadane silnika (nazwa, licencja, port, API),
-- listę wariantów deploymentu (Docker, embedded w binarce, native, zewnętrzny),
-- opcjonalne presety modeli (rekomendowane modele dla danego silnika).
+przez TentaFlow — np. vLLM, llama.cpp, sherpa-onnx. Manifest jest **single source of truth**:
+opisuje metadane silnika i tryby uruchamiania (Docker, native, external), a wszystkie warstwy
+(GUI, build pipeline, runtime) konsumują jego treść.
 
 ### Lokalizacja
 
@@ -18,7 +16,7 @@ tentaflow-containers/
 ├── llm/_services/llama-cpp.toml
 ├── llm/_services/vllm.toml
 ├── tts/_services/sherpa-onnx.toml
-├── stt/_services/<engine>.toml
+├── stt/_services/whisper.toml
 └── ...
 ```
 
@@ -26,153 +24,142 @@ tentaflow-containers/
 
 | Konsument | Co czyta | Co robi |
 |-----------|----------|---------|
-| `tentaflow-core/build.rs` | wszystkie `*.toml` z `_services/` | embeduje manifesty do binarki, waliduje semantycznie, generuje katalog usług |
-| Dashboard GUI | wbudowane manifesty przez REST `/api/v1/catalog` | renderuje listę silników i wariantów |
-| `build-containers.sh` | manifesty z `deploy_mode = "docker"` | buduje obrazy lokalnie wg `[variant.build]` |
-| `build-natives.sh` | manifesty z `deploy_mode = "native"` | kompiluje natywne binarki wg `[variant.build]` |
+| `tentaflow-core/build.rs` | wszystkie `*.toml` z `_services/` | waliduje semantycznie, generuje `services_generated.rs` (Rust const z embedded JSON) oraz `wwwroot/js/generated/services-manifest.js` (ESM module) |
+| `tentaflow-core/src/services/manifest/registry.rs` | embedded JSON | leniwie tworzy `ManifestRegistry` (singleton) |
+| Dashboard GUI | `services-manifest.js` | renderuje katalog silników, kafelki w wizardzie deploymentu |
+| `build-containers.sh` | manifesty z sekcją `[deploy.docker]` | buduje obrazy lokalnie wg `context_path` |
+| `build-natives.sh` | manifesty z `[deploy.native]` runtime=binary | kompiluje natywne binarki wg `binary_path` |
+
+### Auto-discovery kategorii
+
+Dodanie pliku `*.toml` do `<category>/_services/` automatycznie sprawia, że kategoria pojawi się
+w GUI. **Pusta kategoria (brak plików `*.toml`) jest ukryta** — np. jeśli nikt nie doda
+manifestu do `vision/_services/`, sekcja "Vision" nie pojawi się w wizardzie.
 
 ---
 
-## 2. Hierarchia pliku TOML
-
-Plik manifestu MA dokładnie jedną sekcję `[engine]` i jeden lub więcej bloków `[[variant]]`.
-Może też mieć dowolną liczbę bloków `[[model_preset]]` (opcjonalne).
+## 2. Anatomia pliku TOML
 
 ```toml
-[engine]              # dokładnie 1
-# ...
+# Sekcja [engine] — metadata silnika.
+[engine]
+id = "vllm"                                # REQUIRED: kebab-case [a-z0-9][a-z0-9_-]{0,63}
+category = "llm"                           # REQUIRED: enum (patrz tabela)
+name = "vLLM"                              # REQUIRED: nazwa wyświetlana w GUI
+description_pl = "Serwer LLM..."           # REQUIRED: max 200 znaków
+description_en = "LLM server..."           # REQUIRED: max 200 znaków
+homepage = "https://github.com/..."        # REQUIRED: URL projektu
+license = "Apache-2.0"                     # REQUIRED: SPDX id
+icon = "vllm"                              # OPTIONAL: klucz w CatalogIcons.js
+default_port = 8000                        # REQUIRED: u16 (1..65535)
+api = "openai-compatible"                  # REQUIRED: enum API
+version = "0.6.3"                          # REQUIRED: wersja referencyjna
 
-[[variant]]           # 1 lub więcej
-# ...
-[variant.build]       # podsekcja, zależna od deploy_mode
-# ...
+# Sekcja [deploy.docker] — opcjonalna; jeśli obecna, w wizardzie pojawi się
+# przycisk "Docker".
+[deploy.docker]
+context_path = "llm/docker/vllm"           # REQUIRED: ścieżka pod tentaflow-containers/
+platforms = ["linux", "windows"]           # REQUIRED: array OS-ów
+download_image = "ghcr.io/.../vllm:latest" # OPTIONAL (Pro feature)
+download_size_mb = 8500                    # OPTIONAL
 
-[[variant]]
-# ...
-[variant.feature_flag]
-# ...
+# Sekcja [deploy.native] — opcjonalna; w wizardzie przycisk "Native".
+# `runtime` decyduje o sposobie uruchomienia natywnego silnika.
+[deploy.native]
+platforms = ["linux", "macos", "windows"]  # REQUIRED
+runtime = "embedded"                       # REQUIRED: embedded | binary | python-bundle
+feature_flag = "inference-llamacpp"        # gdy runtime = embedded
+# binary_path = "tts/native/sherpa-onnx"   # gdy runtime = binary
+# bundle_path = "llm/python/vllm"          # gdy runtime = python-bundle
 
-[[model_preset]]      # 0 lub więcej
-# ...
+# Sekcja [deploy.external] — opcjonalna; w wizardzie przycisk "External".
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_binary = "ollama"                # REQUIRED: nazwa binarki w PATH
+detection_endpoint = "http://localhost:11434"   # REQUIRED: URL do health check
+detection_health_path = "/api/tags"        # OPTIONAL, default "/"
+
+# Sekcja [[model_preset]] — 0 lub więcej rekomendowanych modeli.
+[[model_preset]]
+id = "qwen3.5-0.8b"                        # REQUIRED
+display_name = "Qwen 3.5 0.8B"             # REQUIRED
+repo = "Qwen/Qwen3.5-0.8B"                 # REQUIRED: HF repo / GGUF URL / MLX repo
+quantization = "Q4_K_M"                    # OPTIONAL
+recommended = true                         # OPTIONAL, default false
 ```
 
 ---
 
 ## 3. Sekcja `[engine]`
 
-| Pole | Typ | Wymagane | Opis | Przykład |
-|------|-----|----------|------|----------|
-| `id` | string (kebab-case `[a-z0-9-]+`) | tak | Unikalny identyfikator silnika w obrębie katalogu (i globalnie). | `"vllm"` |
-| `category` | enum | tak | Kategoria usługi. Patrz lista poniżej. | `"llm"` |
-| `name` | string | tak | Nazwa wyświetlana w GUI. | `"vLLM"` |
-| `description_pl` | string (max 200) | tak | Opis po polsku. | `"Serwer LLM z PagedAttention..."` |
-| `description_en` | string (max 200) | tak | Opis po angielsku. | `"Production LLM server..."` |
-| `homepage` | URL | tak | Strona projektu. | `"https://github.com/vllm-project/vllm"` |
-| `license` | string SPDX | tak | Identyfikator SPDX licencji. | `"Apache-2.0"` |
-| `api` | enum | tak | Protokół API. Patrz lista poniżej. | `"openai-compatible"` |
-| `default_port` | u16 (1–65535) | tak | Domyślny port silnika. | `8000` |
-| `version` | string | tak | Wersja referencyjna silnika. | `"0.6.3"` |
-| `tags` | array of string | nie | Etykiety opisowe dla wyszukiwarki. | `["paged-attention", "production"]` |
-| `also_serves` | array of category enum | nie | Inne kategorie obsługiwane przez ten sam silnik. | `["embeddings"]` |
-| `docs_url` | URL | nie | Adres dokumentacji. | `"https://docs.vllm.ai"` |
-| `icon` | string | nie | Klucz ikony w `wwwroot/js/modules/catalog/CatalogIcons.js`. | `"vllm"` |
-
-### Dozwolone wartości `category`
-
-`llm`, `stt`, `tts`, `embeddings`, `reranker`, `vision`, `image-gen`, `video-gen`,
-`music-gen`, `model-3d-gen`, `agents`, `tools`.
-
-### Dozwolone wartości `api`
-
-`openai-compatible`, `ollama-native`, `sherpa-tts`, `sherpa-stt`, `comfyui`, `custom`.
-
----
-
-## 4. Sekcja `[[variant]]`
-
 | Pole | Typ | Wymagane | Opis |
 |------|-----|----------|------|
-| `id` | string (kebab-case) | tak | Unikalny identyfikator wariantu w obrębie silnika. |
-| `deploy_mode` | enum | tak | Tryb deploymentu (patrz niżej). |
-| `target_os` | enum lub array | tak | System operacyjny / systemy. |
-| `target_arch` | enum lub array | tak | Architektura CPU. |
-| `gpu_backend` | enum lub array | tak | Akceleracja GPU. |
-| `status` | enum | tak | Status dojrzałości. |
-| `vram_gb_min` | u16 | warunkowo | Wymagane gdy `gpu_backend != "cpu"`. |
-| `ram_gb_min` | u16 | nie | Minimalna pamięć RAM. |
-| `disk_gb_min` | u16 | nie | Minimalne wolne miejsce. |
-| `notes_pl` | string | nie | Dodatkowa notka dla użytkownika (po polsku). |
-| `notes_en` | string | nie | Dodatkowa notka dla użytkownika (po angielsku). |
+| `id` | string (regex `^[a-z0-9][a-z0-9_-]{0,63}$`) | tak | Unikalny identyfikator silnika (globalnie). |
+| `category` | enum | tak | Kategoria usługi. Patrz lista poniżej. |
+| `name` | string | tak | Nazwa wyświetlana w GUI. |
+| `description_pl` | string (max 200) | tak | Opis po polsku. |
+| `description_en` | string (max 200) | tak | Opis po angielsku. |
+| `homepage` | URL | tak | Strona projektu. |
+| `license` | string SPDX | tak | Identyfikator SPDX licencji. |
+| `icon` | string | nie | Klucz ikony w `wwwroot/js/modules/catalog/CatalogIcons.js`. Brak = ikona kategorii. |
+| `default_port` | u16 (1–65535) | tak | Domyślny port silnika. |
+| `api` | enum | tak | Protokół API. Patrz lista poniżej. |
+| `version` | string | tak | Wersja referencyjna silnika. |
 
 ### Dozwolone wartości
 
 | Pole | Wartości |
 |------|----------|
-| `deploy_mode` | `native`, `docker`, `python-bundle`, `embedded`, `external` |
-| `target_os` | `linux`, `macos`, `windows`, `ios`, `android` |
-| `target_arch` | `x86_64`, `aarch64`, `any` |
-| `gpu_backend` | `cpu`, `cuda`, `rocm`, `vulkan`, `metal`, `mlx`, `xpu` |
-| `status` | `stable`, `experimental`, `planned`, `deprecated` |
+| `category` | `llm`, `stt`, `tts`, `embeddings`, `reranker`, `vision`, `image-gen`, `video-gen`, `music-gen`, `model-3d-gen`, `agents`, `tools` |
+| `api` | `openai-compatible`, `ollama-native`, `sherpa-tts`, `sherpa-stt`, `comfyui`, `custom` |
 
 ---
 
-## 5. Podsekcje wariantu
+## 4. Sekcje deploymentu
 
-Każdy `[[variant]]` MOŻE zawierać podsekcje. To, która jest wymagana, zależy od `deploy_mode`:
+Manifest **musi mieć przynajmniej jedną** sekcję deploy: `[deploy.docker]`, `[deploy.native]` lub
+`[deploy.external]`. Każda definiuje jedną opcję uruchomienia w wizardzie GUI.
 
-| `deploy_mode` | Wymagana podsekcja | Opcjonalna podsekcja |
-|---------------|--------------------|-----------------------|
-| `docker` | `[variant.build]` | `[variant.download]` |
-| `python-bundle` | `[variant.build]` | – |
-| `native` | `[variant.build]` | `[variant.download]` |
-| `embedded` | `[variant.feature_flag]` | – |
-| `external` | `[variant.detection]` | – |
-
-### 5.1. `[variant.build]`
-
-Definiuje sposób lokalnego buildu (Dockerfile, skrypt natywny, bundle Python).
+### 4.1. `[deploy.docker]`
 
 | Pole | Typ | Wymagane | Opis |
 |------|-----|----------|------|
-| `context_path` | string | tak | Ścieżka względem `tentaflow-containers/`. Katalog MUSI istnieć. |
-| `dockerfile` | string | nie | Tylko dla `deploy_mode = "docker"`. Default: `"Dockerfile"`. |
-| `build_args` | table `string→string` | nie | Argumenty `--build-arg` (Docker) lub zmienne środowiskowe buildu. |
-| `tags` | array of string | nie | Lokalne tagi obrazu / artefaktu. |
+| `context_path` | string | tak | Ścieżka kontekstu Dockerfile, względem `tentaflow-containers/`. Katalog MUSI istnieć (sprawdzane przez build.rs). |
+| `platforms` | array enum OS | tak | Systemy, na których ten obraz może być zbudowany / uruchomiony. |
+| `download_image` | string | nie | Referencja OCI prebuilt image (Pro feature). |
+| `download_size_mb` | u64 | nie | Rozmiar do pobrania (informacyjnie). |
 
-### 5.2. `[variant.download]`
-
-Definiuje prebuilt artefakt do pobrania (głównie dla wariantu Pro).
+### 4.2. `[deploy.native]`
 
 | Pole | Typ | Wymagane | Opis |
 |------|-----|----------|------|
-| `image` | string | tak | Referencja OCI z tagiem. |
-| `digest` | string `sha256:...` | warunkowo | 64 znaki hex. Wymagane gdy `enabled = true`. |
-| `size_mb` | u64 | nie | Rozmiar do pobrania. |
-| `license_required` | enum `pro`/`enterprise` | nie | Domyślnie `"pro"`. |
-| `enabled` | bool | nie | Domyślnie `false`. |
+| `platforms` | array enum OS | tak | Systemy, na których działa wariant natywny. |
+| `runtime` | enum `embedded` / `binary` / `python-bundle` | tak | Sposób uruchomienia. |
+| `feature_flag` | string | warunkowo | Wymagane gdy `runtime = embedded`. Cargo feature aktywujący silnik w binarce `tentaflow-core`. |
+| `binary_path` | string | warunkowo | Wymagane gdy `runtime = binary`. Katalog pod `tentaflow-containers/` zawierający `build.sh`. |
+| `bundle_path` | string | warunkowo | Wymagane gdy `runtime = python-bundle`. Katalog z `bundle.toml` + `server.py`. |
 
-### 5.3. `[variant.feature_flag]`
+#### Co znaczy `runtime`
 
-Wymagane gdy `deploy_mode = "embedded"`. Wskazuje Cargo feature flag aktywujący silnik
-w binarce TentaFlow.
+- **`embedded`** — silnik wkompilowany bezpośrednio w binarkę `tentaflow` (np. `llama.cpp`,
+  `MLX`). Włączany Cargo featurem (`feature_flag`). Niewidoczny dla usera jako osobna binarka.
+- **`binary`** — natywna binarka kompilowana skryptem `binary_path/build.sh`, instalowana
+  jako sidecar (np. `sherpa-onnx`, `stable-diffusion-cpp`).
+- **`python-bundle`** — bundle Pythona (venv + `server.py`) zarządzany przez TentaFlow
+  (np. `vllm`, `xtts`).
 
-| Pole | Typ | Wymagane | Opis |
-|------|-----|----------|------|
-| `name` | string | tak | Nazwa Cargo feature, np. `"inference-llamacpp"`. |
-
-### 5.4. `[variant.detection]`
-
-Wymagane gdy `deploy_mode = "external"`. Opisuje jak wykryć zewnętrzny serwis.
+### 4.3. `[deploy.external]`
 
 | Pole | Typ | Wymagane | Opis |
 |------|-----|----------|------|
-| `binary` | string | tak | Nazwa binarki w `PATH`, np. `"ollama"`. |
-| `endpoint` | URL | tak | Adres health check. |
-| `health_path` | string | nie | Domyślnie `"/"`. |
+| `platforms` | array enum OS | tak | Systemy, na których wykrywanie ma sens. |
+| `detection_binary` | string | tak | Nazwa binarki w `PATH` (np. `ollama`). |
+| `detection_endpoint` | URL | tak | Adres health check (np. `http://localhost:11434`). |
+| `detection_health_path` | string | nie | Ścieżka health check, default `/`. |
 
 ---
 
-## 6. Sekcja `[[model_preset]]` (opcjonalna)
+## 5. Sekcja `[[model_preset]]` (opcjonalna)
 
 Lista rekomendowanych modeli dla silnika. Zero lub więcej bloków na plik.
 
@@ -182,194 +169,44 @@ Lista rekomendowanych modeli dla silnika. Zero lub więcej bloków na plik.
 | `display_name` | string | tak | Nazwa wyświetlana. |
 | `repo` | string | tak | Repo HuggingFace, URL GGUF, repo MLX itp. |
 | `quantization` | string | nie | Np. `"Q4_K_M"`, `"fp16"`, `"int4"`. |
-| `vram_gb_min` | u16 | nie | Minimalne VRAM dla tego modelu. |
-| `recommended` | bool | nie | Domyślnie `false`. Jeden preset na silnik powinien być `true`. |
+| `recommended` | bool | nie | Default `false`. Zwykle jeden preset na silnik powinien być `true`. |
 
 ---
 
-## 7. Reguły walidacji semantycznej
+## 6. Reguły walidacji semantycznej (4 reguły)
 
-Build.rs sprawdza poniższe reguły dla każdego wariantu. Naruszenie = błąd kompilacji.
+Build.rs sprawdza poniższe reguły dla każdego manifestu. Naruszenie = błąd kompilacji
+z komunikatem wskazującym plik, sekcję i pole.
 
 | # | Reguła |
 |---|--------|
-| 1 | `gpu_backend = "metal"` ⇒ `target_os ∈ {macos, ios}` |
-| 2 | `gpu_backend = "mlx"` ⇒ `target_os ∈ {macos, ios}` AND `deploy_mode = "embedded"` |
-| 3 | `gpu_backend = "cuda"` ⇒ `target_os ∈ {linux, windows}` |
-| 4 | `gpu_backend = "rocm"` ⇒ `target_os = "linux"` |
-| 5 | `gpu_backend = "xpu"` ⇒ `target_os ∈ {linux, windows}` |
-| 6 | `deploy_mode = "docker"` ⇒ `target_os ∈ {linux, windows}` (macOS Docker bez GPU passthrough w v1) |
-| 7 | `variant.build.context_path` musi istnieć na dysku (sprawdzane przez build.rs) |
-| 8 | `variant.download.enabled = true` ⇒ `digest` podany i pasuje do `^sha256:[a-f0-9]{64}$` |
-| 9 | Engine `id` unikalny globalnie (cross-file); variant `id` unikalny w obrębie engine |
+| 1 | `engine.id` musi pasować do regex `^[a-z0-9][a-z0-9_-]{0,63}$` (chroni przed path-traversal/RCE). |
+| 2 | Manifest MUSI mieć przynajmniej jedną sekcję deploy (`[deploy.docker]`, `[deploy.native]` lub `[deploy.external]`). |
+| 3 | `deploy.native.runtime` musi być spójny z polami: `embedded` ⇒ `feature_flag` (i brak `binary_path`/`bundle_path`); `binary` ⇒ `binary_path` (i brak `feature_flag`/`bundle_path`); `python-bundle` ⇒ `bundle_path` (i brak `feature_flag`/`binary_path`). |
+| 4 | Ścieżki muszą istnieć na dysku — `deploy.docker.context_path`, `deploy.native.binary_path`, `deploy.native.bundle_path` (sprawdzane build-time, runtime nie ma dostępu do FS). |
 
-### 7.1. Walidacja iloczynu kartezjańskiego
-
-Pola `target_os` i `gpu_backend` mogą być zarówno pojedynczą wartością, jak i tablicą.
-Gdy oba są tablicami, walidator sprawdza KAŻDĄ parę — wariant przechodzi tylko gdy
-**każdy** GPU backend jest dopuszczalny dla **każdego** OS z listy.
-
-Implementacja (`tentaflow-core/src/services/manifest/validate.rs`):
-
-```rust
-if !os_list.iter().all(|o| required.contains(o)) {
-    errors.push(ValidationError::InvalidGpuOsCombo { ... });
-}
-```
-
-#### Przykład — niepoprawny wariant
-
-```toml
-[[variant]]
-id = "multi-os-multi-gpu"
-target_os = ["linux", "macos"]
-gpu_backend = ["cuda", "metal"]
-```
-
-Walidator odrzuci ten wariant, ponieważ:
-
-- `cuda` wymaga `target_os ∈ {linux, windows}` — `macos` w liście łamie regułę 3
-- `metal` wymaga `target_os ∈ {macos, ios}` — `linux` w liście łamie regułę 1
-
-Iloczyn kartezjański daje 4 pary `(os, gpu)`, z czego tylko `(linux, cuda)` i
-`(macos, metal)` są semantycznie sensowne — pozostałe dwie są niemożliwe.
-
-#### Przykład — poprawny wariant
-
-Aby udostępnić cztery konfiguracje, zdefiniuj cztery osobne warianty:
-
-```toml
-[[variant]]
-id = "linux-x64-cuda"
-target_os = "linux"
-gpu_backend = "cuda"
-# ...
-
-[[variant]]
-id = "macos-arm64-metal"
-target_os = "macos"
-gpu_backend = "metal"
-# ...
-```
-
-### 7.2. Pozytywne i negatywne przykłady reguł
-
-| Reguła | OK | Błąd |
-|--------|----|------|
-| 1 (`metal`) | `target_os = "macos"` + `gpu_backend = "metal"` | `target_os = "linux"` + `gpu_backend = "metal"` |
-| 2 (`mlx`) | `deploy_mode = "embedded"` + `target_os = "macos"` + `gpu_backend = "mlx"` | `deploy_mode = "docker"` + `gpu_backend = "mlx"` |
-| 3 (`cuda`) | `target_os = ["linux","windows"]` + `gpu_backend = "cuda"` | `target_os = "macos"` + `gpu_backend = "cuda"` |
-| 4 (`rocm`) | `target_os = "linux"` + `gpu_backend = "rocm"` | `target_os = "windows"` + `gpu_backend = "rocm"` |
-| 5 (`xpu`) | `target_os = "linux"` + `gpu_backend = "xpu"` | `target_os = "macos"` + `gpu_backend = "xpu"` |
-| 6 (`docker`) | `deploy_mode = "docker"` + `target_os = "linux"` | `deploy_mode = "docker"` + `target_os = "macos"` (brak GPU passthrough) |
-| 7 (`context_path`) | `context_path = "llm/docker/vllm"` (katalog istnieje) | `context_path = "llm/docker/foobar"` (brak katalogu) |
-| 8 (`download.enabled`) | `enabled = true` + `digest = "sha256:abc...64hex..."` | `enabled = true` + brak `digest` lub format niezgodny z regex |
-| 9 (`id`) | `engine.id = "vllm"` jeden raz w całym katalogu | dwa pliki z `engine.id = "vllm"` |
+Dodatkowo build.rs egzekwuje **globalną unikalność `engine.id`** w obrębie całego repo.
 
 ---
 
-## 8. Build vs Download (license gating)
-
-Każdy `[[variant]]` typu `deploy_mode = "docker"` MOŻE definiować zarówno
-`[variant.build]` jak i `[variant.download]`. Są to dwa rozłączne kanały
-instalacji obrazu:
-
-| Kanał | Sekcja TOML | Wymagana licencja | Status w v1 |
-|-------|-------------|-------------------|-------------|
-| Build | `[variant.build]` | Free (zawsze) | Aktywne, kontekst Dockerfile w repo |
-| Download | `[variant.download]` | Pro lub Enterprise (gating w `tentaflow-core/src/license/checker.rs`) | `enabled = false` — infrastruktura przygotowana, brak publikacji |
-
-Gating implementuje endpoint `POST /api/services/deploy` — wybór
-`deploy_method = "download"` przy braku licencji Pro zwraca błąd HTTP zanim
-docker pull się uruchomi.
-
-Dla wariantów `native` analogicznie: `[variant.build]` zawsze, `[variant.download]`
-opcjonalne (prebuilt `.tar.gz` z registry).
-
----
-
-## 9. Przykłady
-
-### vLLM (Docker, prebuilt opcjonalnie)
-
-```toml
-[engine]
-id = "vllm"
-category = "llm"
-name = "vLLM"
-api = "openai-compatible"
-default_port = 8000
-version = "0.6.3"
-
-[[variant]]
-id = "linux-x64-cuda"
-deploy_mode = "docker"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "stable"
-vram_gb_min = 8
-
-[variant.build]
-context_path = "llm/docker/vllm"
-
-[variant.download]
-image = "ghcr.io/slyb00ts/tentaflow-pro/vllm:linux-x64-cuda-v0.6.3"
-digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-enabled = false
-```
-
-### llama.cpp (embedded przez Cargo feature)
-
-```toml
-[[variant]]
-id = "embedded-metal"
-deploy_mode = "embedded"
-target_os = ["macos", "ios"]
-target_arch = "aarch64"
-gpu_backend = "metal"
-status = "stable"
-vram_gb_min = 4
-
-[variant.feature_flag]
-name = "inference-llamacpp"
-```
-
-### sherpa-onnx (native binarka)
-
-```toml
-[[variant]]
-id = "native-linux-x64-cpu"
-deploy_mode = "native"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cpu"
-status = "stable"
-
-[variant.build]
-context_path = "tts/native/sherpa-onnx"
-```
-
----
-
-## 10. Jak dodać nowy silnik
+## 7. Jak dodać nowy silnik
 
 1. **Wybierz kategorię** — np. nowy silnik STT trafia do `tentaflow-containers/stt/`.
-2. **Utwórz katalogi buildu** — w zależności od deploy mode:
+2. **Utwórz katalogi buildu** w zależności od planowanych trybów:
    - Docker: `<kategoria>/docker/<id>/Dockerfile`
-   - Python bundle: `<kategoria>/python/<id>/`
-   - Native: `<kategoria>/native/<id>/build.sh`
+   - Native binary: `<kategoria>/native/<id>/build.sh`
+   - Python bundle: `<kategoria>/python/<id>/{bundle.toml, server.py}`
+   - Embedded: tylko Cargo feature w `tentaflow-core/Cargo.toml` — żadnego katalogu pod `tentaflow-containers/`.
 3. **Stwórz manifest** — `<kategoria>/_services/<id>.toml` zgodny z tym schema.
-4. **Zweryfikuj 9 reguł** — patrz sekcja 7.
-5. **Uruchom `cargo build`** w `tentaflow-core/` — build.rs zwaliduje plik i wbuduje go do
-   binarki. Błędy walidacji semantycznej zatrzymają kompilację.
-6. **Uruchom skrypt buildu** — odpowiednio `build-containers.sh` lub `build-natives.sh`,
-   żeby zbudować artefakty lokalnie.
-7. **Sprawdź w GUI** — po starcie binarki w katalogu usług powinien pojawić się nowy silnik.
+4. **Uruchom `cargo build`** w `tentaflow-core/`. Build.rs sprawdzi 4 reguły i odmówi
+   kompilacji przy błędzie. Po sukcesie w outpucie pojawi się
+   `Manifest serwisow: zaladowano N silnikow z N plikow TOML`.
+5. **Sprawdź w GUI** — w katalogu usług powinien pojawić się nowy kafelek (kategoria
+   automatycznie odsłonięta, jeśli była wcześniej pusta).
 
 ### Konwencje nazewnicze
 
 - `engine.id`: kebab-case, krótki, zgodny z nazwą upstream (`vllm`, `llama-cpp`, `sherpa-onnx`).
-- `variant.id`: kebab-case, format `<scope>-<arch>-<gpu>`, np. `linux-x64-cuda`,
-  `embedded-metal`, `native-macos-arm64-metal`.
-- `image` w `[variant.download]`: `ghcr.io/slyb00ts/tentaflow-pro/<engine>:<variant_id>-v<version>`.
+- `context_path` / `binary_path` / `bundle_path`: zgodne z layoutem `<kategoria>/<tryb>/<id>`.
+- `feature_flag`: prefiks `inference-` dla silników wnioskowania (`inference-llamacpp`,
+  `inference-mlx`, `inference-whisper`).

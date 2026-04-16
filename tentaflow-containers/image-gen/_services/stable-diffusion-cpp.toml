@@ -1,83 +1,24 @@
-# =============================================================================
-# Plik: image-gen/_services/stable-diffusion-cpp.toml
-# Opis: Manifest silnika stable-diffusion.cpp. Tryb deploymentu: native
-#       (binarka ze zrodel C++). Lekka implementacja SD/Flux dzialajaca
-#       na CPU lub GPU. Wersja: latest (TODO sprawdzic stabilna).
-# =============================================================================
+# Manifest serwisu stable-diffusion.cpp — natywna binarka SD w C++.
 
 [engine]
 id = "stable-diffusion-cpp"
 category = "image-gen"
 name = "stable-diffusion.cpp"
-description_pl = "stable-diffusion.cpp — natywna implementacja SD/Flux w C++. Lekka, szybka, dziala na CPU."
-description_en = "stable-diffusion.cpp — native C++ implementation of SD/Flux. Lightweight, fast, runs on CPU."
+description_pl = "Lekka implementacja Stable Diffusion w C++. Dziala na CPU i GPU bez Pythona."
+description_en = "Lightweight Stable Diffusion in C++. Runs on CPU and GPU without Python."
 homepage = "https://github.com/leejet/stable-diffusion.cpp"
 license = "MIT"
-api = "custom"
 default_port = 5000
+api = "custom"
 version = "latest"
-tags = ["image-gen", "stable-diffusion", "flux", "cpp", "lightweight"]
-icon = "sd-cpp"
 
-# Wariant Linux x64 CUDA - glowny.
-[[variant]]
-id = "native-linux-x64-cuda"
-deploy_mode = "native"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "stable"
-vram_gb_min = 4
-ram_gb_min = 8
-disk_gb_min = 5
-notes_pl = "Buildowany z CUDA Toolkit 12.x. Szybsze niz CPU, ale wolniejsze niz ComfyUI/diffusers."
-notes_en = "Built with CUDA Toolkit 12.x. Faster than CPU, slower than ComfyUI/diffusers."
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "binary"
+binary_path = "image-gen/native/stable-diffusion-cpp"
 
-[variant.build]
-context_path = "image-gen/native/stable-diffusion-cpp"
-tags = ["sd-cpp-cuda-linux-x86_64"]
-
-[variant.build.build_args]
-SD_CPP_BACKEND = "cuda"
-
-# Wariant macOS Apple Silicon Metal - planowany.
-[[variant]]
-id = "native-macos-arm64-metal"
-deploy_mode = "native"
-target_os = "macos"
-target_arch = "aarch64"
-gpu_backend = "metal"
-status = "planned"
-vram_gb_min = 4
-ram_gb_min = 8
-disk_gb_min = 5
-notes_pl = "Planowane: build z Metal backend dla Apple Silicon."
-notes_en = "Planned: Metal backend build for Apple Silicon."
-
-[variant.build]
-context_path = "image-gen/native/stable-diffusion-cpp"
-tags = ["sd-cpp-metal-macos-arm64"]
-
-[variant.build.build_args]
-SD_CPP_BACKEND = "metal"
-
-# Wariant Windows x64 CUDA - planowany.
-[[variant]]
-id = "native-windows-x64-cuda"
-deploy_mode = "native"
-target_os = "windows"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "planned"
-vram_gb_min = 4
-ram_gb_min = 8
-disk_gb_min = 5
-notes_pl = "Planowane: build dla Windows z MSVC + CUDA."
-notes_en = "Planned: Windows build with MSVC + CUDA."
-
-[variant.build]
-context_path = "image-gen/native/stable-diffusion-cpp"
-tags = ["sd-cpp-cuda-windows-x86_64"]
-
-[variant.build.build_args]
-SD_CPP_BACKEND = "cuda"
+[[model_preset]]
+id = "sd-1-5-gguf"
+display_name = "Stable Diffusion 1.5 (GGUF)"
+repo = "leejet/stable-diffusion.cpp/sd-v1-5"
+recommended = true

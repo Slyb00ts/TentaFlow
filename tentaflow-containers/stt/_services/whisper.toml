@@ -1,153 +1,34 @@
-# =============================================================================
-# Plik: stt/_services/whisper.toml
-# Opis: Manifest silnika Whisper. Warianty:
-#       - native per platforma (Linux/macOS/Windows, kazdy z odpowiednim GPU)
-#       - docker linux+cuda (zwykly Whisper)
-#       - docker linux+cuda Faster Whisper (4x szybszy, wymaga GPU)
-# =============================================================================
+# Manifest serwisu Whisper — wbudowany engine STT (whisper-rs) na wszystkie platformy.
 
 [engine]
 id = "whisper"
 category = "stt"
 name = "Whisper"
-description_pl = "Whisper.cpp — natywny silnik rozpoznawania mowy (CPU/GPU). Wariant Faster Whisper to GPU-only docker z 4x szybszym inference."
-description_en = "Whisper.cpp — native speech recognition engine (CPU/GPU). Faster Whisper variant is GPU-only docker with 4x faster inference."
+description_pl = "Silnik STT od OpenAI. Multijezykowa transkrypcja audio → tekst."
+description_en = "OpenAI's STT engine. Multilingual audio-to-text transcription."
 homepage = "https://github.com/openai/whisper"
-docs_url = "https://github.com/ggerganov/whisper.cpp"
 license = "MIT"
-api = "openai-compatible"
-default_port = 5030
-version = "1.7.4"
-tags = ["asr", "speech-to-text", "multilingual", "openai-whisper"]
 icon = "whisper"
+default_port = 5030
+api = "openai-compatible"
+version = "1.7.4"
 
-# Wariant native Linux x64 - CPU lub CUDA (wybierane w czasie buildu binarki).
-[[variant]]
-id = "native-linux-x64"
-deploy_mode = "native"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = ["cpu", "cuda"]
-status = "stable"
-ram_gb_min = 2
-disk_gb_min = 3
-notes_pl = "Build whisper.cpp dla Linux x86_64. Backend CPU lub CUDA wybierany flaga buildu."
-notes_en = "whisper.cpp build for Linux x86_64. CPU or CUDA backend selected by build flag."
-
-[variant.build]
-context_path = "stt/native/whisper-cpp"
-tags = ["whisper-cpp-linux-x86_64"]
-
-[variant.build.build_args]
-WHISPER_CPP_VERSION = "1.7.4"
-
-# Wariant native macOS Apple Silicon - Metal automatycznie.
-[[variant]]
-id = "native-macos-arm64"
-deploy_mode = "native"
-target_os = "macos"
-target_arch = "aarch64"
-gpu_backend = ["cpu", "metal"]
-status = "stable"
-ram_gb_min = 2
-disk_gb_min = 3
-notes_pl = "Build whisper.cpp dla Apple Silicon. Metal wykorzystywany automatycznie."
-notes_en = "whisper.cpp build for Apple Silicon. Metal used automatically."
-
-[variant.build]
-context_path = "stt/native/whisper-cpp"
-tags = ["whisper-cpp-macos-arm64"]
-
-[variant.build.build_args]
-WHISPER_CPP_VERSION = "1.7.4"
-
-# Wariant native Windows x64 - CPU lub CUDA.
-[[variant]]
-id = "native-windows-x64"
-deploy_mode = "native"
-target_os = "windows"
-target_arch = "x86_64"
-gpu_backend = ["cpu", "cuda"]
-status = "stable"
-ram_gb_min = 2
-disk_gb_min = 3
-notes_pl = "Build whisper.cpp dla Windows x86_64. Backend CPU lub CUDA wybierany flaga buildu."
-notes_en = "whisper.cpp build for Windows x86_64. CPU or CUDA backend selected by build flag."
-
-[variant.build]
-context_path = "stt/native/whisper-cpp"
-tags = ["whisper-cpp-windows-x86_64"]
-
-[variant.build.build_args]
-WHISPER_CPP_VERSION = "1.7.4"
-
-# Wariant docker - zwykly Whisper na CUDA. Dla uzytkownikow ktorzy chca
-# kontener i nie chca buildowac binarki natywnie.
-[[variant]]
-id = "linux-x64-cuda-docker"
-deploy_mode = "docker"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "stable"
-vram_gb_min = 4
-ram_gb_min = 8
-disk_gb_min = 10
-notes_pl = "Standardowy Whisper w kontenerze. Wymaga nvidia-container-toolkit."
-notes_en = "Standard Whisper in container. Requires nvidia-container-toolkit."
-
-[variant.build]
+[deploy.docker]
 context_path = "stt/docker/whisper"
-dockerfile = "Dockerfile"
-tags = ["tentaflow/whisper:cuda-x86_64"]
+platforms = ["linux", "windows"]
 
-[variant.build.build_args]
-WHISPER_VERSION = "1.7.4"
-
-# Wariant docker - Faster Whisper. Ten sam image co linux-x64-cuda-docker,
-# ale z osobnym entrypointem uruchamiajacym faster-whisper backend.
-[[variant]]
-id = "linux-x64-cuda-faster"
-deploy_mode = "docker"
-target_os = "linux"
-target_arch = "x86_64"
-gpu_backend = "cuda"
-status = "experimental"
-vram_gb_min = 4
-ram_gb_min = 8
-disk_gb_min = 10
-notes_pl = "Faster Whisper — 4x szybszy niz zwykly Whisper, wymaga GPU CUDA."
-notes_en = "Faster Whisper — 4x faster than standard Whisper, requires CUDA GPU."
-
-[variant.build]
-context_path = "stt/docker/whisper"
-dockerfile = "Dockerfile"
-tags = ["tentaflow/whisper:faster-cuda-x86_64"]
-
-[variant.build.build_args]
-WHISPER_VERSION = "1.7.4"
-WHISPER_BACKEND = "faster"
-
-# Rekomendowane modele Whisper (multilingual).
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+feature_flag = "inference-whisper"
 
 [[model_preset]]
 id = "whisper-large-v3-turbo"
 display_name = "Whisper Large v3 Turbo"
 repo = "openai/whisper-large-v3-turbo"
-quantization = "fp16"
-vram_gb_min = 6
 recommended = true
 
 [[model_preset]]
 id = "whisper-base"
 display_name = "Whisper Base"
 repo = "openai/whisper-base"
-quantization = "fp16"
-vram_gb_min = 1
-
-[[model_preset]]
-id = "whisper-tiny"
-display_name = "Whisper Tiny"
-repo = "openai/whisper-tiny"
-quantization = "fp16"
-vram_gb_min = 1

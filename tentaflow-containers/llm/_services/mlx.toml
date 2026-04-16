@@ -1,70 +1,26 @@
-# =============================================================================
-# Plik: llm/_services/mlx.toml
-# Opis: Manifest silnika MLX (Apple). Tryb deploymentu: embedded przez Cargo
-#       feature flag. Dziala wylacznie na Apple Silicon (Mac M1+/iOS).
-# =============================================================================
+# Manifest serwisu MLX — wbudowany engine LLM dla Apple Silicon (macOS/iOS).
 
 [engine]
 id = "mlx"
 category = "llm"
 name = "MLX"
-description_pl = "Framework Apple do ML, uzywa Metal bezposrednio. Najszybszy LLM na Apple Silicon. Nie dziala na Intel Mac, nie dziala pod Dockerem na macOS."
-description_en = "Apple's ML framework using Metal directly. Fastest LLM on Apple Silicon."
+description_pl = "Apple ML framework dla Apple Silicon. Najszybszy LLM na M1/M2/M3/M4."
+description_en = "Apple's ML framework for Apple Silicon. Fastest on M1/M2/M3/M4."
 homepage = "https://github.com/ml-explore/mlx"
-docs_url = "https://ml-explore.github.io/mlx/"
 license = "MIT"
-api = "openai-compatible"
-default_port = 8080
-version = "0.20.0"
-tags = ["apple-silicon", "metal", "embedded"]
-also_serves = ["embeddings"]
 icon = "mlx"
+default_port = 8080
+api = "openai-compatible"
+version = "0.20.0"
 
-# Wariant macOS Apple Silicon - glowny i najlepiej przetestowany.
-[[variant]]
-id = "macos-arm64-mlx"
-deploy_mode = "embedded"
-target_os = "macos"
-target_arch = "aarch64"
-gpu_backend = "mlx"
-status = "stable"
-ram_gb_min = 8
-disk_gb_min = 2
-notes_pl = "Wymaga Apple Silicon (M1/M2/M3/M4). Brak wsparcia Intel Mac."
-notes_en = "Requires Apple Silicon (M1/M2/M3/M4). No Intel Mac support."
-
-[variant.feature_flag]
-name = "inference-mlx"
-
-# Wariant iOS - eksperymentalny, wymaga Swift bridge.
-[[variant]]
-id = "ios-arm64-mlx"
-deploy_mode = "embedded"
-target_os = "ios"
-target_arch = "aarch64"
-gpu_backend = "mlx"
-status = "experimental"
-ram_gb_min = 6
-disk_gb_min = 2
-notes_pl = "Wymaga Swift bridge (inference-mlx-swift). Implementacja w Fazie 3."
-notes_en = "Requires Swift bridge (inference-mlx-swift). Implementation in Phase 3."
-
-[variant.feature_flag]
-name = "inference-mlx-swift"
-
-# Rekomendowane modele MLX (kwantyzowane dla unified memory).
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx"
 
 [[model_preset]]
-id = "qwen3.5-0.8b-mlx-4bit"
+id = "qwen3-5-0-8b-mlx-4bit"
 display_name = "Qwen 3.5 0.8B (MLX 4-bit)"
 repo = "mlx-community/Qwen3.5-0.8B-bit4"
 quantization = "int4"
-vram_gb_min = 1
 recommended = true
-
-[[model_preset]]
-id = "llama-3.2-3b-mlx-4bit"
-display_name = "Llama 3.2 3B Instruct (MLX 4-bit)"
-repo = "mlx-community/Llama-3.2-3B-Instruct-4bit"
-quantization = "int4"
-vram_gb_min = 4
