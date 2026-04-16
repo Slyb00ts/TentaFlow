@@ -301,7 +301,12 @@ jobs:
           wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key \
             | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg
           CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/latest ${CODENAME} main" \
+          # Pinujemy na konkretna wersje ROCm (7.2) zamiast `latest`.
+          # `latest` = floating tag — AMD usuwa stare .deb pliki z poola gdy
+          # pushuje nowy release, a Packages index nie jest jeszcze odswiezony
+          # → apt widzi referencje do pliku ktorego CDN juz nie ma (404).
+          # `apt/7.2` to zamrozona wersja, pliki stabilne.
+          echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/7.2 ${CODENAME} main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list
           # Pin=600 forsuje ROCm wersje z repo.radeon.com nad Ubuntu (500).
           # KONIECZNE — Ubuntu noble ma swoje `rocminfo 5.7.1`, `rocm-cmake 6.0.0`,
@@ -381,18 +386,21 @@ jobs:
               runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
               ''
             }}
-          # ExternalProject vulkan-shaders-gen TryCompile dostaje rownolegle
-          # cl.exe z /MP i wszystkie pisza do vc143.pdb -> C1041.
-          # CFLAGS/CXXFLAGS env sa czytane przez cmake jako CMAKE_*_FLAGS_INIT
-          # tylko dla projektow bez explicit flag (INNER ExternalProject).
-          # MSYS_NO_PATHCONV + MSYS2_ARG_CONV_EXCL wylaczaja MSYS path
-          # conversion — bez nich Git Bash tlumaczy `/FS` na
-          # `C:/Program Files/Git/FS` (widzi Unix-path-like argument).
-          CFLAGS: /FS
-          CXXFLAGS: /FS
-          MSYS_NO_PATHCONV: 1
-          MSYS2_ARG_CONV_EXCL: "*"
         run: |
+          # Windows tylko: CFLAGS=/FS -> cmake czyta jako CMAKE_*_FLAGS_INIT
+          # dla INNER ExternalProject vulkan-shaders-gen TryCompile (outer ma
+          # explicit flags, wiec env ignorowane). Zapobiega C1041 na vc143.pdb
+          # z rownoleglych cl.exe /MP.
+          # MSYS_NO_PATHCONV+MSYS2_ARG_CONV_EXCL: Git Bash bez tego tlumaczy
+          # `/FS` na `C:/Program Files/Git/FS` (widzi Unix-path-like arg).
+          # NIE mozna tego trzymac w env: YAML — cc-rs na macOS/Linux tez
+          # czyta CFLAGS i wali /FS do clanga/gcc (nie rozumieja tego flaga).
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            export CFLAGS=/FS
+            export CXXFLAGS=/FS
+            export MSYS_NO_PATHCONV=1
+            export MSYS2_ARG_CONV_EXCL="*"
+          fi
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
           else
