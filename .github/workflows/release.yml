@@ -381,16 +381,17 @@ jobs:
               runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
               ''
             }}
-          # ExternalProject vulkan-shaders-gen (zagniezdzone cmake + MSBuild
-          # z TryCompile) dostaje rownolegle cl.exe z domyslnego /MP i wszystkie
-          # pisza do tego samego vc143.pdb -> C1041.
+          # ExternalProject vulkan-shaders-gen TryCompile dostaje rownolegle
+          # cl.exe z /MP i wszystkie pisza do vc143.pdb -> C1041.
           # CFLAGS/CXXFLAGS env sa czytane przez cmake jako CMAKE_*_FLAGS_INIT
-          # TYLKO dla projektow ktore nie ustawiaja flag jawnie (czyli wlasnie
-          # INNER ExternalProject). Outer whisper-rs-sys / llama-cpp-sys-2
-          # ustawiaja -DCMAKE_C_FLAGS jawnie → env jest ignorowane, wiec
-          # compiler-id probe (ktory byl wywolany przez CL=/FS) pozostaje czysty.
+          # tylko dla projektow bez explicit flag (INNER ExternalProject).
+          # MSYS_NO_PATHCONV + MSYS2_ARG_CONV_EXCL wylaczaja MSYS path
+          # conversion — bez nich Git Bash tlumaczy `/FS` na
+          # `C:/Program Files/Git/FS` (widzi Unix-path-like argument).
           CFLAGS: /FS
           CXXFLAGS: /FS
+          MSYS_NO_PATHCONV: 1
+          MSYS2_ARG_CONV_EXCL: "*"
         run: |
           if [[ -n "${{ matrix.features }}" ]]; then
             cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
