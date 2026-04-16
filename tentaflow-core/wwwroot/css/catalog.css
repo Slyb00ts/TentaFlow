@@ -687,3 +687,94 @@
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+/* --- Wizard taby (np. Preset / HuggingFace w kroku 2) --- */
+.wizard-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--color-border);
+  margin-bottom: var(--spacing-md);
+}
+
+.wizard-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: var(--spacing-sm) var(--spacing-md);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+  font-family: var(--font-family);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.wizard-tab:hover {
+  color: var(--color-text-primary);
+}
+
+.wizard-tab.active {
+  color: var(--color-accent);
+  border-bottom-color: var(--color-accent);
+}
+
+.wizard-tab:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+.wizard-tab-content {
+  margin-top: var(--spacing-sm);
+}
+
+/* --- Wizard - karty trybow deploymentu (Docker/Native/External) --- */
+.deploy-method-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-md);
+}
+
+.deploy-method-card {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-lg);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+  font-family: var(--font-family);
+}
+
+.deploy-method-card:hover {
+  border-color: var(--color-border-hover);
+  background: var(--color-bg-hover);
+}
+
+.deploy-method-card.selected {
+  border-color: var(--color-accent);
+  background: var(--color-accent-light);
+}
+
+.deploy-method-card:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.deploy-method-card-icon {
+  font-size: 28px;
+  line-height: 1;
+  margin-bottom: var(--spacing-sm);
+}
+
+.deploy-method-card-name {
+  font-weight: 600;
+  font-size: var(--font-size-md);
+  color: var(--color-text-primary);
+}
+
+.deploy-method-card-desc {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  margin-top: var(--spacing-xs);
+  line-height: 1.4;
+}

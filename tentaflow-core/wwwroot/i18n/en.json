@@ -64,7 +64,8 @@
     "back": "Back",
     "password": "Password",
     "preview": "Preview",
-    "language": "Language"
+    "language": "Language",
+    "deploy": "Deploy"
   },
   "dashboard": {
     "metrics": {
@@ -1032,7 +1033,7 @@
     "download_transcripts": "Download transcripts"
   },
   "wizard": {
-    "title": "Deploy engine",
+    "title": "Deploying engine",
     "step1": "Deployment method",
     "step2": "Select model",
     "step3": "Configure",
@@ -1043,15 +1044,29 @@
     "fromPreset": "From preset",
     "searchHuggingface": "Search on HuggingFace",
     "huggingfaceToken": "HuggingFace token (optional)",
+    "noPresets": "No recommended models — use HuggingFace search",
+    "presetHint": "Select a recommended model for this engine",
+    "hfSearchHint": "Type at least 2 characters to search",
+    "hfSearchPlaceholder": "e.g. qwen, llama, mistral...",
+    "noMethodsAvailable": "No deployment methods available for platform {os}.",
+    "containerName": "Container name",
+    "port": "Port",
+    "modelLabel": "Model",
     "method": {
       "docker": "Docker",
       "native": "Native",
-      "external": "External"
+      "external": "External",
+      "dockerDesc": "Container with resource isolation",
+      "nativeDesc": "Fastest, runs directly on host",
+      "externalDesc": "Connects to an already running installation"
     },
     "startDeploy": "Start deploy",
     "cancel": "Cancel",
     "next": "Next",
-    "back": "Back"
+    "back": "Back",
+    "deployStarted": "Deploy started: {id}",
+    "deployFailed": "Deploy failed: {error}",
+    "engineNotFound": "Engine \"{id}\" not found in manifest"
   },
   "category": {
     "llm": "Language Models (LLM)",
