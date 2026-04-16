@@ -108,12 +108,36 @@ po szczegoly nazewnictwa i platform docelowych.
 ## Manifest serwisow (TOML)
 
 Manifesty `_services/<engine-id>.toml` opisuja silnik deklaratywnie:
-identyfikator, kategoria, warianty deployment (docker/native/python/embedded),
-wymagania GPU, mapa portow, aliasy modeli. Tentaflow-core odczytuje je przy
-buildzie i generuje wpisy w GUI wizardzie.
+identyfikator, kategoria, warianty deployment (`docker`/`native`/`python-bundle`/`embedded`/`external`),
+wymagania GPU, mapa portow, aliasy modeli. `tentaflow-core/build.rs` odczytuje
+wszystkie manifesty przy `cargo build`, waliduje 9 regul semantycznych i generuje:
 
-**Schema TOML zostanie udokumentowane w `_schema/SCHEMA.md` w iteracji 2** —
-narazie ten katalog jest pusty (`_services/.gitkeep` jako placeholder).
+- Rust const w `$OUT_DIR/services_generated.rs` — uzywany przez
+  `tentaflow-core/src/services/manifest/registry.rs`
+- JS module `tentaflow-core/wwwroot/js/generated/services-manifest.js` —
+  konsumowany przez `wwwroot/js/modules/catalog/ManifestStore.js` w GUI
+
+Pelna specyfikacja: [`_schema/SCHEMA.md`](./_schema/SCHEMA.md) (sekcje, pola,
+podsekcje, enum-y, reguly walidacji, przyklady). JSON Schema do walidacji w
+edytorze: [`_schema/schema.json`](./_schema/schema.json).
+
+### Build vs Download
+
+Kazdy `[[variant]]` typu `docker` ma dwie opcje instalacji:
+
+- **Build** — lokalny `docker build` z `[variant.build].context_path`. Zawsze
+  dostepne (Free).
+- **Download** — pull prebuilt image z `[variant.download].image`. Wymaga
+  TentaFlow Pro (sprawdzane przez `tentaflow-core/src/license/checker.rs`).
+  W v1 wszystkie `download.enabled = false` — infrastruktura przygotowana
+  pod Pro, zadne obrazy nie sa publikowane.
+
+### Jak dodac nowy silnik
+
+Procedura krok po kroku w `_schema/SCHEMA.md` (sekcja "Jak dodac nowy silnik").
+W skrocie: utworz katalog buildu (`docker/<id>/` lub `native/<id>/` lub
+`python/<id>/`), napisz `_services/<id>.toml` zgodny ze schema, uruchom
+`cargo build` w `tentaflow-core/` — walidator zaakceptuje albo zwroci blad.
 
 ## Deploy
 

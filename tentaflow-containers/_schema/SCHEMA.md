@@ -203,9 +203,92 @@ Build.rs sprawdza poniższe reguły dla każdego wariantu. Naruszenie = błąd k
 | 8 | `variant.download.enabled = true` ⇒ `digest` podany i pasuje do `^sha256:[a-f0-9]{64}$` |
 | 9 | Engine `id` unikalny globalnie (cross-file); variant `id` unikalny w obrębie engine |
 
+### 7.1. Walidacja iloczynu kartezjańskiego
+
+Pola `target_os` i `gpu_backend` mogą być zarówno pojedynczą wartością, jak i tablicą.
+Gdy oba są tablicami, walidator sprawdza KAŻDĄ parę — wariant przechodzi tylko gdy
+**każdy** GPU backend jest dopuszczalny dla **każdego** OS z listy.
+
+Implementacja (`tentaflow-core/src/services/manifest/validate.rs`):
+
+```rust
+if !os_list.iter().all(|o| required.contains(o)) {
+    errors.push(ValidationError::InvalidGpuOsCombo { ... });
+}
+```
+
+#### Przykład — niepoprawny wariant
+
+```toml
+[[variant]]
+id = "multi-os-multi-gpu"
+target_os = ["linux", "macos"]
+gpu_backend = ["cuda", "metal"]
+```
+
+Walidator odrzuci ten wariant, ponieważ:
+
+- `cuda` wymaga `target_os ∈ {linux, windows}` — `macos` w liście łamie regułę 3
+- `metal` wymaga `target_os ∈ {macos, ios}` — `linux` w liście łamie regułę 1
+
+Iloczyn kartezjański daje 4 pary `(os, gpu)`, z czego tylko `(linux, cuda)` i
+`(macos, metal)` są semantycznie sensowne — pozostałe dwie są niemożliwe.
+
+#### Przykład — poprawny wariant
+
+Aby udostępnić cztery konfiguracje, zdefiniuj cztery osobne warianty:
+
+```toml
+[[variant]]
+id = "linux-x64-cuda"
+target_os = "linux"
+gpu_backend = "cuda"
+# ...
+
+[[variant]]
+id = "macos-arm64-metal"
+target_os = "macos"
+gpu_backend = "metal"
+# ...
+```
+
+### 7.2. Pozytywne i negatywne przykłady reguł
+
+| Reguła | OK | Błąd |
+|--------|----|------|
+| 1 (`metal`) | `target_os = "macos"` + `gpu_backend = "metal"` | `target_os = "linux"` + `gpu_backend = "metal"` |
+| 2 (`mlx`) | `deploy_mode = "embedded"` + `target_os = "macos"` + `gpu_backend = "mlx"` | `deploy_mode = "docker"` + `gpu_backend = "mlx"` |
+| 3 (`cuda`) | `target_os = ["linux","windows"]` + `gpu_backend = "cuda"` | `target_os = "macos"` + `gpu_backend = "cuda"` |
+| 4 (`rocm`) | `target_os = "linux"` + `gpu_backend = "rocm"` | `target_os = "windows"` + `gpu_backend = "rocm"` |
+| 5 (`xpu`) | `target_os = "linux"` + `gpu_backend = "xpu"` | `target_os = "macos"` + `gpu_backend = "xpu"` |
+| 6 (`docker`) | `deploy_mode = "docker"` + `target_os = "linux"` | `deploy_mode = "docker"` + `target_os = "macos"` (brak GPU passthrough) |
+| 7 (`context_path`) | `context_path = "llm/docker/vllm"` (katalog istnieje) | `context_path = "llm/docker/foobar"` (brak katalogu) |
+| 8 (`download.enabled`) | `enabled = true` + `digest = "sha256:abc...64hex..."` | `enabled = true` + brak `digest` lub format niezgodny z regex |
+| 9 (`id`) | `engine.id = "vllm"` jeden raz w całym katalogu | dwa pliki z `engine.id = "vllm"` |
+
 ---
 
-## 8. Przykłady
+## 8. Build vs Download (license gating)
+
+Każdy `[[variant]]` typu `deploy_mode = "docker"` MOŻE definiować zarówno
+`[variant.build]` jak i `[variant.download]`. Są to dwa rozłączne kanały
+instalacji obrazu:
+
+| Kanał | Sekcja TOML | Wymagana licencja | Status w v1 |
+|-------|-------------|-------------------|-------------|
+| Build | `[variant.build]` | Free (zawsze) | Aktywne, kontekst Dockerfile w repo |
+| Download | `[variant.download]` | Pro lub Enterprise (gating w `tentaflow-core/src/license/checker.rs`) | `enabled = false` — infrastruktura przygotowana, brak publikacji |
+
+Gating implementuje endpoint `POST /api/services/deploy` — wybór
+`deploy_method = "download"` przy braku licencji Pro zwraca błąd HTTP zanim
+docker pull się uruchomi.
+
+Dla wariantów `native` analogicznie: `[variant.build]` zawsze, `[variant.download]`
+opcjonalne (prebuilt `.tar.gz` z registry).
+
+---
+
+## 9. Przykłady
 
 ### vLLM (Docker, prebuilt opcjonalnie)
 
@@ -269,7 +352,7 @@ context_path = "tts/native/sherpa-onnx"
 
 ---
 
-## 9. Jak dodać nowy silnik
+## 10. Jak dodać nowy silnik
 
 1. **Wybierz kategorię** — np. nowy silnik STT trafia do `tentaflow-containers/stt/`.
 2. **Utwórz katalogi buildu** — w zależności od deploy mode:
