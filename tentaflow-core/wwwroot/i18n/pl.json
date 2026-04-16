@@ -64,7 +64,8 @@
     "back": "Wstecz",
     "password": "Hasło",
     "preview": "Podgląd",
-    "language": "Język"
+    "language": "Język",
+    "deploy": "Wdroż"
   },
   "dashboard": {
     "metrics": {
@@ -1037,26 +1038,40 @@
     "download_transcripts": "Pobierz transkrypcje"
   },
   "wizard": {
-    "title": "Wdroz silnik",
+    "title": "Wdrażanie silnika",
     "step1": "Tryb deploymentu",
     "step2": "Wybor modelu",
     "step3": "Konfiguracja",
     "selectNode": "Wybierz wezel docelowy",
-    "selectMethod": "Wybierz tryb deploymentu",
+    "selectMethod": "Wybierz tryb wdrożenia",
     "selectModel": "Wybierz model",
     "configureRuntime": "Skonfiguruj runtime",
     "fromPreset": "Z presetu",
     "searchHuggingface": "Wyszukaj na HuggingFace",
     "huggingfaceToken": "Token HuggingFace (opcjonalny)",
+    "noPresets": "Brak rekomendowanych modeli — użyj wyszukiwarki HuggingFace",
+    "presetHint": "Wybierz rekomendowany model dla tego silnika",
+    "hfSearchHint": "Wpisz minimum 2 znaki, aby wyszukać",
+    "hfSearchPlaceholder": "np. qwen, llama, mistral...",
+    "noMethodsAvailable": "Brak dostępnych trybów wdrożenia dla platformy {os}.",
+    "containerName": "Nazwa kontenera",
+    "port": "Port",
+    "modelLabel": "Model",
     "method": {
       "docker": "Docker",
       "native": "Natywnie",
-      "external": "Zewnetrznie"
+      "external": "Zewnętrzny",
+      "dockerDesc": "Kontener z izolacją zasobów",
+      "nativeDesc": "Najszybsze, działa bezpośrednio na hoście",
+      "externalDesc": "Łączy się z już działającą instalacją"
     },
     "startDeploy": "Uruchom deploy",
     "cancel": "Anuluj",
     "next": "Dalej",
-    "back": "Wstecz"
+    "back": "Wstecz",
+    "deployStarted": "Deploy wystartował: {id}",
+    "deployFailed": "Deploy nieudany: {error}",
+    "engineNotFound": "Silnik \"{id}\" nie istnieje w manifeście"
   },
   "category": {
     "llm": "Modele jezykowe (LLM)",
