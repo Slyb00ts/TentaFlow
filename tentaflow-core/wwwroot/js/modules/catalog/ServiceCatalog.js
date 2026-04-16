@@ -169,21 +169,19 @@ const ServiceCatalog = (() => {
       console.error('[ServiceCatalog] init manifest blad:', err);
     }
 
-    const categories = ManifestStore.allCategories();
-    container.innerHTML = categories.map(cat => {
-      const engines = ManifestStore.byCategory(cat);
-      const titleKey = 'category.' + cat;
-      const title = Utils.escapeHtml(I18n.t(titleKey));
+    const hostOs = await detectHostOs();
+    const categories = ManifestStore.nonEmptyCategories();
 
-      if (engines.length === 0) {
-        return `
-          <section class="catalog-section catalog-section-empty" style="margin-bottom: var(--spacing-lg);">
-            <h2 style="font-size: var(--font-size-md); margin-bottom: var(--spacing-sm);">${title}</h2>
-            <p class="empty-state-hint">${I18n.t('category.empty')}</p>
-          </section>
-        `;
-      }
+    if (categories.length === 0) {
+      container.innerHTML = `<p class="empty-state-hint">${I18n.t('catalog.noEngines')}</p>`;
+      return;
+    }
 
+    const html = categories.map(cat => {
+      const engines = ManifestStore.byCategory(cat)
+        .filter(e => ManifestStore.isEngineCompatible(e, hostOs));
+      if (engines.length === 0) return '';
+      const title = Utils.escapeHtml(I18n.t('category.' + cat));
       const cards = engines.map(renderEngineCard).join('');
       return `
         <section class="catalog-section" style="margin-bottom: var(--spacing-lg);">
@@ -193,6 +191,12 @@ const ServiceCatalog = (() => {
       `;
     }).join('');
 
+    if (!html.trim()) {
+      container.innerHTML = `<p class="empty-state-hint">${I18n.t('catalog.noEngines')}</p>`;
+      return;
+    }
+    container.innerHTML = html;
+
     // Podpiecie klikow na kafelki silnikow
     const cards = container.querySelectorAll('.catalog-card[data-engine-id]');
     cards.forEach(card => {
@@ -201,47 +205,74 @@ const ServiceCatalog = (() => {
         if (!engId) return;
         EngineDeployWizard.open(engId, { nodeId: currentNodeId });
       };
-      const btn = card.querySelector('.catalog-deploy-btn');
-      if (btn) {
-        btn.addEventListener('click', (e) => { e.stopPropagation(); handler(); });
-      }
       card.addEventListener('click', handler);
     });
   }
 
-  // Pojedynczy kafelek silnika z manifestu.
-  function renderEngineCard(manifest) {
-    const e = manifest.engine || {};
-    const variants = manifest.variant || [];
-    const stableCount = variants.filter(v => v.status === 'stable').length;
-    const expCount = variants.filter(v => v.status === 'experimental').length;
-    const plannedCount = variants.filter(v => v.status === 'planned').length;
-    const iconHtml = (typeof CatalogIcons !== 'undefined' && CatalogIcons.get)
-      ? CatalogIcons.get(e.icon || e.id || e.category)
-      : '';
+  // Mapowanie kategoria -> klucz ikony (gdy engine.icon brak).
+  function categoryIconKey(category) {
+    const map = {
+      'llm': 'cpu',
+      'stt': 'mic',
+      'tts': 'speaker',
+      'embeddings': 'vector',
+      'reranker': 'sort',
+      'image-gen': 'image',
+      'agents': 'wrench',
+      'tools': 'wrench'
+    };
+    return map[category] || 'cpu';
+  }
 
-    let badges = '';
-    if (stableCount > 0) badges += `<span class="badge catalog-badge badge-stable">${stableCount} ${I18n.t('wizard.statusStable')}</span>`;
-    if (expCount > 0) badges += `<span class="badge catalog-badge badge-experimental">${expCount} ${I18n.t('wizard.statusExperimental')}</span>`;
-    if (plannedCount > 0 && stableCount === 0 && expCount === 0) {
-      badges += `<span class="badge catalog-badge badge-planned">${plannedCount} ${I18n.t('wizard.statusPlanned')}</span>`;
+  // Wykrycie OS hosta — z /api/mesh/nodes (lokalny node) z fallbackiem na user-agent.
+  async function detectHostOs() {
+    try {
+      let nodes;
+      if (typeof ApiClient !== 'undefined' && typeof ApiClient.get === 'function') {
+        nodes = await ApiClient.get('/api/mesh/nodes');
+      } else {
+        const r = await fetch('/api/mesh/nodes');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        nodes = await r.json();
+      }
+      if (Array.isArray(nodes) && nodes.length > 0) {
+        const local = nodes.find(n => n && n.is_local === true) || nodes[0];
+        if (local) {
+          const os = local.os || (local.platform && local.platform.os);
+          if (os) return String(os).toLowerCase();
+        }
+      }
+    } catch (err) {
+      console.warn('[ServiceCatalog] detectHostOs fallback (UA):', err);
     }
-    if (e.license) badges += `<span class="badge catalog-badge">${Utils.escapeHtml(e.license)}</span>`;
+    return defaultHostOs();
+  }
+
+  function defaultHostOs() {
+    const ua = (navigator.userAgent || '').toLowerCase();
+    if (ua.indexOf('mac') !== -1) return 'macos';
+    if (ua.indexOf('win') !== -1) return 'windows';
+    return 'linux';
+  }
+
+  // Pojedynczy kafelek silnika z manifestu — bez badge'y, bez statusow.
+  function renderEngineCard(service) {
+    const e = (service && service.engine) || {};
+    const iconKey = e.icon || categoryIconKey(e.category);
+    const iconHtml = (typeof CatalogIcons !== 'undefined' && CatalogIcons.render)
+      ? CatalogIcons.render(iconKey)
+      : '';
+    const desc = e.description_pl || e.description_en || '';
 
     return `
-      <div class="catalog-card" data-engine-id="${Utils.escapeAttr(e.id)}">
+      <div class="catalog-card" data-engine-id="${Utils.escapeAttr(e.id || '')}">
         <div class="catalog-card-header">
           <div class="catalog-card-icon">${iconHtml}</div>
           <div>
-            <div class="catalog-card-title">${Utils.escapeHtml(e.name || e.id)}</div>
-            <div class="catalog-card-port">Port: ${Utils.escapeHtml(String(e.default_port || ''))}</div>
+            <div class="catalog-card-title">${Utils.escapeHtml(e.name || e.id || '')}</div>
           </div>
         </div>
-        <div class="catalog-card-desc">${Utils.escapeHtml(e.description_pl || e.description_en || '')}</div>
-        <div class="catalog-card-footer">
-          <div class="catalog-card-badges">${badges}</div>
-          <button class="btn btn-primary btn-sm catalog-deploy-btn">Deploy</button>
-        </div>
+        <div class="catalog-card-desc">${Utils.escapeHtml(desc)}</div>
       </div>
     `;
   }

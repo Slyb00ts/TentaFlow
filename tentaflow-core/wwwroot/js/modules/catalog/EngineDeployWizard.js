@@ -1,10 +1,10 @@
 // =============================================================================
 // Plik: modules/catalog/EngineDeployWizard.js
-// Opis: Uniwersalny wizard deploymentu silnikow AI. Zastepuje 3 stare wizardy
-//       (LLMDeployWizard, SttDeployWizard, ServiceDeployModal). Dziala dla
-//       wszystkich 12 kategorii.
-//       Kroki: 1) wybor wezla, 2) wybor wariantu, 3) Build/Download, 4) konfig.
-// Przyklad: EngineDeployWizard.open('llama-cpp', { nodeId: 'local' });
+// Opis: Wizard wdrazania silnikow AI dla nowego (uproszczonego) schematu
+//       manifestu. Trzy kroki: 1) wybor trybu deploymentu (docker/native/external)
+//       dostepnego dla platformy hosta, 2) wybor modelu (preset z manifestu lub
+//       wyszukiwarka HuggingFace), 3) konfiguracja runtime (port, ekstra param).
+// Przyklad: EngineDeployWizard.open('vllm');
 // =============================================================================
 
 const EngineDeployWizard = (() => {
@@ -14,13 +14,21 @@ const EngineDeployWizard = (() => {
   let engineId = null;
   let engineEntry = null;
   let nodes = [];
-  let licenseInfo = null;
+  let hostOs = 'linux';
+  let availableMethods = [];
+  let hfToken = '';
+  let modelSourceMode = 'preset'; // 'preset' albo 'hf'
+  let hfSearchTimer = null;
+  let hfResults = [];
+  let hfSearching = false;
 
   let selection = {
     nodeId: null,
-    variantId: null,
-    deployMethod: 'build',
-    config: {}
+    deployMethod: null,
+    modelPresetId: null,
+    modelRepo: null,
+    port: null,
+    containerName: null
   };
 
   // Otwarcie wizarda dla danego silnika.
@@ -29,17 +37,19 @@ const EngineDeployWizard = (() => {
     engineId = engId;
     engineEntry = null;
     currentStep = 1;
+    modelSourceMode = 'preset';
+    hfResults = [];
     selection = {
       nodeId: (opts && opts.nodeId) || null,
-      variantId: null,
-      deployMethod: 'build',
-      config: {}
+      deployMethod: null,
+      modelPresetId: null,
+      modelRepo: null,
+      port: null,
+      containerName: null
     };
 
-    // Pokaz natychmiast szkielet (placeholder)
     renderModal('<div class="wizard-progress">' + I18n.t('common.loading') + '</div>');
 
-    // Zaladuj manifest, licencje i wezly rownolegle
     try {
       await ManifestStore.init();
     } catch (err) {
@@ -48,25 +58,53 @@ const EngineDeployWizard = (() => {
 
     engineEntry = ManifestStore.byId(engineId);
     if (!engineEntry) {
-      renderModal('<div class="wizard-error">Engine \'' + Utils.escapeHtml(engineId) + '\' nie istnieje w manifescie</div>');
+      renderModal('<div class="wizard-error">Engine \'' + Utils.escapeHtml(engineId || '') + '\' nie istnieje w manifescie</div>');
       return;
     }
 
     try {
-      [licenseInfo, nodes] = await Promise.all([
-        LicenseBadge.fetchInfo(),
-        fetchNodes()
-      ]);
+      nodes = await fetchNodes();
     } catch (err) {
-      console.error('[EngineDeployWizard] init blad:', err);
-      licenseInfo = { tier: 'free', allows_pro: false, allows_enterprise: false };
+      console.error('[EngineDeployWizard] fetchNodes blad:', err);
       nodes = [];
     }
 
-    // Domyslny wezel: preselekcja, lub local, lub pierwszy z listy
+    // Domyslny wezel: preselekcja, lub local, lub pierwszy z listy.
     if (!selection.nodeId) {
-      const local = nodes.find(n => n.is_local) || nodes[0];
+      const local = nodes.find(n => n && n.is_local === true) || nodes[0];
       selection.nodeId = local ? (local.node_id || local.id) : null;
+    }
+
+    hostOs = pickHostOsFromNode(selection.nodeId);
+    availableMethods = ManifestStore.availableDeployMethods(engineEntry, hostOs);
+
+    // Domyslna metoda — pierwsza dostepna dla platformy.
+    if (availableMethods.length > 0) {
+      selection.deployMethod = availableMethods[0];
+    }
+
+    // Domyslne wartosci konfiguracji.
+    const eng = engineEntry.engine || {};
+    selection.port = eng.default_port || 8080;
+    selection.containerName = `tentaflow-${(eng.id || 'svc').toLowerCase()}-${randomSuffix()}`;
+
+    const presets = ManifestStore.modelPresets(engineEntry);
+    if (presets.length > 0) {
+      const rec = presets.find(p => p && p.recommended) || presets[0];
+      if (rec) selection.modelPresetId = rec.id;
+    }
+
+    // Token HF z ustawien (opcjonalny).
+    try {
+      if (typeof ApiClient !== 'undefined' && typeof ApiClient.get === 'function') {
+        const settings = await ApiClient.get('/api/settings').catch(() => null);
+        if (Array.isArray(settings)) {
+          const t = settings.find(s => s && s.key === 'hf_token');
+          if (t && t.value) hfToken = String(t.value);
+        }
+      }
+    } catch {
+      hfToken = '';
     }
 
     refreshModal();
@@ -77,7 +115,16 @@ const EngineDeployWizard = (() => {
     if (el) el.remove();
   }
 
-  // Pobiera liste wezlow z mesh API (z fallbackiem do "local").
+  function randomSuffix(len) {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let r = '';
+    for (let i = 0; i < (len || 5); i++) {
+      r += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return r;
+  }
+
+  // Pobiera liste wezlow z mesh API z fallbackiem na "local".
   async function fetchNodes() {
     try {
       let resp;
@@ -89,54 +136,40 @@ const EngineDeployWizard = (() => {
         resp = await r.json();
       }
       if (Array.isArray(resp) && resp.length > 0) {
-        return resp.filter(n => n.is_trusted === true || n.is_local === true);
+        return resp.filter(n => n && (n.is_trusted === true || n.is_local === true));
       }
     } catch (err) {
       console.warn('[EngineDeployWizard] fetchNodes fallback:', err);
     }
     return [{
       node_id: 'local', id: 'local', name: 'Local', is_local: true,
-      os: 'linux', arch: 'x86_64', gpu: 'cpu'
+      os: defaultUaOs()
     }];
   }
 
-  // Wyciaga capabilities (os/arch/gpu) z obiektu wezla z roznych zrodel.
-  function nodeCapabilities(node) {
-    if (!node) return null;
-    const os = (node.os || (node.platform && node.platform.os) || 'linux').toLowerCase();
-    const arch = (node.arch || (node.platform && node.platform.arch) || 'x86_64').toLowerCase();
-    let gpu = node.gpu;
-    if (!gpu && Array.isArray(node.gpu_info) && node.gpu_info.length > 0) {
-      const g = node.gpu_info[0];
-      const name = String(g.name || '').toLowerCase();
-      if (name.indexOf('nvidia') !== -1 || name.indexOf('rtx') !== -1 || name.indexOf('gtx') !== -1) gpu = 'cuda';
-      else if (name.indexOf('amd') !== -1 || name.indexOf('radeon') !== -1) gpu = 'rocm';
-      else if (name.indexOf('apple') !== -1 || name.indexOf('metal') !== -1) gpu = 'metal';
-      else gpu = 'cpu';
-    }
-    if (!gpu) gpu = 'cpu';
-    return { os: os, arch: arch, gpu: gpu };
+  function defaultUaOs() {
+    const ua = (navigator.userAgent || '').toLowerCase();
+    if (ua.indexOf('mac') !== -1) return 'macos';
+    if (ua.indexOf('win') !== -1) return 'windows';
+    return 'linux';
   }
 
-  function selectedNode() {
-    if (!selection.nodeId) return null;
-    return nodes.find(n => (n.node_id || n.id) === selection.nodeId) || null;
+  function pickHostOsFromNode(nodeId) {
+    const node = nodes.find(n => n && (n.node_id || n.id) === nodeId);
+    if (!node) return defaultUaOs();
+    const os = node.os || (node.platform && node.platform.os);
+    return os ? String(os).toLowerCase() : defaultUaOs();
   }
 
-  function selectedVariant() {
-    if (!engineEntry || !selection.variantId) return null;
-    const variants = engineEntry.variant || [];
-    return variants.find(v => v.id === selection.variantId) || null;
-  }
+  // ---- Render modala -------------------------------------------------------
 
-  // Renderuje overlay modala (bez animacji, prostym innerHTML).
   function renderModal(bodyHtml) {
     close();
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay active';
     overlay.id = 'engine-deploy-wizard';
     overlay.innerHTML =
-      '<div class="modal" style="max-width: 640px;">' +
+      '<div class="modal" style="max-width: 720px;">' +
         '<div class="modal-header">' +
           '<h3 id="edw-title">' + I18n.t('wizard.title') + '</h3>' +
           '<button class="modal-close" id="edw-close">&times;</button>' +
@@ -150,33 +183,21 @@ const EngineDeployWizard = (() => {
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
   }
 
-  // Pelne odswiezenie zawartosci modala (po zaladowaniu danych lub zmianie kroku).
   function refreshModal() {
     const titleEl = document.getElementById('edw-title');
-    const bodyEl = document.getElementById('edw-body');
-    const footerEl = document.getElementById('edw-footer');
-    if (!bodyEl || !footerEl) {
-      // Modal zniknal — odtworz
-      renderModal('');
+    if (titleEl && engineEntry && engineEntry.engine) {
+      titleEl.textContent = I18n.t('wizard.title') + ': ' + (engineEntry.engine.name || engineEntry.engine.id);
     }
-
-    const t = document.getElementById('edw-title');
-    if (t && engineEntry && engineEntry.engine) {
-      t.textContent = I18n.t('wizard.title') + ': ' + engineEntry.engine.name;
-    }
-
-    const b = document.getElementById('edw-body');
-    if (b) b.innerHTML = renderStepIndicator() + renderStepBody();
-
-    const f = document.getElementById('edw-footer');
-    if (f) f.innerHTML = renderFooter();
-
+    const body = document.getElementById('edw-body');
+    if (body) body.innerHTML = renderStepIndicator() + renderStepBody();
+    const footer = document.getElementById('edw-footer');
+    if (footer) footer.innerHTML = renderFooter();
     bindStepInputs();
     bindFooter();
   }
 
   function renderStepIndicator() {
-    const total = 4;
+    const total = 3;
     let html = '<div class="wizard-step-indicator">';
     for (let i = 1; i <= total; i++) {
       const cls = i === currentStep ? 'active' : i < currentStep ? 'done' : '';
@@ -188,10 +209,9 @@ const EngineDeployWizard = (() => {
 
   function renderStepBody() {
     switch (currentStep) {
-      case 1: return renderStepNode();
-      case 2: return renderStepVariant();
-      case 3: return renderStepMethod();
-      case 4: return renderStepConfig();
+      case 1: return renderStepMethod();
+      case 2: return renderStepModel();
+      case 3: return renderStepRuntime();
       default: return '';
     }
   }
@@ -201,7 +221,7 @@ const EngineDeployWizard = (() => {
     if (currentStep > 1) {
       html += '<button class="btn btn-secondary btn-sm" id="edw-back">\u2190 ' + I18n.t('wizard.back') + '</button>';
     }
-    if (currentStep < 4) {
+    if (currentStep < 3) {
       html += '<button class="btn btn-primary btn-sm" id="edw-next">' + I18n.t('wizard.next') + ' \u2192</button>';
     } else {
       html += '<button class="btn btn-primary btn-sm" id="edw-deploy">' + I18n.t('wizard.startDeploy') + '</button>';
@@ -209,178 +229,259 @@ const EngineDeployWizard = (() => {
     return html;
   }
 
-  // ---- Step 1: wybor wezla -------------------------------------------------
-
-  function renderStepNode() {
-    const opts = nodes.map(n => {
-      const nid = n.node_id || n.id;
-      const label = (n.hostname || n.name || nid) +
-        ' (' + (n.os || 'linux') + '/' + (n.arch || 'x86_64') + '/' + (n.gpu || 'cpu') + ')';
-      const sel = nid === selection.nodeId ? ' selected' : '';
-      return '<option value="' + Utils.escapeAttr(nid) + '"' + sel + '>' + Utils.escapeHtml(label) + '</option>';
-    }).join('');
-
-    return '<h3>' + I18n.t('wizard.selectNode') + '</h3>' +
-      '<div class="form-group">' +
-        '<select id="edw-node-select" class="form-input">' + opts + '</select>' +
-      '</div>';
-  }
-
-  // ---- Step 2: wybor wariantu ---------------------------------------------
-
-  function renderStepVariant() {
-    const node = selectedNode();
-    const caps = nodeCapabilities(node);
-    const compatible = ManifestStore.compatibleVariants(engineEntry, caps);
-
-    if (compatible.length === 0) {
-      return '<h3>' + I18n.t('wizard.selectVariant') + '</h3>' +
-        '<p class="empty-state-text">' + I18n.t('manifest.noVariantsForPlatform') + '</p>';
-    }
-
-    const items = compatible.map(v => {
-      const selectedCls = v.id === selection.variantId ? ' selected' : '';
-      const disabled = v.status === 'planned' || v.status === 'deprecated';
-      const statusKey = 'wizard.status' + v.status.charAt(0).toUpperCase() + v.status.slice(1);
-      const statusLabel = I18n.t(statusKey);
-      const vram = v.vram_gb_min ? '<span class="badge catalog-badge">VRAM \u2265 ' + v.vram_gb_min + ' GB</span>' : '';
-      const ram = v.ram_gb_min ? '<span class="badge catalog-badge">RAM \u2265 ' + v.ram_gb_min + ' GB</span>' : '';
-      const mode = '<span class="badge catalog-badge">' + Utils.escapeHtml(v.deploy_mode || '') + '</span>';
-      const notes = v.notes_pl ? '<div class="variant-notes" style="font-size:0.85em;color:var(--color-text-muted);margin-top:4px;">' + Utils.escapeHtml(v.notes_pl) + '</div>' : '';
-
-      return '<label class="variant-card' + selectedCls + (disabled ? ' disabled' : '') + '" style="display:block;border:1px solid var(--color-border);border-radius:6px;padding:10px;margin-bottom:8px;cursor:' + (disabled ? 'not-allowed' : 'pointer') + ';opacity:' + (disabled ? '0.5' : '1') + ';">' +
-        '<div style="display:flex;align-items:center;gap:8px;">' +
-          '<input type="radio" name="edw-variant" value="' + Utils.escapeAttr(v.id) + '"' +
-            (v.id === selection.variantId ? ' checked' : '') +
-            (disabled ? ' disabled' : '') + '>' +
-          '<strong>' + Utils.escapeHtml(v.id) + '</strong>' +
-          '<span class="badge badge-' + Utils.escapeAttr(v.status) + '" style="font-size:10px;">' + Utils.escapeHtml(statusLabel) + '</span>' +
-          mode + vram + ram +
-        '</div>' + notes +
-      '</label>';
-    }).join('');
-
-    return '<h3>' + I18n.t('wizard.selectVariant') + '</h3>' +
-      '<div class="variant-list">' + items + '</div>';
-  }
-
-  // ---- Step 3: Build / Download -------------------------------------------
+  // ---- Krok 1: wybor trybu deploymentu ------------------------------------
 
   function renderStepMethod() {
-    const variant = selectedVariant();
-    if (!variant) {
-      return '<p class="empty-state-text">' + I18n.t('wizard.selectVariant') + '</p>';
+    if (!availableMethods || availableMethods.length === 0) {
+      return '<h3>' + I18n.t('wizard.selectMethod') + '</h3>' +
+        '<p class="empty-state-text">Brak dostepnych trybow deploymentu dla platformy ' + Utils.escapeHtml(hostOs) + '.</p>';
     }
 
-    const hasBuild = !!variant.build;
-    const hasDownload = !!variant.download;
-    const proAllowed = LicenseBadge.isProAllowed(licenseInfo);
-    const downloadEnabled = hasDownload && variant.download.enabled !== false && proAllowed;
+    const labelMap = {
+      docker: I18n.t('wizard.method.docker'),
+      native: I18n.t('wizard.method.native'),
+      external: I18n.t('wizard.method.external')
+    };
 
-    let html = '<h3>' + I18n.t('wizard.selectMethod') + '</h3>';
+    const cards = availableMethods.map(m => {
+      const sel = selection.deployMethod === m ? ' selected' : '';
+      return '<button type="button" class="edw-method-btn' + sel + '" data-method="' + Utils.escapeAttr(m) + '" ' +
+        'style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:18px;border:1px solid var(--color-border);border-radius:8px;background:transparent;cursor:pointer;flex:1;min-width:140px;' +
+        (selection.deployMethod === m ? 'border-color:var(--color-primary);background:var(--color-primary-light, rgba(52,152,219,0.1));' : '') + '">' +
+        '<strong style="font-size:1.05em;">' + Utils.escapeHtml(labelMap[m] || m) + '</strong>' +
+        '</button>';
+    }).join('');
 
-    if (hasBuild) {
-      const sel = selection.deployMethod === 'build' ? ' checked' : '';
-      html +=
-        '<label class="method-card" style="display:block;border:1px solid var(--color-border);border-radius:6px;padding:12px;margin-bottom:8px;cursor:pointer;">' +
-          '<input type="radio" name="edw-method" value="build"' + sel + '> ' +
-          '<strong>' + I18n.t('wizard.build') + '</strong>' +
-          '<p style="margin:6px 0 0 24px;color:var(--color-text-muted);font-size:0.9em;">' + I18n.t('wizard.buildDescription') + '</p>' +
-        '</label>';
-    }
-
-    if (hasDownload) {
-      const dl = variant.download;
-      const sizeMb = dl && dl.size_mb ? ' (' + dl.size_mb + ' MB)' : '';
-      const lockTitle = !proAllowed ? I18n.t('wizard.proRequired') : (dl && dl.enabled === false ? 'Download niedostepny w tej wersji' : '');
-      const sel = selection.deployMethod === 'download' && downloadEnabled ? ' checked' : '';
-      html +=
-        '<label class="method-card' + (downloadEnabled ? '' : ' disabled') + '" style="display:block;border:1px solid var(--color-border);border-radius:6px;padding:12px;margin-bottom:8px;cursor:' + (downloadEnabled ? 'pointer' : 'not-allowed') + ';opacity:' + (downloadEnabled ? '1' : '0.55') + ';" title="' + Utils.escapeAttr(lockTitle) + '">' +
-          '<input type="radio" name="edw-method" value="download"' + sel + (downloadEnabled ? '' : ' disabled') + '> ' +
-          '<strong>' + I18n.t('wizard.download') + '</strong>' + sizeMb +
-          '<p style="margin:6px 0 0 24px;color:var(--color-text-muted);font-size:0.9em;">' + I18n.t('wizard.downloadDescription') + '</p>' +
-          (!proAllowed ? '<div style="margin:6px 0 0 24px;font-size:0.85em;color:var(--color-warning);">\uD83D\uDD12 ' + I18n.t('wizard.proRequired') + '</div>' : '') +
-        '</label>';
-    }
-
-    if (!hasBuild && !hasDownload) {
-      html += '<p class="empty-state-text">Brak metod deploymentu dla tego wariantu.</p>';
-    }
-
-    return html;
+    return '<h3>' + I18n.t('wizard.selectMethod') + '</h3>' +
+      '<div class="edw-method-grid" style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px;">' +
+        cards +
+      '</div>';
   }
 
-  // ---- Step 4: konfig --------------------------------------------------------
+  // ---- Krok 2: wybor modelu (preset lub HuggingFace search) ---------------
 
-  function renderStepConfig() {
-    const eng = engineEntry.engine || {};
-    const presets = engineEntry.model_preset || [];
-    const port = (selection.config && selection.config.port) || eng.default_port || 8080;
-    const presetSel = (selection.config && selection.config.model_preset_id)
-      || (presets.find(p => p.recommended) || presets[0] || {}).id || '';
+  function renderStepModel() {
+    const presets = ManifestStore.modelPresets(engineEntry);
+    const hasPresets = presets.length > 0;
 
-    let html = '<h3>' + I18n.t('wizard.configureRuntime') + '</h3>';
-
-    if (presets.length > 0) {
-      const opts = presets.map(p => {
-        const sel = p.id === presetSel ? ' selected' : '';
-        const star = p.recommended ? ' \u2605' : '';
-        return '<option value="' + Utils.escapeAttr(p.id) + '"' + sel + '>' + Utils.escapeHtml(p.display_name) + star + '</option>';
-      }).join('');
-      html +=
-        '<div class="form-group">' +
-          '<label for="edw-preset">Model preset</label>' +
-          '<select id="edw-preset" class="form-input">' + opts + '</select>' +
-        '</div>';
-    }
-
-    html +=
-      '<div class="form-group">' +
-        '<label for="edw-port">Port</label>' +
-        '<input type="number" id="edw-port" class="form-input" min="1024" max="65535" value="' + Utils.escapeAttr(String(port)) + '">' +
+    const tabs = '<div class="edw-model-tabs" style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid var(--color-border);">' +
+      (hasPresets ? `<button type="button" class="edw-tab${modelSourceMode === 'preset' ? ' active' : ''}" data-source="preset" style="background:transparent;border:none;padding:8px 14px;cursor:pointer;border-bottom:2px solid ${modelSourceMode === 'preset' ? 'var(--color-primary)' : 'transparent'};">${Utils.escapeHtml(I18n.t('wizard.fromPreset'))}</button>` : '') +
+      `<button type="button" class="edw-tab${modelSourceMode === 'hf' ? ' active' : ''}" data-source="hf" style="background:transparent;border:none;padding:8px 14px;cursor:pointer;border-bottom:2px solid ${modelSourceMode === 'hf' ? 'var(--color-primary)' : 'transparent'};">${Utils.escapeHtml(I18n.t('wizard.searchHuggingface'))}</button>` +
       '</div>';
 
-    return html;
+    let body = '';
+    if (modelSourceMode === 'preset' && hasPresets) {
+      body = renderPresetPicker(presets);
+    } else {
+      body = renderHfSearch();
+    }
+
+    return '<h3>' + I18n.t('wizard.selectModel') + '</h3>' + tabs + body;
   }
 
-  // ---- Eventy --------------------------------------------------------------
+  function renderPresetPicker(presets) {
+    const rows = presets.map(p => {
+      if (!p) return '';
+      const id = p.id || '';
+      const display = p.display_name || p.repo || id;
+      const repo = p.repo || '';
+      const quant = p.quantization || '';
+      const star = p.recommended ? ' \u2605' : '';
+      const sel = selection.modelPresetId === id ? ' checked' : '';
+      return `<label class="edw-preset-row" style="display:flex;gap:10px;padding:8px;border:1px solid var(--color-border);border-radius:6px;margin-bottom:6px;cursor:pointer;align-items:center;">
+        <input type="radio" name="edw-preset" value="${Utils.escapeAttr(id)}"${sel}>
+        <div style="flex:1;">
+          <div style="font-weight:600;">${Utils.escapeHtml(display)}${star}</div>
+          <div style="font-size:0.85em;color:var(--color-text-muted);">${Utils.escapeHtml(repo)}${quant ? ' \u2022 ' + Utils.escapeHtml(quant) : ''}</div>
+        </div>
+      </label>`;
+    }).join('');
+
+    return `<div class="edw-preset-list">${rows}</div>`;
+  }
+
+  function renderHfSearch() {
+    const repoFilter = hfSearchFilterHint();
+    const items = hfResults.map(r => {
+      const id = r.id || r.modelId || '';
+      const downloads = r.downloads ? formatCount(r.downloads) : '';
+      const likes = r.likes ? r.likes : '';
+      const lastModified = r.lastModified ? r.lastModified.substring(0, 10) : '';
+      const sel = selection.modelRepo === id ? ' selected' : '';
+      return `<div class="edw-hf-item${sel}" data-repo="${Utils.escapeAttr(id)}"
+        style="padding:8px;border:1px solid var(--color-border);border-radius:6px;margin-bottom:6px;cursor:pointer;${selection.modelRepo === id ? 'border-color:var(--color-primary);background:var(--color-primary-light, rgba(52,152,219,0.08));' : ''}">
+        <div style="font-weight:600;font-family:monospace;font-size:0.9em;">${Utils.escapeHtml(id)}</div>
+        <div style="font-size:0.8em;color:var(--color-text-muted);margin-top:2px;">
+          ${downloads ? '\u2193 ' + downloads : ''}
+          ${likes ? ' \u2022 \u2665 ' + likes : ''}
+          ${lastModified ? ' \u2022 ' + lastModified : ''}
+        </div>
+      </div>`;
+    }).join('');
+
+    const placeholder = hfSearching
+      ? `<div class="empty-state-hint">${I18n.t('common.loading')}</div>`
+      : (hfResults.length === 0 ? '<div class="empty-state-hint">\u2014</div>' : '');
+
+    return `
+      <div class="form-group">
+        <input type="text" id="edw-hf-search" class="form-input"
+          placeholder="np. qwen, llama, mistral..." value="">
+        ${repoFilter ? `<div class="form-hint" style="font-size:0.8em;color:var(--color-text-muted);margin-top:4px;">${repoFilter}</div>` : ''}
+      </div>
+      <div class="form-group">
+        <label for="edw-hf-token" style="font-size:0.85em;">${Utils.escapeHtml(I18n.t('wizard.huggingfaceToken'))}</label>
+        <input type="password" id="edw-hf-token" class="form-input" value="${Utils.escapeAttr(hfToken)}" autocomplete="off">
+      </div>
+      <div class="edw-hf-results" id="edw-hf-results" style="max-height:280px;overflow-y:auto;">
+        ${items || placeholder}
+      </div>
+    `;
+  }
+
+  // Wskazowka filtrujaca: jesli silnik wymaga GGUF/MLX — pokaz info.
+  function hfSearchFilterHint() {
+    if (!engineEntry || !engineEntry.engine) return '';
+    const id = String(engineEntry.engine.id || '').toLowerCase();
+    if (id.indexOf('llama') !== -1 || id.indexOf('llamacpp') !== -1) return 'Filtrowane do modeli GGUF';
+    if (id === 'mlx') return 'Filtrowane do mlx-community/*';
+    return '';
+  }
+
+  function formatCount(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+  }
+
+  // ---- Krok 3: konfiguracja runtime ---------------------------------------
+
+  function renderStepRuntime() {
+    const eng = engineEntry.engine || {};
+    const port = selection.port || eng.default_port || 8080;
+    const cname = selection.containerName || '';
+
+    const summary = renderModelSummary();
+
+    let extra = '';
+    if (selection.deployMethod === 'docker') {
+      extra = `
+        <div class="form-group">
+          <label for="edw-cname">Nazwa kontenera</label>
+          <input type="text" id="edw-cname" class="form-input" value="${Utils.escapeAttr(cname)}">
+        </div>
+      `;
+    }
+
+    return '<h3>' + I18n.t('wizard.configureRuntime') + '</h3>' +
+      summary +
+      '<div class="form-group">' +
+        '<label for="edw-port">Port</label>' +
+        '<input type="number" id="edw-port" class="form-input" min="1" max="65535" value="' + Utils.escapeAttr(String(port)) + '">' +
+      '</div>' + extra;
+  }
+
+  function renderModelSummary() {
+    let modelDesc = '';
+    if (selection.modelRepo) {
+      modelDesc = `<code style="font-family:monospace;">${Utils.escapeHtml(selection.modelRepo)}</code> <span style="color:var(--color-text-muted);font-size:0.85em;">(HuggingFace)</span>`;
+    } else if (selection.modelPresetId) {
+      const presets = ManifestStore.modelPresets(engineEntry);
+      const preset = presets.find(p => p && p.id === selection.modelPresetId);
+      if (preset) {
+        modelDesc = `<strong>${Utils.escapeHtml(preset.display_name || preset.id)}</strong>` +
+          (preset.repo ? ` <span style="color:var(--color-text-muted);font-size:0.85em;">${Utils.escapeHtml(preset.repo)}</span>` : '');
+      }
+    }
+    if (!modelDesc) return '';
+    return `<div class="wizard-summary" style="margin-bottom:12px;padding:10px;background:var(--color-bg-secondary, rgba(0,0,0,0.04));border-radius:6px;">
+      <div style="font-size:0.85em;color:var(--color-text-muted);margin-bottom:4px;">Model</div>
+      <div>${modelDesc}</div>
+    </div>`;
+  }
+
+  // ---- Bind eventow --------------------------------------------------------
 
   function bindStepInputs() {
-    const nodeSel = document.getElementById('edw-node-select');
-    if (nodeSel) {
-      nodeSel.addEventListener('change', () => {
-        selection.nodeId = nodeSel.value;
-        // Reset wybranego wariantu jesli zmieniono wezel
-        selection.variantId = null;
-      });
-    }
+    if (currentStep === 1) bindStepMethodInputs();
+    if (currentStep === 2) bindStepModelInputs();
+    if (currentStep === 3) bindStepRuntimeInputs();
+  }
 
-    const variantRadios = document.querySelectorAll('input[name="edw-variant"]');
-    variantRadios.forEach(r => {
-      r.addEventListener('change', (e) => {
-        if (e.target.checked) selection.variantId = e.target.value;
+  function bindStepMethodInputs() {
+    document.querySelectorAll('.edw-method-btn[data-method]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        selection.deployMethod = btn.dataset.method;
+        refreshModal();
+      });
+    });
+  }
+
+  function bindStepModelInputs() {
+    document.querySelectorAll('.edw-tab[data-source]').forEach(t => {
+      t.addEventListener('click', () => {
+        modelSourceMode = t.dataset.source;
+        refreshModal();
       });
     });
 
-    const methodRadios = document.querySelectorAll('input[name="edw-method"]');
-    methodRadios.forEach(r => {
-      r.addEventListener('change', (e) => {
-        if (e.target.checked) selection.deployMethod = e.target.value;
+    document.querySelectorAll('input[name="edw-preset"]').forEach(r => {
+      r.addEventListener('change', e => {
+        if (e.target.checked) {
+          selection.modelPresetId = e.target.value;
+          selection.modelRepo = null;
+        }
       });
     });
 
-    const presetSel = document.getElementById('edw-preset');
-    if (presetSel) {
-      presetSel.addEventListener('change', () => {
-        selection.config.model_preset_id = presetSel.value;
+    const search = document.getElementById('edw-hf-search');
+    if (search) {
+      search.addEventListener('input', () => {
+        clearTimeout(hfSearchTimer);
+        const q = search.value.trim();
+        if (q.length < 2) {
+          hfResults = [];
+          updateHfResults();
+          return;
+        }
+        hfSearchTimer = setTimeout(() => doHfSearch(q), 500);
       });
     }
 
+    const tokenInput = document.getElementById('edw-hf-token');
+    if (tokenInput) {
+      tokenInput.addEventListener('input', () => {
+        hfToken = tokenInput.value;
+      });
+    }
+
+    document.querySelectorAll('.edw-hf-item[data-repo]').forEach(it => {
+      it.addEventListener('click', () => {
+        selection.modelRepo = it.dataset.repo;
+        selection.modelPresetId = null;
+        // Visualne podswietlenie bez pelnego refreshModal (zachowuje wyniki).
+        document.querySelectorAll('.edw-hf-item').forEach(x => {
+          x.style.borderColor = 'var(--color-border)';
+          x.style.background = '';
+        });
+        it.style.borderColor = 'var(--color-primary)';
+        it.style.background = 'var(--color-primary-light, rgba(52,152,219,0.08))';
+      });
+    });
+  }
+
+  function bindStepRuntimeInputs() {
     const portInput = document.getElementById('edw-port');
     if (portInput) {
       portInput.addEventListener('input', () => {
         const v = parseInt(portInput.value, 10);
-        selection.config.port = isNaN(v) ? portInput.value : v;
+        selection.port = isNaN(v) ? portInput.value : v;
+      });
+    }
+    const cnameInput = document.getElementById('edw-cname');
+    if (cnameInput) {
+      cnameInput.addEventListener('input', () => {
+        selection.containerName = cnameInput.value.trim();
       });
     }
   }
@@ -401,10 +502,6 @@ const EngineDeployWizard = (() => {
     if (nextBtn) nextBtn.addEventListener('click', () => {
       if (!canAdvance()) return;
       currentStep++;
-      // Auto-preselekcja przy wejsciu do kroku 3
-      if (currentStep === 3) preselectMethod();
-      // Auto-preselekcja przy wejsciu do kroku 4
-      if (currentStep === 4) preselectConfig();
       refreshModal();
     });
 
@@ -414,22 +511,15 @@ const EngineDeployWizard = (() => {
 
   function canAdvance() {
     if (currentStep === 1) {
-      if (!selection.nodeId) {
-        if (typeof App !== 'undefined' && App.showToast) App.showToast(I18n.t('wizard.selectNode'), 'error');
+      if (!selection.deployMethod) {
+        if (typeof App !== 'undefined' && App.showToast) App.showToast(I18n.t('wizard.selectMethod'), 'error');
         return false;
       }
       return true;
     }
     if (currentStep === 2) {
-      if (!selection.variantId) {
-        if (typeof App !== 'undefined' && App.showToast) App.showToast(I18n.t('wizard.selectVariant'), 'error');
-        return false;
-      }
-      return true;
-    }
-    if (currentStep === 3) {
-      if (!selection.deployMethod) {
-        if (typeof App !== 'undefined' && App.showToast) App.showToast(I18n.t('wizard.selectMethod'), 'error');
+      if (!selection.modelPresetId && !selection.modelRepo) {
+        if (typeof App !== 'undefined' && App.showToast) App.showToast(I18n.t('wizard.selectModel'), 'error');
         return false;
       }
       return true;
@@ -437,34 +527,81 @@ const EngineDeployWizard = (() => {
     return true;
   }
 
-  // Preselekcja metody Build/Download na podstawie wariantu i licencji
-  function preselectMethod() {
-    const variant = selectedVariant();
-    if (!variant) return;
-    const hasBuild = !!variant.build;
-    const hasDownload = !!variant.download;
-    const proAllowed = LicenseBadge.isProAllowed(licenseInfo);
-    const downloadEnabled = hasDownload && variant.download.enabled !== false && proAllowed;
+  // ---- HuggingFace search --------------------------------------------------
 
-    if (selection.deployMethod === 'download' && !downloadEnabled) {
-      selection.deployMethod = hasBuild ? 'build' : (hasDownload ? 'download' : 'build');
-    }
-    if (!selection.deployMethod) {
-      selection.deployMethod = hasBuild ? 'build' : 'download';
+  async function doHfSearch(query) {
+    hfSearching = true;
+    updateHfResults();
+    try {
+      const url = 'https://huggingface.co/api/models?search=' + encodeURIComponent(query) + '&limit=20';
+      const headers = {};
+      if (hfToken) headers['Authorization'] = 'Bearer ' + hfToken;
+      const resp = await fetch(url, { headers });
+      if (!resp.ok) throw new Error('HF API ' + resp.status);
+      let data = await resp.json();
+      if (!Array.isArray(data)) data = [];
+
+      // Filtrowanie per silnik (GGUF / MLX).
+      const engId = String((engineEntry.engine && engineEntry.engine.id) || '').toLowerCase();
+      if (engId.indexOf('llama') !== -1 || engId.indexOf('llamacpp') !== -1) {
+        data = data.filter(m => String(m.id || '').toLowerCase().indexOf('gguf') !== -1);
+      } else if (engId === 'mlx') {
+        data = data.filter(m => {
+          const id = String(m.id || '').toLowerCase();
+          return id.indexOf('mlx-') !== -1 || id.indexOf('mlx-community/') !== -1;
+        });
+      }
+
+      hfResults = data;
+    } catch (err) {
+      console.error('[EngineDeployWizard] HF search blad:', err);
+      hfResults = [];
+    } finally {
+      hfSearching = false;
+      updateHfResults();
     }
   }
 
-  // Preselekcja portu i model_preset
-  function preselectConfig() {
-    const eng = engineEntry.engine || {};
-    if (selection.config.port === undefined) {
-      selection.config.port = eng.default_port || 8080;
+  function updateHfResults() {
+    const box = document.getElementById('edw-hf-results');
+    if (!box) return;
+    if (hfSearching) {
+      box.innerHTML = `<div class="empty-state-hint">${I18n.t('common.loading')}</div>`;
+      return;
     }
-    const presets = engineEntry.model_preset || [];
-    if (!selection.config.model_preset_id && presets.length > 0) {
-      const rec = presets.find(p => p.recommended) || presets[0];
-      if (rec) selection.config.model_preset_id = rec.id;
+    if (hfResults.length === 0) {
+      box.innerHTML = '<div class="empty-state-hint">\u2014</div>';
+      return;
     }
+    box.innerHTML = hfResults.map(r => {
+      const id = r.id || r.modelId || '';
+      const downloads = r.downloads ? formatCount(r.downloads) : '';
+      const likes = r.likes ? r.likes : '';
+      const lastModified = r.lastModified ? r.lastModified.substring(0, 10) : '';
+      const isSel = selection.modelRepo === id;
+      return `<div class="edw-hf-item" data-repo="${Utils.escapeAttr(id)}"
+        style="padding:8px;border:1px solid ${isSel ? 'var(--color-primary)' : 'var(--color-border)'};border-radius:6px;margin-bottom:6px;cursor:pointer;${isSel ? 'background:var(--color-primary-light, rgba(52,152,219,0.08));' : ''}">
+        <div style="font-weight:600;font-family:monospace;font-size:0.9em;">${Utils.escapeHtml(id)}</div>
+        <div style="font-size:0.8em;color:var(--color-text-muted);margin-top:2px;">
+          ${downloads ? '\u2193 ' + downloads : ''}
+          ${likes ? ' \u2022 \u2665 ' + likes : ''}
+          ${lastModified ? ' \u2022 ' + lastModified : ''}
+        </div>
+      </div>`;
+    }).join('');
+
+    box.querySelectorAll('.edw-hf-item[data-repo]').forEach(it => {
+      it.addEventListener('click', () => {
+        selection.modelRepo = it.dataset.repo;
+        selection.modelPresetId = null;
+        box.querySelectorAll('.edw-hf-item').forEach(x => {
+          x.style.borderColor = 'var(--color-border)';
+          x.style.background = '';
+        });
+        it.style.borderColor = 'var(--color-primary)';
+        it.style.background = 'var(--color-primary-light, rgba(52,152,219,0.08))';
+      });
+    });
   }
 
   // ---- Deploy --------------------------------------------------------------
@@ -473,12 +610,17 @@ const EngineDeployWizard = (() => {
     const deployBtn = document.getElementById('edw-deploy');
     if (deployBtn) deployBtn.disabled = true;
 
+    const eng = engineEntry.engine || {};
     const body = {
-      engine_id: engineEntry.engine.id,
-      variant_id: selection.variantId,
+      engine_id: eng.id,
       deploy_method: selection.deployMethod,
       node_id: selection.nodeId,
-      config: selection.config || {}
+      config: {
+        model_preset_id: selection.modelPresetId || null,
+        model_repo: selection.modelRepo || null,
+        port: selection.port || eng.default_port,
+        container_name: selection.containerName || null
+      }
     };
 
     try {
@@ -492,26 +634,27 @@ const EngineDeployWizard = (() => {
           body: JSON.stringify(body)
         });
         data = await resp.json();
-        if (!resp.ok) throw new Error(data && (data.message || data.error_code) || 'HTTP ' + resp.status);
+        if (!resp.ok) throw new Error((data && (data.message || data.error_code)) || 'HTTP ' + resp.status);
       }
 
+      const id = (data && data.deploy_id) ? data.deploy_id : '?';
       if (typeof App !== 'undefined' && App.showToast) {
-        App.showToast('Deploy wystartowal: ' + (data && data.deploy_id ? data.deploy_id : '?'), 'success');
+        App.showToast('Deploy wystartowal: ' + id, 'success');
+      } else {
+        alert('Deploy wystartowal: ' + id);
       }
-      // TODO[future iter]: podpiac WebSocket data.websocket_url do live progress
       console.log('[EngineDeployWizard] deploy started:', data);
       setTimeout(close, 1500);
     } catch (err) {
       console.error('[EngineDeployWizard] deploy error:', err);
       if (typeof App !== 'undefined' && App.showToast) {
         App.showToast('Blad: ' + (err.message || err), 'error');
+      } else {
+        alert('Deploy nieudany: ' + (err.message || err));
       }
       if (deployBtn) deployBtn.disabled = false;
     }
   }
 
-  return {
-    open: open,
-    close: close
-  };
+  return { open, close };
 })();
