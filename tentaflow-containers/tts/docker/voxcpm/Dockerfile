@@ -38,9 +38,9 @@ RUN git clone --depth 1 https://github.com/OpenBMB/VoxCPM.git || \
 ENV PYTHONPATH="/opt/VoxCPM:$PYTHONPATH"
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/tts-voxcpm/server.py /app/server.py
-COPY tentaflow-containers/tts-voxcpm/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/tts-voxcpm/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/tts/docker/voxcpm/server.py /app/server.py
+COPY tentaflow-containers/tts/docker/voxcpm/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/tts/docker/voxcpm/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

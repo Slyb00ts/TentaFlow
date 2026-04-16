@@ -23,8 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
-COPY tentaflow-containers/embeddings/config.default.toml /app/config.default.toml
-COPY tentaflow-containers/embeddings/entrypoint.sh /app/entrypoint.sh
+COPY tentaflow-containers/embeddings/docker/hf-tei/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/embeddings/docker/hf-tei/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000/udp

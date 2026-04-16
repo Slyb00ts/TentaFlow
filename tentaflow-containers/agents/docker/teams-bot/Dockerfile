@@ -41,7 +41,7 @@ WORKDIR /build
 # Binary kopiujemy POZA /build/target (cache mount znika po RUN) do /artifacts.
 COPY tentaflow-protocol/ tentaflow-protocol/
 COPY tentaflow-voice/ tentaflow-voice/
-COPY tentaflow-containers/teams-bot/ tentaflow-containers/teams-bot/
+COPY tentaflow-containers/agents/docker/teams-bot/ tentaflow-containers/teams-bot/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
@@ -77,11 +77,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -s /bin/bash sidecar
 
 # Konfiguracja PulseAudio
-COPY tentaflow-containers/teams-bot/pulseaudio.conf /etc/pulse/default.pa
+COPY tentaflow-containers/agents/docker/teams-bot/pulseaudio.conf /etc/pulse/default.pa
 
 # Model Silero VAD (diarization jest w routerze, nie w bocie)
 RUN mkdir -p /opt/models
-COPY tentaflow-containers/teams-bot/models/silero_vad.onnx /opt/models/silero_vad.onnx
+COPY tentaflow-containers/agents/docker/teams-bot/models/silero_vad.onnx /opt/models/silero_vad.onnx
 
 # Binary z etapu budowania (skopiowane poza cache mount do /artifacts)
 COPY --from=builder /artifacts/tentaflow-meeting /usr/local/bin/tentaflow-meeting
