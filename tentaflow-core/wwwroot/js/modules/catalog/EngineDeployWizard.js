@@ -1,10 +1,10 @@
 // =============================================================================
 // Plik: modules/catalog/EngineDeployWizard.js
-// Opis: Wizard wdrazania silnikow AI dla nowego (uproszczonego) schematu
-//       manifestu. Trzy kroki: 1) wybor trybu deploymentu (docker/native/external)
-//       dostepnego dla platformy hosta, 2) wybor modelu (preset z manifestu lub
+// Opis: Wizard wdrażania silników AI dla nowego (uproszczonego) schematu
+//       manifestu. Trzy kroki: 1) wybór trybu deploymentu (docker/native/external)
+//       dostępnego dla platformy hosta, 2) wybór modelu (preset z manifestu lub
 //       wyszukiwarka HuggingFace), 3) konfiguracja runtime (port, ekstra param).
-// Przyklad: EngineDeployWizard.open('vllm');
+// Przykład: EngineDeployWizard.open('vllm');
 // =============================================================================
 
 const EngineDeployWizard = (() => {
@@ -17,10 +17,11 @@ const EngineDeployWizard = (() => {
   let hostOs = 'linux';
   let availableMethods = [];
   let hfToken = '';
-  let modelSourceMode = 'preset'; // 'preset' albo 'hf'
+  let modelSourceMode = 'preset';
   let hfSearchTimer = null;
   let hfResults = [];
   let hfSearching = false;
+  let hfSearchQuery = '';
 
   let selection = {
     nodeId: null,
@@ -32,13 +33,14 @@ const EngineDeployWizard = (() => {
   };
 
   // Otwarcie wizarda dla danego silnika.
-  // opts.nodeId — preselekcja wezla (np. z MeshNodeDetail).
+  // opts.nodeId — preselekcja węzła (np. z MeshNodeDetail).
   async function open(engId, opts) {
     engineId = engId;
     engineEntry = null;
     currentStep = 1;
     modelSourceMode = 'preset';
     hfResults = [];
+    hfSearchQuery = '';
     selection = {
       nodeId: (opts && opts.nodeId) || null,
       deployMethod: null,
@@ -48,7 +50,7 @@ const EngineDeployWizard = (() => {
       containerName: null
     };
 
-    renderModal('<div class="wizard-progress">' + I18n.t('common.loading') + '</div>');
+    renderModalShell(`<div class="form-hint">${I18n.t('common.loading')}</div>`);
 
     try {
       await ManifestStore.init();
@@ -58,7 +60,8 @@ const EngineDeployWizard = (() => {
 
     engineEntry = ManifestStore.byId(engineId);
     if (!engineEntry) {
-      renderModal('<div class="wizard-error">Engine \'' + Utils.escapeHtml(engineId || '') + '\' nie istnieje w manifescie</div>');
+      const msg = I18n.t('wizard.engineNotFound').replace('{id}', Utils.escapeHtml(engineId || ''));
+      renderModalShell(`<div class="form-hint">${msg}</div>`);
       return;
     }
 
@@ -69,7 +72,6 @@ const EngineDeployWizard = (() => {
       nodes = [];
     }
 
-    // Domyslny wezel: preselekcja, lub local, lub pierwszy z listy.
     if (!selection.nodeId) {
       const local = nodes.find(n => n && n.is_local === true) || nodes[0];
       selection.nodeId = local ? (local.node_id || local.id) : null;
@@ -78,12 +80,10 @@ const EngineDeployWizard = (() => {
     hostOs = pickHostOsFromNode(selection.nodeId);
     availableMethods = ManifestStore.availableDeployMethods(engineEntry, hostOs);
 
-    // Domyslna metoda — pierwsza dostepna dla platformy.
     if (availableMethods.length > 0) {
       selection.deployMethod = availableMethods[0];
     }
 
-    // Domyslne wartosci konfiguracji.
     const eng = engineEntry.engine || {};
     selection.port = eng.default_port || 8080;
     selection.containerName = `tentaflow-${(eng.id || 'svc').toLowerCase()}-${randomSuffix()}`;
@@ -92,9 +92,11 @@ const EngineDeployWizard = (() => {
     if (presets.length > 0) {
       const rec = presets.find(p => p && p.recommended) || presets[0];
       if (rec) selection.modelPresetId = rec.id;
+    } else {
+      // Brak presetow — od razu otworz wyszukiwarke HF.
+      modelSourceMode = 'hf';
     }
 
-    // Token HF z ustawien (opcjonalny).
     try {
       if (typeof ApiClient !== 'undefined' && typeof ApiClient.get === 'function') {
         const settings = await ApiClient.get('/api/settings').catch(() => null);
@@ -124,7 +126,7 @@ const EngineDeployWizard = (() => {
     return r;
   }
 
-  // Pobiera liste wezlow z mesh API z fallbackiem na "local".
+  // Pobiera listę węzłów z mesh API z fallbackiem na "local".
   async function fetchNodes() {
     try {
       let resp;
@@ -163,7 +165,8 @@ const EngineDeployWizard = (() => {
 
   // ---- Render modala -------------------------------------------------------
 
-  function renderModal(bodyHtml) {
+  // Tworzy szkielet modala (overlay + modal + header + body + footer).
+  function renderModalShell(bodyHtml) {
     close();
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay active';
@@ -172,7 +175,7 @@ const EngineDeployWizard = (() => {
       '<div class="modal" style="max-width: 720px;">' +
         '<div class="modal-header">' +
           '<h3 id="edw-title">' + I18n.t('wizard.title') + '</h3>' +
-          '<button class="modal-close" id="edw-close">&times;</button>' +
+          '<button class="modal-close" id="edw-close" aria-label="' + I18n.t('common.close') + '">&times;</button>' +
         '</div>' +
         '<div class="modal-body" id="edw-body">' + bodyHtml + '</div>' +
         '<div class="modal-footer" id="edw-footer"></div>' +
@@ -217,12 +220,12 @@ const EngineDeployWizard = (() => {
   }
 
   function renderFooter() {
-    let html = '<button class="btn btn-ghost btn-sm" id="edw-cancel">' + I18n.t('wizard.cancel') + '</button>';
+    let html = '<button class="btn btn-ghost btn-sm" id="edw-cancel">' + I18n.t('common.cancel') + '</button>';
     if (currentStep > 1) {
-      html += '<button class="btn btn-secondary btn-sm" id="edw-back">\u2190 ' + I18n.t('wizard.back') + '</button>';
+      html += '<button class="btn btn-secondary btn-sm" id="edw-back">\u2190 ' + I18n.t('common.back') + '</button>';
     }
     if (currentStep < 3) {
-      html += '<button class="btn btn-primary btn-sm" id="edw-next">' + I18n.t('wizard.next') + ' \u2192</button>';
+      html += '<button class="btn btn-primary btn-sm" id="edw-next">' + I18n.t('common.next') + ' \u2192</button>';
     } else {
       html += '<button class="btn btn-primary btn-sm" id="edw-deploy">' + I18n.t('wizard.startDeploy') + '</button>';
     }
@@ -233,29 +236,31 @@ const EngineDeployWizard = (() => {
 
   function renderStepMethod() {
     if (!availableMethods || availableMethods.length === 0) {
-      return '<h3>' + I18n.t('wizard.selectMethod') + '</h3>' +
-        '<p class="empty-state-text">Brak dostepnych trybow deploymentu dla platformy ' + Utils.escapeHtml(hostOs) + '.</p>';
+      const msg = I18n.t('wizard.noMethodsAvailable').replace('{os}', Utils.escapeHtml(hostOs));
+      return '<h4>' + I18n.t('wizard.selectMethod') + '</h4>' +
+        '<p class="form-hint">' + msg + '</p>';
     }
-
-    const labelMap = {
-      docker: I18n.t('wizard.method.docker'),
-      native: I18n.t('wizard.method.native'),
-      external: I18n.t('wizard.method.external')
-    };
 
     const cards = availableMethods.map(m => {
       const sel = selection.deployMethod === m ? ' selected' : '';
-      return '<button type="button" class="edw-method-btn' + sel + '" data-method="' + Utils.escapeAttr(m) + '" ' +
-        'style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:18px;border:1px solid var(--color-border);border-radius:8px;background:transparent;cursor:pointer;flex:1;min-width:140px;' +
-        (selection.deployMethod === m ? 'border-color:var(--color-primary);background:var(--color-primary-light, rgba(52,152,219,0.1));' : '') + '">' +
-        '<strong style="font-size:1.05em;">' + Utils.escapeHtml(labelMap[m] || m) + '</strong>' +
-        '</button>';
+      const name = I18n.t('wizard.method.' + m);
+      const desc = I18n.t('wizard.method.' + m + 'Desc');
+      return '<button type="button" class="deploy-method-card' + sel + '" data-method="' + Utils.escapeAttr(m) + '">' +
+        '<div class="deploy-method-card-icon">' + methodIcon(m) + '</div>' +
+        '<div class="deploy-method-card-name">' + Utils.escapeHtml(name) + '</div>' +
+        '<div class="deploy-method-card-desc">' + Utils.escapeHtml(desc) + '</div>' +
+      '</button>';
     }).join('');
 
-    return '<h3>' + I18n.t('wizard.selectMethod') + '</h3>' +
-      '<div class="edw-method-grid" style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px;">' +
-        cards +
-      '</div>';
+    return '<h4>' + I18n.t('wizard.selectMethod') + '</h4>' +
+      '<div class="deploy-method-grid">' + cards + '</div>';
+  }
+
+  function methodIcon(method) {
+    if (method === 'docker') return '\uD83D\uDC33';
+    if (method === 'native') return '\u26A1';
+    if (method === 'external') return '\uD83D\uDD17';
+    return '\uD83D\uDCE6';
   }
 
   // ---- Krok 2: wybor modelu (preset lub HuggingFace search) ---------------
@@ -264,87 +269,103 @@ const EngineDeployWizard = (() => {
     const presets = ManifestStore.modelPresets(engineEntry);
     const hasPresets = presets.length > 0;
 
-    const tabs = '<div class="edw-model-tabs" style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid var(--color-border);">' +
-      (hasPresets ? `<button type="button" class="edw-tab${modelSourceMode === 'preset' ? ' active' : ''}" data-source="preset" style="background:transparent;border:none;padding:8px 14px;cursor:pointer;border-bottom:2px solid ${modelSourceMode === 'preset' ? 'var(--color-primary)' : 'transparent'};">${Utils.escapeHtml(I18n.t('wizard.fromPreset'))}</button>` : '') +
-      `<button type="button" class="edw-tab${modelSourceMode === 'hf' ? ' active' : ''}" data-source="hf" style="background:transparent;border:none;padding:8px 14px;cursor:pointer;border-bottom:2px solid ${modelSourceMode === 'hf' ? 'var(--color-primary)' : 'transparent'};">${Utils.escapeHtml(I18n.t('wizard.searchHuggingface'))}</button>` +
+    let tabs = '<div class="wizard-tabs">';
+    if (hasPresets) {
+      tabs += '<button type="button" class="wizard-tab' + (modelSourceMode === 'preset' ? ' active' : '') + '" data-mode="preset">' +
+        Utils.escapeHtml(I18n.t('wizard.fromPreset')) + '</button>';
+    }
+    tabs += '<button type="button" class="wizard-tab' + (modelSourceMode === 'hf' ? ' active' : '') + '" data-mode="hf">' +
+      Utils.escapeHtml(I18n.t('wizard.searchHuggingface')) + '</button>';
+    tabs += '</div>';
+
+    const content = '<div class="wizard-tab-content">' +
+      (modelSourceMode === 'preset' && hasPresets ? renderPresetSelector(presets) : renderHfSearch()) +
       '</div>';
 
-    let body = '';
-    if (modelSourceMode === 'preset' && hasPresets) {
-      body = renderPresetPicker(presets);
-    } else {
-      body = renderHfSearch();
-    }
-
-    return '<h3>' + I18n.t('wizard.selectModel') + '</h3>' + tabs + body;
+    return '<h4>' + I18n.t('wizard.selectModel') + '</h4>' + tabs + content;
   }
 
-  function renderPresetPicker(presets) {
-    const rows = presets.map(p => {
+  function renderPresetSelector(presets) {
+    if (!presets.length) {
+      return `<p class="form-hint">${I18n.t('wizard.noPresets')}</p>`;
+    }
+    const items = presets.map(p => {
       if (!p) return '';
       const id = p.id || '';
       const display = p.display_name || p.repo || id;
       const repo = p.repo || '';
       const quant = p.quantization || '';
-      const star = p.recommended ? ' \u2605' : '';
-      const sel = selection.modelPresetId === id ? ' checked' : '';
-      return `<label class="edw-preset-row" style="display:flex;gap:10px;padding:8px;border:1px solid var(--color-border);border-radius:6px;margin-bottom:6px;cursor:pointer;align-items:center;">
-        <input type="radio" name="edw-preset" value="${Utils.escapeAttr(id)}"${sel}>
-        <div style="flex:1;">
-          <div style="font-weight:600;">${Utils.escapeHtml(display)}${star}</div>
-          <div style="font-size:0.85em;color:var(--color-text-muted);">${Utils.escapeHtml(repo)}${quant ? ' \u2022 ' + Utils.escapeHtml(quant) : ''}</div>
-        </div>
-      </label>`;
+      const star = p.recommended ? ' \u2B50' : '';
+      const sel = selection.modelPresetId === id ? ' selected' : '';
+      const info = repo + (quant ? ' \u2022 ' + quant : '');
+      return '<div class="model-item' + sel + '" data-preset-id="' + Utils.escapeAttr(id) + '">' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div class="model-item-name">' + Utils.escapeHtml(display) + star + '</div>' +
+          (info ? '<div class="model-item-info">' + Utils.escapeHtml(info) + '</div>' : '') +
+        '</div>' +
+      '</div>';
     }).join('');
 
-    return `<div class="edw-preset-list">${rows}</div>`;
+    return '<div class="model-list">' + items + '</div>' +
+      '<p class="form-hint">' + I18n.t('wizard.presetHint') + '</p>';
   }
 
   function renderHfSearch() {
-    const repoFilter = hfSearchFilterHint();
-    const items = hfResults.map(r => {
+    const placeholder = I18n.t('wizard.hfSearchPlaceholder');
+    const tokenLabel = I18n.t('wizard.huggingfaceToken');
+    const repoFilterHint = hfSearchFilterHint();
+
+    return `
+      <div class="form-group">
+        <input type="text" id="edw-hf-search" class="form-input"
+          placeholder="${Utils.escapeAttr(placeholder)}"
+          value="${Utils.escapeAttr(hfSearchQuery)}"
+          autocomplete="off">
+        <div class="form-hint">${I18n.t('wizard.hfSearchHint')}${repoFilterHint ? ' \u2022 ' + Utils.escapeHtml(repoFilterHint) : ''}</div>
+      </div>
+      <div class="form-group">
+        <label for="edw-hf-token">${Utils.escapeHtml(tokenLabel)}</label>
+        <input type="password" id="edw-hf-token" class="form-input"
+          value="${Utils.escapeAttr(hfToken)}" autocomplete="off">
+      </div>
+      <div class="model-list" id="edw-hf-results">
+        ${renderHfResultsHtml()}
+      </div>
+    `;
+  }
+
+  function renderHfResultsHtml() {
+    if (hfSearching) {
+      return `<p class="form-hint">${I18n.t('common.loading')}</p>`;
+    }
+    if (hfResults.length === 0) {
+      return '';
+    }
+    return hfResults.map(r => {
       const id = r.id || r.modelId || '';
       const downloads = r.downloads ? formatCount(r.downloads) : '';
       const likes = r.likes ? r.likes : '';
       const lastModified = r.lastModified ? r.lastModified.substring(0, 10) : '';
       const sel = selection.modelRepo === id ? ' selected' : '';
-      return `<div class="edw-hf-item${sel}" data-repo="${Utils.escapeAttr(id)}"
-        style="padding:8px;border:1px solid var(--color-border);border-radius:6px;margin-bottom:6px;cursor:pointer;${selection.modelRepo === id ? 'border-color:var(--color-primary);background:var(--color-primary-light, rgba(52,152,219,0.08));' : ''}">
-        <div style="font-weight:600;font-family:monospace;font-size:0.9em;">${Utils.escapeHtml(id)}</div>
-        <div style="font-size:0.8em;color:var(--color-text-muted);margin-top:2px;">
-          ${downloads ? '\u2193 ' + downloads : ''}
-          ${likes ? ' \u2022 \u2665 ' + likes : ''}
-          ${lastModified ? ' \u2022 ' + lastModified : ''}
-        </div>
-      </div>`;
+      let info = '';
+      if (downloads) info += '\u2193 ' + downloads;
+      if (likes) info += (info ? ' \u2022 ' : '') + '\u2665 ' + likes;
+      if (lastModified) info += (info ? ' \u2022 ' : '') + lastModified;
+      return '<div class="model-item' + sel + '" data-repo="' + Utils.escapeAttr(id) + '">' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div class="model-item-name" style="font-family:\'JetBrains Mono\',\'Fira Code\',monospace;font-size:var(--font-size-sm);">' + Utils.escapeHtml(id) + '</div>' +
+          (info ? '<div class="model-item-info">' + Utils.escapeHtml(info) + '</div>' : '') +
+        '</div>' +
+      '</div>';
     }).join('');
-
-    const placeholder = hfSearching
-      ? `<div class="empty-state-hint">${I18n.t('common.loading')}</div>`
-      : (hfResults.length === 0 ? '<div class="empty-state-hint">\u2014</div>' : '');
-
-    return `
-      <div class="form-group">
-        <input type="text" id="edw-hf-search" class="form-input"
-          placeholder="np. qwen, llama, mistral..." value="">
-        ${repoFilter ? `<div class="form-hint" style="font-size:0.8em;color:var(--color-text-muted);margin-top:4px;">${repoFilter}</div>` : ''}
-      </div>
-      <div class="form-group">
-        <label for="edw-hf-token" style="font-size:0.85em;">${Utils.escapeHtml(I18n.t('wizard.huggingfaceToken'))}</label>
-        <input type="password" id="edw-hf-token" class="form-input" value="${Utils.escapeAttr(hfToken)}" autocomplete="off">
-      </div>
-      <div class="edw-hf-results" id="edw-hf-results" style="max-height:280px;overflow-y:auto;">
-        ${items || placeholder}
-      </div>
-    `;
   }
 
-  // Wskazowka filtrujaca: jesli silnik wymaga GGUF/MLX — pokaz info.
+  // Wskazówka filtrująca: jeśli silnik wymaga GGUF/MLX — pokaż info.
   function hfSearchFilterHint() {
     if (!engineEntry || !engineEntry.engine) return '';
     const id = String(engineEntry.engine.id || '').toLowerCase();
-    if (id.indexOf('llama') !== -1 || id.indexOf('llamacpp') !== -1) return 'Filtrowane do modeli GGUF';
-    if (id === 'mlx') return 'Filtrowane do mlx-community/*';
+    if (id.indexOf('llama') !== -1 || id.indexOf('llamacpp') !== -1) return 'GGUF';
+    if (id === 'mlx') return 'mlx-community/*';
     return '';
   }
 
@@ -365,18 +386,17 @@ const EngineDeployWizard = (() => {
 
     let extra = '';
     if (selection.deployMethod === 'docker') {
-      extra = `
-        <div class="form-group">
-          <label for="edw-cname">Nazwa kontenera</label>
-          <input type="text" id="edw-cname" class="form-input" value="${Utils.escapeAttr(cname)}">
-        </div>
-      `;
+      extra =
+        '<div class="form-group">' +
+          '<label for="edw-cname">' + I18n.t('wizard.containerName') + '</label>' +
+          '<input type="text" id="edw-cname" class="form-input" value="' + Utils.escapeAttr(cname) + '">' +
+        '</div>';
     }
 
-    return '<h3>' + I18n.t('wizard.configureRuntime') + '</h3>' +
+    return '<h4>' + I18n.t('wizard.configureRuntime') + '</h4>' +
       summary +
       '<div class="form-group">' +
-        '<label for="edw-port">Port</label>' +
+        '<label for="edw-port">' + I18n.t('wizard.port') + '</label>' +
         '<input type="number" id="edw-port" class="form-input" min="1" max="65535" value="' + Utils.escapeAttr(String(port)) + '">' +
       '</div>' + extra;
   }
@@ -384,20 +404,21 @@ const EngineDeployWizard = (() => {
   function renderModelSummary() {
     let modelDesc = '';
     if (selection.modelRepo) {
-      modelDesc = `<code style="font-family:monospace;">${Utils.escapeHtml(selection.modelRepo)}</code> <span style="color:var(--color-text-muted);font-size:0.85em;">(HuggingFace)</span>`;
+      modelDesc = '<code>' + Utils.escapeHtml(selection.modelRepo) + '</code> ' +
+        '<span style="color:var(--color-text-muted);font-size:var(--font-size-xs);">(HuggingFace)</span>';
     } else if (selection.modelPresetId) {
       const presets = ManifestStore.modelPresets(engineEntry);
       const preset = presets.find(p => p && p.id === selection.modelPresetId);
       if (preset) {
-        modelDesc = `<strong>${Utils.escapeHtml(preset.display_name || preset.id)}</strong>` +
-          (preset.repo ? ` <span style="color:var(--color-text-muted);font-size:0.85em;">${Utils.escapeHtml(preset.repo)}</span>` : '');
+        modelDesc = '<strong>' + Utils.escapeHtml(preset.display_name || preset.id) + '</strong>' +
+          (preset.repo ? ' <span style="color:var(--color-text-muted);font-size:var(--font-size-xs);">' + Utils.escapeHtml(preset.repo) + '</span>' : '');
       }
     }
     if (!modelDesc) return '';
-    return `<div class="wizard-summary" style="margin-bottom:12px;padding:10px;background:var(--color-bg-secondary, rgba(0,0,0,0.04));border-radius:6px;">
-      <div style="font-size:0.85em;color:var(--color-text-muted);margin-bottom:4px;">Model</div>
-      <div>${modelDesc}</div>
-    </div>`;
+    return '<div class="form-group">' +
+      '<label>' + I18n.t('wizard.modelLabel') + '</label>' +
+      '<div>' + modelDesc + '</div>' +
+    '</div>';
   }
 
   // ---- Bind eventow --------------------------------------------------------
@@ -409,7 +430,7 @@ const EngineDeployWizard = (() => {
   }
 
   function bindStepMethodInputs() {
-    document.querySelectorAll('.edw-method-btn[data-method]').forEach(btn => {
+    document.querySelectorAll('.deploy-method-card[data-method]').forEach(btn => {
       btn.addEventListener('click', () => {
         selection.deployMethod = btn.dataset.method;
         refreshModal();
@@ -418,19 +439,21 @@ const EngineDeployWizard = (() => {
   }
 
   function bindStepModelInputs() {
-    document.querySelectorAll('.edw-tab[data-source]').forEach(t => {
+    // Przelaczanie miedzy zakladkami "preset" / "hf".
+    document.querySelectorAll('.wizard-tab[data-mode]').forEach(t => {
       t.addEventListener('click', () => {
-        modelSourceMode = t.dataset.source;
+        modelSourceMode = t.dataset.mode;
         refreshModal();
       });
     });
 
-    document.querySelectorAll('input[name="edw-preset"]').forEach(r => {
-      r.addEventListener('change', e => {
-        if (e.target.checked) {
-          selection.modelPresetId = e.target.value;
-          selection.modelRepo = null;
-        }
+    // Wybor presetu (klik calego wiersza).
+    document.querySelectorAll('.model-item[data-preset-id]').forEach(it => {
+      it.addEventListener('click', () => {
+        selection.modelPresetId = it.dataset.presetId;
+        selection.modelRepo = null;
+        document.querySelectorAll('.model-item[data-preset-id]').forEach(x => x.classList.remove('selected'));
+        it.classList.add('selected');
       });
     });
 
@@ -438,6 +461,7 @@ const EngineDeployWizard = (() => {
     if (search) {
       search.addEventListener('input', () => {
         clearTimeout(hfSearchTimer);
+        hfSearchQuery = search.value;
         const q = search.value.trim();
         if (q.length < 2) {
           hfResults = [];
@@ -455,17 +479,16 @@ const EngineDeployWizard = (() => {
       });
     }
 
-    document.querySelectorAll('.edw-hf-item[data-repo]').forEach(it => {
+    bindHfResultClicks();
+  }
+
+  function bindHfResultClicks() {
+    document.querySelectorAll('.model-item[data-repo]').forEach(it => {
       it.addEventListener('click', () => {
         selection.modelRepo = it.dataset.repo;
         selection.modelPresetId = null;
-        // Visualne podswietlenie bez pelnego refreshModal (zachowuje wyniki).
-        document.querySelectorAll('.edw-hf-item').forEach(x => {
-          x.style.borderColor = 'var(--color-border)';
-          x.style.background = '';
-        });
-        it.style.borderColor = 'var(--color-primary)';
-        it.style.background = 'var(--color-primary-light, rgba(52,152,219,0.08))';
+        document.querySelectorAll('.model-item[data-repo]').forEach(x => x.classList.remove('selected'));
+        it.classList.add('selected');
       });
     });
   }
@@ -541,7 +564,6 @@ const EngineDeployWizard = (() => {
       let data = await resp.json();
       if (!Array.isArray(data)) data = [];
 
-      // Filtrowanie per silnik (GGUF / MLX).
       const engId = String((engineEntry.engine && engineEntry.engine.id) || '').toLowerCase();
       if (engId.indexOf('llama') !== -1 || engId.indexOf('llamacpp') !== -1) {
         data = data.filter(m => String(m.id || '').toLowerCase().indexOf('gguf') !== -1);
@@ -565,43 +587,8 @@ const EngineDeployWizard = (() => {
   function updateHfResults() {
     const box = document.getElementById('edw-hf-results');
     if (!box) return;
-    if (hfSearching) {
-      box.innerHTML = `<div class="empty-state-hint">${I18n.t('common.loading')}</div>`;
-      return;
-    }
-    if (hfResults.length === 0) {
-      box.innerHTML = '<div class="empty-state-hint">\u2014</div>';
-      return;
-    }
-    box.innerHTML = hfResults.map(r => {
-      const id = r.id || r.modelId || '';
-      const downloads = r.downloads ? formatCount(r.downloads) : '';
-      const likes = r.likes ? r.likes : '';
-      const lastModified = r.lastModified ? r.lastModified.substring(0, 10) : '';
-      const isSel = selection.modelRepo === id;
-      return `<div class="edw-hf-item" data-repo="${Utils.escapeAttr(id)}"
-        style="padding:8px;border:1px solid ${isSel ? 'var(--color-primary)' : 'var(--color-border)'};border-radius:6px;margin-bottom:6px;cursor:pointer;${isSel ? 'background:var(--color-primary-light, rgba(52,152,219,0.08));' : ''}">
-        <div style="font-weight:600;font-family:monospace;font-size:0.9em;">${Utils.escapeHtml(id)}</div>
-        <div style="font-size:0.8em;color:var(--color-text-muted);margin-top:2px;">
-          ${downloads ? '\u2193 ' + downloads : ''}
-          ${likes ? ' \u2022 \u2665 ' + likes : ''}
-          ${lastModified ? ' \u2022 ' + lastModified : ''}
-        </div>
-      </div>`;
-    }).join('');
-
-    box.querySelectorAll('.edw-hf-item[data-repo]').forEach(it => {
-      it.addEventListener('click', () => {
-        selection.modelRepo = it.dataset.repo;
-        selection.modelPresetId = null;
-        box.querySelectorAll('.edw-hf-item').forEach(x => {
-          x.style.borderColor = 'var(--color-border)';
-          x.style.background = '';
-        });
-        it.style.borderColor = 'var(--color-primary)';
-        it.style.background = 'var(--color-primary-light, rgba(52,152,219,0.08))';
-      });
-    });
+    box.innerHTML = renderHfResultsHtml();
+    bindHfResultClicks();
   }
 
   // ---- Deploy --------------------------------------------------------------
@@ -638,19 +625,21 @@ const EngineDeployWizard = (() => {
       }
 
       const id = (data && data.deploy_id) ? data.deploy_id : '?';
+      const msg = I18n.t('wizard.deployStarted').replace('{id}', id);
       if (typeof App !== 'undefined' && App.showToast) {
-        App.showToast('Deploy wystartowal: ' + id, 'success');
+        App.showToast(msg, 'success');
       } else {
-        alert('Deploy wystartowal: ' + id);
+        alert(msg);
       }
       console.log('[EngineDeployWizard] deploy started:', data);
       setTimeout(close, 1500);
     } catch (err) {
       console.error('[EngineDeployWizard] deploy error:', err);
+      const msg = I18n.t('wizard.deployFailed').replace('{error}', err.message || err);
       if (typeof App !== 'undefined' && App.showToast) {
-        App.showToast('Blad: ' + (err.message || err), 'error');
+        App.showToast(msg, 'error');
       } else {
-        alert('Deploy nieudany: ' + (err.message || err));
+        alert(msg);
       }
       if (deployBtn) deployBtn.disabled = false;
     }
