@@ -15,6 +15,13 @@ bin/
 # Wygenerowany manifest serwisow dla GUI (build.rs produkuje przy kompilacji)
 tentaflow-core/wwwroot/js/generated/
 
+# Wygenerowany wasm-bindgen glue dla protocol codec (build.rs produkuje)
+tentaflow-core/wwwroot/js/protocol/wasm_glue.js
+tentaflow-core/wwwroot/js/protocol/wasm_glue_bg.wasm
+
+# Wygenerowany cbindgen header dla .NET P/Invoke
+tentaflow-client/native/include/
+
 # =============================================================================
 # Bazy danych
 # =============================================================================
