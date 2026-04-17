@@ -10,8 +10,9 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     ApiKeyCreateResponse, ApiKeySummary, AuthLoginResponse, AuthMeResponse, ChatStreamChunk,
-    ChatStreamEnd, ClusterUpdateResponse, MessageBody, ModelSummary, NodeSummary, ProtocolError,
-    ProtocolErrorCode,
+    ChatStreamEnd, ClusterUpdateResponse, DashboardSnapshot, MeshPairInitResponse,
+    MeshPeerSummary, MessageBody, ModelSummary, NodeSummary, ProtocolError, ProtocolErrorCode,
+    SettingEntry,
 };
 
 use super::HandlerContext;
@@ -318,4 +319,114 @@ pub fn cluster_update(
             trace_id: None,
         }),
     }
+}
+
+// =============================================================================
+// Mesh peers — R-LIST + W-ACTION archetypy.
+// Policy: UserSession dla list (dashboard view), UserSession dla pair init
+// (pairing wymaga zalogowanego admina — docelowo SessionAuthKind::Admin w phase 2).
+// =============================================================================
+
+#[handler(variant = "MeshPeersListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_peers_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::MeshPeersListResponse {
+        peers: vec![MeshPeerSummary {
+            node_id: [0u8; 32],
+            display_name: "self".to_string(),
+            trust_state: "trusted".to_string(),
+            endpoint: None,
+            last_seen_epoch: None,
+        }],
+    })
+}
+
+#[handler(variant = "MeshPairInitRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_pair_init(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::MeshPairInitRequestBody(_) => {
+            Ok(MessageBody::MeshPairInitResponseBody(MeshPairInitResponse {
+                pair_id: "bootstrap-pair".to_string(),
+                expires_at_epoch: 0,
+            }))
+        }
+        _ => Err(ProtocolError {
+            code: ProtocolErrorCode::BadRequest,
+            message: "mesh_pair_init expected MeshPairInitRequestBody variant".to_string(),
+            trace_id: None,
+        }),
+    }
+}
+
+// =============================================================================
+// Settings — R-LIST + W-UPDATE archetypy.
+// Policy: UserSession (tylko zalogowany admin/user moze czytac/pisac settings).
+// =============================================================================
+
+#[handler(variant = "SettingsListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn settings_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::SettingsListResponse {
+        entries: vec![SettingEntry {
+            key: "bootstrap".to_string(),
+            value: "placeholder".to_string(),
+            is_secret: false,
+        }],
+    })
+}
+
+#[handler(variant = "SettingsUpdateRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn settings_update(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::SettingsUpdateRequestBody(payload) => Ok(MessageBody::SettingsUpdateResponse {
+            applied: payload.entries.len() as u32,
+        }),
+        _ => Err(ProtocolError {
+            code: ProtocolErrorCode::BadRequest,
+            message: "settings_update expected SettingsUpdateRequestBody variant".to_string(),
+            trace_id: None,
+        }),
+    }
+}
+
+// =============================================================================
+// Dashboard metrics — R-LIST, subscription candidate (subskrypcja w #36 phase 2).
+// Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "DashboardMetricsRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn dashboard_metrics(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::DashboardMetricsResponse(DashboardSnapshot {
+        cpu_usage_percent: 0.0,
+        ram_used_mb: 0,
+        ram_total_mb: 0,
+        active_requests: 0,
+        total_requests: 0,
+        total_errors: 0,
+        tokens_per_second: 0,
+        active_services: 0,
+    }))
 }
