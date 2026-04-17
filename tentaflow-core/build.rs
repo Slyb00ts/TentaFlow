@@ -19,6 +19,11 @@ fn main() {
     // To musi byc PRZED dlugim WASM-buildem, zeby blad walidacji wykryl sie szybko.
     generate_services_manifest(&out_dir_env);
 
+    // Zbuduj tentaflow-protocol-wasm (Envelope + MessageBody codec dla browsera)
+    // i wygeneruj wasm-bindgen JS glue do wwwroot/js/protocol/.
+    // MUSI byc przed generate_wwwroot_embed zeby wynikowe pliki trafily do embed.
+    build_protocol_wasm_bindings();
+
     // Generuj wwwroot_embed.rs — pliki statyczne wbudowane w binarie
     // (po wygenerowaniu services-manifest.js, zeby trafil do embed).
     generate_wwwroot_embed(&out_dir_env);
@@ -1033,4 +1038,170 @@ fn chrono_now_iso() -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, m, d, hour, min, sec
     )
+}
+
+// =============================================================================
+// tentaflow-protocol-wasm — build + wasm-bindgen JS glue
+// =============================================================================
+
+/// Buduje crate tentaflow-protocol-wasm do targetu wasm32-unknown-unknown,
+/// pozniej wola wasm-bindgen CLI zeby wygenerowac JS glue (target=web) do
+/// wwwroot/js/protocol/. Generowane pliki (wasm_glue.js + wasm_glue_bg.wasm)
+/// sa pozniej embedowane do binarki przez generate_wwwroot_embed.
+///
+/// Non-blocking: brak wasm32-unknown-unknown targetu lub brak wasm-bindgen
+/// CLI skutkuje ostrzezeniem, nie bledem kompilacji. CI runner zainstaluje
+/// oba narzedzia, lokalne `cargo build` zostanie z istniejacymi plikami
+/// (lub ich brakiem — codec.js otrzyma ImportError przy starcie GUI, co
+/// sygnalizuje programiscie ze trzeba odswiezyc pipeline).
+fn build_protocol_wasm_bindings() {
+    // Sciezki wejsciowe/wyjsciowe
+    let crate_dir = Path::new("../tentaflow-protocol-wasm");
+    let protocol_dir = Path::new("../tentaflow-protocol");
+    let out_js_dir = Path::new("wwwroot/js/protocol");
+
+    if !crate_dir.exists() {
+        println!(
+            "cargo:warning=build_protocol_wasm_bindings: brak crate {}, pomijam",
+            crate_dir.display()
+        );
+        return;
+    }
+
+    // Rerun-if-changed hooks na zrodlach
+    println!("cargo:rerun-if-changed={}/src", crate_dir.display());
+    println!("cargo:rerun-if-changed={}/Cargo.toml", crate_dir.display());
+    println!("cargo:rerun-if-changed={}/src", protocol_dir.display());
+    println!("cargo:rerun-if-changed={}/Cargo.toml", protocol_dir.display());
+
+    // Sprawdz wasm32-unknown-unknown target
+    if !check_wasm_browser_target() {
+        println!(
+            "cargo:warning=tentaflow-protocol-wasm: brak wasm32-unknown-unknown targetu \
+             (zainstaluj: rustup target add wasm32-unknown-unknown), pomijam generacje JS glue"
+        );
+        return;
+    }
+
+    // Sprawdz wasm-bindgen CLI — wersja musi byc zgodna z dependency w Cargo.toml
+    let bindgen_version = detect_wasm_bindgen_version().unwrap_or_else(|| "unknown".to_string());
+    if bindgen_version == "unknown" {
+        println!(
+            "cargo:warning=tentaflow-protocol-wasm: brak wasm-bindgen CLI w PATH \
+             (zainstaluj: cargo install wasm-bindgen-cli --version 0.2.100), pomijam"
+        );
+        return;
+    }
+
+    // CARGO_TARGET_DIR isolation — oddzielny target dir dla WASM build zeby
+    // uniknac lockingu na parent cargo i race condition na metadata.json.
+    let isolated_target = PathBuf::from(std::env::var("OUT_DIR").unwrap())
+        .join("protocol_wasm_target");
+    std::fs::create_dir_all(&isolated_target).ok();
+
+    // 1) cargo build --target wasm32-unknown-unknown --release
+    let status = Command::new("cargo")
+        .args(["build", "--target", "wasm32-unknown-unknown", "--release"])
+        .current_dir(crate_dir)
+        .env("CARGO_TARGET_DIR", &isolated_target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CFLAGS")
+        .env_remove("CXXFLAGS")
+        .env_remove("IPHONEOS_DEPLOYMENT_TARGET")
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:warning=tentaflow-protocol-wasm: kompilacja wasm32 OK");
+        }
+        Ok(s) => {
+            println!(
+                "cargo:warning=tentaflow-protocol-wasm: cargo build zakonczone kodem {}, pomijam glue",
+                s
+            );
+            return;
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=tentaflow-protocol-wasm: nie udalo sie uruchomic cargo: {}, pomijam",
+                e
+            );
+            return;
+        }
+    }
+
+    let wasm_file = isolated_target
+        .join("wasm32-unknown-unknown/release/tentaflow_protocol_wasm.wasm");
+    if !wasm_file.exists() {
+        println!(
+            "cargo:warning=tentaflow-protocol-wasm: brak wynikowego .wasm: {}, pomijam",
+            wasm_file.display()
+        );
+        return;
+    }
+
+    // 2) wasm-bindgen --target web --out-dir wwwroot/js/protocol --out-name wasm_glue
+    std::fs::create_dir_all(out_js_dir).ok();
+    let status = Command::new("wasm-bindgen")
+        .args([
+            "--target",
+            "web",
+            "--out-dir",
+        ])
+        .arg(out_js_dir)
+        .args(["--out-name", "wasm_glue", "--no-typescript"])
+        .arg(&wasm_file)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!(
+                "cargo:warning=tentaflow-protocol-wasm: wasm-bindgen ({}) wygenerowal glue do {}",
+                bindgen_version,
+                out_js_dir.display()
+            );
+        }
+        Ok(s) => {
+            println!(
+                "cargo:warning=tentaflow-protocol-wasm: wasm-bindgen zakonczone kodem {}, glue moze byc stale",
+                s
+            );
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=tentaflow-protocol-wasm: nie udalo sie uruchomic wasm-bindgen: {}",
+                e
+            );
+        }
+    }
+}
+
+/// Sprawdza czy wasm32-unknown-unknown jest zainstalowany (browser target).
+fn check_wasm_browser_target() -> bool {
+    let output = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output();
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout
+                .lines()
+                .any(|line| line.trim() == "wasm32-unknown-unknown")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Zwraca wersje zainstalowanego wasm-bindgen CLI (np. "0.2.100") lub None.
+fn detect_wasm_bindgen_version() -> Option<String> {
+    let output = Command::new("wasm-bindgen")
+        .args(["--version"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Format: "wasm-bindgen 0.2.100"
+    text.split_whitespace().nth(1).map(|s| s.to_string())
 }
