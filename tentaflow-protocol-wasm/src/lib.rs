@@ -20,7 +20,8 @@ use tentaflow_protocol::{
     envelope::{message_kind, Envelope, EnvelopeFlags, Routing},
     message_body::{
         ApiKeyCreateRequest, AuthLoginRequest, ChatMessage, ChatStreamRequest, ClusterUpdateRequest,
-        MessageBody, ProtocolError, ProtocolErrorCode,
+        MeshPairInitRequest, MessageBody, ProtocolError, ProtocolErrorCode, SettingEntry,
+        SettingsUpdateRequest,
     },
     SCHEMA_VERSION as PROTOCOL_SCHEMA_VERSION,
 };
@@ -325,6 +326,57 @@ pub fn encode_cluster_update_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::MeshPeersListRequest (unit variant).
+#[wasm_bindgen(js_name = encodeMeshPeersListRequest)]
+pub fn encode_mesh_peers_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeshPeersListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::MeshPairInitRequest { node_id (32 bytes), pin }.
+#[wasm_bindgen(js_name = encodeMeshPairInitRequest)]
+pub fn encode_mesh_pair_init_request(node_id: &[u8], pin: String) -> Result<Vec<u8>, JsError> {
+    if node_id.len() != 32 {
+        return Err(JsError::new("node_id must be exactly 32 bytes"));
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(node_id);
+    encode_body_inner(&MessageBody::MeshPairInitRequestBody(MeshPairInitRequest {
+        node_id: buf,
+        pin,
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::SettingsListRequest (unit variant).
+#[wasm_bindgen(js_name = encodeSettingsListRequest)]
+pub fn encode_settings_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SettingsListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::SettingsUpdateRequest — simplified: para key/value/is_secret.
+/// Pelna lista (N elementow) po integracji serde-wasm-bindgen (#36 phase 2).
+#[wasm_bindgen(js_name = encodeSettingsUpdateSingle)]
+pub fn encode_settings_update_single(
+    key: String,
+    value: String,
+    is_secret: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SettingsUpdateRequestBody(SettingsUpdateRequest {
+        entries: vec![SettingEntry {
+            key,
+            value,
+            is_secret,
+        }],
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::DashboardMetricsRequest (unit variant).
+#[wasm_bindgen(js_name = encodeDashboardMetricsRequest)]
+pub fn encode_dashboard_metrics_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::DashboardMetricsRequest).map_err(|e| JsError::new(&e))
+}
+
 // =============================================================================
 // MessageBody decode (zwraca JS object z variant tag + polami)
 // =============================================================================
@@ -493,6 +545,79 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "ClusterUpdateResponse".into());
             set(&obj, "clusterId", resp.cluster_id.into());
             set(&obj, "updatedAtEpoch", resp.updated_at_epoch.into());
+        }
+        MessageBody::MeshPeersListRequest => {
+            set(&obj, "variant", "MeshPeersListRequest".into());
+        }
+        MessageBody::MeshPeersListResponse { peers } => {
+            set(&obj, "variant", "MeshPeersListResponse".into());
+            let arr = js_sys::Array::new();
+            for p in peers {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", js_sys::Uint8Array::from(&p.node_id[..]).into());
+                set(&item, "displayName", p.display_name.into());
+                set(&item, "trustState", p.trust_state.into());
+                if let Some(ep) = p.endpoint {
+                    set(&item, "endpoint", ep.into());
+                }
+                if let Some(ls) = p.last_seen_epoch {
+                    set(&item, "lastSeenEpoch", ls.into());
+                }
+                arr.push(&item.into());
+            }
+            set(&obj, "peers", arr.into());
+        }
+        MessageBody::MeshPairInitRequestBody(req) => {
+            set(&obj, "variant", "MeshPairInitRequest".into());
+            set(&obj, "nodeId", js_sys::Uint8Array::from(&req.node_id[..]).into());
+            set(&obj, "pin", req.pin.into());
+        }
+        MessageBody::MeshPairInitResponseBody(resp) => {
+            set(&obj, "variant", "MeshPairInitResponse".into());
+            set(&obj, "pairId", resp.pair_id.into());
+            set(&obj, "expiresAtEpoch", resp.expires_at_epoch.into());
+        }
+        MessageBody::SettingsListRequest => {
+            set(&obj, "variant", "SettingsListRequest".into());
+        }
+        MessageBody::SettingsListResponse { entries } => {
+            set(&obj, "variant", "SettingsListResponse".into());
+            let arr = js_sys::Array::new();
+            for e in entries {
+                let item = js_sys::Object::new();
+                set(&item, "key", e.key.into());
+                // Nie exposujemy wartosci jesli is_secret — chroni logs/devtools.
+                if e.is_secret {
+                    set(&item, "value", "<redacted>".into());
+                } else {
+                    set(&item, "value", e.value.into());
+                }
+                set(&item, "isSecret", e.is_secret.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "entries", arr.into());
+        }
+        MessageBody::SettingsUpdateRequestBody(req) => {
+            set(&obj, "variant", "SettingsUpdateRequest".into());
+            set(&obj, "entriesCount", (req.entries.len() as u32).into());
+        }
+        MessageBody::SettingsUpdateResponse { applied } => {
+            set(&obj, "variant", "SettingsUpdateResponse".into());
+            set(&obj, "applied", applied.into());
+        }
+        MessageBody::DashboardMetricsRequest => {
+            set(&obj, "variant", "DashboardMetricsRequest".into());
+        }
+        MessageBody::DashboardMetricsResponse(s) => {
+            set(&obj, "variant", "DashboardMetricsResponse".into());
+            set(&obj, "cpuUsagePercent", (s.cpu_usage_percent as f64).into());
+            set(&obj, "ramUsedMb", s.ram_used_mb.into());
+            set(&obj, "ramTotalMb", s.ram_total_mb.into());
+            set(&obj, "activeRequests", s.active_requests.into());
+            set(&obj, "totalRequests", s.total_requests.into());
+            set(&obj, "totalErrors", s.total_errors.into());
+            set(&obj, "tokensPerSecond", s.tokens_per_second.into());
+            set(&obj, "activeServices", (s.active_services as u32).into());
         }
         MessageBody::Error(err) => {
             set(&obj, "variant", "Error".into());
