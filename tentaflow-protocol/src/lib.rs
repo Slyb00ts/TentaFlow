@@ -34,6 +34,7 @@ pub use envelope::{
 pub use message_body::{
     ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeySummary, AuthLoginRequest,
     AuthLoginResponse, AuthMeResponse, ChatMessage, ChatStreamChunk, ChatStreamEnd,
-    ChatStreamRequest, ClusterUpdateRequest, ClusterUpdateResponse, MessageBody,
-    ModelSummary, NodeSummary, ProtocolError, ProtocolErrorCode,
+    ChatStreamRequest, ClusterUpdateRequest, ClusterUpdateResponse, DashboardSnapshot,
+    MeshPairInitRequest, MeshPairInitResponse, MeshPeerSummary, MessageBody, ModelSummary,
+    NodeSummary, ProtocolError, ProtocolErrorCode, SettingEntry, SettingsUpdateRequest,
 };

@@ -225,6 +225,16 @@ fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ChatStreamEndBody(_) => "ChatStreamEnd",
         MessageBody::ClusterUpdateRequestBody(_) => "ClusterUpdateRequest",
         MessageBody::ClusterUpdateResponseBody(_) => "ClusterUpdateResponse",
+        MessageBody::MeshPeersListRequest => "MeshPeersListRequest",
+        MessageBody::MeshPeersListResponse { .. } => "MeshPeersListResponse",
+        MessageBody::MeshPairInitRequestBody(_) => "MeshPairInitRequest",
+        MessageBody::MeshPairInitResponseBody(_) => "MeshPairInitResponse",
+        MessageBody::SettingsListRequest => "SettingsListRequest",
+        MessageBody::SettingsListResponse { .. } => "SettingsListResponse",
+        MessageBody::SettingsUpdateRequestBody(_) => "SettingsUpdateRequest",
+        MessageBody::SettingsUpdateResponse { .. } => "SettingsUpdateResponse",
+        MessageBody::DashboardMetricsRequest => "DashboardMetricsRequest",
+        MessageBody::DashboardMetricsResponse(_) => "DashboardMetricsResponse",
         MessageBody::Error(_) => "Error",
     }
 }
