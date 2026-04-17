@@ -22,6 +22,18 @@
 
 pub mod types;
 pub mod mesh;
+pub mod envelope;
+pub mod message_body;
 
 pub use types::*;
 pub use mesh::*;
+pub use envelope::{
+    message_kind, Envelope, EnvelopeFlags, Routing, SessionAuth, SignedSessionClaim,
+    SCHEMA_VERSION,
+};
+pub use message_body::{
+    ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeySummary, AuthLoginRequest,
+    AuthLoginResponse, AuthMeResponse, ChatMessage, ChatStreamChunk, ChatStreamEnd,
+    ChatStreamRequest, ClusterUpdateRequest, ClusterUpdateResponse, MessageBody,
+    ModelSummary, NodeSummary, ProtocolError, ProtocolErrorCode,
+};
