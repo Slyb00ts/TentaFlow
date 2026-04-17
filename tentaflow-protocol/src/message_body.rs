@@ -167,6 +167,67 @@ pub struct ChatStreamEnd {
 }
 
 // =============================================================================
+// Mesh peers (R-LIST + W-ACTION archetypy, migration-map #87-#92)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPeerSummary {
+    pub node_id: [u8; 32],
+    pub display_name: String,
+    /// "trusted" / "pending" / "revoked" / "online".
+    pub trust_state: String,
+    /// Hostname lub ostatni znany IP.
+    pub endpoint: Option<String>,
+    pub last_seen_epoch: Option<u64>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairInitRequest {
+    pub node_id: [u8; 32],
+    /// PIN wpisany przez administratora (6 cyfr).
+    pub pin: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairInitResponse {
+    pub pair_id: String,
+    pub expires_at_epoch: u64,
+}
+
+// =============================================================================
+// Settings (R-LIST + W-UPDATE archetypy, migration-map #147-#148)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SettingEntry {
+    pub key: String,
+    pub value: String,
+    /// Czy wartosc powinna byc zaszyfrowana (secret).
+    pub is_secret: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SettingsUpdateRequest {
+    pub entries: Vec<SettingEntry>,
+}
+
+// =============================================================================
+// Dashboard metrics (R-LIST z subscription candidate, migration-map #60)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct DashboardSnapshot {
+    pub cpu_usage_percent: f32,
+    pub ram_used_mb: u64,
+    pub ram_total_mb: u64,
+    pub active_requests: u64,
+    pub total_requests: u64,
+    pub total_errors: u64,
+    pub tokens_per_second: u64,
+    pub active_services: u32,
+}
+
+// =============================================================================
 // Cluster (W-UPDATE archetyp, migration-map #53)
 // =============================================================================
 
@@ -244,6 +305,22 @@ pub enum MessageBody {
     // ---- Cluster (W-UPDATE) ----
     ClusterUpdateRequestBody(ClusterUpdateRequest),
     ClusterUpdateResponseBody(ClusterUpdateResponse),
+
+    // ---- Mesh peers (R-LIST + W-ACTION) ----
+    MeshPeersListRequest,
+    MeshPeersListResponse { peers: Vec<MeshPeerSummary> },
+    MeshPairInitRequestBody(MeshPairInitRequest),
+    MeshPairInitResponseBody(MeshPairInitResponse),
+
+    // ---- Settings (R-LIST + W-UPDATE) ----
+    SettingsListRequest,
+    SettingsListResponse { entries: Vec<SettingEntry> },
+    SettingsUpdateRequestBody(SettingsUpdateRequest),
+    SettingsUpdateResponse { applied: u32 },
+
+    // ---- Dashboard (R-LIST + subscription candidate) ----
+    DashboardMetricsRequest,
+    DashboardMetricsResponse(DashboardSnapshot),
 
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
@@ -518,6 +595,70 @@ mod tests {
             cluster_id: "dev".to_string(),
             updated_at_epoch: 1_700_200_000,
         });
+        assert_eq!(round_trip(resp.clone()), resp);
+    }
+
+    #[test]
+    fn mesh_peers_round_trip() {
+        let list = MessageBody::MeshPeersListResponse {
+            peers: vec![MeshPeerSummary {
+                node_id: [7u8; 32],
+                display_name: "peer-1".to_string(),
+                trust_state: "trusted".to_string(),
+                endpoint: Some("10.0.0.1:8090".to_string()),
+                last_seen_epoch: Some(1_700_000_000),
+            }],
+        };
+        assert_eq!(round_trip(list.clone()), list);
+
+        let pair = MessageBody::MeshPairInitRequestBody(MeshPairInitRequest {
+            node_id: [8u8; 32],
+            pin: "123456".to_string(),
+        });
+        assert_eq!(round_trip(pair.clone()), pair);
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let list = MessageBody::SettingsListResponse {
+            entries: vec![
+                SettingEntry {
+                    key: "theme".to_string(),
+                    value: "dark".to_string(),
+                    is_secret: false,
+                },
+                SettingEntry {
+                    key: "api_key".to_string(),
+                    value: "s3cret".to_string(),
+                    is_secret: true,
+                },
+            ],
+        };
+        assert_eq!(round_trip(list.clone()), list);
+
+        let update = MessageBody::SettingsUpdateRequestBody(SettingsUpdateRequest {
+            entries: vec![SettingEntry {
+                key: "theme".to_string(),
+                value: "light".to_string(),
+                is_secret: false,
+            }],
+        });
+        assert_eq!(round_trip(update.clone()), update);
+    }
+
+    #[test]
+    fn dashboard_metrics_round_trip() {
+        let resp = MessageBody::DashboardMetricsResponse(DashboardSnapshot {
+            cpu_usage_percent: 42.5,
+            ram_used_mb: 1024,
+            ram_total_mb: 8192,
+            active_requests: 3,
+            total_requests: 12345,
+            total_errors: 7,
+            tokens_per_second: 50,
+            active_services: 4,
+        });
+        // DashboardSnapshot has f32 → MessageBody is PartialEq only.
         assert_eq!(round_trip(resp.clone()), resp);
     }
 
