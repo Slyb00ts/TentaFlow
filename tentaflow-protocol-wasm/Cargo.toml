@@ -1,0 +1,32 @@
+[package]
+name = "tentaflow-protocol-wasm"
+version = "0.1.0"
+edition = "2021"
+authors = ["TentaFlow"]
+description = "WASM bindings dla tentaflow-protocol — browser-side rkyv codec + Envelope helpers"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core protocol types (zero-copy rkyv)
+tentaflow-protocol = { path = "../tentaflow-protocol" }
+
+# WASM bindings
+wasm-bindgen = "=0.2.108"
+js-sys = "0.3"
+
+# rkyv (same pinned version jak w tentaflow-protocol)
+rkyv = { version = "0.8.12", features = ["unaligned"] }
+bytecheck = "0.8"
+
+# Logging w browser
+console_error_panic_hook = { version = "0.1.7", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]
+
+[profile.release]
+opt-level = "z"     # size optimization (bundle size budget)
+lto = true
+codegen-units = 1
