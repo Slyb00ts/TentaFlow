@@ -23,6 +23,12 @@ gpu-metal = ["inference-llamacpp", "llama-cpp-2/metal", "whisper-rs/metal"]
 # Protocol (zawsze)
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 
+# Proc-macro #[handler] + #[policy] + #[observed]
+tentaflow-macros = { path = "../tentaflow-macros" }
+
+# Linker-based handler registration (per-handler submit, no monolithic const array)
+inventory = "0.3"
+
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1"

@@ -3,6 +3,11 @@
 // Opis: TentaFlow Core — wspolna biblioteka dla Router, Desktop i Mobile.
 // =============================================================================
 
+// Self-alias umozliwia proc-macrom z `tentaflow-macros` uzywac bezwzglednej
+// sciezki `::tentaflow_core::dispatch::*` zarowno w zewnetrznych crate'ach jak
+// i w kodzie samego tentaflow-core (handlerom).
+extern crate self as tentaflow_core;
+
 pub mod config;
 pub mod error;
 pub mod crypto;
@@ -27,6 +32,7 @@ pub mod diarization;
 pub mod auth;
 pub mod api;
 pub mod audit;
+pub mod dispatch;
 
 pub mod addon;
 pub mod deploy;

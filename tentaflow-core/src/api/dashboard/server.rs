@@ -378,6 +378,44 @@ pub async fn handle_request(
         return Ok(response);
     }
 
+    // WebSocket upgrade /ws/api — binary rkyv protocol (bootstrap, Task #30).
+    // Dispatch do `ws_binary::handle_ws_connection`. Auth jest re-checkowany
+    // wewnatrz loopu per MessageBody variant po implementacji #26/#27.
+    if method == Method::GET && path == "/ws/api" {
+        let (_ws_key, accept, ws_subprotocol) = match validate_ws_upgrade(&req, &db, &query_string, cors_origin.as_deref(), &settings_cipher) {
+            Ok(v) => v,
+            Err(resp) => return Ok(resp),
+        };
+
+        let upgrade = hyper::upgrade::on(&mut req);
+
+        tokio::spawn(async move {
+            match upgrade.await {
+                Ok(upgraded) => {
+                    let io = TokioIo::new(upgraded);
+                    super::ws_binary::handle_ws_connection(io).await;
+                }
+                Err(e) => {
+                    error!("Blad WebSocket upgrade (binary): {}", e);
+                }
+            }
+        });
+
+        let mut ws_resp = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Accept", accept);
+        if let Some(ref proto) = ws_subprotocol {
+            ws_resp = ws_resp.header("Sec-WebSocket-Protocol", proto.as_str());
+        }
+        let response = ws_resp
+            .body(Either::Left(Full::new(Bytes::new())))
+            .unwrap();
+
+        return Ok(response);
+    }
+
     // Endpointy BEZ auth
     if method == Method::POST && path == "/api/auth/login" {
         let body_bytes = req.collect().await?.to_bytes();
