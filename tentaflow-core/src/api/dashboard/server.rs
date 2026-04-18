@@ -382,7 +382,8 @@ pub async fn handle_request(
     // Dispatch do `ws_binary::handle_ws_connection`. Auth jest re-checkowany
     // wewnatrz loopu per MessageBody variant po implementacji #26/#27.
     if method == Method::GET && path == "/ws/api" {
-        let (_ws_key, accept, ws_subprotocol) = match validate_ws_upgrade(&req, &db, &query_string, cors_origin.as_deref(), &settings_cipher) {
+        // Anonymous WS OK — login flow musi zlozyc WS bez JWT zeby zalogowac.
+        let (_ws_key, accept, ws_subprotocol) = match validate_ws_upgrade_optional_auth(&req, &db, cors_origin.as_deref(), &settings_cipher) {
             Ok(v) => v,
             Err(resp) => return Ok(resp),
         };
@@ -1794,6 +1795,64 @@ fn validate_ws_upgrade(
     match ws_token {
         Some(ref t) if auth::validate_jwt(t, &jwt_secret).is_ok() => {}
         _ => return Err(json_error_cors(401, "Brak lub niepoprawny token autoryzacji", cors_origin)),
+    }
+
+    let ws_key = match req.headers().get("sec-websocket-key") {
+        Some(key) => key.to_str().unwrap_or("").to_string(),
+        None => return Err(json_error_cors(400, "Brak Sec-WebSocket-Key", cors_origin)),
+    };
+
+    let accept = compute_ws_accept(&ws_key);
+    Ok((ws_key, accept, subprotocol))
+}
+
+/// Walidacja WS upgrade dla `/ws/api` — pozwala anonymous (login flow musi
+/// zlozyc WS bez JWT zeby wyslac AuthLoginRequest). Auth-aware policy check
+/// dzieje sie potem per-handler.
+fn validate_ws_upgrade_optional_auth(
+    req: &Request<Incoming>,
+    db: &DbPool,
+    cors_origin: Option<&str>,
+    settings_cipher: &crate::crypto::SettingsCipher,
+) -> Result<(String, String, Option<String>), Response<DashboardBody>> {
+    let is_upgrade = req
+        .headers()
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if !is_upgrade {
+        return Err(json_error_cors(400, "Wymagany WebSocket upgrade", cors_origin));
+    }
+
+    let proto_header = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+
+    let subprotocol = proto_header
+        .as_deref()
+        .and_then(|v| v.split(',').find(|s| s.trim().starts_with("bearer.")))
+        .map(|s| s.trim().to_string());
+
+    // Jesli token podany — zwaliduj. Brak tokena = anonymous OK.
+    if let Some(sub) = subprotocol.as_deref() {
+        if let Some(token) = sub.strip_prefix("bearer.") {
+            let jwt_secret = match db::repository::get_setting_secure(db, "jwt_secret", settings_cipher) {
+                Ok(Some(s)) => s,
+                _ => {
+                    return Err(json_error_cors(
+                        500,
+                        "Brak jwt_secret w konfiguracji",
+                        cors_origin,
+                    ))
+                }
+            };
+            if auth::validate_jwt(token, &jwt_secret).is_err() {
+                return Err(json_error_cors(401, "Niepoprawny token", cors_origin));
+            }
+        }
     }
 
     let ws_key = match req.headers().get("sec-websocket-key") {

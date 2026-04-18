@@ -38,6 +38,8 @@ export class BinaryWsClient {
     this.reconnectAttempt = 0;
     this.closed = false;
     this.outbox = [];
+    // Sequence per connection — server odrzuca <= last_seen, wiec MUSI rosnac.
+    this.nextSequence = 1n;
 
     this.jwtToken = opts.jwtToken ?? null;
     this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 15_000;
@@ -136,14 +138,25 @@ export class BinaryWsClient {
   }
 
   /**
+   * Pobiera kolejny sequence number (BigInt). Server wymaga monotonicznie
+   * rosnacych sequences w obrebie connection.
+   */
+  takeSequence() {
+    const seq = this.nextSequence;
+    this.nextSequence = this.nextSequence + 1n;
+    return seq;
+  }
+
+  /**
    * Wysyla request i czeka na odpowiedz po correlation_id.
    * @param {string} kind — klucz z `encode` (np. `'nodeListRequest'`)
-   * @param {...any} args — argumenty przekazywane do `encode[kind]` (po correlation_id)
+   * @param {...any} args — argumenty przekazywane do `encode[kind]` (po correlation_id, sequence)
    * @returns {Promise<{envelope, body}>}
    */
   request(kind, ...args) {
     const correlationId = this.nextCorrelationId();
-    const frame = encode[kind](correlationId, ...args);
+    const sequence = this.takeSequence();
+    const frame = encode[kind](correlationId, ...args, sequence);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(correlationId.toString());
@@ -193,7 +206,8 @@ export class BinaryWsClient {
 
   async _handshake() {
     const correlationId = this.nextCorrelationId();
-    const frame = encode.metaSchemaVersionCheck(correlationId, schemaVersion());
+    const sequence = this.takeSequence();
+    const frame = encode.metaSchemaVersionCheck(correlationId, schemaVersion(), sequence);
     const resultPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(correlationId.toString());
@@ -274,7 +288,8 @@ export class BinaryWsClient {
     this.heartbeatTimer = setInterval(() => {
       if (!this.connected) return;
       const correlationId = this.nextCorrelationId();
-      const frame = encode.metaHeartbeat(correlationId, Math.floor(Date.now() / 1000));
+      const sequence = this.takeSequence();
+      const frame = encode.metaHeartbeat(correlationId, Math.floor(Date.now() / 1000), sequence);
       this.ws.send(frame);
     }, this.heartbeatIntervalMs);
   }
