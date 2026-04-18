@@ -15,6 +15,7 @@ use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionA
 pub mod handlers;
 pub mod metrics;
 pub mod recorder;
+pub mod stream_handlers;
 pub mod subscription;
 
 #[cfg(test)]
@@ -210,7 +211,8 @@ pub fn dispatch(
 
 /// Mapuje MessageBody enum discriminant na string nazwe wariantu. Musi byc
 /// zgodne z nazwami przekazywanymi do `#[handler(variant = "...")]`.
-fn variant_name_of(body: &MessageBody) -> &'static str {
+/// Pub(crate) zeby ws_binary mogl uzyc dla streaming dispatch.
+pub fn variant_name_of(body: &MessageBody) -> &'static str {
     match body {
         MessageBody::MetaSchemaVersionCheck { .. } => "MetaSchemaVersionCheck",
         MessageBody::MetaSchemaVersionAck { .. } => "MetaSchemaVersionAck",

@@ -194,6 +194,47 @@ pub fn push_end(sub: &Subscription, final_body: Option<MessageBody>) -> Result<(
 }
 
 // =============================================================================
+// Streaming handler registry (parallel do HandlerMeta dla sync handlerow)
+// =============================================================================
+
+/// Wskaznik do funkcji streaming handlera. Spawnowany jako task — handler
+/// pisze chunki przez `Subscription::tx` (mpsc), writer task drainuje rx i
+/// emituje IS_STREAM_CHUNK / IS_STREAM_END frames przez WSS.
+pub type StreamHandlerFn = fn(MessageBody, super::HandlerContext, Arc<Subscription>);
+
+/// Metadata streaming handlera. Rejestrowane oddzielnie od HandlerMeta zeby
+/// ws_binary mogl rozroznic sync (zwraca jedna odpowiedz) vs streaming
+/// (spawnuje writer task z mpsc).
+pub struct StreamHandlerMeta {
+    pub variant_name: &'static str,
+    pub required_auth: super::SessionAuthKind,
+    pub handler_fn: StreamHandlerFn,
+}
+
+inventory::collect!(StreamHandlerMeta);
+
+static STREAM_REGISTRY: OnceLock<HashMap<&'static str, &'static StreamHandlerMeta>> =
+    OnceLock::new();
+
+fn stream_registry() -> &'static HashMap<&'static str, &'static StreamHandlerMeta> {
+    STREAM_REGISTRY.get_or_init(|| {
+        inventory::iter::<StreamHandlerMeta>()
+            .map(|h| (h.variant_name, h))
+            .collect()
+    })
+}
+
+/// Wyszukuje streaming handler po nazwie wariantu.
+pub fn find_stream_handler(variant_name: &str) -> Option<&'static StreamHandlerMeta> {
+    stream_registry().get(variant_name).copied()
+}
+
+/// Liczba zarejestrowanych streaming handlerow (debug/observability).
+pub fn stream_handler_count() -> usize {
+    stream_registry().len()
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 
