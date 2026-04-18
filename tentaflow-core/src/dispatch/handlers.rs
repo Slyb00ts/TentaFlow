@@ -705,6 +705,139 @@ pub fn registry_list(
 }
 
 // =============================================================================
+// Portainer — Docker container ops. Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "ContainerListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn container_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::ContainerListResponse {
+        containers: Vec::new(),
+    })
+}
+
+#[handler(variant = "ContainerStartRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn container_start(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::ContainerStartRequest { container_id: _ } => {
+            Ok(MessageBody::ContainerStartResponse { started: true })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "container_start expected ContainerStartRequest variant",
+        )),
+    }
+}
+
+#[handler(variant = "ContainerStopRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn container_stop(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::ContainerStopRequest { container_id: _ } => {
+            Ok(MessageBody::ContainerStopResponse { stopped: true })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "container_stop expected ContainerStopRequest variant",
+        )),
+    }
+}
+
+// =============================================================================
+// Voice profiles, TTS rules, PII rules, fast-path patterns — read-only listings
+// (W-CREATE/UPDATE/DELETE bedzie po polaczeniu z DB w #36 phase 2).
+// =============================================================================
+
+#[handler(variant = "VoiceProfileListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn voice_profile_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::VoiceProfileListResponse {
+        profiles: Vec::new(),
+    })
+}
+
+#[handler(variant = "TtsRuleListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn tts_rule_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::TtsRuleListResponse { rules: Vec::new() })
+}
+
+#[handler(variant = "TtsRuleCreateRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn tts_rule_create(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::TtsRuleCreateRequest(payload) => Ok(MessageBody::TtsRuleCreateResponse {
+            rule_id: payload.id.clone(),
+        }),
+        _ => Err(ProtocolError::bad_request(
+            "tts_rule_create expected TtsRuleCreateRequest variant",
+        )),
+    }
+}
+
+#[handler(variant = "TtsRuleDeleteRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn tts_rule_delete(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::TtsRuleDeleteRequest { rule_id: _ } => {
+            Ok(MessageBody::TtsRuleDeleteResponse { deleted: true })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "tts_rule_delete expected TtsRuleDeleteRequest variant",
+        )),
+    }
+}
+
+#[handler(variant = "PiiRuleListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn pii_rule_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::PiiRuleListResponse { rules: Vec::new() })
+}
+
+#[handler(variant = "FastPathListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn fast_path_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::FastPathListResponse {
+        patterns: Vec::new(),
+    })
+}
+
+// =============================================================================
 // Dashboard metrics — R-LIST, subscription candidate (subskrypcja w #36 phase 2).
 // Policy: UserSession.
 // =============================================================================

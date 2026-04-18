@@ -395,6 +395,81 @@ pub struct AuditEvent {
 }
 
 // =============================================================================
+// Portainer — Docker container ops (migration-map #248-#259)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ContainerSummary {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    /// "running" | "stopped" | "paused" | "exited".
+    pub state: String,
+    pub created_at_epoch: u64,
+    pub ports: Vec<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLogChunk {
+    pub container_id: String,
+    pub stream: String, // "stdout" | "stderr"
+    pub line: String,
+    pub ts_epoch: u64,
+}
+
+// =============================================================================
+// Voice profiles — speaker enrollment (migration-map #325-#332)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VoiceProfileSummary {
+    pub id: String,
+    pub display_name: String,
+    pub embedding_count: u32,
+    pub created_at_epoch: u64,
+}
+
+// =============================================================================
+// TTS rules — text→speech routing rules (migration-map #316-#319)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct TtsRule {
+    pub id: String,
+    /// Regex pattern w treści wiadomości.
+    pub pattern: String,
+    /// Voice ID do uzycia gdy pattern matchuje.
+    pub voice_id: String,
+    pub priority: i32,
+}
+
+// =============================================================================
+// PII rules — personally-identifiable-info redaction (migration-map #239-#242)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PiiRule {
+    pub id: String,
+    /// "email" | "phone" | "ssn" | "credit-card" | "custom".
+    pub kind: String,
+    pub regex: String,
+    /// "redact" | "hash" | "tokenize".
+    pub action: String,
+}
+
+// =============================================================================
+// Fast-path patterns — bypass routing for known prompts (migration-map #61-#64)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FastPathPattern {
+    pub id: String,
+    pub pattern: String,
+    pub response: String,
+    pub priority: i32,
+}
+
+// =============================================================================
 // Mesh trust events (W-ACTION + Event-push archetypy, mesh discriminants 0x23/0x24)
 // =============================================================================
 
@@ -591,6 +666,36 @@ pub enum MessageBody {
 
     // ---- Audit (event push — server -> client) ----
     AuditEventBody(AuditEvent),
+
+    // ---- Portainer (R-LIST + R-STREAM dla logs) ----
+    ContainerListRequest,
+    ContainerListResponse { containers: Vec<ContainerSummary> },
+    ContainerStartRequest { container_id: String },
+    ContainerStartResponse { started: bool },
+    ContainerStopRequest { container_id: String },
+    ContainerStopResponse { stopped: bool },
+    ContainerLogStreamRequest { container_id: String, follow: bool },
+    ContainerLogChunkBody(ContainerLogChunk),
+
+    // ---- Voice profiles (R-LIST) ----
+    VoiceProfileListRequest,
+    VoiceProfileListResponse { profiles: Vec<VoiceProfileSummary> },
+
+    // ---- TTS rules (R-LIST + W-CREATE/UPDATE/DELETE) ----
+    TtsRuleListRequest,
+    TtsRuleListResponse { rules: Vec<TtsRule> },
+    TtsRuleCreateRequest(TtsRule),
+    TtsRuleCreateResponse { rule_id: String },
+    TtsRuleDeleteRequest { rule_id: String },
+    TtsRuleDeleteResponse { deleted: bool },
+
+    // ---- PII rules ----
+    PiiRuleListRequest,
+    PiiRuleListResponse { rules: Vec<PiiRule> },
+
+    // ---- Fast-path patterns ----
+    FastPathListRequest,
+    FastPathListResponse { patterns: Vec<FastPathPattern> },
 
     // ---- Models (R-ONE + W-ACTION) ----
     ModelDetailRequest { model_id: String },

@@ -859,6 +859,139 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "message", e.message.into());
         }
+        MessageBody::ContainerListRequest => {
+            set(&obj, "variant", "ContainerListRequest".into());
+        }
+        MessageBody::ContainerListResponse { containers } => {
+            set(&obj, "variant", "ContainerListResponse".into());
+            let arr = js_sys::Array::new();
+            for c in containers {
+                let item = js_sys::Object::new();
+                set(&item, "id", c.id.into());
+                set(&item, "name", c.name.into());
+                set(&item, "image", c.image.into());
+                set(&item, "state", c.state.into());
+                set(&item, "createdAtEpoch", c.created_at_epoch.into());
+                let ports = js_sys::Array::new();
+                for p in c.ports {
+                    ports.push(&JsValue::from_str(&p));
+                }
+                set(&item, "ports", ports.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "containers", arr.into());
+        }
+        MessageBody::ContainerStartRequest { container_id } => {
+            set(&obj, "variant", "ContainerStartRequest".into());
+            set(&obj, "containerId", container_id.into());
+        }
+        MessageBody::ContainerStartResponse { started } => {
+            set(&obj, "variant", "ContainerStartResponse".into());
+            set(&obj, "started", started.into());
+        }
+        MessageBody::ContainerStopRequest { container_id } => {
+            set(&obj, "variant", "ContainerStopRequest".into());
+            set(&obj, "containerId", container_id.into());
+        }
+        MessageBody::ContainerStopResponse { stopped } => {
+            set(&obj, "variant", "ContainerStopResponse".into());
+            set(&obj, "stopped", stopped.into());
+        }
+        MessageBody::ContainerLogStreamRequest { container_id, follow } => {
+            set(&obj, "variant", "ContainerLogStreamRequest".into());
+            set(&obj, "containerId", container_id.into());
+            set(&obj, "follow", follow.into());
+        }
+        MessageBody::ContainerLogChunkBody(c) => {
+            set(&obj, "variant", "ContainerLogChunk".into());
+            set(&obj, "containerId", c.container_id.into());
+            set(&obj, "stream", c.stream.into());
+            set(&obj, "line", c.line.into());
+            set(&obj, "tsEpoch", c.ts_epoch.into());
+        }
+        MessageBody::VoiceProfileListRequest => {
+            set(&obj, "variant", "VoiceProfileListRequest".into());
+        }
+        MessageBody::VoiceProfileListResponse { profiles } => {
+            set(&obj, "variant", "VoiceProfileListResponse".into());
+            let arr = js_sys::Array::new();
+            for p in profiles {
+                let item = js_sys::Object::new();
+                set(&item, "id", p.id.into());
+                set(&item, "displayName", p.display_name.into());
+                set(&item, "embeddingCount", (p.embedding_count as u32).into());
+                set(&item, "createdAtEpoch", p.created_at_epoch.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "profiles", arr.into());
+        }
+        MessageBody::TtsRuleListRequest => {
+            set(&obj, "variant", "TtsRuleListRequest".into());
+        }
+        MessageBody::TtsRuleListResponse { rules } => {
+            set(&obj, "variant", "TtsRuleListResponse".into());
+            let arr = js_sys::Array::new();
+            for r in rules {
+                let item = js_sys::Object::new();
+                set(&item, "id", r.id.into());
+                set(&item, "pattern", r.pattern.into());
+                set(&item, "voiceId", r.voice_id.into());
+                set(&item, "priority", r.priority.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "rules", arr.into());
+        }
+        MessageBody::TtsRuleCreateRequest(r) => {
+            set(&obj, "variant", "TtsRuleCreateRequest".into());
+            set(&obj, "id", r.id.into());
+            set(&obj, "pattern", r.pattern.into());
+            set(&obj, "voiceId", r.voice_id.into());
+            set(&obj, "priority", r.priority.into());
+        }
+        MessageBody::TtsRuleCreateResponse { rule_id } => {
+            set(&obj, "variant", "TtsRuleCreateResponse".into());
+            set(&obj, "ruleId", rule_id.into());
+        }
+        MessageBody::TtsRuleDeleteRequest { rule_id } => {
+            set(&obj, "variant", "TtsRuleDeleteRequest".into());
+            set(&obj, "ruleId", rule_id.into());
+        }
+        MessageBody::TtsRuleDeleteResponse { deleted } => {
+            set(&obj, "variant", "TtsRuleDeleteResponse".into());
+            set(&obj, "deleted", deleted.into());
+        }
+        MessageBody::PiiRuleListRequest => {
+            set(&obj, "variant", "PiiRuleListRequest".into());
+        }
+        MessageBody::PiiRuleListResponse { rules } => {
+            set(&obj, "variant", "PiiRuleListResponse".into());
+            let arr = js_sys::Array::new();
+            for r in rules {
+                let item = js_sys::Object::new();
+                set(&item, "id", r.id.into());
+                set(&item, "kind", r.kind.into());
+                set(&item, "regex", r.regex.into());
+                set(&item, "action", r.action.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "rules", arr.into());
+        }
+        MessageBody::FastPathListRequest => {
+            set(&obj, "variant", "FastPathListRequest".into());
+        }
+        MessageBody::FastPathListResponse { patterns } => {
+            set(&obj, "variant", "FastPathListResponse".into());
+            let arr = js_sys::Array::new();
+            for p in patterns {
+                let item = js_sys::Object::new();
+                set(&item, "id", p.id.into());
+                set(&item, "pattern", p.pattern.into());
+                set(&item, "response", p.response.into());
+                set(&item, "priority", p.priority.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "patterns", arr.into());
+        }
         MessageBody::MeshPeersListRequest => {
             set(&obj, "variant", "MeshPeersListRequest".into());
         }
