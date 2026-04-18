@@ -97,6 +97,19 @@ impl EnvelopeFlags {
     }
 }
 
+impl std::ops::BitOr for EnvelopeFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for EnvelopeFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 // =============================================================================
 // SessionAuth (reference do typu autoryzacji sesji)
 // =============================================================================

@@ -17,7 +17,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 
-use crate::dispatch::{self, HandlerContext};
+use crate::dispatch::{
+    self,
+    subscription::{self, SubscriptionEvent},
+    HandlerContext,
+};
 
 /// Limit rozmiaru pojedynczego binary frame (bajty). Wiecej = close 1009 (message too big).
 /// Konserwatywnie 1 MiB — typowe requesty sa <1 KiB, deploy manifests mieszcza sie w 64 KiB.
@@ -198,12 +202,82 @@ where
                     }
                 }
 
-                // Dispatch przez registry (handlerzy rejestrowani przez `#[handler]`).
-                // Session ustanowiona raz przy WSS upgrade z JWT claims.
                 let ctx = HandlerContext {
                     session: session.clone(),
                     correlation_id: envelope.correlation_id,
                 };
+
+                // Sprawdz czy to streaming variant — jesli tak, spawnuj stream
+                // handler z subscription, drain mpsc, emituj IS_STREAM_CHUNK
+                // / IS_STREAM_END frames. Bootstrap: blokuje main read loop dla
+                // tej subscription (1 aktywny stream per connection).
+                let variant_name = dispatch::variant_name_of(&body);
+                if let Some(stream_meta) = subscription::find_stream_handler(variant_name) {
+                    if !stream_meta.required_auth.session_satisfies(&session) {
+                        let _ = send_protocol_error(
+                            &mut sink,
+                            envelope.correlation_id,
+                            next_server_sequence,
+                            ProtocolErrorCode::PolicyDenied,
+                            "stream handler requires elevated session",
+                        )
+                        .await;
+                        next_server_sequence += 1;
+                        continue;
+                    }
+                    let registry = subscription::global();
+                    let (sub, mut rx) = registry.create(envelope.correlation_id, None);
+                    (stream_meta.handler_fn)(body.clone(), ctx.clone(), sub);
+
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            SubscriptionEvent::Chunk(chunk_body) => {
+                                let _ = send_body(
+                                    &mut sink,
+                                    envelope.correlation_id,
+                                    next_server_sequence,
+                                    envelope.message_kind,
+                                    &chunk_body,
+                                    EnvelopeFlags::IS_STREAM_CHUNK,
+                                )
+                                .await;
+                                next_server_sequence += 1;
+                            }
+                            SubscriptionEvent::End(final_body) => {
+                                let body = final_body
+                                    .unwrap_or_else(|| MessageBody::MetaCancelStream);
+                                let _ = send_body(
+                                    &mut sink,
+                                    envelope.correlation_id,
+                                    next_server_sequence,
+                                    envelope.message_kind,
+                                    &body,
+                                    EnvelopeFlags::IS_STREAM_END,
+                                )
+                                .await;
+                                next_server_sequence += 1;
+                                break;
+                            }
+                            SubscriptionEvent::Error(err) => {
+                                let _ = send_body(
+                                    &mut sink,
+                                    envelope.correlation_id,
+                                    next_server_sequence,
+                                    envelope.message_kind,
+                                    &MessageBody::Error(err),
+                                    EnvelopeFlags::IS_ERROR | EnvelopeFlags::IS_STREAM_END,
+                                )
+                                .await;
+                                next_server_sequence += 1;
+                                break;
+                            }
+                        }
+                    }
+                    registry.cancel(envelope.correlation_id);
+                    continue;
+                }
+
+                // Sync handler — pojedyncza odpowiedz.
                 let (resp_body, is_error) = dispatch::dispatch(&body, &ctx);
                 let flags = if is_error {
                     EnvelopeFlags::IS_ERROR
