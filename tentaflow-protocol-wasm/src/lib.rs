@@ -546,6 +546,25 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "clusterId", resp.cluster_id.into());
             set(&obj, "updatedAtEpoch", resp.updated_at_epoch.into());
         }
+        MessageBody::MeshTrustRevoked(evt) => {
+            set(&obj, "variant", "MeshTrustRevoked".into());
+            set(
+                &obj,
+                "revokedNodeId",
+                js_sys::Uint8Array::from(&evt.revoked_node_id[..]).into(),
+            );
+            set(&obj, "reason", evt.reason.into());
+            set(&obj, "revokedAtEpoch", evt.revoked_at_epoch.into());
+        }
+        MessageBody::MeshTrustedKeysSync(evt) => {
+            set(&obj, "variant", "MeshTrustedKeysSync".into());
+            let arr = js_sys::Array::new();
+            for k in evt.trusted_keys {
+                arr.push(&js_sys::Uint8Array::from(&k[..]).into());
+            }
+            set(&obj, "trustedKeys", arr.into());
+            set(&obj, "epoch", (evt.epoch as u32).into());
+        }
         MessageBody::MeshPeersListRequest => {
             set(&obj, "variant", "MeshPeersListRequest".into());
         }

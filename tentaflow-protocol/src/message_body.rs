@@ -207,6 +207,32 @@ pub struct ChatStreamEnd {
 }
 
 // =============================================================================
+// Mesh trust events (W-ACTION + Event-push archetypy, mesh discriminants 0x23/0x24)
+// =============================================================================
+
+/// Broadcast: trust dla noda zostal cofniety (TrustRevoked, mesh discriminant 0x23).
+/// Rozsylany do wszystkich peerow zeby usunac compromised key z trusted_keys.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustRevokedEvent {
+    /// Node ktorego trust cofniety (Ed25519 public key, 32 bajty).
+    pub revoked_node_id: [u8; 32],
+    /// Powod cofniecia (audit trail).
+    pub reason: String,
+    /// Unix epoch — kiedy nastapilo cofniecie.
+    pub revoked_at_epoch: u64,
+}
+
+/// Sync trusted_keys po pairing — node A wysyla swoja liste do noda B
+/// zeby B widzial peerow A's mesh (mesh discriminant 0x24).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustedKeysSyncEvent {
+    /// Lista trusted Ed25519 public keys (kazdy 32 bajty).
+    pub trusted_keys: Vec<[u8; 32]>,
+    /// Aktualny epoch sender'a (do replay protection).
+    pub epoch: u32,
+}
+
+// =============================================================================
 // Mesh peers (R-LIST + W-ACTION archetypy, migration-map #87-#92)
 // =============================================================================
 
@@ -351,6 +377,10 @@ pub enum MessageBody {
     MeshPeersListResponse { peers: Vec<MeshPeerSummary> },
     MeshPairInitRequestBody(MeshPairInitRequest),
     MeshPairInitResponseBody(MeshPairInitResponse),
+
+    // ---- Mesh trust events (broadcast / sync) ----
+    MeshTrustRevoked(MeshTrustRevokedEvent),
+    MeshTrustedKeysSync(MeshTrustedKeysSyncEvent),
 
     // ---- Settings (R-LIST + W-UPDATE) ----
     SettingsListRequest,
@@ -700,6 +730,25 @@ mod tests {
             }],
         });
         assert_eq!(round_trip(update.clone()), update);
+    }
+
+    #[test]
+    fn mesh_trust_revoked_round_trip() {
+        let evt = MessageBody::MeshTrustRevoked(MeshTrustRevokedEvent {
+            revoked_node_id: [0xAAu8; 32],
+            reason: "key compromise detected".to_string(),
+            revoked_at_epoch: 1_700_500_000,
+        });
+        assert_eq!(round_trip(evt.clone()), evt);
+    }
+
+    #[test]
+    fn mesh_trusted_keys_sync_round_trip() {
+        let evt = MessageBody::MeshTrustedKeysSync(MeshTrustedKeysSyncEvent {
+            trusted_keys: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+            epoch: 42,
+        });
+        assert_eq!(round_trip(evt.clone()), evt);
     }
 
     #[test]
