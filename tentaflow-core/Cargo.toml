@@ -60,6 +60,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Crypto
 argon2 = "0.5"
 sha2 = "0.10"
+hmac = "0.12"
 aes-gcm = "0.10"
 hkdf = "0.12"
 zeroize = "1.7"
