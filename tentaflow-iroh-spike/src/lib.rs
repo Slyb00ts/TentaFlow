@@ -12,6 +12,7 @@
 // =============================================================================
 
 pub mod accept_connect;
+pub mod epoch_rotation;
 pub mod pairing;
 pub mod replay;
 
