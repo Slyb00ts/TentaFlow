@@ -12,6 +12,7 @@ description = "Throwaway evaluation crate dla iroh jako alternatywy dla quinn (T
 [dependencies]
 # Iroh QUIC + node-id (pre-1.0, oceniamy stability)
 iroh = "0.28"
+iroh-net = "0.28"
 
 tokio = { version = "1.35", features = ["full"] }
 anyhow = "1"
