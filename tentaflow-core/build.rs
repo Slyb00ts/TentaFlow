@@ -415,11 +415,14 @@ fn escape_path(path: &Path) -> String {
 // Generowanie wwwroot_embed.rs — pliki statyczne dashboardu
 // =============================================================================
 
-/// Skanuje wwwroot/ rekurencyjnie i generuje wwwroot_embed.rs z include_bytes!
+/// Skanuje www/ rekurencyjnie i generuje wwwroot_embed.rs z include_bytes!
 /// dla kazdego pliku. Rejestruje rerun-if-changed na kazdym pliku zeby cargo
 /// automatycznie rekompilowalo po zmianie jakiegokolwiek zasobu www.
+///
+/// UWAGA: zmieniono z wwwroot/ na www/ (2026-04-18) — wwwroot/ zostawiony
+/// na dysku jako referencja starego GUI ale NIE jest embedowany w binarce.
 fn generate_wwwroot_embed(out_dir: &Path) {
-    let wwwroot = Path::new("wwwroot");
+    let wwwroot = Path::new("www");
     if !wwwroot.exists() {
         // Brak wwwroot — generuj pusta funkcje lookup
         let code = "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8])> { None }\n";
@@ -432,7 +435,7 @@ fn generate_wwwroot_embed(out_dir: &Path) {
 
     // Rejestruj rerun-if-changed na kazdym pliku — cargo ZAWSZE rekompiluje
     // gdy jakikolwiek plik www sie zmieni
-    println!("cargo:rerun-if-changed=wwwroot");
+    println!("cargo:rerun-if-changed=www");
     for (_, abs_path) in &files {
         println!("cargo:rerun-if-changed={}", abs_path.display());
     }
@@ -571,7 +574,7 @@ fn pack_container_contexts(out_dir: &Path) {
 // Generator manifestu serwisow — skanuje tentaflow-containers/*/_services/*.toml,
 // waliduje semantycznie 4 reguly ze SCHEMA.md i emituje:
 //   - $OUT_DIR/services_generated.rs       (Rust const z embedded JSON)
-//   - wwwroot/js/generated/services-manifest.js  (ESM module dla GUI)
+//   - www/js/generated/services-manifest.js  (ESM module dla GUI)
 //
 // UWAGA: typy serde sa duplikatem z src/services/manifest/types.rs.
 // To wymuszone — build.rs i lib to osobne crates i nie moga dzielic kodu
@@ -852,7 +855,7 @@ fn generate_services_manifest(out_dir: &Path) {
             containers_dir.display()
         );
         write_generated(out_dir, "[]");
-        write_js_module(Path::new("wwwroot/js/generated/services-manifest.js"), "[]");
+        write_js_module(Path::new("www/js/generated/services-manifest.js"), "[]");
         return;
     }
 
@@ -958,7 +961,7 @@ fn generate_services_manifest(out_dir: &Path) {
     write_generated(out_dir, &json_compact);
 
     // GUI module — zapisujemy do wwwroot, ale podajemy sciezke wzgledem build.rs CWD.
-    let js_path = Path::new("wwwroot/js/generated/services-manifest.js");
+    let js_path = Path::new("www/js/generated/services-manifest.js");
     if let Some(parent) = js_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -1058,7 +1061,7 @@ fn build_protocol_wasm_bindings() {
     // Sciezki wejsciowe/wyjsciowe
     let crate_dir = Path::new("../tentaflow-protocol-wasm");
     let protocol_dir = Path::new("../tentaflow-protocol");
-    let out_js_dir = Path::new("wwwroot/js/protocol");
+    let out_js_dir = Path::new("www/js/protocol");
 
     if !crate_dir.exists() {
         println!(
