@@ -387,13 +387,16 @@ pub async fn handle_request(
             Err(resp) => return Ok(resp),
         };
 
+        // Extract user_id z JWT claims zeby propagowac do dispatch ctx.
+        let user_id = extract_ws_user_id(&req, &db, &settings_cipher);
+
         let upgrade = hyper::upgrade::on(&mut req);
 
         tokio::spawn(async move {
             match upgrade.await {
                 Ok(upgraded) => {
                     let io = TokioIo::new(upgraded);
-                    super::ws_binary::handle_ws_connection(io).await;
+                    super::ws_binary::handle_ws_connection(io, user_id).await;
                 }
                 Err(e) => {
                     error!("Blad WebSocket upgrade (binary): {}", e);
@@ -1770,6 +1773,32 @@ fn validate_ws_upgrade(
 
     let accept = compute_ws_accept(&ws_key);
     Ok((ws_key, accept, subprotocol))
+}
+
+/// Wyciaga user_id z JWT subprotokolu Sec-WebSocket-Protocol: bearer.<token>.
+/// Wolane PO `validate_ws_upgrade` (ktore juz zweryfikowalo token) — tu tylko
+/// reparsujemy claims zeby propagowac user_id do binary dispatcher (ws_binary.rs).
+/// Zwraca None gdy nie udalo sie extract (degraduje do anonymous session).
+fn extract_ws_user_id(
+    req: &Request<Incoming>,
+    db: &DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
+) -> Option<i64> {
+    let jwt_secret = db::repository::get_setting_secure(db, "jwt_secret", settings_cipher)
+        .ok()
+        .flatten()?;
+
+    let proto_header = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())?;
+
+    let token = proto_header
+        .split(',')
+        .find(|s| s.trim().starts_with("bearer."))
+        .and_then(|s| s.trim().strip_prefix("bearer."))?;
+
+    auth::validate_jwt(token, &jwt_secret).ok().map(|c| c.user_id)
 }
 
 /// Routing endpointow mesh — peers, parowanie, zaufanie, nody, serwisy, komendy
