@@ -62,6 +62,9 @@ where
     let mut next_server_sequence: u32 = 1;
     let mut last_client_sequence: u32 = 0;
     let mut handshake_done = false;
+    // Tracking subskrypcji utworzonych przez to polaczenie — sprzatamy je przy
+    // disconnect zeby uniknac memory leak w global SubscriptionRegistry.
+    let mut owned_subscription_ids: Vec<u64> = Vec::new();
 
     debug!("binary-WS: nowe polaczenie");
 
@@ -227,6 +230,7 @@ where
                     }
                     let registry = subscription::global();
                     let (sub, mut rx) = registry.create(envelope.correlation_id, None);
+                    owned_subscription_ids.push(envelope.correlation_id);
                     (stream_meta.handler_fn)(body.clone(), ctx.clone(), sub);
 
                     while let Some(event) = rx.recv().await {
@@ -274,6 +278,7 @@ where
                         }
                     }
                     registry.cancel(envelope.correlation_id);
+                    owned_subscription_ids.retain(|&id| id != envelope.correlation_id);
                     continue;
                 }
 
@@ -312,6 +317,21 @@ where
             Message::Close(_) => break,
             Message::Frame(_) => {}
         }
+    }
+
+    // Cleanup wszystkich subskrypcji utworzonych przez to polaczenie zeby
+    // unikngac memory leak w global SubscriptionRegistry.
+    if !owned_subscription_ids.is_empty() {
+        let registry = subscription::global();
+        let cleanup_count = owned_subscription_ids
+            .iter()
+            .filter(|&&id| registry.cancel(id))
+            .count();
+        debug!(
+            cleanup_count,
+            owned = owned_subscription_ids.len(),
+            "binary-WS: cleanup subskrypcji przy disconnect"
+        );
     }
 
     debug!("binary-WS: polaczenie zamkniete");
