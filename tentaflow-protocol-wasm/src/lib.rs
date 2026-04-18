@@ -85,7 +85,7 @@ pub fn message_kind_map() -> JsValue {
 /// Pure-Rust implementacja (testowalna bez wasm-bindgen shima).
 fn encode_envelope_direct_inner(
     correlation_id: u64,
-    sequence: u32,
+    sequence: u64,
     message_kind: u16,
     body: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
@@ -102,7 +102,7 @@ fn encode_envelope_direct_inner(
 #[wasm_bindgen(js_name = encodeEnvelopeDirect)]
 pub fn encode_envelope_direct(
     correlation_id: u64,
-    sequence: u32,
+    sequence: u64,
     message_kind: u16,
     body: Vec<u8>,
 ) -> Result<Vec<u8>, JsError> {
@@ -119,7 +119,7 @@ pub struct EnvelopeView {
     #[wasm_bindgen(readonly)]
     pub correlation_id: u64,
     #[wasm_bindgen(readonly)]
-    pub sequence: u32,
+    pub sequence: u64,
     #[wasm_bindgen(readonly)]
     pub message_kind: u16,
     #[wasm_bindgen(readonly)]
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn protocol_schema_version_matches() {
-        assert_eq!(PROTOCOL_SCHEMA_VERSION, 2);
+        assert_eq!(PROTOCOL_SCHEMA_VERSION, 3);
     }
 
     #[test]
