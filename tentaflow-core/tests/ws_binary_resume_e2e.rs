@@ -37,7 +37,7 @@ async fn streaming_handler_emits_chunks_and_end() {
         max_tokens: None,
     });
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id: [0u8; 16] },
+        session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
         correlation_id: 100,
         resume_secret: Some(Arc::new(b"e2e-secret".to_vec())),
     };
@@ -65,7 +65,8 @@ async fn resume_token_round_trip_through_subscribe_resume_handler() {
     let secret = Arc::new(b"e2e-resume-secret".to_vec());
 
     // Krok 1: serwer wystawia token (symulujac zakonczenie streama).
-    let token_bytes = resume_token::issue(42u128, 7u64, &secret);
+    let user_id = [0u8; 16];
+    let token_bytes = resume_token::issue(42u128, 7u64, user_id, &secret);
     assert!(!token_bytes.is_empty());
 
     // Krok 2: klient ze swojej strony wysyla SubscribeResumeRequest z tokenem.
@@ -76,7 +77,7 @@ async fn resume_token_round_trip_through_subscribe_resume_handler() {
         resume_token: token_bytes,
     };
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id: [0u8; 16] },
+        session: SessionAuth::UserSession { user_id, role: None },
         correlation_id: 200,
         resume_secret: Some(secret.clone()),
     };
@@ -107,12 +108,12 @@ async fn invalid_resume_token_results_in_negative_ack() {
     let h = find_stream_handler("SubscribeResumeRequest").expect("registered");
 
     // Wystawiamy token z innym sekretem — verify powinno failowac.
-    let bad_token = resume_token::issue(42u128, 7u64, b"different-secret");
+    let bad_token = resume_token::issue(42u128, 7u64, [0u8; 16], b"different-secret");
     let req = MessageBody::SubscribeResumeRequest {
         resume_token: bad_token,
     };
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id: [0u8; 16] },
+        session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
         correlation_id: 300,
         resume_secret: Some(secret),
     };
@@ -163,7 +164,7 @@ async fn recorder_round_trip_with_dispatch() {
     let _ = recorder::init(&path);
 
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id: [0u8; 16] },
+        session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
         correlation_id: 999,
         resume_secret: None,
     };

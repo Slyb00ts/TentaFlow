@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use tentaflow_protocol::{ChatStreamChunk, ChatStreamEnd, MessageBody};
+use tentaflow_protocol::{ChatStreamChunk, ChatStreamEnd, MessageBody, SessionAuth};
 
 use super::recorder;
 use super::resume_token::{self, ResumeError};
@@ -92,7 +92,24 @@ fn subscribe_resume_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
             }
         };
 
-        let token = match resume_token::verify(&resume_token_bytes, &secret) {
+        // P0 FIX: token musi byc zwiazany z user_id caller'a. Anonymous nie ma
+        // resume capability w ogole — Anonymous nie moze otrzymac tokenu od
+        // wystawiciela (nie ma user_id), wiec verify zawsze padnie.
+        let caller_user_id = match &ctx.session {
+            SessionAuth::UserSession { user_id, .. } => *user_id,
+            _ => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::SubscribeResumeAck {
+                        accepted: false,
+                        error: Some("resume requires UserSession".to_string()),
+                    }),
+                );
+                return;
+            }
+        };
+
+        let token = match resume_token::verify(&resume_token_bytes, &caller_user_id, &secret) {
             Ok(t) => t,
             Err(ResumeError::Expired) => {
                 let _ = push_end(
@@ -120,6 +137,17 @@ fn subscribe_resume_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
                     Some(MessageBody::SubscribeResumeAck {
                         accepted: false,
                         error: Some("resume token malformed".to_string()),
+                    }),
+                );
+                return;
+            }
+            Err(ResumeError::UserMismatch) => {
+                // P0 FIX: kluczowy check — token nalezy do innego usera, replay attack.
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::SubscribeResumeAck {
+                        accepted: false,
+                        error: Some("resume token belongs to different user".to_string()),
                     }),
                 );
                 return;
@@ -206,6 +234,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p0_cross_user_resume_attack_rejected() {
+        use super::super::resume_token;
+        use super::super::subscription::{SubscriptionEvent, SubscriptionRegistry};
+        use super::super::HandlerContext;
+        use std::sync::Arc;
+        use tentaflow_protocol::{MessageBody, SessionAuth};
+
+        let secret = Arc::new(b"test-secret".to_vec());
+        let alice = [0xAAu8; 16];
+        let bob = [0xBBu8; 16];
+
+        // Alice's token (server wystawil dla niej).
+        let alice_token = resume_token::issue(42, 5, alice, &secret);
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(99, None);
+        let h = find_stream_handler("SubscribeResumeRequest").unwrap();
+
+        // Bob proboje uzyc tokenu Alice.
+        let req = MessageBody::SubscribeResumeRequest {
+            resume_token: alice_token,
+        };
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession { user_id: bob, role: None },
+            correlation_id: 99,
+            resume_secret: Some(secret),
+        };
+        (h.handler_fn)(req, ctx, sub);
+
+        let event = rx.recv().await.expect("end with error ack");
+        match event {
+            SubscriptionEvent::End(Some(MessageBody::SubscribeResumeAck { accepted, error })) => {
+                assert!(!accepted, "P0 fix: cross-user token must be rejected");
+                let msg = error.unwrap();
+                assert!(
+                    msg.contains("different user"),
+                    "expected user-mismatch error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected End(SubscribeResumeAck rejected), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn subscribe_resume_handler_rejects_invalid_token() {
         use super::super::subscription::SubscriptionRegistry;
         use super::super::HandlerContext;
@@ -215,11 +288,12 @@ mod tests {
         let reg = SubscriptionRegistry::new();
         let (sub, mut rx) = reg.create(1, None);
         let h = find_stream_handler("SubscribeResumeRequest").unwrap();
+        // 80-byte token (current TOKEN_LEN) of garbage — will fail signature verify.
         let req = MessageBody::SubscribeResumeRequest {
-            resume_token: vec![0u8; 64], // garbage bytes
+            resume_token: vec![0u8; 80],
         };
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 1,
             resume_secret: Some(Arc::new(b"test-secret".to_vec())),
         };
@@ -229,7 +303,12 @@ mod tests {
         match event {
             SubscriptionEvent::End(Some(MessageBody::SubscribeResumeAck { accepted, error })) => {
                 assert!(!accepted);
-                assert!(error.unwrap().contains("signature invalid"));
+                let msg = error.unwrap();
+                assert!(
+                    msg.contains("signature invalid") || msg.contains("different user"),
+                    "expected signature/user error, got: {}",
+                    msg
+                );
             }
             other => panic!("expected End(SubscribeResumeAck), got {:?}", other),
         }
@@ -244,7 +323,8 @@ mod tests {
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
         let secret = Arc::new(b"test-secret".to_vec());
-        let token = resume_token::issue(42, 5, &secret);
+        let user_id = [0u8; 16];
+        let token = resume_token::issue(42, 5, user_id, &secret);
 
         let reg = SubscriptionRegistry::new();
         let (sub, mut rx) = reg.create(2, None);
@@ -253,7 +333,7 @@ mod tests {
             resume_token: token,
         };
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            session: SessionAuth::UserSession { user_id, role: None },
             correlation_id: 2,
             resume_secret: Some(secret),
         };
@@ -292,7 +372,7 @@ mod tests {
             max_tokens: None,
         });
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 1,
             resume_secret: None,
         };
