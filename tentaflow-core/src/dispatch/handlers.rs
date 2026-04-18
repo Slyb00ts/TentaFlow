@@ -595,6 +595,116 @@ pub fn flow_executions_list(
 }
 
 // =============================================================================
+// Services — runtime engine management. Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "ServiceListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn service_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::ServiceListResponse {
+        services: Vec::new(),
+    })
+}
+
+#[handler(variant = "ServiceDeployRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn service_deploy(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::ServiceDeployRequestBody(_payload) => Ok(MessageBody::ServiceDeployAccepted {
+            deploy_id: format!("deploy-{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)),
+        }),
+        _ => Err(ProtocolError::bad_request(
+            "service_deploy expected ServiceDeployRequestBody variant",
+        )),
+    }
+}
+
+#[handler(variant = "ServiceStopRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn service_stop(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::ServiceStopRequest { service_id: _ } => {
+            Ok(MessageBody::ServiceStopResponse { stopped: true })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "service_stop expected ServiceStopRequest variant",
+        )),
+    }
+}
+
+// =============================================================================
+// Prompts — prompt template CRUD (R-LIST + R-ONE). Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "PromptListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn prompt_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::PromptListResponse {
+        prompts: Vec::new(),
+    })
+}
+
+#[handler(variant = "PromptDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn prompt_detail(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::PromptDetail;
+    match req {
+        MessageBody::PromptDetailRequest { prompt_id } => {
+            Ok(MessageBody::PromptDetailResponse(PromptDetail {
+                id: prompt_id.clone(),
+                name: "stub".to_string(),
+                category: "general".to_string(),
+                template: "".to_string(),
+                variables: Vec::new(),
+                updated_at_epoch: 0,
+            }))
+        }
+        _ => Err(ProtocolError::bad_request(
+            "prompt_detail expected PromptDetailRequest variant",
+        )),
+    }
+}
+
+// =============================================================================
+// Registries — Docker/Conda registries listing. Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "RegistryListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn registry_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::RegistryListResponse {
+        registries: Vec::new(),
+    })
+}
+
+// =============================================================================
 // Dashboard metrics — R-LIST, subscription candidate (subskrypcja w #36 phase 2).
 // Policy: UserSession.
 // =============================================================================

@@ -749,6 +749,116 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "executions", arr.into());
         }
+        MessageBody::ServiceListRequest => {
+            set(&obj, "variant", "ServiceListRequest".into());
+        }
+        MessageBody::ServiceListResponse { services } => {
+            set(&obj, "variant", "ServiceListResponse".into());
+            let arr = js_sys::Array::new();
+            for s in services {
+                let item = js_sys::Object::new();
+                set(&item, "id", s.id.into());
+                set(&item, "engineId", s.engine_id.into());
+                set(&item, "modelId", s.model_id.into());
+                set(&item, "status", s.status.into());
+                set(&item, "deployMethod", s.deploy_method.into());
+                if let Some(url) = s.endpoint_url {
+                    set(&item, "endpointUrl", url.into());
+                }
+                if let Some(t) = s.started_at_epoch {
+                    set(&item, "startedAtEpoch", t.into());
+                }
+                arr.push(&item.into());
+            }
+            set(&obj, "services", arr.into());
+        }
+        MessageBody::ServiceDeployRequestBody(req) => {
+            set(&obj, "variant", "ServiceDeployRequest".into());
+            set(&obj, "engineId", req.engine_id.into());
+            set(&obj, "modelId", req.model_id.into());
+            set(&obj, "deployMethod", req.deploy_method.into());
+            set(&obj, "nodeId", js_sys::Uint8Array::from(&req.node_id[..]).into());
+        }
+        MessageBody::ServiceDeployAccepted { deploy_id } => {
+            set(&obj, "variant", "ServiceDeployAccepted".into());
+            set(&obj, "deployId", deploy_id.into());
+        }
+        MessageBody::ServiceDeployProgressBody(p) => {
+            set(&obj, "variant", "ServiceDeployProgress".into());
+            set(&obj, "deployId", p.deploy_id.into());
+            set(&obj, "stage", p.stage.into());
+            set(&obj, "progressPercent", (p.progress_percent as u32).into());
+            set(&obj, "message", p.message.into());
+        }
+        MessageBody::ServiceStopRequest { service_id } => {
+            set(&obj, "variant", "ServiceStopRequest".into());
+            set(&obj, "serviceId", service_id.into());
+        }
+        MessageBody::ServiceStopResponse { stopped } => {
+            set(&obj, "variant", "ServiceStopResponse".into());
+            set(&obj, "stopped", stopped.into());
+        }
+        MessageBody::PromptListRequest => {
+            set(&obj, "variant", "PromptListRequest".into());
+        }
+        MessageBody::PromptListResponse { prompts } => {
+            set(&obj, "variant", "PromptListResponse".into());
+            let arr = js_sys::Array::new();
+            for p in prompts {
+                let item = js_sys::Object::new();
+                set(&item, "id", p.id.into());
+                set(&item, "name", p.name.into());
+                set(&item, "category", p.category.into());
+                set(&item, "updatedAtEpoch", p.updated_at_epoch.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "prompts", arr.into());
+        }
+        MessageBody::PromptDetailRequest { prompt_id } => {
+            set(&obj, "variant", "PromptDetailRequest".into());
+            set(&obj, "promptId", prompt_id.into());
+        }
+        MessageBody::PromptDetailResponse(d) => {
+            set(&obj, "variant", "PromptDetailResponse".into());
+            set(&obj, "id", d.id.into());
+            set(&obj, "name", d.name.into());
+            set(&obj, "category", d.category.into());
+            set(&obj, "template", d.template.into());
+            let vars = js_sys::Array::new();
+            for v in d.variables {
+                vars.push(&JsValue::from_str(&v));
+            }
+            set(&obj, "variables", vars.into());
+            set(&obj, "updatedAtEpoch", d.updated_at_epoch.into());
+        }
+        MessageBody::RegistryListRequest => {
+            set(&obj, "variant", "RegistryListRequest".into());
+        }
+        MessageBody::RegistryListResponse { registries } => {
+            set(&obj, "variant", "RegistryListResponse".into());
+            let arr = js_sys::Array::new();
+            for r in registries {
+                let item = js_sys::Object::new();
+                set(&item, "id", r.id.into());
+                set(&item, "url", r.url.into());
+                set(&item, "kind", r.kind.into());
+                set(&item, "authRequired", r.auth_required.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "registries", arr.into());
+        }
+        MessageBody::AuditEventBody(e) => {
+            set(&obj, "variant", "AuditEvent".into());
+            set(&obj, "tsEpoch", e.ts_epoch.into());
+            if let Some(u) = e.user_id {
+                set(&obj, "userId", js_sys::Uint8Array::from(&u[..]).into());
+            }
+            set(&obj, "eventKind", e.event_kind.into());
+            if let Some(r) = e.resource_id {
+                set(&obj, "resourceId", r.into());
+            }
+            set(&obj, "message", e.message.into());
+        }
         MessageBody::MeshPeersListRequest => {
             set(&obj, "variant", "MeshPeersListRequest".into());
         }
