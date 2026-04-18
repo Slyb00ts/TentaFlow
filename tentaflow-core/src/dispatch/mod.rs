@@ -242,6 +242,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::MeshPeersListResponse { .. } => "MeshPeersListResponse",
         MessageBody::MeshPairInitRequestBody(_) => "MeshPairInitRequest",
         MessageBody::MeshPairInitResponseBody(_) => "MeshPairInitResponse",
+        MessageBody::MeshTrustRevoked(_) => "MeshTrustRevoked",
+        MessageBody::MeshTrustedKeysSync(_) => "MeshTrustedKeysSync",
         MessageBody::SettingsListRequest => "SettingsListRequest",
         MessageBody::SettingsListResponse { .. } => "SettingsListResponse",
         MessageBody::SettingsUpdateRequestBody(_) => "SettingsUpdateRequest",
