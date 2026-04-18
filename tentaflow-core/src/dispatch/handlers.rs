@@ -80,11 +80,9 @@ pub fn meta_heartbeat(
         MessageBody::MetaHeartbeat { sent_at_epoch } => Ok(MessageBody::MetaHeartbeat {
             sent_at_epoch: *sent_at_epoch,
         }),
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "meta_heartbeat expected MetaHeartbeat variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "meta_heartbeat expected MetaHeartbeat variant",
+        )),
     }
 }
 
@@ -100,11 +98,10 @@ pub fn meta_cancel_stream(
     _req: &MessageBody,
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    Err(ProtocolError {
-        code: ProtocolErrorCode::StreamCancelled,
-        message: "no active stream for this correlation_id".to_string(),
-        trace_id: None,
-    })
+    Err(ProtocolError::new(
+        ProtocolErrorCode::StreamCancelled,
+        "no active stream for this correlation_id",
+    ))
 }
 
 // =============================================================================
@@ -120,16 +117,12 @@ pub fn node_info_request(
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     match req {
-        MessageBody::NodeInfoRequest { node_id: _ } => Err(ProtocolError {
-            code: ProtocolErrorCode::NotFound,
-            message: "node info not implemented yet (bootstrap stub)".to_string(),
-            trace_id: None,
-        }),
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "node_info_request expected NodeInfoRequest variant".to_string(),
-            trace_id: None,
-        }),
+        MessageBody::NodeInfoRequest { node_id: _ } => Err(ProtocolError::not_found(
+            "node info not implemented yet (bootstrap stub)",
+        )),
+        _ => Err(ProtocolError::bad_request(
+            "node_info_request expected NodeInfoRequest variant",
+        )),
     }
 }
 
@@ -169,11 +162,9 @@ pub fn api_key_create(
                 token: "bootstrap-stub-token".to_string(),
             }))
         }
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "api_key_create expected ApiKeyCreateRequestBody variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "api_key_create expected ApiKeyCreateRequestBody variant",
+        )),
     }
 }
 
@@ -188,11 +179,9 @@ pub fn api_key_revoke(
         MessageBody::ApiKeyRevokeRequest { key_id: _ } => {
             Ok(MessageBody::ApiKeyRevokeResponse { deleted: true })
         }
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "api_key_revoke expected ApiKeyRevokeRequest variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "api_key_revoke expected ApiKeyRevokeRequest variant",
+        )),
     }
 }
 
@@ -217,11 +206,9 @@ pub fn auth_login(
                 role: "user".to_string(),
             }))
         }
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "auth_login expected AuthLoginRequestBody variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "auth_login expected AuthLoginRequestBody variant",
+        )),
     }
 }
 
@@ -261,11 +248,9 @@ pub fn chat_stream_request(
                 completion_tokens: 0,
             }))
         }
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "chat_stream_request expected ChatStreamRequestBody variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "chat_stream_request expected ChatStreamRequestBody variant",
+        )),
     }
 }
 
@@ -285,11 +270,9 @@ pub fn chat_stream_chunk(
                 delta: chunk.delta.clone(),
             }))
         }
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "chat_stream_chunk expected ChatStreamChunkBody variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "chat_stream_chunk expected ChatStreamChunkBody variant",
+        )),
     }
 }
 
@@ -313,11 +296,9 @@ pub fn cluster_update(
                 updated_at_epoch: 0,
             }))
         }
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "cluster_update expected ClusterUpdateRequestBody variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "cluster_update expected ClusterUpdateRequestBody variant",
+        )),
     }
 }
 
@@ -359,11 +340,9 @@ pub fn mesh_pair_init(
                 expires_at_epoch: 0,
             }))
         }
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "mesh_pair_init expected MeshPairInitRequestBody variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "mesh_pair_init expected MeshPairInitRequestBody variant",
+        )),
     }
 }
 
@@ -399,11 +378,9 @@ pub fn settings_update(
         MessageBody::SettingsUpdateRequestBody(payload) => Ok(MessageBody::SettingsUpdateResponse {
             applied: payload.entries.len() as u32,
         }),
-        _ => Err(ProtocolError {
-            code: ProtocolErrorCode::BadRequest,
-            message: "settings_update expected SettingsUpdateRequestBody variant".to_string(),
-            trace_id: None,
-        }),
+        _ => Err(ProtocolError::bad_request(
+            "settings_update expected SettingsUpdateRequestBody variant",
+        )),
     }
 }
 
