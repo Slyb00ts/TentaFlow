@@ -7,12 +7,15 @@
 //       Pelny dispatch tablicy variantow dokonczy sie po #27 (proc-macro + inventory).
 // =============================================================================
 
-use futures::{SinkExt, StreamExt};
+use futures::{stream::SplitSink, SinkExt, StreamExt};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tentaflow_protocol::{
     envelope::{Envelope, EnvelopeFlags, Routing},
     message_body::{MessageBody, ProtocolError, ProtocolErrorCode},
     SCHEMA_VERSION, SessionAuth,
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
@@ -23,28 +26,52 @@ use crate::dispatch::{
     HandlerContext,
 };
 
+/// Sink wrapped in async mutex zeby main read loop + streaming tasks moga
+/// dzielic write side WS bez wzajemnego blokowania read side.
+type SharedSink<S> = Arc<AsyncMutex<SplitSink<WebSocketStream<S>, Message>>>;
+
 /// Limit rozmiaru pojedynczego binary frame (bajty). Wiecej = close 1009 (message too big).
 /// Konserwatywnie 1 MiB — typowe requesty sa <1 KiB, deploy manifests mieszcza sie w 64 KiB.
 const MAX_FRAME_SIZE: usize = 1_048_576;
 
 /// Mapuje SQLite i64 user_id do 16-bajtowego SessionAuth user_id.
-/// Padding: 8 zero bytes + 8 bytes LE u64 reprezentacja i64.
+/// Format zeby odroznic od stub `[0u8; 16]` (system user / nieuwierzytelniony):
+///   bajt 0    = 0xFF (marker "i64-derived")
+///   bajt 1-7  = 0x00 (reserved)
+///   bajt 8-15 = LE u64 reprezentacja i64 (sign-extended)
+/// Real UUIDv4 nigdy nie ma 0xFF na pozycji 0 (variant=10xx, version=4xxx),
+/// wiec konflikt z UUID space wykluczony.
 fn user_id_to_bytes(user_id: i64) -> [u8; 16] {
     let mut buf = [0u8; 16];
+    buf[0] = 0xFF;
     buf[8..].copy_from_slice(&(user_id as u64).to_le_bytes());
     buf
+}
+
+/// Odwrotnosc `user_id_to_bytes` — przy walidacji ze user_id ma marker 0xFF.
+/// Zwraca None gdy bajty nie sa formatu i64-derived (system stub lub real UUID).
+#[allow(dead_code)]
+pub fn bytes_to_user_id(bytes: &[u8; 16]) -> Option<i64> {
+    if bytes[0] != 0xFF || bytes[1..8].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut le = [0u8; 8];
+    le.copy_from_slice(&bytes[8..]);
+    Some(i64::from_le_bytes(le))
 }
 
 /// Obsluguje pojedyncze polaczenie binary-WS. Single-threaded loop read/write,
 /// kazdy frame dispatch synchroniczny (dla streamingu bedzie osobny task per stream).
 ///
-/// `user_id` z JWT claims (extract_ws_user_id w server.rs). None = degraduje do
-/// Anonymous session — handler dispatch sprawdzi czy wariant na to pozwala.
+/// `user_id` + `role` z JWT claims (extract_ws_user_session w server.rs).
+/// None = degraduje do Anonymous session — handler dispatch sprawdzi czy wariant
+/// na to pozwala.
 /// `resume_secret` = HMAC key dla SubscribeResumeOffer tokens emitowanych przy
 /// IS_STREAM_END (zwykle reuse jwt_secret).
 pub async fn handle_ws_connection<S>(
     stream: S,
     user_id: Option<i64>,
+    role: Option<String>,
     resume_secret: std::sync::Arc<Vec<u8>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -52,6 +79,7 @@ pub async fn handle_ws_connection<S>(
     let session = match user_id {
         Some(id) => SessionAuth::UserSession {
             user_id: user_id_to_bytes(id),
+            role: role.clone(),
         },
         None => SessionAuth::Anonymous,
     };
@@ -62,10 +90,13 @@ pub async fn handle_ws_connection<S>(
         None,
     )
     .await;
-    let (mut sink, mut source) = ws.split();
+    let (sink, mut source) = ws.split();
+    let sink: SharedSink<S> = Arc::new(AsyncMutex::new(sink));
 
-    let mut next_server_sequence: u32 = 1;
-    let mut last_client_sequence: u32 = 0;
+    // Atomic sequence shared miedzy main loop a streaming tasks.
+    // P1 FIX: u64 zeby uniknac overflow na long-lived connections.
+    let next_server_sequence = Arc::new(AtomicU64::new(1));
+    let mut last_client_sequence: u64 = 0;
     let mut handshake_done = false;
     // Tracking subskrypcji utworzonych przez to polaczenie — sprzatamy je przy
     // disconnect zeby uniknac memory leak w global SubscriptionRegistry.
@@ -90,11 +121,9 @@ pub async fn handle_ws_connection<S>(
                         bytes.len(),
                         MAX_FRAME_SIZE
                     );
-                    let _ = sink
-                        .send(Message::Close(Some(close_frame(
-                            1009,
-                            "message too big",
-                        ))))
+                    let mut guard = sink.lock().await;
+                    let _ = guard
+                        .send(Message::Close(Some(close_frame(1009, "message too big"))))
                         .await;
                     break;
                 }
@@ -104,14 +133,13 @@ pub async fn handle_ws_connection<S>(
                     Err(e) => {
                         warn!("binary-WS: malformed envelope: {}", e);
                         let _ = send_protocol_error(
-                            &mut sink,
+                            &sink,
                             0,
-                            next_server_sequence,
+                            next_seq(&next_server_sequence),
                             ProtocolErrorCode::InvalidFrame,
                             "malformed envelope",
                         )
                         .await;
-                        next_server_sequence += 1;
                         continue;
                     }
                 };
@@ -119,14 +147,13 @@ pub async fn handle_ws_connection<S>(
                 if !matches!(envelope.routing, Routing::Direct) {
                     warn!("binary-WS: forward routing nie wspierany (jeszcze) w GUI WS");
                     let _ = send_protocol_error(
-                        &mut sink,
+                        &sink,
                         envelope.correlation_id,
-                        next_server_sequence,
+                        next_seq(&next_server_sequence),
                         ProtocolErrorCode::NotImplemented,
                         "forward routing not supported on this endpoint",
                     )
                     .await;
-                    next_server_sequence += 1;
                     continue;
                 }
 
@@ -136,14 +163,13 @@ pub async fn handle_ws_connection<S>(
                         envelope.sequence, last_client_sequence
                     );
                     let _ = send_protocol_error(
-                        &mut sink,
+                        &sink,
                         envelope.correlation_id,
-                        next_server_sequence,
+                        next_seq(&next_server_sequence),
                         ProtocolErrorCode::InvalidFrame,
                         "sequence not monotonically increasing",
                     )
                     .await;
-                    next_server_sequence += 1;
                     continue;
                 }
                 last_client_sequence = envelope.sequence;
@@ -155,14 +181,13 @@ pub async fn handle_ws_connection<S>(
                     Err(e) => {
                         warn!("binary-WS: malformed body: {}", e);
                         let _ = send_protocol_error(
-                            &mut sink,
+                            &sink,
                             envelope.correlation_id,
-                            next_server_sequence,
+                            next_seq(&next_server_sequence),
                             ProtocolErrorCode::InvalidFrame,
                             "malformed body",
                         )
                         .await;
-                        next_server_sequence += 1;
                         continue;
                     }
                 };
@@ -176,15 +201,14 @@ pub async fn handle_ws_connection<S>(
                                 accepted,
                             };
                             let _ = send_body(
-                                &mut sink,
+                                &sink,
                                 envelope.correlation_id,
-                                next_server_sequence,
+                                next_seq(&next_server_sequence),
                                 envelope.message_kind,
                                 &response,
                                 EnvelopeFlags::empty(),
                             )
                             .await;
-                            next_server_sequence += 1;
                             if !accepted {
                                 warn!(
                                     "binary-WS: schema mismatch client={} server={}",
@@ -197,14 +221,13 @@ pub async fn handle_ws_connection<S>(
                         }
                         _ => {
                             let _ = send_protocol_error(
-                                &mut sink,
+                                &sink,
                                 envelope.correlation_id,
-                                next_server_sequence,
+                                next_seq(&next_server_sequence),
                                 ProtocolErrorCode::AuthRequired,
                                 "handshake required (MetaSchemaVersionCheck)",
                             )
                             .await;
-                            next_server_sequence += 1;
                             break;
                         }
                     }
@@ -216,93 +239,103 @@ pub async fn handle_ws_connection<S>(
                     resume_secret: Some(resume_secret.clone()),
                 };
 
-                // Sprawdz czy to streaming variant — jesli tak, spawnuj stream
-                // handler z subscription, drain mpsc, emituj IS_STREAM_CHUNK
-                // / IS_STREAM_END frames. Bootstrap: blokuje main read loop dla
-                // tej subscription (1 aktywny stream per connection).
                 let variant_name = dispatch::variant_name_of(&body);
+
+                // P1 FIX: streaming = osobny tokio task, NIE blokuje main read loop.
+                // Wiele streamow moze biec rownolegle; klient moze cancel/heartbeat
+                // miedzy chunkami (sink jest w Mutex — write contention znikoma vs
+                // korzysci concurrency).
                 if let Some(stream_meta) = subscription::find_stream_handler(variant_name) {
                     if !stream_meta.required_auth.session_satisfies(&session) {
                         let _ = send_protocol_error(
-                            &mut sink,
+                            &sink,
                             envelope.correlation_id,
-                            next_server_sequence,
+                            next_seq(&next_server_sequence),
                             ProtocolErrorCode::PolicyDenied,
                             "stream handler requires elevated session",
                         )
                         .await;
-                        next_server_sequence += 1;
                         continue;
                     }
                     let registry = subscription::global();
-                    let (sub, mut rx) = registry.create(envelope.correlation_id, None);
+                    let (sub, rx) = registry.create(envelope.correlation_id, None);
                     owned_subscription_ids.push(envelope.correlation_id);
                     (stream_meta.handler_fn)(body.clone(), ctx.clone(), sub);
 
-                    while let Some(event) = rx.recv().await {
-                        match event {
-                            SubscriptionEvent::Chunk(chunk_body) => {
-                                let _ = send_body(
-                                    &mut sink,
-                                    envelope.correlation_id,
-                                    next_server_sequence,
-                                    envelope.message_kind,
-                                    &chunk_body,
-                                    EnvelopeFlags::IS_STREAM_CHUNK,
-                                )
-                                .await;
-                                next_server_sequence += 1;
-                            }
-                            SubscriptionEvent::End(final_body) => {
-                                // Emit SubscribeResumeOffer NAJPIERW (przed final body).
-                                // Klient po reconnect uzyje tokenu w SubscribeResumeRequest.
-                                let token = resume_token::issue(
-                                    envelope.correlation_id as u128,
-                                    next_server_sequence as u64,
-                                    &resume_secret,
-                                );
-                                let _ = send_body(
-                                    &mut sink,
-                                    envelope.correlation_id,
-                                    next_server_sequence,
-                                    envelope.message_kind,
-                                    &MessageBody::SubscribeResumeOffer { resume_token: token },
-                                    EnvelopeFlags::empty(),
-                                )
-                                .await;
-                                next_server_sequence += 1;
+                    // Spawn writer task — drain rx, push frames przez sink (Mutex'd).
+                    let sink_clone = Arc::clone(&sink);
+                    let seq_clone = Arc::clone(&next_server_sequence);
+                    let resume_secret_clone = Arc::clone(&resume_secret);
+                    let originating_user_id = match &session {
+                        SessionAuth::UserSession { user_id, .. } => *user_id,
+                        _ => [0u8; 16],
+                    };
+                    let correlation_id = envelope.correlation_id;
+                    let message_kind = envelope.message_kind;
 
-                                let body = final_body
-                                    .unwrap_or_else(|| MessageBody::MetaCancelStream);
-                                let _ = send_body(
-                                    &mut sink,
-                                    envelope.correlation_id,
-                                    next_server_sequence,
-                                    envelope.message_kind,
-                                    &body,
-                                    EnvelopeFlags::IS_STREAM_END,
-                                )
-                                .await;
-                                next_server_sequence += 1;
-                                break;
-                            }
-                            SubscriptionEvent::Error(err) => {
-                                let _ = send_body(
-                                    &mut sink,
-                                    envelope.correlation_id,
-                                    next_server_sequence,
-                                    envelope.message_kind,
-                                    &MessageBody::Error(err),
-                                    EnvelopeFlags::IS_ERROR | EnvelopeFlags::IS_STREAM_END,
-                                )
-                                .await;
-                                next_server_sequence += 1;
-                                break;
+                    tokio::spawn(async move {
+                        let mut rx = rx;
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                SubscriptionEvent::Chunk(chunk_body) => {
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &chunk_body,
+                                        EnvelopeFlags::IS_STREAM_CHUNK,
+                                    )
+                                    .await;
+                                }
+                                SubscriptionEvent::End(final_body) => {
+                                    let token = resume_token::issue(
+                                        correlation_id as u128,
+                                        seq_clone.load(Ordering::SeqCst),
+                                        originating_user_id,
+                                        &resume_secret_clone,
+                                    );
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &MessageBody::SubscribeResumeOffer {
+                                            resume_token: token,
+                                        },
+                                        EnvelopeFlags::empty(),
+                                    )
+                                    .await;
+                                    let body = final_body
+                                        .unwrap_or_else(|| MessageBody::MetaCancelStream);
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &body,
+                                        EnvelopeFlags::IS_STREAM_END,
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                SubscriptionEvent::Error(err) => {
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &MessageBody::Error(err),
+                                        EnvelopeFlags::IS_ERROR | EnvelopeFlags::IS_STREAM_END,
+                                    )
+                                    .await;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    registry.cancel(envelope.correlation_id);
-                    owned_subscription_ids.retain(|&id| id != envelope.correlation_id);
+                        // Cleanup po naturalnym koncu (writer task wie kiedy stream sie konczy).
+                        subscription::global().cancel(correlation_id);
+                    });
                     continue;
                 }
 
@@ -314,19 +347,19 @@ pub async fn handle_ws_connection<S>(
                     EnvelopeFlags::empty()
                 };
                 let _ = send_body(
-                    &mut sink,
+                    &sink,
                     envelope.correlation_id,
-                    next_server_sequence,
+                    next_seq(&next_server_sequence),
                     envelope.message_kind,
                     &resp_body,
                     flags,
                 )
                 .await;
-                next_server_sequence += 1;
             }
             Message::Text(t) => {
                 warn!("binary-WS: otrzymano text frame ({} bajtow) — zamykam", t.len());
-                let _ = sink
+                let mut guard = sink.lock().await;
+                let _ = guard
                     .send(Message::Close(Some(close_frame(
                         1003,
                         "text frames not supported",
@@ -335,7 +368,8 @@ pub async fn handle_ws_connection<S>(
                 break;
             }
             Message::Ping(data) => {
-                let _ = sink.send(Message::Pong(data)).await;
+                let mut guard = sink.lock().await;
+                let _ = guard.send(Message::Pong(data)).await;
             }
             Message::Pong(_) => {}
             Message::Close(_) => break,
@@ -362,9 +396,9 @@ pub async fn handle_ws_connection<S>(
 }
 
 async fn send_body<S>(
-    sink: &mut futures::stream::SplitSink<WebSocketStream<S>, Message>,
+    sink: &SharedSink<S>,
     correlation_id: u64,
-    sequence: u32,
+    sequence: u64,
     message_kind: u16,
     body: &MessageBody,
     flags: EnvelopeFlags,
@@ -388,13 +422,14 @@ where
             return Ok(());
         }
     };
-    sink.send(Message::Binary(env_bytes)).await
+    let mut guard = sink.lock().await;
+    guard.send(Message::Binary(env_bytes)).await
 }
 
 async fn send_protocol_error<S>(
-    sink: &mut futures::stream::SplitSink<WebSocketStream<S>, Message>,
+    sink: &SharedSink<S>,
     correlation_id: u64,
-    sequence: u32,
+    sequence: u64,
     code: ProtocolErrorCode,
     message: &str,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error>
@@ -415,6 +450,11 @@ where
         EnvelopeFlags::IS_ERROR,
     )
     .await
+}
+
+/// Helper: pobierz nastepny server sequence (atomic).
+fn next_seq(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::SeqCst)
 }
 
 fn close_frame(

@@ -387,8 +387,12 @@ pub async fn handle_request(
             Err(resp) => return Ok(resp),
         };
 
-        // Extract user_id z JWT claims zeby propagowac do dispatch ctx.
-        let user_id = extract_ws_user_id(&req, &db, &settings_cipher);
+        // Extract (user_id, role) z JWT claims + DB lookup zeby propagowac
+        // do dispatch ctx. Role z DB jest Zero Trust (nie z JWT).
+        let (user_id, role) = match extract_ws_user_session(&req, &db, &settings_cipher) {
+            Some((id, r)) => (Some(id), r),
+            None => (None, None),
+        };
 
         // Reuse jwt_secret jako HMAC key dla resume tokens (rotacja sekretu
         // automatycznie unieważnia wszystkie outstanding tokens — pozadane).
@@ -406,7 +410,7 @@ pub async fn handle_request(
             match upgrade.await {
                 Ok(upgraded) => {
                     let io = TokioIo::new(upgraded);
-                    super::ws_binary::handle_ws_connection(io, user_id, resume_secret).await;
+                    super::ws_binary::handle_ws_connection(io, user_id, role, resume_secret).await;
                 }
                 Err(e) => {
                     error!("Blad WebSocket upgrade (binary): {}", e);
@@ -1785,15 +1789,16 @@ fn validate_ws_upgrade(
     Ok((ws_key, accept, subprotocol))
 }
 
-/// Wyciaga user_id z JWT subprotokolu Sec-WebSocket-Protocol: bearer.<token>.
+/// Wyciaga (user_id, role) z JWT subprotokolu Sec-WebSocket-Protocol: bearer.<token>
+/// + DB lookup dla role (Zero Trust — JWT nie nosi role per VULN-004).
 /// Wolane PO `validate_ws_upgrade` (ktore juz zweryfikowalo token) — tu tylko
-/// reparsujemy claims zeby propagowac user_id do binary dispatcher (ws_binary.rs).
+/// reparsujemy claims i wzbogacamy o role z DB.
 /// Zwraca None gdy nie udalo sie extract (degraduje do anonymous session).
-fn extract_ws_user_id(
+fn extract_ws_user_session(
     req: &Request<Incoming>,
     db: &DbPool,
     settings_cipher: &crate::crypto::SettingsCipher,
-) -> Option<i64> {
+) -> Option<(i64, Option<String>)> {
     let jwt_secret = db::repository::get_setting_secure(db, "jwt_secret", settings_cipher)
         .ok()
         .flatten()?;
@@ -1808,7 +1813,16 @@ fn extract_ws_user_id(
         .find(|s| s.trim().starts_with("bearer."))
         .and_then(|s| s.trim().strip_prefix("bearer."))?;
 
-    auth::validate_jwt(token, &jwt_secret).ok().map(|c| c.user_id)
+    let claims = auth::validate_jwt(token, &jwt_secret).ok()?;
+
+    // Zero Trust: role z DB lookup, nie z JWT (chroni przed token-replay z
+    // odebranymi uprawnieniami).
+    let role = db::repository::get_user_account_by_id(db, claims.user_id)
+        .ok()
+        .flatten()
+        .map(|acc| if acc.is_admin { "admin".to_string() } else { "user".to_string() });
+
+    Some((claims.user_id, role))
 }
 
 /// Routing endpointow mesh — peers, parowanie, zaufanie, nody, serwisy, komendy
