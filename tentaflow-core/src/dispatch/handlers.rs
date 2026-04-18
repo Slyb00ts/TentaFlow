@@ -392,59 +392,9 @@ pub fn settings_update(
 // Policy: UserSession (tej samej tier co oryginalny stream).
 // =============================================================================
 
-#[handler(variant = "SubscribeResumeRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub fn subscribe_resume_request(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    use super::resume_token::{self, ResumeError};
-    match req {
-        MessageBody::SubscribeResumeRequest { resume_token } => {
-            // Token verify wymaga sekretu (HMAC key). Brak sekretu w ctx =
-            // connection nie zostal skonfigurowany dla resume — odrzucamy.
-            let secret = match &ctx.resume_secret {
-                Some(s) => s,
-                None => {
-                    return Ok(MessageBody::SubscribeResumeAck {
-                        accepted: false,
-                        error: Some("server not configured for resume".to_string()),
-                    });
-                }
-            };
-
-            match resume_token::verify(resume_token, secret) {
-                Ok(_token) => {
-                    // Token ok. Replay z recorder buffer to phase 2 — na razie
-                    // sygnalujemy ze token byl wazny, ale klient musi
-                    // re-subscribe (brak buffer drainage).
-                    Ok(MessageBody::SubscribeResumeAck {
-                        accepted: false,
-                        error: Some(
-                            "token valid; replay from buffer not implemented yet".to_string(),
-                        ),
-                    })
-                }
-                Err(ResumeError::Expired) => Ok(MessageBody::SubscribeResumeAck {
-                    accepted: false,
-                    error: Some("resume token expired".to_string()),
-                }),
-                Err(ResumeError::SignatureMismatch) => Ok(MessageBody::SubscribeResumeAck {
-                    accepted: false,
-                    error: Some("resume token signature invalid".to_string()),
-                }),
-                Err(ResumeError::InvalidLength) => Ok(MessageBody::SubscribeResumeAck {
-                    accepted: false,
-                    error: Some("resume token malformed".to_string()),
-                }),
-            }
-        }
-        _ => Err(ProtocolError::bad_request(
-            "subscribe_resume_request expected SubscribeResumeRequest variant",
-        )),
-    }
-}
+// SubscribeResumeRequest jest streaming handlerem (patrz stream_handlers.rs) —
+// emituje SubscribeResumeAck jako pierwszy chunk, potem replay z recorder
+// buffer, na koncu IS_STREAM_END. Sync handlera tu juz nie ma.
 
 // =============================================================================
 // Dashboard metrics — R-LIST, subscription candidate (subskrypcja w #36 phase 2).

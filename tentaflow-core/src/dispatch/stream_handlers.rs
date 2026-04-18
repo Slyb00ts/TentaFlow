@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use tentaflow_protocol::{ChatStreamChunk, ChatStreamEnd, MessageBody};
 
+use super::recorder;
+use super::resume_token::{self, ResumeError};
 use super::subscription::{push_chunk, push_end, Subscription, StreamHandlerMeta};
 use super::{HandlerContext, SessionAuthKind};
 
@@ -57,6 +59,131 @@ inventory::submit! {
 }
 
 // =============================================================================
+// SubscribeResumeRequest — verify token, replay z recorder buffer, end.
+// =============================================================================
+
+fn subscribe_resume_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    tokio::spawn(async move {
+        let resume_token_bytes = match &req {
+            MessageBody::SubscribeResumeRequest { resume_token } => resume_token.clone(),
+            _ => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::SubscribeResumeAck {
+                        accepted: false,
+                        error: Some("expected SubscribeResumeRequest variant".to_string()),
+                    }),
+                );
+                return;
+            }
+        };
+
+        let secret = match &ctx.resume_secret {
+            Some(s) => s.clone(),
+            None => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::SubscribeResumeAck {
+                        accepted: false,
+                        error: Some("server not configured for resume".to_string()),
+                    }),
+                );
+                return;
+            }
+        };
+
+        let token = match resume_token::verify(&resume_token_bytes, &secret) {
+            Ok(t) => t,
+            Err(ResumeError::Expired) => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::SubscribeResumeAck {
+                        accepted: false,
+                        error: Some("resume token expired".to_string()),
+                    }),
+                );
+                return;
+            }
+            Err(ResumeError::SignatureMismatch) => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::SubscribeResumeAck {
+                        accepted: false,
+                        error: Some("resume token signature invalid".to_string()),
+                    }),
+                );
+                return;
+            }
+            Err(ResumeError::InvalidLength) => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::SubscribeResumeAck {
+                        accepted: false,
+                        error: Some("resume token malformed".to_string()),
+                    }),
+                );
+                return;
+            }
+        };
+
+        // Token ok — emit ack jako pierwszy chunk, potem replay.
+        if push_chunk(
+            &sub,
+            MessageBody::SubscribeResumeAck {
+                accepted: true,
+                error: None,
+            },
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        // Pobierz frame'y z recorder buffer (tylko jesli recorder zainicjalizowany).
+        if let Some(rec) = recorder::global() {
+            // Token zawiera last_sequence ktore klient widzial — replay zaczyna sie
+            // od first frame z id > last_sequence (uproszczenie: traktujemy
+            // sequence == row id, ostateczna mapa po dopiacych test e2e).
+            let target_correlation = token.subscription_id as u64;
+            match rec.outgoing_after(target_correlation, token.last_sequence as i64) {
+                Ok(frames) => {
+                    for frame in frames {
+                        if let Ok(body) = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(
+                            &frame.body_bytes,
+                        ) {
+                            if push_chunk(&sub, body).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = push_end(
+                        &sub,
+                        Some(MessageBody::SubscribeResumeAck {
+                            accepted: false,
+                            error: Some(format!("recorder query failed: {}", e)),
+                        }),
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Koniec replay — klient teraz live.
+        let _ = push_end(&sub, None);
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "SubscribeResumeRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: subscribe_resume_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 
@@ -67,9 +194,82 @@ mod tests {
 
     #[test]
     fn chat_stream_handler_registered() {
-        assert!(stream_handler_count() >= 1);
+        assert!(stream_handler_count() >= 2);
         let h = find_stream_handler("ChatStreamRequest").unwrap();
         assert_eq!(h.required_auth, SessionAuthKind::UserSession);
+    }
+
+    #[test]
+    fn subscribe_resume_handler_registered() {
+        let h = find_stream_handler("SubscribeResumeRequest").unwrap();
+        assert_eq!(h.required_auth, SessionAuthKind::UserSession);
+    }
+
+    #[tokio::test]
+    async fn subscribe_resume_handler_rejects_invalid_token() {
+        use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
+        use std::sync::Arc;
+        use tentaflow_protocol::{MessageBody, SessionAuth};
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(1, None);
+        let h = find_stream_handler("SubscribeResumeRequest").unwrap();
+        let req = MessageBody::SubscribeResumeRequest {
+            resume_token: vec![0u8; 64], // garbage bytes
+        };
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            correlation_id: 1,
+            resume_secret: Some(Arc::new(b"test-secret".to_vec())),
+        };
+        (h.handler_fn)(req, ctx, sub);
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            SubscriptionEvent::End(Some(MessageBody::SubscribeResumeAck { accepted, error })) => {
+                assert!(!accepted);
+                assert!(error.unwrap().contains("signature invalid"));
+            }
+            other => panic!("expected End(SubscribeResumeAck), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_resume_handler_accepts_valid_token() {
+        use super::super::resume_token;
+        use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
+        use std::sync::Arc;
+        use tentaflow_protocol::{MessageBody, SessionAuth};
+
+        let secret = Arc::new(b"test-secret".to_vec());
+        let token = resume_token::issue(42, 5, &secret);
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(2, None);
+        let h = find_stream_handler("SubscribeResumeRequest").unwrap();
+        let req = MessageBody::SubscribeResumeRequest {
+            resume_token: token,
+        };
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            correlation_id: 2,
+            resume_secret: Some(secret),
+        };
+        (h.handler_fn)(req, ctx, sub);
+
+        // Pierwszy event: Ack accepted=true.
+        let event1 = rx.recv().await.unwrap();
+        match event1 {
+            SubscriptionEvent::Chunk(MessageBody::SubscribeResumeAck { accepted, error: _ }) => {
+                assert!(accepted);
+            }
+            other => panic!("expected Chunk(SubscribeResumeAck accepted), got {:?}", other),
+        }
+        // Drugi event: End (brak recorder = brak replay frames).
+        let event2 = rx.recv().await.unwrap();
+        assert!(matches!(event2, SubscriptionEvent::End(None)));
     }
 
     #[tokio::test]
