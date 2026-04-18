@@ -72,11 +72,11 @@ pub enum SessionAuthKind {
 
 impl SessionAuthKind {
     /// Czy sesja spelnia minimalny tier wymagany przez handler.
-    /// Polityka (bootstrap):
+    /// Polityka:
     /// - Anonymous: KAZDA sesja OK (publiczne endpointy, np. ModelList).
-    /// - ApiKey: wymaga ApiKey LUB UserSession/Admin LUB MeshTrust.
-    /// - UserSession: wymaga UserSession lub Admin.
-    /// - Admin: wymaga UserSession (bootstrap) — docelowo z role=admin claim.
+    /// - ApiKey: wymaga ApiKey LUB UserSession LUB MeshTrust.
+    /// - UserSession: wymaga UserSession (dowolny role).
+    /// - Admin: wymaga UserSession z role="admin" (Zero Trust, role z DB).
     /// - MeshTrust: wymaga MeshTrust (mesh peer-only).
     pub fn session_satisfies(&self, session: &SessionAuth) -> bool {
         match self {
@@ -85,9 +85,11 @@ impl SessionAuthKind {
                 session,
                 SessionAuth::ApiKey { .. } | SessionAuth::UserSession { .. } | SessionAuth::MeshTrust { .. }
             ),
-            SessionAuthKind::UserSession | SessionAuthKind::Admin => {
-                matches!(session, SessionAuth::UserSession { .. })
-            }
+            SessionAuthKind::UserSession => matches!(session, SessionAuth::UserSession { .. }),
+            SessionAuthKind::Admin => matches!(
+                session,
+                SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+            ),
             SessionAuthKind::MeshTrust => matches!(session, SessionAuth::MeshTrust { .. }),
         }
     }
@@ -182,16 +184,24 @@ pub fn dispatch(
     }
 
     // Opt-in recording: jesli recorder zainicjalizowany (TENTAFLOW_TRACE_WSS=1),
-    // zapisuje incoming frame. Wynik trafi na osobny record po dispatchu.
+    // zapisuje incoming frame. P1 FIX: dla sensitive variantow body jest empty
+    // (variant name + correlation_id wystarczaja do audit, tresc by exposowala
+    // hasla/tokeny do SQLite recordera).
     if let Some(rec) = recorder::global() {
-        let body_bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(body).map(|b| b.to_vec()).unwrap_or_default();
+        let body_bytes = if is_sensitive_variant(body) {
+            Vec::new()
+        } else {
+            rkyv::to_bytes::<rkyv::rancor::Error>(body)
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
+        };
+        let flags: u8 = if is_sensitive_variant(body) { 0b1000_0000 } else { 0 };
         rec.record(
             recorder::Direction::Incoming,
             ctx.correlation_id,
             0,
             variant_name,
-            0,
+            flags,
             &body_bytes,
         );
     }
@@ -207,11 +217,19 @@ pub fn dispatch(
     timer.finish(result.1);
 
     if let Some(rec) = recorder::global() {
-        let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&result.0)
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
+        let body_bytes = if is_sensitive_variant(&result.0) {
+            Vec::new()
+        } else {
+            rkyv::to_bytes::<rkyv::rancor::Error>(&result.0)
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
+        };
         let resp_variant_name = variant_name_of(&result.0);
-        let flags: u8 = if result.1 { 0b0000_0001 } else { 0 };
+        // Bit 0 = is_error, bit 7 = body_redacted (sensitive variant)
+        let mut flags: u8 = if result.1 { 0b0000_0001 } else { 0 };
+        if is_sensitive_variant(&result.0) {
+            flags |= 0b1000_0000;
+        }
         rec.record(
             recorder::Direction::Outgoing,
             ctx.correlation_id,
@@ -223,6 +241,25 @@ pub fn dispatch(
     }
 
     result
+}
+
+/// Czy body tego variantu zawiera sekrety ktorych NIE wolno logowac do recordera.
+/// Recorder w dispatch::dispatch() sprawdza te funkcje; gdy true, zapisuje pusty
+/// body + flag marker zeby audit wiedzial ze byl frame, ale tresci nie ma.
+///
+/// Secrets list (P1 fix):
+///   - AuthLoginRequest: plaintext password
+///   - AuthLoginResponse: JWT token (short-lived, ale still bearer)
+///   - ApiKeyCreateResponse: plaintext "shown only once" token
+///   - SettingsUpdateRequest: potencjalnie is_secret=true entries
+fn is_sensitive_variant(body: &MessageBody) -> bool {
+    matches!(
+        body,
+        MessageBody::AuthLoginRequestBody(_)
+            | MessageBody::AuthLoginResponseBody(_)
+            | MessageBody::ApiKeyCreateResponseBody(_)
+            | MessageBody::SettingsUpdateRequestBody(_)
+    )
 }
 
 /// Mapuje MessageBody enum discriminant na string nazwe wariantu. Musi byc
@@ -340,14 +377,40 @@ mod tests {
     fn session_auth_kind_anonymous_accepts_all() {
         assert!(SessionAuthKind::Anonymous.session_satisfies(&SessionAuth::Anonymous));
         assert!(SessionAuthKind::Anonymous.session_satisfies(&SessionAuth::UserSession {
-            user_id: [0u8; 16]
+            user_id: [0u8; 16],
+            role: None,
+        }));
+    }
+
+    #[test]
+    fn session_auth_kind_admin_requires_role_admin() {
+        let kind = SessionAuthKind::Admin;
+        // UserSession z role=admin → OK
+        assert!(kind.session_satisfies(&SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: Some("admin".to_string()),
+        }));
+        // UserSession z innym role → reject
+        assert!(!kind.session_satisfies(&SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: Some("user".to_string()),
+        }));
+        // UserSession bez role → reject (Zero Trust default)
+        assert!(!kind.session_satisfies(&SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: None,
+        }));
+        // Inne sesje → reject
+        assert!(!kind.session_satisfies(&SessionAuth::Anonymous));
+        assert!(!kind.session_satisfies(&SessionAuth::ApiKey {
+            key_id: "x".to_string()
         }));
     }
 
     #[test]
     fn session_auth_kind_user_session_requires_exact_match() {
         let kind = SessionAuthKind::UserSession;
-        assert!(kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16] }));
+        assert!(kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16], role: None }));
         assert!(!kind.session_satisfies(&SessionAuth::Anonymous));
         assert!(!kind.session_satisfies(&SessionAuth::ApiKey {
             key_id: "x".to_string()
@@ -364,7 +427,7 @@ mod tests {
         assert!(kind.session_satisfies(&SessionAuth::ApiKey {
             key_id: "x".to_string()
         }));
-        assert!(kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16] }));
+        assert!(kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16], role: None }));
         assert!(kind.session_satisfies(&SessionAuth::MeshTrust {
             node_id: [0u8; 32],
             epoch: 0
@@ -380,7 +443,7 @@ mod tests {
             epoch: 0
         }));
         assert!(!kind.session_satisfies(&SessionAuth::Anonymous));
-        assert!(!kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16] }));
+        assert!(!kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16], role: None }));
     }
 
     #[test]
@@ -390,7 +453,7 @@ mod tests {
         // NOTE: ten test zalezy od tego ze handler dla Error nie istnieje
         // (bo Error to output variant, nie input).
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 1,
             resume_secret: None,
         };
@@ -430,7 +493,7 @@ mod tests {
             ClusterUpdateRequest,
         };
         let ctx_user = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 100,
             resume_secret: None,
         };
@@ -468,13 +531,21 @@ mod tests {
         assert!(!w_create.1);
         assert!(matches!(w_create.0, MessageBody::ApiKeyCreateResponseBody(_)));
 
+        let ctx_admin = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 101,
+            resume_secret: None,
+        };
         let w_update = dispatch(
             &MessageBody::ClusterUpdateRequestBody(ClusterUpdateRequest {
                 cluster_id: "c1".to_string(),
                 name: "Prod".to_string(),
                 description: None,
             }),
-            &ctx_user,
+            &ctx_admin,
         );
         assert!(!w_update.1);
         assert!(matches!(w_update.0, MessageBody::ClusterUpdateResponseBody(_)));
@@ -506,7 +577,7 @@ mod tests {
     #[test]
     fn dispatch_node_list_request_via_registry() {
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 7,
             resume_secret: None,
         };
