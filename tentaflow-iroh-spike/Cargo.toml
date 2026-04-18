@@ -1,0 +1,22 @@
+[package]
+name = "tentaflow-iroh-spike"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Throwaway evaluation crate dla iroh jako alternatywy dla quinn (Tasks #14-#22)"
+
+# Spike crate isolated od main workspace — nie wciagamy iroh zaleznosci do core
+# dopoki #22 (binary decision) nie zapadnie. Jesli decision = adopt, robimy
+# integrate-merge; jesli cut, usuwamy ten katalog.
+
+[dependencies]
+# Iroh QUIC + node-id (pre-1.0, oceniamy stability)
+iroh = "0.28"
+
+tokio = { version = "1.35", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["full", "test-util"] }
