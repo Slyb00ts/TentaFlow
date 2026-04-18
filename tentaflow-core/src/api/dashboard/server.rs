@@ -390,13 +390,23 @@ pub async fn handle_request(
         // Extract user_id z JWT claims zeby propagowac do dispatch ctx.
         let user_id = extract_ws_user_id(&req, &db, &settings_cipher);
 
+        // Reuse jwt_secret jako HMAC key dla resume tokens (rotacja sekretu
+        // automatycznie unieważnia wszystkie outstanding tokens — pozadane).
+        let resume_secret = std::sync::Arc::new(
+            db::repository::get_setting_secure(&db, "jwt_secret", &settings_cipher)
+                .ok()
+                .flatten()
+                .map(|s| s.into_bytes())
+                .unwrap_or_default(),
+        );
+
         let upgrade = hyper::upgrade::on(&mut req);
 
         tokio::spawn(async move {
             match upgrade.await {
                 Ok(upgraded) => {
                     let io = TokioIo::new(upgraded);
-                    super::ws_binary::handle_ws_connection(io, user_id).await;
+                    super::ws_binary::handle_ws_connection(io, user_id, resume_secret).await;
                 }
                 Err(e) => {
                     error!("Blad WebSocket upgrade (binary): {}", e);

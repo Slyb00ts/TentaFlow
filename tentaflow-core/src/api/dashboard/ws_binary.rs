@@ -18,7 +18,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 
 use crate::dispatch::{
-    self,
+    self, resume_token,
     subscription::{self, SubscriptionEvent},
     HandlerContext,
 };
@@ -40,8 +40,13 @@ fn user_id_to_bytes(user_id: i64) -> [u8; 16] {
 ///
 /// `user_id` z JWT claims (extract_ws_user_id w server.rs). None = degraduje do
 /// Anonymous session — handler dispatch sprawdzi czy wariant na to pozwala.
-pub async fn handle_ws_connection<S>(stream: S, user_id: Option<i64>)
-where
+/// `resume_secret` = HMAC key dla SubscribeResumeOffer tokens emitowanych przy
+/// IS_STREAM_END (zwykle reuse jwt_secret).
+pub async fn handle_ws_connection<S>(
+    stream: S,
+    user_id: Option<i64>,
+    resume_secret: std::sync::Arc<Vec<u8>>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let session = match user_id {
@@ -248,6 +253,24 @@ where
                                 next_server_sequence += 1;
                             }
                             SubscriptionEvent::End(final_body) => {
+                                // Emit SubscribeResumeOffer NAJPIERW (przed final body).
+                                // Klient po reconnect uzyje tokenu w SubscribeResumeRequest.
+                                let token = resume_token::issue(
+                                    envelope.correlation_id as u128,
+                                    next_server_sequence as u64,
+                                    &resume_secret,
+                                );
+                                let _ = send_body(
+                                    &mut sink,
+                                    envelope.correlation_id,
+                                    next_server_sequence,
+                                    envelope.message_kind,
+                                    &MessageBody::SubscribeResumeOffer { resume_token: token },
+                                    EnvelopeFlags::empty(),
+                                )
+                                .await;
+                                next_server_sequence += 1;
+
                                 let body = final_body
                                     .unwrap_or_else(|| MessageBody::MetaCancelStream);
                                 let _ = send_body(
