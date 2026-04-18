@@ -9,20 +9,21 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 
 const AuditBinary = (() => {
   'use strict';
-  let unsolicitedHandler = null;
+  let unsubscribe = null;
   let events = [];
   const MAX_EVENTS = 200;
 
   async function start() {
     const client = await ApiBinary.client();
-    unsolicitedHandler = ({ envelope, body }) => {
+    // P2c FIX: addUnsolicitedListener — composable, wiele screens moze sluchac
+    // bez clobberowania siebie wzajemnie.
+    unsubscribe = client.addUnsolicitedListener(({ envelope, body }) => {
       if (body?.variant === 'AuditEvent') {
         events.unshift(body);
         if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
         renderTable();
       }
-    };
-    client.onUnsolicited = unsolicitedHandler;
+    });
   }
 
   function renderTable() {
@@ -47,7 +48,10 @@ const AuditBinary = (() => {
     },
     unmount: () => {
       events = [];
-      unsolicitedHandler = null;
+      if (unsubscribe) {
+        unsubscribe();
+        unsubscribe = null;
+      }
     },
   };
 })();

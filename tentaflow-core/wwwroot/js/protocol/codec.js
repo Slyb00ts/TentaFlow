@@ -62,7 +62,7 @@ export const encode = {
     const body = _wasm.encodeNodeListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -74,7 +74,7 @@ export const encode = {
     const body = _wasm.encodeModelListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -86,7 +86,7 @@ export const encode = {
     const body = _wasm.encodeMetaSchemaVersionCheck(clientVersion);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_SCHEMA_VERSION_CHECK,
       body,
     );
@@ -98,7 +98,7 @@ export const encode = {
     const body = _wasm.encodeMetaHeartbeat(BigInt(sentAtEpoch));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -110,7 +110,7 @@ export const encode = {
     const body = _wasm.encodeMetaCancelStream();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_CANCEL_STREAM,
       body,
     );
@@ -122,7 +122,7 @@ export const encode = {
     const body = _wasm.encodeNodeInfoRequest(nodeId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -134,7 +134,7 @@ export const encode = {
     const body = _wasm.encodeApiKeyListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -146,7 +146,7 @@ export const encode = {
     const body = _wasm.encodeApiKeyCreateRequest(name, scopes);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -158,7 +158,7 @@ export const encode = {
     const body = _wasm.encodeApiKeyRevokeRequest(keyId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -170,7 +170,7 @@ export const encode = {
     const body = _wasm.encodeAuthLoginRequest(username, password);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -182,7 +182,7 @@ export const encode = {
     const body = _wasm.encodeAuthMeRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -194,7 +194,7 @@ export const encode = {
     const body = _wasm.encodeChatStreamRequestSimple(modelId, userMessage);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
@@ -206,7 +206,7 @@ export const encode = {
     const body = _wasm.encodeClusterUpdateRequest(clusterId, name, description ?? null);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
-      sequence,
+      BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
     );
