@@ -385,6 +385,37 @@ pub fn settings_update(
 }
 
 // =============================================================================
+// SubscribeResumeRequest — klient resume po disconnect.
+// Bootstrap: weryfikujemy token signature, ale buffer replay z recorder
+// to phase 2 (#34). Tu zwracamy SubscribeResumeAck { accepted: false } z
+// reasonem zeby klient wiedzial ze trzeba subscribe od zera.
+// Policy: UserSession (tej samej tier co oryginalny stream).
+// =============================================================================
+
+#[handler(variant = "SubscribeResumeRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn subscribe_resume_request(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::SubscribeResumeRequest { resume_token } => {
+            // Bootstrap: signature check tylko (HMAC), buffer replay TBD.
+            // Real secret pozyskamy z db settings w phase 2; tu stub.
+            let _ = resume_token;
+            Ok(MessageBody::SubscribeResumeAck {
+                accepted: false,
+                error: Some("resume not implemented yet — please re-subscribe".to_string()),
+            })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "subscribe_resume_request expected SubscribeResumeRequest variant",
+        )),
+    }
+}
+
+// =============================================================================
 // Dashboard metrics — R-LIST, subscription candidate (subskrypcja w #36 phase 2).
 // Policy: UserSession.
 // =============================================================================

@@ -377,6 +377,14 @@ pub fn encode_dashboard_metrics_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::DashboardMetricsRequest).map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::SubscribeResumeRequest { resume_token }.
+/// Klient po reconnect przekazuje token z poprzedniej SubscribeResumeOffer.
+#[wasm_bindgen(js_name = encodeSubscribeResumeRequest)]
+pub fn encode_subscribe_resume_request(resume_token: Vec<u8>) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::SubscribeResumeRequest { resume_token })
+        .map_err(|e| JsError::new(&e))
+}
+
 // =============================================================================
 // MessageBody decode (zwraca JS object z variant tag + polami)
 // =============================================================================
@@ -564,6 +572,21 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "trustedKeys", arr.into());
             set(&obj, "epoch", (evt.epoch as u32).into());
+        }
+        MessageBody::SubscribeResumeRequest { resume_token } => {
+            set(&obj, "variant", "SubscribeResumeRequest".into());
+            set(&obj, "resumeToken", js_sys::Uint8Array::from(&resume_token[..]).into());
+        }
+        MessageBody::SubscribeResumeAck { accepted, error } => {
+            set(&obj, "variant", "SubscribeResumeAck".into());
+            set(&obj, "accepted", accepted.into());
+            if let Some(err) = error {
+                set(&obj, "error", err.into());
+            }
+        }
+        MessageBody::SubscribeResumeOffer { resume_token } => {
+            set(&obj, "variant", "SubscribeResumeOffer".into());
+            set(&obj, "resumeToken", js_sys::Uint8Array::from(&resume_token[..]).into());
         }
         MessageBody::MeshPeersListRequest => {
             set(&obj, "variant", "MeshPeersListRequest".into());
