@@ -397,6 +397,204 @@ pub fn settings_update(
 // buffer, na koncu IS_STREAM_END. Sync handlera tu juz nie ma.
 
 // =============================================================================
+// Models — szczegoly + instalacja/usuwanie. Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "ModelDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn model_detail_request(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::ModelDetail;
+    match req {
+        MessageBody::ModelDetailRequest { model_id } => {
+            Ok(MessageBody::ModelDetailResponse(ModelDetail {
+                id: model_id.clone(),
+                category: "llm".to_string(),
+                engine_id: "llama-cpp".to_string(),
+                local_path: None,
+                size_bytes: 0,
+                availability: "not-installed".to_string(),
+                description: "bootstrap stub".to_string(),
+                checksum_sha256: None,
+            }))
+        }
+        _ => Err(ProtocolError::bad_request(
+            "model_detail_request expected ModelDetailRequest variant",
+        )),
+    }
+}
+
+#[handler(variant = "ModelInstallRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn model_install(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::ModelInstallRequestBody(payload) => Ok(MessageBody::ModelInstallResponse {
+            model_id: payload.model_id.clone(),
+            accepted: true,
+        }),
+        _ => Err(ProtocolError::bad_request(
+            "model_install expected ModelInstallRequestBody variant",
+        )),
+    }
+}
+
+#[handler(variant = "ModelDeleteRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn model_delete(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::ModelDeleteRequest { model_id: _ } => {
+            Ok(MessageBody::ModelDeleteResponse { deleted: true })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "model_delete expected ModelDeleteRequest variant",
+        )),
+    }
+}
+
+// =============================================================================
+// Hub — engine catalog + HuggingFace search. Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "HubEngineListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn hub_engine_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::HubEngineSummary;
+    Ok(MessageBody::HubEngineListResponse {
+        engines: vec![HubEngineSummary {
+            id: "llama-cpp".to_string(),
+            display_name: "llama.cpp".to_string(),
+            category: "llm".to_string(),
+            deploy_methods: vec!["docker".to_string(), "native".to_string()],
+            default_port: 8080,
+        }],
+    })
+}
+
+#[handler(variant = "HubModelSearchRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn hub_model_search(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::HubModelSearchRequest { query: _ } => {
+            // Bootstrap: zwracamy puste wyniki — integracja z hf-hub crate w phase 2.
+            Ok(MessageBody::HubModelSearchResponse {
+                results: Vec::new(),
+            })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "hub_model_search expected HubModelSearchRequest variant",
+        )),
+    }
+}
+
+// =============================================================================
+// Flows — workflow CRUD + executions. Policy: UserSession.
+// =============================================================================
+
+#[handler(variant = "FlowListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_list(
+    _req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    Ok(MessageBody::FlowListResponse { flows: Vec::new() })
+}
+
+#[handler(variant = "FlowDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_detail(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::FlowDetail;
+    match req {
+        MessageBody::FlowDetailRequest { flow_id } => Ok(MessageBody::FlowDetailResponse(FlowDetail {
+            id: flow_id.clone(),
+            name: "stub".to_string(),
+            description: None,
+            graph_json: "{\"nodes\":[],\"edges\":[]}".to_string(),
+            enabled: false,
+        })),
+        _ => Err(ProtocolError::bad_request(
+            "flow_detail expected FlowDetailRequest variant",
+        )),
+    }
+}
+
+#[handler(variant = "FlowCreateRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_create(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::FlowCreateRequestBody(payload) => Ok(MessageBody::FlowCreateResponse {
+            flow_id: format!("flow-{}", payload.name),
+        }),
+        _ => Err(ProtocolError::bad_request(
+            "flow_create expected FlowCreateRequestBody variant",
+        )),
+    }
+}
+
+#[handler(variant = "FlowDeleteRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_delete(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::FlowDeleteRequest { flow_id: _ } => {
+            Ok(MessageBody::FlowDeleteResponse { deleted: true })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "flow_delete expected FlowDeleteRequest variant",
+        )),
+    }
+}
+
+#[handler(variant = "FlowExecutionsListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_executions_list(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::FlowExecutionsListRequest { flow_id: _ } => {
+            Ok(MessageBody::FlowExecutionsListResponse {
+                executions: Vec::new(),
+            })
+        }
+        _ => Err(ProtocolError::bad_request(
+            "flow_executions_list expected FlowExecutionsListRequest variant",
+        )),
+    }
+}
+
+// =============================================================================
 // Dashboard metrics — R-LIST, subscription candidate (subskrypcja w #36 phase 2).
 // Policy: UserSession.
 // =============================================================================

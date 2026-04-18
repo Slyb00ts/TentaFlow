@@ -207,6 +207,111 @@ pub struct ChatStreamEnd {
 }
 
 // =============================================================================
+// Models — szczegoly modelu (R-ONE), instalacja/odinstalacja (W-ACTION)
+// migration-map #218-#227
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelDetail {
+    pub id: String,
+    pub category: String,
+    pub engine_id: String,
+    /// Sciezka pliku modelu na disku (jesli zainstalowany).
+    pub local_path: Option<String>,
+    /// Rozmiar w bajtach.
+    pub size_bytes: u64,
+    /// "ready" | "downloading" | "not-installed" | "error".
+    pub availability: String,
+    /// Opis (z manifest.toml).
+    pub description: String,
+    /// Hash SHA256 dla weryfikacji integralnosci.
+    pub checksum_sha256: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelInstallRequest {
+    pub model_id: String,
+    /// Repozytorium HuggingFace (np. "Qwen/Qwen3.5-0.8B").
+    pub source_repo: String,
+}
+
+// =============================================================================
+// Hub — HuggingFace integration (R-LIST + R-STREAM dla download progress)
+// migration-map #81-#86
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct HubEngineSummary {
+    pub id: String,
+    pub display_name: String,
+    pub category: String,
+    /// "docker" | "native" | "external".
+    pub deploy_methods: Vec<String>,
+    pub default_port: u16,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct HubModelSearchResult {
+    pub repo_id: String,
+    pub display_name: String,
+    pub author: String,
+    /// Liczba downloadow w HuggingFace (popularity signal).
+    pub downloads: u64,
+    pub likes: u64,
+    pub last_modified_epoch: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct HubDownloadProgress {
+    pub model_id: String,
+    pub bytes_downloaded: u64,
+    pub bytes_total: u64,
+    pub speed_bps: u64,
+    pub eta_seconds: Option<u64>,
+}
+
+// =============================================================================
+// Flows — workflow CRUD + executions (migration-map #65-#80)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowSummary {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at_epoch: u64,
+    pub updated_at_epoch: u64,
+    pub enabled: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowDetail {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// JSON DAG definition (zachowane jako string — parsowane przez flow_engine).
+    pub graph_json: String,
+    pub enabled: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowCreateRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub graph_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowExecutionSummary {
+    pub id: String,
+    pub flow_id: String,
+    /// "pending" | "running" | "completed" | "failed" | "cancelled".
+    pub status: String,
+    pub started_at_epoch: u64,
+    pub completed_at_epoch: Option<u64>,
+}
+
+// =============================================================================
 // Mesh trust events (W-ACTION + Event-push archetypy, mesh discriminants 0x23/0x24)
 // =============================================================================
 
@@ -381,6 +486,33 @@ pub enum MessageBody {
     // ---- Mesh trust events (broadcast / sync) ----
     MeshTrustRevoked(MeshTrustRevokedEvent),
     MeshTrustedKeysSync(MeshTrustedKeysSyncEvent),
+
+    // ---- Models (R-ONE + W-ACTION) ----
+    ModelDetailRequest { model_id: String },
+    ModelDetailResponse(ModelDetail),
+    ModelInstallRequestBody(ModelInstallRequest),
+    ModelInstallResponse { model_id: String, accepted: bool },
+    ModelDeleteRequest { model_id: String },
+    ModelDeleteResponse { deleted: bool },
+
+    // ---- Hub (R-LIST + R-STREAM dla download) ----
+    HubEngineListRequest,
+    HubEngineListResponse { engines: Vec<HubEngineSummary> },
+    HubModelSearchRequest { query: String },
+    HubModelSearchResponse { results: Vec<HubModelSearchResult> },
+    HubDownloadProgressBody(HubDownloadProgress),
+
+    // ---- Flows (R-LIST + R-ONE + W-CREATE/UPDATE/DELETE + executions) ----
+    FlowListRequest,
+    FlowListResponse { flows: Vec<FlowSummary> },
+    FlowDetailRequest { flow_id: String },
+    FlowDetailResponse(FlowDetail),
+    FlowCreateRequestBody(FlowCreateRequest),
+    FlowCreateResponse { flow_id: String },
+    FlowDeleteRequest { flow_id: String },
+    FlowDeleteResponse { deleted: bool },
+    FlowExecutionsListRequest { flow_id: String },
+    FlowExecutionsListResponse { executions: Vec<FlowExecutionSummary> },
 
     // ---- Subscription resume (client requests replay after reconnect) ----
     /// Klient -> serwer: zaresumuj subscription z tokenem ktory dostal w

@@ -35,7 +35,9 @@ pub use message_body::{
     ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeySummary, AuthLoginRequest,
     AuthLoginResponse, AuthMeResponse, ChatMessage, ChatStreamChunk, ChatStreamEnd,
     ChatStreamRequest, ClusterUpdateRequest, ClusterUpdateResponse, DashboardSnapshot,
-    MeshPairInitRequest, MeshPairInitResponse, MeshPeerSummary, MeshTrustRevokedEvent,
-    MeshTrustedKeysSyncEvent, MessageBody, ModelSummary, NodeSummary, ProtocolError,
+    FlowCreateRequest, FlowDetail, FlowExecutionSummary, FlowSummary, HubDownloadProgress,
+    HubEngineSummary, HubModelSearchResult, MeshPairInitRequest, MeshPairInitResponse,
+    MeshPeerSummary, MeshTrustRevokedEvent, MeshTrustedKeysSyncEvent, MessageBody,
+    ModelDetail, ModelInstallRequest, ModelSummary, NodeSummary, ProtocolError,
     ProtocolErrorCode, SettingEntry, SettingsUpdateRequest,
 };
