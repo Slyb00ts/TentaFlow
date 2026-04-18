@@ -588,6 +588,167 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "SubscribeResumeOffer".into());
             set(&obj, "resumeToken", js_sys::Uint8Array::from(&resume_token[..]).into());
         }
+        MessageBody::ModelDetailRequest { model_id } => {
+            set(&obj, "variant", "ModelDetailRequest".into());
+            set(&obj, "modelId", model_id.into());
+        }
+        MessageBody::ModelDetailResponse(d) => {
+            set(&obj, "variant", "ModelDetailResponse".into());
+            set(&obj, "id", d.id.into());
+            set(&obj, "category", d.category.into());
+            set(&obj, "engineId", d.engine_id.into());
+            if let Some(p) = d.local_path {
+                set(&obj, "localPath", p.into());
+            }
+            set(&obj, "sizeBytes", d.size_bytes.into());
+            set(&obj, "availability", d.availability.into());
+            set(&obj, "description", d.description.into());
+            if let Some(c) = d.checksum_sha256 {
+                set(&obj, "checksumSha256", c.into());
+            }
+        }
+        MessageBody::ModelInstallRequestBody(req) => {
+            set(&obj, "variant", "ModelInstallRequest".into());
+            set(&obj, "modelId", req.model_id.into());
+            set(&obj, "sourceRepo", req.source_repo.into());
+        }
+        MessageBody::ModelInstallResponse { model_id, accepted } => {
+            set(&obj, "variant", "ModelInstallResponse".into());
+            set(&obj, "modelId", model_id.into());
+            set(&obj, "accepted", accepted.into());
+        }
+        MessageBody::ModelDeleteRequest { model_id } => {
+            set(&obj, "variant", "ModelDeleteRequest".into());
+            set(&obj, "modelId", model_id.into());
+        }
+        MessageBody::ModelDeleteResponse { deleted } => {
+            set(&obj, "variant", "ModelDeleteResponse".into());
+            set(&obj, "deleted", deleted.into());
+        }
+        MessageBody::HubEngineListRequest => {
+            set(&obj, "variant", "HubEngineListRequest".into());
+        }
+        MessageBody::HubEngineListResponse { engines } => {
+            set(&obj, "variant", "HubEngineListResponse".into());
+            let arr = js_sys::Array::new();
+            for e in engines {
+                let item = js_sys::Object::new();
+                set(&item, "id", e.id.into());
+                set(&item, "displayName", e.display_name.into());
+                set(&item, "category", e.category.into());
+                let methods = js_sys::Array::new();
+                for m in e.deploy_methods {
+                    methods.push(&JsValue::from_str(&m));
+                }
+                set(&item, "deployMethods", methods.into());
+                set(&item, "defaultPort", (e.default_port as u32).into());
+                arr.push(&item.into());
+            }
+            set(&obj, "engines", arr.into());
+        }
+        MessageBody::HubModelSearchRequest { query } => {
+            set(&obj, "variant", "HubModelSearchRequest".into());
+            set(&obj, "query", query.into());
+        }
+        MessageBody::HubModelSearchResponse { results } => {
+            set(&obj, "variant", "HubModelSearchResponse".into());
+            let arr = js_sys::Array::new();
+            for r in results {
+                let item = js_sys::Object::new();
+                set(&item, "repoId", r.repo_id.into());
+                set(&item, "displayName", r.display_name.into());
+                set(&item, "author", r.author.into());
+                set(&item, "downloads", r.downloads.into());
+                set(&item, "likes", r.likes.into());
+                set(&item, "lastModifiedEpoch", r.last_modified_epoch.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "results", arr.into());
+        }
+        MessageBody::HubDownloadProgressBody(p) => {
+            set(&obj, "variant", "HubDownloadProgress".into());
+            set(&obj, "modelId", p.model_id.into());
+            set(&obj, "bytesDownloaded", p.bytes_downloaded.into());
+            set(&obj, "bytesTotal", p.bytes_total.into());
+            set(&obj, "speedBps", p.speed_bps.into());
+            if let Some(eta) = p.eta_seconds {
+                set(&obj, "etaSeconds", eta.into());
+            }
+        }
+        MessageBody::FlowListRequest => {
+            set(&obj, "variant", "FlowListRequest".into());
+        }
+        MessageBody::FlowListResponse { flows } => {
+            set(&obj, "variant", "FlowListResponse".into());
+            let arr = js_sys::Array::new();
+            for f in flows {
+                let item = js_sys::Object::new();
+                set(&item, "id", f.id.into());
+                set(&item, "name", f.name.into());
+                if let Some(d) = f.description {
+                    set(&item, "description", d.into());
+                }
+                set(&item, "createdAtEpoch", f.created_at_epoch.into());
+                set(&item, "updatedAtEpoch", f.updated_at_epoch.into());
+                set(&item, "enabled", f.enabled.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "flows", arr.into());
+        }
+        MessageBody::FlowDetailRequest { flow_id } => {
+            set(&obj, "variant", "FlowDetailRequest".into());
+            set(&obj, "flowId", flow_id.into());
+        }
+        MessageBody::FlowDetailResponse(d) => {
+            set(&obj, "variant", "FlowDetailResponse".into());
+            set(&obj, "id", d.id.into());
+            set(&obj, "name", d.name.into());
+            if let Some(desc) = d.description {
+                set(&obj, "description", desc.into());
+            }
+            set(&obj, "graphJson", d.graph_json.into());
+            set(&obj, "enabled", d.enabled.into());
+        }
+        MessageBody::FlowCreateRequestBody(req) => {
+            set(&obj, "variant", "FlowCreateRequest".into());
+            set(&obj, "name", req.name.into());
+            if let Some(d) = req.description {
+                set(&obj, "description", d.into());
+            }
+            set(&obj, "graphJson", req.graph_json.into());
+        }
+        MessageBody::FlowCreateResponse { flow_id } => {
+            set(&obj, "variant", "FlowCreateResponse".into());
+            set(&obj, "flowId", flow_id.into());
+        }
+        MessageBody::FlowDeleteRequest { flow_id } => {
+            set(&obj, "variant", "FlowDeleteRequest".into());
+            set(&obj, "flowId", flow_id.into());
+        }
+        MessageBody::FlowDeleteResponse { deleted } => {
+            set(&obj, "variant", "FlowDeleteResponse".into());
+            set(&obj, "deleted", deleted.into());
+        }
+        MessageBody::FlowExecutionsListRequest { flow_id } => {
+            set(&obj, "variant", "FlowExecutionsListRequest".into());
+            set(&obj, "flowId", flow_id.into());
+        }
+        MessageBody::FlowExecutionsListResponse { executions } => {
+            set(&obj, "variant", "FlowExecutionsListResponse".into());
+            let arr = js_sys::Array::new();
+            for e in executions {
+                let item = js_sys::Object::new();
+                set(&item, "id", e.id.into());
+                set(&item, "flowId", e.flow_id.into());
+                set(&item, "status", e.status.into());
+                set(&item, "startedAtEpoch", e.started_at_epoch.into());
+                if let Some(c) = e.completed_at_epoch {
+                    set(&item, "completedAtEpoch", c.into());
+                }
+                arr.push(&item.into());
+            }
+            set(&obj, "executions", arr.into());
+        }
         MessageBody::MeshPeersListRequest => {
             set(&obj, "variant", "MeshPeersListRequest".into());
         }
