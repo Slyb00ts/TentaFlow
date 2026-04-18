@@ -508,6 +508,7 @@ fn guess_mime(path: &str) -> &'static str {
         "webp" => "image/webp",
         "txt" => "text/plain",
         "xml" => "application/xml",
+        "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
 }

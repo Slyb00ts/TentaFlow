@@ -65,8 +65,9 @@ export const ApiBinary = {
   async subscribe(kind, payload, { onChunk, onEnd, onError } = {}) {
     const client = await getClient();
     const correlationId = client.nextCorrelationId();
+    const sequence = client.takeSequence();
     const codec = await import('./codec.js');
-    const frame = codec.encode[kind](correlationId, payload);
+    const frame = codec.encode[kind](correlationId, payload, sequence);
 
     const unsubscribe = client.subscribe(correlationId, ({ envelope, body }) => {
       if (envelope.isError) {
