@@ -278,12 +278,11 @@ pub fn chat_stream_chunk(
 
 // =============================================================================
 // Cluster — W-UPDATE archetyp.
-// Policy: UserSession (admin-only ograniczenie dodamy w #36 phase 2 — teraz
-// bootstrap na UserSession zeby handler byl w rejestrze).
+// Policy: Admin (zmiana cluster config to admin-only — wymaga role=admin claim).
 // =============================================================================
 
 #[handler(variant = "ClusterUpdateRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn cluster_update(
     req: &MessageBody,
@@ -304,8 +303,8 @@ pub fn cluster_update(
 
 // =============================================================================
 // Mesh peers — R-LIST + W-ACTION archetypy.
-// Policy: UserSession dla list (dashboard view), UserSession dla pair init
-// (pairing wymaga zalogowanego admina — docelowo SessionAuthKind::Admin w phase 2).
+// Policy: UserSession dla list (dashboard read), Admin dla pair init
+// (pairing modyfikuje trusted_keys — wymaga role=admin claim).
 // =============================================================================
 
 #[handler(variant = "MeshPeersListRequest", since = (1, 0))]
@@ -327,7 +326,7 @@ pub fn mesh_peers_list(
 }
 
 #[handler(variant = "MeshPairInitRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(Admin)]
 #[observed]
 pub fn mesh_pair_init(
     req: &MessageBody,
