@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
 pub mod handlers;
+pub mod metrics;
 pub mod recorder;
 pub mod subscription;
 
@@ -178,6 +179,7 @@ pub fn dispatch(
         );
     }
 
+    let timer = metrics::Timer::start(handler.variant_name);
     let result = match (handler.dispatch_fn)(body, ctx) {
         Ok(response) => {
             let is_err = matches!(response, MessageBody::Error(_));
@@ -185,6 +187,7 @@ pub fn dispatch(
         }
         Err(err) => (MessageBody::Error(err), true),
     };
+    timer.finish(result.1);
 
     if let Some(rec) = recorder::global() {
         let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&result.0)
