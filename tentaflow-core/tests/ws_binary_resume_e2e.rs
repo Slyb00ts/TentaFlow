@@ -80,6 +80,7 @@ async fn resume_token_round_trip_through_subscribe_resume_handler() {
         session: SessionAuth::UserSession { user_id, role: None },
         correlation_id: 200,
         resume_secret: Some(secret.clone()),
+        state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
 
     (h.handler_fn)(req, ctx, sub);
@@ -116,6 +117,7 @@ async fn invalid_resume_token_results_in_negative_ack() {
         session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
         correlation_id: 300,
         resume_secret: Some(secret),
+        state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
 
     (h.handler_fn)(req, ctx, sub);
@@ -140,6 +142,7 @@ async fn dispatch_metrics_record_chat_stream_calls() {
         session: SessionAuth::Anonymous,
         correlation_id: 1,
         resume_secret: None,
+        state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
     let _ = dispatch::dispatch(
         &MessageBody::MetaHeartbeat {
@@ -167,6 +170,7 @@ async fn recorder_round_trip_with_dispatch() {
         session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
         correlation_id: 999,
         resume_secret: None,
+        state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
     let _ = dispatch::dispatch(&MessageBody::NodeListRequest, &ctx);
 

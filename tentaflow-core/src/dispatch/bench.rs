@@ -40,6 +40,7 @@ mod tests {
             session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 1,
             resume_secret: None,
+            state: super::super::state::AppState::for_test(),
         };
 
         let variants = [

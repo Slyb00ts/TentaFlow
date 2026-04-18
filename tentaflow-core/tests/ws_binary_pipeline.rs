@@ -38,6 +38,7 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
         session,
         correlation_id: env.correlation_id,
         resume_secret: None,
+        state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
     let (resp_body, is_error) = dispatch::dispatch(&body, &ctx);
 
