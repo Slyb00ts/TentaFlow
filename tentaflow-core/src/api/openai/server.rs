@@ -1068,6 +1068,10 @@ async fn handle_metrics(
     output.push_str("# TYPE tentaflow_ai_active_connections gauge\n");
     output.push_str(&format!("tentaflow_ai_active_connections{{}} {}\n\n", metrics.active_connections));
 
+    // WSS handler metrics (per MessageBody variant). Lazy-init w
+    // dispatch::metrics gdy ktorykolwiek handler bedzie wywolany.
+    output.push_str(&crate::dispatch::metrics::render_prometheus());
+
     let body = hyper::body::Bytes::from(output);
     let stream = futures::stream::once(async move {
         Ok(Frame::data(body))
