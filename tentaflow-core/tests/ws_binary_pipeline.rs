@@ -77,6 +77,7 @@ fn node_list_request_full_pipeline() {
         &req,
         SessionAuth::UserSession {
             user_id: [0u8; 16],
+            role: None,
         },
     );
     let (env, body) = decode_response(&resp);
@@ -139,6 +140,7 @@ fn auth_login_then_auth_me_flow() {
         &me_req,
         SessionAuth::UserSession {
             user_id: [0u8; 16],
+            role: None,
         },
     );
     let (_, me_body) = decode_response(&me_resp);
@@ -155,6 +157,7 @@ fn dashboard_metrics_request_returns_snapshot() {
         &req,
         SessionAuth::UserSession {
             user_id: [0u8; 16],
+            role: None,
         },
     );
     let (_, body) = decode_response(&resp);
@@ -168,6 +171,7 @@ fn mesh_peers_list_response_contains_self() {
         &req,
         SessionAuth::UserSession {
             user_id: [0u8; 16],
+            role: None,
         },
     );
     let (_, body) = decode_response(&resp);
@@ -201,6 +205,7 @@ fn settings_update_returns_applied_count() {
         &req,
         SessionAuth::UserSession {
             user_id: [0u8; 16],
+            role: None,
         },
     );
     let (_, body) = decode_response(&resp);
@@ -218,6 +223,7 @@ fn correlation_id_preserved_across_pipeline() {
             &req,
             SessionAuth::UserSession {
                 user_id: [0u8; 16],
+                role: None,
             },
         );
         let (env, _) = decode_response(&resp);
@@ -244,6 +250,7 @@ fn unknown_variant_returns_not_implemented() {
         &req,
         SessionAuth::UserSession {
             user_id: [0u8; 16],
+            role: None,
         },
     );
     let (env, body) = decode_response(&resp);

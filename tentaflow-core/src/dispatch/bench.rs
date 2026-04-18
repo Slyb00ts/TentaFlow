@@ -37,7 +37,7 @@ mod tests {
         let _ = find("NodeListRequest"); // warm-up
 
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16] },
+            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 1,
             resume_secret: None,
         };
