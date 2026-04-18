@@ -312,6 +312,89 @@ pub struct FlowExecutionSummary {
 }
 
 // =============================================================================
+// Services — runtime engine deployments (migration-map #295-#303)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSummary {
+    pub id: String,
+    pub engine_id: String,
+    pub model_id: String,
+    /// "running" | "starting" | "stopped" | "error".
+    pub status: String,
+    pub deploy_method: String,
+    pub endpoint_url: Option<String>,
+    pub started_at_epoch: Option<u64>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDeployRequest {
+    pub engine_id: String,
+    pub model_id: String,
+    /// "docker" | "native" | "external".
+    pub deploy_method: String,
+    pub node_id: [u8; 32],
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDeployProgress {
+    pub deploy_id: String,
+    /// "pulling" | "building" | "starting" | "ready" | "failed".
+    pub stage: String,
+    pub progress_percent: u8,
+    pub message: String,
+}
+
+// =============================================================================
+// Prompts — prompt templates (migration-map #265-#269)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PromptSummary {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub updated_at_epoch: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PromptDetail {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub template: String,
+    pub variables: Vec<String>,
+    pub updated_at_epoch: u64,
+}
+
+// =============================================================================
+// Registries — Docker/Conda registries (migration-map #275-#279)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RegistrySummary {
+    pub id: String,
+    pub url: String,
+    /// "docker" | "conda" | "huggingface".
+    pub kind: String,
+    pub auth_required: bool,
+}
+
+// =============================================================================
+// Audit logs — read-only event stream (event-push archetype)
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub ts_epoch: u64,
+    pub user_id: Option<[u8; 16]>,
+    /// "login" | "logout" | "deploy" | "delete" | "config-change" itp.
+    pub event_kind: String,
+    pub resource_id: Option<String>,
+    pub message: String,
+}
+
+// =============================================================================
 // Mesh trust events (W-ACTION + Event-push archetypy, mesh discriminants 0x23/0x24)
 // =============================================================================
 
@@ -486,6 +569,28 @@ pub enum MessageBody {
     // ---- Mesh trust events (broadcast / sync) ----
     MeshTrustRevoked(MeshTrustRevokedEvent),
     MeshTrustedKeysSync(MeshTrustedKeysSyncEvent),
+
+    // ---- Services (R-LIST + W-ACTION + R-STREAM dla deploy progress) ----
+    ServiceListRequest,
+    ServiceListResponse { services: Vec<ServiceSummary> },
+    ServiceDeployRequestBody(ServiceDeployRequest),
+    ServiceDeployAccepted { deploy_id: String },
+    ServiceDeployProgressBody(ServiceDeployProgress),
+    ServiceStopRequest { service_id: String },
+    ServiceStopResponse { stopped: bool },
+
+    // ---- Prompts (R-LIST + R-ONE) ----
+    PromptListRequest,
+    PromptListResponse { prompts: Vec<PromptSummary> },
+    PromptDetailRequest { prompt_id: String },
+    PromptDetailResponse(PromptDetail),
+
+    // ---- Registries (R-LIST) ----
+    RegistryListRequest,
+    RegistryListResponse { registries: Vec<RegistrySummary> },
+
+    // ---- Audit (event push — server -> client) ----
+    AuditEventBody(AuditEvent),
 
     // ---- Models (R-ONE + W-ACTION) ----
     ModelDetailRequest { model_id: String },

@@ -32,12 +32,13 @@ pub use envelope::{
     SCHEMA_VERSION,
 };
 pub use message_body::{
-    ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeySummary, AuthLoginRequest,
+    ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginRequest,
     AuthLoginResponse, AuthMeResponse, ChatMessage, ChatStreamChunk, ChatStreamEnd,
     ChatStreamRequest, ClusterUpdateRequest, ClusterUpdateResponse, DashboardSnapshot,
     FlowCreateRequest, FlowDetail, FlowExecutionSummary, FlowSummary, HubDownloadProgress,
     HubEngineSummary, HubModelSearchResult, MeshPairInitRequest, MeshPairInitResponse,
     MeshPeerSummary, MeshTrustRevokedEvent, MeshTrustedKeysSyncEvent, MessageBody,
-    ModelDetail, ModelInstallRequest, ModelSummary, NodeSummary, ProtocolError,
-    ProtocolErrorCode, SettingEntry, SettingsUpdateRequest,
+    ModelDetail, ModelInstallRequest, ModelSummary, NodeSummary, PromptDetail, PromptSummary,
+    ProtocolError, ProtocolErrorCode, RegistrySummary, ServiceDeployProgress,
+    ServiceDeployRequest, ServiceSummary, SettingEntry, SettingsUpdateRequest,
 };
