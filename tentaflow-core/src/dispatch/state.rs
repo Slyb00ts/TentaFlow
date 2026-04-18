@@ -8,10 +8,8 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
 use crate::config::RouterConfig;
 use crate::crypto::{SecretsCipher, SettingsCipher};
-#[cfg(test)]
 use crate::license::StaticLicenseChecker;
 use crate::db::DbPool;
 use crate::license::LicenseChecker;
@@ -37,10 +35,10 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Test-only fixture — in-memory SQLite + minimalne real components.
-    /// To NIE jest production stub; to test infrastructure (akceptowalne)
-    /// uzywane wylacznie pod #[cfg(test)] gates.
-    #[cfg(test)]
+    /// Test fixture — tempfile SQLite + minimalne real components.
+    /// Wylacznie do uzytku w testach (unit + integration). Production NIGDY
+    /// nie wola for_test — produkcja konstruuje AppState ze swoich realnych
+    /// resources w handle_request (server.rs).
     pub fn for_test() -> Arc<Self> {
         use std::path::PathBuf;
 
