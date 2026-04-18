@@ -14,6 +14,7 @@ use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionA
 
 pub mod handlers;
 pub mod recorder;
+pub mod subscription;
 
 #[cfg(test)]
 mod bench;
@@ -44,6 +45,10 @@ pub enum SessionAuthKind {
     Anonymous,
     ApiKey,
     UserSession,
+    /// Admin = UserSession z rola "admin" w JWT claims. Bootstrap traktuje
+    /// rownoznacznie z UserSession — finalna RBAC z claim parsing przyjdzie
+    /// w #36 phase 2 razem z auth/session.rs.
+    Admin,
     MeshTrust,
 }
 
@@ -51,8 +56,9 @@ impl SessionAuthKind {
     /// Czy sesja spelnia minimalny tier wymagany przez handler.
     /// Polityka (bootstrap):
     /// - Anonymous: KAZDA sesja OK (publiczne endpointy, np. ModelList).
-    /// - ApiKey: wymaga ApiKey LUB UserSession LUB MeshTrust.
-    /// - UserSession: wymaga UserSession (admin dashboard — tylko GUI).
+    /// - ApiKey: wymaga ApiKey LUB UserSession/Admin LUB MeshTrust.
+    /// - UserSession: wymaga UserSession lub Admin.
+    /// - Admin: wymaga UserSession (bootstrap) — docelowo z role=admin claim.
     /// - MeshTrust: wymaga MeshTrust (mesh peer-only).
     pub fn session_satisfies(&self, session: &SessionAuth) -> bool {
         match self {
@@ -61,7 +67,9 @@ impl SessionAuthKind {
                 session,
                 SessionAuth::ApiKey { .. } | SessionAuth::UserSession { .. } | SessionAuth::MeshTrust { .. }
             ),
-            SessionAuthKind::UserSession => matches!(session, SessionAuth::UserSession { .. }),
+            SessionAuthKind::UserSession | SessionAuthKind::Admin => {
+                matches!(session, SessionAuth::UserSession { .. })
+            }
             SessionAuthKind::MeshTrust => matches!(session, SessionAuth::MeshTrust { .. }),
         }
     }
