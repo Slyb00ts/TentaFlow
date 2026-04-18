@@ -15,6 +15,7 @@ pub mod accept_connect;
 pub mod epoch_rotation;
 pub mod pairing;
 pub mod replay;
+pub mod trust_state;
 
 /// Nazwa ALPN dla mesh peers — taka sama jak w produkcji `tentaflow-mesh`.
 pub const MESH_ALPN: &[u8] = b"tentaflow-mesh";
