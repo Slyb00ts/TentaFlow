@@ -86,6 +86,46 @@ pub struct ProtocolError {
     pub trace_id: Option<String>,
 }
 
+impl ProtocolError {
+    /// Convenience: nowy blad z kodem + message, bez trace_id.
+    pub fn new(code: ProtocolErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            trace_id: None,
+        }
+    }
+
+    /// Convenience: BadRequest z message.
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(ProtocolErrorCode::BadRequest, message)
+    }
+
+    /// Convenience: Internal z message.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(ProtocolErrorCode::Internal, message)
+    }
+
+    /// Convenience: NotFound z message.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(ProtocolErrorCode::NotFound, message)
+    }
+
+    /// Convenience: dodaj trace_id (builder-style).
+    pub fn with_trace(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
+}
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
 // =============================================================================
 // API Keys (R-LIST + W-CREATE + W-DELETE archetypes, migration-map #37-#39)
 // =============================================================================
@@ -490,6 +530,22 @@ mod tests {
     fn empty_body_bytes_rejected() {
         let result = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn protocol_error_constructors() {
+        let e = ProtocolError::bad_request("missing field");
+        assert_eq!(e.code, ProtocolErrorCode::BadRequest);
+        assert_eq!(e.message, "missing field");
+        assert!(e.trace_id.is_none());
+
+        let e = ProtocolError::internal("oops").with_trace("tr-123");
+        assert_eq!(e.code, ProtocolErrorCode::Internal);
+        assert_eq!(e.trace_id.as_deref(), Some("tr-123"));
+
+        let e = ProtocolError::not_found("user/42");
+        assert_eq!(e.code, ProtocolErrorCode::NotFound);
+        assert!(format!("{}", e).contains("NotFound"));
     }
 
     #[test]
