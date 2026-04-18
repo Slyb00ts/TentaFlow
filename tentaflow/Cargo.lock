@@ -5619,6 +5619,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "hkdf",
+ "hmac",
  "hostname",
  "hound",
  "http-body-util",
