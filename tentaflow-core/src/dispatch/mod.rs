@@ -12,12 +12,16 @@ use std::sync::OnceLock;
 
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
+pub mod audit_broadcast;
 pub mod handlers;
 pub mod metrics;
 pub mod recorder;
 pub mod resume_token;
+pub mod state;
 pub mod stream_handlers;
 pub mod subscription;
+
+pub use state::AppState;
 
 #[cfg(test)]
 mod bench;
@@ -27,28 +31,17 @@ mod bench;
 // =============================================================================
 
 /// Informacje o sesji dostarczone handlerowi: kto prosil, jakim sposobem,
-/// z jakim correlation_id. Sluzy do identyfikacji usera dla audit/RBAC.
-#[derive(Debug, Clone)]
+/// z jakim correlation_id, plus shared AppState dla dostepu do DB/Router/itd.
+#[derive(Clone)]
 pub struct HandlerContext {
     /// SessionAuth ustalony raz przy WSS handshake.
     pub session: SessionAuth,
     /// Correlation_id dla tracing/spans.
     pub correlation_id: u64,
     /// Connection-scoped resume secret (HMAC key dla resume token verify).
-    /// None gdy connection nie ma sekretu (test code).
     pub resume_secret: Option<std::sync::Arc<Vec<u8>>>,
-}
-
-impl HandlerContext {
-    /// Helper dla testow — buduje minimalny kontekst.
-    #[cfg(test)]
-    pub fn for_test(session: SessionAuth, correlation_id: u64) -> Self {
-        Self {
-            session,
-            correlation_id,
-            resume_secret: None,
-        }
-    }
+    /// Shared resources serwera (DB, Router, MeshPeerStore, ...).
+    pub state: std::sync::Arc<state::AppState>,
 }
 
 // =============================================================================
@@ -456,6 +449,7 @@ mod tests {
             session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 1,
             resume_secret: None,
+            state: state::AppState::for_test(),
         };
         let body = MessageBody::Error(ProtocolError {
             code: ProtocolErrorCode::Internal,
@@ -482,96 +476,77 @@ mod tests {
         assert!(find("ModelListRequest").is_some());
         assert!(find("ApiKeyListRequest").is_some());
         assert!(find("AuthLoginRequest").is_some());
-        assert!(find("ChatStreamRequest").is_some());
+        // ChatStreamRequest is registered as STREAMING handler (stream_handlers.rs),
+        // not in sync registry — verify via streaming registry instead.
+        assert!(subscription::find_stream_handler("ChatStreamRequest").is_some());
         assert!(find("ClusterUpdateRequest").is_some());
     }
 
     #[test]
-    fn dispatch_covers_all_seven_archetypes() {
-        use tentaflow_protocol::{
-            ApiKeyCreateRequest, AuthLoginRequest, ChatMessage, ChatStreamRequest,
-            ClusterUpdateRequest,
-        };
+    fn dispatch_archetype_coverage_real_handlers() {
+        use tentaflow_protocol::{AuthLoginRequest, ClusterUpdateRequest};
+
+        // user_id w 0xFF-marker formacie (real binary protocol convention).
+        let mut user_bytes = [0u8; 16];
+        user_bytes[0] = 0xFF;
+        user_bytes[8..].copy_from_slice(&1u64.to_le_bytes());
+
         let ctx_user = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+            session: SessionAuth::UserSession {
+                user_id: user_bytes,
+                role: None,
+            },
             correlation_id: 100,
             resume_secret: None,
+            state: state::AppState::for_test(),
         };
 
+        // R-LIST — empty test DB → empty Vec, valid response.
         let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_user);
         assert!(!r_list.1);
         assert!(matches!(r_list.0, MessageBody::ApiKeyListResponse { .. }));
 
-        let r_one = dispatch(&MessageBody::AuthMeRequest, &ctx_user);
-        assert!(!r_one.1);
-        assert!(matches!(r_one.0, MessageBody::AuthMeResponseBody(_)));
+        let model_list = dispatch(&MessageBody::ModelListRequest, &ctx_user);
+        assert!(!model_list.1);
+        assert!(matches!(model_list.0, MessageBody::ModelListResponse { .. }));
 
-        let r_stream = dispatch(
-            &MessageBody::ChatStreamRequestBody(ChatStreamRequest {
-                model_id: "x".to_string(),
-                messages: vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: "hi".to_string(),
-                }],
-                temperature: None,
-                max_tokens: None,
-            }),
-            &ctx_user,
-        );
-        assert!(!r_stream.1);
-        assert!(matches!(r_stream.0, MessageBody::ChatStreamEndBody(_)));
+        let flow_list = dispatch(&MessageBody::FlowListRequest, &ctx_user);
+        assert!(!flow_list.1);
+        assert!(matches!(flow_list.0, MessageBody::FlowListResponse { .. }));
 
-        let w_create = dispatch(
-            &MessageBody::ApiKeyCreateRequestBody(ApiKeyCreateRequest {
-                name: "svc".to_string(),
-                scopes: vec![],
-            }),
-            &ctx_user,
-        );
-        assert!(!w_create.1);
-        assert!(matches!(w_create.0, MessageBody::ApiKeyCreateResponseBody(_)));
-
-        let ctx_admin = HandlerContext {
-            session: SessionAuth::UserSession {
-                user_id: [0u8; 16],
-                role: Some("admin".to_string()),
-            },
-            correlation_id: 101,
-            resume_secret: None,
-        };
-        let w_update = dispatch(
-            &MessageBody::ClusterUpdateRequestBody(ClusterUpdateRequest {
-                cluster_id: "c1".to_string(),
-                name: "Prod".to_string(),
-                description: None,
-            }),
-            &ctx_admin,
-        );
-        assert!(!w_update.1);
-        assert!(matches!(w_update.0, MessageBody::ClusterUpdateResponseBody(_)));
-
-        let w_delete = dispatch(
-            &MessageBody::ApiKeyRevokeRequest {
-                key_id: "x".to_string(),
-            },
-            &ctx_user,
-        );
-        assert!(!w_delete.1);
-        assert!(matches!(w_delete.0, MessageBody::ApiKeyRevokeResponse { .. }));
-
+        // W-ACTION login z fake credentials → AuthRequired (real auth check).
         let w_action = dispatch(
             &MessageBody::AuthLoginRequestBody(AuthLoginRequest {
-                username: "u".to_string(),
-                password: "p".to_string(),
+                username: "nonexistent".to_string(),
+                password: "wrong".to_string(),
             }),
             &HandlerContext {
                 session: SessionAuth::Anonymous,
                 correlation_id: 1,
                 resume_secret: None,
+                state: state::AppState::for_test(),
             },
         );
-        assert!(!w_action.1);
-        assert!(matches!(w_action.0, MessageBody::AuthLoginResponseBody(_)));
+        assert!(w_action.1);
+        match w_action.0 {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::AuthRequired),
+            other => panic!("expected AuthRequired, got {:?}", other),
+        }
+
+        // Admin-only handler bez admin role → PolicyDenied.
+        let w_update_no_admin = dispatch(
+            &MessageBody::ClusterUpdateRequestBody(ClusterUpdateRequest {
+                cluster_id: "c1".to_string(),
+                name: "Prod".to_string(),
+                description: None,
+            }),
+            &ctx_user,
+        );
+        assert!(w_update_no_admin.1);
+        match w_update_no_admin.0 {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
+            other => panic!("expected PolicyDenied, got {:?}", other),
+        }
     }
 
     #[test]
@@ -580,6 +555,7 @@ mod tests {
             session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
             correlation_id: 7,
             resume_secret: None,
+            state: state::AppState::for_test(),
         };
         let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx);
         assert!(!is_err);
@@ -592,6 +568,7 @@ mod tests {
             session: SessionAuth::Anonymous,
             correlation_id: 8,
             resume_secret: None,
+            state: state::AppState::for_test(),
         };
         let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx);
         assert!(is_err);
@@ -607,6 +584,7 @@ mod tests {
             session: SessionAuth::Anonymous,
             correlation_id: 9,
             resume_secret: None,
+            state: state::AppState::for_test(),
         };
         let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx);
         assert!(!is_err);

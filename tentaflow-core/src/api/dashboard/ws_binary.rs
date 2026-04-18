@@ -21,10 +21,11 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 
 use crate::dispatch::{
-    self, resume_token,
+    self, audit_broadcast, resume_token,
     subscription::{self, SubscriptionEvent},
-    HandlerContext,
+    AppState, HandlerContext,
 };
+use tentaflow_protocol::MessageBody as Mb;
 
 /// Sink wrapped in async mutex zeby main read loop + streaming tasks moga
 /// dzielic write side WS bez wzajemnego blokowania read side.
@@ -73,6 +74,7 @@ pub async fn handle_ws_connection<S>(
     user_id: Option<i64>,
     role: Option<String>,
     resume_secret: std::sync::Arc<Vec<u8>>,
+    app_state: std::sync::Arc<AppState>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -103,6 +105,26 @@ pub async fn handle_ws_connection<S>(
     let mut owned_subscription_ids: Vec<u64> = Vec::new();
 
     debug!("binary-WS: nowe polaczenie");
+
+    // Spawnuj task ktory pushuje audit eventy jako unsolicited frames.
+    {
+        let sink_audit = Arc::clone(&sink);
+        let seq_audit = Arc::clone(&next_server_sequence);
+        let mut audit_rx = audit_broadcast::subscribe();
+        tokio::spawn(async move {
+            while let Ok(event) = audit_rx.recv().await {
+                let _ = send_body(
+                    &sink_audit,
+                    0, // unsolicited — correlation_id 0 (no matching request)
+                    next_seq(&seq_audit),
+                    tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
+                    &Mb::AuditEventBody(event),
+                    EnvelopeFlags::empty(),
+                )
+                .await;
+            }
+        });
+    }
 
     while let Some(msg) = source.next().await {
         let msg = match msg {
@@ -237,6 +259,7 @@ pub async fn handle_ws_connection<S>(
                     session: session.clone(),
                     correlation_id: envelope.correlation_id,
                     resume_secret: Some(resume_secret.clone()),
+                    state: app_state.clone(),
                 };
 
                 let variant_name = dispatch::variant_name_of(&body);

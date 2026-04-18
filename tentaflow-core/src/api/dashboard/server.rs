@@ -404,13 +404,29 @@ pub async fn handle_request(
                 .unwrap_or_default(),
         );
 
+        // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
+        let app_state = std::sync::Arc::new(crate::dispatch::AppState {
+            db: db.clone(),
+            router: router.clone(),
+            mesh_peer_store: mesh_peer_store.clone(),
+            service_manager: service_manager.clone(),
+            metrics: metrics.clone(),
+            settings_cipher: settings_cipher.clone(),
+            cipher: cipher.clone(),
+            quic_mesh: quic_mesh.clone(),
+            local_node_id: local_node_id.clone(),
+            mesh_security: mesh_security.clone(),
+            permission_checker: permission_checker.clone(),
+            license: license.clone(),
+        });
+
         let upgrade = hyper::upgrade::on(&mut req);
 
         tokio::spawn(async move {
             match upgrade.await {
                 Ok(upgraded) => {
                     let io = TokioIo::new(upgraded);
-                    super::ws_binary::handle_ws_connection(io, user_id, role, resume_secret).await;
+                    super::ws_binary::handle_ws_connection(io, user_id, role, resume_secret, app_state).await;
                 }
                 Err(e) => {
                     error!("Blad WebSocket upgrade (binary): {}", e);
