@@ -23,12 +23,30 @@ use crate::dispatch::{self, HandlerContext};
 /// Konserwatywnie 1 MiB — typowe requesty sa <1 KiB, deploy manifests mieszcza sie w 64 KiB.
 const MAX_FRAME_SIZE: usize = 1_048_576;
 
+/// Mapuje SQLite i64 user_id do 16-bajtowego SessionAuth user_id.
+/// Padding: 8 zero bytes + 8 bytes LE u64 reprezentacja i64.
+fn user_id_to_bytes(user_id: i64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[8..].copy_from_slice(&(user_id as u64).to_le_bytes());
+    buf
+}
+
 /// Obsluguje pojedyncze polaczenie binary-WS. Single-threaded loop read/write,
 /// kazdy frame dispatch synchroniczny (dla streamingu bedzie osobny task per stream).
-pub async fn handle_ws_connection<S>(stream: S)
+///
+/// `user_id` z JWT claims (extract_ws_user_id w server.rs). None = degraduje do
+/// Anonymous session — handler dispatch sprawdzi czy wariant na to pozwala.
+pub async fn handle_ws_connection<S>(stream: S, user_id: Option<i64>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let session = match user_id {
+        Some(id) => SessionAuth::UserSession {
+            user_id: user_id_to_bytes(id),
+        },
+        None => SessionAuth::Anonymous,
+    };
+
     let ws = WebSocketStream::from_raw_socket(
         stream,
         tokio_tungstenite::tungstenite::protocol::Role::Server,
@@ -181,10 +199,9 @@ where
                 }
 
                 // Dispatch przez registry (handlerzy rejestrowani przez `#[handler]`).
-                // Auth na razie = UserSession placeholder (JWT validator w validate_ws_upgrade
-                // juz zweryfikowal token; user_id trzeba bedzie propagowac w #36).
+                // Session ustanowiona raz przy WSS upgrade z JWT claims.
                 let ctx = HandlerContext {
-                    session: SessionAuth::UserSession { user_id: [0u8; 16] },
+                    session: session.clone(),
                     correlation_id: envelope.correlation_id,
                 };
                 let (resp_body, is_error) = dispatch::dispatch(&body, &ctx);
