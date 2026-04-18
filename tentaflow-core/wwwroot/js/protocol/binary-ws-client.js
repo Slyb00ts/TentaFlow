@@ -44,7 +44,33 @@ export class BinaryWsClient {
     this.onOpen = opts.onOpen ?? noop;
     this.onClose = opts.onClose ?? noop;
     this.onProtocolError = opts.onProtocolError ?? noop;
-    this.onUnsolicited = opts.onUnsolicited ?? noop;
+    // P2c FIX: lista listenerow dla unsolicited frame (kazda screen moze
+    // dodac swoj). Stare onUnsolicited (single) zachowane jako shortcut.
+    this._unsolicitedListeners = [];
+    if (opts.onUnsolicited) this._unsolicitedListeners.push(opts.onUnsolicited);
+  }
+
+  /**
+   * Dodaje listener dla unsolicited frame (server-push events bez request match).
+   * Zwraca unsubscribe callback.
+   */
+  addUnsolicitedListener(listener) {
+    this._unsolicitedListeners.push(listener);
+    return () => {
+      const idx = this._unsolicitedListeners.indexOf(listener);
+      if (idx >= 0) this._unsolicitedListeners.splice(idx, 1);
+    };
+  }
+
+  /**
+   * Backward compat: ustawia jedyny listener (zachowuje stary onUnsolicited semantyke).
+   * Lepiej uzywac addUnsolicitedListener dla composition.
+   */
+  set onUnsolicited(listener) {
+    this._unsolicitedListeners = listener ? [listener] : [];
+  }
+  get onUnsolicited() {
+    return this._unsolicitedListeners[0] ?? noop;
   }
 
   /**
@@ -224,7 +250,14 @@ export class BinaryWsClient {
       return;
     }
 
-    this.onUnsolicited({ envelope, body });
+    // P2c FIX: dispatch do wszystkich listenerow (multiple screens).
+    for (const listener of this._unsolicitedListeners) {
+      try {
+        listener({ envelope, body });
+      } catch (err) {
+        console.error('[ws] unsolicited listener threw:', err);
+      }
+    }
   }
 
   _startHeartbeat() {
