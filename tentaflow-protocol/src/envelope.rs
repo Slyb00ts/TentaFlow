@@ -18,7 +18,12 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// Wersja schematu protokolu. Handshake porownuje wartosc klienta z serwerem;
 /// mismatch = reject. Inkrementowac przy KAZDEJ breaking change w Envelope
 /// lub MessageBody. Migration przez dual-version support w przejsciowym okienku.
-pub const SCHEMA_VERSION: u16 = 2;
+///
+/// v3 changes (2026-04-18):
+///   - Envelope.sequence u32 -> u64 (overflow bug fix)
+///   - SessionAuth::UserSession adds `role: Option<String>` (RBAC)
+///   - Resume tokens now bind to originating_user_id (P0 fix)
+pub const SCHEMA_VERSION: u16 = 3;
 
 // =============================================================================
 // Message kind discriminants
@@ -125,8 +130,12 @@ pub enum SessionAuth {
     Anonymous,
     /// Zewnetrzny klient uwierzytelniony przez API key (key_id do logowania).
     ApiKey { key_id: String },
-    /// Browser GUI przez WSS; user_id jako 16-byte UUID.
-    UserSession { user_id: [u8; 16] },
+    /// Browser GUI przez WSS; user_id jako 16-byte UUID. `role` z JWT claims
+    /// ("admin" / "user" / itp.); None gdy claims nie maja role field.
+    UserSession {
+        user_id: [u8; 16],
+        role: Option<String>,
+    },
     /// Mesh peer trusted przez pairing; node_id = Ed25519 pubkey, epoch = key rotation.
     MeshTrust { node_id: [u8; 32], epoch: u32 },
 }
@@ -187,9 +196,12 @@ impl SignedSessionClaim {
                 buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
-            SessionAuth::UserSession { user_id } => {
+            SessionAuth::UserSession { user_id, role } => {
                 buf.push(2);
                 buf.extend_from_slice(user_id);
+                let role_bytes = role.as_deref().unwrap_or("").as_bytes();
+                buf.extend_from_slice(&(role_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(role_bytes);
             }
             SessionAuth::MeshTrust { node_id, epoch } => {
                 buf.push(3);
@@ -221,8 +233,9 @@ pub struct Envelope {
     pub schema_version: u16,
     /// Linkuje request z response/stream chunkami. Per-connection unikalny.
     pub correlation_id: u64,
-    /// Per-connection counter. Replay window (sliding) na serwerze.
-    pub sequence: u32,
+    /// Per-connection counter. Replay window (sliding) na serwerze. u64 zeby
+    /// uniknac overflow na long-lived connections (4B+ frames).
+    pub sequence: u64,
     /// Discriminant wariantu MessageBody (patrz `message_kind` module).
     pub message_kind: u16,
     /// Flagi bitowe (error / stream chunk / stream end).
@@ -239,7 +252,7 @@ impl Envelope {
     /// Nowy direct-routed envelope bez session claima (zwykly client->node).
     pub fn new_direct(
         correlation_id: u64,
-        sequence: u32,
+        sequence: u64,
         message_kind: u16,
         body: Vec<u8>,
     ) -> Self {
@@ -258,7 +271,7 @@ impl Envelope {
     /// Nowy forward envelope z session claim (node A -> node B).
     pub fn new_forward(
         correlation_id: u64,
-        sequence: u32,
+        sequence: u64,
         message_kind: u16,
         target_node_id: [u8; 32],
         claim: SignedSessionClaim,
@@ -308,6 +321,7 @@ mod tests {
             originating_user_id: [7u8; 16],
             originating_session_type: SessionAuth::UserSession {
                 user_id: [7u8; 16],
+                role: Some("user".to_string()),
             },
             issued_at_epoch: 1_700_000_000,
             forwarding_node_id: [9u8; 32],
@@ -410,8 +424,9 @@ mod tests {
     fn signing_message_stable_layout() {
         let claim = sample_claim();
         let msg = claim.signing_message();
-        // [16] user_id + [8] epoch + [32] node_id + [1] discriminant + [16] UserSession.user_id
-        assert_eq!(msg.len(), 16 + 8 + 32 + 1 + 16);
+        // [16] user_id + [8] epoch + [32] node_id + [1] discriminant
+        // + [16] UserSession.user_id + [4] role_len + [4] "user" bytes
+        assert_eq!(msg.len(), 16 + 8 + 32 + 1 + 16 + 4 + 4);
         assert_eq!(&msg[0..16], &[7u8; 16]);
         assert_eq!(
             &msg[16..24],
@@ -420,6 +435,9 @@ mod tests {
         );
         assert_eq!(&msg[24..56], &[9u8; 32]);
         assert_eq!(msg[56], 2, "UserSession discriminant");
+        assert_eq!(&msg[57..73], &[7u8; 16], "user_id");
+        assert_eq!(&msg[73..77], &4u32.to_le_bytes(), "role len");
+        assert_eq!(&msg[77..81], b"user", "role bytes");
     }
 
     #[test]
@@ -466,7 +484,14 @@ mod tests {
             SessionAuth::ApiKey {
                 key_id: "abc123".to_string(),
             },
-            SessionAuth::UserSession { user_id: [3u8; 16] },
+            SessionAuth::UserSession {
+                user_id: [3u8; 16],
+                role: Some("admin".to_string()),
+            },
+            SessionAuth::UserSession {
+                user_id: [4u8; 16],
+                role: None,
+            },
             SessionAuth::MeshTrust {
                 node_id: [5u8; 32],
                 epoch: 7,
