@@ -34,6 +34,21 @@ pub struct HandlerContext {
     pub session: SessionAuth,
     /// Correlation_id dla tracing/spans.
     pub correlation_id: u64,
+    /// Connection-scoped resume secret (HMAC key dla resume token verify).
+    /// None gdy connection nie ma sekretu (test code).
+    pub resume_secret: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+impl HandlerContext {
+    /// Helper dla testow — buduje minimalny kontekst.
+    #[cfg(test)]
+    pub fn for_test(session: SessionAuth, correlation_id: u64) -> Self {
+        Self {
+            session,
+            correlation_id,
+            resume_secret: None,
+        }
+    }
 }
 
 // =============================================================================
@@ -322,6 +337,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::UserSession { user_id: [0u8; 16] },
             correlation_id: 1,
+            resume_secret: None,
         };
         let body = MessageBody::Error(ProtocolError {
             code: ProtocolErrorCode::Internal,
@@ -361,6 +377,7 @@ mod tests {
         let ctx_user = HandlerContext {
             session: SessionAuth::UserSession { user_id: [0u8; 16] },
             correlation_id: 100,
+            resume_secret: None,
         };
 
         let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_user);
@@ -424,6 +441,7 @@ mod tests {
             &HandlerContext {
                 session: SessionAuth::Anonymous,
                 correlation_id: 1,
+                resume_secret: None,
             },
         );
         assert!(!w_action.1);
@@ -435,6 +453,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::UserSession { user_id: [0u8; 16] },
             correlation_id: 7,
+            resume_secret: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx);
         assert!(!is_err);
@@ -446,6 +465,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 8,
+            resume_secret: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx);
         assert!(is_err);
@@ -460,6 +480,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 9,
+            resume_secret: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx);
         assert!(!is_err);

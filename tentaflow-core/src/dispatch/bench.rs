@@ -39,6 +39,7 @@ mod tests {
         let ctx = HandlerContext {
             session: SessionAuth::UserSession { user_id: [0u8; 16] },
             correlation_id: 1,
+            resume_secret: None,
         };
 
         let variants = [
