@@ -382,6 +382,18 @@ pub enum MessageBody {
     MeshTrustRevoked(MeshTrustRevokedEvent),
     MeshTrustedKeysSync(MeshTrustedKeysSyncEvent),
 
+    // ---- Subscription resume (client requests replay after reconnect) ----
+    /// Klient -> serwer: zaresumuj subscription z tokenem ktory dostal w
+    /// SubscribeResumeOffer przy ostatnim disconnect.
+    SubscribeResumeRequest { resume_token: Vec<u8> },
+    /// Serwer -> klient: ack/reject. Jesli accepted=true, subskrypcja jest
+    /// odtworzona pod tym samym correlation_id i serwer zaraz wysle brakujace
+    /// chunki z recorder buffer.
+    SubscribeResumeAck { accepted: bool, error: Option<String> },
+    /// Serwer -> klient: token ktory pozwoli na resume po disconnect.
+    /// Wysylany RAZEM z IS_STREAM_END (envelope flag), opcjonalny.
+    SubscribeResumeOffer { resume_token: Vec<u8> },
+
     // ---- Settings (R-LIST + W-UPDATE) ----
     SettingsListRequest,
     SettingsListResponse { entries: Vec<SettingEntry> },
