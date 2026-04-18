@@ -205,6 +205,28 @@ impl Recorder {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Query: wychodzace (Outgoing) frame'y dla correlation_id z `id` > `after_id`.
+    /// Sluzy do resume replay — klient po reconnect prosi o frame'y po ostatnim
+    /// otrzymanym sequence; serwer zwraca brakujace chunki.
+    pub fn outgoing_after(
+        &self,
+        correlation_id: u64,
+        after_id: i64,
+    ) -> Result<Vec<RecordedFrame>, RecorderError> {
+        let conn = self.conn.lock().expect("mutex");
+        let mut stmt = conn.prepare(
+            r#"SELECT id, ts_unix_millis, direction, correlation_id, message_kind,
+                      variant_name, flags, body_bytes
+               FROM wss_frames
+               WHERE correlation_id = ?1
+                 AND direction = 'out'
+                 AND id > ?2
+               ORDER BY id ASC"#,
+        )?;
+        let rows = stmt.query_map(params![correlation_id as i64, after_id], row_to_frame)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     /// Usuwa frame'y starsze niz `older_than_ms` ms (cleanup job).
     pub fn prune_older_than(&self, older_than_ms: i64) -> Result<usize, RecorderError> {
         let cutoff = SystemTime::now()
@@ -282,6 +304,40 @@ mod tests {
         assert_eq!(frames[0].variant_name, "Req");
         assert_eq!(frames[1].variant_name, "Chunk1");
         assert_eq!(frames[2].variant_name, "Chunk2");
+    }
+
+    #[test]
+    fn outgoing_after_returns_only_outgoing_with_id_gt_cutoff() {
+        let rec = make_recorder();
+        rec.record(Direction::Incoming, 1, 0x1, "Req", 0, &[1]);
+        rec.record(Direction::Outgoing, 1, 0x1, "Chunk1", 2, &[2]);
+        rec.record(Direction::Outgoing, 1, 0x1, "Chunk2", 2, &[3]);
+        rec.record(Direction::Outgoing, 1, 0x1, "Chunk3", 4, &[4]);
+        rec.record(Direction::Incoming, 99, 0x1, "Other", 0, &[0]);
+
+        let all = rec.by_correlation(1).unwrap();
+        assert_eq!(all.len(), 4);
+        let chunk2_id = all
+            .iter()
+            .find(|f| f.variant_name == "Chunk2")
+            .unwrap()
+            .id;
+
+        let after = rec.outgoing_after(1, chunk2_id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].variant_name, "Chunk3");
+    }
+
+    #[test]
+    fn outgoing_after_excludes_other_correlations() {
+        let rec = make_recorder();
+        rec.record(Direction::Outgoing, 1, 0x1, "A", 0, &[]);
+        rec.record(Direction::Outgoing, 2, 0x1, "B", 0, &[]);
+        rec.record(Direction::Outgoing, 1, 0x1, "C", 0, &[]);
+
+        let after = rec.outgoing_after(1, 0).unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(after.iter().all(|f| f.correlation_id == 1));
     }
 
     #[test]
