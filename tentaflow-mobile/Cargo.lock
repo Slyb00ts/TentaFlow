@@ -2764,6 +2764,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "io-extras"
 version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5755,11 +5764,13 @@ dependencies = [
  "hex",
  "hf-hub",
  "hkdf",
+ "hmac",
  "hostname",
  "hound",
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",
+ "inventory",
  "jsonwebtoken",
  "lazy_static",
  "libc",
@@ -5785,6 +5796,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "tentaflow-macros",
  "tentaflow-protocol",
  "thiserror 1.0.69",
  "tokio",
@@ -5810,6 +5822,15 @@ dependencies = [
  "zeroize",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "tentaflow-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
