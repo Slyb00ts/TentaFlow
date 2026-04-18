@@ -40,6 +40,7 @@ async fn streaming_handler_emits_chunks_and_end() {
         session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
         correlation_id: 100,
         resume_secret: Some(Arc::new(b"e2e-secret".to_vec())),
+        state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
 
     (h.handler_fn)(req, ctx, sub);

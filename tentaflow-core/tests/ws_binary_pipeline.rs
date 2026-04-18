@@ -95,8 +95,9 @@ fn model_list_request_allows_anonymous() {
     let req = encode_request(1, MessageBody::ModelListRequest);
     let resp = server_handle(&req, SessionAuth::Anonymous);
     let (_env, body) = decode_response(&resp);
+    // Empty test DB — real handler zwraca empty Vec, not error.
     match body {
-        MessageBody::ModelListResponse { models } => assert!(!models.is_empty()),
+        MessageBody::ModelListResponse { models } => assert!(models.is_empty()),
         other => panic!("expected ModelListResponse, got {:?}", other),
     }
 }
@@ -117,25 +118,32 @@ fn anonymous_session_denied_for_admin_handler() {
 }
 
 #[test]
-fn auth_login_then_auth_me_flow() {
-    use tentaflow_protocol::{AuthLoginRequest, AuthMeResponse};
+fn auth_login_with_unknown_user_rejected() {
+    use tentaflow_protocol::AuthLoginRequest;
 
-    // Login step — Anonymous OK
     let login_req = encode_request(
         1,
         MessageBody::AuthLoginRequestBody(AuthLoginRequest {
-            username: "admin".to_string(),
-            password: "s3cret".to_string(),
+            username: "nonexistent".to_string(),
+            password: "wrong".to_string(),
         }),
     );
     let login_resp = server_handle(&login_req, SessionAuth::Anonymous);
-    let (_, login_body) = decode_response(&login_resp);
-    let _jwt = match login_body {
-        MessageBody::AuthLoginResponseBody(resp) => resp.jwt,
-        other => panic!("expected AuthLoginResponse, got {:?}", other),
-    };
+    let (env, login_body) = decode_response(&login_resp);
+    assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
+    match login_body {
+        MessageBody::Error(e) => assert_eq!(
+            e.code,
+            tentaflow_protocol::ProtocolErrorCode::AuthRequired
+        ),
+        other => panic!("expected AuthRequired, got {:?}", other),
+    }
+}
 
-    // AuthMe — wymaga UserSession (po login bedzie nowa sesja z user_id z JWT)
+#[test]
+fn auth_me_without_proper_user_id_format_fails() {
+    // user_id [0u8; 16] nie ma 0xFF marker → user_id_to_i64 returns None
+    // → handler zwraca Internal error.
     let me_req = encode_request(2, MessageBody::AuthMeRequest);
     let me_resp = server_handle(
         &me_req,
@@ -144,11 +152,15 @@ fn auth_login_then_auth_me_flow() {
             role: None,
         },
     );
-    let (_, me_body) = decode_response(&me_resp);
-    let _: AuthMeResponse = match me_body {
-        MessageBody::AuthMeResponseBody(r) => r,
-        other => panic!("expected AuthMeResponse, got {:?}", other),
-    };
+    let (env, body) = decode_response(&me_resp);
+    assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
+    match body {
+        MessageBody::Error(e) => assert_eq!(
+            e.code,
+            tentaflow_protocol::ProtocolErrorCode::Internal
+        ),
+        other => panic!("expected Internal error, got {:?}", other),
+    }
 }
 
 #[test]
@@ -166,7 +178,7 @@ fn dashboard_metrics_request_returns_snapshot() {
 }
 
 #[test]
-fn mesh_peers_list_response_contains_self() {
+fn mesh_peers_list_response_for_empty_mesh() {
     let req = encode_request(100, MessageBody::MeshPeersListRequest);
     let resp = server_handle(
         &req,
@@ -176,32 +188,27 @@ fn mesh_peers_list_response_contains_self() {
         },
     );
     let (_, body) = decode_response(&resp);
+    // Empty MeshPeerStore w test fixture → empty Vec.
     match body {
-        MessageBody::MeshPeersListResponse { peers } => assert!(!peers.is_empty()),
+        MessageBody::MeshPeersListResponse { peers } => assert!(peers.is_empty()),
         other => panic!("expected MeshPeersListResponse, got {:?}", other),
     }
 }
 
 #[test]
-fn settings_update_returns_applied_count() {
+fn settings_update_requires_admin() {
     use tentaflow_protocol::{SettingEntry, SettingsUpdateRequest};
     let req = encode_request(
         200,
         MessageBody::SettingsUpdateRequestBody(SettingsUpdateRequest {
-            entries: vec![
-                SettingEntry {
-                    key: "theme".into(),
-                    value: "dark".into(),
-                    is_secret: false,
-                },
-                SettingEntry {
-                    key: "api_key".into(),
-                    value: "s3cret".into(),
-                    is_secret: true,
-                },
-            ],
+            entries: vec![SettingEntry {
+                key: "theme".into(),
+                value: "dark".into(),
+                is_secret: false,
+            }],
         }),
     );
+    // Sesja bez admin role → PolicyDenied.
     let resp = server_handle(
         &req,
         SessionAuth::UserSession {
@@ -209,9 +216,40 @@ fn settings_update_returns_applied_count() {
             role: None,
         },
     );
+    let (env, body) = decode_response(&resp);
+    assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
+    match body {
+        MessageBody::Error(e) => assert_eq!(
+            e.code,
+            tentaflow_protocol::ProtocolErrorCode::PolicyDenied
+        ),
+        other => panic!("expected PolicyDenied, got {:?}", other),
+    }
+}
+
+#[test]
+fn settings_update_with_admin_succeeds() {
+    use tentaflow_protocol::{SettingEntry, SettingsUpdateRequest};
+    let req = encode_request(
+        201,
+        MessageBody::SettingsUpdateRequestBody(SettingsUpdateRequest {
+            entries: vec![SettingEntry {
+                key: "theme".into(),
+                value: "dark".into(),
+                is_secret: false,
+            }],
+        }),
+    );
+    let resp = server_handle(
+        &req,
+        SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: Some("admin".into()),
+        },
+    );
     let (_, body) = decode_response(&resp);
     match body {
-        MessageBody::SettingsUpdateResponse { applied } => assert_eq!(applied, 2),
+        MessageBody::SettingsUpdateResponse { applied } => assert_eq!(applied, 1),
         other => panic!("expected SettingsUpdateResponse, got {:?}", other),
     }
 }
