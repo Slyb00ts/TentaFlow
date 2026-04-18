@@ -12,6 +12,7 @@
 // =============================================================================
 
 pub mod accept_connect;
+pub mod pairing;
 pub mod replay;
 
 /// Nazwa ALPN dla mesh peers — taka sama jak w produkcji `tentaflow-mesh`.
