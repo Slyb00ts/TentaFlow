@@ -482,6 +482,61 @@ impl QuicMeshManager {
         }
     }
 
+    /// Obsługa klienta (ALPN `tentaflow`) — każdy bidi stream to jeden
+    /// request/response. Klient wysyła surowe rkyv bajty `ModelRequest`,
+    /// `forward_handler` (opakowanie `Router::route_model_request`) zwraca
+    /// rkyv bajty `ModelResponse`, które zapisujemy do send half + finish.
+    /// Brak wymogu pairingu/zaufania — klienci są zewnętrzni, autoryzacja
+    /// dzieje się na poziomie TLS (cert).
+    async fn handle_client_connection(
+        connection: quinn::Connection,
+        forward_handler: Arc<RwLock<Option<ForwardHandler>>>,
+    ) {
+        loop {
+            let (mut send, mut recv) = match connection.accept_bi().await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(remote = %connection.remote_address(),
+                        "Klient tentaflow: accept_bi zakończony: {}", e);
+                    return;
+                }
+            };
+            let fh = forward_handler.clone();
+            let remote = connection.remote_address();
+            tokio::spawn(async move {
+                // Limit 16 MiB na request (audio + embeddings).
+                let request_bytes = match recv.read_to_end(16 * 1024 * 1024).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(remote = %remote, "Klient: błąd odczytu requestu: {}", e);
+                        return;
+                    }
+                };
+                let handler_opt = fh.read().await.clone();
+                let response_bytes = if let Some(handler) = handler_opt {
+                    match handler(request_bytes).await {
+                        bytes if !bytes.is_empty() => bytes,
+                        _ => {
+                            warn!(remote = %remote, "Klient: forward_handler zwrócił pusty bufor");
+                            return;
+                        }
+                    }
+                } else {
+                    warn!(remote = %remote, "Klient: brak forward_handler — odrzucam");
+                    let _ = send.finish();
+                    return;
+                };
+                if let Err(e) = send.write_all(&response_bytes).await {
+                    warn!(remote = %remote, "Klient: błąd zapisu odpowiedzi: {}", e);
+                    return;
+                }
+                if let Err(e) = send.finish() {
+                    debug!(remote = %remote, "Klient: błąd finish: {}", e);
+                }
+            });
+        }
+    }
+
     /// Obsluguje polaczenie przychodzace — odczytuje node_id peera i waliduje regule
     async fn handle_incoming(
         incoming: quinn::Incoming,
@@ -499,6 +554,20 @@ impl QuicMeshManager {
                 return;
             }
         };
+
+        // Rozgałęzienie per ALPN: "tentaflow" → klient (rkyv ModelRequest/Response),
+        // "tentaflow-mesh" → mesh peer (obecny path z node_id + shared secret).
+        let negotiated_alpn = connection
+            .handshake_data()
+            .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|d| d.protocol);
+        if let Some(ref alpn) = negotiated_alpn {
+            if alpn.as_slice() == b"tentaflow" {
+                info!(remote = %connection.remote_address(), "Klient tentaflow connected (ALPN tentaflow)");
+                Self::handle_client_connection(connection, forward_handler).await;
+                return;
+            }
+        }
 
         // Czekaj na bidi-stream z identyfikacja peera (max 10s)
         let (mut send, mut recv) = match tokio::time::timeout(
@@ -2276,7 +2345,16 @@ impl QuicMeshManager {
             .with_single_cert(certs, key_der.clone_key())
             .context("Nie udalo sie skonfigurowac server TLS")?;
 
-        server_crypto.alpn_protocols = vec![b"tentaflow-mesh".to_vec()];
+        // Jeden endpoint akceptuje dwa ALPN na tym samym porcie:
+        // - "tentaflow-mesh": peer-to-peer mesh (obecny kod)
+        // - "tentaflow":      natywni klienci (Tab5, tentaflow-client) — ścieżka
+        //                     rkyv(ModelRequest/ModelResponse) przez `forward_handler`
+        //                     (opakowuje `Router::route_model_request`).
+        // Rozróżnienie po handshake: `connection.handshake_data().protocol`.
+        server_crypto.alpn_protocols = vec![
+            b"tentaflow-mesh".to_vec(),
+            b"tentaflow".to_vec(),
+        ];
 
         // Client config — pomijamy weryfikacje serwera (mesh internal)
         let mut client_crypto = rustls::ClientConfig::builder()
