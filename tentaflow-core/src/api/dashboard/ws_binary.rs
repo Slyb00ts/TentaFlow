@@ -213,6 +213,7 @@ pub async fn handle_ws_connection<S>(
                 let ctx = HandlerContext {
                     session: session.clone(),
                     correlation_id: envelope.correlation_id,
+                    resume_secret: Some(resume_secret.clone()),
                 };
 
                 // Sprawdz czy to streaming variant — jesli tak, spawnuj stream

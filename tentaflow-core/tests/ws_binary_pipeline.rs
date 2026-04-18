@@ -37,6 +37,7 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
     let ctx = HandlerContext {
         session,
         correlation_id: env.correlation_id,
+        resume_secret: None,
     };
     let (resp_body, is_error) = dispatch::dispatch(&body, &ctx);
 
