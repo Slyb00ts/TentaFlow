@@ -1,0 +1,84 @@
+/* =============================================================================
+ * tokens.css — design system, kolory + typografia + odstepy
+ * Indigo/lilac palette per DESIGN.md, dark theme z light fallbackiem.
+ * ============================================================================= */
+
+:root {
+  /* Primary palette */
+  --color-bg: #0b0e1a;
+  --color-bg-elevated: #131726;
+  --color-bg-hover: #1a1f33;
+  --color-surface: #181d2e;
+  --color-surface-2: #20263c;
+  --color-border: #2a3050;
+  --color-border-strong: #3a4170;
+
+  --color-text: #e6e8f0;
+  --color-text-muted: #8b91ad;
+  --color-text-faint: #5c6285;
+
+  --color-accent: #6366f1;
+  --color-accent-2: #a78bfa;
+  --color-accent-hover: #7c7ff5;
+
+  --gradient-logo: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  --gradient-accent: linear-gradient(90deg, #6366f1, #a78bfa);
+
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+  --color-error: #ef4444;
+  --color-info: #38bdf8;
+
+  --glow-accent: 0 0 24px rgba(99, 102, 241, 0.35);
+  --glow-success: 0 0 16px rgba(34, 197, 94, 0.35);
+  --glow-error: 0 0 16px rgba(239, 68, 68, 0.35);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.5);
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-8: 48px;
+  --space-10: 64px;
+
+  --font-sans: 'Manrope', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --text-xs: 11px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 32px;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  --line-tight: 1.25;
+  --line-base: 1.5;
+  --line-loose: 1.7;
+
+  --ease-quick: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+  --duration-slow: 360ms;
+
+  --sidebar-width: 240px;
+  --topbar-height: 56px;
+}
