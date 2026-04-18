@@ -15,6 +15,7 @@ use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionA
 pub mod handlers;
 pub mod metrics;
 pub mod recorder;
+pub mod resume_token;
 pub mod stream_handlers;
 pub mod subscription;
 
