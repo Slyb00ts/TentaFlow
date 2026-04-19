@@ -20,7 +20,8 @@ pub mod chat_template;
 pub mod middleware;
 pub mod meeting_transcript;
 pub mod transcript_store;
-pub(crate) mod reverse_request;
+pub mod reverse_request;
+pub mod live_metrics;
 
 // Re-eksporty publicznych typow
 pub use router::{

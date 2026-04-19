@@ -1,75 +1,590 @@
 // =============================================================================
 // Plik: modules/services.js
-// Opis: Lista serwisow + stop (admin).
+// Opis: Ekran Services — 3 zakladki:
+//       1) Lista   — tabela deployowanych serwisow z auto-refresh 5s
+//       2) Aliasy  — CRUD aliasow modeli (/api/model-aliases)
+//       3) Modele  — zbiorcza lista modeli ze wszystkich nodow mesh
+//      "Nowy serwis" otwiera Catalog (target picker → wizard). Brak osobnego
+//      modala i przyciskow "Odswiez" / "Wdroz z katalogu" — te byly duplikatem.
+//      Auto-refresh uzywa morphdom przez /js/lib/patch.js zeby nie migotac.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, toast, formatDate } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, formatDate, apiGet, apiPost, apiDelete } from '/js/utils.js';
+import { I18n } from '/js/i18n.js';
+import { Router } from '/js/router.js';
+import { patchInner } from '/js/lib/patch.js';
 
 let services = [];
+let aliases = [];
+let meshNodes = [];
+let quicStatusMap = {};
+let refreshTimer = null;
+let quicTimer = null;
+let currentTab = 'list';
+let lastQuery = '';
 
-const ServicesScreen = {
-  title: 'Serwisy',
-  render() {
-    return `
-      <div class="content-header">
-        <h1>Serwisy</h1>
-        <button class="btn" id="btn-refresh">Odśwież</button>
-      </div>
-      <div class="card" style="padding: 0;">
-        <div id="services-host"></div>
-      </div>`;
-  },
-  async mount() {
-    byId('btn-refresh').addEventListener('click', load);
-    await load();
-  },
-  unmount() { services = []; },
-};
-
-async function load() {
-  try {
-    services = await ApiBinary.list('serviceListRequest');
-    renderTable();
-  } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
+function sprite(id) {
+  return `<svg class="icon"><use href="#i-${id}"/></svg>`;
 }
 
-function renderTable() {
-  const host = byId('services-host');
-  if (!host) return;
-  if (services.length === 0) {
-    host.innerHTML = `<div class="empty-state"><div class="empty-state-text">Brak serwisów</div></div>`;
-    return;
+const ServicesScreen = {
+  get title() { return I18n.t('nav.services'); },
+  render() {
+    return `
+      <div class="page-header">
+        <div>
+          <h1>${sprite('services')} ${escapeHtml(I18n.t('services.title'))}</h1>
+          <div class="sub" id="services-sub">${escapeHtml(I18n.t('common.loading'))}</div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="svc-new">${sprite('plus')}${escapeHtml(I18n.t('services.add_service'))}</button>
+        </div>
+      </div>
+
+      <div class="rules-tabs" id="svc-tabs">
+        <div class="rules-tab active" data-tab="list">${sprite('services')}${escapeHtml(I18n.t('services.tab_list'))}<span class="badge" id="svc-tab-list-count">0</span></div>
+        <div class="rules-tab" data-tab="aliases">${sprite('share')}${escapeHtml(I18n.t('services.tab_aliases'))}<span class="badge" id="svc-tab-aliases-count">0</span></div>
+        <div class="rules-tab" data-tab="models">${sprite('model')}${escapeHtml(I18n.t('services.tab_models'))}<span class="badge" id="svc-tab-models-count">0</span></div>
+      </div>
+
+      <div id="svc-tab-body"></div>
+    `;
+  },
+  async mount() {
+    byId('svc-new')?.addEventListener('click', () => Router.navigate('catalog'));
+    byId('svc-tabs')?.addEventListener('click', handleTabClick);
+
+    await loadAll();
+    refreshTimer = setInterval(() => {
+      loadForCurrentTab();
+    }, 5000);
+    quicTimer = setInterval(loadQuicStatus, 5000);
+  },
+  unmount() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    if (quicTimer) clearInterval(quicTimer);
+    refreshTimer = null;
+    quicTimer = null;
+    services = [];
+    aliases = [];
+    meshNodes = [];
+    quicStatusMap = {};
+  },
+};
+
+// ---- Data loading ---------------------------------------------------------
+
+async function loadAll() {
+  try {
+    const [svc, al, nodes] = await Promise.all([
+      ApiBinary.list('serviceListRequest').catch(() => []),
+      apiGet('/api/model-aliases').catch(() => []),
+      apiGet('/api/mesh/nodes').catch(() => []),
+    ]);
+    services = svc || [];
+    aliases = al || [];
+    meshNodes = nodes || [];
+    renderTab();
+    updateSubtitle();
+    updateTabCounts();
+    await loadQuicStatus();
+  } catch (err) {
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
   }
-  host.innerHTML = `
-    <table class="data-table">
-      <thead><tr>
-        <th>Silnik</th><th>Model</th><th>Status</th><th>Strategia</th><th>Uruchomiono</th><th></th>
-      </tr></thead>
-      <tbody>
-        ${services.map((s) => `
-          <tr>
-            <td>${escapeHtml(s.engineId)}</td>
-            <td><code>${escapeHtml(s.modelId)}</code></td>
-            <td><span class="badge badge-${s.status === 'running' ? 'success' : 'warning'}">${escapeHtml(s.status)}</span></td>
-            <td>${escapeHtml(s.deployMethod)}</td>
-            <td>${s.startedAtEpoch ? formatDate(s.startedAtEpoch) : '—'}</td>
-            <td><button class="btn btn-sm btn-danger" data-stop="${escapeHtml(s.id)}">Stop</button></td>
-          </tr>`).join('')}
-      </tbody>
-    </table>`;
-  host.querySelectorAll('[data-stop]').forEach((b) => {
-    b.addEventListener('click', () => stop(b.dataset.stop));
+}
+
+async function loadForCurrentTab() {
+  try {
+    if (currentTab === 'list') {
+      services = await ApiBinary.list('serviceListRequest');
+      patchListTab();
+    } else if (currentTab === 'aliases') {
+      aliases = await apiGet('/api/model-aliases');
+      patchAliasesTab();
+    } else if (currentTab === 'models') {
+      meshNodes = await apiGet('/api/mesh/nodes');
+      patchModelsTab();
+    }
+    updateSubtitle();
+    updateTabCounts();
+  } catch (err) {
+    console.warn('[services] refresh failed:', err.message);
+  }
+}
+
+async function loadQuicStatus() {
+  try {
+    const resp = await ApiBinary.one('serviceQuicStatusRequest');
+    const next = {};
+    for (const item of resp.statuses ?? []) next[item.name] = item.status;
+    quicStatusMap = next;
+    if (currentTab === 'list') updateQuicDots();
+  } catch (err) {
+    console.warn('[services] quic status:', err.message);
+  }
+}
+
+function updateSubtitle() {
+  const running = services.filter((s) => ['running', 'active', 'ready'].includes((s.status || '').toLowerCase())).length;
+  const total = services.length;
+  const sub = byId('services-sub');
+  if (!sub) return;
+  sub.textContent = total === 0
+    ? I18n.t('services.subtitle_empty')
+    : I18n.t('services.subtitle_format', { total, running, nodes: meshNodes.length });
+}
+
+function updateTabCounts() {
+  const c1 = byId('svc-tab-list-count'); if (c1) c1.textContent = String(services.length);
+  const c2 = byId('svc-tab-aliases-count'); if (c2) c2.textContent = String(aliases.length);
+  const models = collectUniqueModels();
+  const c3 = byId('svc-tab-models-count'); if (c3) c3.textContent = String(models.length);
+}
+
+// ---- Tabs -----------------------------------------------------------------
+
+function handleTabClick(e) {
+  const t = e.target.closest('.rules-tab');
+  if (!t) return;
+  const id = t.dataset.tab;
+  if (!id || id === currentTab) return;
+  currentTab = id;
+  document.querySelectorAll('#svc-tabs .rules-tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === id));
+  renderTab();
+}
+
+function renderTab() {
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  if (currentTab === 'list') body.innerHTML = renderListTab();
+  else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
+  else if (currentTab === 'models') body.innerHTML = renderModelsTab();
+  bindTabEvents();
+  if (currentTab === 'list') updateQuicDots();
+}
+
+function patchListTab() {
+  if (currentTab !== 'list') return;
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  patchInner(body, renderListTab());
+  bindTabEvents();
+  updateQuicDots();
+}
+
+function patchAliasesTab() {
+  if (currentTab !== 'aliases') return;
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  patchInner(body, renderAliasesTab());
+  bindTabEvents();
+}
+
+function patchModelsTab() {
+  if (currentTab !== 'models') return;
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  patchInner(body, renderModelsTab());
+  bindTabEvents();
+}
+
+function bindTabEvents() {
+  const body = byId('svc-tab-body');
+  if (!body) return;
+
+  // List tab
+  body.querySelectorAll('[data-svc-delete]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      stopService(b.dataset.svcDelete, b.dataset.svcName);
+    };
+  });
+  body.querySelectorAll('[data-empty-cta]').forEach((b) => {
+    b.onclick = () => Router.navigate('catalog');
+  });
+
+  // Aliases tab
+  body.querySelectorAll('[data-alias-edit]').forEach((b) => {
+    b.onclick = () => {
+      const a = aliases.find((x) => String(x.id) === b.dataset.aliasEdit);
+      if (a) openAliasModal(a);
+    };
+  });
+  body.querySelectorAll('[data-alias-delete]').forEach((b) => {
+    b.onclick = () => deleteAlias(b.dataset.aliasDelete, b.dataset.aliasName);
+  });
+  body.querySelectorAll('[data-new-alias]').forEach((b) => {
+    b.onclick = () => openAliasModal(null);
   });
 }
 
-async function stop(serviceId) {
-  if (!confirm('Zatrzymać serwis?')) return;
+// ---- List tab -------------------------------------------------------------
+
+function renderListTab() {
+  if (services.length === 0) {
+    return `
+      <div class="empty-big">
+        ${sprite('services')}
+        <h3>${escapeHtml(I18n.t('services.empty'))}</h3>
+        <p>${escapeHtml(I18n.t('services.empty_hint'))}</p>
+        <button class="btn btn-primary" data-empty-cta>${sprite('plus')}${escapeHtml(I18n.t('services.empty_cta'))}</button>
+      </div>
+    `;
+  }
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>${escapeHtml(I18n.t('services.col_name'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_type'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_node'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_quic_address'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_quic_status'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_created'))}</th>
+          <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${services.map(renderRow).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderRow(s) {
+  const cfg = parseConfig(s.configJson);
+  const quicAddr = extractQuicAddr(cfg);
+  const nodeLabel = s.nodeHostname
+    || (s.nodeId ? `${s.nodeId.slice(0, 12)}…` : I18n.t('services.deploy_local'));
+  return `
+    <tr data-key="svc-${escapeAttr(s.id)}">
+      <td data-label="${escapeAttr(I18n.t('services.col_name'))}"><strong style="color: var(--accent-2);">${escapeHtml(s.name)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_type'))}"><span class="scope-chip ${typeChipClass(s.serviceType)}">${escapeHtml((s.serviceType || '').toUpperCase())}</span></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_node'))}" style="font-size: 12px;">${escapeHtml(nodeLabel)}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddr ? `<code style="font-size:11px;">${escapeHtml(quicAddr)}</code>` : '<span style="color:var(--text-3);">—</span>'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}"><span data-quic-status="${escapeAttr(s.name)}"><span class="tag-status offline">${escapeHtml(I18n.t('services.status.none'))}</span></span></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
+        <button class="btn btn-danger btn-icon" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}">${sprite('trash')}</button>
+      </td>
+    </tr>
+  `;
+}
+
+function updateQuicDots() {
+  document.querySelectorAll('[data-quic-status]').forEach((el) => {
+    const name = el.dataset.quicStatus;
+    const raw = (quicStatusMap[name] || 'none').toLowerCase();
+    let cls = 'offline', labelKey = 'services.status.none';
+    if (raw === 'connected' || raw === 'ready') {
+      cls = 'online';
+      labelKey = raw === 'ready' ? 'services.status.ready' : 'services.status.connected';
+    } else if (raw === 'connecting') { cls = 'pending'; labelKey = 'services.status.connecting'; }
+    else if (raw === 'disconnected') { cls = 'offline'; labelKey = 'services.status.disconnected'; }
+    else if (raw === 'config_error') { cls = 'offline'; labelKey = 'services.status.config_error'; }
+    const target = `<span class="tag-status ${cls}">${escapeHtml(I18n.t(labelKey))}</span>`;
+    if (el.innerHTML !== target) el.innerHTML = target;
+  });
+}
+
+// ---- Aliases tab ----------------------------------------------------------
+
+function renderAliasesTab() {
+  return `
+    <div class="info-card">
+      <div>${sprite('info')}<strong>${escapeHtml(I18n.t('services.aliases_info_title'))}</strong> — ${escapeHtml(I18n.t('services.aliases_info_body'))}</div>
+    </div>
+    ${aliases.length === 0 ? `
+      <div class="empty-big">
+        ${sprite('share')}
+        <h3>${escapeHtml(I18n.t('services.aliases_empty'))}</h3>
+        <p>${escapeHtml(I18n.t('services.aliases_empty_hint'))}</p>
+        <button class="btn btn-primary" data-new-alias>${sprite('plus')}${escapeHtml(I18n.t('services.new_alias'))}</button>
+      </div>
+    ` : `
+      <div class="svc-aliases-toolbar">
+        <button class="btn btn-primary btn-sm" data-new-alias>${sprite('plus')}${escapeHtml(I18n.t('services.new_alias'))}</button>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>${escapeHtml(I18n.t('services.alias_col_name'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_target'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_strategy'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_fallback'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_active'))}</th>
+            <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${aliases.map(renderAliasRow).join('')}
+        </tbody>
+      </table>
+    `}
+  `;
+}
+
+function renderAliasRow(a) {
+  const fallbacks = (a.fallback_targets || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const activeBadge = a.is_active
+    ? `<span class="tag-status online">● ${escapeHtml(I18n.t('services.alias_active'))}</span>`
+    : `<span class="tag-status offline">● ${escapeHtml(I18n.t('services.alias_inactive'))}</span>`;
+  return `
+    <tr data-key="alias-${escapeAttr(a.id)}">
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_name'))}"><strong style="color:var(--accent-2);">${escapeHtml(a.alias)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_target'))}"><code style="font-size:11px;">${escapeHtml(a.target_model)}</code></td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_strategy'))}"><span class="scope-chip chat">${escapeHtml(a.strategy || 'FirstAvailable')}</span></td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_fallback'))}">${fallbacks.length > 0 ? fallbacks.map((f) => `<span class="scope-chip mesh-read">${escapeHtml(f)}</span>`).join(' ') : '<span style="color:var(--text-3);">—</span>'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_active'))}">${activeBadge}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
+        <button class="btn btn-ghost btn-icon" data-alias-edit="${escapeAttr(a.id)}" title="${escapeAttr(I18n.t('common.edit'))}">${sprite('settings')}</button>
+        <button class="btn btn-danger btn-icon" data-alias-delete="${escapeAttr(a.id)}" data-alias-name="${escapeAttr(a.alias)}" title="${escapeAttr(I18n.t('common.delete'))}">${sprite('trash')}</button>
+      </td>
+    </tr>
+  `;
+}
+
+// ---- Models tab -----------------------------------------------------------
+
+function collectUniqueModels() {
+  // Zbiera z meshNodes[].models[] — grupuj po kluczu (alias|backend|kind).
+  const map = new Map();
+  for (const n of meshNodes) {
+    const list = Array.isArray(n.models) ? n.models : [];
+    const nodeLabel = n.hostname || (n.node_id ? n.node_id.slice(0, 12) : '?');
+    for (const m of list) {
+      const key = `${m.alias}|${m.backend || ''}|${m.kind || ''}`;
+      if (!map.has(key)) {
+        map.set(key, {
+          alias: m.alias,
+          kind: m.kind || '',
+          backend: m.backend || '',
+          size_mb: m.size_mb || 0,
+          loaded: !!m.loaded,
+          nodes: [nodeLabel],
+        });
+      } else {
+        const entry = map.get(key);
+        if (!entry.nodes.includes(nodeLabel)) entry.nodes.push(nodeLabel);
+        entry.loaded = entry.loaded || m.loaded;
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => a.alias.localeCompare(b.alias));
+}
+
+function renderModelsTab() {
+  const models = collectUniqueModels();
+  if (models.length === 0) {
+    return `
+      <div class="empty-big">
+        ${sprite('model')}
+        <h3>${escapeHtml(I18n.t('services.models_empty'))}</h3>
+        <p>${escapeHtml(I18n.t('services.models_empty_hint'))}</p>
+        <button class="btn btn-primary" data-empty-cta>${sprite('plus')}${escapeHtml(I18n.t('services.add_service'))}</button>
+      </div>
+    `;
+  }
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>${escapeHtml(I18n.t('services.model_col_alias'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_kind'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_backend'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_status'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_nodes'))}</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${models.map(renderModelRow).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderModelRow(m) {
+  const key = `${m.alias}|${m.backend}|${m.kind}`;
+  const statusChip = m.loaded
+    ? `<span class="tag-status online">● ${escapeHtml(I18n.t('services.model_loaded'))}</span>`
+    : `<span class="tag-status offline">● ${escapeHtml(I18n.t('services.model_unloaded'))}</span>`;
+  const nodeBadges = m.nodes.map((n) => `<span class="scope-chip mesh-read">${escapeHtml(n)}</span>`).join(' ');
+  return `
+    <tr data-key="model-${escapeAttr(key)}">
+      <td data-label="${escapeAttr(I18n.t('services.model_col_alias'))}"><strong>${escapeHtml(m.alias)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_kind'))}"><span class="scope-chip ${typeChipClass(m.kind)}">${escapeHtml(m.kind.toUpperCase() || '—')}</span></td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_backend'))}"><code style="font-size:11px;">${escapeHtml(m.backend || '—')}</code></td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_status'))}">${statusChip}</td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_nodes'))}">${nodeBadges}</td>
+    </tr>
+  `;
+}
+
+// ---- Alias modal ----------------------------------------------------------
+
+function openAliasModal(alias) {
+  const isEdit = !!alias;
+  const availableTargets = collectUniqueModels().map((m) => m.alias);
+
+  const html = `
+    <div class="modal-backdrop active" id="alias-modal">
+      <div class="modal" style="max-width:520px;">
+        <div class="modal-header">
+          <h3>${escapeHtml(I18n.t(isEdit ? 'services.alias_edit' : 'services.new_alias'))}</h3>
+          <button class="modal-close" id="alias-close">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-row">
+            <label class="label">${escapeHtml(I18n.t('services.alias_col_name'))}</label>
+            <input class="input" id="alias-name" value="${escapeAttr(alias?.alias ?? '')}" ${isEdit ? 'disabled' : ''} placeholder="llm-fast">
+          </div>
+          <div class="form-row">
+            <label class="label">${escapeHtml(I18n.t('services.alias_col_target'))}</label>
+            <input class="input" id="alias-target" value="${escapeAttr(alias?.target_model ?? '')}" list="alias-target-list" placeholder="llm-chat">
+            <datalist id="alias-target-list">
+              ${availableTargets.map((t) => `<option value="${escapeAttr(t)}"></option>`).join('')}
+            </datalist>
+          </div>
+          <div class="form-row">
+            <label class="label">${escapeHtml(I18n.t('services.alias_col_strategy'))}</label>
+            <select class="input" id="alias-strategy">
+              <option value="FirstAvailable" ${(alias?.strategy || 'FirstAvailable') === 'FirstAvailable' ? 'selected' : ''}>FirstAvailable</option>
+              <option value="RoundRobin" ${alias?.strategy === 'RoundRobin' ? 'selected' : ''}>RoundRobin</option>
+              <option value="LeastLoaded" ${alias?.strategy === 'LeastLoaded' ? 'selected' : ''}>LeastLoaded</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label class="label">${escapeHtml(I18n.t('services.alias_col_fallback'))}</label>
+            <input class="input" id="alias-fallback" value="${escapeAttr(alias?.fallback_targets ?? '')}" placeholder="llm-big, llm-chat (przez przecinek)">
+            <div class="form-hint">${escapeHtml(I18n.t('services.alias_fallback_hint'))}</div>
+          </div>
+          <div class="form-error" id="alias-error" hidden></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="alias-cancel">${escapeHtml(I18n.t('common.cancel'))}</button>
+          <button class="btn btn-primary" id="alias-save">${escapeHtml(I18n.t(isEdit ? 'common.save' : 'common.add'))}</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.insertAdjacentHTML('beforeend', html);
+  const close = () => byId('alias-modal')?.remove();
+  byId('alias-close')?.addEventListener('click', close);
+  byId('alias-cancel')?.addEventListener('click', close);
+  byId('alias-save')?.addEventListener('click', async () => {
+    const name = byId('alias-name').value.trim();
+    const target = byId('alias-target').value.trim();
+    const strategy = byId('alias-strategy').value;
+    const fallback = byId('alias-fallback').value.trim();
+    const err = byId('alias-error');
+    if (!name || !target) {
+      err.textContent = I18n.t('services.alias_required');
+      err.hidden = false;
+      return;
+    }
+    try {
+      if (isEdit) {
+        await fetch(`/api/model-aliases/${encodeURIComponent(alias.id)}`, {
+          method: 'PUT',
+          headers: authHeaders(true),
+          body: JSON.stringify({ alias: name, target_model: target, is_active: true }),
+        }).then(checkOk);
+      } else {
+        await apiPost('/api/model-aliases', {
+          alias: name,
+          target_model: target,
+          strategy,
+          fallback_targets: fallback || null,
+        });
+      }
+      toast(I18n.t(isEdit ? 'services.alias_updated' : 'services.alias_created'), 'success');
+      close();
+      await loadAll();
+    } catch (e) {
+      err.textContent = e.message;
+      err.hidden = false;
+    }
+  });
+}
+
+async function deleteAlias(id, name) {
+  if (!confirm(I18n.t('services.alias_delete_confirm', { name }))) return;
   try {
-    const r = await ApiBinary.action('serviceStopRequest', { serviceId });
-    if (r.stopped) { toast('Zatrzymano', 'success'); await load(); }
-    else { toast('Serwis nie znaleziony', 'warning'); }
-  } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
+    await apiDelete(`/api/model-aliases/${encodeURIComponent(id)}`);
+    toast(I18n.t('services.alias_deleted', { name }), 'success');
+    await loadAll();
+  } catch (e) {
+    toast(`${I18n.t('common.error')}: ${e.message}`, 'error');
+  }
+}
+
+// ---- Helpers --------------------------------------------------------------
+
+function authHeaders(json) {
+  const jwt = localStorage.getItem('tentaflow_jwt');
+  const h = {};
+  if (json) h['Content-Type'] = 'application/json';
+  if (jwt) h['Authorization'] = `Bearer ${jwt}`;
+  return h;
+}
+
+async function checkOk(resp) {
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`${resp.status}${text ? `: ${text}` : ''}`);
+  }
+  return resp.json();
+}
+
+async function stopService(id, name) {
+  if (!confirm(I18n.t('services.delete_confirm', { name }))) return;
+  try {
+    const r = await ApiBinary.action('serviceStopRequest', { serviceId: id });
+    if (r.stopped) {
+      toast(I18n.t('services.delete_success', { name }), 'success');
+      services = await ApiBinary.list('serviceListRequest');
+      patchListTab();
+      updateSubtitle();
+      updateTabCounts();
+    } else {
+      toast(I18n.t('services.delete_not_found'), 'warning');
+    }
+  } catch (err) {
+    toast(I18n.t('services.delete_error', { error: err.message }), 'error');
+  }
+}
+
+function parseConfig(json) {
+  if (!json) return {};
+  try { return JSON.parse(json); } catch { return {}; }
+}
+
+function extractQuicAddr(cfg) {
+  if (!cfg) return '';
+  if (cfg.quic_url) return String(cfg.quic_url).replace(/^quic:\/\//, '');
+  if (cfg.quic_port && cfg.agent_domain) return `${cfg.agent_domain}:${cfg.quic_port}`;
+  return '';
+}
+
+function typeChipClass(t) {
+  switch ((t || '').toLowerCase()) {
+    case 'llm': return 'chat';
+    case 'embedding':
+    case 'embeddings': return 'mesh-read';
+    case 'stt':
+    case 'tts': return 'deploy';
+    case 'rag': return 'mesh-admin';
+    default: return 'license';
+  }
+}
+
+function formatDateOnly(s) {
+  try {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return d.toLocaleDateString(I18n.getLanguage(), { day: '2-digit', month: '2-digit', year: 'numeric' });
+  } catch { return s; }
 }
 
 export default ServicesScreen;

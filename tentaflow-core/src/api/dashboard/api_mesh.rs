@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::db::{self, DbPool};
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::MeshPeerStore;
-use crate::mesh::quic_mesh::QuicMeshManager;
+use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::security::MeshSecurity;
 use anyhow::Result;
 use serde::Deserialize;
@@ -64,7 +64,7 @@ pub async fn handle_initiate_pairing(
     pool: &DbPool,
     security: &Arc<MeshSecurity>,
     remote_node_id: &str,
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     local_node_id: &str,
     peer_store: &MeshPeerStore,
 ) -> Result<(u16, String)> {
@@ -185,7 +185,7 @@ pub fn handle_confirm_pairing(
     security: &Arc<MeshSecurity>,
     remote_node_id: &str,
     body: &[u8],
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
     if !is_valid_id(remote_node_id) {
@@ -305,7 +305,7 @@ pub fn handle_confirm_pairing(
 pub fn handle_reject_pairing(
     security: &Arc<MeshSecurity>,
     remote_node_id: &str,
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
     if !is_valid_id(remote_node_id) {
@@ -337,7 +337,7 @@ pub fn handle_reject_pairing(
 pub fn handle_revoke_trust(
     security: &Arc<MeshSecurity>,
     node_id: &str,
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
     if !is_valid_id(node_id) {
@@ -538,6 +538,9 @@ pub fn handle_list_nodes(
             "network_rx_bytes": network_rx,
             "network_tx_bytes": network_tx,
             "network_interfaces": network_interfaces,
+            "models": p.models,
+            "active_requests": p.active_requests,
+            "tokens_per_sec": p.tokens_per_sec,
             "is_trusted": is_trusted,
             "is_local": is_local,
             "source": source,
@@ -575,7 +578,7 @@ pub fn handle_list_nodes(
 /// WSZYSTKIE dane z peer_store cache — zero wywolan collect_*/sysinfo/docker.
 pub fn handle_get_node(
     store: &MeshPeerStore,
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     node_id: &str,
     local_node_id: &str,
     mesh_security: &Option<Arc<MeshSecurity>>,
@@ -649,6 +652,9 @@ pub fn handle_get_node(
                 "networks": p.networks,
                 "network_interfaces": network_interfaces,
                 "services": services,
+                "models": p.models,
+                "active_requests": p.active_requests,
+                "tokens_per_sec": p.tokens_per_sec,
                 "is_local": is_local,
                 "is_trusted": is_trusted,
                 "trust": trust,
@@ -668,7 +674,7 @@ pub struct ConnectRequest {
 
 /// POST /api/mesh/connect — reczne polaczenie IP:port
 pub async fn handle_connect(
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     body: &[u8],
 ) -> Result<(u16, String)> {
     if body.len() > MAX_MESH_BODY_SIZE {
@@ -714,7 +720,7 @@ pub struct CommandRequest {
 
 /// POST /api/mesh/nodes/:id/command — wyslij komende do noda
 pub async fn handle_send_command(
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     mesh_security: &Option<Arc<MeshSecurity>>,
     node_id: &str,
     body: &[u8],
@@ -849,7 +855,7 @@ struct NetworkConfigRequest {
 
 /// POST /api/mesh/nodes/:id/network-config — zmiana konfiguracji sieciowej na zdalnym nodzie
 pub async fn handle_network_config(
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
     mesh_security: &Option<Arc<MeshSecurity>>,
     node_id: &str,
     body: &[u8],
@@ -948,7 +954,7 @@ pub fn handle_retrust(
 
 /// GET /api/mesh/services — wszystkie serwisy w mesh
 pub fn handle_list_mesh_services(
-    quic_mesh: &Option<Arc<QuicMeshManager>>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
 ) -> Result<(u16, String)> {
     match quic_mesh {
         Some(ref qm) => {

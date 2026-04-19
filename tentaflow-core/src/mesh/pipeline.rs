@@ -5,7 +5,6 @@
 //       Uzywany przez Router.New, Desktop i Mobile (ta sama logika).
 // =============================================================================
 
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,11 +12,17 @@ use anyhow::Result;
 use tracing::{debug, error, info, warn};
 
 use crate::config::MeshConfig;
-use crate::mesh::discovery::{MdnsDiscovery, PeerEvent};
+// use crate::mesh::discovery::{MdnsDiscovery, PeerEvent}; — usuniete wraz z mesh/discovery.rs
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
-use crate::mesh::quic_mesh::{QuicMeshConfig, QuicMeshEvent, QuicMeshManager};
+use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::security::MeshSecurity;
+use crate::routing::live_metrics;
+
+/// Snapshot live-metrics routera — zwracany do heartbeat.
+fn routing_metrics_snapshot() -> (u32, f32) {
+    live_metrics::snapshot()
+}
 
 /// Konfiguracja mesh pipeline
 pub struct MeshPipelineConfig {
@@ -31,24 +36,22 @@ pub struct MeshPipelineConfig {
 
 /// Wynik uruchomienia mesh pipeline — trzeba trzymac alive do konca zycia aplikacji
 pub struct MeshPipelineHandles {
-    /// mDNS discovery — Drop wyrejestruje serwis. MUSI zyc.
-    pub mdns: Option<MdnsDiscovery>,
-    /// QuicMeshManager — potrzebny do forward handlerów i bezposredniej komunikacji
-    pub quic_mesh: Option<Arc<QuicMeshManager>>,
-    /// MeshSecurity — klucze, parowanie, szyfrowanie
+    /// Legacy: zachowane jako `Option<()>` dla compat z istniejacymi callerami.
+    /// iroh obsluguje LAN mDNS przez MdnsAddressLookup, nie ma osobnego handle.
+    pub mdns: Option<()>,
+    /// IrohMeshManager — forward handler, connections, wszystkie send_* metody.
+    pub quic_mesh: Option<Arc<IrohMeshManager>>,
+    /// MeshSecurity — tozsamosc Ed25519, trusted_keys, pairing.
     pub security: Option<Arc<MeshSecurity>>,
 }
 
 impl MeshPipelineHandles {
-    /// Graceful shutdown — zamyka QUIC endpoint i wszystkie polaczenia,
-    /// potem dropuje mDNS (wyrejestrowanie serwisu).
-    /// BEZ tego porty UDP zostaja zajete jako zombie.
+    /// Graceful shutdown — zamyka iroh endpoint i wszystkie polaczenia.
     pub async fn shutdown(mut self) {
         if let Some(ref qm) = self.quic_mesh {
             qm.send_node_leaving().await;
             qm.shutdown().await;
         }
-        // mDNS dropowany automatycznie — wyrejestruje serwis
         self.mdns.take();
         self.quic_mesh.take();
         self.security.take();
@@ -132,201 +135,105 @@ pub async fn start_mesh_pipeline(
         swap_used_mb: 0,
         docker_available,
         docker_version,
+        models: vec![],
+        active_requests: 0,
+        tokens_per_sec: 0.0,
     });
 
-    // mDNS discovery
-    let mdns = match MdnsDiscovery::new(node_id, mesh_port) {
-        Ok(mdns) => {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            if let Err(e) = mdns.start_discovery(tx) {
-                warn!("Nie udalo sie uruchomic mDNS browse: {}", e);
-            }
+    // iroh endpoint: LAN mDNS + pkarr-DHT discovery + relay — wszystko wbudowane.
+    let iroh_cfg = IrohMeshConfig {
+        node_id: node_id.clone(),
+        bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], mesh_port)),
+        relay_url: None,
+        heartbeat_interval: Duration::from_millis(mesh_config.heartbeat_interval_ms),
+    };
 
-            // QuicMeshManager
-            let quic_mesh_config = QuicMeshConfig {
-                node_id: node_id.clone(),
-                listen_port: mesh_port,
-                heartbeat_interval: Duration::from_millis(mesh_config.heartbeat_interval_ms),
-                reconnect_base: Duration::from_secs(1),
-                reconnect_max: Duration::from_secs(30),
-            };
-
-            match QuicMeshManager::new(quic_mesh_config, mesh_security.clone()) {
-                Ok(quic_mesh) => {
-                    let qm = quic_mesh.clone();
-                    tokio::spawn(async move {
-                        qm.start();
-                    });
-
-                    // Reconnect do trusted peerow z zapisanych adresow w DB (przed mDNS)
-                    if let Some(ref sec) = mesh_security {
-                        if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
-                            for node in &trusted {
-                                if node.last_addresses.is_empty() { continue; }
-                                let addrs: Vec<std::net::SocketAddr> = node.last_addresses
-                                    .split(',')
-                                    .filter_map(|s| s.trim().parse().ok())
-                                    .collect();
-                                if addrs.is_empty() { continue; }
-                                let qm = quic_mesh.clone();
-                                let nid = node.node_id.clone();
-                                tokio::spawn(async move {
-                                    for addr in &addrs {
-                                        match qm.connect_to_peer(&nid, *addr).await {
-                                            Ok(()) => {
-                                                info!(peer_id = %nid, addr = %addr, "Reconnect z DB udany");
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                debug!(peer_id = %nid, addr = %addr, "Reconnect z DB: {}", e);
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-
-                    // Task 1: mDNS discovery → add to peer store → connect via QUIC
-                    spawn_mdns_handler(rx, quic_mesh.clone(), mesh_peer_store.clone(), node_id.clone());
-
-                    // Task 2: QUIC events → update peer store
-                    spawn_quic_event_handler(
-                        quic_mesh.clone(),
-                        mesh_peer_store.clone(),
-                        local_node_info.clone(),
-                        mesh_security.clone(),
-                        node_id.clone(),
-                    );
-
-                    // Docker container cache — co 5s
-                    let docker_cache = spawn_docker_cache();
-
-                    // Task 3: Heartbeat sender — co 500ms
-                    spawn_heartbeat_sender(
-                        quic_mesh.clone(),
-                        mesh_peer_store.clone(),
-                        node_id.clone(),
-                        docker_cache,
-                    );
-
-                    // Task 4: Slow refresh — co 60s odswiezaj adresy IP, Docker, OS info
-                    spawn_slow_refresh(
-                        mesh_peer_store.clone(),
-                        node_id.clone(),
-                    );
-
-                    // [CR-011] Task 5: Czyszczenie wygaslych parowan — co 30s
-                    if let Some(ref sec) = mesh_security {
-                        spawn_pairing_cleanup(sec.clone());
-                    }
-
-                    // Task 6: Rotacja kluczy szyfrowania — co 24h
-                    if let Some(ref sec) = mesh_security {
-                        spawn_key_rotation_task(quic_mesh.clone(), sec.clone());
-                    }
-
-                    // Task 7: Okresowe proby bezposredniego polaczenia z relay-only peerami
-                    {
-                        let qm = quic_mesh.clone();
-                        let ps = mesh_peer_store.clone();
-                        let sec = mesh_security.clone();
-                        tokio::spawn(async move {
-                            let mut interval = tokio::time::interval(Duration::from_secs(300));
-                            interval.tick().await;
-                            loop {
-                                interval.tick().await;
-
-                                let routing_table = ps.get_routing_table();
-                                let sec_ref = match &sec {
-                                    Some(s) => s,
-                                    None => continue,
-                                };
-
-                                for (peer_id, entry) in &routing_table {
-                                    // Pomijaj bezposrednio polaczone
-                                    if entry.direct { continue; }
-
-                                    // Tylko trusted peery
-                                    if !sec_ref.is_trusted(peer_id) { continue; }
-
-                                    // Moze juz nawiazano polaczenie od ostatniego recalc
-                                    if qm.is_connected(peer_id).await { continue; }
-
-                                    // Pobierz adresy z peer_store
-                                    let mut addrs: Vec<std::net::SocketAddr> = Vec::new();
-                                    if let Some(peer_info) = ps.get(peer_id) {
-                                        for ip in &peer_info.addresses {
-                                            if peer_info.port > 0 {
-                                                addrs.push(std::net::SocketAddr::new(*ip, peer_info.port));
-                                            }
-                                        }
-                                    }
-                                    // Fallback: adresy z bazy danych
-                                    if addrs.is_empty() {
-                                        if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec_ref.db) {
-                                            if let Some(tn) = trusted.iter().find(|t| t.node_id == *peer_id) {
-                                                for part in tn.last_addresses.split(',') {
-                                                    if let Ok(addr) = part.trim().parse::<std::net::SocketAddr>() {
-                                                        addrs.push(addr);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if addrs.is_empty() { continue; }
-
-                                    // Probuj kazdy adres po kolei
-                                    for addr in &addrs {
-                                        match qm.connect_to_peer(peer_id, *addr).await {
-                                            Ok(()) => {
-                                                info!(peer_id = %peer_id, addr = %addr, "Bezposrednie polaczenie nawiazane (bylo relay)");
-                                                break;
-                                            }
-                                            Err(_) => continue,
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-
-                    info!("Mesh networking uruchomiony (QUIC mesh + mDNS)");
-
-                    return Ok(MeshPipelineHandles {
-                        mdns: Some(mdns),
-                        quic_mesh: Some(quic_mesh),
-                        security: mesh_security,
-                    });
-                }
-                Err(e) => {
-                    error!("Nie udalo sie utworzyc QuicMeshManager: {}", e);
-                }
-            }
-
-            Some(mdns)
-        }
-        Err(e) => {
-            warn!("Nie udalo sie uruchomic mDNS: {}", e);
-            None
+    let security_for_mesh = match mesh_security.clone() {
+        Some(s) => s,
+        None => {
+            anyhow::bail!("MeshSecurity niedostepne dla iroh mesh manager");
         }
     };
 
-    Ok(MeshPipelineHandles {
-        mdns,
-        quic_mesh: None,
-        security: mesh_security,
-    })
+    match IrohMeshManager::new(iroh_cfg, security_for_mesh).await {
+        Ok(quic_mesh) => {
+            {
+                let qm = quic_mesh.clone();
+                tokio::spawn(async move {
+                    qm.start();
+                });
+            }
+
+            // Reconnect do trusted peerow po EndpointId — iroh sam rozwiazuje adres.
+            if let Some(ref sec) = mesh_security {
+                if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
+                    for node in &trusted {
+                        let qm = quic_mesh.clone();
+                        let nid = node.node_id.clone();
+                        tokio::spawn(async move {
+                            let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+                            if let Err(e) = qm.connect_to_peer(&nid, dummy_addr).await {
+                                debug!(peer_id = %nid, "Reconnect via iroh: {}", e);
+                            }
+                        });
+                    }
+                }
+            }
+
+            spawn_quic_event_handler(
+                quic_mesh.clone(),
+                mesh_peer_store.clone(),
+                local_node_info.clone(),
+                mesh_security.clone(),
+                node_id.clone(),
+            );
+
+            let docker_cache = spawn_docker_cache();
+            spawn_heartbeat_sender(
+                quic_mesh.clone(),
+                mesh_peer_store.clone(),
+                node_id.clone(),
+                docker_cache,
+            );
+            spawn_slow_refresh(mesh_peer_store.clone(), node_id.clone());
+
+            if let Some(ref sec) = mesh_security {
+                spawn_pairing_cleanup(sec.clone());
+            }
+
+            info!("Mesh networking uruchomiony (iroh transport)");
+
+            Ok(MeshPipelineHandles {
+                mdns: None,
+                quic_mesh: Some(quic_mesh),
+                security: mesh_security,
+            })
+        }
+        Err(e) => {
+            error!("Nie udalo sie utworzyc IrohMeshManager: {}", e);
+            Ok(MeshPipelineHandles {
+                mdns: None,
+                quic_mesh: None,
+                security: mesh_security,
+            })
+        }
+    }
 }
 
 // =============================================================================
 // Wewnetrzne taski mesh pipeline
 // =============================================================================
 
+#[allow(dead_code)]
+fn _unused_spawn_mdns_handler_placeholder() {}
+
+// Legacy spawn_mdns_handler usuniety — iroh robi LAN discovery przez
+// MdnsAddressLookup w IrohEndpoint::bind. Peer events plyna przez
+// IrohMeshEvent::PeerConnected -> spawn_quic_event_handler.
+#[cfg(never)]
 fn spawn_mdns_handler(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<PeerEvent>,
-    quic_mesh: Arc<QuicMeshManager>,
+    quic_mesh: Arc<IrohMeshManager>,
     peer_store: MeshPeerStore,
     local_node_id: String,
 ) {
@@ -412,6 +319,9 @@ fn spawn_mdns_handler(
                         swap_used_mb: 0,
                         docker_available: false,
                         docker_version: String::new(),
+                        models: vec![],
+                        active_requests: 0,
+                        tokens_per_sec: 0.0,
                     });
 
                     // Probuj kazdy adres az sie polacz
@@ -446,7 +356,7 @@ fn spawn_mdns_handler(
 }
 
 fn spawn_quic_event_handler(
-    quic_mesh: Arc<QuicMeshManager>,
+    quic_mesh: Arc<IrohMeshManager>,
     peer_store: MeshPeerStore,
     local_node_info: NodeInfo,
     mesh_security: Option<Arc<MeshSecurity>>,
@@ -461,7 +371,7 @@ fn spawn_quic_event_handler(
 
         loop {
             match event_rx.recv().await {
-                Ok(QuicMeshEvent::NodeInfoReceived { node_id, data }) => {
+                Ok(IrohMeshEvent::NodeInfoReceived { node_id, data }) => {
                     // Safety net — przetwarzaj NodeInfo TYLKO od trusted peerow
                     let is_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
@@ -489,15 +399,11 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(QuicMeshEvent::PeerConnected { node_id }) => {
+                Ok(IrohMeshEvent::PeerConnected { node_id }) => {
                     info!(peer_id = %node_id, "QUIC peer polaczony");
                     peer_store.set_quic_connected(&node_id, true);
                     peer_store.set_status(&node_id, "connected");
 
-                    // Resetuj stan replay — nowe polaczenie = peer startuje nonce od zera
-                    if let Some(ref sec) = mesh_security {
-                        sec.reset_replay_state(&node_id);
-                    }
                     // Wyslij swoje NodeInfo do nowego peera — TYLKO jesli zaufany
                     let should_send = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
@@ -571,15 +477,10 @@ fn spawn_quic_event_handler(
                     // Przelicz routing po polaczeniu nowego peera
                     peer_store.recalculate_routes(&local_node_id);
                 }
-                Ok(QuicMeshEvent::PeerDisconnected { node_id }) => {
+                Ok(IrohMeshEvent::PeerDisconnected { node_id }) => {
                     info!(peer_id = %node_id, "QUIC peer rozlaczony");
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "disconnected");
-
-                    // Resetuj stan replay — po rekonnekcie peer startuje nonce od zera
-                    if let Some(ref sec) = mesh_security {
-                        sec.reset_replay_state(&node_id);
-                    }
 
                     // Przelicz routing po rozlaczeniu peera
                     peer_store.recalculate_routes(&local_node_id);
@@ -611,12 +512,12 @@ fn spawn_quic_event_handler(
                                 }
                             }
                         }
-                        if !addrs.is_empty() {
-                            qm_events.spawn_reconnect_loop(node_id.clone(), addrs);
-                        }
+                        // iroh sam wykonuje reconnect przez discovery + relay
+                        // gdy peer wroci online — nie potrzebujemy wlasnej petli.
+                        let _ = addrs;
                     }
                 }
-                Ok(QuicMeshEvent::HeartbeatReceived { node_id, heartbeat }) => {
+                Ok(IrohMeshEvent::HeartbeatReceived { node_id, heartbeat }) => {
                     // Safety net — przetwarzaj heartbeat TYLKO od trusted peerow
                     let is_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
@@ -640,13 +541,15 @@ fn spawn_quic_event_handler(
                             metrics.cpu_temperature_c,
                             metrics.swap_total_mb,
                             metrics.swap_used_mb,
+                            metrics.active_requests,
+                            metrics.tokens_per_sec,
                         );
 
                         // Aktualizuj topologie peera na podstawie jego connected_peers
                         peer_store.update_topology(&node_id, metrics.connected_peers);
                     }
                 }
-                Ok(QuicMeshEvent::PairingRequestReceived { peer_id, data }) => {
+                Ok(IrohMeshEvent::PairingRequestReceived { peer_id, data }) => {
                     info!(peer_id = %peer_id, data_len = data.len(), "Odebrano PairingRequest przez QUIC");
                     if let Some(ref sec) = mesh_security {
                         match serde_json::from_slice::<serde_json::Value>(&data) {
@@ -677,7 +580,7 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(QuicMeshEvent::PairingConfirmReceived { peer_id, data }) => {
+                Ok(IrohMeshEvent::PairingConfirmReceived { peer_id, data }) => {
                     // Parsuj JSON i zatwierdz parowanie — dodaj do zaufanych
                     if let Some(ref sec) = mesh_security {
                         match serde_json::from_slice::<serde_json::Value>(&data) {
@@ -765,7 +668,7 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(QuicMeshEvent::PairingRejectReceived { peer_id, data }) => {
+                Ok(IrohMeshEvent::PairingRejectReceived { peer_id, data }) => {
                     // Parsuj JSON i usun oczekujace parowanie
                     if let Some(ref sec) = mesh_security {
                         match serde_json::from_slice::<serde_json::Value>(&data) {
@@ -783,7 +686,7 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(QuicMeshEvent::TrustRevokedReceived { node_id, revoked_node_id }) => {
+                Ok(IrohMeshEvent::TrustRevokedReceived { node_id, revoked_node_id }) => {
                     if let Some(ref sec) = mesh_security {
                         let sender_trusted = sec.is_trusted(&node_id);
                         let i_am_revoked = revoked_node_id == local_node_id;
@@ -822,7 +725,7 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(QuicMeshEvent::NodeLeavingReceived { node_id }) => {
+                Ok(IrohMeshEvent::NodeLeavingReceived { node_id }) => {
                     let sender_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
                         None => false,
@@ -835,57 +738,12 @@ fn spawn_quic_event_handler(
                     info!("Node {} opuszcza mesh (graceful leave)", node_id);
                     qm_events.disconnect_peer(&node_id).await;
                 }
-                Ok(QuicMeshEvent::KeyRotationReceived { node_id, ephemeral_public_key_hex }) => {
-                    if let Some(ref sec) = mesh_security {
-                        if !sec.is_trusted(&node_id) {
-                            warn!("KeyRotation od niezaufanego noda {}", node_id);
-                            continue;
-                        }
-                        if let Ok(their_pub_bytes) = hex::decode(&ephemeral_public_key_hex) {
-                            if their_pub_bytes.len() == 32 {
-                                let mut key = [0u8; 32];
-                                key.copy_from_slice(&their_pub_bytes);
-                                match sec.respond_to_key_rotation(&node_id, &key) {
-                                    Ok((our_pub, epoch)) => {
-                                        info!(peer_id = %node_id, epoch, "Rotacja klucza — wyslanie odpowiedzi");
-                                        let payload = tentaflow_protocol::mesh::KeyRotationResponsePayload {
-                                            from_node_id: local_node_id.to_string(),
-                                            ephemeral_public_key: hex::encode(our_pub),
-                                        };
-                                        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                                            .map(|v| v.to_vec())
-                                            .unwrap_or_default();
-                                        if let Err(e) = qm_events.send_key_rotation_response(&node_id, &data).await {
-                                            warn!("Blad wysylania KeyRotationResponse do {}: {}", node_id, e);
-                                        }
-                                    }
-                                    Err(e) => warn!("Blad rotacji klucza dla {}: {}", node_id, e),
-                                }
-                            }
-                        }
-                    }
+                Ok(IrohMeshEvent::KeyRotationReceived { .. })
+                | Ok(IrohMeshEvent::KeyRotationResponseReceived { .. }) => {
+                    // Rotacja kluczy jest obsluzona przez iroh TLS per-connection —
+                    // legacy zdarzenia od starych peerow sa ignorowane.
                 }
-                Ok(QuicMeshEvent::KeyRotationResponseReceived { node_id, ephemeral_public_key_hex }) => {
-                    if let Some(ref sec) = mesh_security {
-                        if !sec.is_trusted(&node_id) {
-                            warn!("KeyRotationResponse od niezaufanego noda {}", node_id);
-                            continue;
-                        }
-                        if let Ok(their_pub_bytes) = hex::decode(&ephemeral_public_key_hex) {
-                            if their_pub_bytes.len() == 32 {
-                                let mut key = [0u8; 32];
-                                key.copy_from_slice(&their_pub_bytes);
-                                match sec.finalize_key_rotation(&node_id, &key) {
-                                    Ok(epoch) => {
-                                        info!(peer_id = %node_id, epoch, "Rotacja klucza sfinalizowana");
-                                    }
-                                    Err(e) => warn!("Blad finalizacji rotacji dla {}: {}", node_id, e),
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(QuicMeshEvent::TrustedKeysSyncReceived { node_id, keys }) => {
+                Ok(IrohMeshEvent::TrustedKeysSyncReceived { node_id, keys }) => {
                     // Akceptuj sync TYLKO od trusted peera
                     let sender_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
@@ -923,7 +781,7 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(QuicMeshEvent::RelayFrameReceived { from_node_id: _, frame }) => {
+                Ok(IrohMeshEvent::RelayFrameReceived { from_node_id: _, frame }) => {
                     // Sprawdz TTL
                     if frame.ttl == 0 {
                         warn!(source = %frame.source_node_id, dest = %frame.destination_node_id, "Relay frame TTL wyczerpany — odrzucam");
@@ -932,22 +790,14 @@ fn spawn_quic_event_handler(
 
                     // Czy ja jestem odbiorca koncowym?
                     if frame.destination_node_id == local_node_id {
-                        // Deszyfruj payload kluczem nadawcy (end-to-end)
-                        if let Some(ref sec) = mesh_security {
-                            match sec.decrypt_from_node(&frame.source_node_id, &frame.payload) {
-                                Ok(_decrypted) => {
-                                    info!(
-                                        source = %frame.source_node_id,
-                                        disc = frame.discriminant,
-                                        hops = 4u8.saturating_sub(frame.ttl) + 1,
-                                        "Otrzymano relay frame (multi-hop)"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(source = %frame.source_node_id, "Blad deszyfrowania relay payload: {}", e);
-                                }
-                            }
-                        }
+                        // iroh TLS zapewnia end-to-end encryption na polaczeniu —
+                        // payload jest juz odszyfrowany przy odbiorze streamu.
+                        info!(
+                            source = %frame.source_node_id,
+                            disc = frame.discriminant,
+                            hops = 4u8.saturating_sub(frame.ttl) + 1,
+                            "Otrzymano relay frame (multi-hop)"
+                        );
                     } else {
                         // Forward do next-hop
                         let mut forwarded_frame = frame;
@@ -977,14 +827,14 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(QuicMeshEvent::MeshCommandReceived { from_node_id, command }) => {
+                Ok(IrohMeshEvent::MeshCommandReceived { from_node_id, command }) => {
                     info!(from = %from_node_id, "Otrzymano MeshCommand — przekazuje do executora");
                     qm_events.handle_command_received(&from_node_id, &command).await;
                 }
-                Ok(QuicMeshEvent::MeshCommandResponseReceived { from_node_id, data }) => {
+                Ok(IrohMeshEvent::MeshCommandResponseReceived { from_node_id, data }) => {
                     qm_events.handle_command_response_received(&from_node_id, &data).await;
                 }
-                Ok(QuicMeshEvent::CrdtDeltaReceived { node_id, .. }) => {
+                Ok(IrohMeshEvent::CrdtDeltaReceived { node_id, .. }) => {
                     // Safety net — przetwarzaj CRDT delta TYLKO od trusted peerow
                     let is_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
@@ -995,7 +845,7 @@ fn spawn_quic_event_handler(
                     }
                     // Dalsze przetwarzanie CRDT delta (jesli bedzie potrzebne) — tu placeholder
                 }
-                Ok(QuicMeshEvent::FullStateReceived { node_id, .. }) => {
+                Ok(IrohMeshEvent::FullStateReceived { node_id, .. }) => {
                     // Safety net — przetwarzaj FullState TYLKO od trusted peerow
                     let is_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
@@ -1005,6 +855,23 @@ fn spawn_quic_event_handler(
                         debug!(peer_id = %node_id, "Pomijam FullState od niezaufanego peera (safety net)");
                     }
                     // Dalsze przetwarzanie FullState (jesli bedzie potrzebne) — tu placeholder
+                }
+                Ok(IrohMeshEvent::ModelListUpdate { node_id, data }) => {
+                    // ModelsSync — nadpisuje liste modeli danego peera.
+                    // Format: rkyv-zakodowany `ModelsSync { models: Vec<PeerModelInfo> }`.
+                    match rkyv::from_bytes::<crate::mesh::peer_store::ModelsSync, rkyv::rancor::Error>(&data) {
+                        Ok(sync) => {
+                            debug!(
+                                node_id = %node_id,
+                                models_count = sync.models.len(),
+                                "ModelsSync odebrany"
+                            );
+                            peer_store.update_models(&node_id, sync.models);
+                        }
+                        Err(e) => {
+                            warn!(node_id = %node_id, "Blad deserializacji ModelsSync: {}", e);
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1044,7 +911,7 @@ fn spawn_docker_cache() -> Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::
 /// - Metryki klonowane raz zamiast 3 razy (gpus, containers, networks)
 /// - Serializacja RAZ, potem broadcast do wszystkich peerow
 fn spawn_heartbeat_sender(
-    quic_mesh: Arc<QuicMeshManager>,
+    quic_mesh: Arc<IrohMeshManager>,
     peer_store: MeshPeerStore,
     local_node_id: String,
     docker_cache: Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>>,
@@ -1064,6 +931,10 @@ fn spawn_heartbeat_sender(
 
                 // [OPT] Buduj HeartbeatMetrics najpierw, potem aktualizuj store
                 // z referencji — unika podwojnego klonowania gpus/containers/networks
+                // Snapshot licznikow routingu — uzywane do wyswietlenia
+                // "aktywne" i tok/s w Mesh UI per-node.
+                let (active_requests, tokens_per_sec) = routing_metrics_snapshot();
+
                 let hb = HeartbeatMetrics {
                     cpu_usage_percent: m.cpu_usage_percent,
                     ram_used_mb: m.ram_used_mb,
@@ -1075,6 +946,8 @@ fn spawn_heartbeat_sender(
                     swap_total_mb: m.swap_total_mb,
                     swap_used_mb: m.swap_used_mb,
                     connected_peers: connected_peers.clone(),
+                    active_requests,
+                    tokens_per_sec,
                 };
 
                 // Aktualizuj metryki lokalnego noda w store (klonowanie z hb)
@@ -1089,6 +962,8 @@ fn spawn_heartbeat_sender(
                     hb.cpu_temperature_c,
                     hb.swap_total_mb,
                     hb.swap_used_mb,
+                    hb.active_requests,
+                    hb.tokens_per_sec,
                 );
 
                 // Aktualizuj topologie lokalnego noda
@@ -1104,9 +979,43 @@ fn spawn_heartbeat_sender(
                 if heartbeat_count % 10 == 0 {
                     peer_store.recalculate_routes(&local_node_id);
                 }
+
+                // ModelsSync broadcast co 60 heartbeatow (~30s). Serwer-side
+                // scrape z service_registry zwraca aktualne aliasy + stan zaladowania.
+                if heartbeat_count % 60 == 0 {
+                    let models = collect_local_models(&quic_mesh);
+                    peer_store.update_models(&local_node_id, models.clone());
+                    let sync = crate::mesh::peer_store::ModelsSync { models };
+                    if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&sync) {
+                        quic_mesh.send_models_sync_data(&data).await;
+                    }
+                }
             }
         }
     });
+}
+
+/// Buduje liste `PeerModelInfo` z lokalnego service_registry. Tylko LOKALNE
+/// serwisy (te na biezacym nodzie) — modele z peerow przychodza przez
+/// ModelsSync od ich wlascicieli.
+fn collect_local_models(quic_mesh: &Arc<IrohMeshManager>) -> Vec<crate::mesh::peer_store::PeerModelInfo> {
+    let registry = quic_mesh.service_registry();
+    registry
+        .local_services()
+        .into_iter()
+        .flat_map(|svc| {
+            let kind = svc.service_type.clone();
+            svc.models.into_iter().map(move |alias| {
+                crate::mesh::peer_store::PeerModelInfo {
+                    alias,
+                    kind: kind.clone(),
+                    backend: kind.clone(),
+                    size_mb: 0,
+                    loaded: true,
+                }
+            })
+        })
+        .collect()
 }
 
 /// Slow refresh — co 60s odswiezaj wolno-zmienne dane lokalnego noda:
@@ -1141,49 +1050,6 @@ fn spawn_slow_refresh(
 }
 
 /// Periodyczna rotacja kluczy szyfrowania — co 24h
-fn spawn_key_rotation_task(
-    quic_mesh: Arc<QuicMeshManager>,
-    security: Arc<MeshSecurity>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(crate::mesh::security::KEY_ROTATION_INTERVAL);
-        interval.tick().await;
-
-        loop {
-            interval.tick().await;
-            info!("Rozpoczynam rotacje kluczy");
-            rotate_all_keys(&quic_mesh, &security).await;
-        }
-    });
-}
-
-async fn rotate_all_keys(quic_mesh: &QuicMeshManager, security: &MeshSecurity) {
-    let trusted_ids = security.trusted_node_ids_snapshot();
-
-    // Wyczysc wygasle pending rotacje
-    security.cleanup_pending_rotations();
-
-    for peer_id in trusted_ids.iter() {
-        let ephemeral_public = security.initiate_key_rotation(peer_id);
-        let payload = tentaflow_protocol::mesh::KeyRotationPayload {
-            from_node_id: quic_mesh.node_id().to_string(),
-            ephemeral_public_key: hex::encode(ephemeral_public),
-        };
-        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-            .map(|v| v.to_vec())
-            .unwrap_or_default();
-
-        match quic_mesh.send_key_rotation(peer_id, &data).await {
-            Ok(_) => {
-                info!(peer_id = %peer_id, "Wyslano KeyRotation request");
-            }
-            Err(e) => {
-                warn!(peer_id = %peer_id, "Blad wysylania KeyRotation: {}", e);
-            }
-        }
-    }
-}
-
 /// [CR-011] Periodyczne czyszczenie wygaslych parowan — co 30 sekund
 fn spawn_pairing_cleanup(mesh_security: Arc<MeshSecurity>) {
     tokio::spawn(async move {

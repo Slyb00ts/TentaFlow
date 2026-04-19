@@ -55,15 +55,11 @@ async fn subscribe_meeting_transcripts(
 ) -> anyhow::Result<()> {
     info!("Rozpoczynam subskrypcje transkrypcji z meeting bot");
 
-    // Pobierz polaczenie QUIC
-    let conn = {
-        let conn_arc = quic_client.connection();
-        let conn_guard = conn_arc.lock().await;
-        conn_guard
-            .as_ref()
-            .cloned()
-            .context("Brak aktywnego polaczenia QUIC do meeting bot")?
-    };
+    // Pobierz aktywne polaczenie iroh (z auto-reconnect).
+    let conn = quic_client
+        .iroh_connection()
+        .await
+        .context("Brak aktywnego polaczenia iroh do meeting bot")?;
 
     // Otworz bidirektionalny stream
     let (mut send, mut recv) = conn
@@ -143,9 +139,9 @@ async fn subscribe_meeting_transcripts(
 /// Odczytuje pojedynczy chunk ze streamu QUIC (4-bajtowy length prefix + rkyv payload).
 /// Zwraca None jesli stream zostal zamkniety.
 async fn read_stream_chunk(
-    recv: &mut quinn::RecvStream,
+    recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<Option<tentaflow_protocol::ModelStreamChunk>> {
-    use quinn::ReadExactError;
+    use iroh::endpoint::ReadExactError;
 
     // Odczytaj 4 bajty dlugosci (big-endian)
     let mut len_buf = [0u8; 4];

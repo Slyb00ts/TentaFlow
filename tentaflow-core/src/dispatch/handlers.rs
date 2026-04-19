@@ -8,12 +8,11 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
-    ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginResponse, AuthMeResponse,
-    ChatStreamChunk, ChatStreamEnd, ClusterUpdateResponse, DashboardSnapshot, FlowDetail,
+    ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginResponse, AuthMeResponse, ClusterUpdateResponse, DashboardSnapshot, FlowDetail,
     FlowExecutionSummary, FlowSummary, HubEngineSummary, MeshPairInitResponse, MeshPeerSummary,
     MessageBody, ModelDetail, ModelSummary, NodeSummary, PromptDetail, PromptSummary,
-    ProtocolError, ProtocolErrorCode, RegistrySummary, ServiceSummary, SessionAuth, SettingEntry,
-    TtsRule,
+    ProtocolError, ProtocolErrorCode, RegistrySummary, ServiceQuicStatus, ServiceSummary,
+    SessionAuth, SettingEntry, TtsRule,
 };
 
 use super::HandlerContext;
@@ -930,7 +929,7 @@ pub fn mesh_pair_init(
         Some(&ctx.state.local_node_id),
     );
 
-    // Real handshake (Ed25519+PIN) wykonuje QuicMeshManager — handler tu
+    // Real handshake (Ed25519+PIN) wykonuje IrohMeshManager — handler tu
     // tylko rejestruje intencje pair init. UI obserwuje peer status zmiany
     // przez MeshPeersList polling lub future subscription.
     Ok(MessageBody::MeshPairInitResponseBody(MeshPairInitResponse {
@@ -1060,19 +1059,257 @@ pub fn service_list(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
+    let peers = ctx.state.mesh_peer_store.list();
+
     let summaries: Vec<ServiceSummary> = services
         .into_iter()
-        .map(|s| ServiceSummary {
-            id: s.id.to_string(),
-            engine_id: s.service_type,
-            model_id: s.name,
-            status: s.status,
-            deploy_method: s.strategy,
-            endpoint_url: None,
-            started_at_epoch: parse_ts_opt(&Some(s.created_at)),
+        .map(|s| {
+            let node_hostname = s.node_id.as_ref().and_then(|nid| {
+                peers
+                    .iter()
+                    .find(|p| p.node_id == *nid)
+                    .map(|p| p.hostname.clone())
+            });
+            let (engine_id, model_id, deploy_method, endpoint_url) = extract_deploy_fields(
+                &s.service_type,
+                &s.strategy,
+                &s.config_json,
+            );
+            ServiceSummary {
+                id: s.id.to_string(),
+                name: s.name,
+                service_type: s.service_type,
+                strategy: s.strategy,
+                status: s.status,
+                config_json: s.config_json,
+                node_id: s.node_id,
+                node_hostname,
+                created_at: s.created_at.clone(),
+                deploy_method,
+                endpoint_url,
+                started_at_epoch: parse_ts_opt(&Some(s.created_at)),
+                engine_id,
+                model_id,
+            }
         })
         .collect();
     Ok(MessageBody::ServiceListResponse { services: summaries })
+}
+
+/// Wyciaga pola specyficzne dla deployu silnika z config_json serwisu.
+/// Zwraca (engine_id, model_id, deploy_method, endpoint_url) dla serwisow
+/// pochodzacych z katalogu silnikow; dla user-defined endpointow wszystkie
+/// pola sa None poza endpoint_url ktory moze zawierac quic_url.
+fn extract_deploy_fields(
+    service_type: &str,
+    strategy: &str,
+    config_json: &str,
+) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+    let parsed: serde_json::Value = match serde_json::from_str(config_json) {
+        Ok(v) => v,
+        Err(_) => return (None, None, None, None),
+    };
+    let deploy_method = parsed
+        .get("deploy_method")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let endpoint_url = parsed
+        .get("quic_url")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            parsed
+                .get("endpoint_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+
+    if deploy_method.is_some() {
+        // Serwis stworzony przez ServiceDeployRequest z katalogu silnikow:
+        // engine_id = service_type, model_id = name, strategy = deploy_method.
+        (
+            Some(service_type.to_string()),
+            Some(strategy.to_string()),
+            deploy_method,
+            endpoint_url,
+        )
+    } else {
+        (None, None, None, endpoint_url)
+    }
+}
+
+#[handler(variant = "ServiceCreateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_create(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceCreateRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected ServiceCreateRequestBody")),
+    };
+
+    if payload.name.trim().is_empty() {
+        return Err(ProtocolError::bad_request("name is required"));
+    }
+    if !matches!(
+        payload.service_type.as_str(),
+        "llm" | "embedding" | "stt" | "tts" | "rag" | "tools" | "memory" | "reranker"
+    ) {
+        return Err(ProtocolError::bad_request(
+            "service_type must be one of llm/embedding/stt/tts/rag/tools/memory/reranker",
+        ));
+    }
+    let strategy = if payload.strategy.is_empty() {
+        "single"
+    } else {
+        payload.strategy.as_str()
+    };
+
+    // config_json wchodzi jako juz serializowany string z klienta, walidacja ze
+    // jest to poprawny JSON zeby zablokowac trash w DB.
+    let _: serde_json::Value = serde_json::from_str(&payload.config_json)
+        .map_err(|_| ProtocolError::bad_request("config_json must be valid JSON"))?;
+
+    let id = repository::create_service(
+        &ctx.state.db,
+        &payload.name,
+        &payload.service_type,
+        strategy,
+        None,
+        &payload.config_json,
+    )
+    .map_err(db_err)?;
+
+    // Po stworzeniu uzupelniamy node_id jezeli zostal podany — osobnym updatem.
+    if let Some(node_id_hex) = payload.node_id.as_deref() {
+        if !node_id_hex.is_empty() {
+            repository::set_service_node_id(&ctx.state.db, id, Some(node_id_hex))
+                .map_err(db_err)?;
+        }
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        user_id,
+        None,
+        "service.create",
+        Some(&id.to_string()),
+        Some(&payload.name),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+
+    Ok(MessageBody::ServiceCreateResponse {
+        id: id.to_string(),
+    })
+}
+
+#[handler(variant = "ServiceUpdateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceUpdateRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected ServiceUpdateRequestBody")),
+    };
+
+    let id: i64 = payload
+        .id
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("id must be integer"))?;
+
+    // Sprawdz czy serwis istnieje — repository::update_service nie zwraca
+    // informacji o liczbie wierszy (zawsze Ok(())).
+    let exists = repository::get_service(&ctx.state.db, id)
+        .map_err(db_err)?
+        .is_some();
+    if !exists {
+        return Ok(MessageBody::ServiceUpdateResponse { updated: false });
+    }
+
+    let _: serde_json::Value = serde_json::from_str(&payload.config_json)
+        .map_err(|_| ProtocolError::bad_request("config_json must be valid JSON"))?;
+
+    repository::update_service(
+        &ctx.state.db,
+        id,
+        &payload.name,
+        &payload.service_type,
+        &payload.strategy,
+        None,
+        &payload.status,
+        &payload.config_json,
+    )
+    .map_err(db_err)?;
+
+    let node_id_opt = payload.node_id.as_deref().filter(|s| !s.is_empty());
+    repository::set_service_node_id(&ctx.state.db, id, node_id_opt).map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        user_id,
+        None,
+        "service.update",
+        Some(&id.to_string()),
+        Some(&payload.name),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+
+    Ok(MessageBody::ServiceUpdateResponse { updated: true })
+}
+
+#[handler(variant = "ServiceQuicStatusRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn service_quic_status(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    // Zwraca lista (name, status) dla kazdego serwisu ze statusem okreslonym
+    // na podstawie pola `status` w DB + probki konfiguracji. Realna probe QUIC
+    // przez iroh jest wykonywana przez tlo background task — tu zwracamy
+    // ostatni znany stan.
+    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
+    let statuses: Vec<ServiceQuicStatus> = services
+        .into_iter()
+        .map(|s| ServiceQuicStatus {
+            name: s.name,
+            status: map_db_status_to_quic(&s.status, &s.config_json),
+        })
+        .collect();
+    Ok(MessageBody::ServiceQuicStatusResponse { statuses })
+}
+
+/// Mapa statusu z DB + konfiguracji na reprezentacje uzywana przez GUI.
+fn map_db_status_to_quic(db_status: &str, config_json: &str) -> String {
+    let has_quic = serde_json::from_str::<serde_json::Value>(config_json)
+        .ok()
+        .and_then(|v| {
+            v.get("quic_url")
+                .and_then(|q| q.as_str())
+                .map(|s| !s.is_empty())
+        })
+        .unwrap_or(false);
+
+    if !has_quic && db_status != "running" {
+        return "config_error".to_string();
+    }
+    match db_status {
+        "running" => "connected".to_string(),
+        "starting" => "connecting".to_string(),
+        "stopped" | "inactive" => "disconnected".to_string(),
+        "error" => "config_error".to_string(),
+        "ready" | "active" => "ready".to_string(),
+        _ => "none".to_string(),
+    }
 }
 
 #[handler(variant = "ServiceDeployRequest", since = (1, 0))]
@@ -1090,13 +1327,36 @@ pub fn service_deploy(
     if payload.engine_id.is_empty() || payload.model_id.is_empty() {
         return Err(ProtocolError::bad_request("engine_id and model_id required"));
     }
+    if !matches!(payload.deploy_method.as_str(), "docker" | "native" | "external") {
+        return Err(ProtocolError::bad_request(
+            "deploy_method must be docker/native/external",
+        ));
+    }
 
-    let deploy_id = format!(
-        "deploy-{}-{}-{}",
-        payload.engine_id,
-        payload.model_id,
-        chrono::Utc::now().timestamp()
-    );
+    let config_json = serde_json::json!({
+        "deploy_method": payload.deploy_method,
+        "node_id": hex::encode(payload.node_id),
+    })
+    .to_string();
+
+    let service_row_id = repository::create_service(
+        &ctx.state.db,
+        &payload.model_id,
+        &payload.engine_id,
+        &payload.deploy_method,
+        None,
+        &config_json,
+    )
+    .map_err(db_err)?;
+
+    repository::set_service_node_id(
+        &ctx.state.db,
+        service_row_id,
+        Some(&hex::encode(payload.node_id)),
+    )
+    .map_err(db_err)?;
+
+    let deploy_id = service_row_id.to_string();
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     let _ = repository::log_audit(

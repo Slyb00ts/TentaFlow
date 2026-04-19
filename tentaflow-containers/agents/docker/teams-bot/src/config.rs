@@ -16,15 +16,20 @@ pub struct MeetingConfig {
     /// Sciezka do plikow cookies Chromium (JSON)
     pub auth_cookies_path: String,
 
-    /// Port serwera QUIC kontenera (router laczy sie do niego)
-    #[serde(default = "default_quic_port")]
-    pub quic_port: u16,
+    /// Port UDP na ktorym iroh endpoint nasluchuje (router laczy sie po EndpointId).
+    #[serde(default = "default_transport_port")]
+    pub transport_port: u16,
 
-    /// Sciezka do certyfikatu TLS (PEM). None = self-signed
-    pub tls_cert: Option<String>,
+    /// Sciezka do pliku z Ed25519 secret key (32 bajty raw). None = ephemeral.
+    pub secret_key_path: Option<String>,
 
-    /// Sciezka do klucza prywatnego TLS (PEM). None = self-signed
-    pub tls_key: Option<String>,
+    /// Wlacza LAN mDNS discovery.
+    #[serde(default = "default_true")]
+    pub enable_lan_discovery: bool,
+
+    /// Wlacza DHT pkarr-mainline.
+    #[serde(default = "default_true")]
+    pub enable_dht_discovery: bool,
 
     /// Nazwa urzadzenia audio PulseAudio (None = domyslne)
     pub audio_device: Option<String>,
@@ -58,8 +63,12 @@ pub struct MeetingConfig {
     pub vad_rms_threshold: f32,
 }
 
-fn default_quic_port() -> u16 {
+fn default_transport_port() -> u16 {
     5000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_chunk_duration() -> u32 {
@@ -101,10 +110,13 @@ impl MeetingConfig {
             meeting_url: std::env::var("MEETING_URL").unwrap_or_default(),
             auth_cookies_path: std::env::var("AUTH_COOKIES_PATH")
                 .unwrap_or_else(|_| "/tmp/cookies.json".to_string()),
-            quic_port: std::env::var("QUIC_PORT")
+            transport_port: std::env::var("TRANSPORT_PORT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(5000),
-            tls_cert: std::env::var("TLS_CERT").ok(),
-            tls_key: std::env::var("TLS_KEY").ok(),
+            secret_key_path: std::env::var("SECRET_KEY_PATH").ok(),
+            enable_lan_discovery: std::env::var("ENABLE_LAN_DISCOVERY")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(true),
+            enable_dht_discovery: std::env::var("ENABLE_DHT_DISCOVERY")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(true),
             audio_device: std::env::var("AUDIO_DEVICE").ok(),
             vad_model_path: std::env::var("VAD_MODEL_PATH")
                 .ok()
@@ -146,11 +158,10 @@ mod tests {
 
     #[test]
     fn parse_full_config_all_fields() {
-        // Parsowanie pelnej konfiguracji ze wszystkimi polami
         let toml_str = r#"
             meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
             auth_cookies_path = "/tmp/cookies.json"
-            quic_port = 6000
+            transport_port = 6000
             chunk_duration_ms = 300
             silence_threshold_ms = 3000
             audio_device = "pulse_monitor"
@@ -158,14 +169,13 @@ mod tests {
             stt_model = "whisper-large"
             tts_model = "teams-tts"
             tts_voice = "nova"
-            tls_cert = "/certs/cert.pem"
-            tls_key = "/certs/key.pem"
+            secret_key_path = "/data/endpoint-key.bin"
             bot_name = "Testowy Bot"
         "#;
 
         let config: MeetingConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.bot_name, "Testowy Bot");
-        assert_eq!(config.quic_port, 6000);
+        assert_eq!(config.transport_port, 6000);
         assert_eq!(config.chunk_duration_ms, 300);
         assert_eq!(config.silence_threshold_ms, 3000);
         assert_eq!(config.audio_device.as_deref(), Some("pulse_monitor"));
@@ -173,20 +183,18 @@ mod tests {
         assert_eq!(config.stt_model.as_deref(), Some("whisper-large"));
         assert_eq!(config.tts_model.as_deref(), Some("teams-tts"));
         assert_eq!(config.tts_voice.as_deref(), Some("nova"));
-        assert_eq!(config.tls_cert.as_deref(), Some("/certs/cert.pem"));
-        assert_eq!(config.tls_key.as_deref(), Some("/certs/key.pem"));
+        assert_eq!(config.secret_key_path.as_deref(), Some("/data/endpoint-key.bin"));
     }
 
     #[test]
     fn parse_minimal_config_uses_defaults() {
-        // Minimalna konfiguracja — tylko wymagane pola, reszta domyslna
         let toml_str = r#"
             meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
             auth_cookies_path = "/tmp/cookies.json"
         "#;
 
         let config: MeetingConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.quic_port, 5000);
+        assert_eq!(config.transport_port, 5000);
         assert_eq!(config.chunk_duration_ms, 250);
         assert_eq!(config.silence_threshold_ms, 500);
         assert!(config.audio_device.is_none());
@@ -194,8 +202,9 @@ mod tests {
         assert!(config.stt_model.is_none());
         assert!(config.tts_model.is_none());
         assert!(config.tts_voice.is_none());
-        assert!(config.tls_cert.is_none());
-        assert!(config.tls_key.is_none());
+        assert!(config.secret_key_path.is_none());
+        assert!(config.enable_lan_discovery);
+        assert!(config.enable_dht_discovery);
     }
 
     #[test]

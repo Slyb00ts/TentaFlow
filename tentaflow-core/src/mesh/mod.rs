@@ -6,9 +6,8 @@
 pub mod gossip;
 pub mod crdt;
 pub mod crdt_store;
-pub mod discovery;
+pub mod iroh_manager;
 pub mod peer_manager;
-pub mod quic_mesh;
 pub mod peer_store;
 pub mod node_info_collector;
 pub mod pipeline;

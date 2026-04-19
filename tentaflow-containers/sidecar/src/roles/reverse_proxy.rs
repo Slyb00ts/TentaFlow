@@ -1,11 +1,12 @@
 // =============================================================================
 // Plik: roles/reverse_proxy.rs
-// Opis: Rola ReverseProxy — sidecar nasluchuje QUIC od routera i forwarduje
+// Opis: Rola ReverseProxy — sidecar nasluchuje iroh od routera i forwarduje
 //       requesty do lokalnego HTTP API silnika (vLLM, llama.cpp-server, sglang,
 //       sherpa itp). Obsluguje OpenAI-compatible chat/embeddings + raw HTTP
 //       passthrough. SSE z upstreamu mapowane na ModelStreamChunk.
 // =============================================================================
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,13 +17,14 @@ use tentaflow_protocol::{
     ErrorType, ModelPayload, ModelRequest, ModelResponse, ModelResult, ModelStreamChunk,
     StreamChunkType,
 };
+use tentaflow_transport::{
+    build_server_endpoint, serve_model_requests, HandleError, ModelHandler, ModelOutcome,
+    ServerEndpointConfig, ALPN_SERVICE,
+};
 use tokio::sync::watch;
 
 use crate::config::{Role, SidecarConfig, UpstreamApi};
-use crate::quic::{
-    handler::{HandleOutcome, Handler, HandlerError},
-    server::{QuicServer, QuicServerConfig},
-};
+use crate::identity;
 
 pub async fn run(config: SidecarConfig) -> Result<()> {
     let (upstream_url, timeout_ms, api) = match &config.role {
@@ -34,38 +36,44 @@ pub async fn run(config: SidecarConfig) -> Result<()> {
         _ => anyhow::bail!("ReverseProxy::run wywolany z bledna rola"),
     };
 
-    let handler = ReverseProxyHandler::new(upstream_url, timeout_ms, api, config.model_aliases.clone())?;
+    let handler = Arc::new(ReverseProxyHandler::new(
+        upstream_url,
+        timeout_ms,
+        api,
+        config.model_aliases.clone(),
+    )?);
 
-    let quic_cfg = QuicServerConfig {
-        bind: format!("0.0.0.0:{}", config.quic.port).parse()?,
-        keep_alive_interval: Duration::from_secs(10),
-        max_idle_timeout: Duration::from_secs(30),
-        max_concurrent_bi_streams: 200,
-        tls_cert_pem: load_pem(&config.quic.tls_cert)?,
-        tls_key_pem: load_pem(&config.quic.tls_key)?,
-    };
+    let secret_key = identity::load_or_generate(config.transport.secret_key_path.as_deref())?;
+    let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.transport.port).parse()?;
+
+    let endpoint = build_server_endpoint(ServerEndpointConfig {
+        secret_key,
+        bind_addr,
+        alpns: vec![ALPN_SERVICE.to_vec()],
+        relay_url: None,
+        enable_lan_discovery: config.transport.enable_lan_discovery,
+        enable_dht_discovery: config.transport.enable_dht_discovery,
+    })
+    .await?;
+
+    tracing::info!(
+        endpoint_id = %endpoint.id().fmt_short(),
+        bind = %bind_addr,
+        "Sidecar iroh endpoint gotowy"
+    );
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Ctrl+C handler — wysyla shutdown do QUIC servera, ten zamyka polaczenia
-    // z CloseCode::Shutdown co peer (router) odbierze i zaloguje.
     let sh_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Ctrl+C odebrany — wysylam shutdown do QUIC");
+        tracing::info!("Ctrl+C — wysylam shutdown");
         let _ = sh_tx.send(true);
     });
 
-    let server = QuicServer::new(quic_cfg, handler);
-    server.run(shutdown_rx).await?;
+    serve_model_requests(endpoint, handler, shutdown_rx).await?;
     tracing::info!("ReverseProxy: zakonczony");
     Ok(())
-}
-
-fn load_pem(path: &Option<String>) -> Result<Option<Vec<u8>>> {
-    match path {
-        Some(p) => Ok(Some(std::fs::read(p)?)),
-        None => Ok(None),
-    }
 }
 
 /// Handler ktory tlumaczy ModelRequest ↔ lokalne HTTP API silnika.
@@ -99,12 +107,12 @@ impl ReverseProxyHandler {
         &self,
         request: &ModelRequest,
         payload: &CompletionPayload,
-    ) -> Result<HandleOutcome, HandlerError> {
+    ) -> Result<ModelOutcome, HandleError> {
         let url = match self.api {
             UpstreamApi::OpenAi => format!("{}/chat/completions", self.upstream.trim_end_matches('/')),
             UpstreamApi::LlamaCpp => format!("{}/v1/chat/completions", self.upstream.trim_end_matches('/')),
             UpstreamApi::Sherpa => {
-                return Err(HandlerError::UnsupportedRequest(
+                return Err(HandleError::UnsupportedRequest(
                     "Sherpa API nie obsluguje chat".into(),
                 ))
             }
@@ -147,7 +155,7 @@ impl ReverseProxyHandler {
         url: &str,
         body: serde_json::Value,
         request_id: String,
-    ) -> Result<HandleOutcome, HandlerError> {
+    ) -> Result<ModelOutcome, HandleError> {
         let resp = self
             .client
             .post(url)
@@ -156,16 +164,16 @@ impl ReverseProxyHandler {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    HandlerError::Timeout
+                    HandleError::Timeout
                 } else {
-                    HandlerError::UpstreamUnavailable(e.to_string())
+                    HandleError::UpstreamUnavailable(e.to_string())
                 }
             })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Ok(HandleOutcome::Unary(error_response(
+            return Ok(ModelOutcome::Unary(error_response(
                 &request_id,
                 &format!("upstream HTTP {}: {}", status, text),
             )));
@@ -174,7 +182,7 @@ impl ReverseProxyHandler {
         let json: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| HandlerError::Internal(format!("parse upstream JSON: {}", e)))?;
+            .map_err(|e| HandleError::Internal(format!("parse upstream JSON: {}", e)))?;
 
         let text = json
             .pointer("/choices/0/message/content")
@@ -191,7 +199,7 @@ impl ReverseProxyHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        Ok(HandleOutcome::Unary(ModelResponse {
+        Ok(ModelOutcome::Unary(ModelResponse {
             request_id,
             result: ModelResult::Completion(CompletionResult {
                 text,
@@ -214,7 +222,7 @@ impl ReverseProxyHandler {
         url: &str,
         body: serde_json::Value,
         request_id: String,
-    ) -> Result<HandleOutcome, HandlerError> {
+    ) -> Result<ModelOutcome, HandleError> {
         use futures_util::StreamExt;
 
         let resp = self
@@ -223,12 +231,12 @@ impl ReverseProxyHandler {
             .json(&body)
             .send()
             .await
-            .map_err(|e| HandlerError::UpstreamUnavailable(e.to_string()))?;
+            .map_err(|e| HandleError::UpstreamUnavailable(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::UpstreamUnavailable(format!(
+            return Err(HandleError::UpstreamUnavailable(format!(
                 "upstream HTTP {}: {}",
                 status, text
             )));
@@ -295,20 +303,20 @@ impl ReverseProxyHandler {
             }
         });
 
-        Ok(HandleOutcome::Stream(rx))
+        Ok(ModelOutcome::Stream(rx))
     }
 
     async fn handle_embeddings(
         &self,
         request: &ModelRequest,
         payload: &EmbeddingsPayload,
-    ) -> Result<HandleOutcome, HandlerError> {
+    ) -> Result<ModelOutcome, HandleError> {
         let url = match self.api {
             UpstreamApi::OpenAi | UpstreamApi::LlamaCpp => {
                 format!("{}/embeddings", self.upstream.trim_end_matches('/'))
             }
             _ => {
-                return Err(HandlerError::UnsupportedRequest(
+                return Err(HandleError::UnsupportedRequest(
                     "ten upstream API nie ma endpointu /embeddings".into(),
                 ))
             }
@@ -325,12 +333,12 @@ impl ReverseProxyHandler {
             .json(&body)
             .send()
             .await
-            .map_err(|e| HandlerError::UpstreamUnavailable(e.to_string()))?;
+            .map_err(|e| HandleError::UpstreamUnavailable(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Ok(HandleOutcome::Unary(error_response(
+            return Ok(ModelOutcome::Unary(error_response(
                 &request.request_id,
                 &format!("upstream HTTP {}: {}", status, text),
             )));
@@ -339,7 +347,7 @@ impl ReverseProxyHandler {
         let json: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| HandlerError::Internal(format!("parse upstream JSON: {}", e)))?;
+            .map_err(|e| HandleError::Internal(format!("parse upstream JSON: {}", e)))?;
 
         let embeddings: Vec<Vec<f32>> = json
             .pointer("/data")
@@ -363,7 +371,7 @@ impl ReverseProxyHandler {
             .unwrap_or(&payload.model)
             .to_string();
 
-        Ok(HandleOutcome::Unary(ModelResponse {
+        Ok(ModelOutcome::Unary(ModelResponse {
             request_id: request.request_id.clone(),
             result: ModelResult::Embeddings(EmbeddingsResult {
                 dimensions: embeddings.first().map(|e| e.len()).unwrap_or(0),
@@ -376,20 +384,16 @@ impl ReverseProxyHandler {
 }
 
 #[async_trait]
-impl Handler for ReverseProxyHandler {
-    async fn handle(&self, request: ModelRequest) -> Result<HandleOutcome, HandlerError> {
+impl ModelHandler for ReverseProxyHandler {
+    async fn handle(&self, request: ModelRequest) -> Result<ModelOutcome, HandleError> {
         match &request.payload {
             ModelPayload::Completion(p) => self.handle_chat(&request, p).await,
             ModelPayload::Embeddings(p) => self.handle_embeddings(&request, p).await,
-            other => Err(HandlerError::UnsupportedRequest(format!(
+            other => Err(HandleError::UnsupportedRequest(format!(
                 "payload {:?} nie obslugiwany przez ReverseProxy",
                 std::mem::discriminant(other)
             ))),
         }
-    }
-
-    fn advertise_models(&self) -> Vec<String> {
-        self.aliases.clone()
     }
 }
 

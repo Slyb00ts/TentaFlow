@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use rusqlite::Connection;
 use tracing::info;
 
@@ -33,10 +33,10 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     }
 
     let manifest_content = std::fs::read_to_string(&manifest_path)
-        .context("Nie udalo sie odczytac manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac manifest.toml: {e}"))?;
 
     let manifest = parse_manifest_toml(&manifest_content)
-        .context("Nie udalo sie sparsowac manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac manifest.toml: {e}"))?;
 
     // 2. Walidacja
     validate_manifest(&manifest)?;
@@ -58,7 +58,7 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     }
 
     let wasm_bytes = std::fs::read(&wasm_path)
-        .context("Nie udalo sie odczytac pliku WASM")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac pliku WASM: {e}"))?;
 
     let platforms_json = serde_json::to_string(&manifest.platforms)
         .unwrap_or_else(|_| "[\"all\"]".to_string());
@@ -110,7 +110,7 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
             category,
             &disambiguation_json,
         ],
-    ).context("Nie udalo sie zarejestrowac addonu w DB")?;
+    ).map_err(|e| anyhow::anyhow!("Nie udalo sie zarejestrowac addonu w DB: {e}"))?;
 
     // Uprawnienia, narzedzia i limity sa przechowywane w manifest_json
     // (tabela addons.manifest_json zawiera pelny manifest)
@@ -264,7 +264,7 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     conn.execute(
         "DELETE FROM addons WHERE addon_id = ?1",
         rusqlite::params![addon_id],
-    ).context("Nie udalo sie usunac addonu z DB")?;
+    ).map_err(|e| anyhow::anyhow!("Nie udalo sie usunac addonu z DB: {e}"))?;
 
     conn.execute("COMMIT", [])?;
 
@@ -288,10 +288,10 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     // Odczytaj nowy manifest
     let manifest_path = new_dir.join("manifest.toml");
     let manifest_content = std::fs::read_to_string(&manifest_path)
-        .context("Nie udalo sie odczytac nowego manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac nowego manifest.toml: {e}"))?;
 
     let new_manifest = parse_manifest_toml(&manifest_content)
-        .context("Nie udalo sie sparsowac nowego manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac nowego manifest.toml: {e}"))?;
 
     validate_manifest(&new_manifest)?;
 
@@ -328,7 +328,7 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
         "SELECT version FROM addons WHERE addon_id = ?1",
         rusqlite::params![addon_id],
         |row| row.get(0),
-    ).context("Addon nie znaleziony")?;
+    ).map_err(|e| anyhow::anyhow!("Addon nie znaleziony: {e}"))?;
 
     info!(
         "Upgrade addonu '{}': {} -> {}",
@@ -481,15 +481,15 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
 
     // Parsuj jako zagniezdony format [addon]
     let parsed: toml::Value = toml::from_str(content)
-        .context("Niepoprawny format TOML")?;
+        .map_err(|e| anyhow::anyhow!("Niepoprawny format TOML: {e}"))?;
 
     let addon = parsed.get("addon")
-        .context("Brak sekcji [addon] w manifest.toml")?;
+        .ok_or_else(|| anyhow::anyhow!("Brak sekcji [addon] w manifest.toml"))?;
 
     let addon_id = addon.get("id").and_then(|v| v.as_str())
-        .context("Brak addon.id")?;
+        .ok_or_else(|| anyhow::anyhow!("Brak addon.id"))?;
     let version = addon.get("version").and_then(|v| v.as_str())
-        .context("Brak addon.version")?;
+        .ok_or_else(|| anyhow::anyhow!("Brak addon.version"))?;
     let display_name = addon.get("name").and_then(|v| v.as_str())
         .unwrap_or(addon_id);
     let description = addon.get("description").and_then(|v| v.as_str()).map(String::from);

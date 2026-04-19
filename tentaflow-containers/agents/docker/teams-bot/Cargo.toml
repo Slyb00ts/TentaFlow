@@ -9,8 +9,10 @@ name = "tentaflow-meeting"
 path = "src/main.rs"
 
 [dependencies]
-# Protokol i serializacja
-tentaflow-protocol = { path = "../../tentaflow-protocol" }
+# Protokol i transport iroh
+tentaflow-protocol = { path = "../../../../tentaflow-protocol" }
+tentaflow-transport = { path = "../../../../tentaflow-transport" }
+iroh = { version = "0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 rkyv = { version = "0.8", features = ["unaligned"] }
 
 # Async runtime
@@ -24,15 +26,8 @@ futures = "0.3"
 tokio-tungstenite = "0.24"
 
 # Silero VAD — pure Rust implementation z tentaflow-voice
-# Zastepuje wczesniejsza implementacje przez ort/onnxruntime.
-tentaflow-voice = { path = "../../tentaflow-voice" }
+tentaflow-voice = { path = "../../../../tentaflow-voice" }
 parking_lot = "0.12"
-
-# QUIC serwer
-quinn = "0.11"
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
-rcgen = "0.13"
 
 # Konfiguracja
 toml = "0.8"
@@ -50,3 +45,4 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 byteorder = "1"
 uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"

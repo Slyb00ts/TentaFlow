@@ -16,7 +16,7 @@ pub mod log;
 pub mod network;
 pub mod service;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use super::AddonState;
 use super::runtime::{WasmLinker, WasmCaller, WasmMemory, AsContext, AsContextMut};
@@ -51,137 +51,137 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     linker.func_wrap(
         "tentaflow", "llm_generate",
         llm::llm_generate,
-    ).context("Rejestracja llm_generate")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja llm_generate: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "llm_generate_stream_start",
         llm::llm_generate_stream_start,
-    ).context("Rejestracja llm_generate_stream_start")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_start: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "llm_generate_stream_next",
         llm::llm_generate_stream_next,
-    ).context("Rejestracja llm_generate_stream_next")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_next: {e}"))?;
 
     // --- Storage API ---
     linker.func_wrap(
         "tentaflow", "storage_get",
         storage::storage_get,
-    ).context("Rejestracja storage_get")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_get: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "storage_set",
         storage::storage_set,
-    ).context("Rejestracja storage_set")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_set: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "storage_delete",
         storage::storage_delete,
-    ).context("Rejestracja storage_delete")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_delete: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "storage_list",
         storage::storage_list,
-    ).context("Rejestracja storage_list")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_list: {e}"))?;
 
     // --- HTTP API ---
     linker.func_wrap(
         "tentaflow", "http_request",
         http::http_request,
-    ).context("Rejestracja http_request")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja http_request: {e}"))?;
 
     // --- Event API ---
     linker.func_wrap(
         "tentaflow", "event_subscribe",
         events::event_subscribe,
-    ).context("Rejestracja event_subscribe")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja event_subscribe: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "event_publish",
         events::event_publish,
-    ).context("Rejestracja event_publish")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja event_publish: {e}"))?;
 
     // --- UI API ---
     linker.func_wrap(
         "tentaflow", "ui_render",
         ui::ui_render,
-    ).context("Rejestracja ui_render")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja ui_render: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "ui_notify",
         ui::ui_notify,
-    ).context("Rejestracja ui_notify")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja ui_notify: {e}"))?;
 
     // --- User API ---
     linker.func_wrap(
         "tentaflow", "user_get_current",
         user::user_get_current,
-    ).context("Rejestracja user_get_current")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja user_get_current: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "user_check_permission",
         user::user_check_permission,
-    ).context("Rejestracja user_check_permission")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja user_check_permission: {e}"))?;
 
     // --- Secrets API ---
     linker.func_wrap(
         "tentaflow", "secret_get",
         secrets::secret_get,
-    ).context("Rejestracja secret_get")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja secret_get: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "secret_set",
         secrets::secret_set,
-    ).context("Rejestracja secret_set")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja secret_set: {e}"))?;
 
     // --- Log API ---
     linker.func_wrap(
         "tentaflow", "log_info",
         log::log_info,
-    ).context("Rejestracja log_info")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja log_info: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "log_warn",
         log::log_warn,
-    ).context("Rejestracja log_warn")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja log_warn: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "log_error",
         log::log_error,
-    ).context("Rejestracja log_error")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja log_error: {e}"))?;
 
     // --- Tool API ---
     linker.func_wrap(
         "tentaflow", "tool_register",
         tool_register,
-    ).context("Rejestracja tool_register")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja tool_register: {e}"))?;
 
     // --- Network API (proxy TCP/UDP) ---
     linker.func_wrap(
         "tentaflow", "net_connect",
         network::host_net_connect,
-    ).context("Rejestracja net_connect")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja net_connect: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "net_send",
         network::host_net_send,
-    ).context("Rejestracja net_send")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja net_send: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "net_recv",
         network::host_net_recv,
-    ).context("Rejestracja net_recv")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja net_recv: {e}"))?;
 
     linker.func_wrap(
         "tentaflow", "net_close",
         network::host_net_close,
-    ).context("Rejestracja net_close")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja net_close: {e}"))?;
 
     // --- Service API (QUIC proxy do zarejestrowanych serwisow) ---
     linker.func_wrap(
         "tentaflow", "service_request",
         service::service_request,
-    ).context("Rejestracja service_request")?;
+    ).map_err(|e| anyhow::anyhow!("Rejestracja service_request: {e}"))?;
 
     Ok(())
 }

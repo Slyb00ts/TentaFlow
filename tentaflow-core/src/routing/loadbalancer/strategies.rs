@@ -7,7 +7,7 @@
 
 use crate::routing::backend::BackendClient;
 use crate::error::{Result, CoreError};
-use rand::Rng;
+use rand::RngExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -277,7 +277,7 @@ impl LoadBalancingStrategy for WeightedStrategy {
         validate_backends(backends)?;
 
         // Roulette wheel selection z binary search O(log n)
-        let random_value = rand::thread_rng().gen_range(0..self.total_weight);
+        let random_value = rand::rng().random_range(0..self.total_weight);
 
         // Binary search: znajdz pierwszy indeks gdzie cumulative_weight > random_value
         let idx = self

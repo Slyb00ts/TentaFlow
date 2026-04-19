@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, RwLock};
@@ -417,7 +417,7 @@ impl GossipEngine {
 
                 // Wybierz losowo fanout peerow
                 let selected: Vec<_> = {
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     targets
                         .choose_multiple(&mut rng, config.fanout.min(targets.len()))
                         .copied()
@@ -537,7 +537,7 @@ impl GossipEngine {
                         };
 
                         if let Some(relay) = {
-                            let mut rng = rand::thread_rng();
+                            let mut rng = rand::rng();
                             other_peers.choose(&mut rng).copied()
                         } {
                             let new_seq = seq_counter.fetch_add(1, Ordering::Relaxed);
@@ -684,7 +684,7 @@ impl GossipEngine {
                 };
 
                 let target = {
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     targets.choose(&mut rng).copied()
                 };
 

@@ -41,14 +41,15 @@
 // ============================================================================
 
 use anyhow::{Context, Result};
-use quinn::{Connection, Endpoint};
-use rustls::pki_types::CertificateDer;
+use iroh::endpoint::{Connection, ReadExactError};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tentaflow_protocol::*;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn, error};
+
+use tentaflow_transport::{build_client_endpoint, ALPN_SERVICE};
 
 /// Metryki z embeddings.
 #[derive(Debug, Clone)]
@@ -296,14 +297,11 @@ pub struct TentaFlowClient {
     reconnect_interval_ms: AtomicU32,
 }
 
-/// Konfiguracja klienta QUIC (one-way TLS - klient NIE wysyła certyfikatu).
+/// Konfiguracja klienta iroh.
 #[derive(Clone)]
 pub struct ClientConfigInternal {
-    /// URL Router (np. "quic://localhost:3000")
+    /// URL w formacie `iroh://<hex-endpoint-id>` albo czysty hex (32 bajty Ed25519).
     pub router_url: String,
-
-    /// Ścieżka do certyfikatu CA (opcjonalne - jeśli None, używa systemowych CA)
-    pub ca_path: Option<String>,
 
     /// Timeout requestu (ms)
     pub timeout_ms: u64,
@@ -323,41 +321,21 @@ impl TentaFlowClient {
     ///
     /// Zwraca: Połączony klient lub błąd
     pub async fn connect(config: ClientConfigInternal) -> Result<Self> {
-        info!("Łączenie z Router: {}", config.router_url);
+        info!("Łączenie z Router (iroh): {}", config.router_url);
 
-        // Parsuj URL (usuń prefix quic://)
-        let url = config.router_url.strip_prefix("quic://").unwrap_or(&config.router_url);
-        let parts: Vec<&str> = url.split(':').collect();
-        let host = parts.get(0).unwrap_or(&"localhost");
-        let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(3000);
+        let endpoint_id = parse_endpoint_id(&config.router_url)
+            .context("Niepoprawny URL routera (wymagany `iroh://<hex>` albo 64-znakowy hex)")?;
 
-        // Wczytaj certyfikaty CA (opcjonalne)
-        let ca_certs = Self::load_ca_certs(&config)?;
-
-        // Zbuduj konfigurację klienta QUIC (one-way TLS)
-        let client_config = Self::build_client_config(ca_certs)?;
-
-        // Utwórz endpoint QUIC (bind na dowolny port)
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-        endpoint.set_default_client_config(client_config);
-
-        // Rozwiąż adres (DNS lub IP)
-        let addr: SocketAddr = format!("{}:{}", host, port).parse()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                format!("{}:{}", host, port)
-                    .to_socket_addrs()?
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Nie udało się rozwiązać DNS"))
-            })?;
-
-        // Nawiąż połączenie QUIC
-        let connection = endpoint
-            .connect(addr, host)?
+        let endpoint = build_client_endpoint(vec![ALPN_SERVICE.to_vec()])
             .await
-            .context("QUIC handshake nieudany")?;
+            .context("iroh endpoint bind")?;
 
-        info!("Połączono z Router: {}", addr);
+        let connection = endpoint
+            .connect(EndpointAddr::new(endpoint_id), ALPN_SERVICE)
+            .await
+            .context("iroh handshake nieudany")?;
+
+        info!("Połączono z Router: endpoint_id={}", endpoint_id.fmt_short());
 
         Ok(Self {
             connection: Arc::new(Mutex::new(Some(connection))),
@@ -401,37 +379,21 @@ impl TentaFlowClient {
         let max_attempts = self.max_reconnect_attempts.load(Ordering::Relaxed);
         let interval_ms = self.reconnect_interval_ms.load(Ordering::Relaxed);
 
-        // Parsuj URL
-        let url = self.config.router_url.strip_prefix("quic://").unwrap_or(&self.config.router_url);
-        let parts: Vec<&str> = url.split(':').collect();
-        let host = parts.get(0).unwrap_or(&"localhost").to_string();
-        let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(3000);
-
-        // Rozwiąż adres
-        let addr: SocketAddr = format!("{}:{}", host, port).parse()
-            .or_else(|_| {
-                use std::net::ToSocketAddrs;
-                format!("{}:{}", host, port)
-                    .to_socket_addrs()?
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Nie udało się rozwiązać DNS"))
-            })?;
+        let endpoint_id = parse_endpoint_id(&self.config.router_url)
+            .context("Niepoprawny URL routera")?;
 
         for attempt in 1..=max_attempts {
-            info!("Próba reconnect {}/{} do {}", attempt, max_attempts, addr);
+            info!("Próba reconnect {}/{} do {}", attempt, max_attempts, endpoint_id.fmt_short());
 
-            match self.endpoint.connect(addr, &host) {
-                Ok(connecting) => {
-                    match connecting.await {
-                        Ok(connection) => {
-                            info!("Reconnect udany po {} próbach", attempt);
-                            *self.connection.lock() = Some(connection);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            warn!("Próba {} nieudana: {}", attempt, e);
-                        }
-                    }
+            match self
+                .endpoint
+                .connect(EndpointAddr::new(endpoint_id), ALPN_SERVICE)
+                .await
+            {
+                Ok(connection) => {
+                    info!("Reconnect udany po {} próbach", attempt);
+                    *self.connection.lock() = Some(connection);
+                    return Ok(());
                 }
                 Err(e) => {
                     warn!("Próba {} nieudana: {}", attempt, e);
@@ -725,7 +687,7 @@ impl TentaFlowClient {
             let mut len_buf = [0u8; 4];
             match recv.read_exact(&mut len_buf).await {
                 Ok(()) => {}
-                Err(quinn::ReadExactError::FinishedEarly(_)) => {
+                Err(ReadExactError::FinishedEarly(_)) => {
                     break;
                 }
                 Err(e) => {
@@ -2108,72 +2070,25 @@ impl TentaFlowClient {
         }
     }
 
-    // =========================================================================
-    // TLS HELPERS
-    // =========================================================================
+}
 
-    /// Ładuje certyfikaty CA z pliku (opcjonalne).
-    /// Jeśli brak pliku CA, używa systemowych certyfikatów.
-    fn load_ca_certs(config: &ClientConfigInternal) -> Result<Vec<CertificateDer<'static>>> {
-        match &config.ca_path {
-            Some(ca_path) => {
-                let ca_pem = std::fs::read(ca_path)
-                    .context("Failed to read CA certificate")?;
-                let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &ca_pem[..])
-                    .filter_map(|r| r.ok())
-                    .collect();
+/// Parsuje URL routera w formacie `iroh://<hex>` albo czysty 64-znakowy hex.
+fn parse_endpoint_id(url: &str) -> Result<EndpointId> {
+    let raw = url.trim();
+    let hex_str = raw
+        .strip_prefix("iroh://")
+        .unwrap_or(raw)
+        .trim_end_matches('/')
+        .trim_start_matches("0x");
 
-                if ca_certs.is_empty() {
-                    anyhow::bail!("No CA certificates found in: {}", ca_path);
-                }
-
-                debug!("Załadowano {} certyfikatów CA z {}", ca_certs.len(), ca_path);
-                Ok(ca_certs)
-            }
-            None => {
-                debug!("Brak pliku CA - używam systemowych certyfikatów");
-                Ok(vec![])
-            }
-        }
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| anyhow::anyhow!("hex EndpointId: {e}"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("EndpointId musi miec 32 bajty, ma {}", bytes.len());
     }
-
-    /// Buduje konfigurację klienta QUIC (one-way TLS - klient NIE wysyła certyfikatu).
-    fn build_client_config(ca_certs: Vec<CertificateDer<'static>>) -> Result<quinn::ClientConfig> {
-        let root_store = if ca_certs.is_empty() {
-            // Użyj systemowych certyfikatów CA
-            let mut store = rustls::RootCertStore::empty();
-            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            debug!("Używam systemowych certyfikatów CA ({} certyfikatów)", store.len());
-            store
-        } else {
-            // Użyj podanych certyfikatów CA
-            let mut store = rustls::RootCertStore::empty();
-            for ca in ca_certs {
-                store.add(ca)?;
-            }
-            store
-        };
-
-        // One-way TLS: klient NIE wysyła certyfikatu
-        let mut client_crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        // Ustaw ALPN protocol - musi być zgodny z Router ("tentaflow")
-        client_crypto.alpn_protocols = vec![b"tentaflow".to_vec()];
-
-        let mut client_config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-        ));
-
-        // Transport config
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
-        client_config.transport_config(Arc::new(transport));
-
-        Ok(client_config)
-    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    EndpointId::from_bytes(&arr).map_err(|e| anyhow::anyhow!("niepoprawny EndpointId: {e}"))
 }
 
 #[cfg(test)]

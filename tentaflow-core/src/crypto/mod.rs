@@ -12,7 +12,6 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hkdf::Hkdf;
-use rand::RngCore;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -38,7 +37,7 @@ fn decode_hex_32(hex_str: &str) -> anyhow::Result<[u8; 32]> {
 /// Generuje losowy 32-bajtowy klucz jako hex string (VULN-025: OsRng zamiast thread_rng)
 pub fn generate_master_key() -> String {
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    getrandom::fill(&mut key).expect("OS RNG fill_bytes");
     let mut hex = String::with_capacity(64);
     for b in &key {
         use std::fmt::Write;
@@ -76,7 +75,7 @@ impl SecretsCipher {
     /// VULN-025: OsRng zamiast thread_rng dla materialu kryptograficznego
     pub fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG fill_bytes");
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = self
@@ -201,7 +200,7 @@ pub fn load_or_create_master_key_in(custom_dir: Option<&std::path::Path>) -> any
         Ok(key)
     } else {
         let mut key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key);
+        getrandom::fill(&mut key).expect("OS RNG fill_bytes");
 
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -273,7 +272,7 @@ impl SettingsCipher {
     /// Szyfruj wartosc. Zwraca "enc:base64(nonce||ciphertext)"
     pub fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG fill_bytes");
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = self
@@ -339,8 +338,7 @@ pub fn migrate_plaintext_secrets(
 
 /// Hashuje haslo uzytkownika algorytmem argon2 (PHC string format)
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-    use rand::rngs::OsRng;
+    use argon2::{Argon2, PasswordHasher, password_hash::{SaltString, rand_core::OsRng}};
 
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();

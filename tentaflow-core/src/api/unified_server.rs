@@ -23,7 +23,7 @@ use crate::config::NodeConfig;
 use crate::crypto::{generate_master_key, SecretsCipher, SettingsCipher};
 use crate::db;
 use crate::mesh::peer_store::MeshPeerStore;
-use crate::mesh::quic_mesh::QuicMeshManager;
+use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::security::MeshSecurity;
 use crate::metrics::RouterMetrics;
 use crate::routing::Router;
@@ -54,7 +54,7 @@ pub fn start_unified_server(
     metrics: &Arc<RouterMetrics>,
     router: &Arc<Router>,
     mesh_peer_store: &MeshPeerStore,
-    quic_mesh: Option<Arc<QuicMeshManager>>,
+    quic_mesh: Option<Arc<IrohMeshManager>>,
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
 ) -> Result<()> {
@@ -68,7 +68,7 @@ pub fn start_unified_server_with_permissions(
     metrics: &Arc<RouterMetrics>,
     router: &Arc<Router>,
     mesh_peer_store: &MeshPeerStore,
-    quic_mesh: Option<Arc<QuicMeshManager>>,
+    quic_mesh: Option<Arc<IrohMeshManager>>,
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
@@ -122,9 +122,9 @@ pub fn start_unified_server_with_permissions(
         let cert_pem = include_bytes!("../../../certs/cert.pem");
         let key_pem = include_bytes!("../../../certs/key.pem");
 
-        let certs = crate::net::quic::tls::parse_certs_pem(cert_pem)
+        let certs = crate::api::tls_pem::parse_certs_pem(cert_pem)
             .expect("Nie udalo sie sparsowac wbudowanego certyfikatu");
-        let key = crate::net::quic::tls::parse_key_pem(key_pem)
+        let key = crate::api::tls_pem::parse_key_pem(key_pem)
             .expect("Nie udalo sie sparsowac wbudowanego klucza");
 
         let mut tls_config = rustls::ServerConfig::builder()

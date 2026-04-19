@@ -37,7 +37,7 @@ pub struct DashboardServer {
     service_manager: Arc<ServiceManager>,
     router: Arc<Router>,
     mesh_peer_store: MeshPeerStore,
-    quic_mesh: Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>,
+    quic_mesh: Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
@@ -70,7 +70,7 @@ impl DashboardServer {
     }
 
     /// Ustawia QUIC mesh manager i local node id — wymagane do forwardowania komend
-    pub fn with_quic_mesh(mut self, quic_mesh: Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>, local_node_id: Arc<str>) -> Self {
+    pub fn with_quic_mesh(mut self, quic_mesh: Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>, local_node_id: Arc<str>) -> Self {
         self.quic_mesh = quic_mesh;
         self.local_node_id = local_node_id;
         self
@@ -245,7 +245,7 @@ pub async fn handle_request(
     service_manager: Arc<ServiceManager>,
     router: Arc<Router>,
     mesh_peer_store: MeshPeerStore,
-    quic_mesh: Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>,
+    quic_mesh: Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
@@ -1908,7 +1908,7 @@ async fn route_mesh_api(
     db: &DbPool,
     mesh_peer_store: &MeshPeerStore,
     mesh_security: &Option<Arc<crate::mesh::security::MeshSecurity>>,
-    quic_mesh: &Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>,
+    quic_mesh: &Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
     local_node_id: &str,
     body: &[u8],
     claims: &auth::Claims,
@@ -2043,7 +2043,7 @@ async fn route_clusters_api(
     db: &DbPool,
     body: &[u8],
     claims: &auth::Claims,
-    quic_mesh: &Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>,
+    quic_mesh: &Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
 ) -> (u16, String) {
     // GET /api/clusters
     if path == "/api/clusters" && *method == Method::GET {

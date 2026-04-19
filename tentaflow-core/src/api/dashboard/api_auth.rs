@@ -7,7 +7,6 @@ use crate::db::{self, DbPool};
 use super::auth::{self, Claims};
 use anyhow::Result;
 use parking_lot::Mutex;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -138,7 +137,7 @@ pub fn handle_login(pool: &DbPool, body: &[u8], remote_addr: &str, settings_ciph
         _ => {
             // VULN-009: Kryptograficznie bezpieczny secret z OsRng
             let mut key = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut key);
+            getrandom::fill(&mut key).expect("OS RNG fill_bytes");
             let generated = hex::encode(key);
             db::repository::set_setting_secure(pool, "jwt_secret", &generated, settings_cipher)?;
             generated

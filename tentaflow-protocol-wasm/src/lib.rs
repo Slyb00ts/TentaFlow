@@ -20,12 +20,16 @@ use tentaflow_protocol::{
     envelope::{message_kind, Envelope, EnvelopeFlags, Routing},
     message_body::{
         ApiKeyCreateRequest, AuthLoginRequest, ChatMessage, ChatStreamRequest, ClusterUpdateRequest,
-        MeshPairInitRequest, MessageBody, ProtocolError, ProtocolErrorCode, SettingEntry,
-        SettingsUpdateRequest,
+        FlowCreateRequest, MeshPairInitRequest, MessageBody, ModelInstallRequest, ProtocolError,
+        ProtocolErrorCode, ServiceCreateRequest, ServiceDeployRequest, ServiceUpdateRequest,
+        SettingEntry, SettingsUpdateRequest, TtsRule,
     },
     SCHEMA_VERSION as PROTOCOL_SCHEMA_VERSION,
 };
 use wasm_bindgen::prelude::*;
+
+mod identity;
+pub use identity::*;
 
 // =============================================================================
 // Init
@@ -383,6 +387,285 @@ pub fn encode_dashboard_metrics_request() -> Result<Vec<u8>, JsError> {
 pub fn encode_subscribe_resume_request(resume_token: Vec<u8>) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::SubscribeResumeRequest { resume_token })
         .map_err(|e| JsError::new(&e))
+}
+
+// --- Models ---------------------------------------------------------------
+
+/// MessageBody::ModelDetailRequest { model_id }.
+#[wasm_bindgen(js_name = encodeModelDetailRequest)]
+pub fn encode_model_detail_request(model_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelDetailRequest { model_id }).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelInstallRequest { model_id, source_repo }.
+#[wasm_bindgen(js_name = encodeModelInstallRequest)]
+pub fn encode_model_install_request(
+    model_id: String,
+    source_repo: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelInstallRequestBody(ModelInstallRequest {
+        model_id,
+        source_repo,
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelDeleteRequest { model_id }.
+#[wasm_bindgen(js_name = encodeModelDeleteRequest)]
+pub fn encode_model_delete_request(model_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelDeleteRequest { model_id }).map_err(|e| JsError::new(&e))
+}
+
+// --- Hub ------------------------------------------------------------------
+
+/// MessageBody::HubEngineListRequest (unit).
+#[wasm_bindgen(js_name = encodeHubEngineListRequest)]
+pub fn encode_hub_engine_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::HubEngineListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::HubModelSearchRequest { query }.
+#[wasm_bindgen(js_name = encodeHubModelSearchRequest)]
+pub fn encode_hub_model_search_request(query: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::HubModelSearchRequest { query }).map_err(|e| JsError::new(&e))
+}
+
+// --- Flows ----------------------------------------------------------------
+
+/// MessageBody::FlowListRequest (unit).
+#[wasm_bindgen(js_name = encodeFlowListRequest)]
+pub fn encode_flow_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FlowListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::FlowDetailRequest { flow_id }.
+#[wasm_bindgen(js_name = encodeFlowDetailRequest)]
+pub fn encode_flow_detail_request(flow_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FlowDetailRequest { flow_id }).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::FlowCreateRequest { name, description, graph_json }.
+#[wasm_bindgen(js_name = encodeFlowCreateRequest)]
+pub fn encode_flow_create_request(
+    name: String,
+    description: Option<String>,
+    graph_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FlowCreateRequestBody(FlowCreateRequest {
+        name,
+        description,
+        graph_json,
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::FlowDeleteRequest { flow_id }.
+#[wasm_bindgen(js_name = encodeFlowDeleteRequest)]
+pub fn encode_flow_delete_request(flow_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FlowDeleteRequest { flow_id }).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::FlowExecutionsListRequest { flow_id }.
+#[wasm_bindgen(js_name = encodeFlowExecutionsListRequest)]
+pub fn encode_flow_executions_list_request(flow_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FlowExecutionsListRequest { flow_id })
+        .map_err(|e| JsError::new(&e))
+}
+
+// --- Services -------------------------------------------------------------
+
+/// MessageBody::ServiceListRequest (unit).
+#[wasm_bindgen(js_name = encodeServiceListRequest)]
+pub fn encode_service_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ServiceListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceStopRequest { service_id }.
+#[wasm_bindgen(js_name = encodeServiceStopRequest)]
+pub fn encode_service_stop_request(service_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ServiceStopRequest { service_id })
+        .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceDeployRequest { engine_id, model_id, deploy_method, node_id }.
+/// node_id MUSI byc 32 bajtami.
+#[wasm_bindgen(js_name = encodeServiceDeployRequest)]
+pub fn encode_service_deploy_request(
+    engine_id: String,
+    model_id: String,
+    deploy_method: String,
+    node_id: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    if node_id.len() != 32 {
+        return Err(JsError::new("node_id must be exactly 32 bytes"));
+    }
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(node_id);
+    encode_body_inner(&MessageBody::ServiceDeployRequestBody(ServiceDeployRequest {
+        engine_id,
+        model_id,
+        deploy_method,
+        node_id: buf,
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceCreateRequest { name, service_type, strategy, config_json,
+/// node_id?, cluster_id? }. `node_id` jest hex-enkodowanym ciagiem 64 znakow
+/// (32 bajty), pusty string traktowany jako None.
+#[wasm_bindgen(js_name = encodeServiceCreateRequest)]
+pub fn encode_service_create_request(
+    name: String,
+    service_type: String,
+    strategy: String,
+    config_json: String,
+    node_id: Option<String>,
+    cluster_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ServiceCreateRequestBody(ServiceCreateRequest {
+        name,
+        service_type,
+        strategy,
+        config_json,
+        node_id: node_id.filter(|s| !s.is_empty()),
+        cluster_id: cluster_id.filter(|s| !s.is_empty()),
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceUpdateRequest { id, name, service_type, strategy, status,
+/// config_json, node_id?, cluster_id? }.
+#[wasm_bindgen(js_name = encodeServiceUpdateRequest)]
+pub fn encode_service_update_request(
+    id: String,
+    name: String,
+    service_type: String,
+    strategy: String,
+    status: String,
+    config_json: String,
+    node_id: Option<String>,
+    cluster_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ServiceUpdateRequestBody(ServiceUpdateRequest {
+        id,
+        name,
+        service_type,
+        strategy,
+        status,
+        config_json,
+        node_id: node_id.filter(|s| !s.is_empty()),
+        cluster_id: cluster_id.filter(|s| !s.is_empty()),
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceQuicStatusRequest (unit). Periodyczne polling QUIC.
+#[wasm_bindgen(js_name = encodeServiceQuicStatusRequest)]
+pub fn encode_service_quic_status_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ServiceQuicStatusRequest).map_err(|e| JsError::new(&e))
+}
+
+// --- Prompts --------------------------------------------------------------
+
+/// MessageBody::PromptListRequest (unit).
+#[wasm_bindgen(js_name = encodePromptListRequest)]
+pub fn encode_prompt_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::PromptListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::PromptDetailRequest { prompt_id }.
+#[wasm_bindgen(js_name = encodePromptDetailRequest)]
+pub fn encode_prompt_detail_request(prompt_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::PromptDetailRequest { prompt_id })
+        .map_err(|e| JsError::new(&e))
+}
+
+// --- Registries -----------------------------------------------------------
+
+/// MessageBody::RegistryListRequest (unit).
+#[wasm_bindgen(js_name = encodeRegistryListRequest)]
+pub fn encode_registry_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::RegistryListRequest).map_err(|e| JsError::new(&e))
+}
+
+// --- TTS rules ------------------------------------------------------------
+
+/// MessageBody::TtsRuleListRequest (unit).
+#[wasm_bindgen(js_name = encodeTtsRuleListRequest)]
+pub fn encode_tts_rule_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TtsRuleListRequest).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::TtsRuleCreateRequest(TtsRule).
+#[wasm_bindgen(js_name = encodeTtsRuleCreateRequest)]
+pub fn encode_tts_rule_create_request(
+    id: String,
+    pattern: String,
+    voice_id: String,
+    priority: i32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TtsRuleCreateRequest(TtsRule {
+        id,
+        pattern,
+        voice_id,
+        priority,
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::TtsRuleDeleteRequest { rule_id }.
+#[wasm_bindgen(js_name = encodeTtsRuleDeleteRequest)]
+pub fn encode_tts_rule_delete_request(rule_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TtsRuleDeleteRequest { rule_id })
+        .map_err(|e| JsError::new(&e))
+}
+
+// --- PII rules ------------------------------------------------------------
+
+/// MessageBody::PiiRuleListRequest (unit).
+#[wasm_bindgen(js_name = encodePiiRuleListRequest)]
+pub fn encode_pii_rule_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::PiiRuleListRequest).map_err(|e| JsError::new(&e))
+}
+
+// --- Fast-path ------------------------------------------------------------
+
+/// MessageBody::FastPathListRequest (unit).
+#[wasm_bindgen(js_name = encodeFastPathListRequest)]
+pub fn encode_fast_path_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FastPathListRequest).map_err(|e| JsError::new(&e))
+}
+
+// --- Settings (multi-entry) -----------------------------------------------
+
+/// MessageBody::SettingsUpdateRequest — trzy rownolegle tablice (keys/values/is_secrets).
+/// Wszystkie 3 musza miec ten sam dlugosc. Pozwala na batch update z JS bez
+/// serde-wasm-bindgen.
+#[wasm_bindgen(js_name = encodeSettingsUpdateBatch)]
+pub fn encode_settings_update_batch(
+    keys: Vec<String>,
+    values: Vec<String>,
+    is_secrets: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    if keys.len() != values.len() || keys.len() != is_secrets.len() {
+        return Err(JsError::new(
+            "keys, values, is_secrets must have same length",
+        ));
+    }
+    let entries = keys
+        .into_iter()
+        .zip(values.into_iter())
+        .zip(is_secrets.into_iter())
+        .map(|((key, value), secret)| SettingEntry {
+            key,
+            value,
+            is_secret: secret != 0,
+        })
+        .collect();
+    encode_body_inner(&MessageBody::SettingsUpdateRequestBody(SettingsUpdateRequest {
+        entries,
+    }))
+    .map_err(|e| JsError::new(&e))
 }
 
 // =============================================================================
@@ -758,19 +1041,86 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             for s in services {
                 let item = js_sys::Object::new();
                 set(&item, "id", s.id.into());
-                set(&item, "engineId", s.engine_id.into());
-                set(&item, "modelId", s.model_id.into());
+                set(&item, "name", s.name.into());
+                set(&item, "serviceType", s.service_type.into());
+                set(&item, "strategy", s.strategy.into());
                 set(&item, "status", s.status.into());
-                set(&item, "deployMethod", s.deploy_method.into());
+                set(&item, "configJson", s.config_json.into());
+                set(&item, "createdAt", s.created_at.into());
+                if let Some(nid) = s.node_id {
+                    set(&item, "nodeId", nid.into());
+                }
+                if let Some(host) = s.node_hostname {
+                    set(&item, "nodeHostname", host.into());
+                }
+                if let Some(method) = s.deploy_method {
+                    set(&item, "deployMethod", method.into());
+                }
                 if let Some(url) = s.endpoint_url {
                     set(&item, "endpointUrl", url.into());
                 }
                 if let Some(t) = s.started_at_epoch {
                     set(&item, "startedAtEpoch", t.into());
                 }
+                if let Some(eid) = s.engine_id {
+                    set(&item, "engineId", eid.into());
+                }
+                if let Some(mid) = s.model_id {
+                    set(&item, "modelId", mid.into());
+                }
                 arr.push(&item.into());
             }
             set(&obj, "services", arr.into());
+        }
+        MessageBody::ServiceCreateRequestBody(req) => {
+            set(&obj, "variant", "ServiceCreateRequest".into());
+            set(&obj, "name", req.name.into());
+            set(&obj, "serviceType", req.service_type.into());
+            set(&obj, "strategy", req.strategy.into());
+            set(&obj, "configJson", req.config_json.into());
+            if let Some(nid) = req.node_id {
+                set(&obj, "nodeId", nid.into());
+            }
+            if let Some(cid) = req.cluster_id {
+                set(&obj, "clusterId", cid.into());
+            }
+        }
+        MessageBody::ServiceCreateResponse { id } => {
+            set(&obj, "variant", "ServiceCreateResponse".into());
+            set(&obj, "id", id.into());
+        }
+        MessageBody::ServiceUpdateRequestBody(req) => {
+            set(&obj, "variant", "ServiceUpdateRequest".into());
+            set(&obj, "id", req.id.into());
+            set(&obj, "name", req.name.into());
+            set(&obj, "serviceType", req.service_type.into());
+            set(&obj, "strategy", req.strategy.into());
+            set(&obj, "status", req.status.into());
+            set(&obj, "configJson", req.config_json.into());
+            if let Some(nid) = req.node_id {
+                set(&obj, "nodeId", nid.into());
+            }
+            if let Some(cid) = req.cluster_id {
+                set(&obj, "clusterId", cid.into());
+            }
+        }
+        MessageBody::ServiceUpdateResponse { updated } => {
+            set(&obj, "variant", "ServiceUpdateResponse".into());
+            set(&obj, "updated", updated.into());
+        }
+        MessageBody::ServiceQuicStatusRequest => {
+            set(&obj, "variant", "ServiceQuicStatusRequest".into());
+        }
+        MessageBody::ServiceQuicStatusResponse { statuses } => {
+            set(&obj, "variant", "ServiceQuicStatusResponse".into());
+            let arr = js_sys::Array::new();
+            for st in statuses {
+                let item = js_sys::Object::new();
+                set(&item, "name", st.name.into());
+                set(&item, "status", st.status.into());
+                arr.push(&item.into());
+            }
+            set(&obj, "statuses", arr.into());
         }
         MessageBody::ServiceDeployRequestBody(req) => {
             set(&obj, "variant", "ServiceDeployRequest".into());
@@ -1114,7 +1464,7 @@ mod tests {
 
     #[test]
     fn protocol_schema_version_matches() {
-        assert_eq!(PROTOCOL_SCHEMA_VERSION, 3);
+        assert_eq!(PROTOCOL_SCHEMA_VERSION, 5);
     }
 
     #[test]

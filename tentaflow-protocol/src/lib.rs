@@ -40,7 +40,7 @@ pub use message_body::{
     HubModelSearchResult, MeshPairInitRequest, MeshPairInitResponse, MeshPeerSummary,
     MeshTrustRevokedEvent, MeshTrustedKeysSyncEvent, MessageBody, ModelDetail,
     ModelInstallRequest, ModelSummary, NodeSummary, PiiRule, PromptDetail, PromptSummary,
-    ProtocolError, ProtocolErrorCode, RegistrySummary, ServiceDeployProgress,
-    ServiceDeployRequest, ServiceSummary, SettingEntry, SettingsUpdateRequest, TtsRule,
-    VoiceProfileSummary,
+    ProtocolError, ProtocolErrorCode, RegistrySummary, ServiceCreateRequest,
+    ServiceDeployProgress, ServiceDeployRequest, ServiceQuicStatus, ServiceSummary,
+    ServiceUpdateRequest, SettingEntry, SettingsUpdateRequest, TtsRule, VoiceProfileSummary,
 };

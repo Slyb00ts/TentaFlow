@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::db::{self, DbPool};
 use crate::db::models::{NewModelEntry, UpdateModelEntry};
-use crate::mesh::quic_mesh::QuicMeshManager;
+use crate::mesh::iroh_manager::IrohMeshManager;
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -184,7 +184,7 @@ pub fn handle_delete_alias(pool: &DbPool, id: i64) -> Result<(u16, String)> {
 }
 
 /// GET /api/models/unified — unikalne modele ze wszystkich nodow mesh
-pub fn handle_unified_models(quic_mesh: &Option<Arc<QuicMeshManager>>) -> Result<(u16, String)> {
+pub fn handle_unified_models(quic_mesh: &Option<Arc<IrohMeshManager>>) -> Result<(u16, String)> {
     match quic_mesh {
         Some(ref qm) => {
             let models = qm.service_registry().unique_models();

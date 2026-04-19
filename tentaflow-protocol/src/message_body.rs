@@ -318,13 +318,63 @@ pub struct FlowExecutionSummary {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSummary {
     pub id: String,
-    pub engine_id: String,
-    pub model_id: String,
-    /// "running" | "starting" | "stopped" | "error".
+    /// Nazwa serwisu nadana przez uzytkownika (np. `embeddings-bge`).
+    pub name: String,
+    /// Typ: "llm" | "embedding" | "stt" | "tts" | "rag" | "tools" | "memory" | "reranker".
+    pub service_type: String,
+    /// Strategia routingu (np. `single`).
+    pub strategy: String,
+    /// "active" | "inactive" | "running" | "starting" | "stopped" | "error".
     pub status: String,
-    pub deploy_method: String,
+    /// Serializowany JSON konfiguracji (quic_url, sni_domain, cluster_id).
+    pub config_json: String,
+    /// `None` gdy lokalny, hex enkodowany node_id mesh w innym wypadku.
+    pub node_id: Option<String>,
+    /// Czytelna nazwa wezla mesh (hostname) dla kolumny tabeli.
+    pub node_hostname: Option<String>,
+    /// ISO-8601 timestamp utworzenia.
+    pub created_at: String,
+    /// Metoda wdrozenia gdy serwis pochodzi z katalogu silnikow: "docker" | "native" | "external".
+    pub deploy_method: Option<String>,
+    /// Zewnetrzny URL endpointu silnika (jesli znany).
     pub endpoint_url: Option<String>,
+    /// Unix epoch uruchomienia silnika.
     pub started_at_epoch: Option<u64>,
+    /// Identyfikator silnika z katalogu (jesli wdrozony z katalogu).
+    pub engine_id: Option<String>,
+    /// Identyfikator modelu (jesli serwis obsluguje konkretny model).
+    pub model_id: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceCreateRequest {
+    pub name: String,
+    pub service_type: String,
+    pub strategy: String,
+    pub config_json: String,
+    /// Hex-enkodowany 32-bajtowy node_id lub `None` dla lokalnego.
+    pub node_id: Option<String>,
+    /// Id klastra do ktorego serwis nalezy.
+    pub cluster_id: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceUpdateRequest {
+    pub id: String,
+    pub name: String,
+    pub service_type: String,
+    pub strategy: String,
+    pub status: String,
+    pub config_json: String,
+    pub node_id: Option<String>,
+    pub cluster_id: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceQuicStatus {
+    pub name: String,
+    /// "connected" | "connecting" | "disconnected" | "ready" | "config_error" | "none".
+    pub status: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -648,11 +698,17 @@ pub enum MessageBody {
     // ---- Services (R-LIST + W-ACTION + R-STREAM dla deploy progress) ----
     ServiceListRequest,
     ServiceListResponse { services: Vec<ServiceSummary> },
+    ServiceCreateRequestBody(ServiceCreateRequest),
+    ServiceCreateResponse { id: String },
+    ServiceUpdateRequestBody(ServiceUpdateRequest),
+    ServiceUpdateResponse { updated: bool },
     ServiceDeployRequestBody(ServiceDeployRequest),
     ServiceDeployAccepted { deploy_id: String },
     ServiceDeployProgressBody(ServiceDeployProgress),
     ServiceStopRequest { service_id: String },
     ServiceStopResponse { stopped: bool },
+    ServiceQuicStatusRequest,
+    ServiceQuicStatusResponse { statuses: Vec<ServiceQuicStatus> },
 
     // ---- Prompts (R-LIST + R-ONE) ----
     PromptListRequest,

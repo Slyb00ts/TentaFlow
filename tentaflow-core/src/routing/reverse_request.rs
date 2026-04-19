@@ -40,14 +40,11 @@ async fn reverse_listener_loop(
     info!("Reverse listener '{}': uruchomiony", service_name);
 
     loop {
-        // Pobierz connection z klienta
-        let conn_arc = client.connection();
-        let conn_guard = conn_arc.lock().await;
-        let conn = match conn_guard.as_ref() {
-            Some(c) => c.clone(),
-            None => {
-                drop(conn_guard);
-                // Polaczenie jeszcze nie gotowe lub utracone — czekaj
+        // Pobierz aktywne polaczenie iroh (z auto-reconnect).
+        let conn = match client.iroh_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("Reverse listener '{}': brak polaczenia: {}", service_name, e);
                 tokio::select! {
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
                         continue;
@@ -62,7 +59,6 @@ async fn reverse_listener_loop(
                 continue;
             }
         };
-        drop(conn_guard);
 
         tokio::select! {
             result = conn.accept_bi() => {
@@ -74,11 +70,11 @@ async fn reverse_listener_loop(
                             handle_reverse_stream(send, recv, router_clone, name_clone).await;
                         });
                     }
-                    Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                    Err(iroh::endpoint::ConnectionError::ApplicationClosed { .. }) => {
                         info!("Reverse listener '{}': polaczenie zamkniete przez kontener", service_name);
                         break;
                     }
-                    Err(quinn::ConnectionError::ConnectionClosed { .. }) => {
+                    Err(iroh::endpoint::ConnectionError::ConnectionClosed { .. }) => {
                         info!("Reverse listener '{}': polaczenie zamkniete", service_name);
                         break;
                     }
@@ -103,8 +99,8 @@ async fn reverse_listener_loop(
 /// Obsluguje pojedynczy odwrotny strumien od kontenera.
 /// Czyta ModelRequest, routuje przez Router, odsyla ModelResponse.
 async fn handle_reverse_stream(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     router: Router,
     service_name: String,
 ) {
@@ -160,8 +156,9 @@ async fn handle_reverse_stream(
     }
 }
 
-/// Dispatchuje odwrotny request przez odpowiednia metode Routera.
-async fn dispatch_reverse_request(
+/// Dispatchuje odwrotny request przez odpowiednia metode Routera. Dostepne
+/// publicznie zeby forward handler mesh mogl uzyc tej samej sciezki.
+pub async fn dispatch_reverse_request(
     router: &Router,
     request: tentaflow_protocol::ModelRequest,
 ) -> tentaflow_protocol::ModelResponse {
@@ -219,10 +216,7 @@ async fn dispatch_reverse_request(
                 (stt_res, ident)
             };
             #[cfg(not(feature = "inference-diarization"))]
-            let (stt_result, identify_result): (
-                _,
-                Option<crate::diarization::service::IdentifyResult>,
-            ) = (stt_future.await, None);
+            let (stt_result, identify_result): (_, Option<()>) = (stt_future.await, None);
 
             match stt_result {
                 Ok(response) => {

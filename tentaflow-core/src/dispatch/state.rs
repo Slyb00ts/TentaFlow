@@ -27,7 +27,7 @@ pub struct AppState {
     pub metrics: Arc<RouterMetrics>,
     pub settings_cipher: Arc<SettingsCipher>,
     pub cipher: Arc<SecretsCipher>,
-    pub quic_mesh: Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>,
+    pub quic_mesh: Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
     pub local_node_id: Arc<str>,
     pub mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     pub permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,

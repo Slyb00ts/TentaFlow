@@ -68,7 +68,7 @@ pub struct Router {
     pub(crate) local_stt: Arc<super::local_stt::LocalSttHandler>,
 
     /// Mesh manager — do forwardowania requestow do zdalnych nodow
-    pub(crate) mesh_manager: Arc<parking_lot::RwLock<Option<Arc<crate::mesh::quic_mesh::QuicMeshManager>>>>,
+    pub(crate) mesh_manager: Arc<parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>>,
 
     /// Cache aliasow modeli z DB (alias -> DbModelAlias)
     pub(crate) alias_cache: Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::db::models::DbModelAlias>>>,
@@ -768,7 +768,7 @@ impl Router {
     // ========================================================================
 
     /// Ustawia mesh manager (wywolane po inicjalizacji mesh pipeline)
-    pub fn set_mesh_manager(&self, manager: Arc<crate::mesh::quic_mesh::QuicMeshManager>) {
+    pub fn set_mesh_manager(&self, manager: Arc<crate::mesh::iroh_manager::IrohMeshManager>) {
         *self.mesh_manager.write() = Some(manager);
     }
 

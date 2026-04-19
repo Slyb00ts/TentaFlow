@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::{info, error};
 
 use crate::db::DbPool;
@@ -42,7 +42,7 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
 
     let data_dir = bundled_addons_dir();
     std::fs::create_dir_all(&data_dir)
-        .context("Nie udalo sie utworzyc katalogu dla wbudowanych addonow")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc katalogu dla wbudowanych addonow: {e}"))?;
 
     for addon in BUNDLED_ADDONS {
         if let Err(e) = install_single_bundled_addon(addon, db, &data_dir) {
@@ -68,7 +68,7 @@ fn install_single_bundled_addon(
         Ok(v) => v,
         Err(e) => {
             error!("Nie udalo sie sparsowac manifest.toml dla '{}': {}\nManifest (pierwsze 200 znakow): {}", addon.name, e, &addon.manifest_toml[..addon.manifest_toml.len().min(200)]);
-            return Err(e.context("Nie udalo sie sparsowac manifest.toml"));
+            return Err(anyhow::anyhow!("Nie udalo sie sparsowac manifest.toml: {e}"));
         }
     };
 
@@ -105,10 +105,10 @@ fn install_single_bundled_addon(
 
     // Zapisz pliki
     std::fs::write(addon_dir.join("addon.wasm"), addon.wasm_bytes)
-        .context("Nie udalo sie zapisac pliku WASM")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac pliku WASM: {e}"))?;
 
     std::fs::write(addon_dir.join("manifest.toml"), addon.manifest_toml)
-        .context("Nie udalo sie zapisac manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac manifest.toml: {e}"))?;
 
     if !addon.skill_md.is_empty() {
         std::fs::write(addon_dir.join("SKILL.md"), addon.skill_md).ok();
@@ -148,19 +148,19 @@ fn install_single_bundled_addon(
 /// - Stary: addon_id = "..." version = "..."
 fn parse_addon_id_and_version(manifest_toml: &str) -> Result<(String, String)> {
     let parsed: toml::Value = toml::from_str(manifest_toml)
-        .context("Niepoprawny format manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Niepoprawny format manifest.toml: {e}"))?;
 
     // Nowy format: [addon] id = "...", version = "..."
     if let Some(addon_section) = parsed.get("addon") {
         let id = addon_section
             .get("id")
             .and_then(|v| v.as_str())
-            .context("Brak pola addon.id w manifest.toml")?;
+            .ok_or_else(|| anyhow::anyhow!("Brak pola addon.id w manifest.toml"))?;
 
         let version = addon_section
             .get("version")
             .and_then(|v| v.as_str())
-            .context("Brak pola addon.version w manifest.toml")?;
+            .ok_or_else(|| anyhow::anyhow!("Brak pola addon.version w manifest.toml"))?;
 
         return Ok((id.to_string(), version.to_string()));
     }
@@ -169,12 +169,12 @@ fn parse_addon_id_and_version(manifest_toml: &str) -> Result<(String, String)> {
     let id = parsed
         .get("addon_id")
         .and_then(|v| v.as_str())
-        .context("Brak pola addon_id ani addon.id w manifest.toml")?;
+        .ok_or_else(|| anyhow::anyhow!("Brak pola addon_id ani addon.id w manifest.toml"))?;
 
     let version = parsed
         .get("version")
         .and_then(|v| v.as_str())
-        .context("Brak pola version w manifest.toml")?;
+        .ok_or_else(|| anyhow::anyhow!("Brak pola version w manifest.toml"))?;
 
     Ok((id.to_string(), version.to_string()))
 }
