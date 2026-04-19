@@ -11,6 +11,7 @@
 // =============================================================================
 
 import { codecReady, encode, decodeFrame, schemaVersion, makeCorrelationIdGenerator } from './codec.js';
+import { openTransport, TRANSPORT_WEBTRANSPORT, TRANSPORT_WEBSOCKET } from './transport.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const RECONNECT_BASE_MS = 1000;
@@ -85,47 +86,22 @@ export class BinaryWsClient {
       this.nextCorrelationId = makeCorrelationIdGenerator();
     }
 
-    return new Promise((resolve, reject) => {
-      // JWT subprotocol auth — backend's validate_ws_upgrade reads bearer.<token>
-      // z Sec-WebSocket-Protocol header.
-      const protocols = [];
-      if (this.jwtToken) {
-        protocols.push(`bearer.${this.jwtToken}`);
-      }
-      const ws = protocols.length > 0
-        ? new WebSocket(this.url, protocols)
-        : new WebSocket(this.url);
-      ws.binaryType = 'arraybuffer';
-      this.ws = ws;
-
-      ws.onopen = () => {
-        this.connected = true;
-        this.reconnectAttempt = 0;
-        this._handshake()
-          .then(() => {
-            this._startHeartbeat();
-            this._drainOutbox();
-            this.onOpen();
-            resolve();
-          })
-          .catch((err) => {
-            ws.close();
-            reject(err);
-          });
-      };
-
-      ws.onmessage = (evt) => this._handleMessage(evt);
-      ws.onerror = (evt) => {
-        if (!this.connected) reject(new Error('WebSocket error before open'));
-      };
-      ws.onclose = () => {
-        this.connected = false;
-        this._stopHeartbeat();
-        this._rejectAllPending(new Error('connection closed'));
-        this.onClose();
-        if (!this.closed) this._scheduleReconnect();
-      };
-    });
+    try {
+      this.transport = await openTransport({ jwtToken: this.jwtToken });
+      this.connected = true;
+      this.reconnectAttempt = 0;
+      this._transportUnsub = this.transport.onMessage((bytes) => this._handleBytes(bytes));
+      console.info(`[ws] transport: ${this.transport.kind}`);
+      await this._handshake();
+      this._startHeartbeat();
+      this._drainOutbox();
+      this.onOpen();
+    } catch (err) {
+      this.connected = false;
+      if (this.transport) this.transport.close();
+      this.transport = null;
+      throw err;
+    }
   }
 
   /**
@@ -134,7 +110,9 @@ export class BinaryWsClient {
   close() {
     this.closed = true;
     this._stopHeartbeat();
-    if (this.ws) this.ws.close();
+    if (this._transportUnsub) this._transportUnsub();
+    if (this.transport) this.transport.close();
+    this.transport = null;
   }
 
   /**
@@ -190,8 +168,10 @@ export class BinaryWsClient {
    * Wysyla raw Uint8Array. Gdy zakolejkowany w outbox, drain po reconnect.
    */
   _send(bytes) {
-    if (this.connected && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(bytes);
+    if (this.connected && this.transport?.isOpen()) {
+      this.transport.send(bytes).catch((err) => {
+        console.error('[ws] send error:', err);
+      });
     } else {
       this.outbox.push(bytes);
     }
@@ -200,7 +180,9 @@ export class BinaryWsClient {
   _drainOutbox() {
     while (this.outbox.length > 0 && this.connected) {
       const frame = this.outbox.shift();
-      this.ws.send(frame);
+      this.transport.send(frame).catch((err) => {
+        console.error('[ws] drain send error:', err);
+      });
     }
   }
 
@@ -224,7 +206,7 @@ export class BinaryWsClient {
         },
       });
     });
-    this.ws.send(frame);
+    await this.transport.send(frame);
     const { body } = await resultPromise;
     if (body.variant !== 'MetaSchemaVersionAck' || !body.accepted) {
       throw new Error(
@@ -233,8 +215,7 @@ export class BinaryWsClient {
     }
   }
 
-  _handleMessage(evt) {
-    const bytes = new Uint8Array(evt.data);
+  _handleBytes(bytes) {
     let decoded;
     try {
       decoded = decodeFrame(bytes);
@@ -286,11 +267,11 @@ export class BinaryWsClient {
   _startHeartbeat() {
     if (this.heartbeatIntervalMs <= 0) return;
     this.heartbeatTimer = setInterval(() => {
-      if (!this.connected) return;
+      if (!this.connected || !this.transport?.isOpen()) return;
       const correlationId = this.nextCorrelationId();
       const sequence = this.takeSequence();
       const frame = encode.metaHeartbeat(correlationId, Math.floor(Date.now() / 1000), sequence);
-      this.ws.send(frame);
+      this.transport.send(frame).catch((err) => console.error('[ws] heartbeat send:', err));
     }, this.heartbeatIntervalMs);
   }
 

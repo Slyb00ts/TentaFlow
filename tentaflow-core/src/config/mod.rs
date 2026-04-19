@@ -129,6 +129,17 @@ pub struct MeshConfig {
     /// Nazwa klastra (tylko peery z ta sama nazwa sie lacza)
     #[serde(default = "default_cluster_name")]
     pub cluster_name: String,
+
+    /// URL serwera relay iroh uzywanego gdy bezposrednie QUIC hole punching
+    /// nie jest mozliwe (NAT, firewall). Domyslnie publiczny `use.iroh.network`
+    /// hostowany przez n0. Override wpisem w DB `settings.mesh.iroh_relay_url`.
+    #[serde(default = "default_iroh_relay_url")]
+    pub iroh_relay_url: String,
+}
+
+/// Publiczny relay n0 — dla produkcji offline-first zalecany self-hosted.
+fn default_iroh_relay_url() -> String {
+    "https://use.iroh.network./".to_string()
 }
 
 // =============================================================================
@@ -976,6 +987,7 @@ impl Default for NodeConfig {
                 heartbeat_interval_ms: default_heartbeat_interval_ms(),
                 peer_timeout_ms: default_peer_timeout_ms(),
                 cluster_name: "tentaflow".to_string(),
+                iroh_relay_url: default_iroh_relay_url(),
             }),
             inference: None,
         }

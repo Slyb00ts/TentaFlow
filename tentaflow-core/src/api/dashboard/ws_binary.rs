@@ -446,7 +446,7 @@ where
         }
     };
     let mut guard = sink.lock().await;
-    guard.send(Message::Binary(env_bytes)).await
+    guard.send(Message::Binary(env_bytes.into())).await
 }
 
 async fn send_protocol_error<S>(
@@ -483,10 +483,10 @@ fn next_seq(counter: &AtomicU64) -> u64 {
 fn close_frame(
     code: u16,
     reason: &'static str,
-) -> tokio_tungstenite::tungstenite::protocol::CloseFrame<'static> {
+) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
     tokio_tungstenite::tungstenite::protocol::CloseFrame {
         code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(code),
-        reason: std::borrow::Cow::Borrowed(reason),
+        reason: reason.into(),
     }
 }
 

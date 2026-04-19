@@ -440,7 +440,7 @@ impl AddonManager {
         // Wywolaj on_start() jesli addon go eksportuje
         if let Some(on_start) = instance.get_typed_func::<(), i32>(&mut store, "on_start").ok() {
             let result = on_start.call(&mut store, ())
-                .context("Blad wywolania on_start()")?;
+                .map_err(|e| anyhow::anyhow!("Blad wywolania on_start(): {e}"))?;
             if result != 0 {
                 bail!("on_start() zwrocil blad: {}", result);
             }
@@ -453,7 +453,7 @@ impl AddonManager {
                 "INSERT INTO addon_instances (addon_id, instance_id, instance_name, status, created_by, started_at) \
                  VALUES (?1, ?2, ?3, 'running', ?4, datetime('now'))",
                 rusqlite::params![addon_id, &instance_id, format!("{}-{}", addon_id, &instance_id[..8]), user_id],
-            ).context("Nie udalo sie zapisac instancji w DB")?;
+            ).map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac instancji w DB: {e}"))?;
         }
 
         let addon_instance = AddonInstance {
@@ -539,7 +539,7 @@ impl AddonManager {
             conn.execute(
                 "UPDATE addon_instances SET status = 'stopped', stopped_at = datetime('now') WHERE instance_id = ?1",
                 rusqlite::params![instance_id],
-            ).context("Nie udalo sie zaktualizowac statusu instancji")?;
+            ).map_err(|e| anyhow::anyhow!("Nie udalo sie zaktualizowac statusu instancji: {e}"))?;
         }
 
         // Opublikuj event
@@ -619,11 +619,11 @@ impl AddonManager {
             // Pobierz alloc z guest
             let alloc_fn = addon_instance.instance
                 .get_typed_func::<i32, i32>(&mut addon_instance.store, "alloc")
-                .context("Addon nie eksportuje funkcji alloc()")?;
+                .map_err(|e| anyhow::anyhow!("Addon nie eksportuje funkcji alloc(): {e}"))?;
 
             // Alokuj bufor wejsciowy w guest memory
             let input_ptr = alloc_fn.call(&mut addon_instance.store, request_bytes.len() as i32)
-                .context("Blad alokacji pamieci guest")?;
+                .map_err(|e| anyhow::anyhow!("Blad alokacji pamieci guest: {e}"))?;
 
             // CR-004: Sprawdz poprawnosc wskaznika
             if input_ptr < 0 {
@@ -633,12 +633,12 @@ impl AddonManager {
             // Zapisz dane do guest memory
             let memory = addon_instance.instance
                 .get_memory(&mut addon_instance.store, "memory")
-                .context("Brak eksportu 'memory' w module WASM")?;
+                .ok_or_else(|| anyhow::anyhow!("Brak eksportu 'memory' w module WASM"))?;
 
             // CR-005: Sprawdz granice pamieci z checked_add
             let input_end = (input_ptr as usize)
                 .checked_add(request_bytes.len())
-                .context("Przepelnienie przy obliczaniu konca bufora wejsciowego")?;
+                .ok_or_else(|| anyhow::anyhow!("Przepelnienie przy obliczaniu konca bufora wejsciowego"))?;
             let mem_size = memory.data(&addon_instance.store).len();
             if input_end > mem_size {
                 bail!("Bufor wejsciowy wykracza poza pamiec guest ({} > {})", input_end, mem_size);
@@ -651,7 +651,7 @@ impl AddonManager {
             // Alokuj bufor wyjsciowy (64KB)
             let out_cap: i32 = 65536;
             let out_ptr = alloc_fn.call(&mut addon_instance.store, out_cap)
-                .context("Blad alokacji bufora wyjsciowego")?;
+                .map_err(|e| anyhow::anyhow!("Blad alokacji bufora wyjsciowego: {e}"))?;
 
             if out_ptr < 0 {
                 bail!("alloc() zwrocil niepoprawny wskaznik wyjsciowy: {}", out_ptr);
@@ -659,7 +659,7 @@ impl AddonManager {
 
             // Alokuj miejsce na dlugosc wyniku (4 bajty)
             let out_len_ptr = alloc_fn.call(&mut addon_instance.store, 4)
-                .context("Blad alokacji out_len")?;
+                .map_err(|e| anyhow::anyhow!("Blad alokacji out_len: {e}"))?;
 
             if out_len_ptr < 0 {
                 bail!("alloc() zwrocil niepoprawny wskaznik out_len: {}", out_len_ptr);
@@ -668,12 +668,12 @@ impl AddonManager {
             // Wywolaj on_request w guest
             let on_request = addon_instance.instance
                 .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut addon_instance.store, "on_request")
-                .context("Addon nie eksportuje funkcji on_request()")?;
+                .map_err(|e| anyhow::anyhow!("Addon nie eksportuje funkcji on_request(): {e}"))?;
 
             let result_code = on_request.call(
                 &mut addon_instance.store,
                 (input_ptr, request_bytes.len() as i32, out_ptr, out_cap, out_len_ptr),
-            ).context("Blad wywolania on_request()")?;
+            ).map_err(|e| anyhow::anyhow!("Blad wywolania on_request(): {e}"))?;
 
             if result_code != 0 {
                 bail!("on_request() zwrocil blad: {}", result_code);
@@ -685,7 +685,7 @@ impl AddonManager {
             // CR-005: Sprawdz granice pamieci przy odczycie dlugosci
             let out_len_end = (out_len_ptr as usize)
                 .checked_add(4)
-                .context("Przepelnienie przy obliczaniu konca out_len")?;
+                .ok_or_else(|| anyhow::anyhow!("Przepelnienie przy obliczaniu konca out_len"))?;
             if out_len_end > mem_data.len() {
                 bail!("out_len_ptr wykracza poza pamiec guest");
             }
@@ -700,7 +700,7 @@ impl AddonManager {
             // CR-005: Sprawdz granice pamieci przy odczycie wyniku
             let result_end = (out_ptr as usize)
                 .checked_add(out_len as usize)
-                .context("Przepelnienie przy obliczaniu konca wyniku")?;
+                .ok_or_else(|| anyhow::anyhow!("Przepelnienie przy obliczaniu konca wyniku"))?;
             if result_end > mem_data.len() {
                 bail!("Bufor wyniku wykracza poza pamiec guest ({} > {})", result_end, mem_data.len());
             }
@@ -708,7 +708,7 @@ impl AddonManager {
             // Odczytaj wynik
             let result_bytes = &mem_data[out_ptr as usize..result_end];
             let result: serde_json::Value = serde_json::from_slice(result_bytes)
-                .context("Nie udalo sie zdekodowac odpowiedzi z addonu")?;
+                .map_err(|e| anyhow::anyhow!("Nie udalo sie zdekodowac odpowiedzi z addonu: {e}"))?;
 
             // Zwolnij pamiec guest
             if let Ok(dealloc_fn) = addon_instance.instance

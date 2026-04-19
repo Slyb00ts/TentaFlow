@@ -709,8 +709,7 @@ fn migrate_sha256_passwords(conn: &Connection) -> Result<()> {
 
 /// Generuje kryptograficznie losowy JWT secret (32 bajty -> 64 znaki hex)
 fn generate_jwt_secret() -> String {
-    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS RNG fill_bytes");
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

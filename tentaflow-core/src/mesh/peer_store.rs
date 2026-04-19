@@ -13,6 +13,21 @@ use parking_lot::RwLock;
 use serde::{Serialize, Deserialize};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
+/// Informacje o modelu zaladowanym na nodzie mesh
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+pub struct PeerModelInfo {
+    /// Alias/nazwa modelu (np. "qwen3.5-0.8b", "whisper-large-v3")
+    pub alias: String,
+    /// Kategoria: "llm", "stt", "tts", "embeddings", "image", "vision"
+    pub kind: String,
+    /// Backend ktory serwuje model (np. "llama-cpp", "mlx", "vllm", "whisper-rs")
+    pub backend: String,
+    /// Rozmiar pliku wag w MB (0 jesli nieznany)
+    pub size_mb: u64,
+    /// Czy model jest zaladowany do pamieci i gotowy do inferencji
+    pub loaded: bool,
+}
+
 /// Informacje o pojedynczym peerze w sieci mesh
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshPeerInfo {
@@ -40,6 +55,15 @@ pub struct MeshPeerInfo {
     pub docker_available: bool,
     /// Wersja Docker serwera (np. "27.5.1")
     pub docker_version: String,
+    /// Modele zaladowane / dostepne na nodzie (propagowane przez ModelsSync).
+    #[serde(default)]
+    pub models: Vec<PeerModelInfo>,
+    /// Liczba aktualnie obslugiwanych requestow (snapshot z heartbeat).
+    #[serde(default)]
+    pub active_requests: u32,
+    /// Wygenerowane tokenow/sekunde w ostatnim oknie metryk.
+    #[serde(default)]
+    pub tokens_per_sec: f32,
 }
 
 /// Informacje o GPU peera
@@ -110,6 +134,17 @@ pub struct HeartbeatMetrics {
     pub swap_used_mb: u64,
     /// Lista polaczonych peer_ids — do propagacji topologii mesh
     pub connected_peers: Vec<String>,
+    /// Aktualna liczba obslugiwanych requestow (inference, ingest, itp.)
+    pub active_requests: u32,
+    /// Wygenerowane tokeny/sekunde w oknie metrycznym (tylko LLM).
+    pub tokens_per_sec: f32,
+}
+
+/// Broadcast z lista modeli zaladowanych/dostepnych na nodzie. Wysylany co
+/// `models_sync_interval` (domyslnie 30s) oraz po kazdej zmianie listy modeli.
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+pub struct ModelsSync {
+    pub models: Vec<PeerModelInfo>,
 }
 
 /// Wpis w tabeli routingu — jak dotrzec do danego noda
@@ -304,7 +339,21 @@ impl MeshPeerStore {
     }
 
     /// Aktualizuje biezace metryki peera (z heartbeatu)
-    pub fn update_metrics(&self, node_id: &str, cpu_usage: f32, ram_used: u64, gpus: Vec<PeerGpuInfo>, containers: Vec<PeerContainerInfo>, networks: Vec<PeerNetworkInfo>, platform: String, cpu_temperature_c: Option<f32>, swap_total_mb: u64, swap_used_mb: u64) {
+    pub fn update_metrics(
+        &self,
+        node_id: &str,
+        cpu_usage: f32,
+        ram_used: u64,
+        gpus: Vec<PeerGpuInfo>,
+        containers: Vec<PeerContainerInfo>,
+        networks: Vec<PeerNetworkInfo>,
+        platform: String,
+        cpu_temperature_c: Option<f32>,
+        swap_total_mb: u64,
+        swap_used_mb: u64,
+        active_requests: u32,
+        tokens_per_sec: f32,
+    ) {
         let mut peers = self.peers.write();
         let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
         p.cpu_usage_percent = cpu_usage;
@@ -315,9 +364,55 @@ impl MeshPeerStore {
         p.cpu_temperature_c = cpu_temperature_c;
         p.swap_total_mb = swap_total_mb;
         p.swap_used_mb = swap_used_mb;
+        p.active_requests = active_requests;
+        p.tokens_per_sec = tokens_per_sec;
         if !platform.is_empty() {
             p.platform = platform;
         }
+        drop(peers);
+        self.mark_dirty();
+    }
+
+    /// Inicjalizuje wpis lokalnego noda — wywoływane przy starcie tentaflow
+    /// niezaleznie od config.mesh.enabled. Dzieki temu /api/mesh/nodes zawsze
+    /// zwraca przynajmniej local. node_info wypelnione przez node_info_collector.
+    pub fn seed_local(
+        &self,
+        node_id: &str,
+        hostname: String,
+        os_info: String,
+        platform: String,
+        cpu_count: u32,
+        ram_total_mb: u64,
+        gpu_info: Vec<PeerGpuInfo>,
+        addresses: Vec<IpAddr>,
+        docker_available: bool,
+        docker_version: String,
+    ) {
+        let mut peers = self.peers.write();
+        let entry = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
+        entry.hostname = hostname;
+        entry.os_info = os_info;
+        entry.platform = platform;
+        entry.cpu_count = cpu_count;
+        entry.ram_total_mb = ram_total_mb;
+        entry.gpu_info = gpu_info;
+        entry.addresses = addresses;
+        entry.docker_available = docker_available;
+        entry.docker_version = docker_version;
+        entry.role = if entry.role.is_empty() { "router".to_string() } else { entry.role.clone() };
+        entry.status = "connected".to_string();
+        entry.quic_connected = true;
+        drop(peers);
+        self.mark_dirty();
+    }
+
+    /// Aktualizuje liste modeli propagowanych przez ModelsSync. Nadpisuje
+    /// calkowicie — peer jest zrodlem prawdy dla swoich modeli.
+    pub fn update_models(&self, node_id: &str, models: Vec<PeerModelInfo>) {
+        let mut peers = self.peers.write();
+        let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
+        p.models = models;
         drop(peers);
         self.mark_dirty();
     }
@@ -428,6 +523,9 @@ impl MeshPeerStore {
             swap_used_mb: 0,
             docker_available: false,
             docker_version: String::new(),
+            models: vec![],
+            active_requests: 0,
+            tokens_per_sec: 0.0,
         }
     }
 }

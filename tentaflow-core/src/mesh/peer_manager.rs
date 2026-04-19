@@ -19,7 +19,7 @@ use crate::error::CoreError;
 use crate::mesh::crdt::{CrdtOperation, CrdtState, LamportClock};
 use crate::mesh::gossip::{GossipEngine, GossipEvent, PeerState};
 use crate::mesh::peer_store::{PeerContainerInfo, PeerGpuInfo};
-use crate::mesh::quic_mesh::{QuicMeshEvent, QuicMeshManager};
+use crate::mesh::iroh_manager::{IrohMeshEvent, IrohMeshManager};
 
 // Progi czasowe dla maintenance loop
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
@@ -118,7 +118,7 @@ pub struct PeerManager {
     event_tx: broadcast::Sender<MeshEvent>,
     clock: Arc<RwLock<LamportClock>>,
     _config: MeshConfig,
-    quic_mesh: RwLock<Option<Arc<QuicMeshManager>>>,
+    quic_mesh: RwLock<Option<Arc<IrohMeshManager>>>,
 }
 
 impl PeerManager {
@@ -327,8 +327,8 @@ impl PeerManager {
         &self.gossip
     }
 
-    /// Ustawia referencje do QuicMeshManager
-    pub fn set_quic_mesh(&self, qm: Arc<QuicMeshManager>) {
+    /// Ustawia referencje do IrohMeshManager
+    pub fn set_quic_mesh(&self, qm: Arc<IrohMeshManager>) {
         *self.quic_mesh.write() = Some(qm);
     }
 
@@ -469,7 +469,7 @@ impl PeerManager {
             let mut gossip_rx = manager.gossip.subscribe();
             let mut maintenance_tick = tokio::time::interval(MAINTENANCE_INTERVAL);
 
-            // Subskrypcja QUIC events (jesli QuicMeshManager jest ustawiony)
+            // Subskrypcja QUIC events (jesli IrohMeshManager jest ustawiony)
             let quic_rx = {
                 let qm = manager.quic_mesh.read();
                 qm.as_ref().map(|q| q.subscribe())
@@ -519,14 +519,14 @@ impl PeerManager {
         })
     }
 
-    /// Obsluguje zdarzenie z QuicMeshManager
-    async fn handle_quic_event(&self, event: QuicMeshEvent) {
+    /// Obsluguje zdarzenie z IrohMeshManager
+    async fn handle_quic_event(&self, event: IrohMeshEvent) {
         match event {
-            QuicMeshEvent::PeerConnected { node_id } => {
+            IrohMeshEvent::PeerConnected { node_id } => {
                 self.set_quic_connected(&node_id, true);
                 let _ = self.event_tx.send(MeshEvent::QuicConnected(node_id));
             }
-            QuicMeshEvent::PeerDisconnected { node_id } => {
+            IrohMeshEvent::PeerDisconnected { node_id } => {
                 self.set_quic_connected(&node_id, false);
                 let _ = self.event_tx.send(MeshEvent::QuicDisconnected(node_id.clone()));
 
@@ -537,19 +537,12 @@ impl PeerManager {
                 };
 
                 if should_reconnect {
-                    let qm = self.quic_mesh.read();
-                    if let Some(qm) = qm.as_ref() {
-                        let addrs: Vec<SocketAddr> = {
-                            let peers = self.known_peers.read();
-                            peers.get(&node_id).map_or_else(Vec::new, |p| p.addresses.clone())
-                        };
-                        if !addrs.is_empty() {
-                            qm.spawn_reconnect_loop(node_id, addrs);
-                        }
-                    }
+                    // iroh sam wznowi polaczenie przez discovery+relay gdy peer wroci.
+                    let _ = self.quic_mesh.read();
+                    let _ = node_id;
                 }
             }
-            QuicMeshEvent::HeartbeatReceived { node_id, heartbeat } => {
+            IrohMeshEvent::HeartbeatReceived { node_id, heartbeat } => {
                 // Deserializuj heartbeat z rkyv
                 if let Ok(archived) = rkyv::access::<
                     rkyv::Archived<tentaflow_protocol::mesh::MeshHeartbeat>,
@@ -584,7 +577,7 @@ impl PeerManager {
                 }
                 let _ = self.event_tx.send(MeshEvent::HeartbeatReceived { from: node_id });
             }
-            QuicMeshEvent::FullStateReceived { node_id, state } => {
+            IrohMeshEvent::FullStateReceived { node_id, state } => {
                 // Deserializuj FullState z rkyv i zaktualizuj modele + kontenery + CRDT
                 if let Ok(archived) = rkyv::access::<
                     rkyv::Archived<tentaflow_protocol::mesh::MeshFullState>,
@@ -652,7 +645,7 @@ impl PeerManager {
                     warn!(peer_id = %node_id, "Nie udalo sie zdeserializowac FullState");
                 }
             }
-            QuicMeshEvent::ModelListUpdate { node_id, data } => {
+            IrohMeshEvent::ModelListUpdate { node_id, data } => {
                 if let Ok(models) = serde_json::from_slice::<Vec<serde_json::Value>>(&data) {
                     let peer_models: Vec<PeerModelInfo> = models
                         .iter()
@@ -669,7 +662,7 @@ impl PeerManager {
                     self.update_peer_models(&node_id, peer_models);
                 }
             }
-            QuicMeshEvent::ContainerListUpdate { node_id, data } => {
+            IrohMeshEvent::ContainerListUpdate { node_id, data } => {
                 if let Ok(containers) = serde_json::from_slice::<Vec<serde_json::Value>>(&data) {
                     let peer_containers: Vec<PeerContainerInfo> = containers
                         .iter()
@@ -688,26 +681,27 @@ impl PeerManager {
                     self.update_peer_containers(&node_id, peer_containers);
                 }
             }
-            QuicMeshEvent::CrdtDeltaReceived { .. }
-            | QuicMeshEvent::ForwardRequest { .. }
-            | QuicMeshEvent::NodeInfoReceived { .. }
-            | QuicMeshEvent::PairingRequestReceived { .. }
-            | QuicMeshEvent::PairingConfirmReceived { .. }
-            | QuicMeshEvent::PairingRejectReceived { .. }
-            | QuicMeshEvent::MeshCommandReceived { .. }
-            | QuicMeshEvent::MeshCommandResponseReceived { .. }
-            | QuicMeshEvent::MeshDeployProgressReceived { .. }
-            | QuicMeshEvent::MeshLogChunkReceived { .. }
-            | QuicMeshEvent::ServiceAnnounceReceived { .. }
-            | QuicMeshEvent::ServiceQueryAllReceived { .. }
-            | QuicMeshEvent::ServiceResponseAllReceived { .. }
-            | QuicMeshEvent::TrustRevokedReceived { .. }
-            | QuicMeshEvent::KeyRotationReceived { .. }
-            | QuicMeshEvent::KeyRotationResponseReceived { .. }
-            | QuicMeshEvent::TrustedKeysSyncReceived { .. }
-            | QuicMeshEvent::NodeLeavingReceived { .. }
-            | QuicMeshEvent::RelayFrameReceived { .. }
-            | QuicMeshEvent::AliasSyncReceived { .. } => {
+            IrohMeshEvent::CrdtDeltaReceived { .. }
+            | IrohMeshEvent::ForwardRequest { .. }
+            | IrohMeshEvent::ForwardRequestReceived { .. }
+            | IrohMeshEvent::NodeInfoReceived { .. }
+            | IrohMeshEvent::PairingRequestReceived { .. }
+            | IrohMeshEvent::PairingConfirmReceived { .. }
+            | IrohMeshEvent::PairingRejectReceived { .. }
+            | IrohMeshEvent::MeshCommandReceived { .. }
+            | IrohMeshEvent::MeshCommandResponseReceived { .. }
+            | IrohMeshEvent::MeshDeployProgressReceived { .. }
+            | IrohMeshEvent::MeshLogChunkReceived { .. }
+            | IrohMeshEvent::ServiceAnnounceReceived { .. }
+            | IrohMeshEvent::ServiceQueryAllReceived { .. }
+            | IrohMeshEvent::ServiceResponseAllReceived { .. }
+            | IrohMeshEvent::TrustRevokedReceived { .. }
+            | IrohMeshEvent::KeyRotationReceived { .. }
+            | IrohMeshEvent::KeyRotationResponseReceived { .. }
+            | IrohMeshEvent::TrustedKeysSyncReceived { .. }
+            | IrohMeshEvent::NodeLeavingReceived { .. }
+            | IrohMeshEvent::RelayFrameReceived { .. }
+            | IrohMeshEvent::AliasSyncReceived { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }
@@ -889,6 +883,7 @@ mod tests {
             heartbeat_interval_ms: 500,
             peer_timeout_ms: 3000,
             cluster_name: "test".to_string(),
+            iroh_relay_url: "https://use.iroh.network./".to_string(),
         };
         PeerManager::new("test-node".to_string(), gossip, mesh_config)
     }

@@ -1,20 +1,23 @@
 // =============================================================================
 // Plik: app.js
-// Opis: Entry point. Sprawdza JWT, jesli brak → login screen, w innym wypadku
-//       montuje app shell (sidebar + topbar + content) i nawigacje.
+// Opis: Punkt wejscia aplikacji. Inicjalizuje codec WASM oraz tlumaczenia,
+//       weryfikuje JWT, montuje shell aplikacji (sidebar 260 px + main) z
+//       hierarchicznym menu zaleznym od roli (admin/user) oraz dolnym
+//       przelacznikiem jezyka.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { codecReady } from '/js/protocol/codec.js';
 import { Router } from '/js/router.js';
-import { icon } from '/js/icons.js';
-import { byId, escapeHtml, toast } from '/js/utils.js';
+import { byId, escapeHtml } from '/js/utils.js';
+import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 
 import LoginScreen from '/js/modules/login.js';
+import FaceBackground from '/js/modules/faceBackground.js';
 import DashboardScreen from '/js/modules/dashboard.js';
-import ModelsScreen from '/js/modules/models.js';
 import ServicesScreen from '/js/modules/services.js';
 import HubScreen from '/js/modules/hub.js';
+import CatalogScreen from '/js/modules/catalog.js';
 import MeshScreen from '/js/modules/mesh.js';
 import ClustersScreen from '/js/modules/clusters.js';
 import FlowsScreen from '/js/modules/flows.js';
@@ -27,53 +30,104 @@ import UsersScreen from '/js/modules/users.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
 
-const SIDEBAR_SECTIONS = [
+// Helper: SVG <use> reference do inline sprite.
+function sprite(id) {
+  return `<svg class="icon"><use href="#i-${id}"/></svg>`;
+}
+
+// Pelny menu admin per mockup #1 — labele zamiast tekstu trzymane jako klucze i18n.
+const ADMIN_NAV = [
   {
-    title: 'Główne',
+    headingKey: 'nav.section_general',
+    icon: 'settings',
     items: [
-      { id: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
-      { id: 'chat', label: 'Chat', icon: 'chat' },
+      { id: 'dashboard', labelKey: 'nav.dashboard', icon: 'dashboard' },
+      { id: 'services', labelKey: 'nav.services', icon: 'services' },
+      { id: 'apikeys', labelKey: 'nav.apikeys', icon: 'key' },
+      { id: 'settings', labelKey: 'nav.settings', icon: 'settings' },
     ],
   },
   {
-    title: 'AI',
+    headingKey: 'nav.section_core',
+    icon: 'core',
     items: [
-      { id: 'models', label: 'Modele', icon: 'models' },
-      { id: 'services', label: 'Serwisy', icon: 'services' },
-      { id: 'hub', label: 'Hub silników', icon: 'hub' },
-      { id: 'prompts', label: 'Prompty', icon: 'prompts' },
-      { id: 'flows', label: 'Flows', icon: 'flows' },
+      { id: 'mesh', labelKey: 'nav.mesh', icon: 'network' },
+      { id: 'clusters', labelKey: 'nav.clusters', icon: 'cluster' },
+      { id: 'prompts', labelKey: 'nav.prompts', icon: 'prompt' },
     ],
   },
   {
-    title: 'Mesh',
+    headingKey: 'nav.section_workflows',
+    icon: 'flow',
     items: [
-      { id: 'mesh', label: 'Peers', icon: 'mesh' },
-      { id: 'clusters', label: 'Klastry', icon: 'clusters' },
+      { id: 'flows', labelKey: 'nav.flows', icon: 'flow' },
+      { id: 'playground', labelKey: 'nav.playground', icon: 'play' },
+      { id: 'rules', labelKey: 'nav.rules', icon: 'rules' },
+      { id: 'registries', labelKey: 'nav.registries', icon: 'registry' },
     ],
   },
   {
-    title: 'Administracja',
+    headingKey: 'nav.section_integrations',
+    icon: 'puzzle',
     items: [
-      { id: 'apikeys', label: 'Klucze API', icon: 'apikeys' },
-      { id: 'users', label: 'Użytkownicy', icon: 'users' },
-      { id: 'rules', label: 'Reguły', icon: 'rules' },
-      { id: 'registries', label: 'Rejestry', icon: 'registries' },
-      { id: 'settings', label: 'Ustawienia', icon: 'settings' },
-      { id: 'audit', label: 'Audit log', icon: 'audit' },
+      { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
+    ],
+  },
+  {
+    headingKey: 'nav.section_management',
+    icon: 'management',
+    items: [
+      { id: 'applications', labelKey: 'nav.applications', icon: 'apps' },
+      { id: 'users', labelKey: 'nav.users', icon: 'users' },
+      { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
+    ],
+  },
+];
+
+// Menu user per mockup #2.
+const USER_NAV = [
+  {
+    headingKey: 'nav.section_apps',
+    icon: 'apps',
+    items: [
+      { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
+      { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
+      { id: 'images', labelKey: 'nav.images', icon: 'image' },
+      { id: 'notes', labelKey: 'nav.notes', icon: 'mic', badge: 'soon' },
+      { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
+      { id: 'flows-user', labelKey: 'nav.flows_user', icon: 'workflow-app' },
+      { id: 'prompts-user', labelKey: 'nav.prompts_user', icon: 'star' },
+      { id: 'tts', labelKey: 'nav.tts', icon: 'speaker' },
+      { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
+      { id: 'search-app', labelKey: 'nav.search_app', icon: 'search', badge: 'soon' },
+    ],
+  },
+  {
+    headingKey: 'nav.section_network',
+    icon: 'network',
+    items: [
+      { id: 'mesh-user', labelKey: 'nav.mesh_user', icon: 'network' },
+      { id: 'tailscale-user', labelKey: 'nav.tailscale_user', icon: 'zap' },
+    ],
+  },
+  {
+    headingKey: 'nav.section_account',
+    icon: 'user',
+    items: [
+      { id: 'profile', labelKey: 'nav.profile', icon: 'user' },
+      { id: 'settings-user', labelKey: 'nav.settings_user', icon: 'settings' },
     ],
   },
 ];
 
 async function bootstrap() {
-  await codecReady;
+  await Promise.all([codecReady, I18n.init()]);
 
   if (!ApiBinary.hasJwt()) {
     renderLogin();
     return;
   }
 
-  // Verify JWT against /ws/api by trying authMeRequest.
   try {
     await ApiBinary.one('authMeRequest');
     renderApp();
@@ -87,64 +141,157 @@ async function bootstrap() {
 function renderLogin() {
   const root = byId('app-root');
   root.innerHTML = LoginScreen.render();
-  LoginScreen.mount({
-    onSuccess: () => renderApp(),
-  });
+  LoginScreen.mount({ onSuccess: () => renderApp() });
+  I18n.applyDataI18n();
 }
 
 async function renderApp() {
+  FaceBackground.hide();
   const root = byId('app-root');
   const me = await ApiBinary.one('authMeRequest').catch(() => null);
+  const role = (me?.role ?? 'user').toLowerCase();
+  const isAdmin = role === 'admin';
+  const initials = (me?.username ?? '?').slice(0, 2).toUpperCase();
 
-  root.innerHTML = `
-    <div class="app-shell">
-      <aside class="sidebar">
-        <div class="sidebar-brand">
-          <div class="sidebar-brand-mark">T</div>
-          <div class="sidebar-brand-name">TentaFlow</div>
-        </div>
-        ${SIDEBAR_SECTIONS.map((section) => `
-          <div class="sidebar-section">
-            <div class="sidebar-section-title">${escapeHtml(section.title)}</div>
-            ${section.items.map((item) => `
-              <a class="nav-item" data-view="${item.id}">
-                ${icon(item.icon)}
-                <span>${escapeHtml(item.label)}</span>
-              </a>
-            `).join('')}
+  function paint() {
+    const nav = isAdmin ? ADMIN_NAV : USER_NAV;
+    const userClass = isAdmin ? 'admin' : 'user';
+    const roleLabel = I18n.t(isAdmin ? 'role.administrator' : 'role.user');
+    const logoutLabel = I18n.t('nav.logout');
+
+    root.innerHTML = `
+      <div class="app">
+        <header class="mobile-header" id="mobile-header">
+          <button class="mobile-menu-btn" id="mobile-menu-btn" aria-label="Menu">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+          </button>
+          <div class="mobile-header-logo">
+            <img src="/tentaflow.png" alt="" width="24">
+            <span>TentaFlow</span>
           </div>
-        `).join('')}
-        <div class="sidebar-footer">
-          <a class="nav-item" id="nav-logout" style="color: var(--color-text-muted);">
-            ${icon('logout')}
-            <span>Wyloguj</span>
-          </a>
-        </div>
-      </aside>
-      <header class="topbar">
-        <h1 class="topbar-title" id="topbar-title">Dashboard</h1>
-        <div class="topbar-actions">
-          <span class="connection-pill" id="connection-pill">
-            <span class="status-dot online"></span>
-            <span id="connection-status">Połączono</span>
-          </span>
-          <span class="user-pill">
-            <span class="user-avatar">${(me?.username ?? '?').charAt(0).toUpperCase()}</span>
-            <span>${escapeHtml(me?.username ?? 'user')}</span>
-            <span class="badge badge-accent">${escapeHtml(me?.role ?? 'user')}</span>
-          </span>
-        </div>
-      </header>
-      <main class="content" id="content"></main>
-    </div>
-  `;
+        </header>
+        <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+        <aside class="sidebar" id="app-sidebar">
+          <div class="logo">
+            <img class="octo" src="/tentaflow.png" alt="">
+            <span class="name">TentaFlow</span>
+          </div>
+          ${nav.map((section) => `
+            <div class="nav-section">
+              <div class="heading">${sprite(section.icon)}${escapeHtml(I18n.t(section.headingKey))}</div>
+              ${section.items.map((it) => `
+                <div class="nav-item" data-view="${it.id}">
+                  ${sprite(it.icon)}
+                  <span>${escapeHtml(I18n.t(it.labelKey))}</span>
+                  ${it.badge ? `<span class="badge ${it.badge === 'soon' ? 'soon' : ''}">${escapeHtml(it.badge)}</span>` : ''}
+                </div>
+              `).join('')}
+            </div>
+          `).join('')}
+          <div class="footer">
+            <div class="lang-switcher" id="lang-switcher">
+              <select class="lang-select" id="lang-select" title="${escapeHtml(I18n.t('lang.label'))}">
+                ${SUPPORTED_LANGS.map((l) => `
+                  <option value="${l.code}" ${l.code === I18n.getLanguage() ? 'selected' : ''}>${l.flag} ${escapeHtml(l.label)}</option>
+                `).join('')}
+              </select>
+            </div>
+            <div class="user-chip ${userClass}">
+              <div class="avatar">${escapeHtml(initials)}</div>
+              <div class="info">
+                <div class="name-t">${escapeHtml(me?.username ?? 'unknown')}</div>
+                <div class="role">${escapeHtml(roleLabel)}</div>
+              </div>
+            </div>
+            <div class="nav-item logout" id="nav-logout">${sprite('logout')}<span>${escapeHtml(logoutLabel)}</span></div>
+          </div>
+        </aside>
+        <main class="main" id="main"></main>
+      </div>
+    `;
 
-  // Register screens.
+    setupDrawer();
+
+    document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        const view = el.dataset.view;
+        document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
+        el.classList.add('active');
+        Router.navigate(view);
+        // Mobile: zamknij drawer po wyborze
+        closeDrawer();
+      });
+    });
+
+    byId('nav-logout')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      ApiBinary.clearSession();
+      renderLogin();
+    });
+
+    byId('lang-select')?.addEventListener('change', async (e) => {
+      await I18n.setLanguage(e.target.value);
+    });
+  }
+
+  function openDrawer() {
+    document.body.classList.add('drawer-open');
+  }
+  function closeDrawer() {
+    document.body.classList.remove('drawer-open');
+  }
+  function setupDrawer() {
+    byId('mobile-menu-btn')?.addEventListener('click', () => {
+      if (document.body.classList.contains('drawer-open')) closeDrawer();
+      else openDrawer();
+    });
+    byId('sidebar-backdrop')?.addEventListener('click', closeDrawer);
+
+    // Swipe from edge — otwarcie
+    let touchStartX = null;
+    document.addEventListener('touchstart', (e) => {
+      if (e.touches[0].clientX < 20 && !document.body.classList.contains('drawer-open')) {
+        touchStartX = e.touches[0].clientX;
+      }
+    }, { passive: true });
+    document.addEventListener('touchmove', (e) => {
+      if (touchStartX != null) {
+        const dx = e.touches[0].clientX - touchStartX;
+        if (dx > 60) {
+          openDrawer();
+          touchStartX = null;
+        }
+      }
+    }, { passive: true });
+    document.addEventListener('touchend', () => { touchStartX = null; }, { passive: true });
+
+    // Swipe-left na otwartym drawerze — zamkniecie
+    let drawerTouchX = null;
+    const sidebar = byId('app-sidebar');
+    sidebar?.addEventListener('touchstart', (e) => {
+      if (document.body.classList.contains('drawer-open')) {
+        drawerTouchX = e.touches[0].clientX;
+      }
+    }, { passive: true });
+    sidebar?.addEventListener('touchmove', (e) => {
+      if (drawerTouchX != null) {
+        const dx = e.touches[0].clientX - drawerTouchX;
+        if (dx < -60) {
+          closeDrawer();
+          drawerTouchX = null;
+        }
+      }
+    }, { passive: true });
+    sidebar?.addEventListener('touchend', () => { drawerTouchX = null; }, { passive: true });
+  }
+
   Router.register('dashboard', DashboardScreen);
   Router.register('chat', ChatScreen);
-  Router.register('models', ModelsScreen);
   Router.register('services', ServicesScreen);
   Router.register('hub', HubScreen);
+  // `catalog` nie ma w menu — serwisy z niego korzystają przy "Nowy serwis".
+  Router.register('catalog', CatalogScreen);
   Router.register('prompts', PromptsScreen);
   Router.register('flows', FlowsScreen);
   Router.register('mesh', MeshScreen);
@@ -156,29 +303,20 @@ async function renderApp() {
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);
 
-  Router.init('dashboard');
+  paint();
 
-  byId('nav-logout')?.addEventListener('click', (e) => {
-    e.preventDefault();
-    ApiBinary.clearSession();
-    renderLogin();
+  // Po zmianie jezyka odswiezamy shell + biezacy widok zeby wszystkie label'e zostaly przelozone.
+  I18n.subscribe(async () => {
+    const current = Router.current();
+    paint();
+    const initial = document.querySelector(`[data-view="${current ?? (isAdmin ? 'dashboard' : 'apps-home')}"]`);
+    if (initial) initial.classList.add('active');
+    await Router.navigate(current ?? (isAdmin ? 'dashboard' : 'apps-home'));
   });
 
-  // Heartbeat dla connection indicator.
-  setInterval(async () => {
-    try {
-      const start = performance.now();
-      await ApiBinary.one('metaHeartbeat', BigInt(Math.floor(Date.now() / 1000)));
-      const rtt = Math.round(performance.now() - start);
-      const status = byId('connection-status');
-      if (status) status.textContent = `${rtt}ms`;
-    } catch {
-      const status = byId('connection-status');
-      if (status) status.textContent = 'offline';
-      const dot = document.querySelector('#connection-pill .status-dot');
-      if (dot) dot.className = 'status-dot offline';
-    }
-  }, 5000);
+  Router.init(isAdmin ? 'dashboard' : 'apps-home');
+  const initial = document.querySelector(`[data-view="${isAdmin ? 'dashboard' : 'apps-home'}"]`);
+  if (initial) initial.classList.add('active');
 }
 
 window.addEventListener('error', (e) => {

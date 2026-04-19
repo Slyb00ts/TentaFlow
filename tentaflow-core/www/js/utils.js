@@ -13,6 +13,11 @@ export function escapeHtml(s) {
     .replaceAll("'", '&#39;');
 }
 
+/// Dla wartosci w atrybutach HTML — ten sam escape co escapeHtml, alias dla czytelnosci.
+export function escapeAttr(s) {
+  return escapeHtml(s);
+}
+
 export function formatDate(epochSeconds) {
   if (!epochSeconds) return '—';
   const d = new Date(Number(epochSeconds) * 1000);
@@ -81,4 +86,71 @@ export function bytesToHex(bytes) {
 
 export function shortHex(bytes, len = 8) {
   return bytesToHex(bytes).slice(0, len);
+}
+
+const JWT_STORAGE_KEY = 'tentaflow_jwt';
+
+/// REST GET z naglowkiem JWT z localStorage. Rzuca blad przy non-2xx.
+export async function apiGet(path) {
+  const jwt = localStorage.getItem(JWT_STORAGE_KEY);
+  const resp = await fetch(path, {
+    headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`${resp.status} ${resp.statusText}${text ? `: ${text}` : ''}`);
+  }
+  return resp.json();
+}
+
+/// REST POST z JSON body i JWT.
+export async function apiPost(path, body) {
+  const jwt = localStorage.getItem(JWT_STORAGE_KEY);
+  const headers = { 'Content-Type': 'application/json' };
+  if (jwt) headers.Authorization = `Bearer ${jwt}`;
+  const resp = await fetch(path, {
+    method: 'POST',
+    headers,
+    body: body != null ? JSON.stringify(body) : undefined,
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`${resp.status} ${resp.statusText}${text ? `: ${text}` : ''}`);
+  }
+  const ct = resp.headers.get('content-type') || '';
+  return ct.includes('application/json') ? resp.json() : resp.text();
+}
+
+/// REST DELETE.
+export async function apiDelete(path) {
+  const jwt = localStorage.getItem(JWT_STORAGE_KEY);
+  const resp = await fetch(path, {
+    method: 'DELETE',
+    headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`${resp.status} ${resp.statusText}${text ? `: ${text}` : ''}`);
+  }
+  return resp;
+}
+
+/// Formatuje bajty jako "12.3 MB" / "456 KB" / "8.2 GB".
+export function formatBytes(bytes) {
+  if (bytes == null) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  let v = Math.abs(bytes);
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+/// Formatuje MB jako czytelna wartosc: "2.1 GB" / "512 MB".
+export function formatMb(mb) {
+  if (mb == null) return '—';
+  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+  return `${Math.round(mb)} MB`;
 }
