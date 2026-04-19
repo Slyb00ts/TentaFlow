@@ -117,6 +117,27 @@
   width: 100%; margin-top: 18px; justify-content: center;
 }
 
+/* Login form po migracji na tf-* — wymusza spacing i full-width submit */
+#login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+#login-form tf-input {
+  display: block;
+  width: 100%;
+}
+#login-form tf-button {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+}
+#login-form tf-button > button,
+#login-form tf-button .tf-btn {
+  width: 100%;
+  justify-content: center;
+}
+
 /* --- Toast notifications ------------------------------------------------- */
 .toast-container {
   position: fixed; top: 20px; right: 20px; z-index: 2000;

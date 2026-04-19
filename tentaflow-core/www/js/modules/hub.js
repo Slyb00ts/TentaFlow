@@ -27,12 +27,12 @@ const HubScreen = {
             <div class="card">
               <div class="card-header">
                 <h3 class="card-title">${escapeHtml(e.displayName)}</h3>
-                <span class="badge badge-accent">${escapeHtml(e.category)}</span>
+                <tf-chip status="accent">${escapeHtml(e.category)}</tf-chip>
               </div>
               <div class="form-row"><span class="label">ID</span><div><code>${escapeHtml(e.id)}</code></div></div>
               <div class="form-row"><span class="label">Port domyślny</span><div>${e.defaultPort}</div></div>
               <div class="form-row"><span class="label">Tryby deploymentu</span>
-                <div>${e.deployMethods.map((m) => `<span class="badge">${escapeHtml(m)}</span>`).join(' ')}</div>
+                <div>${e.deployMethods.map((m) => `<tf-chip status="accent">${escapeHtml(m)}</tf-chip>`).join(' ')}</div>
               </div>
             </div>`).join('')}
         </div>`;

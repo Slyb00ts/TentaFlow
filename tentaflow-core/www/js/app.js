@@ -11,6 +11,7 @@ import { codecReady } from '/js/protocol/codec.js';
 import { Router } from '/js/router.js';
 import { byId, escapeHtml } from '/js/utils.js';
 import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
+import '/js/components/index.js';
 
 import LoginScreen from '/js/modules/login.js';
 import FaceBackground from '/js/modules/faceBackground.js';
@@ -146,7 +147,9 @@ function renderLogin() {
 }
 
 async function renderApp() {
-  FaceBackground.hide();
+  // Face-bg chowa się sam po zakończeniu `transitionOut`. Dla przypadku
+  // świeżego JWT (bez ekranu logowania) `hide()` i tak nie zostaje wywołany,
+  // bo kontener `.face-bg` nie istnieje — `hide()` robi wtedy no-op.
   const root = byId('app-root');
   const me = await ApiBinary.one('authMeRequest').catch(() => null);
   const role = (me?.role ?? 'user').toLowerCase();
@@ -176,18 +179,20 @@ async function renderApp() {
             <img class="octo" src="/tentaflow.png" alt="">
             <span class="name">TentaFlow</span>
           </div>
-          ${nav.map((section) => `
-            <div class="nav-section">
-              <div class="heading">${sprite(section.icon)}${escapeHtml(I18n.t(section.headingKey))}</div>
-              ${section.items.map((it) => `
-                <div class="nav-item" data-view="${it.id}">
-                  ${sprite(it.icon)}
-                  <span>${escapeHtml(I18n.t(it.labelKey))}</span>
-                  ${it.badge ? `<span class="badge ${it.badge === 'soon' ? 'soon' : ''}">${escapeHtml(it.badge)}</span>` : ''}
-                </div>
-              `).join('')}
-            </div>
-          `).join('')}
+          <div class="sidebar-nav">
+            ${nav.map((section) => `
+              <div class="nav-section">
+                <div class="heading">${sprite(section.icon)}${escapeHtml(I18n.t(section.headingKey))}</div>
+                ${section.items.map((it) => `
+                  <div class="nav-item" data-view="${it.id}">
+                    ${sprite(it.icon)}
+                    <span>${escapeHtml(I18n.t(it.labelKey))}</span>
+                    ${it.badge ? `<span class="badge ${it.badge === 'soon' ? 'soon' : ''}">${escapeHtml(it.badge)}</span>` : ''}
+                  </div>
+                `).join('')}
+              </div>
+            `).join('')}
+          </div>
           <div class="footer">
             <div class="lang-switcher" id="lang-switcher">
               <select class="lang-select" id="lang-select" title="${escapeHtml(I18n.t('lang.label'))}">

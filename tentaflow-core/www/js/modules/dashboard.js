@@ -5,6 +5,7 @@
 //       czasu rzeczywistego i panele ostatnich zdarzen oraz aktywnych prze-
 //       plywow. Subskrybuje broadcast `AuditEvent` z serwera dla live feedu
 //       i odswieza metryki przez `dashboardMetricsRequest` co 5 sekund.
+//       Kontrolki akcji w headerze uzywaja komponentow <tf-button>.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -33,8 +34,8 @@ const DashboardScreen = {
           <div class="sub">${escapeHtml(I18n.t('home.subtitle'))}</div>
         </div>
         <div class="actions">
-          <button class="btn btn-secondary" id="dash-refresh">${sprite('refresh')}${escapeHtml(I18n.t('home.refresh'))}</button>
-          <button class="btn btn-primary" id="dash-add-node">${sprite('plus')}${escapeHtml(I18n.t('home.add_node'))}</button>
+          <tf-button variant="secondary" id="dash-refresh">${sprite('refresh')}${escapeHtml(I18n.t('home.refresh'))}</tf-button>
+          <tf-button variant="primary" id="dash-add-node">${sprite('plus')}${escapeHtml(I18n.t('home.add_node'))}</tf-button>
         </div>
       </div>
 

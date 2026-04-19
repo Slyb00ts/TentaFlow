@@ -27,8 +27,8 @@ const RegistriesScreen = {
           <tbody>
             ${regs.map((r) => `<tr>
               <td><code>${escapeHtml(r.url)}</code></td>
-              <td><span class="badge">${escapeHtml(r.kind)}</span></td>
-              <td>${r.authRequired ? '<span class="badge badge-warning">tak</span>' : '<span class="badge badge-success">nie</span>'}</td>
+              <td><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
+              <td>${r.authRequired ? '<tf-chip status="warn">tak</tf-chip>' : '<tf-chip status="ok">nie</tf-chip>'}</td>
             </tr>`).join('')}
           </tbody>
         </table>`;

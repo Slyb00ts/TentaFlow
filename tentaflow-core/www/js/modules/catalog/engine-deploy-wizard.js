@@ -91,7 +91,12 @@ export async function openDeployWizard(engineId, opts = {}) {
 
 export function close() {
   const el = document.getElementById('engine-deploy-wizard');
-  if (el) el.remove();
+  if (el) {
+    if (typeof el.close === 'function') el.close(true);
+    else el.remove();
+  }
+  const backdrop = document.getElementById('engine-deploy-wizard-backdrop');
+  if (backdrop) backdrop.remove();
 }
 
 // ---- Data -----------------------------------------------------------------
@@ -146,30 +151,34 @@ function randomSuffix(len = 5) {
 
 function renderShell(bodyHtml) {
   close();
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-backdrop active';
-  overlay.id = 'engine-deploy-wizard';
-  overlay.innerHTML = `
-    <div class="modal" style="max-width: 720px;">
-      <div class="modal-header">
-        <h3 id="edw-title">${escapeHtml(I18n.t('wizard.title'))}</h3>
-        <button class="modal-close" id="edw-close" aria-label="${escapeAttr(I18n.t('common.close'))}">×</button>
-      </div>
-      <div class="modal-body" id="edw-body">${bodyHtml}</div>
-      <div class="modal-footer" id="edw-footer"></div>
-    </div>
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  backdrop.id = 'engine-deploy-wizard-backdrop';
+  document.body.appendChild(backdrop);
+
+  const win = document.createElement('tf-window');
+  win.id = 'engine-deploy-wizard';
+  win.setAttribute('title', I18n.t('wizard.title'));
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  win.setAttribute('width', '720');
+  win.innerHTML = `
+    <div slot="body" id="edw-body">${bodyHtml}</div>
+    <div slot="footer" id="edw-footer"></div>
   `;
-  document.body.appendChild(overlay);
-  overlay.querySelector('#edw-close')?.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
+  document.body.appendChild(win);
+
+  win.addEventListener('close-request', () => {
+    backdrop.remove();
   });
+  backdrop.addEventListener('click', () => close());
 }
 
 function refreshModal() {
-  const titleEl = document.getElementById('edw-title');
-  if (titleEl && engineEntry?.engine) {
-    titleEl.textContent = `${I18n.t('wizard.title')}: ${engineEntry.engine.name || engineEntry.engine.id}`;
+  const win = document.getElementById('engine-deploy-wizard');
+  if (win && engineEntry?.engine) {
+    win.setAttribute('title', `${I18n.t('wizard.title')}: ${engineEntry.engine.name || engineEntry.engine.id}`);
   }
   const body = document.getElementById('edw-body');
   if (body) body.innerHTML = renderStepIndicator() + renderStepBody();
@@ -200,14 +209,14 @@ function renderStepBody() {
 }
 
 function renderFooter() {
-  let html = `<button class="btn btn-ghost" id="edw-cancel">${escapeHtml(I18n.t('common.cancel'))}</button>`;
+  let html = `<tf-button variant="ghost" id="edw-cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>`;
   if (currentStep > 1) {
-    html += `<button class="btn btn-secondary" id="edw-back">← ${escapeHtml(I18n.t('common.back'))}</button>`;
+    html += `<tf-button variant="secondary" id="edw-back"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:rotate(180deg)"><use href="#i-chevron-right"/></svg>${escapeHtml(I18n.t('common.back'))}</tf-button>`;
   }
   if (currentStep < 3) {
-    html += `<button class="btn btn-primary" id="edw-next">${escapeHtml(I18n.t('common.next'))} →</button>`;
+    html += `<tf-button variant="primary" id="edw-next">${escapeHtml(I18n.t('common.next'))}<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-chevron-right"/></svg></tf-button>`;
   } else {
-    html += `<button class="btn btn-primary" id="edw-deploy">${escapeHtml(I18n.t('wizard.startDeploy'))}</button>`;
+    html += `<tf-button variant="primary" id="edw-deploy">${escapeHtml(I18n.t('wizard.startDeploy'))}</tf-button>`;
   }
   return html;
 }
@@ -249,7 +258,7 @@ function renderStepMethod() {
     nodeSelector = `
       <div class="form-group" style="margin-top:16px;">
         <label>${escapeHtml(I18n.t('wizard.targetNode'))}</label>
-        <select class="input" id="edw-node-select">${options}</select>
+        <tf-select id="edw-node-select" value="${escapeAttr(selection.nodeId || '')}">${options}</tf-select>
       </div>
     `;
   }
@@ -267,12 +276,12 @@ function renderStepModel() {
   const presets = Manifest.modelPresets(engineEntry);
   const hasPresets = presets.length > 0;
 
-  let tabs = '<div class="wizard-tabs">';
+  let tabs = `<tf-tabs variant="underline" id="edw-model-tabs" value="${escapeAttr(modelSourceMode)}">`;
   if (hasPresets) {
-    tabs += `<button type="button" class="wizard-tab${modelSourceMode === 'preset' ? ' active' : ''}" data-mode="preset">${escapeHtml(I18n.t('wizard.fromPreset'))}</button>`;
+    tabs += `<tf-tab id="preset">${escapeHtml(I18n.t('wizard.fromPreset'))}</tf-tab>`;
   }
-  tabs += `<button type="button" class="wizard-tab${modelSourceMode === 'hf' ? ' active' : ''}" data-mode="hf">${escapeHtml(I18n.t('wizard.searchHuggingface'))}</button>`;
-  tabs += '</div>';
+  tabs += `<tf-tab id="hf">${escapeHtml(I18n.t('wizard.searchHuggingface'))}</tf-tab>`;
+  tabs += '</tf-tabs>';
 
   const content = modelSourceMode === 'preset' && hasPresets
     ? renderPresetSelector(presets)
@@ -316,17 +325,18 @@ function renderPresetSelector(presets) {
 
 function renderHfSearch() {
   const filterHint = hfSearchFilterHint();
+  const hintText = `${I18n.t('wizard.hfSearchHint')}${filterHint ? ' · ' + filterHint : ''}`;
   return `
     <div class="form-group">
-      <input type="text" id="edw-hf-search" class="input"
+      <tf-input type="text" id="edw-hf-search"
         placeholder="${escapeAttr(I18n.t('wizard.hfSearchPlaceholder'))}"
-        value="${escapeAttr(hfSearchQuery)}" autocomplete="off">
-      <div class="form-hint">${escapeHtml(I18n.t('wizard.hfSearchHint'))}${filterHint ? ' · ' + escapeHtml(filterHint) : ''}</div>
+        value="${escapeAttr(hfSearchQuery)}" autocomplete="off"
+        hint="${escapeAttr(hintText)}"></tf-input>
     </div>
     <div class="form-group">
-      <label>${escapeHtml(I18n.t('wizard.huggingfaceToken'))}</label>
-      <input type="password" id="edw-hf-token" class="input"
-        value="${escapeAttr(hfToken)}" autocomplete="off">
+      <tf-input type="password" id="edw-hf-token"
+        label="${escapeAttr(I18n.t('wizard.huggingfaceToken'))}"
+        value="${escapeAttr(hfToken)}" autocomplete="off"></tf-input>
     </div>
     <div class="model-list" id="edw-hf-results">${renderHfResultsHtml()}</div>
   `;
@@ -401,8 +411,9 @@ function renderStepRuntime() {
   if (selection.deployMethod === 'docker') {
     extra = `
       <div class="form-group">
-        <label>${escapeHtml(I18n.t('wizard.containerName'))}</label>
-        <input type="text" id="edw-cname" class="input" value="${escapeAttr(cname)}">
+        <tf-input type="text" id="edw-cname"
+          label="${escapeAttr(I18n.t('wizard.containerName'))}"
+          value="${escapeAttr(cname)}"></tf-input>
       </div>
     `;
   }
@@ -411,8 +422,9 @@ function renderStepRuntime() {
     <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.configureRuntime'))}</h4>
     ${summary}
     <div class="form-group">
-      <label>${escapeHtml(I18n.t('wizard.port'))}</label>
-      <input type="number" id="edw-port" class="input" min="1" max="65535" value="${escapeAttr(String(port))}">
+      <tf-input type="number" id="edw-port"
+        label="${escapeAttr(I18n.t('wizard.port'))}"
+        value="${escapeAttr(String(port))}"></tf-input>
     </div>
     ${extra}
   `;
@@ -435,8 +447,8 @@ function bindStepMethodInputs() {
   });
   const nodeSel = document.getElementById('edw-node-select');
   if (nodeSel) {
-    nodeSel.addEventListener('change', () => {
-      selection.nodeId = nodeSel.value;
+    nodeSel.addEventListener('change', (e) => {
+      selection.nodeId = e.detail?.value ?? nodeSel.value;
       hostOs = pickHostOs(selection.nodeId);
       availableMethods = Manifest.availableDeployMethods(engineEntry, hostOs);
       if (!availableMethods.includes(selection.deployMethod)) {
@@ -448,12 +460,13 @@ function bindStepMethodInputs() {
 }
 
 function bindStepModelInputs() {
-  document.querySelectorAll('.wizard-tab[data-mode]').forEach((t) => {
-    t.addEventListener('click', () => {
-      modelSourceMode = t.dataset.mode;
+  const modelTabs = document.getElementById('edw-model-tabs');
+  if (modelTabs) {
+    modelTabs.addEventListener('change', (e) => {
+      modelSourceMode = e.detail?.value || 'preset';
       refreshModal();
     });
-  });
+  }
 
   document.querySelectorAll('.model-item[data-preset-id]').forEach((it) => {
     it.addEventListener('click', () => {
@@ -466,10 +479,11 @@ function bindStepModelInputs() {
 
   const search = document.getElementById('edw-hf-search');
   if (search) {
-    search.addEventListener('input', () => {
+    search.addEventListener('input', (e) => {
       clearTimeout(hfSearchTimer);
-      hfSearchQuery = search.value;
-      const q = search.value.trim();
+      const v = e.detail?.value ?? search.value;
+      hfSearchQuery = v;
+      const q = String(v).trim();
       if (q.length < 2) {
         hfResults = [];
         updateHfResults();
@@ -481,8 +495,8 @@ function bindStepModelInputs() {
 
   const tokenInput = document.getElementById('edw-hf-token');
   if (tokenInput) {
-    tokenInput.addEventListener('input', () => {
-      hfToken = tokenInput.value;
+    tokenInput.addEventListener('input', (e) => {
+      hfToken = e.detail?.value ?? tokenInput.value;
     });
   }
 
@@ -503,15 +517,17 @@ function bindHfResultClicks() {
 function bindStepRuntimeInputs() {
   const portInput = document.getElementById('edw-port');
   if (portInput) {
-    portInput.addEventListener('input', () => {
-      const v = parseInt(portInput.value, 10);
-      selection.port = isNaN(v) ? portInput.value : v;
+    portInput.addEventListener('input', (e) => {
+      const raw = e.detail?.value ?? portInput.value;
+      const v = parseInt(raw, 10);
+      selection.port = isNaN(v) ? raw : v;
     });
   }
   const cnameInput = document.getElementById('edw-cname');
   if (cnameInput) {
-    cnameInput.addEventListener('input', () => {
-      selection.containerName = cnameInput.value.trim();
+    cnameInput.addEventListener('input', (e) => {
+      const raw = e.detail?.value ?? cnameInput.value;
+      selection.containerName = String(raw).trim();
     });
   }
 }
@@ -594,7 +610,7 @@ function updateHfResults() {
 
 async function startDeploy() {
   const btn = document.getElementById('edw-deploy');
-  if (btn) btn.disabled = true;
+  if (btn) btn.setAttribute('disabled', '');
 
   const eng = engineEntry.engine || {};
   const body = {
@@ -616,6 +632,6 @@ async function startDeploy() {
     setTimeout(close, 1200);
   } catch (err) {
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
-    if (btn) btn.disabled = false;
+    if (btn) btn.removeAttribute('disabled');
   }
 }
