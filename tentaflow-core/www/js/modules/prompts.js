@@ -38,9 +38,9 @@ function renderTable() {
         ${prompts.map((p) => `
           <tr>
             <td>${escapeHtml(p.name)}</td>
-            <td><span class="badge">${escapeHtml(p.category)}</span></td>
+            <td><tf-chip status="accent">${escapeHtml(p.category)}</tf-chip></td>
             <td>${formatDate(p.updatedAtEpoch)}</td>
-            <td><button class="btn btn-sm" data-detail="${escapeHtml(p.id)}">Pokaż</button></td>
+            <td><tf-button variant="secondary" size="sm" data-detail="${escapeHtml(p.id)}">Pokaż</tf-button></td>
           </tr>`).join('')}
       </tbody>
     </table>`;
@@ -57,11 +57,11 @@ async function showDetail(promptId) {
       <div class="card" style="margin-top: var(--space-4);">
         <div class="card-header">
           <h3 class="card-title">${escapeHtml(d.name)}</h3>
-          <button class="btn btn-ghost btn-sm" id="close-prompt">×</button>
+          <tf-button variant="ghost" size="sm" id="close-prompt">×</tf-button>
         </div>
         <div class="form-row"><span class="label">Kategoria</span><div>${escapeHtml(d.category)}</div></div>
         <div class="form-row"><span class="label">Zmienne</span>
-          <div>${d.variables.map((v) => `<span class="badge">${escapeHtml(v)}</span>`).join(' ') || '—'}</div></div>
+          <div>${d.variables.map((v) => `<tf-chip status="accent">${escapeHtml(v)}</tf-chip>`).join(' ') || '—'}</div></div>
         <div class="form-row"><span class="label">Treść</span>
           <pre style="background: var(--color-bg); padding: var(--space-3); border-radius: var(--radius-md); border: 1px solid var(--color-border); white-space: pre-wrap;">${escapeHtml(d.template)}</pre>
         </div>

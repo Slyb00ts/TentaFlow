@@ -5,7 +5,11 @@
          półprzezroczyste tło, żeby mimika była widoczna przez rozmycie.
    ============================================================================= */
 
-/* Kontener pełnoekranowy — fade-in opacity przy `is-visible`. */
+/* Kontener pełnoekranowy — fade-in opacity przy `is-visible`. Z-index 10
+   stawia wireframe NAD #app-root (z-index 1 podczas tranzycji), żeby
+   podczas animacji login → UI siatka twarzy była widoczna nad rosnącym
+   (jeszcze mikroskopijnym) UI. Karta logowania musi mieć z-index > 10,
+   żeby formularz pozostał klikalny podczas loginu. */
 .face-bg {
   position: fixed;
   inset: 0;
@@ -13,7 +17,7 @@
   height: 100vh;
   pointer-events: none;
   overflow: hidden;
-  z-index: 0;
+  z-index: 10;
   opacity: 0;
   transition: opacity 0.6s ease;
 }
@@ -37,12 +41,12 @@ body.has-face-bg .login-shell {
   background: transparent;
   background-image: none;
   position: relative;
-  z-index: 1;
+  z-index: 15;
 }
 
 body.has-face-bg .login-card {
   position: relative;
-  z-index: 2;
+  z-index: 20;
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
   background-color: rgba(20, 24, 54, 0.72);
@@ -53,5 +57,58 @@ body.has-face-bg .login-card {
 @media (prefers-reduced-motion: reduce) {
   .face-bg {
     transition: none;
+  }
+}
+
+/* ---- Przejście login → main UI (render natywny) -------------------------- */
+
+/* Karta logowania — fade-out + blur, bez scale (żeby nie konkurowała wizualnie
+   z rosnącą twarzą). GPU-friendly: opacity + filter. */
+.login-card.is-transitioning {
+  animation: tf-login-out 0.5s cubic-bezier(0.7, 0, 0.3, 1) forwards;
+  pointer-events: none;
+  will-change: opacity, filter;
+}
+@keyframes tf-login-out {
+  from {
+    opacity: 1;
+    filter: blur(0px);
+  }
+  to {
+    opacity: 0;
+    filter: blur(8px);
+  }
+}
+
+/* Fade-out canvasa twarzy — inline style ustawia opacity, transition trzymamy
+   krótki żeby klatki sterowane z RAF nie kolidowały z interpolacją CSS. */
+#face-bg-root canvas {
+  transition: opacity 0.12s linear;
+}
+
+/* UI wynurzające się z oka. JS co klatkę ustawia --tf-ui-scale. Oko podczas
+   tranzycji zawsze w centrum viewportu (korekcja zoomCx/zoomCy w JS), więc
+   transform-origin jest stałe = 50% 50%. UI leży pod wireframe twarzy
+   (z-index 1 < face-bg 10) — wireframe prześwieca przez transparentny canvas
+   a mikroskopijny UI rośnie od pierwszej klatki synchronicznie z twarzą. */
+#app-root.is-emerging {
+  position: relative;
+  z-index: 1;
+  transform-origin: 50% 50%;
+  /* translate najpierw, potem scale — offset zanika gdy UI rosnie do 1 */
+  transform:
+    translate(var(--tf-ui-offset-x, 0), var(--tf-ui-offset-y, 0))
+    scale(var(--tf-ui-scale, 0.01));
+  transition: none;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-card.is-transitioning {
+    animation: none;
+    opacity: 0;
+  }
+  #app-root.is-emerging {
+    transform: none;
   }
 }

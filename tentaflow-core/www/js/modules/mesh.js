@@ -2,7 +2,8 @@
 // Plik: modules/mesh.js
 // Opis: Widok Mesh — sekcje (ten node / sparowane / oczekujace), kafelki z
 //       ring-gauges (CPU/RAM/VRAM-sum/GPU-avg), meta rows (modele, aktywne
-//       req/tok-s, RTT), auto-refresh 5s. Zakladki Lista/Diagram. Pair flow.
+//       req/tok-s, RTT), auto-refresh 5s. Zakladki Lista/Diagram (tf-tabs).
+//       Pair flow na tf-window. Chipy statusow nodow na tf-chip.
 //       Dane z REST /api/mesh/nodes + /api/mesh/pending. JWT z localStorage.
 // =============================================================================
 
@@ -20,6 +21,11 @@ import { I18n } from '/js/i18n.js';
 import MeshDetailScreen from '/js/modules/mesh-detail.js';
 import { renderDiagram, bindDiagramEvents, destroyDiagram } from '/js/modules/mesh-diagram.js';
 import { patchInner } from '/js/lib/patch.js';
+import '/js/components/tf-button.js';
+import '/js/components/tf-chip.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-tabs.js';
+import '/js/components/tf-window.js';
 
 let nodes = [];
 let pending = [];
@@ -37,15 +43,15 @@ const MeshScreen = {
             <div class="sub" id="mesh-sub"></div>
           </div>
           <div class="actions">
-            <button class="btn btn-secondary" id="btn-pair-new">
-              <span class="ico">+</span> ${escapeHtml(I18n.t('mesh.pair_new'))}
-            </button>
+            <tf-button variant="secondary" icon="plus" id="btn-pair-new">${escapeHtml(I18n.t('mesh.pair_new'))}</tf-button>
           </div>
         </div>
 
         <div class="mesh-tabs" id="mesh-tabs">
-          <div class="mesh-tab active" data-tab="list">${escapeHtml(I18n.t('mesh.tab_list'))}</div>
-          <div class="mesh-tab" data-tab="diagram">${escapeHtml(I18n.t('mesh.tab_diagram'))}</div>
+          <tf-tabs variant="soft" value="list" id="mesh-tabs-nav">
+            <tf-tab id="list">${escapeHtml(I18n.t('mesh.tab_list'))}</tf-tab>
+            <tf-tab id="diagram">${escapeHtml(I18n.t('mesh.tab_diagram'))}</tf-tab>
+          </tf-tabs>
           <div class="mesh-tab-spacer"></div>
           <div class="mesh-legend-compact">
             <span><span class="dot" style="background:var(--success,#22c55e);"></span>${escapeHtml(I18n.t('mesh.legend_local'))}</span>
@@ -64,8 +70,8 @@ const MeshScreen = {
   async mount() {
     byId('btn-pair-new')?.addEventListener('click', openPairModal);
 
-    const tabsEl = byId('mesh-tabs');
-    if (tabsEl) tabsEl.addEventListener('click', handleTabClick);
+    const tabsEl = byId('mesh-tabs-nav');
+    if (tabsEl) tabsEl.addEventListener('change', handleTabChange);
 
     const contentEl = byId('mesh-tab-content');
     if (contentEl) contentEl.addEventListener('click', handleCardClick);
@@ -127,13 +133,10 @@ function pluralize(n, singleKey, pluralKey) {
 
 // ---- Tabs -----------------------------------------------------------------
 
-function handleTabClick(e) {
-  const tab = e.target.closest('.mesh-tab');
-  if (!tab) return;
-  const id = tab.dataset.tab;
+function handleTabChange(e) {
+  const id = e.detail?.value;
   if (!id || id === activeTab) return;
   activeTab = id;
-  document.querySelectorAll('.mesh-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === id));
   renderActiveTab();
 }
 
@@ -202,12 +205,12 @@ function renderPendingCard(pairing) {
       <div class="mesh-card-head">
         <div class="mesh-card-ico pending">?</div>
         <div class="mesh-card-title">
-          <div class="name-t">${escapeHtml(shortId || I18n.t('mesh.unknown_host'))}<span class="tag-status pending">${escapeHtml(I18n.t('mesh.pending'))}</span></div>
+          <div class="name-t">${escapeHtml(shortId || I18n.t('mesh.unknown_host'))}<tf-chip status="pending" dot>${escapeHtml(I18n.t('mesh.pending'))}</tf-chip></div>
           <div class="details">${escapeHtml(I18n.t('mesh.pending_hint'))}</div>
         </div>
         <div class="mesh-card-actions">
-          <button class="btn btn-primary btn-icon" title="${escapeAttr(I18n.t('mesh.pair'))}" data-pairing-confirm="${escapeAttr(nodeId)}">+</button>
-          <button class="btn btn-ghost btn-icon" title="${escapeAttr(I18n.t('mesh.reject_pairing'))}" data-pairing-reject="${escapeAttr(nodeId)}">×</button>
+          <tf-button variant="primary" size="sm" icon="plus" title="${escapeAttr(I18n.t('mesh.pair'))}" data-pairing-confirm="${escapeAttr(nodeId)}"></tf-button>
+          <tf-button variant="ghost" size="sm" icon="x" title="${escapeAttr(I18n.t('mesh.reject_pairing'))}" data-pairing-reject="${escapeAttr(nodeId)}"></tf-button>
         </div>
       </div>
       <div class="mesh-card-meta">
@@ -230,12 +233,10 @@ function renderNodeCard(node, kind) {
 
   // Status chip
   let statusChip = '';
-  if (kind === 'local') {
-    statusChip = `<span class="tag-status online">● ${escapeHtml(I18n.t('mesh.online'))}</span>`;
-  } else if (online) {
-    statusChip = `<span class="tag-status online">● ${escapeHtml(I18n.t('mesh.online'))}</span>`;
+  if (kind === 'local' || online) {
+    statusChip = `<tf-chip status="online" dot>${escapeHtml(I18n.t('mesh.online'))}</tf-chip>`;
   } else {
-    statusChip = `<span class="tag-status offline">● ${escapeHtml(I18n.t('mesh.offline'))}</span>`;
+    statusChip = `<tf-chip status="offline" dot>${escapeHtml(I18n.t('mesh.offline'))}</tf-chip>`;
   }
 
   // Relay chip — jesli routed przez inny node
@@ -245,7 +246,7 @@ function renderNodeCard(node, kind) {
     const hopsLabel = route.hops === 1 ? I18n.t('mesh.hop_one') : I18n.t('mesh.hop_many', { count: route.hops });
     const nextHopNode = nodes.find(n => (n.node_id || '') === route.next_hop);
     const nextHopName = (nextHopNode && nextHopNode.hostname) || route.next_hop.slice(0, 8);
-    relayChip = `<span class="tag-status relay" title="${escapeAttr(hopsLabel + ' via ' + nextHopName)}">${escapeHtml(hopsLabel)}</span>`;
+    relayChip = `<tf-chip status="info" title="${escapeAttr(hopsLabel + ' via ' + nextHopName)}">${escapeHtml(hopsLabel)}</tf-chip>`;
   }
 
   // Details row — IP + (uptime | RTT) + protocol
@@ -266,11 +267,11 @@ function renderNodeCard(node, kind) {
   let actions = '';
   if (kind === 'trusted') {
     actions = `
-      <button class="btn btn-ghost btn-icon" title="${escapeAttr(I18n.t('mesh.revoke_trust'))}" data-node-revoke="${escapeAttr(nodeId)}">×</button>
+      <tf-button variant="ghost" size="sm" icon="x" title="${escapeAttr(I18n.t('mesh.revoke_trust'))}" data-node-revoke="${escapeAttr(nodeId)}"></tf-button>
     `;
   } else if (kind === 'discovered') {
     actions = `
-      <button class="btn btn-primary btn-icon" title="${escapeAttr(I18n.t('mesh.pair'))}" data-node-pair="${escapeAttr(nodeId)}">+</button>
+      <tf-button variant="primary" size="sm" icon="plus" title="${escapeAttr(I18n.t('mesh.pair'))}" data-node-pair="${escapeAttr(nodeId)}"></tf-button>
     `;
   }
 
@@ -447,160 +448,150 @@ function handleCardClick(e) {
 
 // ---- Pair flow ------------------------------------------------------------
 
+// Generyczny helper do stworzenia okna pairingu (tf-window + backdrop).
+function createPairWindow({ title, bodyHtml, submitLabel, submitAction, onSubmit }) {
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', title);
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('min-width', '420');
+  win.setAttribute('width', '460');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+
+  const bodyWrap = document.createElement('div');
+  bodyWrap.slot = 'body';
+  bodyWrap.innerHTML = bodyHtml;
+  win.appendChild(bodyWrap);
+
+  const footWrap = document.createElement('div');
+  footWrap.slot = 'footer';
+  footWrap.innerHTML = `
+    <tf-button variant="secondary" data-action="cancel" label="${escapeAttr(I18n.t('common.cancel'))}"></tf-button>
+    <tf-button variant="primary" data-action="${escapeAttr(submitAction)}" label="${escapeAttr(submitLabel)}"></tf-button>
+  `;
+  win.appendChild(footWrap);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.appendChild(backdrop);
+  document.body.appendChild(win);
+
+  const cleanup = () => {
+    if (win.isConnected) win.remove();
+    if (backdrop.isConnected) backdrop.remove();
+  };
+
+  win.addEventListener('action', async (e) => {
+    const action = e.detail?.action;
+    if (action === 'cancel' || action === 'close') {
+      cleanup();
+      return;
+    }
+    if (action === submitAction) {
+      e.preventDefault();
+      try {
+        const ok = await onSubmit(win);
+        if (ok) {
+          cleanup();
+          await loadData();
+          renderActiveTab();
+        }
+      } catch (err) {
+        const errBox = win.querySelector('.form-error');
+        if (errBox) {
+          errBox.textContent = err.message;
+          errBox.hidden = false;
+        }
+      }
+    }
+  });
+
+  return win;
+}
+
 function openPairModal() {
   // Modal: node_id hex + PIN (outgoing — uzytkownik inicjuje).
-  const html = `
-    <div class="modal-backdrop active" id="pair-modal">
-      <div class="modal">
-        <div class="modal-header">
-          <h3 class="modal-title">${escapeHtml(I18n.t('mesh.pair_title'))}</h3>
-          <button class="modal-close" id="pair-close">×</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('mesh.pair_node_id_label'))}</label>
-            <input class="input" id="pair-node-id" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="64">
-          </div>
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('mesh.pair_pin_label'))}</label>
-            <input class="input" id="pair-pin" placeholder="000000" maxlength="6" inputmode="numeric" style="text-align:center;letter-spacing:0.2em;">
-            <div class="form-hint">${escapeHtml(I18n.t('mesh.pair_pin_hint'))}</div>
-          </div>
-          <div class="form-error" id="pair-error" hidden></div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" id="pair-cancel">${escapeHtml(I18n.t('common.cancel'))}</button>
-          <button class="btn btn-primary" id="pair-submit">${escapeHtml(I18n.t('mesh.pair'))}</button>
-        </div>
-      </div>
-    </div>
+  const bodyHtml = `
+    <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="64"></tf-input>
+    <tf-input id="pair-pin" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000000" maxlength="6" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.pair_pin_hint'))}"></tf-input>
+    <div class="form-error" hidden></div>
   `;
-  document.body.insertAdjacentHTML('beforeend', html);
-  const close = () => byId('pair-modal')?.remove();
-  byId('pair-close')?.addEventListener('click', close);
-  byId('pair-cancel')?.addEventListener('click', close);
-  byId('pair-submit')?.addEventListener('click', async () => {
-    const idHex = byId('pair-node-id').value.trim().toLowerCase();
-    const pin = byId('pair-pin').value.trim();
-    const err = byId('pair-error');
-    if (!/^[0-9a-f]{64}$/.test(idHex)) {
-      err.textContent = I18n.t('mesh.pair_invalid_node_id');
-      err.hidden = false;
-      return;
-    }
-    if (!/^\d{6}$/.test(pin)) {
-      err.textContent = I18n.t('mesh.pair_invalid_pin');
-      err.hidden = false;
-      return;
-    }
-    try {
+  createPairWindow({
+    title: I18n.t('mesh.pair_title'),
+    bodyHtml,
+    submitLabel: I18n.t('mesh.pair'),
+    submitAction: 'pair',
+    onSubmit: async (win) => {
+      const idHex = (win.querySelector('#pair-node-id')?.value || '').trim().toLowerCase();
+      const pin = (win.querySelector('#pair-pin')?.value || '').trim();
+      const errBox = win.querySelector('.form-error');
+      if (!/^[0-9a-f]{64}$/.test(idHex)) {
+        errBox.textContent = I18n.t('mesh.pair_invalid_node_id');
+        errBox.hidden = false;
+        return false;
+      }
+      if (!/^\d{6}$/.test(pin)) {
+        errBox.textContent = I18n.t('mesh.pair_invalid_pin');
+        errBox.hidden = false;
+        return false;
+      }
       await apiPost(`/api/mesh/pair/${encodeURIComponent(idHex)}`, { pin });
       toast(I18n.t('mesh.pair_success'), 'success');
-      close();
-      await loadData();
-      renderActiveTab();
-    } catch (e) {
-      err.textContent = e.message;
-      err.hidden = false;
-    }
+      return true;
+    },
   });
 }
 
 function openPinModal(nodeId) {
   // PIN dla outgoing pair — skrot gdy node juz wykryty.
-  const html = `
-    <div class="modal-backdrop active" id="pin-modal">
-      <div class="modal">
-        <div class="modal-header">
-          <h3 class="modal-title">${escapeHtml(I18n.t('mesh.pair_pin_title'))}</h3>
-          <button class="modal-close" id="pin-close">×</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('mesh.pair_pin_label'))}</label>
-            <input class="input" id="pin-input" placeholder="000000" maxlength="6" inputmode="numeric" style="text-align:center;letter-spacing:0.2em;">
-            <div class="form-hint">${escapeHtml(I18n.t('mesh.pair_pin_hint'))}</div>
-          </div>
-          <div class="form-error" id="pin-error" hidden></div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" id="pin-cancel">${escapeHtml(I18n.t('common.cancel'))}</button>
-          <button class="btn btn-primary" id="pin-submit">${escapeHtml(I18n.t('mesh.pair'))}</button>
-        </div>
-      </div>
-    </div>
+  const bodyHtml = `
+    <tf-input id="pin-input" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000000" maxlength="6" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.pair_pin_hint'))}"></tf-input>
+    <div class="form-error" hidden></div>
   `;
-  document.body.insertAdjacentHTML('beforeend', html);
-  const close = () => byId('pin-modal')?.remove();
-  byId('pin-close')?.addEventListener('click', close);
-  byId('pin-cancel')?.addEventListener('click', close);
-  byId('pin-submit')?.addEventListener('click', async () => {
-    const pin = byId('pin-input').value.trim();
-    const err = byId('pin-error');
-    if (!/^\d{6}$/.test(pin)) {
-      err.textContent = I18n.t('mesh.pair_invalid_pin');
-      err.hidden = false;
-      return;
-    }
-    try {
+  createPairWindow({
+    title: I18n.t('mesh.pair_pin_title'),
+    bodyHtml,
+    submitLabel: I18n.t('mesh.pair'),
+    submitAction: 'pair',
+    onSubmit: async (win) => {
+      const pin = (win.querySelector('#pin-input')?.value || '').trim();
+      const errBox = win.querySelector('.form-error');
+      if (!/^\d{6}$/.test(pin)) {
+        errBox.textContent = I18n.t('mesh.pair_invalid_pin');
+        errBox.hidden = false;
+        return false;
+      }
       await apiPost(`/api/mesh/pair/${encodeURIComponent(nodeId)}`, { pin });
       toast(I18n.t('mesh.pair_success'), 'success');
-      close();
-      await loadData();
-      renderActiveTab();
-    } catch (e) {
-      err.textContent = e.message;
-      err.hidden = false;
-    }
+      return true;
+    },
   });
 }
 
 function openConfirmPinModal(nodeId) {
   // PIN dla incoming pairing confirm.
-  const html = `
-    <div class="modal-backdrop active" id="confirm-pin-modal">
-      <div class="modal">
-        <div class="modal-header">
-          <h3 class="modal-title">${escapeHtml(I18n.t('mesh.confirm_pin_title'))}</h3>
-          <button class="modal-close" id="confirm-pin-close">×</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('mesh.pair_pin_label'))}</label>
-            <input class="input" id="confirm-pin-input" placeholder="000000" maxlength="6" inputmode="numeric" style="text-align:center;letter-spacing:0.2em;">
-            <div class="form-hint">${escapeHtml(I18n.t('mesh.confirm_pin_hint'))}</div>
-          </div>
-          <div class="form-error" id="confirm-pin-error" hidden></div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" id="confirm-pin-cancel">${escapeHtml(I18n.t('common.cancel'))}</button>
-          <button class="btn btn-primary" id="confirm-pin-submit">${escapeHtml(I18n.t('mesh.confirm_pairing'))}</button>
-        </div>
-      </div>
-    </div>
+  const bodyHtml = `
+    <tf-input id="confirm-pin-input" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000000" maxlength="6" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.confirm_pin_hint'))}"></tf-input>
+    <div class="form-error" hidden></div>
   `;
-  document.body.insertAdjacentHTML('beforeend', html);
-  const close = () => byId('confirm-pin-modal')?.remove();
-  byId('confirm-pin-close')?.addEventListener('click', close);
-  byId('confirm-pin-cancel')?.addEventListener('click', close);
-  byId('confirm-pin-submit')?.addEventListener('click', async () => {
-    const pin = byId('confirm-pin-input').value.trim();
-    const err = byId('confirm-pin-error');
-    if (!/^\d{6}$/.test(pin)) {
-      err.textContent = I18n.t('mesh.pair_invalid_pin');
-      err.hidden = false;
-      return;
-    }
-    try {
+  createPairWindow({
+    title: I18n.t('mesh.confirm_pin_title'),
+    bodyHtml,
+    submitLabel: I18n.t('mesh.confirm_pairing'),
+    submitAction: 'confirm',
+    onSubmit: async (win) => {
+      const pin = (win.querySelector('#confirm-pin-input')?.value || '').trim();
+      const errBox = win.querySelector('.form-error');
+      if (!/^\d{6}$/.test(pin)) {
+        errBox.textContent = I18n.t('mesh.pair_invalid_pin');
+        errBox.hidden = false;
+        return false;
+      }
       await apiPost(`/api/mesh/pair/${encodeURIComponent(nodeId)}/confirm`, { pin });
       toast(I18n.t('mesh.pair_confirm_success'), 'success');
-      close();
-      await loadData();
-      renderActiveTab();
-    } catch (e) {
-      err.textContent = e.message;
-      err.hidden = false;
-    }
+      return true;
+    },
   });
 }
 

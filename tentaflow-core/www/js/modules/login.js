@@ -1,15 +1,16 @@
 // =============================================================================
 // Plik: modules/login.js
 // Opis: Ekran logowania uzywajacy `authLoginRequest` z protokolu binarnego.
-//       Po sukcesie zapisuje JWT i wywoluje callback `onSuccess`. Etykiety
-//       i komunikaty bledow pochodza z modulu I18n; przelacznik jezyka renderuje
-//       sie nad formularzem.
+//       Po sukcesie zapisuje JWT i wywoluje callback `onSuccess`. Formularz
+//       zbudowany z komponentow tf-* (tf-input, tf-select, tf-button);
+//       etykiety pochodza z modulu I18n. Przelacznik jezyka nad formularzem.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml } from '/js/utils.js';
 import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import FaceBackground from '/js/modules/faceBackground.js';
+import { Sfx } from '/js/lib/sfx.js';
 
 const LoginScreen = {
   render() {
@@ -23,22 +24,18 @@ const LoginScreen = {
           </div>
 
           <div style="display: flex; justify-content: flex-end; margin-bottom: 8px;">
-            <select id="login-lang" style="padding: 6px 10px; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 12px;" title="${escapeHtml(I18n.t('lang.label'))}">
+            <tf-select id="login-lang" title="${escapeHtml(I18n.t('lang.label'))}">
               ${SUPPORTED_LANGS.map((l) => `
                 <option value="${l.code}" ${l.code === I18n.getLanguage() ? 'selected' : ''}>${l.flag} ${escapeHtml(l.label)}</option>
               `).join('')}
-            </select>
+            </tf-select>
           </div>
 
           <form id="login-form">
-            <label for="login-username">${escapeHtml(I18n.t('login.username'))}</label>
-            <input id="login-username" type="text" autocomplete="username" required autofocus>
-            <label for="login-password">${escapeHtml(I18n.t('login.password'))}</label>
-            <input id="login-password" type="password" autocomplete="current-password" required>
-            <button class="btn btn-primary login-submit" type="submit" id="login-submit">
-              ${escapeHtml(I18n.t('login.submit'))}
-            </button>
-            <div id="login-error" class="login-error" style="display: none;"></div>
+            <tf-input id="login-username" type="text" label="${escapeHtml(I18n.t('login.username'))}" autocomplete="username" required autofocus></tf-input>
+            <tf-input id="login-password" type="password" label="${escapeHtml(I18n.t('login.password'))}" autocomplete="current-password" required></tf-input>
+            <tf-button id="login-submit" variant="primary" size="md" type="submit" label="${escapeHtml(I18n.t('login.submit'))}"></tf-button>
+            <div id="login-error" class="tf-error-text" style="display: none;"></div>
           </form>
         </div>
       </div>
@@ -53,7 +50,7 @@ const LoginScreen = {
     const errorEl = byId('login-error');
 
     byId('login-lang')?.addEventListener('change', async (e) => {
-      await I18n.setLanguage(e.target.value);
+      await I18n.setLanguage(e.detail.value);
       const root = byId('app-root');
       root.innerHTML = LoginScreen.render();
       LoginScreen.mount({ onSuccess });
@@ -65,24 +62,34 @@ const LoginScreen = {
       const password = byId('login-password').value;
       if (!username || !password) return;
 
-      submitBtn.disabled = true;
-      submitBtn.textContent = `${I18n.t('login.submit')}…`;
+      submitBtn.setAttribute('disabled', '');
+      submitBtn.setAttribute('label', `${I18n.t('login.submit')}…`);
       errorEl.style.display = 'none';
 
       try {
         const result = await ApiBinary.action('authLoginRequest', { username, password });
         if (result.variant === 'AuthLoginResponse' && result.jwt) {
           ApiBinary.setJwt(result.jwt);
-          FaceBackground.hide();
-          onSuccess();
+          // Kinematograficzne przejście: zoom do oka → reveal UI.
+          // Karta logowania fade-outuje przez klasę CSS, UI montujemy
+          // w onMidpoint (ok. 1.1 s), face-bg chowa się w onComplete.
+          const loginCard = document.querySelector('.login-card');
+          if (loginCard) loginCard.classList.add('is-transitioning');
+          Sfx.play('login-success');
+          FaceBackground.transitionOut({
+            onMidpoint: () => onSuccess(),
+            onComplete: () => {},
+          });
         } else {
           throw new Error(I18n.t('common.error'));
         }
       } catch (err) {
         errorEl.textContent = err.message ?? I18n.t('common.error');
         errorEl.style.display = 'block';
-        submitBtn.disabled = false;
-        submitBtn.textContent = I18n.t('login.submit');
+        submitBtn.removeAttribute('disabled');
+        submitBtn.setAttribute('label', I18n.t('login.submit'));
+        FaceBackground.shakeHead();
+        Sfx.play('login-fail');
       }
     });
   },

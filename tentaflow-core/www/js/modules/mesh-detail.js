@@ -4,7 +4,7 @@
 //       status + add service), system info row, VRAM summary (suma po GPU),
 //       2-kolumnowy CPU + Memory, karty per-GPU (usage + VRAM + temp + power),
 //       sekcja network interfaces, tabela kontenerow. Auto-refresh 2s gdy
-//       tab widoczny, 5s gdy ukryty.
+//       tab widoczny, 5s gdy ukryty. UI na komponentach tf-* (button, chip).
 // =============================================================================
 
 import {
@@ -18,6 +18,8 @@ import {
   formatBytes,
 } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import '/js/components/tf-button.js';
+import '/js/components/tf-chip.js';
 
 let currentNodeId = null;
 let nodeData = null;
@@ -117,7 +119,7 @@ function renderSkeleton() {
   return `
     <div class="mesh-detail">
       <div class="mesh-detail-topbar">
-        <button class="btn btn-ghost btn-sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</button>
+        <tf-button variant="ghost" size="sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</tf-button>
         <div class="mesh-detail-title"><span class="skeleton" style="display:inline-block;width:200px;height:24px;"></span></div>
       </div>
       <div class="mesh-detail-vram"><div class="skeleton" style="width:100%;height:32px;"></div></div>
@@ -137,7 +139,7 @@ function renderDetail() {
     content.innerHTML = `
       <div class="mesh-detail">
         <div class="mesh-detail-topbar">
-          <button class="btn btn-ghost btn-sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</button>
+          <tf-button variant="ghost" size="sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</tf-button>
         </div>
         <div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('mesh.load_error'))}</div></div>
       </div>
@@ -150,8 +152,8 @@ function renderDetail() {
   const hostname = n.hostname || n.node_id?.slice(0, 12) || I18n.t('mesh.unknown_host');
   const online = isOnline(n);
   const statusChip = online
-    ? `<span class="tag-status online">● ${escapeHtml(I18n.t('mesh.online'))}</span>`
-    : `<span class="tag-status offline">● ${escapeHtml(I18n.t('mesh.offline'))}</span>`;
+    ? `<tf-chip status="online" dot>${escapeHtml(I18n.t('mesh.online'))}</tf-chip>`
+    : `<tf-chip status="offline" dot>${escapeHtml(I18n.t('mesh.offline'))}</tf-chip>`;
 
   const systemInfo = buildSystemInfo(n);
   const vramBar = buildVramSummary(n);
@@ -167,9 +169,9 @@ function renderDetail() {
   content.innerHTML = `
     <div class="mesh-detail${freshness}">
       <div class="mesh-detail-topbar">
-        <button class="btn btn-ghost btn-sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</button>
+        <tf-button variant="ghost" size="sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</tf-button>
         <div class="mesh-detail-title">
-          <div class="name">${escapeHtml(hostname)}${n.is_local ? ` <span class="pill pill-local">${escapeHtml(I18n.t('mesh.local'))}</span>` : ''}</div>
+          <div class="name">${escapeHtml(hostname)}${n.is_local ? ` <tf-chip status="accent">${escapeHtml(I18n.t('mesh.local'))}</tf-chip>` : ''}</div>
           ${statusChip}
         </div>
         <div class="mesh-detail-actions"></div>
@@ -340,7 +342,7 @@ function buildModelsList(n) {
         <span class="model-alias"><code>${escapeHtml(m.alias || '—')}</code></span>
         <span class="model-backend">${escapeHtml(m.backend || '—')}</span>
         ${m.size_mb ? `<span class="model-size">${formatMb(m.size_mb)}</span>` : ''}
-        ${m.loaded ? `<span class="tag-status online">● ${escapeHtml(I18n.t('mesh.loaded'))}</span>` : `<span class="tag-status offline">${escapeHtml(I18n.t('mesh.unloaded'))}</span>`}
+        ${m.loaded ? `<tf-chip status="online" dot>${escapeHtml(I18n.t('mesh.loaded'))}</tf-chip>` : `<tf-chip status="offline">${escapeHtml(I18n.t('mesh.unloaded'))}</tf-chip>`}
       </div>
     `;
   }).join('');
@@ -362,9 +364,9 @@ function buildContainersTable(n) {
       ? `${formatMb(c.memory_mb || 0)} / ${formatMb(c.memory_limit_mb)}`
       : formatMb(c.memory_mb || 0);
     const actions = running
-      ? `<button class="btn btn-ghost btn-sm" data-container-action="stop" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.stop'))}</button>
-         <button class="btn btn-ghost btn-sm" data-container-action="restart" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.restart'))}</button>`
-      : `<button class="btn btn-ghost btn-sm" data-container-action="start" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.start'))}</button>`;
+      ? `<tf-button variant="ghost" size="sm" data-container-action="stop" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.stop'))}</tf-button>
+         <tf-button variant="ghost" size="sm" data-container-action="restart" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.restart'))}</tf-button>`
+      : `<tf-button variant="ghost" size="sm" data-container-action="start" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.start'))}</tf-button>`;
     return `
       <tr>
         <td><strong>${escapeHtml(c.name || '—')}</strong></td>

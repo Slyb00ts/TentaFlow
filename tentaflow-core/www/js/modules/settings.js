@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: modules/settings.js
-// Opis: Lista ustawien + bulk update.
+// Opis: Lista ustawien + bulk update. Uzywa komponentow tf-button, tf-input, tf-chip.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -15,7 +15,7 @@ const SettingsScreen = {
     return `
       <div class="content-header">
         <h1>Ustawienia</h1>
-        <button class="btn btn-primary" id="btn-save-settings" disabled>Zapisz zmiany</button>
+        <tf-button variant="primary" id="btn-save-settings" disabled label="Zapisz zmiany"></tf-button>
       </div>
       <div class="card" id="settings-host"></div>`;
   },
@@ -35,28 +35,48 @@ function renderForm() {
     host.innerHTML = `<div class="empty-state"><div class="empty-state-text">Brak ustawień</div></div>`;
     return;
   }
-  host.innerHTML = entries.map((e) => `
-    <div class="form-row">
-      <label class="label" for="set-${escapeHtml(e.key)}">
-        ${escapeHtml(e.key)}
-        ${e.isSecret ? '<span class="badge badge-warning" style="margin-left: var(--space-2);">secret</span>' : ''}
-      </label>
-      <input class="input" id="set-${escapeHtml(e.key)}"
-        type="${e.isSecret ? 'password' : 'text'}"
-        value="${e.isSecret ? '' : escapeHtml(e.value)}"
-        placeholder="${e.isSecret ? '<redacted> — wpisz, aby zaktualizować' : ''}"
-        data-key="${escapeHtml(e.key)}"
-        data-secret="${e.isSecret}">
-    </div>
-  `).join('');
-  host.querySelectorAll('input[data-key]').forEach((input) => {
-    input.addEventListener('input', () => {
+  host.innerHTML = entries.map((e) => {
+    const keyEsc = escapeHtml(e.key);
+    const type = e.isSecret ? 'password' : 'text';
+    const value = e.isSecret ? '' : escapeHtml(e.value);
+    const placeholder = e.isSecret ? '<redacted> — wpisz, aby zaktualizować' : '';
+    if (e.isSecret) {
+      return `
+        <div class="form-row">
+          <tf-input
+            id="set-${keyEsc}"
+            type="${type}"
+            value="${value}"
+            placeholder="${placeholder}"
+            data-key="${keyEsc}"
+            data-secret="true"><span slot="label">${keyEsc} <tf-chip status="warn">secret</tf-chip></span></tf-input>
+        </div>
+      `;
+    }
+    return `
+      <div class="form-row">
+        <tf-input
+          id="set-${keyEsc}"
+          type="${type}"
+          label="${keyEsc}"
+          value="${value}"
+          placeholder="${placeholder}"
+          data-key="${keyEsc}"
+          data-secret="false"></tf-input>
+      </div>
+    `;
+  }).join('');
+  host.querySelectorAll('tf-input[data-key]').forEach((input) => {
+    input.addEventListener('input', (ev) => {
+      const val = ev.detail?.value ?? input.value;
       dirty.set(input.dataset.key, {
         key: input.dataset.key,
-        value: input.value,
+        value: val,
         isSecret: input.dataset.secret === 'true',
       });
-      byId('btn-save-settings').disabled = dirty.size === 0;
+      const btn = byId('btn-save-settings');
+      if (dirty.size === 0) btn.setAttribute('disabled', '');
+      else btn.removeAttribute('disabled');
     });
   });
 }
@@ -72,7 +92,7 @@ async function save() {
     const r = await ApiBinary.action('settingsUpdateRequest', { entries: updates });
     toast(`Zapisano ${r.applied} ustawień`, 'success');
     dirty.clear();
-    byId('btn-save-settings').disabled = true;
+    byId('btn-save-settings').setAttribute('disabled', '');
   } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
 }
 

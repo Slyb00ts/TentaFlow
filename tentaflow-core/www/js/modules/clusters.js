@@ -13,13 +13,15 @@ const ClustersScreen = {
       <div class="content-header"><h1>Klastry</h1></div>
       <div class="card">
         <h3 class="card-title" style="margin-bottom: var(--space-4);">Edytuj cluster</h3>
-        <div class="form-row"><label class="label" for="cl-id">Cluster ID</label>
-          <input class="input" id="cl-id" placeholder="dev"></div>
-        <div class="form-row"><label class="label" for="cl-name">Nazwa</label>
-          <input class="input" id="cl-name"></div>
+        <div class="form-row">
+          <tf-input id="cl-id" label="Cluster ID" placeholder="dev"></tf-input>
+        </div>
+        <div class="form-row">
+          <tf-input id="cl-name" label="Nazwa"></tf-input>
+        </div>
         <div class="form-row"><label class="label" for="cl-desc">Opis</label>
           <textarea class="textarea" id="cl-desc"></textarea></div>
-        <button class="btn btn-primary" id="cl-save">Zapisz zmiany</button>
+        <tf-button variant="primary" id="cl-save">Zapisz zmiany</tf-button>
         <p style="margin-top: var(--space-4); color: var(--color-text-muted); font-size: var(--text-sm);">
           Pełna lista klastrów + tworzenie/usuwanie wymaga osobnych wariantów (ClusterListRequest itd.) — dokładamy w kolejnym kroku.
         </p>
