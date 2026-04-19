@@ -386,7 +386,7 @@ fn build_engine_support(
     let has_metal = gpu.metal_available;
     let has_any_gpu = has_cuda || has_rocm || has_xpu || has_metal;
     let has_docker = backends.contains(&DeployBackend::Docker);
-    let has_python = runtimes.python.is_some();
+    let _has_python = runtimes.python.is_some();
 
     // Helper text pokazujacy ktory backend wygrywa
     let gpu_reason = || -> String {

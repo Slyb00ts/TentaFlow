@@ -142,7 +142,7 @@ impl MeshCommandExecutor {
             MeshCommandType::BandwidthProbe {
                 target_ip,
                 target_port,
-                rdma_port,
+                rdma_port: _,
                 bind_interface,
                 duration_ms,
                 mode,
@@ -170,7 +170,7 @@ impl MeshCommandExecutor {
                         };
 
                         // Probuj RDMA server na osobnym porcie (jesli dostepne)
-                        let mut rdma_port: u16 = 0;
+                        let rdma_port: u16 = 0;
                         #[cfg(feature = "rdma-probe")]
                         if let Some(rdma_dev) = crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface) {
                             match crate::mesh::rdma_probe::start_rdma_probe_server(

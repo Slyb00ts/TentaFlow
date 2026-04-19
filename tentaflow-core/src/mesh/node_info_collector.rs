@@ -86,13 +86,19 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     let handle = std::thread::spawn(move || {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
         });
 
-        // Zbierz adaptery ze wszystkich backendow
-        let all_adapters: Vec<wgpu::AdapterInfo> = instance.enumerate_adapters(wgpu::Backends::all())
+        // Zbierz adaptery ze wszystkich backendow — wgpu 29 zwraca Future
+        let adapters: Vec<wgpu::Adapter> = futures::executor::block_on(
+            instance.enumerate_adapters(wgpu::Backends::all())
+        );
+        let all_adapters: Vec<wgpu::AdapterInfo> = adapters
             .into_iter()
             .map(|a| a.get_info())
             .filter(|info| info.device_type != wgpu::DeviceType::Cpu)
@@ -108,7 +114,7 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
             wgpu::Backend::Gl,
         ].iter().find(|&&b| all_adapters.iter().any(|a| a.backend == b)).copied();
 
-        let mut gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
+        let gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
             all_adapters.iter()
                 .filter(|a| a.backend == backend)
                 .map(|info| {

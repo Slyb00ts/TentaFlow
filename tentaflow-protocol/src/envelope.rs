@@ -23,7 +23,23 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Envelope.sequence u32 -> u64 (overflow bug fix)
 ///   - SessionAuth::UserSession adds `role: Option<String>` (RBAC)
 ///   - Resume tokens now bind to originating_user_id (P0 fix)
-pub const SCHEMA_VERSION: u16 = 3;
+/// v4 changes (2026-04-18):
+///   - ServiceSummary rozszerzony o name/service_type/strategy/config_json/
+///     node_id/node_hostname/created_at (migracja funkcjonalnosci wwwroot)
+///   - Nowe wiadomosci ServiceCreateRequest/Response, ServiceUpdateRequest/Response
+///   - Nowe wiadomosci ServiceQuicStatusRequest/Response do monitorowania QUIC
+/// v5 changes (2026-04-18): BREAKING — brak backward compat z nodami na v4
+///   - Mesh transport zmieniony z quinn (custom TLS + ChaCha20-Poly1305 wrap +
+///     epoch rotation + nonce counter + sliding window replay) na iroh
+///     (QUIC z TLS 1.3 + relay fallback + LAN mDNS + DHT pkarr discovery).
+///   - MeshPeerSummary.endpoint pole porzucone — iroh rozwiazuje adres po
+///     EndpointId (wczesniej NodeId).
+///   - ALPN zmienione na `tentaflow-mesh/v1`, `tentaflow-pairing/v1`,
+///     `tentaflow-api/v1`.
+///   - Custom AEAD/replay/rotation usunieta z `mesh/security.rs` — bezpieczenstwo
+///     transportu zapewnia iroh TLS. Zostaje Ed25519 identity, trusted_keys,
+///     PIN pairing + X25519 pin-proof derywacja, TrustRevoked broadcast.
+pub const SCHEMA_VERSION: u16 = 5;
 
 // =============================================================================
 // Message kind discriminants

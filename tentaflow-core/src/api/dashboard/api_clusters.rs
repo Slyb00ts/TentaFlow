@@ -186,7 +186,7 @@ pub struct ProbeInterfaceEntry {
 /// Zwraca probe_id. Wyniki streamowane przez GET /api/clusters/probe/:id (SSE).
 pub async fn handle_start_probe(
     body: &[u8],
-    quic_mesh: Arc<crate::mesh::quic_mesh::QuicMeshManager>,
+    quic_mesh: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
 ) -> Result<(u16, String)> {
     // Limit rozmiaru body (max 64KB)
     if body.len() > 65536 {
@@ -302,7 +302,7 @@ pub async fn handle_delete_probe(probe_id: &str) -> Result<(u16, String)> {
 /// Scheduler z matryca zajetosci: nie testuj rownoczesnie na tym samym interfejsie.
 /// Po kazdym tescie SSE event aktualizuje GUI.
 async fn run_probe_orchestration(
-    qm: Arc<crate::mesh::quic_mesh::QuicMeshManager>,
+    qm: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
     pairs: Vec<(NodeInterface, NodeInterface)>,
     tx: mpsc::Sender<String>,
     _probe_id: String,
@@ -416,7 +416,7 @@ async fn run_probe_orchestration(
 
 /// Probuje jedna pare interfejsow: serwer na node_b, klient na node_a
 async fn probe_pair(
-    qm: &crate::mesh::quic_mesh::QuicMeshManager,
+    qm: &crate::mesh::iroh_manager::IrohMeshManager,
     iface_a: &NodeInterface,
     iface_b: &NodeInterface,
     nonce: &[u8; 32],
@@ -456,13 +456,13 @@ async fn probe_pair(
         ).await {
             Ok((port, handle)) => {
                 tokio::spawn(async move { let _ = handle.await; });
-                crate::mesh::quic_mesh::CommandWaitResponse {
+                crate::mesh::iroh_manager::CommandWaitResponse { command_id: String::new(),
                     success: true,
                     output: serde_json::json!({"port": port}).to_string(),
                     error: None,
                 }
             }
-            Err(e) => crate::mesh::quic_mesh::CommandWaitResponse {
+            Err(e) => crate::mesh::iroh_manager::CommandWaitResponse { command_id: String::new(),
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
@@ -526,7 +526,7 @@ async fn probe_pair(
                     "latency_us": result.latency_us,
                     "streams_completed": result.streams_completed,
                 }).to_string();
-                crate::mesh::quic_mesh::CommandWaitResponse {
+                crate::mesh::iroh_manager::CommandWaitResponse { command_id: String::new(),
                     success: true,
                     output,
                     error: None,
@@ -534,7 +534,7 @@ async fn probe_pair(
             }
             Err(e) => {
                 tracing::error!("  Lokalny probe client failed: {}", e);
-                crate::mesh::quic_mesh::CommandWaitResponse {
+                crate::mesh::iroh_manager::CommandWaitResponse { command_id: String::new(),
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),

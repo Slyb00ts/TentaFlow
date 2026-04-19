@@ -31,12 +31,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Inicjalizacja CryptoProvider dla rustls (wymagane przed uzyciem TLS)
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Blad instalacji CryptoProvider");
-
-
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -50,15 +44,15 @@ async fn main() -> Result<()> {
     let config = MeetingConfig::load(&args.config)?;
     tracing::info!(meeting_url = %config.meeting_url, "Konfiguracja zaladowana");
 
-    // 2. Uruchom serwer QUIC — router laczy sie do kontenera
+    // 2. Uruchom serwer iroh — router laczy sie do kontenera po EndpointId
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let quic_config = quic_server::ContainerQuicConfig {
-        port: config.quic_port,
-        tls_cert: config.tls_cert.clone(),
-        tls_key: config.tls_key.clone(),
-        ..Default::default()
+    let transport_config = quic_server::ContainerTransportConfig {
+        port: config.transport_port,
+        secret_key_path: config.secret_key_path.clone(),
+        enable_lan_discovery: config.enable_lan_discovery,
+        enable_dht_discovery: config.enable_dht_discovery,
     };
-    let quic = quic_server::MeetingQuicServer::new(quic_config);
+    let quic = quic_server::MeetingQuicServer::new(transport_config);
     let transcript_tx = quic.transcript_sender();
     let router_client_handle = quic.router_client_handle();
     let mut command_rx = quic.command_receiver().await
@@ -66,10 +60,10 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         if let Err(e) = quic.run(shutdown_rx).await {
-            tracing::error!("Blad serwera QUIC: {}", e);
+            tracing::error!("Blad serwera iroh: {}", e);
         }
     });
-    tracing::info!(port = config.quic_port, "Serwer QUIC kontenera uruchomiony");
+    tracing::info!(port = config.transport_port, "Serwer iroh kontenera uruchomiony");
 
     // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do STT/TTS)
     tracing::info!("Czekam na polaczenie routera...");

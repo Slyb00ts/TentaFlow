@@ -4,7 +4,7 @@
 //       Eksportuje ujednolicone type aliasy i funkcje do operacji na WASM.
 // =============================================================================
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::info;
 use wasmtime::{Config, OptLevel};
 
@@ -60,7 +60,7 @@ pub fn create_engine() -> Result<WasmEngine> {
     config.memory_reservation_for_growth(0);
 
     let engine = WasmEngine::new(&config)
-        .context("Nie udalo sie utworzyc silnika Wasmtime")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc silnika Wasmtime: {e}"))?;
 
     info!("Silnik Wasmtime utworzony (fuel metering + epoch interruption)");
 
@@ -74,7 +74,7 @@ pub fn create_engine() -> Result<WasmEngine> {
 /// Kompiluje bajty WASM do modulu Wasmtime z walidacja
 pub fn compile_module(engine: &WasmEngine, wasm_bytes: &[u8]) -> Result<WasmModule> {
     let module = WasmModule::new(engine, wasm_bytes)
-        .context("Nie udalo sie skompilowac modulu WASM")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie skompilowac modulu WASM: {e}"))?;
 
     info!(
         "Modul WASM skompilowany ({} bajtow, {} eksportow)",
@@ -95,7 +95,7 @@ pub fn create_store(engine: &WasmEngine, state: AddonState) -> Result<WasmStore<
 
     // Ustaw poczatkowe paliwo — addon zuzywa paliwo z kazdej instrukcji WASM
     store.set_fuel(DEFAULT_FUEL_LIMIT)
-        .context("Nie udalo sie ustawic paliwa")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie ustawic paliwa: {e}"))?;
 
     // Ustaw epoch deadline — pozwala na przerywanie z innego watku
     store.epoch_deadline_async_yield_and_update(1);
@@ -109,14 +109,14 @@ pub fn create_store(engine: &WasmEngine, state: AddonState) -> Result<WasmStore<
 /// Doladowuje paliwo w istniejacym store (np. po wznowieniu operacji)
 pub fn refuel_store(store: &mut WasmStore<AddonState>, fuel: u64) -> Result<()> {
     store.set_fuel(fuel)
-        .context("Nie udalo sie doladowac paliwa")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie doladowac paliwa: {e}"))?;
     Ok(())
 }
 
 /// Sprawdza ile paliwa pozostalo w store
 pub fn remaining_fuel(store: &WasmStore<AddonState>) -> Result<u64> {
     store.get_fuel()
-        .context("Nie udalo sie odczytac poziomu paliwa")
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac poziomu paliwa: {e}"))
 }
 
 // =============================================================================
@@ -129,12 +129,12 @@ pub fn get_memory(caller: &mut WasmCaller<'_, AddonState>) -> Option<WasmMemory>
 }
 
 /// Zwraca slice danych z pamieci guest (immutable)
-pub fn memory_data<'a, T: 'a>(memory: &WasmMemory, store: &'a impl AsContext<Data = T>) -> &'a [u8] {
+pub fn memory_data<'a, T: 'static>(memory: &WasmMemory, store: &'a impl AsContext<Data = T>) -> &'a [u8] {
     memory.data(store)
 }
 
 /// Zwraca mutowalny slice danych z pamieci guest
-pub fn memory_data_mut<'a, T: 'a>(memory: &WasmMemory, store: &'a mut impl AsContextMut<Data = T>) -> &'a mut [u8] {
+pub fn memory_data_mut<'a, T: 'static>(memory: &WasmMemory, store: &'a mut impl AsContextMut<Data = T>) -> &'a mut [u8] {
     memory.data_mut(store)
 }
 
@@ -150,5 +150,5 @@ pub fn instantiate(
     module: &WasmModule,
 ) -> Result<WasmInstance> {
     linker.instantiate(store, module)
-        .context("Nie udalo sie utworzyc instancji WASM")
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc instancji WASM: {e}"))
 }

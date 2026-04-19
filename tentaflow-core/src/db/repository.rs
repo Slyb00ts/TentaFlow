@@ -282,6 +282,17 @@ pub fn delete_service(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Ustawia `node_id` serwisu (hex-enkodowany klucz mesh) lub czysci pole
+/// jezeli przekazano `None`. Aktualizuje `updated_at` do bierzacego czasu.
+pub fn set_service_node_id(pool: &DbPool, id: i64, node_id: Option<&str>) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE services SET node_id = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, node_id],
+    )?;
+    Ok(())
+}
+
 /// Kaskadowe usuwanie serwisu po nazwie: backendy, modele, serwis
 pub fn delete_service_cascade_by_name(pool: &DbPool, name: &str) -> Result<u32> {
     let conn = acquire(pool)?;

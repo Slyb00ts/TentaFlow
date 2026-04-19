@@ -1297,14 +1297,10 @@ impl ServiceManager {
                         info!("Memory '{}': Callback listener started", name_clone);
 
                         loop {
-                            // Pobierz connection
-                            let conn_arc = client_for_callback.connection();
-                            let conn_guard = conn_arc.lock().await;
-                            let conn = match conn_guard.as_ref() {
-                                Some(c) => c.clone(),
-                                None => {
-                                    drop(conn_guard); // Zwolnij lock przed sleep
-                                    // Czekaj na reconnect lub shutdown
+                            // Pobierz aktywne polaczenie iroh (z auto-reconnect).
+                            let conn = match client_for_callback.iroh_connection().await {
+                                Ok(c) => c,
+                                Err(_) => {
                                     tokio::select! {
                                         _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
                                             continue;
@@ -1314,9 +1310,9 @@ impl ServiceManager {
                                             break;
                                         }
                                     }
+                                    continue;
                                 }
                             };
-                            drop(conn_guard); // Zwolnij lock po pobraniu connection
 
                             // Accept incoming bi-directional stream (callback od Memory)
                             tokio::select! {
@@ -1381,7 +1377,7 @@ impl ServiceManager {
                                                 }
                                             });
                                         }
-                                        Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                                        Err(iroh::endpoint::ConnectionError::ApplicationClosed { .. }) => {
                                             info!("Memory '{}': Connection closed by server", name_clone);
                                             break;
                                         }

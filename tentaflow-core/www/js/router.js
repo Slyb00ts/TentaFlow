@@ -33,25 +33,21 @@ export const Router = {
     currentScreen = screen;
 
     // Sidebar active.
-    document.querySelectorAll('.nav-item[data-view]').forEach((el) => {
+    document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
       el.classList.toggle('active', el.dataset.view === id);
     });
 
-    // Topbar title.
-    const titleEl = document.getElementById('topbar-title');
-    if (titleEl) titleEl.textContent = screen.title ?? id;
-
-    // Render.
-    const content = document.getElementById('content');
+    // Render do #main (wymiana calej zawartosci main, screen sam buduje page-header).
+    const content = document.getElementById('main');
     if (!content) return;
-    content.innerHTML = '<div class="view-loader"><div class="view-loader-spinner"></div>Ładowanie…</div>';
+    content.innerHTML = '<div style="padding:48px;text-align:center;color:var(--text-3);">Ładowanie…</div>';
     try {
       const html = await screen.render();
       content.innerHTML = html;
       if (screen.mount) await screen.mount();
     } catch (e) {
       console.error(`[router] render ${id} failed`, e);
-      content.innerHTML = `<div class="card"><h3>Błąd ładowania widoku</h3><pre>${e.message}</pre></div>`;
+      content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${e.message}</pre></div>`;
     }
   },
 
@@ -60,12 +56,6 @@ export const Router = {
   },
 
   init(defaultId) {
-    document.querySelectorAll('.nav-item[data-view]').forEach((el) => {
-      el.addEventListener('click', (e) => {
-        e.preventDefault();
-        this.navigate(el.dataset.view);
-      });
-    });
     if (defaultId) this.navigate(defaultId);
   },
 };
