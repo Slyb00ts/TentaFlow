@@ -1,11 +1,11 @@
 // =============================================================================
 // Plik: modules/services.js
-// Opis: Ekran Services — 3 zakladki:
+// Opis: Ekran Services — 3 zakladki (tf-tabs underline):
 //       1) Lista   — tabela deployowanych serwisow z auto-refresh 5s
-//       2) Aliasy  — CRUD aliasow modeli (/api/model-aliases)
+//       2) Aliasy  — CRUD aliasow modeli (/api/model-aliases), edycja w tf-window
 //       3) Modele  — zbiorcza lista modeli ze wszystkich nodow mesh
-//      "Nowy serwis" otwiera Catalog (target picker → wizard). Brak osobnego
-//      modala i przyciskow "Odswiez" / "Wdroz z katalogu" — te byly duplikatem.
+//      "Nowy serwis" otwiera Catalog (target picker → wizard). Edycja aliasu
+//      oraz potwierdzenia usuwania korzystaja z komponentu <tf-window>.
 //      Auto-refresh uzywa morphdom przez /js/lib/patch.js zeby nie migotac.
 // =============================================================================
 
@@ -14,6 +14,7 @@ import { byId, escapeHtml, escapeAttr, toast, formatDate, apiGet, apiPost, apiDe
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
+import { TfWindow } from '/js/components/tf-window.js';
 
 let services = [];
 let aliases = [];
@@ -38,22 +39,22 @@ const ServicesScreen = {
           <div class="sub" id="services-sub">${escapeHtml(I18n.t('common.loading'))}</div>
         </div>
         <div class="actions">
-          <button class="btn btn-primary" id="svc-new">${sprite('plus')}${escapeHtml(I18n.t('services.add_service'))}</button>
+          <tf-button variant="primary" icon="plus" id="svc-new">${escapeHtml(I18n.t('services.add_service'))}</tf-button>
         </div>
       </div>
 
-      <div class="rules-tabs" id="svc-tabs">
-        <div class="rules-tab active" data-tab="list">${sprite('services')}${escapeHtml(I18n.t('services.tab_list'))}<span class="badge" id="svc-tab-list-count">0</span></div>
-        <div class="rules-tab" data-tab="aliases">${sprite('share')}${escapeHtml(I18n.t('services.tab_aliases'))}<span class="badge" id="svc-tab-aliases-count">0</span></div>
-        <div class="rules-tab" data-tab="models">${sprite('model')}${escapeHtml(I18n.t('services.tab_models'))}<span class="badge" id="svc-tab-models-count">0</span></div>
-      </div>
+      <tf-tabs variant="underline" value="list" id="svc-tabs">
+        <tf-tab id="list" icon="services" count="0">${escapeHtml(I18n.t('services.tab_list'))}</tf-tab>
+        <tf-tab id="aliases" icon="share" count="0">${escapeHtml(I18n.t('services.tab_aliases'))}</tf-tab>
+        <tf-tab id="models" icon="model" count="0">${escapeHtml(I18n.t('services.tab_models'))}</tf-tab>
+      </tf-tabs>
 
       <div id="svc-tab-body"></div>
     `;
   },
   async mount() {
     byId('svc-new')?.addEventListener('click', () => Router.navigate('catalog'));
-    byId('svc-tabs')?.addEventListener('click', handleTabClick);
+    byId('svc-tabs')?.addEventListener('change', handleTabChange);
 
     await loadAll();
     refreshTimer = setInterval(() => {
@@ -136,21 +137,22 @@ function updateSubtitle() {
 }
 
 function updateTabCounts() {
-  const c1 = byId('svc-tab-list-count'); if (c1) c1.textContent = String(services.length);
-  const c2 = byId('svc-tab-aliases-count'); if (c2) c2.textContent = String(aliases.length);
-  const models = collectUniqueModels();
-  const c3 = byId('svc-tab-models-count'); if (c3) c3.textContent = String(models.length);
+  const tabs = byId('svc-tabs');
+  if (!tabs) return;
+  const listTab = tabs.querySelector('tf-tab#list');
+  const aliasTab = tabs.querySelector('tf-tab#aliases');
+  const modelsTab = tabs.querySelector('tf-tab#models');
+  if (listTab) listTab.setAttribute('count', String(services.length));
+  if (aliasTab) aliasTab.setAttribute('count', String(aliases.length));
+  if (modelsTab) modelsTab.setAttribute('count', String(collectUniqueModels().length));
 }
 
 // ---- Tabs -----------------------------------------------------------------
 
-function handleTabClick(e) {
-  const t = e.target.closest('.rules-tab');
-  if (!t) return;
-  const id = t.dataset.tab;
+function handleTabChange(e) {
+  const id = e.detail?.value;
   if (!id || id === currentTab) return;
   currentTab = id;
-  document.querySelectorAll('#svc-tabs .rules-tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === id));
   renderTab();
 }
 
@@ -228,7 +230,7 @@ function renderListTab() {
         ${sprite('services')}
         <h3>${escapeHtml(I18n.t('services.empty'))}</h3>
         <p>${escapeHtml(I18n.t('services.empty_hint'))}</p>
-        <button class="btn btn-primary" data-empty-cta>${sprite('plus')}${escapeHtml(I18n.t('services.empty_cta'))}</button>
+        <tf-button variant="primary" icon="plus" data-empty-cta>${escapeHtml(I18n.t('services.empty_cta'))}</tf-button>
       </div>
     `;
   }
@@ -266,7 +268,7 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}"><span data-quic-status="${escapeAttr(s.name)}"><span class="tag-status offline">${escapeHtml(I18n.t('services.status.none'))}</span></span></td>
       <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
-        <button class="btn btn-danger btn-icon" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}">${sprite('trash')}</button>
+        <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
       </td>
     </tr>
   `;
@@ -300,11 +302,11 @@ function renderAliasesTab() {
         ${sprite('share')}
         <h3>${escapeHtml(I18n.t('services.aliases_empty'))}</h3>
         <p>${escapeHtml(I18n.t('services.aliases_empty_hint'))}</p>
-        <button class="btn btn-primary" data-new-alias>${sprite('plus')}${escapeHtml(I18n.t('services.new_alias'))}</button>
+        <tf-button variant="primary" icon="plus" data-new-alias>${escapeHtml(I18n.t('services.new_alias'))}</tf-button>
       </div>
     ` : `
       <div class="svc-aliases-toolbar">
-        <button class="btn btn-primary btn-sm" data-new-alias>${sprite('plus')}${escapeHtml(I18n.t('services.new_alias'))}</button>
+        <tf-button variant="primary" size="sm" icon="plus" data-new-alias>${escapeHtml(I18n.t('services.new_alias'))}</tf-button>
       </div>
       <table class="data-table">
         <thead>
@@ -338,8 +340,8 @@ function renderAliasRow(a) {
       <td data-label="${escapeAttr(I18n.t('services.alias_col_fallback'))}">${fallbacks.length > 0 ? fallbacks.map((f) => `<span class="scope-chip mesh-read">${escapeHtml(f)}</span>`).join(' ') : '<span style="color:var(--text-3);">—</span>'}</td>
       <td data-label="${escapeAttr(I18n.t('services.alias_col_active'))}">${activeBadge}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
-        <button class="btn btn-ghost btn-icon" data-alias-edit="${escapeAttr(a.id)}" title="${escapeAttr(I18n.t('common.edit'))}">${sprite('settings')}</button>
-        <button class="btn btn-danger btn-icon" data-alias-delete="${escapeAttr(a.id)}" data-alias-name="${escapeAttr(a.alias)}" title="${escapeAttr(I18n.t('common.delete'))}">${sprite('trash')}</button>
+        <tf-button variant="ghost" size="sm" icon="settings" data-alias-edit="${escapeAttr(a.id)}" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>
+        <tf-button variant="danger" size="sm" icon="trash" data-alias-delete="${escapeAttr(a.id)}" data-alias-name="${escapeAttr(a.alias)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
       </td>
     </tr>
   `;
@@ -382,7 +384,7 @@ function renderModelsTab() {
         ${sprite('model')}
         <h3>${escapeHtml(I18n.t('services.models_empty'))}</h3>
         <p>${escapeHtml(I18n.t('services.models_empty_hint'))}</p>
-        <button class="btn btn-primary" data-empty-cta>${sprite('plus')}${escapeHtml(I18n.t('services.add_service'))}</button>
+        <tf-button variant="primary" icon="plus" data-empty-cta>${escapeHtml(I18n.t('services.add_service'))}</tf-button>
       </div>
     `;
   }
@@ -427,62 +429,122 @@ function openAliasModal(alias) {
   const isEdit = !!alias;
   const availableTargets = collectUniqueModels().map((m) => m.alias);
 
-  const html = `
-    <div class="modal-backdrop active" id="alias-modal">
-      <div class="modal" style="max-width:520px;">
-        <div class="modal-header">
-          <h3>${escapeHtml(I18n.t(isEdit ? 'services.alias_edit' : 'services.new_alias'))}</h3>
-          <button class="modal-close" id="alias-close">×</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('services.alias_col_name'))}</label>
-            <input class="input" id="alias-name" value="${escapeAttr(alias?.alias ?? '')}" ${isEdit ? 'disabled' : ''} placeholder="llm-fast">
-          </div>
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('services.alias_col_target'))}</label>
-            <input class="input" id="alias-target" value="${escapeAttr(alias?.target_model ?? '')}" list="alias-target-list" placeholder="llm-chat">
-            <datalist id="alias-target-list">
-              ${availableTargets.map((t) => `<option value="${escapeAttr(t)}"></option>`).join('')}
-            </datalist>
-          </div>
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('services.alias_col_strategy'))}</label>
-            <select class="input" id="alias-strategy">
-              <option value="FirstAvailable" ${(alias?.strategy || 'FirstAvailable') === 'FirstAvailable' ? 'selected' : ''}>FirstAvailable</option>
-              <option value="RoundRobin" ${alias?.strategy === 'RoundRobin' ? 'selected' : ''}>RoundRobin</option>
-              <option value="LeastLoaded" ${alias?.strategy === 'LeastLoaded' ? 'selected' : ''}>LeastLoaded</option>
-            </select>
-          </div>
-          <div class="form-row">
-            <label class="label">${escapeHtml(I18n.t('services.alias_col_fallback'))}</label>
-            <input class="input" id="alias-fallback" value="${escapeAttr(alias?.fallback_targets ?? '')}" placeholder="llm-big, llm-chat (przez przecinek)">
-            <div class="form-hint">${escapeHtml(I18n.t('services.alias_fallback_hint'))}</div>
-          </div>
-          <div class="form-error" id="alias-error" hidden></div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" id="alias-cancel">${escapeHtml(I18n.t('common.cancel'))}</button>
-          <button class="btn btn-primary" id="alias-save">${escapeHtml(I18n.t(isEdit ? 'common.save' : 'common.add'))}</button>
-        </div>
-      </div>
+  // Body formularza — tf-input dla pol tekstowych, tf-select dla strategii.
+  const bodyEl = document.createElement('div');
+  bodyEl.innerHTML = `
+    <div class="form-row">
+      <tf-input
+        id="al-name"
+        label="${escapeAttr(I18n.t('services.alias_col_name'))}"
+        value="${escapeAttr(alias?.alias ?? '')}"
+        placeholder="llm-fast"
+        ${isEdit ? 'disabled' : ''}
+      ></tf-input>
     </div>
+    <div class="form-row">
+      <tf-input
+        id="al-target"
+        label="${escapeAttr(I18n.t('services.alias_col_target'))}"
+        value="${escapeAttr(alias?.target_model ?? '')}"
+        placeholder="llm-chat"
+      ></tf-input>
+      <datalist id="al-target-list">
+        ${availableTargets.map((t) => `<option value="${escapeAttr(t)}"></option>`).join('')}
+      </datalist>
+    </div>
+    <div class="form-row">
+      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_strategy'))}</span>
+      <tf-select id="al-strategy" value="${escapeAttr(alias?.strategy || 'FirstAvailable')}">
+        <option value="FirstAvailable">FirstAvailable</option>
+        <option value="RoundRobin">RoundRobin</option>
+        <option value="LeastLoaded">LeastLoaded</option>
+      </tf-select>
+    </div>
+    <div class="form-row">
+      <tf-input
+        id="al-fallback"
+        label="${escapeAttr(I18n.t('services.alias_col_fallback'))}"
+        value="${escapeAttr(alias?.fallback_targets ?? '')}"
+        placeholder="llm-big, llm-chat"
+        hint="${escapeAttr(I18n.t('services.alias_fallback_hint'))}"
+      ></tf-input>
+    </div>
+    <div class="form-error" id="al-error" hidden style="color: var(--color-danger, #ef4444); font-size: 12px; margin-top: var(--space-2);"></div>
   `;
-  document.body.insertAdjacentHTML('beforeend', html);
-  const close = () => byId('alias-modal')?.remove();
-  byId('alias-close')?.addEventListener('click', close);
-  byId('alias-cancel')?.addEventListener('click', close);
-  byId('alias-save')?.addEventListener('click', async () => {
-    const name = byId('alias-name').value.trim();
-    const target = byId('alias-target').value.trim();
-    const strategy = byId('alias-strategy').value;
-    const fallback = byId('alias-fallback').value.trim();
-    const err = byId('alias-error');
-    if (!name || !target) {
-      err.textContent = I18n.t('services.alias_required');
-      err.hidden = false;
+
+  const footerEl = document.createElement('div');
+  footerEl.innerHTML = `
+    <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+    <tf-button variant="primary" data-action="save" id="al-save-btn">${escapeHtml(I18n.t(isEdit ? 'common.save' : 'common.add'))}</tf-button>
+  `;
+
+  // Tworzymy okno recznie — potrzebujemy kontroli nad zamknieciem (walidacja
+  // + bledy API powinny pozostawic okno otwarte, a nie kazdy action je zamyka).
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', I18n.t(isEdit ? 'services.alias_edit' : 'services.new_alias'));
+  win.setAttribute('icon', isEdit ? 'settings' : 'plus');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('min-width', '460');
+  win.setAttribute('min-height', '380');
+  win.setAttribute('width', '520');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+
+  const bodyWrap = document.createElement('div');
+  bodyWrap.slot = 'body';
+  bodyWrap.appendChild(bodyEl);
+  win.appendChild(bodyWrap);
+
+  const footWrap = document.createElement('div');
+  footWrap.slot = 'footer';
+  footWrap.appendChild(footerEl);
+  win.appendChild(footWrap);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.appendChild(backdrop);
+  document.body.appendChild(win);
+
+  // Natywny atrybut `list` nie jest przekazywany przez tf-input — ustawiamy
+  // go recznie na wewnetrznym <input> aby zachowac autocomplete.
+  queueMicrotask(() => {
+    const targetNative = win.querySelector('#al-target input');
+    if (targetNative) targetNative.setAttribute('list', 'al-target-list');
+  });
+
+  const cleanup = () => {
+    if (win.isConnected) win.remove();
+    if (backdrop.isConnected) backdrop.remove();
+  };
+
+  win.addEventListener('action', async (e) => {
+    const action = e.detail?.action;
+    if (action === 'close' || action === 'cancel') {
+      cleanup();
       return;
     }
+    if (action !== 'save') return;
+
+    const nameInput = win.querySelector('#al-name');
+    const targetInput = win.querySelector('#al-target');
+    const strategySelect = win.querySelector('#al-strategy');
+    const fallbackInput = win.querySelector('#al-fallback');
+    const errEl = win.querySelector('#al-error');
+
+    const name = (nameInput?.value || '').trim();
+    const target = (targetInput?.value || '').trim();
+    const strategy = strategySelect?.value || 'FirstAvailable';
+    const fallback = (fallbackInput?.value || '').trim();
+
+    if (!name || !target) {
+      if (errEl) {
+        errEl.textContent = I18n.t('services.alias_required');
+        errEl.hidden = false;
+      }
+      return;
+    }
+
     try {
       if (isEdit) {
         await fetch(`/api/model-aliases/${encodeURIComponent(alias.id)}`, {
@@ -499,17 +561,26 @@ function openAliasModal(alias) {
         });
       }
       toast(I18n.t(isEdit ? 'services.alias_updated' : 'services.alias_created'), 'success');
-      close();
+      cleanup();
       await loadAll();
-    } catch (e) {
-      err.textContent = e.message;
-      err.hidden = false;
+    } catch (err) {
+      if (errEl) {
+        errEl.textContent = err.message;
+        errEl.hidden = false;
+      }
     }
   });
 }
 
 async function deleteAlias(id, name) {
-  if (!confirm(I18n.t('services.alias_delete_confirm', { name }))) return;
+  const ok = await TfWindow.confirm({
+    title: I18n.t('common.delete'),
+    message: I18n.t('services.alias_delete_confirm', { name }),
+    confirmLabel: I18n.t('common.delete'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await apiDelete(`/api/model-aliases/${encodeURIComponent(id)}`);
     toast(I18n.t('services.alias_deleted', { name }), 'success');
@@ -538,7 +609,14 @@ async function checkOk(resp) {
 }
 
 async function stopService(id, name) {
-  if (!confirm(I18n.t('services.delete_confirm', { name }))) return;
+  const ok = await TfWindow.confirm({
+    title: I18n.t('common.delete'),
+    message: I18n.t('services.delete_confirm', { name }),
+    confirmLabel: I18n.t('common.delete'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
   try {
     const r = await ApiBinary.action('serviceStopRequest', { serviceId: id });
     if (r.stopped) {

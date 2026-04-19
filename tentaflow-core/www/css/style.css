@@ -61,6 +61,8 @@ html, body {
   text-size-adjust: 100%;
   overscroll-behavior: none;
   touch-action: manipulation;
+  height: 100%;
+  overflow: hidden;
 }
 img { display: block; }
 
@@ -253,7 +255,7 @@ input, textarea, select {
 }
 
 /* ============ APP SHELL ============ */
-.app { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; min-height: 100dvh; }
+.app { display: grid; grid-template-columns: 260px 1fr; height: 100vh; height: 100dvh; overflow: hidden; }
 
 /* Mobile header — widoczny tylko na ≤767px */
 .mobile-header {
@@ -295,11 +297,53 @@ input, textarea, select {
   border-right: 1px solid var(--border);
   padding: 18px 0 12px;
   display: flex; flex-direction: column;
-  overflow-y: auto;
+  height: 100%;
+  overflow: hidden;
 }
 .sidebar .logo {
   display: flex; align-items: center; gap: 10px;
   padding: 0 20px 20px;
+  flex-shrink: 0;
+}
+/* Srodkowa sekcja — jedyny scrollowalny obszar sidebaru.
+   min-height:0 konieczne, by flex child mogl byc krotszy niz content. */
+.sidebar-nav {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* Spojny cienki scrollbar dla sidebar-nav i main — WebKit + Firefox. */
+.sidebar-nav,
+.main {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-hover) transparent;
+}
+.sidebar-nav::-webkit-scrollbar,
+.main::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.sidebar-nav::-webkit-scrollbar-track,
+.main::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sidebar-nav::-webkit-scrollbar-thumb,
+.main::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background 0.15s;
+}
+.sidebar-nav::-webkit-scrollbar-thumb:hover,
+.main::-webkit-scrollbar-thumb:hover {
+  background: var(--border-hover);
+  background-clip: padding-box;
+}
+.sidebar-nav::-webkit-scrollbar-corner,
+.main::-webkit-scrollbar-corner {
+  background: transparent;
 }
 .sidebar .logo .octo { width: 30px; height: auto; }
 .sidebar .logo .name {
@@ -349,6 +393,7 @@ input, textarea, select {
 .sidebar .footer {
   margin-top: auto; padding: 12px 12px 0;
   border-top: 1px solid var(--border);
+  flex-shrink: 0;
 }
 .user-chip {
   display: flex; align-items: center; gap: 10px;
@@ -376,7 +421,10 @@ input, textarea, select {
   padding: 24px 32px;
   background: var(--bg);
   background-image: radial-gradient(circle at 90% 10%, rgba(99, 102, 241, 0.08) 0%, transparent 45%);
-  overflow: hidden;
+  height: 100vh;
+  height: 100dvh;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .page-header {
   display: flex; justify-content: space-between; align-items: flex-start;
@@ -1641,12 +1689,20 @@ input, textarea, select {
 
 /* Mobile */
 @media (max-width: 767px) {
-  /* Layout: jedna kolumna + sticky mobile header */
+  /* Layout: jedna kolumna + sticky mobile header. Mobile: flex column,
+     main zajmuje reszte, drawer jest poza flow (position:fixed). */
   .app {
+    display: flex;
+    flex-direction: column;
     grid-template-columns: 1fr;
-    min-height: 100vh; min-height: 100dvh;
+    height: 100vh; height: 100dvh;
   }
-  .mobile-header { display: flex; }
+  .mobile-header { display: flex; flex-shrink: 0; }
+  .main {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+  }
 
   /* Sidebar staje sie off-canvas drawer */
   .sidebar {
@@ -1887,13 +1943,23 @@ input, textarea, select {
   transition: all 0.2s;
 }
 .wizard-step-dot.active {
-  background: var(--accent-1); color: white;
-  border-color: var(--accent-1);
-  box-shadow: 0 0 0 4px var(--accent-glow);
+  background: linear-gradient(135deg, #6366f1 0%, #a78bfa 100%);
+  color: white;
+  border-color: #818cf8;
+  box-shadow:
+    0 0 14px rgba(99, 102, 241, 0.6),
+    0 0 28px rgba(99, 102, 241, 0.35),
+    0 0 52px rgba(99, 102, 241, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 .wizard-step-dot.done {
-  background: var(--success); color: white;
-  border-color: var(--success);
+  background: linear-gradient(135deg, #22c55e 0%, #10b981 100%);
+  color: white;
+  border-color: #34d399;
+  box-shadow:
+    0 0 10px rgba(34, 197, 94, 0.45),
+    0 0 22px rgba(34, 197, 94, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 .wizard-step-line {
   flex: 0 0 40px; height: 2px;

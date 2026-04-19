@@ -28,7 +28,6 @@ let nimContainers = [];
 let nimFilteredContainers = [];
 let nimActiveCategory = 'all';
 let nimSearchQuery = '';
-let nimSearchTimer = null;
 
 const NIM_CATEGORIES = ['all', 'llm', 'vlm', 'embedding', 'reranker', 'stt', 'tts'];
 
@@ -95,14 +94,14 @@ function renderRoot() {
         <div class="sub">${renderTargetBadge()}</div>
       </div>
       <div class="actions">
-        <button class="btn btn-secondary" id="catalog-change-target">${iconSvg('refresh')}${escapeHtml(I18n.t('catalog.change_target'))}</button>
+        <tf-button variant="secondary" icon="refresh" id="catalog-change-target">${escapeHtml(I18n.t('catalog.change_target'))}</tf-button>
       </div>
     </div>
 
-    <div class="rules-tabs" id="catalog-tabs">
-      <div class="rules-tab${activeTab === 'tentaflow' ? ' active' : ''}" data-tab="tentaflow">${iconSvg('catalog')}${escapeHtml(I18n.t('catalog.tab_tentaflow'))}<span class="badge" id="catalog-count">0</span></div>
-      <div class="rules-tab${activeTab === 'nim' ? ' active' : ''}" data-tab="nim">${iconSvg('zap')}${escapeHtml(I18n.t('catalog.tab_nim'))}</div>
-    </div>
+    <tf-tabs variant="underline" id="catalog-tabs" value="${escapeAttr(activeTab)}">
+      <tf-tab id="tentaflow" icon="catalog" count="0">${escapeHtml(I18n.t('catalog.tab_tentaflow'))}</tf-tab>
+      <tf-tab id="nim" icon="zap">${escapeHtml(I18n.t('catalog.tab_nim'))}</tf-tab>
+    </tf-tabs>
 
     <div id="catalog-content">
       <div class="catalog-loading">${escapeHtml(I18n.t('common.loading'))}</div>
@@ -113,7 +112,7 @@ function renderRoot() {
     target = null;
     renderRoot();
   });
-  byId('catalog-tabs')?.addEventListener('click', handleTabClick);
+  byId('catalog-tabs')?.addEventListener('change', handleTabChange);
 
   renderActiveTab();
   updateCount();
@@ -272,15 +271,10 @@ function isOnline(node) {
 
 // ---- Tabs -----------------------------------------------------------------
 
-function handleTabClick(e) {
-  const tab = e.target.closest('.rules-tab');
-  if (!tab) return;
-  const id = tab.dataset.tab;
+function handleTabChange(e) {
+  const id = e.detail?.value;
   if (!id || id === activeTab) return;
   activeTab = id;
-  document.querySelectorAll('#catalog-tabs .rules-tab').forEach((t) => {
-    t.classList.toggle('active', t.dataset.tab === id);
-  });
   renderActiveTab();
 }
 
@@ -300,8 +294,8 @@ function updateCount() {
   if (!target) return;
   const targetOs = target.os || 'linux';
   const total = Manifest.all().filter((s) => Manifest.isEngineCompatible(s, targetOs)).length;
-  const badge = byId('catalog-count');
-  if (badge) badge.textContent = String(total);
+  const tab = document.querySelector('#catalog-tabs tf-tab#tentaflow');
+  if (tab) tab.setAttribute('count', String(total));
 }
 
 // ---- TentaFlow tab --------------------------------------------------------
@@ -362,9 +356,9 @@ function renderEngineCard(service, targetOs) {
         <div class="meta-row methods">${escapeHtml(I18n.t('catalog.deploy_as'))}: ${methodsLabel}</div>
       </div>
       <div class="catalog-card-foot">
-        <button class="btn btn-primary btn-sm" data-engine-deploy="${escapeAttr(e.id || '')}">
-          ${iconSvg('plus')}${escapeHtml(I18n.t('catalog.deploy'))}
-        </button>
+        <tf-button variant="primary" size="sm" icon="plus" data-engine-deploy="${escapeAttr(e.id || '')}">
+          ${escapeHtml(I18n.t('catalog.deploy'))}
+        </tf-button>
       </div>
     </div>
   `;
@@ -460,7 +454,7 @@ function renderNimNoApiKey() {
       <div class="nim-empty-ico">${renderIcon('cpu', 48)}</div>
       <div class="empty-state-text">${escapeHtml(I18n.t('nim.no_api_key'))}</div>
       <div class="empty-state-hint">${escapeHtml(I18n.t('nim.no_api_key_hint'))}</div>
-      <button class="btn btn-primary nim-go-settings" style="margin-top:14px;">${escapeHtml(I18n.t('nim.go_to_settings'))}</button>
+      <tf-button variant="primary" class="nim-go-settings" style="margin-top:14px;">${escapeHtml(I18n.t('nim.go_to_settings'))}</tf-button>
     </div>
   `;
 }
@@ -471,7 +465,7 @@ function renderNimAuthFailed() {
       <div class="nim-empty-ico warning">⚠</div>
       <div class="empty-state-text">${escapeHtml(I18n.t('nim.auth_failed'))}</div>
       <div class="empty-state-hint">${escapeHtml(I18n.t('nim.auth_failed_hint'))}</div>
-      <button class="btn btn-primary nim-go-settings" style="margin-top:14px;">${escapeHtml(I18n.t('nim.go_to_settings'))}</button>
+      <tf-button variant="primary" class="nim-go-settings" style="margin-top:14px;">${escapeHtml(I18n.t('nim.go_to_settings'))}</tf-button>
     </div>
   `;
 }
@@ -510,22 +504,14 @@ function publisherColor(publisher) {
 }
 
 function renderNimContent() {
-  const hasQuery = nimSearchQuery && nimSearchQuery.length > 0;
   const toolbar = `
     <div class="nim-toolbar">
-      <label class="search-input${hasQuery ? ' has-value' : ''}">
-        <svg class="search-input-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="11" cy="11" r="7"/>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-        </svg>
-        <input type="search" class="nim-search" placeholder="${escapeAttr(I18n.t('nim.search'))}" value="${escapeAttr(nimSearchQuery)}" autocomplete="off" spellcheck="false">
-        <button type="button" class="search-input-clear nim-search-clear" aria-label="Clear">×</button>
-      </label>
-      <div class="nim-filters" role="tablist">
+      <tf-searchbox class="nim-search" placeholder="${escapeAttr(I18n.t('nim.search'))}" value="${escapeAttr(nimSearchQuery)}" debounce="200"></tf-searchbox>
+      <tf-tabs class="nim-filters" variant="soft" value="${escapeAttr(nimActiveCategory)}">
         ${NIM_CATEGORIES.map((cat) => `
-          <button class="nim-filter${nimActiveCategory === cat ? ' active' : ''}" data-category="${cat}" role="tab">${escapeHtml(nimCategoryLabel(cat))}</button>
+          <tf-tab id="${escapeAttr(cat)}">${escapeHtml(nimCategoryLabel(cat))}</tf-tab>
         `).join('')}
-      </div>
+      </tf-tabs>
     </div>
   `;
 
@@ -556,7 +542,7 @@ function renderNimContent() {
           </div>
         </div>
         <div class="catalog-card-foot">
-          <button class="btn btn-primary btn-sm nim-deploy-btn">${escapeHtml(I18n.t('nim.deploy'))}</button>
+          <tf-button variant="primary" size="sm" class="nim-deploy-btn">${escapeHtml(I18n.t('nim.deploy'))}</tf-button>
         </div>
       </div>
     `;
@@ -566,53 +552,22 @@ function renderNimContent() {
 }
 
 function bindNimEvents() {
-  const search = document.querySelector('.nim-search');
-  const searchWrap = search?.closest('.search-input');
-  const clearBtn = document.querySelector('.nim-search-clear');
+  const search = document.querySelector('tf-searchbox.nim-search');
   if (search) {
-    const syncHasValue = () => {
-      if (searchWrap) searchWrap.classList.toggle('has-value', search.value.length > 0);
-    };
-    syncHasValue();
-    search.addEventListener('input', () => {
-      syncHasValue();
-      clearTimeout(nimSearchTimer);
-      nimSearchTimer = setTimeout(() => {
-        nimSearchQuery = search.value.trim();
-        applyNimFilters();
-        refreshNimGrid();
-      }, 200);
-    });
-    // ESC czysci
-    search.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        search.value = '';
-        syncHasValue();
-        nimSearchQuery = '';
-        applyNimFilters();
-        refreshNimGrid();
-      }
-    });
-  }
-  if (clearBtn) {
-    clearBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      if (!search) return;
-      search.value = '';
-      search.focus();
-      if (searchWrap) searchWrap.classList.remove('has-value');
-      nimSearchQuery = '';
+    search.addEventListener('search', (e) => {
+      nimSearchQuery = String(e.detail?.value || '').trim();
       applyNimFilters();
       refreshNimGrid();
     });
   }
-  document.querySelectorAll('.nim-filter[data-category]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      nimActiveCategory = btn.dataset.category;
+  const filters = document.querySelector('tf-tabs.nim-filters');
+  if (filters) {
+    filters.addEventListener('change', (e) => {
+      nimActiveCategory = e.detail?.value || 'all';
       applyNimFilters();
       refreshNimGrid();
     });
-  });
+  }
   document.querySelectorAll('.nim-card[data-nim-image]').forEach((card) => {
     const open = (e) => {
       e.stopPropagation();

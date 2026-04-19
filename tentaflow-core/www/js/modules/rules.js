@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: modules/rules.js
-// Opis: 3 zakladki: TTS / PII / Fast-path.
+// Opis: 3 zakladki (tf-tabs): TTS / PII / Fast-path.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -13,19 +13,20 @@ const RulesScreen = {
   render() {
     return `
       <div class="content-header"><h1>Reguły</h1></div>
-      <div style="margin-bottom: var(--space-4); display: flex; gap: var(--space-2);">
-        <button class="btn" data-tab="tts">TTS</button>
-        <button class="btn" data-tab="pii">PII</button>
-        <button class="btn" data-tab="fastpath">Fast-path</button>
+      <div style="margin-bottom: var(--space-4);">
+        <tf-tabs variant="underline" value="${activeTab}" id="rules-tabs">
+          <tf-tab id="tts">TTS</tf-tab>
+          <tf-tab id="pii">PII</tf-tab>
+          <tf-tab id="fastpath">Fast-path</tf-tab>
+        </tf-tabs>
       </div>
       <div class="card" style="padding: 0;"><div id="rules-host"></div></div>`;
   },
   async mount() {
-    document.querySelectorAll('[data-tab]').forEach((b) => {
-      b.addEventListener('click', () => {
-        activeTab = b.dataset.tab;
-        loadActive();
-      });
+    const tabs = byId('rules-tabs');
+    tabs.addEventListener('change', (e) => {
+      activeTab = e.detail.value;
+      loadActive();
     });
     await loadActive();
   },
@@ -34,9 +35,6 @@ const RulesScreen = {
 
 async function loadActive() {
   const host = byId('rules-host');
-  document.querySelectorAll('[data-tab]').forEach((b) => {
-    b.classList.toggle('btn-primary', b.dataset.tab === activeTab);
-  });
   host.innerHTML = '<div class="view-loader"><div class="view-loader-spinner"></div>Ładowanie…</div>';
   try {
     if (activeTab === 'tts') await loadTts(host);
@@ -58,7 +56,7 @@ async function loadTts(host) {
         <td><code>${escapeHtml(r.pattern)}</code></td>
         <td>${escapeHtml(r.voiceId)}</td>
         <td>${r.priority}</td>
-        <td><button class="btn btn-sm btn-danger" data-rm="${escapeHtml(r.id)}">Usuń</button></td>
+        <td><tf-button variant="danger" size="sm" data-rm="${escapeHtml(r.id)}">Usuń</tf-button></td>
       </tr>`).join('')}</tbody>
     </table>`;
   host.querySelectorAll('[data-rm]').forEach((b) => {
@@ -79,7 +77,7 @@ async function loadPii(host) {
     : `<table class="data-table">
         <thead><tr><th>Kategoria</th><th>Regex</th><th>Akcja</th></tr></thead>
         <tbody>${rules.map((r) => `<tr>
-          <td><span class="badge">${escapeHtml(r.kind)}</span></td>
+          <td><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
           <td><code>${escapeHtml(r.regex)}</code></td>
           <td>${escapeHtml(r.action)}</td>
         </tr>`).join('')}</tbody>

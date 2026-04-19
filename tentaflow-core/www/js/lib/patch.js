@@ -33,6 +33,7 @@ export function patchInner(target, newInnerHTML, opts = {}) {
   morphdom(target, tmp, {
     childrenOnly: true,
     onBeforeElUpdated: (fromEl, toEl) => defaultOnBeforeElUpdated(fromEl, toEl, opts),
+    onBeforeElChildrenUpdated: defaultOnBeforeElChildrenUpdated,
     getNodeKey: defaultGetNodeKey,
   });
 }
@@ -46,8 +47,22 @@ export function patchOuter(target, newHtml, opts = {}) {
   if (!newEl) return;
   morphdom(target, newEl, {
     onBeforeElUpdated: (fromEl, toEl) => defaultOnBeforeElUpdated(fromEl, toEl, opts),
+    onBeforeElChildrenUpdated: defaultOnBeforeElChildrenUpdated,
     getNodeKey: defaultGetNodeKey,
   });
+}
+
+// Komponenty tf-* (Web Components) same zarzadzaja wnetrznym DOM. Morphdom
+// domyslnie schodzi w nie i konfliktuje z renderingiem komponentu (np. usuwa
+// wewnetrzny <button class="tf-btn"> wstawiony przez tf-button i zostawia
+// goly tekst). Blokujemy zejscie w dzieci custom elementow — atrybuty sa
+// nadal reconcile'owane, wiec `attributeChangedCallback` lapie zmiany.
+function defaultOnBeforeElChildrenUpdated(fromEl) {
+  const tag = fromEl.tagName;
+  if (tag && tag.indexOf('-') !== -1 && tag.toLowerCase().startsWith('tf-')) {
+    return false;
+  }
+  return true;
 }
 
 function defaultGetNodeKey(node) {

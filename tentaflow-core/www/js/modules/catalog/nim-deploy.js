@@ -22,76 +22,78 @@ export async function openNimDeployModal(container, preselectedNode = null) {
     // ignore
   }
 
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-backdrop active';
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  backdrop.id = 'nim-deploy-backdrop';
+
+  const overlay = document.createElement('tf-window');
   overlay.id = 'nim-deploy-modal';
+  overlay.setAttribute('title', `${I18n.t('nim.deploy_title')}: ${container.display_name || container.name}`);
+  overlay.setAttribute('buttons', 'close');
+  overlay.setAttribute('initial-x', 'center');
+  overlay.setAttribute('initial-y', 'center');
+  overlay.setAttribute('width', '640');
   overlay.innerHTML = `
-    <div class="modal" style="max-width: 640px;">
-      <div class="modal-header">
-        <h3>${escapeHtml(I18n.t('nim.deploy_title'))}: ${escapeHtml(container.display_name || container.name)}</h3>
-        <button class="modal-close" id="nim-modal-close">×</button>
-      </div>
-      <div class="modal-body">
-        <div class="nim-summary">
+    <div slot="body">
+      <div class="nim-summary">
+        <div class="nim-summary-row">
+          <span class="label">Image:</span>
+          <span class="value mono">${escapeHtml(container.image)}:${escapeHtml(container.latest_tag || 'latest')}</span>
+        </div>
+        ${container.min_gpu_memory_gb ? `
           <div class="nim-summary-row">
-            <span class="label">Image:</span>
-            <span class="value mono">${escapeHtml(container.image)}:${escapeHtml(container.latest_tag || 'latest')}</span>
-          </div>
-          ${container.min_gpu_memory_gb ? `
-            <div class="nim-summary-row">
-              <span class="label">${escapeHtml(I18n.t('nim.vram'))}:</span>
-              <span class="value">${container.min_gpu_memory_gb} GB</span>
-            </div>` : ''}
-        </div>
-
-        <div class="nim-deploy-grid">
-          <div class="form-group">
-            <label>${escapeHtml(I18n.t('wizard.targetNode'))}</label>
-            <select class="input" id="nim-target-node">
-              ${nodes.map((n) => {
-                const nid = n.node_id || n.id;
-                const label = n.hostname || nid;
-                const sel = nid === preselectedNode ? 'selected' : '';
-                return `<option value="${escapeAttr(nid)}" ${sel}>${escapeHtml(label)}</option>`;
-              }).join('')}
-            </select>
-          </div>
-          <div class="form-group">
-            <label>Port</label>
-            <input type="number" class="input" id="nim-port" value="8000" min="1" max="65535">
-          </div>
-          <div class="form-group">
-            <label>GPU</label>
-            <select class="input" id="nim-gpu">
-              <option value="all">All GPUs</option>
-              <option value="0">GPU 0</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>${escapeHtml(I18n.t('wizard.containerName'))}</label>
-            <input type="text" class="input" id="nim-container-name" value="nim-${escapeAttr(container.name)}">
-          </div>
-        </div>
-
-        <div class="form-group" style="margin-top:14px;">
-          <label>${escapeHtml(I18n.t('nim.env_vars'))}</label>
-          <div id="nim-env-vars">
-            <div class="nim-env-row">
-              <input type="text" class="input nim-env-key" placeholder="Key">
-              <input type="text" class="input nim-env-value" placeholder="Value">
-            </div>
-          </div>
-          <button class="btn btn-ghost btn-sm" id="nim-add-env" style="margin-top:6px;">+ ${escapeHtml(I18n.t('nim.add_env'))}</button>
-        </div>
-
-        <div id="nim-deploy-result"></div>
+            <span class="label">${escapeHtml(I18n.t('nim.vram'))}:</span>
+            <span class="value">${container.min_gpu_memory_gb} GB</span>
+          </div>` : ''}
       </div>
-      <div class="modal-footer">
-        <button class="btn btn-ghost" id="nim-modal-cancel">${escapeHtml(I18n.t('common.cancel'))}</button>
-        <button class="btn btn-primary" id="nim-modal-deploy">${escapeHtml(I18n.t('nim.deploy'))}</button>
+
+      <div class="nim-deploy-grid">
+        <div class="form-group">
+          <label>${escapeHtml(I18n.t('wizard.targetNode'))}</label>
+          <tf-select id="nim-target-node" value="${escapeAttr(preselectedNode || '')}">
+            ${nodes.map((n) => {
+              const nid = n.node_id || n.id;
+              const label = n.hostname || nid;
+              return `<option value="${escapeAttr(nid)}">${escapeHtml(label)}</option>`;
+            }).join('')}
+          </tf-select>
+        </div>
+        <div class="form-group">
+          <tf-input type="number" id="nim-port" label="Port" value="8000"></tf-input>
+        </div>
+        <div class="form-group">
+          <label>GPU</label>
+          <tf-select id="nim-gpu" value="all">
+            <option value="all">All GPUs</option>
+            <option value="0">GPU 0</option>
+          </tf-select>
+        </div>
+        <div class="form-group">
+          <tf-input type="text" id="nim-container-name"
+            label="${escapeAttr(I18n.t('wizard.containerName'))}"
+            value="nim-${escapeAttr(container.name)}"></tf-input>
+        </div>
       </div>
+
+      <div class="form-group" style="margin-top:14px;">
+        <label>${escapeHtml(I18n.t('nim.env_vars'))}</label>
+        <div id="nim-env-vars">
+          <div class="nim-env-row">
+            <tf-input type="text" class="nim-env-key" placeholder="Key"></tf-input>
+            <tf-input type="text" class="nim-env-value" placeholder="Value"></tf-input>
+          </div>
+        </div>
+        <tf-button variant="ghost" size="sm" id="nim-add-env" style="margin-top:6px;">+ ${escapeHtml(I18n.t('nim.add_env'))}</tf-button>
+      </div>
+
+      <div id="nim-deploy-result"></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <tf-button variant="primary" id="nim-modal-deploy" data-action="deploy">${escapeHtml(I18n.t('nim.deploy'))}</tf-button>
     </div>
   `;
+  document.body.appendChild(backdrop);
   document.body.appendChild(overlay);
 
   const nodeSelect = document.getElementById('nim-target-node');
@@ -103,12 +105,15 @@ export async function openNimDeployModal(container, preselectedNode = null) {
       const data = await apiGet(`/api/mesh/nodes/${encodeURIComponent(nodeId)}`);
       const gpus = Array.isArray(data?.gpu_info) ? data.gpu_info : [];
       if (gpus.length > 0) {
-        gpuSelect.innerHTML = '<option value="all">All GPUs</option>' +
+        const inner = gpuSelect.querySelector('select');
+        if (!inner) return;
+        inner.innerHTML = '<option value="all">All GPUs</option>' +
           gpus.map((g, i) => {
             const idx = g.index ?? i;
             const vram = g.vram_total_mb ? Math.round(g.vram_total_mb / 1024) + ' GB' : '';
             return `<option value="${idx}">GPU ${idx}: ${escapeHtml(g.name || '')}${vram ? ` (${vram})` : ''}</option>`;
           }).join('');
+        gpuSelect.setAttribute('value', 'all');
       }
     } catch {
       // ignore
@@ -118,25 +123,32 @@ export async function openNimDeployModal(container, preselectedNode = null) {
   if (preselectedNode) loadNodeGpus(preselectedNode);
   else if (nodes.length > 0) loadNodeGpus(nodes[0].node_id || nodes[0].id);
 
-  nodeSelect?.addEventListener('change', () => loadNodeGpus(nodeSelect.value));
+  nodeSelect?.addEventListener('change', (e) => loadNodeGpus(e.detail?.value ?? nodeSelect.value));
 
   document.getElementById('nim-add-env')?.addEventListener('click', () => {
     const envContainer = document.getElementById('nim-env-vars');
     const row = document.createElement('div');
     row.className = 'nim-env-row';
     row.innerHTML = `
-      <input type="text" class="input nim-env-key" placeholder="Key">
-      <input type="text" class="input nim-env-value" placeholder="Value">
+      <tf-input type="text" class="nim-env-key" placeholder="Key"></tf-input>
+      <tf-input type="text" class="nim-env-value" placeholder="Value"></tf-input>
     `;
     envContainer.appendChild(row);
   });
 
-  const close = () => overlay.remove();
-  document.getElementById('nim-modal-close')?.addEventListener('click', close);
-  document.getElementById('nim-modal-cancel')?.addEventListener('click', close);
+  overlay.addEventListener('action', (e) => {
+    if (e.detail?.action === 'deploy') {
+      e.preventDefault();
+      executeDeploy(container, overlay);
+    }
+    // cancel — standardowe zamkniecie
+  });
 
-  document.getElementById('nim-modal-deploy')?.addEventListener('click', () => {
-    executeDeploy(container, overlay);
+  overlay.addEventListener('close-request', () => {
+    backdrop.remove();
+  });
+  backdrop.addEventListener('click', () => {
+    if (typeof overlay.close === 'function') overlay.close();
   });
 }
 
@@ -145,24 +157,26 @@ export async function openNimDeployModal(container, preselectedNode = null) {
 async function executeDeploy(container, overlay) {
   const deployBtn = document.getElementById('nim-modal-deploy');
   const resultEl = document.getElementById('nim-deploy-result');
-  if (deployBtn) deployBtn.disabled = true;
+  if (deployBtn) deployBtn.setAttribute('disabled', '');
 
   const targetNodeId = document.getElementById('nim-target-node').value;
   const port = parseInt(document.getElementById('nim-port').value, 10) || 8000;
   const gpuId = document.getElementById('nim-gpu').value;
-  const rawName = document.getElementById('nim-container-name').value.trim() || `nim-${container.name}`;
+  const rawName = String(document.getElementById('nim-container-name').value || '').trim() || `nim-${container.name}`;
   const containerName = rawName.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
 
   if (!targetNodeId) {
     toast(I18n.t('nim.select_node'), 'error');
-    if (deployBtn) deployBtn.disabled = false;
+    if (deployBtn) deployBtn.removeAttribute('disabled');
     return;
   }
 
   const envVars = {};
   document.querySelectorAll('.nim-env-row').forEach((row) => {
-    const key = row.querySelector('.nim-env-key')?.value.trim();
-    const val = row.querySelector('.nim-env-value')?.value || '';
+    const keyEl = row.querySelector('.nim-env-key');
+    const valEl = row.querySelector('.nim-env-value');
+    const key = String(keyEl?.value || '').trim();
+    const val = String(valEl?.value || '');
     if (key) envVars[key] = val;
   });
 
@@ -218,11 +232,14 @@ async function executeDeploy(container, overlay) {
         ws.close();
         if (msg.success) {
           toast(`${container.display_name || container.name} deployed`, 'success');
-          setTimeout(() => overlay.remove(), 1800);
+          setTimeout(() => {
+            if (typeof overlay.close === 'function') overlay.close(true);
+            else overlay.remove();
+          }, 1800);
         } else {
           handleDeployError(msg.error || 'Unknown error', container, overlay, resultEl);
         }
-        if (deployBtn) deployBtn.disabled = false;
+        if (deployBtn) deployBtn.removeAttribute('disabled');
       }
     } catch {
       // ignore parse errors
@@ -235,12 +252,12 @@ async function executeDeploy(container, overlay) {
       resultEl.innerHTML = `<div class="deploy-fail">${escapeHtml(I18n.t('nim.ws_error'))}</div>`;
     }
     toast(I18n.t('nim.ws_error'), 'error');
-    if (deployBtn) deployBtn.disabled = false;
+    if (deployBtn) deployBtn.removeAttribute('disabled');
   };
 
   ws.onclose = () => {
     clearInterval(timerInterval);
-    if (deployBtn) deployBtn.disabled = false;
+    if (deployBtn) deployBtn.removeAttribute('disabled');
   };
 }
 
@@ -255,8 +272,10 @@ function handleDeployError(errMsg, container, overlay, resultEl) {
         <div class="title">${escapeHtml(I18n.t('nim.eula_title'))}</div>
         <div class="desc">${escapeHtml(I18n.t('nim.eula_desc'))}</div>
         <div class="actions">
-          <a href="${escapeAttr(eulaUrl)}" target="_blank" rel="noopener" class="btn btn-primary btn-sm">${escapeHtml(I18n.t('nim.accept_license'))} ↗</a>
-          <button class="btn btn-secondary btn-sm" id="nim-retry-deploy">${escapeHtml(I18n.t('nim.retry'))}</button>
+          <a href="${escapeAttr(eulaUrl)}" target="_blank" rel="noopener" class="nim-eula-link">
+            <tf-button variant="primary" size="sm">${escapeHtml(I18n.t('nim.accept_license'))} ↗</tf-button>
+          </a>
+          <tf-button variant="secondary" size="sm" id="nim-retry-deploy">${escapeHtml(I18n.t('nim.retry'))}</tf-button>
         </div>
       </div>
     `;

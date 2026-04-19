@@ -1,10 +1,11 @@
 // =============================================================================
 // Plik: modules/apikeys.js
-// Opis: Lista + create + revoke kluczy API.
+// Opis: Lista + create + revoke kluczy API. Uzywa tf-window, tf-button, tf-input.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, toast, formatDate, formatRelative } from '/js/utils.js';
+import { TfWindow } from '/js/components/tf-window.js';
 
 let keys = [];
 
@@ -14,7 +15,7 @@ const ApiKeysScreen = {
     return `
       <div class="content-header">
         <h1>Klucze API</h1>
-        <button class="btn btn-primary" id="btn-create-key">Utwórz klucz</button>
+        <tf-button variant="primary" id="btn-create-key" label="Utwórz klucz"></tf-button>
       </div>
       <div class="card" style="padding: 0;"><div id="keys-host"></div></div>`;
   },
@@ -46,7 +47,7 @@ function renderTable() {
         <td>${escapeHtml(k.name)}</td>
         <td>${formatDate(k.createdAtEpoch)}</td>
         <td>${k.lastUsedAtEpoch ? formatRelative(k.lastUsedAtEpoch) : '—'}</td>
-        <td><button class="btn btn-sm btn-danger" data-revoke="${escapeHtml(k.keyId)}">Usuń</button></td>
+        <td><tf-button variant="danger" size="sm" data-revoke="${escapeHtml(k.keyId)}" label="Usuń"></tf-button></td>
       </tr>`).join('')}</tbody>
     </table>`;
   host.querySelectorAll('[data-revoke]').forEach((b) => {
@@ -55,7 +56,14 @@ function renderTable() {
 }
 
 async function revoke(keyId) {
-  if (!confirm(`Usunąć klucz ${keyId}?`)) return;
+  const ok = await TfWindow.confirm({
+    title: 'Usuń klucz API',
+    message: `Usunąć klucz ${keyId}?`,
+    confirmLabel: 'Usuń',
+    cancelLabel: 'Anuluj',
+    danger: true,
+  });
+  if (!ok) return;
   try {
     const r = await ApiBinary.action('apiKeyRevokeRequest', { keyId });
     if (r.deleted) { toast('Usunięto', 'success'); await load(); }
@@ -64,39 +72,77 @@ async function revoke(keyId) {
 }
 
 function openCreateModal() {
-  document.body.insertAdjacentHTML('beforeend', `
-    <div class="modal-backdrop" id="key-modal">
-      <div class="modal">
-        <div class="modal-header"><h3 class="modal-title">Nowy klucz API</h3>
-          <button class="btn btn-ghost btn-sm" id="k-x">×</button></div>
-        <div class="modal-body">
-          <div class="form-row">
-            <label class="label" for="k-name">Nazwa</label>
-            <input class="input" id="k-name" placeholder="np. CI Pipeline">
-          </div>
-          <div id="k-result" style="display: none; margin-top: var(--space-4);">
-            <div class="label">Skopiuj klucz — będzie widoczny tylko teraz!</div>
-            <pre id="k-result-token" style="background: var(--color-bg); padding: var(--space-3); border-radius: var(--radius-md); border: 1px solid var(--color-border); word-break: break-all; user-select: all;"></pre>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn" id="k-close">Zamknij</button>
-          <button class="btn btn-primary" id="k-create">Utwórz</button>
-        </div>
-      </div>
-    </div>`);
-  const close = () => byId('key-modal')?.remove();
-  byId('k-x').addEventListener('click', close);
-  byId('k-close').addEventListener('click', () => { close(); load(); });
-  byId('k-create').addEventListener('click', async () => {
-    const name = byId('k-name').value.trim();
-    if (!name) { toast('Nazwa wymagana', 'warning'); return; }
-    try {
-      const r = await ApiBinary.action('apiKeyCreateRequest', { name, scopes: [] });
-      byId('k-result').style.display = 'block';
-      byId('k-result-token').textContent = r.token;
-      byId('k-create').disabled = true;
-    } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
+  // Body okna — tf-input dla nazwy + kontener na wynik (token)
+  const bodyEl = document.createElement('div');
+  bodyEl.innerHTML = `
+    <div class="form-row">
+      <tf-input id="k-name" label="Nazwa" placeholder="np. CI Pipeline" autofocus></tf-input>
+    </div>
+    <div id="k-result" style="display: none; margin-top: var(--space-4);">
+      <div class="tf-label">Skopiuj klucz — będzie widoczny tylko teraz!</div>
+      <pre id="k-result-token" style="background: var(--color-bg); padding: var(--space-3); border-radius: var(--radius-md); border: 1px solid var(--color-border); word-break: break-all; user-select: all;"></pre>
+    </div>
+  `;
+
+  const footerEl = document.createElement('div');
+  footerEl.innerHTML = `
+    <tf-button variant="ghost" data-action="close" label="Zamknij"></tf-button>
+    <tf-button variant="primary" data-action="create" label="Utwórz" id="k-create-btn"></tf-button>
+  `;
+
+  // Recznie tworzymy okno (nie uzywamy TfWindow.open bo potrzebujemy nie zamykac
+  // okna po akcji "create" — serwer zwraca token ktory musi zobaczyc uzytkownik).
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', 'Nowy klucz API');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('min-width', '420');
+  win.setAttribute('min-height', '220');
+  win.setAttribute('width', '460');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+
+  const bodyWrap = document.createElement('div');
+  bodyWrap.slot = 'body';
+  bodyWrap.appendChild(bodyEl);
+  win.appendChild(bodyWrap);
+
+  const footWrap = document.createElement('div');
+  footWrap.slot = 'footer';
+  footWrap.appendChild(footerEl);
+  win.appendChild(footWrap);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.appendChild(backdrop);
+  document.body.appendChild(win);
+
+  const cleanup = () => {
+    if (win.isConnected) win.remove();
+    if (backdrop.isConnected) backdrop.remove();
+    load();
+  };
+
+  win.addEventListener('action', async (e) => {
+    const action = e.detail?.action;
+    if (action === 'close') {
+      cleanup();
+      return;
+    }
+    if (action === 'create') {
+      const nameInput = win.querySelector('#k-name');
+      const name = (nameInput?.value || '').trim();
+      if (!name) { toast('Nazwa wymagana', 'warning'); return; }
+      try {
+        const r = await ApiBinary.action('apiKeyCreateRequest', { name, scopes: [] });
+        const resultBox = win.querySelector('#k-result');
+        const resultToken = win.querySelector('#k-result-token');
+        resultBox.style.display = 'block';
+        resultToken.textContent = r.token;
+        const createBtn = win.querySelector('#k-create-btn');
+        if (createBtn) createBtn.setAttribute('disabled', '');
+      } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
+    }
   });
 }
 

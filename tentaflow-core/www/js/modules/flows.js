@@ -14,7 +14,7 @@ const FlowsScreen = {
     return `
       <div class="content-header">
         <h1>Flows</h1>
-        <button class="btn btn-primary" id="btn-new-flow">Nowy flow</button>
+        <tf-button variant="primary" id="btn-new-flow">Nowy flow</tf-button>
       </div>
       <div class="card" style="padding: 0;">
         <div id="flows-host"></div>
@@ -49,11 +49,11 @@ function renderTable() {
           <tr>
             <td>${escapeHtml(f.name)}</td>
             <td>${escapeHtml(f.description ?? '')}</td>
-            <td><span class="badge badge-${f.enabled ? 'success' : 'warning'}">${f.enabled ? 'aktywny' : 'wyłączony'}</span></td>
+            <td><tf-chip status="${f.enabled ? 'ok' : 'warn'}">${f.enabled ? 'aktywny' : 'wyłączony'}</tf-chip></td>
             <td>${formatDate(f.updatedAtEpoch)}</td>
             <td>
-              <button class="btn btn-sm" data-execs="${escapeHtml(f.id)}">Wykonania</button>
-              <button class="btn btn-sm btn-danger" data-delete="${escapeHtml(f.id)}">Usuń</button>
+              <tf-button variant="secondary" size="sm" data-execs="${escapeHtml(f.id)}">Wykonania</tf-button>
+              <tf-button variant="danger" size="sm" data-delete="${escapeHtml(f.id)}">Usuń</tf-button>
             </td>
           </tr>`).join('')}
       </tbody>
@@ -104,12 +104,14 @@ function openCreateModal() {
     <div class="modal-backdrop" id="flow-modal">
       <div class="modal modal-lg">
         <div class="modal-header"><h3 class="modal-title">Nowy flow</h3>
-          <button class="btn btn-ghost btn-sm" id="fl-x">×</button></div>
+          <tf-button variant="ghost" size="sm" id="fl-x">×</tf-button></div>
         <div class="modal-body">
-          <div class="form-row"><label class="label" for="fl-name">Nazwa</label>
-            <input class="input" id="fl-name"></div>
-          <div class="form-row"><label class="label" for="fl-desc">Opis</label>
-            <input class="input" id="fl-desc"></div>
+          <div class="form-row">
+            <tf-input id="fl-name" label="Nazwa"></tf-input>
+          </div>
+          <div class="form-row">
+            <tf-input id="fl-desc" label="Opis"></tf-input>
+          </div>
           <div class="form-row"><label class="label" for="fl-graph">Graph JSON</label>
             <textarea class="textarea" id="fl-graph" rows="10">{
   "nodes": [],
@@ -117,8 +119,8 @@ function openCreateModal() {
 }</textarea></div>
         </div>
         <div class="modal-footer">
-          <button class="btn" id="fl-cancel">Anuluj</button>
-          <button class="btn btn-primary" id="fl-create">Utwórz</button>
+          <tf-button variant="secondary" id="fl-cancel">Anuluj</tf-button>
+          <tf-button variant="primary" id="fl-create">Utwórz</tf-button>
         </div>
       </div>
     </div>`);

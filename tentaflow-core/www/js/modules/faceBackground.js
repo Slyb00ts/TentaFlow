@@ -68,6 +68,62 @@ function buildEdgeList() {
 
 const EDGES = buildEdgeList();
 
+// Head_5 (piotr.bin) ma wlasna topologie 486 wierzcholkow — standardowe
+// indeksy MediaPipe FaceMesh trafiaja tu w czolo/policzek, nie w oko.
+// Wyliczamy indeksy oka z blendshape'a `blink` uzywajac tych samych masek
+// co `apply()`: `blink_left` (lewe oko widza) uzywa LEFT_MASK — czyli maski
+// sa per-widza, nie per-twarz. Dodatkowo filtrujemy po Y by odrzucic vertices
+// policzka (blink ma minimalne delty na policzkach). Zachowujemy tylko
+// wierzcholki z TOP-K najwiekszymi deltami — to gwarantuje ze dostaniemy
+// powieki + rogi oka, a nie rozproszona okolice.
+function findEyeIndicesFromBlink(side) {
+  const mask = side === 'viewer-left' ? LEFT_MASK : RIGHT_MASK;
+  const blinkIdx = BS_INDEX.blink;
+  if (blinkIdx == null || blinkIdx < 0) return [];
+  const deltas = BLENDSHAPE_DELTAS[blinkIdx];
+  if (!deltas) return [];
+  const MASK_THRESHOLD = 0.5;
+  const candidates = [];
+  for (let i = 0; i < NUM_VERTICES; i++) {
+    if (mask[i] < MASK_THRESHOLD) continue;
+    const j = i * 3;
+    const dx = deltas[j];
+    const dy = deltas[j + 1];
+    const dz = deltas[j + 2];
+    const mag = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (mag > 0) candidates.push({ i, mag });
+  }
+  // Sortuj malejaco i wez TOP 12 — to daje tesne centrum oka bez otaczajacej
+  // skory twarzy (policzek/brwi maja marginalny blink ale nie sa oczami).
+  candidates.sort((a, b) => b.mag - a.mag);
+  const TOP_K = Math.min(12, candidates.length);
+  return candidates.slice(0, TOP_K).map((c) => c.i);
+}
+
+const VIEWER_LEFT_EYE_INDICES = findEyeIndicesFromBlink('viewer-left');
+if (typeof console !== 'undefined' && console.debug) {
+  // Diagnostyka: srednia pozycja 3D wybranych vertices (w przestrzeni modelu).
+  let avgX = 0;
+  let avgY = 0;
+  let avgZ = 0;
+  for (const i of VIEWER_LEFT_EYE_INDICES) {
+    avgX += BASE_POSITIONS[i * 3];
+    avgY += BASE_POSITIONS[i * 3 + 1];
+    avgZ += BASE_POSITIONS[i * 3 + 2];
+  }
+  if (VIEWER_LEFT_EYE_INDICES.length > 0) {
+    avgX /= VIEWER_LEFT_EYE_INDICES.length;
+    avgY /= VIEWER_LEFT_EYE_INDICES.length;
+    avgZ /= VIEWER_LEFT_EYE_INDICES.length;
+  }
+  console.debug(
+    '[face] viewer-left eye:',
+    VIEWER_LEFT_EYE_INDICES.length,
+    'vertices, avg pos (x,y,z) =',
+    avgX.toFixed(3), avgY.toFixed(3), avgZ.toFixed(3),
+  );
+}
+
 // Parametry glow przez offscreen canvas + ctx.filter='blur()'. Pipeline:
 // 1) offscreen: pełny biały stroke wszystkich bucketów,
 // 2) main: dwie warstwy blur z compositem 'lighter' (szeroki + wąski glow),
@@ -182,6 +238,23 @@ const state = {
   orientationSetupAttempted: false,
   betaBaseline: null,
   scaleMul: DESKTOP_SCALE_MUL,
+  // Flaga aktywna podczas animacji przejścia login → main UI. Wyłącza
+  // planowanie nowych idle-akcji w tickIdle, żeby mimika była spokojna
+  // podczas zoomu w oko.
+  transitioning: false,
+  transitionRafId: 0,
+  // Nadpisania parametrów kamery używane w renderFrame podczas tranzycji.
+  // null = brak nadpisania, używane są wartości bazowe (cx=w*0.5 itd.).
+  // Wartości zoomCx/zoomCy są w FIZYCZNYCH pikselach (tak jak canvas.width).
+  zoomCx: null,
+  zoomCy: null,
+  yawOverride: null,
+  pitchOverride: null,
+  // Head shake "no" — faza w czasie `state.phase` kiedy wystartowal shake.
+  // null = brak aktywnego shake. shakeDuration trzymane obok na wypadek
+  // dynamicznej korekty (np. reduced-motion).
+  shakeT0: null,
+  shakeDuration: 0.8,
 };
 
 /**
@@ -319,11 +392,41 @@ function ensureGlowCanvas(w, h) {
  * i boki głowy delikatnie prześwitywały zamiast znikać skokowo. Alpha rośnie
  * z gamma 1.8 od tyłu do przodu, lineWidth też skaluje się z głębokością.
  */
+// Interpolacja koloru stroke biały → czerwony (255,60,60) w oknie shake.
+// Envelope: 0→1 w pierwszych 20% czasu, hold do 70%, 1→0 do końca.
+function computeTintColor() {
+  if (state.shakeT0 === null || state.shakeT0 === undefined) {
+    return { r: 255, g: 255, b: 255 };
+  }
+  const t = state.phase - state.shakeT0;
+  const D = state.shakeDuration;
+  if (t < 0 || t >= D) return { r: 255, g: 255, b: 255 };
+
+  let strength;
+  if (t < D * 0.2) {
+    strength = t / (D * 0.2);
+  } else if (t < D * 0.7) {
+    strength = 1;
+  } else {
+    strength = 1 - (t - D * 0.7) / (D * 0.3);
+  }
+  strength = strength * strength * (3 - 2 * strength);
+
+  const targetR = 255;
+  const targetG = 60;
+  const targetB = 60;
+  const r = Math.round(255 + (targetR - 255) * strength);
+  const g = Math.round(255 + (targetG - 255) * strength);
+  const b = Math.round(255 + (targetB - 255) * strength);
+  return { r, g, b };
+}
+
 function drawEdges(ctx, dpr) {
   const px = state.projX;
   const py = state.projY;
   const pz = state.projZ;
   const nz = state.normalZ;
+  const tint = computeTintColor();
 
   // Klucz bucketu koduje: isContour (1 bit) | lineWidth bucket (4 bity) |
   // alpha bucket (5 bitów). Kubełki 0..19 dla alpha, 0..9 dla grubości.
@@ -357,7 +460,7 @@ function drawEdges(ctx, dpr) {
     // Krzywa głębi z baseline 0.30 i liniową rampą do 0.95. Wyraźny kontrast
     // przód-tył: tył głowy × najciemniejszy visFade ≈ 0.024 (prawie znika),
     // przód × visFade=1 ≈ 0.95 (pełna jasność).
-    let alpha = (depthT * 0.65 + 0.3) * visFade;
+    let alpha = (depthT * 0.55 + 0.45) * visFade;
     if (!isContour) alpha *= 0.5;
     if (alpha < 0.01) continue;
 
@@ -391,8 +494,8 @@ function drawEdges(ctx, dpr) {
     const widthBucket = (key >> 5) & 0xf;
     const alpha = alphaBucket / 19;
     const depthT = widthBucket / 9;
-    glowCtx.lineWidth = dpr * (0.9 + depthT * 0.4);
-    glowCtx.strokeStyle = `rgba(255, 255, 255,${alpha.toFixed(3)})`;
+    glowCtx.lineWidth = dpr * (1.4 + depthT * 0.5);
+    glowCtx.strokeStyle = `rgba(${tint.r},${tint.g},${tint.b},${alpha.toFixed(3)})`;
     glowCtx.beginPath();
     for (let i = 0; i < arr.length; i++) {
       const e = EDGES[arr[i]];
@@ -439,8 +542,8 @@ function drawEdges(ctx, dpr) {
     const widthBucket = (key >> 5) & 0xf;
     const alpha = alphaBucket / 19;
     const depthT = widthBucket / 9;
-    ctx.lineWidth = dpr * (0.9 + depthT * 0.4);
-    ctx.strokeStyle = `rgba(255, 255, 255,${alpha.toFixed(3)})`;
+    ctx.lineWidth = dpr * (1.4 + depthT * 0.5);
+    ctx.strokeStyle = `rgba(${tint.r},${tint.g},${tint.b},${alpha.toFixed(3)})`;
     ctx.beginPath();
     for (let i = 0; i < arr.length; i++) {
       const e = EDGES[arr[i]];
@@ -572,6 +675,13 @@ function tickIdle() {
   } else {
     m.blink_left = 0;
     m.blink_right = 0;
+  }
+
+  // Podczas animacji przejścia nie planujemy nowych akcji idle — twarz
+  // utrzymuje spokojną mimikę, tylko ewentualne już zaplanowane zanikają.
+  if (state.transitioning) {
+    evalActions(t, m);
+    return;
   }
 
   // Mikro-uśmieszki / grymasy — losowa polaryzacja (obie strony zerowe lub ujemne).
@@ -714,16 +824,36 @@ function renderFrame(nowMs) {
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  const cx = w * 0.5;
-  // Środek projekcji przesunięty o 6% wysokości viewportu w dół — twarz
-  // siada wizualnie niżej niż geometryczne centrum ekranu.
-  const cy = h * 0.56;
+  // Środek projekcji — podczas tranzycji nadpisywany przez zoomCx/zoomCy
+  // (w FIZYCZNYCH pikselach), w przeciwnym razie 50% / 56% viewportu.
+  const cx = state.zoomCx !== null ? state.zoomCx : w * 0.5;
+  const cy = state.zoomCy !== null ? state.zoomCy : h * 0.56;
   const baseScale = Math.min(w, h) * state.scaleMul;
 
-  const yawBase = Math.sin(state.phase * 0.15) * 0.15;
-  const pitchBase = PITCH_BASE_OFFSET + Math.sin(state.phase * 0.1) * 0.08;
-  const yaw = yawBase + state.parallaxYaw;
-  const pitch = pitchBase + state.parallaxPitch;
+  // Head shake "no" — podczas aktywnego shake nadpisujemy bazowy sway i
+  // parallax, żeby głowa oscylowała wokół frontalu (0,0) zamiast sumować
+  // trzy źródła rotacji i pokazywać bok / tył głowy.
+  let yaw;
+  let pitch;
+  if (state.shakeT0 !== null && (state.phase - state.shakeT0) >= state.shakeDuration) {
+    state.shakeT0 = null;
+  }
+  if (state.yawOverride !== null) {
+    // Tranzycja: patrzymy frontalnie, bez parallaxu ani sway.
+    yaw = state.yawOverride;
+    pitch = state.pitchOverride;
+  } else if (state.shakeT0 !== null) {
+    const tShake = state.phase - state.shakeT0;
+    const damp = 1 - tShake / state.shakeDuration;
+    // Amplituda ±0.35 rad (~20°) — wyraźne "nie" bez widocznego boku głowy.
+    yaw = damp * Math.sin((tShake / state.shakeDuration) * Math.PI * 6) * 0.35;
+    pitch = PITCH_BASE_OFFSET;
+  } else {
+    const yawBase = Math.sin(state.phase * 0.15) * 0.15;
+    const pitchBase = PITCH_BASE_OFFSET + Math.sin(state.phase * 0.1) * 0.08;
+    yaw = yawBase + state.parallaxYaw;
+    pitch = pitchBase + state.parallaxPitch;
+  }
 
   project(cx, cy, baseScale, yaw, pitch);
   drawEdges(ctx, state.dpr);
@@ -915,6 +1045,45 @@ function handleResize() {
   }
 }
 
+/**
+ * Oblicza średni offset 2D projekcji grupy wierzchołków (dla danego yaw/pitch)
+ * w jednostkach "pre-scale" — czyli wartość `x1 * invDepth` uśredniona po
+ * indeksach. Żeby uzyskać pozycję w pikselach wystarczy pomnożyć przez
+ * `scalePersp = baseScale * 1.8` i dodać `cx`/`cy`.
+ *
+ * Używa aktualnych `state.workVertices` (po blendshapes z bieżącej klatki),
+ * więc pozycja oka uwzględnia np. częściowe zamknięcie powiek.
+ */
+function computeEyeOffset(indices, yaw, pitch) {
+  const sinY = Math.sin(yaw);
+  const cosY = Math.cos(yaw);
+  const sinP = Math.sin(pitch);
+  const cosP = Math.cos(pitch);
+  const src = state.workVertices;
+  let sumX = 0;
+  let sumY = 0;
+  let count = 0;
+  for (let k = 0; k < indices.length; k++) {
+    const i = indices[k];
+    if (i >= NUM_VERTICES) continue;
+    const j = i * 3;
+    const x = src[j];
+    const y = src[j + 1];
+    const z = src[j + 2];
+    const x1 = x * cosY + z * sinY;
+    const z1 = -x * sinY + z * cosY;
+    const y1 = y * cosP - z1 * sinP;
+    const z2 = y * sinP + z1 * cosP;
+    const depth = 1.8 - z2;
+    const invDepth = depth > 0.1 ? 1.0 / depth : 1.0 / 0.1;
+    sumX += x1 * invDepth;
+    sumY += y1 * invDepth;
+    count++;
+  }
+  if (count === 0) return { dx: 0, dy: 0 };
+  return { dx: sumX / count, dy: sumY / count };
+}
+
 export const FaceBackground = {
   show() {
     if (document.getElementById(CONTAINER_ID)) return;
@@ -954,6 +1123,8 @@ export const FaceBackground = {
     state.parallaxPitch = 0;
     state.orientationSetupAttempted = false;
     state.betaBaseline = null;
+    state.shakeT0 = null;
+    state.shakeDuration = 0.8;
     state.scaleMul = isMobileViewport() ? MOBILE_SCALE_MUL : DESKTOP_SCALE_MUL;
 
     syncCanvasSize();
@@ -980,6 +1151,189 @@ export const FaceBackground = {
       document.addEventListener('visibilitychange', state.visibilityHandler);
       startLoop();
     }
+  },
+
+  /**
+   * Przejście login → main UI realizowane PRZEZ NATYWNY pipeline twarzy.
+   * Animuje `state.scaleMul` (twarz rośnie wielokrotnie poza viewport) oraz
+   * `state.zoomCx`/`zoomCy` (kamera śledzi lewe oko = lewa strona ekranu widza),
+   * tak żeby oko zawsze wylądowało na środku viewportu. Równolegle UI rośnie
+   * proporcjonalnie (CSS var --tf-ui-scale), jakby wynurzało się z tęczówki.
+   *
+   * Brak CSS transform na kontenerze twarzy — render idzie każdą klatkę przez
+   * pipeline project() + drawEdges(), więc krawędzie pozostają ostre.
+   *
+   * opts:
+   *  - onMidpoint(): wywołany w połowie — UI powinno zostać zmountowane
+   *  - onComplete(): wywołany po pełnym zakończeniu (face-bg ukryty)
+   */
+  transitionOut(opts) {
+    const onMidpoint = (opts && opts.onMidpoint) || (() => {});
+    const onComplete = (opts && opts.onComplete) || (() => {});
+
+    if (!state.canvas) {
+      onMidpoint();
+      onComplete();
+      return;
+    }
+
+    if (state.reducedMotion) {
+      // Tryb oszczędny — natychmiast mountujemy UI, krótki fade canvasa.
+      onMidpoint();
+      state.canvas.style.transition = 'opacity 0.2s linear';
+      state.canvas.style.opacity = '0';
+      setTimeout(() => {
+        FaceBackground.hide();
+        onComplete();
+      }, 200);
+      return;
+    }
+
+    state.transitioning = true;
+
+    // Wyzeruj wszelkie zaplanowane idle-akcje, żeby mimika nie zaszumiała oka.
+    state.actions.length = 0;
+
+    // Zablokuj sway i parallax — patrzymy frontalnie, oko ma być stabilne.
+    state.targetYaw = 0;
+    state.targetPitch = 0;
+    state.parallaxYaw = 0;
+    state.parallaxPitch = 0;
+    state.yawOverride = 0;
+    state.pitchOverride = PITCH_BASE_OFFSET;
+
+    // Indeksy oka wyliczone z blendshape'a blink + maski strony (patrz
+    // findEyeIndicesFromBlink u gory pliku). Fallback na centroid (0) gdy
+    // z jakiegos powodu detekcja nic nie zwrocila.
+    const eyeIndices = VIEWER_LEFT_EYE_INDICES.length > 0
+      ? VIEWER_LEFT_EYE_INDICES
+      : [0];
+
+    const scaleStart = state.scaleMul;
+    // scaleEnd=13: UI zaczyna przy ~0.022 (vs 0.029 przy 10) — mniejsze, zeby
+    // w caosci zmiescilo sie w tęczówce na starcie. Twarz rośnie wtedy
+    // wiekszaniej, ale w ostatnich 30% i tak fade-outuje wiec wizualnie bez
+    // roznicy na koncu.
+    const scaleEnd = 13;
+    const DURATION = 2600;
+    const FADE_START_T = 0.7;
+    // Niewielki offset UI na prawo i w dol — srodek wykrytych vertices oka
+    // jest troche wyzej/lewo niz srodek tęczówki (blink porusza gornie
+    // powieki bardziej niz dolne), wiec UI musi zostac przesunięty.
+    const UI_OFFSET_X = 15;
+    const UI_OFFSET_Y = 25;
+
+    const startTime = performance.now();
+
+    const easeInOutCubic = (t) =>
+      t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+    // UI mountowane od razu — start pierwszej klatki z mikroskopijnym scalem
+    // w pozycji oka, potem rośnie proporcjonalnie razem z twarzą.
+    try { onMidpoint(); } catch (e) { console.error('[faceBg] onMidpoint error:', e); }
+    let uiRoot = null;
+
+    const tick = (nowMs) => {
+      const elapsed = nowMs - startTime;
+      const t = Math.min(elapsed / DURATION, 1);
+      const et = easeInOutCubic(t);
+
+      // 1. Rosnąca skala twarzy — każda klatka renderowana natywnym pipeline'em.
+      state.scaleMul = scaleStart + (scaleEnd - scaleStart) * et;
+
+      // 2. Pozycja kamery: cx = w/2 - dx * scalePersp tak, żeby po projekcji
+      //    średni piksel oka trafił w środek viewportu (w fizycznych pikselach).
+      const canvas = state.canvas;
+      if (!canvas) {
+        state.transitionRafId = 0;
+        state.transitioning = false;
+        onComplete();
+        return;
+      }
+      const wPx = canvas.width;
+      const hPx = canvas.height;
+      const baseScale = Math.min(wPx, hPx) * state.scaleMul;
+      const scalePersp = baseScale * 1.8;
+      const { dx, dy } = computeEyeOffset(eyeIndices, 0, PITCH_BASE_OFFSET);
+      state.zoomCx = wPx * 0.5 - dx * scalePersp;
+      state.zoomCy = hPx * 0.5 - dy * scalePersp;
+
+      // 3. UI skaluje się proporcjonalnie do rozmiaru oka. Rozmiar oka na
+      //    ekranie rośnie liniowo z baseScale → scaleMul. Start ≈ 0.03, koniec = 1.
+      const uiScale = state.scaleMul / scaleEnd;
+
+      // 4. Pollujemy #app-root co klatkę — renderApp() może być async (czeka
+      //    na auth/me), więc element może pojawić się z opóźnieniem. Koszt
+      //    getElementById w RAF jest pomijalny.
+      if (!uiRoot) uiRoot = document.getElementById('app-root');
+      if (uiRoot) {
+        if (!uiRoot.classList.contains('is-emerging')) {
+          uiRoot.classList.add('is-emerging');
+        }
+        uiRoot.style.setProperty('--tf-ui-scale', uiScale.toFixed(4));
+        // Offset interpoluje od pelnej wartosci (gdy UI male, offset w px jest
+        // proporcjonalnie duzy wzgledem rozmiaru UI) do zera (gdy UI wypelnia
+        // viewport i powinno byc wycentrowane). Liniowo z (1 - uiScale).
+        const offFactor = Math.max(0, 1 - uiScale);
+        uiRoot.style.setProperty('--tf-ui-offset-x', `${(UI_OFFSET_X * offFactor).toFixed(1)}px`);
+        uiRoot.style.setProperty('--tf-ui-offset-y', `${(UI_OFFSET_Y * offFactor).toFixed(1)}px`);
+      }
+
+      // 5. Fade-out canvasa w ostatnich ~30% czasu — twarz znika, UI zostaje.
+      if (t > FADE_START_T && state.canvas) {
+        const ft = (t - FADE_START_T) / (1 - FADE_START_T);
+        state.canvas.style.opacity = (1 - ft).toFixed(3);
+      }
+
+      if (t < 1) {
+        state.transitionRafId = requestAnimationFrame(tick);
+      } else {
+        state.transitionRafId = 0;
+        state.transitioning = false;
+
+        // Reset nadpisań kamery (i tak za chwilę hide() ubija canvas).
+        state.zoomCx = null;
+        state.zoomCy = null;
+        state.yawOverride = null;
+        state.pitchOverride = null;
+        state.scaleMul = scaleStart;
+
+        if (uiRoot) {
+          uiRoot.classList.remove('is-emerging');
+          uiRoot.style.removeProperty('--tf-ui-scale');
+          uiRoot.style.removeProperty('--tf-ui-offset-x');
+          uiRoot.style.removeProperty('--tf-ui-offset-y');
+        }
+
+        FaceBackground.hide();
+        try { onComplete(); } catch (e) { console.error('[faceBg] onComplete error:', e); }
+      }
+    };
+
+    state.transitionRafId = requestAnimationFrame(tick);
+  },
+
+  /**
+   * Animacja "no" — oscylacja yaw z tlumieniem przez ~0.8 s plus overlay
+   * angry na brwiach. W reduced-motion robimy pojedyncze, male kiwniecie,
+   * zeby nie irytowac uzytkownikow wrazliwych na ruch.
+   */
+  shakeHead() {
+    if (!state.canvas) return;
+    if (state.reducedMotion) {
+      state.shakeT0 = state.phase;
+      state.shakeDuration = 0.4;
+      return;
+    }
+    state.shakeT0 = state.phase;
+    state.shakeDuration = 0.8;
+    scheduleAction(state.phase, {
+      bsKey: 'angry',
+      peakValue: 0.4,
+      attack: 0.1,
+      hold: 0.5,
+      release: 0.2,
+    });
   },
 
   hide() {

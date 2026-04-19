@@ -3,7 +3,8 @@
 // Opis: Streaming chat z historia wiadomosci. Lista wiadomosci wirtualizowana
 //       (VirtualList + pretext text-measure) — plynnie obsluguje 10000+
 //       wiadomosci. Pin-to-bottom auto-scroll przy nowych chunkach.
-//       Layout: header (model select) + scrollowana lista + bottom composer.
+//       Layout: header (tf-select model) + scrollowana lista + bottom composer
+//       (textarea + tf-button send).
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -28,16 +29,14 @@ const ChatScreen = {
       <div class="chat-shell">
         <div class="chat-header">
           <h1>${escapeHtml(I18n.t('chat.title'))}</h1>
-          <select class="input chat-model-select" id="chat-model"></select>
+          <tf-select class="chat-model-select" id="chat-model"></tf-select>
         </div>
         <div class="chat-list" id="chat-list"></div>
         <div class="chat-composer">
           <textarea class="input chat-input" id="chat-input"
             placeholder="${escapeHtml(I18n.t('chat.placeholder'))}"
             rows="2"></textarea>
-          <button class="btn btn-primary chat-send" id="chat-send" aria-label="Send">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-          </button>
+          <tf-button variant="primary" icon="send" id="chat-send" label="Send"></tf-button>
         </div>
       </div>
     `;
@@ -48,10 +47,17 @@ const ChatScreen = {
     } catch {
       modelOptions = [];
     }
+    // tf-select w connectedCallback tworzy wewnetrzny <select> — wstrzykujemy
+    // <option> bezposrednio do niego, bo tf-select przejmuje dzieci tylko raz.
     const sel = byId('chat-model');
-    sel.innerHTML = modelOptions.length === 0
+    const innerSelect = sel.querySelector('select');
+    const optionsHtml = modelOptions.length === 0
       ? `<option value="default">default</option>`
       : modelOptions.map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('');
+    if (innerSelect) {
+      innerSelect.innerHTML = optionsHtml;
+      sel.setAttribute('value', innerSelect.value);
+    }
 
     const host = byId('chat-list');
     listWidth = host.clientWidth;

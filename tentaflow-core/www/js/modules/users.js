@@ -20,7 +20,7 @@ const UsersScreen = {
         <div class="card" style="max-width: 480px;">
           <div class="card-header">
             <h3 class="card-title">Twój profil</h3>
-            <span class="badge badge-accent">${escapeHtml(me.role)}</span>
+            <tf-chip status="accent">${escapeHtml(me.role)}</tf-chip>
           </div>
           <div class="form-row"><span class="label">Username</span>
             <div style="font-size: var(--text-lg);">${escapeHtml(me.username)}</div></div>
