@@ -576,6 +576,243 @@ pub struct MeshPairInitResponse {
 }
 
 // =============================================================================
+// Mesh extended (FAZA 1a/1b: read-only + write actions for admin/dashboard).
+// Helper structs are mirrored 1:1 by `mesh_node_info_to_js` and the
+// per-variant encoders in `tentaflow-protocol-wasm`.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeshNodeGpuInfo {
+    pub vendor: String,
+    pub name: String,
+    pub vram_total_mb: u64,
+    pub vram_used_mb: Option<u64>,
+    pub temperature_c: Option<f32>,
+    pub power_draw_w: Option<f32>,
+    pub utilization_percent: Option<f32>,
+    pub driver_version: Option<String>,
+    pub cuda_version: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeNetworkInterface {
+    pub name: String,
+    pub link_up: bool,
+    pub speed_mbps: Option<u32>,
+    pub ipv4_address: Option<String>,
+    pub interface_type: Option<String>,
+    pub rdma_available: Option<bool>,
+    pub roce_available: Option<bool>,
+    pub numa_node: Option<i32>,
+    pub rx_bytes_per_sec: Option<u64>,
+    pub tx_bytes_per_sec: Option<u64>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeModel {
+    pub alias: String,
+    pub kind: Option<String>,
+    pub backend: Option<String>,
+    pub size_mb: Option<u64>,
+    pub loaded: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeshNodeContainer {
+    pub name: String,
+    pub image: String,
+    pub status: String,
+    pub cpu_percent: Option<f32>,
+    pub memory_mb: Option<f32>,
+    pub memory_limit_mb: Option<u64>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeRoute {
+    pub hops: u32,
+    pub direct: bool,
+    pub next_hop: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeshNodeInfo {
+    pub node_id: String,
+    pub hostname: String,
+    pub ip: Option<String>,
+    pub status: String,
+    pub source: String,
+    pub is_local: bool,
+    pub uptime_secs: Option<u64>,
+    pub gpu_info: Option<MeshNodeGpuInfo>,
+    pub network_interfaces: Vec<MeshNodeNetworkInterface>,
+    pub cpu_count: Option<u32>,
+    pub cpu_usage_percent: Option<f32>,
+    pub ram_total_mb: Option<u64>,
+    pub ram_used_mb: Option<u64>,
+    pub vram_total_mb: Option<u64>,
+    pub vram_used_mb: Option<u64>,
+    pub gpu_load_percent: Option<f32>,
+    pub models: Vec<MeshNodeModel>,
+    pub containers: Vec<MeshNodeContainer>,
+    pub last_seen_epoch: Option<i64>,
+    pub route: Option<MeshNodeRoute>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeshNodeListResponse {
+    pub nodes: Vec<MeshNodeInfo>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeshNodeDetailRequest {
+    pub node_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeshNodeDetailResponse {
+    pub node: MeshNodeInfo,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPendingPair {
+    pub pair_id: String,
+    pub remote_node_id: String,
+    pub remote_hostname: Option<String>,
+    pub remote_ip: Option<String>,
+    pub initiated_at: i64,
+    pub state: String,
+    pub pin: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPendingListResponse {
+    pub pending: Vec<MeshPendingPair>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshIdentityResponse {
+    pub node_id: String,
+    pub hostname: String,
+    pub public_key: String,
+    pub addresses: Vec<String>,
+    pub version: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshServicesEntry {
+    pub service_name: String,
+    pub node_id: String,
+    pub status: String,
+    pub endpoint: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshServicesListResponse {
+    pub services: Vec<MeshServicesEntry>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustedNode {
+    pub node_id: String,
+    pub hostname: Option<String>,
+    pub trusted_since_epoch: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustedListResponse {
+    pub trusted: Vec<MeshTrustedNode>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairingStartRequest {
+    pub remote_address: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairingStartResponse {
+    pub pair_id: String,
+    pub pin: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairingConfirmRequest {
+    pub pair_id: String,
+    pub pin: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairingConfirmResponse {
+    pub ok: bool,
+    pub trusted_node_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairingRejectRequest {
+    pub pair_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairingRejectResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustRevokeRequest {
+    pub node_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustRevokeResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustRetrustRequest {
+    pub node_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshTrustRetrustResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshConnectRequest {
+    pub address: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshConnectResponse {
+    pub ok: bool,
+    pub remote_node_id: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeCommandRequest {
+    pub node_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeCommandResponse {
+    pub ok: bool,
+    pub output: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeNetworkConfigRequest {
+    pub node_id: String,
+    pub interface_name: String,
+    pub config_json: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshNodeNetworkConfigResponse {
+    pub ok: bool,
+}
+
+// =============================================================================
 // Settings (R-LIST + W-UPDATE archetypy, migration-map #147-#148)
 // =============================================================================
 
@@ -1013,6 +1250,36 @@ pub enum MessageBody {
     // ---- Mesh trust events (broadcast / sync) ----
     MeshTrustRevoked(MeshTrustRevokedEvent),
     MeshTrustedKeysSync(MeshTrustedKeysSyncEvent),
+
+    // ---- Mesh extended (read-only + admin actions) ----
+    MeshNodeListRequest,
+    MeshNodeListResponseBody(MeshNodeListResponse),
+    MeshNodeDetailRequestBody(MeshNodeDetailRequest),
+    MeshNodeDetailResponseBody(MeshNodeDetailResponse),
+    MeshPendingListRequest,
+    MeshPendingListResponseBody(MeshPendingListResponse),
+    MeshIdentityRequest,
+    MeshIdentityResponseBody(MeshIdentityResponse),
+    MeshServicesListRequest,
+    MeshServicesListResponseBody(MeshServicesListResponse),
+    MeshTrustedListRequest,
+    MeshTrustedListResponseBody(MeshTrustedListResponse),
+    MeshPairingStartRequestBody(MeshPairingStartRequest),
+    MeshPairingStartResponseBody(MeshPairingStartResponse),
+    MeshPairingConfirmRequestBody(MeshPairingConfirmRequest),
+    MeshPairingConfirmResponseBody(MeshPairingConfirmResponse),
+    MeshPairingRejectRequestBody(MeshPairingRejectRequest),
+    MeshPairingRejectResponseBody(MeshPairingRejectResponse),
+    MeshTrustRevokeRequestBody(MeshTrustRevokeRequest),
+    MeshTrustRevokeResponseBody(MeshTrustRevokeResponse),
+    MeshTrustRetrustRequestBody(MeshTrustRetrustRequest),
+    MeshTrustRetrustResponseBody(MeshTrustRetrustResponse),
+    MeshConnectRequestBody(MeshConnectRequest),
+    MeshConnectResponseBody(MeshConnectResponse),
+    MeshNodeCommandRequestBody(MeshNodeCommandRequest),
+    MeshNodeCommandResponseBody(MeshNodeCommandResponse),
+    MeshNodeNetworkConfigRequestBody(MeshNodeNetworkConfigRequest),
+    MeshNodeNetworkConfigResponseBody(MeshNodeNetworkConfigResponse),
 
     // ---- Services (R-LIST + W-ACTION + R-STREAM dla deploy progress) ----
     ServiceListRequest,
