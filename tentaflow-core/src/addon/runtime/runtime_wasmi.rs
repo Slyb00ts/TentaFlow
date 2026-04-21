@@ -57,10 +57,7 @@ pub fn compile_module(engine: &WasmEngine, wasm_bytes: &[u8]) -> Result<WasmModu
     let module = WasmModule::new(engine, wasm_bytes)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie skompilowac modulu WASM: {}", e))?;
 
-    info!(
-        "Modul WASM skompilowany ({} bajtow)",
-        wasm_bytes.len(),
-    );
+    info!("Modul WASM skompilowany ({} bajtow)", wasm_bytes.len(),);
 
     Ok(module)
 }
@@ -75,29 +72,35 @@ pub fn create_store(engine: &WasmEngine, state: AddonState) -> Result<WasmStore<
     let mut store = WasmStore::new(engine, state);
 
     // Ustaw poczatkowe paliwo — addon zuzywa paliwo z kazdej instrukcji WASM
-    store.set_fuel(DEFAULT_FUEL_LIMIT)
+    store
+        .set_fuel(DEFAULT_FUEL_LIMIT)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie ustawic paliwa: {}", e))?;
 
     // Limit pamieci — ogranicza memory.grow i table.grow per instancja
     // Uzywamy store_limits z AddonState (pole cfg-gated)
     store.limiter(|state| &mut state.store_limits);
 
-    info!("Store wasmi utworzony (fuel={}, memory_limit={}MB)",
-        DEFAULT_FUEL_LIMIT, memory_limit / (1024 * 1024));
+    info!(
+        "Store wasmi utworzony (fuel={}, memory_limit={}MB)",
+        DEFAULT_FUEL_LIMIT,
+        memory_limit / (1024 * 1024)
+    );
 
     Ok(store)
 }
 
 /// Doladowuje paliwo w istniejacym store (np. po wznowieniu operacji)
 pub fn refuel_store(store: &mut WasmStore<AddonState>, fuel: u64) -> Result<()> {
-    store.set_fuel(fuel)
+    store
+        .set_fuel(fuel)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie doladowac paliwa: {}", e))?;
     Ok(())
 }
 
 /// Sprawdza ile paliwa pozostalo w store
 pub fn remaining_fuel(store: &WasmStore<AddonState>) -> Result<u64> {
-    store.get_fuel()
+    store
+        .get_fuel()
         .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac poziomu paliwa: {}", e))
 }
 
@@ -111,12 +114,18 @@ pub fn get_memory(caller: &mut WasmCaller<'_, AddonState>) -> Option<WasmMemory>
 }
 
 /// Zwraca slice danych z pamieci guest (immutable)
-pub fn memory_data<'a, T: 'a>(memory: &WasmMemory, store: &'a impl AsContext<Data = T>) -> &'a [u8] {
+pub fn memory_data<'a, T: 'a>(
+    memory: &WasmMemory,
+    store: &'a impl AsContext<Data = T>,
+) -> &'a [u8] {
     memory.data(store)
 }
 
 /// Zwraca mutowalny slice danych z pamieci guest
-pub fn memory_data_mut<'a, T: 'a>(memory: &WasmMemory, store: &'a mut impl AsContextMut<Data = T>) -> &'a mut [u8] {
+pub fn memory_data_mut<'a, T: 'a>(
+    memory: &WasmMemory,
+    store: &'a mut impl AsContextMut<Data = T>,
+) -> &'a mut [u8] {
     memory.data_mut(store)
 }
 
@@ -131,7 +140,8 @@ pub fn instantiate(
     store: &mut WasmStore<AddonState>,
     module: &WasmModule,
 ) -> Result<WasmInstance> {
-    linker.instantiate(&mut *store, module)
+    linker
+        .instantiate(&mut *store, module)
         .and_then(|i| Ok(i.ensure_no_start(store)?))
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc instancji WASM: {}", e))
 }

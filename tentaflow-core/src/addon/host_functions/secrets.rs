@@ -2,17 +2,20 @@
 // Plik: addon/host_functions/secrets.rs
 // Opis: Host functions Secrets API — szyfrowane sekrety per addon per user.
 //       Sekrety sa przechowywane w DB zaszyfrowane AES-256-GCM.
+// Uprawnienia: "secrets" (get/set). Fail-closed — brak uprawnienia blokuje
+//              dostep zanim klucz szyfrujacy zostanie derivowany. Scoping do
+//              (addon_id, user_id) wymuszany przez zapytania DB.
 // =============================================================================
 
-use tracing::{info, warn};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use sha2::Sha256;
+use tracing::{info, warn};
 
 use super::{
-    AddonState, ABI_OK, ABI_ERR_PERMISSION, ABI_ERR_OPERATION, ABI_ERR_NOT_FOUND,
-    get_memory, read_guest_string, read_guest_bytes, write_guest_output, audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_bytes, read_guest_string,
+    write_guest_output, AddonState, WasmCaller, ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION,
+    ABI_ERR_PERMISSION, ABI_OK,
 };
 use crate::db;
 
@@ -51,7 +54,14 @@ pub fn secret_get(
 
     // Sprawdz uprawnienie secrets (ro)
     if !check_permission(caller.data(), "secrets", None) {
-        audit_log(caller.data(), "secret.get", Some("secrets"), Some(&key), "denied", None);
+        audit_log(
+            caller.data(),
+            "secret.get",
+            Some("secrets"),
+            Some(&key),
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
@@ -69,7 +79,8 @@ pub fn secret_get(
                      ORDER BY user_id DESC LIMIT 1",
                     rusqlite::params![&addon_id, user_id, &key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
-                ).ok()
+                )
+                .ok()
             }
             Err(_) => return ABI_ERR_OPERATION,
         }
@@ -78,7 +89,14 @@ pub fn secret_get(
     let (encrypted_value, nonce_bytes) = match secret_data {
         Some(data) => data,
         None => {
-            audit_log(caller.data(), "secret.get", Some("secrets"), Some(&key), "ok", Some("not found"));
+            audit_log(
+                caller.data(),
+                "secret.get",
+                Some("secrets"),
+                Some(&key),
+                "ok",
+                Some("not found"),
+            );
             return ABI_ERR_NOT_FOUND;
         }
     };
@@ -87,7 +105,14 @@ pub fn secret_get(
     let decryption_key = match derive_key(&addon_id, caller.data()) {
         Some(k) => k,
         None => {
-            audit_log(caller.data(), "secret.get", Some("secrets"), Some(&key), "error", Some("Brak encryption_master_key"));
+            audit_log(
+                caller.data(),
+                "secret.get",
+                Some("secrets"),
+                Some(&key),
+                "error",
+                Some("Brak encryption_master_key"),
+            );
             return ABI_ERR_OPERATION;
         }
     };
@@ -99,14 +124,35 @@ pub fn secret_get(
         Err(e) => {
             let msg = format!("Blad deszyfrowania: {}", e);
             warn!("secret_get: {}", msg);
-            audit_log(caller.data(), "secret.get", Some("secrets"), Some(&key), "error", Some(&msg));
+            audit_log(
+                caller.data(),
+                "secret.get",
+                Some("secrets"),
+                Some(&key),
+                "error",
+                Some(&msg),
+            );
             return ABI_ERR_OPERATION;
         }
     };
 
-    audit_log(caller.data(), "secret.get", Some("secrets"), Some(&key), "ok", None);
+    audit_log(
+        caller.data(),
+        "secret.get",
+        Some("secrets"),
+        Some(&key),
+        "ok",
+        None,
+    );
 
-    write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, &decrypted)
+    write_guest_output(
+        &memory,
+        &mut caller,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        &decrypted,
+    )
 }
 
 // =============================================================================
@@ -143,7 +189,14 @@ pub fn secret_set(
 
     // Sprawdz uprawnienie secrets (rw)
     if !check_permission(caller.data(), "secrets", None) {
-        audit_log(caller.data(), "secret.set", Some("secrets"), Some(&key), "denied", None);
+        audit_log(
+            caller.data(),
+            "secret.set",
+            Some("secrets"),
+            Some(&key),
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
@@ -154,7 +207,14 @@ pub fn secret_set(
     let encryption_key = match derive_key(&addon_id, caller.data()) {
         Some(k) => k,
         None => {
-            audit_log(caller.data(), "secret.set", Some("secrets"), Some(&key), "error", Some("Brak encryption_master_key"));
+            audit_log(
+                caller.data(),
+                "secret.set",
+                Some("secrets"),
+                Some(&key),
+                "error",
+                Some("Brak encryption_master_key"),
+            );
             return ABI_ERR_OPERATION;
         }
     };
@@ -169,7 +229,14 @@ pub fn secret_set(
         Err(e) => {
             let msg = format!("Blad szyfrowania: {}", e);
             warn!("secret_set: {}", msg);
-            audit_log(caller.data(), "secret.set", Some("secrets"), Some(&key), "error", Some(&msg));
+            audit_log(
+                caller.data(),
+                "secret.set",
+                Some("secrets"),
+                Some(&key),
+                "error",
+                Some(&msg),
+            );
             return ABI_ERR_OPERATION;
         }
     };
@@ -177,14 +244,12 @@ pub fn secret_set(
     // Zapisz w DB
     let result = {
         match caller.data().db.lock() {
-            Ok(conn) => {
-                conn.execute(
-                    "INSERT OR REPLACE INTO addon_secrets \
+            Ok(conn) => conn.execute(
+                "INSERT OR REPLACE INTO addon_secrets \
                      (addon_id, user_id, secret_key, encrypted_value, nonce, updated_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-                    rusqlite::params![&addon_id, user_id, &key, &encrypted, &nonce_bytes[..]],
-                )
-            }
+                rusqlite::params![&addon_id, user_id, &key, &encrypted, &nonce_bytes[..]],
+            ),
             Err(_) => return ABI_ERR_OPERATION,
         }
     };
@@ -192,12 +257,26 @@ pub fn secret_set(
     match result {
         Ok(_) => {
             info!("secret_set: addon='{}', key='{}'", addon_id, key);
-            audit_log(caller.data(), "secret.set", Some("secrets"), Some(&key), "ok", None);
+            audit_log(
+                caller.data(),
+                "secret.set",
+                Some("secrets"),
+                Some(&key),
+                "ok",
+                None,
+            );
             ABI_OK
         }
         Err(e) => {
             let msg = e.to_string();
-            audit_log(caller.data(), "secret.set", Some("secrets"), Some(&key), "error", Some(&msg));
+            audit_log(
+                caller.data(),
+                "secret.set",
+                Some("secrets"),
+                Some(&key),
+                "error",
+                Some(&msg),
+            );
             ABI_ERR_OPERATION
         }
     }
@@ -215,7 +294,11 @@ fn derive_key(addon_id: &str, state: &AddonState) -> Option<[u8; 32]> {
     use hkdf::Hkdf;
 
     // VULN-022: Brak fallbacku — jesli nie ma master key, zwracamy None
-    let master_key = match db::repository::get_setting_secure(&state.db, "encryption_master_key", &state.settings_cipher) {
+    let master_key = match db::repository::get_setting_secure(
+        &state.db,
+        "encryption_master_key",
+        &state.settings_cipher,
+    ) {
         Ok(Some(key)) if !key.is_empty() => key,
         _ => {
             tracing::error!(
@@ -227,10 +310,7 @@ fn derive_key(addon_id: &str, state: &AddonState) -> Option<[u8; 32]> {
 
     let hk = Hkdf::<Sha256>::new(Some(SECRET_KEY_SALT), master_key.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(
-        format!("addon:{}:secrets", addon_id).as_bytes(),
-        &mut key,
-    )
-    .expect("HKDF expand nie powinien zawodzic z 32 bajtami");
+    hk.expand(format!("addon:{}:secrets", addon_id).as_bytes(), &mut key)
+        .expect("HKDF expand nie powinien zawodzic z 32 bajtami");
     Some(key)
 }

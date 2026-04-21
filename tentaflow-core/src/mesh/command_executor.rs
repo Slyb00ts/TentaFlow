@@ -31,11 +31,7 @@ impl MeshCommandExecutor {
     }
 
     /// Wykonaj komende od zdalnego noda. Sprawdza trust przed wykonaniem.
-    pub async fn execute(
-        &self,
-        from_node_id: &str,
-        command: MeshCommandType,
-    ) -> CommandResponse {
+    pub async fn execute(&self, from_node_id: &str, command: MeshCommandType) -> CommandResponse {
         if !self.security.is_trusted(from_node_id) {
             warn!(
                 from = %from_node_id,
@@ -59,7 +55,10 @@ impl MeshCommandExecutor {
                 cert_pem,
                 key_pem,
                 target_dir,
-            } => self.handle_provision_certs(&cert_pem, &key_pem, &target_dir).await,
+            } => {
+                self.handle_provision_certs(&cert_pem, &key_pem, &target_dir)
+                    .await
+            }
 
             MeshCommandType::ListContainers => CommandResponse {
                 success: true,
@@ -105,7 +104,8 @@ impl MeshCommandExecutor {
                     );
                     pwd.zeroize();
                     r
-                }).await;
+                })
+                .await;
                 match result {
                     Ok(Ok(output)) => CommandResponse {
                         success: true,
@@ -142,7 +142,7 @@ impl MeshCommandExecutor {
             MeshCommandType::BandwidthProbe {
                 target_ip,
                 target_port,
-                rdma_port,
+                rdma_port: _,
                 bind_interface,
                 duration_ms,
                 mode,
@@ -155,8 +155,12 @@ impl MeshCommandExecutor {
                     "server" => {
                         // Startuj TCP server ZAWSZE (fallback)
                         let tcp_result = crate::mesh::bandwidth_probe::start_probe_server(
-                            &target_ip, &nonce_arr, num_streams, duration_ms,
-                        ).await;
+                            &target_ip,
+                            &nonce_arr,
+                            num_streams,
+                            duration_ms,
+                        )
+                        .await;
 
                         let (tcp_port, tcp_handle) = match tcp_result {
                             Ok((port, handle)) => (port, Some(handle)),
@@ -170,15 +174,24 @@ impl MeshCommandExecutor {
                         };
 
                         // Probuj RDMA server na osobnym porcie (jesli dostepne)
-                        let mut rdma_port: u16 = 0;
+                        let rdma_port: u16 = 0;
                         #[cfg(feature = "rdma-probe")]
-                        if let Some(rdma_dev) = crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface) {
+                        if let Some(rdma_dev) =
+                            crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface)
+                        {
                             match crate::mesh::rdma_probe::start_rdma_probe_server(
-                                &target_ip, &rdma_dev, &nonce_arr, duration_ms,
-                            ).await {
+                                &target_ip,
+                                &rdma_dev,
+                                &nonce_arr,
+                                duration_ms,
+                            )
+                            .await
+                            {
                                 Ok((port, handle)) => {
                                     rdma_port = port;
-                                    tokio::spawn(async move { let _ = handle.await; });
+                                    tokio::spawn(async move {
+                                        let _ = handle.await;
+                                    });
                                     tracing::info!("RDMA server na porcie {}", port);
                                 }
                                 Err(e) => {
@@ -189,7 +202,9 @@ impl MeshCommandExecutor {
 
                         // Spawn TCP handle w tle
                         if let Some(handle) = tcp_handle {
-                            tokio::spawn(async move { let _ = handle.await; });
+                            tokio::spawn(async move {
+                                let _ = handle.await;
+                            });
                         }
 
                         // Zwroc OBA porty — klient sprobuje RDMA, jesli fail uzyje TCP
@@ -198,7 +213,8 @@ impl MeshCommandExecutor {
                             output: serde_json::json!({
                                 "port": tcp_port,
                                 "rdma_port": rdma_port,
-                            }).to_string(),
+                            })
+                            .to_string(),
                             error: None,
                         }
                     }
@@ -206,10 +222,20 @@ impl MeshCommandExecutor {
                         // Probuj RDMA jesli serwer zwrocil rdma_port > 0
                         #[cfg(feature = "rdma-probe")]
                         if rdma_port > 0 {
-                            if let Some(rdma_dev) = crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface) {
+                            if let Some(rdma_dev) =
+                                crate::mesh::rdma_probe::find_rdma_device_for_interface(
+                                    &bind_interface,
+                                )
+                            {
                                 match crate::mesh::rdma_probe::start_rdma_probe_client(
-                                    &target_ip, rdma_port, &rdma_dev, &nonce_arr, duration_ms,
-                                ).await {
+                                    &target_ip,
+                                    rdma_port,
+                                    &rdma_dev,
+                                    &nonce_arr,
+                                    duration_ms,
+                                )
+                                .await
+                                {
                                     Ok(result) => {
                                         return CommandResponse {
                                             success: true,
@@ -220,7 +246,8 @@ impl MeshCommandExecutor {
                                                 "latency_us": result.latency_us,
                                                 "streams_completed": 1,
                                                 "rdma": true,
-                                            }).to_string(),
+                                            })
+                                            .to_string(),
                                             error: None,
                                         };
                                     }
@@ -233,8 +260,15 @@ impl MeshCommandExecutor {
 
                         // TCP multi-stream (fallback lub jedyny tryb)
                         match crate::mesh::bandwidth_probe::start_probe_client(
-                            &target_ip, target_port, &bind_interface, &nonce_arr, num_streams, duration_ms,
-                        ).await {
+                            &target_ip,
+                            target_port,
+                            &bind_interface,
+                            &nonce_arr,
+                            num_streams,
+                            duration_ms,
+                        )
+                        .await
+                        {
                             Ok(result) => {
                                 let output = serde_json::json!({
                                     "bandwidth_mbps": result.bandwidth_mbps,
@@ -242,7 +276,8 @@ impl MeshCommandExecutor {
                                     "duration_ms": result.duration_ms,
                                     "latency_us": result.latency_us,
                                     "streams_completed": result.streams_completed,
-                                }).to_string();
+                                })
+                                .to_string();
                                 CommandResponse {
                                     success: true,
                                     output,
@@ -264,13 +299,11 @@ impl MeshCommandExecutor {
                 }
             }
 
-            MeshCommandType::BandwidthProbeCancel => {
-                CommandResponse {
-                    success: true,
-                    output: String::new(),
-                    error: None,
-                }
-            }
+            MeshCommandType::BandwidthProbeCancel => CommandResponse {
+                success: true,
+                output: String::new(),
+                error: None,
+            },
         }
     }
 
@@ -347,8 +380,8 @@ impl MeshCommandExecutor {
 
         // Sprawdzenie po komponentach sciezki (Path::starts_with)
         let is_allowed = allowed_dirs.iter().any(|allowed| {
-            let allowed_canonical = Self::safe_canonicalize(allowed)
-                .unwrap_or_else(|_| allowed.clone());
+            let allowed_canonical =
+                Self::safe_canonicalize(allowed).unwrap_or_else(|_| allowed.clone());
             canonical.starts_with(&allowed_canonical)
         });
 

@@ -129,6 +129,17 @@ pub struct MeshConfig {
     /// Nazwa klastra (tylko peery z ta sama nazwa sie lacza)
     #[serde(default = "default_cluster_name")]
     pub cluster_name: String,
+
+    /// URL serwera relay iroh uzywanego gdy bezposrednie QUIC hole punching
+    /// nie jest mozliwe (NAT, firewall). Domyslnie publiczny `use.iroh.network`
+    /// hostowany przez n0. Override wpisem w DB `settings.mesh.iroh_relay_url`.
+    #[serde(default = "default_iroh_relay_url")]
+    pub iroh_relay_url: String,
+}
+
+/// Publiczny relay n0 — dla produkcji offline-first zalecany self-hosted.
+fn default_iroh_relay_url() -> String {
+    "https://use.iroh.network./".to_string()
 }
 
 // =============================================================================
@@ -751,11 +762,10 @@ impl NodeConfig {
             source: e.into(),
         })?;
 
-        let config: NodeConfig =
-            toml::from_str(&content).map_err(|e| CoreError::ConfigError {
-                message: "Blad parsowania TOML".to_string(),
-                source: e.into(),
-            })?;
+        let config: NodeConfig = toml::from_str(&content).map_err(|e| CoreError::ConfigError {
+            message: "Blad parsowania TOML".to_string(),
+            source: e.into(),
+        })?;
 
         config.validate()?;
         Ok(config)
@@ -787,10 +797,7 @@ impl NodeConfig {
 
             if service.backends.is_empty() {
                 return Err(CoreError::ConfigError {
-                    message: format!(
-                        "Serwis '{}' nie ma zadnych backendow",
-                        service.name
-                    ),
+                    message: format!("Serwis '{}' nie ma zadnych backendow", service.name),
                     source: anyhow::anyhow!("backends jest puste"),
                 }
                 .into());
@@ -804,7 +811,9 @@ impl NodeConfig {
                             "Nieznana strategia load balancingu '{}' dla serwisu '{}'",
                             service.strategy, service.name
                         ),
-                        source: anyhow::anyhow!("Dozwolone: single, least_loaded, round_robin, weighted"),
+                        source: anyhow::anyhow!(
+                            "Dozwolone: single, least_loaded, round_robin, weighted"
+                        ),
                     }
                     .into());
                 }
@@ -826,11 +835,7 @@ impl NodeConfig {
     }
 
     /// Waliduje konfiguracje pojedynczego protokolu
-    fn validate_protocol_config(
-        &self,
-        config: &ProtocolConfig,
-        protocol_name: &str,
-    ) -> Result<()> {
+    fn validate_protocol_config(&self, config: &ProtocolConfig, protocol_name: &str) -> Result<()> {
         if !config.bind.contains(':') {
             return Err(CoreError::ConfigError {
                 message: format!(
@@ -879,7 +884,10 @@ impl NodeConfig {
     }
 
     /// Znajduje wszystkie serwisy danego typu.
-    pub fn find_services_by_type(&self, service_type: ServiceType) -> impl Iterator<Item = &ServiceConnection> {
+    pub fn find_services_by_type(
+        &self,
+        service_type: ServiceType,
+    ) -> impl Iterator<Item = &ServiceConnection> {
         self.services
             .iter()
             .filter(move |service| service.service_type == service_type)
@@ -976,6 +984,7 @@ impl Default for NodeConfig {
                 heartbeat_interval_ms: default_heartbeat_interval_ms(),
                 peer_timeout_ms: default_peer_timeout_ms(),
                 cluster_name: "tentaflow".to_string(),
+                iroh_relay_url: default_iroh_relay_url(),
             }),
             inference: None,
         }

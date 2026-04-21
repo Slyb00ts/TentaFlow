@@ -2,7 +2,7 @@
 name = "tentaflow-sidecar"
 version = "0.1.0"
 edition = "2021"
-description = "Generyczny sidecar QUIC dla kontenerow TentaFlow (llm/stt/tts/embeddings/reranker). Rola wybierana z config.toml, kontener AI nic nie wie o QUIC."
+description = "Generyczny sidecar iroh dla kontenerow TentaFlow (llm/stt/tts/embeddings/reranker). Rola wybierana z config.toml, kontener AI nic nie wie o transporcie."
 
 [lib]
 name = "tentaflow_sidecar"
@@ -14,18 +14,15 @@ path = "src/main.rs"
 
 [dependencies]
 tentaflow-protocol = { path = "../../tentaflow-protocol" }
+tentaflow-transport = { path = "../../tentaflow-transport" }
+iroh = { version = "0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 rkyv = { version = "0.8", features = ["unaligned"] }
 
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 parking_lot = "0.12"
 
-quinn = "0.11"
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
-rcgen = "0.13"
-
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 bytes = "1"
 futures-util = "0.3"
 
@@ -39,4 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tentaflow-transport = { path = "../../tentaflow-transport" }

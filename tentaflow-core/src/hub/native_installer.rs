@@ -24,11 +24,26 @@ pub struct InstallPlan {
 /// Krok instalacji
 #[derive(Debug, Clone)]
 pub enum InstallStep {
-    CheckBinary { name: String, path: Option<String> },
-    DownloadBinary { url: String, target: String },
-    RunCommand { cmd: String, args: Vec<String>, desc: String },
-    PipInstall { package: String },
-    DownloadModel { model_id: String, format: String },
+    CheckBinary {
+        name: String,
+        path: Option<String>,
+    },
+    DownloadBinary {
+        url: String,
+        target: String,
+    },
+    RunCommand {
+        cmd: String,
+        args: Vec<String>,
+        desc: String,
+    },
+    PipInstall {
+        package: String,
+    },
+    DownloadModel {
+        model_id: String,
+        format: String,
+    },
 }
 
 /// Konfiguracja natywnego uruchomienia silnika
@@ -195,14 +210,15 @@ pub fn plan_run(
             // Komenda jest pusta — model jest ladowany przez InferenceManager::load_model().
             command: String::new(),
             args: vec![],
-            env: HashMap::from([
-                ("MLX_MODEL_PATH".to_string(), model_path.to_string_lossy().to_string()),
-            ]),
+            env: HashMap::from([(
+                "MLX_MODEL_PATH".to_string(),
+                model_path.to_string_lossy().to_string(),
+            )]),
         },
         "llamacpp" => {
             // Znajdz plik GGUF w katalogu modelu
-            let gguf_path = find_gguf_file(&model_path)
-                .unwrap_or_else(|| model_path.join("model.gguf"));
+            let gguf_path =
+                find_gguf_file(&model_path).unwrap_or_else(|| model_path.join("model.gguf"));
 
             NativeRunConfig {
                 engine_id: engine_id.to_string(),
@@ -222,7 +238,10 @@ pub fn plan_run(
             }
         }
         _ => {
-            return Err(format!("Nieobslugiwany silnik do natywnego uruchomienia: {}", engine_id));
+            return Err(format!(
+                "Nieobslugiwany silnik do natywnego uruchomienia: {}",
+                engine_id
+            ));
         }
     };
 
@@ -239,9 +258,7 @@ pub async fn execute_install(
         match step {
             InstallStep::CheckBinary { name, path } => {
                 let check_path = path.as_deref().unwrap_or(name);
-                let _ = progress_tx
-                    .send(format!("Sprawdzanie: {}...", name))
-                    .await;
+                let _ = progress_tx.send(format!("Sprawdzanie: {}...", name)).await;
 
                 let output = tokio::process::Command::new("which")
                     .arg(check_path)
@@ -250,9 +267,7 @@ pub async fn execute_install(
 
                 match output {
                     Ok(o) if o.status.success() => {
-                        let _ = progress_tx
-                            .send(format!("Znaleziono: {}", name))
-                            .await;
+                        let _ = progress_tx.send(format!("Znaleziono: {}", name)).await;
                         // Binary istnieje — pomijamy dalsze kroki instalacji tego narzedzia
                         return Ok(());
                     }
@@ -264,15 +279,11 @@ pub async fn execute_install(
                 }
             }
             InstallStep::DownloadBinary { url, target } => {
-                let _ = progress_tx
-                    .send(format!("Pobieranie: {}", url))
-                    .await;
+                let _ = progress_tx.send(format!("Pobieranie: {}", url)).await;
                 info!(url = %url, target = %target, "Pobieranie binary");
                 // W pelnej implementacji: pobierz i zainstaluj
                 // Na razie logujemy krok
-                let _ = progress_tx
-                    .send(format!("Pobrano: {}", target))
-                    .await;
+                let _ = progress_tx.send(format!("Pobrano: {}", target)).await;
             }
             InstallStep::RunCommand { cmd, args, desc } => {
                 let _ = progress_tx.send(format!("Wykonywanie: {}", desc)).await;
@@ -291,9 +302,7 @@ pub async fn execute_install(
                         .send(format!("Ostrzezenie: {} — {}", desc, stderr))
                         .await;
                 } else {
-                    let _ = progress_tx
-                        .send(format!("OK: {}", desc))
-                        .await;
+                    let _ = progress_tx.send(format!("OK: {}", desc)).await;
                 }
             }
             InstallStep::PipInstall { package } => {
@@ -326,7 +335,8 @@ pub async fn execute_install(
                         .send(format!("Model juz pobrany: {}", model_id))
                         .await;
                 } else {
-                    let (dl_tx, mut dl_rx) = mpsc::channel::<super::model_store::DownloadProgress>(16);
+                    let (dl_tx, mut dl_rx) =
+                        mpsc::channel::<super::model_store::DownloadProgress>(16);
                     let progress_tx2 = progress_tx.clone();
                     let model_id2 = model_id.clone();
 
@@ -334,17 +344,12 @@ pub async fn execute_install(
                     let progress_fwd = tokio::spawn(async move {
                         while let Some(p) = dl_rx.recv().await {
                             let _ = progress_tx2
-                                .send(format!(
-                                    "Pobieranie {}: {:.1}%",
-                                    model_id2, p.percent
-                                ))
+                                .send(format!("Pobieranie {}: {:.1}%", model_id2, p.percent))
                                 .await;
                         }
                     });
 
-                    model_store
-                        .download_model(model_id, None, dl_tx)
-                        .await?;
+                    model_store.download_model(model_id, None, dl_tx).await?;
 
                     let _ = progress_fwd.await;
                     let _ = progress_tx
@@ -360,7 +365,9 @@ pub async fn execute_install(
 
 /// Uruchamia silnik natywnie jako proces potomny.
 /// Dla MLX zwraca None — silnik dziala in-process przez InferenceManager.
-pub async fn start_engine(config: &NativeRunConfig) -> Result<Option<tokio::process::Child>, String> {
+pub async fn start_engine(
+    config: &NativeRunConfig,
+) -> Result<Option<tokio::process::Child>, String> {
     // MLX dziala in-process — nie uruchamiamy osobnego procesu
     if config.engine_id == "mlx" || config.command.is_empty() {
         info!(

@@ -3,8 +3,8 @@
 // Opis: CRUD regul czyszczenia tekstu dla TTS.
 // =============================================================================
 
-use crate::db::{self, DbPool};
 use crate::db::models::UpdateTtsCleaningRule;
+use crate::db::{self, DbPool};
 use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
@@ -38,18 +38,24 @@ pub fn handle_list(pool: &DbPool, offset: i64, limit: i64) -> Result<(u16, Strin
 
 /// POST /api/tts-rules - utworz regule TTS
 pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateTtsRuleRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: CreateTtsRuleRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if !ALLOWED_RULE_TYPES.contains(&req.rule_type.as_str()) {
-        return Ok((400, format!(
-            r#"{{"error":"Niedozwolona wartosc rule_type '{}'. Dozwolone: {}"}}"#,
-            req.rule_type,
-            ALLOWED_RULE_TYPES.join(", ")
-        )));
+        return Ok((
+            400,
+            format!(
+                r#"{{"error":"Niedozwolona wartosc rule_type '{}'. Dozwolone: {}"}}"#,
+                req.rule_type,
+                ALLOWED_RULE_TYPES.join(", ")
+            ),
+        ));
     }
     if let Err(e) = Regex::new(&req.pattern) {
-        return Ok((400, format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e)));
+        return Ok((
+            400,
+            format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e),
+        ));
     }
 
     let id = db::repository::create_tts_cleaning_rule(
@@ -68,21 +74,30 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
 pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
     let existing = db::repository::get_tts_cleaning_rule(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Regula TTS o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Regula TTS o id {} nie istnieje"}}"#, id),
+        ));
     }
 
-    let req: UpdateTtsRuleRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: UpdateTtsRuleRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if !ALLOWED_RULE_TYPES.contains(&req.rule_type.as_str()) {
-        return Ok((400, format!(
-            r#"{{"error":"Niedozwolona wartosc rule_type '{}'. Dozwolone: {}"}}"#,
-            req.rule_type,
-            ALLOWED_RULE_TYPES.join(", ")
-        )));
+        return Ok((
+            400,
+            format!(
+                r#"{{"error":"Niedozwolona wartosc rule_type '{}'. Dozwolone: {}"}}"#,
+                req.rule_type,
+                ALLOWED_RULE_TYPES.join(", ")
+            ),
+        ));
     }
     if let Err(e) = Regex::new(&req.pattern) {
-        return Ok((400, format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e)));
+        return Ok((
+            400,
+            format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e),
+        ));
     }
 
     let params = UpdateTtsCleaningRule {
@@ -104,7 +119,10 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
 pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     let existing = db::repository::get_tts_cleaning_rule(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Regula TTS o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Regula TTS o id {} nie istnieje"}}"#, id),
+        ));
     }
 
     db::repository::delete_tts_cleaning_rule(pool, id)?;

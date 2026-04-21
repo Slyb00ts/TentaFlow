@@ -277,9 +277,7 @@ mod tests {
     #[test]
     fn test_clean_text_phone() {
         let middleware = ResponseMiddleware::new(true);
-        let result = middleware
-            .clean_text("Telefon: +48 123 456 789")
-            .unwrap();
+        let result = middleware.clean_text("Telefon: +48 123 456 789").unwrap();
         assert!(result.contains("[TELEFON]"));
     }
 

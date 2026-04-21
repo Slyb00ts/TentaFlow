@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tentaflow.dev/schemas/service-manifest-v2.json",
+  "title": "TentaFlow Service Manifest",
+  "description": "Manifest TOML opisujacy jeden silnik wnioskowania (engine) i jego tryby deploymentu.",
+  "type": "object",
+  "required": ["engine", "deploy"],
+  "additionalProperties": false,
+  "properties": {
+    "engine": { "$ref": "#/$defs/engine" },
+    "deploy": { "$ref": "#/$defs/deploy" },
+    "model_preset": {
+      "type": "array",
+      "description": "Opcjonalna lista rekomendowanych modeli (TOML: [[model_preset]]).",
+      "items": { "$ref": "#/$defs/model_preset" }
+    }
+  },
+  "$defs": {
+    "category": {
+      "type": "string",
+      "enum": [
+        "llm", "stt", "tts", "embeddings", "reranker",
+        "vision", "image-gen", "video-gen", "music-gen",
+        "model-3d-gen", "agents", "tools"
+      ]
+    },
+    "api": {
+      "type": "string",
+      "enum": [
+        "openai-compatible", "ollama-native",
+        "sherpa-tts", "sherpa-stt", "comfyui", "custom"
+      ]
+    },
+    "target_os": {
+      "type": "string",
+      "enum": ["linux", "macos", "windows", "ios", "android"]
+    },
+    "platforms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/target_os" }
+    },
+    "engine_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "description": "Identyfikator: 1-64 znakow, kebab/snake_case, zaczyna sie od litery lub cyfry."
+    },
+    "preset_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "engine": {
+      "type": "object",
+      "required": [
+        "id", "category", "name",
+        "description_pl", "description_en",
+        "homepage", "license",
+        "default_port", "api", "version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/engine_id" },
+        "category": { "$ref": "#/$defs/category" },
+        "name": { "type": "string", "minLength": 1 },
+        "description_pl": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "description_en": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "homepage": { "type": "string", "format": "uri" },
+        "license": { "type": "string", "minLength": 1 },
+        "icon": { "type": "string" },
+        "default_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "api": { "$ref": "#/$defs/api" },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "deploy": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "docker": { "$ref": "#/$defs/deploy_docker" },
+        "native": { "$ref": "#/$defs/deploy_native" },
+        "external": { "$ref": "#/$defs/deploy_external" }
+      }
+    },
+    "deploy_docker": {
+      "type": "object",
+      "required": ["context_path", "platforms"],
+      "additionalProperties": false,
+      "properties": {
+        "context_path": { "type": "string", "minLength": 1 },
+        "platforms": { "$ref": "#/$defs/platforms" },
+        "download_image": { "type": "string", "minLength": 1 },
+        "download_size_mb": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "deploy_native": {
+      "type": "object",
+      "required": ["platforms", "runtime"],
+      "additionalProperties": false,
+      "properties": {
+        "platforms": { "$ref": "#/$defs/platforms" },
+        "runtime": {
+          "type": "string",
+          "enum": ["embedded", "binary", "python-bundle"]
+        },
+        "feature_flag": { "type": "string", "minLength": 1 },
+        "binary_path": { "type": "string", "minLength": 1 },
+        "bundle_path": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "runtime": { "const": "embedded" } } },
+          "then": {
+            "required": ["feature_flag"],
+            "not": { "anyOf": [
+              { "required": ["binary_path"] },
+              { "required": ["bundle_path"] }
+            ]}
+          }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "binary" } } },
+          "then": {
+            "required": ["binary_path"],
+            "not": { "anyOf": [
+              { "required": ["feature_flag"] },
+              { "required": ["bundle_path"] }
+            ]}
+          }
+        },
+        {
+          "if": { "properties": { "runtime": { "const": "python-bundle" } } },
+          "then": {
+            "required": ["bundle_path"],
+            "not": { "anyOf": [
+              { "required": ["feature_flag"] },
+              { "required": ["binary_path"] }
+            ]}
+          }
+        }
+      ]
+    },
+    "deploy_external": {
+      "type": "object",
+      "required": ["platforms", "detection_binary", "detection_endpoint"],
+      "additionalProperties": false,
+      "properties": {
+        "platforms": { "$ref": "#/$defs/platforms" },
+        "detection_binary": { "type": "string", "minLength": 1 },
+        "detection_endpoint": { "type": "string", "format": "uri" },
+        "detection_health_path": { "type": "string", "minLength": 1, "default": "/" }
+      }
+    },
+    "model_preset": {
+      "type": "object",
+      "required": ["id", "display_name", "repo"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/preset_id" },
+        "display_name": { "type": "string", "minLength": 1 },
+        "repo": { "type": "string", "minLength": 1 },
+        "quantization": { "type": "string" },
+        "recommended": { "type": "boolean", "default": false }
+      }
+    }
+  }
+}

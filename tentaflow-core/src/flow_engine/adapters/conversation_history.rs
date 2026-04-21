@@ -36,7 +36,10 @@ impl NodeAdapter for ConversationHistoryAdapter {
             .and_then(|v| v.as_u64())
             .unwrap_or(20) as usize;
 
-        let session_id = ctx.session_id.clone().unwrap_or_else(|| "default".to_string());
+        let session_id = ctx
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         let cache = &self.service_manager.conversation_cache;
 
         // Pobierz historie
@@ -53,9 +56,12 @@ impl NodeAdapter for ConversationHistoryAdapter {
             };
 
             // Znajdz pozycje wstawienia: po pierwszym system message
-            let insert_pos: usize = if ctx.messages.first()
+            let insert_pos: usize = if ctx
+                .messages
+                .first()
                 .and_then(|m| m.get("role"))
-                .and_then(|r| r.as_str()) == Some("system")
+                .and_then(|r| r.as_str())
+                == Some("system")
             {
                 1
             } else {
@@ -63,12 +69,15 @@ impl NodeAdapter for ConversationHistoryAdapter {
             };
 
             // Konwertuj historie na format messages
-            let history_messages: Vec<Value> = limited.iter().map(|msg| {
-                serde_json::json!({
-                    "role": msg.role,
-                    "content": msg.content,
+            let history_messages: Vec<Value> = limited
+                .iter()
+                .map(|msg| {
+                    serde_json::json!({
+                        "role": msg.role,
+                        "content": msg.content,
+                    })
                 })
-            }).collect();
+                .collect();
 
             // Wstaw przed ostatnia wiadomoscia user
             let last_msg = ctx.messages.pop();

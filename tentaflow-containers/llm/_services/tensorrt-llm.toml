@@ -1,0 +1,24 @@
+# Manifest serwisu TensorRT-LLM — silnik NVIDIA do produkcji LLM.
+
+[engine]
+id = "tensorrt-llm"
+category = "llm"
+name = "TensorRT-LLM"
+description_pl = "Silnik LLM NVIDIA z optymalizacja TensorRT. Najszybsze inference na GPU NVIDIA."
+description_en = "NVIDIA's LLM engine with TensorRT optimization. Fastest inference on NVIDIA GPUs."
+homepage = "https://github.com/NVIDIA/TensorRT-LLM"
+license = "Apache-2.0"
+icon = "nvidia"
+default_port = 8000
+api = "openai-compatible"
+version = "0.13.0"
+
+[deploy.docker]
+context_path = "llm/docker/tensorrt-llm"
+platforms = ["linux", "windows"]
+
+[[model_preset]]
+id = "llama-3-1-8b-instruct"
+display_name = "Llama 3.1 8B Instruct"
+repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+recommended = true

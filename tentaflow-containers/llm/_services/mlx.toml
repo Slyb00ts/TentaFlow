@@ -1,0 +1,26 @@
+# Manifest serwisu MLX — wbudowany engine LLM dla Apple Silicon (macOS/iOS).
+
+[engine]
+id = "mlx"
+category = "llm"
+name = "MLX"
+description_pl = "Apple ML framework dla Apple Silicon. Najszybszy LLM na M1/M2/M3/M4."
+description_en = "Apple's ML framework for Apple Silicon. Fastest on M1/M2/M3/M4."
+homepage = "https://github.com/ml-explore/mlx"
+license = "MIT"
+icon = "mlx"
+default_port = 8080
+api = "openai-compatible"
+version = "0.20.0"
+
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx"
+
+[[model_preset]]
+id = "qwen3-5-0-8b-mlx-4bit"
+display_name = "Qwen 3.5 0.8B (MLX 4-bit)"
+repo = "mlx-community/Qwen3.5-0.8B-bit4"
+quantization = "int4"
+recommended = true

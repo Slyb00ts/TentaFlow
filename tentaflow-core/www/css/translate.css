@@ -1,0 +1,66 @@
+/* =============================================================================
+   File: translate.css — layout for the Translate user app.
+   ============================================================================= */
+
+.translate-page { max-width: 1200px; margin: 0 auto; }
+
+.translate-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  padding: 16px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+}
+
+.translate-toolbar tf-select { min-width: 160px; flex: 0 1 auto; }
+
+.translate-swap-btn { align-self: flex-end; }
+
+.translate-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 16px;
+}
+
+@media (max-width: 768px) {
+  .translate-grid { grid-template-columns: 1fr; }
+}
+
+.translate-panel {
+  background: var(--bg-card, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  min-height: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.translate-panel tf-textarea { flex: 1; }
+
+.translate-result {
+  flex: 1;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  color: var(--text-1, inherit);
+}
+
+.translate-placeholder { color: var(--text-3, #888); font-style: italic; }
+
+.translate-error-text { color: var(--danger, #ef4444); }
+
+.translate-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-3, #888);
+}
+
+.translate-counter { font-variant-numeric: tabular-nums; }

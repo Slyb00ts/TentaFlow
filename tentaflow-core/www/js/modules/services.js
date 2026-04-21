@@ -1,0 +1,791 @@
+// =============================================================================
+// Plik: modules/services.js
+// Opis: Ekran Services — 3 zakladki (tf-tabs underline):
+//       1) Lista   — tabela deployowanych serwisow z auto-refresh 5s
+//       2) Aliasy  — CRUD aliasow modeli (binary: modelAlias*Request), edycja w tf-window
+//       3) Modele  — zbiorcza lista modeli ze wszystkich nodow mesh
+//      "Nowy serwis" otwiera Catalog (target picker → wizard). Edycja aliasu
+//      oraz potwierdzenia usuwania korzystaja z komponentu <tf-window>.
+//      Auto-refresh uzywa morphdom przez /js/lib/patch.js zeby nie migotac.
+// =============================================================================
+
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
+import { I18n } from '/js/i18n.js';
+import { Router } from '/js/router.js';
+import { patchInner } from '/js/lib/patch.js';
+import { TfWindow } from '/js/components/tf-window.js';
+
+let services = [];
+let aliases = [];
+let meshNodes = [];
+let unifiedModels = [];
+let quicStatusMap = {};
+let refreshTimer = null;
+let quicTimer = null;
+let currentTab = 'list';
+let lastQuery = '';
+
+function sprite(id) {
+  return `<svg class="icon"><use href="#i-${id}"/></svg>`;
+}
+
+const ServicesScreen = {
+  get title() { return I18n.t('nav.services'); },
+  render() {
+    return `
+      <div class="page-header">
+        <div>
+          <h1>${sprite('services')} ${escapeHtml(I18n.t('services.title'))}</h1>
+          <div class="sub" id="services-sub">${escapeHtml(I18n.t('common.loading'))}</div>
+        </div>
+        <div class="actions">
+          <tf-button variant="primary" icon="plus" id="svc-new">${escapeHtml(I18n.t('services.add_service'))}</tf-button>
+        </div>
+      </div>
+
+      <tf-tabs variant="underline" value="${currentTab}" id="svc-tabs">
+        <tf-tab id="list" icon="services" count="0">${escapeHtml(I18n.t('services.tab_list'))}</tf-tab>
+        <tf-tab id="aliases" icon="share" count="0">${escapeHtml(I18n.t('services.tab_aliases'))}</tf-tab>
+        <tf-tab id="models" icon="model" count="0">${escapeHtml(I18n.t('services.tab_models'))}</tf-tab>
+      </tf-tabs>
+
+      <div id="svc-tab-body"></div>
+    `;
+  },
+  async mount() {
+    byId('svc-new')?.addEventListener('click', () => Router.navigate('catalog'));
+    byId('svc-tabs')?.addEventListener('change', handleTabChange);
+
+    await loadAll();
+    refreshTimer = setInterval(() => {
+      loadForCurrentTab();
+    }, 5000);
+    quicTimer = setInterval(loadQuicStatus, 5000);
+  },
+  unmount() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    if (quicTimer) clearInterval(quicTimer);
+    refreshTimer = null;
+    quicTimer = null;
+    services = [];
+    aliases = [];
+    meshNodes = [];
+    unifiedModels = [];
+    quicStatusMap = {};
+  },
+};
+
+// ---- Data loading ---------------------------------------------------------
+
+async function loadAll() {
+  try {
+    const [svc, al, nodes, unified] = await Promise.all([
+      ApiBinary.list('serviceListRequest').catch(() => []),
+      ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
+      ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
+      ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+    ]);
+    services = svc || [];
+    aliases = al || [];
+    meshNodes = nodes || [];
+    unifiedModels = Array.isArray(unified) ? unified : [];
+    // Lokalny service_registry jest swiezy — /api/mesh/nodes nie ma modeli
+    // lokalnego noda az heartbeat nie ustabilizuje sie. Mergujemy z modelsUnifiedListRequest.
+    mergeUnifiedModelsIntoNodes();
+    renderTab();
+    updateSubtitle();
+    updateTabCounts();
+    await loadQuicStatus();
+  } catch (err) {
+    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
+  }
+}
+
+async function loadForCurrentTab() {
+  try {
+    if (currentTab === 'list') {
+      services = await ApiBinary.list('serviceListRequest');
+      patchListTab();
+    } else if (currentTab === 'aliases') {
+      aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
+      patchAliasesTab();
+    } else if (currentTab === 'models') {
+      const [nodes, unified] = await Promise.all([
+        ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
+        ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ]);
+      meshNodes = nodes || [];
+      unifiedModels = Array.isArray(unified) ? unified : [];
+      mergeUnifiedModelsIntoNodes();
+      patchModelsTab();
+    }
+    updateSubtitle();
+    updateTabCounts();
+  } catch (err) {
+    console.warn('[services] refresh failed:', err.message);
+  }
+}
+
+async function loadQuicStatus() {
+  try {
+    const resp = await ApiBinary.one('serviceQuicStatusRequest');
+    const next = {};
+    for (const item of resp.statuses ?? []) next[item.name] = item.status;
+    quicStatusMap = next;
+    if (currentTab === 'list') updateQuicDots();
+  } catch (err) {
+    console.warn('[services] quic status:', err.message);
+  }
+}
+
+function updateSubtitle() {
+  const running = services.filter((s) => ['running', 'active', 'ready'].includes((s.status || '').toLowerCase())).length;
+  const total = services.length;
+  const sub = byId('services-sub');
+  if (!sub) return;
+  sub.textContent = total === 0
+    ? I18n.t('services.subtitle_empty')
+    : I18n.t('services.subtitle_format', { total, running, nodes: meshNodes.length });
+}
+
+function updateTabCounts() {
+  const tabs = byId('svc-tabs');
+  if (!tabs) return;
+  const listTab = tabs.querySelector('tf-tab#list');
+  const aliasTab = tabs.querySelector('tf-tab#aliases');
+  const modelsTab = tabs.querySelector('tf-tab#models');
+  if (listTab) listTab.setAttribute('count', String(services.length));
+  if (aliasTab) aliasTab.setAttribute('count', String(aliases.length));
+  if (modelsTab) modelsTab.setAttribute('count', String(collectUniqueModels().length));
+}
+
+// ---- Tabs -----------------------------------------------------------------
+
+function handleTabChange(e) {
+  const id = e.detail?.value;
+  if (!id || id === currentTab) return;
+  currentTab = id;
+  renderTab();
+}
+
+function renderTab() {
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  if (currentTab === 'list') body.innerHTML = renderListTab();
+  else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
+  else if (currentTab === 'models') body.innerHTML = renderModelsTab();
+  bindTabEvents();
+  if (currentTab === 'list') updateQuicDots();
+}
+
+function patchListTab() {
+  if (currentTab !== 'list') return;
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  patchInner(body, renderListTab());
+  bindTabEvents();
+  updateQuicDots();
+}
+
+function patchAliasesTab() {
+  if (currentTab !== 'aliases') return;
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  patchInner(body, renderAliasesTab());
+  bindTabEvents();
+}
+
+function patchModelsTab() {
+  if (currentTab !== 'models') return;
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  patchInner(body, renderModelsTab());
+  bindTabEvents();
+}
+
+function bindTabEvents() {
+  const body = byId('svc-tab-body');
+  if (!body) return;
+
+  // List tab
+  body.querySelectorAll('[data-svc-delete]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      stopService(b.dataset.svcDelete, b.dataset.svcName);
+    };
+  });
+  body.querySelectorAll('[data-empty-cta]').forEach((b) => {
+    b.onclick = () => Router.navigate('catalog');
+  });
+
+  // Aliases tab
+  body.querySelectorAll('[data-alias-edit]').forEach((b) => {
+    b.onclick = () => {
+      const a = aliases.find((x) => String(x.id) === b.dataset.aliasEdit);
+      if (a) openAliasModal(a);
+    };
+  });
+  body.querySelectorAll('[data-alias-delete]').forEach((b) => {
+    b.onclick = () => deleteAlias(b.dataset.aliasDelete, b.dataset.aliasName);
+  });
+  body.querySelectorAll('[data-new-alias]').forEach((b) => {
+    b.onclick = () => openAliasModal(null);
+  });
+}
+
+// ---- List tab -------------------------------------------------------------
+
+function renderListTab() {
+  if (services.length === 0) {
+    return `
+      <div class="empty-big">
+        ${sprite('services')}
+        <h3>${escapeHtml(I18n.t('services.empty'))}</h3>
+        <p>${escapeHtml(I18n.t('services.empty_hint'))}</p>
+        <tf-button variant="primary" icon="plus" data-empty-cta>${escapeHtml(I18n.t('services.empty_cta'))}</tf-button>
+      </div>
+    `;
+  }
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>${escapeHtml(I18n.t('services.col_name'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_type'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_node'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_quic_address'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_quic_status'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_created'))}</th>
+          <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${services.map(renderRow).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderRow(s) {
+  const cfg = parseConfig(s.configJson);
+  const quicAddr = extractQuicAddr(cfg);
+  const nodeLabel = s.nodeHostname
+    || (s.nodeId ? `${s.nodeId.slice(0, 12)}…` : I18n.t('services.deploy_local'));
+  return `
+    <tr data-key="svc-${escapeAttr(s.id)}">
+      <td data-label="${escapeAttr(I18n.t('services.col_name'))}"><strong style="color: var(--accent-2);">${escapeHtml(s.name)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_type'))}"><span class="scope-chip ${typeChipClass(s.serviceType)}">${escapeHtml((s.serviceType || '').toUpperCase())}</span></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_node'))}" style="font-size: 12px;">${escapeHtml(nodeLabel)}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddr ? `<code style="font-size:11px;">${escapeHtml(quicAddr)}</code>` : '<span style="color:var(--text-3);">—</span>'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}"><span data-quic-status="${escapeAttr(s.name)}"><span class="tag-status offline">${escapeHtml(I18n.t('services.status.none'))}</span></span></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
+        <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
+      </td>
+    </tr>
+  `;
+}
+
+function updateQuicDots() {
+  document.querySelectorAll('[data-quic-status]').forEach((el) => {
+    const name = el.dataset.quicStatus;
+    const raw = (quicStatusMap[name] || 'none').toLowerCase();
+    let cls = 'offline', labelKey = 'services.status.none';
+    if (raw === 'connected' || raw === 'ready') {
+      cls = 'online';
+      labelKey = raw === 'ready' ? 'services.status.ready' : 'services.status.connected';
+    } else if (raw === 'connecting') { cls = 'pending'; labelKey = 'services.status.connecting'; }
+    else if (raw === 'disconnected') { cls = 'offline'; labelKey = 'services.status.disconnected'; }
+    else if (raw === 'config_error') { cls = 'offline'; labelKey = 'services.status.config_error'; }
+    const target = `<span class="tag-status ${cls}">${escapeHtml(I18n.t(labelKey))}</span>`;
+    if (el.innerHTML !== target) el.innerHTML = target;
+  });
+}
+
+// ---- Aliases tab ----------------------------------------------------------
+
+function renderAliasesTab() {
+  const title = escapeHtml(I18n.t('services.aliases_info_title'));
+  // Strzalka w tresci jako ikona zamiast znaku → — ladniejsze wyrownanie
+  // wertykalne, spojne z innymi strzalkami w UI.
+  const arrowIcon = '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px;margin:0 4px;color:var(--accent-2)"><use href="#i-chevron-right"/></svg>';
+  const body = escapeHtml(I18n.t('services.aliases_info_body')).replace('→', arrowIcon);
+  return `
+    <div class="info-card">
+      ${sprite('info')}
+      <div><strong>${title}</strong> — ${body}</div>
+    </div>
+    ${aliases.length === 0 ? `
+      <div class="empty-big">
+        ${sprite('share')}
+        <h3>${escapeHtml(I18n.t('services.aliases_empty'))}</h3>
+        <p>${escapeHtml(I18n.t('services.aliases_empty_hint'))}</p>
+        <tf-button variant="primary" icon="plus" data-new-alias>${escapeHtml(I18n.t('services.new_alias'))}</tf-button>
+      </div>
+    ` : `
+      <div class="svc-aliases-toolbar">
+        <tf-button variant="primary" size="sm" icon="plus" data-new-alias>${escapeHtml(I18n.t('services.new_alias'))}</tf-button>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>${escapeHtml(I18n.t('services.alias_col_name'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_target'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_strategy'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_fallback'))}</th>
+            <th>${escapeHtml(I18n.t('services.alias_col_active'))}</th>
+            <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${aliases.map(renderAliasRow).join('')}
+        </tbody>
+      </table>
+    `}
+  `;
+}
+
+function renderAliasRow(a) {
+  const fallbacks = (a.fallback_targets || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const activeBadge = a.is_active
+    ? `<span class="tag-status online">● ${escapeHtml(I18n.t('services.alias_active'))}</span>`
+    : `<span class="tag-status offline">● ${escapeHtml(I18n.t('services.alias_inactive'))}</span>`;
+  return `
+    <tr data-key="alias-${escapeAttr(a.id)}">
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_name'))}"><strong style="color:var(--accent-2);">${escapeHtml(a.alias)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_target'))}"><code style="font-size:11px;">${escapeHtml(a.target_model)}</code></td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_strategy'))}"><span class="scope-chip chat">${escapeHtml(a.strategy || 'FirstAvailable')}</span></td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_fallback'))}">${fallbacks.length > 0 ? fallbacks.map((f) => `<span class="scope-chip mesh-read">${escapeHtml(f)}</span>`).join(' ') : '<span style="color:var(--text-3);">—</span>'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.alias_col_active'))}">${activeBadge}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
+        <tf-button variant="ghost" size="sm" icon="settings" data-alias-edit="${escapeAttr(a.id)}" title="${escapeAttr(I18n.t('common.edit'))}"></tf-button>
+        <tf-button variant="danger" size="sm" icon="trash" data-alias-delete="${escapeAttr(a.id)}" data-alias-name="${escapeAttr(a.alias)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
+      </td>
+    </tr>
+  `;
+}
+
+// ---- Models tab -----------------------------------------------------------
+
+// Dokleja modele z modelsUnifiedListRequest do odpowiednich nodow w meshNodes —
+// konieczne, bo /api/mesh/nodes nie zawsze ma modele lokalnego noda (peer_store
+// aktualizuje sie dopiero po heartbeat). Dedup po aliasie.
+function mergeUnifiedModelsIntoNodes() {
+  if (!Array.isArray(unifiedModels) || unifiedModels.length === 0) return;
+  const byNode = new Map();
+  for (const m of unifiedModels) {
+    const alias = m.model_name || m.alias;
+    const kind = m.service_type || m.kind;
+    if (!alias) continue;
+    const instances = Array.isArray(m.instances) ? m.instances : [];
+    for (const inst of instances) {
+      const nid = inst.node_id;
+      if (!nid) continue;
+      if (!byNode.has(nid)) byNode.set(nid, []);
+      byNode.get(nid).push({
+        alias,
+        kind,
+        backend: inst.backend || m.backend || '',
+        size_mb: inst.size_mb || m.size_mb || 0,
+        loaded: inst.status === 'running' || inst.status === 'ready',
+      });
+    }
+  }
+  for (const node of meshNodes) {
+    const extra = byNode.get(node.node_id);
+    if (!extra || extra.length === 0) continue;
+    const existing = Array.isArray(node.models) ? node.models.slice() : [];
+    const seen = new Set(existing.map((m) => m.alias).filter(Boolean));
+    for (const m of extra) {
+      if (!seen.has(m.alias)) {
+        existing.push(m);
+        seen.add(m.alias);
+      }
+    }
+    node.models = existing;
+  }
+}
+
+
+function collectUniqueModels() {
+  // Zbiera z meshNodes[].models[] — grupuj po kluczu (alias|backend|kind).
+  const map = new Map();
+  for (const n of meshNodes) {
+    const list = Array.isArray(n.models) ? n.models : [];
+    const nodeLabel = n.hostname || (n.node_id ? n.node_id.slice(0, 12) : '?');
+    for (const m of list) {
+      const key = `${m.alias}|${m.backend || ''}|${m.kind || ''}`;
+      if (!map.has(key)) {
+        map.set(key, {
+          alias: m.alias,
+          kind: m.kind || '',
+          backend: m.backend || '',
+          size_mb: m.size_mb || 0,
+          loaded: !!m.loaded,
+          nodes: [nodeLabel],
+        });
+      } else {
+        const entry = map.get(key);
+        if (!entry.nodes.includes(nodeLabel)) entry.nodes.push(nodeLabel);
+        entry.loaded = entry.loaded || m.loaded;
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => a.alias.localeCompare(b.alias));
+}
+
+function renderModelsTab() {
+  const models = collectUniqueModels();
+  if (models.length === 0) {
+    return `
+      <div class="empty-big">
+        ${sprite('model')}
+        <h3>${escapeHtml(I18n.t('services.models_empty'))}</h3>
+        <p>${escapeHtml(I18n.t('services.models_empty_hint'))}</p>
+        <tf-button variant="primary" icon="plus" data-empty-cta>${escapeHtml(I18n.t('services.add_service'))}</tf-button>
+      </div>
+    `;
+  }
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>${escapeHtml(I18n.t('services.model_col_alias'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_kind'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_backend'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_status'))}</th>
+          <th>${escapeHtml(I18n.t('services.model_col_nodes'))}</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${models.map(renderModelRow).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderModelRow(m) {
+  const key = `${m.alias}|${m.backend}|${m.kind}`;
+  const statusChip = m.loaded
+    ? `<span class="tag-status online">● ${escapeHtml(I18n.t('services.model_loaded'))}</span>`
+    : `<span class="tag-status offline">● ${escapeHtml(I18n.t('services.model_unloaded'))}</span>`;
+  const nodeBadges = m.nodes.map((n) => `<span class="scope-chip mesh-read">${escapeHtml(n)}</span>`).join(' ');
+  return `
+    <tr data-key="model-${escapeAttr(key)}">
+      <td data-label="${escapeAttr(I18n.t('services.model_col_alias'))}"><strong>${escapeHtml(m.alias)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_kind'))}"><span class="scope-chip ${typeChipClass(m.kind)}">${escapeHtml(m.kind.toUpperCase() || '—')}</span></td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_backend'))}"><code style="font-size:11px;">${escapeHtml(m.backend || '—')}</code></td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_status'))}">${statusChip}</td>
+      <td data-label="${escapeAttr(I18n.t('services.model_col_nodes'))}">${nodeBadges}</td>
+    </tr>
+  `;
+}
+
+// ---- Alias modal ----------------------------------------------------------
+
+function buildTargetOptionList(excludeAliasName) {
+  // Modele ze wszystkich nodow — identyfikator to alias modelu (techniczna nazwa).
+  const models = collectUniqueModels().map((m) => ({
+    value: m.alias,
+    label: m.alias + (m.backend ? ` · ${m.backend}` : '') + (m.kind ? ` (${m.kind})` : ''),
+  }));
+  // Inne aliasy — alias moze wskazywac na inny alias (chain routing), ale nie na siebie.
+  const aliasTargets = (aliases || [])
+    .filter((a) => a.alias && a.alias !== excludeAliasName)
+    .map((a) => ({
+      value: a.alias,
+      label: `${a.alias} (alias)`,
+    }));
+  const seen = new Set();
+  const out = [];
+  for (const t of [...models, ...aliasTargets]) {
+    if (seen.has(t.value)) continue;
+    seen.add(t.value);
+    out.push(t);
+  }
+  return out.sort((a, b) => a.value.localeCompare(b.value));
+}
+
+function openAliasModal(alias) {
+  const isEdit = !!alias;
+  const targets = buildTargetOptionList(alias?.alias);
+
+  // Stan wybranych fallback targets (backend zwraca CSV string).
+  let selectedFallbacks = [];
+  if (isEdit && alias.fallback_targets) {
+    selectedFallbacks = alias.fallback_targets
+      .split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
+  // Strategia w API: lowercase_snake (first_available | round_robin | least_loaded).
+  const currentStrategy = (alias?.strategy || 'round_robin').toLowerCase();
+  const currentTarget = alias?.target_model || '';
+
+  const bodyEl = document.createElement('div');
+  bodyEl.style.display = 'flex';
+  bodyEl.style.flexDirection = 'column';
+  bodyEl.style.gap = '14px';
+
+  const targetOptionsHtml = targets.map((t) =>
+    `<option value="${escapeAttr(t.value)}">${escapeHtml(t.label)}</option>`,
+  ).join('');
+
+  bodyEl.innerHTML = `
+    <tf-input
+      id="al-name"
+      label="${escapeAttr(I18n.t('services.alias_col_name'))}"
+      value="${escapeAttr(alias?.alias ?? '')}"
+      placeholder="np. llm-fast"
+      ${isEdit ? 'disabled' : ''}
+    ></tf-input>
+
+    <div class="form-row">
+      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_target'))}</span>
+      <tf-select id="al-target" value="${escapeAttr(currentTarget)}">
+        <option value="">— ${escapeHtml(I18n.t('services.alias_target_placeholder'))} —</option>
+        ${targetOptionsHtml}
+      </tf-select>
+    </div>
+
+    <div class="form-row">
+      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_strategy'))}</span>
+      <tf-select id="al-strategy" value="${escapeAttr(currentStrategy)}">
+        <option value="round_robin">${escapeHtml(I18n.t('services.strategy_round_robin'))}</option>
+        <option value="first_available">${escapeHtml(I18n.t('services.strategy_first_available'))}</option>
+        <option value="least_loaded">${escapeHtml(I18n.t('services.strategy_least_loaded'))}</option>
+      </tf-select>
+    </div>
+
+    <div class="form-row">
+      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_fallback'))}</span>
+      <div id="al-fallback-chips" style="display:flex;flex-wrap:wrap;gap:6px;min-height:24px;margin-bottom:6px;"></div>
+      <tf-select id="al-fallback-add">
+        <option value="">— ${escapeHtml(I18n.t('services.alias_add_fallback'))} —</option>
+        ${targetOptionsHtml}
+      </tf-select>
+      <span class="tf-hint">${escapeHtml(I18n.t('services.alias_fallback_hint'))}</span>
+    </div>
+
+    <div class="form-error" id="al-error" hidden style="color: var(--danger, #ef4444); font-size: 12px;"></div>
+  `;
+
+  const footerEl = document.createElement('div');
+  footerEl.innerHTML = `
+    <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+    <tf-button variant="primary" data-action="save" id="al-save-btn">${escapeHtml(I18n.t(isEdit ? 'common.save' : 'common.add'))}</tf-button>
+  `;
+
+  // Wlasne tf-window — walidacja i bledy API nie powinny zamykac okna.
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', I18n.t(isEdit ? 'services.alias_edit' : 'services.new_alias'));
+  win.setAttribute('icon', isEdit ? 'settings' : 'plus');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('min-width', '460');
+  win.setAttribute('min-height', '420');
+  win.setAttribute('width', '520');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+
+  const bodyWrap = document.createElement('div');
+  bodyWrap.slot = 'body';
+  bodyWrap.appendChild(bodyEl);
+  win.appendChild(bodyWrap);
+
+  const footWrap = document.createElement('div');
+  footWrap.slot = 'footer';
+  footWrap.appendChild(footerEl);
+  win.appendChild(footWrap);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.appendChild(backdrop);
+  document.body.appendChild(win);
+
+  const cleanup = () => {
+    if (win.isConnected) win.remove();
+    if (backdrop.isConnected) backdrop.remove();
+  };
+
+  // Render chipow wybranych fallbackow
+  function renderFallbackChips() {
+    const c = bodyEl.querySelector('#al-fallback-chips');
+    if (!c) return;
+    if (selectedFallbacks.length === 0) {
+      c.innerHTML = `<span style="color:var(--text-3);font-size:12px;">—</span>`;
+      return;
+    }
+    c.innerHTML = selectedFallbacks.map((name, idx) => `
+      <tf-chip status="info" style="cursor:default;">
+        ${escapeHtml(name)}
+        <span style="margin-left:6px;cursor:pointer;font-weight:bold;" data-rm="${idx}">×</span>
+      </tf-chip>
+    `).join('');
+  }
+  renderFallbackChips();
+
+  // Dodawanie fallback z tf-select
+  queueMicrotask(() => {
+    const addSelect = bodyEl.querySelector('#al-fallback-add');
+    if (addSelect) {
+      addSelect.addEventListener('change', (e) => {
+        const val = e.detail?.value ?? addSelect.value;
+        const primaryTarget = bodyEl.querySelector('#al-target')?.value || '';
+        if (val && !selectedFallbacks.includes(val) && val !== primaryTarget) {
+          selectedFallbacks.push(val);
+          renderFallbackChips();
+        }
+        // reset selekcji do placeholder
+        addSelect.setAttribute('value', '');
+        const innerSel = addSelect.querySelector('select');
+        if (innerSel) innerSel.value = '';
+      });
+    }
+  });
+
+  // Usuwanie chipow przez delegacje
+  bodyEl.querySelector('#al-fallback-chips').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-rm]');
+    if (!btn) return;
+    const idx = parseInt(btn.dataset.rm, 10);
+    if (!Number.isNaN(idx)) {
+      selectedFallbacks.splice(idx, 1);
+      renderFallbackChips();
+    }
+  });
+
+  win.addEventListener('action', async (e) => {
+    const action = e.detail?.action;
+    if (action === 'close' || action === 'cancel') {
+      cleanup();
+      return;
+    }
+    if (action !== 'save') return;
+
+    const nameInput = win.querySelector('#al-name');
+    const targetSelect = win.querySelector('#al-target');
+    const strategySelect = win.querySelector('#al-strategy');
+    const errEl = win.querySelector('#al-error');
+
+    const name = (nameInput?.value || '').trim();
+    const target = (targetSelect?.value || '').trim();
+    const strategy = (strategySelect?.value || 'round_robin').toLowerCase();
+    const fallback = selectedFallbacks.join(',');
+
+    if (!name || !target) {
+      if (errEl) {
+        errEl.textContent = I18n.t('services.alias_required');
+        errEl.hidden = false;
+      }
+      return;
+    }
+
+    try {
+      if (isEdit) {
+        await ApiBinary.action('modelAliasUpdateRequest', {
+          id: alias.id,
+          alias: name,
+          targetModel: target,
+          isActive: true,
+          strategy,
+          fallbackTargets: fallback || null,
+        });
+      } else {
+        await ApiBinary.action('modelAliasCreateRequest', {
+          alias: name,
+          targetModel: target,
+          strategy,
+          fallbackTargets: fallback || null,
+        });
+      }
+      toast(I18n.t(isEdit ? 'services.alias_updated' : 'services.alias_created'), 'success');
+      cleanup();
+      await loadAll();
+    } catch (err) {
+      if (errEl) {
+        errEl.textContent = err.message;
+        errEl.hidden = false;
+      }
+    }
+  });
+}
+
+async function deleteAlias(id, name) {
+  const ok = await TfWindow.confirm({
+    title: I18n.t('common.delete'),
+    message: I18n.t('services.alias_delete_confirm', { name }),
+    confirmLabel: I18n.t('common.delete'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await ApiBinary.action('modelAliasDeleteRequest', { id });
+    toast(I18n.t('services.alias_deleted', { name }), 'success');
+    await loadAll();
+  } catch (e) {
+    toast(`${I18n.t('common.error')}: ${e.message}`, 'error');
+  }
+}
+
+// ---- Helpers --------------------------------------------------------------
+
+async function stopService(id, name) {
+  const ok = await TfWindow.confirm({
+    title: I18n.t('common.delete'),
+    message: I18n.t('services.delete_confirm', { name }),
+    confirmLabel: I18n.t('common.delete'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await ApiBinary.action('serviceStopRequest', { serviceId: id });
+    if (r.stopped) {
+      toast(I18n.t('services.delete_success', { name }), 'success');
+      services = await ApiBinary.list('serviceListRequest');
+      patchListTab();
+      updateSubtitle();
+      updateTabCounts();
+    } else {
+      toast(I18n.t('services.delete_not_found'), 'warning');
+    }
+  } catch (err) {
+    toast(I18n.t('services.delete_error', { error: err.message }), 'error');
+  }
+}
+
+function parseConfig(json) {
+  if (!json) return {};
+  try { return JSON.parse(json); } catch { return {}; }
+}
+
+function extractQuicAddr(cfg) {
+  if (!cfg) return '';
+  if (cfg.quic_url) return String(cfg.quic_url).replace(/^quic:\/\//, '');
+  if (cfg.quic_port && cfg.agent_domain) return `${cfg.agent_domain}:${cfg.quic_port}`;
+  return '';
+}
+
+function typeChipClass(t) {
+  switch ((t || '').toLowerCase()) {
+    case 'llm': return 'chat';
+    case 'embedding':
+    case 'embeddings': return 'mesh-read';
+    case 'stt':
+    case 'tts': return 'deploy';
+    case 'rag': return 'mesh-admin';
+    default: return 'license';
+  }
+}
+
+function formatDateOnly(s) {
+  try {
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    return d.toLocaleDateString(I18n.getLanguage(), { day: '2-digit', month: '2-digit', year: 'numeric' });
+  } catch { return s; }
+}
+
+export default ServicesScreen;

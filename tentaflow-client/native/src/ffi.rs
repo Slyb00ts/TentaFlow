@@ -116,15 +116,11 @@ pub extern "C" fn tentaflow_client_new(config: *const ClientConfig) -> *mut Tent
         }
     };
 
-    // CA path jest opcjonalny (może być null)
-    let ca_path = unsafe {
-        if config.ca_path.is_null() {
-            None
-        } else {
-            match CStr::from_ptr(config.ca_path).to_str() {
-                Ok(s) if !s.is_empty() => Some(s.to_string()),
-                _ => None,
-            }
+    // Pole `ca_path` z C ABI jest ignorowane — iroh nie uzywa CA bundle.
+    // EndpointId jest wbudowany w URL `iroh://<hex>` albo w `router_url`.
+    let _ = unsafe {
+        if !config.ca_path.is_null() {
+            CStr::from_ptr(config.ca_path).to_str().ok();
         }
     };
 
@@ -132,7 +128,6 @@ pub extern "C" fn tentaflow_client_new(config: *const ClientConfig) -> *mut Tent
 
     let internal_config = ClientConfigInternal {
         router_url,
-        ca_path,
         timeout_ms,
     };
 

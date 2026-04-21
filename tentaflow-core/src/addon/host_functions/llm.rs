@@ -2,14 +2,16 @@
 // Plik: addon/host_functions/llm.rs
 // Opis: Host functions LLM API — generowanie tekstu (synchroniczne i strumieniowe).
 //       Addon wywoluje te funkcje aby korzystac z modeli LLM dostepnych w Core.
+// Uprawnienia: "llm" (wywolanie LLM), "llm_model" z resource=<model_name>
+//              (per-model whitelist). Fail-closed — brak uprawnienia przerywa
+//              operacje zanim trafi do backendu inferencji.
 // =============================================================================
 
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use super::{
-    AddonState, ABI_ERR_PERMISSION, ABI_ERR_OPERATION, ABI_ERR_RATE_LIMIT,
-    get_memory, read_guest_string, write_guest_output, audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_string, write_guest_output, AddonState,
+    WasmCaller, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_ERR_RATE_LIMIT,
 };
 
 use crate::addon::rate_limiter::ResourceType;
@@ -56,8 +58,7 @@ pub fn llm_generate(
 
     // Odczytaj opcjonalna nazwe modelu
     let model_name = if model_ptr != 0 && model_len > 0 {
-        read_guest_string(&memory, &caller, model_ptr, model_len)
-            .map(|s| s.to_string())
+        read_guest_string(&memory, &caller, model_ptr, model_len).map(|s| s.to_string())
     } else {
         None
     };
@@ -73,25 +74,54 @@ pub fn llm_generate(
     // Sprawdz uprawnienia
     let has_llm_perm = check_permission(caller.data(), "llm", None);
     if !has_llm_perm {
-        audit_log(caller.data(), "llm.generate", Some("llm"), model_name.as_deref(), "denied", None);
+        audit_log(
+            caller.data(),
+            "llm.generate",
+            Some("llm"),
+            model_name.as_deref(),
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
     // Sprawdz uprawnienie do konkretnego modelu jesli podany
     if let Some(ref model) = model_name {
         if !check_permission(caller.data(), "llm_model", Some(model)) {
-            audit_log(caller.data(), "llm.generate", Some("llm_model"), Some(model), "denied", None);
+            audit_log(
+                caller.data(),
+                "llm.generate",
+                Some("llm_model"),
+                Some(model),
+                "denied",
+                None,
+            );
             return ABI_ERR_PERMISSION;
         }
     }
 
     let addon_id = caller.data().addon_id.clone();
-    info!("llm_generate: addon='{}', model={:?}, prompt_len={}", addon_id, model_name, prompt.len());
+    info!(
+        "llm_generate: addon='{}', model={:?}, prompt_len={}",
+        addon_id,
+        model_name,
+        prompt.len()
+    );
 
     // Sprawdz rate limit LLM przez in-memory rate limiter
     if let Some(ref rate_limiter) = caller.data().rate_limiter {
-        if rate_limiter.check(&addon_id, ResourceType::LlmTokens).is_err() {
-            audit_log(caller.data(), "llm.generate", Some("llm"), model_name.as_deref(), "error", Some("rate limit exceeded"));
+        if rate_limiter
+            .check(&addon_id, ResourceType::LlmTokens)
+            .is_err()
+        {
+            audit_log(
+                caller.data(),
+                "llm.generate",
+                Some("llm"),
+                model_name.as_deref(),
+                "error",
+                Some("rate limit exceeded"),
+            );
             return ABI_ERR_RATE_LIMIT;
         }
     }
@@ -101,29 +131,46 @@ pub fn llm_generate(
         Some(r) => r.clone(),
         None => {
             warn!("llm_generate: router niedostepny dla addon='{}'", addon_id);
-            audit_log(caller.data(), "llm.generate", Some("llm"), model_name.as_deref(), "error", Some("router unavailable"));
+            audit_log(
+                caller.data(),
+                "llm.generate",
+                Some("llm"),
+                model_name.as_deref(),
+                "error",
+                Some("router unavailable"),
+            );
             return ABI_ERR_OPERATION;
         }
     };
 
     // Parsuj opcje z JSON
-    let temperature = _options_json.as_ref().and_then(|o| o.get("temperature")).and_then(|v| v.as_f64()).map(|v| v as f32);
-    let max_tokens = _options_json.as_ref().and_then(|o| o.get("max_tokens")).and_then(|v| v.as_u64()).map(|v| v as u32);
-    let top_p = _options_json.as_ref().and_then(|o| o.get("top_p")).and_then(|v| v.as_f64()).map(|v| v as f32);
+    let temperature = _options_json
+        .as_ref()
+        .and_then(|o| o.get("temperature"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+    let max_tokens = _options_json
+        .as_ref()
+        .and_then(|o| o.get("max_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let top_p = _options_json
+        .as_ref()
+        .and_then(|o| o.get("top_p"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
 
     // Zbuduj ChatCompletionRequest
     let request = ChatCompletionRequest {
         model: model_name.unwrap_or_else(|| "default".to_string()),
-        messages: vec![
-            Message {
-                role: "user".to_string(),
-                content: Some(MessageContent::Text(prompt)),
-                reasoning_content: None,
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        ],
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(prompt)),
+            reasoning_content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
         temperature,
         max_tokens,
         top_p,
@@ -151,26 +198,39 @@ pub fn llm_generate(
         Ok(route_result) => {
             // Wyciagnij tekst z pierwszego choice
             let response = route_result.response;
-            response.choices.first()
+            response
+                .choices
+                .first()
                 .and_then(|choice| choice.message.content.as_ref())
                 .map(|content| match content {
                     MessageContent::Text(text) => text.clone(),
                     MessageContent::Parts(parts) => {
                         // Sklej czesci tekstowe
-                        parts.iter().filter_map(|p| {
-                            if let crate::api::openai::types::ContentPart::Text { text } = p {
-                                Some(text.as_str())
-                            } else {
-                                None
-                            }
-                        }).collect::<Vec<_>>().join("")
+                        parts
+                            .iter()
+                            .filter_map(|p| {
+                                if let crate::api::openai::types::ContentPart::Text { text } = p {
+                                    Some(text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("")
                     }
                 })
                 .unwrap_or_default()
         }
         Err(e) => {
             error!("llm_generate: blad routera dla addon='{}': {}", addon_id, e);
-            audit_log(caller.data(), "llm.generate", Some("llm"), None, "error", Some(&e.to_string()));
+            audit_log(
+                caller.data(),
+                "llm.generate",
+                Some("llm"),
+                None,
+                "error",
+                Some(&e.to_string()),
+            );
             return ABI_ERR_OPERATION;
         }
     };
@@ -184,17 +244,17 @@ pub fn llm_generate(
     let result_bytes = result_text.as_bytes();
 
     // Loguj do audit
-    audit_log(
-        caller.data(),
-        "llm.generate",
-        Some("llm"),
-        None,
-        "ok",
-        None,
-    );
+    audit_log(caller.data(), "llm.generate", Some("llm"), None, "ok", None);
 
     // Zapisz wynik do pamieci guest
-    write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, result_bytes)
+    write_guest_output(
+        &memory,
+        &mut caller,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        result_bytes,
+    )
 }
 
 // =============================================================================
@@ -231,27 +291,43 @@ pub fn llm_generate_stream_start(
 
     // Odczytaj model
     let model_name = if model_ptr != 0 && model_len > 0 {
-        read_guest_string(&memory, &caller, model_ptr, model_len)
-            .map(|s| s.to_string())
+        read_guest_string(&memory, &caller, model_ptr, model_len).map(|s| s.to_string())
     } else {
         None
     };
 
     // Sprawdz uprawnienia
     if !check_permission(caller.data(), "llm", None) {
-        audit_log(caller.data(), "llm.generate_stream", Some("llm"), model_name.as_deref(), "denied", None);
+        audit_log(
+            caller.data(),
+            "llm.generate_stream",
+            Some("llm"),
+            model_name.as_deref(),
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
     if let Some(ref model) = model_name {
         if !check_permission(caller.data(), "llm_model", Some(model)) {
-            audit_log(caller.data(), "llm.generate_stream", Some("llm_model"), Some(model), "denied", None);
+            audit_log(
+                caller.data(),
+                "llm.generate_stream",
+                Some("llm_model"),
+                Some(model),
+                "denied",
+                None,
+            );
             return ABI_ERR_PERMISSION;
         }
     }
 
     let addon_id = caller.data().addon_id.clone();
-    info!("llm_generate_stream_start: addon='{}', model={:?}", addon_id, model_name);
+    info!(
+        "llm_generate_stream_start: addon='{}', model={:?}",
+        addon_id, model_name
+    );
 
     // Generuj callback_id — prosty inkrementalny ID
     // W produkcji to bedzie zarzadzane przez StreamManager
@@ -298,8 +374,78 @@ pub fn llm_generate_stream_next(
         return ABI_ERR_OPERATION;
     }
 
+    // Fail-closed: kazdy krok strumienia wymaga ciagle uprawnienia "llm".
+    // Cofniecie uprawnienia w trakcie strumienia natychmiast blokuje kolejne pobrania.
+    if !check_permission(caller.data(), "llm", None) {
+        audit_log(
+            caller.data(),
+            "llm.generate_stream_next",
+            Some("llm"),
+            Some(&callback_id.to_string()),
+            "denied",
+            None,
+        );
+        return ABI_ERR_PERMISSION;
+    }
+
     // W produkcji: pobierz nastepny fragment z kolejki strumienia
     // Na razie zwracamy pusty fragment (koniec strumienia)
     let empty: &[u8] = &[];
     write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::addon::event_bus::EventBus;
+    use crate::addon::host_functions::check_permission;
+    use crate::addon::host_functions::network::NetworkConnectionManager;
+    use crate::addon::permissions::PermissionChecker;
+    use crate::addon::AddonManifest;
+    use parking_lot::Mutex;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn make_state(permissions: Vec<String>) -> AddonState {
+        let db = crate::db::init(Path::new(":memory:")).unwrap();
+        AddonState {
+            addon_id: "llm-test-addon".to_string(),
+            instance_id: "t".to_string(),
+            user_id: None,
+            db: db.clone(),
+            permissions,
+            event_bus: Arc::new(EventBus::new()),
+            permission_checker: Arc::new(PermissionChecker::new(db)),
+            fuel_consumed: 0,
+            is_system_call: true,
+            rate_limiter: None,
+            net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
+            settings_cipher: Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32])),
+            manifest: Arc::new(AddonManifest::default()),
+            memory_limit: 64 * 1024 * 1024,
+            oauth_refresh_guard: std::sync::Arc::new(
+                crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
+            ),
+            router: None,
+        }
+    }
+
+    #[test]
+    fn llm_generate_denied_without_permission() {
+        // Addon bez "llm" — wszystkie 3 host functions (generate, stream_start, stream_next) odrzucaja.
+        let state = make_state(vec!["storage".to_string()]);
+        assert!(
+            !check_permission(&state, "llm", None),
+            "Brak 'llm' w permissions → Denied"
+        );
+    }
+
+    #[test]
+    fn llm_stream_next_denied_mid_stream_when_permission_missing() {
+        // Nawet jesli stream_start przeszedl, kazdy stream_next rewalidauje.
+        // Symulujemy addon ktory nigdy nie mial uprawnienia → stream_next odrzuca.
+        let state = make_state(vec![]);
+        assert!(!check_permission(&state, "llm", None),
+            "stream_next bez 'llm' → Denied (ochrona przed cofnietym uprawnieniem w trakcie strumienia)");
+    }
 }

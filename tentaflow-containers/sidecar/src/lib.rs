@@ -1,9 +1,9 @@
 // =============================================================================
 // Plik: lib.rs
-// Opis: Publiczny interfejs sidecara — eksportuje moduly ktore uzywane sa przez
-//       integration tests (tests/*.rs) oraz przez binarke (main.rs).
+// Opis: Publiczny interfejs sidecara — eksportuje moduly uzywane przez
+//       integration tests (tests/*.rs) oraz binarke (main.rs).
 // =============================================================================
 
 pub mod config;
-pub mod quic;
+pub mod identity;
 pub mod roles;

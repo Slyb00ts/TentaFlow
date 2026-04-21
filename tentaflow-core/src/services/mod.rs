@@ -4,11 +4,12 @@
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
+pub mod embeddings;
+pub mod manifest;
+pub mod portainer;
 pub mod rag;
 pub mod tts;
-pub mod embeddings;
-pub mod portainer;
 
-pub use rag::{RAGClient, RAGEngineConfigCompat};
-pub use tts::{TTSClient, TTSConfigCompat, SynthesizeCallback, TTSBufferingProcessor};
 pub use embeddings::{EmbeddingsClient, EmbeddingsEngineConfigCompat};
+pub use rag::{RAGClient, RAGEngineConfigCompat};
+pub use tts::{SynthesizeCallback, TTSBufferingProcessor, TTSClient, TTSConfigCompat};

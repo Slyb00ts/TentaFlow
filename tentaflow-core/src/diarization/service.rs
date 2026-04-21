@@ -19,7 +19,7 @@
 // Nowa sciezka wymaga meeting_id zeby wszystko bylo w pelni audytowalne.
 // =============================================================================
 
-use super::tracker::{MeetingSpeakerTracker, TrackResult};
+use super::tracker::MeetingSpeakerTracker;
 use super::voice_profile::{
     self, EnrollmentResult, EnrollmentSample, PersonIdentity, ENROLL_HOP_SAMPLES,
     ENROLL_WINDOW_SAMPLES, INCREMENTAL_LEARN_THRESHOLD,
@@ -85,8 +85,12 @@ fn active_trackers() -> &'static Mutex<HashMap<String, MeetingSpeakerTracker>> {
 /// Rejestruje nowy meeting w trackerach — laduje istniejace temp speakers z DB
 /// (jesli bot sie przelaczyl, stan jest odzyskany).
 pub fn start_meeting(pool: &DbPool, meeting_id: &str) -> Result<()> {
-    let tracker =
-        MeetingSpeakerTracker::load_or_new(pool, meeting_id, DEFAULT_TRACKER_THRESHOLD, DEFAULT_MAX_SPEAKERS)?;
+    let tracker = MeetingSpeakerTracker::load_or_new(
+        pool,
+        meeting_id,
+        DEFAULT_TRACKER_THRESHOLD,
+        DEFAULT_MAX_SPEAKERS,
+    )?;
     info!(
         meeting_id = %meeting_id,
         existing_speakers = tracker.speaker_count(),
@@ -204,7 +208,8 @@ pub fn identify_speaker_with_profiles(
                 }
             } else {
                 // Nie jesto tak pewne — tylko touch last_seen
-                if let Err(e) = crate::db::repository::touch_voice_profile(pool, result.profile_id) {
+                if let Err(e) = crate::db::repository::touch_voice_profile(pool, result.profile_id)
+                {
                     warn!("touch_voice_profile failed: {}", e);
                 }
             }
@@ -334,8 +339,7 @@ pub fn enroll_profile_from_pcm(
             }
         };
         let snr = voice_profile::estimate_snr_db(window);
-        let rms: f32 =
-            (window.iter().map(|x| x * x).sum::<f32>() / window.len() as f32).sqrt();
+        let rms: f32 = (window.iter().map(|x| x * x).sum::<f32>() / window.len() as f32).sqrt();
         let window_duration_ms = (ENROLL_WINDOW_SAMPLES * 1000 / 16000) as u64;
         enrollment_samples.push(EnrollmentSample {
             embedding,
@@ -455,26 +459,25 @@ mod tests {
         start_meeting(&pool, meeting_id).unwrap();
 
         // 2. Enroll dwoch mowcow z prawdziwego audio
-        let samples = read_wav_i16_16k("/tmp/sample_voices.wav")
-            .expect("wymaga /tmp/sample_voices.wav");
+        let samples =
+            read_wav_i16_16k("/tmp/sample_voices.wav").expect("wymaga /tmp/sample_voices.wav");
         let glos1_i16 = &samples[0..16000 * 9 / 2];
         let glos2_i16 = &samples[5 * 16000..];
         let pcm1: Vec<u8> = glos1_i16.iter().flat_map(|&s| s.to_le_bytes()).collect();
         let pcm2: Vec<u8> = glos2_i16.iter().flat_map(|&s| s.to_le_bytes()).collect();
 
         let jan = PersonIdentity::new("Jan").with_last_name("Kowalski");
-        let result1 = enroll_profile_from_pcm(&pool, &jan, &pcm1, "integration-test")
-            .expect("Jan enroll");
+        let result1 =
+            enroll_profile_from_pcm(&pool, &jan, &pcm1, "integration-test").expect("Jan enroll");
         assert_eq!(result1.name, "Jan Kowalski");
 
         let anna = PersonIdentity::new("Anna").with_last_name("Nowak");
-        let result2 = enroll_profile_from_pcm(&pool, &anna, &pcm2, "integration-test")
-            .expect("Anna enroll");
+        let result2 =
+            enroll_profile_from_pcm(&pool, &anna, &pcm2, "integration-test").expect("Anna enroll");
         assert_eq!(result2.name, "Anna Nowak");
 
         // 3. Identify Jana → enrolled match
-        let ident1 = identify_speaker_with_profiles(&pool, &pcm1, meeting_id)
-            .expect("ident jan");
+        let ident1 = identify_speaker_with_profiles(&pool, &pcm1, meeting_id).expect("ident jan");
         assert_eq!(ident1.label, "Jan Kowalski");
         assert_eq!(ident1.profile_id, Some(result1.profile_id));
         assert!(ident1.is_enrolled);
@@ -486,8 +489,7 @@ mod tests {
         );
 
         // 4. Identify Anny → enrolled match
-        let ident2 = identify_speaker_with_profiles(&pool, &pcm2, meeting_id)
-            .expect("ident anna");
+        let ident2 = identify_speaker_with_profiles(&pool, &pcm2, meeting_id).expect("ident anna");
         assert_eq!(ident2.label, "Anna Nowak");
         assert_eq!(ident2.profile_id, Some(result2.profile_id));
         assert!(ident2.is_enrolled);
@@ -502,8 +504,8 @@ mod tests {
         crate::db::repository::delete_voice_profile(&pool, result1.profile_id).unwrap();
         crate::db::repository::delete_voice_profile(&pool, result2.profile_id).unwrap();
 
-        let ident3 = identify_speaker_with_profiles(&pool, &pcm1, meeting_id)
-            .expect("ident fallback");
+        let ident3 =
+            identify_speaker_with_profiles(&pool, &pcm1, meeting_id).expect("ident fallback");
         assert!(!ident3.is_enrolled, "no enrolled profiles left");
         assert!(ident3.label.starts_with("SPEAKER_"));
         println!("Unknown voice → {} (fallback)", ident3.label);
@@ -517,7 +519,10 @@ mod tests {
         println!(
             "DB temp speakers for {}: {:?}",
             meeting_id,
-            temps.iter().map(|t| (&t.temp_label, t.sample_count)).collect::<Vec<_>>()
+            temps
+                .iter()
+                .map(|t| (&t.temp_label, t.sample_count))
+                .collect::<Vec<_>>()
         );
 
         println!("=== Full live flow OK ===");
@@ -532,12 +537,18 @@ mod tests {
         while pos + 8 <= bytes.len() {
             let cid = &bytes[pos..pos + 4];
             let csz = u32::from_le_bytes([
-                bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                bytes[pos + 4],
+                bytes[pos + 5],
+                bytes[pos + 6],
+                bytes[pos + 7],
             ]) as usize;
             pos += 8;
             if cid == b"data" {
                 let pcm = &bytes[pos..pos + csz];
-                return Ok(pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect());
+                return Ok(pcm
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect());
             }
             pos += csz;
         }
