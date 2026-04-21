@@ -292,6 +292,8 @@ pub struct FlowDetail {
     /// JSON DAG definition (zachowane jako string — parsowane przez flow_engine).
     pub graph_json: String,
     pub enabled: bool,
+    /// Raw flow status column: "active" | "draft" | "archived" itp.
+    pub status: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -758,6 +760,105 @@ pub struct ClusterProbeStreamEnd {
 }
 
 // =============================================================================
+// Flows phase 3 — partial update, node template palette, version history
+// =============================================================================
+
+/// Partial update — fields left `None` keep their existing server-side value.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowUpdateRequest {
+    pub flow_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// Full DAG JSON replacement when present.
+    pub flow_json: Option<String>,
+    /// Raw status column ("active" | "draft" | "archived" ...).
+    pub status: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowUpdateResponse {
+    pub ok: bool,
+}
+
+/// Single entry in the node-template palette shown by the flow builder.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowNodeTemplate {
+    /// Database row id (palette template id).
+    pub id: i64,
+    pub node_type: String,
+    pub category: String,
+    pub label: String,
+    pub description: Option<String>,
+    /// Default config JSON shoved into a new node when dropped on the canvas.
+    pub default_config: String,
+    pub icon: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowNodeTemplatesListResponse {
+    pub templates: Vec<FlowNodeTemplate>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionListRequest {
+    pub flow_id: String,
+}
+
+/// Lightweight view (no full flow_json) for the version-history list.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionSummary {
+    pub id: String,
+    pub flow_id: String,
+    pub version_num: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub created_at_epoch: u64,
+    pub created_by: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionListResponse {
+    pub versions: Vec<FlowVersionSummary>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionGetRequest {
+    pub flow_id: String,
+    pub version_id: String,
+}
+
+/// Full version payload including embedded DAG JSON for diff/restore.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionFull {
+    pub id: String,
+    pub flow_id: String,
+    pub version_num: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub flow_json: String,
+    pub created_at_epoch: u64,
+    pub created_by: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionGetResponse {
+    pub version: FlowVersionFull,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionRestoreRequest {
+    pub flow_id: String,
+    pub version_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct FlowVersionRestoreResponse {
+    pub ok: bool,
+}
+
+// =============================================================================
 // MessageBody — wszystkie warianty
 // =============================================================================
 
@@ -928,6 +1029,18 @@ pub enum MessageBody {
     FlowDeleteResponse { deleted: bool },
     FlowExecutionsListRequest { flow_id: String },
     FlowExecutionsListResponse { executions: Vec<FlowExecutionSummary> },
+
+    // ---- Flows phase 3 (partial update, node templates, version history) ----
+    FlowUpdateRequestBody(FlowUpdateRequest),
+    FlowUpdateResponseBody(FlowUpdateResponse),
+    FlowNodeTemplatesListRequest,
+    FlowNodeTemplatesListResponseBody(FlowNodeTemplatesListResponse),
+    FlowVersionListRequestBody(FlowVersionListRequest),
+    FlowVersionListResponseBody(FlowVersionListResponse),
+    FlowVersionGetRequestBody(FlowVersionGetRequest),
+    FlowVersionGetResponseBody(FlowVersionGetResponse),
+    FlowVersionRestoreRequestBody(FlowVersionRestoreRequest),
+    FlowVersionRestoreResponseBody(FlowVersionRestoreResponse),
 
     // ---- Subscription resume (client requests replay after reconnect) ----
     /// Klient -> serwer: zaresumuj subscription z tokenem ktory dostal w
