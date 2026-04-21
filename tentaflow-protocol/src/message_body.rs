@@ -1165,6 +1165,136 @@ pub struct NgcStatusResponse {
 }
 
 // =============================================================================
+// Models / aliases / catalog (FAZA 2 + FAZA 5 — REST -> binary)
+// =============================================================================
+
+/// Instance of a unified model on a specific mesh node.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct UnifiedModelInstance {
+    pub node_id: String,
+    pub node_hostname: Option<String>,
+    pub service_id: String,
+    pub status: String,
+}
+
+/// Unified model entry aggregating instances across mesh nodes.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct UnifiedModel {
+    pub model_name: String,
+    pub service_type: String,
+    pub instances: Vec<UnifiedModelInstance>,
+}
+
+/// Response for `ModelsUnifiedListRequest`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelsUnifiedListResponse {
+    pub models: Vec<UnifiedModel>,
+}
+
+/// Single model alias entry mapped from `DbModelAlias`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasEntry {
+    pub id: i64,
+    pub alias: String,
+    pub target_model: String,
+    pub is_active: bool,
+    pub fallback_targets: Option<String>,
+    pub strategy: Option<String>,
+}
+
+/// Response for `ModelAliasListRequest`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasListResponse {
+    pub aliases: Vec<ModelAliasEntry>,
+}
+
+/// Request: create new model alias (Admin).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasCreateRequest {
+    pub alias: String,
+    pub target_model: String,
+    pub strategy: Option<String>,
+    pub fallback_targets: Option<String>,
+}
+
+/// Response: id of the newly created alias row.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasCreateResponse {
+    pub id: i64,
+}
+
+/// Request: update existing model alias by id (Admin).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasUpdateRequest {
+    pub id: i64,
+    pub alias: String,
+    pub target_model: String,
+    pub is_active: Option<bool>,
+    pub strategy: Option<String>,
+    pub fallback_targets: Option<String>,
+}
+
+/// Response: whether update succeeded.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasUpdateResponse {
+    pub ok: bool,
+}
+
+/// Request: delete alias by id (Admin).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasDeleteRequest {
+    pub id: i64,
+}
+
+/// Response: whether delete succeeded.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ModelAliasDeleteResponse {
+    pub ok: bool,
+}
+
+/// Single NIM catalog container entry mirrored from `api_nim::NimContainer`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NimContainerEntry {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub image: String,
+    pub latest_tag: String,
+    pub publisher: String,
+    pub category: String,
+    pub min_gpu_memory_gb: Option<u32>,
+    pub updated_at: Option<String>,
+    pub self_hostable: bool,
+}
+
+/// Response for `NimCatalogListRequest` (optional fetch error string).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NimCatalogListResponse {
+    pub containers: Vec<NimContainerEntry>,
+    pub error: Option<String>,
+}
+
+/// Request: deploy engine described by Service Manifest (Admin).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceManifestDeployRequest {
+    pub engine_id: String,
+    pub deploy_method: String,
+    pub node_id: String,
+    pub config_json: String,
+}
+
+/// Response: deploy descriptor plus websocket URL for progress stream.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceManifestDeployResponse {
+    pub status: String,
+    pub deploy_id: String,
+    pub engine_id: String,
+    pub deploy_method: String,
+    pub node_id: String,
+    pub websocket_url: String,
+}
+
+// =============================================================================
 // MessageBody — wszystkie warianty
 // =============================================================================
 
@@ -1411,6 +1541,22 @@ pub enum MessageBody {
     // ---- Dashboard (R-LIST + subscription candidate) ----
     DashboardMetricsRequest,
     DashboardMetricsResponse(DashboardSnapshot),
+
+    // ---- Models / aliases / catalog -----
+    ModelsUnifiedListRequest,
+    ModelsUnifiedListResponseBody(ModelsUnifiedListResponse),
+    ModelAliasListRequest,
+    ModelAliasListResponseBody(ModelAliasListResponse),
+    ModelAliasCreateRequestBody(ModelAliasCreateRequest),
+    ModelAliasCreateResponseBody(ModelAliasCreateResponse),
+    ModelAliasUpdateRequestBody(ModelAliasUpdateRequest),
+    ModelAliasUpdateResponseBody(ModelAliasUpdateResponse),
+    ModelAliasDeleteRequestBody(ModelAliasDeleteRequest),
+    ModelAliasDeleteResponseBody(ModelAliasDeleteResponse),
+    NimCatalogListRequest,
+    NimCatalogListResponseBody(NimCatalogListResponse),
+    ServiceManifestDeployRequestBody(ServiceManifestDeployRequest),
+    ServiceManifestDeployResponseBody(ServiceManifestDeployResponse),
 
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
