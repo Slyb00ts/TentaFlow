@@ -407,10 +407,13 @@ async fn handle_stt_load(
                 );
             }
 
+            let size_mb = model_info.size_bytes / (1024 * 1024);
             router.register_native_service_in_mesh(
                 "whisper-stt-native",
                 "stt",
                 vec!["whisper-large-v3-turbo".to_string()],
+                Some(model_info.backend.clone()),
+                vec![size_mb],
             );
 
             let json = serde_json::to_string(&model_info).unwrap_or_default();

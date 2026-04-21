@@ -1149,14 +1149,18 @@ fn collect_local_models(
         .into_iter()
         .flat_map(|svc| {
             let kind = svc.service_type.clone();
+            let backend = svc.engine_id.clone().unwrap_or_default();
+            let sizes = svc.model_sizes_mb.clone();
+            let loaded = matches!(svc.status.as_str(), "running" | "ready");
             svc.models
                 .into_iter()
-                .map(move |alias| crate::mesh::peer_store::PeerModelInfo {
+                .enumerate()
+                .map(move |(idx, alias)| crate::mesh::peer_store::PeerModelInfo {
                     alias,
                     kind: kind.clone(),
-                    backend: kind.clone(),
-                    size_mb: 0,
-                    loaded: true,
+                    backend: backend.clone(),
+                    size_mb: sizes.get(idx).copied().unwrap_or(0),
+                    loaded,
                 })
         })
         .collect()

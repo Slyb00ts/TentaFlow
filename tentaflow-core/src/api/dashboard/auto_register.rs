@@ -27,6 +27,11 @@ pub struct DeployedServiceInfo {
     pub node_ip: Option<String>,
     /// Protokol polaczenia: "http" (domyslny) lub "quic"
     pub protocol: String,
+    /// Engine identifier from the deploy wizard (e.g. "vllm", "llama-cpp", "ollama").
+    /// Empty when unknown — caller must set this from config.
+    pub engine_id: String,
+    /// Model weights size in MB on disk (0 when unknown).
+    pub model_size_mb: u64,
 }
 
 /// Automatycznie rejestruje serwis po udanym deploy kontenera.
@@ -183,6 +188,12 @@ pub async fn auto_register_deployed_service(
         &info.service_name,
         &info.service_type,
         vec![model_name.clone()],
+        if info.engine_id.is_empty() {
+            None
+        } else {
+            Some(info.engine_id.clone())
+        },
+        vec![info.model_size_mb],
     );
 
     send_progress(
@@ -322,6 +333,12 @@ async fn auto_register_quic_service(
         &info.service_name,
         &info.service_type,
         vec![model_name.clone()],
+        if info.engine_id.is_empty() {
+            None
+        } else {
+            Some(info.engine_id.clone())
+        },
+        vec![info.model_size_mb],
     );
 
     send_progress(
