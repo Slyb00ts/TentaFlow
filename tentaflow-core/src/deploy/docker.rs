@@ -32,12 +32,12 @@ pub struct DeployRequest {
 
 /// Buduje obraz Docker z embedowanego kontekstu i uruchamia kontener.
 pub async fn deploy(req: &DeployRequest) -> Result<String> {
-    let docker = Docker::connect_with_local_defaults()
-        .context("nie mozna polaczyc z Docker daemon (sprawdz czy dziala i uzytkownik ma uprawnienia)")?;
+    let docker = Docker::connect_with_local_defaults().context(
+        "nie mozna polaczyc z Docker daemon (sprawdz czy dziala i uzytkownik ma uprawnienia)",
+    )?;
 
     let workdir = tempfile::tempdir().context("tworzenie tmpdir dla kontekstu")?;
-    bundle::extract_to(workdir.path())
-        .context("rozpakowanie embedowanego bundle")?;
+    bundle::extract_to(workdir.path()).context("rozpakowanie embedowanego bundle")?;
 
     let image_tag = req
         .image_tag
@@ -48,19 +48,14 @@ pub async fn deploy(req: &DeployRequest) -> Result<String> {
     run_container(&docker, req, &image_tag).await
 }
 
-async fn build_image(
-    docker: &Docker,
-    context: &Path,
-    container: &str,
-    tag: &str,
-) -> Result<()> {
-    use bollard::image::BuildImageOptions;
+async fn build_image(docker: &Docker, context: &Path, container: &str, tag: &str) -> Result<()> {
+    use bollard::query_parameters::BuildImageOptions;
     use futures::StreamExt;
 
     let dockerfile = format!("tentaflow-containers/{}/Dockerfile", container);
     let opts = BuildImageOptions {
         dockerfile,
-        t: tag.to_string(),
+        t: Some(tag.to_string()),
         rm: true,
         ..Default::default()
     };
@@ -72,15 +67,21 @@ async fn build_image(
         .context("pakowanie kontekstu do tar dla bollard")?;
     let tar_bytes = tar_builder.into_inner()?;
 
-    let mut stream = docker.build_image(opts, None, Some(tar_bytes.into()));
+    use bollard::body_full;
+    use hyper::body::Bytes;
+    let body = body_full(Bytes::from(tar_bytes));
+    let mut stream = docker.build_image(opts, None, Some(body));
     while let Some(item) = stream.next().await {
         match item {
             Ok(info) => {
                 if let Some(stream) = info.stream {
                     tracing::info!(target: "docker_build", "{}", stream.trim_end());
                 }
-                if let Some(err) = info.error {
-                    anyhow::bail!("docker build error: {}", err);
+                if let Some(err_detail) = info.error_detail {
+                    anyhow::bail!(
+                        "docker build error: {}",
+                        err_detail.message.unwrap_or_default()
+                    );
                 }
             }
             Err(e) => return Err(anyhow::anyhow!("bollard build: {}", e)),
@@ -91,8 +92,8 @@ async fn build_image(
 }
 
 async fn run_container(docker: &Docker, req: &DeployRequest, image: &str) -> Result<String> {
-    use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
-    use bollard::models::{HostConfig, PortBinding, DeviceRequest};
+    use bollard::models::{ContainerCreateBody as Config, DeviceRequest, HostConfig, PortBinding};
+    use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 
     let name = req
         .instance_name
@@ -142,24 +143,29 @@ async fn run_container(docker: &Docker, req: &DeployRequest, image: &str) -> Res
         ..Default::default()
     };
 
+    let exposed_ports_vec: Vec<String> = exposed.into_keys().collect();
     let config = Config {
         image: Some(image.to_string()),
         env: if env.is_empty() { None } else { Some(env) },
-        exposed_ports: if exposed.is_empty() { None } else { Some(exposed) },
+        exposed_ports: if exposed_ports_vec.is_empty() {
+            None
+        } else {
+            Some(exposed_ports_vec)
+        },
         host_config: Some(host_config),
         ..Default::default()
     };
 
     let create_opts = CreateContainerOptions {
-        name: name.clone(),
-        platform: None,
+        name: Some(name.clone()),
+        platform: String::new(),
     };
 
     // Usun stary kontener o tej samej nazwie (jesli istnieje)
     let _ = docker
         .remove_container(
             &name,
-            Some(bollard::container::RemoveContainerOptions {
+            Some(bollard::query_parameters::RemoveContainerOptions {
                 force: true,
                 ..Default::default()
             }),
@@ -171,7 +177,7 @@ async fn run_container(docker: &Docker, req: &DeployRequest, image: &str) -> Res
         .await
         .with_context(|| format!("create_container {}", name))?;
     docker
-        .start_container(&name, None::<StartContainerOptions<String>>)
+        .start_container(&name, None::<StartContainerOptions>)
         .await
         .with_context(|| format!("start_container {}", name))?;
 
@@ -189,7 +195,7 @@ pub async fn stop(name: &str) -> Result<()> {
     docker
         .remove_container(
             name,
-            Some(bollard::container::RemoveContainerOptions {
+            Some(bollard::query_parameters::RemoveContainerOptions {
                 force: true,
                 ..Default::default()
             }),

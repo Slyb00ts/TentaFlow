@@ -32,6 +32,8 @@ pub struct ModelInstance {
     pub node_name: String,
     pub service_id: String,
     pub status: String,
+    pub backend: Option<String>,
+    pub size_mb: Option<u64>,
 }
 
 // =============================================================================
@@ -156,17 +158,17 @@ impl MeshServiceRegistry {
         let mut model_map: HashMap<(String, String), Vec<ModelInstance>> = HashMap::new();
 
         for svc in &all_services {
-            for model_name in &svc.models {
+            for (idx, model_name) in svc.models.iter().enumerate() {
                 let key = (model_name.clone(), svc.service_type.clone());
-                model_map
-                    .entry(key)
-                    .or_default()
-                    .push(ModelInstance {
-                        node_id: svc.node_id.clone(),
-                        node_name: svc.service_name.clone(),
-                        service_id: svc.service_id.clone(),
-                        status: svc.status.clone(),
-                    });
+                let size_mb = svc.model_sizes_mb.get(idx).copied().filter(|v| *v > 0);
+                model_map.entry(key).or_default().push(ModelInstance {
+                    node_id: svc.node_id.clone(),
+                    node_name: svc.service_name.clone(),
+                    service_id: svc.service_id.clone(),
+                    status: svc.status.clone(),
+                    backend: svc.engine_id.clone(),
+                    size_mb,
+                });
             }
         }
 
@@ -292,6 +294,8 @@ mod tests {
             status: "running".to_string(),
             models: models.into_iter().map(String::from).collect(),
             load_percent: 10,
+            engine_id: None,
+            model_sizes_mb: Vec::new(),
         }
     }
 
@@ -331,7 +335,10 @@ mod tests {
     #[test]
     fn remove_node_czysci_serwisy() {
         let registry = MeshServiceRegistry::new("node-a".to_string());
-        registry.update_remote("node-b", vec![make_service("s1", "llm", "node-b", vec!["m1"])]);
+        registry.update_remote(
+            "node-b",
+            vec![make_service("s1", "llm", "node-b", vec!["m1"])],
+        );
         registry.remove_node("node-b");
 
         let visible = registry.visible_services();
@@ -344,7 +351,12 @@ mod tests {
         registry.register_local(make_service("s1", "llm", "node-a", vec!["llama3"]));
         registry.update_remote(
             "node-b",
-            vec![make_service("s2", "llm", "node-b", vec!["llama3", "mistral"])],
+            vec![make_service(
+                "s2",
+                "llm",
+                "node-b",
+                vec!["llama3", "mistral"],
+            )],
         );
 
         let models = registry.unique_models();
@@ -374,7 +386,10 @@ mod tests {
         registry.update_remote("node-b", vec![]);
 
         let route = registry.find_route("node-b");
-        assert_eq!(route, Some(vec!["node-a".to_string(), "node-b".to_string()]));
+        assert_eq!(
+            route,
+            Some(vec!["node-a".to_string(), "node-b".to_string()])
+        );
     }
 
     #[test]

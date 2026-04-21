@@ -73,10 +73,10 @@ pub struct MatchResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchConfidence {
-    VeryConfident,  // >= 0.70
-    Confident,      // >= 0.55
-    Uncertain,      // >= 0.45 (NIE jest traktowany jako match)
-    NoMatch,        // < 0.45
+    VeryConfident, // >= 0.70
+    Confident,     // >= 0.55
+    Uncertain,     // >= 0.45 (NIE jest traktowany jako match)
+    NoMatch,       // < 0.45
 }
 
 impl MatchConfidence {
@@ -170,10 +170,22 @@ pub struct EnrollmentResult {
 /// Powód rejekcji enrollment
 #[derive(Debug, Clone)]
 pub enum EnrollmentError {
-    TooShortAudio { got_ms: u64, required_ms: u64 },
-    TooFewSamples { got: usize, required: usize },
-    LowSnr { got_db: f32, required_db: f32 },
-    InconsistentSamples { intra_similarity: f32, required: f32 },
+    TooShortAudio {
+        got_ms: u64,
+        required_ms: u64,
+    },
+    TooFewSamples {
+        got: usize,
+        required: usize,
+    },
+    LowSnr {
+        got_db: f32,
+        required_db: f32,
+    },
+    InconsistentSamples {
+        intra_similarity: f32,
+        required: f32,
+    },
     NoSpeech,
     ModelUnavailable,
 }
@@ -181,7 +193,10 @@ pub enum EnrollmentError {
 impl std::fmt::Display for EnrollmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooShortAudio { got_ms, required_ms } => write!(
+            Self::TooShortAudio {
+                got_ms,
+                required_ms,
+            } => write!(
                 f,
                 "audio za krotkie: {} ms, wymagane minimum {} ms",
                 got_ms, required_ms
@@ -191,12 +206,18 @@ impl std::fmt::Display for EnrollmentError {
                 "za malo slidingowych probek: {}, wymagane minimum {}",
                 got, required
             ),
-            Self::LowSnr { got_db, required_db } => write!(
+            Self::LowSnr {
+                got_db,
+                required_db,
+            } => write!(
                 f,
                 "za duzo szumu: SNR {:.1} dB, wymagane >= {:.1} dB",
                 got_db, required_db
             ),
-            Self::InconsistentSamples { intra_similarity, required } => write!(
+            Self::InconsistentSamples {
+                intra_similarity,
+                required,
+            } => write!(
                 f,
                 "niespojne probki glosu: intra-similarity {:.3}, wymagane >= {:.3}",
                 intra_similarity, required
@@ -492,7 +513,11 @@ pub fn enroll_profile(
                 cnt += 1;
             }
         }
-        let intra = if cnt > 0 { per_sample_intra / cnt as f32 } else { 1.0 };
+        let intra = if cnt > 0 {
+            per_sample_intra / cnt as f32
+        } else {
+            1.0
+        };
 
         repo::add_voice_profile_sample(
             pool,
@@ -532,10 +557,7 @@ pub fn enroll_profile(
 ///
 /// Strategia: kombinacja centroid similarity + top-5 mean similarity ze wszystkimi
 /// samples profilu. Top-K jest odporne na outliery lepiej niz max.
-pub fn match_to_profiles(
-    pool: &DbPool,
-    embedding: &[f32],
-) -> Result<Option<MatchResult>> {
+pub fn match_to_profiles(pool: &DbPool, embedding: &[f32]) -> Result<Option<MatchResult>> {
     let profiles = repo::list_voice_profiles(pool)?;
     if profiles.is_empty() {
         return Ok(None);
@@ -591,7 +613,11 @@ pub fn match_to_profiles(
             "Profile match candidate"
         );
 
-        if best.as_ref().map(|b| this_result.score > b.score).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|b| this_result.score > b.score)
+            .unwrap_or(true)
+        {
             best = Some(this_result);
         }
     }
@@ -643,8 +669,7 @@ pub fn add_sample_to_profile(
     if intra < MIN_INTRA_SIMILARITY {
         warn!(
             profile_id,
-            intra,
-            "Incremental sample rejected — low coherence with existing"
+            intra, "Incremental sample rejected — low coherence with existing"
         );
         return Ok(());
     }
@@ -674,13 +699,17 @@ pub fn add_sample_to_profile(
     let new_count = updated.len() as i64;
 
     let centroid_bytes = embedding_to_bytes(&new_centroid);
-    repo::update_voice_profile_stats(pool, profile_id, &centroid_bytes, new_count, new_reliability)?;
+    repo::update_voice_profile_stats(
+        pool,
+        profile_id,
+        &centroid_bytes,
+        new_count,
+        new_reliability,
+    )?;
 
     debug!(
         profile_id,
-        new_count,
-        new_reliability,
-        "Profile updated via incremental learning"
+        new_count, new_reliability, "Profile updated via incremental learning"
     );
 
     Ok(())
@@ -824,10 +853,7 @@ mod tests {
             },
         ];
         let result = build_profile_from_samples(&samples);
-        assert!(matches!(
-            result,
-            Err(EnrollmentError::TooFewSamples { .. })
-        ));
+        assert!(matches!(result, Err(EnrollmentError::TooFewSamples { .. })));
     }
 
     #[test]
@@ -898,9 +924,18 @@ mod tests {
 
     #[test]
     fn match_confidence_thresholds() {
-        assert_eq!(MatchConfidence::from_score(0.80), MatchConfidence::VeryConfident);
-        assert_eq!(MatchConfidence::from_score(0.60), MatchConfidence::Confident);
-        assert_eq!(MatchConfidence::from_score(0.50), MatchConfidence::Uncertain);
+        assert_eq!(
+            MatchConfidence::from_score(0.80),
+            MatchConfidence::VeryConfident
+        );
+        assert_eq!(
+            MatchConfidence::from_score(0.60),
+            MatchConfidence::Confident
+        );
+        assert_eq!(
+            MatchConfidence::from_score(0.50),
+            MatchConfidence::Uncertain
+        );
         assert_eq!(MatchConfidence::from_score(0.30), MatchConfidence::NoMatch);
     }
 
@@ -954,9 +989,8 @@ mod tests {
         let identity1 = PersonIdentity::new("Jan")
             .with_last_name("Kowalski")
             .with_nickname("janek");
-        let result = crate::diarization::service::enroll_profile_from_pcm(
-            &pool, &identity1, &pcm1, "test",
-        );
+        let result =
+            crate::diarization::service::enroll_profile_from_pcm(&pool, &identity1, &pcm1, "test");
         println!("Enrollment result: {:?}", result);
         let enrollment = result.expect("enrollment should succeed");
         assert!(enrollment.samples_accepted >= 3);
@@ -967,8 +1001,8 @@ mod tests {
         let samples_f32_1 = pcm_i16_le_to_f32(&pcm1);
         let ext_path = std::env::var("DIARIZATION_MODEL_PATH")
             .unwrap_or_else(|_| "../models/diarization/embedding.onnx".to_string());
-        let ext = crate::diarization::embedding::EmbeddingExtractor::new(&ext_path)
-            .expect("model load");
+        let ext =
+            crate::diarization::embedding::EmbeddingExtractor::new(&ext_path).expect("model load");
         let mid = samples_f32_1.len() / 2;
         let clip1 = &samples_f32_1[mid.saturating_sub(12000)..mid + 12000];
         let emb1 = ext.extract(clip1).expect("extract 1");
@@ -991,7 +1025,10 @@ mod tests {
                 m2.profile_name, m2.score
             );
             // Cross-speaker score powinien byc znacznie nizszy
-            assert!(m2.score < m1.score, "glos 2 vs profil glos 1 powinien miec nizszy score");
+            assert!(
+                m2.score < m1.score,
+                "glos 2 vs profil glos 1 powinien miec nizszy score"
+            );
             // Jesli to fałszywy match (score >= MATCH_CONFIDENT), test fail
             assert!(
                 m2.score < MATCH_CONFIDENT || !m2.confidence.is_match(),
@@ -1004,9 +1041,8 @@ mod tests {
 
         // 6. Enrollment głosu 2 jako "Anna Nowak" (bez nick)
         let identity2 = PersonIdentity::new("Anna").with_last_name("Nowak");
-        let result2 = crate::diarization::service::enroll_profile_from_pcm(
-            &pool, &identity2, &pcm2, "test",
-        );
+        let result2 =
+            crate::diarization::service::enroll_profile_from_pcm(&pool, &identity2, &pcm2, "test");
         println!("Enrollment result 2: {:?}", result2);
         let e2 = result2.expect("drugi enrollment powinien sie udac");
         assert_eq!(e2.name, "Anna Nowak");
@@ -1022,11 +1058,17 @@ mod tests {
 
         // 8. Sprawdz ze profile maja poprawnie rozbite pola first/last/nickname
         let profiles = list_profiles(&pool).expect("list");
-        let jan = profiles.iter().find(|p| p.first_name == "Jan").expect("Jan");
+        let jan = profiles
+            .iter()
+            .find(|p| p.first_name == "Jan")
+            .expect("Jan");
         assert_eq!(jan.first_name, "Jan");
         assert_eq!(jan.last_name.as_deref(), Some("Kowalski"));
         assert_eq!(jan.nickname.as_deref(), Some("janek"));
-        let anna = profiles.iter().find(|p| p.first_name == "Anna").expect("Anna");
+        let anna = profiles
+            .iter()
+            .find(|p| p.first_name == "Anna")
+            .expect("Anna");
         assert_eq!(anna.last_name.as_deref(), Some("Nowak"));
         assert_eq!(anna.nickname, None);
 
@@ -1044,12 +1086,18 @@ mod tests {
         while pos + 8 <= bytes.len() {
             let cid = &bytes[pos..pos + 4];
             let csz = u32::from_le_bytes([
-                bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                bytes[pos + 4],
+                bytes[pos + 5],
+                bytes[pos + 6],
+                bytes[pos + 7],
             ]) as usize;
             pos += 8;
             if cid == b"data" {
                 let pcm = &bytes[pos..pos + csz];
-                return Ok(pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect());
+                return Ok(pcm
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect());
             }
             pos += csz;
         }

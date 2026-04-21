@@ -1,0 +1,24 @@
+# Manifest serwisu stable-diffusion.cpp — natywna binarka SD w C++.
+
+[engine]
+id = "stable-diffusion-cpp"
+category = "image-gen"
+name = "stable-diffusion.cpp"
+description_pl = "Lekka implementacja Stable Diffusion w C++. Dziala na CPU i GPU bez Pythona."
+description_en = "Lightweight Stable Diffusion in C++. Runs on CPU and GPU without Python."
+homepage = "https://github.com/leejet/stable-diffusion.cpp"
+license = "MIT"
+default_port = 5000
+api = "custom"
+version = "latest"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "binary"
+binary_path = "image-gen/native/stable-diffusion-cpp"
+
+[[model_preset]]
+id = "sd-1-5-gguf"
+display_name = "Stable Diffusion 1.5 (GGUF)"
+repo = "leejet/stable-diffusion.cpp/sd-v1-5"
+recommended = true

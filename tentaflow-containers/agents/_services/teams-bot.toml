@@ -1,0 +1,17 @@
+# Manifest agenta teams-bot — bot Microsoft Teams (transkrypcja + TTS).
+
+[engine]
+id = "teams-bot"
+category = "agents"
+name = "Teams Bot"
+description_pl = "Bot Microsoft Teams - laczy sie z meeting, transkrybuje, odpowiada przez TTS."
+description_en = "Microsoft Teams bot - joins meetings, transcribes, responds via TTS."
+homepage = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/what-are-bots"
+license = "MIT"
+default_port = 5000
+api = "custom"
+version = "0.1.0"
+
+[deploy.docker]
+context_path = "agents/docker/teams-bot"
+platforms = ["linux"]

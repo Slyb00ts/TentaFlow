@@ -3,8 +3,8 @@
 // Opis: CRUD regul filtrowania danych osobowych (PII).
 // =============================================================================
 
-use crate::db::{self, DbPool};
 use crate::db::models::{NewPiiRule, UpdatePiiRule};
+use crate::db::{self, DbPool};
 use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
@@ -40,14 +40,20 @@ pub fn handle_list(pool: &DbPool, offset: i64, limit: i64) -> Result<(u16, Strin
 
 /// POST /api/pii-rules - utworz regule PII
 pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreatePiiRuleRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: CreatePiiRuleRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if req.name.trim().is_empty() {
-        return Ok((400, r#"{"error":"Pole 'name' nie moze byc puste"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Pole 'name' nie może być puste"}"#.to_string(),
+        ));
     }
     if let Err(e) = Regex::new(&req.pattern) {
-        return Ok((400, format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e)));
+        return Ok((
+            400,
+            format!(r#"{{"error":"Niepoprawne wyrażenie regularne: {}"}}"#, e),
+        ));
     }
 
     let params = NewPiiRule {
@@ -69,17 +75,26 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
 pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
     let existing = db::repository::get_pii_rule(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Regula PII o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Reguła PII o id {} nie istnieje"}}"#, id),
+        ));
     }
 
-    let req: UpdatePiiRuleRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: UpdatePiiRuleRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if req.name.trim().is_empty() {
-        return Ok((400, r#"{"error":"Pole 'name' nie moze byc puste"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Pole 'name' nie może być puste"}"#.to_string(),
+        ));
     }
     if let Err(e) = Regex::new(&req.pattern) {
-        return Ok((400, format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e)));
+        return Ok((
+            400,
+            format!(r#"{{"error":"Niepoprawne wyrażenie regularne: {}"}}"#, e),
+        ));
     }
 
     let params = UpdatePiiRule {
@@ -103,7 +118,10 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
 pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     let existing = db::repository::get_pii_rule(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Regula PII o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Reguła PII o id {} nie istnieje"}}"#, id),
+        ));
     }
 
     db::repository::delete_pii_rule(pool, id)?;

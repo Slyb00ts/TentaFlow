@@ -187,7 +187,10 @@ impl AuditLogger {
         let conn = match self.db.lock() {
             Ok(c) => c,
             Err(e) => {
-                error!("Nie udalo sie uzyskac polaczenia DB dla flush audytu: {}", e);
+                error!(
+                    "Nie udalo sie uzyskac polaczenia DB dla flush audytu: {}",
+                    e
+                );
                 // Proba zwrocenia wpisow do bufora
                 let mut buffer = self.buffer.lock();
                 for entry in entries {
@@ -219,18 +222,16 @@ impl AuditLogger {
 
         let mut inserted = 0u64;
         for entry in &entries {
-            let result = stmt.execute(
-                rusqlite::params![
-                    entry.timestamp.to_rfc3339(),
-                    entry.user_id,
-                    entry.addon_id,
-                    entry.action,
-                    entry.resource,
-                    entry.details,
-                    entry.ip_address,
-                    entry.node_id,
-                ],
-            );
+            let result = stmt.execute(rusqlite::params![
+                entry.timestamp.to_rfc3339(),
+                entry.user_id,
+                entry.addon_id,
+                entry.action,
+                entry.resource,
+                entry.details,
+                entry.ip_address,
+                entry.node_id,
+            ]);
 
             match result {
                 Ok(_) => inserted += 1,
@@ -249,7 +250,10 @@ impl AuditLogger {
             return;
         }
 
-        debug!("Flush audytu zakonczony: {}/{} wpisow zapisanych", inserted, count);
+        debug!(
+            "Flush audytu zakonczony: {}/{} wpisow zapisanych",
+            inserted, count
+        );
     }
 
     /// Uruchamia tokio task do cyklicznego flush bufora co flush_interval_ms
@@ -268,9 +272,14 @@ impl AuditLogger {
 
     /// Usuwa wpisy audytowe starsze niz podana liczba dni
     pub fn cleanup(&self, days_to_keep: u32) -> anyhow::Result<u64> {
-        info!("Czyszczenie wpisow audytowych starszych niz {} dni", days_to_keep);
+        info!(
+            "Czyszczenie wpisow audytowych starszych niz {} dni",
+            days_to_keep
+        );
 
-        let conn = self.db.lock()
+        let conn = self
+            .db
+            .lock()
             .map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
 
         let deleted = conn.execute(
@@ -289,13 +298,15 @@ impl AuditLogger {
         offset: u32,
         limit: u32,
     ) -> anyhow::Result<Vec<AuditEntry>> {
-        let conn = self.db.lock()
+        let conn = self
+            .db
+            .lock()
             .map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
 
         // Buduj zapytanie dynamicznie z filtrami
         let mut sql = String::from(
             "SELECT timestamp, user_id, addon_id, action, resource, details, ip_address, node_id \
-             FROM audit_log WHERE 1=1"
+             FROM audit_log WHERE 1=1",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
@@ -326,11 +337,16 @@ impl AuditLogger {
             idx += 1;
         }
 
-        sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ?{} OFFSET ?{}", idx, idx + 1));
+        sql.push_str(&format!(
+            " ORDER BY timestamp DESC LIMIT ?{} OFFSET ?{}",
+            idx,
+            idx + 1
+        ));
         params.push(Box::new(limit as i64));
         params.push(Box::new(offset as i64));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -357,7 +373,9 @@ impl AuditLogger {
 
     /// Zwraca calkowita liczbe wpisow audytowych spelniajacych filtry
     pub fn count(&self, filters: &AuditFilters) -> anyhow::Result<u64> {
-        let conn = self.db.lock()
+        let conn = self
+            .db
+            .lock()
             .map_err(|e| anyhow::anyhow!("Blad blokady DB: {}", e))?;
 
         let mut sql = String::from("SELECT COUNT(*) FROM audit_log WHERE 1=1");
@@ -390,20 +408,19 @@ impl AuditLogger {
             let _ = idx;
         }
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let count: i64 = conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
         Ok(count as u64)
     }
 
     /// Eksportuje wpisy audytowe jako CSV.
     /// W10: Przetwarzanie w batches po 1000 — zapobiega OOM przy duzych zbiorach danych.
-    pub fn export_csv(
-        &self,
-        filters: &AuditFilters,
-    ) -> anyhow::Result<String> {
+    pub fn export_csv(&self, filters: &AuditFilters) -> anyhow::Result<String> {
         const BATCH_SIZE: u32 = 1_000;
 
-        let mut csv = String::from("timestamp,user_id,addon_id,action,resource,details,ip_address,node_id\n");
+        let mut csv =
+            String::from("timestamp,user_id,addon_id,action,resource,details,ip_address,node_id\n");
         let mut offset: u32 = 0;
 
         loop {
@@ -417,8 +434,16 @@ impl AuditLogger {
                     entry.user_id.map(|id| id.to_string()).unwrap_or_default(),
                     entry.addon_id.as_deref().unwrap_or(""),
                     escape_csv_field(&entry.action),
-                    entry.resource.as_deref().map(escape_csv_field).unwrap_or_default(),
-                    entry.details.as_deref().map(escape_csv_field).unwrap_or_default(),
+                    entry
+                        .resource
+                        .as_deref()
+                        .map(escape_csv_field)
+                        .unwrap_or_default(),
+                    entry
+                        .details
+                        .as_deref()
+                        .map(escape_csv_field)
+                        .unwrap_or_default(),
                     entry.ip_address.as_deref().unwrap_or(""),
                     entry.node_id.as_deref().unwrap_or(""),
                 ));

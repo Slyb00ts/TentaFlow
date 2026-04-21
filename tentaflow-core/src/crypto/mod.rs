@@ -12,7 +12,6 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hkdf::Hkdf;
-use rand::RngCore;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -25,7 +24,10 @@ const ENCRYPTED_PREFIX: &str = "enc:";
 /// Dekoduje 64-znakowy hex string na tablice 32 bajtow
 fn decode_hex_32(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     if hex_str.len() != 64 {
-        anyhow::bail!("Oczekiwano 64 znaki hex (32 bajty), otrzymano {}", hex_str.len());
+        anyhow::bail!(
+            "Oczekiwano 64 znaki hex (32 bajty), otrzymano {}",
+            hex_str.len()
+        );
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
@@ -38,7 +40,7 @@ fn decode_hex_32(hex_str: &str) -> anyhow::Result<[u8; 32]> {
 /// Generuje losowy 32-bajtowy klucz jako hex string (VULN-025: OsRng zamiast thread_rng)
 pub fn generate_master_key() -> String {
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    getrandom::fill(&mut key).expect("OS RNG fill_bytes");
     let mut hex = String::with_capacity(64);
     for b in &key {
         use std::fmt::Write;
@@ -57,7 +59,7 @@ impl SecretsCipher {
     pub fn new(master_key_hex: &str) -> anyhow::Result<Self> {
         let master_key = Zeroizing::new(
             decode_hex_32(master_key_hex)
-                .map_err(|e| anyhow::anyhow!("Nieprawidlowy master key hex: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Nieprawidlowy master key hex: {}", e))?,
         );
 
         // HKDF-SHA256 key derivation z sol
@@ -76,7 +78,7 @@ impl SecretsCipher {
     /// VULN-025: OsRng zamiast thread_rng dla materialu kryptograficznego
     pub fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG fill_bytes");
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = self
@@ -97,7 +99,8 @@ impl SecretsCipher {
 
     /// Deszyfruje "enc:" + base64(nonce_12B || ciphertext || tag_16B) -> plaintext
     pub fn decrypt(&self, encrypted_value: &str) -> anyhow::Result<String> {
-        let b64_part = encrypted_value.strip_prefix(ENCRYPTED_PREFIX)
+        let b64_part = encrypted_value
+            .strip_prefix(ENCRYPTED_PREFIX)
             .unwrap_or(encrypted_value);
 
         let decoded = B64
@@ -142,7 +145,10 @@ impl SecretsCipher {
         match self.decrypt(value) {
             Ok(plaintext) => std::borrow::Cow::Owned(plaintext),
             Err(e) => {
-                tracing::warn!("Deszyfrowanie nie powiodlo sie dla wartosci z prefixem enc: - {}", e);
+                tracing::warn!(
+                    "Deszyfrowanie nie powiodlo sie dla wartosci z prefixem enc: - {}",
+                    e
+                );
                 std::borrow::Cow::Borrowed(value)
             }
         }
@@ -181,7 +187,9 @@ pub fn master_key_path(custom_dir: Option<&std::path::Path>) -> anyhow::Result<s
 
 /// Laduje master key z pliku lub generuje nowy
 /// custom_dir: opcjonalny katalog (mobile/desktop podaja swoj data_dir)
-pub fn load_or_create_master_key_in(custom_dir: Option<&std::path::Path>) -> anyhow::Result<[u8; 32]> {
+pub fn load_or_create_master_key_in(
+    custom_dir: Option<&std::path::Path>,
+) -> anyhow::Result<[u8; 32]> {
     let key_path = master_key_path(custom_dir)?;
 
     if key_path.exists() {
@@ -201,7 +209,7 @@ pub fn load_or_create_master_key_in(custom_dir: Option<&std::path::Path>) -> any
         Ok(key)
     } else {
         let mut key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key);
+        getrandom::fill(&mut key).expect("OS RNG fill_bytes");
 
         if let Some(parent) = key_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -238,7 +246,12 @@ fn restrict_file_acl_windows(path: &std::path::Path) {
     let path_str = path.to_string_lossy();
     let username = std::env::var("USERNAME").unwrap_or_else(|_| "CURRENT_USER".to_string());
     let _ = Command::new("icacls")
-        .args([&*path_str, "/inheritance:r", "/grant:r", &format!("{}:F", username)])
+        .args([
+            &*path_str,
+            "/inheritance:r",
+            "/grant:r",
+            &format!("{}:F", username),
+        ])
         .output();
 }
 
@@ -273,7 +286,7 @@ impl SettingsCipher {
     /// Szyfruj wartosc. Zwraca "enc:base64(nonce||ciphertext)"
     pub fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG fill_bytes");
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = self
@@ -339,8 +352,10 @@ pub fn migrate_plaintext_secrets(
 
 /// Hashuje haslo uzytkownika algorytmem argon2 (PHC string format)
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-    use rand::rngs::OsRng;
+    use argon2::{
+        password_hash::{rand_core::OsRng, SaltString},
+        Argon2, PasswordHasher,
+    };
 
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -352,7 +367,7 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 
 /// Weryfikuje haslo uzytkownika z zapisanym hashem argon2
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    use argon2::{Argon2, PasswordVerifier, PasswordHash};
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
 
     let Ok(parsed_hash) = PasswordHash::new(hash) else {
         return false;
@@ -441,7 +456,8 @@ mod tests {
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )",
-        ).unwrap();
+        )
+        .unwrap();
 
         let pool: crate::db::DbPool = Arc::new(Mutex::new(conn));
 
@@ -455,7 +471,9 @@ mod tests {
         assert_eq!(migrated, 2); // jwt_secret + node_private_key
 
         // Sprawdz ze sa zaszyfrowane
-        let jwt_raw = crate::db::repository::get_setting(&pool, "jwt_secret").unwrap().unwrap();
+        let jwt_raw = crate::db::repository::get_setting(&pool, "jwt_secret")
+            .unwrap()
+            .unwrap();
         assert!(jwt_raw.starts_with("enc:"));
 
         // Sprawdz odczyt przez get_setting_secure
@@ -469,7 +487,9 @@ mod tests {
         assert_eq!(migrated2, 0);
 
         // jwt_expiry_hours nie powinno byc zmienione
-        let hours = crate::db::repository::get_setting(&pool, "jwt_expiry_hours").unwrap().unwrap();
+        let hours = crate::db::repository::get_setting(&pool, "jwt_expiry_hours")
+            .unwrap()
+            .unwrap();
         assert_eq!(hours, "24");
     }
 }

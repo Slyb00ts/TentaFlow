@@ -6,11 +6,14 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use anyhow::{bail, Result};
 use tracing::info;
 
-use super::{AddonManifest, AddonDeclaredPermission, DisambiguationRule, ManifestPermission, ManifestTool, ManifestNetworkRule, ResourceRequirements};
+use super::{
+    AddonDeclaredPermission, AddonManifest, AddonOAuthProviderSection, AddonVisibilitySection,
+    DisambiguationRule, ManifestNetworkRule, ManifestTool, ManifestToolParameter,
+    ResourceRequirements,
+};
 use crate::db::DbPool;
 
 // =============================================================================
@@ -33,10 +36,10 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     }
 
     let manifest_content = std::fs::read_to_string(&manifest_path)
-        .context("Nie udalo sie odczytac manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac manifest.toml: {e}"))?;
 
     let manifest = parse_manifest_toml(&manifest_content)
-        .context("Nie udalo sie sparsowac manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac manifest.toml: {e}"))?;
 
     // 2. Walidacja
     validate_manifest(&manifest)?;
@@ -48,7 +51,10 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     if let Ok(canonical) = wasm_path.canonicalize() {
         if let Ok(base) = addon_dir.canonicalize() {
             if !canonical.starts_with(&base) {
-                bail!("Path traversal wykryty w wasm_file: {:?}", manifest.wasm_file);
+                bail!(
+                    "Path traversal wykryty w wasm_file: {:?}",
+                    manifest.wasm_file
+                );
             }
         }
     }
@@ -58,10 +64,10 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     }
 
     let wasm_bytes = std::fs::read(&wasm_path)
-        .context("Nie udalo sie odczytac pliku WASM")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac pliku WASM: {e}"))?;
 
-    let platforms_json = serde_json::to_string(&manifest.platforms)
-        .unwrap_or_else(|_| "[\"all\"]".to_string());
+    let platforms_json =
+        serde_json::to_string(&manifest.platforms).unwrap_or_else(|_| "[\"all\"]".to_string());
 
     let wasm_size = wasm_bytes.len() as i64;
 
@@ -71,32 +77,44 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
     conn.execute("BEGIN TRANSACTION", [])?;
 
     // Sprawdz czy addon juz istnieje
-    let existing: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = ?1",
-        rusqlite::params![&manifest.addon_id],
-        |row| row.get(0),
-    ).unwrap_or(false);
+    let existing: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = ?1",
+            rusqlite::params![&manifest.addon_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
 
     if existing {
         conn.execute("ROLLBACK", [])?;
-        bail!("Addon '{}' jest juz zainstalowany. Uzyj upgrade() zamiast install()", manifest.addon_id);
+        bail!(
+            "Addon '{}' jest juz zainstalowany. Uzyj upgrade() zamiast install()",
+            manifest.addon_id
+        );
     }
 
     // Odczytaj SKILL.md z katalogu addonu (jesli istnieje)
     let skill_md = std::fs::read_to_string(addon_dir.join("SKILL.md")).ok();
 
-    let keywords_json = serde_json::to_string(&manifest.keywords)
-        .unwrap_or_else(|_| "[]".to_string());
+    let keywords_json =
+        serde_json::to_string(&manifest.keywords).unwrap_or_else(|_| "[]".to_string());
 
     let category = manifest.category.as_deref().unwrap_or("");
 
-    let disambiguation_json = serde_json::to_string(&manifest.disambiguation)
-        .unwrap_or_else(|_| "[]".to_string());
+    let disambiguation_json =
+        serde_json::to_string(&manifest.disambiguation).unwrap_or_else(|_| "[]".to_string());
 
-    // 5. Tabela addons — schemat z migracji 14 + 25 + 26 (skill_md, keywords_json, category, disambiguation_json)
+    let icon = manifest.icon.as_deref().unwrap_or("");
+    let runtime = manifest.runtime.as_deref().unwrap_or("wasmtime");
+    let license = manifest.license.as_deref().unwrap_or("");
+    let show_in_catalog = manifest.show_in_catalog.unwrap_or(true) as i64;
+
+    // 5. Tabela addons — schemat z migracji 14 + 25 + 26 + 43 + 44
+    // (skill_md, keywords_json, category, disambiguation_json, icon, runtime,
+    //  wasm_size_bytes, license, show_in_catalog)
     conn.execute(
-        "INSERT INTO addons (addon_id, name, version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11)",
+        "INSERT INTO addons (addon_id, name, version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         rusqlite::params![
             &manifest.addon_id,
             &manifest.display_name,
@@ -109,8 +127,13 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
             &keywords_json,
             category,
             &disambiguation_json,
+            icon,
+            runtime,
+            wasm_size,
+            license,
+            show_in_catalog,
         ],
-    ).context("Nie udalo sie zarejestrowac addonu w DB")?;
+    ).map_err(|e| anyhow::anyhow!("Nie udalo sie zarejestrowac addonu w DB: {e}"))?;
 
     // Uprawnienia, narzedzia i limity sa przechowywane w manifest_json
     // (tabela addons.manifest_json zawiera pelny manifest)
@@ -138,7 +161,8 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
               vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
              VALUES (?1, 0, 0, 0, 1, 0, 0, 0, 0)",
             rusqlite::params![&manifest.addon_id],
-        ).ok();
+        )
+        .ok();
     }
 
     // Zapisz reguly sieciowe z manifestu (TCP/UDP + HTTP domains)
@@ -149,65 +173,102 @@ pub fn install(addon_dir: &Path, db: &DbPool) -> Result<AddonManifest> {
              (addon_id, rule_id, protocol, host, port, description, required, approved) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
-                &manifest.addon_id, &rule.id, &rule.protocol,
-                &rule.host, rule.port,
+                &manifest.addon_id,
+                &rule.id,
+                &rule.protocol,
+                &rule.host,
+                rule.port,
                 rule.description.as_deref().unwrap_or(""),
                 rule.required as i32,
                 if rule.required { 1 } else { 0 }
             ],
-        ).ok();
+        )
+        .ok();
     }
 
     conn.execute("COMMIT", [])?;
+    drop(conn);
+
+    // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
+    sync_manifest_metadata(db, &manifest)?;
 
     info!(
-        "Addon '{}' v{} zainstalowany ({} bajtow WASM, {} uprawnien, {} narzedzi, {} regul sieciowych)",
-        manifest.addon_id, manifest.version, wasm_size,
-        manifest.permissions.len(), manifest.tools.len(), manifest.network_rules.len()
+        "Addon '{}' v{} installed ({} WASM bytes, {} permissions, {} tools, {} network rules)",
+        manifest.addon_id,
+        manifest.version,
+        wasm_size,
+        manifest.declared_permissions.len(),
+        manifest.tools.len(),
+        manifest.network_rules.len()
     );
 
     Ok(manifest)
 }
 
-/// Uzupelnia reguly sieciowe HTTP domains dla juz zainstalowanych addonow.
-/// Wywoływane przy starcie — addony zainstalowane przed ta zmiana nie maja
-/// regul HTTP w addon_network_rules. Parsuje manifest_json (TOML) i dodaje brakujace.
-pub fn ensure_http_domain_rules(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT addon_id, manifest_json FROM addons"
-    )?;
+// =============================================================================
+// Synchronizacja katalogu uprawnien, providerow OAuth i widocznosci z manifestu
+// =============================================================================
 
-    let addons: Vec<(String, String)> = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?.filter_map(|r| r.ok()).collect();
+/// Synchronizuje wpisy pomocnicze po install/upgrade addona:
+/// - permission_catalog (upsert + diff delete)
+/// - oauth_providers_decl (upsert per wpis)
+/// - visibility (admin_only + default_groups)
+pub fn sync_manifest_metadata(db: &crate::db::DbPool, manifest: &AddonManifest) -> Result<()> {
+    use crate::db::repository;
 
-    for (addon_id, manifest_toml) in &addons {
-        let table = match manifest_toml.parse::<toml::Table>() {
-            Ok(t) => t,
-            Err(_) => continue,
+    // 1. Permission catalog — zrodlem prawdy sa declared_permissions
+    let addon_id = &manifest.addon_id;
+    let mut keep_ids: Vec<String> = Vec::with_capacity(manifest.declared_permissions.len());
+    for (idx, perm) in manifest.declared_permissions.iter().enumerate() {
+        if perm.id.is_empty() {
+            continue;
+        }
+        let entry = repository::DbAddonPermissionCatalogEntry {
+            addon_id: addon_id.clone(),
+            permission_id: perm.id.clone(),
+            display_name: if perm.display_name.is_empty() {
+                perm.id.clone()
+            } else {
+                perm.display_name.clone()
+            },
+            description: perm.description.clone(),
+            risk: if perm.risk.is_empty() {
+                "low".to_string()
+            } else {
+                perm.risk.clone()
+            },
+            sort_order: idx as i32,
         };
+        repository::upsert_permission_catalog(db, &entry)?;
+        keep_ids.push(perm.id.clone());
+    }
+    repository::delete_permission_catalog_missing(db, addon_id, &keep_ids)?;
 
-        let domains = match table.get("permissions")
-            .and_then(|p| p.get("http"))
-            .and_then(|h| h.get("domains"))
-            .and_then(|d| d.as_array())
-        {
-            Some(d) => d,
-            None => continue,
+    // 2. OAuth providers — upsert deklaracji
+    for prov in &manifest.oauth_provider {
+        if prov.id.is_empty() {
+            continue;
+        }
+        let decl = repository::DbAddonOAuthProviderDecl {
+            addon_id: addon_id.clone(),
+            provider_id: prov.id.clone(),
+            display_name: prov.display_name.clone(),
+            authorize_url: prov.authorize_url.clone(),
+            token_url: prov.token_url.clone(),
+            revoke_url: prov.revoke_url.clone(),
+            scopes: prov.scopes.join(" "),
+            mode: prov.mode.clone(),
+            pkce: prov.pkce,
         };
+        repository::upsert_oauth_providers_decl(db, &decl)?;
+    }
 
-        for domain in domains {
-            if let Some(host) = domain.as_str() {
-                let rule_id = format!("http-{}", host);
-                conn.execute(
-                    "INSERT OR IGNORE INTO addon_network_rules \
-                     (addon_id, rule_id, protocol, host, port, description, required, approved) \
-                     VALUES (?1, ?2, 'tcp', ?3, 443, ?4, 1, 1)",
-                    rusqlite::params![
-                        addon_id, &rule_id, host,
-                        format!("HTTPS API — {}", host)
-                    ],
-                ).ok();
+    // 3. Widocznosc: admin_only + domyslne grupy
+    if let Some(v) = &manifest.visibility {
+        repository::set_addon_admin_only(db, addon_id, v.admin_only)?;
+        for group_name in &v.default_groups {
+            if let Some(gid) = repository::get_group_id_by_name(db, group_name)? {
+                repository::set_addon_visibility(db, addon_id, gid, true, None)?;
             }
         }
     }
@@ -229,11 +290,13 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     let conn = db.lock().unwrap();
 
     // Sprawdz czy addon istnieje
-    let exists: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = ?1",
-        rusqlite::params![addon_id],
-        |row| row.get(0),
-    ).unwrap_or(false);
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = ?1",
+            rusqlite::params![addon_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
 
     if !exists {
         bail!("Addon '{}' nie jest zainstalowany", addon_id);
@@ -257,14 +320,16 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
         conn.execute(
             &format!("DELETE FROM {} WHERE addon_id = ?1", table),
             rusqlite::params![addon_id],
-        ).ok(); // Ignoruj bledy — tabela moze nie istniec jeszcze
+        )
+        .ok(); // Ignoruj bledy — tabela moze nie istniec jeszcze
     }
 
     // Glowna tabela addons
     conn.execute(
         "DELETE FROM addons WHERE addon_id = ?1",
         rusqlite::params![addon_id],
-    ).context("Nie udalo sie usunac addonu z DB")?;
+    )
+    .map_err(|e| anyhow::anyhow!("Nie udalo sie usunac addonu z DB: {e}"))?;
 
     conn.execute("COMMIT", [])?;
 
@@ -288,17 +353,18 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     // Odczytaj nowy manifest
     let manifest_path = new_dir.join("manifest.toml");
     let manifest_content = std::fs::read_to_string(&manifest_path)
-        .context("Nie udalo sie odczytac nowego manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie odczytac nowego manifest.toml: {e}"))?;
 
     let new_manifest = parse_manifest_toml(&manifest_content)
-        .context("Nie udalo sie sparsowac nowego manifest.toml")?;
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie sparsowac nowego manifest.toml: {e}"))?;
 
     validate_manifest(&new_manifest)?;
 
     if new_manifest.addon_id != addon_id {
         bail!(
             "addon_id w manifescie ('{}') nie zgadza sie z '{}' ",
-            new_manifest.addon_id, addon_id
+            new_manifest.addon_id,
+            addon_id
         );
     }
 
@@ -309,7 +375,10 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     if let Ok(canonical) = wasm_path.canonicalize() {
         if let Ok(base) = new_dir.canonicalize() {
             if !canonical.starts_with(&base) {
-                bail!("Path traversal wykryty w wasm_file: {:?}", new_manifest.wasm_file);
+                bail!(
+                    "Path traversal wykryty w wasm_file: {:?}",
+                    new_manifest.wasm_file
+                );
             }
         }
     }
@@ -318,33 +387,59 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
         bail!("Brak pliku WASM: {:?}", wasm_path);
     }
 
+    // Size is captured from the WASM file on disk; metadata() avoids reading
+    // the module contents twice (install() does a full read for validation,
+    // upgrade() trusts the lifecycle path traversal check above).
+    let wasm_size = std::fs::metadata(&wasm_path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+
     let platforms_json = serde_json::to_string(&new_manifest.platforms)?;
+
+    let icon = new_manifest.icon.as_deref().unwrap_or("");
+    let runtime = new_manifest.runtime.as_deref().unwrap_or("wasmtime");
+    let category = new_manifest.category.as_deref().unwrap_or("");
+    let license = new_manifest.license.as_deref().unwrap_or("");
+    let show_in_catalog = new_manifest.show_in_catalog.unwrap_or(true) as i64;
 
     let conn = db.lock().unwrap();
     conn.execute("BEGIN TRANSACTION", [])?;
 
     // Pobierz stara wersje
-    let old_version: String = conn.query_row(
-        "SELECT version FROM addons WHERE addon_id = ?1",
-        rusqlite::params![addon_id],
-        |row| row.get(0),
-    ).context("Addon nie znaleziony")?;
+    let old_version: String = conn
+        .query_row(
+            "SELECT version FROM addons WHERE addon_id = ?1",
+            rusqlite::params![addon_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| anyhow::anyhow!("Addon nie znaleziony: {e}"))?;
 
     info!(
         "Upgrade addonu '{}': {} -> {}",
         addon_id, old_version, new_manifest.version
     );
 
-    // Zaktualizuj metadane addonu
+    // Zaktualizuj metadane addonu (w tym UI metadata z migracji 43 + 44).
     conn.execute(
         "UPDATE addons SET version = ?1, name = ?2, description = ?3, author = ?4, \
-         manifest_json = ?5, platforms = ?6, updated_at = datetime('now') \
-         WHERE addon_id = ?7",
+         manifest_json = ?5, platforms = ?6, category = ?7, icon = ?8, runtime = ?9, \
+         wasm_size_bytes = ?10, license = ?11, show_in_catalog = ?12, \
+         updated_at = datetime('now') \
+         WHERE addon_id = ?13",
         rusqlite::params![
-            &new_manifest.version, &new_manifest.display_name,
+            &new_manifest.version,
+            &new_manifest.display_name,
             &new_manifest.description.as_deref().unwrap_or(""),
             &new_manifest.author.as_deref().unwrap_or(""),
-            &manifest_content, &platforms_json, addon_id,
+            &manifest_content,
+            &platforms_json,
+            category,
+            icon,
+            runtime,
+            wasm_size,
+            license,
+            show_in_catalog,
+            addon_id,
         ],
     )?;
 
@@ -371,7 +466,8 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
               vram_limit_mb, storage_limit_mb, http_requests_per_min, llm_tokens_per_min) \
              VALUES (?1, 0, 0, 0, 1, 0, 0, 0, 0)",
             rusqlite::params![addon_id],
-        ).ok();
+        )
+        .ok();
     }
 
     // Synchronizacja regul sieciowych:
@@ -381,8 +477,15 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
     sync_network_rules(&conn, addon_id, &new_manifest.network_rules)?;
 
     conn.execute("COMMIT", [])?;
+    drop(conn);
 
-    info!("Addon '{}' zaktualizowany do v{}", addon_id, new_manifest.version);
+    // Synchronizacja metadanych z manifestu (permission catalog, oauth providers, visibility)
+    sync_manifest_metadata(db, &new_manifest)?;
+
+    info!(
+        "Addon '{}' zaktualizowany do v{}",
+        addon_id, new_manifest.version
+    );
 
     Ok(())
 }
@@ -391,290 +494,532 @@ pub fn upgrade(addon_id: &str, new_dir: &Path, db: &DbPool) -> Result<()> {
 // Walidacja manifestu
 // =============================================================================
 
-/// Waliduje manifest addonu — wymagane pola, poprawnosc uprawnien
+/// Valid risk levels for declared permissions.
+const VALID_RISK: &[&str] = &["low", "medium", "high", "critical"];
+
+/// Legacy manifest sections that are explicitly rejected to prevent silent
+/// acceptance of mixed formats. Addons must be rewritten to the canonical
+/// format (see SCHEMA in repository docs).
+const LEGACY_SECTIONS: &[&str] = &[
+    "permissions",       // old [permissions] with required/optional category lists
+    "addon_permissions", // old [[addon_permissions]] array
+    "network_rules",     // old [[network_rules]] (singular in new format)
+    "tools",             // old [tools.name] nested subtables
+];
+
+/// Validates a parsed manifest — required fields, permission risk levels,
+/// unique network rule ids, non-empty tool fields.
 fn validate_manifest(manifest: &AddonManifest) -> Result<()> {
     if manifest.addon_id.is_empty() {
-        bail!("addon_id nie moze byc pusty");
+        bail!("addon.id is empty");
     }
-
     if manifest.addon_id.len() > 128 {
-        bail!("addon_id za dlugi (max 128 znakow)");
+        bail!("addon.id too long (max 128 chars)");
     }
-
-    // addon_id moze zawierac tylko litery, cyfry, kropki i myslniki
-    if !manifest.addon_id.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
-        bail!("addon_id zawiera niedozwolone znaki (dozwolone: a-z, 0-9, '.', '-', '_')");
+    if !manifest
+        .addon_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        bail!("addon.id contains disallowed characters (allowed: a-z, 0-9, '.', '-', '_')");
     }
-
     if manifest.version.is_empty() {
-        bail!("version nie moze byc pusta");
+        bail!("addon.version is empty");
     }
-
     if manifest.display_name.is_empty() {
-        bail!("display_name nie moze byc pusty");
+        bail!("addon.name is empty");
     }
-
     if manifest.wasm_file.is_empty() {
-        bail!("wasm_file nie moze byc pusty");
+        bail!("addon.wasm_file is empty");
     }
 
-    // Waliduj uprawnienia
-    let valid_permission_types = [
-        "llm", "llm_model", "embeddings", "rag",
-        "storage", "http", "events", "ui",
-        "audio", "audio_capture", "audio_play", "tts", "stt",
-        "camera", "notifications", "background",
-        "secrets", "user_info", "timer",
-        "addon_communicate", "log",
-        "network", "service",
-    ];
-
-    for perm in &manifest.permissions {
-        if !valid_permission_types.contains(&perm.permission_type.as_str()) {
-            bail!("Nieznany typ uprawnienia: '{}'", perm.permission_type);
+    let mut perm_ids = std::collections::HashSet::new();
+    for perm in &manifest.declared_permissions {
+        if perm.id.is_empty() {
+            bail!("permission.id is empty");
         }
-
-        // access_level usuniety — uprawnienia sa teraz boolean (przyznane/nieprzyznane)
+        if !perm_ids.insert(&perm.id) {
+            bail!("duplicate permission.id: '{}'", perm.id);
+        }
+        if perm.display_name.is_empty() {
+            bail!("permission '{}': display_name is empty", perm.id);
+        }
+        if !VALID_RISK.contains(&perm.risk.as_str()) {
+            bail!(
+                "permission '{}': risk must be low|medium|high|critical (got '{}')",
+                perm.id,
+                perm.risk
+            );
+        }
     }
 
-    // Waliduj narzedzia
     for tool in &manifest.tools {
         if tool.name.is_empty() {
-            bail!("Nazwa narzedzia nie moze byc pusta");
+            bail!("tool.id is empty");
         }
         if tool.description.is_empty() {
-            bail!("Opis narzedzia '{}' nie moze byc pusty", tool.name);
+            bail!("tool '{}': description is empty", tool.name);
         }
     }
 
-    // VULN-044: Waliduj reguly sieciowe — unikalne ID, niepuste pola, poprawny protokol
     let mut rule_ids = std::collections::HashSet::new();
     for rule in &manifest.network_rules {
         if rule.id.is_empty() {
-            bail!("network_rule.id pusty");
+            bail!("network_rule.id is empty");
         }
         if !rule_ids.insert(&rule.id) {
-            bail!("duplikat network_rule.id: '{}'", rule.id);
+            bail!("duplicate network_rule.id: '{}'", rule.id);
         }
         if rule.host.is_empty() {
-            bail!("network_rule '{}': host pusty", rule.id);
+            bail!("network_rule '{}': host is empty", rule.id);
         }
         if rule.port == 0 {
-            bail!("network_rule '{}': port musi byc 1-65535", rule.id);
+            bail!("network_rule '{}': port must be 1-65535", rule.id);
         }
         if rule.protocol != "tcp" && rule.protocol != "udp" {
-            bail!("network_rule '{}': protocol musi byc 'tcp' lub 'udp'", rule.id);
+            bail!(
+                "network_rule '{}': protocol must be 'tcp' or 'udp'",
+                rule.id
+            );
+        }
+    }
+
+    for prov in &manifest.oauth_provider {
+        if prov.id.is_empty() {
+            bail!("oauth_provider.id is empty");
+        }
+        if prov.authorize_url.is_empty() || prov.token_url.is_empty() {
+            bail!(
+                "oauth_provider '{}': authorize_url and token_url must be set",
+                prov.id
+            );
+        }
+        if !matches!(prov.mode.as_str(), "global" | "individual" | "none") {
+            bail!(
+                "oauth_provider '{}': mode must be global|individual|none",
+                prov.id
+            );
         }
     }
 
     Ok(())
 }
 
-/// Parsuje manifest.toml obslugujac oba formaty:
-/// - Nowy: [addon] id, name, version, wasm_file + [permissions] + [tools]
-/// - Stary: flat addon_id, version, display_name, wasm_file
+/// Parses the canonical manifest format:
+/// - `[addon]` section holding id/name/version/wasm_file/... (required).
+/// - `[[permission]]` array of declared granular permissions.
+/// - `[[tool]]` array with optional nested `[[tool.parameter]]` items.
+/// - `[[oauth_provider]]`, `[[network_rule]]` arrays.
+/// - Sections `[visibility]`, `[resources]`, `[lifecycle]`, `[config.schema]`.
+///
+/// Legacy sections (`[permissions]`, `[[addon_permissions]]`, singular `[tools.X]`,
+/// `[[network_rules]]`) are rejected with a clear error — addons must migrate to
+/// the canonical format instead of relying on backward-compat shims.
 pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
-    // Sprobuj najpierw flat format (stary)
-    if let Ok(manifest) = toml::from_str::<AddonManifest>(content) {
-        return Ok(manifest);
+    let parsed: toml::Value =
+        toml::from_str(content).map_err(|e| anyhow::anyhow!("invalid TOML: {e}"))?;
+
+    let top = parsed
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("manifest root must be a TOML table"))?;
+
+    for legacy in LEGACY_SECTIONS {
+        if top.contains_key(*legacy) {
+            bail!(
+                "manifest uses legacy section '[{}]' — migrate to the canonical format \
+                 ([[permission]], [[tool]], [[network_rule]])",
+                legacy
+            );
+        }
     }
 
-    // Parsuj jako zagniezdony format [addon]
-    let parsed: toml::Value = toml::from_str(content)
-        .context("Niepoprawny format TOML")?;
+    let addon = top
+        .get("addon")
+        .and_then(|v| v.as_table())
+        .ok_or_else(|| anyhow::anyhow!("missing [addon] section"))?;
 
-    let addon = parsed.get("addon")
-        .context("Brak sekcji [addon] w manifest.toml")?;
-
-    let addon_id = addon.get("id").and_then(|v| v.as_str())
-        .context("Brak addon.id")?;
-    let version = addon.get("version").and_then(|v| v.as_str())
-        .context("Brak addon.version")?;
-    let display_name = addon.get("name").and_then(|v| v.as_str())
-        .unwrap_or(addon_id);
-    let description = addon.get("description").and_then(|v| v.as_str()).map(String::from);
-    let author = addon.get("author").and_then(|v| v.as_str()).map(String::from);
-    let wasm_file = addon.get("wasm_file").and_then(|v| v.as_str())
-        .unwrap_or("addon.wasm");
-    let platforms = addon.get("platforms")
+    let addon_id = addon
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing addon.id"))?
+        .to_string();
+    let version = addon
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing addon.version"))?
+        .to_string();
+    let display_name = addon
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&addon_id)
+        .to_string();
+    let description = addon
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let author = addon
+        .get("author")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let wasm_file = addon
+        .get("wasm_file")
+        .and_then(|v| v.as_str())
+        .unwrap_or("addon.wasm")
+        .to_string();
+    let platforms = addon
+        .get("platforms")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-
-    // Parsuj permissions
-    let mut permissions = Vec::new();
-    if let Some(perms) = parsed.get("permissions") {
-        if let Some(required) = perms.get("required").and_then(|v| v.as_array()) {
-            for p in required {
-                if let Some(s) = p.as_str() {
-                    permissions.push(ManifestPermission {
-                        permission_type: s.to_string(),
-                        resource_pattern: None,
-                        access_level: "rw".to_string(),
-                        reason: None,
-                        required: true,
-                    });
-                }
-            }
-        }
-        if let Some(optional) = perms.get("optional").and_then(|v| v.as_array()) {
-            for p in optional {
-                if let Some(s) = p.as_str() {
-                    permissions.push(ManifestPermission {
-                        permission_type: s.to_string(),
-                        resource_pattern: None,
-                        access_level: "rw".to_string(),
-                        reason: None,
-                        required: false,
-                    });
-                }
-            }
-        }
-    }
-
-    // Parsuj tools
-    let mut tools = Vec::new();
-    if let Some(tools_section) = parsed.get("tools") {
-        if let Some(table) = tools_section.as_table() {
-            for (tool_name, tool_val) in table {
-                if let Some(desc) = tool_val.get("description").and_then(|v| v.as_str()) {
-                    let params = tool_val.get("parameters")
-                        .map(|v| serde_json::to_value(v).unwrap_or_default())
-                        .unwrap_or(serde_json::json!({}));
-                    let keywords = tool_val.get("keywords")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter()
-                            .filter_map(|item| item.as_str().map(String::from))
-                            .collect::<Vec<String>>())
-                        .unwrap_or_default();
-                    tools.push(ManifestTool {
-                        name: tool_name.clone(),
-                        description: desc.to_string(),
-                        parameters_schema: params,
-                        return_schema: None,
-                        keywords,
-                    });
-                }
-            }
-        }
-    }
-
-    // Parsuj addon_permissions — granularne uprawnienia deklarowane przez addon
-    let mut declared_permissions = Vec::new();
-    if let Some(perms_array) = parsed.get("addon_permissions").and_then(|v| v.as_array()) {
-        for perm in perms_array {
-            declared_permissions.push(AddonDeclaredPermission {
-                id: perm.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                name: perm.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                description: perm.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                category: perm.get("category").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            });
-        }
-    }
-
-    // Parsuj network_rules — jawne reguly sieciowe TCP/UDP z [[network_rules]]
-    let mut network_rules = Vec::new();
-    if let Some(rules) = parsed.get("network_rules").and_then(|v| v.as_array()) {
-        for rule in rules {
-            network_rules.push(ManifestNetworkRule {
-                id: rule.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                protocol: rule.get("protocol").and_then(|v| v.as_str()).unwrap_or("tcp").to_string(),
-                host: rule.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                port: rule.get("port").and_then(|v| v.as_integer()).unwrap_or(0) as u16,
-                description: rule.get("description").and_then(|v| v.as_str()).map(String::from),
-                required: rule.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
-            });
-        }
-    }
-
-    // Konwertuj HTTP domains z [permissions.http].domains na reguly sieciowe
-    // Kazda domena HTTP to reguła TCP:443 — widoczna w UI, domyslnie dozwolona
-    if let Some(http_domains) = parsed.get("permissions")
-        .and_then(|p| p.get("http"))
-        .and_then(|h| h.get("domains"))
-        .and_then(|d| d.as_array())
-    {
-        for domain in http_domains {
-            if let Some(host) = domain.as_str() {
-                let rule_id = format!("http-{}", host);
-                // Nie dodawaj duplikatu jesli juz jest w network_rules
-                if !network_rules.iter().any(|r| r.id == rule_id) {
-                    network_rules.push(ManifestNetworkRule {
-                        id: rule_id,
-                        protocol: "tcp".to_string(),
-                        host: host.to_string(),
-                        port: 443,
-                        description: Some(format!("HTTPS API — {}", host)),
-                        required: true,
-                    });
-                }
-            }
-        }
-    }
-
-    let addon_keywords = parsed.get("addon")
-        .and_then(|a| a.get("keywords"))
+    let keywords = addon
+        .get("keywords")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter()
-            .filter_map(|item| item.as_str().map(String::from))
-            .collect::<Vec<String>>())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-
-    let category = parsed.get("addon")
-        .and_then(|a| a.get("category"))
+    let category = addon
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let icon = addon.get("icon").and_then(|v| v.as_str()).map(String::from);
+    let runtime = addon
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let license = addon
+        .get("license")
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    // Parsuj disambiguation — reguly rozstrzygania niejednoznacznych zapytan
-    let disambiguation = parsed.get("addon")
-        .and_then(|a| a.get("disambiguation"))
+    let declared_permissions = top
+        .get("permission")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter().filter_map(|item| {
-                let trigger = item.get("trigger")
-                    .and_then(|t| t.as_array())
-                    .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let prefer = item.get("prefer").and_then(|v| v.as_str())?.to_string();
-                let over = item.get("over").and_then(|v| v.as_str())?.to_string();
-                let when = item.get("when").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                Some(DisambiguationRule { trigger, prefer, over, when })
-            }).collect::<Vec<_>>()
+            arr.iter()
+                .map(|p| AddonDeclaredPermission {
+                    id: p
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    display_name: p
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    description: p
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    risk: p
+                        .get("risk")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("low")
+                        .to_string(),
+                })
+                .collect()
         })
         .unwrap_or_default();
 
-    // Parsuj sekcje [resources] — wymagania zasobow deklarowane przez addon
-    let resources = parsed.get("resources").map(|res| {
-        ResourceRequirements {
-            storage_total_mb: res.get("storage_total_mb").and_then(|v| v.as_integer()).map(|v| v as u64),
-            storage_value_mb: res.get("storage_value_mb").and_then(|v| v.as_integer()).map(|v| v as u64),
-            llm_tokens_per_minute: res.get("llm_tokens_per_minute").and_then(|v| v.as_integer()).map(|v| v as u64),
-            http_requests_per_minute: res.get("http_requests_per_minute").and_then(|v| v.as_integer()).map(|v| v as u64),
-            memory_mb: res.get("memory_mb").and_then(|v| v.as_integer()).map(|v| v as u64),
-            fuel_limit: res.get("fuel_limit").and_then(|v| v.as_integer()).map(|v| v as u64),
-        }
+    let oauth_provider = top
+        .get("oauth_provider")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
+                    Some(AddonOAuthProviderSection {
+                        id,
+                        display_name: p
+                            .get("display_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        authorize_url: p
+                            .get("authorize_url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        token_url: p
+                            .get("token_url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        revoke_url: p
+                            .get("revoke_url")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        scopes: p
+                            .get("scopes")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|s| s.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        mode: p
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("individual")
+                            .to_string(),
+                        pkce: p.get("pkce").and_then(|v| v.as_bool()).unwrap_or(true),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let network_rules = top
+        .get("network_rule")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|r| ManifestNetworkRule {
+                    id: r
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    protocol: r
+                        .get("protocol")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tcp")
+                        .to_string(),
+                    host: r
+                        .get("host")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    port: r.get("port").and_then(|v| v.as_integer()).unwrap_or(443) as u16,
+                    description: r
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    required: r.get("required").and_then(|v| v.as_bool()).unwrap_or(true),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let tools = top
+        .get("tool")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    let id = t
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let description = t
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let keywords_t = t
+                        .get("keywords")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let parameters: Vec<ManifestToolParameter> = t
+                        .get("parameter")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .map(|p| ManifestToolParameter {
+                                    name: p
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    param_type: p
+                                        .get("param_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("string")
+                                        .to_string(),
+                                    description: p
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    required: p
+                                        .get("required")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    ManifestTool {
+                        name: id,
+                        description,
+                        parameters_schema: build_parameters_schema(&parameters),
+                        return_schema: None,
+                        keywords: keywords_t,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let visibility = top.get("visibility").map(|v| AddonVisibilitySection {
+        admin_only: v
+            .get("admin_only")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        default_groups: v
+            .get("default_groups")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        show_in_catalog: v.get("show_in_catalog").and_then(|x| x.as_bool()),
+    });
+
+    // `[visibility].show_in_catalog` controls the top-level flag stored in the
+    // addons table; falls back to `[addon].show_in_catalog` if someone puts it there.
+    let show_in_catalog = visibility
+        .as_ref()
+        .and_then(|v| v.show_in_catalog)
+        .or_else(|| addon.get("show_in_catalog").and_then(|v| v.as_bool()));
+
+    let disambiguation = addon
+        .get("disambiguation")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let trigger = item
+                        .get("trigger")
+                        .and_then(|t| t.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let prefer = item.get("prefer").and_then(|v| v.as_str())?.to_string();
+                    let over = item.get("over").and_then(|v| v.as_str())?.to_string();
+                    let when = item
+                        .get("when")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(DisambiguationRule {
+                        trigger,
+                        prefer,
+                        over,
+                        when,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let resources = top.get("resources").map(|res| ResourceRequirements {
+        storage_total_mb: res
+            .get("storage_total_mb")
+            .and_then(|v| v.as_integer())
+            .or_else(|| res.get("storage_mb").and_then(|v| v.as_integer()))
+            .map(|v| v as u64),
+        storage_value_mb: res
+            .get("storage_value_mb")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u64),
+        llm_tokens_per_minute: res
+            .get("llm_tokens_per_minute")
+            .and_then(|v| v.as_integer())
+            .or_else(|| res.get("llm_tokens_per_min").and_then(|v| v.as_integer()))
+            .map(|v| v as u64),
+        http_requests_per_minute: res
+            .get("http_requests_per_minute")
+            .and_then(|v| v.as_integer())
+            .or_else(|| {
+                res.get("http_requests_per_min")
+                    .and_then(|v| v.as_integer())
+            })
+            .map(|v| v as u64),
+        memory_mb: res
+            .get("memory_mb")
+            .and_then(|v| v.as_integer())
+            .or_else(|| res.get("ram_mb").and_then(|v| v.as_integer()))
+            .map(|v| v as u64),
+        fuel_limit: res
+            .get("fuel_limit")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u64),
     });
 
     Ok(AddonManifest {
-        addon_id: addon_id.to_string(),
-        version: version.to_string(),
-        display_name: display_name.to_string(),
+        addon_id,
+        version,
+        display_name,
         description,
         author,
-        permissions,
         platforms,
-        wasm_file: wasm_file.to_string(),
-        skill_file: Some("SKILL.md".to_string()),
-        blocks_file: Some("blocks.json".to_string()),
-        icon_file: None,
-        resource_limits: None,
-        keywords: addon_keywords,
+        wasm_file,
+        keywords,
         category,
+        icon,
+        runtime,
         tools,
         declared_permissions,
         network_rules,
         disambiguation,
         resources,
+        visibility,
+        oauth_provider,
+        license,
+        show_in_catalog,
+    })
+}
+
+/// Builds a JSON Schema `object` from `[[tool.parameter]]` entries. Keeps the
+/// `parameters_schema` field shape that existing tool_dispatch/host code expects.
+fn build_parameters_schema(params: &[ManifestToolParameter]) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for p in params {
+        if p.name.is_empty() {
+            continue;
+        }
+        let mut prop = serde_json::Map::new();
+        prop.insert(
+            "type".to_string(),
+            serde_json::Value::String(p.param_type.clone()),
+        );
+        if !p.description.is_empty() {
+            prop.insert(
+                "description".to_string(),
+                serde_json::Value::String(p.description.clone()),
+            );
+        }
+        properties.insert(p.name.clone(), serde_json::Value::Object(prop));
+        if p.required {
+            required.push(serde_json::Value::String(p.name.clone()));
+        }
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
     })
 }
 
@@ -695,13 +1040,11 @@ fn sync_network_rules(
     new_rules: &[ManifestNetworkRule],
 ) -> Result<()> {
     // Pobierz istniejace rule_id z DB
-    let mut stmt = conn.prepare(
-        "SELECT rule_id FROM addon_network_rules WHERE addon_id = ?1"
-    )?;
-    let existing_ids: Vec<String> = stmt.query_map(
-        rusqlite::params![addon_id],
-        |row| row.get::<_, String>(0),
-    )?.filter_map(|r| r.ok()).collect();
+    let mut stmt = conn.prepare("SELECT rule_id FROM addon_network_rules WHERE addon_id = ?1")?;
+    let existing_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![addon_id], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
 
     let new_ids: Vec<&str> = new_rules.iter().map(|r| r.id.as_str()).collect();
 
@@ -712,7 +1055,10 @@ fn sync_network_rules(
                 "DELETE FROM addon_network_rules WHERE addon_id = ?1 AND rule_id = ?2",
                 rusqlite::params![addon_id, old_id],
             )?;
-            info!("upgrade: usunieto regule sieciowa '{}' addonu '{}'", old_id, addon_id);
+            info!(
+                "upgrade: usunieto regule sieciowa '{}' addonu '{}'",
+                old_id, addon_id
+            );
         }
     }
 
@@ -721,16 +1067,17 @@ fn sync_network_rules(
     for rule in new_rules {
         if existing_ids.contains(&rule.id) {
             // Sprawdz czy cel polaczenia sie zmienil (host, port, protocol)
-            let (old_host, old_port, old_proto): (String, i64, String) = conn.query_row(
-                "SELECT host, port, protocol FROM addon_network_rules \
+            let (old_host, old_port, old_proto): (String, i64, String) = conn
+                .query_row(
+                    "SELECT host, port, protocol FROM addon_network_rules \
                  WHERE addon_id = ?1 AND rule_id = ?2",
-                rusqlite::params![addon_id, &rule.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).unwrap_or_default();
+                    rusqlite::params![addon_id, &rule.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap_or_default();
 
-            let target_changed = old_host != rule.host
-                || old_port != rule.port as i64
-                || old_proto != rule.protocol;
+            let target_changed =
+                old_host != rule.host || old_port != rule.port as i64 || old_proto != rule.protocol;
 
             if target_changed {
                 // Cel polaczenia sie zmienil — wymagaj ponownego zatwierdzenia
@@ -740,10 +1087,13 @@ fn sync_network_rules(
                          approved = 0, approved_by = NULL, approved_at = NULL \
                      WHERE addon_id = ?6 AND rule_id = ?7",
                     rusqlite::params![
-                        &rule.protocol, &rule.host, rule.port,
+                        &rule.protocol,
+                        &rule.host,
+                        rule.port,
                         rule.description.as_deref().unwrap_or(""),
                         rule.required as i32,
-                        addon_id, &rule.id,
+                        addon_id,
+                        &rule.id,
                     ],
                 )?;
                 info!(
@@ -759,7 +1109,8 @@ fn sync_network_rules(
                     rusqlite::params![
                         rule.description.as_deref().unwrap_or(""),
                         rule.required as i32,
-                        addon_id, &rule.id,
+                        addon_id,
+                        &rule.id,
                     ],
                 )?;
             }
@@ -770,15 +1121,76 @@ fn sync_network_rules(
                  (addon_id, rule_id, protocol, host, port, description, required, approved) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
                 rusqlite::params![
-                    addon_id, &rule.id, &rule.protocol,
-                    &rule.host, rule.port,
+                    addon_id,
+                    &rule.id,
+                    &rule.protocol,
+                    &rule.host,
+                    rule.port,
                     rule.description.as_deref().unwrap_or(""),
                     rule.required as i32,
                 ],
             )?;
-            info!("upgrade: dodano nowa regule sieciowa '{}' addonu '{}' (wymaga zatwierdzenia)", rule.id, addon_id);
+            info!(
+                "upgrade: dodano nowa regule sieciowa '{}' addonu '{}' (wymaga zatwierdzenia)",
+                rule.id, addon_id
+            );
         }
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Testy
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn minimal_wasm_bytes() -> Vec<u8> {
+        // Minimal valid WASM module header: magic "\0asm" + version 1.
+        vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    #[test]
+    fn test_lifecycle_install_persists_wasm_size_and_ui_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let addon_dir = tmp.path();
+
+        let manifest = r#"
+[addon]
+id = "size-test"
+name = "Size Test"
+version = "0.1.0"
+description = "lifecycle install size/icon/runtime round-trip"
+author = "tests"
+platforms = ["linux"]
+wasm_file = "addon.wasm"
+category = "communication"
+icon = "i-meeting"
+runtime = "wasmtime"
+"#;
+        std::fs::write(addon_dir.join("manifest.toml"), manifest).unwrap();
+
+        let wasm = minimal_wasm_bytes();
+        let mut f = std::fs::File::create(addon_dir.join("addon.wasm")).unwrap();
+        f.write_all(&wasm).unwrap();
+        drop(f);
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("init in-memory db");
+        let installed = install(addon_dir, &db).expect("install should succeed");
+        assert_eq!(installed.icon.as_deref(), Some("i-meeting"));
+        assert_eq!(installed.runtime.as_deref(), Some("wasmtime"));
+        assert_eq!(installed.category.as_deref(), Some("communication"));
+
+        let row = crate::db::repository::get_addon(&db, "size-test")
+            .unwrap()
+            .expect("addon row present");
+        assert_eq!(row.icon, "i-meeting");
+        assert_eq!(row.runtime, "wasmtime");
+        assert_eq!(row.category, "communication");
+        assert_eq!(row.wasm_size_bytes, wasm.len() as i64);
+    }
 }

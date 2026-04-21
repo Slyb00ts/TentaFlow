@@ -3,11 +3,10 @@
 // Opis: Endpointy logowania i informacji o zalogowanym uzytkowniku.
 // =============================================================================
 
-use crate::db::{self, DbPool};
 use super::auth::{self, Claims};
+use crate::db::{self, DbPool};
 use anyhow::Result;
 use parking_lot::Mutex;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -99,7 +98,12 @@ pub struct MeResponse {
 /// POST /api/auth/login - logowanie, zwraca token JWT.
 /// VULN-002: Rate limiting — max 10 prob na 60 sekund per username.
 /// VULN-035: Dual rate limiting — dodatkowy limit 30/min per IP.
-pub fn handle_login(pool: &DbPool, body: &[u8], remote_addr: &str, settings_cipher: &crate::crypto::SettingsCipher) -> Result<(u16, String)> {
+pub fn handle_login(
+    pool: &DbPool,
+    body: &[u8],
+    remote_addr: &str,
+    settings_cipher: &crate::crypto::SettingsCipher,
+) -> Result<(u16, String)> {
     let req: LoginRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => return Ok((400, json_error("Niepoprawny format danych logowania"))),
@@ -108,37 +112,48 @@ pub fn handle_login(pool: &DbPool, body: &[u8], remote_addr: &str, settings_ciph
     // VULN-035: Sprawdz rate limit per IP (30/min) — przed weryfikacja hasla
     if !LOGIN_RATE_LIMITER.check_and_record(&format!("ip:{}", remote_addr), 30) {
         warn!("Rate limit logowania (IP): remote_addr={}", remote_addr);
-        return Ok((429, json_error("Zbyt wiele prob logowania z tego adresu. Sprobuj ponownie za minute.")));
+        return Ok((
+            429,
+            json_error("Zbyt wiele prób logowania z tego adresu. Spróbuj ponownie za minutę."),
+        ));
     }
 
     // VULN-002: Sprawdz rate limit per username (10/min)
     if !LOGIN_RATE_LIMITER.check_and_record(&req.username, 10) {
         // VULN-013: Logowanie zdarzen bezpieczenstwa — rate limit
         warn!("Rate limit logowania: username={}", req.username);
-        return Ok((429, json_error("Zbyt wiele prob logowania. Sprobuj ponownie za minute.")));
+        return Ok((
+            429,
+            json_error("Zbyt wiele prób logowania. Spróbuj ponownie za minutę."),
+        ));
     }
 
     // Weryfikacja logowania w tabeli user_accounts
     // VULN-003: Sprawdz must_change_password z user_accounts
-    let (user_id, username, needs_password_change) =
-        if let Some(ua) = db::repository::verify_user_account_password(pool, &req.username, &req.password)? {
-            (ua.id, ua.username, ua.must_change_password)
-        } else {
-            // VULN-013: Logowanie zdarzen bezpieczenstwa — nieudane logowanie
-            warn!("Nieudana proba logowania: username={}", req.username);
-            return Ok((401, json_error("Niepoprawna nazwa uzytkownika lub haslo")));
-        };
+    let (user_id, username, needs_password_change) = if let Some(ua) =
+        db::repository::verify_user_account_password(pool, &req.username, &req.password)?
+    {
+        (ua.id, ua.username, ua.must_change_password)
+    } else {
+        // VULN-013: Logowanie zdarzen bezpieczenstwa — nieudane logowanie
+        warn!("Nieudana proba logowania: username={}", req.username);
+        return Ok((401, json_error("Niepoprawna nazwa użytkownika lub hasło")));
+    };
 
     // VULN-013: Logowanie zdarzen bezpieczenstwa — udane logowanie
-    info!("Uzytkownik zalogowany: username={}, user_id={}", username, user_id);
+    info!(
+        "Uzytkownik zalogowany: username={}, user_id={}",
+        username, user_id
+    );
 
     // Pobierz jwt_secret z ustawien; jesli brak — wygeneruj i zapisz
-    let jwt_secret = match db::repository::get_setting_secure(pool, "jwt_secret", settings_cipher)? {
+    let jwt_secret = match db::repository::get_setting_secure(pool, "jwt_secret", settings_cipher)?
+    {
         Some(s) if !s.is_empty() => s,
         _ => {
             // VULN-009: Kryptograficznie bezpieczny secret z OsRng
             let mut key = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut key);
+            getrandom::fill(&mut key).expect("OS RNG fill_bytes");
             let generated = hex::encode(key);
             db::repository::set_setting_secure(pool, "jwt_secret", &generated, settings_cipher)?;
             generated
@@ -171,20 +186,24 @@ pub fn handle_me(claims: &Claims) -> Result<(u16, String)> {
 }
 
 /// POST /api/auth/change-password - zmiana hasla
-pub fn handle_change_password(pool: &DbPool, claims: &Claims, body: &[u8]) -> Result<(u16, String)> {
-    let req: ChangePasswordRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+pub fn handle_change_password(
+    pool: &DbPool,
+    claims: &Claims,
+    body: &[u8],
+) -> Result<(u16, String)> {
+    let req: ChangePasswordRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let user = db::repository::get_user_by_username(pool, &claims.sub)?
         .ok_or_else(|| anyhow::anyhow!("Uzytkownik nie istnieje"))?;
 
     if !auth::verify_password(&req.current_password, &user.password_hash) {
-        return Ok((401, json_error("Niepoprawne aktualne haslo")));
+        return Ok((401, json_error("Niepoprawne aktualne hasło")));
     }
 
     // VULN-011: Ujednolicenie minimalnej dlugosci hasla — 8 znakow
     if req.new_password.len() < 8 {
-        return Ok((400, json_error("Nowe haslo musi miec minimum 8 znakow")));
+        return Ok((400, json_error("Nowe hasło musi mieć minimum 8 znaków")));
     }
 
     let new_hash = auth::hash_password(&req.new_password)?;
@@ -194,7 +213,10 @@ pub fn handle_change_password(pool: &DbPool, claims: &Claims, body: &[u8]) -> Re
     // VULN-013: Logowanie zdarzen bezpieczenstwa — zmiana hasla
     info!("Zmiana hasla: user_id={}", claims.user_id);
 
-    Ok((200, r#"{"message":"Haslo zmienione pomyslnie"}"#.to_string()))
+    Ok((
+        200,
+        r#"{"message":"Hasło zmienione pomyślnie"}"#.to_string(),
+    ))
 }
 
 fn json_error(message: &str) -> String {

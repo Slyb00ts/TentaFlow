@@ -5,7 +5,7 @@
 //
 //       Flow:
 //        1. Rozpakuj embed bundle (deploy::bundle::extract_to) do tmpdir.
-//        2. Odczytaj tentaflow-containers/python-bundles/<engine>/bundle.toml.
+//        2. Odczytaj tentaflow-containers/<kategoria>/python/<engine>/bundle.toml.
 //        3. Zapewnij Pythona relokowalnego w ~/.cache/tentaflow/python/<ver>/
 //           (pobierz python-build-standalone dla platformy, jesli brak).
 //        4. Zapewnij `uv` binarke w ~/.cache/tentaflow/bin/ (pobierz z GitHub).
@@ -17,9 +17,9 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::collections::HashMap;
 
 /// Sparsowane bundle.toml.
 #[derive(Debug, Clone, Deserialize)]
@@ -54,7 +54,7 @@ pub struct BundleMeta {
     pub engine: String,
     pub description: String,
     pub python_version: String,
-    pub source: String,            // "pypi" | "git"
+    pub source: String, // "pypi" | "git"
     #[serde(default)]
     pub pypi_package: Option<String>,
     #[serde(default)]
@@ -116,16 +116,47 @@ pub fn cache_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("nie mozna ustalic cache dir"))
 }
 
+/// Znajduje katalog bundla Pythona dla danego silnika.
+/// Skanuje wszystkie kategorie w tentaflow-containers/ szukajac
+/// <category>/python/<engine_id>/. Zwraca pierwsze trafienie (engine_id
+/// powinien byc unikalny w obrebie projektu).
+fn find_bundle_dir(workspace_root: &Path, engine_id: &str) -> Option<PathBuf> {
+    let containers = workspace_root.join("tentaflow-containers");
+    let categories = [
+        "llm",
+        "stt",
+        "tts",
+        "embeddings",
+        "reranker",
+        "vision",
+        "image-gen",
+        "video-gen",
+        "music-gen",
+        "model-3d-gen",
+        "agents",
+        "tools",
+    ];
+    for category in categories {
+        let candidate = containers.join(category).join("python").join(engine_id);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Odczytuje bundle.toml z rozpakowanego kontekstu.
 pub fn read_bundle_spec(extracted_root: &Path, engine: &str) -> Result<BundleSpec> {
-    let path = extracted_root
-        .join("tentaflow-containers/python-bundles")
-        .join(engine)
-        .join("bundle.toml");
+    let bundle_dir = find_bundle_dir(extracted_root, engine)
+        .ok_or_else(|| anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            engine
+        ))?;
+    let path = bundle_dir.join("bundle.toml");
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("brak bundle.toml: {}", path.display()))?;
-    let spec: BundleSpec = toml::from_str(&content)
-        .with_context(|| format!("parsowanie {}", path.display()))?;
+    let spec: BundleSpec =
+        toml::from_str(&content).with_context(|| format!("parsowanie {}", path.display()))?;
     Ok(spec)
 }
 
@@ -157,10 +188,11 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
     let uv_bin = ensure_uv(&cache).ok();
 
     let venv_dir = cache.join("envs").join(engine);
-    let bundle_src = extracted
-        .path()
-        .join("tentaflow-containers/python-bundles")
-        .join(engine);
+    let bundle_src = find_bundle_dir(extracted.path(), engine)
+        .ok_or_else(|| anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            engine
+        ))?;
 
     create_venv(&python_bin, &venv_dir)?;
     install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
@@ -194,10 +226,11 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
     let uv_bin = ensure_uv(&cache).ok();
 
     let venv_dir = cache.join("envs").join(&req.engine);
-    let bundle_src = extracted
-        .path()
-        .join("tentaflow-containers/python-bundles")
-        .join(&req.engine);
+    let bundle_src = find_bundle_dir(extracted.path(), &req.engine)
+        .ok_or_else(|| anyhow::anyhow!(
+            "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
+            req.engine
+        ))?;
 
     create_venv(&python_bin, &venv_dir)?;
     install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
@@ -228,7 +261,8 @@ fn check_platform_compat(req: &Requires) -> Result<()> {
     if !req.platforms.iter().any(|p| p == &current) {
         anyhow::bail!(
             "silnik nie wspiera platformy {} (wspierane: {:?})",
-            current, req.platforms
+            current,
+            req.platforms
         );
     }
     Ok(())
@@ -253,8 +287,13 @@ fn ensure_python(cache: &Path, py_ver: &str) -> Result<PathBuf> {
         return Ok(python_bin);
     }
 
-    let triple = pbs_triple()
-        .with_context(|| format!("nie znam PBS triple dla {}-{}", std::env::consts::OS, std::env::consts::ARCH))?;
+    let triple = pbs_triple().with_context(|| {
+        format!(
+            "nie znam PBS triple dla {}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
     let full_ver = resolve_full_python_version(py_ver);
     let date = pbs_date();
     let url = format!(
@@ -285,12 +324,13 @@ fn ensure_uv(cache: &Path) -> Result<PathBuf> {
     }
     std::fs::create_dir_all(&bin_dir)?;
 
-    let triple = uv_triple()
-        .context("nie znam uv target triple dla tej platformy")?;
+    let triple = uv_triple().context("nie znam uv target triple dla tej platformy")?;
     let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
     let url = format!(
         "https://github.com/astral-sh/uv/releases/download/{ver}/uv-{triple}.{ext}",
-        ver = UV_VERSION, triple = triple, ext = ext
+        ver = UV_VERSION,
+        triple = triple,
+        ext = ext
     );
 
     tracing::info!(url = %url, "Pobieram uv");
@@ -326,12 +366,16 @@ fn ensure_uv(cache: &Path) -> Result<PathBuf> {
 /// Rekurencyjne (plytko, 2 poziomy) wyszukiwanie plikow do znalezienia uv po extract.
 fn walkdir_shallow(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
             if let Ok(inner) = std::fs::read_dir(&p) {
-                for ie in inner.flatten() { out.push(ie.path()); }
+                for ie in inner.flatten() {
+                    out.push(ie.path());
+                }
             }
         } else {
             out.push(p);
@@ -361,7 +405,7 @@ fn resolve_full_python_version(v: &str) -> String {
         "3.11" => "3.11.15".into(),
         "3.12" => "3.12.13".into(),
         "3.13" => "3.13.13".into(),
-        other  => other.to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -371,22 +415,22 @@ fn pbs_date() -> String {
 
 fn pbs_triple() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux",  "x86_64")  => Some("x86_64-unknown-linux-gnu"),
-        ("linux",  "aarch64") => Some("aarch64-unknown-linux-gnu"),
-        ("macos",  "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos",  "x86_64")  => Some("x86_64-apple-darwin"),
-        ("windows","x86_64")  => Some("x86_64-pc-windows-msvc-shared"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc-shared"),
         _ => None,
     }
 }
 
 fn uv_triple() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux",   "x86_64")  => Some("x86_64-unknown-linux-gnu"),
-        ("linux",   "aarch64") => Some("aarch64-unknown-linux-gnu"),
-        ("macos",   "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos",   "x86_64")  => Some("x86_64-apple-darwin"),
-        ("windows", "x86_64")  => Some("x86_64-pc-windows-msvc"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
         _ => None,
     }
 }
@@ -430,8 +474,7 @@ fn create_venv(python: &Path, venv: &Path) -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(venv.parent().unwrap()).ok();
-    run(Command::new(python).args(["-m", "venv", venv.to_str().unwrap()]))
-        .context("tworzenie venv")
+    run(Command::new(python).args(["-m", "venv", venv.to_str().unwrap()])).context("tworzenie venv")
 }
 
 /// Instaluje zaleznosci przez `uv pip` lub klasyczny `pip`. Parametr
@@ -453,7 +496,9 @@ fn install_deps(
 
     let lock = bundle_src.join("requirements.lock");
     if lock.exists() {
-        installer.install_requirements(&lock).context("install lock")?;
+        installer
+            .install_requirements(&lock)
+            .context("install lock")?;
     }
 
     // Extras (wymagajace tylko pypi — accelerate, vllm-metal, nemo_toolkit itp.).
@@ -461,19 +506,28 @@ fn install_deps(
     // glownym pakiecie (kiedy torch jest obecny).
     if let Some(v) = variant {
         for extra in &v.extras {
-            installer.install_package(extra)
+            installer
+                .install_package(extra)
                 .with_context(|| format!("install extra {}", extra))?;
         }
     }
 
     match spec.bundle.source.as_str() {
         "pypi" => {
-            let pkg = spec.bundle.pypi_package.as_deref().unwrap_or(&spec.bundle.engine);
-            installer.install_package(pkg)
+            let pkg = spec
+                .bundle
+                .pypi_package
+                .as_deref()
+                .unwrap_or(&spec.bundle.engine);
+            installer
+                .install_package(pkg)
                 .with_context(|| format!("install {}", pkg))?;
         }
         "git" => {
-            let repo = spec.bundle.git_repo.as_deref()
+            let repo = spec
+                .bundle
+                .git_repo
+                .as_deref()
                 .context("source=git wymaga git_repo")?;
             let refname = spec.bundle.git_ref.as_deref().unwrap_or("main");
             let clone_dir = venv.join("src").join(&spec.bundle.engine);
@@ -481,11 +535,13 @@ fn install_deps(
                 std::fs::create_dir_all(clone_dir.parent().unwrap()).ok();
                 run(Command::new("git")
                     .arg("clone")
-                    .arg("--depth").arg("1")
-                    .arg("--branch").arg(refname)
+                    .arg("--depth")
+                    .arg("1")
+                    .arg("--branch")
+                    .arg(refname)
                     .arg(repo)
                     .arg(&clone_dir))
-                    .context("git clone")?;
+                .context("git clone")?;
             }
             // Podkatalog z pyproject/setup.py (np. SGLang -> python/)
             let pkg_dir = match spec.bundle.install_subdir.as_deref() {
@@ -499,13 +555,17 @@ fn install_deps(
             // Tryb instalacji: editable (domyslne) vs requirements_txt (ComfyUI)
             let mode = spec.bundle.install_mode.as_deref().unwrap_or("editable");
             match mode {
-                "editable" => installer.install_editable(&pkg_dir).context("install -e .")?,
+                "editable" => installer
+                    .install_editable(&pkg_dir)
+                    .context("install -e .")?,
                 "requirements_txt" => {
                     let req = pkg_dir.join("requirements.txt");
                     if !req.exists() {
                         anyhow::bail!("install_mode=requirements_txt a brak {}", req.display());
                     }
-                    installer.install_requirements(&req).context("install -r requirements.txt")?;
+                    installer
+                        .install_requirements(&req)
+                        .context("install -r requirements.txt")?;
                 }
                 other => anyhow::bail!("nieznany install_mode: {}", other),
             }
@@ -517,7 +577,8 @@ fn install_deps(
     // Instalujemy extras ktore wymagaja torcha do buildu kerneli CUDA.
     if let Some(v) = variant {
         for extra in &v.extras_no_build_isolation {
-            installer.install_package_no_build_isolation(extra)
+            installer
+                .install_package_no_build_isolation(extra)
                 .with_context(|| format!("install {} (no-build-isolation)", extra))?;
         }
     }
@@ -539,7 +600,9 @@ fn install_deps(
 /// bez niego jest dalej valid. Nie dotykamy nic innego.
 fn patch_pyproject_if_needed(pkg_dir: &Path) -> Result<()> {
     let pj = pkg_dir.join("pyproject.toml");
-    if !pj.exists() { return Ok(()); }
+    if !pj.exists() {
+        return Ok(());
+    }
     let content = std::fs::read_to_string(&pj)?;
 
     let mut out = String::with_capacity(content.len());
@@ -563,7 +626,9 @@ fn patch_pyproject_if_needed(pkg_dir: &Path) -> Result<()> {
                 if trimmed.contains('{') && !trimmed.contains('}') {
                     // Drop linie az zlapie zamykajacy `}`
                     while let Some(inner) = iter.next() {
-                        if inner.contains('}') { break; }
+                        if inner.contains('}') {
+                            break;
+                        }
                     }
                 }
                 continue; // skip tej linii
@@ -585,9 +650,9 @@ fn backend_to_str(b: &crate::system_check::GpuBackend) -> &'static str {
     match b {
         Cuda => "cuda",
         Rocm => "rocm",
-        Xpu  => "xpu",
+        Xpu => "xpu",
         Metal => "metal",
-        Cpu  => "cpu",
+        Cpu => "cpu",
     }
 }
 
@@ -606,7 +671,8 @@ fn pick_install_variant<'a>(
     // Fallback: spytaj pierwsze dostepne, ale ostrzez
     tracing::warn!(
         "brak wariantu dla backendu '{}', uzywam '{}' jako fallback",
-        backend, variants[0].backend
+        backend,
+        variants[0].backend
     );
     Ok(Some(&variants[0]))
 }
@@ -622,7 +688,11 @@ struct Installer<'a> {
 
 impl<'a> Installer<'a> {
     fn new(venv: &Path, uv: Option<&'a Path>, extra_index_url: Option<String>) -> Self {
-        Self { venv: venv.to_path_buf(), uv, extra_index_url }
+        Self {
+            venv: venv.to_path_buf(),
+            uv,
+            extra_index_url,
+        }
     }
     fn cmd(&self) -> Command {
         if let Some(uv) = self.uv {
@@ -652,7 +722,11 @@ impl<'a> Installer<'a> {
     }
     fn upgrade_pip(&self) -> Result<()> {
         let mut c = self.cmd();
-        c.arg("install").arg("--upgrade").arg("pip").arg("wheel").arg("setuptools>=77");
+        c.arg("install")
+            .arg("--upgrade")
+            .arg("pip")
+            .arg("wheel")
+            .arg("setuptools>=77");
         run(&mut c)
     }
     fn install_requirements(&self, path: &Path) -> Result<()> {
@@ -740,8 +814,7 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
 
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
-    let child = cmd.spawn()
-        .with_context(|| format!("spawn {:?}", exe))?;
+    let child = cmd.spawn().with_context(|| format!("spawn {:?}", exe))?;
     Ok(child)
 }
 
@@ -761,7 +834,9 @@ fn substitute_vars_full(
     let mut out = s.to_string();
     loop {
         let Some(start) = out.find("${") else { break };
-        let Some(end_rel) = out[start..].find('}') else { break };
+        let Some(end_rel) = out[start..].find('}') else {
+            break;
+        };
         let end = start + end_rel;
         let inner = &out[start + 2..end];
         let (name, default) = match inner.split_once(":-") {
@@ -771,7 +846,10 @@ fn substitute_vars_full(
         let value = match name {
             "BUNDLE_DIR" => bundle_dir_str.clone(),
             "VENV_DIR" => venv_dir_str.clone(),
-            _ => env.get(name).cloned().unwrap_or_else(|| default.unwrap_or_default()),
+            _ => env
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| default.unwrap_or_default()),
         };
         out.replace_range(start..=end, &value);
     }
@@ -785,7 +863,9 @@ fn venv_bin(venv: &Path, bin: &str) -> PathBuf {
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
-    let status = cmd.status().with_context(|| format!("uruchomienie {:?}", cmd.get_program()))?;
+    let status = cmd
+        .status()
+        .with_context(|| format!("uruchomienie {:?}", cmd.get_program()))?;
     if !status.success() {
         anyhow::bail!("{:?} zwrocilo kod {}", cmd.get_program(), status);
     }
@@ -822,15 +902,20 @@ mod tests {
     fn read_bundle_spec_parses_vllm() {
         // Sprawdzamy ze kazdy bundle.toml w repo jest poprawny
         let workspace = std::path::PathBuf::from("..");
-        for engine in ["vllm", "sglang", "xtts", "voxcpm", "parakeet", "qwen-asr", "comfyui"] {
-            let path = workspace
-                .join("tentaflow-containers/python-bundles")
-                .join(engine)
-                .join("bundle.toml");
-            if !path.exists() { continue; }
+        for engine in [
+            "vllm", "sglang", "xtts", "voxcpm", "parakeet", "qwen-asr", "comfyui",
+        ] {
+            let bundle_dir = match find_bundle_dir(&workspace, engine) {
+                Some(d) => d,
+                None => continue,
+            };
+            let path = bundle_dir.join("bundle.toml");
+            if !path.exists() {
+                continue;
+            }
             let content = std::fs::read_to_string(&path).unwrap();
-            let spec: BundleSpec = toml::from_str(&content)
-                .unwrap_or_else(|e| panic!("parse {}: {}", engine, e));
+            let spec: BundleSpec =
+                toml::from_str(&content).unwrap_or_else(|e| panic!("parse {}: {}", engine, e));
             assert_eq!(spec.bundle.engine, engine);
             assert!(spec.launch.internal_port > 0);
         }
@@ -839,9 +924,27 @@ mod tests {
     #[test]
     fn pick_variant_matches_backend() {
         let variants = vec![
-            InstallVariant { backend: "cuda".into(), extra_index: Some("a".into()), extras: vec![], extras_no_build_isolation: vec![], install_hint: None },
-            InstallVariant { backend: "rocm".into(), extra_index: Some("b".into()), extras: vec![], extras_no_build_isolation: vec![], install_hint: None },
-            InstallVariant { backend: "metal".into(), extra_index: None, extras: vec!["vllm-metal".into()], extras_no_build_isolation: vec![], install_hint: None },
+            InstallVariant {
+                backend: "cuda".into(),
+                extra_index: Some("a".into()),
+                extras: vec![],
+                extras_no_build_isolation: vec![],
+                install_hint: None,
+            },
+            InstallVariant {
+                backend: "rocm".into(),
+                extra_index: Some("b".into()),
+                extras: vec![],
+                extras_no_build_isolation: vec![],
+                install_hint: None,
+            },
+            InstallVariant {
+                backend: "metal".into(),
+                extra_index: None,
+                extras: vec!["vllm-metal".into()],
+                extras_no_build_isolation: vec![],
+                install_hint: None,
+            },
         ];
         let v = pick_install_variant(&variants, "rocm").unwrap().unwrap();
         assert_eq!(v.backend, "rocm");

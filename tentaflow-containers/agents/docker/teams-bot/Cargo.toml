@@ -1,0 +1,48 @@
+[package]
+name = "tentaflow-teams-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Sidecar do spotkan Teams — automatyzacja przegladarki + audio pipeline"
+
+[[bin]]
+name = "tentaflow-meeting"
+path = "src/main.rs"
+
+[dependencies]
+# Protokol i transport iroh
+tentaflow-protocol = { path = "../../../../tentaflow-protocol" }
+tentaflow-transport = { path = "../../../../tentaflow-transport" }
+iroh = { version = "0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
+rkyv = { version = "0.8", features = ["unaligned"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Automatyzacja przegladarki
+chromiumoxide = "0.9"
+futures = "0.3"
+
+# WebSocket serwer localhost — most audio miedzy Chromium (JS) a Rust
+tokio-tungstenite = "0.24"
+
+# Silero VAD — pure Rust implementation z tentaflow-voice
+tentaflow-voice = { path = "../../../../tentaflow-voice" }
+parking_lot = "0.12"
+
+# Konfiguracja
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Inne
+anyhow = "1"
+byteorder = "1"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"

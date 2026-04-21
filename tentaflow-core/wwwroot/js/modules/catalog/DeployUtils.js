@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: modules/catalog/DeployUtils.js
-// Opis: Wspolne funkcje dla LLMDeployWizard i ServiceDeployModal -
+// Opis: Wspolne funkcje deploymentu (uzywane przez ServiceCatalog/NIM) -
 //       wyszukiwanie wolnego portu, pasek postepu deploy.
 // =============================================================================
 

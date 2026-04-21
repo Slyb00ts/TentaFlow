@@ -3,8 +3,8 @@
 // Opis: Zarzadzanie kluczami API - lista, tworzenie, usuwanie.
 // =============================================================================
 
-use crate::db::{self, DbPool};
 use super::auth;
+use crate::db::{self, DbPool};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -62,12 +62,18 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
     };
 
     if req.name.is_empty() || req.name.len() > 200 {
-        return Ok((400, r#"{"error":"Nazwa musi miec od 1 do 200 znakow"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Nazwa musi miec od 1 do 200 znakow"}"#.to_string(),
+        ));
     }
 
     let rate_limit = req.rate_limit_rps.unwrap_or(60);
     if !(1..=10000).contains(&rate_limit) {
-        return Ok((400, r#"{"error":"rate_limit_rps musi byc w zakresie 1-10000"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"rate_limit_rps musi byc w zakresie 1-10000"}"#.to_string(),
+        ));
     }
 
     // Generuj losowy klucz API

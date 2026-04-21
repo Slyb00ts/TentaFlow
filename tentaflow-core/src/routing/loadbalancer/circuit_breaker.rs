@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn, info};
+use tracing::{debug, info, warn};
 
 /// Stan circuit breakera
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +151,10 @@ impl CircuitBreaker {
                     if state.half_open_calls < self.config.half_open_max_calls {
                         state.half_open_calls += 1;
                         let calls = state.half_open_calls;
-                        (true, LogAction::HalfOpenTest(calls, self.config.half_open_max_calls))
+                        (
+                            true,
+                            LogAction::HalfOpenTest(calls, self.config.half_open_max_calls),
+                        )
                     } else {
                         (false, LogAction::HalfOpenLimit)
                     }
@@ -162,19 +165,34 @@ impl CircuitBreaker {
         match log_action {
             LogAction::None => {}
             LogAction::OpenToHalfOpen => {
-                info!("Circuit breaker '{}': OPEN -> HALF_OPEN (timeout uplynal)", self.backend_name);
+                info!(
+                    "Circuit breaker '{}': OPEN -> HALF_OPEN (timeout uplynal)",
+                    self.backend_name
+                );
             }
             LogAction::OpenRemaining(ms) => {
-                debug!("Circuit breaker '{}': OPEN - odrzucam request ({}ms pozostalo)", self.backend_name, ms);
+                debug!(
+                    "Circuit breaker '{}': OPEN - odrzucam request ({}ms pozostalo)",
+                    self.backend_name, ms
+                );
             }
             LogAction::OpenNoTimestamp => {
-                warn!("Circuit breaker '{}': OPEN ale brak opened_at - resetuje do CLOSED", self.backend_name);
+                warn!(
+                    "Circuit breaker '{}': OPEN ale brak opened_at - resetuje do CLOSED",
+                    self.backend_name
+                );
             }
             LogAction::HalfOpenTest(calls, max) => {
-                debug!("Circuit breaker '{}': HALF_OPEN - testowy request {}/{}", self.backend_name, calls, max);
+                debug!(
+                    "Circuit breaker '{}': HALF_OPEN - testowy request {}/{}",
+                    self.backend_name, calls, max
+                );
             }
             LogAction::HalfOpenLimit => {
-                debug!("Circuit breaker '{}': HALF_OPEN - limit testowych requestow przekroczony", self.backend_name);
+                debug!(
+                    "Circuit breaker '{}': HALF_OPEN - limit testowych requestow przekroczony",
+                    self.backend_name
+                );
             }
         }
 
@@ -210,21 +228,28 @@ impl CircuitBreaker {
                     Some(("half_open_closed", 0))
                 }
 
-                CircuitState::Open => {
-                    Some(("open_unexpected", 0))
-                }
+                CircuitState::Open => Some(("open_unexpected", 0)),
             }
         };
 
         match log_action {
             Some(("debug_reset", prev)) => {
-                debug!("Circuit breaker '{}': sukces - resetuje error count ({} -> 0)", self.backend_name, prev);
+                debug!(
+                    "Circuit breaker '{}': sukces - resetuje error count ({} -> 0)",
+                    self.backend_name, prev
+                );
             }
             Some(("half_open_closed", _)) => {
-                info!("Circuit breaker '{}': HALF_OPEN -> CLOSED (backend naprawiony)", self.backend_name);
+                info!(
+                    "Circuit breaker '{}': HALF_OPEN -> CLOSED (backend naprawiony)",
+                    self.backend_name
+                );
             }
             Some(("open_unexpected", _)) => {
-                warn!("Circuit breaker '{}': sukces w stanie OPEN (nie powinno sie zdarzyc)", self.backend_name);
+                warn!(
+                    "Circuit breaker '{}': sukces w stanie OPEN (nie powinno sie zdarzyc)",
+                    self.backend_name
+                );
             }
             _ => {}
         }
@@ -269,24 +294,34 @@ impl CircuitBreaker {
                     FailLog::HalfOpenToOpen
                 }
 
-                CircuitState::Open => {
-                    FailLog::OpenUnexpected
-                }
+                CircuitState::Open => FailLog::OpenUnexpected,
             }
         };
 
         match log_action {
             FailLog::ClosedError(count, threshold) => {
-                debug!("Circuit breaker '{}': blad {}/{}", self.backend_name, count, threshold);
+                debug!(
+                    "Circuit breaker '{}': blad {}/{}",
+                    self.backend_name, count, threshold
+                );
             }
             FailLog::ClosedToOpen(count) => {
-                warn!("Circuit breaker '{}': CLOSED -> OPEN (threshold przekroczony: {} bledow)", self.backend_name, count);
+                warn!(
+                    "Circuit breaker '{}': CLOSED -> OPEN (threshold przekroczony: {} bledow)",
+                    self.backend_name, count
+                );
             }
             FailLog::HalfOpenToOpen => {
-                warn!("Circuit breaker '{}': HALF_OPEN -> OPEN (testowy request failed)", self.backend_name);
+                warn!(
+                    "Circuit breaker '{}': HALF_OPEN -> OPEN (testowy request failed)",
+                    self.backend_name
+                );
             }
             FailLog::OpenUnexpected => {
-                warn!("Circuit breaker '{}': blad w stanie OPEN (nie powinno sie zdarzyc)", self.backend_name);
+                warn!(
+                    "Circuit breaker '{}': blad w stanie OPEN (nie powinno sie zdarzyc)",
+                    self.backend_name
+                );
             }
         }
     }
@@ -298,7 +333,10 @@ impl CircuitBreaker {
 
     /// Zwraca aktualny error count (tylko dla CLOSED)
     pub fn error_count(&self) -> u32 {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).error_count
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .error_count
     }
 
     /// Resetuje circuit breaker do stanu CLOSED (force reset)
@@ -312,7 +350,10 @@ impl CircuitBreaker {
             state.half_open_calls = 0;
             state.opened_at = None;
         };
-        info!("Circuit breaker '{}': force reset do CLOSED", self.backend_name);
+        info!(
+            "Circuit breaker '{}': force reset do CLOSED",
+            self.backend_name
+        );
     }
 }
 

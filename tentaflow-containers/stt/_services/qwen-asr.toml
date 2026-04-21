@@ -1,0 +1,28 @@
+# Manifest serwisu Qwen3-ASR — multijezykowy ASR oparty o vLLM backend.
+
+[engine]
+id = "qwen-asr"
+category = "stt"
+name = "Qwen3-ASR"
+description_pl = "Multijezykowy ASR od Alibaba. Bardzo dobra jakosc dla chinskiego i angielskiego."
+description_en = "Alibaba's multilingual ASR. Excellent quality for Chinese and English."
+homepage = "https://github.com/QwenLM/Qwen-Audio"
+license = "Apache-2.0"
+default_port = 5030
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.docker]
+context_path = "stt/docker/qwen-asr"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "stt/python/qwen-asr"
+
+[[model_preset]]
+id = "qwen-audio-asr"
+display_name = "Qwen-Audio ASR"
+repo = "Qwen/Qwen-Audio"
+recommended = true

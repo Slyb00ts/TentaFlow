@@ -4,9 +4,9 @@
 //       Logi addonu trafiaja do tracing z odpowiednim poziomem i kontekstem.
 // =============================================================================
 
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use super::{AddonState, ABI_OK, ABI_ERR_OPERATION, get_memory, read_guest_string, WasmCaller};
+use super::{get_memory, read_guest_string, AddonState, WasmCaller, ABI_ERR_OPERATION, ABI_OK};
 
 // =============================================================================
 // log_info — log na poziomie INFO
@@ -17,11 +17,7 @@ use super::{AddonState, ABI_OK, ABI_ERR_OPERATION, get_memory, read_guest_string
 /// ABI:
 /// - msg_ptr/msg_len: wiadomosc UTF-8
 /// - Zwraca: ABI_OK lub kod bledu
-pub fn log_info(
-    mut caller: WasmCaller<'_, AddonState>,
-    msg_ptr: i32,
-    msg_len: i32,
-) -> i32 {
+pub fn log_info(mut caller: WasmCaller<'_, AddonState>, msg_ptr: i32, msg_len: i32) -> i32 {
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return ABI_ERR_OPERATION,
@@ -54,11 +50,7 @@ pub fn log_info(
 /// ABI:
 /// - msg_ptr/msg_len: wiadomosc UTF-8
 /// - Zwraca: ABI_OK lub kod bledu
-pub fn log_warn(
-    mut caller: WasmCaller<'_, AddonState>,
-    msg_ptr: i32,
-    msg_len: i32,
-) -> i32 {
+pub fn log_warn(mut caller: WasmCaller<'_, AddonState>, msg_ptr: i32, msg_len: i32) -> i32 {
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return ABI_ERR_OPERATION,
@@ -91,11 +83,7 @@ pub fn log_warn(
 /// ABI:
 /// - msg_ptr/msg_len: wiadomosc UTF-8
 /// - Zwraca: ABI_OK lub kod bledu
-pub fn log_error(
-    mut caller: WasmCaller<'_, AddonState>,
-    msg_ptr: i32,
-    msg_len: i32,
-) -> i32 {
+pub fn log_error(mut caller: WasmCaller<'_, AddonState>, msg_ptr: i32, msg_len: i32) -> i32 {
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return ABI_ERR_OPERATION,

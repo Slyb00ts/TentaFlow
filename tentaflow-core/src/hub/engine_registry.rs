@@ -148,7 +148,10 @@ pub fn engine_by_id(id: &str) -> Option<&'static EngineDefinition> {
 }
 
 /// Zwraca silniki dostepne na danej platformie i o danym typie ("llm", "stt")
-pub fn engines_for_platform_and_type(platform: &Platform, engine_type: &str) -> Vec<&'static EngineDefinition> {
+pub fn engines_for_platform_and_type(
+    platform: &Platform,
+    engine_type: &str,
+) -> Vec<&'static EngineDefinition> {
     ENGINES
         .iter()
         .filter(|e| e.supported_platforms.contains(platform) && e.engine_type == engine_type)
@@ -190,17 +193,35 @@ pub fn deploy_mode_for(engine_id: &str, platform: &Platform) -> DeployMode {
 /// Zwraca platforme biezacego hosta
 pub fn current_platform() -> Platform {
     #[cfg(target_os = "macos")]
-    { Platform::MacOS }
+    {
+        Platform::MacOS
+    }
     #[cfg(target_os = "linux")]
-    { Platform::Linux }
+    {
+        Platform::Linux
+    }
     #[cfg(target_os = "windows")]
-    { Platform::Windows }
+    {
+        Platform::Windows
+    }
     #[cfg(target_os = "ios")]
-    { Platform::IOS }
+    {
+        Platform::IOS
+    }
     #[cfg(target_os = "android")]
-    { Platform::Android }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows", target_os = "ios", target_os = "android")))]
-    { Platform::Linux }
+    {
+        Platform::Android
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    {
+        Platform::Linux
+    }
 }
 
 /// Serializowalna wersja EngineDefinition do odpowiedzi JSON
@@ -232,7 +253,11 @@ impl EngineDefinition {
                 DeployMode::Docker => "docker".to_string(),
                 DeployMode::Native => "native".to_string(),
             },
-            supported_platforms: self.supported_platforms.iter().map(|p| format!("{:?}", p)).collect(),
+            supported_platforms: self
+                .supported_platforms
+                .iter()
+                .map(|p| format!("{:?}", p))
+                .collect(),
             engine_type: self.engine_type.to_string(),
         }
     }

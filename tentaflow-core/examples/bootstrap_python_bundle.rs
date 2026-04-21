@@ -12,7 +12,9 @@ fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    let engine = std::env::args().nth(1).unwrap_or_else(|| "voxcpm".to_string());
+    let engine = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "voxcpm".to_string());
     println!("Bootstrap bundle: {}", engine);
 
     let started = std::time::Instant::now();

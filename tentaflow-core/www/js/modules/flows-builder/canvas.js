@@ -1,0 +1,861 @@
+// =============================================================================
+// Plik: modules/flows-builder/canvas.js
+// Opis: Canvas Flow Buildera - renderowanie nodów jako HTML (position absolute),
+//       krawędzi jako SVG bezier w WORLD coords, pan/zoom (wheel = zoom),
+//       pointer-events z rAF throttle. Historia undo/redo in-memory.
+// =============================================================================
+
+import { escapeHtml, escapeAttr } from '/js/utils.js';
+import { I18n } from '/js/i18n.js';
+
+const NODE_WIDTH = 280;
+const NODE_H_APPROX = 110;
+const GRID = 10;
+const MAX_HISTORY = 30;
+// Layout portów: header ma ~44px, porty zaczynają się od HEADER_OFFSET i są
+// rozłożone co PORT_STEP pikseli.
+const PORT_HEADER_OFFSET = 44;
+const PORT_STEP = 22;
+const DRAG_THRESHOLD = 4;
+
+// Mapa category -> ikona (sprite id) używana dla renderowania nodów na canvas
+const TYPE_ICON = {
+  trigger: 'bolt',
+  start: 'bolt',
+  llm: 'chip',
+  stt: 'mic',
+  tts: 'speaker',
+  rag: 'rag-db',
+  memory: 'rag-db',
+  embeddings: 'sparkle',
+  reranker: 'sparkle',
+  condition: 'branch',
+  switch: 'branch',
+  template: 'code',
+  transform: 'transform',
+  pii_filter: 'shield',
+  tts_clean: 'shield',
+  router: 'transform',
+  output: 'arrow-out',
+  end: 'arrow-out',
+  conversation_history: 'rag-db',
+  session_context: 'rag-db',
+  speaker_context: 'rag-db',
+  memory_analyzer: 'sparkle',
+};
+
+// Mapa node_type -> CSS var dla --node-color
+function typeVar(type) {
+  const map = {
+    trigger: '--node-trigger',
+    start: '--node-start',
+    llm: '--node-llm',
+    stt: '--node-stt',
+    tts: '--node-tts',
+    rag: '--node-rag',
+    memory: '--node-memory',
+    embeddings: '--node-embeddings',
+    reranker: '--node-reranker',
+    condition: '--node-condition',
+    switch: '--node-switch',
+    template: '--node-template',
+    transform: '--node-transform',
+    pii_filter: '--node-pii_filter',
+    tts_clean: '--node-tts_clean',
+    router: '--node-router',
+    output: '--node-output',
+    end: '--node-end',
+    conversation_history: '--node-conversation_history',
+    session_context: '--node-session_context',
+    speaker_context: '--node-speaker_context',
+    memory_analyzer: '--node-memory_analyzer',
+  };
+  return map[type] || '--node-llm';
+}
+
+// Kategoria -> krótka etykieta na nodzie
+const TYPE_CATEGORY = {
+  trigger: 'trigger', start: 'trigger',
+  llm: 'ai', embeddings: 'ai', reranker: 'ai', stt: 'ai', tts: 'ai',
+  rag: 'rag', memory: 'rag', conversation_history: 'rag', session_context: 'rag',
+  speaker_context: 'rag', memory_analyzer: 'rag',
+  condition: 'logic', switch: 'logic',
+  template: 'transform', transform: 'transform', router: 'transform',
+  pii_filter: 'filter', tts_clean: 'filter',
+  output: 'output', end: 'output',
+};
+
+// Zwraca listę portów wejściowych/wyjściowych dla nody. Bierze je najpierw z
+// templatki (pole `inputs`/`outputs` albo `params_schema.ports`), potem
+// stosuje heurystyki po typie.
+function portsForNode(node, template) {
+  const isTrigger = node.type === 'trigger' || node.type === 'start';
+  const isOutput = node.type === 'output' || node.type === 'end';
+
+  let inputs = [];
+  let outputs = [];
+
+  const readList = (raw) => {
+    if (!raw) return null;
+    if (Array.isArray(raw)) return raw.map((p) => (typeof p === 'string' ? { name: p } : p));
+    return null;
+  };
+
+  let tplIn = null;
+  let tplOut = null;
+  if (template) {
+    tplIn = readList(template.inputs);
+    tplOut = readList(template.outputs);
+    if (!tplIn || !tplOut) {
+      try {
+        const schema = typeof template.params_schema === 'string'
+          ? JSON.parse(template.params_schema)
+          : template.params_schema;
+        if (schema && schema.ports) {
+          if (!tplIn) tplIn = readList(schema.ports.inputs);
+          if (!tplOut) tplOut = readList(schema.ports.outputs);
+        }
+      } catch (_) {}
+    }
+  }
+
+  inputs = tplIn || (isTrigger ? [] : [{ name: 'in' }]);
+
+  if (tplOut) {
+    outputs = tplOut;
+  } else if (node.type === 'condition') {
+    outputs = [{ name: 'true' }, { name: 'false' }];
+  } else if (node.type === 'switch' || node.type === 'router') {
+    const cases = Array.isArray(node.config?.cases) ? node.config.cases : [];
+    if (cases.length > 0) {
+      outputs = cases.map((c, i) => ({ name: typeof c === 'string' ? c : (c.name || `case_${i + 1}`) }));
+      outputs.push({ name: 'default' });
+    } else {
+      outputs = [{ name: 'case_1' }, { name: 'case_2' }, { name: 'default' }];
+    }
+  } else if (isOutput) {
+    outputs = [];
+  } else {
+    outputs = [{ name: 'out' }];
+  }
+
+  return { inputs, outputs };
+}
+
+export class FlowCanvas {
+  constructor(rootEl, opts = {}) {
+    this.root = rootEl;
+    this.opts = opts;
+    this.nodes = [];
+    this.edges = [];
+    this.selectedIds = new Set();
+    this.selectedEdgeId = null;
+    this.view = { x: 0, y: 0, zoom: 1 };
+    this.history = [];
+    this.historyIndex = -1;
+    this.onChange = opts.onChange || (() => {});
+    this.onSelect = opts.onSelect || (() => {});
+    this.onViewChange = opts.onViewChange || (() => {});
+    this.templates = new Map(); // node_type -> template
+    this._zTop = 1;
+
+    this._rafPending = false;
+    this._draggingNode = null;     // { ids, startClientX, startClientY, origs, moved, pointerId }
+    this._connecting = null;        // { fromNode, fromPort, currentX, currentY, pointerId }
+    this._panning = null;           // { startClientX, startClientY, origView, pointerId }
+    this._pinch = null;             // { startDist, startZoom, cx, cy }
+    this._pointerMovePending = null;
+    this._suppressNextClick = false;
+
+    this._buildDom();
+    this._bindEvents();
+  }
+
+  setTemplates(list) {
+    this.templates.clear();
+    for (const t of list || []) {
+      this.templates.set(t.node_type, t);
+    }
+  }
+
+  _buildDom() {
+    this.root.classList.add('fb-canvas');
+    this.root.innerHTML = `
+      <div class="fb-canvas-world">
+        <svg class="fb-edges" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div class="fb-nodes-layer"></div>
+      </div>
+      <div class="fb-canvas-hint" data-role="hint">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 5v14M5 12h14"/></svg>
+        <div>${escapeHtml(I18n.t('flows_builder.canvas_hint'))}</div>
+      </div>
+    `;
+    this.world = this.root.querySelector('.fb-canvas-world');
+    this.svg = this.root.querySelector('.fb-edges');
+    this.nodesLayer = this.root.querySelector('.fb-nodes-layer');
+    this.hintEl = this.root.querySelector('[data-role="hint"]');
+  }
+
+  _bindEvents() {
+    this._h = {
+      pd: this._onPointerDown.bind(this),
+      pm: this._onPointerMove.bind(this),
+      pu: this._onPointerUp.bind(this),
+      wh: this._onWheel.bind(this),
+      ck: this._onClick.bind(this),
+    };
+    this.root.addEventListener('pointerdown', this._h.pd);
+    window.addEventListener('pointermove', this._h.pm);
+    window.addEventListener('pointerup', this._h.pu);
+    window.addEventListener('pointercancel', this._h.pu);
+    this.root.addEventListener('wheel', this._h.wh, { passive: false });
+    this.root.addEventListener('click', this._h.ck);
+    this._activePointers = new Map();
+  }
+
+  destroy() {
+    if (this._h) {
+      this.root.removeEventListener('pointerdown', this._h.pd);
+      window.removeEventListener('pointermove', this._h.pm);
+      window.removeEventListener('pointerup', this._h.pu);
+      window.removeEventListener('pointercancel', this._h.pu);
+      this.root.removeEventListener('wheel', this._h.wh);
+      this.root.removeEventListener('click', this._h.ck);
+    }
+    this.root.innerHTML = '';
+  }
+
+  // -------------------------------------------------------------------------
+  // Dane
+  // -------------------------------------------------------------------------
+  setData(nodes, edges, { reset = true } = {}) {
+    this.nodes = (nodes || []).map((n) => ({ ...n, config: n.config || {} }));
+    this.edges = (edges || []).map((e) => ({ ...e }));
+    this.selectedIds.clear();
+    this.selectedEdgeId = null;
+    if (reset) {
+      this.history = [];
+      this.historyIndex = -1;
+      this._pushHistory();
+    }
+    this.render();
+  }
+
+  getData() {
+    return {
+      nodes: this.nodes.map((n) => ({ ...n, config: { ...n.config } })),
+      edges: this.edges.map((e) => ({ ...e })),
+    };
+  }
+
+  _pushHistory() {
+    // Odcinamy redo-branche po nowej operacji
+    this.history = this.history.slice(0, this.historyIndex + 1);
+    this.history.push(JSON.stringify({ nodes: this.nodes, edges: this.edges }));
+    if (this.history.length > MAX_HISTORY) this.history.shift();
+    this.historyIndex = this.history.length - 1;
+  }
+
+  undo() {
+    if (this.historyIndex <= 0) return;
+    this.historyIndex -= 1;
+    const snap = JSON.parse(this.history[this.historyIndex]);
+    this.nodes = snap.nodes;
+    this.edges = snap.edges;
+    this.selectedIds.clear();
+    this.selectedEdgeId = null;
+    this.render();
+    this.onChange();
+  }
+
+  redo() {
+    if (this.historyIndex >= this.history.length - 1) return;
+    this.historyIndex += 1;
+    const snap = JSON.parse(this.history[this.historyIndex]);
+    this.nodes = snap.nodes;
+    this.edges = snap.edges;
+    this.render();
+    this.onChange();
+  }
+
+  // -------------------------------------------------------------------------
+  // CRUD nody / krawędzie
+  // -------------------------------------------------------------------------
+  addNodeFromTemplate(tpl, clientX, clientY) {
+    const pt = this._clientToWorld(clientX, clientY);
+    let defaultConfig = {};
+    try { defaultConfig = JSON.parse(tpl.default_config || '{}'); } catch (_) {}
+    const node = {
+      id: 'n_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+      type: tpl.node_type,
+      label: tpl.label || tpl.node_type,
+      x: Math.round((pt.x - NODE_WIDTH / 2) / GRID) * GRID,
+      y: Math.round((pt.y - NODE_H_APPROX / 2) / GRID) * GRID,
+      config: defaultConfig,
+    };
+    this.nodes.push(node);
+    this._pushHistory();
+    this.render();
+    this.selectNode(node.id);
+    this.onChange();
+    return node;
+  }
+
+  updateNodeConfig(nodeId, patch) {
+    const n = this.nodes.find((x) => x.id === nodeId);
+    if (!n) return;
+    n.config = { ...n.config, ...patch };
+    this._pushHistory();
+    this._renderSingleNode(n);
+    this.onChange();
+  }
+
+  updateNodeLabel(nodeId, label) {
+    const n = this.nodes.find((x) => x.id === nodeId);
+    if (!n) return;
+    n.label = label;
+    this._pushHistory();
+    this._renderSingleNode(n);
+    this.onChange();
+  }
+
+  removeNodes(ids) {
+    const idSet = new Set(ids);
+    this.nodes = this.nodes.filter((n) => !idSet.has(n.id));
+    this.edges = this.edges.filter((e) => !idSet.has(e.from_node) && !idSet.has(e.to_node));
+    this.selectedIds.clear();
+    this._pushHistory();
+    this.render();
+    this.onChange();
+  }
+
+  duplicateNodes(ids) {
+    const idMap = new Map();
+    const clones = [];
+    for (const id of ids) {
+      const n = this.nodes.find((x) => x.id === id);
+      if (!n) continue;
+      const clone = {
+        ...n,
+        id: 'n_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+        x: n.x + 30,
+        y: n.y + 30,
+        config: { ...n.config },
+      };
+      idMap.set(n.id, clone.id);
+      clones.push(clone);
+    }
+    this.nodes.push(...clones);
+    this.selectedIds = new Set(clones.map((c) => c.id));
+    this._pushHistory();
+    this.render();
+    this.onChange();
+  }
+
+  deleteSelected() {
+    if (this.selectedIds.size > 0) {
+      this.removeNodes([...this.selectedIds]);
+      return;
+    }
+    if (this.selectedEdgeId) {
+      this.edges = this.edges.filter((e) => e.id !== this.selectedEdgeId);
+      this.selectedEdgeId = null;
+      this._pushHistory();
+      this.render();
+      this.onChange();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Selekcja
+  // -------------------------------------------------------------------------
+  selectNode(id, { additive = false } = {}) {
+    if (!additive) this.selectedIds.clear();
+    if (id) this.selectedIds.add(id);
+    this.selectedEdgeId = null;
+    this._applySelectionClasses();
+    const node = this.selectedIds.size === 1
+      ? this.nodes.find((n) => n.id === [...this.selectedIds][0])
+      : null;
+    this.onSelect(node);
+  }
+
+  clearSelection() {
+    this.selectedIds.clear();
+    this.selectedEdgeId = null;
+    this._applySelectionClasses();
+    this.onSelect(null);
+  }
+
+  _applySelectionClasses() {
+    this.nodesLayer.querySelectorAll('.fb-node').forEach((el) => {
+      el.classList.toggle('selected', this.selectedIds.has(el.dataset.nodeId));
+    });
+    this.svg.querySelectorAll('.fb-edge-path').forEach((p) => {
+      p.classList.toggle('selected', p.dataset.edgeId === this.selectedEdgeId);
+    });
+  }
+
+  _bringToFront(nodeEl) {
+    this._zTop += 1;
+    nodeEl.style.zIndex = String(this._zTop);
+  }
+
+  // -------------------------------------------------------------------------
+  // Rendering
+  // -------------------------------------------------------------------------
+  render() {
+    this._renderNodes();
+    this._renderEdges();
+    this._applyView();
+    if (this.hintEl) this.hintEl.style.display = this.nodes.length === 0 ? 'flex' : 'none';
+  }
+
+  _renderNodes() {
+    this.nodesLayer.innerHTML = '';
+    for (const n of this.nodes) {
+      this.nodesLayer.appendChild(this._buildNodeEl(n));
+    }
+    this._applySelectionClasses();
+  }
+
+  _renderSingleNode(n) {
+    const old = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(n.id)}"]`);
+    const fresh = this._buildNodeEl(n);
+    if (old) old.replaceWith(fresh);
+    else this.nodesLayer.appendChild(fresh);
+    this._applySelectionClasses();
+    this._renderEdges();
+  }
+
+  _buildNodeEl(n) {
+    const div = document.createElement('div');
+    div.className = 'fb-node';
+    div.dataset.nodeId = n.id;
+    div.style.left = `${n.x}px`;
+    div.style.top = `${n.y}px`;
+    div.style.width = `${NODE_WIDTH}px`;
+    div.style.setProperty('--node-color', `var(${typeVar(n.type)})`);
+
+    if (this._hasError(n)) div.classList.add('error');
+
+    const iconId = TYPE_ICON[n.type] || 'chip';
+    const cat = TYPE_CATEGORY[n.type] || n.type;
+    const tmpl = this.templates.get(n.type);
+    const title = n.label || (tmpl?.label) || n.type;
+
+    const { inputs, outputs } = portsForNode(n, tmpl);
+
+    const inPortsHtml = inputs.map((p, i) => this._renderPortEl(n.id, p, i, 'in', inputs.length)).join('');
+    const outPortsHtml = outputs.map((p, i) => this._renderPortEl(n.id, p, i, 'out', outputs.length)).join('');
+
+    div.innerHTML = `
+      <div class="fb-node-header">
+        <div class="fb-node-badge"><svg><use href="#i-${iconId}"/></svg></div>
+        <div class="fb-node-title">${escapeHtml(title)}</div>
+        ${this._hasError(n)
+          ? `<span class="fb-node-error-icon" title="${escapeAttr(I18n.t('flows_builder.node_error_tooltip'))}"><svg><use href="#i-alert"/></svg></span>`
+          : `<span class="fb-node-type">${escapeHtml(cat)}</span>`}
+      </div>
+      <div class="fb-node-body">${this._renderNodeSummary(n)}</div>
+      ${inPortsHtml}
+      ${outPortsHtml}
+    `;
+    return div;
+  }
+
+  _renderPortEl(nodeId, port, idx, side, total) {
+    const top = PORT_HEADER_OFFSET + idx * PORT_STEP;
+    const showLabel = total >= 2;
+    const labelHtml = showLabel
+      ? `<span class="fb-port-label">${escapeHtml(port.name)}</span>`
+      : '';
+    const cls = side === 'in' ? 'fb-port fb-port-in' : 'fb-port fb-port-out';
+    return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(port.name)}">${labelHtml}</div>`;
+  }
+
+  _renderNodeSummary(n) {
+    const c = n.config || {};
+    const keys = Object.keys(c).filter((k) => c[k] !== null && c[k] !== undefined && c[k] !== '');
+    if (keys.length === 0) return '<div class="fb-node-row"><span class="fb-key">—</span></div>';
+    return keys.slice(0, 4).map((k) => {
+      const v = c[k];
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      // Truncate w CSS przez ellipsę — tu tylko udostępniamy pełną wartość w title
+      return `<div class="fb-node-row" title="${escapeAttr(k + ': ' + s)}"><span class="fb-key">${escapeHtml(k)}</span><span class="fb-val">${escapeHtml(s)}</span></div>`;
+    }).join('');
+  }
+
+  _hasError(n) {
+    const tmpl = this.templates.get(n.type);
+    if (!tmpl || !tmpl.params_schema) return false;
+    let schema;
+    try { schema = typeof tmpl.params_schema === 'string' ? JSON.parse(tmpl.params_schema) : tmpl.params_schema; }
+    catch (_) { return false; }
+    const required = schema.required || [];
+    for (const key of required) {
+      const v = n.config?.[key];
+      if (v === null || v === undefined || v === '') return true;
+    }
+    return false;
+  }
+
+  // Zwraca pozycję portu w WORLD coords (bez pan/zoom).
+  _getPortWorldPos(nodeId, portName, side) {
+    const node = this.nodes.find((n) => n.id === nodeId);
+    if (!node) return { x: 0, y: 0 };
+    const tmpl = this.templates.get(node.type);
+    const { inputs, outputs } = portsForNode(node, tmpl);
+    const list = side === 'in' ? inputs : outputs;
+    let idx = list.findIndex((p) => p.name === portName);
+    if (idx < 0) idx = 0;
+    const worldX = side === 'in' ? node.x : node.x + NODE_WIDTH;
+    // +8 bo port ma 16px i jego centrum jest w top + 8
+    const worldY = node.y + PORT_HEADER_OFFSET + idx * PORT_STEP + 8;
+    return { x: worldX, y: worldY };
+  }
+
+  _renderEdges() {
+    // Zbudujmy SVG na nowo — edges zwykle nieliczne.
+    const svgNs = 'http://www.w3.org/2000/svg';
+    this.svg.innerHTML = '';
+    for (const e of this.edges) {
+      const from = this.nodes.find((n) => n.id === e.from_node);
+      const to = this.nodes.find((n) => n.id === e.to_node);
+      if (!from || !to) continue;
+      const fp = this._getPortWorldPos(e.from_node, e.from_port || 'out', 'out');
+      const tp = this._getPortWorldPos(e.to_node, e.to_port || 'in', 'in');
+      const d = this._bezierPath(fp.x, fp.y, tp.x, tp.y);
+      // Hit area
+      const hit = document.createElementNS(svgNs, 'path');
+      hit.setAttribute('class', 'fb-edge-hit');
+      hit.setAttribute('d', d);
+      hit.dataset.edgeId = e.id;
+      this.svg.appendChild(hit);
+      // Visible path
+      const p = document.createElementNS(svgNs, 'path');
+      p.setAttribute('class', 'fb-edge-path');
+      p.setAttribute('d', d);
+      p.dataset.edgeId = e.id;
+      if (this.selectedEdgeId === e.id) p.classList.add('selected');
+      this.svg.appendChild(p);
+      // Animowana kropka przepływu
+      const dot = document.createElementNS(svgNs, 'circle');
+      dot.setAttribute('class', 'fb-edge-flow');
+      dot.setAttribute('r', '3');
+      const anim = document.createElementNS(svgNs, 'animateMotion');
+      anim.setAttribute('dur', '2.4s');
+      anim.setAttribute('repeatCount', 'indefinite');
+      anim.setAttribute('path', d);
+      dot.appendChild(anim);
+      this.svg.appendChild(dot);
+    }
+    // Tymczasowa linia podczas łączenia
+    if (this._connecting) {
+      const { fromNode, fromPort, currentX, currentY } = this._connecting;
+      const fp = this._getPortWorldPos(fromNode.id, fromPort, 'out');
+      const d = this._bezierPath(fp.x, fp.y, currentX, currentY);
+      const p = document.createElementNS(svgNs, 'path');
+      p.setAttribute('class', 'fb-edge-path temp');
+      p.setAttribute('d', d);
+      this.svg.appendChild(p);
+    }
+  }
+
+  _bezierPath(x1, y1, x2, y2) {
+    const dx = Math.max(40, Math.abs(x2 - x1) * 0.5);
+    return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+  }
+
+  // -------------------------------------------------------------------------
+  // Pan / zoom
+  // -------------------------------------------------------------------------
+  _applyView() {
+    this.world.style.transform = `translate(${this.view.x}px, ${this.view.y}px) scale(${this.view.zoom})`;
+    this.onViewChange(this.view);
+  }
+
+  setZoom(zoom, cx, cy) {
+    const rect = this.root.getBoundingClientRect();
+    if (cx === undefined) cx = rect.width / 2;
+    if (cy === undefined) cy = rect.height / 2;
+    const z = Math.max(0.2, Math.min(3, zoom));
+    // Zoom względem punktu (cx,cy) w lokalnych współrz. canvasu
+    const worldX = (cx - this.view.x) / this.view.zoom;
+    const worldY = (cy - this.view.y) / this.view.zoom;
+    this.view.x = cx - worldX * z;
+    this.view.y = cy - worldY * z;
+    this.view.zoom = z;
+    this._applyView();
+  }
+
+  zoomBy(factor) {
+    this.setZoom(this.view.zoom * factor);
+  }
+
+  resetZoom() {
+    this.view = { x: 0, y: 0, zoom: 1 };
+    this._applyView();
+  }
+
+  fitToContent() {
+    if (this.nodes.length === 0) { this.resetZoom(); return; }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of this.nodes) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + NODE_WIDTH);
+      maxY = Math.max(maxY, n.y + NODE_H_APPROX);
+    }
+    const pad = 40;
+    const rect = this.root.getBoundingClientRect();
+    const w = maxX - minX + pad * 2;
+    const h = maxY - minY + pad * 2;
+    const z = Math.min(1, Math.min(rect.width / w, rect.height / h));
+    this.view.zoom = z;
+    this.view.x = (rect.width - (maxX + minX) * z) / 2;
+    this.view.y = (rect.height - (maxY + minY) * z) / 2;
+    this._applyView();
+  }
+
+  _clientToWorld(clientX, clientY) {
+    const rect = this.root.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left - this.view.x) / this.view.zoom,
+      y: (clientY - rect.top - this.view.y) / this.view.zoom,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Zdarzenia pointer
+  // -------------------------------------------------------------------------
+  _onPointerDown(ev) {
+    if (ev.button !== undefined && ev.button !== 0) return;
+    this._activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+    // Pinch start
+    if (this._activePointers.size === 2) {
+      const pts = [...this._activePointers.values()];
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      const cx = (pts[0].x + pts[1].x) / 2;
+      const cy = (pts[0].y + pts[1].y) / 2;
+      const rect = this.root.getBoundingClientRect();
+      this._pinch = { startDist: dist, startZoom: this.view.zoom, cx: cx - rect.left, cy: cy - rect.top };
+      this._draggingNode = null;
+      this._panning = null;
+      this._connecting = null;
+      return;
+    }
+
+    // 1) Port out → start łączenia
+    const portOut = ev.target.closest('.fb-port-out');
+    if (portOut) {
+      const nodeId = portOut.dataset.nodeId;
+      const node = this.nodes.find((n) => n.id === nodeId);
+      if (node) {
+        const pt = this._clientToWorld(ev.clientX, ev.clientY);
+        this._connecting = {
+          fromNode: node,
+          fromPort: portOut.dataset.port || 'out',
+          currentX: pt.x,
+          currentY: pt.y,
+          pointerId: ev.pointerId,
+        };
+        try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
+        ev.preventDefault();
+      }
+      return;
+    }
+
+    // 2) Port in → nic, obsłużony przy release łączenia
+    if (ev.target.closest('.fb-port-in')) return;
+
+    // 3) Node → drag (ignoruj interaktywne elementy wewnątrz)
+    const nodeEl = ev.target.closest('.fb-node');
+    if (nodeEl) {
+      if (ev.target.closest('input, select, textarea, button, tf-button, [data-no-drag]')) return;
+      const id = nodeEl.dataset.nodeId;
+      const additive = ev.shiftKey;
+      if (!this.selectedIds.has(id)) this.selectNode(id, { additive });
+      this._bringToFront(nodeEl);
+      const origs = new Map();
+      for (const sid of this.selectedIds) {
+        const nd = this.nodes.find((n) => n.id === sid);
+        if (nd) origs.set(sid, { x: nd.x, y: nd.y });
+      }
+      this._draggingNode = {
+        ids: [...this.selectedIds],
+        startClientX: ev.clientX,
+        startClientY: ev.clientY,
+        origs,
+        moved: false,
+        pointerId: ev.pointerId,
+      };
+      try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
+      ev.preventDefault();
+      return;
+    }
+
+    // 4) Pusty canvas → pan
+    this._panning = {
+      startClientX: ev.clientX,
+      startClientY: ev.clientY,
+      origView: { ...this.view },
+      pointerId: ev.pointerId,
+      moved: false,
+    };
+    try { this.root.setPointerCapture(ev.pointerId); } catch (_) {}
+    this.root.classList.add('panning');
+    ev.preventDefault();
+  }
+
+  _onPointerMove(ev) {
+    if (this._activePointers.has(ev.pointerId)) {
+      this._activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    }
+
+    if (this._pinch && this._activePointers.size === 2) {
+      const pts = [...this._activePointers.values()];
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      const factor = dist / this._pinch.startDist;
+      this.setZoom(this._pinch.startZoom * factor, this._pinch.cx, this._pinch.cy);
+      return;
+    }
+
+    this._pointerMovePending = { clientX: ev.clientX, clientY: ev.clientY };
+    if (!this._rafPending) {
+      this._rafPending = true;
+      requestAnimationFrame(() => {
+        this._rafPending = false;
+        const p = this._pointerMovePending;
+        if (!p) return;
+        this._flushPointerMove(p.clientX, p.clientY);
+      });
+    }
+  }
+
+  _flushPointerMove(clientX, clientY) {
+    if (this._draggingNode) {
+      const dx = (clientX - this._draggingNode.startClientX) / this.view.zoom;
+      const dy = (clientY - this._draggingNode.startClientY) / this.view.zoom;
+      if (!this._draggingNode.moved && Math.hypot(dx, dy) * this.view.zoom < DRAG_THRESHOLD) return;
+      this._draggingNode.moved = true;
+      for (const id of this._draggingNode.ids) {
+        const n = this.nodes.find((x) => x.id === id);
+        const orig = this._draggingNode.origs.get(id);
+        if (!n || !orig) continue;
+        n.x = Math.round((orig.x + dx) / GRID) * GRID;
+        n.y = Math.round((orig.y + dy) / GRID) * GRID;
+        const el = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(id)}"]`);
+        if (el) {
+          el.style.left = `${n.x}px`;
+          el.style.top = `${n.y}px`;
+          el.classList.add('dragging');
+        }
+      }
+      this._renderEdges();
+      return;
+    }
+
+    if (this._connecting) {
+      const pt = this._clientToWorld(clientX, clientY);
+      this._connecting.currentX = pt.x;
+      this._connecting.currentY = pt.y;
+      this._renderEdges();
+      // Hover target port
+      const under = document.elementFromPoint(clientX, clientY);
+      document.querySelectorAll('.fb-port.drop-target').forEach((p) => p.classList.remove('drop-target'));
+      const targetPort = under?.closest('.fb-port-in');
+      if (targetPort) targetPort.classList.add('drop-target');
+      return;
+    }
+
+    if (this._panning) {
+      const ddx = clientX - this._panning.startClientX;
+      const ddy = clientY - this._panning.startClientY;
+      if (!this._panning.moved && Math.hypot(ddx, ddy) < DRAG_THRESHOLD) return;
+      this._panning.moved = true;
+      this.view.x = this._panning.origView.x + ddx;
+      this.view.y = this._panning.origView.y + ddy;
+      this._applyView();
+    }
+  }
+
+  _onPointerUp(ev) {
+    this._activePointers.delete(ev.pointerId);
+    if (this._activePointers.size < 2) this._pinch = null;
+
+    if (this._draggingNode && this._draggingNode.pointerId === ev.pointerId) {
+      this.nodesLayer.querySelectorAll('.fb-node.dragging').forEach((el) => el.classList.remove('dragging'));
+      if (this._draggingNode.moved) {
+        this._pushHistory();
+        this.onChange();
+        this._suppressNextClick = true;
+      }
+      this._draggingNode = null;
+    }
+
+    if (this._connecting && this._connecting.pointerId === ev.pointerId) {
+      const target = document.elementFromPoint(ev.clientX, ev.clientY);
+      const portIn = target?.closest?.('.fb-port-in');
+      if (portIn) {
+        const toNodeId = portIn.dataset.nodeId;
+        const toPort = portIn.dataset.port || 'in';
+        if (toNodeId && toNodeId !== this._connecting.fromNode.id) {
+          const exists = this.edges.some((e) =>
+            e.from_node === this._connecting.fromNode.id
+            && e.to_node === toNodeId
+            && e.from_port === this._connecting.fromPort
+            && e.to_port === toPort);
+          if (!exists) {
+            this.edges.push({
+              id: 'e_' + Date.now().toString(36),
+              from_node: this._connecting.fromNode.id,
+              to_node: toNodeId,
+              from_port: this._connecting.fromPort,
+              to_port: toPort,
+            });
+            this._pushHistory();
+            this.onChange();
+          }
+        }
+      }
+      document.querySelectorAll('.fb-port.drop-target').forEach((p) => p.classList.remove('drop-target'));
+      this._connecting = null;
+      this._renderEdges();
+    }
+
+    if (this._panning && this._panning.pointerId === ev.pointerId) {
+      if (this._panning.moved) this._suppressNextClick = true;
+      this._panning = null;
+      this.root.classList.remove('panning');
+    }
+  }
+
+  _onClick(ev) {
+    if (this._suppressNextClick) { this._suppressNextClick = false; return; }
+    const hit = ev.target.closest('.fb-edge-hit');
+    if (hit) {
+      this.selectedIds.clear();
+      this.selectedEdgeId = hit.dataset.edgeId;
+      this._applySelectionClasses();
+      this.onSelect(null);
+      return;
+    }
+    const nodeEl = ev.target.closest('.fb-node');
+    if (nodeEl) {
+      this.selectNode(nodeEl.dataset.nodeId, { additive: ev.shiftKey });
+      return;
+    }
+    // Pusty canvas → deselect
+    this.clearSelection();
+  }
+
+  _onWheel(ev) {
+    // Wheel = zoom zawsze (modifier klawiszowy pominięty — wygoda edytora).
+    ev.preventDefault();
+    const factor = ev.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const rect = this.root.getBoundingClientRect();
+    this.setZoom(this.view.zoom * factor, ev.clientX - rect.left, ev.clientY - rect.top);
+  }
+}

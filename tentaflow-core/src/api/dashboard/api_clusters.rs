@@ -5,8 +5,7 @@
 
 use crate::db::{self, DbPool};
 use crate::mesh::cluster_probe::{
-    NodeInterface, PairProbeResult,
-    filter_reachable_pairs, optimal_assignment,
+    filter_reachable_pairs, optimal_assignment, NodeInterface, PairProbeResult,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -57,11 +56,14 @@ pub fn handle_list(pool: &DbPool) -> Result<(u16, String)> {
 
 /// POST /api/clusters — utworz cluster (generuje cluster_id jako UUID)
 pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateClusterRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: CreateClusterRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if req.name.trim().is_empty() {
-        return Ok((400, r#"{"error":"Pole 'name' nie moze byc puste"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Pole 'name' nie może być puste"}"#.to_string(),
+        ));
     }
 
     let cluster_id = uuid::Uuid::new_v4().to_string();
@@ -87,18 +89,26 @@ pub fn handle_get(pool: &DbPool, cluster_id: &str) -> Result<(u16, String)> {
             let result = ClusterWithMembers { cluster, members };
             Ok((200, serde_json::to_string(&result)?))
         }
-        None => Ok((404, serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)}).to_string())),
+        None => Ok((
+            404,
+            serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)})
+                .to_string(),
+        )),
     }
 }
 
 /// PUT /api/clusters/:id — aktualizuj cluster
 pub fn handle_update(pool: &DbPool, cluster_id: &str, body: &[u8]) -> Result<(u16, String)> {
     if db::repository::get_cluster(pool, cluster_id)?.is_none() {
-        return Ok((404, serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)}).to_string()));
+        return Ok((
+            404,
+            serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)})
+                .to_string(),
+        ));
     }
 
-    let req: UpdateClusterRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: UpdateClusterRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let description = req.description.as_deref().unwrap_or("");
     let strategy = req.strategy.as_deref().unwrap_or("distributed");
@@ -117,7 +127,11 @@ pub fn handle_update(pool: &DbPool, cluster_id: &str, body: &[u8]) -> Result<(u1
 /// DELETE /api/clusters/:id — usun cluster
 pub fn handle_delete(pool: &DbPool, cluster_id: &str) -> Result<(u16, String)> {
     if db::repository::get_cluster(pool, cluster_id)?.is_none() {
-        return Ok((404, serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)}).to_string()));
+        return Ok((
+            404,
+            serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)})
+                .to_string(),
+        ));
     }
 
     db::repository::delete_cluster(pool, cluster_id)?;
@@ -127,11 +141,15 @@ pub fn handle_delete(pool: &DbPool, cluster_id: &str) -> Result<(u16, String)> {
 /// POST /api/clusters/:id/members — dodaj node do clustera
 pub fn handle_add_member(pool: &DbPool, cluster_id: &str, body: &[u8]) -> Result<(u16, String)> {
     if db::repository::get_cluster(pool, cluster_id)?.is_none() {
-        return Ok((404, serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)}).to_string()));
+        return Ok((
+            404,
+            serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)})
+                .to_string(),
+        ));
     }
 
-    let req: AddMemberRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: AddMemberRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let role = req.role.as_deref().unwrap_or("worker");
 
@@ -140,14 +158,35 @@ pub fn handle_add_member(pool: &DbPool, cluster_id: &str, body: &[u8]) -> Result
         return Ok((400, r#"{"error":"Niepoprawna rola"}"#.to_string()));
     }
 
-    db::repository::add_cluster_member(pool, cluster_id, &req.node_id, role, &req.interface_name, &req.interface_ip, req.interface_speed_mbps, &req.interface_type)?;
-    Ok((201, serde_json::json!({"ok": true, "cluster_id": cluster_id, "node_id": req.node_id}).to_string()))
+    db::repository::add_cluster_member(
+        pool,
+        cluster_id,
+        &req.node_id,
+        role,
+        &req.interface_name,
+        &req.interface_ip,
+        req.interface_speed_mbps,
+        &req.interface_type,
+    )?;
+    Ok((
+        201,
+        serde_json::json!({"ok": true, "cluster_id": cluster_id, "node_id": req.node_id})
+            .to_string(),
+    ))
 }
 
 /// DELETE /api/clusters/:id/members/:node_id — usun node z clustera
-pub fn handle_remove_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> Result<(u16, String)> {
+pub fn handle_remove_member(
+    pool: &DbPool,
+    cluster_id: &str,
+    node_id: &str,
+) -> Result<(u16, String)> {
     if db::repository::get_cluster(pool, cluster_id)?.is_none() {
-        return Ok((404, serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)}).to_string()));
+        return Ok((
+            404,
+            serde_json::json!({"error": format!("Cluster '{}' nie istnieje", cluster_id)})
+                .to_string(),
+        ));
     }
 
     db::repository::remove_cluster_member(pool, cluster_id, node_id)?;
@@ -159,8 +198,9 @@ pub fn handle_remove_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> R
 // =============================================================================
 
 /// Globalny stan aktywnych probe streamow (receiver + czas utworzenia + jednorazowy token SSE)
-static PROBE_STREAMS: LazyLock<Mutex<HashMap<String, (mpsc::Receiver<String>, std::time::Instant, String)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PROBE_STREAMS: LazyLock<
+    Mutex<HashMap<String, (mpsc::Receiver<String>, std::time::Instant, String)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Deserialize)]
 pub struct ProbeRequest {
@@ -186,15 +226,15 @@ pub struct ProbeInterfaceEntry {
 /// Zwraca probe_id. Wyniki streamowane przez GET /api/clusters/probe/:id (SSE).
 pub async fn handle_start_probe(
     body: &[u8],
-    quic_mesh: Arc<crate::mesh::quic_mesh::QuicMeshManager>,
+    quic_mesh: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
 ) -> Result<(u16, String)> {
     // Limit rozmiaru body (max 64KB)
     if body.len() > 65536 {
         return Ok((413, r#"{"error":"Body za duze (max 64KB)"}"#.to_string()));
     }
 
-    let req: ProbeRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: ProbeRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     // Walidacja rozmiaru requestu
     if req.nodes.len() > 32 {
@@ -202,7 +242,10 @@ pub async fn handle_start_probe(
     }
     let total_interfaces: usize = req.nodes.iter().map(|n| n.interfaces.len()).sum();
     if total_interfaces > 256 {
-        return Ok((400, r#"{"error":"Za duzo interfejsow (max 256)"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Za duzo interfejsow (max 256)"}"#.to_string(),
+        ));
     }
 
     // Czyszczenie przeterminowanych wpisow i limit rownoleglych probow
@@ -211,7 +254,10 @@ pub async fn handle_start_probe(
         let now = std::time::Instant::now();
         streams.retain(|_, (_, created, _)| now.duration_since(*created).as_secs() < 60);
         if streams.len() >= 5 {
-            return Ok((429, r#"{"error":"Za duzo aktywnych probow. Sprobuj pozniej."}"#.to_string()));
+            return Ok((
+                429,
+                r#"{"error":"Za duzo aktywnych probow. Sprobuj pozniej."}"#.to_string(),
+            ));
         }
     }
 
@@ -219,7 +265,13 @@ pub async fn handle_start_probe(
     for n in &req.nodes {
         tracing::info!("  Node {}: {} interfejsow", n.node_id, n.interfaces.len());
         for i in &n.interfaces {
-            tracing::info!("    {} ip={} mask={} speed={}", i.name, i.ip, i.netmask, i.speed_mbps);
+            tracing::info!(
+                "    {} ip={} mask={} speed={}",
+                i.name,
+                i.ip,
+                i.netmask,
+                i.speed_mbps
+            );
         }
     }
 
@@ -230,28 +282,44 @@ pub async fn handle_start_probe(
     // Waliduj ze kazdy node jest znany i polaczony
     for n in &req.nodes {
         if !quic_mesh.is_connected(&n.node_id).await && n.node_id != quic_mesh.node_id() {
-            return Ok((400, serde_json::json!({"error": format!("Node {} nie jest polaczony", n.node_id)}).to_string()));
+            return Ok((
+                400,
+                serde_json::json!({"error": format!("Node {} nie jest połączony", n.node_id)})
+                    .to_string(),
+            ));
         }
     }
 
     let probe_id = uuid::Uuid::new_v4().to_string();
-    let sse_token: String = (0..32).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
+    let sse_token: String = (0..32)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect();
 
     // Konwersja na NodeInterface
-    let node_interfaces: Vec<Vec<NodeInterface>> = req.nodes.iter().map(|n| {
-        n.interfaces.iter().map(|i| NodeInterface {
-            node_id: n.node_id.clone(),
-            name: i.name.clone(),
-            ip: i.ip.clone(),
-            netmask: i.netmask.clone(),
-            speed_mbps: i.speed_mbps,
-            rdma_available: i.rdma,
-        }).collect()
-    }).collect();
+    let node_interfaces: Vec<Vec<NodeInterface>> = req
+        .nodes
+        .iter()
+        .map(|n| {
+            n.interfaces
+                .iter()
+                .map(|i| NodeInterface {
+                    node_id: n.node_id.clone(),
+                    name: i.name.clone(),
+                    ip: i.ip.clone(),
+                    netmask: i.netmask.clone(),
+                    speed_mbps: i.speed_mbps,
+                    rdma_available: i.rdma,
+                })
+                .collect()
+        })
+        .collect();
 
     // Pre-filter subnetow — testuj WSZYSTKIE reachable pary (nie tylko najszybsza)
     let reachable = filter_reachable_pairs(&node_interfaces);
-    tracing::info!("Probe: {} osiagalnych par interfejsow do probing", reachable.len());
+    tracing::info!(
+        "Probe: {} osiagalnych par interfejsow do probing",
+        reachable.len()
+    );
 
     // Konwertuj na flat lista par do testowania (kazda para interfejsow osobno)
     let all_pairs: Vec<(NodeInterface, NodeInterface)> = reachable;
@@ -270,18 +338,28 @@ pub async fn handle_start_probe(
 
     {
         let mut streams = PROBE_STREAMS.lock().await;
-        streams.insert(probe_id.clone(), (rx, std::time::Instant::now(), sse_token.clone()));
+        streams.insert(
+            probe_id.clone(),
+            (rx, std::time::Instant::now(), sse_token.clone()),
+        );
     }
 
-    Ok((200, serde_json::json!({
-        "probe_id": probe_id,
-        "total_pairs": total,
-        "sse_token": sse_token,
-    }).to_string()))
+    Ok((
+        200,
+        serde_json::json!({
+            "probe_id": probe_id,
+            "total_pairs": total,
+            "sse_token": sse_token,
+        })
+        .to_string(),
+    ))
 }
 
 /// GET /api/clusters/probe/:probe_id — pobierz receiver SSE wynikow probing (z walidacja tokenu)
-pub async fn handle_probe_stream_with_token(probe_id: &str, token: &str) -> Option<mpsc::Receiver<String>> {
+pub async fn handle_probe_stream_with_token(
+    probe_id: &str,
+    token: &str,
+) -> Option<mpsc::Receiver<String>> {
     let mut streams = PROBE_STREAMS.lock().await;
     if let Some((_, _, stored_token)) = streams.get(probe_id) {
         if stored_token == token {
@@ -302,7 +380,7 @@ pub async fn handle_delete_probe(probe_id: &str) -> Result<(u16, String)> {
 /// Scheduler z matryca zajetosci: nie testuj rownoczesnie na tym samym interfejsie.
 /// Po kazdym tescie SSE event aktualizuje GUI.
 async fn run_probe_orchestration(
-    qm: Arc<crate::mesh::quic_mesh::QuicMeshManager>,
+    qm: Arc<crate::mesh::iroh_manager::IrohMeshManager>,
     pairs: Vec<(NodeInterface, NodeInterface)>,
     tx: mpsc::Sender<String>,
     _probe_id: String,
@@ -330,12 +408,16 @@ async fn run_probe_orchestration(
 
         // Znajdz wszystkie pary ktore mozna uruchomic rownolegle (rozne interfejsy)
         for i in 0..queue.len() {
-            if done[i] { continue; }
+            if done[i] {
+                continue;
+            }
 
             let key_a = (queue[i].0.node_id.clone(), queue[i].0.name.clone());
             let key_b = (queue[i].1.node_id.clone(), queue[i].1.name.clone());
 
-            if busy.contains(&key_a) || busy.contains(&key_b) { continue; }
+            if busy.contains(&key_a) || busy.contains(&key_b) {
+                continue;
+            }
 
             // Oznacz jako zajete
             busy.insert(key_a);
@@ -351,15 +433,38 @@ async fn run_probe_orchestration(
             let total_pairs = total;
 
             let handle = tokio::spawn(async move {
-                match probe_pair(&qm, &iface_a, &iface_b, &nonce_copy, progress, total_pairs, &tx_clone).await {
+                match probe_pair(
+                    &qm,
+                    &iface_a,
+                    &iface_b,
+                    &nonce_copy,
+                    progress,
+                    total_pairs,
+                    &tx_clone,
+                )
+                .await
+                {
                     Ok(r) => {
-                        tracing::info!("Probe wynik: {} ({}) <-> {} ({}) = {:.0} Mbps (reachable={})",
-                            r.node_a, iface_a.name, r.node_b, iface_b.name, r.bandwidth_mbps, r.reachable);
+                        tracing::info!(
+                            "Probe wynik: {} ({}) <-> {} ({}) = {:.0} Mbps (reachable={})",
+                            r.node_a,
+                            iface_a.name,
+                            r.node_b,
+                            iface_b.name,
+                            r.bandwidth_mbps,
+                            r.reachable
+                        );
                         r
                     }
                     Err(e) => {
-                        tracing::error!("Probe error: {} ({}) <-> {} ({}): {}",
-                            iface_a.node_id, iface_a.name, iface_b.node_id, iface_b.name, e);
+                        tracing::error!(
+                            "Probe error: {} ({}) <-> {} ({}): {}",
+                            iface_a.node_id,
+                            iface_a.name,
+                            iface_b.node_id,
+                            iface_b.name,
+                            e
+                        );
                         PairProbeResult {
                             node_a: iface_a.node_id.clone(),
                             node_b: iface_b.node_id.clone(),
@@ -403,20 +508,26 @@ async fn run_probe_orchestration(
         }
     }
 
-    tracing::info!("Probe zakonczony: {} wynikow z {} par interfejsow", results.len(), total);
+    tracing::info!(
+        "Probe zakonczony: {} wynikow z {} par interfejsow",
+        results.len(),
+        total
+    );
 
     // Optymalny algorytm przypisania
     let detection = optimal_assignment(&results);
 
-    let _ = tx.send(format!(
-        "event: detection_complete\ndata: {}\n\n",
-        serde_json::to_string(&detection).unwrap_or_default()
-    )).await;
+    let _ = tx
+        .send(format!(
+            "event: detection_complete\ndata: {}\n\n",
+            serde_json::to_string(&detection).unwrap_or_default()
+        ))
+        .await;
 }
 
 /// Probuje jedna pare interfejsow: serwer na node_b, klient na node_a
 async fn probe_pair(
-    qm: &crate::mesh::quic_mesh::QuicMeshManager,
+    qm: &crate::mesh::iroh_manager::IrohMeshManager,
     iface_a: &NodeInterface,
     iface_b: &NodeInterface,
     nonce: &[u8; 32],
@@ -428,13 +539,31 @@ async fn probe_pair(
 
     // Dobierz ilosc streamow na podstawie predkosci linku
     let link_speed = std::cmp::min(iface_a.speed_mbps, iface_b.speed_mbps);
-    let num_streams: u8 = if link_speed >= 100000 { 16 }      // 100G+ = 16 streamow
-        else if link_speed >= 10000 { 8 }                       // 10G = 8 streamow
-        else if link_speed >= 1000 { 2 }                        // 1G = 2 streamy
-        else { 1 };                                             // <1G = 1 stream
+    let num_streams: u8 = if link_speed >= 100000 {
+        16
+    }
+    // 100G+ = 16 streamow
+    else if link_speed >= 10000 {
+        8
+    }
+    // 10G = 8 streamow
+    else if link_speed >= 1000 {
+        2
+    }
+    // 1G = 2 streamy
+    else {
+        1
+    }; // <1G = 1 stream
 
-    tracing::info!("Probe para: {} ({}) <-> {} ({}) streams={} link_speed={}",
-        iface_a.node_id, iface_a.name, iface_b.node_id, iface_b.name, num_streams, link_speed);
+    tracing::info!(
+        "Probe para: {} ({}) <-> {} ({}) streams={} link_speed={}",
+        iface_a.node_id,
+        iface_a.name,
+        iface_b.node_id,
+        iface_b.name,
+        num_streams,
+        link_speed
+    );
 
     // Wyslij BandwidthProbe{mode:server} do node_b
     let server_cmd = MeshCommandType::BandwidthProbe {
@@ -450,19 +579,31 @@ async fn probe_pair(
 
     let local_node_id_srv = qm.node_id().to_string();
     let server_response = if iface_b.node_id == local_node_id_srv {
-        tracing::info!("  Serwer jest lokalny, uruchamiam probe server bezposrednio na {}", iface_b.ip);
+        tracing::info!(
+            "  Serwer jest lokalny, uruchamiam probe server bezposrednio na {}",
+            iface_b.ip
+        );
         match crate::mesh::bandwidth_probe::start_probe_server(
-            &iface_b.ip, nonce, num_streams, 2000,
-        ).await {
+            &iface_b.ip,
+            nonce,
+            num_streams,
+            2000,
+        )
+        .await
+        {
             Ok((port, handle)) => {
-                tokio::spawn(async move { let _ = handle.await; });
-                crate::mesh::quic_mesh::CommandWaitResponse {
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                });
+                crate::mesh::iroh_manager::CommandWaitResponse {
+                    command_id: String::new(),
                     success: true,
                     output: serde_json::json!({"port": port}).to_string(),
                     error: None,
                 }
             }
-            Err(e) => crate::mesh::quic_mesh::CommandWaitResponse {
+            Err(e) => crate::mesh::iroh_manager::CommandWaitResponse {
+                command_id: String::new(),
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
@@ -470,9 +611,14 @@ async fn probe_pair(
         }
     } else {
         tracing::info!("  Wysylam server cmd do {}", iface_b.node_id);
-        qm.send_command_and_wait(&iface_b.node_id, server_cmd, 10).await?
+        qm.send_command_and_wait(&iface_b.node_id, server_cmd, 10)
+            .await?
     };
-    tracing::info!("  Server response: success={} output={}", server_response.success, server_response.output);
+    tracing::info!(
+        "  Server response: success={} output={}",
+        server_response.success,
+        server_response.output
+    );
 
     if !server_response.success {
         return Ok(PairProbeResult {
@@ -488,8 +634,8 @@ async fn probe_pair(
     }
 
     // Parsuj porty z odpowiedzi serwera (TCP + opcjonalnie RDMA)
-    let server_json = serde_json::from_str::<serde_json::Value>(&server_response.output)
-        .unwrap_or_default();
+    let server_json =
+        serde_json::from_str::<serde_json::Value>(&server_response.output).unwrap_or_default();
     let port: u16 = server_json["port"].as_u64().unwrap_or(0) as u16;
     let rdma_port: u16 = server_json["rdma_port"].as_u64().unwrap_or(0) as u16;
 
@@ -514,10 +660,21 @@ async fn probe_pair(
     // Jesli klient jest lokalnym nodem, uruchom probe bezposrednio (nie przez MeshCommand)
     let local_node_id = qm.node_id().to_string();
     let client_response = if iface_a.node_id == local_node_id {
-        tracing::info!("  Klient jest lokalny, uruchamiam probe bezposrednio -> {}:{}", iface_b.ip, port);
+        tracing::info!(
+            "  Klient jest lokalny, uruchamiam probe bezposrednio -> {}:{}",
+            iface_b.ip,
+            port
+        );
         match crate::mesh::bandwidth_probe::start_probe_client(
-            &iface_b.ip, port, &iface_a.name, nonce, num_streams, 2000,
-        ).await {
+            &iface_b.ip,
+            port,
+            &iface_a.name,
+            nonce,
+            num_streams,
+            2000,
+        )
+        .await
+        {
             Ok(result) => {
                 let output = serde_json::json!({
                     "bandwidth_mbps": result.bandwidth_mbps,
@@ -525,8 +682,10 @@ async fn probe_pair(
                     "duration_ms": result.duration_ms,
                     "latency_us": result.latency_us,
                     "streams_completed": result.streams_completed,
-                }).to_string();
-                crate::mesh::quic_mesh::CommandWaitResponse {
+                })
+                .to_string();
+                crate::mesh::iroh_manager::CommandWaitResponse {
+                    command_id: String::new(),
                     success: true,
                     output,
                     error: None,
@@ -534,7 +693,8 @@ async fn probe_pair(
             }
             Err(e) => {
                 tracing::error!("  Lokalny probe client failed: {}", e);
-                crate::mesh::quic_mesh::CommandWaitResponse {
+                crate::mesh::iroh_manager::CommandWaitResponse {
+                    command_id: String::new(),
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
@@ -542,13 +702,23 @@ async fn probe_pair(
             }
         }
     } else {
-        tracing::info!("  Wysylam client cmd do {} -> {}:{}", iface_a.node_id, iface_b.ip, port);
-        qm.send_command_and_wait(&iface_a.node_id, client_cmd, 10).await?
+        tracing::info!(
+            "  Wysylam client cmd do {} -> {}:{}",
+            iface_a.node_id,
+            iface_b.ip,
+            port
+        );
+        qm.send_command_and_wait(&iface_a.node_id, client_cmd, 10)
+            .await?
     };
-    tracing::info!("  Client response: success={} output={}", client_response.success, client_response.output);
+    tracing::info!(
+        "  Client response: success={} output={}",
+        client_response.success,
+        client_response.output
+    );
 
-    let client_json = serde_json::from_str::<serde_json::Value>(&client_response.output)
-        .unwrap_or_default();
+    let client_json =
+        serde_json::from_str::<serde_json::Value>(&client_response.output).unwrap_or_default();
     let bandwidth_mbps = client_json["bandwidth_mbps"].as_f64().unwrap_or(0.0);
     let mut latency_us = client_json["latency_us"].as_f64().unwrap_or(0.0) as u64;
     let is_rdma = client_json["rdma"].as_bool().unwrap_or(false);
@@ -584,7 +754,9 @@ async fn probe_pair(
         "progress": progress,
         "total": total,
     });
-    let _ = tx.send(format!("event: probe_result\ndata: {}\n\n", event_data)).await;
+    let _ = tx
+        .send(format!("event: probe_result\ndata: {}\n\n", event_data))
+        .await;
 
     Ok(result)
 }

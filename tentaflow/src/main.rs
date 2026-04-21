@@ -144,6 +144,47 @@ async fn run_server(args: Args) -> Result<()> {
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
 
+    // Node id — persistent w DB, zawsze wygenerowany niezaleznie od mesh.enabled,
+    // zeby /api/mesh/nodes od razu zwracal local entry.
+    let local_node_id_str = db::repository::get_setting(&db, "node_id")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let _ = db::repository::set_setting(&db, "node_id", &id);
+            info!("Wygenerowano nowy node_id: {}", id);
+            id
+        });
+
+    // Seed lokalnego noda w peer_store — synchronicznie, przed startupem mesh.
+    // Dzieki temu catalog/services/mesh GUI zawsze ma target "local" do dyspozycji.
+    {
+        use tentaflow_core::mesh::node_info_collector;
+        let info = node_info_collector::collect_node_info(&local_node_id_str);
+        let hostname = if info.hostname.is_empty() {
+            "(local)".to_string()
+        } else {
+            format!("{} (local)", info.hostname)
+        };
+        let platform = node_info_collector::detect_platform();
+        let os_info = node_info_collector::collect_os_distro();
+        let (docker_available, docker_version) = node_info_collector::collect_docker_info();
+        let addresses = node_info_collector::collect_local_addresses();
+        mesh_peer_store.seed_local(
+            &local_node_id_str,
+            hostname,
+            if os_info.is_empty() { info.os_info.clone() } else { os_info },
+            platform,
+            info.cpu_count,
+            info.ram_total_mb,
+            info.gpu_info.clone(),
+            addresses,
+            docker_available,
+            docker_version,
+        );
+        info!(node_id = %local_node_id_str, "Local node seeded in peer_store");
+    }
+
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
     let router: Arc<Router> = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
@@ -152,8 +193,9 @@ async fn run_server(args: Args) -> Result<()> {
     // Zaladuj serwisy QUIC z bazy danych (metoda w Core)
     router.load_db_services();
 
-    // Przywroc natywne serwisy (in-process MLX/llama.cpp) z bazy
-    router.restore_native_services().await;
+    // Native service restoration is deferred until mesh is attached below.
+    // Calling restore_native_services() here would silently skip mesh
+    // registration because Router.mesh_manager is still None.
 
     // Zainstaluj wbudowane addony
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
@@ -168,25 +210,17 @@ async fn run_server(args: Args) -> Result<()> {
     addon_manager.set_router(router.clone());
     router.service_manager().set_event_bus(addon_manager.event_bus().clone());
 
-    // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
-    let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::quic_mesh::QuicMeshManager>> = None;
+    // Mesh networking — iroh (LAN mDNS + DHT + relay), wspoldzielony pipeline z Core
+    let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>> = None;
     let mut mesh_security_for_server: Option<Arc<tentaflow_core::mesh::security::MeshSecurity>> = None;
     let mut local_node_id_for_server: Arc<str> = Arc::from("");
     let _mesh_handles;
 
+    local_node_id_for_server = Arc::from(local_node_id_str.as_str());
+
     if let Some(ref mesh_config) = config.mesh {
         if mesh_config.enabled {
-            // Persystentny node_id — generowany raz i zapisywany w bazie
-            let node_id = db::repository::get_setting(&db, "node_id")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    let _ = db::repository::set_setting(&db, "node_id", &id);
-                    info!("Wygenerowano nowy node_id: {}", id);
-                    id
-                });
-            local_node_id_for_server = Arc::from(node_id.as_str());
+            let node_id = local_node_id_str.clone();
 
             let pipeline_config = MeshPipelineConfig {
                 node_id: node_id.clone(),
@@ -209,26 +243,36 @@ async fn run_server(args: Args) -> Result<()> {
                         mesh_mgr.set_forward_handler(std::sync::Arc::new(move |payload: Vec<u8>| {
                             let router = router_for_forward.clone();
                             Box::pin(async move {
-                                use tentaflow_core::net::quic::server::RouterHandler;
-                                match router.route_model_request(&payload, true).await {
-                                    Ok(response) => response,
+                                use tentaflow_protocol::*;
+                                let request: ModelRequest = match rkyv::access::<ArchivedModelRequest, rkyv::rancor::Error>(&payload)
+                                    .and_then(|archived| rkyv::deserialize::<ModelRequest, rkyv::rancor::Error>(archived))
+                                {
+                                    Ok(r) => r,
                                     Err(e) => {
-                                        tracing::error!("Forward handler: blad routingu: {}", e);
-                                        use tentaflow_protocol::*;
+                                        tracing::error!("Forward handler: blad deserializacji ModelRequest: {}", e);
                                         let error_response = ModelResponse {
                                             request_id: String::new(),
                                             result: ModelResult::Error(ErrorInfo {
                                                 error_type: ErrorType::InternalError,
-                                                message: format!("Forward handler: {}", e),
+                                                message: format!("Forward handler deserialize: {}", e),
                                                 details: None,
                                             }),
                                             metrics: None,
                                         };
-                                        rkyv::to_bytes::<rkyv::rancor::Error>(&error_response)
+                                        return rkyv::to_bytes::<rkyv::rancor::Error>(&error_response)
                                             .map(|b| b.into_vec())
-                                            .unwrap_or_default()
+                                            .unwrap_or_default();
                                     }
-                                }
+                                };
+
+                                let response = tentaflow_core::routing::reverse_request::dispatch_reverse_request(
+                                    &router,
+                                    request,
+                                ).await;
+
+                                rkyv::to_bytes::<rkyv::rancor::Error>(&response)
+                                    .map(|b| b.into_vec())
+                                    .unwrap_or_default()
                             })
                         })).await;
 
@@ -238,7 +282,7 @@ async fn run_server(args: Args) -> Result<()> {
                         tokio::spawn(async move {
                             loop {
                                 match alias_rx.recv().await {
-                                    Ok(tentaflow_core::mesh::quic_mesh::QuicMeshEvent::AliasSyncReceived { from_node_id, data }) => {
+                                    Ok(tentaflow_core::mesh::iroh_manager::IrohMeshEvent::AliasSyncReceived { from_node_id, data }) => {
                                         match serde_json::from_slice::<Vec<tentaflow_core::db::models::DbModelAlias>>(&data) {
                                             Ok(aliases) => {
                                                 tracing::debug!(from = %from_node_id, count = aliases.len(), "Alias cache zsynchronizowany z peera");
@@ -276,6 +320,11 @@ async fn run_server(args: Args) -> Result<()> {
         info!("Brak konfiguracji mesh");
         _mesh_handles = None;
     }
+
+    // Restore native services (in-process MLX/llama.cpp) from DB. Done after
+    // mesh attachment so register_native_service_in_mesh can publish them to
+    // the mesh service registry.
+    router.restore_native_services().await;
 
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();

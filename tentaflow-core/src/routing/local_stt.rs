@@ -4,7 +4,9 @@
 //       wywolania SttEngine. Obsluguje transkrypcje audio przez Whisper backend.
 // =============================================================================
 
-use crate::api::openai::types::{TranscriptionRequest, TranscriptionResponse, TranscriptionSegment};
+use crate::api::openai::types::{
+    TranscriptionRequest, TranscriptionResponse, TranscriptionSegment,
+};
 use crate::stt::{SttManager, TranscribeParams};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,15 +18,15 @@ pub struct LocalSttHandler {
 
 impl LocalSttHandler {
     pub fn new(manager: Arc<RwLock<SttManager>>) -> Self {
-        Self { stt_manager: manager }
+        Self {
+            stt_manager: manager,
+        }
     }
 
     /// Czy jest zaladowany jakikolwiek model STT
     pub async fn is_available(&self) -> bool {
         let mgr = self.stt_manager.read().await;
-        mgr.active_engine()
-            .map(|e| e.is_loaded())
-            .unwrap_or(false)
+        mgr.active_engine().map(|e| e.is_loaded()).unwrap_or(false)
     }
 
     /// Synchroniczna wersja is_available — uzywa try_read() na RwLock
@@ -96,31 +98,30 @@ impl LocalSttHandler {
             .collect();
 
         // Konwertuj TranscribeResult -> TranscriptionResponse
-        let segments =
-            if request.response_format.as_deref() == Some("verbose_json") {
-                Some(
-                    filtered_segments
-                        .iter()
-                        .map(|seg| TranscriptionSegment {
-                            id: seg.id,
-                            seek: 0,
-                            start: seg.start as f32,
-                            end: seg.end as f32,
-                            text: seg.text.clone(),
-                            tokens: seg.tokens.iter().map(|&t| t as u32).collect(),
-                            temperature: 0.0,
-                            avg_logprob: seg.avg_logprob,
-                            compression_ratio: seg.compression_ratio,
-                            no_speech_prob: seg.no_speech_prob,
-                            speaker_label: None,
-                            speaker_similarity: None,
-                            is_known_speaker: None,
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            };
+        let segments = if request.response_format.as_deref() == Some("verbose_json") {
+            Some(
+                filtered_segments
+                    .iter()
+                    .map(|seg| TranscriptionSegment {
+                        id: seg.id,
+                        seek: 0,
+                        start: seg.start as f32,
+                        end: seg.end as f32,
+                        text: seg.text.clone(),
+                        tokens: seg.tokens.iter().map(|&t| t as u32).collect(),
+                        temperature: 0.0,
+                        avg_logprob: seg.avg_logprob,
+                        compression_ratio: seg.compression_ratio,
+                        no_speech_prob: seg.no_speech_prob,
+                        speaker_label: None,
+                        speaker_similarity: None,
+                        is_known_speaker: None,
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
         // Tekst z przefiltrowanych segmentow
         let text = if filtered_segments.len() < result.segments.len() {

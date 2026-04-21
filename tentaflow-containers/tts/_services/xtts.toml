@@ -1,0 +1,29 @@
+# Manifest serwisu XTTS v2 — TTS Coqui z klonowaniem glosu.
+
+[engine]
+id = "xtts"
+category = "tts"
+name = "XTTS v2"
+description_pl = "Silnik TTS od Coqui z funkcja klonowania glosu (voice cloning)."
+description_en = "Coqui TTS engine with voice cloning support."
+homepage = "https://github.com/coqui-ai/TTS"
+license = "CPML"
+icon = "xtts"
+default_port = 5020
+api = "openai-compatible"
+version = "2.0.3"
+
+[deploy.docker]
+context_path = "tts/docker/xtts"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "tts/python/xtts"
+
+[[model_preset]]
+id = "xtts-v2"
+display_name = "XTTS v2"
+repo = "coqui/XTTS-v2"
+recommended = true
