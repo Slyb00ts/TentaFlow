@@ -252,6 +252,26 @@ impl MeshPeerStore {
         self.mark_dirty();
     }
 
+    pub fn is_quic_connected(&self, node_id: &str) -> bool {
+        self.peers
+            .read()
+            .get(node_id)
+            .map(|p| p.quic_connected)
+            .unwrap_or(false)
+    }
+
+    pub fn set_addresses(&self, node_id: &str, addrs: Vec<IpAddr>) {
+        let mut peers = self.peers.write();
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
+        if !addrs.is_empty() {
+            p.addresses = addrs;
+        }
+        drop(peers);
+        self.mark_dirty();
+    }
+
     pub fn remove(&self, node_id: &str) {
         self.peers.write().remove(node_id);
         self.mark_dirty();
