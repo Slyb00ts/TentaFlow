@@ -16,12 +16,12 @@ import {
   LEFT_MASK,
   RIGHT_MASK,
   BS_INDEX,
-} from '/js/generated/face-data.js';
+} from '/js/data/face-data.js';
 
 import {
   FACEMESH_CONTOURS,
   FACEMESH_FILL,
-} from '/js/generated/face-edges.js';
+} from '/js/data/face-edges.js';
 
 const CONTAINER_ID = 'face-bg-root';
 const CANVAS_ID = 'face-bg-canvas';
