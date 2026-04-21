@@ -145,7 +145,7 @@ pub fn start_unified_server_with_permissions(
             .with_single_cert(certs, key)
             .expect("Nie udalo sie skonfigurowac TLS");
 
-        tls_config.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         TlsAcceptor::from(Arc::new(tls_config))
     };

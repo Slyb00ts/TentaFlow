@@ -51,10 +51,11 @@ Przyklady:
   $0 --cuda           # Baza + CUDA
   $0 --all-gpu        # Baza + wszystkie GPU backends
 
-Obslugiwane dystrybucje:
+Obslugiwane systemy:
   - Arch Linux / CachyOS / Manjaro
   - Ubuntu / Debian / Linux Mint / Pop!_OS
   - Fedora / RHEL / CentOS Stream
+  - macOS (Homebrew)
 EOF
 }
 
@@ -78,6 +79,11 @@ done
 # --- Sprawdzenie uprawnien ---
 
 check_sudo() {
+    # macOS uzywa Homebrew, ktory nie wymaga sudo
+    if [[ "$DISTRO" == "macos" ]]; then
+        return
+    fi
+
     if [[ $EUID -eq 0 ]]; then
         log_warn "Uruchomiono jako root. Rustup bedzie instalowany dla roota."
     else
@@ -105,6 +111,15 @@ run_privileged() {
 # --- Detekcja dystrybucji ---
 
 detect_distro() {
+    # macOS (Darwin) — uzywa Homebrew
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        DISTRO="macos"
+        local mac_version
+        mac_version=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+        log_info "Wykryto system: ${BOLD}macOS $mac_version${NC}"
+        return
+    fi
+
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         source /etc/os-release
@@ -198,6 +213,27 @@ install_base() {
             run_privileged dnf install -y "${pkgs[@]}"
             INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "vulkan-loader" "sqlite-devel")
             ;;
+        macos)
+            if ! command -v brew &>/dev/null; then
+                log_error "Homebrew nie jest zainstalowany. Zainstaluj go najpierw:"
+                log_error '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+                exit 1
+            fi
+
+            log_info "Aktualizacja Homebrew..."
+            brew update
+
+            local pkgs=(
+                cmake
+                llvm
+                pkg-config
+                openssl@3
+                sqlite
+            )
+            log_info "Instalacja: ${pkgs[*]}"
+            brew install "${pkgs[@]}"
+            INSTALLED+=("cmake" "llvm (clang+lld)" "pkg-config" "openssl@3" "sqlite")
+            ;;
     esac
 
     log_ok "Bazowe zaleznosci zainstalowane"
@@ -228,11 +264,12 @@ install_rust() {
     INSTALLED+=("rust-stable")
 }
 
-# --- WASM target ---
+# --- WASM targets ---
 
 install_wasm_target() {
-    log_section "WASM target (wasm32-wasip1)"
+    log_section "WASM targets (wasm32-wasip1 + wasm32-unknown-unknown)"
 
+    # wasm32-wasip1 — dla addonow (Wasmtime/wasmi sandbox)
     if rustup target list --installed | grep -q "wasm32-wasip1"; then
         log_ok "wasm32-wasip1 juz zainstalowany"
     else
@@ -241,7 +278,74 @@ install_wasm_target() {
         INSTALLED+=("wasm32-wasip1")
     fi
 
-    log_ok "WASM target gotowy"
+    # wasm32-unknown-unknown — dla tentaflow-protocol-wasm (browser glue)
+    if rustup target list --installed | grep -q "wasm32-unknown-unknown"; then
+        log_ok "wasm32-unknown-unknown juz zainstalowany"
+    else
+        log_info "Dodawanie targetu wasm32-unknown-unknown..."
+        rustup target add wasm32-unknown-unknown
+        INSTALLED+=("wasm32-unknown-unknown")
+    fi
+
+    log_ok "WASM targets gotowe"
+}
+
+# --- wasm-bindgen CLI ---
+
+# Wersja MUSI byc zgodna z dependency w tentaflow-protocol-wasm/Cargo.toml
+# oraz z hardkodowana wartoscia w tentaflow-core/build.rs (funkcja
+# build_protocol_wasm_bindings). Bez tego narzedzia GUI nie dostanie
+# plikow www/js/protocol/wasm_glue.{js,wasm} i codec.js rzuci ImportError.
+WASM_BINDGEN_VERSION="0.2.108"
+
+install_wasm_bindgen_cli() {
+    log_section "wasm-bindgen CLI (v${WASM_BINDGEN_VERSION})"
+
+    if command -v wasm-bindgen &>/dev/null; then
+        local current
+        current=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')
+        if [[ "$current" == "$WASM_BINDGEN_VERSION" ]]; then
+            log_ok "wasm-bindgen $current juz zainstalowany"
+            return
+        else
+            log_warn "wasm-bindgen $current != wymagana $WASM_BINDGEN_VERSION — reinstaluje"
+        fi
+    fi
+
+    log_info "Kompilacja wasm-bindgen-cli (moze potrwac kilka minut)..."
+    cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+    INSTALLED+=("wasm-bindgen-cli ${WASM_BINDGEN_VERSION}")
+
+    log_ok "wasm-bindgen CLI gotowy"
+}
+
+# --- iOS targets (macOS only) ---
+
+install_ios_targets() {
+    # Targety iOS maja sens tylko na macOS (wymagaja Xcode CLT + SDK).
+    if [[ "$DISTRO" != "macos" ]]; then
+        return
+    fi
+
+    log_section "iOS targety (aarch64-apple-ios + aarch64-apple-ios-sim)"
+
+    if ! xcode-select -p &>/dev/null; then
+        log_warn "Xcode Command Line Tools niezainstalowane — pomijam iOS targety."
+        log_warn "Zainstaluj recznie: xcode-select --install"
+        return
+    fi
+
+    for t in aarch64-apple-ios aarch64-apple-ios-sim; do
+        if rustup target list --installed | grep -q "^$t$"; then
+            log_ok "$t juz zainstalowany"
+        else
+            log_info "Dodawanie targetu $t..."
+            rustup target add "$t"
+            INSTALLED+=("$t")
+        fi
+    done
+
+    log_ok "iOS targety gotowe"
 }
 
 # --- CUDA ---
@@ -457,12 +561,37 @@ verify_installation() {
         ok=false
     fi
 
-    # wasm target
+    # wasm targets
     if rustup target list --installed 2>/dev/null | grep -q "wasm32-wasip1"; then
         log_ok "wasm32-wasip1: zainstalowany"
     else
         log_error "wasm32-wasip1: BRAK"
         ok=false
+    fi
+    if rustup target list --installed 2>/dev/null | grep -q "wasm32-unknown-unknown"; then
+        log_ok "wasm32-unknown-unknown: zainstalowany"
+    else
+        log_error "wasm32-unknown-unknown: BRAK"
+        ok=false
+    fi
+
+    # wasm-bindgen CLI
+    if command -v wasm-bindgen &>/dev/null; then
+        log_ok "wasm-bindgen: $(wasm-bindgen --version 2>/dev/null)"
+    else
+        log_error "wasm-bindgen: NIE ZNALEZIONO (GUI nie dostanie wasm_glue.js)"
+        ok=false
+    fi
+
+    # iOS targets (tylko macOS)
+    if [[ "$DISTRO" == "macos" ]]; then
+        for t in aarch64-apple-ios aarch64-apple-ios-sim; do
+            if rustup target list --installed 2>/dev/null | grep -q "^$t$"; then
+                log_ok "$t: zainstalowany"
+            else
+                log_warn "$t: BRAK (wymagany do buildu mobile/ios)"
+            fi
+        done
     fi
 
     # pkg-config
@@ -547,6 +676,8 @@ main() {
     install_base
     install_rust
     install_wasm_target
+    install_wasm_bindgen_cli
+    install_ios_targets
 
     if [[ "$INSTALL_CUDA" == true ]]; then
         install_cuda
