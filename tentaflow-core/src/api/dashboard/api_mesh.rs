@@ -42,7 +42,7 @@ pub async fn handle_initiate_pairing(
     security: &Arc<MeshSecurity>,
     remote_node_id: &str,
     quic_mesh: &Option<Arc<IrohMeshManager>>,
-    local_node_id: &str,
+    _local_node_id: &str,
     peer_store: &MeshPeerStore,
 ) -> Result<(u16, String)> {
     if !is_valid_id(remote_node_id) {
@@ -59,10 +59,13 @@ pub async fn handle_initiate_pairing(
 
     let pin = security.initiate_pairing(remote_node_id)?;
 
-    // Wyslij PairingRequest przez QUIC — synchronicznie, z informacja o bledzie
+    // Wyslij PairingRequest przez QUIC — synchronicznie, z informacja o bledzie.
+    // from_node_id musi byc Ed25519 pubkey hex (to samo ID ktorym iroh identyfikuje
+    // peera), zeby odbiorca mogl odnalezc to samo ID w swoim discovered store.
+    let local_ed25519 = security.ed25519_public_key_hex();
     if let Some(ref qm) = quic_mesh {
         let payload = serde_json::json!({
-            "from_node_id": local_node_id,
+            "from_node_id": &local_ed25519,
             "public_key": security.public_key_hex(),
             "pin": &pin,
         });
