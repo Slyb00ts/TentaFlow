@@ -63,4 +63,9 @@ pub use message_body::{
     SsoProviderCreateRequest, SsoProviderCreateResponse, SsoProviderDeleteRequest,
     SsoProviderDeleteResponse, SsoProviderEntry, SsoProvidersListResponse,
     TlsStatusResponse, NgcStatusResponse, TtsRule, VoiceProfileSummary,
+    ModelAliasCreateRequest, ModelAliasCreateResponse, ModelAliasDeleteRequest,
+    ModelAliasDeleteResponse, ModelAliasEntry, ModelAliasListResponse, ModelAliasUpdateRequest,
+    ModelAliasUpdateResponse, ModelsUnifiedListResponse, NimCatalogListResponse,
+    NimContainerEntry, ServiceManifestDeployRequest, ServiceManifestDeployResponse, UnifiedModel,
+    UnifiedModelInstance,
 };
