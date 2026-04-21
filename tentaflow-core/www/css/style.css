@@ -1003,6 +1003,41 @@ input, textarea, select {
 }
 .pair-pin-timer { font-size: 13px; color: var(--warning, #f59e0b); font-weight: 600; }
 .pair-pin-steps { font-size: 11px; color: var(--text-3); text-align: center; line-height: 1.6; white-space: pre-line; }
+
+/* tf-pin-input — OTP-style 6-digit PIN input */
+.tf-pin-input { display: flex; justify-content: center; align-items: center; gap: 10px; margin: 16px 0 12px; }
+.tf-pin-group { display: flex; gap: 10px; }
+.tf-pin-sep { color: var(--text-3); font-size: 22px; font-weight: 300; user-select: none; padding: 0 2px; line-height: 1; }
+.tf-pin-cell {
+  width: 52px; height: 64px;
+  background: var(--bg-input, #0b0e22);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius, 10px);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 28px; font-weight: 700;
+  color: var(--text);
+  text-align: center;
+  outline: none;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+  caret-color: var(--accent-1, #818cf8);
+  padding: 0;
+}
+.tf-pin-cell:hover:not(:disabled) { border-color: var(--border-hover, #2f3668); }
+.tf-pin-cell:focus {
+  border-color: var(--accent-1, #818cf8);
+  background: rgba(99,102,241,0.06);
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.2);
+}
+.tf-pin-cell.filled { border-color: rgba(99,102,241,0.5); color: var(--accent-2, #a78bfa); }
+.tf-pin-cell.error { border-color: var(--danger, #ef4444); background: rgba(239,68,68,0.08); animation: tf-pin-shake 0.3s ease; }
+.tf-pin-cell.success { border-color: var(--success, #22c55e); background: rgba(34,197,94,0.08); color: var(--success, #22c55e); }
+.tf-pin-cell:disabled { opacity: 0.5; cursor: not-allowed; }
+@keyframes tf-pin-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-4px); }
+  75% { transform: translateX(4px); }
+}
+
 .meta-item.warning-meta { color: var(--warning); }
 .meta-item.warning-meta .icon { color: var(--warning); }
 
