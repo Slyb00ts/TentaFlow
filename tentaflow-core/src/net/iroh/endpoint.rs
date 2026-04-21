@@ -9,8 +9,11 @@
 
 use std::net::SocketAddr;
 
+use futures::Stream;
 use iroh::{
-    address_lookup::{DhtAddressLookup, DnsAddressLookup, MdnsAddressLookup, PkarrPublisher},
+    address_lookup::{
+        DhtAddressLookup, DiscoveryEvent, DnsAddressLookup, MdnsAddressLookup, PkarrPublisher,
+    },
     endpoint::presets,
     protocol::Router,
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
@@ -47,9 +50,13 @@ impl IrohConfig {
 }
 
 /// Opakowanie na `iroh::Endpoint` + ewentualny `Router` obslugujacy ALPN-y.
+/// Trzyma tez uchwyt na `MdnsAddressLookup` zeby udostepnic strumien
+/// `DiscoveryEvent` warstwie mesh — bez tego autodiscovery po LAN nie
+/// propaguje sie do gossip/peer_manager.
 pub struct IrohEndpoint {
     endpoint: Endpoint,
     router: Option<Router>,
+    mdns: Option<MdnsAddressLookup>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,27 +70,17 @@ pub enum IrohEndpointError {
 impl IrohEndpoint {
     /// Tworzy i bind'uje endpoint z podana konfiguracja.
     pub async fn bind(config: IrohConfig) -> Result<Self, IrohEndpointError> {
-        let mut builder = Endpoint::builder(presets::N0::default())
+        let builder = Endpoint::builder(presets::N0::default())
             .secret_key(config.secret_key.clone())
             .alpns(vec![
                 ALPN_MESH.to_vec(),
                 ALPN_PAIRING.to_vec(),
                 ALPN_API.to_vec(),
-            ]);
-
-        builder = builder
+            ])
             .bind_addr(config.bind_addr)
             .map_err(|e| IrohEndpointError::InvalidBind(format!("{e:?}")))?;
 
-        if config.enable_lan_discovery {
-            builder = builder.address_lookup(MdnsAddressLookup::builder());
-        }
-        if config.enable_dht_discovery {
-            builder = builder.address_lookup(DhtAddressLookup::builder());
-        }
-        // DNS i Pkarr publisher uzywaja domyslnej n0 konfiguracji — wywolane
-        // przez preset `presets::N0`, wiec nie dodajemy recznie.
-        let _ = &builder;
+        // DNS i Pkarr publisher uzywaja domyslnej n0 konfiguracji przez preset N0.
         let _ = PkarrPublisher::n0_dns;
         let _ = DnsAddressLookup::n0_dns;
 
@@ -91,6 +88,32 @@ impl IrohEndpoint {
             .bind()
             .await
             .map_err(|e| IrohEndpointError::Bind(format!("{e:?}")))?;
+
+        // mDNS musi byc zbudowane z endpoint.id() i zachowane jako instancja,
+        // zeby mozna bylo subskrybowac DiscoveryEvent-y. Builder przekazany
+        // do Endpoint pre-bind nie daje uchwytu do subscribe — bug 137#.
+        let mdns = if config.enable_lan_discovery {
+            let m = MdnsAddressLookup::builder()
+                .build(endpoint.id())
+                .map_err(|e| IrohEndpointError::Bind(format!("mdns build: {e:?}")))?;
+            endpoint
+                .address_lookup()
+                .map_err(|e| IrohEndpointError::Bind(format!("address_lookup: {e:?}")))?
+                .add(m.clone());
+            Some(m)
+        } else {
+            None
+        };
+
+        if config.enable_dht_discovery {
+            let dht = DhtAddressLookup::builder()
+                .build()
+                .map_err(|e| IrohEndpointError::Bind(format!("dht build: {e:?}")))?;
+            endpoint
+                .address_lookup()
+                .map_err(|e| IrohEndpointError::Bind(format!("address_lookup: {e:?}")))?
+                .add(dht);
+        }
 
         if let Some(_relay) = config.relay_url {
             // TODO(task-58): override relay per-config. Aktualny iroh 0.98
@@ -100,7 +123,18 @@ impl IrohEndpoint {
         Ok(Self {
             endpoint,
             router: None,
+            mdns,
         })
+    }
+
+    /// Subskrypcja strumienia DiscoveryEvent z LAN mDNS. `None` jesli
+    /// `enable_lan_discovery = false`. Mesh manager uzywa tego do auto-dial
+    /// kazdego nowego peera na LAN.
+    pub async fn mdns_discovery_events(
+        &self,
+    ) -> Option<impl Stream<Item = DiscoveryEvent> + Unpin + Send> {
+        let mdns = self.mdns.as_ref()?;
+        Some(mdns.subscribe().await)
     }
 
     /// Zwraca `EndpointId` (Ed25519 public key) tego endpointa.
@@ -122,6 +156,11 @@ impl IrohEndpoint {
             .spawn();
         self.router = Some(router);
         self
+    }
+
+    /// Zwraca `true` jesli endpoint ma aktywny mDNS lookup.
+    pub fn has_mdns(&self) -> bool {
+        self.mdns.is_some()
     }
 
     /// Otwiera wychodzace polaczenie do peera (rozwiazanie adresu przez
