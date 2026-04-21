@@ -1475,7 +1475,21 @@
     "back": "Back",
     "deployStarted": "Deploy started: {id}",
     "deployFailed": "Deploy failed: {error}",
-    "engineNotFound": "Engine \"{id}\" not found in manifest"
+    "engineNotFound": "Engine \"{id}\" not found in manifest",
+    "step_gpu": "GPUs",
+    "gpu_title": "Select GPUs on {node}",
+    "gpu_subtitle": "Choose which GPUs this deployment will use on the selected node.",
+    "gpu_mode_all": "Use all GPUs ({n})",
+    "gpu_mode_specific": "Pick specific GPUs",
+    "gpu_mode_none": "Do not use GPU (CPU only)",
+    "gpu_mode_all_hint": "Expose every visible GPU to the container.",
+    "gpu_mode_specific_hint": "Only the selected GPU indices will be passed through.",
+    "gpu_mode_none_hint": "Container runs on CPU; no GPU resources will be requested.",
+    "gpu_empty_on_node": "This node has no GPUs visible.",
+    "gpu_select_at_least_one": "Select at least one GPU or choose a different mode.",
+    "gpu_summary_specific": "Selected {n} GPU(s) · {total_vram} total VRAM",
+    "gpu_summary_all": "Will use all GPUs on the node",
+    "gpu_summary_none": "Will not use GPU"
   },
   "category": {
     "llm": "Language Models (LLM)",

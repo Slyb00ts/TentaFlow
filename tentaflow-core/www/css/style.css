@@ -3007,3 +3007,29 @@ textarea {
   padding: 0 12px 12px;
 }
 
+
+/* Engine deploy wizard — GPU selection step */
+.gpu-mode-group { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.gpu-mode-group label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.gpu-mode-group input[type="radio"] { accent-color: var(--accent-1); width: 16px; height: 16px; }
+
+.gpu-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-left: 24px; }
+.gpu-list[hidden] { display: none; }
+
+.gpu-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.gpu-row:hover { border-color: var(--border-hover); }
+.gpu-row input[type="checkbox"] { accent-color: var(--accent-1); width: 16px; height: 16px; }
+.gpu-info { min-width: 0; }
+.gpu-name { font-weight: 600; font-size: 13px; }
+.gpu-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.gpu-summary { margin-top: 12px; }

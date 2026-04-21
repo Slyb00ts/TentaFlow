@@ -1,10 +1,11 @@
 // =============================================================================
-// Plik: modules/catalog/engine-deploy-wizard.js
-// Opis: 3-krokowy wizard deploymentu silnika z manifestu:
-//       (1) tryb: docker | native | external (kafelki wg availableDeployMethods)
-//       (2) model: preset z manifestu albo wyszukiwarka HuggingFace Hub
-//       (3) runtime: port, container name (gdy docker), ewentualne extra params
-//       Submit → POST /api/services/deploy.
+// File: modules/catalog/engine-deploy-wizard.js
+// Purpose: 4-step engine deploy wizard driven by service manifest.
+//   (1) method: docker | native | external (tiles from availableDeployMethods)
+//   (2) model:  preset from manifest or HuggingFace Hub search
+//   (3) gpu:    pick GPUs on the selected node (all | specific | none)
+//   (4) runtime: port, container name (docker) and extras
+//   Submit → POST /api/services/deploy.
 // =============================================================================
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
@@ -32,7 +33,21 @@ let selection = {
   modelRepo: null,
   port: null,
   containerName: null,
+  gpuSelectMode: 'all',   // 'all' | 'specific' | 'none'
+  gpuIds: [],             // e.g. ['0','2'] when gpuSelectMode === 'specific'
 };
+
+// Cache per-node GPU lists to avoid re-querying when switching back and forth.
+const gpuListByNode = new Map();
+
+// Ordered step ids with optional skip predicate. Runtime order derived at
+// navigation time by filtering out steps whose skip() returns true.
+const STEPS = [
+  { id: 'method' },
+  { id: 'model' },
+  { id: 'gpu', skip: shouldSkipGpuStep },
+  { id: 'runtime' },
+];
 
 /// Publiczne API: otwiera wizard dla `engineId`. `opts` opcjonalnie zawiera
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
@@ -48,7 +63,10 @@ export async function openDeployWizard(engineId, opts = {}) {
     modelRepo: null,
     port: null,
     containerName: null,
+    gpuSelectMode: 'all',
+    gpuIds: [],
   };
+  gpuListByNode.clear();
 
   renderShell(`<div class="form-hint">${escapeHtml(I18n.t('common.loading'))}</div>`);
 
@@ -190,32 +208,45 @@ function refreshModal() {
   bindFooter();
 }
 
+function activeSteps() {
+  return STEPS.filter((s) => !(typeof s.skip === 'function' && s.skip()));
+}
+
+function currentStepId() {
+  const steps = activeSteps();
+  const idx = Math.max(1, Math.min(currentStep, steps.length));
+  return steps[idx - 1]?.id;
+}
+
 function renderStepIndicator() {
+  const steps = activeSteps();
   let html = '<div class="wizard-step-indicator">';
-  for (let i = 1; i <= 3; i++) {
+  for (let i = 1; i <= steps.length; i++) {
     const cls = i === currentStep ? 'active' : (i < currentStep ? 'done' : '');
     html += `<div class="wizard-step-dot ${cls}"><span>${i}</span></div>`;
-    if (i < 3) html += '<div class="wizard-step-line"></div>';
+    if (i < steps.length) html += '<div class="wizard-step-line"></div>';
   }
   html += '</div>';
   return html;
 }
 
 function renderStepBody() {
-  switch (currentStep) {
-    case 1: return renderStepMethod();
-    case 2: return renderStepModel();
-    case 3: return renderStepRuntime();
+  switch (currentStepId()) {
+    case 'method':  return renderStepMethod();
+    case 'model':   return renderStepModel();
+    case 'gpu':     return renderStepGpu();
+    case 'runtime': return renderStepRuntime();
     default: return '';
   }
 }
 
 function renderFooter() {
+  const steps = activeSteps();
   let html = `<tf-button variant="ghost" id="edw-cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>`;
   if (currentStep > 1) {
     html += `<tf-button variant="secondary" id="edw-back"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:rotate(180deg)"><use href="#i-chevron-right"/></svg>${escapeHtml(I18n.t('common.back'))}</tf-button>`;
   }
-  if (currentStep < 3) {
+  if (currentStep < steps.length) {
     html += `<tf-button variant="primary" id="edw-next">${escapeHtml(I18n.t('common.next'))}<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-chevron-right"/></svg></tf-button>`;
   } else {
     html += `<tf-button variant="primary" id="edw-deploy">${escapeHtml(I18n.t('wizard.startDeploy'))}</tf-button>`;
@@ -432,12 +463,148 @@ function renderStepRuntime() {
   `;
 }
 
+// ---- Step 3: GPUs ---------------------------------------------------------
+
+// The GPU step is skipped when there are no GPUs on the selected node. The
+// engine manifest may opt out via `engine.gpu_supported === false`; by default
+// (field absent) we assume the engine can use GPUs if the node has any.
+function shouldSkipGpuStep() {
+  const gpus = nodeGpus(selection.nodeId);
+  if (gpus.length === 0) return true;
+  const gpuSupported = engineEntry?.engine?.gpu_supported;
+  if (gpuSupported === false) return true;
+  return false;
+}
+
+function nodeGpus(nodeId) {
+  if (!nodeId) return [];
+  if (gpuListByNode.has(nodeId)) return gpuListByNode.get(nodeId);
+  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  const gpus = Array.isArray(node?.gpus) ? node.gpus : [];
+  gpuListByNode.set(nodeId, gpus);
+  return gpus;
+}
+
+function nodeDisplayName(nodeId) {
+  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  return node?.hostname || node?.node_id || node?.id || nodeId || '';
+}
+
+function fmtMb(mb) {
+  const n = Number(mb) || 0;
+  if (n <= 0) return '—';
+  if (n >= 1024) return `${Math.round(n / 1024)} GB`;
+  return `${Math.round(n)} MB`;
+}
+
+function vendorStatus(vendor) {
+  const v = String(vendor || '').toLowerCase();
+  if (v.includes('nvidia')) return 'accent';
+  if (v.includes('amd')) return 'warn';
+  if (v.includes('intel')) return 'info';
+  return 'info';
+}
+
+function gpuSummaryText(gpus) {
+  if (selection.gpuSelectMode === 'none') return I18n.t('wizard.gpu_summary_none');
+  if (selection.gpuSelectMode === 'all') return I18n.t('wizard.gpu_summary_all');
+  const ids = new Set(selection.gpuIds);
+  const chosen = gpus.filter((_, idx) => ids.has(String(idx)));
+  const totalVram = chosen.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
+  return I18n.t('wizard.gpu_summary_specific', { n: chosen.length, total_vram: fmtMb(totalVram) });
+}
+
+function renderStepGpu() {
+  const gpus = nodeGpus(selection.nodeId);
+  const mode = selection.gpuSelectMode || 'all';
+  const selectedSet = new Set(selection.gpuIds);
+
+  const rows = gpus.map((g, idx) => {
+    const meta = [
+      `${fmtMb(g.vram_total_mb)} VRAM`,
+      g.usage_percent != null ? `util ${Math.round(g.usage_percent)}%` : '',
+      g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '',
+      g.driver_version ? `driver ${escapeHtml(String(g.driver_version))}` : '',
+    ].filter(Boolean).join(' · ');
+    const checked = selectedSet.has(String(idx)) ? 'checked' : '';
+    const vendor = g.vendor || '—';
+    return `
+      <label class="gpu-row">
+        <input type="checkbox" value="${idx}" ${checked}>
+        <div class="gpu-info">
+          <div class="gpu-name">GPU ${idx} · ${escapeHtml(String(g.name || ''))}</div>
+          <div class="gpu-meta">${meta}</div>
+        </div>
+        <tf-chip status="${escapeAttr(vendorStatus(vendor))}">${escapeHtml(String(vendor))}</tf-chip>
+      </label>
+    `;
+  }).join('');
+
+  const listHidden = mode !== 'specific' ? 'hidden' : '';
+  const nodeName = escapeHtml(nodeDisplayName(selection.nodeId));
+
+  return `
+    <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.gpu_title', { node: nodeName }))}</h4>
+    <p class="form-hint">${escapeHtml(I18n.t('wizard.gpu_subtitle'))}</p>
+
+    <div class="gpu-mode-group">
+      <label>
+        <input type="radio" name="gpu-mode" value="all" ${mode === 'all' ? 'checked' : ''}>
+        <span>${escapeHtml(I18n.t('wizard.gpu_mode_all', { n: gpus.length }))}</span>
+      </label>
+      <label>
+        <input type="radio" name="gpu-mode" value="specific" ${mode === 'specific' ? 'checked' : ''}>
+        <span>${escapeHtml(I18n.t('wizard.gpu_mode_specific'))}</span>
+      </label>
+      <label>
+        <input type="radio" name="gpu-mode" value="none" ${mode === 'none' ? 'checked' : ''}>
+        <span>${escapeHtml(I18n.t('wizard.gpu_mode_none'))}</span>
+      </label>
+    </div>
+
+    <div class="gpu-list" ${listHidden}>${rows}</div>
+
+    <div class="gpu-summary form-hint">${escapeHtml(gpuSummaryText(gpus))}</div>
+  `;
+}
+
+function bindStepGpuInputs() {
+  document.querySelectorAll('input[name="gpu-mode"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      if (!radio.checked) return;
+      const mode = radio.value;
+      selection.gpuSelectMode = mode;
+      if (mode === 'all' || mode === 'none') {
+        selection.gpuIds = [];
+      } else if (mode === 'specific' && selection.gpuIds.length === 0) {
+        const gpus = nodeGpus(selection.nodeId);
+        if (gpus.length > 0) selection.gpuIds = ['0'];
+      }
+      refreshModal();
+    });
+  });
+
+  document.querySelectorAll('.gpu-list input[type="checkbox"]').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const id = String(cb.value);
+      const set = new Set(selection.gpuIds);
+      if (cb.checked) set.add(id); else set.delete(id);
+      selection.gpuIds = Array.from(set).sort((a, b) => Number(a) - Number(b));
+      const box = document.querySelector('.gpu-summary');
+      if (box) box.textContent = gpuSummaryText(nodeGpus(selection.nodeId));
+    });
+  });
+}
+
 // ---- Bindings -------------------------------------------------------------
 
 function bindStepInputs() {
-  if (currentStep === 1) bindStepMethodInputs();
-  if (currentStep === 2) bindStepModelInputs();
-  if (currentStep === 3) bindStepRuntimeInputs();
+  switch (currentStepId()) {
+    case 'method':  bindStepMethodInputs(); break;
+    case 'model':   bindStepModelInputs(); break;
+    case 'gpu':     bindStepGpuInputs(); break;
+    case 'runtime': bindStepRuntimeInputs(); break;
+  }
 }
 
 function bindStepMethodInputs() {
@@ -456,6 +623,9 @@ function bindStepMethodInputs() {
       if (!availableMethods.includes(selection.deployMethod)) {
         selection.deployMethod = availableMethods[0] || null;
       }
+      // GPU inventory is per-node; reset selection when target changes.
+      selection.gpuSelectMode = 'all';
+      selection.gpuIds = [];
       refreshModal();
     });
   }
@@ -551,21 +721,28 @@ function bindFooter() {
 }
 
 function canAdvance() {
-  if (currentStep === 1) {
-    if (!selection.deployMethod) {
-      toast(I18n.t('wizard.selectMethod'), 'error');
-      return false;
-    }
-    return true;
+  switch (currentStepId()) {
+    case 'method':
+      if (!selection.deployMethod) {
+        toast(I18n.t('wizard.selectMethod'), 'error');
+        return false;
+      }
+      return true;
+    case 'model':
+      if (!selection.modelPresetId && !selection.modelRepo) {
+        toast(I18n.t('wizard.selectModel'), 'error');
+        return false;
+      }
+      return true;
+    case 'gpu':
+      if (selection.gpuSelectMode === 'specific' && selection.gpuIds.length === 0) {
+        toast(I18n.t('wizard.gpu_select_at_least_one'), 'error');
+        return false;
+      }
+      return true;
+    default:
+      return true;
   }
-  if (currentStep === 2) {
-    if (!selection.modelPresetId && !selection.modelRepo) {
-      toast(I18n.t('wizard.selectModel'), 'error');
-      return false;
-    }
-    return true;
-  }
-  return true;
 }
 
 // ---- HF search ------------------------------------------------------------
@@ -620,6 +797,8 @@ async function startDeploy() {
     model_repo: selection.modelRepo || null,
     port: selection.port || eng.default_port,
     container_name: selection.containerName || null,
+    gpu_select_mode: selection.gpuSelectMode,
+    gpu_ids: selection.gpuSelectMode === 'specific' ? selection.gpuIds : null,
   });
 
   try {
