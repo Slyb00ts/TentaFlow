@@ -709,7 +709,8 @@ impl PeerManager {
             | IrohMeshEvent::TrustedKeysSyncReceived { .. }
             | IrohMeshEvent::NodeLeavingReceived { .. }
             | IrohMeshEvent::RelayFrameReceived { .. }
-            | IrohMeshEvent::AliasSyncReceived { .. } => {
+            | IrohMeshEvent::AliasSyncReceived { .. }
+            | IrohMeshEvent::PeerDiscovered { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }

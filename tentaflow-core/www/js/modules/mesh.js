@@ -234,6 +234,38 @@ function renderPendingSection(list) {
   `;
 }
 
+/// Karta dla peera odkrytego przez mDNS/DHT, jeszcze nie sparowanego.
+/// Dashed orange border, brak gauges, info o sposobie odkrycia + fingerprint.
+function renderDiscoveredCard(node) {
+  const nodeId = node.node_id || '';
+  const fpRaw = nodeId ? nodeId.slice(0, 12) : '';
+  const shortFp = fpRaw ? fpRaw.match(/.{1,2}/g).join(':') : '—';
+  const hostname = node.hostname || (nodeId ? nodeId.slice(0, 12) : I18n.t('mesh.unknown_host'));
+  const ip = node.ip || (node.ip_addresses && node.ip_addresses[0]) || '—';
+  const details = [
+    escapeHtml(String(ip)),
+    escapeHtml(I18n.t('mesh.discovered_via_mdns')),
+    `fingerprint ${escapeHtml(shortFp)}...`,
+  ].join(' · ');
+  return `
+    <div class="mesh-card pending" data-node-detail="${escapeAttr(nodeId)}">
+      <div class="mesh-card-head">
+        <div class="mesh-card-ico pending"><svg class="icon icon-lg"><use href="#i-question"/></svg></div>
+        <div class="mesh-card-title">
+          <div class="name-t">${escapeHtml(hostname)}<tf-chip status="pending" dot>${escapeHtml(I18n.t('mesh.pending'))}</tf-chip></div>
+          <div class="details">${details}</div>
+        </div>
+        <div class="mesh-card-actions">
+          <tf-button variant="primary" size="sm" icon="plus" title="${escapeAttr(I18n.t('mesh.pair'))}" data-node-pair="${escapeAttr(nodeId)}"></tf-button>
+        </div>
+      </div>
+      <div class="mesh-card-meta">
+        <div class="meta-item"><svg class="icon"><use href="#i-info"/></svg><span>${escapeHtml(I18n.t('mesh.discovered_hint'))}</span></div>
+      </div>
+    </div>
+  `;
+}
+
 function renderPendingCard(pairing) {
   const nodeId = pairing.remote_node_id || '';
   const shortId = nodeId.slice(0, 16);
@@ -258,6 +290,9 @@ function renderPendingCard(pairing) {
 }
 
 function renderNodeCard(node, kind) {
+  if (kind === 'discovered') {
+    return renderDiscoveredCard(node);
+  }
   const nodeId = node.node_id || '';
   const hostname = node.hostname || nodeId.slice(0, 12) || I18n.t('mesh.unknown_host');
   const online = isOnline(node);
@@ -548,10 +583,10 @@ function createPairWindow({ title, bodyHtml, submitLabel, submitAction, onSubmit
 }
 
 function openPairModal() {
-  // Modal: node_id hex + PIN (outgoing — uzytkownik inicjuje).
+  // Modal: tylko NodeID. Backend generuje PIN, UI wyswietla go w kolejnym
+  // modalu do odczytania uzytkownikowi na drugim urzadzeniu.
   const bodyHtml = `
     <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="64"></tf-input>
-    <tf-input id="pair-pin" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000000" maxlength="6" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.pair_pin_hint'))}"></tf-input>
     <div class="form-error" hidden></div>
   `;
   createPairWindow({
@@ -561,49 +596,75 @@ function openPairModal() {
     submitAction: 'pair',
     onSubmit: async (win) => {
       const idHex = (win.querySelector('#pair-node-id')?.value || '').trim().toLowerCase();
-      const pin = (win.querySelector('#pair-pin')?.value || '').trim();
       const errBox = win.querySelector('.form-error');
       if (!/^[0-9a-f]{64}$/.test(idHex)) {
         errBox.textContent = I18n.t('mesh.pair_invalid_node_id');
         errBox.hidden = false;
         return false;
       }
-      if (!/^\d{6}$/.test(pin)) {
-        errBox.textContent = I18n.t('mesh.pair_invalid_pin');
+      try {
+        const resp = await ApiBinary.action('meshPairingStartRequest', { remoteAddress: idHex });
+        if (resp?.pin) {
+          openPinDisplayModal(idHex, resp.pin);
+        } else {
+          toast(I18n.t('mesh.pair_success'), 'success');
+        }
+        return true;
+      } catch (e) {
+        errBox.textContent = e.message || I18n.t('mesh.pair_failed');
         errBox.hidden = false;
         return false;
       }
-      await ApiBinary.action('meshPairingStartRequest', { remoteAddress: idHex });
-      toast(I18n.t('mesh.pair_success'), 'success');
-      return true;
     },
   });
 }
 
 function openPinModal(nodeId) {
-  // PIN dla outgoing pair — skrot gdy node juz wykryty.
+  // Skrot dla discovered card — od razu inicjuje parowanie i pokazuje PIN.
+  // Nic do wpisania: backend generuje PIN, uzytkownik przekazuje drugiemu nodowi.
+  (async () => {
+    try {
+      const resp = await ApiBinary.action('meshPairingStartRequest', { remoteAddress: nodeId });
+      if (resp?.pin) {
+        openPinDisplayModal(nodeId, resp.pin);
+      } else {
+        toast(I18n.t('mesh.pair_failed'), 'error');
+      }
+    } catch (e) {
+      toast(`${I18n.t('mesh.pair_failed')}: ${e.message || ''}`, 'error');
+    }
+  })();
+}
+
+/// Modal pokazujacy wygenerowany PIN do przekazania na drugi node. Zawiera
+/// odliczanie 60s, NodeID docelowego noda i instrukcje. User kopiuje PIN, idzie
+/// do drugiego noda, potwierdza parowanie wpisujac PIN tam.
+function openPinDisplayModal(targetNodeId, pin) {
+  const pinGroups = pin.replace(/(\d{3})(\d{3})/, '$1 $2');
+  const shortId = targetNodeId.slice(0, 16);
   const bodyHtml = `
-    <tf-input id="pin-input" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000000" maxlength="6" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.pair_pin_hint'))}"></tf-input>
-    <div class="form-error" hidden></div>
+    <div class="pair-pin-display">
+      <div class="pair-pin-hint">${escapeHtml(I18n.t('mesh.pair_pin_display_intro', { node: shortId }))}</div>
+      <div class="pair-pin-value" data-pin="${escapeAttr(pin)}">${escapeHtml(pinGroups)}</div>
+      <div class="pair-pin-timer"><span id="pair-pin-countdown">60</span>s</div>
+      <div class="pair-pin-steps">${escapeHtml(I18n.t('mesh.pair_pin_display_steps'))}</div>
+    </div>
   `;
   createPairWindow({
-    title: I18n.t('mesh.pair_pin_title'),
+    title: I18n.t('mesh.pair_pin_display_title'),
     bodyHtml,
-    submitLabel: I18n.t('mesh.pair'),
-    submitAction: 'pair',
-    onSubmit: async (win) => {
-      const pin = (win.querySelector('#pin-input')?.value || '').trim();
-      const errBox = win.querySelector('.form-error');
-      if (!/^\d{6}$/.test(pin)) {
-        errBox.textContent = I18n.t('mesh.pair_invalid_pin');
-        errBox.hidden = false;
-        return false;
-      }
-      await ApiBinary.action('meshPairingStartRequest', { remoteAddress: nodeId });
-      toast(I18n.t('mesh.pair_success'), 'success');
-      return true;
-    },
+    submitLabel: I18n.t('common.close') || 'Zamknij',
+    submitAction: 'close',
+    onSubmit: async () => true,
   });
+  // Odliczanie 60s — po wygasnieciu PIN przestaje byc wazny (backend cleanup).
+  let remaining = 60;
+  const iv = setInterval(() => {
+    remaining -= 1;
+    const el = document.querySelector('#pair-pin-countdown');
+    if (el) el.textContent = String(remaining);
+    if (remaining <= 0 || !el) clearInterval(iv);
+  }, 1000);
 }
 
 function openConfirmPinModal(nodeId) {
