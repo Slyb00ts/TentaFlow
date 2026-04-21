@@ -270,7 +270,7 @@ function renderNodeMini(member) {
   const ram = live && live.ram_total_mb
     ? Math.round(((live.ram_used_mb || 0) / live.ram_total_mb) * 100)
     : null;
-  const gpus = live && Array.isArray(live.gpu_info) ? live.gpu_info : [];
+  const gpus = live && Array.isArray(live.gpus) ? live.gpus : [];
   const vramUsed = gpus.reduce((s, g) => s + (g.vram_used_mb || 0), 0);
   const vramTotal = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
   const vramPct = vramTotal > 0 ? Math.round((vramUsed / vramTotal) * 100) : null;
@@ -401,7 +401,7 @@ function renderSummaryColumn(cluster, members) {
   const totalCpu = members.reduce((s, m) => s + (m.live?.cpu_count || 0), 0);
   const totalRam = members.reduce((s, m) => s + (m.live?.ram_total_mb || 0), 0);
   const totalVram = members.reduce((s, m) => {
-    const g = Array.isArray(m.live?.gpu_info) ? m.live.gpu_info : [];
+    const g = Array.isArray(m.live?.gpus) ? m.live.gpus : [];
     return s + g.reduce((x, gg) => x + (gg.vram_total_mb || 0), 0);
   }, 0);
 
