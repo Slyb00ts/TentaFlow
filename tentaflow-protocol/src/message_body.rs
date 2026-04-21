@@ -858,6 +858,75 @@ pub struct FlowVersionRestoreResponse {
     pub ok: bool,
 }
 
+// ----- SSO / TLS / NGC -----
+
+/// Pojedynczy wpis providera SSO dla listy admina. `client_secret` nie jest
+/// zwracany do GUI — jedynie pola nie-sekretne. `default_group_id` jest opcjonalny
+/// (Option) bo provider moze nie mapowac uzytkownikow do grupy domyslnej.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SsoProviderEntry {
+    pub id: i64,
+    pub name: String,
+    pub provider_type: String,
+    pub discovery_url: String,
+    pub enabled: bool,
+    pub auto_create_users: bool,
+    pub default_group_id: Option<i64>,
+    pub created_at: String,
+}
+
+/// Response: lista wszystkich skonfigurowanych providerow SSO (Admin only).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SsoProvidersListResponse {
+    pub providers: Vec<SsoProviderEntry>,
+}
+
+/// Request: utworz nowego providera SSO/OIDC. `client_secret` jest szyfrowany
+/// po stronie serwera przed zapisem do bazy (cipher w AppState).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SsoProviderCreateRequest {
+    pub name: String,
+    pub provider_type: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub discovery_url: String,
+    pub auto_create_users: bool,
+    pub default_group_id: Option<i64>,
+}
+
+/// Response: potwierdzenie utworzenia providera SSO.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SsoProviderCreateResponse {
+    pub id: i64,
+    pub name: String,
+    pub provider_type: String,
+}
+
+/// Request: usun providera SSO po id.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SsoProviderDeleteRequest {
+    pub id: i64,
+}
+
+/// Response: flagaczy provider istnial i zostal usuniety.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct SsoProviderDeleteResponse {
+    pub deleted: bool,
+}
+
+/// Response: status konfiguracji TLS (obecnosc cert/key w settings, bez ujawniania wartosci).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct TlsStatusResponse {
+    pub has_cert: bool,
+    pub has_key: bool,
+}
+
+/// Response: status konfiguracji NGC (czy API key jest ustawiony, bez ujawniania wartosci).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NgcStatusResponse {
+    pub configured: bool,
+}
+
 // =============================================================================
 // MessageBody — wszystkie warianty
 // =============================================================================
@@ -1041,6 +1110,18 @@ pub enum MessageBody {
     FlowVersionGetResponseBody(FlowVersionGetResponse),
     FlowVersionRestoreRequestBody(FlowVersionRestoreRequest),
     FlowVersionRestoreResponseBody(FlowVersionRestoreResponse),
+
+    // ---- SSO / TLS / NGC (FAZA 4 — REST -> binary) ----
+    SsoProvidersListRequest,
+    SsoProvidersListResponseBody(SsoProvidersListResponse),
+    SsoProviderCreateRequestBody(SsoProviderCreateRequest),
+    SsoProviderCreateResponseBody(SsoProviderCreateResponse),
+    SsoProviderDeleteRequestBody(SsoProviderDeleteRequest),
+    SsoProviderDeleteResponseBody(SsoProviderDeleteResponse),
+    TlsStatusRequest,
+    TlsStatusResponseBody(TlsStatusResponse),
+    NgcStatusRequest,
+    NgcStatusResponseBody(NgcStatusResponse),
 
     // ---- Subscription resume (client requests replay after reconnect) ----
     /// Klient -> serwer: zaresumuj subscription z tokenem ktory dostal w
