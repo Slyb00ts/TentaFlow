@@ -25,6 +25,11 @@ import {
 
 const CONTAINER_ID = 'face-bg-root';
 const CANVAS_ID = 'face-bg-canvas';
+// Drugi canvas pod main — rysujemy tam edges w 1× rozdzielczosci (niezaleznie
+// od DPR), CSS `filter: blur(...)` + `mix-blend-mode: plus-lighter` robi glow
+// na GPU compositorze. Bez tego Canvas 2D ctx.filter blur na Retina macOS
+// leci przez CPU/Skia i zjada budzet klatki.
+const GLOW_CANVAS_ID = 'face-glow-canvas';
 
 // Domyślne nachylenie głowy w dół (broda niżej). Wartość ujemna, bo po
 // korekcie parallax negatywny pitch = spojrzenie w dół. Sumuje się z
@@ -124,15 +129,11 @@ if (typeof console !== 'undefined' && console.debug) {
   );
 }
 
-// Parametry glow przez offscreen canvas + ctx.filter='blur()'. Pipeline:
-// 1) offscreen: pełny biały stroke wszystkich bucketów,
-// 2) main: dwie warstwy blur z compositem 'lighter' (szeroki + wąski glow),
-// 3) main: ostry biały rdzeń bez filtra. Parametry wyniesione, żeby tuning
-// intensywności nie wymagał edycji pętli renderującej.
-const GLOW_OUTER_BLUR_PX = 12;
-const GLOW_OUTER_ALPHA = 0.55;
-const GLOW_INNER_BLUR_PX = 4;
-const GLOW_INNER_ALPHA = 0.85;
+// Pipeline glow: dwa DOM canvasy na sobie w #face-bg-root.
+// 1) glow canvas (rozdzielczosc 1×, bez DPR): pelny stroke krawedzi,
+// 2) main canvas (DPR×): ostry bialy rdzen — ten sam stroke bez blur.
+// CSS filter: blur + mix-blend-mode: plus-lighter na glow robi aureole
+// na GPU compositorze. Intensywnosc/radius tuned w face.css (#face-glow-canvas).
 
 // Aproksymowane normale per-vertex: kierunek od centroidu do wierzchołka.
 // Dla quasi-wypukłej bryły twarzy to dobra aproksymacja; pozwala tanio
@@ -367,23 +368,17 @@ function project(cx, cy, scale, yaw, pitch) {
  * fallback do zwykłego <canvas>) o wymiarach odpowiadających fizycznym
  * pikselom głównego canvas. Jeśli rozmiar się zmienił — realokuje bufor.
  */
+// Glow canvas jest elementem DOM (nie OffscreenCanvas) tworzonym w show().
+// Tu tylko aktualizujemy jego wymiary bitmapy. Rozdzielczosc = CSS pixels
+// (bez mnoznika DPR) — filter: blur() w CSS i tak je zmyli, a 4× mniej
+// pikseli na Retina to 4× tansze rysowanie krawedzi.
 function ensureGlowCanvas(w, h) {
-  const existing = state.glowCanvas;
-  if (existing && existing.width === w && existing.height === h) {
-    return;
-  }
-  if (!existing) {
-    if (typeof OffscreenCanvas !== 'undefined') {
-      state.glowCanvas = new OffscreenCanvas(w, h);
-    } else {
-      state.glowCanvas = document.createElement('canvas');
-      state.glowCanvas.width = w;
-      state.glowCanvas.height = h;
-    }
-    state.glowCtx = state.glowCanvas.getContext('2d', { alpha: true });
-  } else {
-    existing.width = w;
-    existing.height = h;
+  const glow = state.glowCanvas;
+  if (!glow) return;
+  if (glow.width !== w || glow.height !== h) {
+    glow.width = w;
+    glow.height = h;
+    state.glowCtx = glow.getContext('2d', { alpha: true });
   }
 }
 
@@ -481,61 +476,44 @@ function drawEdges(ctx, dpr) {
   // `round` dawał białe kropki na końcówkach w miejscach łączenia trójkątów.
 
   const mainCanvas = state.canvas;
-  ensureGlowCanvas(mainCanvas.width, mainCanvas.height);
+  // Glow canvas trzymamy w CSS pixels — niezaleznie od DPR. CSS `filter: blur`
+  // na compositorze maskuje nizsza rozdzielczosc i robi blur na GPU.
+  const glowW = Math.max(1, Math.floor(mainCanvas.width / dpr));
+  const glowH = Math.max(1, Math.floor(mainCanvas.height / dpr));
+  ensureGlowCanvas(glowW, glowH);
   const glowCanvas = state.glowCanvas;
   const glowCtx = state.glowCtx;
 
-  // Pass 1 (offscreen): batche stroke dla warstwy glow. Kolor i alpha identyczne
-  // jak core, żeby dwie warstwy blur miały właściwą intensywność wynikową.
-  glowCtx.clearRect(0, 0, glowCanvas.width, glowCanvas.height);
-  glowCtx.lineCap = 'butt';
-  glowCtx.globalCompositeOperation = 'source-over';
-  for (const [key, arr] of buckets) {
-    const alphaBucket = key & 0x1f;
-    const widthBucket = (key >> 5) & 0xf;
-    const alpha = alphaBucket / 19;
-    const depthT = widthBucket / 9;
-    glowCtx.lineWidth = dpr * (1.4 + depthT * 0.5);
-    glowCtx.strokeStyle = `rgba(${tint.r},${tint.g},${tint.b},${alpha.toFixed(3)})`;
-    glowCtx.beginPath();
-    for (let i = 0; i < arr.length; i++) {
-      const e = EDGES[arr[i]];
-      const a = e[0];
-      const b = e[1];
-      glowCtx.moveTo(px[a], py[a]);
-      glowCtx.lineTo(px[b], py[b]);
+  // Pass 1 (glow canvas w 1×): batche stroke krawedzi. CTM skaluje 1/dpr,
+  // wiec wszystkie wspolrzedne / lineWidth podajemy w tej samej skali co main
+  // canvas (physical pixels) — upraszcza kod, narzut transform jest zerowy.
+  if (glowCanvas && glowCtx) {
+    glowCtx.setTransform(1 / dpr, 0, 0, 1 / dpr, 0, 0);
+    glowCtx.clearRect(0, 0, mainCanvas.width, mainCanvas.height);
+    glowCtx.lineCap = 'butt';
+    glowCtx.globalCompositeOperation = 'source-over';
+    for (const [key, arr] of buckets) {
+      const alphaBucket = key & 0x1f;
+      const widthBucket = (key >> 5) & 0xf;
+      const alpha = alphaBucket / 19;
+      const depthT = widthBucket / 9;
+      glowCtx.lineWidth = dpr * (1.4 + depthT * 0.5);
+      glowCtx.strokeStyle = `rgba(${tint.r},${tint.g},${tint.b},${alpha.toFixed(3)})`;
+      glowCtx.beginPath();
+      for (let i = 0; i < arr.length; i++) {
+        const e = EDGES[arr[i]];
+        const a = e[0];
+        const b = e[1];
+        glowCtx.moveTo(px[a], py[a]);
+        glowCtx.lineTo(px[b], py[b]);
+      }
+      glowCtx.stroke();
     }
-    glowCtx.stroke();
+    glowCtx.setTransform(1, 0, 0, 1, 0, 0);
   }
 
-  // Pass 2 (main): dwie warstwy blur z compositem 'lighter'. Szeroki outer glow
-  // daje aureolę, wąski inner glow gęstnieje bliżej linii. 'lighter' sumuje
-  // intensywności — dwie warstwy dają płynny gradient poświaty.
-  ctx.save();
-  ctx.globalCompositeOperation = 'lighter';
-
-  if (typeof ctx.filter !== 'undefined') {
-    ctx.filter = `blur(${GLOW_OUTER_BLUR_PX * dpr}px)`;
-    ctx.globalAlpha = GLOW_OUTER_ALPHA;
-    ctx.drawImage(glowCanvas, 0, 0, glowCanvas.width, glowCanvas.height);
-
-    ctx.filter = `blur(${GLOW_INNER_BLUR_PX * dpr}px)`;
-    ctx.globalAlpha = GLOW_INNER_ALPHA;
-    ctx.drawImage(glowCanvas, 0, 0, glowCanvas.width, glowCanvas.height);
-
-    ctx.filter = 'none';
-  } else {
-    // Fallback dla środowisk bez ctx.filter (bardzo starych silników):
-    // nakładamy ostrą kopię offscreen z obniżoną alfą jako przybliżenie glow.
-    ctx.globalAlpha = GLOW_OUTER_ALPHA;
-    ctx.drawImage(glowCanvas, 0, 0, glowCanvas.width, glowCanvas.height);
-  }
-
-  ctx.globalAlpha = 1.0;
-  ctx.restore();
-
-  // Pass 3 (main): ostry biały rdzeń bez filtra, nad glow. Krawędzie są ostro
-  // białe w środku, a wokół nich miękka poświata z dwóch warstw blur.
+  // Pass 3 (main): ostry biały rdzeń bez filtra. Blur-owana kopia tej samej
+  // geometrii na glow canvas z CSS filter daje aureole — kompozyt robi GPU.
   ctx.lineCap = 'butt';
   ctx.globalCompositeOperation = 'source-over';
   for (const [key, arr] of buckets) {
@@ -915,8 +893,9 @@ function syncCanvasSize() {
   state.canvas.height = Math.max(1, Math.floor(h * dpr));
   state.canvas.style.width = `${w}px`;
   state.canvas.style.height = `${h}px`;
-  // Offscreen glow musi podążać za rozmiarem main canvas w fizycznych pikselach.
-  ensureGlowCanvas(state.canvas.width, state.canvas.height);
+  // Glow canvas w CSS pixels (bez DPR). CSS filter: blur w compositorze
+  // zamazuje nizsza rozdzielczosc — zysk 4× na Retina bez widocznej utraty.
+  ensureGlowCanvas(Math.max(1, Math.floor(w)), Math.max(1, Math.floor(h)));
 }
 
 function startLoop() {
@@ -1121,6 +1100,13 @@ export const FaceBackground = {
     container.id = CONTAINER_ID;
     container.className = 'face-bg';
 
+    // Glow canvas idzie PRZED main — CSS z-index/order decyduje o ukladzie,
+    // ale w przypadku braku z-indexu later-wins, wiec main musi byc drugi.
+    const glowCanvas = document.createElement('canvas');
+    glowCanvas.id = GLOW_CANVAS_ID;
+    glowCanvas.setAttribute('aria-hidden', 'true');
+    container.appendChild(glowCanvas);
+
     const canvas = document.createElement('canvas');
     canvas.id = CANVAS_ID;
     canvas.setAttribute('aria-hidden', 'true');
@@ -1131,6 +1117,8 @@ export const FaceBackground = {
 
     state.canvas = canvas;
     state.ctx = canvas.getContext('2d', { alpha: true });
+    state.glowCanvas = glowCanvas;
+    state.glowCtx = glowCanvas.getContext('2d', { alpha: true });
     state.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     // Reset harmonogramu idle-animacji na start sesji.
