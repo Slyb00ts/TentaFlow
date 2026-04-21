@@ -32,7 +32,9 @@ pub use envelope::{
     SCHEMA_VERSION,
 };
 pub use message_body::{
-    ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginRequest,
+    ApiKeyCreateRequest, ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuditLogCleanupRequest,
+    AuditLogCleanupResponse, AuditLogEntry, AuditLogExportRequest, AuditLogExportResponse,
+    AuditLogFilters, AuditLogListRequest, AuditLogListResponse, AuthLoginRequest,
     AuthLoginResponse, AuthMeResponse, ChatMessage, ChatStreamChunk, ChatStreamEnd,
     ChatStreamRequest, ClusterAddMemberRequest, ClusterAddMemberResponse, ClusterCreateRequest,
     ClusterCreateResponse, ClusterDeleteRequest, ClusterDeleteResponse, ClusterDetailRequest,
