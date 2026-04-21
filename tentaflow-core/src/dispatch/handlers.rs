@@ -2990,6 +2990,12 @@ pub fn models_unified_list(
         &ctx.state.mesh_peer_store,
         ctx.state.local_node_id.as_ref(),
     );
+    merge_service_manager_models(
+        &mut models,
+        &ctx.state.service_manager,
+        &ctx.state.db,
+        ctx.state.local_node_id.as_ref(),
+    );
     Ok(MessageBody::ModelsUnifiedListResponseBody(
         tentaflow_protocol::ModelsUnifiedListResponse { models },
     ))
@@ -3105,6 +3111,104 @@ fn merge_peer_store_models(
             }
             present.insert(key);
         }
+    }
+}
+
+// Third fallback source for the unified models list: ServiceManager.model_pool.
+// The pool is populated from DB in Router::new() independently of mesh state,
+// so it survives mesh startup races (e.g. when register_native_service_in_mesh
+// runs before the mesh manager is attached). Each pool entry maps a model name
+// to one or more DB-backed services; we resolve size/backend/status by looking
+// up the underlying DbService and the model file on disk.
+fn merge_service_manager_models(
+    models: &mut Vec<tentaflow_protocol::UnifiedModel>,
+    service_manager: &crate::routing::service_manager::ServiceManager,
+    db: &crate::db::DbPool,
+    local_node_id: &str,
+) {
+    let pool_entries = service_manager.get_model_pool_info();
+    if pool_entries.is_empty() {
+        return;
+    }
+
+    // Cache DB services by name so we avoid repeated queries.
+    let db_services: std::collections::HashMap<String, crate::db::models::DbService> =
+        match crate::db::repository::list_services(db) {
+            Ok(list) => list.into_iter().map(|s| (s.name.clone(), s)).collect(),
+            Err(_) => std::collections::HashMap::new(),
+        };
+
+    use std::collections::HashSet;
+    let mut present: HashSet<(String, String, String)> = HashSet::new();
+    for m in models.iter() {
+        for inst in m.instances.iter() {
+            present.insert((
+                m.model_name.clone(),
+                m.service_type.clone(),
+                inst.node_id.clone(),
+            ));
+        }
+    }
+
+    for (model_name, service_names, _strategy, service_type) in pool_entries {
+        let key = (
+            model_name.clone(),
+            service_type.clone(),
+            local_node_id.to_string(),
+        );
+        if present.contains(&key) {
+            continue;
+        }
+
+        // Resolve backend / size / status from the underlying DB service.
+        // We use the first mapped service; pool entries for a single model
+        // share backend and point at the same model file. If no DB service
+        // matches, the pool entry is stale (service deleted) — skip it.
+        let svc = match service_names
+            .iter()
+            .find_map(|name| db_services.get(name))
+        {
+            Some(s) => s,
+            None => continue,
+        };
+        let cfg: serde_json::Value =
+            serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
+        let backend = cfg
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let size_mb = cfg
+            .get("model_path")
+            .and_then(|v| v.as_str())
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() / (1024 * 1024));
+        let loaded = svc.status == "running";
+        let status = if loaded { "running" } else { "stopped" }.to_string();
+
+        let service_id = format!("pool-{}-{}", service_type, model_name);
+        let instance = tentaflow_protocol::UnifiedModelInstance {
+            node_id: local_node_id.to_string(),
+            node_hostname: None,
+            service_id,
+            status,
+            backend,
+            size_mb,
+            loaded,
+        };
+
+        let group = models
+            .iter_mut()
+            .find(|m| m.model_name == model_name && m.service_type == service_type);
+        match group {
+            Some(g) => g.instances.push(instance),
+            None => models.push(tentaflow_protocol::UnifiedModel {
+                model_name: model_name.clone(),
+                service_type: service_type.clone(),
+                instances: vec![instance],
+            }),
+        }
+        present.insert(key);
     }
 }
 
