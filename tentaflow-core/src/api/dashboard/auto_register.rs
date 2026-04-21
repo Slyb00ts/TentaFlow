@@ -381,7 +381,7 @@ async fn wait_for_quic_health(quic_url: &str) -> Result<()> {
         url: quic_url.to_string(),
         tls_ca: None,
         server_name: None,
-        alpn: "tentaflow".to_string(),
+        alpn: "tentaflow-service/v1".to_string(),
         timeout_ms: 8000,
         auto_reconnect: false,
         reconnect_interval_ms: 0,
