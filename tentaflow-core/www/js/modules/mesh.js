@@ -670,7 +670,7 @@ function openPinDisplayModal(targetNodeId, pin) {
 function openConfirmPinModal(nodeId) {
   // PIN dla incoming pairing confirm.
   const bodyHtml = `
-    <tf-input id="confirm-pin-input" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000000" maxlength="6" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.confirm_pin_hint'))}"></tf-input>
+    <tf-input id="confirm-pin-input" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000 000" maxlength="8" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.confirm_pin_hint'))}"></tf-input>
     <div class="form-error" hidden></div>
   `;
   createPairWindow({
@@ -679,7 +679,7 @@ function openConfirmPinModal(nodeId) {
     submitLabel: I18n.t('mesh.confirm_pairing'),
     submitAction: 'confirm',
     onSubmit: async (win) => {
-      const pin = (win.querySelector('#confirm-pin-input')?.value || '').trim();
+      const pin = (win.querySelector('#confirm-pin-input')?.value || '').replace(/\D/g, '');
       const errBox = win.querySelector('.form-error');
       if (!/^\d{6}$/.test(pin)) {
         errBox.textContent = I18n.t('mesh.pair_invalid_pin');
