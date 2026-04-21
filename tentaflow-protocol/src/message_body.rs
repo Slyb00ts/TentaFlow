@@ -607,20 +607,154 @@ pub struct DashboardSnapshot {
 }
 
 // =============================================================================
-// Cluster (W-UPDATE archetyp, migration-map #53)
+// Clusters — full CRUD + member ops + probe streaming
 // =============================================================================
 
+/// Cluster summary returned by list/detail endpoints. Aggregates derived in
+/// handler (members_count, members_online, status from online count).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub strategy: String,
+    /// "active" | "inactive" — derived from members_online count.
+    pub status: String,
+    pub members_count: u32,
+    pub members_online: u32,
+    /// Unix epoch seconds (from SQLite timestamp parse).
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub failover_enabled: bool,
+    pub failover_target: Option<String>,
+    pub health_check_interval_ms: u32,
+    pub timeout_ms: u32,
+}
+
+/// Single member of a cluster (node + interface info).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterMember {
+    /// Hex-encoded 32-byte mesh node id.
+    pub node_id: String,
+    /// Peer hostname or node_id fallback.
+    pub hostname: String,
+    /// "online" | "offline" — from peer_store.
+    pub status: String,
+    pub interface_type: Option<String>,
+    pub interface_speed_mbps: Option<u32>,
+    /// Unix epoch seconds when member joined the cluster.
+    pub joined_at: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterListResponse {
+    pub clusters: Vec<ClusterInfo>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterDetailRequest {
+    pub cluster_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterDetailResponse {
+    pub cluster: ClusterInfo,
+    pub members: Vec<ClusterMember>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterCreateRequest {
+    pub name: String,
+    pub description: Option<String>,
+    /// "distributed" | "replicated" | "primary_replica".
+    pub strategy: String,
+    pub failover_enabled: bool,
+    pub failover_target: Option<String>,
+    pub health_check_interval_ms: u32,
+    pub timeout_ms: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterCreateResponse {
+    pub cluster_id: String,
+}
+
+/// Partial-update request: `None` leaves the current value untouched server-side.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ClusterUpdateRequest {
     pub cluster_id: String,
-    pub name: String,
+    pub name: Option<String>,
     pub description: Option<String>,
+    pub strategy: Option<String>,
+    pub failover_enabled: Option<bool>,
+    pub failover_target: Option<String>,
+    pub health_check_interval_ms: Option<u32>,
+    pub timeout_ms: Option<u32>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ClusterUpdateResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterDeleteRequest {
     pub cluster_id: String,
-    pub updated_at_epoch: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterDeleteResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterAddMemberRequest {
+    pub cluster_id: String,
+    pub node_id: String,
+    pub interface_type: Option<String>,
+    pub interface_speed_mbps: Option<u32>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterAddMemberResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterRemoveMemberRequest {
+    pub cluster_id: String,
+    pub node_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterRemoveMemberResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterProbeStreamRequest {
+    pub node_ids: Vec<String>,
+}
+
+/// Single probe event. `event_type` is one of "started" | "probing_pair" |
+/// "result" | "complete"; the populated optional fields depend on it.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterProbeStreamChunk {
+    pub event_type: String,
+    pub source_node: Option<String>,
+    pub target_node: Option<String>,
+    pub success: Option<bool>,
+    pub latency_ms: Option<u32>,
+    pub bandwidth_mbps: Option<u32>,
+    pub interface_type: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ClusterProbeStreamEnd {
+    pub total_pairs: u32,
+    pub successful: u32,
+    pub failed: u32,
 }
 
 // =============================================================================
@@ -681,9 +815,24 @@ pub enum MessageBody {
     ChatStreamChunkBody(ChatStreamChunk),
     ChatStreamEndBody(ChatStreamEnd),
 
-    // ---- Cluster (W-UPDATE) ----
+    // ---- Clusters (full CRUD + member ops + probe streaming) ----
+    ClusterListRequest,
+    ClusterListResponseBody(ClusterListResponse),
+    ClusterDetailRequestBody(ClusterDetailRequest),
+    ClusterDetailResponseBody(ClusterDetailResponse),
+    ClusterCreateRequestBody(ClusterCreateRequest),
+    ClusterCreateResponseBody(ClusterCreateResponse),
     ClusterUpdateRequestBody(ClusterUpdateRequest),
     ClusterUpdateResponseBody(ClusterUpdateResponse),
+    ClusterDeleteRequestBody(ClusterDeleteRequest),
+    ClusterDeleteResponseBody(ClusterDeleteResponse),
+    ClusterAddMemberRequestBody(ClusterAddMemberRequest),
+    ClusterAddMemberResponseBody(ClusterAddMemberResponse),
+    ClusterRemoveMemberRequestBody(ClusterRemoveMemberRequest),
+    ClusterRemoveMemberResponseBody(ClusterRemoveMemberResponse),
+    ClusterProbeStreamRequestBody(ClusterProbeStreamRequest),
+    ClusterProbeStreamChunkBody(ClusterProbeStreamChunk),
+    ClusterProbeStreamEndBody(ClusterProbeStreamEnd),
 
     // ---- Mesh peers (R-LIST + W-ACTION) ----
     MeshPeersListRequest,
@@ -1082,15 +1231,17 @@ mod tests {
     fn cluster_update_round_trip() {
         let req = MessageBody::ClusterUpdateRequestBody(ClusterUpdateRequest {
             cluster_id: "dev".to_string(),
-            name: "Development".to_string(),
+            name: Some("Development".to_string()),
             description: Some("Internal cluster".to_string()),
+            strategy: None,
+            failover_enabled: Some(true),
+            failover_target: None,
+            health_check_interval_ms: Some(5000),
+            timeout_ms: Some(30000),
         });
         assert_eq!(round_trip(req.clone()), req);
 
-        let resp = MessageBody::ClusterUpdateResponseBody(ClusterUpdateResponse {
-            cluster_id: "dev".to_string(),
-            updated_at_epoch: 1_700_200_000,
-        });
+        let resp = MessageBody::ClusterUpdateResponseBody(ClusterUpdateResponse { ok: true });
         assert_eq!(round_trip(resp.clone()), resp);
     }
 
