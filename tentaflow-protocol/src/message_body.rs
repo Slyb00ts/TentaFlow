@@ -446,6 +446,67 @@ pub struct AuditEvent {
     pub message: String,
 }
 
+// ----- Audit log screen (Admin only) -----
+
+/// Optional filters for audit log list/export — all fields nullable.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditLogFilters {
+    pub user_id: Option<i64>,
+    pub addon_id: Option<String>,
+    pub action: Option<String>,
+    pub from_date: Option<String>,
+    pub to_date: Option<String>,
+    pub search: Option<String>,
+}
+
+/// Single audit log row as returned to the Admin screen.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub action: String,
+    pub user_id: Option<i64>,
+    pub addon_id: Option<String>,
+    pub resource: Option<String>,
+    pub details: Option<String>,
+    pub ip_address: Option<String>,
+    pub node_id: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogListRequest {
+    pub filters: AuditLogFilters,
+    pub offset: u64,
+    pub limit: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogListResponse {
+    pub entries: Vec<AuditLogEntry>,
+    pub total_count: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogExportRequest {
+    pub filters: AuditLogFilters,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogExportResponse {
+    pub csv: String,
+    pub row_count: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogCleanupRequest {
+    pub keep_days: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AuditLogCleanupResponse {
+    pub deleted_count: u64,
+}
+
 // =============================================================================
 // Portainer — Docker container ops (migration-map #248-#259)
 // =============================================================================
@@ -1438,6 +1499,14 @@ pub enum MessageBody {
 
     // ---- Audit (event push — server -> client) ----
     AuditEventBody(AuditEvent),
+
+    // ----- Audit log -----
+    AuditLogListRequestBody(AuditLogListRequest),
+    AuditLogListResponseBody(AuditLogListResponse),
+    AuditLogExportRequestBody(AuditLogExportRequest),
+    AuditLogExportResponseBody(AuditLogExportResponse),
+    AuditLogCleanupRequestBody(AuditLogCleanupRequest),
+    AuditLogCleanupResponseBody(AuditLogCleanupResponse),
 
     // ---- Portainer (R-LIST + R-STREAM dla logs) ----
     ContainerListRequest,
