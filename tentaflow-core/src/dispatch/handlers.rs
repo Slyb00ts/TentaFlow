@@ -2638,8 +2638,8 @@ fn store_peer_to_proto(
             name: c.name.clone(),
             image: c.image.clone(),
             status: c.status.clone(),
-            cpu_percent: Some(c.cpu_percent),
-            memory_mb: Some(c.memory_mb),
+            cpu_percent: Some(c.cpu_percent as f32),
+            memory_mb: Some(c.memory_mb as f32),
             memory_limit_mb: if c.memory_limit_mb == 0 {
                 None
             } else {
