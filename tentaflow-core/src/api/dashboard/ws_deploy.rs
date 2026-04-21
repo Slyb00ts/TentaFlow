@@ -548,6 +548,46 @@ services:
     }
 
     #[test]
+    fn parse_compose_handles_gpu_none_mode_omits_reservations() {
+        // gpu_select_mode='none' w wizardzie -> generator pomija deploy.resources
+        let yaml = r#"
+services:
+  rag:
+    image: x
+    container_name: x
+    ports:
+      - "5000:5000"
+networks:
+  tentaflow-ai:
+    name: tentaflow-ai
+"#;
+        let p = parse_compose_for_bundle(yaml).expect("parse");
+        assert!(!p.gpu);
+        assert!(!p.env.contains_key("NVIDIA_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn parse_compose_specific_device_ids_multi() {
+        // gpu_select_mode='specific', gpu_ids=['1','3'] -> device_ids: ['1','3']
+        let yaml = r#"
+services:
+  llm:
+    image: x
+    container_name: x
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1', '3']
+              capabilities: [gpu]
+"#;
+        let p = parse_compose_for_bundle(yaml).expect("parse");
+        assert!(p.gpu);
+        assert_eq!(p.env.get("NVIDIA_VISIBLE_DEVICES").unwrap(), "1,3");
+    }
+
+    #[test]
     fn parse_compose_handles_gpu_all() {
         let yaml = r#"
 services:
