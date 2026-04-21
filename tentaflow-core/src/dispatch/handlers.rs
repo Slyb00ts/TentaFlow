@@ -2984,8 +2984,21 @@ pub fn models_unified_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let unified = crate::api::dashboard::api_models::collect_unified(&ctx.state.quic_mesh);
-    let models = unified
+    let mut models = unified_from_service_registry(&ctx.state.quic_mesh);
+    merge_peer_store_models(
+        &mut models,
+        &ctx.state.mesh_peer_store,
+        ctx.state.local_node_id.as_ref(),
+    );
+    Ok(MessageBody::ModelsUnifiedListResponseBody(
+        tentaflow_protocol::ModelsUnifiedListResponse { models },
+    ))
+}
+
+fn unified_from_service_registry(
+    quic_mesh: &Option<std::sync::Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
+) -> Vec<tentaflow_protocol::UnifiedModel> {
+    crate::api::dashboard::api_models::collect_unified(quic_mesh)
         .into_iter()
         .map(|m| tentaflow_protocol::UnifiedModel {
             model_name: m.model_name,
@@ -3011,10 +3024,88 @@ pub fn models_unified_list(
                 })
                 .collect(),
         })
-        .collect();
-    Ok(MessageBody::ModelsUnifiedListResponseBody(
-        tentaflow_protocol::ModelsUnifiedListResponse { models },
-    ))
+        .collect()
+}
+
+// Supplement the unified list with models cached in peer_store (populated by
+// ModelsSync broadcasts from remote nodes plus the local heartbeat task).
+// This covers the ~30s window before the first ModelsSync fires and any
+// peers whose services haven't been announced through service_registry yet.
+fn merge_peer_store_models(
+    models: &mut Vec<tentaflow_protocol::UnifiedModel>,
+    peer_store: &crate::mesh::peer_store::MeshPeerStore,
+    local_node_id: &str,
+) {
+    use std::collections::HashSet;
+    let peers = peer_store.list();
+    if peers.is_empty() {
+        return;
+    }
+
+    let mut present: HashSet<(String, String, String)> = HashSet::new();
+    for m in models.iter() {
+        for inst in m.instances.iter() {
+            present.insert((
+                m.model_name.clone(),
+                m.service_type.clone(),
+                inst.node_id.clone(),
+            ));
+        }
+    }
+
+    for peer in peers.iter() {
+        for pm in peer.models.iter() {
+            if pm.alias.is_empty() {
+                continue;
+            }
+            let key = (pm.alias.clone(), pm.kind.clone(), peer.node_id.clone());
+            if present.contains(&key) {
+                continue;
+            }
+            let hostname = if peer.hostname.is_empty() {
+                None
+            } else {
+                Some(peer.hostname.clone())
+            };
+            let service_id = if peer.node_id == local_node_id {
+                format!("local-{}-{}", pm.kind, pm.alias)
+            } else {
+                format!("peer-{}-{}", &peer.node_id, pm.alias)
+            };
+            let size_mb = if pm.size_mb > 0 { Some(pm.size_mb) } else { None };
+            let backend = if pm.backend.is_empty() {
+                None
+            } else {
+                Some(pm.backend.clone())
+            };
+            let instance = tentaflow_protocol::UnifiedModelInstance {
+                node_id: peer.node_id.clone(),
+                node_hostname: hostname,
+                service_id,
+                status: if pm.loaded {
+                    "running".to_string()
+                } else {
+                    "stopped".to_string()
+                },
+                backend,
+                size_mb,
+                loaded: pm.loaded,
+            };
+
+            let group = models
+                .iter_mut()
+                .find(|m| m.model_name == pm.alias && m.service_type == pm.kind);
+            match group {
+                Some(g) => g.instances.push(instance),
+                None => models.push(tentaflow_protocol::UnifiedModel {
+                    model_name: pm.alias.clone(),
+                    service_type: pm.kind.clone(),
+                    instances: vec![instance],
+                }),
+            }
+            present.insert(key);
+        }
+    }
 }
 
 #[handler(variant = "ModelAliasListRequest", since = (1, 0))]
