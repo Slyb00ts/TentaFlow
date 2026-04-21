@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "ai.solutio.mobile"
+    namespace = "ai.tentaflow.mobile"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "ai.solutio.mobile"
+        applicationId = "ai.tentaflow.mobile"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
