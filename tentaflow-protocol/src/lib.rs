@@ -50,6 +50,8 @@ pub use message_body::{
     MessageBody, ModelDetail, ModelInstallRequest, ModelSummary, NodeSummary, PiiRule,
     PromptDetail, PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
     ServiceCreateRequest, ServiceDeployProgress, ServiceDeployRequest, ServiceQuicStatus,
-    ServiceSummary, ServiceUpdateRequest, SettingEntry, SettingsUpdateRequest, TtsRule,
-    VoiceProfileSummary,
+    ServiceSummary, ServiceUpdateRequest, SettingEntry, SettingsUpdateRequest,
+    SsoProviderCreateRequest, SsoProviderCreateResponse, SsoProviderDeleteRequest,
+    SsoProviderDeleteResponse, SsoProviderEntry, SsoProvidersListResponse,
+    TlsStatusResponse, NgcStatusResponse, TtsRule, VoiceProfileSummary,
 };
