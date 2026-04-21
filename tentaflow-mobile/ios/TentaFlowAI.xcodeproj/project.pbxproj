@@ -17,7 +17,7 @@
 		A0000003 /* NativeDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000004 /* NativeDiscovery.swift */; };
 		A1000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* App.swift */; };
 		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* ContentView.swift */; };
-		A1000003 /* libsolutio_ai_mobile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000003 /* libsolutio_ai_mobile.a */; };
+		A1000003 /* libtentaflow_mobile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000003 /* libtentaflow_mobile.a */; };
 		A1000004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000004 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -27,11 +27,11 @@
 		A0000004 /* NativeDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeDiscovery.swift; sourceTree = "<group>"; };
 		A2000001 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		A2000003 /* libsolutio_ai_mobile.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libsolutio_ai_mobile.a; sourceTree = "<group>"; };
+		A2000003 /* libtentaflow_mobile.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libtentaflow_mobile.a; sourceTree = "<group>"; };
 		A2000004 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A2000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		A2000006 /* SolutioAI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SolutioAI-Bridging-Header.h"; sourceTree = "<group>"; };
-		A2000010 /* SolutioAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SolutioAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2000006 /* TentaFlowAI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "TentaFlowAI-Bridging-Header.h"; sourceTree = "<group>"; };
+		A2000010 /* TentaFlowAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TentaFlowAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -44,7 +44,7 @@
 				275C52502F6EBF9300AF3541 /* MLXVLM in Frameworks */,
 				275C52482F6EBF9300AF3541 /* MLXEmbedders in Frameworks */,
 				275C524C2F6EBF9300AF3541 /* MLXLMCommon in Frameworks */,
-				A1000003 /* libsolutio_ai_mobile.a in Frameworks */,
+				A1000003 /* libtentaflow_mobile.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -54,13 +54,13 @@
 		A4000001 = {
 			isa = PBXGroup;
 			children = (
-				A4000002 /* SolutioAI */,
+				A4000002 /* TentaFlowAI */,
 				A4000003 /* Products */,
 				A4000004 /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
-		A4000002 /* SolutioAI */ = {
+		A4000002 /* TentaFlowAI */ = {
 			isa = PBXGroup;
 			children = (
 				275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */,
@@ -70,15 +70,15 @@
 				A2000002 /* ContentView.swift */,
 				A2000004 /* Assets.xcassets */,
 				A2000005 /* Info.plist */,
-				A2000006 /* SolutioAI-Bridging-Header.h */,
+				A2000006 /* TentaFlowAI-Bridging-Header.h */,
 			);
-			path = SolutioAI;
+			path = TentaFlowAI;
 			sourceTree = "<group>";
 		};
 		A4000003 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				A2000010 /* SolutioAI.app */,
+				A2000010 /* TentaFlowAI.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -86,7 +86,7 @@
 		A4000004 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				A2000003 /* libsolutio_ai_mobile.a */,
+				A2000003 /* libtentaflow_mobile.a */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -94,9 +94,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A5000001 /* SolutioAI */ = {
+		A5000001 /* TentaFlowAI */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = A7000001 /* Build configuration list for PBXNativeTarget "SolutioAI" */;
+			buildConfigurationList = A7000001 /* Build configuration list for PBXNativeTarget "TentaFlowAI" */;
 			buildPhases = (
 				A8000001 /* Sources */,
 				A3000001 /* Frameworks */,
@@ -106,9 +106,9 @@
 			);
 			dependencies = (
 			);
-			name = SolutioAI;
-			productName = SolutioAI;
-			productReference = A2000010 /* SolutioAI.app */;
+			name = TentaFlowAI;
+			productName = TentaFlowAI;
+			productReference = A2000010 /* TentaFlowAI.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -121,7 +121,7 @@
 				LastSwiftUpdateCheck = 1540;
 				LastUpgradeCheck = 1540;
 			};
-			buildConfigurationList = A7000002 /* Build configuration list for PBXProject "SolutioAI" */;
+			buildConfigurationList = A7000002 /* Build configuration list for PBXProject "TentaFlowAI" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -138,7 +138,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				A5000001 /* SolutioAI */,
+				A5000001 /* TentaFlowAI */,
 			);
 		};
 /* End PBXProject section */
@@ -178,7 +178,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = KZXD4ZWQ85;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = SolutioAI/Info.plist;
+				INFOPLIST_FILE = TentaFlowAI/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -192,7 +192,7 @@
 				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
-					"-lsolutio_ai_mobile",
+					"-ltentaflow_mobile",
 					"-lc++",
 					"-framework",
 					Metal,
@@ -210,10 +210,10 @@
 					SystemConfiguration,
 					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin/libclang_rt.ios.a,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = ai.solutio.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.tentaflow.mobile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SWIFT_OBJC_BRIDGING_HEADER = "SolutioAI/SolutioAI-Bridging-Header.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "TentaFlowAI/TentaFlowAI-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -227,7 +227,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = KZXD4ZWQ85;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = SolutioAI/Info.plist;
+				INFOPLIST_FILE = TentaFlowAI/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -241,7 +241,7 @@
 				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
-					"-lsolutio_ai_mobile",
+					"-ltentaflow_mobile",
 					"-lc++",
 					"-framework",
 					Metal,
@@ -259,10 +259,10 @@
 					SystemConfiguration,
 					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin/libclang_rt.ios.a,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = ai.solutio.mobile;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.tentaflow.mobile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SWIFT_OBJC_BRIDGING_HEADER = "SolutioAI/SolutioAI-Bridging-Header.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "TentaFlowAI/TentaFlowAI-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -317,7 +317,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A7000001 /* Build configuration list for PBXNativeTarget "SolutioAI" */ = {
+		A7000001 /* Build configuration list for PBXNativeTarget "TentaFlowAI" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				AB000001 /* Debug */,
@@ -326,7 +326,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		A7000002 /* Build configuration list for PBXProject "SolutioAI" */ = {
+		A7000002 /* Build configuration list for PBXProject "TentaFlowAI" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				AC000001 /* Debug */,
