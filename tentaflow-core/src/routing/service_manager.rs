@@ -1587,7 +1587,6 @@ impl ServiceManager {
                                             break;
                                         }
                                     }
-                                    continue;
                                 }
                             };
 

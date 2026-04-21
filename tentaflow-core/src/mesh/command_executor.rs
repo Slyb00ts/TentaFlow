@@ -142,7 +142,7 @@ impl MeshCommandExecutor {
             MeshCommandType::BandwidthProbe {
                 target_ip,
                 target_port,
-                rdma_port: _,
+                rdma_port,
                 bind_interface,
                 duration_ms,
                 mode,
@@ -173,8 +173,9 @@ impl MeshCommandExecutor {
                             }
                         };
 
-                        // Probuj RDMA server na osobnym porcie (jesli dostepne)
-                        let rdma_port: u16 = 0;
+                        // Server negotiates its own RDMA listener port locally; it's a different
+                        // value from the caller-supplied `rdma_port` (which is a client-side hint).
+                        let mut server_rdma_port: u16 = 0;
                         #[cfg(feature = "rdma-probe")]
                         if let Some(rdma_dev) =
                             crate::mesh::rdma_probe::find_rdma_device_for_interface(&bind_interface)
@@ -188,7 +189,7 @@ impl MeshCommandExecutor {
                             .await
                             {
                                 Ok((port, handle)) => {
-                                    rdma_port = port;
+                                    server_rdma_port = port;
                                     tokio::spawn(async move {
                                         let _ = handle.await;
                                     });
@@ -212,7 +213,7 @@ impl MeshCommandExecutor {
                             success: true,
                             output: serde_json::json!({
                                 "port": tcp_port,
-                                "rdma_port": rdma_port,
+                                "rdma_port": server_rdma_port,
                             })
                             .to_string(),
                             error: None,

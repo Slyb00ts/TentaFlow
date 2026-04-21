@@ -453,7 +453,6 @@ impl IrohMeshManager {
             .open_uni()
             .await
             .map_err(|e| anyhow::anyhow!("open_uni: {e}"))?;
-        use tokio::io::AsyncWriteExt;
         send.write_all(&[discriminant])
             .await
             .map_err(|e| anyhow::anyhow!("write discriminant: {e}"))?;
@@ -632,7 +631,6 @@ impl IrohMeshManager {
                 .open_bi()
                 .await
                 .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-            use tokio::io::AsyncWriteExt;
             send.write_all(&[tentaflow_protocol::mesh::MESH_MSG_FORWARD_REQ])
                 .await
                 .map_err(|e| anyhow::anyhow!("write disc: {e}"))?;
@@ -893,7 +891,6 @@ impl IrohMeshManagerRef {
         remote_hex: String,
         mut recv: iroh::endpoint::RecvStream,
     ) -> Result<(), IrohStreamError> {
-        use tokio::io::AsyncReadExt;
         let mut disc = [0u8; 1];
         recv.read_exact(&mut disc)
             .await

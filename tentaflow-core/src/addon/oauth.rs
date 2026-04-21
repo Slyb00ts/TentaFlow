@@ -7,7 +7,6 @@
 //       z manifestu addonu.
 // =============================================================================
 
-use anyhow::{Context, Result};
 use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

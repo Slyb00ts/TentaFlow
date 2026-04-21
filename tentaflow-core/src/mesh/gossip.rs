@@ -423,7 +423,7 @@ impl GossipEngine {
                 let selected: Vec<_> = {
                     let mut rng = rand::rng();
                     targets
-                        .choose_multiple(&mut rng, config.fanout.min(targets.len()))
+                        .sample(&mut rng, config.fanout.min(targets.len()))
                         .copied()
                         .collect()
                 };

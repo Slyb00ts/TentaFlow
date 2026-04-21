@@ -14,7 +14,6 @@ use std::sync::Arc;
 use iroh::endpoint::Connection;
 use iroh::protocol::ProtocolHandler;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::mesh::security::MeshSecurity;

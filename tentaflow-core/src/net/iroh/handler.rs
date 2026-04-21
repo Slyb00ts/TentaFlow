@@ -58,7 +58,6 @@ pub async fn write_envelope(
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(IrohStreamError::FrameTooLarge(bytes.len()));
     }
-    use tokio::io::AsyncWriteExt;
     send.write_all(&(bytes.len() as u32).to_be_bytes())
         .await
         .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
@@ -72,7 +71,6 @@ pub async fn write_envelope(
 pub async fn read_envelope_and_body(
     recv: &mut RecvStream,
 ) -> Result<(Envelope, MessageBody), IrohStreamError> {
-    use tokio::io::AsyncReadExt;
     let mut len_bytes = [0u8; 4];
     recv.read_exact(&mut len_bytes)
         .await

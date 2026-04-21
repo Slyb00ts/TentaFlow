@@ -5,8 +5,8 @@
 
 use super::{
     api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_fast_path, api_flows,
-    api_hub, api_mesh, api_models, api_pii_rules, api_prompts, api_registries, api_services,
-    api_tts_rules, auth, static_files,
+    api_hub, api_models, api_pii_rules, api_prompts, api_registries, api_services, api_tts_rules,
+    auth, static_files,
 };
 use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
@@ -902,18 +902,7 @@ pub async fn handle_request(
     // Mesh API — pozostale write paths (pairing/trust/connect/command/network-config).
     // Read paths przeniesione do binarnego protokolu (FAZA 1a).
     if path.starts_with("/api/mesh/") {
-        let (status, response_body) = route_mesh_api(
-            &method,
-            &path,
-            &db,
-            &mesh_peer_store,
-            &mesh_security,
-            &quic_mesh,
-            &local_node_id,
-            &body_bytes,
-            &claims,
-        )
-        .await;
+        let (status, response_body) = route_mesh_api().await;
         return Ok(json_response_cors(
             status,
             response_body,
@@ -1103,10 +1092,8 @@ pub async fn handle_request(
         let (status, response_body) = route_addon_system_api(
             &method,
             &path,
-            &query_string,
             &db,
             &claims,
-            &cipher,
             &body_bytes,
             &permission_checker,
             Some(&router),
@@ -1305,7 +1292,6 @@ pub async fn handle_request(
         &db,
         &claims,
         &body_bytes,
-        &settings_cipher,
     );
 
     Ok(json_response_cors(
@@ -1357,7 +1343,6 @@ fn route_api(
     db: &DbPool,
     claims: &auth::Claims,
     body: &[u8],
-    settings_cipher: &Arc<crate::crypto::SettingsCipher>,
 ) -> (u16, String) {
     match (method, path) {
         // Auth
@@ -1851,10 +1836,8 @@ async fn route_hub_api(
 fn route_addon_system_api(
     method: &Method,
     path: &str,
-    query: &str,
     db: &DbPool,
     claims: &auth::Claims,
-    cipher: &Arc<crate::crypto::SecretsCipher>,
     body: &[u8],
     permission_checker: &Option<Arc<crate::addon::permissions::PermissionChecker>>,
     router: Option<&Arc<Router>>,
@@ -2170,32 +2153,10 @@ fn extract_ws_user_session(
 
 /// Routing endpointow mesh — peers, parowanie, zaufanie, nody, serwisy, komendy
 /// VULN-031: Mutujace endpointy (pair, trust) wymagaja uprawnien administratora
-async fn route_mesh_api(
-    method: &Method,
-    path: &str,
-    db: &DbPool,
-    mesh_peer_store: &MeshPeerStore,
-    mesh_security: &Option<Arc<crate::mesh::security::MeshSecurity>>,
-    quic_mesh: &Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
-    local_node_id: &str,
-    body: &[u8],
-    claims: &auth::Claims,
-) -> (u16, String) {
-    // FAZA 1a: nodes/pending/identity/services/peers/trusted przeniesione do
-    // binary (MeshNodeListRequest / MeshNodeDetailRequest / ...).
-    // FAZA 1b: pairing/trust/connect/command/network-config przeniesione
-    // do async binary handlers (patrz dispatch/mesh_write_handlers.rs).
-    // W tym module REST-route nie obsluguje juz zadnych endpointow mesh.
-    let _ = (
-        db,
-        mesh_peer_store,
-        mesh_security,
-        quic_mesh,
-        local_node_id,
-        body,
-        claims,
-    );
-
+async fn route_mesh_api() -> (u16, String) {
+    // All /api/mesh/* paths are served by the binary protocol dispatcher
+    // (see dispatch/mesh_write_handlers.rs). REST hits here only for legacy
+    // URLs and returns 404.
     (
         404,
         serde_json::json!({"error": "Nieznany endpoint mesh"}).to_string(),
