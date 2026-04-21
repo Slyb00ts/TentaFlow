@@ -1236,6 +1236,12 @@ pub struct UnifiedModelInstance {
     pub node_hostname: Option<String>,
     pub service_id: String,
     pub status: String,
+    /// Engine serving the model (e.g. "llama-cpp", "vllm", "mlx", "whisper-rs").
+    pub backend: Option<String>,
+    /// Model weights size in MB when known.
+    pub size_mb: Option<u64>,
+    /// Convenience flag mirroring "status is running/ready".
+    pub loaded: bool,
 }
 
 /// Unified model entry aggregating instances across mesh nodes.
