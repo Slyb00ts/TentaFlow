@@ -179,6 +179,13 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
+    /// Odkryty nowy peer przez mDNS/DHT — wypala zanim zaczniemy dial.
+    /// Pipeline pisze do peer_store z source=discovered zeby UI widzial peera
+    /// nawet gdy dial nie zdazyl wypalic.
+    PeerDiscovered {
+        node_id: String,
+        addresses: Vec<std::net::SocketAddr>,
+    },
 }
 
 /// Aktywne polaczenie zalogowane przez manager.
@@ -296,10 +303,16 @@ impl IrohMeshManager {
                         if peer_hex == self_hex {
                             continue;
                         }
+                        let addresses: Vec<std::net::SocketAddr> =
+                            endpoint_info.data.ip_addrs().copied().collect();
+                        let _ = self_arc.event_tx.send(IrohMeshEvent::PeerDiscovered {
+                            node_id: peer_hex.clone(),
+                            addresses: addresses.clone(),
+                        });
                         if self_arc.is_connected(&peer_hex).await {
                             continue;
                         }
-                        info!(peer = %peer_hex, "iroh_mesh: odkryty nowy peer na LAN — dial");
+                        info!(peer = %peer_hex, addrs = ?addresses, "iroh_mesh: odkryty nowy peer — dial");
                         let me = Arc::clone(&self_arc);
                         tokio::spawn(async move {
                             let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));

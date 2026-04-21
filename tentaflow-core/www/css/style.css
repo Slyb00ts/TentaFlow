@@ -987,6 +987,22 @@ input, textarea, select {
 }
 .meta-item .icon { width: 13px; height: 13px; color: var(--accent-2); flex-shrink: 0; margin-top: 2px; }
 .meta-item strong { color: var(--text); font-weight: 600; }
+
+/* Pairing PIN display */
+.pair-pin-display { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 12px 4px; }
+.pair-pin-hint { font-size: 12px; color: var(--text-2); text-align: center; line-height: 1.5; }
+.pair-pin-value {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 42px; font-weight: 700; letter-spacing: 6px;
+  color: var(--accent-1, #818cf8);
+  background: rgba(99,102,241,0.08);
+  border: 1px dashed rgba(99,102,241,0.4);
+  border-radius: 10px;
+  padding: 16px 24px;
+  user-select: all;
+}
+.pair-pin-timer { font-size: 13px; color: var(--warning, #f59e0b); font-weight: 600; }
+.pair-pin-steps { font-size: 11px; color: var(--text-3); text-align: center; line-height: 1.6; white-space: pre-line; }
 .meta-item.warning-meta { color: var(--warning); }
 .meta-item.warning-meta .icon { color: var(--warning); }
 

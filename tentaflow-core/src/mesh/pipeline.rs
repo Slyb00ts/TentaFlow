@@ -912,6 +912,23 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
+                Ok(IrohMeshEvent::PeerDiscovered { node_id, addresses }) => {
+                    // mDNS/DHT zobaczylo peera. Jesli peer juz polaczony, NodeInfo
+                    // jest zrodlem prawdy — nie nadpisujemy. Inaczej dodaj do
+                    // peer_store zeby UI pokazal go jako "discovered" (dashed
+                    // pending card), nawet jesli dial jeszcze nie wypalil.
+                    if node_id == local_node_id {
+                        continue;
+                    }
+                    if peer_store.is_quic_connected(&node_id) {
+                        continue;
+                    }
+                    let ips: Vec<std::net::IpAddr> =
+                        addresses.iter().map(|sa| sa.ip()).collect();
+                    peer_store.set_addresses(&node_id, ips);
+                    peer_store.set_status(&node_id, "discovered");
+                    debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!("Event receiver opuscil {} wiadomosci", n);
