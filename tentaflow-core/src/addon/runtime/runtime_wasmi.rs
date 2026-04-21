@@ -134,14 +134,18 @@ pub fn create_linker(engine: &WasmEngine) -> WasmLinker<AddonState> {
     WasmLinker::new(engine)
 }
 
-/// Instancjacja modulu WASM w podanym store — wasmi wymaga ensure_no_start
+/// Instancjacja modulu WASM w podanym store.
+///
+/// wasmi 1.0.x eksportuje tylko `instantiate_and_start` — nie ma publicznego
+/// `InstancePre`/`ensure_no_start` jak w 0.x, ani jak w Wasmtime. Jesli modul
+/// ma funkcje `_start`, zostanie uruchomiona. Addony TentaFlow powinny
+/// eksportowac funkcje wywolywane na zadanie, wiec `_start` nie jest oczekiwany.
 pub fn instantiate(
     linker: &WasmLinker<AddonState>,
     store: &mut WasmStore<AddonState>,
     module: &WasmModule,
 ) -> Result<WasmInstance> {
     linker
-        .instantiate(&mut *store, module)
-        .and_then(|i| Ok(i.ensure_no_start(store)?))
+        .instantiate_and_start(&mut *store, module)
         .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc instancji WASM: {}", e))
 }
