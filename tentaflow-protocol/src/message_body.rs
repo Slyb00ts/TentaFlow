@@ -717,6 +717,7 @@ pub struct MeshNodeInfo {
     pub containers: Vec<MeshNodeContainer>,
     pub last_seen_epoch: Option<i64>,
     pub route: Option<MeshNodeRoute>,
+    pub platform: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]

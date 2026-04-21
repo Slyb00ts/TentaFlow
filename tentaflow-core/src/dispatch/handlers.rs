@@ -2683,6 +2683,7 @@ fn store_peer_to_proto(
         containers,
         last_seen_epoch: Some(parse_ts(&p.discovered_at) as i64),
         route,
+        platform: p.platform.clone(),
     }
 }
 
@@ -2776,6 +2777,7 @@ pub fn mesh_node_list(
             containers: Vec::new(),
             last_seen_epoch: None,
             route: None,
+            platform: String::new(),
         });
     }
 
