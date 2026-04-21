@@ -2970,7 +2970,15 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     }
                     set(&inst, "serviceId", i.service_id.clone().into());
                     set(&inst, "service_id", i.service_id.into());
-                    set(&inst, "status", i.status.into());
+                    set(&inst, "status", i.status.clone().into());
+                    if let Some(ref b) = i.backend {
+                        set(&inst, "backend", b.clone().into());
+                    }
+                    if let Some(s) = i.size_mb {
+                        set(&inst, "sizeMb", (s as f64).into());
+                        set(&inst, "size_mb", (s as f64).into());
+                    }
+                    set(&inst, "loaded", i.loaded.into());
                     instances.push(&inst.into());
                 }
                 set(&item, "instances", instances.into());
