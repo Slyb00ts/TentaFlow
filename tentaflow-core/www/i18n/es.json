@@ -1576,7 +1576,21 @@
     "deployFailed": "Despliegue fallido: {error}",
     "engineNotFound": "Motor \"{id}\" no existe en el manifiesto",
     "recommended": "Recomendado",
-    "targetNode": "Nodo destino"
+    "targetNode": "Nodo destino",
+    "step_gpu": "GPUs",
+    "gpu_title": "Seleccionar GPUs en {node}",
+    "gpu_subtitle": "Elige qué GPUs usará este despliegue en el nodo seleccionado.",
+    "gpu_mode_all": "Usar todas las GPUs ({n})",
+    "gpu_mode_specific": "Elegir GPUs específicas",
+    "gpu_mode_none": "No usar GPU (solo CPU)",
+    "gpu_mode_all_hint": "Expone todas las GPUs visibles al contenedor.",
+    "gpu_mode_specific_hint": "Solo se pasarán los índices de GPU seleccionados.",
+    "gpu_mode_none_hint": "El contenedor se ejecuta en CPU; no se reservarán recursos de GPU.",
+    "gpu_empty_on_node": "Este nodo no reporta ninguna GPU.",
+    "gpu_select_at_least_one": "Selecciona al menos una GPU o elige otro modo.",
+    "gpu_summary_specific": "Seleccionadas {n} GPU(s) · {total_vram} VRAM total",
+    "gpu_summary_all": "Se usarán todas las GPUs del nodo",
+    "gpu_summary_none": "No se usará GPU"
   },
   "category": {
     "llm": "Modelos de lenguaje (LLM)",
