@@ -170,7 +170,8 @@ async function renderApp() {
   const initials = (me?.username ?? '?').slice(0, 2).toUpperCase();
 
   function paint() {
-    const nav = isAdmin ? ADMIN_NAV : USER_NAV;
+    // Admin sees their admin nav plus the user-facing apps appended — admin is a superset of user.
+    const nav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
     const userClass = isAdmin ? 'admin' : 'user';
     const roleLabel = I18n.t(isAdmin ? 'role.administrator' : 'role.user');
     const logoutLabel = I18n.t('nav.logout');
