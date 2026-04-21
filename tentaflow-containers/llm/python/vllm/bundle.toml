@@ -41,6 +41,6 @@ extras = []
 install_hint = "VLLM_TARGET_DEVICE=rocm"
 
 [[install_variants]]
-backend = "metal"
-extras = ["vllm-metal"]
-install_hint = "VLLM_TARGET_DEVICE=metal"
+backend = "mlx"
+extras = ["mlx-lm", "mlx"]
+install_hint = "VLLM_TARGET_DEVICE=mlx"
