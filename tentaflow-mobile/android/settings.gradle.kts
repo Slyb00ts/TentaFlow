@@ -13,5 +13,5 @@ dependencyResolution {
     }
 }
 
-rootProject.name = "SolutioAI"
+rootProject.name = "TentaFlowAI"
 include(":app")
