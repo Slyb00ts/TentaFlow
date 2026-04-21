@@ -68,7 +68,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
-    collector.start().await;
+    collector.start(shutdown_tx.subscribe()).await;
 
     // Identyfikator wezla
     // Persystentny node_id — generowany raz i zapisywany w bazie
