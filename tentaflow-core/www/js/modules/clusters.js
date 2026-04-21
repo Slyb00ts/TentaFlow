@@ -87,7 +87,7 @@ function stopRefresh() {
 async function loadAll() {
   try {
     // Klastry idą binarnie; mesh nodes pozostaje na REST (brak binarnego odpowiednika
-    // dla pełnych info o nodach: gpu_info, network_interfaces, ram_total_mb itp.).
+    // dla pełnych info o nodach: gpus, network_interfaces, ram_total_mb itp.).
     const [clustersBody, nodesResp] = await Promise.all([
       ApiBinary.one('clusterListRequest').catch(() => null),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
@@ -258,7 +258,7 @@ function aggregateMetrics(members) {
   // VRAM — suma po wszystkich GPU na wszystkich nodach
   let vramUsed = 0, vramTotal = 0, gpuCount = 0, gpuUsageSum = 0, gpuUsageCnt = 0;
   for (const x of live) {
-    const gpus = Array.isArray(x.gpu_info) ? x.gpu_info : [];
+    const gpus = Array.isArray(x.gpus) ? x.gpus : [];
     for (const g of gpus) {
       if (g.vram_used_mb) vramUsed += g.vram_used_mb;
       if (g.vram_total_mb) vramTotal += g.vram_total_mb;

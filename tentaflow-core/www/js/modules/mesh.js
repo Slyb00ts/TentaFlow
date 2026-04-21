@@ -347,7 +347,7 @@ function buildGauges(node) {
   }
 
   // VRAM — suma z wszystkich GPU
-  const gpus = Array.isArray(node.gpu_info) ? node.gpu_info : [];
+  const gpus = Array.isArray(node.gpus) ? node.gpus : [];
   if (gpus.length > 0) {
     const vramUsed = gpus.reduce((s, x) => s + (x.vram_used_mb || 0), 0);
     const vramTotal = gpus.reduce((s, x) => s + (x.vram_total_mb || 0), 0);

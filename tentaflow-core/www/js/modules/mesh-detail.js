@@ -209,8 +209,8 @@ function buildSystemInfo(n) {
   const parts = [];
   if (n.os_info) parts.push(escapeHtml(n.os_info));
   if (n.docker_version) parts.push(`Docker ${escapeHtml(n.docker_version)}`);
-  const gpuSummary = Array.isArray(n.gpu_info) && n.gpu_info.length > 0
-    ? n.gpu_info.map(g => g.name).filter(Boolean).join(', ')
+  const gpuSummary = Array.isArray(n.gpus) && n.gpus.length > 0
+    ? n.gpus.map(g => g.name).filter(Boolean).join(', ')
     : null;
   if (gpuSummary) parts.push(escapeHtml(gpuSummary));
   if (parts.length === 0) return '<span class="muted">—</span>';
@@ -218,7 +218,7 @@ function buildSystemInfo(n) {
 }
 
 function buildVramSummary(n) {
-  const gpus = Array.isArray(n.gpu_info) ? n.gpu_info : [];
+  const gpus = Array.isArray(n.gpus) ? n.gpus : [];
   if (gpus.length === 0) {
     return `<div class="mesh-detail-vram muted">${escapeHtml(I18n.t('mesh.no_gpu'))}</div>`;
   }
@@ -285,7 +285,7 @@ function buildCpuMemory(n) {
 }
 
 function buildGpuCards(n) {
-  const gpus = Array.isArray(n.gpu_info) ? n.gpu_info : [];
+  const gpus = Array.isArray(n.gpus) ? n.gpus : [];
   if (gpus.length === 0) return '';
   const cards = gpus.map((g, idx) => {
     const usage = g.usage_percent ?? 0;
