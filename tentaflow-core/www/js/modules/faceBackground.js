@@ -237,6 +237,7 @@ const state = {
   orientationSetupHandler: null,
   orientationSetupAttempted: false,
   betaBaseline: null,
+  gammaBaseline: null,
   scaleMul: DESKTOP_SCALE_MUL,
   // Flaga aktywna podczas animacji przejścia login → main UI. Wyłącza
   // planowanie nowych idle-akcji w tickIdle, żeby mimika była spokojna
@@ -960,20 +961,48 @@ function handleDeviceOrientation(e) {
   const betaRaw = e.beta;
   if (gammaRaw == null || betaRaw == null) return;
 
-  if (state.betaBaseline === null) {
-    state.betaBaseline = betaRaw;
+  if (state.betaBaseline === null) state.betaBaseline = betaRaw;
+  if (state.gammaBaseline === null) state.gammaBaseline = gammaRaw;
+
+  const gDelta = gammaRaw - state.gammaBaseline;
+  const bDelta = betaRaw - state.betaBaseline;
+
+  // Przeliczenie gamma/beta (zwracane w SPACE URZADZENIA) na yaw/pitch
+  // ekranu z uwzglednieniem orientacji. W portrecie gamma = roll poziomy
+  // (yaw), beta = tilt pionowy (pitch). W landscape sa zamienione.
+  const angle = (typeof screen !== 'undefined' && screen.orientation)
+    ? screen.orientation.angle
+    : (window.orientation || 0);
+
+  let yawRaw;
+  let pitchRaw;
+  if (angle === 90) {
+    // Landscape (home button po prawej) — osie zamienione i z innymi znakami
+    yawRaw = -bDelta;
+    pitchRaw = gDelta;
+  } else if (angle === -90 || angle === 270) {
+    // Landscape (home button po lewej)
+    yawRaw = bDelta;
+    pitchRaw = -gDelta;
+  } else if (angle === 180) {
+    // Upside-down portrait
+    yawRaw = -gDelta;
+    pitchRaw = -bDelta;
+  } else {
+    // Portrait (domyslnie)
+    yawRaw = gDelta;
+    pitchRaw = bDelta;
   }
 
-  let gamma = gammaRaw;
-  if (gamma < -GYRO_GAMMA_RANGE) gamma = -GYRO_GAMMA_RANGE;
-  else if (gamma > GYRO_GAMMA_RANGE) gamma = GYRO_GAMMA_RANGE;
+  const clampG = (v) => Math.max(-GYRO_GAMMA_RANGE, Math.min(GYRO_GAMMA_RANGE, v));
+  const clampB = (v) => Math.max(-GYRO_BETA_RANGE, Math.min(GYRO_BETA_RANGE, v));
+  yawRaw = clampG(yawRaw);
+  pitchRaw = clampB(pitchRaw);
 
-  let betaDelta = betaRaw - state.betaBaseline;
-  if (betaDelta < -GYRO_BETA_RANGE) betaDelta = -GYRO_BETA_RANGE;
-  else if (betaDelta > GYRO_BETA_RANGE) betaDelta = GYRO_BETA_RANGE;
-
-  state.targetYaw = (gamma / GYRO_GAMMA_RANGE) * GYRO_YAW_GAIN;
-  state.targetPitch = -(betaDelta / GYRO_BETA_RANGE) * GYRO_PITCH_GAIN;
+  // Znaki: tilt telefonu w lewo (patrzac widza) = twarz patrzy w lewo
+  // (mirror), tilt do siebie (top bliżej widza) = twarz patrzy w dol.
+  state.targetYaw = -(yawRaw / GYRO_GAMMA_RANGE) * GYRO_YAW_GAIN;
+  state.targetPitch = (pitchRaw / GYRO_BETA_RANGE) * GYRO_PITCH_GAIN;
 }
 
 // Dopina listener orientation po uzyskaniu permission (iOS) albo bezpośrednio
@@ -1123,6 +1152,7 @@ export const FaceBackground = {
     state.parallaxPitch = 0;
     state.orientationSetupAttempted = false;
     state.betaBaseline = null;
+    state.gammaBaseline = null;
     state.shakeT0 = null;
     state.shakeDuration = 0.8;
     state.scaleMul = isMobileViewport() ? MOBILE_SCALE_MUL : DESKTOP_SCALE_MUL;
@@ -1140,13 +1170,18 @@ export const FaceBackground = {
     window.addEventListener('resize', state.resizeHandler);
 
     if (!state.reducedMotion) {
-      if (isMobileViewport()) {
-        // Mobile: parallax z żyroskopu (wymaga user gesture na iOS dla permission).
+      // Zyroskop probujemy zawsze — iPad w trybie desktop nie matchuje
+      // pointer:coarse ani wąskiego viewportu, ale dalej ma DeviceOrientationEvent.
+      // Android i starsze iOS: listener dopina się od razu. iOS 13+: czeka na
+      // permission po pierwszym tapnięciu.
+      if (typeof window !== 'undefined' && typeof DeviceOrientationEvent !== 'undefined') {
         setupDeviceOrientation();
-      } else {
-        state.mouseHandler = handleMouseMove;
-        window.addEventListener('mousemove', state.mouseHandler);
       }
+      // Mouse handler rownolegle — na desktop pracuje, na mobile bez myszki
+      // nie strzela eventow. Nie szkodzi, bo targetYaw/Pitch i tak overrideuje
+      // ostatnio aktywne zrodlo wartosci.
+      state.mouseHandler = handleMouseMove;
+      window.addEventListener('mousemove', state.mouseHandler);
       state.visibilityHandler = handleVisibilityChange;
       document.addEventListener('visibilitychange', state.visibilityHandler);
       startLoop();
@@ -1210,11 +1245,11 @@ export const FaceBackground = {
       : [0];
 
     const scaleStart = state.scaleMul;
-    // scaleEnd=13: UI zaczyna przy ~0.022 (vs 0.029 przy 10) — mniejsze, zeby
-    // w caosci zmiescilo sie w tęczówce na starcie. Twarz rośnie wtedy
-    // wiekszaniej, ale w ostatnich 30% i tak fade-outuje wiec wizualnie bez
-    // roznicy na koncu.
-    const scaleEnd = 13;
+    // scaleEnd=13 na desktopie, 18 na mobile (9:16 portret wymaga wiekszego
+    // zoomu zeby UI zmiescilo sie w tęczówce na starcie — na desktopie 13
+    // wystarcza). Twarz w ostatnich 30% fade-outuje wiec wizualnie bez roznicy.
+    const isMobile = isMobileViewport();
+    const scaleEnd = isMobile ? 18 : 13;
     const DURATION = 2600;
     const FADE_START_T = 0.7;
     // Niewielki offset UI na prawo i w dol — srodek wykrytych vertices oka
@@ -1271,6 +1306,10 @@ export const FaceBackground = {
           uiRoot.classList.add('is-emerging');
         }
         uiRoot.style.setProperty('--tf-ui-scale', uiScale.toFixed(4));
+        // Opacity fade-in: szybciej niz scale, zeby UI stal sie widoczny juz
+        // w pierwszych klatkach animacji (mnoznik 5 → pelna alfa przy uiScale ≈ 0.2).
+        const uiOpacity = Math.min(1, uiScale * 5);
+        uiRoot.style.setProperty('--tf-ui-opacity', uiOpacity.toFixed(3));
         // Offset interpoluje od pelnej wartosci (gdy UI male, offset w px jest
         // proporcjonalnie duzy wzgledem rozmiaru UI) do zera (gdy UI wypelnia
         // viewport i powinno byc wycentrowane). Liniowo z (1 - uiScale).
@@ -1301,6 +1340,7 @@ export const FaceBackground = {
         if (uiRoot) {
           uiRoot.classList.remove('is-emerging');
           uiRoot.style.removeProperty('--tf-ui-scale');
+          uiRoot.style.removeProperty('--tf-ui-opacity');
           uiRoot.style.removeProperty('--tf-ui-offset-x');
           uiRoot.style.removeProperty('--tf-ui-offset-y');
         }
@@ -1356,6 +1396,7 @@ export const FaceBackground = {
     }
     state.orientationSetupAttempted = false;
     state.betaBaseline = null;
+    state.gammaBaseline = null;
     if (state.visibilityHandler) {
       document.removeEventListener('visibilitychange', state.visibilityHandler);
       state.visibilityHandler = null;

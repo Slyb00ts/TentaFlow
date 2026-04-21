@@ -2,7 +2,7 @@
 // Plik: modules/services.js
 // Opis: Ekran Services — 3 zakladki (tf-tabs underline):
 //       1) Lista   — tabela deployowanych serwisow z auto-refresh 5s
-//       2) Aliasy  — CRUD aliasow modeli (/api/model-aliases), edycja w tf-window
+//       2) Aliasy  — CRUD aliasow modeli (binary: modelAlias*Request), edycja w tf-window
 //       3) Modele  — zbiorcza lista modeli ze wszystkich nodow mesh
 //      "Nowy serwis" otwiera Catalog (target picker → wizard). Edycja aliasu
 //      oraz potwierdzenia usuwania korzystaja z komponentu <tf-window>.
@@ -10,7 +10,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, formatDate, apiGet, apiPost, apiDelete } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
@@ -19,6 +19,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 let services = [];
 let aliases = [];
 let meshNodes = [];
+let unifiedModels = [];
 let quicStatusMap = {};
 let refreshTimer = null;
 let quicTimer = null;
@@ -43,7 +44,7 @@ const ServicesScreen = {
         </div>
       </div>
 
-      <tf-tabs variant="underline" value="list" id="svc-tabs">
+      <tf-tabs variant="underline" value="${currentTab}" id="svc-tabs">
         <tf-tab id="list" icon="services" count="0">${escapeHtml(I18n.t('services.tab_list'))}</tf-tab>
         <tf-tab id="aliases" icon="share" count="0">${escapeHtml(I18n.t('services.tab_aliases'))}</tf-tab>
         <tf-tab id="models" icon="model" count="0">${escapeHtml(I18n.t('services.tab_models'))}</tf-tab>
@@ -70,6 +71,7 @@ const ServicesScreen = {
     services = [];
     aliases = [];
     meshNodes = [];
+    unifiedModels = [];
     quicStatusMap = {};
   },
 };
@@ -78,14 +80,19 @@ const ServicesScreen = {
 
 async function loadAll() {
   try {
-    const [svc, al, nodes] = await Promise.all([
+    const [svc, al, nodes, unified] = await Promise.all([
       ApiBinary.list('serviceListRequest').catch(() => []),
-      apiGet('/api/model-aliases').catch(() => []),
-      apiGet('/api/mesh/nodes').catch(() => []),
+      ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
+      ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
+      ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
     ]);
     services = svc || [];
     aliases = al || [];
     meshNodes = nodes || [];
+    unifiedModels = Array.isArray(unified) ? unified : [];
+    // Lokalny service_registry jest swiezy — /api/mesh/nodes nie ma modeli
+    // lokalnego noda az heartbeat nie ustabilizuje sie. Mergujemy z modelsUnifiedListRequest.
+    mergeUnifiedModelsIntoNodes();
     renderTab();
     updateSubtitle();
     updateTabCounts();
@@ -101,10 +108,16 @@ async function loadForCurrentTab() {
       services = await ApiBinary.list('serviceListRequest');
       patchListTab();
     } else if (currentTab === 'aliases') {
-      aliases = await apiGet('/api/model-aliases');
+      aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
       patchAliasesTab();
     } else if (currentTab === 'models') {
-      meshNodes = await apiGet('/api/mesh/nodes');
+      const [nodes, unified] = await Promise.all([
+        ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
+        ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ]);
+      meshNodes = nodes || [];
+      unifiedModels = Array.isArray(unified) ? unified : [];
+      mergeUnifiedModelsIntoNodes();
       patchModelsTab();
     }
     updateSubtitle();
@@ -293,9 +306,15 @@ function updateQuicDots() {
 // ---- Aliases tab ----------------------------------------------------------
 
 function renderAliasesTab() {
+  const title = escapeHtml(I18n.t('services.aliases_info_title'));
+  // Strzalka w tresci jako ikona zamiast znaku → — ladniejsze wyrownanie
+  // wertykalne, spojne z innymi strzalkami w UI.
+  const arrowIcon = '<svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:-1px;margin:0 4px;color:var(--accent-2)"><use href="#i-chevron-right"/></svg>';
+  const body = escapeHtml(I18n.t('services.aliases_info_body')).replace('→', arrowIcon);
   return `
     <div class="info-card">
-      <div>${sprite('info')}<strong>${escapeHtml(I18n.t('services.aliases_info_title'))}</strong> — ${escapeHtml(I18n.t('services.aliases_info_body'))}</div>
+      ${sprite('info')}
+      <div><strong>${title}</strong> — ${body}</div>
     </div>
     ${aliases.length === 0 ? `
       <div class="empty-big">
@@ -348,6 +367,46 @@ function renderAliasRow(a) {
 }
 
 // ---- Models tab -----------------------------------------------------------
+
+// Dokleja modele z modelsUnifiedListRequest do odpowiednich nodow w meshNodes —
+// konieczne, bo /api/mesh/nodes nie zawsze ma modele lokalnego noda (peer_store
+// aktualizuje sie dopiero po heartbeat). Dedup po aliasie.
+function mergeUnifiedModelsIntoNodes() {
+  if (!Array.isArray(unifiedModels) || unifiedModels.length === 0) return;
+  const byNode = new Map();
+  for (const m of unifiedModels) {
+    const alias = m.model_name || m.alias;
+    const kind = m.service_type || m.kind;
+    if (!alias) continue;
+    const instances = Array.isArray(m.instances) ? m.instances : [];
+    for (const inst of instances) {
+      const nid = inst.node_id;
+      if (!nid) continue;
+      if (!byNode.has(nid)) byNode.set(nid, []);
+      byNode.get(nid).push({
+        alias,
+        kind,
+        backend: inst.backend || m.backend || '',
+        size_mb: inst.size_mb || m.size_mb || 0,
+        loaded: inst.status === 'running' || inst.status === 'ready',
+      });
+    }
+  }
+  for (const node of meshNodes) {
+    const extra = byNode.get(node.node_id);
+    if (!extra || extra.length === 0) continue;
+    const existing = Array.isArray(node.models) ? node.models.slice() : [];
+    const seen = new Set(existing.map((m) => m.alias).filter(Boolean));
+    for (const m of extra) {
+      if (!seen.has(m.alias)) {
+        existing.push(m);
+        seen.add(m.alias);
+      }
+    }
+    node.models = existing;
+  }
+}
+
 
 function collectUniqueModels() {
   // Zbiera z meshNodes[].models[] — grupuj po kluczu (alias|backend|kind).
@@ -425,51 +484,90 @@ function renderModelRow(m) {
 
 // ---- Alias modal ----------------------------------------------------------
 
+function buildTargetOptionList(excludeAliasName) {
+  // Modele ze wszystkich nodow — identyfikator to alias modelu (techniczna nazwa).
+  const models = collectUniqueModels().map((m) => ({
+    value: m.alias,
+    label: m.alias + (m.backend ? ` · ${m.backend}` : '') + (m.kind ? ` (${m.kind})` : ''),
+  }));
+  // Inne aliasy — alias moze wskazywac na inny alias (chain routing), ale nie na siebie.
+  const aliasTargets = (aliases || [])
+    .filter((a) => a.alias && a.alias !== excludeAliasName)
+    .map((a) => ({
+      value: a.alias,
+      label: `${a.alias} (alias)`,
+    }));
+  const seen = new Set();
+  const out = [];
+  for (const t of [...models, ...aliasTargets]) {
+    if (seen.has(t.value)) continue;
+    seen.add(t.value);
+    out.push(t);
+  }
+  return out.sort((a, b) => a.value.localeCompare(b.value));
+}
+
 function openAliasModal(alias) {
   const isEdit = !!alias;
-  const availableTargets = collectUniqueModels().map((m) => m.alias);
+  const targets = buildTargetOptionList(alias?.alias);
 
-  // Body formularza — tf-input dla pol tekstowych, tf-select dla strategii.
+  // Stan wybranych fallback targets (backend zwraca CSV string).
+  let selectedFallbacks = [];
+  if (isEdit && alias.fallback_targets) {
+    selectedFallbacks = alias.fallback_targets
+      .split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
+  // Strategia w API: lowercase_snake (first_available | round_robin | least_loaded).
+  const currentStrategy = (alias?.strategy || 'round_robin').toLowerCase();
+  const currentTarget = alias?.target_model || '';
+
   const bodyEl = document.createElement('div');
+  bodyEl.style.display = 'flex';
+  bodyEl.style.flexDirection = 'column';
+  bodyEl.style.gap = '14px';
+
+  const targetOptionsHtml = targets.map((t) =>
+    `<option value="${escapeAttr(t.value)}">${escapeHtml(t.label)}</option>`,
+  ).join('');
+
   bodyEl.innerHTML = `
+    <tf-input
+      id="al-name"
+      label="${escapeAttr(I18n.t('services.alias_col_name'))}"
+      value="${escapeAttr(alias?.alias ?? '')}"
+      placeholder="np. llm-fast"
+      ${isEdit ? 'disabled' : ''}
+    ></tf-input>
+
     <div class="form-row">
-      <tf-input
-        id="al-name"
-        label="${escapeAttr(I18n.t('services.alias_col_name'))}"
-        value="${escapeAttr(alias?.alias ?? '')}"
-        placeholder="llm-fast"
-        ${isEdit ? 'disabled' : ''}
-      ></tf-input>
-    </div>
-    <div class="form-row">
-      <tf-input
-        id="al-target"
-        label="${escapeAttr(I18n.t('services.alias_col_target'))}"
-        value="${escapeAttr(alias?.target_model ?? '')}"
-        placeholder="llm-chat"
-      ></tf-input>
-      <datalist id="al-target-list">
-        ${availableTargets.map((t) => `<option value="${escapeAttr(t)}"></option>`).join('')}
-      </datalist>
-    </div>
-    <div class="form-row">
-      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_strategy'))}</span>
-      <tf-select id="al-strategy" value="${escapeAttr(alias?.strategy || 'FirstAvailable')}">
-        <option value="FirstAvailable">FirstAvailable</option>
-        <option value="RoundRobin">RoundRobin</option>
-        <option value="LeastLoaded">LeastLoaded</option>
+      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_target'))}</span>
+      <tf-select id="al-target" value="${escapeAttr(currentTarget)}">
+        <option value="">— ${escapeHtml(I18n.t('services.alias_target_placeholder'))} —</option>
+        ${targetOptionsHtml}
       </tf-select>
     </div>
+
     <div class="form-row">
-      <tf-input
-        id="al-fallback"
-        label="${escapeAttr(I18n.t('services.alias_col_fallback'))}"
-        value="${escapeAttr(alias?.fallback_targets ?? '')}"
-        placeholder="llm-big, llm-chat"
-        hint="${escapeAttr(I18n.t('services.alias_fallback_hint'))}"
-      ></tf-input>
+      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_strategy'))}</span>
+      <tf-select id="al-strategy" value="${escapeAttr(currentStrategy)}">
+        <option value="round_robin">${escapeHtml(I18n.t('services.strategy_round_robin'))}</option>
+        <option value="first_available">${escapeHtml(I18n.t('services.strategy_first_available'))}</option>
+        <option value="least_loaded">${escapeHtml(I18n.t('services.strategy_least_loaded'))}</option>
+      </tf-select>
     </div>
-    <div class="form-error" id="al-error" hidden style="color: var(--color-danger, #ef4444); font-size: 12px; margin-top: var(--space-2);"></div>
+
+    <div class="form-row">
+      <span class="tf-label">${escapeHtml(I18n.t('services.alias_col_fallback'))}</span>
+      <div id="al-fallback-chips" style="display:flex;flex-wrap:wrap;gap:6px;min-height:24px;margin-bottom:6px;"></div>
+      <tf-select id="al-fallback-add">
+        <option value="">— ${escapeHtml(I18n.t('services.alias_add_fallback'))} —</option>
+        ${targetOptionsHtml}
+      </tf-select>
+      <span class="tf-hint">${escapeHtml(I18n.t('services.alias_fallback_hint'))}</span>
+    </div>
+
+    <div class="form-error" id="al-error" hidden style="color: var(--danger, #ef4444); font-size: 12px;"></div>
   `;
 
   const footerEl = document.createElement('div');
@@ -478,15 +576,14 @@ function openAliasModal(alias) {
     <tf-button variant="primary" data-action="save" id="al-save-btn">${escapeHtml(I18n.t(isEdit ? 'common.save' : 'common.add'))}</tf-button>
   `;
 
-  // Tworzymy okno recznie — potrzebujemy kontroli nad zamknieciem (walidacja
-  // + bledy API powinny pozostawic okno otwarte, a nie kazdy action je zamyka).
+  // Wlasne tf-window — walidacja i bledy API nie powinny zamykac okna.
   const win = document.createElement('tf-window');
   win.setAttribute('title', I18n.t(isEdit ? 'services.alias_edit' : 'services.new_alias'));
   win.setAttribute('icon', isEdit ? 'settings' : 'plus');
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
   win.setAttribute('min-width', '460');
-  win.setAttribute('min-height', '380');
+  win.setAttribute('min-height', '420');
   win.setAttribute('width', '520');
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
@@ -506,17 +603,57 @@ function openAliasModal(alias) {
   document.body.appendChild(backdrop);
   document.body.appendChild(win);
 
-  // Natywny atrybut `list` nie jest przekazywany przez tf-input — ustawiamy
-  // go recznie na wewnetrznym <input> aby zachowac autocomplete.
-  queueMicrotask(() => {
-    const targetNative = win.querySelector('#al-target input');
-    if (targetNative) targetNative.setAttribute('list', 'al-target-list');
-  });
-
   const cleanup = () => {
     if (win.isConnected) win.remove();
     if (backdrop.isConnected) backdrop.remove();
   };
+
+  // Render chipow wybranych fallbackow
+  function renderFallbackChips() {
+    const c = bodyEl.querySelector('#al-fallback-chips');
+    if (!c) return;
+    if (selectedFallbacks.length === 0) {
+      c.innerHTML = `<span style="color:var(--text-3);font-size:12px;">—</span>`;
+      return;
+    }
+    c.innerHTML = selectedFallbacks.map((name, idx) => `
+      <tf-chip status="info" style="cursor:default;">
+        ${escapeHtml(name)}
+        <span style="margin-left:6px;cursor:pointer;font-weight:bold;" data-rm="${idx}">×</span>
+      </tf-chip>
+    `).join('');
+  }
+  renderFallbackChips();
+
+  // Dodawanie fallback z tf-select
+  queueMicrotask(() => {
+    const addSelect = bodyEl.querySelector('#al-fallback-add');
+    if (addSelect) {
+      addSelect.addEventListener('change', (e) => {
+        const val = e.detail?.value ?? addSelect.value;
+        const primaryTarget = bodyEl.querySelector('#al-target')?.value || '';
+        if (val && !selectedFallbacks.includes(val) && val !== primaryTarget) {
+          selectedFallbacks.push(val);
+          renderFallbackChips();
+        }
+        // reset selekcji do placeholder
+        addSelect.setAttribute('value', '');
+        const innerSel = addSelect.querySelector('select');
+        if (innerSel) innerSel.value = '';
+      });
+    }
+  });
+
+  // Usuwanie chipow przez delegacje
+  bodyEl.querySelector('#al-fallback-chips').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-rm]');
+    if (!btn) return;
+    const idx = parseInt(btn.dataset.rm, 10);
+    if (!Number.isNaN(idx)) {
+      selectedFallbacks.splice(idx, 1);
+      renderFallbackChips();
+    }
+  });
 
   win.addEventListener('action', async (e) => {
     const action = e.detail?.action;
@@ -527,15 +664,14 @@ function openAliasModal(alias) {
     if (action !== 'save') return;
 
     const nameInput = win.querySelector('#al-name');
-    const targetInput = win.querySelector('#al-target');
+    const targetSelect = win.querySelector('#al-target');
     const strategySelect = win.querySelector('#al-strategy');
-    const fallbackInput = win.querySelector('#al-fallback');
     const errEl = win.querySelector('#al-error');
 
     const name = (nameInput?.value || '').trim();
-    const target = (targetInput?.value || '').trim();
-    const strategy = strategySelect?.value || 'FirstAvailable';
-    const fallback = (fallbackInput?.value || '').trim();
+    const target = (targetSelect?.value || '').trim();
+    const strategy = (strategySelect?.value || 'round_robin').toLowerCase();
+    const fallback = selectedFallbacks.join(',');
 
     if (!name || !target) {
       if (errEl) {
@@ -547,17 +683,20 @@ function openAliasModal(alias) {
 
     try {
       if (isEdit) {
-        await fetch(`/api/model-aliases/${encodeURIComponent(alias.id)}`, {
-          method: 'PUT',
-          headers: authHeaders(true),
-          body: JSON.stringify({ alias: name, target_model: target, is_active: true }),
-        }).then(checkOk);
-      } else {
-        await apiPost('/api/model-aliases', {
+        await ApiBinary.action('modelAliasUpdateRequest', {
+          id: alias.id,
           alias: name,
-          target_model: target,
+          targetModel: target,
+          isActive: true,
           strategy,
-          fallback_targets: fallback || null,
+          fallbackTargets: fallback || null,
+        });
+      } else {
+        await ApiBinary.action('modelAliasCreateRequest', {
+          alias: name,
+          targetModel: target,
+          strategy,
+          fallbackTargets: fallback || null,
         });
       }
       toast(I18n.t(isEdit ? 'services.alias_updated' : 'services.alias_created'), 'success');
@@ -582,7 +721,7 @@ async function deleteAlias(id, name) {
   });
   if (!ok) return;
   try {
-    await apiDelete(`/api/model-aliases/${encodeURIComponent(id)}`);
+    await ApiBinary.action('modelAliasDeleteRequest', { id });
     toast(I18n.t('services.alias_deleted', { name }), 'success');
     await loadAll();
   } catch (e) {
@@ -591,22 +730,6 @@ async function deleteAlias(id, name) {
 }
 
 // ---- Helpers --------------------------------------------------------------
-
-function authHeaders(json) {
-  const jwt = localStorage.getItem('tentaflow_jwt');
-  const h = {};
-  if (json) h['Content-Type'] = 'application/json';
-  if (jwt) h['Authorization'] = `Bearer ${jwt}`;
-  return h;
-}
-
-async function checkOk(resp) {
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`${resp.status}${text ? `: ${text}` : ''}`);
-  }
-  return resp.json();
-}
 
 async function stopService(id, name) {
   const ok = await TfWindow.confirm({

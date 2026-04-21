@@ -44,8 +44,7 @@ pub fn load_relay_url(db: &DbPool, mesh_cfg: Option<&MeshConfig>) -> RelayUrl {
         }
     }
 
-    parse_relay_url(DEFAULT_RELAY_URL)
-        .expect("domyslny relay URL zawsze sie parsuje")
+    parse_relay_url(DEFAULT_RELAY_URL).expect("domyslny relay URL zawsze sie parsuje")
 }
 
 fn parse_relay_url(raw: &str) -> Result<RelayUrl, url::ParseError> {

@@ -30,7 +30,6 @@ impl ModelFormat {
             _ => None,
         }
     }
-
 }
 
 /// Informacje o dostepnym modelu w repozytorium
@@ -89,7 +88,10 @@ impl ModelManager {
         let (progress_tx, _) = broadcast::channel(64);
 
         if let Err(e) = std::fs::create_dir_all(&models_dir) {
-            warn!("Nie udalo sie utworzyc katalogu modeli {:?}: {}", models_dir, e);
+            warn!(
+                "Nie udalo sie utworzyc katalogu modeli {:?}: {}",
+                models_dir, e
+            );
         }
 
         Self {
@@ -147,11 +149,7 @@ impl ModelManager {
     /// Pobiera model z HuggingFace Hub.
     /// Wykorzystuje hf-hub do pobrania pliku z repozytorium.
     /// Zwraca sciezke do pobranego pliku w cache.
-    pub async fn download_model(
-        &self,
-        repo_id: &str,
-        filename: &str,
-    ) -> anyhow::Result<PathBuf> {
+    pub async fn download_model(&self, repo_id: &str, filename: &str) -> anyhow::Result<PathBuf> {
         let repo_id = repo_id.to_string();
         let filename = filename.to_string();
         let models_dir = self.models_dir.clone();
@@ -160,7 +158,10 @@ impl ModelManager {
         // Sprawdz czy plik juz istnieje w cache
         let target_path = models_dir.join(&filename);
         if target_path.exists() {
-            info!("Model '{}' juz istnieje w cache: {:?}", filename, target_path);
+            info!(
+                "Model '{}' juz istnieje w cache: {:?}",
+                filename, target_path
+            );
             return Ok(target_path);
         }
 
@@ -175,7 +176,10 @@ impl ModelManager {
             status: DownloadStatus::Pending,
         });
 
-        info!("Pobieranie modelu '{}' z repozytorium '{}'", filename, repo_id);
+        info!(
+            "Pobieranie modelu '{}' z repozytorium '{}'",
+            filename, repo_id
+        );
 
         // hf-hub API jest synchroniczne — uruchamiamy w osobnym watku
         let downloaded_path = tokio::task::spawn_blocking({
@@ -211,9 +215,7 @@ impl ModelManager {
                 })?;
 
                 let elapsed = start.elapsed();
-                let file_size = std::fs::metadata(&hf_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let file_size = std::fs::metadata(&hf_path).map(|m| m.len()).unwrap_or(0);
 
                 let speed_bps = if elapsed.as_secs() > 0 {
                     file_size / elapsed.as_secs()
@@ -242,9 +244,7 @@ impl ModelManager {
                 })?;
 
                 // Weryfikacja rozmiaru po skopiowaniu
-                let copied_size = std::fs::metadata(&target)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let copied_size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
 
                 if copied_size != file_size {
                     std::fs::remove_file(&target).ok();
@@ -290,9 +290,7 @@ impl ModelManager {
             anyhow::bail!("Model '{}' nie istnieje w cache", filename);
         }
 
-        let size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         std::fs::remove_file(&path)
             .with_context(|| format!("Nie udalo sie usunac modelu {:?}", path))?;
@@ -321,9 +319,7 @@ impl ModelManager {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() {
-                total += std::fs::metadata(&path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                total += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             }
         }
 
@@ -350,12 +346,9 @@ impl ModelManager {
 /// Np. "mistral-7b-instruct-v0.3.Q4_K_M.gguf" -> Some("Q4_K_M")
 fn extract_quantization(filename: &str) -> Option<String> {
     let patterns = [
-        "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L",
-        "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M",
-        "Q5_0", "Q5_1", "Q5_K_S", "Q5_K_M",
-        "Q6_K", "Q8_0", "F16", "F32",
-        "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M",
-        "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ4_XS", "IQ4_NL",
+        "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_0", "Q5_1",
+        "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0", "F16", "F32", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS",
+        "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ4_XS", "IQ4_NL",
     ];
 
     let upper = filename.to_uppercase();

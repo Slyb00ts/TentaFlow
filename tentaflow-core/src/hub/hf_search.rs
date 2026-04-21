@@ -94,9 +94,9 @@ pub async fn search_models(
         .into_iter()
         .map(|m| {
             let model_id = m.model_id.or(m.id).unwrap_or_default();
-            let author = m.author.unwrap_or_else(|| {
-                model_id.split('/').next().unwrap_or("unknown").to_string()
-            });
+            let author = m
+                .author
+                .unwrap_or_else(|| model_id.split('/').next().unwrap_or("unknown").to_string());
             HfModelResult {
                 model_id,
                 author,
@@ -110,10 +110,7 @@ pub async fn search_models(
 }
 
 /// Wyszukuje modele Ollama (z wbudowanej biblioteki)
-pub async fn search_ollama_models(
-    query: &str,
-    _limit: u32,
-) -> Result<Vec<HfModelResult>, String> {
+pub async fn search_ollama_models(query: &str, _limit: u32) -> Result<Vec<HfModelResult>, String> {
     // Ollama nie ma publicznego search API — zwracamy statyczna liste
     // filtrowana po zapytaniu
     let all = default_ollama_models();
@@ -125,10 +122,7 @@ pub async fn search_ollama_models(
 
     Ok(all
         .into_iter()
-        .filter(|m| {
-            m.model_id.to_lowercase().contains(&q)
-                || m.author.to_lowercase().contains(&q)
-        })
+        .filter(|m| m.model_id.to_lowercase().contains(&q) || m.author.to_lowercase().contains(&q))
         .collect())
 }
 
@@ -136,22 +130,62 @@ pub async fn search_ollama_models(
 pub fn default_models(engine_id: &str) -> Vec<HfModelResult> {
     match engine_id {
         "sglang" | "vllm" => vec![
-            hf_model("speakleash/Bielik-11B-v3.0-Instruct-FP8-Dynamic", "speakleash", "text-generation"),
-            hf_model("meta-llama/Llama-3.1-8B-Instruct", "meta-llama", "text-generation"),
+            hf_model(
+                "speakleash/Bielik-11B-v3.0-Instruct-FP8-Dynamic",
+                "speakleash",
+                "text-generation",
+            ),
+            hf_model(
+                "meta-llama/Llama-3.1-8B-Instruct",
+                "meta-llama",
+                "text-generation",
+            ),
             hf_model("Qwen/Qwen2.5-7B-Instruct", "Qwen", "text-generation"),
-            hf_model("mistralai/Mistral-7B-Instruct-v0.3", "mistralai", "text-generation"),
+            hf_model(
+                "mistralai/Mistral-7B-Instruct-v0.3",
+                "mistralai",
+                "text-generation",
+            ),
         ],
         "llamacpp" => vec![
-            hf_model("bartowski/Llama-3.1-8B-Instruct-GGUF", "bartowski", "text-generation"),
+            hf_model(
+                "bartowski/Llama-3.1-8B-Instruct-GGUF",
+                "bartowski",
+                "text-generation",
+            ),
             hf_model("TheBloke/Llama-2-7B-GGUF", "TheBloke", "text-generation"),
-            hf_model("bartowski/Qwen2.5-7B-Instruct-GGUF", "bartowski", "text-generation"),
-            hf_model("bartowski/Mistral-7B-Instruct-v0.3-GGUF", "bartowski", "text-generation"),
+            hf_model(
+                "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                "bartowski",
+                "text-generation",
+            ),
+            hf_model(
+                "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+                "bartowski",
+                "text-generation",
+            ),
         ],
         "mlx" => vec![
-            hf_model("mlx-community/Llama-3.1-8B-Instruct-4bit", "mlx-community", "text-generation"),
-            hf_model("mlx-community/Qwen2.5-7B-Instruct-4bit", "mlx-community", "text-generation"),
-            hf_model("mlx-community/Mistral-7B-Instruct-v0.3-4bit", "mlx-community", "text-generation"),
-            hf_model("mlx-community/phi-4-4bit", "mlx-community", "text-generation"),
+            hf_model(
+                "mlx-community/Llama-3.1-8B-Instruct-4bit",
+                "mlx-community",
+                "text-generation",
+            ),
+            hf_model(
+                "mlx-community/Qwen2.5-7B-Instruct-4bit",
+                "mlx-community",
+                "text-generation",
+            ),
+            hf_model(
+                "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+                "mlx-community",
+                "text-generation",
+            ),
+            hf_model(
+                "mlx-community/phi-4-4bit",
+                "mlx-community",
+                "text-generation",
+            ),
         ],
         "ollama" => default_ollama_models(),
         _ => vec![],

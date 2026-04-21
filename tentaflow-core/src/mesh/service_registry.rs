@@ -158,15 +158,12 @@ impl MeshServiceRegistry {
         for svc in &all_services {
             for model_name in &svc.models {
                 let key = (model_name.clone(), svc.service_type.clone());
-                model_map
-                    .entry(key)
-                    .or_default()
-                    .push(ModelInstance {
-                        node_id: svc.node_id.clone(),
-                        node_name: svc.service_name.clone(),
-                        service_id: svc.service_id.clone(),
-                        status: svc.status.clone(),
-                    });
+                model_map.entry(key).or_default().push(ModelInstance {
+                    node_id: svc.node_id.clone(),
+                    node_name: svc.service_name.clone(),
+                    service_id: svc.service_id.clone(),
+                    status: svc.status.clone(),
+                });
             }
         }
 
@@ -331,7 +328,10 @@ mod tests {
     #[test]
     fn remove_node_czysci_serwisy() {
         let registry = MeshServiceRegistry::new("node-a".to_string());
-        registry.update_remote("node-b", vec![make_service("s1", "llm", "node-b", vec!["m1"])]);
+        registry.update_remote(
+            "node-b",
+            vec![make_service("s1", "llm", "node-b", vec!["m1"])],
+        );
         registry.remove_node("node-b");
 
         let visible = registry.visible_services();
@@ -344,7 +344,12 @@ mod tests {
         registry.register_local(make_service("s1", "llm", "node-a", vec!["llama3"]));
         registry.update_remote(
             "node-b",
-            vec![make_service("s2", "llm", "node-b", vec!["llama3", "mistral"])],
+            vec![make_service(
+                "s2",
+                "llm",
+                "node-b",
+                vec!["llama3", "mistral"],
+            )],
         );
 
         let models = registry.unique_models();
@@ -374,7 +379,10 @@ mod tests {
         registry.update_remote("node-b", vec![]);
 
         let route = registry.find_route("node-b");
-        assert_eq!(route, Some(vec!["node-a".to_string(), "node-b".to_string()]));
+        assert_eq!(
+            route,
+            Some(vec!["node-a".to_string(), "node-b".to_string()])
+        );
     }
 
     #[test]

@@ -91,14 +91,14 @@ impl RAGClient {
         };
         debug!("RAG send_request: {}", request.request_id);
 
-        let response = self
-            .inner
-            .send_request(request)
-            .await
-            .map_err(|e| CoreError::NetworkError {
-                message: format!("iroh RAG request: {e}"),
-                source: anyhow::anyhow!(e.to_string()),
-            })?;
+        let response =
+            self.inner
+                .send_request(request)
+                .await
+                .map_err(|e| CoreError::NetworkError {
+                    message: format!("iroh RAG request: {e}"),
+                    source: anyhow::anyhow!(e.to_string()),
+                })?;
 
         match response.result {
             ModelResult::RAG(result) => Ok(result),

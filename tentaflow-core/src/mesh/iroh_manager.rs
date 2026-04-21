@@ -71,37 +71,114 @@ impl Default for IrohMeshConfig {
 /// Zdarzenia emitowane przez IrohMeshManager.
 #[derive(Debug, Clone)]
 pub enum IrohMeshEvent {
-    PeerConnected { node_id: String },
-    PeerDisconnected { node_id: String },
-    HeartbeatReceived { node_id: String, heartbeat: Vec<u8> },
-    NodeInfoReceived { node_id: String, data: Vec<u8> },
-    CrdtDeltaReceived { node_id: String, data: Vec<u8> },
-    PairingRequestReceived { peer_id: String, data: Vec<u8> },
-    PairingConfirmReceived { peer_id: String, data: Vec<u8> },
-    PairingRejectReceived { peer_id: String, data: Vec<u8> },
-    ServiceAnnounceReceived { node_id: String, data: Vec<u8> },
-    AliasSyncReceived { from_node_id: String, data: Vec<u8> },
-    TrustRevokedReceived { node_id: String, revoked_node_id: String },
-    TrustedKeysSyncReceived { node_id: String, keys: Vec<(String, String)> },
-    NodeLeavingReceived { node_id: String },
-    ModelListUpdate { node_id: String, data: Vec<u8> },
-    ContainerListUpdate { node_id: String, data: Vec<u8> },
-    MeshCommandReceived { from_node_id: String, command: Vec<u8> },
-    MeshCommandResponseReceived { from_node_id: String, data: Vec<u8> },
-    MeshDeployProgressReceived { from_node_id: String, data: Vec<u8> },
-    MeshLogChunkReceived { from_node_id: String, data: Vec<u8> },
-    ForwardRequestReceived { from_node_id: String, request_id: String, payload: Vec<u8> },
+    PeerConnected {
+        node_id: String,
+    },
+    PeerDisconnected {
+        node_id: String,
+    },
+    HeartbeatReceived {
+        node_id: String,
+        heartbeat: Vec<u8>,
+    },
+    NodeInfoReceived {
+        node_id: String,
+        data: Vec<u8>,
+    },
+    CrdtDeltaReceived {
+        node_id: String,
+        data: Vec<u8>,
+    },
+    PairingRequestReceived {
+        peer_id: String,
+        data: Vec<u8>,
+    },
+    PairingConfirmReceived {
+        peer_id: String,
+        data: Vec<u8>,
+    },
+    PairingRejectReceived {
+        peer_id: String,
+        data: Vec<u8>,
+    },
+    ServiceAnnounceReceived {
+        node_id: String,
+        data: Vec<u8>,
+    },
+    AliasSyncReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    TrustRevokedReceived {
+        node_id: String,
+        revoked_node_id: String,
+    },
+    TrustedKeysSyncReceived {
+        node_id: String,
+        keys: Vec<(String, String)>,
+    },
+    NodeLeavingReceived {
+        node_id: String,
+    },
+    ModelListUpdate {
+        node_id: String,
+        data: Vec<u8>,
+    },
+    ContainerListUpdate {
+        node_id: String,
+        data: Vec<u8>,
+    },
+    MeshCommandReceived {
+        from_node_id: String,
+        command: Vec<u8>,
+    },
+    MeshCommandResponseReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    MeshDeployProgressReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    MeshLogChunkReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    ForwardRequestReceived {
+        from_node_id: String,
+        request_id: String,
+        payload: Vec<u8>,
+    },
     /// Alias dla compat z legacy QuicMeshEvent::ForwardRequest.
-    ForwardRequest { node_id: String, request_id: String, payload: Vec<u8> },
-    FullStateReceived { node_id: String, state: Vec<u8> },
-    KeyRotationReceived { node_id: String, ephemeral_public_key_hex: String },
-    KeyRotationResponseReceived { node_id: String, ephemeral_public_key_hex: String },
+    ForwardRequest {
+        node_id: String,
+        request_id: String,
+        payload: Vec<u8>,
+    },
+    FullStateReceived {
+        node_id: String,
+        state: Vec<u8>,
+    },
+    KeyRotationReceived {
+        node_id: String,
+        ephemeral_public_key_hex: String,
+    },
+    KeyRotationResponseReceived {
+        node_id: String,
+        ephemeral_public_key_hex: String,
+    },
     RelayFrameReceived {
         from_node_id: String,
         frame: tentaflow_protocol::mesh::MeshRelayFrame,
     },
-    ServiceQueryAllReceived { from_node_id: String, data: Vec<u8> },
-    ServiceResponseAllReceived { from_node_id: String, data: Vec<u8> },
+    ServiceQueryAllReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
+    ServiceResponseAllReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
 }
 
 /// Aktywne polaczenie zalogowane przez manager.
@@ -127,10 +204,7 @@ pub struct IrohMeshManager {
 
 impl IrohMeshManager {
     /// Tworzy manager bind'ujac iroh Endpoint z discovery (LAN + DHT + relay).
-    pub async fn new(
-        config: IrohMeshConfig,
-        security: Arc<MeshSecurity>,
-    ) -> Result<Arc<Self>> {
+    pub async fn new(config: IrohMeshConfig, security: Arc<MeshSecurity>) -> Result<Arc<Self>> {
         let secret_key = build_secret_key_from_security(&security)?;
         let iroh_config = IrohConfig {
             secret_key,
@@ -223,7 +297,8 @@ impl IrohMeshManager {
 
         match alpn {
             a if a == ALPN_MESH => {
-                self.register_connection(remote_hex.clone(), connection.clone()).await;
+                self.register_connection(remote_hex.clone(), connection.clone())
+                    .await;
                 let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
                     node_id: remote_hex.clone(),
                 });
@@ -236,19 +311,21 @@ impl IrohMeshManager {
                 // PairingHandler::accept uzywany przez iroh Router jest tutaj
                 // zastepowany manualnym obslugiwaniem — w pelnej integracji
                 // ProtocolHandler jest rejestrowany przy bind przez Router.
-                let handler = PairingHandler::new(
-                    Arc::clone(&self.security),
-                    hostname(),
-                );
+                let handler = PairingHandler::new(Arc::clone(&self.security), hostname());
                 if let Err(e) = handler_accept_connection(&handler, connection).await {
                     warn!("iroh_mesh: pairing accept blad: {}", e);
                 }
             }
             a if a == ALPN_API => {
-                debug!("iroh_mesh: ALPN_API otrzymane — delegacja do dashboard layer (zadanie #56)");
+                debug!(
+                    "iroh_mesh: ALPN_API otrzymane — delegacja do dashboard layer (zadanie #56)"
+                );
             }
             other => {
-                warn!("iroh_mesh: nieznany ALPN: {:?}", String::from_utf8_lossy(other));
+                warn!(
+                    "iroh_mesh: nieznany ALPN: {:?}",
+                    String::from_utf8_lossy(other)
+                );
             }
         }
         Ok(())
@@ -438,7 +515,9 @@ impl IrohMeshManager {
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
         let ids: Vec<String> = self.connected_peers().await;
         for id in ids {
-            let _ = self.send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data).await;
+            let _ = self
+                .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
+                .await;
         }
     }
 
@@ -447,32 +526,60 @@ impl IrohMeshManager {
     pub async fn send_models_sync_data(&self, data: &[u8]) {
         let ids: Vec<String> = self.connected_peers().await;
         for id in ids {
-            let _ = self.send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data).await;
+            let _ = self
+                .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
+                .await;
         }
     }
 
     pub async fn send_node_info(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data).await
+        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_NODE_INFO, data)
+            .await
     }
 
     pub async fn send_pairing_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_PAIRING_REQUEST, data).await
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_PAIRING_REQUEST,
+            data,
+        )
+        .await
     }
 
     pub async fn send_pairing_confirm(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_PAIRING_CONFIRM, data).await
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_PAIRING_CONFIRM,
+            data,
+        )
+        .await
     }
 
     pub async fn send_pairing_reject(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_PAIRING_REJECT, data).await
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_PAIRING_REJECT,
+            data,
+        )
+        .await
     }
 
     pub async fn send_trust_revoked(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, data).await
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
+            data,
+        )
+        .await
     }
 
     pub async fn send_trusted_keys_sync(&self, node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC, data).await
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
+            data,
+        )
+        .await
     }
 
     pub async fn send_node_leaving(&self) {
@@ -539,8 +646,7 @@ impl IrohMeshManager {
             send.write_all(&payload)
                 .await
                 .map_err(|e| anyhow::anyhow!("write payload: {e}"))?;
-            send.finish()
-                .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+            send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
             let response = recv
                 .read_to_end(MAX_MSG_BYTES)
@@ -593,8 +699,8 @@ impl IrohMeshManager {
             "sender_node_id": self.node_id(),
             "command": command,
         });
-        let data = serde_json::to_vec(&envelope)
-            .map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
+        let data =
+            serde_json::to_vec(&envelope).map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
         self.send_command_and_wait_bytes(target_node_id, command_id, data, Duration::from_secs(600))
             .await
             .map(|r| crate::mesh::command_executor::CommandResponse {
@@ -621,8 +727,8 @@ impl IrohMeshManager {
             "sender_node_id": self.node_id(),
             "command": command,
         });
-        let data = serde_json::to_vec(&envelope)
-            .map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
+        let data =
+            serde_json::to_vec(&envelope).map_err(|e| anyhow::anyhow!("encode command: {e}"))?;
         self.send_command_and_wait_bytes(
             target_node_id,
             command_id,
@@ -640,10 +746,17 @@ impl IrohMeshManager {
         timeout: Duration,
     ) -> Result<CommandWaitResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.command_waiters.write().await.insert(command_id.clone(), tx);
+        self.command_waiters
+            .write()
+            .await
+            .insert(command_id.clone(), tx);
 
-        self.send_to_peer(target_node_id, tentaflow_protocol::mesh::MESH_MSG_COMMAND, &data)
-            .await?;
+        self.send_to_peer(
+            target_node_id,
+            tentaflow_protocol::mesh::MESH_MSG_COMMAND,
+            &data,
+        )
+        .await?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
@@ -691,34 +804,53 @@ impl IrohMeshManager {
         // Parse JSON: { command_id, success, output, error? } i rozwiaz waiter.
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
             let command_id = val.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
-            let success = val.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let success = val
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let output = val.get("output").and_then(|v| v.as_str()).unwrap_or("");
             let error = val.get("error").and_then(|v| v.as_str());
             if !command_id.is_empty() {
-                self.resolve_command_waiter(command_id, success, output, error).await;
+                self.resolve_command_waiter(command_id, success, output, error)
+                    .await;
             }
         }
     }
 
     pub async fn send_key_rotation(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(target_node_id, tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION, data).await
+        self.send_to_peer(
+            target_node_id,
+            tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION,
+            data,
+        )
+        .await
     }
 
-    pub async fn send_key_rotation_response(&self, target_node_id: &str, data: &[u8]) -> Result<()> {
-        self.send_to_peer(target_node_id, tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION_RESPONSE, data).await
+    pub async fn send_key_rotation_response(
+        &self,
+        target_node_id: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        self.send_to_peer(
+            target_node_id,
+            tentaflow_protocol::mesh::MESH_MSG_KEY_ROTATION_RESPONSE,
+            data,
+        )
+        .await
     }
 
     /// Wysyla relay frame (multi-hop) do nastepnego noda w trasie.
     pub async fn send_relay_frame(&self, next_hop_id: &str, frame_bytes: &[u8]) -> Result<()> {
-        self.send_to_peer(next_hop_id, tentaflow_protocol::mesh::MESH_MSG_RELAY_FRAME, frame_bytes).await
+        self.send_to_peer(
+            next_hop_id,
+            tentaflow_protocol::mesh::MESH_MSG_RELAY_FRAME,
+            frame_bytes,
+        )
+        .await
     }
 
     /// Wysyla payload przez relay do docelowego peera (wybiera pierwszy hop z config).
-    pub async fn send_via_relay(
-        &self,
-        via_node_id: &str,
-        frame_bytes: &[u8],
-    ) -> Result<()> {
+    pub async fn send_via_relay(&self, via_node_id: &str, frame_bytes: &[u8]) -> Result<()> {
         self.send_relay_frame(via_node_id, frame_bytes).await
     }
 }
@@ -817,7 +949,11 @@ impl IrohMeshManagerRef {
                 // payload: JSON { revoked_node_id }
                 let revoked: String = serde_json::from_slice::<serde_json::Value>(&payload)
                     .ok()
-                    .and_then(|v| v.get("revoked_node_id").and_then(|x| x.as_str()).map(String::from))
+                    .and_then(|v| {
+                        v.get("revoked_node_id")
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                    })
                     .unwrap_or_default();
                 IrohMeshEvent::TrustRevokedReceived {
                     node_id: remote_hex,
@@ -869,10 +1005,7 @@ impl IrohMeshManagerRef {
 
 /// Funkcja pomocnicza wywolywana przez accept loop przy pairing ALPN. Separacja
 /// od manager-a ulatwia testowanie.
-async fn handler_accept_connection(
-    handler: &PairingHandler,
-    connection: Connection,
-) -> Result<()> {
+async fn handler_accept_connection(handler: &PairingHandler, connection: Connection) -> Result<()> {
     use iroh::protocol::ProtocolHandler;
     handler
         .accept(connection)

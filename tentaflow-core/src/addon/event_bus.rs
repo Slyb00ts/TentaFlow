@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 // =============================================================================
@@ -158,7 +158,10 @@ impl EventBus {
         });
         subs.retain(|_, v| !v.is_empty());
 
-        debug!("EventBus: addon '{}' odsubskrybowany ze wszystkich eventow", addon_id);
+        debug!(
+            "EventBus: addon '{}' odsubskrybowany ze wszystkich eventow",
+            addon_id
+        );
     }
 
     /// Odsubskrybowuje konkretna instancje

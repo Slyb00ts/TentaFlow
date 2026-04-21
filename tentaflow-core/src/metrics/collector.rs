@@ -35,7 +35,8 @@ impl MetricsCollector {
         let mut sh1 = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(1));
-            let mut prev_output_tokens: u64 = metrics_tps.total_output_tokens.load(Ordering::Relaxed);
+            let mut prev_output_tokens: u64 =
+                metrics_tps.total_output_tokens.load(Ordering::Relaxed);
             let mut prev_input_tokens: u64 = metrics_tps.total_input_tokens.load(Ordering::Relaxed);
 
             loop {

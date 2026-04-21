@@ -75,6 +75,21 @@ tf-select {
 }
 tf-button {
   display: inline-flex;
+  vertical-align: middle;
+}
+
+/* Sloty tf-window (footer + actions) — auto-flex z gapem, bez koniecznosci
+   inline-style w kazdym uzyciu. Wyrownanie pionowe + 10px gap miedzy
+   przyciskami. */
+tf-window [slot="footer"],
+tf-window [slot="actions"] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+tf-window [slot="footer"] {
+  justify-content: flex-end;
 }
 
 /* =============================================================================
@@ -449,6 +464,19 @@ tf-button {
   opacity: 0.4;
   cursor: not-allowed;
 }
+tf-toggle[size="sm"] .tf-toggle {
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  padding: 2px;
+}
+tf-toggle[size="sm"] .tf-toggle::after {
+  width: 10px;
+  height: 10px;
+}
+tf-toggle[size="sm"] .tf-toggle.on::after {
+  transform: translateX(12px);
+}
 /* ripple po kliknieciu przelacznika */
 .tf-toggle.tf-ripple::before {
   content: '';
@@ -469,6 +497,27 @@ tf-button {
    tf-tabs (3 warianty)
    ============================================================================= */
 
+/* Host element: flex container that layers viewport with fade/chev overlays. */
+tf-tabs {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.tf-tabs-viewport {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+/* Underline variant draws its bottom rule on the viewport so the 2px indicator
+   sits inside the clipping box. */
+.tf-tabs-viewport.tf-tabs-variant-underline {
+  border-bottom: 1px solid var(--tf-border);
+}
+
 .tf-tabs {
   position: relative;
   display: inline-flex;
@@ -477,7 +526,16 @@ tf-button {
   background: var(--tf-bg-card);
   border: 1px solid var(--tf-border);
   border-radius: var(--tf-radius);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-behavior: smooth;
+  touch-action: pan-x;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  white-space: nowrap;
+  max-width: 100%;
 }
+.tf-tabs::-webkit-scrollbar { display: none; }
 .tf-tab {
   display: inline-flex;
   align-items: center;
@@ -496,6 +554,21 @@ tf-button {
   font-family: inherit;
   position: relative;
   z-index: 1;
+}
+/* SVG sprite symbols referenced via <use> don't inherit stroke/fill from sprite defs,
+   so components rendering icons without an explicit class need stroke:currentColor + fill:none
+   at the container level. Apply to tabs, menu items, and anywhere else that uses
+   <svg><use href="#i-..."/></svg> inline. */
+.tf-tab svg,
+.tf-menu-item svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
 }
 .tf-tab .tf-tab-count {
   font-size: 10px;
@@ -559,7 +632,16 @@ tf-button {
   background: var(--tf-bg-card);
   border: 1px solid var(--tf-border);
   border-radius: var(--tf-radius);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-behavior: smooth;
+  touch-action: pan-x;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  white-space: nowrap;
+  max-width: 100%;
 }
+.tf-tabs-soft::-webkit-scrollbar { display: none; }
 .tf-tabs-soft .tf-tab.active {
   background: var(--tf-accent-glow);
   color: var(--tf-accent-2);
@@ -580,11 +662,19 @@ tf-button {
 
 .tf-tabs-underline {
   position: relative;
-  display: flex;
+  display: inline-flex;
   gap: 4px;
-  border-bottom: 1px solid var(--tf-border);
   padding: 0 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-behavior: smooth;
+  touch-action: pan-x;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  white-space: nowrap;
+  max-width: 100%;
 }
+.tf-tabs-underline::-webkit-scrollbar { display: none; }
 .tf-tabs-underline .tf-tab {
   border-radius: 0;
   padding: 12px 14px 14px;
@@ -612,7 +702,7 @@ tf-button {
 .tf-tabs-underline .tf-tab-underline-bar {
   position: absolute;
   left: 0;
-  bottom: -1px;
+  bottom: 0;
   height: 2px;
   background: var(--tf-gradient-accent);
   border-radius: 2px 2px 0 0;
@@ -625,6 +715,78 @@ tf-button {
   pointer-events: none;
 }
 .tf-tabs-underline .tf-tab-underline-bar[data-ready] { opacity: 1; }
+
+/* Overflow affordances: gradient fades + chevron scroll buttons. */
+.tf-tabs-fade {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 36px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  z-index: 2;
+}
+.tf-tabs-fade.visible { opacity: 1; }
+.tf-tabs-fade-left {
+  left: 0;
+  background: linear-gradient(to right, var(--tf-bg-card) 20%, rgba(0, 0, 0, 0) 100%);
+  border-top-left-radius: var(--tf-radius);
+  border-bottom-left-radius: var(--tf-radius);
+}
+.tf-tabs-fade-right {
+  right: 0;
+  background: linear-gradient(to left, var(--tf-bg-card) 20%, rgba(0, 0, 0, 0) 100%);
+  border-top-right-radius: var(--tf-radius);
+  border-bottom-right-radius: var(--tf-radius);
+}
+
+.tf-tabs-chev {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--tf-bg-3);
+  border: 1px solid var(--tf-border);
+  color: var(--tf-text-2);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, background 0.15s, color 0.15s;
+  font-family: inherit;
+}
+.tf-tabs-chev.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+.tf-tabs-chev:hover {
+  background: var(--tf-accent-glow);
+  color: var(--tf-text);
+}
+.tf-tabs-chev svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.tf-tabs-chev-left { left: 4px; }
+.tf-tabs-chev-right { right: 4px; }
+
+/* On small screens fades + touch-drag are the primary affordance; hide chevrons
+   to save space. */
+@media (max-width: 640px) {
+  .tf-tabs-chev { display: none; }
+}
 
 /* =============================================================================
    tf-table
@@ -775,6 +937,18 @@ tf-button {
   border-radius: 50%;
   background: currentColor;
   animation: tf-chip-pulse 2s ease-in-out infinite;
+}
+.tf-chip .tf-chip-icon {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
+.tf-chip.clickable {
+  cursor: pointer;
+}
+tf-chip[clickable]:focus-visible > .tf-chip {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 2px;
 }
 /* pending ma wlasna, wolniejsza pulsacje opacity — sygnalizuje "trwa operacja" */
 .tf-chip.pending .tf-chip-dot {
@@ -981,6 +1155,11 @@ tf-button {
   width: 16px;
   height: 16px;
   color: var(--tf-accent-2);
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
 }
 
 .tf-window-actions {

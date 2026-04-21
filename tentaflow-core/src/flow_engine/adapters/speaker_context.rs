@@ -30,7 +30,10 @@ impl SpeakerContextAdapter {
 
     /// Pobierz tresc promptu z rejestru i podstaw zmienne
     fn resolve_prompt(&self, prompt_id: &str, vars: &[(&str, &str)]) -> Option<String> {
-        let content = self.service_manager.prompt_registry.get_content(prompt_id)?;
+        let content = self
+            .service_manager
+            .prompt_registry
+            .get_content(prompt_id)?;
         let mut result = content.to_string();
         for (key, value) in vars {
             result = result.replace(&format!("{{{}}}", key), value);
@@ -72,7 +75,9 @@ impl SpeakerContextAdapter {
     fn is_noise(text: &str) -> bool {
         let trimmed = text.trim();
         trimmed.len() < 3
-            || trimmed.chars().all(|c| c.is_ascii_digit() || c.is_whitespace())
+            || trimmed
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_whitespace())
     }
 }
 
@@ -91,7 +96,9 @@ impl NodeAdapter for SpeakerContextAdapter {
         let confidence = ctx.speaker_confidence;
         let speaker_name = ctx.speaker_name.clone();
 
-        let is_first_message = ctx.node_results.values()
+        let is_first_message = ctx
+            .node_results
+            .values()
             .find_map(|v| v.get("is_first_message").and_then(|f| f.as_bool()))
             .unwrap_or(true);
 
@@ -110,16 +117,20 @@ impl NodeAdapter for SpeakerContextAdapter {
 
         if confidence >= medium_threshold && person_id.is_some() {
             recognized = true;
-            let name = speaker_name.clone().unwrap_or_else(|| "Nieznany".to_string());
+            let name = speaker_name
+                .clone()
+                .unwrap_or_else(|| "Nieznany".to_string());
             person_name = name.clone();
 
             if confidence >= high_threshold {
                 let prompt_id = if is_first_message {
-                    node_config.get("personalization_first_prompt")
+                    node_config
+                        .get("personalization_first_prompt")
                         .and_then(|v| v.as_str())
                         .unwrap_or("personalization_first_template")
                 } else {
-                    node_config.get("personalization_continue_prompt")
+                    node_config
+                        .get("personalization_continue_prompt")
                         .and_then(|v| v.as_str())
                         .unwrap_or("personalization_continue_template")
                 };
@@ -128,7 +139,8 @@ impl NodeAdapter for SpeakerContextAdapter {
                     Self::append_to_system_message(&mut ctx.messages, &suffix);
                 }
             } else {
-                let prompt_id = node_config.get("medium_confidence_known_prompt")
+                let prompt_id = node_config
+                    .get("medium_confidence_known_prompt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("medium_confidence_known_template");
 
@@ -140,11 +152,14 @@ impl NodeAdapter for SpeakerContextAdapter {
             if Self::is_noise(&ctx.input) {
                 debug!("SpeakerContext: szum, pomijam");
             } else if Self::is_introduction(&ctx.input) {
-                let prompt_id = node_config.get("new_speaker_prompt")
+                let prompt_id = node_config
+                    .get("new_speaker_prompt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("new_speaker_introduced_template");
 
-                let extracted_name = ctx.input.trim()
+                let extracted_name = ctx
+                    .input
+                    .trim()
                     .trim_start_matches("jestem ")
                     .trim_start_matches("Jestem ")
                     .trim_start_matches("mam na imię ")
@@ -162,12 +177,15 @@ impl NodeAdapter for SpeakerContextAdapter {
 
                 if !extracted_name.is_empty() {
                     person_name = extracted_name.to_string();
-                    if let Some(suffix) = self.resolve_prompt(prompt_id, &[("name", extracted_name)]) {
+                    if let Some(suffix) =
+                        self.resolve_prompt(prompt_id, &[("name", extracted_name)])
+                    {
                         Self::append_to_system_message(&mut ctx.messages, &suffix);
                     }
                 }
             } else if confidence >= medium_threshold {
-                let prompt_id = node_config.get("medium_confidence_unknown_prompt")
+                let prompt_id = node_config
+                    .get("medium_confidence_unknown_prompt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("medium_confidence_unknown");
 
@@ -175,7 +193,8 @@ impl NodeAdapter for SpeakerContextAdapter {
                     Self::append_to_system_message(&mut ctx.messages, &suffix);
                 }
             } else if !is_first_message {
-                let prompt_id = node_config.get("new_voice_prompt")
+                let prompt_id = node_config
+                    .get("new_voice_prompt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("new_voice_during_conversation");
 
@@ -183,7 +202,8 @@ impl NodeAdapter for SpeakerContextAdapter {
                     Self::append_to_system_message(&mut ctx.messages, &suffix);
                 }
             } else {
-                let prompt_id = node_config.get("unknown_user_prompt")
+                let prompt_id = node_config
+                    .get("unknown_user_prompt")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown_user_strong");
 

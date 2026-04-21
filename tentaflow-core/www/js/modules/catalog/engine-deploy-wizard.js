@@ -7,7 +7,8 @@
 //       Submit → POST /api/services/deploy.
 // =============================================================================
 
-import { escapeHtml, escapeAttr, toast, apiGet, apiPost } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
 import { deployIcon, render as renderIcon } from '/js/modules/catalog/catalog-icons.js';
@@ -103,7 +104,7 @@ export function close() {
 
 async function fetchNodes() {
   try {
-    const resp = await apiGet('/api/mesh/nodes');
+    const resp = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
     if (Array.isArray(resp) && resp.length > 0) {
       return resp.filter((n) => n && (n.is_trusted === true || n.is_local === true));
     }
@@ -115,10 +116,11 @@ async function fetchNodes() {
 
 async function loadHfToken() {
   try {
-    const settings = await apiGet('/api/settings');
-    if (Array.isArray(settings)) {
-      const t = settings.find((s) => s && s.key === 'hf_token');
-      if (t?.value) return String(t.value);
+    const entries = await ApiBinary.list('settingsListRequest', { arrayKey: 'entries' });
+    if (Array.isArray(entries)) {
+      const t = entries.find((s) => s && s.key === 'hf_token');
+      // Wartosci sekretow sa redaktowane przez protokol — traktujemy jako brak.
+      if (t?.value && t.value !== '<redacted>') return String(t.value);
     }
   } catch {
     // ignore
@@ -613,21 +615,21 @@ async function startDeploy() {
   if (btn) btn.setAttribute('disabled', '');
 
   const eng = engineEntry.engine || {};
-  const body = {
-    engine_id: eng.id,
-    deploy_method: selection.deployMethod,
-    node_id: selection.nodeId,
-    config: {
-      model_preset_id: selection.modelPresetId || null,
-      model_repo: selection.modelRepo || null,
-      port: selection.port || eng.default_port,
-      container_name: selection.containerName || null,
-    },
-  };
+  const configJson = JSON.stringify({
+    model_preset_id: selection.modelPresetId || null,
+    model_repo: selection.modelRepo || null,
+    port: selection.port || eng.default_port,
+    container_name: selection.containerName || null,
+  });
 
   try {
-    const data = await apiPost('/api/services/deploy', body);
-    const id = data?.deploy_id || data?.deployId || '?';
+    const data = await ApiBinary.action('serviceManifestDeployRequest', {
+      engineId: eng.id,
+      deployMethod: selection.deployMethod,
+      nodeId: selection.nodeId,
+      configJson,
+    });
+    const id = data?.deployId || '?';
     toast(I18n.t('wizard.deployStarted').replace('{id}', id), 'success');
     setTimeout(close, 1200);
   } catch (err) {

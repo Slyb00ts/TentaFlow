@@ -281,8 +281,22 @@ mod tests {
     #[test]
     fn record_and_query_latest() {
         let rec = make_recorder();
-        rec.record(Direction::Incoming, 1, 0xF001, "NodeListRequest", 0, &[1, 2, 3]);
-        rec.record(Direction::Outgoing, 1, 0xF001, "NodeListResponse", 0, &[4, 5, 6]);
+        rec.record(
+            Direction::Incoming,
+            1,
+            0xF001,
+            "NodeListRequest",
+            0,
+            &[1, 2, 3],
+        );
+        rec.record(
+            Direction::Outgoing,
+            1,
+            0xF001,
+            "NodeListResponse",
+            0,
+            &[4, 5, 6],
+        );
         let frames = rec.latest(10).unwrap();
         assert_eq!(frames.len(), 2);
         // Nowsze pierwsze
@@ -317,11 +331,7 @@ mod tests {
 
         let all = rec.by_correlation(1).unwrap();
         assert_eq!(all.len(), 4);
-        let chunk2_id = all
-            .iter()
-            .find(|f| f.variant_name == "Chunk2")
-            .unwrap()
-            .id;
+        let chunk2_id = all.iter().find(|f| f.variant_name == "Chunk2").unwrap().id;
 
         let after = rec.outgoing_after(1, chunk2_id).unwrap();
         assert_eq!(after.len(), 1);

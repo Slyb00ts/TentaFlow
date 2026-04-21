@@ -130,7 +130,10 @@ impl Router {
                     .as_deref()
                     .map(PoolStrategy::parse)
                     .unwrap_or(PoolStrategy::FirstAvailable);
-                debug!("resolve_route: alias cache {} -> {:?} ({})", model, targets, strategy);
+                debug!(
+                    "resolve_route: alias cache {} -> {:?} ({})",
+                    model, targets, strategy
+                );
                 return ResolvedRoute { targets, strategy };
             }
         }
@@ -224,10 +227,7 @@ impl Router {
             PoolStrategy::FirstAvailable => backends.iter().collect(),
             PoolStrategy::RoundRobin | PoolStrategy::LeastLoaded => {
                 let len = backends.len();
-                let idx = self
-                    .route_counter
-                    .fetch_add(1, Ordering::Relaxed)
-                    % len;
+                let idx = self.route_counter.fetch_add(1, Ordering::Relaxed) % len;
                 let mut result: Vec<&BackendHandle> = Vec::with_capacity(len);
                 for i in 0..len {
                     result.push(&backends[(idx + i) % len]);
@@ -274,7 +274,10 @@ impl Router {
                 // Ogranicz hop count dla mesh
                 if let BackendHandle::MeshForward(_, _) = handle {
                     if hop_count >= MAX_HOPS {
-                        debug!("dispatch_with_fallback: pomijam mesh forward (hop_count={})", hop_count);
+                        debug!(
+                            "dispatch_with_fallback: pomijam mesh forward (hop_count={})",
+                            hop_count
+                        );
                         continue;
                     }
                 }
@@ -305,9 +308,8 @@ impl Router {
             fallbacks_tried += 1;
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("Brak dostepnych backendow dla modelu '{}'", model)
-        }))
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("Brak dostepnych backendow dla modelu '{}'", model)))
     }
 
     /// Aktualizuje alias cache z zewnetrznych danych (np. sync z peera mesh)
@@ -366,7 +368,9 @@ mod middleware_tests {
         let cloned = handle.clone();
 
         // Assert
-        assert!(matches!(cloned, BackendHandle::MeshForward(ref n, ref s) if n == "node-1" && s == "svc-llm"));
+        assert!(
+            matches!(cloned, BackendHandle::MeshForward(ref n, ref s) if n == "node-1" && s == "svc-llm")
+        );
     }
 
     #[test]

@@ -12,11 +12,9 @@ import {
   escapeHtml,
   escapeAttr,
   toast,
-  apiGet,
-  apiPost,
-  apiDelete,
   formatMb,
 } from '/js/utils.js';
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import MeshDetailScreen from '/js/modules/mesh-detail.js';
 import { renderDiagram, bindDiagramEvents, destroyDiagram } from '/js/modules/mesh-diagram.js';
@@ -29,6 +27,7 @@ import '/js/components/tf-window.js';
 
 let nodes = [];
 let pending = [];
+let unifiedModels = [];
 let refreshInterval = null;
 let activeTab = 'list';
 
@@ -91,6 +90,7 @@ const MeshScreen = {
     destroyDiagram();
     nodes = [];
     pending = [];
+    unifiedModels = [];
     activeTab = 'list';
   },
 };
@@ -99,12 +99,18 @@ const MeshScreen = {
 
 async function loadData() {
   try {
-    const [nodesResp, pendingResp] = await Promise.all([
-      apiGet('/api/mesh/nodes'),
-      apiGet('/api/mesh/pending').catch(() => []),
+    const [nodesResp, pendingResp, unifiedResp] = await Promise.all([
+      ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
+      ApiBinary.list('meshPendingListRequest', { arrayKey: 'pending' }).catch(() => []),
+      ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
     ]);
     nodes = Array.isArray(nodesResp) ? nodesResp : [];
     pending = Array.isArray(pendingResp) ? pendingResp : [];
+    unifiedModels = Array.isArray(unifiedResp) ? unifiedResp : [];
+    // Merge: backend populuje node.models tylko co ~30s (ModelsSync broadcast).
+    // Lokalny service_registry jest swiezy od razu — sciagamy przez modelsUnifiedListRequest
+    // i dla kazdego noda dokladamy brakujace modele (dedup po aliasie).
+    mergeUnifiedModelsIntoNodes();
     updateSubheader();
   } catch (err) {
     toast(`${I18n.t('mesh.load_error')}: ${err.message}`, 'error');
@@ -125,6 +131,37 @@ function updateSubheader() {
     parts.push(`${pendingIncoming} ${escapeHtml(I18n.t('mesh.pending_count'))}`);
   }
   sub.textContent = parts.join(' · ');
+}
+
+function mergeUnifiedModelsIntoNodes() {
+  if (!Array.isArray(unifiedModels) || unifiedModels.length === 0) return;
+  // Zbuduj mape node_id -> lista aliasow + service_type.
+  const byNode = new Map();
+  for (const m of unifiedModels) {
+    const alias = m.model_name || m.alias;
+    const kind = m.service_type || m.kind;
+    if (!alias) continue;
+    const instances = Array.isArray(m.instances) ? m.instances : [];
+    for (const inst of instances) {
+      const nid = inst.node_id;
+      if (!nid) continue;
+      if (!byNode.has(nid)) byNode.set(nid, []);
+      byNode.get(nid).push({ alias, kind, loaded: inst.status === 'running' || inst.status === 'ready' });
+    }
+  }
+  for (const node of nodes) {
+    const extra = byNode.get(node.node_id);
+    if (!extra || extra.length === 0) continue;
+    const existing = Array.isArray(node.models) ? node.models.slice() : [];
+    const seen = new Set(existing.map(m => m.alias).filter(Boolean));
+    for (const m of extra) {
+      if (!seen.has(m.alias)) {
+        existing.push(m);
+        seen.add(m.alias);
+      }
+    }
+    node.models = existing;
+  }
 }
 
 function pluralize(n, singleKey, pluralKey) {
@@ -267,7 +304,7 @@ function renderNodeCard(node, kind) {
   let actions = '';
   if (kind === 'trusted') {
     actions = `
-      <tf-button variant="ghost" size="sm" icon="x" title="${escapeAttr(I18n.t('mesh.revoke_trust'))}" data-node-revoke="${escapeAttr(nodeId)}"></tf-button>
+      <tf-button variant="danger" size="sm" icon="trash" title="${escapeAttr(I18n.t('mesh.revoke_trust'))}" data-node-revoke="${escapeAttr(nodeId)}"></tf-button>
     `;
   } else if (kind === 'discovered') {
     actions = `
@@ -335,7 +372,7 @@ function buildGauges(node) {
 
 function renderRing(label, val, unit, sub, pct) {
   const safePct = pct == null ? 0 : Math.max(0, Math.min(100, pct));
-  const hot = pct != null && pct > 80 ? ' hot' : (pct != null && pct > 60 ? ' warm' : '');
+  const hot = pct != null && pct > 85 ? ' hot' : (pct != null && pct > 60 ? ' warm' : '');
   const dim = pct == null ? ' dim' : '';
   return `
     <div class="gauge">
@@ -536,7 +573,7 @@ function openPairModal() {
         errBox.hidden = false;
         return false;
       }
-      await apiPost(`/api/mesh/pair/${encodeURIComponent(idHex)}`, { pin });
+      await ApiBinary.action('meshPairingStartRequest', { remoteAddress: idHex });
       toast(I18n.t('mesh.pair_success'), 'success');
       return true;
     },
@@ -562,7 +599,7 @@ function openPinModal(nodeId) {
         errBox.hidden = false;
         return false;
       }
-      await apiPost(`/api/mesh/pair/${encodeURIComponent(nodeId)}`, { pin });
+      await ApiBinary.action('meshPairingStartRequest', { remoteAddress: nodeId });
       toast(I18n.t('mesh.pair_success'), 'success');
       return true;
     },
@@ -588,7 +625,7 @@ function openConfirmPinModal(nodeId) {
         errBox.hidden = false;
         return false;
       }
-      await apiPost(`/api/mesh/pair/${encodeURIComponent(nodeId)}/confirm`, { pin });
+      await ApiBinary.action('meshPairingConfirmRequest', { pairId: nodeId, pin });
       toast(I18n.t('mesh.pair_confirm_success'), 'success');
       return true;
     },
@@ -597,7 +634,7 @@ function openConfirmPinModal(nodeId) {
 
 async function rejectPairing(nodeId) {
   try {
-    await apiPost(`/api/mesh/pair/${encodeURIComponent(nodeId)}/reject`, {});
+    await ApiBinary.action('meshPairingRejectRequest', { pairId: nodeId });
     toast(I18n.t('mesh.pairing_rejected'), 'success');
     await loadData();
     renderActiveTab();
@@ -609,7 +646,7 @@ async function rejectPairing(nodeId) {
 async function revokeTrust(nodeId) {
   if (!confirm(I18n.t('mesh.revoke_confirm'))) return;
   try {
-    await apiDelete(`/api/mesh/trust/${encodeURIComponent(nodeId)}`);
+    await ApiBinary.action('meshTrustRevokeRequest', { nodeId });
     toast(I18n.t('mesh.revoke_success'), 'success');
     await loadData();
     renderActiveTab();

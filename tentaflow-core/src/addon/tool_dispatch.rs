@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -95,24 +95,23 @@ impl ToolDispatcher {
 
         // Sprawdz czy addon istnieje i ma zarejestrowane to narzedzie
         let tools = self.addon_manager.list_tools();
-        let tool_exists = tools.iter().any(|t| {
-            t.addon_id == addon_id && t.tool_name == function_name
-        });
+        let tool_exists = tools
+            .iter()
+            .any(|t| t.addon_id == addon_id && t.tool_name == function_name);
 
         if !tool_exists {
             bail!(
                 "Narzedzie '{}.{}' nie jest zarejestrowane w zadnym addonanie",
-                addon_id, function_name
+                addon_id,
+                function_name
             );
         }
 
         // Sprawdz uprawnienia uzytkownika do tego addonu
-        let perm_result = self.addon_manager.permission_checker().check(
-            addon_id,
-            user_id,
-            "llm",
-            None,
-        );
+        let perm_result = self
+            .addon_manager
+            .permission_checker()
+            .check(addon_id, user_id, "llm", None);
 
         if !perm_result.is_granted() {
             warn!(
@@ -121,12 +120,14 @@ impl ToolDispatcher {
             );
             bail!(
                 "Brak uprawnien do wywolania narzedzia '{}.{}'",
-                addon_id, function_name
+                addon_id,
+                function_name
             );
         }
 
         // Deleguj wywolanie do AddonManager
-        self.addon_manager.call_tool(addon_id, function_name, arguments, user_id)
+        self.addon_manager
+            .call_tool(addon_id, function_name, arguments, user_id)
     }
 
     /// Przetwarza liste tool_calls z odpowiedzi LLM.
@@ -136,40 +137,48 @@ impl ToolDispatcher {
         tool_calls: &[LlmToolCall],
         user_id: i64,
     ) -> Vec<ToolCallResult> {
-        tool_calls.iter().map(|call| {
-            let arguments: serde_json::Value = serde_json::from_str(&call.function.arguments)
-                .unwrap_or_else(|e| {
-                    warn!("Niepoprawny JSON w argumentach tool_call '{}': {}", call.function.name, e);
-                    serde_json::json!({})
-                });
+        tool_calls
+            .iter()
+            .map(|call| {
+                let arguments: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            "Niepoprawny JSON w argumentach tool_call '{}': {}",
+                            call.function.name, e
+                        );
+                        serde_json::json!({})
+                    });
 
-            match self.dispatch_tool_call(&call.function.name, arguments, user_id) {
-                Ok(result) => ToolCallResult {
-                    tool_call_id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    content: serde_json::to_string(&result).unwrap_or_default(),
-                    success: true,
-                },
-                Err(e) => {
-                    warn!("Blad wywolania narzedzia '{}': {}", call.function.name, e);
-                    ToolCallResult {
+                match self.dispatch_tool_call(&call.function.name, arguments, user_id) {
+                    Ok(result) => ToolCallResult {
                         tool_call_id: call.id.clone(),
                         name: call.function.name.clone(),
-                        content: serde_json::json!({
-                            "error": e.to_string()
-                        }).to_string(),
-                        success: false,
+                        content: serde_json::to_string(&result).unwrap_or_default(),
+                        success: true,
+                    },
+                    Err(e) => {
+                        warn!("Blad wywolania narzedzia '{}': {}", call.function.name, e);
+                        ToolCallResult {
+                            tool_call_id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            content: serde_json::json!({
+                                "error": e.to_string()
+                            })
+                            .to_string(),
+                            success: false,
+                        }
                     }
                 }
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Zwraca liste narzedzi w formacie OpenAI function calling.
     /// Filtruje po uprawnieniach uzytkownika — zwraca tylko narzedzia
     /// do ktorych uzytkownik ma dostep.
     pub fn get_tools_for_llm(&self, user_id: i64) -> Vec<serde_json::Value> {
-        self.addon_manager.list_tools()
+        self.addon_manager
+            .list_tools()
             .into_iter()
             .filter(|tool| {
                 // Sprawdz czy uzytkownik ma uprawnienie "llm" do tego addonu
@@ -199,7 +208,8 @@ impl ToolDispatcher {
 
     /// Zwraca liste narzedzi bez filtrowania uprawnien (dla admina/diagnostyki)
     pub fn get_all_tools_for_llm(&self) -> Vec<serde_json::Value> {
-        self.addon_manager.list_tools()
+        self.addon_manager
+            .list_tools()
             .into_iter()
             .map(|tool| {
                 let full_name = format!("{}.{}", tool.addon_id, tool.tool_name);
@@ -217,17 +227,18 @@ impl ToolDispatcher {
     }
 
     /// Formatuje wyniki tool_calls jako wiadomosci OpenAI (role=tool)
-    pub fn format_results_as_messages(
-        results: &[ToolCallResult],
-    ) -> Vec<serde_json::Value> {
-        results.iter().map(|result| {
-            serde_json::json!({
-                "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "name": result.name,
-                "content": result.content,
+    pub fn format_results_as_messages(results: &[ToolCallResult]) -> Vec<serde_json::Value> {
+        results
+            .iter()
+            .map(|result| {
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": result.tool_call_id,
+                    "name": result.name,
+                    "content": result.content,
+                })
             })
-        }).collect()
+            .collect()
     }
 
     /// Zwraca referencje do AddonManager

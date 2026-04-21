@@ -97,7 +97,10 @@ impl IrohEndpoint {
             // ustawia relay przez presets. Override wymaga `relay_mode` w builderze.
         }
 
-        Ok(Self { endpoint, router: None })
+        Ok(Self {
+            endpoint,
+            router: None,
+        })
     }
 
     /// Zwraca `EndpointId` (Ed25519 public key) tego endpointa.

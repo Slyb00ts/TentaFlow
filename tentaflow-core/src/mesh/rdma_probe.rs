@@ -316,8 +316,7 @@ mod macos_rdma {
             .get()
             .ok_or_else(|| anyhow!("Swift RDMA bridge nie zarejestrowany — brak probe server"))?;
 
-        let ip = CString::new(bind_ip)
-            .map_err(|_| anyhow!("Niepoprawny bind_ip: zawiera NUL"))?;
+        let ip = CString::new(bind_ip).map_err(|_| anyhow!("Niepoprawny bind_ip: zawiera NUL"))?;
         let nonce_copy = *nonce;
         let dur = duration_ms;
 
@@ -365,8 +364,8 @@ mod macos_rdma {
             .get()
             .ok_or_else(|| anyhow!("Swift RDMA bridge nie zarejestrowany — brak probe client"))?;
 
-        let ip = CString::new(target_ip)
-            .map_err(|_| anyhow!("Niepoprawny target_ip: zawiera NUL"))?;
+        let ip =
+            CString::new(target_ip).map_err(|_| anyhow!("Niepoprawny target_ip: zawiera NUL"))?;
         let nonce_copy = *nonce;
         let port = target_port;
         let dur = duration_ms;
@@ -427,9 +426,7 @@ mod macos_rdma {
         // SAFETY: callback_ctx to Box<std::sync::mpsc::Sender<RdmaProbeResult>>
         // zaalokowany w start_rdma_probe_*_macos. Zwalniamy tutaj.
         let tx = unsafe {
-            Box::from_raw(
-                callback_ctx as *mut std::sync::mpsc::Sender<super::RdmaProbeResult>,
-            )
+            Box::from_raw(callback_ctx as *mut std::sync::mpsc::Sender<super::RdmaProbeResult>)
         };
 
         let _ = tx.send(super::RdmaProbeResult {
@@ -478,10 +475,7 @@ mod linux_rdma {
                 "/sys/class/infiniband/{}/ports/1/gid_attrs/types/{}",
                 device_name, i
             );
-            let gid_path = format!(
-                "/sys/class/infiniband/{}/ports/1/gids/{}",
-                device_name, i
-            );
+            let gid_path = format!("/sys/class/infiniband/{}/ports/1/gids/{}", device_name, i);
 
             let gid_type = match std::fs::read_to_string(&type_path) {
                 Ok(t) => t,
@@ -710,10 +704,7 @@ mod linux_rdma {
 
                 if target_dev.is_null() {
                     ibv_free_device_list(device_list);
-                    return Err(anyhow!(
-                        "Nie znaleziono urzadzenia RDMA: {}",
-                        device_name
-                    ));
+                    return Err(anyhow!("Nie znaleziono urzadzenia RDMA: {}", device_name));
                 }
 
                 // Otworz kontekst urzadzenia
@@ -731,13 +722,7 @@ mod linux_rdma {
                 }
 
                 // Stworz Completion Queue (128 wpisow)
-                let cq = ibv_create_cq(
-                    ctx,
-                    128,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
-                );
+                let cq = ibv_create_cq(ctx, 128, std::ptr::null_mut(), std::ptr::null_mut(), 0);
                 if cq.is_null() {
                     ibv_dealloc_pd(pd);
                     ibv_close_device(ctx);
@@ -748,15 +733,9 @@ mod linux_rdma {
                 let mut buf = vec![0xABu8; RDMA_BUF_SIZE];
 
                 // Zarejestruj region pamieci z dostepem local write + remote write + remote read
-                let access = IBV_ACCESS_LOCAL_WRITE
-                    | IBV_ACCESS_REMOTE_WRITE
-                    | IBV_ACCESS_REMOTE_READ;
-                let mr = ibv_reg_mr(
-                    pd,
-                    buf.as_mut_ptr().cast(),
-                    RDMA_BUF_SIZE,
-                    access as i32,
-                );
+                let access =
+                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+                let mr = ibv_reg_mr(pd, buf.as_mut_ptr().cast(), RDMA_BUF_SIZE, access as i32);
                 if mr.is_null() {
                     ibv_destroy_cq(cq);
                     ibv_dealloc_pd(pd);
@@ -790,10 +769,7 @@ mod linux_rdma {
                 attr.port_num = 1;
                 attr.qp_access_flags = access;
 
-                let mask = IBV_QP_STATE
-                    | IBV_QP_PKEY_INDEX
-                    | IBV_QP_PORT
-                    | IBV_QP_ACCESS_FLAGS;
+                let mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
 
                 let ret = ibv_modify_qp(qp, &mut attr, mask);
                 if ret != 0 {
@@ -814,7 +790,10 @@ mod linux_rdma {
                 // Odczytaj aktywne MTU z portu
                 let mut port_attr: ibv_port_attr = std::mem::zeroed();
                 let ret = ibv_query_port(ctx, 1, &mut port_attr);
-                let active_mtu = if ret == 0 && port_attr.active_mtu >= IBV_MTU_256 && port_attr.active_mtu <= IBV_MTU_4096 {
+                let active_mtu = if ret == 0
+                    && port_attr.active_mtu >= IBV_MTU_256
+                    && port_attr.active_mtu <= IBV_MTU_4096
+                {
                     port_attr.active_mtu
                 } else {
                     IBV_MTU_1024
@@ -942,13 +921,19 @@ mod linux_rdma {
                     wr.send_flags = IBV_SEND_SIGNALED | 0x8; // IBV_SEND_INLINE = 0x8
 
                     let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-                    if ibv_post_send(self.qp, &mut wr, &mut bad_wr) != 0 { break; }
+                    if ibv_post_send(self.qp, &mut wr, &mut bad_wr) != 0 {
+                        break;
+                    }
 
                     let mut wc: ibv_wc = std::mem::zeroed();
                     loop {
                         let n = ibv_poll_cq(self.cq, 1, &mut wc);
-                        if n > 0 { break; }
-                        if n < 0 { return Ok(0.0); }
+                        if n > 0 {
+                            break;
+                        }
+                        if n < 0 {
+                            return Ok(0.0);
+                        }
                     }
                 }
 
@@ -968,7 +953,9 @@ mod linux_rdma {
 
                     let t = std::time::Instant::now();
                     let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-                    if ibv_post_send(self.qp, &mut wr, &mut bad_wr) != 0 { break; }
+                    if ibv_post_send(self.qp, &mut wr, &mut bad_wr) != 0 {
+                        break;
+                    }
 
                     let mut wc: ibv_wc = std::mem::zeroed();
                     loop {
@@ -979,11 +966,15 @@ mod linux_rdma {
                             }
                             break;
                         }
-                        if n < 0 { break; }
+                        if n < 0 {
+                            break;
+                        }
                     }
                 }
 
-                if samples.is_empty() { return Ok(0.0); }
+                if samples.is_empty() {
+                    return Ok(0.0);
+                }
 
                 // Mediana
                 samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -995,11 +986,7 @@ mod linux_rdma {
         }
 
         /// Polacz QP i wysylaj dane (strona klienta)
-        fn connect_and_send(
-            &self,
-            remote: &QpInfo,
-            duration_ms: u32,
-        ) -> Result<RdmaProbeResult> {
+        fn connect_and_send(&self, remote: &QpInfo, duration_ms: u32) -> Result<RdmaProbeResult> {
             self.connect_qp(remote)?;
 
             // Pomiar latency: warmup + inline SEND RTT (jak ib_send_lat)
@@ -1026,7 +1013,9 @@ mod linux_rdma {
 
                     let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
                     let ret = ibv_post_send(self.qp, &mut wr, &mut bad_wr);
-                    if ret != 0 { break; }
+                    if ret != 0 {
+                        break;
+                    }
 
                     let mut wc: ibv_wc = std::mem::zeroed();
                     loop {
@@ -1038,7 +1027,9 @@ mod linux_rdma {
                             total_bytes += RDMA_BUF_SIZE as u64;
                             break;
                         }
-                        if n < 0 { return Err(anyhow!("ibv_poll_cq failed")); }
+                        if n < 0 {
+                            return Err(anyhow!("ibv_poll_cq failed"));
+                        }
                     }
                 }
             }
@@ -1069,8 +1060,7 @@ mod linux_rdma {
 
             let start = std::time::Instant::now();
             // Dodatkowe 3s na setup i ostatnie pakiety
-            let deadline =
-                start + std::time::Duration::from_millis(duration_ms as u64 + 3000);
+            let deadline = start + std::time::Duration::from_millis(duration_ms as u64 + 3000);
             let mut total_bytes: u64 = 0;
 
             unsafe {
@@ -1112,8 +1102,7 @@ mod linux_rdma {
                             wr.sg_list = &mut sge;
                             wr.num_sge = 1;
 
-                            let mut bad_wr: *mut ibv_recv_wr =
-                                std::ptr::null_mut();
+                            let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
                             ibv_post_recv(self.qp, &mut wr, &mut bad_wr);
                         }
                     } else if n < 0 {

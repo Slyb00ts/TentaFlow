@@ -1,53 +1,18 @@
-# =============================================================================
-# Plik: addons/memory/manifest.toml
-# Opis: Manifest addonu Memory — persistent AI memory with knowledge graph,
-#       vector search, and automatic consolidation across 4 layers.
-# =============================================================================
-
 [addon]
 id = "memory"
 name = "TentaFlow Memory"
 version = "0.1.0"
-description = "Persistent AI memory with knowledge graph, vector search, conversation history, and REM consolidation"
-author = "TentaFlow"
+description = "Persistent AI memory with knowledge graph, vector search, conversation history and REM consolidation."
 category = "ai"
 keywords = ["memory", "remember", "recall", "forget", "knowledge", "graph", "facts", "summary", "context", "history", "conversation"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "rag-db"
+runtime = "wasmtime"
 platforms = ["linux", "macos", "windows", "ios", "android"]
 wasm_file = "addon.wasm"
 
-[permissions]
-required = ["storage", "log", "events", "timer"]
-optional = ["llm", "http", "notifications"]
-
-[permissions.llm]
-models = ["*"]
-
-# Granularne uprawnienia deklarowane przez addon
-[[addon_permissions]]
-id = "memory_read"
-name = "Read memories"
-description = "Can read and search stored memories"
-category = "Memory"
-
-[[addon_permissions]]
-id = "memory_write"
-name = "Write memories"
-description = "Can store new facts and memories"
-category = "Memory"
-
-[[addon_permissions]]
-id = "memory_delete"
-name = "Delete memories"
-description = "Can forget/remove stored memories"
-category = "Memory"
-
-[[addon_permissions]]
-id = "memory_admin"
-name = "Manage global memory"
-description = "Can modify global and project memory layers"
-category = "Administration"
-
-# Disambiguation rules
 [[addon.disambiguation]]
 trigger = ["remember", "store this", "save this", "note this"]
 prefer = "memory.memory_store"
@@ -60,11 +25,80 @@ prefer = "memory.memory_recall"
 over = "memory.memory_search"
 when = "user asks about previously stored information"
 
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Read key-value entries scoped to this addon."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Write key-value entries scoped to this addon."
+risk = "medium"
+
+[[permission]]
+id = "storage.delete"
+display_name = "Delete addon storage"
+description = "Remove key-value entries scoped to this addon."
+risk = "medium"
+
+[[permission]]
+id = "events.publish"
+display_name = "Publish events"
+description = "Emit memory lifecycle events (stored/recalled/forgotten)."
+risk = "low"
+
+[[permission]]
+id = "events.subscribe"
+display_name = "Subscribe to events"
+description = "Listen to chat events to auto-extract facts."
+risk = "low"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Generate with LLM"
+description = "Summarize conversations and extract facts using an LLM."
+risk = "medium"
+
+[[permission]]
+id = "memory.read"
+display_name = "Read memories"
+description = "Read and search stored memories."
+risk = "low"
+
+[[permission]]
+id = "memory.write"
+display_name = "Write memories"
+description = "Store new facts and memories."
+risk = "medium"
+
+[[permission]]
+id = "memory.delete"
+display_name = "Delete memories"
+description = "Forget or remove stored memories."
+risk = "medium"
+
+[[permission]]
+id = "memory.admin"
+display_name = "Manage global memory"
+description = "Modify the global and project memory layers shared across users."
+risk = "high"
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 512
+storage_mb = 1024
+llm_tokens_per_min = 200000
+
 [lifecycle]
 background = true
 auto_start = true
 
-[config]
 [config.schema]
 rem_interval_minutes = { type = "number", label = "REM consolidation interval (minutes)", default = 60 }
 max_context_tokens = { type = "number", label = "Max memory tokens in LLM context", default = 1024 }
@@ -73,119 +107,176 @@ auto_extract_facts = { type = "boolean", label = "Automatically extract facts fr
 auto_summarize_interval = { type = "number", label = "Auto-summarize every N messages", default = 10 }
 decay_threshold_days = { type = "number", label = "Days without access before memory decay", default = 30 }
 
-# Tools
-[tools.memory_store]
-description = "Store a fact, preference, or piece of information in memory"
+[[tool]]
+id = "memory_store"
+display_name = "Store a memory"
+description = "Store a fact, preference or piece of information in memory."
 keywords = ["remember", "store", "save", "note", "memorize", "keep"]
-[tools.memory_store.parameters]
-type = "object"
-required = ["fact"]
-[tools.memory_store.parameters.properties.fact]
-type = "string"
-description = "The information to store"
-[tools.memory_store.parameters.properties.layer]
-type = "string"
-description = "Memory layer: global, project, user, conversation (default: auto-detect)"
-[tools.memory_store.parameters.properties.tags]
-type = "string"
-description = "Comma-separated tags for categorization"
 
-[tools.memory_recall]
-description = "Recall relevant memories for a given context or query"
+[[tool.parameter]]
+name = "fact"
+param_type = "string"
+description = "The information to store."
+required = true
+
+[[tool.parameter]]
+name = "layer"
+param_type = "string"
+description = "Memory layer: global, project, user, conversation (default: auto-detect)."
+required = false
+
+[[tool.parameter]]
+name = "tags"
+param_type = "string"
+description = "Comma-separated tags for categorization."
+required = false
+
+[[tool]]
+id = "memory_recall"
+display_name = "Recall memories"
+description = "Recall relevant memories for a given context or query."
 keywords = ["remember", "recall", "know", "remind", "context", "history"]
-[tools.memory_recall.parameters]
-type = "object"
-required = ["query"]
-[tools.memory_recall.parameters.properties.query]
-type = "string"
-description = "What to search for"
-[tools.memory_recall.parameters.properties.layers]
-type = "string"
-description = "Which layers to search: global,project,user,conversation (default: all)"
-[tools.memory_recall.parameters.properties.limit]
-type = "number"
-description = "Maximum results (default: 10)"
 
-[tools.memory_search]
-description = "Search memories by semantic similarity"
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "What to search for."
+required = true
+
+[[tool.parameter]]
+name = "layers"
+param_type = "string"
+description = "Which layers to search: global,project,user,conversation (default: all)."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maximum results (default: 10)."
+required = false
+
+[[tool]]
+id = "memory_search"
+display_name = "Search memories"
+description = "Search memories by semantic similarity."
 keywords = ["search", "find", "look up", "related", "similar"]
-[tools.memory_search.parameters]
-type = "object"
-required = ["query"]
-[tools.memory_search.parameters.properties.query]
-type = "string"
-description = "Search query"
-[tools.memory_search.parameters.properties.layers]
-type = "string"
-description = "Which layers to search (default: all)"
-[tools.memory_search.parameters.properties.type]
-type = "string"
-description = "Filter by type: fact, decision, correction, preference (default: all)"
-[tools.memory_search.parameters.properties.limit]
-type = "number"
-description = "Maximum results (default: 10)"
 
-[tools.memory_forget]
-description = "Remove a specific memory"
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Search query."
+required = true
+
+[[tool.parameter]]
+name = "layers"
+param_type = "string"
+description = "Which layers to search (default: all)."
+required = false
+
+[[tool.parameter]]
+name = "type"
+param_type = "string"
+description = "Filter by type: fact, decision, correction, preference (default: all)."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maximum results (default: 10)."
+required = false
+
+[[tool]]
+id = "memory_forget"
+display_name = "Forget a memory"
+description = "Remove a specific memory."
 keywords = ["forget", "remove", "delete", "erase", "clear"]
-[tools.memory_forget.parameters]
-type = "object"
-[tools.memory_forget.parameters.properties.query]
-type = "string"
-description = "What to forget (semantic search)"
-[tools.memory_forget.parameters.properties.node_id]
-type = "number"
-description = "Specific node ID to remove"
 
-[tools.memory_correct]
-description = "Correct a wrong memory with the right information"
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "What to forget (semantic search)."
+required = false
+
+[[tool.parameter]]
+name = "node_id"
+param_type = "number"
+description = "Specific node ID to remove."
+required = false
+
+[[tool]]
+id = "memory_correct"
+display_name = "Correct a memory"
+description = "Correct a wrong memory with the right information."
 keywords = ["correct", "fix", "wrong", "update", "change", "actually"]
-[tools.memory_correct.parameters]
-type = "object"
-required = ["wrong", "correct"]
-[tools.memory_correct.parameters.properties.wrong]
-type = "string"
-description = "The incorrect fact"
-[tools.memory_correct.parameters.properties.correct]
-type = "string"
-description = "The correct fact"
-[tools.memory_correct.parameters.properties.source]
-type = "string"
-description = "Source: user_correction, fact_update (default: user_correction)"
 
-[tools.memory_summarize]
-description = "Generate or retrieve a summary of conversation or topic"
+[[tool.parameter]]
+name = "wrong"
+param_type = "string"
+description = "The incorrect fact."
+required = true
+
+[[tool.parameter]]
+name = "correct"
+param_type = "string"
+description = "The correct fact."
+required = true
+
+[[tool.parameter]]
+name = "source"
+param_type = "string"
+description = "Source: user_correction, fact_update (default: user_correction)."
+required = false
+
+[[tool]]
+id = "memory_summarize"
+display_name = "Summarize a conversation"
+description = "Generate or retrieve a summary of a conversation or topic."
 keywords = ["summarize", "summary", "overview", "recap", "tldr"]
-[tools.memory_summarize.parameters]
-type = "object"
-[tools.memory_summarize.parameters.properties.conversation_id]
-type = "string"
-description = "Conversation to summarize (default: current)"
-[tools.memory_summarize.parameters.properties.topic]
-type = "string"
-description = "Summarize by topic across conversations"
 
-[tools.memory_graph_query]
-description = "Query the knowledge graph for related facts and connections"
+[[tool.parameter]]
+name = "conversation_id"
+param_type = "string"
+description = "Conversation to summarize (default: current)."
+required = false
+
+[[tool.parameter]]
+name = "topic"
+param_type = "string"
+description = "Summarize by topic across conversations."
+required = false
+
+[[tool]]
+id = "memory_graph_query"
+display_name = "Query the knowledge graph"
+description = "Query the knowledge graph for related facts and connections."
 keywords = ["related", "connected", "graph", "relations", "linked", "chain"]
-[tools.memory_graph_query.parameters]
-type = "object"
-required = ["node"]
-[tools.memory_graph_query.parameters.properties.node]
-type = "string"
-description = "Starting concept to explore"
-[tools.memory_graph_query.parameters.properties.depth]
-type = "number"
-description = "How many hops to traverse (default: 2, max: 3)"
-[tools.memory_graph_query.parameters.properties.relations]
-type = "string"
-description = "Filter by relation types (comma-separated)"
 
-[tools.memory_status]
-description = "Show memory statistics and health"
+[[tool.parameter]]
+name = "node"
+param_type = "string"
+description = "Starting concept to explore."
+required = true
+
+[[tool.parameter]]
+name = "depth"
+param_type = "number"
+description = "How many hops to traverse (default: 2, max: 3)."
+required = false
+
+[[tool.parameter]]
+name = "relations"
+param_type = "string"
+description = "Filter by relation types (comma-separated)."
+required = false
+
+[[tool]]
+id = "memory_status"
+display_name = "Memory status"
+description = "Show memory statistics and health."
 keywords = ["memory", "status", "stats", "health", "info"]
-[tools.memory_status.parameters]
-type = "object"
-[tools.memory_status.parameters.properties.layer]
-type = "string"
-description = "Specific layer: global, project, user, conversation (default: all)"
+
+[[tool.parameter]]
+name = "layer"
+param_type = "string"
+description = "Specific layer: global, project, user, conversation (default: all)."
+required = false

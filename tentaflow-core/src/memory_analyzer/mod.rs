@@ -96,8 +96,11 @@ impl MemoryAnalyzer {
         }
 
         // Slow-path: wywolaj LLM dla zlozonych zapytan
-        let system_prompt = self.prompt_registry.require_content(analyzer_llm::QUERY_ANALYSIS_SYSTEM);
-        let user_prompt = format_query_analysis_user_prompt(user_message, session_context, speaker_id);
+        let system_prompt = self
+            .prompt_registry
+            .require_content(analyzer_llm::QUERY_ANALYSIS_SYSTEM);
+        let user_prompt =
+            format_query_analysis_user_prompt(user_message, session_context, speaker_id);
 
         let response = self.call_model(system_prompt, &user_prompt).await?;
 
@@ -113,24 +116,52 @@ impl MemoryAnalyzer {
 
         // Powitania - zawsze NONE
         let greetings = [
-            "cześć", "czesc", "hej", "hejka", "siema", "siemka",
-            "dzień dobry", "dzien dobry", "dobry wieczór", "dobry wieczor",
-            "cześć jarvis", "czesc jarvis", "hej jarvis", "siema jarvis",
-            "witaj", "witam", "hello", "hi",
+            "cześć",
+            "czesc",
+            "hej",
+            "hejka",
+            "siema",
+            "siemka",
+            "dzień dobry",
+            "dzien dobry",
+            "dobry wieczór",
+            "dobry wieczor",
+            "cześć jarvis",
+            "czesc jarvis",
+            "hej jarvis",
+            "siema jarvis",
+            "witaj",
+            "witam",
+            "hello",
+            "hi",
         ];
 
         for greeting in greetings {
             if msg_trimmed == greeting
-               || (msg_trimmed.starts_with(greeting) && msg_trimmed.as_bytes().get(greeting.len()).map_or(false, |&b| b == b' ' || b == b',')) {
+                || (msg_trimmed.starts_with(greeting)
+                    && msg_trimmed
+                        .as_bytes()
+                        .get(greeting.len())
+                        .map_or(false, |&b| b == b' ' || b == b','))
+            {
                 return Some(skip_memory_decision("Fast-path: greeting detected"));
             }
         }
 
         // Pytania do AI (Jarvis) - zawsze NONE
         let ai_questions = [
-            "jak się masz", "jak sie masz", "co słychać", "co slychac",
-            "co robisz", "co porabiasz", "jak tam", "co u ciebie",
-            "pomóż mi", "pomoz mi", "pomocy", "help",
+            "jak się masz",
+            "jak sie masz",
+            "co słychać",
+            "co slychac",
+            "co robisz",
+            "co porabiasz",
+            "jak tam",
+            "co u ciebie",
+            "pomóż mi",
+            "pomoz mi",
+            "pomocy",
+            "help",
         ];
 
         for pattern in ai_questions {
@@ -141,13 +172,19 @@ impl MemoryAnalyzer {
 
         // Przedstawienia sie - zawsze NONE (Memory zapisze po odpowiedzi)
         let introductions = [
-            "mam na imię", "mam na imie",
-            "nazywam się", "nazywam sie", "moje imię to", "moje imie to",
+            "mam na imię",
+            "mam na imie",
+            "nazywam się",
+            "nazywam sie",
+            "moje imię to",
+            "moje imie to",
         ];
 
         for intro in introductions {
             if msg_trimmed.contains(intro) {
-                return Some(skip_memory_decision("Fast-path: self-introduction detected"));
+                return Some(skip_memory_decision(
+                    "Fast-path: self-introduction detected",
+                ));
             }
         }
 
@@ -156,7 +193,9 @@ impl MemoryAnalyzer {
             let rest = &msg_trimmed["jestem ".len()..];
             let word_count = rest.split_whitespace().count();
             if word_count <= 2 {
-                return Some(skip_memory_decision("Fast-path: self-introduction detected"));
+                return Some(skip_memory_decision(
+                    "Fast-path: self-introduction detected",
+                ));
             }
         }
 
@@ -177,7 +216,8 @@ impl MemoryAnalyzer {
         user_message: &str,
         ai_response: &str,
     ) -> Result<StoreDecision, MemoryAnalyzerError> {
-        self.analyze_for_storage_with_speaker(user_message, ai_response, None, None).await
+        self.analyze_for_storage_with_speaker(user_message, ai_response, None, None)
+            .await
     }
 
     /// Analizuje rozmowę i decyduje co zapisać do Memory (z informacją o mówcy)
@@ -192,7 +232,9 @@ impl MemoryAnalyzer {
         speaker_id: Option<&str>,
         speaker_name: Option<&str>,
     ) -> Result<StoreDecision, MemoryAnalyzerError> {
-        let system_prompt = self.prompt_registry.require_content(analyzer_llm::STORE_ANALYSIS_SYSTEM);
+        let system_prompt = self
+            .prompt_registry
+            .require_content(analyzer_llm::STORE_ANALYSIS_SYSTEM);
 
         let user_prompt = match speaker_id {
             Some(sid) => format_store_analysis_user_prompt_with_speaker(
@@ -215,7 +257,9 @@ impl MemoryAnalyzer {
         entity_name: &str,
         candidates: &[(String, String)],
     ) -> Result<String, MemoryAnalyzerError> {
-        let system_prompt = self.prompt_registry.require_content(analyzer_llm::DISAMBIGUATION_SYSTEM);
+        let system_prompt = self
+            .prompt_registry
+            .require_content(analyzer_llm::DISAMBIGUATION_SYSTEM);
         let user_prompt = format_disambiguation_prompt(entity_name, candidates);
 
         self.call_model(system_prompt, &user_prompt).await
@@ -292,7 +336,10 @@ impl MemoryAnalyzer {
         user_prompt: &str,
     ) -> Result<String, MemoryAnalyzerError> {
         // Najpierw sprawdź czy model jest dostępny jako QUIC LLM
-        if self.service_manager.has_quic_llm_service(&self.config.model_name) {
+        if self
+            .service_manager
+            .has_quic_llm_service(&self.config.model_name)
+        {
             return self.call_quic_llm(system_prompt, user_prompt).await;
         }
 
@@ -387,11 +434,13 @@ impl MemoryAnalyzer {
 
         // Jeśli JSON nie ma wymaganych pól, spróbuj wyciągnąć to co się da
         if let Ok(partial) = serde_json::from_str::<serde_json::Value>(&cleaned) {
-            let should_query = partial.get("should_query")
+            let should_query = partial
+                .get("should_query")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let query_type_str = partial.get("query_type")
+            let query_type_str = partial
+                .get("query_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("NONE");
 
@@ -405,9 +454,14 @@ impl MemoryAnalyzer {
                 MemoryQueryType::None
             };
 
-            let search_terms = partial.get("search_terms")
+            let search_terms = partial
+                .get("search_terms")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             debug!(
@@ -426,10 +480,7 @@ impl MemoryAnalyzer {
         }
 
         // Nic się nie udało - zwróć błąd
-        warn!(
-            "Failed to parse QueryDecision JSON: Response: {}",
-            response
-        );
+        warn!("Failed to parse QueryDecision JSON: Response: {}", response);
         Err(MemoryAnalyzerError::ParseError(format!(
             "Invalid JSON response: {}",
             &response[..response.len().min(100)]
@@ -661,10 +712,24 @@ mod tests {
         for greeting in greetings {
             let msg_lower = greeting.to_lowercase().trim().to_string();
             let test_greetings = [
-                "cześć", "czesc", "hej", "hejka", "siema", "siemka",
-                "dzień dobry", "dzien dobry", "dobry wieczór", "dobry wieczor",
-                "cześć jarvis", "czesc jarvis", "hej jarvis", "siema jarvis",
-                "witaj", "witam", "hello", "hi",
+                "cześć",
+                "czesc",
+                "hej",
+                "hejka",
+                "siema",
+                "siemka",
+                "dzień dobry",
+                "dzien dobry",
+                "dobry wieczór",
+                "dobry wieczor",
+                "cześć jarvis",
+                "czesc jarvis",
+                "hej jarvis",
+                "siema jarvis",
+                "witaj",
+                "witam",
+                "hello",
+                "hi",
             ];
 
             let mut found = false;
@@ -689,7 +754,13 @@ mod tests {
 
         for intro in intros {
             let msg_lower = intro.to_lowercase();
-            let intro_patterns = ["jestem ", "mam na imię", "mam na imie", "nazywam się", "nazywam sie"];
+            let intro_patterns = [
+                "jestem ",
+                "mam na imię",
+                "mam na imie",
+                "nazywam się",
+                "nazywam sie",
+            ];
 
             let mut found = false;
             for pattern in intro_patterns {
@@ -714,16 +785,27 @@ mod tests {
             let msg_lower = q.to_lowercase().trim().to_string();
 
             let greetings = [
-                "cześć", "czesc", "hej", "hejka", "siema",
-                "dzień dobry", "dzien dobry",
-                "cześć jarvis", "czesc jarvis", "hej jarvis",
+                "cześć",
+                "czesc",
+                "hej",
+                "hejka",
+                "siema",
+                "dzień dobry",
+                "dzien dobry",
+                "cześć jarvis",
+                "czesc jarvis",
+                "hej jarvis",
             ];
 
-            let is_greeting = greetings.iter().any(|g| {
-                msg_lower == *g || msg_lower.starts_with(&format!("{} ", g))
-            });
+            let is_greeting = greetings
+                .iter()
+                .any(|g| msg_lower == *g || msg_lower.starts_with(&format!("{} ", g)));
 
-            assert!(!is_greeting, "Question should NOT match greeting fast-path: {}", q);
+            assert!(
+                !is_greeting,
+                "Question should NOT match greeting fast-path: {}",
+                q
+            );
         }
     }
 }

@@ -42,11 +42,11 @@ pub struct PathsSnapshot {
 fn collect_paths() -> PathsSnapshot {
     let _ = crate::paths::ensure_models_dirs();
     PathsSnapshot {
-        tentaflow_home:         crate::paths::tentaflow_home().display().to_string(),
-        models_root:            crate::paths::models_root().display().to_string(),
-        hf_home:                crate::paths::hf_home().display().to_string(),
-        torch_home:             crate::paths::torch_home().display().to_string(),
-        container_models_path:  crate::paths::CONTAINER_MODELS_PATH.to_string(),
+        tentaflow_home: crate::paths::tentaflow_home().display().to_string(),
+        models_root: crate::paths::models_root().display().to_string(),
+        hf_home: crate::paths::hf_home().display().to_string(),
+        torch_home: crate::paths::torch_home().display().to_string(),
+        container_models_path: crate::paths::CONTAINER_MODELS_PATH.to_string(),
     }
 }
 
@@ -212,8 +212,11 @@ fn detect_gpu() -> GpuSnapshot {
     };
 
     GpuSnapshot {
-        nvidia, amd, intel,
-        metal_available, vulkan_available,
+        nvidia,
+        amd,
+        intel,
+        metal_available,
+        vulkan_available,
         preferred_backend,
     }
 }
@@ -221,8 +224,12 @@ fn detect_gpu() -> GpuSnapshot {
 /// Wykrywa karty AMD z ROCm 7+. Uzywamy `rocminfo` jesli jest, inaczej
 /// nic nie zwraca — ROCm wymaga tego binary do detekcji kart.
 fn detect_amd_rocm() -> Vec<AmdGpu> {
-    let Ok(out) = Command::new("rocminfo").output() else { return Vec::new(); };
-    if !out.status.success() { return Vec::new(); }
+    let Ok(out) = Command::new("rocminfo").output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
     let text = String::from_utf8_lossy(&out.stdout);
 
     let rocm_version = detect_rocm_version();
@@ -243,7 +250,11 @@ fn detect_amd_rocm() -> Vec<AmdGpu> {
             let name = t.trim_start_matches("Marketing Name:").trim().to_string();
             gpus.push(AmdGpu {
                 index: idx,
-                name: if name.is_empty() { current_name.clone().unwrap_or_default() } else { name },
+                name: if name.is_empty() {
+                    current_name.clone().unwrap_or_default()
+                } else {
+                    name
+                },
                 vram_mb: 0, // rocminfo nie raportuje bezposrednio; live metryki z rocm-smi
                 rocm_version: rocm_version.clone(),
             });
@@ -258,7 +269,10 @@ fn detect_rocm_version() -> Option<String> {
     if let Ok(v) = std::fs::read_to_string("/opt/rocm/.info/version") {
         return Some(v.trim().to_string());
     }
-    let out = Command::new("rocm-smi").arg("--showversion").output().ok()?;
+    let out = Command::new("rocm-smi")
+        .arg("--showversion")
+        .output()
+        .ok()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout);
         for line in s.lines() {
@@ -272,8 +286,12 @@ fn detect_rocm_version() -> Option<String> {
 
 /// Wykrywa Intel Arc / iGPU przez `sycl-ls` (cz. oneAPI).
 fn detect_intel_xpu() -> Vec<IntelGpu> {
-    let Ok(out) = Command::new("sycl-ls").output() else { return Vec::new(); };
-    if !out.status.success() { return Vec::new(); }
+    let Ok(out) = Command::new("sycl-ls").output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut gpus = Vec::new();
     let oneapi_version = detect_oneapi_version();
@@ -282,7 +300,10 @@ fn detect_intel_xpu() -> Vec<IntelGpu> {
         if t.contains("level_zero:gpu") || t.contains("opencl:gpu") {
             // format: "[ext_oneapi_level_zero:gpu:0] Intel(R) Arc(TM) A770 ..."
             if let Some(name) = t.rsplit_once("] ").map(|(_, n)| n.to_string()) {
-                gpus.push(IntelGpu { name, oneapi_version: oneapi_version.clone() });
+                gpus.push(IntelGpu {
+                    name,
+                    oneapi_version: oneapi_version.clone(),
+                });
             }
         }
     }
@@ -290,8 +311,7 @@ fn detect_intel_xpu() -> Vec<IntelGpu> {
 }
 
 fn detect_oneapi_version() -> Option<String> {
-    run_version(["icx", "--version"])
-        .or_else(|| std::env::var("ONEAPI_ROOT").ok())
+    run_version(["icx", "--version"]).or_else(|| std::env::var("ONEAPI_ROOT").ok())
 }
 
 fn detect_nvidia() -> Vec<NvidiaGpu> {
@@ -336,7 +356,11 @@ fn detect_cuda_runtime_version() -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || s == "N/A" { None } else { Some(s) }
+    if s.is_empty() || s == "N/A" {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn detect_vulkan() -> bool {
@@ -351,16 +375,14 @@ fn detect_runtimes() -> Runtimes {
     Runtimes {
         docker: run_version(["docker", "--version"]),
         podman: run_version(["podman", "--version"]),
-        python: run_version(["python3", "--version"]).or_else(|| run_version(["python", "--version"])),
+        python: run_version(["python3", "--version"])
+            .or_else(|| run_version(["python", "--version"])),
         cuda_toolkit: run_version(["nvcc", "--version"]),
     }
 }
 
 fn run_version<const N: usize>(argv: [&str; N]) -> Option<String> {
-    let out = Command::new(argv[0])
-        .args(&argv[1..])
-        .output()
-        .ok()?;
+    let out = Command::new(argv[0]).args(&argv[1..]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -390,11 +412,17 @@ fn build_engine_support(
 
     // Helper text pokazujacy ktory backend wygrywa
     let gpu_reason = || -> String {
-        if has_cuda { "CUDA GPU".into() }
-        else if has_rocm { "AMD ROCm GPU".into() }
-        else if has_metal { "Apple Metal".into() }
-        else if has_xpu { "Intel XPU".into() }
-        else { "tylko CPU".into() }
+        if has_cuda {
+            "CUDA GPU".into()
+        } else if has_rocm {
+            "AMD ROCm GPU".into()
+        } else if has_metal {
+            "Apple Metal".into()
+        } else if has_xpu {
+            "Intel XPU".into()
+        } else {
+            "tylko CPU".into()
+        }
     };
     let _ = gpu_reason;
     let _ = has_any_gpu;
@@ -403,36 +431,65 @@ fn build_engine_support(
 
     // LLM
     out.push(engine(
-        "llm-llamacpp", "llm",
+        "llm-llamacpp",
+        "llm",
         true, // CPU fallback zawsze dziala
-        if has_cuda { "CUDA GPU wykryte" }
-        else if has_metal { "Metal dostepny" }
-        else if gpu.vulkan_available { "Vulkan dostepny" }
-        else { "CPU fallback" },
+        if has_cuda {
+            "CUDA GPU wykryte"
+        } else if has_metal {
+            "Metal dostepny"
+        } else if gpu.vulkan_available {
+            "Vulkan dostepny"
+        } else {
+            "CPU fallback"
+        },
         &["llama.cpp-server (natywna binarka)"],
         &[DeployBackend::Native, DeployBackend::Docker],
     ));
     // vLLM: CUDA, ROCm 7+, Metal (vllm-metal plugin) — nie CPU
     out.push(engine(
-        "llm-vllm", "llm", has_cuda || has_rocm || has_metal,
-        if has_cuda { "CUDA OK" }
-        else if has_rocm { "AMD ROCm OK" }
-        else if has_metal { "Metal (vllm-metal)" }
-        else { "wymaga GPU (CUDA/ROCm/Metal) — dla CPU uzyj llama.cpp" },
+        "llm-vllm",
+        "llm",
+        has_cuda || has_rocm || has_metal,
+        if has_cuda {
+            "CUDA OK"
+        } else if has_rocm {
+            "AMD ROCm OK"
+        } else if has_metal {
+            "Metal (vllm-metal)"
+        } else {
+            "wymaga GPU (CUDA/ROCm/Metal) — dla CPU uzyj llama.cpp"
+        },
         &["CUDA / ROCm 7 / Metal"],
-        if has_docker { &[DeployBackend::Native, DeployBackend::Docker][..] } else { &[DeployBackend::Native][..] },
+        if has_docker {
+            &[DeployBackend::Native, DeployBackend::Docker][..]
+        } else {
+            &[DeployBackend::Native][..]
+        },
     ));
     // SGLang: CUDA lub ROCm
     out.push(engine(
-        "llm-sglang", "llm", has_cuda || has_rocm,
-        if has_cuda { "CUDA OK" }
-        else if has_rocm { "AMD ROCm" }
-        else { "wymaga CUDA/ROCm — dla CPU uzyj llama.cpp" },
+        "llm-sglang",
+        "llm",
+        has_cuda || has_rocm,
+        if has_cuda {
+            "CUDA OK"
+        } else if has_rocm {
+            "AMD ROCm"
+        } else {
+            "wymaga CUDA/ROCm — dla CPU uzyj llama.cpp"
+        },
         &["CUDA / ROCm 7"],
-        if has_docker { &[DeployBackend::Native, DeployBackend::Docker][..] } else { &[DeployBackend::Native][..] },
+        if has_docker {
+            &[DeployBackend::Native, DeployBackend::Docker][..]
+        } else {
+            &[DeployBackend::Native][..]
+        },
     ));
     out.push(engine(
-        "llm-ollama", "llm", has_docker || true,
+        "llm-ollama",
+        "llm",
+        has_docker || true,
         "Ollama ma wlasna natywna binarke",
         &["Docker lub Ollama binarka"],
         &[DeployBackend::Docker, DeployBackend::Native],
@@ -440,69 +497,158 @@ fn build_engine_support(
 
     // STT
     out.push(engine(
-        "stt-whisper", "stt", true,
-        if has_cuda { "CUDA OK" } else if has_metal { "Metal OK" } else { "CPU fallback" },
+        "stt-whisper",
+        "stt",
+        true,
+        if has_cuda {
+            "CUDA OK"
+        } else if has_metal {
+            "Metal OK"
+        } else {
+            "CPU fallback"
+        },
         &["whisper.cpp-server"],
         &[DeployBackend::Native, DeployBackend::Docker],
     ));
     out.push(engine(
-        "stt-parakeet", "stt", has_cuda || has_rocm,
-        if has_cuda { "CUDA OK (NeMo)" }
-        else if has_rocm { "ROCm exp. (NeMo)" }
-        else { "wymaga CUDA (NeMo)" },
+        "stt-parakeet",
+        "stt",
+        has_cuda || has_rocm,
+        if has_cuda {
+            "CUDA OK (NeMo)"
+        } else if has_rocm {
+            "ROCm exp. (NeMo)"
+        } else {
+            "wymaga CUDA (NeMo)"
+        },
         &["CUDA / ROCm 7 (NeMo)"],
-        if has_docker { &[DeployBackend::Native, DeployBackend::Docker][..] } else { &[DeployBackend::Native][..] },
+        if has_docker {
+            &[DeployBackend::Native, DeployBackend::Docker][..]
+        } else {
+            &[DeployBackend::Native][..]
+        },
     ));
     out.push(engine(
-        "stt-qwen-asr", "stt", has_cuda || has_rocm || has_metal,
-        if has_cuda { "CUDA + flash-attn" }
-        else if has_rocm { "AMD ROCm" }
-        else if has_metal { "Metal (MPS)" }
-        else { "wymaga GPU" },
+        "stt-qwen-asr",
+        "stt",
+        has_cuda || has_rocm || has_metal,
+        if has_cuda {
+            "CUDA + flash-attn"
+        } else if has_rocm {
+            "AMD ROCm"
+        } else if has_metal {
+            "Metal (MPS)"
+        } else {
+            "wymaga GPU"
+        },
         &["CUDA / ROCm / Metal + transformers"],
-        if has_docker { &[DeployBackend::Native, DeployBackend::Docker][..] } else { &[DeployBackend::Native][..] },
+        if has_docker {
+            &[DeployBackend::Native, DeployBackend::Docker][..]
+        } else {
+            &[DeployBackend::Native][..]
+        },
     ));
 
     // TTS
     out.push(engine(
-        "tts-sherpa", "tts", true,
+        "tts-sherpa",
+        "tts",
+        true,
         "sherpa-onnx dziala na CPU",
         &["sherpa-onnx (natywna binarka)"],
         &[DeployBackend::Native, DeployBackend::Docker],
     ));
     out.push(engine(
-        "tts-xtts", "tts", has_cuda || has_rocm || has_metal,
-        if has_cuda { "CUDA" } else if has_rocm { "ROCm" } else if has_metal { "Metal MPS" } else { "wymaga GPU" },
+        "tts-xtts",
+        "tts",
+        has_cuda || has_rocm || has_metal,
+        if has_cuda {
+            "CUDA"
+        } else if has_rocm {
+            "ROCm"
+        } else if has_metal {
+            "Metal MPS"
+        } else {
+            "wymaga GPU"
+        },
         &["CUDA / ROCm / Metal (coqui-TTS)"],
-        if has_docker { &[DeployBackend::Native, DeployBackend::Docker][..] } else { &[DeployBackend::Native][..] },
+        if has_docker {
+            &[DeployBackend::Native, DeployBackend::Docker][..]
+        } else {
+            &[DeployBackend::Native][..]
+        },
     ));
     out.push(engine(
-        "tts-voxcpm", "tts", has_cuda || has_rocm || has_metal,
-        if has_cuda { "CUDA" } else if has_rocm { "ROCm" } else if has_metal { "Metal" } else { "wymaga GPU" },
+        "tts-voxcpm",
+        "tts",
+        has_cuda || has_rocm || has_metal,
+        if has_cuda {
+            "CUDA"
+        } else if has_rocm {
+            "ROCm"
+        } else if has_metal {
+            "Metal"
+        } else {
+            "wymaga GPU"
+        },
         &["CUDA / ROCm / Metal (VoxCPM)"],
-        if has_docker { &[DeployBackend::Native, DeployBackend::Docker][..] } else { &[DeployBackend::Native][..] },
+        if has_docker {
+            &[DeployBackend::Native, DeployBackend::Docker][..]
+        } else {
+            &[DeployBackend::Native][..]
+        },
     ));
 
     // Embeddings / Reranker (TEI, Rust+Candle — natywna binarka)
     out.push(engine(
-        "embeddings", "embeddings", true,
-        if has_cuda { "CUDA + Candle" } else if has_metal { "Metal + Candle" } else { "CPU Candle" },
+        "embeddings",
+        "embeddings",
+        true,
+        if has_cuda {
+            "CUDA + Candle"
+        } else if has_metal {
+            "Metal + Candle"
+        } else {
+            "CPU Candle"
+        },
         &["text-embeddings-router (natywna binarka)"],
         &[DeployBackend::Native, DeployBackend::Docker],
     ));
     out.push(engine(
-        "reranker", "reranker", true,
-        if has_cuda { "CUDA + Candle" } else if has_metal { "Metal + Candle" } else { "CPU" },
+        "reranker",
+        "reranker",
+        true,
+        if has_cuda {
+            "CUDA + Candle"
+        } else if has_metal {
+            "Metal + Candle"
+        } else {
+            "CPU"
+        },
         &["text-embeddings-router"],
         &[DeployBackend::Native, DeployBackend::Docker],
     ));
 
     // Image
     out.push(engine(
-        "comfyui", "image", has_cuda || has_rocm || has_metal,
-        if has_cuda { "CUDA" } else if has_rocm { "ROCm" } else if has_metal { "Metal" } else { "wymaga GPU" },
+        "comfyui",
+        "image",
+        has_cuda || has_rocm || has_metal,
+        if has_cuda {
+            "CUDA"
+        } else if has_rocm {
+            "ROCm"
+        } else if has_metal {
+            "Metal"
+        } else {
+            "wymaga GPU"
+        },
         &["CUDA / ROCm / Metal (ComfyUI)"],
-        if has_docker { &[DeployBackend::Native, DeployBackend::Docker][..] } else { &[DeployBackend::Native][..] },
+        if has_docker {
+            &[DeployBackend::Native, DeployBackend::Docker][..]
+        } else {
+            &[DeployBackend::Native][..]
+        },
     ));
 
     out
@@ -542,14 +688,22 @@ mod tests {
     fn llama_is_always_marked_available() {
         // llama-server ma CPU fallback wiec powinien byc OK wszedzie
         let caps = collect();
-        let llm = caps.supported_engines.iter().find(|e| e.engine == "llm-llamacpp").unwrap();
+        let llm = caps
+            .supported_engines
+            .iter()
+            .find(|e| e.engine == "llm-llamacpp")
+            .unwrap();
         assert!(llm.available);
     }
 
     #[test]
     fn vllm_requires_any_gpu_but_not_docker() {
         let caps = collect();
-        let vllm = caps.supported_engines.iter().find(|e| e.engine == "llm-vllm").unwrap();
+        let vllm = caps
+            .supported_engines
+            .iter()
+            .find(|e| e.engine == "llm-vllm")
+            .unwrap();
         let has_cuda = !caps.gpu.nvidia.is_empty() && caps.runtimes.cuda_toolkit.is_some();
         let has_rocm = !caps.gpu.amd.is_empty();
         let has_metal = caps.gpu.metal_available;
@@ -560,11 +714,17 @@ mod tests {
     fn preferred_backend_matches_detected_gpu() {
         let caps = collect();
         use super::GpuBackend::*;
-        let expected = if !caps.gpu.nvidia.is_empty() { Cuda }
-            else if !caps.gpu.amd.is_empty() { Rocm }
-            else if caps.gpu.metal_available { Metal }
-            else if !caps.gpu.intel.is_empty() { Xpu }
-            else { Cpu };
+        let expected = if !caps.gpu.nvidia.is_empty() {
+            Cuda
+        } else if !caps.gpu.amd.is_empty() {
+            Rocm
+        } else if caps.gpu.metal_available {
+            Metal
+        } else if !caps.gpu.intel.is_empty() {
+            Xpu
+        } else {
+            Cpu
+        };
         assert_eq!(caps.gpu.preferred_backend, expected);
     }
 }

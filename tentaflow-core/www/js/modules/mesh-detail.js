@@ -17,6 +17,7 @@ import {
   formatMb,
   formatBytes,
 } from '/js/utils.js';
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -37,7 +38,7 @@ const MeshDetailScreen = {
     wasDisconnected = false;
     lastFetchAt = null;
 
-    const content = document.getElementById('content');
+    const content = document.getElementById('main');
     if (!content) return;
     content.innerHTML = renderSkeleton();
     bindBack(content);
@@ -68,9 +69,9 @@ const MeshDetailScreen = {
 async function loadNode() {
   if (!currentNodeId) return;
   try {
-    const data = await apiGet(`/api/mesh/nodes/${encodeURIComponent(currentNodeId)}`);
+    const resp = await ApiBinary.one('meshNodeDetailRequest', { nodeId: currentNodeId });
     const wasDc = wasDisconnected;
-    nodeData = data;
+    nodeData = resp.node;
     lastFetchAt = Date.now();
     wasDisconnected = false;
     if (wasDc) toast(I18n.t('mesh.reconnected'), 'success');
@@ -89,8 +90,17 @@ function setupRefresh() {
       MeshDetailScreen.cleanup();
       return;
     }
+    // Router mogl nas w miedzyczasie zastapic innym widokiem w #main.
+    // Jesli .mesh-detail zniknelo, cleanup + stop — inaczej interval dalej
+    // nadpisywalby swiezo zrenderowana strone docelowa.
+    if (!document.querySelector('.mesh-detail')) {
+      MeshDetailScreen.cleanup();
+      return;
+    }
     await loadNode();
-    if (currentNodeId) renderDetail();
+    if (currentNodeId && document.querySelector('.mesh-detail')) {
+      renderDetail();
+    }
   }, interval);
 }
 
@@ -132,7 +142,7 @@ function renderSkeleton() {
 }
 
 function renderDetail() {
-  const content = document.getElementById('content');
+  const content = document.getElementById('main');
   if (!content) return;
 
   if (!nodeData) {
@@ -313,12 +323,21 @@ function buildNetworkInterfaces(n) {
     const tx = i.tx_bytes_per_sec || 0;
     const bw = `↓ ${formatBytes(rx)}/s · ↑ ${formatBytes(tx)}/s`;
     const badges = [];
+    if (i.interface_type === 'thunderbolt') {
+      badges.push('<span class="net-badge tb"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" fill="currentColor"/></svg>TB</span>');
+    }
     if (i.rdma_available) badges.push('<span class="net-badge rdma">RDMA</span>');
-    if (i.numa_node != null) badges.push(`<span class="net-badge numa">NUMA${i.numa_node}</span>`);
+    if (i.roce_available) badges.push('<span class="net-badge roce">RoCE</span>');
+    if (i.numa_node != null && i.numa_node >= 0) {
+      badges.push(`<span class="net-badge numa">NUMA${i.numa_node}</span>`);
+    }
+    const nameIcon = i.interface_type === 'thunderbolt'
+      ? '<svg class="net-iface-icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>'
+      : '';
     return `
       <div class="net-row">
         ${dot}
-        <span class="net-name">${escapeHtml(i.name || '—')}</span>
+        <span class="net-name">${nameIcon}${escapeHtml(i.name || '—')}</span>
         <span class="net-speed">${escapeHtml(speed)}</span>
         <span class="net-ip">${escapeHtml(ip)}</span>
         <span class="net-bw">${escapeHtml(bw)}</span>
@@ -406,9 +425,10 @@ function bindContainerActions(root) {
     const name = btn.dataset.containerName;
     if (!action || !name || !currentNodeId) return;
     try {
-      await apiPost(`/api/mesh/nodes/${encodeURIComponent(currentNodeId)}/command`, {
-        command: `container.${action}`,
-        args: { name },
+      await ApiBinary.action('meshNodeCommandRequest', {
+        nodeId: currentNodeId,
+        command: `container_${action}`,
+        args: [name],
       });
       toast(`${action}: ${name}`, 'success');
       await loadNode();

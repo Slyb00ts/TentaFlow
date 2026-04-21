@@ -47,7 +47,7 @@ function renderTable() {
         <td>${escapeHtml(k.name)}</td>
         <td>${formatDate(k.createdAtEpoch)}</td>
         <td>${k.lastUsedAtEpoch ? formatRelative(k.lastUsedAtEpoch) : '—'}</td>
-        <td><tf-button variant="danger" size="sm" data-revoke="${escapeHtml(k.keyId)}" label="Usuń"></tf-button></td>
+        <td><tf-button variant="danger" size="sm" icon="trash" data-revoke="${escapeHtml(k.keyId)}" title="Usuń"></tf-button></td>
       </tr>`).join('')}</tbody>
     </table>`;
   host.querySelectorAll('[data-revoke]').forEach((b) => {

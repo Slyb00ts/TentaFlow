@@ -1,0 +1,1388 @@
+/* =============================================================================
+   Plik: addons.css
+   Opis: Style dla modulow Addons (lista + detail z tabami: Visibility,
+         Permissions matrix, OAuth Config, Linked Accounts) oraz widoku
+         My Connected Accounts. Wykorzystuje zmienne z style.css.
+   ============================================================================= */
+
+/* ---- Lista kart addonow ------------------------------------------------- */
+
+.addons-screen .page-header {
+  margin-bottom: 20px;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.addons-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.addons-toolbar tf-searchbox {
+  flex: 1;
+  min-width: 240px;
+}
+
+tf-chip.filter-chip > .tf-chip {
+  padding: 5px 10px;
+  border-radius: 14px;
+  background: var(--bg-3);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+tf-chip.filter-chip > .tf-chip.clickable:hover {
+  border-color: var(--border-hover);
+  color: var(--text);
+}
+
+tf-chip.filter-chip[active] > .tf-chip {
+  background: var(--accent-glow);
+  color: var(--accent-2);
+  border-color: var(--accent-1);
+}
+
+.addon-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.addons-screen .addon-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  cursor: pointer;
+  transition: all 0.15s;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.addons-screen .addon-card:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-hover);
+  transform: translateY(-1px);
+}
+
+.addons-screen .addon-card.disabled {
+  opacity: 0.6;
+}
+
+.addons-screen .addon-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.addons-screen .addon-ico {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  background: var(--gradient-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.addons-screen .addon-ico .icon {
+  width: 20px;
+  height: 20px;
+}
+
+.addons-screen .addon-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.addons-screen .a-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.addons-screen .a-version {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.addons-screen .a-desc {
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin: 6px 0 10px;
+  min-height: 34px;
+}
+
+.addons-screen .a-badges {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+tf-chip[variant="addon-badge"] > .tf-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  border: 1px solid var(--border);
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+
+tf-chip.addon-badge.oauth-global > .tf-chip {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--success);
+  border-color: rgba(34, 197, 94, 0.3);
+}
+
+tf-chip.addon-badge.oauth-individual > .tf-chip {
+  background: rgba(167, 139, 250, 0.15);
+  color: var(--accent-2);
+  border-color: rgba(167, 139, 250, 0.35);
+}
+
+tf-chip.addon-badge.oauth-none > .tf-chip {
+  background: var(--bg-3);
+  color: var(--text-3);
+}
+
+tf-chip.addon-badge.visibility > .tf-chip {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--warning);
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+tf-chip.addon-badge.perms > .tf-chip {
+  background: rgba(99, 102, 241, 0.1);
+  color: var(--accent-2);
+  border-color: rgba(99, 102, 241, 0.25);
+}
+
+tf-chip.addon-badge.runtime > .tf-chip {
+  background: rgba(96, 165, 250, 0.12);
+  color: var(--info);
+  border-color: rgba(96, 165, 250, 0.3);
+}
+
+tf-chip.addon-badge.state > .tf-chip {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--success);
+  border-color: rgba(34, 197, 94, 0.3);
+}
+
+tf-chip.addon-badge.state-off > .tf-chip {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--warning);
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+.addons-screen .a-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.addons-screen .a-sep {
+  opacity: 0.7;
+}
+
+.addons-screen .a-foot-note {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.addons-screen .a-status {
+  font-weight: 700;
+}
+
+.addons-screen .a-status.on {
+  color: var(--success);
+}
+
+.addons-screen .a-status.off {
+  color: var(--text-3);
+}
+
+.addons-screen .a-foot tf-toggle {
+  margin-left: auto;
+}
+
+/* ---- Detail: shell ------------------------------------------------------- */
+
+.addon-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.addon-detail .addon-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.addon-detail .addon-detail-header h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.addon-detail .addon-detail-header .sub {
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+/* ---- Breadcrumb + new detail-header card (mockup addons-permissions-20260420) */
+
+.addon-detail .breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+}
+
+.addon-detail .breadcrumb .crumb {
+  cursor: pointer;
+}
+
+.addon-detail .breadcrumb .crumb.active {
+  color: var(--text);
+  cursor: default;
+  font-weight: 600;
+}
+
+.addon-detail .breadcrumb .sep {
+  opacity: 0.6;
+}
+
+.addon-detail .detail-header {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 4px;
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.addon-detail .detail-header .big-ico {
+  width: 60px;
+  height: 60px;
+  border-radius: var(--radius);
+  background: var(--gradient-accent, linear-gradient(135deg, var(--accent-1), var(--accent-2)));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.addon-detail .detail-header .big-ico .icon {
+  width: 28px;
+  height: 28px;
+}
+
+.addon-detail .detail-header .d-meta { flex: 1; min-width: 240px; }
+.addon-detail .detail-header .d-name { font-size: 20px; font-weight: 800; color: var(--text); }
+.addon-detail .detail-header .d-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+
+.addon-detail .detail-header .d-badges {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.addon-detail .detail-header .d-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* ---- Generic alerts reused by tabs (mockup .alert) ---------------------- */
+
+.alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm, 8px);
+  font-size: 12.5px;
+  margin-bottom: 16px;
+}
+
+.alert .icon {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.alert strong { font-weight: 700; }
+
+.alert.info {
+  background: rgba(96, 165, 250, 0.1);
+  border: 1px solid rgba(96, 165, 250, 0.3);
+  color: var(--info);
+}
+
+.alert.warn {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  color: var(--warning);
+}
+
+.alert.success {
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  color: var(--success);
+}
+
+/* ---- Visibility group rows (mockup) ------------------------------------ */
+
+.group-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-input, var(--bg-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 8px);
+  margin-bottom: 6px;
+}
+
+.group-row.selected {
+  border-color: var(--accent-1);
+  background: var(--accent-glow, rgba(99, 102, 241, 0.1));
+}
+
+.group-row .g-ico {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm, 8px);
+  background: var(--bg-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+
+.group-row .g-info { flex: 1; min-width: 0; }
+.group-row .g-name { font-weight: 600; font-size: 13px; color: var(--text); }
+.group-row .g-meta { font-size: 11px; color: var(--text-3); }
+
+/* ---- Form row with label + description (mockup) ------------------------- */
+
+.form-row {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.form-row label {
+  font-size: 12px;
+  color: var(--text-2);
+  padding-top: 7px;
+  font-weight: 600;
+}
+
+.form-row .label-desc {
+  font-size: 10.5px;
+  color: var(--text-3);
+  font-weight: 400;
+  margin-top: 2px;
+}
+
+@media (max-width: 640px) {
+  .form-row { grid-template-columns: 1fr; }
+}
+
+/* ---- Section card used on visibility/permissions tabs ------------------- */
+
+.section-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+
+.section-card h3 {
+  margin: 0 0 6px 0;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.section-card .section-sub {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-bottom: 12px;
+}
+
+/* ---- Alerty / info ------------------------------------------------------- */
+
+.addons-alert {
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.addons-alert.info {
+  background: rgba(96, 165, 250, 0.08);
+  border-color: rgba(96, 165, 250, 0.3);
+}
+
+.addons-alert.warn {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: var(--warning);
+}
+
+/* ---- Visibility tabela --------------------------------------------------- */
+
+.addons-visibility-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.addons-visibility-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-3);
+  padding: 10px 14px;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+}
+
+.addons-visibility-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.addons-visibility-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* ---- Permissions matrix -------------------------------------------------- */
+
+.perm-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.perm-matrix th,
+.perm-matrix td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.perm-matrix thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-2);
+  color: var(--text-3);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+  z-index: 1;
+}
+
+.perm-matrix tbody td {
+  background: var(--bg-card);
+}
+
+.perm-matrix .perm-cell-name {
+  min-width: 220px;
+}
+
+.perm-matrix .perm-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.perm-matrix .perm-desc {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 3px;
+}
+
+.perm-risk {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.perm-risk.low { background: rgba(34,197,94,0.15); color: var(--success); }
+.perm-risk.medium { background: rgba(96,165,250,0.15); color: var(--info); }
+.perm-risk.high { background: rgba(245,158,11,0.15); color: var(--warning); }
+.perm-risk.critical { background: rgba(239,68,68,0.15); color: var(--danger); }
+
+.perm-matrix tf-select { min-width: 110px; }
+
+.perm-col-default {
+  background: rgba(99, 102, 241, 0.07);
+}
+
+/* Kolor pomocniczy: wizualna kropka przed allow/deny w select */
+.perm-legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.perm-legend .dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.perm-legend .dot.allow { background: var(--success); }
+.perm-legend .dot.deny { background: var(--danger); }
+.perm-legend .dot.inherit { background: var(--text-3); }
+
+/* ---- Subtabs (pill container) — mockup addons-permissions-20260420 ------- */
+
+.subtabs {
+  display: flex;
+  gap: 6px;
+  background: var(--bg-3);
+  padding: 4px;
+  border-radius: var(--radius-sm, 8px);
+  width: fit-content;
+  margin-bottom: 16px;
+}
+
+.subtab {
+  padding: 6px 12px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-3);
+  cursor: pointer;
+  border-radius: var(--radius-sm, 8px);
+  user-select: none;
+}
+
+.subtab:hover { color: var(--text-2); }
+
+.subtab.active {
+  background: var(--accent-glow, rgba(99,102,241,0.15));
+  color: var(--accent-2);
+}
+
+/* ---- Mockup-faithful matrix (rows = groups, cols = permissions) ---------- */
+
+.perm-matrix th.func,
+.perm-matrix td.func {
+  text-align: center;
+  min-width: 90px;
+}
+
+.perm-matrix .group-name {
+  font-weight: 700;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.perm-matrix .group-meta {
+  font-size: 10px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.perm-matrix tr.row-default td {
+  background: rgba(99, 102, 241, 0.06);
+}
+
+.perm-matrix tr.row-default .group-name {
+  color: var(--accent-2);
+}
+
+.perm-matrix tr.row-locked {
+  opacity: 0.6;
+}
+
+/* Okragly przycisk allow/deny/inherit w komorce macierzy. */
+.perm-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms;
+  color: var(--text-3);
+  padding: 0;
+  font: inherit;
+  line-height: 1;
+}
+
+.perm-btn:hover:not(:disabled) { border-color: var(--border-hover); }
+.perm-btn:disabled { cursor: not-allowed; }
+
+.perm-btn.allow {
+  background: rgba(34,197,94,0.15);
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.perm-btn.deny {
+  background: rgba(239,68,68,0.15);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.perm-btn.inherit {
+  background: transparent;
+  color: var(--text-3);
+  border-style: dashed;
+}
+
+.perm-btn .icon { width: 12px; height: 12px; stroke-width: 2.5; }
+
+/* Legenda pod macierza. */
+.legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 12px;
+  align-items: center;
+}
+
+.legend .li { display: flex; align-items: center; gap: 6px; }
+.legend .dot { width: 10px; height: 10px; border-radius: 50%; }
+.legend .dot.allow { background: var(--success); }
+.legend .dot.deny { background: var(--danger); }
+.legend .dot.inherit { background: transparent; border: 1px dashed var(--text-3); }
+
+/* Pigulka z ID uprawnienia w tabeli opisow (mono font). */
+.perm-id-mono {
+  font-family: ui-monospace, 'SF Mono', monospace;
+  font-size: 11.5px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ---- OAuth config ------------------------------------------------------- */
+
+.oauth-provider-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.oauth-provider-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.oauth-provider-head .name {
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.oauth-scopes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.oauth-scope-chip {
+  font-family: 'SF Mono', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+}
+
+.oauth-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+@media (max-width: 720px) {
+  .oauth-form-grid { grid-template-columns: 1fr; }
+}
+
+.oauth-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.oauth-form-field label {
+  font-size: 11px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+.oauth-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.oauth-mode-card {
+  flex: 1 1 220px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.oauth-mode-card:hover { border-color: var(--border-hover); }
+
+.oauth-mode-card.active {
+  border-color: var(--accent-1);
+  background: rgba(99, 102, 241, 0.1);
+}
+
+.oauth-mode-card .title {
+  font-weight: 700;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.oauth-mode-card .desc {
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.oauth-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+/* ---- OAuth mode grid (Global + Individual side-by-side) ----------------- */
+
+.oauth-provider-block { display: flex; flex-direction: column; gap: 0; }
+
+.oauth-mode-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+@media (max-width: 640px) {
+  .oauth-mode-grid { grid-template-columns: 1fr; }
+}
+
+.oauth-mode-grid .oauth-mode-card {
+  position: relative;
+  flex: unset;
+  padding: 16px 18px;
+  border-width: 2px;
+  background: var(--bg-input, var(--bg-2));
+}
+
+.oauth-mode-grid .oauth-mode-card .mode-radio {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  background: transparent;
+}
+
+.oauth-mode-grid .oauth-mode-card.active .mode-radio {
+  border-color: var(--accent-1);
+}
+
+.oauth-mode-grid .oauth-mode-card.active .mode-radio::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-1);
+}
+
+.oauth-mode-grid .oauth-mode-card .mode-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm, 8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 10px;
+}
+
+.oauth-mode-grid .oauth-mode-card.global .mode-icon {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--success);
+}
+
+.oauth-mode-grid .oauth-mode-card.individual .mode-icon {
+  background: rgba(167, 139, 250, 0.2);
+  color: var(--accent-2);
+}
+
+.oauth-mode-grid .oauth-mode-card h4 {
+  margin: 0 0 4px 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.oauth-mode-grid .oauth-mode-card p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+.oauth-mode-grid .oauth-mode-card .mode-hint {
+  margin-top: 10px;
+  font-size: 10.5px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.oauth-mode-disable {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--bg-2);
+  margin-bottom: 4px;
+}
+
+.oauth-mode-disable.active {
+  border-style: solid;
+  border-color: var(--warning);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.oauth-mode-disable label {
+  font-size: 12.5px;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+/* ---- Secret row (password + eye toggle + change button) ----------------- */
+
+.secret-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.secret-row tf-input { flex: 1; }
+
+/* ---- Scopes chips readonly --------------------------------------------- */
+
+.scopes-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 6px;
+}
+
+/* ---- Shared account indicator (global mode, connected) ------------------ */
+
+.shared-account-indicator {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm, 8px);
+  background: rgba(34, 197, 94, 0.1);
+  color: var(--success);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+/* ---- Info paragraph (individual/global/disabled info-card) -------------- */
+
+.info-paragraph {
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.7;
+  margin: 0;
+}
+
+/* ---- Linked accounts table ---------------------------------------------- */
+
+.linked-accounts-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.linked-accounts-table th,
+.linked-accounts-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.linked-accounts-table thead th {
+  background: var(--bg-2);
+  color: var(--text-3);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.linked-accounts-table .status-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.status-pill.active { background: rgba(34,197,94,0.15); color: var(--success); }
+.status-pill.expired { background: rgba(245,158,11,0.15); color: var(--warning); }
+.status-pill.revoked { background: rgba(239,68,68,0.15); color: var(--danger); }
+
+/* ---- My Connected Accounts (user view) ----------------------------------- */
+
+.myaccounts-page .page-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.myaccounts-page .page-header h1 {
+  font-size: 20px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+}
+
+.myaccounts-page .page-header .subtitle {
+  font-size: 12.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.myaccounts-page .page-header .actions {
+  margin-left: auto;
+}
+
+.myaccounts-page .alert.info {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: color-mix(in srgb, var(--accent, #3b82f6) 8%, var(--bg-card));
+  border: 1px solid color-mix(in srgb, var(--accent, #3b82f6) 25%, transparent);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  margin-bottom: 14px;
+}
+
+.myaccounts-page .alert.info svg {
+  flex-shrink: 0;
+  color: var(--accent, #3b82f6);
+  margin-top: 2px;
+}
+
+.myapps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 14px;
+}
+
+.myapp-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.myapp-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.myapp-ico {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  background: var(--gradient-accent, linear-gradient(135deg, #6366f1, #8b5cf6));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  flex-shrink: 0;
+}
+
+.myapp-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.myapp-name {
+  font-size: 14px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.myapp-desc {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.myapp-linked {
+  background: var(--bg-input, var(--bg-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.myapp-linked.expired {
+  border-color: var(--warning);
+  background: rgba(245, 158, 11, 0.05);
+}
+
+.linked-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--gradient-accent, linear-gradient(135deg, #6366f1, #8b5cf6));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.linked-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.linked-email {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.linked-meta {
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin-top: 1px;
+}
+
+.myapp-linked.expired .linked-meta {
+  color: var(--warning);
+}
+
+.linked-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.myapp-unlinked {
+  background: var(--bg-input, var(--bg-2));
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  text-align: center;
+  margin-top: 10px;
+}
+
+.myapp-unlinked .muted-text {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-bottom: 10px;
+}
+
+/* ---- Empty states -------------------------------------------------------- */
+
+.addons-empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-3);
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--text-3);
+  background: var(--bg-input);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+.empty-state svg {
+  width: 28px;
+  height: 28px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  opacity: 0.5;
+  margin-bottom: 10px;
+}
+
+.empty-state-text {
+  font-weight: 600;
+  color: var(--text-2);
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.empty-state-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.5;
+  max-width: 420px;
+}
+
+@media (max-width: 1180px) {
+  .addon-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .addon-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .addons-screen .page-header {
+    margin-bottom: 16px;
+  }
+
+  .addons-screen .page-header .actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .addons-screen .page-header .actions tf-button {
+    flex: 1;
+  }
+
+  .addons-screen .a-foot {
+    flex-wrap: wrap;
+  }
+
+  .addons-screen .a-foot tf-toggle {
+    margin-left: 0;
+  }
+}
+
+/* ---- Linked accounts (admin tab) ---------------------------------------- */
+
+.linked-accounts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.linked-accounts-header-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.linked-accounts-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.linked-accounts-toolbar tf-searchbox {
+  flex: 1;
+  min-width: 240px;
+}
+
+.account-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-cell .account-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--bg-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+
+.account-email-mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.account-tenant {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.linked-accounts-empty {
+  text-align: center;
+  padding: 30px 20px;
+  color: var(--text-3);
+  font-size: 13px;
+}
+
+/* Network tab — manifest-declared rule rows (read-only) */
+.network-declared-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.network-declared-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.network-declared-row .host {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.network-declared-row .port {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.network-declared-row .quick-action {
+  margin-left: auto;
+}

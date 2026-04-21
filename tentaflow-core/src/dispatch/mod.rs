@@ -8,12 +8,25 @@
 // =============================================================================
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::OnceLock;
 
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
+/// Boxed future zwracany przez handler. Zunifikowana signatura:
+/// sync handlery sa transparentnie owijane przez makro w `async move { ... }`.
+pub type HandlerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<MessageBody, ProtocolError>> + Send + 'a>>;
+
+/// Typ pointera rejestrowany w HandlerMeta. Kazdy handler (sync lub async)
+/// przez makro produkuje funkcje o tej signaturze zwracajaca boxed future.
+pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> HandlerFuture<'a>;
+
+pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
 pub mod handlers;
+pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod recorder;
 pub mod resume_token;
@@ -76,7 +89,9 @@ impl SessionAuthKind {
             SessionAuthKind::Anonymous => true,
             SessionAuthKind::ApiKey => matches!(
                 session,
-                SessionAuth::ApiKey { .. } | SessionAuth::UserSession { .. } | SessionAuth::MeshTrust { .. }
+                SessionAuth::ApiKey { .. }
+                    | SessionAuth::UserSession { .. }
+                    | SessionAuth::MeshTrust { .. }
             ),
             SessionAuthKind::UserSession => matches!(session, SessionAuth::UserSession { .. }),
             SessionAuthKind::Admin => matches!(
@@ -104,8 +119,9 @@ pub struct HandlerMeta {
     pub required_auth: SessionAuthKind,
     /// Nazwa metryki Prometheus dla tego handlera.
     pub metric_name: &'static str,
-    /// Wskaznik do funkcji handlera. Signatura ustawiona sztywno dla bootstrap.
-    pub dispatch_fn: fn(&MessageBody, &HandlerContext) -> Result<MessageBody, ProtocolError>,
+    /// Wskaznik do funkcji handlera. Zunifikowana async signatura — sync
+    /// handlery sa owijane przez makro w `Box::pin(async move { ... })`.
+    pub dispatch_fn: HandlerDispatchFn,
 }
 
 inventory::collect!(HandlerMeta);
@@ -145,11 +161,9 @@ pub fn all_handlers() -> impl Iterator<Item = &'static HandlerMeta> {
 // =============================================================================
 
 /// Wybiera handler po wariancie MessageBody, sprawdza policy, wola dispatch_fn.
-/// Zwraca (response_body, is_error_flag_needed).
-pub fn dispatch(
-    body: &MessageBody,
-    ctx: &HandlerContext,
-) -> (MessageBody, bool) {
+/// Zwraca (response_body, is_error_flag_needed). Signatura jest async —
+/// sync handlery sa owijane w `async move` przez makro `#[handler]`.
+pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody, bool) {
     let variant_name = variant_name_of(body);
     let Some(handler) = find(variant_name) else {
         return (
@@ -188,7 +202,11 @@ pub fn dispatch(
                 .map(|b| b.to_vec())
                 .unwrap_or_default()
         };
-        let flags: u8 = if is_sensitive_variant(body) { 0b1000_0000 } else { 0 };
+        let flags: u8 = if is_sensitive_variant(body) {
+            0b1000_0000
+        } else {
+            0
+        };
         rec.record(
             recorder::Direction::Incoming,
             ctx.correlation_id,
@@ -200,7 +218,8 @@ pub fn dispatch(
     }
 
     let timer = metrics::Timer::start(handler.variant_name);
-    let result = match (handler.dispatch_fn)(body, ctx) {
+    let fut = (handler.dispatch_fn)(body, ctx);
+    let result = match fut.await {
         Ok(response) => {
             let is_err = matches!(response, MessageBody::Error(_));
             (response, is_err)
@@ -252,6 +271,8 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
             | MessageBody::AuthLoginResponseBody(_)
             | MessageBody::ApiKeyCreateResponseBody(_)
             | MessageBody::SettingsUpdateRequestBody(_)
+            | MessageBody::AddonConfigSetRequestBody(_)
+            | MessageBody::AddonInstallRequestBody(_)
     )
 }
 
@@ -282,8 +303,25 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ChatStreamRequestBody(_) => "ChatStreamRequest",
         MessageBody::ChatStreamChunkBody(_) => "ChatStreamChunk",
         MessageBody::ChatStreamEndBody(_) => "ChatStreamEnd",
+        MessageBody::TranslateRequestBody(_) => "TranslateRequest",
+        MessageBody::TranslateResponseBody(_) => "TranslateResponse",
+        MessageBody::ClusterListRequest => "ClusterListRequest",
+        MessageBody::ClusterListResponseBody(_) => "ClusterListResponse",
+        MessageBody::ClusterDetailRequestBody(_) => "ClusterDetailRequest",
+        MessageBody::ClusterDetailResponseBody(_) => "ClusterDetailResponse",
+        MessageBody::ClusterCreateRequestBody(_) => "ClusterCreateRequest",
+        MessageBody::ClusterCreateResponseBody(_) => "ClusterCreateResponse",
         MessageBody::ClusterUpdateRequestBody(_) => "ClusterUpdateRequest",
         MessageBody::ClusterUpdateResponseBody(_) => "ClusterUpdateResponse",
+        MessageBody::ClusterDeleteRequestBody(_) => "ClusterDeleteRequest",
+        MessageBody::ClusterDeleteResponseBody(_) => "ClusterDeleteResponse",
+        MessageBody::ClusterAddMemberRequestBody(_) => "ClusterAddMemberRequest",
+        MessageBody::ClusterAddMemberResponseBody(_) => "ClusterAddMemberResponse",
+        MessageBody::ClusterRemoveMemberRequestBody(_) => "ClusterRemoveMemberRequest",
+        MessageBody::ClusterRemoveMemberResponseBody(_) => "ClusterRemoveMemberResponse",
+        MessageBody::ClusterProbeStreamRequestBody(_) => "ClusterProbeStreamRequest",
+        MessageBody::ClusterProbeStreamChunkBody(_) => "ClusterProbeStreamChunk",
+        MessageBody::ClusterProbeStreamEndBody(_) => "ClusterProbeStreamEnd",
         MessageBody::MeshPeersListRequest => "MeshPeersListRequest",
         MessageBody::MeshPeersListResponse { .. } => "MeshPeersListResponse",
         MessageBody::MeshPairInitRequestBody(_) => "MeshPairInitRequest",
@@ -331,6 +369,22 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::PromptListResponse { .. } => "PromptListResponse",
         MessageBody::PromptDetailRequest { .. } => "PromptDetailRequest",
         MessageBody::PromptDetailResponse(_) => "PromptDetailResponse",
+        MessageBody::NotesRequestBody(r) => match r {
+            tentaflow_protocol::NotesRequest::List(_) => "NotesListRequest",
+            tentaflow_protocol::NotesRequest::Detail(_) => "NoteDetailRequest",
+            tentaflow_protocol::NotesRequest::Create(_) => "NoteCreateRequest",
+            tentaflow_protocol::NotesRequest::Update(_) => "NoteUpdateRequest",
+            tentaflow_protocol::NotesRequest::SetPinned(_) => "NoteSetPinnedRequest",
+            tentaflow_protocol::NotesRequest::Delete(_) => "NoteDeleteRequest",
+        },
+        MessageBody::NotesResponseBody(r) => match r {
+            tentaflow_protocol::NotesResponse::List(_) => "NotesListResponse",
+            tentaflow_protocol::NotesResponse::Detail(_) => "NoteDetailResponse",
+            tentaflow_protocol::NotesResponse::Create(_) => "NoteCreateResponse",
+            tentaflow_protocol::NotesResponse::Update(_) => "NoteUpdateResponse",
+            tentaflow_protocol::NotesResponse::SetPinned(_) => "NoteSetPinnedResponse",
+            tentaflow_protocol::NotesResponse::Delete(_) => "NoteDeleteResponse",
+        },
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",
         MessageBody::AuditEventBody(_) => "AuditEvent",
@@ -360,6 +414,147 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::SettingsUpdateResponse { .. } => "SettingsUpdateResponse",
         MessageBody::DashboardMetricsRequest => "DashboardMetricsRequest",
         MessageBody::DashboardMetricsResponse(_) => "DashboardMetricsResponse",
+        MessageBody::MeshNodeListRequest => "MeshNodeListRequest",
+        MessageBody::MeshNodeListResponseBody(_) => "MeshNodeListResponse",
+        MessageBody::MeshNodeDetailRequestBody(_) => "MeshNodeDetailRequest",
+        MessageBody::MeshNodeDetailResponseBody(_) => "MeshNodeDetailResponse",
+        MessageBody::MeshPendingListRequest => "MeshPendingListRequest",
+        MessageBody::MeshPendingListResponseBody(_) => "MeshPendingListResponse",
+        MessageBody::MeshIdentityRequest => "MeshIdentityRequest",
+        MessageBody::MeshIdentityResponseBody(_) => "MeshIdentityResponse",
+        MessageBody::MeshServicesListRequest => "MeshServicesListRequest",
+        MessageBody::MeshServicesListResponseBody(_) => "MeshServicesListResponse",
+        MessageBody::MeshTrustedListRequest => "MeshTrustedListRequest",
+        MessageBody::MeshTrustedListResponseBody(_) => "MeshTrustedListResponse",
+        MessageBody::MeshPairingStartRequestBody(_) => "MeshPairingStartRequest",
+        MessageBody::MeshPairingStartResponseBody(_) => "MeshPairingStartResponse",
+        MessageBody::MeshPairingConfirmRequestBody(_) => "MeshPairingConfirmRequest",
+        MessageBody::MeshPairingConfirmResponseBody(_) => "MeshPairingConfirmResponse",
+        MessageBody::MeshPairingRejectRequestBody(_) => "MeshPairingRejectRequest",
+        MessageBody::MeshPairingRejectResponseBody(_) => "MeshPairingRejectResponse",
+        MessageBody::MeshTrustRevokeRequestBody(_) => "MeshTrustRevokeRequest",
+        MessageBody::MeshTrustRevokeResponseBody(_) => "MeshTrustRevokeResponse",
+        MessageBody::MeshTrustRetrustRequestBody(_) => "MeshTrustRetrustRequest",
+        MessageBody::MeshTrustRetrustResponseBody(_) => "MeshTrustRetrustResponse",
+        MessageBody::MeshConnectRequestBody(_) => "MeshConnectRequest",
+        MessageBody::MeshConnectResponseBody(_) => "MeshConnectResponse",
+        MessageBody::MeshNodeCommandRequestBody(_) => "MeshNodeCommandRequest",
+        MessageBody::MeshNodeCommandResponseBody(_) => "MeshNodeCommandResponse",
+        MessageBody::MeshNodeNetworkConfigRequestBody(_) => "MeshNodeNetworkConfigRequest",
+        MessageBody::MeshNodeNetworkConfigResponseBody(_) => "MeshNodeNetworkConfigResponse",
+        MessageBody::ModelsUnifiedListRequest => "ModelsUnifiedListRequest",
+        MessageBody::ModelsUnifiedListResponseBody(_) => "ModelsUnifiedListResponse",
+        MessageBody::ModelAliasListRequest => "ModelAliasListRequest",
+        MessageBody::ModelAliasListResponseBody(_) => "ModelAliasListResponse",
+        MessageBody::ModelAliasCreateRequestBody(_) => "ModelAliasCreateRequest",
+        MessageBody::ModelAliasCreateResponseBody(_) => "ModelAliasCreateResponse",
+        MessageBody::ModelAliasUpdateRequestBody(_) => "ModelAliasUpdateRequest",
+        MessageBody::ModelAliasUpdateResponseBody(_) => "ModelAliasUpdateResponse",
+        MessageBody::ModelAliasDeleteRequestBody(_) => "ModelAliasDeleteRequest",
+        MessageBody::ModelAliasDeleteResponseBody(_) => "ModelAliasDeleteResponse",
+        MessageBody::FlowUpdateRequestBody(_) => "FlowUpdateRequest",
+        MessageBody::FlowUpdateResponseBody(_) => "FlowUpdateResponse",
+        MessageBody::FlowNodeTemplatesListRequest => "FlowNodeTemplatesListRequest",
+        MessageBody::FlowNodeTemplatesListResponseBody(_) => "FlowNodeTemplatesListResponse",
+        MessageBody::FlowVersionListRequestBody(_) => "FlowVersionListRequest",
+        MessageBody::FlowVersionListResponseBody(_) => "FlowVersionListResponse",
+        MessageBody::FlowVersionGetRequestBody(_) => "FlowVersionGetRequest",
+        MessageBody::FlowVersionGetResponseBody(_) => "FlowVersionGetResponse",
+        MessageBody::FlowVersionRestoreRequestBody(_) => "FlowVersionRestoreRequest",
+        MessageBody::FlowVersionRestoreResponseBody(_) => "FlowVersionRestoreResponse",
+        MessageBody::SsoProvidersListRequest => "SsoProvidersListRequest",
+        MessageBody::SsoProvidersListResponseBody(_) => "SsoProvidersListResponse",
+        MessageBody::SsoProviderCreateRequestBody(_) => "SsoProviderCreateRequest",
+        MessageBody::SsoProviderCreateResponseBody(_) => "SsoProviderCreateResponse",
+        MessageBody::SsoProviderDeleteRequestBody(_) => "SsoProviderDeleteRequest",
+        MessageBody::SsoProviderDeleteResponseBody(_) => "SsoProviderDeleteResponse",
+        MessageBody::TlsStatusRequest => "TlsStatusRequest",
+        MessageBody::TlsStatusResponseBody(_) => "TlsStatusResponse",
+        MessageBody::NgcStatusRequest => "NgcStatusRequest",
+        MessageBody::NgcStatusResponseBody(_) => "NgcStatusResponse",
+        MessageBody::NimCatalogListRequest => "NimCatalogListRequest",
+        MessageBody::NimCatalogListResponseBody(_) => "NimCatalogListResponse",
+        MessageBody::ServiceManifestDeployRequestBody(_) => "ServiceManifestDeployRequest",
+        MessageBody::ServiceManifestDeployResponseBody(_) => "ServiceManifestDeployResponse",
+        MessageBody::AddonsListRequest => "AddonsListRequest",
+        MessageBody::AddonsListResponseBody(_) => "AddonsListResponse",
+        MessageBody::UsersListRequest => "UsersListRequest",
+        MessageBody::UsersListResponseBody(_) => "UsersListResponse",
+        MessageBody::AuditLogListRequestBody(_) => "AuditLogListRequest",
+        MessageBody::AuditLogListResponseBody(_) => "AuditLogListResponse",
+        MessageBody::AuditLogExportRequestBody(_) => "AuditLogExportRequest",
+        MessageBody::AuditLogExportResponseBody(_) => "AuditLogExportResponse",
+        MessageBody::AuditLogCleanupRequestBody(_) => "AuditLogCleanupRequest",
+        MessageBody::AuditLogCleanupResponseBody(_) => "AuditLogCleanupResponse",
+        MessageBody::AddonDetailRequestBody(_) => "AddonDetailRequest",
+        MessageBody::AddonDetailResponseBody(_) => "AddonDetailResponse",
+        MessageBody::AddonVisibilityListRequestBody(_) => "AddonVisibilityListRequest",
+        MessageBody::AddonVisibilityListResponseBody(_) => "AddonVisibilityListResponse",
+        MessageBody::AddonVisibilitySetRequestBody(_) => "AddonVisibilitySetRequest",
+        MessageBody::AddonVisibilitySetResponseBody(_) => "AddonVisibilitySetResponse",
+        MessageBody::AddonAdminOnlySetRequestBody(_) => "AddonAdminOnlySetRequest",
+        MessageBody::AddonAdminOnlySetResponseBody(_) => "AddonAdminOnlySetResponse",
+        MessageBody::AddonShowInCatalogSetRequestBody(_) => "AddonShowInCatalogSetRequest",
+        MessageBody::AddonShowInCatalogSetResponseBody(_) => "AddonShowInCatalogSetResponse",
+        MessageBody::AddonPermissionCatalogRequestBody(_) => "AddonPermissionCatalogRequest",
+        MessageBody::AddonPermissionCatalogResponseBody(_) => "AddonPermissionCatalogResponse",
+        MessageBody::AddonPermissionMatrixRequestBody(_) => "AddonPermissionMatrixRequest",
+        MessageBody::AddonPermissionMatrixResponseBody(_) => "AddonPermissionMatrixResponse",
+        MessageBody::AddonPermissionSetRequestBody(_) => "AddonPermissionSetRequest",
+        MessageBody::AddonPermissionSetResponseBody(_) => "AddonPermissionSetResponse",
+        MessageBody::AddonPermissionDefaultSetRequestBody(_) => "AddonPermissionDefaultSetRequest",
+        MessageBody::AddonPermissionDefaultSetResponseBody(_) => {
+            "AddonPermissionDefaultSetResponse"
+        }
+        MessageBody::AddonPermissionCheckRequestBody(_) => "AddonPermissionCheckRequest",
+        MessageBody::AddonPermissionCheckResponseBody(_) => "AddonPermissionCheckResponse",
+        MessageBody::AddonOAuthConfigListRequestBody(_) => "AddonOAuthConfigListRequest",
+        MessageBody::AddonOAuthConfigListResponseBody(_) => "AddonOAuthConfigListResponse",
+        MessageBody::AddonOAuthConfigSetRequestBody(_) => "AddonOAuthConfigSetRequest",
+        MessageBody::AddonOAuthConfigSetResponseBody(_) => "AddonOAuthConfigSetResponse",
+        MessageBody::AddonOAuthConfigClearSecretRequestBody(_) => {
+            "AddonOAuthConfigClearSecretRequest"
+        }
+        MessageBody::AddonOAuthConfigClearSecretResponseBody(_) => {
+            "AddonOAuthConfigClearSecretResponse"
+        }
+        MessageBody::AddonOAuthAuthorizeStartRequestBody(_) => "AddonOAuthAuthorizeStartRequest",
+        MessageBody::AddonOAuthAuthorizeStartResponseBody(_) => "AddonOAuthAuthorizeStartResponse",
+        MessageBody::AddonOAuthLinkedAccountsRequestBody(_) => "AddonOAuthLinkedAccountsRequest",
+        MessageBody::AddonOAuthLinkedAccountsResponseBody(_) => "AddonOAuthLinkedAccountsResponse",
+        MessageBody::AddonOAuthRevokeRequestBody(_) => "AddonOAuthRevokeRequest",
+        MessageBody::AddonOAuthRevokeResponseBody(_) => "AddonOAuthRevokeResponse",
+        MessageBody::AddonOAuthReauthorizeRequestBody(_) => "AddonOAuthReauthorizeRequest",
+        MessageBody::AddonOAuthReauthorizeResponseBody(_) => "AddonOAuthReauthorizeResponse",
+        MessageBody::AddonOAuthTestConnectionRequestBody(_) => "AddonOAuthTestConnectionRequest",
+        MessageBody::AddonOAuthTestConnectionResponseBody(_) => "AddonOAuthTestConnectionResponse",
+        MessageBody::MyOAuthAccountsListRequestBody(_) => "MyOAuthAccountsListRequest",
+        MessageBody::MyOAuthAccountsListResponseBody(_) => "MyOAuthAccountsListResponse",
+        MessageBody::AddonPermissionChangedEventBody(_) => "AddonPermissionChangedEvent",
+        MessageBody::AddonToggleRequestBody(_) => "AddonToggleRequest",
+        MessageBody::AddonToggleResponseBody(_) => "AddonToggleResponse",
+        MessageBody::AddonInstallRequestBody(_) => "AddonInstallRequest",
+        MessageBody::AddonInstallResponseBody(_) => "AddonInstallResponse",
+        MessageBody::AddonUninstallRequestBody(_) => "AddonUninstallRequest",
+        MessageBody::AddonUninstallResponseBody(_) => "AddonUninstallResponse",
+        MessageBody::AddonConfigGetRequestBody(_) => "AddonConfigGetRequest",
+        MessageBody::AddonConfigGetResponseBody(_) => "AddonConfigGetResponse",
+        MessageBody::AddonConfigSetRequestBody(_) => "AddonConfigSetRequest",
+        MessageBody::AddonConfigSetResponseBody(_) => "AddonConfigSetResponse",
+        MessageBody::AddonLogsRequestBody(_) => "AddonLogsRequest",
+        MessageBody::AddonLogsResponseBody(_) => "AddonLogsResponse",
+        MessageBody::AddonToolsRequestBody(_) => "AddonToolsRequest",
+        MessageBody::AddonToolsResponseBody(_) => "AddonToolsResponse",
+        MessageBody::AddonResourcesGetRequestBody(_) => "AddonResourcesGetRequest",
+        MessageBody::AddonResourcesGetResponseBody(_) => "AddonResourcesGetResponse",
+        MessageBody::AddonResourcesSetRequestBody(_) => "AddonResourcesSetRequest",
+        MessageBody::AddonResourcesSetResponseBody(_) => "AddonResourcesSetResponse",
+        MessageBody::AddonNetworkRulesGetRequestBody(_) => "AddonNetworkRulesGetRequest",
+        MessageBody::AddonNetworkRulesGetResponseBody(_) => "AddonNetworkRulesGetResponse",
+        MessageBody::AddonNetworkRulesSetRequestBody(_) => "AddonNetworkRulesSetRequest",
+        MessageBody::AddonNetworkRulesSetResponseBody(_) => "AddonNetworkRulesSetResponse",
+        MessageBody::AddonReloadRequestBody(_) => "AddonReloadRequest",
+        MessageBody::AddonReloadResponseBody(_) => "AddonReloadResponse",
         MessageBody::Error(_) => "Error",
     }
 }
@@ -375,10 +570,12 @@ mod tests {
     #[test]
     fn session_auth_kind_anonymous_accepts_all() {
         assert!(SessionAuthKind::Anonymous.session_satisfies(&SessionAuth::Anonymous));
-        assert!(SessionAuthKind::Anonymous.session_satisfies(&SessionAuth::UserSession {
-            user_id: [0u8; 16],
-            role: None,
-        }));
+        assert!(
+            SessionAuthKind::Anonymous.session_satisfies(&SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            })
+        );
     }
 
     #[test]
@@ -409,7 +606,10 @@ mod tests {
     #[test]
     fn session_auth_kind_user_session_requires_exact_match() {
         let kind = SessionAuthKind::UserSession;
-        assert!(kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16], role: None }));
+        assert!(kind.session_satisfies(&SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: None
+        }));
         assert!(!kind.session_satisfies(&SessionAuth::Anonymous));
         assert!(!kind.session_satisfies(&SessionAuth::ApiKey {
             key_id: "x".to_string()
@@ -426,7 +626,10 @@ mod tests {
         assert!(kind.session_satisfies(&SessionAuth::ApiKey {
             key_id: "x".to_string()
         }));
-        assert!(kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16], role: None }));
+        assert!(kind.session_satisfies(&SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: None
+        }));
         assert!(kind.session_satisfies(&SessionAuth::MeshTrust {
             node_id: [0u8; 32],
             epoch: 0
@@ -442,17 +645,23 @@ mod tests {
             epoch: 0
         }));
         assert!(!kind.session_satisfies(&SessionAuth::Anonymous));
-        assert!(!kind.session_satisfies(&SessionAuth::UserSession { user_id: [0u8; 16], role: None }));
+        assert!(!kind.session_satisfies(&SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: None
+        }));
     }
 
-    #[test]
-    fn dispatch_unknown_variant_returns_not_implemented() {
+    #[tokio::test]
+    async fn dispatch_unknown_variant_returns_not_implemented() {
         // Variants are all known by variant_name_of, ale jesli handler nie
         // zarejestrowany w registry (np. Error) zwraca NotImplemented.
         // NOTE: ten test zalezy od tego ze handler dla Error nie istnieje
         // (bo Error to output variant, nie input).
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            },
             correlation_id: 1,
             resume_secret: None,
             state: state::AppState::for_test(),
@@ -462,11 +671,32 @@ mod tests {
             message: "test".to_string(),
             trace_id: None,
         });
-        let (resp, is_err) = dispatch(&body, &ctx);
+        let (resp, is_err) = dispatch(&body, &ctx).await;
         assert!(is_err);
         match resp {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotImplemented),
             _ => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn registry_contains_addon_lifecycle_handlers() {
+        // 12 handlerow lifecycle addonu musi byc zarejestrowane przez inventory.
+        for name in [
+            "AddonToggleRequest",
+            "AddonInstallRequest",
+            "AddonUninstallRequest",
+            "AddonConfigGetRequest",
+            "AddonConfigSetRequest",
+            "AddonLogsRequest",
+            "AddonToolsRequest",
+            "AddonResourcesGetRequest",
+            "AddonResourcesSetRequest",
+            "AddonNetworkRulesGetRequest",
+            "AddonNetworkRulesSetRequest",
+            "AddonReloadRequest",
+        ] {
+            assert!(find(name).is_some(), "handler {} nie zarejestrowany", name);
         }
     }
 
@@ -488,8 +718,8 @@ mod tests {
         assert!(find("ClusterUpdateRequest").is_some());
     }
 
-    #[test]
-    fn dispatch_archetype_coverage_real_handlers() {
+    #[tokio::test]
+    async fn dispatch_archetype_coverage_real_handlers() {
         use tentaflow_protocol::{AuthLoginRequest, ClusterUpdateRequest};
 
         // user_id w 0xFF-marker formacie (real binary protocol convention).
@@ -508,15 +738,18 @@ mod tests {
         };
 
         // R-LIST — empty test DB → empty Vec, valid response.
-        let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_user);
+        let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_user).await;
         assert!(!r_list.1);
         assert!(matches!(r_list.0, MessageBody::ApiKeyListResponse { .. }));
 
-        let model_list = dispatch(&MessageBody::ModelListRequest, &ctx_user);
+        let model_list = dispatch(&MessageBody::ModelListRequest, &ctx_user).await;
         assert!(!model_list.1);
-        assert!(matches!(model_list.0, MessageBody::ModelListResponse { .. }));
+        assert!(matches!(
+            model_list.0,
+            MessageBody::ModelListResponse { .. }
+        ));
 
-        let flow_list = dispatch(&MessageBody::FlowListRequest, &ctx_user);
+        let flow_list = dispatch(&MessageBody::FlowListRequest, &ctx_user).await;
         assert!(!flow_list.1);
         assert!(matches!(flow_list.0, MessageBody::FlowListResponse { .. }));
 
@@ -532,7 +765,8 @@ mod tests {
                 resume_secret: None,
                 state: state::AppState::for_test(),
             },
-        );
+        )
+        .await;
         assert!(w_action.1);
         match w_action.0 {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::AuthRequired),
@@ -543,11 +777,17 @@ mod tests {
         let w_update_no_admin = dispatch(
             &MessageBody::ClusterUpdateRequestBody(ClusterUpdateRequest {
                 cluster_id: "c1".to_string(),
-                name: "Prod".to_string(),
+                name: Some("Prod".to_string()),
                 description: None,
+                strategy: None,
+                failover_enabled: None,
+                failover_target: None,
+                health_check_interval_ms: None,
+                timeout_ms: None,
             }),
             &ctx_user,
-        );
+        )
+        .await;
         assert!(w_update_no_admin.1);
         match w_update_no_admin.0 {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
@@ -555,28 +795,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_node_list_request_via_registry() {
+    #[tokio::test]
+    async fn dispatch_node_list_request_via_registry() {
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            },
             correlation_id: 7,
             resume_secret: None,
             state: state::AppState::for_test(),
         };
-        let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx);
+        let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx).await;
         assert!(!is_err);
         assert!(matches!(resp, MessageBody::NodeListResponse { .. }));
     }
 
-    #[test]
-    fn dispatch_policy_denies_anonymous_for_node_list() {
+    #[tokio::test]
+    async fn dispatch_policy_denies_anonymous_for_node_list() {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 8,
             resume_secret: None,
             state: state::AppState::for_test(),
         };
-        let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx);
+        let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx).await;
         assert!(is_err);
         match resp {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),
@@ -584,16 +827,230 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_model_list_allows_anonymous() {
+    #[tokio::test]
+    async fn dispatch_model_list_allows_anonymous() {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 9,
             resume_secret: None,
             state: state::AppState::for_test(),
         };
-        let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx);
+        let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx).await;
         assert!(!is_err);
         assert!(matches!(resp, MessageBody::ModelListResponse { .. }));
+    }
+}
+
+// =============================================================================
+// Testy enforcementu widocznosci addonow (list + detail + check + tools)
+// =============================================================================
+
+#[cfg(test)]
+mod visibility_enforcement_tests {
+    use super::*;
+    use crate::db::repository;
+
+    /// Helper: buduje user_id bytes w 0xFF-marker formacie.
+    fn user_id_bytes(id: i64) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0] = 0xFF;
+        b[8..].copy_from_slice(&(id as u64).to_le_bytes());
+        b
+    }
+
+    /// Helper: tworzy testowy user i rejestruje addon w DB. Zwraca user_id.
+    fn setup_user_and_addon(db: &crate::db::DbPool, username: &str, addon_id: &str) -> i64 {
+        repository::register_addon(db, addon_id, addon_id, "1.0.0", "{}", "linux")
+            .expect("register_addon failed");
+        repository::create_user_account(db, username, "hash", username, "a@a.pl")
+            .expect("create_user failed")
+    }
+
+    #[tokio::test]
+    async fn test_addons_list_filters_admin_only_for_non_admin() {
+        let state = state::AppState::for_test();
+        // Dwa addony: jeden admin_only, drugi zwykly.
+        repository::register_addon(&state.db, "public-addon", "Public", "1.0.0", "{}", "linux")
+            .unwrap();
+        repository::register_addon(&state.db, "secret-addon", "Secret", "1.0.0", "{}", "linux")
+            .unwrap();
+        repository::set_addon_admin_only(&state.db, "secret-addon", true).unwrap();
+        let user_id =
+            repository::create_user_account(&state.db, "john", "h", "john", "j@j.pl").unwrap();
+
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_id_bytes(user_id),
+                role: None,
+            },
+            correlation_id: 1,
+            resume_secret: None,
+            state: state.clone(),
+        };
+
+        let (resp, is_err) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
+        assert!(!is_err);
+        match resp {
+            MessageBody::AddonsListResponseBody(r) => {
+                let ids: Vec<_> = r.addons.iter().map(|a| a.addon_id.as_str()).collect();
+                assert!(ids.contains(&"public-addon"));
+                assert!(
+                    !ids.contains(&"secret-addon"),
+                    "non-admin nie powinien widziec admin_only"
+                );
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_addons_list_filters_by_group_visibility() {
+        let state = state::AppState::for_test();
+        repository::register_addon(&state.db, "grp-addon", "Grp", "1.0.0", "{}", "linux").unwrap();
+        let user_id =
+            repository::create_user_account(&state.db, "anna", "h", "anna", "a@x.pl").unwrap();
+        // Grupa B — user tam NIE nalezy; addon widoczny tylko dla grupy B.
+        let gb = repository::create_group(&state.db, "groupB", "").unwrap();
+        repository::set_addon_visibility(&state.db, "grp-addon", gb, true, None).unwrap();
+
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_id_bytes(user_id),
+                role: None,
+            },
+            correlation_id: 2,
+            resume_secret: None,
+            state: state.clone(),
+        };
+
+        let (resp, _) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
+        match resp {
+            MessageBody::AddonsListResponseBody(r) => {
+                assert!(r.addons.iter().all(|a| a.addon_id != "grp-addon"));
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_addons_list_admin_sees_all() {
+        let state = state::AppState::for_test();
+        repository::register_addon(&state.db, "a1", "A1", "1.0.0", "{}", "linux").unwrap();
+        repository::register_addon(&state.db, "a2", "A2", "1.0.0", "{}", "linux").unwrap();
+        repository::set_addon_admin_only(&state.db, "a2", true).unwrap();
+        let user_id =
+            repository::create_user_account(&state.db, "root", "h", "root", "r@r.pl").unwrap();
+
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_id_bytes(user_id),
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 3,
+            resume_secret: None,
+            state: state.clone(),
+        };
+
+        let (resp, _) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
+        match resp {
+            MessageBody::AddonsListResponseBody(r) => {
+                assert_eq!(r.addons.len(), 2, "admin powinien widziec wszystkie addony");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_addon_detail_returns_not_found_for_hidden() {
+        let state = state::AppState::for_test();
+        let user_id = setup_user_and_addon(&state.db, "bob", "hidden");
+        repository::set_addon_admin_only(&state.db, "hidden", true).unwrap();
+
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_id_bytes(user_id),
+                role: None,
+            },
+            correlation_id: 4,
+            resume_secret: None,
+            state: state.clone(),
+        };
+
+        let (resp, is_err) = dispatch(
+            &MessageBody::AddonDetailRequestBody(tentaflow_protocol::AddonDetailRequest {
+                addon_id: "hidden".to_string(),
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotFound),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_addon_permission_check_returns_not_found_for_hidden() {
+        let state = state::AppState::for_test();
+        let user_id = setup_user_and_addon(&state.db, "carol", "hidden2");
+        repository::set_addon_admin_only(&state.db, "hidden2", true).unwrap();
+
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_id_bytes(user_id),
+                role: None,
+            },
+            correlation_id: 5,
+            resume_secret: None,
+            state: state.clone(),
+        };
+
+        let (resp, is_err) = dispatch(
+            &MessageBody::AddonPermissionCheckRequestBody(
+                tentaflow_protocol::AddonPermissionCheckRequest {
+                    addon_id: "hidden2".to_string(),
+                    permission_id: "some.perm".to_string(),
+                    user_id: None,
+                },
+            ),
+            &ctx,
+        )
+        .await;
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotFound),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_addon_tools_returns_not_found_for_hidden() {
+        let state = state::AppState::for_test();
+        let user_id = setup_user_and_addon(&state.db, "dave", "hidden3");
+        repository::set_addon_admin_only(&state.db, "hidden3", true).unwrap();
+
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: user_id_bytes(user_id),
+                role: None,
+            },
+            correlation_id: 6,
+            resume_secret: None,
+            state: state.clone(),
+        };
+
+        let (resp, is_err) = dispatch(
+            &MessageBody::AddonToolsRequestBody(tentaflow_protocol::AddonToolsRequest {
+                addon_id: "hidden3".to_string(),
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(is_err);
+        match resp {
+            MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotFound),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
     }
 }

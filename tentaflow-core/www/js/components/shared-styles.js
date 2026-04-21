@@ -34,6 +34,39 @@ export async function getControlsSheet() {
   return _sheetPromise;
 }
 
+// =============================================================================
+// Sprite z symbolami ikon (<symbol id="i-*">) zywuje w light DOM (body).
+// W Shadow DOM referencje <use href="#i-..."> nie osiagaja symboli z document
+// (spec ambiguity + ograniczenia Chrome/Safari), dlatego klonujemy sprite
+// do shadow root raz — aby <use> mialo lokalny target.
+// =============================================================================
+
+let _cachedSprite = null;
+
+function getSourceSprite() {
+  return document.querySelector('svg[data-role="sprite"]')
+    || document.querySelector('body > svg[aria-hidden="true"]');
+}
+
+export function injectSpriteIntoShadow(shadowRoot) {
+  if (!shadowRoot) return;
+  if (!_cachedSprite) {
+    const src = getSourceSprite();
+    if (!src) return;
+    _cachedSprite = src.cloneNode(true);
+    // wyzerowanie atrybutow rozmiaru — sprite ma byc niewidoczny
+    _cachedSprite.setAttribute('width', '0');
+    _cachedSprite.setAttribute('height', '0');
+    _cachedSprite.setAttribute('aria-hidden', 'true');
+    _cachedSprite.style.position = 'absolute';
+    _cachedSprite.style.width = '0';
+    _cachedSprite.style.height = '0';
+    _cachedSprite.style.overflow = 'hidden';
+    _cachedSprite.removeAttribute('data-role');
+  }
+  shadowRoot.appendChild(_cachedSprite.cloneNode(true));
+}
+
 export async function adoptControlsInto(shadowRoot) {
   const sheet = await getControlsSheet();
   if (sheet) {

@@ -510,30 +510,28 @@ impl MeetingSpeakerTracker {
         // Po persist — sprawdz czy ten speaker dorobil sie na promocje
         let mut promoted = false;
         match self.speakers[idx].promotion_candidates() {
-            Ok(quality_idx_list) => {
-                match self.promote_speaker(pool, idx, &quality_idx_list) {
-                    Ok(Some(profile_id)) => {
-                        tracing::info!(
-                            meeting_id = %self.meeting_id,
-                            profile_id,
-                            previous_label = %label,
-                            "Temp speaker promoted to KNOWN_SPEAKER voice_profile"
-                        );
-                        promoted = true;
-                        self.speakers.remove(idx);
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            meeting_id = %self.meeting_id,
-                            speaker = %label,
-                            "Promotion check passed but enroll_profile returned None"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "Promotion failed");
-                    }
+            Ok(quality_idx_list) => match self.promote_speaker(pool, idx, &quality_idx_list) {
+                Ok(Some(profile_id)) => {
+                    tracing::info!(
+                        meeting_id = %self.meeting_id,
+                        profile_id,
+                        previous_label = %label,
+                        "Temp speaker promoted to KNOWN_SPEAKER voice_profile"
+                    );
+                    promoted = true;
+                    self.speakers.remove(idx);
                 }
-            }
+                Ok(None) => {
+                    tracing::warn!(
+                        meeting_id = %self.meeting_id,
+                        speaker = %label,
+                        "Promotion check passed but enroll_profile returned None"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Promotion failed");
+                }
+            },
             Err(reject) => {
                 tracing::info!(
                     meeting_id = %self.meeting_id,
@@ -753,7 +751,9 @@ mod tests {
         let pool = test_pool();
         let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-1", 0.9, 10).unwrap();
 
-        let r1 = tracker.track(&pool, &vec![1.0, 0.0, 0.0], 3000, 20.0).unwrap();
+        let r1 = tracker
+            .track(&pool, &vec![1.0, 0.0, 0.0], 3000, 20.0)
+            .unwrap();
         assert_eq!(r1.label, "SPEAKER_00");
         // Wymus niski cos similarity
         let emb_diff: Vec<f32> = {
@@ -783,8 +783,7 @@ mod tests {
             v
         };
         {
-            let mut tracker =
-                MeetingSpeakerTracker::load_or_new(&pool, "meet-2", 0.5, 10).unwrap();
+            let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-2", 0.5, 10).unwrap();
             tracker.track(&pool, &emb_a, 3000, 20.0).unwrap();
             tracker.track(&pool, &emb_a, 2000, 20.0).unwrap();
             tracker.track(&pool, &emb_b, 3000, 20.0).unwrap();
@@ -805,9 +804,21 @@ mod tests {
     #[test]
     fn encode_decode_blob_v2_roundtrip() {
         let samples = vec![
-            TrackedSample { embedding: dummy_emb(0.0), duration_ms: 3000, snr_db: 18.5 },
-            TrackedSample { embedding: dummy_emb(1.0), duration_ms: 2500, snr_db: 22.1 },
-            TrackedSample { embedding: dummy_emb(2.0), duration_ms: 4000, snr_db: 15.0 },
+            TrackedSample {
+                embedding: dummy_emb(0.0),
+                duration_ms: 3000,
+                snr_db: 18.5,
+            },
+            TrackedSample {
+                embedding: dummy_emb(1.0),
+                duration_ms: 2500,
+                snr_db: 22.1,
+            },
+            TrackedSample {
+                embedding: dummy_emb(2.0),
+                duration_ms: 4000,
+                snr_db: 15.0,
+            },
         ];
         let blob = encode_samples_blob(&samples);
         let decoded = decode_samples_blob(&blob);
@@ -870,7 +881,11 @@ mod tests {
             last_result = Some(tracker2.track(&pool2, &same_voice, 3000, 18.0).unwrap());
         }
         let r5 = last_result.unwrap();
-        assert!(r5.promoted, "should promote on 5th quality sample, got: {:?}", r5);
+        assert!(
+            r5.promoted,
+            "should promote on 5th quality sample, got: {:?}",
+            r5
+        );
 
         // Po promocji speaker zostal usuniety z trackera
         assert_eq!(tracker2.speaker_count(), 0);
@@ -952,21 +967,42 @@ mod tests {
         let pool = test_pool();
         let mut tracker = MeetingSpeakerTracker::load_or_new(&pool, "meet-1", 0.95, 2).unwrap();
 
-        let r1 = tracker.track(&pool, &{
-            let mut v = vec![0.0_f32; 192];
-            v[0] = 1.0;
-            v
-        }, 3000, 20.0).unwrap();
-        let r2 = tracker.track(&pool, &{
-            let mut v = vec![0.0_f32; 192];
-            v[50] = 1.0;
-            v
-        }, 3000, 20.0).unwrap();
-        let r3 = tracker.track(&pool, &{
-            let mut v = vec![0.0_f32; 192];
-            v[100] = 1.0;
-            v
-        }, 3000, 20.0).unwrap();
+        let r1 = tracker
+            .track(
+                &pool,
+                &{
+                    let mut v = vec![0.0_f32; 192];
+                    v[0] = 1.0;
+                    v
+                },
+                3000,
+                20.0,
+            )
+            .unwrap();
+        let r2 = tracker
+            .track(
+                &pool,
+                &{
+                    let mut v = vec![0.0_f32; 192];
+                    v[50] = 1.0;
+                    v
+                },
+                3000,
+                20.0,
+            )
+            .unwrap();
+        let r3 = tracker
+            .track(
+                &pool,
+                &{
+                    let mut v = vec![0.0_f32; 192];
+                    v[100] = 1.0;
+                    v
+                },
+                3000,
+                20.0,
+            )
+            .unwrap();
 
         assert_eq!(r1.label, "SPEAKER_00");
         assert_eq!(r2.label, "SPEAKER_01");

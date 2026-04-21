@@ -32,7 +32,7 @@ const LoginScreen = {
           </div>
 
           <form id="login-form">
-            <tf-input id="login-username" type="text" label="${escapeHtml(I18n.t('login.username'))}" autocomplete="username" required autofocus></tf-input>
+            <tf-input id="login-username" type="text" label="${escapeHtml(I18n.t('login.username'))}" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus></tf-input>
             <tf-input id="login-password" type="password" label="${escapeHtml(I18n.t('login.password'))}" autocomplete="current-password" required></tf-input>
             <tf-button id="login-submit" variant="primary" size="md" type="submit" label="${escapeHtml(I18n.t('login.submit'))}"></tf-button>
             <div id="login-error" class="tf-error-text" style="display: none;"></div>

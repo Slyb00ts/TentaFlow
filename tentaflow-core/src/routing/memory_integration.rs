@@ -19,22 +19,22 @@
 //! 4. Inject do system message
 //! 5. (async) Po odpowiedzi: MemoryAnalyzer.analyze_for_storage() -> Store via QUIC
 
-use crate::error::{Result, CoreError};
-use crate::memory_analyzer::{
-    MemoryAnalyzer, MemoryAnalyzerConfig, MemoryContext, MemoryNodeInfo,
-    MemoryQueryType, MemoryRelationInfo, QueryDecision, StoreDecision,
-};
 use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
-use crate::routing::service_manager::ServiceManager;
-use tentaflow_protocol::{
-    AudioOperation, AudioPayload, MemoryOperation, MemoryPayload,
-    MemoryQueryType as ProtocolQueryType, MemoryResultType,
-    ModelPayload, ModelRequest, ModelResult,
+use crate::error::{CoreError, Result};
+use crate::memory_analyzer::{
+    MemoryAnalyzer, MemoryAnalyzerConfig, MemoryContext, MemoryNodeInfo, MemoryQueryType,
+    MemoryRelationInfo, QueryDecision, StoreDecision,
 };
+use crate::routing::service_manager::ServiceManager;
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+use tentaflow_protocol::{
+    AudioOperation, AudioPayload, MemoryOperation, MemoryPayload,
+    MemoryQueryType as ProtocolQueryType, MemoryResultType, ModelPayload, ModelRequest,
+    ModelResult,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
@@ -80,7 +80,7 @@ pub struct MemoryTimings {
 /// Pojedyncza wiadomosc w historii konwersacji
 #[derive(Debug, Clone)]
 pub struct ConversationMessage {
-    pub role: String,      // "user" lub "assistant"
+    pub role: String, // "user" lub "assistant"
     pub content: String,
     pub timestamp: Instant,
 }
@@ -218,8 +218,13 @@ impl MemoryIntegration {
         // Wyciagnij wszystkie potrzebne dane z memory_opts zanim zrobimy mutable operations
         let (session_id, person_id, speaker_confidence, session_context) = {
             match &request.memory_options {
-                Some(opts) if opts.enabled.unwrap_or(true) && opts.query_enabled.unwrap_or(true) => {
-                    let session_id = opts.session_id.clone().unwrap_or_else(|| "default".to_string());
+                Some(opts)
+                    if opts.enabled.unwrap_or(true) && opts.query_enabled.unwrap_or(true) =>
+                {
+                    let session_id = opts
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string());
                     let person_id = opts.person_id.clone();
                     let speaker_confidence = opts.speaker_confidence.unwrap_or(0.0);
                     let session_context = opts.session_context.clone();
@@ -289,10 +294,15 @@ impl MemoryIntegration {
                         &service_manager,
                         &voice_id_clone,
                         &new_name_clone,
-                    ).await {
+                    )
+                    .await
+                    {
                         error!("Failed to update speaker name in voice DB: {}", e);
                     } else {
-                        debug!("Speaker name updated in voice DB: {} -> {}", voice_id_clone, new_name_clone);
+                        debug!(
+                            "Speaker name updated in voice DB: {} -> {}",
+                            voice_id_clone, new_name_clone
+                        );
                     }
 
                     // 2. Aktualizuj w Memory (graf wiedzy)
@@ -301,10 +311,15 @@ impl MemoryIntegration {
                         &session_id_clone,
                         &voice_id_clone,
                         &new_name_clone,
-                    ).await {
+                    )
+                    .await
+                    {
                         error!("Failed to update person name in Memory: {}", e);
                     } else {
-                        debug!("Person name updated in Memory: voice_id={} -> {}", voice_id_clone, new_name_clone);
+                        debug!(
+                            "Person name updated in Memory: voice_id={} -> {}",
+                            voice_id_clone, new_name_clone
+                        );
                     }
                 });
             }
@@ -324,12 +339,12 @@ impl MemoryIntegration {
                 );
 
                 let t_voice = Instant::now();
-                match self.get_person_context_by_voice(&session_id, person_id).await {
+                match self
+                    .get_person_context_by_voice(&session_id, person_id)
+                    .await
+                {
                     Ok((person_context, person_name)) => {
-                        debug!(
-                            "get_person_context_by_voice took {:?}",
-                            t_voice.elapsed()
-                        );
+                        debug!("get_person_context_by_voice took {:?}", t_voice.elapsed());
                         if !person_context.formatted_context.is_empty() {
                             // Wstrzyknij kontekst osoby do request
                             self.inject_memory_context(&mut request, &person_context);
@@ -344,7 +359,11 @@ impl MemoryIntegration {
                             // Jesli bardzo wysoka pewnosc (>0.85), dodaj personalizacje do system message
                             if speaker_confidence > 0.85 {
                                 if let Some(name) = person_name {
-                                    self.inject_personalization(&mut request, &name, is_first_message);
+                                    self.inject_personalization(
+                                        &mut request,
+                                        &name,
+                                        is_first_message,
+                                    );
                                 }
                             }
                         } else {
@@ -353,8 +372,15 @@ impl MemoryIntegration {
                             debug!("Memory returned empty context for person_id");
                             if speaker_confidence > 0.85 {
                                 if let Some(name) = person_name {
-                                    debug!("Using person_name from Memory (empty context): {}", name);
-                                    self.inject_personalization(&mut request, &name, is_first_message);
+                                    debug!(
+                                        "Using person_name from Memory (empty context): {}",
+                                        name
+                                    );
+                                    self.inject_personalization(
+                                        &mut request,
+                                        &name,
+                                        is_first_message,
+                                    );
                                     user_recognized = true;
                                 }
                             }
@@ -363,9 +389,13 @@ impl MemoryIntegration {
                     Err(e) => {
                         debug!(
                             "get_person_context_by_voice FAILED after {:?}: {}",
-                            t_voice.elapsed(), e
+                            t_voice.elapsed(),
+                            e
                         );
-                        warn!("Failed to get person context: {} - continuing without it", e);
+                        warn!(
+                            "Failed to get person context: {} - continuing without it",
+                            e
+                        );
                     }
                 }
 
@@ -374,7 +404,8 @@ impl MemoryIntegration {
                 if !user_recognized && speaker_confidence > 0.85 {
                     // Pobierz speaker_name z memory_opts (ustawione przez Router po speaker identification)
                     // Musimy sklonowac przed mutable borrow
-                    let stt_speaker_name = request.memory_options
+                    let stt_speaker_name = request
+                        .memory_options
                         .as_ref()
                         .and_then(|opts| opts.speaker_name.clone());
 
@@ -392,11 +423,13 @@ impl MemoryIntegration {
 
         // Jesli uzytkownik nierozpoznany (brak person_id lub niski confidence), dodaj info do system message
         // Ale jesli speaker zostal rozpoznany (person_id + confidence > 0.60), to nie jest "nieznany"
-        let speaker_known = person_id.as_ref().map(|id| !id.is_empty()).unwrap_or(false) && speaker_confidence > 0.60;
+        let speaker_known = person_id.as_ref().map(|id| !id.is_empty()).unwrap_or(false)
+            && speaker_confidence > 0.60;
 
         // Sprawdz czy jest hint o potwierdzeniu tozsamosci (MEDIUM confidence)
         // session_context moze zawierac hint np. "Prawdopodobnie Jan (85%) - zapytaj o potwierdzenie"
-        let has_confirmation_hint = session_context.as_ref()
+        let has_confirmation_hint = session_context
+            .as_ref()
             .map(|ctx| ctx.contains("Prawdopodobnie") || ctx.contains("zapytaj o potwierdzenie"))
             .unwrap_or(false);
 
@@ -423,7 +456,10 @@ impl MemoryIntegration {
                 // Na razie zostawiamy to do store_analysis ktory wykryje przedstawienie
             } else if has_confirmation_hint {
                 // MEDIUM confidence - mamy kandydata, ale potrzebujemy potwierdzenia
-                self.inject_medium_confidence_context(&mut request, session_context.as_deref().unwrap_or(""));
+                self.inject_medium_confidence_context(
+                    &mut request,
+                    session_context.as_deref().unwrap_or(""),
+                );
                 debug!("Medium confidence context injected (needs confirmation)");
             } else if !is_first_message {
                 // Nowy glos W TRAKCIE rozmowy - delikatnie zapytaj
@@ -445,18 +481,29 @@ impl MemoryIntegration {
 
         // === KROK 1: Memory Analyzer - decyzja o zapytaniu (bielik-1.5b) ===
         let t_analyze = Instant::now();
-        let query_decision = match self.analyzer.analyze_query(&user_message, session_context_for_analyzer, person_id.as_deref()).await {
+        let query_decision = match self
+            .analyzer
+            .analyze_query(
+                &user_message,
+                session_context_for_analyzer,
+                person_id.as_deref(),
+            )
+            .await
+        {
             Ok(decision) => {
                 debug!(
                     "Memory Analyzer analyze_query took {:?} (should_query={}, type={:?})",
-                    t_analyze.elapsed(), decision.should_query, decision.query_type
+                    t_analyze.elapsed(),
+                    decision.should_query,
+                    decision.query_type
                 );
                 decision
             }
             Err(e) => {
                 debug!(
                     "Memory Analyzer analyze_query FAILED after {:?}: {}",
-                    t_analyze.elapsed(), e
+                    t_analyze.elapsed(),
+                    e
                 );
                 warn!("MemoryAnalyzer error: {} - uzywam fallback", e);
                 MemoryAnalyzer::fallback_query_decision()
@@ -479,15 +526,14 @@ impl MemoryIntegration {
             Ok(ctx) => {
                 debug!(
                     "query_memory took {:?} ({} nodes, {} relations)",
-                    t_query.elapsed(), ctx.nodes.len(), ctx.relations.len()
+                    t_query.elapsed(),
+                    ctx.nodes.len(),
+                    ctx.relations.len()
                 );
                 ctx
             }
             Err(e) => {
-                debug!(
-                    "query_memory FAILED after {:?}: {}",
-                    t_query.elapsed(), e
-                );
+                debug!("query_memory FAILED after {:?}: {}", t_query.elapsed(), e);
                 warn!("Memory query error: {} - kontynuuje bez kontekstu", e);
                 MemoryContext::default()
             }
@@ -504,10 +550,7 @@ impl MemoryIntegration {
             );
         }
 
-        debug!(
-            "Memory Integration total: {:?}",
-            t_total_start.elapsed()
-        );
+        debug!("Memory Integration total: {:?}", t_total_start.elapsed());
 
         Ok((request, Some(query_decision), timings))
     }
@@ -577,19 +620,24 @@ impl MemoryIntegration {
         );
 
         tokio::spawn(async move {
-            debug!("Memory Store task started for session: {}, speaker: {:?}", session_id, speaker_id);
+            debug!(
+                "Memory Store task started for session: {}, speaker: {:?}",
+                session_id, speaker_id
+            );
 
             // Stworz nowy analyzer w task (nie mozemy przenosic self)
             let analyzer = MemoryAnalyzer::new(service_manager.clone(), None);
 
             // Analizuj co zapisac - z informacja o mowcy (speaker_id + speaker_name)!
             debug!("Memory Store: calling analyze_for_storage_with_speaker, speaker_id={:?}, speaker_name={:?}", speaker_id, speaker_name);
-            let store_decision = match analyzer.analyze_for_storage_with_speaker(
-                &user_message,
-                &response_text,
-                speaker_id.as_deref(),
-                speaker_name.as_deref(),
-            ).await
+            let store_decision = match analyzer
+                .analyze_for_storage_with_speaker(
+                    &user_message,
+                    &response_text,
+                    speaker_id.as_deref(),
+                    speaker_name.as_deref(),
+                )
+                .await
             {
                 Ok(decision) => {
                     debug!(
@@ -615,7 +663,10 @@ impl MemoryIntegration {
             };
 
             if !store_decision.should_store {
-                debug!("Memory Store: should_store=false, reasoning={:?}", store_decision.reasoning);
+                debug!(
+                    "Memory Store: should_store=false, reasoning={:?}",
+                    store_decision.reasoning
+                );
                 return;
             }
 
@@ -646,7 +697,10 @@ impl MemoryIntegration {
 
         // Znajdz QUIC client dla Memory
         let quic_client = self.get_memory_client().await?;
-        debug!("query_memory: get_memory_client took {:?}", t_start.elapsed());
+        debug!(
+            "query_memory: get_memory_client took {:?}",
+            t_start.elapsed()
+        );
 
         // Konwertuj query_type
         // Protocol uzywa: What, WhatCanDo, WhatFor, Where, HowTo, Why, Similar, Pattern
@@ -693,17 +747,11 @@ impl MemoryIntegration {
         let t_quic = Instant::now();
         debug!("query_memory: sending QUIC request for '{}'...", query);
         let response = quic_client.send_request(model_request).await?;
-        debug!(
-            "query_memory: QUIC request took {:?}",
-            t_quic.elapsed()
-        );
+        debug!("query_memory: QUIC request took {:?}", t_quic.elapsed());
 
         // Parsuj odpowiedz
         let result = self.parse_memory_response(response);
-        debug!(
-            "query_memory: total {:?}",
-            t_start.elapsed()
-        );
+        debug!("query_memory: total {:?}", t_start.elapsed());
         result
     }
 
@@ -764,7 +812,8 @@ impl MemoryIntegration {
         if !find_result.found || find_result.node_id.is_none() {
             debug!(
                 "FindByVoice: person not found for voice_id={} (total: {:?})",
-                voice_id, t_start.elapsed()
+                voice_id,
+                t_start.elapsed()
             );
             return Ok((MemoryContext::default(), None));
         }
@@ -786,10 +835,7 @@ impl MemoryIntegration {
             .await?;
         debug!("query_person_context took {:?}", t_context.elapsed());
 
-        debug!(
-            "get_person_context_by_voice total: {:?}",
-            t_start.elapsed()
-        );
+        debug!("get_person_context_by_voice total: {:?}", t_start.elapsed());
 
         Ok((person_context, person_name))
     }
@@ -868,11 +914,8 @@ impl MemoryIntegration {
                         // Konwertuj answers do nodes
                         for answer in query_result.answers {
                             // Konwertuj Option<Vec<(String, String)>> do HashMap
-                            let attributes: std::collections::HashMap<String, String> = answer
-                                .attributes
-                                .unwrap_or_default()
-                                .into_iter()
-                                .collect();
+                            let attributes: std::collections::HashMap<String, String> =
+                                answer.attributes.unwrap_or_default().into_iter().collect();
 
                             context.nodes.push(MemoryNodeInfo {
                                 id: answer.node_id,
@@ -964,7 +1007,14 @@ impl MemoryIntegration {
 
         // Fakty z wyszukiwania
         if !context.facts.is_empty() {
-            data_parts.push(context.facts.iter().map(|f| format!("- {}", f)).collect::<Vec<_>>().join("\n"));
+            data_parts.push(
+                context
+                    .facts
+                    .iter()
+                    .map(|f| format!("- {}", f))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
         }
 
         if data_parts.is_empty() {
@@ -1060,7 +1110,12 @@ impl MemoryIntegration {
     ///
     /// Dodaje informacje o tym kto mowi do system message.
     /// Uzywane gdy speaker_confidence > 0.85 (bardzo wysoka pewnosc rozpoznania).
-    fn inject_personalization(&self, request: &mut ChatCompletionRequest, person_name: &str, is_first_message: bool) {
+    fn inject_personalization(
+        &self,
+        request: &mut ChatCompletionRequest,
+        person_name: &str,
+        is_first_message: bool,
+    ) {
         use crate::prompt_registry::main_llm;
 
         let registry = &self.service_manager.prompt_registry;
@@ -1127,7 +1182,10 @@ impl MemoryIntegration {
         let char_count = trimmed.chars().count();
         if char_count > 3 {
             if let Some(first) = trimmed.chars().next().and_then(|c| c.to_lowercase().next()) {
-                if trimmed.chars().all(|c| c.to_lowercase().next() == Some(first)) {
+                if trimmed
+                    .chars()
+                    .all(|c| c.to_lowercase().next() == Some(first))
+                {
                     return true;
                 }
             }
@@ -1135,10 +1193,9 @@ impl MemoryIntegration {
 
         // Typowe artefakty STT
         let noise_patterns = [
-            "hm", "hmm", "hmmm", "yyy", "eee", "aaa", "mmm",
-            "...", "???", "!!!", "aha", "mhm", "uhm", "ehm",
-            "uch", "och", "ach", "ech", "yhy", "no", "ee",
-            "ha", "he", "ho", "hej", "hę", "hą",
+            "hm", "hmm", "hmmm", "yyy", "eee", "aaa", "mmm", "...", "???", "!!!", "aha", "mhm",
+            "uhm", "ehm", "uch", "och", "ach", "ech", "yhy", "no", "ee", "ha", "he", "ho", "hej",
+            "hę", "hą",
         ];
         let lower = trimmed.to_lowercase();
         for pattern in noise_patterns {
@@ -1158,7 +1215,10 @@ impl MemoryIntegration {
 
         // Wysoki stosunek spolgloskek do samogloskek (typowe dla krzakow STT)
         let vowels = lower.chars().filter(|c| "aeiouyąęó".contains(*c)).count();
-        let consonants = lower.chars().filter(|c| c.is_alphabetic() && !"aeiouyąęó".contains(*c)).count();
+        let consonants = lower
+            .chars()
+            .filter(|c| c.is_alphabetic() && !"aeiouyąęó".contains(*c))
+            .count();
         if consonants > 0 && vowels > 0 {
             let ratio = consonants as f32 / vowels as f32;
             // Normalny tekst ma stosunek ~1.5-2.5, krzaki czesto >4
@@ -1175,16 +1235,86 @@ impl MemoryIntegration {
         // Lista podstawowych slow ktore oznaczaja sensowna wypowiedz
         let common_words = [
             // Polskie
-            "tak", "nie", "co", "jak", "gdzie", "kiedy", "czy", "ale", "to", "ja", "ty",
-            "on", "ona", "ono", "my", "wy", "oni", "jest", "są", "był", "była", "będzie",
-            "mam", "masz", "ma", "mamy", "chcę", "chcesz", "chce", "mogę", "możesz", "może",
-            "cześć", "hej", "witaj", "dzień", "dobry", "wieczór", "proszę", "dziękuję",
-            "przepraszam", "tak", "dobrze", "okej", "super", "fajnie", "świetnie",
-            "jestem", "nazywam", "imię", "wiem", "rozumiem", "pamiętam", "zapamiętaj",
-            "powiedz", "opowiedz", "zrób", "pomóż", "znajdź", "pokaż", "daj",
+            "tak",
+            "nie",
+            "co",
+            "jak",
+            "gdzie",
+            "kiedy",
+            "czy",
+            "ale",
+            "to",
+            "ja",
+            "ty",
+            "on",
+            "ona",
+            "ono",
+            "my",
+            "wy",
+            "oni",
+            "jest",
+            "są",
+            "był",
+            "była",
+            "będzie",
+            "mam",
+            "masz",
+            "ma",
+            "mamy",
+            "chcę",
+            "chcesz",
+            "chce",
+            "mogę",
+            "możesz",
+            "może",
+            "cześć",
+            "hej",
+            "witaj",
+            "dzień",
+            "dobry",
+            "wieczór",
+            "proszę",
+            "dziękuję",
+            "przepraszam",
+            "tak",
+            "dobrze",
+            "okej",
+            "super",
+            "fajnie",
+            "świetnie",
+            "jestem",
+            "nazywam",
+            "imię",
+            "wiem",
+            "rozumiem",
+            "pamiętam",
+            "zapamiętaj",
+            "powiedz",
+            "opowiedz",
+            "zrób",
+            "pomóż",
+            "znajdź",
+            "pokaż",
+            "daj",
             // Angielskie (na wypadek code-switching)
-            "yes", "no", "ok", "okay", "hello", "hi", "bye", "thanks", "please",
-            "what", "how", "where", "when", "why", "who", "the", "and", "or",
+            "yes",
+            "no",
+            "ok",
+            "okay",
+            "hello",
+            "hi",
+            "bye",
+            "thanks",
+            "please",
+            "what",
+            "how",
+            "where",
+            "when",
+            "why",
+            "who",
+            "the",
+            "and",
+            "or",
         ];
 
         for word in text.split_whitespace() {
@@ -1227,9 +1357,18 @@ impl MemoryIntegration {
                     .to_string();
 
                 // Sprawdz czy to wyglada na imie (3-15 znakow, zaczyna sie wielka lub mala)
-                if name.len() >= 2 && name.len() <= 15 && name.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+                if name.len() >= 2
+                    && name.len() <= 15
+                    && name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_alphabetic())
+                        .unwrap_or(false)
+                {
                     // Nie zwracaj jesli to typowe slowo a nie imie
-                    let not_names = ["tu", "tutaj", "teraz", "zawsze", "sam", "sama", "też", "także"];
+                    let not_names = [
+                        "tu", "tutaj", "teraz", "zawsze", "sam", "sama", "też", "także",
+                    ];
                     if !not_names.contains(&name.to_lowercase().as_str()) {
                         return Some(name);
                     }
@@ -1263,7 +1402,8 @@ impl MemoryIntegration {
         // Wyciagnij imie z hinta jesli mozliwe
         // Format hinta: "Prawdopodobnie Jan (75.0%) - zapytaj o potwierdzenie"
         let name_hint = if hint.starts_with("Prawdopodobnie ") {
-            hint.split(" (").next()
+            hint.split(" (")
+                .next()
                 .map(|s| s.replace("Prawdopodobnie ", ""))
                 .unwrap_or_default()
         } else {
@@ -1275,7 +1415,9 @@ impl MemoryIntegration {
             params.insert("name", name_hint.as_str());
             registry.require_template(main_llm::MEDIUM_CONFIDENCE_KNOWN_TEMPLATE, &params)
         } else {
-            registry.require_content(main_llm::MEDIUM_CONFIDENCE_UNKNOWN).to_string()
+            registry
+                .require_content(main_llm::MEDIUM_CONFIDENCE_UNKNOWN)
+                .to_string()
         };
 
         Self::append_to_system_message(request, &context);
@@ -1333,8 +1475,15 @@ impl MemoryIntegration {
     }
 
     /// Znajduje QUIC client dla Memory w service_manager
-    async fn find_memory_client(service_manager: &ServiceManager) -> Result<Arc<crate::net::quic::QuicClient>> {
-        let memory_handles: Vec<_> = service_manager.quic_memory_services.read().values().cloned().collect();
+    async fn find_memory_client(
+        service_manager: &ServiceManager,
+    ) -> Result<Arc<crate::net::quic::QuicClient>> {
+        let memory_handles: Vec<_> = service_manager
+            .quic_memory_services
+            .read()
+            .values()
+            .cloned()
+            .collect();
         for handle in memory_handles {
             let client_guard = handle.client.read().await;
             if let Some(client) = client_guard.as_ref() {
@@ -1365,7 +1514,9 @@ impl MemoryIntegration {
         let mut facts = Vec::new();
 
         // Helper do konwersji HashMap na Vec<(String, String)>
-        fn hashmap_to_vec(map: &std::collections::HashMap<String, String>) -> Vec<(String, String)> {
+        fn hashmap_to_vec(
+            map: &std::collections::HashMap<String, String>,
+        ) -> Vec<(String, String)> {
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         }
 
@@ -1432,13 +1583,11 @@ impl MemoryIntegration {
         // Sprawdz odpowiedz
         match response.result {
             ModelResult::Memory(_) => Ok(()),
-            ModelResult::Error(err) => {
-                Err(CoreError::InternalError {
-                    message: format!("Memory store error: {}", err.message),
-                    source: None,
-                }
-                .into())
+            ModelResult::Error(err) => Err(CoreError::InternalError {
+                message: format!("Memory store error: {}", err.message),
+                source: None,
             }
+            .into()),
             _ => Ok(()),
         }
     }
@@ -1498,10 +1647,30 @@ impl MemoryIntegration {
 
         // Wyklucz popularne slowa ktore nie sa imionami
         let excluded_words: &[&str] = &[
-            "tu", "tam", "tak", "nie", "już", "jeszcze", "bardzo", "dobrze",
-            "tutaj", "teraz", "potem", "później", "dzisiaj", "wczoraj",
-            "pewien", "pewna", "pewne", "jakiś", "jakieś", "każdy",
-            "gotowy", "gotowa", "zajęty", "zajęta",
+            "tu",
+            "tam",
+            "tak",
+            "nie",
+            "już",
+            "jeszcze",
+            "bardzo",
+            "dobrze",
+            "tutaj",
+            "teraz",
+            "potem",
+            "później",
+            "dzisiaj",
+            "wczoraj",
+            "pewien",
+            "pewna",
+            "pewne",
+            "jakiś",
+            "jakieś",
+            "każdy",
+            "gotowy",
+            "gotowa",
+            "zajęty",
+            "zajęta",
         ];
 
         let name_lower = name.to_lowercase();
@@ -1554,7 +1723,10 @@ impl MemoryIntegration {
             ModelResult::Audio(audio_result) => {
                 match audio_result.data {
                     tentaflow_protocol::AudioResultData::SpeakerUpdateNameResult {
-                        success, old_name, new_name, ..
+                        success,
+                        old_name,
+                        new_name,
+                        ..
                     } => {
                         if success {
                             debug!("Speaker name updated: '{}' -> '{}'", old_name, new_name);
@@ -1576,13 +1748,11 @@ impl MemoryIntegration {
                     }
                 }
             }
-            ModelResult::Error(err) => {
-                Err(CoreError::InternalError {
-                    message: format!("SpeakerUpdateName error: {}", err.message),
-                    source: None,
-                }
-                .into())
+            ModelResult::Error(err) => Err(CoreError::InternalError {
+                message: format!("SpeakerUpdateName error: {}", err.message),
+                source: None,
             }
+            .into()),
             _ => {
                 warn!("Unexpected response type for SpeakerUpdateName");
                 Ok(())
@@ -1625,39 +1795,35 @@ impl MemoryIntegration {
         let response = quic_client.send_request(model_request).await?;
 
         match response.result {
-            ModelResult::Memory(memory_result) => {
-                match memory_result.result_type {
-                    MemoryResultType::UpdatePersonName(result) => {
-                        if result.success {
-                            debug!(
-                                "Person name updated in Memory: '{}' -> '{}' (node_id={})",
-                                result.old_name, result.new_name, result.node_id
-                            );
-                            Ok(())
-                        } else {
-                            Err(CoreError::InternalError {
-                                message: format!(
-                                    "Failed to update person name in Memory: {} -> {}",
-                                    result.old_name, result.new_name
-                                ),
-                                source: None,
-                            }
-                            .into())
-                        }
-                    }
-                    _ => {
-                        warn!("Unexpected Memory result type for UpdatePersonName");
+            ModelResult::Memory(memory_result) => match memory_result.result_type {
+                MemoryResultType::UpdatePersonName(result) => {
+                    if result.success {
+                        debug!(
+                            "Person name updated in Memory: '{}' -> '{}' (node_id={})",
+                            result.old_name, result.new_name, result.node_id
+                        );
                         Ok(())
+                    } else {
+                        Err(CoreError::InternalError {
+                            message: format!(
+                                "Failed to update person name in Memory: {} -> {}",
+                                result.old_name, result.new_name
+                            ),
+                            source: None,
+                        }
+                        .into())
                     }
                 }
-            }
-            ModelResult::Error(err) => {
-                Err(CoreError::InternalError {
-                    message: format!("UpdatePersonName error: {}", err.message),
-                    source: None,
+                _ => {
+                    warn!("Unexpected Memory result type for UpdatePersonName");
+                    Ok(())
                 }
-                .into())
+            },
+            ModelResult::Error(err) => Err(CoreError::InternalError {
+                message: format!("UpdatePersonName error: {}", err.message),
+                source: None,
             }
+            .into()),
             _ => {
                 warn!("Unexpected response type for UpdatePersonName");
                 Ok(())
@@ -1704,7 +1870,11 @@ mod tests {
                 .nodes
                 .iter()
                 .map(|n| {
-                    let attrs: Vec<String> = n.attributes.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                    let attrs: Vec<String> = n
+                        .attributes
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect();
                     if attrs.is_empty() {
                         format!("- {} ({})", n.name, n.node_type)
                     } else {

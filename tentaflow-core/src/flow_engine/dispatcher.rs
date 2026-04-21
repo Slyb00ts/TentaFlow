@@ -6,17 +6,17 @@
 
 use crate::config::RouterConfig;
 use crate::db::{repository, DbPool};
-use crate::flow_engine::adapters::AdapterRegistry;
-use crate::flow_engine::adapters::llm::LlmNodeAdapter;
-use crate::flow_engine::adapters::rag::RagNodeAdapter;
-use crate::flow_engine::adapters::stt::SttNodeAdapter;
-use crate::flow_engine::adapters::tts::TtsNodeAdapter;
-use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
-use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
 use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
+use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
+use crate::flow_engine::adapters::llm::LlmNodeAdapter;
+use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
+use crate::flow_engine::adapters::memory_analyzer::MemoryAnalyzerAdapter;
+use crate::flow_engine::adapters::rag::RagNodeAdapter;
 use crate::flow_engine::adapters::session_context::SessionContextAdapter;
 use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
-use crate::flow_engine::adapters::memory_analyzer::MemoryAnalyzerAdapter;
+use crate::flow_engine::adapters::stt::SttNodeAdapter;
+use crate::flow_engine::adapters::tts::TtsNodeAdapter;
+use crate::flow_engine::adapters::AdapterRegistry;
 use crate::flow_engine::cache::FlowCache;
 use crate::flow_engine::executor_async::FlowExecutorAsync;
 use crate::flow_engine::resolver;
@@ -47,22 +47,10 @@ impl FlowDispatcher {
         config: Arc<RouterConfig>,
     ) -> Self {
         let mut registry = AdapterRegistry::new();
-        registry.register(LlmNodeAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(RagNodeAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(SttNodeAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(TtsNodeAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
+        registry.register(LlmNodeAdapter::new(service_manager.clone(), config.clone()));
+        registry.register(RagNodeAdapter::new(service_manager.clone(), config.clone()));
+        registry.register(SttNodeAdapter::new(service_manager.clone(), config.clone()));
+        registry.register(TtsNodeAdapter::new(service_manager.clone(), config.clone()));
         registry.register(EmbeddingsNodeAdapter::new(
             service_manager.clone(),
             config.clone(),
@@ -83,10 +71,7 @@ impl FlowDispatcher {
             service_manager.clone(),
             config.clone(),
         ));
-        registry.register(MemoryAnalyzerAdapter::new(
-            service_manager,
-            config,
-        ));
+        registry.register(MemoryAnalyzerAdapter::new(service_manager, config));
 
         Self {
             db,
@@ -94,7 +79,8 @@ impl FlowDispatcher {
             registry: Arc::new(registry),
             enabled_cache: AtomicBool::new(false),
             enabled_last_check: std::sync::Mutex::new(
-                std::time::Instant::now() - std::time::Duration::from_secs(ENABLED_CACHE_TTL_SECS + 1),
+                std::time::Instant::now()
+                    - std::time::Duration::from_secs(ENABLED_CACHE_TTL_SECS + 1),
             ),
         }
     }
@@ -128,7 +114,10 @@ impl FlowDispatcher {
                     warn!("Blad odczytu ustawienia flow_engine_enabled z DB: {}", e);
                 }
                 Err(e) => {
-                    warn!("Blad spawn_blocking przy sprawdzaniu flow_engine_enabled: {}", e);
+                    warn!(
+                        "Blad spawn_blocking przy sprawdzaniu flow_engine_enabled: {}",
+                        e
+                    );
                 }
             }
         }

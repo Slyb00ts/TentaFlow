@@ -10,7 +10,7 @@
 
 class TfInput extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'disabled', 'autocomplete', 'autofocus', 'required', 'name'];
+    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern'];
   }
 
   constructor() {
@@ -151,6 +151,13 @@ class TfInput extends HTMLElement {
     const name = this.getAttribute('name');
     if (name) this._input.setAttribute('name', name);
     else this._input.removeAttribute('name');
+
+    // Pass-through dla atrybutow kontroli wprowadzania (mobilna klawiatura).
+    for (const attr of ['autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern']) {
+      const v = this.getAttribute(attr);
+      if (v !== null) this._input.setAttribute(attr, v);
+      else this._input.removeAttribute(attr);
+    }
 
     if (this.hasAttribute('required')) this._input.setAttribute('required', '');
     else this._input.removeAttribute('required');

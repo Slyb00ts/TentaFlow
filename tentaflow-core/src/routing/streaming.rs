@@ -5,25 +5,25 @@
 //       TTS buffering, memory store po zakonczeniu streamu.
 // =============================================================================
 
-use crate::error::{Result, CoreError};
 use crate::api::openai::types::{
-    ChatCompletionRequest, ChatCompletionChunk,
-    ChunkChoice, Delta, Message, MessageContent, TTSRequest,
+    ChatCompletionChunk, ChatCompletionRequest, ChunkChoice, Delta, Message, MessageContent,
+    TTSRequest,
 };
-use crate::routing::router::{Router, RequestMetrics};
-use crate::routing::chat::flow_result_to_chat_response;
-use crate::services::tts::{SynthesizeCallback, TTSBufferingProcessor};
+use crate::error::{CoreError, Result};
 use crate::intent_analyzer::{Intent, ToolExecutor};
+use crate::routing::chat::flow_result_to_chat_response;
+use crate::routing::router::{RequestMetrics, Router};
+use crate::services::tts::{SynthesizeCallback, TTSBufferingProcessor};
 
-use tentaflow_protocol::*;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
+use tentaflow_protocol::*;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, error, info, warn};
 
-use futures::Stream;
 use futures::stream::StreamExt;
+use futures::Stream;
 
 impl Router {
     /// Routuje chat completion request (STREAMING MODE).
@@ -34,7 +34,11 @@ impl Router {
     pub async fn route_chat_completion_stream(
         &self,
         mut request: ChatCompletionRequest,
-    ) -> Result<crate::routing::RouteResult<Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>>> {
+    ) -> Result<
+        crate::routing::RouteResult<
+            Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>,
+        >,
+    > {
         let stream_start = std::time::Instant::now();
         let stream_node_name = hostname::get()
             .map(|h| h.to_string_lossy().to_string())
@@ -47,7 +51,9 @@ impl Router {
             match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
                 Ok(Some(result)) => {
                     let response = flow_result_to_chat_response(result, &request.model);
-                    let text = response.choices.first()
+                    let text = response
+                        .choices
+                        .first()
                         .and_then(|c| c.message.content.as_ref())
                         .map(|c| match c {
                             MessageContent::Text(t) => t.clone(),
@@ -89,18 +95,28 @@ impl Router {
                         hop_count: 0,
                         latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
                     };
-                    return Ok(crate::routing::RouteResult { response: Box::pin(stream), metadata });
+                    return Ok(crate::routing::RouteResult {
+                        response: Box::pin(stream),
+                        metadata,
+                    });
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("Flow Engine error (stream), fallback na stary pipeline: {}", e);
+                    warn!(
+                        "Flow Engine error (stream), fallback na stary pipeline: {}",
+                        e
+                    );
                 }
             }
         }
 
         let mut metrics = RequestMetrics::new();
         let route = self.resolve_route(&request.model);
-        let model_name = route.targets.first().cloned().unwrap_or_else(|| request.model.clone());
+        let model_name = route
+            .targets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| request.model.clone());
         metrics.model_name = Some(model_name.clone());
 
         debug!("Routing streaming request dla modelu: {}", model_name);
@@ -148,8 +164,12 @@ impl Router {
 
                 match speaker_result.confidence_level.as_str() {
                     "HIGH" => {
-                        info!("Speaker HIGH confidence: {} (id: {:?}, similarity: {:?})",
-                              speaker_name.as_deref().unwrap_or("?"), speaker_id, speaker_confidence);
+                        info!(
+                            "Speaker HIGH confidence: {} (id: {:?}, similarity: {:?})",
+                            speaker_name.as_deref().unwrap_or("?"),
+                            speaker_id,
+                            speaker_confidence
+                        );
                     }
                     "MEDIUM" => {
                         info!("Speaker MEDIUM confidence: {} (id: {:?}, similarity: {:?}) - needs_confirmation={}",
@@ -157,7 +177,10 @@ impl Router {
                               speaker_result.needs_confirmation);
                     }
                     _ => {
-                        debug!("Speaker LOW/UNKNOWN confidence (similarity: {:?}) - new speaker?", speaker_confidence);
+                        debug!(
+                            "Speaker LOW/UNKNOWN confidence (similarity: {:?}) - new speaker?",
+                            speaker_confidence
+                        );
                     }
                 }
 
@@ -177,7 +200,9 @@ impl Router {
                     } else if speaker_result.is_medium_confidence() {
                         memory_opts.speaker_confidence = speaker_confidence;
                         if let Some(ref name) = speaker_name {
-                            let confirmation_hint = speaker_result.confirmation_message.clone()
+                            let confirmation_hint = speaker_result
+                                .confirmation_message
+                                .clone()
                                 .unwrap_or_else(|| format!("Czy to ty, {}?", name));
                             memory_opts.session_context = Some(format!(
                                 "SPEAKER_CANDIDATE: id={}, name={}, confidence={:.2}, ask: {}",
@@ -191,7 +216,8 @@ impl Router {
                 }
 
                 // === INTENT ANALYZER ===
-                let session_id = request.memory_options
+                let session_id = request
+                    .memory_options
                     .as_ref()
                     .and_then(|m| m.session_id.clone())
                     .unwrap_or_else(|| "default".to_string());
@@ -201,21 +227,26 @@ impl Router {
 
                 let conversation_context = self.build_context_from_conversation_cache(&history, 4);
 
-                let session_context = conversation_context
-                    .or_else(|| request.memory_options
+                let session_context = conversation_context.or_else(|| {
+                    request
+                        .memory_options
                         .as_ref()
                         .and_then(|m| m.session_context.as_deref())
-                        .map(|s| s.to_string()));
+                        .map(|s| s.to_string())
+                });
 
                 let t_intent = std::time::Instant::now();
-                let intent_result = self.intent_analyzer.analyze(
-                    &transcribed_text,
-                    speaker_id.as_deref(),
-                    speaker_name.as_deref(),
-                    speaker_confidence,
-                    Some(&diarized_speakers),
-                    session_context.as_deref(),
-                ).await;
+                let intent_result = self
+                    .intent_analyzer
+                    .analyze(
+                        &transcribed_text,
+                        speaker_id.as_deref(),
+                        speaker_name.as_deref(),
+                        speaker_confidence,
+                        Some(&diarized_speakers),
+                        session_context.as_deref(),
+                    )
+                    .await;
 
                 match intent_result {
                     Ok(analysis) => {
@@ -229,22 +260,49 @@ impl Router {
                         );
 
                         // === HANDLE INTRODUCTION ===
-                        if let Some(Intent::Introduction { ref name, confidence }) = analysis.primary_intent {
+                        if let Some(Intent::Introduction {
+                            ref name,
+                            confidence,
+                        }) = analysis.primary_intent
+                        {
                             info!(
                                 "Wykryto przedstawienie: name='{}', confidence={:.2}, speaker_is_unknown={}",
                                 name, confidence, speaker_result.is_unknown()
                             );
                             if confidence >= 0.7 && speaker_result.is_unknown() {
-                                info!("Intent: ENROLLING new speaker as '{}' (confidence: {:.2})", name, confidence);
+                                info!(
+                                    "Intent: ENROLLING new speaker as '{}' (confidence: {:.2})",
+                                    name, confidence
+                                );
 
-                                let new_speaker_id = format!("voice_{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"));
+                                let new_speaker_id = format!(
+                                    "voice_{}",
+                                    uuid::Uuid::new_v4()
+                                        .to_string()
+                                        .split('-')
+                                        .next()
+                                        .unwrap_or("unknown")
+                                );
 
-                                let stt_service_name = self.service_manager.get_first_stt_service_name().map(|s| s.to_string());
+                                let stt_service_name = self
+                                    .service_manager
+                                    .get_first_stt_service_name()
+                                    .map(|s| s.to_string());
                                 if let Some(service_name) = stt_service_name {
-                                    if let Some(stt_client) = self.service_manager.get_quic_stt_client(&service_name).await {
+                                    if let Some(stt_client) = self
+                                        .service_manager
+                                        .get_quic_stt_client(&service_name)
+                                        .await
+                                    {
                                         let memory_client = {
                                             let mut client = None;
-                                            let memory_handles: Vec<_> = self.service_manager.quic_memory_services.read().values().cloned().collect();
+                                            let memory_handles: Vec<_> = self
+                                                .service_manager
+                                                .quic_memory_services
+                                                .read()
+                                                .values()
+                                                .cloned()
+                                                .collect();
                                             for handle in memory_handles {
                                                 let client_guard = handle.client.read().await;
                                                 if let Some(c) = client_guard.as_ref() {
@@ -261,7 +319,10 @@ impl Router {
                                         let pending_samples = self.pending_voice_samples.clone();
 
                                         tokio::spawn(async move {
-                                            debug!("Enrolling new speaker: id={}, name={}", speaker_id_for_enroll, name_for_enroll);
+                                            debug!(
+                                                "Enrolling new speaker: id={}, name={}",
+                                                speaker_id_for_enroll, name_for_enroll
+                                            );
 
                                             let model_request = tentaflow_protocol::ModelRequest {
                                                 request_id: uuid::Uuid::new_v4().to_string(),
@@ -288,8 +349,12 @@ impl Router {
                                                     );
 
                                                     {
-                                                        let mut pending = pending_samples.write().await;
-                                                        pending.insert(speaker_id_for_enroll.clone(), 3);
+                                                        let mut pending =
+                                                            pending_samples.write().await;
+                                                        pending.insert(
+                                                            speaker_id_for_enroll.clone(),
+                                                            3,
+                                                        );
                                                     }
 
                                                     if let Some(mem_client) = memory_client {
@@ -309,7 +374,10 @@ impl Router {
                                                             session_id: None,
                                                         };
 
-                                                        match mem_client.send_request(memory_request).await {
+                                                        match mem_client
+                                                            .send_request(memory_request)
+                                                            .await
+                                                        {
                                                             Ok(_) => {
                                                                 info!("SUCCESS: Registered person in Memory: {} ({})",
                                                                     name_for_enroll, speaker_id_for_enroll);
@@ -321,7 +389,10 @@ impl Router {
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    error!("FAILED to register voice for {}: {}", name_for_enroll, e);
+                                                    error!(
+                                                        "FAILED to register voice for {}: {}",
+                                                        name_for_enroll, e
+                                                    );
                                                 }
                                             }
                                         });
@@ -333,22 +404,27 @@ impl Router {
                         // === HANDLE TOOL CALLS ===
                         if !analysis.tool_calls.is_empty() {
                             info!("Executing {} tool call(s)", analysis.tool_calls.len());
-                            let execution_results = ToolExecutor::execute_all(&analysis.tool_calls).await;
+                            let execution_results =
+                                ToolExecutor::execute_all(&analysis.tool_calls).await;
 
                             let mut tool_context_parts = Vec::new();
                             for exec_result in &execution_results {
                                 if exec_result.success {
-                                    tool_context_parts.push(format!("[TOOL RESULT] {}", exec_result.message));
+                                    tool_context_parts
+                                        .push(format!("[TOOL RESULT] {}", exec_result.message));
                                 } else {
-                                    tool_context_parts.push(format!("[TOOL INCOMPLETE] {}", exec_result.message));
+                                    tool_context_parts
+                                        .push(format!("[TOOL INCOMPLETE] {}", exec_result.message));
                                 }
                             }
 
                             if !tool_context_parts.is_empty() {
-                                let memory_opts = request.memory_options.get_or_insert_with(Default::default);
+                                let memory_opts =
+                                    request.memory_options.get_or_insert_with(Default::default);
                                 let tool_context = tool_context_parts.join("\n");
                                 if let Some(ref existing) = memory_opts.session_context {
-                                    memory_opts.session_context = Some(format!("{}\n\n{}", existing, tool_context));
+                                    memory_opts.session_context =
+                                        Some(format!("{}\n\n{}", existing, tool_context));
                                 } else {
                                     memory_opts.session_context = Some(tool_context);
                                 }
@@ -357,16 +433,21 @@ impl Router {
 
                         // === INJECT CONTEXT FOR LLM ===
                         if let Some(ref ctx) = analysis.context_for_llm {
-                            let memory_opts = request.memory_options.get_or_insert_with(Default::default);
+                            let memory_opts =
+                                request.memory_options.get_or_insert_with(Default::default);
                             if let Some(ref existing) = memory_opts.session_context {
-                                memory_opts.session_context = Some(format!("{}\n\n{}", existing, ctx));
+                                memory_opts.session_context =
+                                    Some(format!("{}\n\n{}", existing, ctx));
                             } else {
                                 memory_opts.session_context = Some(ctx.clone());
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Intent Analyzer error: {} - continuing without intent analysis", e);
+                        warn!(
+                            "Intent Analyzer error: {} - continuing without intent analysis",
+                            e
+                        );
                     }
                 }
 
@@ -374,19 +455,31 @@ impl Router {
                 if !transcribed_text.trim().is_empty() {
                     // === MULTI-SPEAKER HANDLING ===
                     let multi_speaker_context = if diarized_speakers.len() > 1 {
-                        let known_speakers: Vec<_> = diarized_speakers.iter().filter(|s| s.is_known).collect();
-                        let unknown_speakers: Vec<_> = diarized_speakers.iter().filter(|s| !s.is_known).collect();
+                        let known_speakers: Vec<_> =
+                            diarized_speakers.iter().filter(|s| s.is_known).collect();
+                        let unknown_speakers: Vec<_> =
+                            diarized_speakers.iter().filter(|s| !s.is_known).collect();
 
                         let mut context_parts = Vec::new();
                         for speaker in &known_speakers {
-                            context_parts.push(format!("[{}] mowi: \"{}\"", speaker.label, speaker.text.trim()));
+                            context_parts.push(format!(
+                                "[{}] mowi: \"{}\"",
+                                speaker.label,
+                                speaker.text.trim()
+                            ));
                         }
                         for (i, speaker) in unknown_speakers.iter().enumerate() {
-                            context_parts.push(format!("[Nieznany mowca {}] mowi: \"{}\"", i + 1, speaker.text.trim()));
+                            context_parts.push(format!(
+                                "[Nieznany mowca {}] mowi: \"{}\"",
+                                i + 1,
+                                speaker.text.trim()
+                            ));
                         }
 
-                        let instruction = if known_speakers.len() > 0 && unknown_speakers.len() > 0 {
-                            let known_names: Vec<_> = known_speakers.iter().map(|s| s.label.as_str()).collect();
+                        let instruction = if known_speakers.len() > 0 && unknown_speakers.len() > 0
+                        {
+                            let known_names: Vec<_> =
+                                known_speakers.iter().map(|s| s.label.as_str()).collect();
                             if unknown_speakers.len() == 1 {
                                 format!(
                                     "[INFO MULTI-SPEAKER] W nagraniu slyszę {} osob. Rozpoznaję: {}. Jest tez jedna osoba, ktorej nie znam - zapytaj o imie.",
@@ -408,7 +501,11 @@ impl Router {
                         };
 
                         if !instruction.is_empty() {
-                            Some(format!("{}\n\nTranskrypcja per mowca:\n{}", instruction, context_parts.join("\n")))
+                            Some(format!(
+                                "{}\n\nTranskrypcja per mowca:\n{}",
+                                instruction,
+                                context_parts.join("\n")
+                            ))
                         } else {
                             None
                         }
@@ -417,33 +514,45 @@ impl Router {
                     };
 
                     if let Some(ref ms_context) = multi_speaker_context {
-                        let memory_opts = request.memory_options.get_or_insert_with(Default::default);
+                        let memory_opts =
+                            request.memory_options.get_or_insert_with(Default::default);
                         if let Some(ref existing) = memory_opts.session_context {
-                            memory_opts.session_context = Some(format!("{}\n\n{}", existing, ms_context));
+                            memory_opts.session_context =
+                                Some(format!("{}\n\n{}", existing, ms_context));
                         } else {
                             memory_opts.session_context = Some(ms_context.clone());
                         }
                     }
 
-                    let should_replace = request.messages.last()
+                    let should_replace = request
+                        .messages
+                        .last()
                         .map(|m| {
-                            m.role == "user" &&
-                            m.content.as_ref().map(|c| match c {
-                                crate::api::openai::types::MessageContent::Text(t) => t.trim().is_empty(),
-                                _ => false,
-                            }).unwrap_or(true)
+                            m.role == "user"
+                                && m.content
+                                    .as_ref()
+                                    .map(|c| match c {
+                                        crate::api::openai::types::MessageContent::Text(t) => {
+                                            t.trim().is_empty()
+                                        }
+                                        _ => false,
+                                    })
+                                    .unwrap_or(true)
                         })
                         .unwrap_or(false);
 
                     if should_replace && !request.messages.is_empty() {
                         let last_idx = request.messages.len() - 1;
-                        request.messages[last_idx].content = Some(
-                            crate::api::openai::types::MessageContent::Text(transcribed_text.clone())
-                        );
+                        request.messages[last_idx].content =
+                            Some(crate::api::openai::types::MessageContent::Text(
+                                transcribed_text.clone(),
+                            ));
                     } else {
                         request.messages.push(crate::api::openai::types::Message {
                             role: "user".to_string(),
-                            content: Some(crate::api::openai::types::MessageContent::Text(transcribed_text.clone())),
+                            content: Some(crate::api::openai::types::MessageContent::Text(
+                                transcribed_text.clone(),
+                            )),
                             reasoning_content: None,
                             name: speaker_name,
                             tool_call_id: None,
@@ -470,11 +579,19 @@ impl Router {
         }
 
         // === MEMORY INTEGRATION: Query przed LLM ===
-        let (request, _query_decision, mem_timings) = match self.memory_integration.process_request(request.clone()).await {
+        let (request, _query_decision, mem_timings) = match self
+            .memory_integration
+            .process_request(request.clone())
+            .await
+        {
             Ok((req, decision, timings)) => (req, decision, timings),
             Err(e) => {
                 warn!("Memory integration error: {} - kontynuuje bez pamieci", e);
-                (request, None, crate::routing::memory_integration::MemoryTimings::default())
+                (
+                    request,
+                    None,
+                    crate::routing::memory_integration::MemoryTimings::default(),
+                )
             }
         };
         metrics.query_analysis_ms = mem_timings.query_analysis_ms;
@@ -489,7 +606,11 @@ impl Router {
             for handle in &ordered {
                 match handle {
                     BackendHandle::LocalLlm => {
-                        let sse_rx = match self.local_inference.handle_chat_completion_stream(&request).await {
+                        let sse_rx = match self
+                            .local_inference
+                            .handle_chat_completion_stream(&request)
+                            .await
+                        {
                             Ok(rx) => rx,
                             Err(e) => {
                                 debug!("Lokalna inferencja stream error: {}", e);
@@ -519,7 +640,10 @@ impl Router {
                             hop_count: 0,
                             latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
                         };
-                        return Ok(crate::routing::RouteResult { response: Box::pin(stream), metadata });
+                        return Ok(crate::routing::RouteResult {
+                            response: Box::pin(stream),
+                            metadata,
+                        });
                     }
                     BackendHandle::Rag(_name) => {
                         match self.route_to_rag_stream(request.clone()).await {
@@ -532,7 +656,10 @@ impl Router {
                                     hop_count: 0,
                                     latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
                                 };
-                                return Ok(crate::routing::RouteResult { response: stream, metadata });
+                                return Ok(crate::routing::RouteResult {
+                                    response: stream,
+                                    metadata,
+                                });
                             }
                             Err(e) => {
                                 debug!("RAG stream error: {}", e);
@@ -541,7 +668,14 @@ impl Router {
                         }
                     }
                     BackendHandle::QuicLlm(name) => {
-                        match self.route_to_quic_llm_stream(name.clone(), request.clone(), metrics.clone()).await {
+                        match self
+                            .route_to_quic_llm_stream(
+                                name.clone(),
+                                request.clone(),
+                                metrics.clone(),
+                            )
+                            .await
+                        {
                             Ok(stream) => {
                                 let metadata = crate::routing::RouteMetadata {
                                     served_by_node: stream_node_name.clone(),
@@ -551,7 +685,10 @@ impl Router {
                                     hop_count: 0,
                                     latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
                                 };
-                                return Ok(crate::routing::RouteResult { response: stream, metadata });
+                                return Ok(crate::routing::RouteResult {
+                                    response: stream,
+                                    metadata,
+                                });
                             }
                             Err(e) => {
                                 debug!("QUIC LLM stream error: {}", e);
@@ -568,15 +705,13 @@ impl Router {
         }
 
         // HTTP backend streaming z PII filtering i memory store
-        let backend = self.select_http_backend(&model_name)
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
+        let backend =
+            self.select_http_backend(&model_name)
+                .ok_or_else(|| CoreError::ModelNotFound {
+                    model_name: model_name.clone(),
+                })?;
 
-        debug!(
-            "Wybrany backend streaming: {}",
-            backend.url()
-        );
+        debug!("Wybrany backend streaming: {}", backend.url());
 
         use std::sync::{Arc as StdArc, Mutex};
         let collected_response: StdArc<Mutex<String>> = StdArc::new(Mutex::new(String::new()));
@@ -600,9 +735,8 @@ impl Router {
                 };
 
                 for (idx, choice) in chunk.choices.iter_mut().enumerate() {
-                    let (content_processor, reasoning_processor) = processors
-                        .entry(idx)
-                        .or_insert_with(|| {
+                    let (content_processor, reasoning_processor) =
+                        processors.entry(idx).or_insert_with(|| {
                             (
                                 response_middleware.streaming_processor(),
                                 response_middleware.streaming_processor(),
@@ -670,27 +804,35 @@ impl Router {
             },
         );
 
-        let stream = stream.chain(futures::stream::once(async move {
-            let response_text = collected_response.lock()
-                .map(|r| r.clone())
-                .unwrap_or_default();
+        let stream = stream.chain(
+            futures::stream::once(async move {
+                let response_text = collected_response
+                    .lock()
+                    .map(|r| r.clone())
+                    .unwrap_or_default();
 
-            let mut final_metrics = metrics;
-            final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);
-            info!("\n{}", final_metrics.format_table());
+                let mut final_metrics = metrics;
+                final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);
+                info!("\n{}", final_metrics.format_table());
 
-            if !response_text.is_empty() {
-                memory_integration.process_response_async(&request_for_memory, &response_text, None);
-            }
+                if !response_text.is_empty() {
+                    memory_integration.process_response_async(
+                        &request_for_memory,
+                        &response_text,
+                        None,
+                    );
+                }
 
-            Err::<ChatCompletionChunk, anyhow::Error>(anyhow::anyhow!("__memory_marker__"))
-        }).filter_map(|r| async move {
-            match r {
-                Ok(chunk) => Some(Ok(chunk)),
-                Err(e) if e.to_string() == "__memory_marker__" => None,
-                Err(e) => Some(Err(e)),
-            }
-        }));
+                Err::<ChatCompletionChunk, anyhow::Error>(anyhow::anyhow!("__memory_marker__"))
+            })
+            .filter_map(|r| async move {
+                match r {
+                    Ok(chunk) => Some(Ok(chunk)),
+                    Err(e) if e.to_string() == "__memory_marker__" => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }),
+        );
 
         let metadata = crate::routing::RouteMetadata {
             served_by_node: stream_node_name,
@@ -700,7 +842,10 @@ impl Router {
             hop_count: 0,
             latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
         };
-        Ok(crate::routing::RouteResult { response: Box::pin(stream), metadata })
+        Ok(crate::routing::RouteResult {
+            response: Box::pin(stream),
+            metadata,
+        })
     }
 
     /// Routuje request do RAG engine (STREAMING MODE).
@@ -711,17 +856,30 @@ impl Router {
         use futures::stream::{self, StreamExt};
 
         let route = self.resolve_route(&request.model);
-        let model_name = route.targets.first().cloned().unwrap_or_else(|| request.model.clone());
+        let model_name = route
+            .targets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| request.model.clone());
 
-        let rag_handle = { self.service_manager.rag_services.read().get(&model_name).cloned() }
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
+        let rag_handle = {
+            self.service_manager
+                .rag_services
+                .read()
+                .get(&model_name)
+                .cloned()
+        }
+        .ok_or_else(|| CoreError::ModelNotFound {
+            model_name: model_name.clone(),
+        })?;
 
-        let rag_client = rag_handle.get_client().await
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: model_name.clone(),
-            })?;
+        let rag_client =
+            rag_handle
+                .get_client()
+                .await
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: model_name.clone(),
+                })?;
 
         let query = request
             .messages
@@ -732,7 +890,9 @@ impl Router {
             })
             .ok_or_else(|| CoreError::InvalidRequest {
                 message: "Brak user message w request".to_string(),
-                details: Some("messages[] nie zawiera ostatniej wiadomosci z contentem tekstowym".to_string()),
+                details: Some(
+                    "messages[] nie zawiera ostatniej wiadomosci z contentem tekstowym".to_string(),
+                ),
             })?;
 
         let context = if request.messages.len() > 1 {
@@ -757,10 +917,13 @@ impl Router {
             None
         };
 
-        let (rag_payload, _requires_llm, requires_audio) = crate::routing::build_rag_payload(&request, query, context);
+        let (rag_payload, _requires_llm, requires_audio) =
+            crate::routing::build_rag_payload(&request, query, context);
 
         let tts_service_name = if requires_audio {
-            request.rag_options.as_ref()
+            request
+                .rag_options
+                .as_ref()
                 .and_then(|opts| opts.tts_model.as_ref())
                 .map(|s| s.to_string())
                 .or_else(|| self.service_manager.get_first_tts_service_name())
@@ -775,15 +938,15 @@ impl Router {
         let created = chrono::Utc::now().timestamp() as u64;
 
         if rag_result.requires_llm_processing {
-            let llm_model_name = rag_result
-                .llm_model
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("RAG result requires_llm_processing=true ale llm_model=None"))?;
+            let llm_model_name = rag_result.llm_model.clone().ok_or_else(|| {
+                anyhow::anyhow!("RAG result requires_llm_processing=true ale llm_model=None")
+            })?;
 
-            let llm_backend = self.select_http_backend(&llm_model_name)
-                .ok_or_else(|| CoreError::ModelNotFound {
+            let llm_backend = self.select_http_backend(&llm_model_name).ok_or_else(|| {
+                CoreError::ModelNotFound {
                     model_name: llm_model_name.clone(),
-                })?;
+                }
+            })?;
 
             let llm_request = ChatCompletionRequest {
                 model: llm_model_name.clone(),
@@ -818,25 +981,28 @@ impl Router {
 
             let tts_processor = if requires_audio {
                 if let Some(tts_name) = tts_service_name {
-                    let tts_voice = request.rag_options.as_ref()
+                    let tts_voice = request
+                        .rag_options
+                        .as_ref()
                         .and_then(|opts| opts.tts_voice.clone())
                         .unwrap_or_else(|| "default".to_string());
                     let tts_model = tts_name.to_string();
 
                     let self_clone = self.clone();
-                    let synthesize_fn: SynthesizeCallback = Box::new(move |model, input, voice, speed| {
-                        let router = self_clone.clone();
-                        Box::pin(async move {
-                            let request = TTSRequest {
-                                model,
-                                input,
-                                voice,
-                                response_format: Some("wav".to_string()),
-                                speed: Some(speed),
-                            };
-                            router.synthesize_speech(&request).await.map(|r| r.response)
-                        })
-                    });
+                    let synthesize_fn: SynthesizeCallback =
+                        Box::new(move |model, input, voice, speed| {
+                            let router = self_clone.clone();
+                            Box::pin(async move {
+                                let request = TTSRequest {
+                                    model,
+                                    input,
+                                    voice,
+                                    response_format: Some("wav".to_string()),
+                                    speed: Some(speed),
+                                };
+                                router.synthesize_speech(&request).await.map(|r| r.response)
+                            })
+                        });
 
                     Some(Arc::new(TokioMutex::new(TTSBufferingProcessor::new(
                         synthesize_fn,
@@ -858,43 +1024,43 @@ impl Router {
                 let mut processor = processor_for_stream.lock().unwrap();
                 let chunks: Vec<Result<ChatCompletionChunk>> = match chunk_result {
                     Ok(chunk) => {
-                        let content = chunk.choices.first()
+                        let content = chunk
+                            .choices
+                            .first()
                             .and_then(|choice| choice.delta.content.clone())
                             .unwrap_or_default();
 
                         if !content.is_empty() {
                             match processor.process_token(&content) {
-                                Ok(Some(cleaned_chunks)) => {
-                                    cleaned_chunks
-                                        .into_iter()
-                                        .map(|cleaned_content| {
-                                            Ok(ChatCompletionChunk {
-                                                id: chunk.id.clone(),
-                                                object: "chat.completion.chunk".to_string(),
-                                                created: chunk.created,
-                                                model: chunk.model.clone(),
-                                                choices: vec![ChunkChoice {
-                                                    index: 0,
-                                                    delta: Delta {
-                                                        role: None,
-                                                        content: Some(cleaned_content),
-                                                        reasoning_content: None,
-                                                        tool_calls: None,
-                                                    },
-                                                    finish_reason: None,
-                                                    logprobs: None,
-                                                }],
-                                                system_fingerprint: None,
-                                                audio: None,
-                                                detected_intent: None,
-                                                detected_tools: None,
-                                                transcribed_text: None,
-                                                speaker_id: None,
-                                                speaker_name: None,
-                                            })
+                                Ok(Some(cleaned_chunks)) => cleaned_chunks
+                                    .into_iter()
+                                    .map(|cleaned_content| {
+                                        Ok(ChatCompletionChunk {
+                                            id: chunk.id.clone(),
+                                            object: "chat.completion.chunk".to_string(),
+                                            created: chunk.created,
+                                            model: chunk.model.clone(),
+                                            choices: vec![ChunkChoice {
+                                                index: 0,
+                                                delta: Delta {
+                                                    role: None,
+                                                    content: Some(cleaned_content),
+                                                    reasoning_content: None,
+                                                    tool_calls: None,
+                                                },
+                                                finish_reason: None,
+                                                logprobs: None,
+                                            }],
+                                            system_fingerprint: None,
+                                            audio: None,
+                                            detected_intent: None,
+                                            detected_tools: None,
+                                            transcribed_text: None,
+                                            speaker_id: None,
+                                            speaker_name: None,
                                         })
-                                        .collect()
-                                }
+                                    })
+                                    .collect(),
                                 Ok(None) => vec![],
                                 Err(e) => vec![Err(e)],
                             }
@@ -919,13 +1085,14 @@ impl Router {
                                         if !content.is_empty() {
                                             let content_clone = content.clone();
                                             let mut tts = tts_processor.lock().await;
-                                            let audio_result = tts.process_token(&content_clone).await;
+                                            let audio_result =
+                                                tts.process_token(&content_clone).await;
 
                                             match audio_result {
                                                 Ok(Some(audio_bytes)) => {
                                                     let audio_base64 = base64::Engine::encode(
                                                         &base64::engine::general_purpose::STANDARD,
-                                                        &audio_bytes
+                                                        &audio_bytes,
                                                     );
                                                     chunk.audio = Some(audio_base64);
                                                 }
@@ -995,7 +1162,7 @@ impl Router {
                         Ok(Some(audio_bytes)) => {
                             let audio_base64 = base64::Engine::encode(
                                 &base64::engine::general_purpose::STANDARD,
-                                &audio_bytes
+                                &audio_bytes,
                             );
                             chunks.push(Ok(ChatCompletionChunk {
                                 id: "flush-audio-chunk".to_string(),
@@ -1089,7 +1256,10 @@ impl Router {
             std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let collected_response_clone = collected_response.clone();
 
-        let quic_client = self.service_manager.get_quic_llm_client(&llm_name).await
+        let quic_client = self
+            .service_manager
+            .get_quic_llm_client(&llm_name)
+            .await
             .ok_or_else(|| CoreError::AllBackendsUnavailable {
                 model_name: llm_name.clone(),
             })?;
@@ -1137,132 +1307,148 @@ impl Router {
 
             async move {
                 match chunk_result {
-                    Ok(stream_chunk) => {
-                        match stream_chunk.chunk {
-                            StreamChunkType::TextDelta(text) => {
-                                let cleaned_text = response_middleware.clean_text(&text)
-                                    .unwrap_or_else(|_| text.clone());
+                    Ok(stream_chunk) => match stream_chunk.chunk {
+                        StreamChunkType::TextDelta(text) => {
+                            let cleaned_text = response_middleware
+                                .clean_text(&text)
+                                .unwrap_or_else(|_| text.clone());
 
-                                if let Ok(mut response) = collected_response.lock() {
-                                    response.push_str(&cleaned_text);
-                                }
-
-                                let first = is_first.swap(false, std::sync::atomic::Ordering::SeqCst);
-
-                                Some(Ok(ChatCompletionChunk {
-                                    id: chat_id,
-                                    object: "chat.completion.chunk".to_string(),
-                                    created,
-                                    model: llm_name,
-                                    choices: vec![ChunkChoice {
-                                        index: 0,
-                                        delta: Delta {
-                                            role: if first { Some("assistant".to_string()) } else { None },
-                                            content: Some(cleaned_text),
-                                            reasoning_content: None,
-                                            tool_calls: None,
-                                        },
-                                        finish_reason: None,
-                                        logprobs: None,
-                                    }],
-                                    system_fingerprint: None,
-                                    audio: None,
-                                    detected_intent: None,
-                                    detected_tools: None,
-                                    transcribed_text: None,
-                                    speaker_id: None,
-                                    speaker_name: None,
-                                }))
+                            if let Ok(mut response) = collected_response.lock() {
+                                response.push_str(&cleaned_text);
                             }
-                            StreamChunkType::ReasoningDelta(reasoning) => {
-                                let cleaned_reasoning = response_middleware.clean_text(&reasoning)
-                                    .unwrap_or_else(|_| reasoning.clone());
-                                let first = is_first.swap(false, std::sync::atomic::Ordering::SeqCst);
 
-                                Some(Ok(ChatCompletionChunk {
-                                    id: chat_id,
-                                    object: "chat.completion.chunk".to_string(),
-                                    created,
-                                    model: llm_name,
-                                    choices: vec![ChunkChoice {
-                                        index: 0,
-                                        delta: Delta {
-                                            role: if first { Some("assistant".to_string()) } else { None },
-                                            content: None,
-                                            reasoning_content: Some(cleaned_reasoning),
-                                            tool_calls: None,
+                            let first = is_first.swap(false, std::sync::atomic::Ordering::SeqCst);
+
+                            Some(Ok(ChatCompletionChunk {
+                                id: chat_id,
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: llm_name,
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta {
+                                        role: if first {
+                                            Some("assistant".to_string())
+                                        } else {
+                                            None
                                         },
-                                        finish_reason: None,
-                                        logprobs: None,
-                                    }],
-                                    system_fingerprint: None,
-                                    audio: None,
-                                    detected_intent: None,
-                                    detected_tools: None,
-                                    transcribed_text: None,
-                                    speaker_id: None,
-                                    speaker_name: None,
-                                }))
-                            }
-                            StreamChunkType::Done { final_metrics: _ } => {
-                                Some(Ok(ChatCompletionChunk {
-                                    id: chat_id,
-                                    object: "chat.completion.chunk".to_string(),
-                                    created,
-                                    model: llm_name,
-                                    choices: vec![ChunkChoice {
-                                        index: 0,
-                                        delta: Delta {
-                                            role: None,
-                                            content: None,
-                                            reasoning_content: None,
-                                            tool_calls: None,
-                                        },
-                                        finish_reason: Some("stop".to_string()),
-                                        logprobs: None,
-                                    }],
-                                    system_fingerprint: None,
-                                    audio: None,
-                                    detected_intent: None,
-                                    detected_tools: None,
-                                    transcribed_text: None,
-                                    speaker_id: None,
-                                    speaker_name: None,
-                                }))
-                            }
-                            StreamChunkType::Metadata(_) => None,
-                            _ => None,
+                                        content: Some(cleaned_text),
+                                        reasoning_content: None,
+                                        tool_calls: None,
+                                    },
+                                    finish_reason: None,
+                                    logprobs: None,
+                                }],
+                                system_fingerprint: None,
+                                audio: None,
+                                detected_intent: None,
+                                detected_tools: None,
+                                transcribed_text: None,
+                                speaker_id: None,
+                                speaker_name: None,
+                            }))
                         }
-                    }
+                        StreamChunkType::ReasoningDelta(reasoning) => {
+                            let cleaned_reasoning = response_middleware
+                                .clean_text(&reasoning)
+                                .unwrap_or_else(|_| reasoning.clone());
+                            let first = is_first.swap(false, std::sync::atomic::Ordering::SeqCst);
+
+                            Some(Ok(ChatCompletionChunk {
+                                id: chat_id,
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: llm_name,
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta {
+                                        role: if first {
+                                            Some("assistant".to_string())
+                                        } else {
+                                            None
+                                        },
+                                        content: None,
+                                        reasoning_content: Some(cleaned_reasoning),
+                                        tool_calls: None,
+                                    },
+                                    finish_reason: None,
+                                    logprobs: None,
+                                }],
+                                system_fingerprint: None,
+                                audio: None,
+                                detected_intent: None,
+                                detected_tools: None,
+                                transcribed_text: None,
+                                speaker_id: None,
+                                speaker_name: None,
+                            }))
+                        }
+                        StreamChunkType::Done { final_metrics: _ } => {
+                            Some(Ok(ChatCompletionChunk {
+                                id: chat_id,
+                                object: "chat.completion.chunk".to_string(),
+                                created,
+                                model: llm_name,
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: Delta {
+                                        role: None,
+                                        content: None,
+                                        reasoning_content: None,
+                                        tool_calls: None,
+                                    },
+                                    finish_reason: Some("stop".to_string()),
+                                    logprobs: None,
+                                }],
+                                system_fingerprint: None,
+                                audio: None,
+                                detected_intent: None,
+                                detected_tools: None,
+                                transcribed_text: None,
+                                speaker_id: None,
+                                speaker_name: None,
+                            }))
+                        }
+                        StreamChunkType::Metadata(_) => None,
+                        _ => None,
+                    },
                     Err(e) => Some(Err(anyhow::Error::from(e))),
                 }
             }
         });
 
-        let stream = stream.chain(futures::stream::once(async move {
-            let response_text = collected_response.lock()
-                .map(|r| r.clone())
-                .unwrap_or_default();
+        let stream = stream.chain(
+            futures::stream::once(async move {
+                let response_text = collected_response
+                    .lock()
+                    .map(|r| r.clone())
+                    .unwrap_or_default();
 
-            let mut final_metrics = metrics;
-            final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);
-            info!("\n{}", final_metrics.format_table());
+                let mut final_metrics = metrics;
+                final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);
+                info!("\n{}", final_metrics.format_table());
 
-            if !response_text.is_empty() {
-                memory_integration.process_response_async(&request_for_memory, &response_text, None);
-            }
+                if !response_text.is_empty() {
+                    memory_integration.process_response_async(
+                        &request_for_memory,
+                        &response_text,
+                        None,
+                    );
+                }
 
-            Err::<ChatCompletionChunk, CoreError>(CoreError::InternalError {
-                message: "__memory_marker__".to_string(),
-                source: None,
+                Err::<ChatCompletionChunk, CoreError>(CoreError::InternalError {
+                    message: "__memory_marker__".to_string(),
+                    source: None,
+                })
             })
-        }).filter_map(|r| async move {
-            match r {
-                Ok(chunk) => Some(Ok(chunk)),
-                Err(ref e) if e.to_string().contains("__memory_marker__") => None,
-                Err(e) => Some(Err(anyhow::Error::from(e))),
-            }
-        }));
+            .filter_map(|r| async move {
+                match r {
+                    Ok(chunk) => Some(Ok(chunk)),
+                    Err(ref e) if e.to_string().contains("__memory_marker__") => None,
+                    Err(e) => Some(Err(anyhow::Error::from(e))),
+                }
+            }),
+        );
 
         Ok(Box::pin(stream))
     }

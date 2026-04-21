@@ -6,9 +6,9 @@
 
 use crate::error::Result;
 
-use tracing::debug;
-use regex::Regex;
 use lazy_static::lazy_static;
+use regex::Regex;
+use tracing::debug;
 
 lazy_static! {
     /// Regex do usuwania wielokrotnych spacji
@@ -165,7 +165,7 @@ fn clean_text_for_tts(text: &str) -> String {
     let phonetic_fixes: &[(&str, &str)] = &[
         ("dzisiaj", "dzisaj"),
         ("dzisiejszy", "dzisejszy"),
-        ("ze", "ze"),  // TODO: znalezc lepsza wymowe
+        ("ze", "ze"), // TODO: znalezc lepsza wymowe
         ("sie", "sie"),
     ];
 
@@ -186,7 +186,16 @@ fn clean_text_for_tts(text: &str) -> String {
 /// NIE dzielimy po X tokenach - to tnie slowa w polowie!
 ///
 /// Callback do syntezy mowy - pozwala na uzycie roznych backendow (QUIC/HTTP)
-pub type SynthesizeCallback = Box<dyn Fn(String, String, String, f32) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send>> + Send + Sync>;
+pub type SynthesizeCallback = Box<
+    dyn Fn(
+            String,
+            String,
+            String,
+            f32,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct TTSBufferingProcessor {
     /// Callback do syntezy mowy (uzywa Router.synthesize_speech pod spodem)
@@ -292,12 +301,8 @@ impl TTSBufferingProcessor {
             text_preview
         );
 
-        let audio_bytes = (self.synthesize_fn)(
-            self.model.clone(),
-            text,
-            self.voice.clone(),
-            self.speed,
-        ).await?;
+        let audio_bytes =
+            (self.synthesize_fn)(self.model.clone(), text, self.voice.clone(), self.speed).await?;
 
         Ok(Some(audio_bytes))
     }

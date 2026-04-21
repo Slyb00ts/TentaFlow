@@ -163,8 +163,11 @@ impl FlowExecutorAsync {
         let definition = Self::parse_flow(&flow.flow_json)?;
         let execution_order = Self::topological_sort(&definition)?;
 
-        let node_map: HashMap<&str, &FlowNode> =
-            definition.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let node_map: HashMap<&str, &FlowNode> = definition
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n))
+            .collect();
 
         let outgoing_edges: HashMap<&str, Vec<&FlowEdge>> = {
             let mut map: HashMap<&str, Vec<&FlowEdge>> = HashMap::new();
@@ -235,7 +238,10 @@ impl FlowExecutorAsync {
 
                     if let Some(tokens) = output.get("tokens") {
                         let prompt_t = tokens.get("prompt").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let compl_t = tokens.get("completion").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let compl_t = tokens
+                            .get("completion")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
                         total_prompt_tokens += prompt_t;
                         total_completion_tokens += compl_t;
                     }
@@ -251,14 +257,16 @@ impl FlowExecutorAsync {
                     );
                     let is_condition = node.node_type == "condition" || node.node_type == "switch";
 
-                    context
-                        .node_results
-                        .insert(node_id.clone(), output);
+                    context.node_results.insert(node_id.clone(), output);
 
                     executed_nodes.insert(current_idx);
 
                     if is_final {
-                        final_output = context.node_results.get(node_id).cloned().unwrap_or(serde_json::Value::Null);
+                        final_output = context
+                            .node_results
+                            .get(node_id)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                     }
 
                     if is_condition {
@@ -312,10 +320,7 @@ impl FlowExecutorAsync {
         let latency_ms = start_time.elapsed().as_millis() as i64;
         let total_tokens = total_prompt_tokens + total_completion_tokens;
 
-        let has_errors = context
-            .execution_log
-            .iter()
-            .any(|s| s.status == "error");
+        let has_errors = context.execution_log.iter().any(|s| s.status == "error");
         let final_status = if has_errors { "error" } else { "completed" };
 
         let execution_result = FlowExecutionResult {
@@ -390,11 +395,7 @@ impl FlowExecutorAsync {
     }
 
     /// Wezel trigger - punkt wejscia flow
-    fn execute_trigger(
-        &self,
-        node: &FlowNode,
-        context: &FlowContext,
-    ) -> Result<serde_json::Value> {
+    fn execute_trigger(&self, node: &FlowNode, context: &FlowContext) -> Result<serde_json::Value> {
         debug!(node_id = %node.id, "Trigger: rozpoczecie flow");
         Ok(serde_json::json!({
             "input": context.input,
@@ -501,10 +502,9 @@ impl FlowExecutorAsync {
         context: &mut FlowContext,
     ) -> Result<serde_json::Value> {
         let db_clone = self.db.clone();
-        let rules = tokio::task::spawn_blocking(move || {
-            repository::list_pii_rules_active(&db_clone)
-        })
-        .await??;
+        let rules =
+            tokio::task::spawn_blocking(move || repository::list_pii_rules_active(&db_clone))
+                .await??;
         let mut text = self.resolve_input_text(node, context);
 
         for rule in &rules {
@@ -538,9 +538,11 @@ impl FlowExecutorAsync {
 
         // Przefiltruj ostatnia wiadomosc user w ctx.messages (przed move do context.input)
         if !context.messages.is_empty() {
-            if let Some(last_user_idx) = context.messages.iter().rposition(|m| {
-                m.get("role").and_then(|r| r.as_str()) == Some("user")
-            }) {
+            if let Some(last_user_idx) = context
+                .messages
+                .iter()
+                .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            {
                 context.messages[last_user_idx] = serde_json::json!({
                     "role": "user",
                     "content": &text,
@@ -644,10 +646,7 @@ impl FlowExecutorAsync {
             .unwrap_or(false);
 
         if let Some(edges) = outgoing_edges.get(node_id) {
-            let from_idx = node_idx_map
-                .get(node_id)
-                .copied()
-                .unwrap_or(0);
+            let from_idx = node_idx_map.get(node_id).copied().unwrap_or(0);
 
             // Oblicz raz przed petla - unika alokacji String w kazdej iteracji
             let result_str: String = condition_result
@@ -671,10 +670,7 @@ impl FlowExecutorAsync {
                 };
 
                 if !should_follow {
-                    let to_idx = node_idx_map
-                        .get(edge.to.as_str())
-                        .copied()
-                        .unwrap_or(0);
+                    let to_idx = node_idx_map.get(edge.to.as_str()).copied().unwrap_or(0);
                     blocked_edges.insert(from_idx * n + to_idx);
                 }
             }
@@ -721,10 +717,7 @@ impl FlowExecutorAsync {
         // Backward compat: jawne node_id.pole (np. "n6.should_query")
         if let Some((prefix, rest)) = field.split_once('.') {
             if context.node_results.contains_key(prefix) {
-                return resolve_json_path(
-                    context.node_results.get(prefix).unwrap(),
-                    rest,
-                );
+                return resolve_json_path(context.node_results.get(prefix).unwrap(), rest);
             }
         }
 
@@ -810,7 +803,11 @@ fn evaluate_condition(
 }
 
 /// Porownuje dwie wartosci JSON jako liczby
-fn compare_numbers(a: &serde_json::Value, b: &serde_json::Value, cmp: fn(f64, f64) -> bool) -> bool {
+fn compare_numbers(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    cmp: fn(f64, f64) -> bool,
+) -> bool {
     let a_num = a.as_f64().or_else(|| a.as_i64().map(|i| i as f64));
     let b_num = b.as_f64().or_else(|| b.as_i64().map(|i| i as f64));
 

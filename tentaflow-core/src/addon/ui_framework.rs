@@ -5,7 +5,7 @@
 //       Addon opisuje UI jako strukture danych, Core renderuje odpowiednio.
 // =============================================================================
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 // =============================================================================
 // UiComponent — deklaratywny komponent UI
@@ -80,9 +80,7 @@ pub enum UiComponent {
     },
 
     /// Lista elementow
-    List {
-        items: Vec<UiComponent>,
-    },
+    List { items: Vec<UiComponent> },
 
     /// Formularz
     Form {
@@ -102,10 +100,7 @@ pub enum UiComponent {
     },
 
     /// Blok kodu
-    Code {
-        language: String,
-        content: String,
-    },
+    Code { language: String, content: String },
 
     /// Etykieta statusu (badge)
     Badge {
@@ -178,33 +173,54 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
 
     match component {
         UiComponent::Text { content, style } => {
-            let style_attr = style.as_ref()
+            let style_attr = style
+                .as_ref()
                 .map(|s| format!(" style=\"{}\"", escape_html(s)))
                 .unwrap_or_default();
             html.push_str(&format!(
                 "{}<p class=\"addon-text\"{}>{}</p>\n",
-                pad, style_attr, escape_html(content)
+                pad,
+                style_attr,
+                escape_html(content)
             ));
         }
 
-        UiComponent::Input { id, label, input_type, value, placeholder } => {
+        UiComponent::Input {
+            id,
+            label,
+            input_type,
+            value,
+            placeholder,
+        } => {
             html.push_str(&format!("{}<div class=\"addon-input-group\">\n", pad));
             html.push_str(&format!(
                 "{}  <label for=\"addon-{}\">{}</label>\n",
-                pad, escape_html(id), escape_html(label)
+                pad,
+                escape_html(id),
+                escape_html(label)
             ));
-            let ph = placeholder.as_ref()
+            let ph = placeholder
+                .as_ref()
                 .map(|p| format!(" placeholder=\"{}\"", escape_html(p)))
                 .unwrap_or_default();
             html.push_str(&format!(
                 "{}  <input type=\"{}\" id=\"addon-{}\" name=\"{}\" value=\"{}\"{}>\n",
-                pad, escape_html(input_type), escape_html(id),
-                escape_html(id), escape_html(value), ph
+                pad,
+                escape_html(input_type),
+                escape_html(id),
+                escape_html(id),
+                escape_html(value),
+                ph
             ));
             html.push_str(&format!("{}</div>\n", pad));
         }
 
-        UiComponent::Button { id, label, action, style } => {
+        UiComponent::Button {
+            id,
+            label,
+            action,
+            style,
+        } => {
             let class = match style.as_deref() {
                 Some("primary") => "addon-btn addon-btn-primary",
                 Some("danger") => "addon-btn addon-btn-danger",
@@ -213,25 +229,41 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
             };
             html.push_str(&format!(
                 "{}<button class=\"{}\" id=\"addon-{}\" data-action=\"{}\">{}</button>\n",
-                pad, class, escape_html(id), escape_html(action), escape_html(label)
+                pad,
+                class,
+                escape_html(id),
+                escape_html(action),
+                escape_html(label)
             ));
         }
 
-        UiComponent::Select { id, label, options, selected } => {
+        UiComponent::Select {
+            id,
+            label,
+            options,
+            selected,
+        } => {
             html.push_str(&format!("{}<div class=\"addon-select-group\">\n", pad));
             html.push_str(&format!(
                 "{}  <label for=\"addon-{}\">{}</label>\n",
-                pad, escape_html(id), escape_html(label)
+                pad,
+                escape_html(id),
+                escape_html(label)
             ));
             html.push_str(&format!(
                 "{}  <select id=\"addon-{}\" name=\"{}\">\n",
-                pad, escape_html(id), escape_html(id)
+                pad,
+                escape_html(id),
+                escape_html(id)
             ));
             for (value, display) in options {
                 let sel = if value == selected { " selected" } else { "" };
                 html.push_str(&format!(
                     "{}    <option value=\"{}\"{}>{}</option>\n",
-                    pad, escape_html(value), sel, escape_html(display)
+                    pad,
+                    escape_html(value),
+                    sel,
+                    escape_html(display)
                 ));
             }
             html.push_str(&format!("{}  </select>\n", pad));
@@ -242,20 +274,14 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
             html.push_str(&format!("{}<table class=\"addon-table\">\n", pad));
             html.push_str(&format!("{}  <thead><tr>\n", pad));
             for header in headers {
-                html.push_str(&format!(
-                    "{}    <th>{}</th>\n",
-                    pad, escape_html(header)
-                ));
+                html.push_str(&format!("{}    <th>{}</th>\n", pad, escape_html(header)));
             }
             html.push_str(&format!("{}  </tr></thead>\n", pad));
             html.push_str(&format!("{}  <tbody>\n", pad));
             for row in rows {
                 html.push_str(&format!("{}    <tr>\n", pad));
                 for cell in row {
-                    html.push_str(&format!(
-                        "{}      <td>{}</td>\n",
-                        pad, escape_html(cell)
-                    ));
+                    html.push_str(&format!("{}      <td>{}</td>\n", pad, escape_html(cell)));
                 }
                 html.push_str(&format!("{}    </tr>\n", pad));
             }
@@ -267,7 +293,8 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
             html.push_str(&format!("{}<div class=\"addon-card\">\n", pad));
             html.push_str(&format!(
                 "{}  <h3 class=\"addon-card-title\">{}</h3>\n",
-                pad, escape_html(title)
+                pad,
+                escape_html(title)
             ));
             html.push_str(&format!("{}  <div class=\"addon-card-body\">\n", pad));
             for child in children {
@@ -284,12 +311,19 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
                 let active = if i == 0 { " active" } else { "" };
                 html.push_str(&format!(
                     "{}    <button class=\"addon-tab-btn{}\" data-tab=\"{}\">{}</button>\n",
-                    pad, active, i, escape_html(label)
+                    pad,
+                    active,
+                    i,
+                    escape_html(label)
                 ));
             }
             html.push_str(&format!("{}  </div>\n", pad));
             for (i, (_, content)) in tabs.iter().enumerate() {
-                let display = if i == 0 { "" } else { " style=\"display:none\"" };
+                let display = if i == 0 {
+                    ""
+                } else {
+                    " style=\"display:none\""
+                };
                 html.push_str(&format!(
                     "{}  <div class=\"addon-tab-pane\" data-tab=\"{}\"{}>\n",
                     pad, i, display
@@ -302,12 +336,27 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
             html.push_str(&format!("{}</div>\n", pad));
         }
 
-        UiComponent::Image { src, alt, width, height } => {
-            let w = width.as_ref().map(|w| format!(" width=\"{}\"", escape_html(w))).unwrap_or_default();
-            let h = height.as_ref().map(|h| format!(" height=\"{}\"", escape_html(h))).unwrap_or_default();
+        UiComponent::Image {
+            src,
+            alt,
+            width,
+            height,
+        } => {
+            let w = width
+                .as_ref()
+                .map(|w| format!(" width=\"{}\"", escape_html(w)))
+                .unwrap_or_default();
+            let h = height
+                .as_ref()
+                .map(|h| format!(" height=\"{}\"", escape_html(h)))
+                .unwrap_or_default();
             html.push_str(&format!(
                 "{}<img class=\"addon-image\" src=\"{}\" alt=\"{}\"{}{}>\n",
-                pad, escape_html(src), escape_html(alt), w, h
+                pad,
+                escape_html(src),
+                escape_html(alt),
+                w,
+                h
             ));
         }
 
@@ -321,10 +370,16 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
             html.push_str(&format!("{}</ul>\n", pad));
         }
 
-        UiComponent::Form { id, children, submit_action } => {
+        UiComponent::Form {
+            id,
+            children,
+            submit_action,
+        } => {
             html.push_str(&format!(
                 "{}<form class=\"addon-form\" id=\"addon-form-{}\" data-action=\"{}\">\n",
-                pad, escape_html(id), escape_html(submit_action)
+                pad,
+                escape_html(id),
+                escape_html(submit_action)
             ));
             for child in children {
                 render_component_html(html, child, indent + 2);
@@ -342,7 +397,10 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
 
         UiComponent::Progress { value, label } => {
             let pct = (value * 100.0).min(100.0).max(0.0);
-            let lbl = label.as_ref().map(|l| escape_html(l)).unwrap_or_else(|| format!("{:.0}%", pct));
+            let lbl = label
+                .as_ref()
+                .map(|l| escape_html(l))
+                .unwrap_or_else(|| format!("{:.0}%", pct));
             html.push_str(&format!(
                 "{}<div class=\"addon-progress\">\n\
                  {}  <div class=\"addon-progress-bar\" style=\"width:{:.0}%\">{}</div>\n\
@@ -354,14 +412,18 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
         UiComponent::Code { language, content } => {
             html.push_str(&format!(
                 "{}<pre class=\"addon-code\"><code class=\"language-{}\">{}</code></pre>\n",
-                pad, escape_html(language), escape_html(content)
+                pad,
+                escape_html(language),
+                escape_html(content)
             ));
         }
 
         UiComponent::Badge { text, color } => {
             html.push_str(&format!(
                 "{}<span class=\"addon-badge addon-badge-{}\">{}</span>\n",
-                pad, escape_html(color), escape_html(text)
+                pad,
+                escape_html(color),
+                escape_html(text)
             ));
         }
     }
@@ -374,7 +436,8 @@ fn render_component_html(html: &mut String, component: &UiComponent, indent: usi
 /// Parsuje komponenty UI z wartosci JSON (uzywane przez host function ui_render)
 pub fn parse_components_from_json(json: &serde_json::Value) -> Vec<UiComponent> {
     if let Some(components) = json.get("components").and_then(|v| v.as_array()) {
-        components.iter()
+        components
+            .iter()
             .filter_map(|v| serde_json::from_value::<UiComponent>(v.clone()).ok())
             .collect()
     } else if let Ok(component) = serde_json::from_value::<UiComponent>(json.clone()) {
@@ -434,12 +497,10 @@ mod tests {
             addon_id: "test".to_string(),
             panel_id: "p1".to_string(),
             title: "Test".to_string(),
-            components: vec![
-                UiComponent::Badge {
-                    text: "OK".to_string(),
-                    color: "green".to_string(),
-                },
-            ],
+            components: vec![UiComponent::Badge {
+                text: "OK".to_string(),
+                color: "green".to_string(),
+            }],
         };
 
         let json = panel.to_json();
@@ -480,14 +541,10 @@ mod tests {
             addon_id: "t".to_string(),
             panel_id: "p".to_string(),
             title: "T".to_string(),
-            components: vec![
-                UiComponent::Table {
-                    headers: vec!["Nazwa".to_string(), "Wartosc".to_string()],
-                    rows: vec![
-                        vec!["klucz".to_string(), "123".to_string()],
-                    ],
-                },
-            ],
+            components: vec![UiComponent::Table {
+                headers: vec!["Nazwa".to_string(), "Wartosc".to_string()],
+                rows: vec![vec!["klucz".to_string(), "123".to_string()]],
+            }],
         };
 
         let html = panel.to_html();

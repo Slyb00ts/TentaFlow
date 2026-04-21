@@ -7,8 +7,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{self, DbPool};
 use crate::db::models::SsoProvider;
+use crate::db::{self, DbPool};
 
 /// Konfiguracja OIDC providera (pochodzi z DB — SsoProvider)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,11 +110,7 @@ pub async fn discover(discovery_url: &str) -> Result<OidcDiscovery> {
 }
 
 /// Buduje URL autoryzacji do przekierowania uzytkownika
-pub fn build_auth_url(
-    config: &OidcConfig,
-    discovery: &OidcDiscovery,
-    state: &str,
-) -> String {
+pub fn build_auth_url(config: &OidcConfig, discovery: &OidcDiscovery, state: &str) -> String {
     let scopes = if config.scopes.is_empty() {
         "openid profile email".to_string()
     } else {
@@ -183,10 +179,7 @@ pub async fn exchange_code(
 }
 
 /// Pobiera informacje o uzytkowniku z userinfo endpoint
-pub async fn get_user_info(
-    discovery: &OidcDiscovery,
-    access_token: &str,
-) -> Result<OidcUserInfo> {
+pub async fn get_user_info(discovery: &OidcDiscovery, access_token: &str) -> Result<OidcUserInfo> {
     if discovery.userinfo_endpoint.is_empty() {
         return Err(anyhow::anyhow!(
             "Provider OIDC nie udostepnia userinfo endpoint"
@@ -237,7 +230,10 @@ pub fn provider_to_config(
         client_id: provider.client_id.clone(),
         client_secret: client_secret_decrypted.to_string(),
         discovery_url: provider.discovery_url.clone(),
-        redirect_uri: format!("{}/api/sso/callback", redirect_base_url.trim_end_matches('/')),
+        redirect_uri: format!(
+            "{}/api/sso/callback",
+            redirect_base_url.trim_end_matches('/')
+        ),
         scopes: vec![
             "openid".to_string(),
             "profile".to_string(),
@@ -327,12 +323,8 @@ pub async fn handle_sso_callback(
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
 
-    let token = crate::api::dashboard::auth::generate_jwt(
-        user_id,
-        &username,
-        &jwt_secret,
-        expiry_hours,
-    )?;
+    let token =
+        crate::api::dashboard::auth::generate_jwt(user_id, &username, &jwt_secret, expiry_hours)?;
 
     // Audit log
     let _ = db::repository::log_audit(

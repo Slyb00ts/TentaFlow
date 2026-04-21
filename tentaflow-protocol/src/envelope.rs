@@ -39,7 +39,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Custom AEAD/replay/rotation usunieta z `mesh/security.rs` — bezpieczenstwo
 ///     transportu zapewnia iroh TLS. Zostaje Ed25519 identity, trusted_keys,
 ///     PIN pairing + X25519 pin-proof derywacja, TrustRevoked broadcast.
-pub const SCHEMA_VERSION: u16 = 5;
+pub const SCHEMA_VERSION: u16 = 6;
 
 // =============================================================================
 // Message kind discriminants

@@ -14,22 +14,23 @@ pub mod mlx_swift_bridge;
 
 pub mod model_manager;
 
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
-use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, RwLock};
 
 /// Globalny wspoldzielony InferenceManager — singleton per proces.
 /// Uzywany przez handle_deploy_ws_native do ladowania modeli
 /// i przez Router (LocalInferenceHandler) do obslugi requestow in-process.
-static SHARED_INFERENCE: std::sync::OnceLock<Arc<RwLock<InferenceManager>>> = std::sync::OnceLock::new();
+static SHARED_INFERENCE: std::sync::OnceLock<Arc<RwLock<InferenceManager>>> =
+    std::sync::OnceLock::new();
 
 /// Zwraca globalna instancje InferenceManager (tworzy przy pierwszym uzyciu)
 pub fn shared_inference_manager() -> Arc<RwLock<InferenceManager>> {
-    SHARED_INFERENCE.get_or_init(|| {
-        Arc::new(RwLock::new(InferenceManager::new()))
-    }).clone()
+    SHARED_INFERENCE
+        .get_or_init(|| Arc::new(RwLock::new(InferenceManager::new())))
+        .clone()
 }
 
 /// Informacje o zaladowanym modelu
@@ -133,7 +134,11 @@ pub trait InferenceEngine: Send + Sync {
     fn supported_formats(&self) -> Vec<String>;
 
     /// Zaladuj model z podanej sciezki
-    async fn load_model(&self, model_path: &Path, gpu_layers: Option<u32>) -> anyhow::Result<ModelInfo>;
+    async fn load_model(
+        &self,
+        model_path: &Path,
+        gpu_layers: Option<u32>,
+    ) -> anyhow::Result<ModelInfo>;
 
     /// Wyladuj model z pamieci
     async fn unload_model(&self) -> anyhow::Result<()>;
@@ -145,11 +150,17 @@ pub trait InferenceEngine: Send + Sync {
     async fn generate(&self, params: GenerateParams) -> anyhow::Result<GenerateResult>;
 
     /// Generuj tekst ze streamingiem (zwraca kanal z tokenami)
-    async fn generate_stream(&self, params: GenerateParams) -> anyhow::Result<mpsc::Receiver<StreamToken>>;
+    async fn generate_stream(
+        &self,
+        params: GenerateParams,
+    ) -> anyhow::Result<mpsc::Receiver<StreamToken>>;
 
     /// Oblicz embeddingi (opcjonalne — nie kazdy backend wspiera)
     async fn embeddings(&self, _params: EmbeddingParams) -> anyhow::Result<EmbeddingResult> {
-        anyhow::bail!("Embeddingi nie sa obslugiwane przez backend {}", self.backend_name())
+        anyhow::bail!(
+            "Embeddingi nie sa obslugiwane przez backend {}",
+            self.backend_name()
+        )
     }
 
     /// Czy model jest zaladowany?
@@ -187,17 +198,24 @@ impl InferenceManager {
             }
         }
 
-        Self { engines, active_engine: None }
+        Self {
+            engines,
+            active_engine: None,
+        }
     }
 
     /// Lista dostepnych backendow
     pub fn available_backends(&self) -> Vec<String> {
-        self.engines.iter().map(|e| e.backend_name().to_string()).collect()
+        self.engines
+            .iter()
+            .map(|e| e.backend_name().to_string())
+            .collect()
     }
 
     /// Aktywny silnik (jesli model zaladowany)
     pub fn active_engine(&self) -> Option<&dyn InferenceEngine> {
-        self.active_engine.and_then(|i| self.engines.get(i).map(|e| e.as_ref()))
+        self.active_engine
+            .and_then(|i| self.engines.get(i).map(|e| e.as_ref()))
     }
 
     /// Zaladuj model — automatycznie wybierze backend na podstawie formatu
@@ -207,25 +225,40 @@ impl InferenceManager {
         gpu_layers: Option<u32>,
         preferred_backend: Option<&str>,
     ) -> anyhow::Result<ModelInfo> {
-        let ext = model_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let ext = model_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
 
         let engine_idx = if let Some(backend) = preferred_backend {
-            self.engines.iter().position(|e| e.backend_name() == backend)
+            self.engines
+                .iter()
+                .position(|e| e.backend_name() == backend)
                 .ok_or_else(|| anyhow::anyhow!("Backend '{}' nie jest dostepny", backend))?
         } else if model_path.is_dir() {
             // Katalog z plikami safetensors -> backend MLX
-            self.engines.iter().position(|e| e.backend_name() == "mlx")
+            self.engines
+                .iter()
+                .position(|e| e.backend_name() == "mlx")
                 .or_else(|| self.engines.iter().position(|_| true))
                 .ok_or_else(|| anyhow::anyhow!("Brak backendu MLX dla katalogu modelu"))?
         } else {
             match ext {
-                "gguf" => self.engines.iter().position(|e| e.backend_name() == "llamacpp"),
-                "safetensors" | "mlx" => self.engines.iter().position(|e| e.backend_name() == "mlx"),
+                "gguf" => self
+                    .engines
+                    .iter()
+                    .position(|e| e.backend_name() == "llamacpp"),
+                "safetensors" | "mlx" => {
+                    self.engines.iter().position(|e| e.backend_name() == "mlx")
+                }
                 _ => self.engines.iter().position(|_| true),
-            }.ok_or_else(|| anyhow::anyhow!("Brak backendu obslugujacego format '{}'", ext))?
+            }
+            .ok_or_else(|| anyhow::anyhow!("Brak backendu obslugujacego format '{}'", ext))?
         };
 
-        let info = self.engines[engine_idx].load_model(model_path, gpu_layers).await?;
+        let info = self.engines[engine_idx]
+            .load_model(model_path, gpu_layers)
+            .await?;
         self.active_engine = Some(engine_idx);
         Ok(info)
     }

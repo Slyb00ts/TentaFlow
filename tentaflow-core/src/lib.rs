@@ -9,33 +9,33 @@
 extern crate self as tentaflow_core;
 
 pub mod config;
-pub mod error;
 pub mod crypto;
 pub mod db;
-pub mod net;
-pub mod routing;
+pub mod error;
 pub mod flow_engine;
-pub mod middleware;
-pub mod services;
-pub mod metrics;
-pub mod prompt_registry;
+pub mod hub;
+pub mod inference;
 pub mod intent_analyzer;
 pub mod memory_analyzer;
 pub mod mesh;
-pub mod inference;
+pub mod metrics;
+pub mod middleware;
+pub mod net;
+pub mod prompt_registry;
+pub mod routing;
+pub mod services;
 pub mod stt;
-pub mod hub;
 
 #[cfg(feature = "inference-diarization")]
 pub mod diarization;
 
-pub mod auth;
 pub mod api;
 pub mod audit;
+pub mod auth;
 pub mod dispatch;
 
 pub mod addon;
 pub mod deploy;
+pub mod license;
 pub mod paths;
 pub mod system_check;
-pub mod license;

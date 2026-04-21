@@ -43,7 +43,9 @@ impl ManifestRegistry {
                 let d = &m.deploy;
                 d.docker.as_ref().is_some_and(|x| x.platforms.contains(&os))
                     || d.native.as_ref().is_some_and(|x| x.platforms.contains(&os))
-                    || d.external.as_ref().is_some_and(|x| x.platforms.contains(&os))
+                    || d.external
+                        .as_ref()
+                        .is_some_and(|x| x.platforms.contains(&os))
             })
             .collect()
     }

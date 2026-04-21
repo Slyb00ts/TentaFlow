@@ -6,14 +6,12 @@
 // =============================================================================
 
 use crate::api::openai::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    Choice, ChunkChoice, Delta, EmbeddingData, EmbeddingInput,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, Message,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ChunkChoice, Delta,
+    EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, Message,
     MessageContent, Usage,
 };
 use crate::inference::{
-    EmbeddingParams, GenerateParams, GenerateResult, InferenceManager,
-    StopReason, StreamToken,
+    EmbeddingParams, GenerateParams, GenerateResult, InferenceManager, StopReason, StreamToken,
 };
 use crate::routing::chat_template::{ChatMessage, ChatTemplate};
 
@@ -41,7 +39,10 @@ impl LocalInferenceHandler {
     ) -> anyhow::Result<ChatCompletionResponse> {
         let template = self.get_chat_template().await;
         let params = Self::request_to_generate_params(request, &template);
-        let model_name = self.loaded_model_name().await.unwrap_or_else(|| request.model.clone());
+        let model_name = self
+            .loaded_model_name()
+            .await
+            .unwrap_or_else(|| request.model.clone());
 
         debug!(
             "Lokalna inferencja chat completion: model={}, max_tokens={}",
@@ -68,7 +69,10 @@ impl LocalInferenceHandler {
     ) -> anyhow::Result<mpsc::Receiver<String>> {
         let template = self.get_chat_template().await;
         let params = Self::request_to_generate_params(request, &template);
-        let model_name = self.loaded_model_name().await.unwrap_or_else(|| request.model.clone());
+        let model_name = self
+            .loaded_model_name()
+            .await
+            .unwrap_or_else(|| request.model.clone());
         let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
         let created = chrono::Utc::now().timestamp() as u64;
 
@@ -123,7 +127,10 @@ impl LocalInferenceHandler {
             engine.embeddings(params).await?
         };
 
-        let prompt_tokens = texts.iter().map(|t| t.split_whitespace().count() as u32).sum::<u32>();
+        let prompt_tokens = texts
+            .iter()
+            .map(|t| t.split_whitespace().count() as u32)
+            .sum::<u32>();
 
         let data: Vec<EmbeddingData> = result
             .embeddings
@@ -386,7 +393,12 @@ impl LocalInferenceHandler {
                 }
             }
 
-            if chunk.choices.first().and_then(|c| c.finish_reason.as_ref()).is_some() {
+            if chunk
+                .choices
+                .first()
+                .and_then(|c| c.finish_reason.as_ref())
+                .is_some()
+            {
                 break;
             }
         }

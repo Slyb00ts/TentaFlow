@@ -32,12 +32,12 @@ pub struct DeployRequest {
 
 /// Buduje obraz Docker z embedowanego kontekstu i uruchamia kontener.
 pub async fn deploy(req: &DeployRequest) -> Result<String> {
-    let docker = Docker::connect_with_local_defaults()
-        .context("nie mozna polaczyc z Docker daemon (sprawdz czy dziala i uzytkownik ma uprawnienia)")?;
+    let docker = Docker::connect_with_local_defaults().context(
+        "nie mozna polaczyc z Docker daemon (sprawdz czy dziala i uzytkownik ma uprawnienia)",
+    )?;
 
     let workdir = tempfile::tempdir().context("tworzenie tmpdir dla kontekstu")?;
-    bundle::extract_to(workdir.path())
-        .context("rozpakowanie embedowanego bundle")?;
+    bundle::extract_to(workdir.path()).context("rozpakowanie embedowanego bundle")?;
 
     let image_tag = req
         .image_tag
@@ -48,12 +48,7 @@ pub async fn deploy(req: &DeployRequest) -> Result<String> {
     run_container(&docker, req, &image_tag).await
 }
 
-async fn build_image(
-    docker: &Docker,
-    context: &Path,
-    container: &str,
-    tag: &str,
-) -> Result<()> {
+async fn build_image(docker: &Docker, context: &Path, container: &str, tag: &str) -> Result<()> {
     use bollard::query_parameters::BuildImageOptions;
     use futures::StreamExt;
 
@@ -72,9 +67,8 @@ async fn build_image(
         .context("pakowanie kontekstu do tar dla bollard")?;
     let tar_bytes = tar_builder.into_inner()?;
 
-    
-    use hyper::body::Bytes;
     use bollard::body_full;
+    use hyper::body::Bytes;
     let body = body_full(Bytes::from(tar_bytes));
     let mut stream = docker.build_image(opts, None, Some(body));
     while let Some(item) = stream.next().await {
@@ -98,7 +92,7 @@ async fn build_image(
 }
 
 async fn run_container(docker: &Docker, req: &DeployRequest, image: &str) -> Result<String> {
-    use bollard::models::{ContainerCreateBody as Config, HostConfig, PortBinding, DeviceRequest};
+    use bollard::models::{ContainerCreateBody as Config, DeviceRequest, HostConfig, PortBinding};
     use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 
     let name = req
@@ -153,7 +147,11 @@ async fn run_container(docker: &Docker, req: &DeployRequest, image: &str) -> Res
     let config = Config {
         image: Some(image.to_string()),
         env: if env.is_empty() { None } else { Some(env) },
-        exposed_ports: if exposed_ports_vec.is_empty() { None } else { Some(exposed_ports_vec) },
+        exposed_ports: if exposed_ports_vec.is_empty() {
+            None
+        } else {
+            Some(exposed_ports_vec)
+        },
         host_config: Some(host_config),
         ..Default::default()
     };

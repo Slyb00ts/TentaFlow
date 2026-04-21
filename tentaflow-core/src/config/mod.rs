@@ -762,11 +762,10 @@ impl NodeConfig {
             source: e.into(),
         })?;
 
-        let config: NodeConfig =
-            toml::from_str(&content).map_err(|e| CoreError::ConfigError {
-                message: "Blad parsowania TOML".to_string(),
-                source: e.into(),
-            })?;
+        let config: NodeConfig = toml::from_str(&content).map_err(|e| CoreError::ConfigError {
+            message: "Blad parsowania TOML".to_string(),
+            source: e.into(),
+        })?;
 
         config.validate()?;
         Ok(config)
@@ -798,10 +797,7 @@ impl NodeConfig {
 
             if service.backends.is_empty() {
                 return Err(CoreError::ConfigError {
-                    message: format!(
-                        "Serwis '{}' nie ma zadnych backendow",
-                        service.name
-                    ),
+                    message: format!("Serwis '{}' nie ma zadnych backendow", service.name),
                     source: anyhow::anyhow!("backends jest puste"),
                 }
                 .into());
@@ -815,7 +811,9 @@ impl NodeConfig {
                             "Nieznana strategia load balancingu '{}' dla serwisu '{}'",
                             service.strategy, service.name
                         ),
-                        source: anyhow::anyhow!("Dozwolone: single, least_loaded, round_robin, weighted"),
+                        source: anyhow::anyhow!(
+                            "Dozwolone: single, least_loaded, round_robin, weighted"
+                        ),
                     }
                     .into());
                 }
@@ -837,11 +835,7 @@ impl NodeConfig {
     }
 
     /// Waliduje konfiguracje pojedynczego protokolu
-    fn validate_protocol_config(
-        &self,
-        config: &ProtocolConfig,
-        protocol_name: &str,
-    ) -> Result<()> {
+    fn validate_protocol_config(&self, config: &ProtocolConfig, protocol_name: &str) -> Result<()> {
         if !config.bind.contains(':') {
             return Err(CoreError::ConfigError {
                 message: format!(
@@ -890,7 +884,10 @@ impl NodeConfig {
     }
 
     /// Znajduje wszystkie serwisy danego typu.
-    pub fn find_services_by_type(&self, service_type: ServiceType) -> impl Iterator<Item = &ServiceConnection> {
+    pub fn find_services_by_type(
+        &self,
+        service_type: ServiceType,
+    ) -> impl Iterator<Item = &ServiceConnection> {
         self.services
             .iter()
             .filter(move |service| service.service_type == service_type)

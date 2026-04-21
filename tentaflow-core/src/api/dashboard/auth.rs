@@ -4,7 +4,9 @@
 // =============================================================================
 
 use anyhow::Result;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
@@ -51,7 +53,12 @@ pub fn hash_api_key(key: &str) -> String {
 
 /// Generuje token JWT dla uzytkownika.
 /// VULN-004: Token NIE zawiera flagi is_admin — sprawdzane w DB przy kazdym requeście.
-pub fn generate_jwt(user_id: i64, username: &str, secret: &str, expiry_hours: i64) -> Result<String> {
+pub fn generate_jwt(
+    user_id: i64,
+    username: &str,
+    secret: &str,
+    expiry_hours: i64,
+) -> Result<String> {
     let expiration = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::hours(expiry_hours))
         .ok_or_else(|| anyhow::anyhow!("Blad obliczania czasu wygasniecia tokenu"))?

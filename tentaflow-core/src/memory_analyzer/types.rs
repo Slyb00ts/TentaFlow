@@ -388,7 +388,8 @@ impl<'de> Deserialize<'de> for AnyValue {
                 M: de::MapAccess<'de>,
             {
                 use serde::de::value::MapAccessDeserializer;
-                let value: serde_json::Value = Deserialize::deserialize(MapAccessDeserializer::new(map))?;
+                let value: serde_json::Value =
+                    Deserialize::deserialize(MapAccessDeserializer::new(map))?;
                 Ok(AnyValue(value.to_string()))
             }
         }

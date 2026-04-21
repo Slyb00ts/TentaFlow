@@ -100,7 +100,9 @@ impl NodeAdapter for TtsNodeAdapter {
 
         if let Some(ref service_name) = tts_service_name {
             if self.service_manager.has_quic_tts_service(service_name) {
-                if let Some(quic_client) = self.service_manager.get_quic_tts_client(service_name).await {
+                if let Some(quic_client) =
+                    self.service_manager.get_quic_tts_client(service_name).await
+                {
                     debug!("TTS adapter: uzywam QUIC backend: {}", service_name);
 
                     let request_id = uuid::Uuid::new_v4().to_string();
@@ -121,42 +123,38 @@ impl NodeAdapter for TtsNodeAdapter {
                     };
 
                     match quic_client.send_request(model_request).await {
-                        Ok(response) => {
-                            match response.result {
-                                ModelResult::Audio(audio_result) => {
-                                    match audio_result.data {
-                                        AudioResultData::Audio(audio_bytes) => {
-                                            debug!("TTS adapter: synteza OK, {} bajtow", audio_bytes.len());
+                        Ok(response) => match response.result {
+                            ModelResult::Audio(audio_result) => match audio_result.data {
+                                AudioResultData::Audio(audio_bytes) => {
+                                    debug!("TTS adapter: synteza OK, {} bajtow", audio_bytes.len());
 
-                                            let audio_base64 = base64::Engine::encode(
-                                                &base64::engine::general_purpose::STANDARD,
-                                                &audio_bytes,
-                                            );
-
-                                            return Ok(serde_json::json!({
-                                                "audio_base64": audio_base64,
-                                                "format": format,
-                                                "duration": 0,
-                                                "bytes": audio_bytes.len(),
-                                            }));
-                                        }
-                                        _ => {
-                                            warn!("TTS adapter: nieoczekiwany typ wyniku audio");
-                                        }
-                                    }
-                                }
-                                ModelResult::Error(err) => {
-                                    bail!(
-                                        "TTS adapter QUIC error: {:?} - {}",
-                                        err.error_type,
-                                        err.message
+                                    let audio_base64 = base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &audio_bytes,
                                     );
+
+                                    return Ok(serde_json::json!({
+                                        "audio_base64": audio_base64,
+                                        "format": format,
+                                        "duration": 0,
+                                        "bytes": audio_bytes.len(),
+                                    }));
                                 }
                                 _ => {
-                                    warn!("TTS adapter: nieoczekiwany typ wyniku");
+                                    warn!("TTS adapter: nieoczekiwany typ wyniku audio");
                                 }
+                            },
+                            ModelResult::Error(err) => {
+                                bail!(
+                                    "TTS adapter QUIC error: {:?} - {}",
+                                    err.error_type,
+                                    err.message
+                                );
                             }
-                        }
+                            _ => {
+                                warn!("TTS adapter: nieoczekiwany typ wyniku");
+                            }
+                        },
                         Err(e) => {
                             warn!("TTS adapter: QUIC request failed: {} - probuje fallback", e);
                         }

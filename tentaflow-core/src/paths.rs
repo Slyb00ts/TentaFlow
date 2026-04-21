@@ -48,11 +48,15 @@ pub fn models_root() -> PathBuf {
 
 /// Value for HF_HOME, HUGGINGFACE_HUB_CACHE, TRANSFORMERS_CACHE. HF creates
 /// `hub/models--*/` underneath automatically — no manual subdir juggling.
-pub fn hf_home() -> PathBuf { models_root() }
+pub fn hf_home() -> PathBuf {
+    models_root()
+}
 
 /// Value for TORCH_HOME — separated so HF's `hub/` and torch's `hub/` do
 /// not collide.
-pub fn torch_home() -> PathBuf { models_root().join("torch") }
+pub fn torch_home() -> PathBuf {
+    models_root().join("torch")
+}
 
 /// Ensures the root and the torch subdir exist. HF creates its own `hub/`
 /// the first time a model is downloaded, so we do not pre-create it.

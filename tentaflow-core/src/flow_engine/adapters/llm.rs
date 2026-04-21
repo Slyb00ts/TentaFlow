@@ -10,12 +10,10 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
 use crate::config::RouterConfig;
 use crate::flow_engine::adapters::NodeAdapter;
 use crate::flow_engine::types::FlowContext;
-use crate::api::openai::types::{
-    ChatCompletionRequest, Message, MessageContent,
-};
 use crate::routing::service_manager::ServiceManager;
 
 /// Adapter wezla LLM - generowanie tekstu przez backend LLM.
@@ -44,11 +42,7 @@ impl LlmNodeAdapter {
     }
 
     /// Buduje ChatCompletionRequest z konfiguracji wezla i kontekstu flow
-    fn build_request(
-        &self,
-        node_config: &Value,
-        ctx: &FlowContext,
-    ) -> ChatCompletionRequest {
+    fn build_request(&self, node_config: &Value, ctx: &FlowContext) -> ChatCompletionRequest {
         let use_messages_context = node_config
             .get("use_messages_context")
             .and_then(|v| v.as_bool())
@@ -72,18 +66,22 @@ impl LlmNodeAdapter {
 
         let messages = if use_messages_context && !ctx.messages.is_empty() {
             // Konwertuj ctx.messages na Vec<Message>
-            let mut msgs: Vec<Message> = ctx.messages.iter().filter_map(|v| {
-                let role = v.get("role")?.as_str()?.to_string();
-                let content = v.get("content")?.as_str()?.to_string();
-                Some(Message {
-                    role,
-                    content: Some(MessageContent::Text(content)),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
+            let mut msgs: Vec<Message> = ctx
+                .messages
+                .iter()
+                .filter_map(|v| {
+                    let role = v.get("role")?.as_str()?.to_string();
+                    let content = v.get("content")?.as_str()?.to_string();
+                    Some(Message {
+                        role,
+                        content: Some(MessageContent::Text(content)),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    })
                 })
-            }).collect();
+                .collect();
 
             // Jesli prompt_id ustawiony i brak system message -> prepend
             let resolved_prompt = node_config
@@ -96,14 +94,17 @@ impl LlmNodeAdapter {
             if let Some(prompt) = resolved_prompt {
                 let has_system = msgs.first().map(|m| m.role == "system").unwrap_or(false);
                 if !has_system {
-                    msgs.insert(0, Message {
-                        role: "system".to_string(),
-                        content: Some(MessageContent::Text(prompt)),
-                        name: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    });
+                    msgs.insert(
+                        0,
+                        Message {
+                            role: "system".to_string(),
+                            content: Some(MessageContent::Text(prompt)),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                        },
+                    );
                 }
             }
 
@@ -178,19 +179,22 @@ impl LlmNodeAdapter {
 
     /// Wykrywa kontekst RAG z poprzedniego wezla
     fn detect_rag_context(&self, node_config: &Value, ctx: &FlowContext) -> Option<String> {
-        let prev_result = if let Some(input_from) = node_config.get("input_from").and_then(|v| v.as_str()) {
-            ctx.node_results.get(input_from)
-        } else if let Some(last_log) = ctx.execution_log.last() {
-            ctx.node_results.get(&last_log.node_id)
-        } else {
-            None
-        };
+        let prev_result =
+            if let Some(input_from) = node_config.get("input_from").and_then(|v| v.as_str()) {
+                ctx.node_results.get(input_from)
+            } else if let Some(last_log) = ctx.execution_log.last() {
+                ctx.node_results.get(&last_log.node_id)
+            } else {
+                None
+            };
 
         let prev = prev_result?;
 
         // Jesli wynik zawiera "context" i "sources" - to RAG output
         if prev.get("context").is_some() && prev.get("sources").is_some() {
-            prev.get("context").and_then(|v| v.as_str()).map(|s| s.to_string())
+            prev.get("context")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
         } else {
             None
         }
@@ -237,7 +241,13 @@ impl NodeAdapter for LlmNodeAdapter {
 
         // Sprawdz czy to QUIC LLM
         if self.service_manager.has_quic_llm_service(&model_name) {
-            let quic_handle = { self.service_manager.quic_llm_services.read().get(&model_name).cloned() };
+            let quic_handle = {
+                self.service_manager
+                    .quic_llm_services
+                    .read()
+                    .get(&model_name)
+                    .cloned()
+            };
             if let Some(quic_handle) = quic_handle {
                 if let Some(quic_client) = quic_handle.get_client().await {
                     debug!("LLM adapter: uzywam QUIC backend: {}", model_name);
@@ -288,7 +298,8 @@ impl NodeAdapter for LlmNodeAdapter {
                     match quic_client.send_request(model_request).await {
                         Ok(response) => {
                             // Pobierz tokeny z metryk response
-                            let (tokens_prompt, tokens_completion) = response.metrics
+                            let (tokens_prompt, tokens_completion) = response
+                                .metrics
                                 .as_ref()
                                 .and_then(|m| {
                                     if let Some(tentaflow_protocol::DetailedMetrics::Completion {
@@ -317,11 +328,7 @@ impl NodeAdapter for LlmNodeAdapter {
                                     }));
                                 }
                                 tentaflow_protocol::ModelResult::Error(err) => {
-                                    bail!(
-                                        "QUIC LLM error: {:?} - {}",
-                                        err.error_type,
-                                        err.message
-                                    );
+                                    bail!("QUIC LLM error: {:?} - {}", err.error_type, err.message);
                                 }
                                 _ => {
                                     warn!("QUIC LLM zwrocil nieoczekiwany typ wyniku");
@@ -337,15 +344,14 @@ impl NodeAdapter for LlmNodeAdapter {
         }
 
         // HTTP backend
-        let backend = self.service_manager.get_service_backends_cloned(&model_name);
+        let backend = self
+            .service_manager
+            .get_service_backends_cloned(&model_name);
         match backend {
             Some(backends) if !backends.is_empty() => {
                 let backend = &backends[0];
 
-                debug!(
-                    "LLM adapter: HTTP backend {}",
-                    backend.url(),
-                );
+                debug!("LLM adapter: HTTP backend {}", backend.url(),);
 
                 let response = backend.chat_completion(request).await?;
 
@@ -369,10 +375,14 @@ impl NodeAdapter for LlmNodeAdapter {
                     })
                     .unwrap_or_default();
 
-                let tokens_prompt = response.usage.as_ref()
+                let tokens_prompt = response
+                    .usage
+                    .as_ref()
                     .map(|u| u.prompt_tokens as i64)
                     .unwrap_or(0);
-                let tokens_completion = response.usage.as_ref()
+                let tokens_completion = response
+                    .usage
+                    .as_ref()
                     .map(|u| u.completion_tokens as i64)
                     .unwrap_or(0);
 

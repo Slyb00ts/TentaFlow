@@ -23,24 +23,32 @@ pub struct CrdtStore {
 impl CrdtStore {
     /// Tworzy nowy CrdtStore z istniejacym polaczeniem
     pub fn new(conn: Arc<Mutex<Connection>>) -> Result<Self> {
-        Ok(Self { conn, settings_cipher: None })
+        Ok(Self {
+            conn,
+            settings_cipher: None,
+        })
     }
 
     /// Tworzy CrdtStore z cipherem do szyfrowania/deszyfrowania sekretow
     pub fn with_cipher(conn: Arc<Mutex<Connection>>, cipher: Arc<SettingsCipher>) -> Result<Self> {
-        Ok(Self { conn, settings_cipher: Some(cipher) })
+        Ok(Self {
+            conn,
+            settings_cipher: Some(cipher),
+        })
     }
 
     /// Zapisuje operacje CRDT do tabeli crdt_operations.
     /// Dla UpsertSetting z kluczem wrazliwym — deszyfruje wartosc przed zapisem,
     /// tak aby peer z innym master key mogl odczytac plaintext.
     pub fn save_operation(&self, op: &CrdtOperation, clock: &LamportClock) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
 
         let op_to_save = self.decrypt_setting_for_sync(op);
         let (op_type, op_key) = Self::operation_type_and_key(&op_to_save);
-        let op_data = serde_json::to_string(&op_to_save)
-            .context("Serializacja operacji CRDT")?;
+        let op_data = serde_json::to_string(&op_to_save).context("Serializacja operacji CRDT")?;
 
         conn.execute(
             "INSERT INTO crdt_operations (clock_time, clock_node_hash, op_type, op_key, op_data) \
@@ -58,8 +66,14 @@ impl CrdtStore {
     }
 
     /// Pobiera operacje nowsze niz podany czas (do delta sync)
-    pub fn get_operations_since(&self, since_time: u64) -> Result<Vec<(LamportClock, CrdtOperation)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
+    pub fn get_operations_since(
+        &self,
+        since_time: u64,
+    ) -> Result<Vec<(LamportClock, CrdtOperation)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
 
         let mut stmt = conn.prepare(
             "SELECT clock_time, clock_node_hash, op_data FROM crdt_operations \
@@ -77,8 +91,8 @@ impl CrdtStore {
         for row in rows {
             let (time, node_id_hash, data) = row?;
             let clock = LamportClock { time, node_id_hash };
-            let op: CrdtOperation = serde_json::from_str(&data)
-                .context("Deserializacja operacji CRDT z bazy")?;
+            let op: CrdtOperation =
+                serde_json::from_str(&data).context("Deserializacja operacji CRDT z bazy")?;
             result.push((clock, op));
         }
 
@@ -87,19 +101,28 @@ impl CrdtStore {
 
     /// Aplikuje operacje CRDT do tabel biznesowych
     pub fn apply_to_db(&self, op: &CrdtOperation) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
 
         match op {
-            CrdtOperation::UpsertService { id, name, data_json, .. } => {
+            CrdtOperation::UpsertService {
+                id,
+                name,
+                data_json,
+                ..
+            } => {
                 // Parsuj config z data_json, uzyj domyslnych wartosci dla brakujacych pol
-                let data: serde_json::Value = serde_json::from_str(data_json)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+                let data: serde_json::Value =
+                    serde_json::from_str(data_json).unwrap_or_else(|_| serde_json::json!({}));
 
                 let service_type = data["service_type"].as_str().unwrap_or("llm");
                 let strategy = data["strategy"].as_str().unwrap_or("single");
                 let model_category = data["model_category"].as_str();
                 let status = data["status"].as_str().unwrap_or("active");
-                let config_json = data.get("config_json")
+                let config_json = data
+                    .get("config_json")
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "{}".to_string());
 
@@ -114,9 +137,14 @@ impl CrdtStore {
                 conn.execute("DELETE FROM services WHERE id = ?1", params![id])?;
             }
 
-            CrdtOperation::UpsertModel { id, name, data_json, .. } => {
-                let data: serde_json::Value = serde_json::from_str(data_json)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+            CrdtOperation::UpsertModel {
+                id,
+                name,
+                data_json,
+                ..
+            } => {
+                let data: serde_json::Value =
+                    serde_json::from_str(data_json).unwrap_or_else(|_| serde_json::json!({}));
 
                 let display_name = data["display_name"].as_str();
                 let service_type = data["service_type"].as_str().unwrap_or("llm");
@@ -125,7 +153,8 @@ impl CrdtStore {
                 let flow_id = data["flow_id"].as_i64();
                 let is_public = data["is_public"].as_i64().unwrap_or(1);
                 let is_active = data["is_active"].as_i64().unwrap_or(1);
-                let config_json = data.get("config_json")
+                let config_json = data
+                    .get("config_json")
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "{}".to_string());
 
@@ -154,15 +183,16 @@ impl CrdtStore {
             }
 
             CrdtOperation::UpsertFlow { id, data_json, .. } => {
-                let data: serde_json::Value = serde_json::from_str(data_json)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+                let data: serde_json::Value =
+                    serde_json::from_str(data_json).unwrap_or_else(|_| serde_json::json!({}));
 
                 let name = data["name"].as_str().unwrap_or("unnamed");
                 let description = data["description"].as_str();
                 let version = data["version"].as_i64().unwrap_or(1);
                 let is_default = data["is_default"].as_i64().unwrap_or(0);
                 let service_type = data["service_type"].as_str();
-                let flow_json = data.get("flow_json")
+                let flow_json = data
+                    .get("flow_json")
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "{}".to_string());
                 let status = data["status"].as_str().unwrap_or("draft");
@@ -175,9 +205,13 @@ impl CrdtStore {
                 )?;
             }
 
-            CrdtOperation::UpsertPrompt { prompt_id, data_json, .. } => {
-                let data: serde_json::Value = serde_json::from_str(data_json)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+            CrdtOperation::UpsertPrompt {
+                prompt_id,
+                data_json,
+                ..
+            } => {
+                let data: serde_json::Value =
+                    serde_json::from_str(data_json).unwrap_or_else(|_| serde_json::json!({}));
 
                 let name = data["name"].as_str().unwrap_or("unnamed");
                 let description = data["description"].as_str();
@@ -203,8 +237,8 @@ impl CrdtStore {
             }
 
             CrdtOperation::UpsertApiKey { id, data_json, .. } => {
-                let data: serde_json::Value = serde_json::from_str(data_json)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+                let data: serde_json::Value =
+                    serde_json::from_str(data_json).unwrap_or_else(|_| serde_json::json!({}));
 
                 let key_hash = data["key_hash"].as_str().unwrap_or("");
                 let key_prefix = data["key_prefix"].as_str().unwrap_or("");
@@ -231,7 +265,13 @@ impl CrdtStore {
 
             // --- Nowe operacje: Users ---
             CrdtOperation::UpsertUser {
-                username, password_hash, display_name, email, is_active, is_admin, ..
+                username,
+                password_hash,
+                display_name,
+                email,
+                is_active,
+                is_admin,
+                ..
             } => {
                 // Sprawdz sync exclusions
                 if Self::check_sync_exclusion(&conn, "users")? {
@@ -262,7 +302,9 @@ impl CrdtStore {
             }
 
             // --- Nowe operacje: Groups ---
-            CrdtOperation::UpsertGroup { name, description, .. } => {
+            CrdtOperation::UpsertGroup {
+                name, description, ..
+            } => {
                 if Self::check_sync_exclusion(&conn, "groups")? {
                     return Ok(());
                 }
@@ -277,13 +319,14 @@ impl CrdtStore {
                 if Self::check_sync_exclusion(&conn, "groups")? {
                     return Ok(());
                 }
-                conn.execute(
-                    "DELETE FROM user_groups WHERE name = ?1",
-                    params![name],
-                )?;
+                conn.execute("DELETE FROM user_groups WHERE name = ?1", params![name])?;
             }
 
-            CrdtOperation::AddGroupMember { group_name, username, .. } => {
+            CrdtOperation::AddGroupMember {
+                group_name,
+                username,
+                ..
+            } => {
                 if Self::check_sync_exclusion(&conn, "groups")? {
                     return Ok(());
                 }
@@ -295,7 +338,11 @@ impl CrdtStore {
                 )?;
             }
 
-            CrdtOperation::RemoveGroupMember { group_name, username, .. } => {
+            CrdtOperation::RemoveGroupMember {
+                group_name,
+                username,
+                ..
+            } => {
                 if Self::check_sync_exclusion(&conn, "groups")? {
                     return Ok(());
                 }
@@ -309,23 +356,32 @@ impl CrdtStore {
 
             // --- Nowe operacje: Permissions ---
             CrdtOperation::SetPermission {
-                addon_id, subject_type, subject_name, resource, access_level, ..
+                addon_id,
+                subject_type,
+                subject_name,
+                resource,
+                access_level,
+                ..
             } => {
                 if Self::check_sync_exclusion(&conn, "permissions")? {
                     return Ok(());
                 }
                 // Rozwiaz subject_name na subject_id
                 let subject_id: Option<i64> = match subject_type.as_str() {
-                    "user" => conn.query_row(
-                        "SELECT id FROM user_accounts WHERE username = ?1",
-                        params![subject_name],
-                        |row| row.get(0),
-                    ).ok(),
-                    "group" => conn.query_row(
-                        "SELECT id FROM user_groups WHERE name = ?1",
-                        params![subject_name],
-                        |row| row.get(0),
-                    ).ok(),
+                    "user" => conn
+                        .query_row(
+                            "SELECT id FROM user_accounts WHERE username = ?1",
+                            params![subject_name],
+                            |row| row.get(0),
+                        )
+                        .ok(),
+                    "group" => conn
+                        .query_row(
+                            "SELECT id FROM user_groups WHERE name = ?1",
+                            params![subject_name],
+                            |row| row.get(0),
+                        )
+                        .ok(),
                     _ => None,
                 };
                 if let Some(sid) = subject_id {
@@ -340,22 +396,30 @@ impl CrdtStore {
             }
 
             CrdtOperation::DeletePermission {
-                addon_id, subject_type, subject_name, resource, ..
+                addon_id,
+                subject_type,
+                subject_name,
+                resource,
+                ..
             } => {
                 if Self::check_sync_exclusion(&conn, "permissions")? {
                     return Ok(());
                 }
                 let subject_id: Option<i64> = match subject_type.as_str() {
-                    "user" => conn.query_row(
-                        "SELECT id FROM user_accounts WHERE username = ?1",
-                        params![subject_name],
-                        |row| row.get(0),
-                    ).ok(),
-                    "group" => conn.query_row(
-                        "SELECT id FROM user_groups WHERE name = ?1",
-                        params![subject_name],
-                        |row| row.get(0),
-                    ).ok(),
+                    "user" => conn
+                        .query_row(
+                            "SELECT id FROM user_accounts WHERE username = ?1",
+                            params![subject_name],
+                            |row| row.get(0),
+                        )
+                        .ok(),
+                    "group" => conn
+                        .query_row(
+                            "SELECT id FROM user_groups WHERE name = ?1",
+                            params![subject_name],
+                            |row| row.get(0),
+                        )
+                        .ok(),
                     _ => None,
                 };
                 if let Some(sid) = subject_id {
@@ -369,7 +433,13 @@ impl CrdtStore {
 
             // --- Nowe operacje: Addons ---
             CrdtOperation::SyncAddon {
-                addon_id, name, version, manifest_json, platforms, wasm_hash, ..
+                addon_id,
+                name,
+                version,
+                manifest_json,
+                platforms,
+                wasm_hash,
+                ..
             } => {
                 if Self::check_sync_exclusion(&conn, "addons")? {
                     return Ok(());
@@ -395,14 +465,16 @@ impl CrdtStore {
                 if Self::check_sync_exclusion(&conn, "addons")? {
                     return Ok(());
                 }
-                conn.execute(
-                    "DELETE FROM addons WHERE addon_id = ?1",
-                    params![addon_id],
-                )?;
+                conn.execute("DELETE FROM addons WHERE addon_id = ?1", params![addon_id])?;
             }
 
             // --- Nowe operacje: Addon configs ---
-            CrdtOperation::SetAddonConfig { addon_id, key, value, .. } => {
+            CrdtOperation::SetAddonConfig {
+                addon_id,
+                key,
+                value,
+                ..
+            } => {
                 conn.execute(
                     "INSERT OR REPLACE INTO settings (key, value, updated_at) \
                      VALUES (?1, ?2, datetime('now'))",
@@ -411,7 +483,13 @@ impl CrdtStore {
             }
 
             // --- Nowe operacje: Secrets ---
-            CrdtOperation::SetSecret { addon_id, username, key, encrypted_value, .. } => {
+            CrdtOperation::SetSecret {
+                addon_id,
+                username,
+                key,
+                encrypted_value,
+                ..
+            } => {
                 if Self::check_sync_exclusion(&conn, "secrets")? {
                     return Ok(());
                 }
@@ -420,7 +498,8 @@ impl CrdtStore {
                         "SELECT id FROM user_accounts WHERE username = ?1",
                         params![uname],
                         |row| row.get(0),
-                    ).ok()
+                    )
+                    .ok()
                 });
                 conn.execute(
                     "INSERT INTO addon_secrets (addon_id, user_id, key, value_encrypted) \
@@ -431,7 +510,12 @@ impl CrdtStore {
                 )?;
             }
 
-            CrdtOperation::DeleteSecret { addon_id, username, key, .. } => {
+            CrdtOperation::DeleteSecret {
+                addon_id,
+                username,
+                key,
+                ..
+            } => {
                 if Self::check_sync_exclusion(&conn, "secrets")? {
                     return Ok(());
                 }
@@ -440,7 +524,8 @@ impl CrdtStore {
                         "SELECT id FROM user_accounts WHERE username = ?1",
                         params![uname],
                         |row| row.get(0),
-                    ).ok()
+                    )
+                    .ok()
                 });
                 conn.execute(
                     "DELETE FROM addon_secrets WHERE addon_id = ?1 AND user_id IS ?2 AND key = ?3",
@@ -450,7 +535,13 @@ impl CrdtStore {
 
             // --- Nowe operacje: SSO Providers ---
             CrdtOperation::UpsertSsoProvider {
-                name, provider_type, client_id, client_secret_encrypted, discovery_url, enabled, ..
+                name,
+                provider_type,
+                client_id,
+                client_secret_encrypted,
+                discovery_url,
+                enabled,
+                ..
             } => {
                 if Self::check_sync_exclusion(&conn, "sso")? {
                     return Ok(());
@@ -472,14 +563,15 @@ impl CrdtStore {
                 if Self::check_sync_exclusion(&conn, "sso")? {
                     return Ok(());
                 }
-                conn.execute(
-                    "DELETE FROM sso_providers WHERE name = ?1",
-                    params![name],
-                )?;
+                conn.execute("DELETE FROM sso_providers WHERE name = ?1", params![name])?;
             }
 
             // --- Nowe operacje: Sync Exclusions ---
-            CrdtOperation::SetSyncExclusion { group_name, resource_type, .. } => {
+            CrdtOperation::SetSyncExclusion {
+                group_name,
+                resource_type,
+                ..
+            } => {
                 conn.execute(
                     "INSERT OR IGNORE INTO sync_exclusions (group_id, resource_type) \
                      SELECT id, ?2 FROM user_groups WHERE name = ?1",
@@ -487,7 +579,11 @@ impl CrdtStore {
                 )?;
             }
 
-            CrdtOperation::DeleteSyncExclusion { group_name, resource_type, .. } => {
+            CrdtOperation::DeleteSyncExclusion {
+                group_name,
+                resource_type,
+                ..
+            } => {
                 conn.execute(
                     "DELETE FROM sync_exclusions WHERE group_id IN \
                      (SELECT id FROM user_groups WHERE name = ?1) AND resource_type = ?2",
@@ -496,7 +592,12 @@ impl CrdtStore {
             }
 
             // --- Operacje na zaufanych nodach mesh ---
-            CrdtOperation::AddTrustedNode { node_id, public_key_hex, hostname, .. } => {
+            CrdtOperation::AddTrustedNode {
+                node_id,
+                public_key_hex,
+                hostname,
+                ..
+            } => {
                 conn.execute(
                     "INSERT OR REPLACE INTO trusted_nodes (node_id, public_key, hostname, approved_by, approved_at, is_active) \
                      VALUES (?1, ?2, ?3, 'crdt-sync', datetime('now'), 1)",
@@ -528,21 +629,24 @@ impl CrdtStore {
 
     /// Sprawdza czy dany typ zasobu jest wykluczony z synchronizacji.
     fn check_sync_exclusion(conn: &Connection, resource_type: &str) -> Result<bool> {
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sync_exclusions WHERE resource_type = ?1",
-            params![resource_type],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_exclusions WHERE resource_type = ?1",
+                params![resource_type],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         Ok(count > 0)
     }
 
     /// Pobiera version vector z bazy
     pub fn load_version_vector(&self) -> Result<HashMap<u64, u64>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT node_hash, last_time FROM crdt_version_vector",
-        )?;
+        let mut stmt = conn.prepare("SELECT node_hash, last_time FROM crdt_version_vector")?;
 
         let rows = stmt.query_map([], |row| {
             let node_hash: i64 = row.get(0)?;
@@ -561,7 +665,10 @@ impl CrdtStore {
 
     /// Zapisuje version vector do bazy
     pub fn save_version_vector(&self, vv: &HashMap<u64, u64>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
 
         for (&node_hash, &last_time) in vv {
             conn.execute(
@@ -577,14 +684,14 @@ impl CrdtStore {
     /// Kompaktuje stare operacje — zachowuje tylko najnowsza per klucz.
     /// Zwraca liczbe usunietych wierszy.
     pub fn compact(&self, keep_recent: usize) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Blad locka: {e}"))?;
 
         // Pobierz calkowita liczbe operacji
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM crdt_operations",
-            [],
-            |row| row.get(0),
-        )?;
+        let total: i64 =
+            conn.query_row("SELECT COUNT(*) FROM crdt_operations", [], |row| row.get(0))?;
 
         if (total as usize) <= keep_recent {
             return Ok(0);
@@ -619,48 +726,104 @@ impl CrdtStore {
             CrdtOperation::UpsertAlias { alias, .. } => ("upsert_alias", format!("alias:{alias}")),
             CrdtOperation::DeleteAlias { alias, .. } => ("delete_alias", format!("alias:{alias}")),
             CrdtOperation::UpsertFlow { id, .. } => ("upsert_flow", format!("flow:{id}")),
-            CrdtOperation::UpsertPrompt { prompt_id, .. } => ("upsert_prompt", format!("prompt:{prompt_id}")),
+            CrdtOperation::UpsertPrompt { prompt_id, .. } => {
+                ("upsert_prompt", format!("prompt:{prompt_id}"))
+            }
             CrdtOperation::UpsertApiKey { id, .. } => ("upsert_apikey", format!("apikey:{id}")),
-            CrdtOperation::UpsertSetting { key, .. } => ("upsert_setting", format!("setting:{key}")),
+            CrdtOperation::UpsertSetting { key, .. } => {
+                ("upsert_setting", format!("setting:{key}"))
+            }
 
             // Nowe typy operacji
-            CrdtOperation::UpsertUser { username, .. } => ("upsert_user", format!("user:{username}")),
-            CrdtOperation::DeleteUser { username, .. } => ("delete_user", format!("user:{username}")),
+            CrdtOperation::UpsertUser { username, .. } => {
+                ("upsert_user", format!("user:{username}"))
+            }
+            CrdtOperation::DeleteUser { username, .. } => {
+                ("delete_user", format!("user:{username}"))
+            }
             CrdtOperation::UpsertGroup { name, .. } => ("upsert_group", format!("group:{name}")),
             CrdtOperation::DeleteGroup { name, .. } => ("delete_group", format!("group:{name}")),
-            CrdtOperation::AddGroupMember { group_name, username, .. } => {
-                ("add_group_member", format!("group_member:{group_name}:{username}"))
+            CrdtOperation::AddGroupMember {
+                group_name,
+                username,
+                ..
+            } => (
+                "add_group_member",
+                format!("group_member:{group_name}:{username}"),
+            ),
+            CrdtOperation::RemoveGroupMember {
+                group_name,
+                username,
+                ..
+            } => (
+                "remove_group_member",
+                format!("group_member:{group_name}:{username}"),
+            ),
+            CrdtOperation::SetPermission {
+                addon_id,
+                subject_type,
+                subject_name,
+                resource,
+                ..
+            } => (
+                "set_permission",
+                format!("perm:{addon_id}:{subject_type}:{subject_name}:{resource}"),
+            ),
+            CrdtOperation::DeletePermission {
+                addon_id,
+                subject_type,
+                subject_name,
+                resource,
+                ..
+            } => (
+                "delete_permission",
+                format!("perm:{addon_id}:{subject_type}:{subject_name}:{resource}"),
+            ),
+            CrdtOperation::SyncAddon { addon_id, .. } => {
+                ("sync_addon", format!("addon:{addon_id}"))
             }
-            CrdtOperation::RemoveGroupMember { group_name, username, .. } => {
-                ("remove_group_member", format!("group_member:{group_name}:{username}"))
+            CrdtOperation::DeleteAddon { addon_id, .. } => {
+                ("delete_addon", format!("addon:{addon_id}"))
             }
-            CrdtOperation::SetPermission { addon_id, subject_type, subject_name, resource, .. } => {
-                ("set_permission", format!("perm:{addon_id}:{subject_type}:{subject_name}:{resource}"))
-            }
-            CrdtOperation::DeletePermission { addon_id, subject_type, subject_name, resource, .. } => {
-                ("delete_permission", format!("perm:{addon_id}:{subject_type}:{subject_name}:{resource}"))
-            }
-            CrdtOperation::SyncAddon { addon_id, .. } => ("sync_addon", format!("addon:{addon_id}")),
-            CrdtOperation::DeleteAddon { addon_id, .. } => ("delete_addon", format!("addon:{addon_id}")),
             CrdtOperation::SetAddonConfig { addon_id, key, .. } => {
                 ("set_addon_config", format!("addon_config:{addon_id}:{key}"))
             }
-            CrdtOperation::SetSecret { addon_id, username, key, .. } => {
+            CrdtOperation::SetSecret {
+                addon_id,
+                username,
+                key,
+                ..
+            } => {
                 let uname = username.as_deref().unwrap_or("_global_");
                 ("set_secret", format!("secret:{addon_id}:{uname}:{key}"))
             }
-            CrdtOperation::DeleteSecret { addon_id, username, key, .. } => {
+            CrdtOperation::DeleteSecret {
+                addon_id,
+                username,
+                key,
+                ..
+            } => {
                 let uname = username.as_deref().unwrap_or("_global_");
                 ("delete_secret", format!("secret:{addon_id}:{uname}:{key}"))
             }
             CrdtOperation::UpsertSsoProvider { name, .. } => ("upsert_sso", format!("sso:{name}")),
             CrdtOperation::DeleteSsoProvider { name, .. } => ("delete_sso", format!("sso:{name}")),
-            CrdtOperation::SetSyncExclusion { group_name, resource_type, .. } => {
-                ("set_sync_exclusion", format!("sync_excl:{group_name}:{resource_type}"))
-            }
-            CrdtOperation::DeleteSyncExclusion { group_name, resource_type, .. } => {
-                ("delete_sync_exclusion", format!("sync_excl:{group_name}:{resource_type}"))
-            }
+            CrdtOperation::SetSyncExclusion {
+                group_name,
+                resource_type,
+                ..
+            } => (
+                "set_sync_exclusion",
+                format!("sync_excl:{group_name}:{resource_type}"),
+            ),
+            CrdtOperation::DeleteSyncExclusion {
+                group_name,
+                resource_type,
+                ..
+            } => (
+                "delete_sync_exclusion",
+                format!("sync_excl:{group_name}:{resource_type}"),
+            ),
             CrdtOperation::AddTrustedNode { node_id, .. } => {
                 ("add_trusted_node", format!("trusted_node:{node_id}"))
             }
@@ -827,7 +990,11 @@ mod tests {
 
         let conn = pool.lock().unwrap();
         let val: String = conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params!["test-key"], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params!["test-key"],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(val, "test-value");
     }
@@ -851,7 +1018,11 @@ mod tests {
         {
             let conn = pool.lock().unwrap();
             let target: String = conn
-                .query_row("SELECT target_model FROM model_aliases WHERE alias = 'gpt4'", [], |row| row.get(0))
+                .query_row(
+                    "SELECT target_model FROM model_aliases WHERE alias = 'gpt4'",
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap();
             assert_eq!(target, "openai/gpt-4");
         }
@@ -866,7 +1037,11 @@ mod tests {
 
         let conn = pool.lock().unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM model_aliases WHERE alias = 'gpt4'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM model_aliases WHERE alias = 'gpt4'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -979,9 +1154,16 @@ mod tests {
         // Sprawdz ze w tabeli settings wartosc jest ZASZYFROWANA
         let conn = pool.lock().unwrap();
         let stored: String = conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params!["ngc_api_key"], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params!["ngc_api_key"],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert!(stored.starts_with("enc:"), "Wartosc powinna byc zaszyfrowana, ale: {stored}");
+        assert!(
+            stored.starts_with("enc:"),
+            "Wartosc powinna byc zaszyfrowana, ale: {stored}"
+        );
 
         // Deszyfruj i sprawdz poprawnosc
         let decrypted = cipher.decrypt(&stored).unwrap();
@@ -1014,7 +1196,11 @@ mod tests {
         store.apply_to_db(&op).unwrap();
         let conn = pool.lock().unwrap();
         let stored: String = conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params!["flow_engine_enabled"], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params!["flow_engine_enabled"],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(stored, "true");
     }

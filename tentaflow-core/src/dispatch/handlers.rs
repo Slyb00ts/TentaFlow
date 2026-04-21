@@ -8,11 +8,11 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
-    ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginResponse, AuthMeResponse, ClusterUpdateResponse, DashboardSnapshot, FlowDetail,
-    FlowExecutionSummary, FlowSummary, HubEngineSummary, MeshPairInitResponse, MeshPeerSummary,
-    MessageBody, ModelDetail, ModelSummary, NodeSummary, PromptDetail, PromptSummary,
-    ProtocolError, ProtocolErrorCode, RegistrySummary, ServiceQuicStatus, ServiceSummary,
-    SessionAuth, SettingEntry, TtsRule,
+    ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginResponse, AuthMeResponse,
+    DashboardSnapshot, FlowDetail, FlowExecutionSummary, FlowSummary, HubEngineSummary,
+    MeshPairInitResponse, MeshPeerSummary, MessageBody, ModelDetail, ModelSummary, NodeSummary,
+    PromptDetail, PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
+    ServiceQuicStatus, ServiceSummary, SessionAuth, SettingEntry, TtsRule,
 };
 
 use super::HandlerContext;
@@ -142,10 +142,7 @@ pub fn meta_cancel_stream(
 #[handler(variant = "AuthLoginRequest", since = (1, 0))]
 #[policy(Anonymous)]
 #[observed]
-pub fn auth_login(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AuthLoginRequestBody(p) => p,
         _ => {
@@ -156,9 +153,7 @@ pub fn auth_login(
     };
 
     if payload.username.is_empty() || payload.password.is_empty() {
-        return Err(ProtocolError::bad_request(
-            "username and password required",
-        ));
+        return Err(ProtocolError::bad_request("username and password required"));
     }
 
     let user = repository::get_user_account_by_username(&ctx.state.db, &payload.username)
@@ -181,13 +176,10 @@ pub fn auth_login(
         ));
     }
 
-    let jwt_secret = repository::get_setting_secure(
-        &ctx.state.db,
-        "jwt_secret",
-        &ctx.state.settings_cipher,
-    )
-    .map_err(db_err)?
-    .ok_or_else(|| ProtocolError::internal("jwt_secret not configured"))?;
+    let jwt_secret =
+        repository::get_setting_secure(&ctx.state.db, "jwt_secret", &ctx.state.settings_cipher)
+            .map_err(db_err)?
+            .ok_or_else(|| ProtocolError::internal("jwt_secret not configured"))?;
 
     let jwt = auth::generate_jwt(user.id, &user.username, &jwt_secret, 24)
         .map_err(|e| ProtocolError::internal(format!("jwt generation failed: {}", e)))?;
@@ -225,14 +217,10 @@ pub fn auth_login(
 #[handler(variant = "AuthMeRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn auth_me(
-    _req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let user_id_bytes = require_user_id(ctx)?;
-    let user_id = user_id_to_i64(&user_id_bytes).ok_or_else(|| {
-        ProtocolError::internal("session user_id not in i64-derived format")
-    })?;
+    let user_id = user_id_to_i64(&user_id_bytes)
+        .ok_or_else(|| ProtocolError::internal("session user_id not in i64-derived format"))?;
 
     let user = repository::get_user_account_by_id(&ctx.state.db, user_id)
         .map_err(db_err)?
@@ -241,7 +229,11 @@ pub fn auth_me(
     Ok(MessageBody::AuthMeResponseBody(AuthMeResponse {
         user_id: user_id_bytes,
         username: user.username,
-        role: if user.is_admin { "admin".into() } else { "user".into() },
+        role: if user.is_admin {
+            "admin".into()
+        } else {
+            "user".into()
+        },
     }))
 }
 
@@ -288,9 +280,7 @@ pub fn api_key_create(
     };
 
     if payload.name.is_empty() || payload.name.len() > 200 {
-        return Err(ProtocolError::bad_request(
-            "name must be 1-200 chars",
-        ));
+        return Err(ProtocolError::bad_request("name must be 1-200 chars"));
     }
 
     let raw_key = format!("sk-{}", uuid::Uuid::new_v4().simple());
@@ -312,10 +302,12 @@ pub fn api_key_create(
         Some(&ctx.state.local_node_id),
     );
 
-    Ok(MessageBody::ApiKeyCreateResponseBody(ApiKeyCreateResponse {
-        key_id: key_prefix,
-        token: raw_key,
-    }))
+    Ok(MessageBody::ApiKeyCreateResponseBody(
+        ApiKeyCreateResponse {
+            key_id: key_prefix,
+            token: raw_key,
+        },
+    ))
 }
 
 #[handler(variant = "ApiKeyRevokeRequest", since = (1, 0))]
@@ -427,7 +419,9 @@ pub fn node_info_request(
         }
     };
 
-    let id_str = String::from_utf8_lossy(&node_id[..]).trim_end_matches('\0').to_string();
+    let id_str = String::from_utf8_lossy(&node_id[..])
+        .trim_end_matches('\0')
+        .to_string();
 
     if id_str == *ctx.state.local_node_id {
         let mut self_id = [0u8; 32];
@@ -536,7 +530,11 @@ pub fn model_install(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ModelInstallRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ModelInstallRequestBody")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelInstallRequestBody",
+            ))
+        }
     };
 
     // Real install pipeline goes through hub/download flow - return accepted=true,
@@ -550,10 +548,7 @@ pub fn model_install(
 #[handler(variant = "ModelDeleteRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn model_delete(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let model_id = match req {
         MessageBody::ModelDeleteRequest { model_id } => model_id,
         _ => return Err(ProtocolError::bad_request("expected ModelDeleteRequest")),
@@ -648,10 +643,7 @@ pub fn hub_model_search(
 #[handler(variant = "FlowListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn flow_list(
-    _req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let flows = repository::list_flows(&ctx.state.db, 0, 1000).map_err(db_err)?;
     let summaries: Vec<FlowSummary> = flows
         .into_iter()
@@ -670,10 +662,7 @@ pub fn flow_list(
 #[handler(variant = "FlowDetailRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn flow_detail(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let flow_id_str = match req {
         MessageBody::FlowDetailRequest { flow_id } => flow_id,
         _ => return Err(ProtocolError::bad_request("expected FlowDetailRequest")),
@@ -692,16 +681,14 @@ pub fn flow_detail(
         description: flow.description,
         graph_json: flow.flow_json,
         enabled: flow.status == "active",
+        status: flow.status,
     }))
 }
 
 #[handler(variant = "FlowCreateRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn flow_create(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::FlowCreateRequestBody(p) => p,
         _ => return Err(ProtocolError::bad_request("expected FlowCreateRequestBody")),
@@ -741,10 +728,7 @@ pub fn flow_create(
 #[handler(variant = "FlowDeleteRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn flow_delete(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let flow_id_str = match req {
         MessageBody::FlowDeleteRequest { flow_id } => flow_id,
         _ => return Err(ProtocolError::bad_request("expected FlowDeleteRequest")),
@@ -786,14 +770,18 @@ pub fn flow_executions_list(
 ) -> Result<MessageBody, ProtocolError> {
     let flow_id_str = match req {
         MessageBody::FlowExecutionsListRequest { flow_id } => flow_id,
-        _ => return Err(ProtocolError::bad_request("expected FlowExecutionsListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected FlowExecutionsListRequest",
+            ))
+        }
     };
     let flow_id: i64 = flow_id_str
         .parse()
         .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
 
-    let execs = repository::list_flow_executions_for_flow(&ctx.state.db, flow_id, 100)
-        .map_err(db_err)?;
+    let execs =
+        repository::list_flow_executions_for_flow(&ctx.state.db, flow_id, 100).map_err(db_err)?;
 
     let summaries: Vec<FlowExecutionSummary> = execs
         .into_iter()
@@ -811,8 +799,500 @@ pub fn flow_executions_list(
 }
 
 // =============================================================================
-// Cluster
+// Flows — FAZA 3: update, node templates, wersje (historia + restore)
 // =============================================================================
+
+#[handler(variant = "FlowUpdateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::FlowUpdateRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected FlowUpdateRequestBody")),
+    };
+
+    let flow_id: i64 = payload
+        .flow_id
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
+
+    let existing = repository::get_flow(&ctx.state.db, flow_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+
+    // Partial update — pola nie przeslane zachowuja wartosci z `existing`.
+    let new_name = payload
+        .name
+        .clone()
+        .unwrap_or_else(|| existing.name.clone());
+    if new_name.trim().is_empty() {
+        return Err(ProtocolError::bad_request("flow name required"));
+    }
+    let new_description = match &payload.description {
+        Some(d) => Some(d.clone()),
+        None => existing.description.clone(),
+    };
+    let new_flow_json = payload
+        .flow_json
+        .clone()
+        .unwrap_or_else(|| existing.flow_json.clone());
+    if serde_json::from_str::<serde_json::Value>(&new_flow_json).is_err() {
+        return Err(ProtocolError::bad_request("invalid flow_json"));
+    }
+    let new_status = payload
+        .status
+        .clone()
+        .unwrap_or_else(|| existing.status.clone());
+
+    // Audyt + podpis snapshotu w flow_versions.
+    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let created_by = user_id_opt.map(|u| u.to_string());
+
+    let params = db::models::FlowParams {
+        name: &new_name,
+        description: new_description.as_deref(),
+        is_default: existing.is_default,
+        service_type: existing.service_type.as_deref(),
+        flow_json: &new_flow_json,
+        status: &new_status,
+    };
+
+    match repository::update_flow_with_snapshot(
+        &ctx.state.db,
+        flow_id,
+        existing.version,
+        &params,
+        created_by.as_deref(),
+    ) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("CONFLICT") => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::BadRequest,
+                "flow version conflict",
+            ));
+        }
+        Err(e) => return Err(db_err(e)),
+    }
+
+    audit(
+        ctx,
+        user_id_opt,
+        "flow.update",
+        Some(&format!("flow:{}", flow_id)),
+        Some(&new_name),
+    );
+
+    Ok(MessageBody::FlowUpdateResponseBody(
+        tentaflow_protocol::FlowUpdateResponse { ok: true },
+    ))
+}
+
+#[handler(variant = "FlowNodeTemplatesListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_node_templates_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let rows = repository::list_flow_node_templates(&ctx.state.db).map_err(db_err)?;
+    let templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
+        .into_iter()
+        .map(|t| tentaflow_protocol::FlowNodeTemplate {
+            id: t.id,
+            node_type: t.node_type,
+            category: t.category,
+            label: t.label,
+            description: t.description,
+            default_config: t.default_config,
+            icon: t.icon,
+        })
+        .collect();
+    Ok(MessageBody::FlowNodeTemplatesListResponseBody(
+        tentaflow_protocol::FlowNodeTemplatesListResponse { templates },
+    ))
+}
+
+#[handler(variant = "FlowVersionListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_version_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::FlowVersionListRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected FlowVersionListRequestBody",
+            ))
+        }
+    };
+    let flow_id: i64 = payload
+        .flow_id
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
+
+    if repository::get_flow(&ctx.state.db, flow_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Err(ProtocolError::not_found("flow not found"));
+    }
+
+    let rows = repository::list_flow_versions(&ctx.state.db, flow_id).map_err(db_err)?;
+    let versions: Vec<tentaflow_protocol::FlowVersionSummary> = rows
+        .into_iter()
+        .map(|v| tentaflow_protocol::FlowVersionSummary {
+            id: v.id.to_string(),
+            flow_id: v.flow_id.to_string(),
+            version_num: v.version_num,
+            name: v.name,
+            description: v.description,
+            status: v.status,
+            created_at_epoch: parse_ts(&v.created_at),
+            created_by: v.created_by,
+        })
+        .collect();
+    Ok(MessageBody::FlowVersionListResponseBody(
+        tentaflow_protocol::FlowVersionListResponse { versions },
+    ))
+}
+
+#[handler(variant = "FlowVersionGetRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn flow_version_get(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::FlowVersionGetRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected FlowVersionGetRequestBody",
+            ))
+        }
+    };
+    let flow_id: i64 = payload
+        .flow_id
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
+    let version_id: i64 = payload
+        .version_id
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("version_id must be integer"))?;
+
+    if repository::get_flow(&ctx.state.db, flow_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Err(ProtocolError::not_found("flow not found"));
+    }
+
+    let v = repository::get_flow_version(&ctx.state.db, flow_id, version_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("flow version not found"))?;
+
+    let full = tentaflow_protocol::FlowVersionFull {
+        id: v.id.to_string(),
+        flow_id: v.flow_id.to_string(),
+        version_num: v.version_num,
+        name: v.name,
+        description: v.description,
+        status: v.status,
+        flow_json: v.flow_json.unwrap_or_default(),
+        created_at_epoch: parse_ts(&v.created_at),
+        created_by: v.created_by,
+    };
+    Ok(MessageBody::FlowVersionGetResponseBody(
+        tentaflow_protocol::FlowVersionGetResponse { version: full },
+    ))
+}
+
+#[handler(variant = "FlowVersionRestoreRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn flow_version_restore(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::FlowVersionRestoreRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected FlowVersionRestoreRequestBody",
+            ))
+        }
+    };
+    let flow_id: i64 = payload
+        .flow_id
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("flow_id must be integer"))?;
+    let version_id: i64 = payload
+        .version_id
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("version_id must be integer"))?;
+
+    let existing = repository::get_flow(&ctx.state.db, flow_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+    let version = repository::get_flow_version(&ctx.state.db, flow_id, version_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("flow version not found"))?;
+
+    let flow_json = version.flow_json.as_deref().unwrap_or("");
+    let params = db::models::FlowParams {
+        name: &version.name,
+        description: version.description.as_deref(),
+        is_default: existing.is_default,
+        service_type: existing.service_type.as_deref(),
+        flow_json,
+        status: version.status.as_deref().unwrap_or("draft"),
+    };
+
+    let user_id_opt = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let created_by = user_id_opt.map(|u| u.to_string());
+
+    match repository::update_flow_with_snapshot(
+        &ctx.state.db,
+        flow_id,
+        existing.version,
+        &params,
+        created_by.as_deref(),
+    ) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("CONFLICT") => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::BadRequest,
+                "flow version conflict",
+            ));
+        }
+        Err(e) => return Err(db_err(e)),
+    }
+
+    audit(
+        ctx,
+        user_id_opt,
+        "flow.version.restore",
+        Some(&format!("flow:{}", flow_id)),
+        Some(&format!("version:{}", version_id)),
+    );
+
+    Ok(MessageBody::FlowVersionRestoreResponseBody(
+        tentaflow_protocol::FlowVersionRestoreResponse { ok: true },
+    ))
+}
+
+// =============================================================================
+// Clusters — list/detail/create/update/delete + member ops
+// =============================================================================
+
+/// Konwertuje SQLite "YYYY-MM-DD HH:MM:SS" do i64 epoch sekund.
+fn parse_ts_i64(s: &str) -> i64 {
+    parse_ts(s) as i64
+}
+
+fn db_cluster_to_info(
+    cluster: &crate::db::models::DbCluster,
+    members_count: u32,
+    members_online: u32,
+) -> tentaflow_protocol::ClusterInfo {
+    tentaflow_protocol::ClusterInfo {
+        id: cluster.cluster_id.clone(),
+        name: cluster.name.clone(),
+        description: if cluster.description.is_empty() {
+            None
+        } else {
+            Some(cluster.description.clone())
+        },
+        strategy: cluster.strategy.clone(),
+        // Status klastra wyprowadzamy z liczby online czlonkow.
+        status: if members_online == 0 {
+            "inactive".to_string()
+        } else {
+            "active".to_string()
+        },
+        members_count,
+        members_online,
+        created_at: parse_ts_i64(&cluster.created_at),
+        updated_at: parse_ts_i64(&cluster.updated_at),
+        failover_enabled: cluster.failover_enabled,
+        failover_target: cluster.failover_target.clone(),
+        health_check_interval_ms: cluster.health_check_interval_ms as u32,
+        timeout_ms: cluster.timeout_ms as u32,
+    }
+}
+
+/// Liczy ilu czlonkow klastra ma status "online" w peer_store.
+fn count_online_members(ctx: &HandlerContext, cluster_id: &str) -> (u32, u32) {
+    let members = match repository::list_cluster_members(&ctx.state.db, cluster_id) {
+        Ok(m) => m,
+        Err(_) => return (0, 0),
+    };
+    let total = members.len() as u32;
+    let online = members
+        .iter()
+        .filter(|m| {
+            ctx.state
+                .mesh_peer_store
+                .get(&m.node_id)
+                .map(|p| p.status == "online")
+                .unwrap_or(false)
+        })
+        .count() as u32;
+    (total, online)
+}
+
+#[handler(variant = "ClusterListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn cluster_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let rows = repository::list_clusters_with_counts(&ctx.state.db).map_err(db_err)?;
+    let clusters: Vec<tentaflow_protocol::ClusterInfo> = rows
+        .into_iter()
+        .map(|r| {
+            let (_, online) = count_online_members(ctx, &r.cluster.cluster_id);
+            db_cluster_to_info(&r.cluster, r.members_count as u32, online)
+        })
+        .collect();
+    Ok(MessageBody::ClusterListResponseBody(
+        tentaflow_protocol::ClusterListResponse { clusters },
+    ))
+}
+
+#[handler(variant = "ClusterDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn cluster_detail(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ClusterDetailRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ClusterDetailRequestBody",
+            ))
+        }
+    };
+
+    let cluster = repository::get_cluster(&ctx.state.db, &payload.cluster_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("cluster not found"))?;
+    let db_members =
+        repository::list_cluster_members(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
+
+    let (total, online) = count_online_members(ctx, &payload.cluster_id);
+    let info = db_cluster_to_info(&cluster, total, online);
+
+    let members: Vec<tentaflow_protocol::ClusterMember> = db_members
+        .into_iter()
+        .map(|m| {
+            let peer = ctx.state.mesh_peer_store.get(&m.node_id);
+            tentaflow_protocol::ClusterMember {
+                node_id: m.node_id.clone(),
+                hostname: peer
+                    .as_ref()
+                    .map(|p| {
+                        if p.hostname.is_empty() {
+                            m.node_id.clone()
+                        } else {
+                            p.hostname.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| m.node_id.clone()),
+                status: peer
+                    .map(|p| p.status)
+                    .unwrap_or_else(|| "offline".to_string()),
+                interface_type: if m.interface_type.is_empty() {
+                    None
+                } else {
+                    Some(m.interface_type)
+                },
+                interface_speed_mbps: if m.interface_speed_mbps > 0 {
+                    Some(m.interface_speed_mbps as u32)
+                } else {
+                    None
+                },
+                joined_at: parse_ts_i64(&m.joined_at),
+            }
+        })
+        .collect();
+
+    Ok(MessageBody::ClusterDetailResponseBody(
+        tentaflow_protocol::ClusterDetailResponse {
+            cluster: info,
+            members,
+        },
+    ))
+}
+
+#[handler(variant = "ClusterCreateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn cluster_create(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ClusterCreateRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ClusterCreateRequestBody",
+            ))
+        }
+    };
+
+    if payload.name.trim().is_empty() {
+        return Err(ProtocolError::bad_request("name required"));
+    }
+    let allowed = ["distributed", "replicated", "primary_replica"];
+    if !allowed.contains(&payload.strategy.as_str()) {
+        return Err(ProtocolError::bad_request(
+            "strategy must be distributed/replicated/primary_replica",
+        ));
+    }
+
+    let cluster_id = uuid::Uuid::new_v4().to_string();
+    let description = payload.description.as_deref().unwrap_or("");
+    repository::create_cluster(
+        &ctx.state.db,
+        &cluster_id,
+        &payload.name,
+        description,
+        &payload.strategy,
+    )
+    .map_err(db_err)?;
+
+    repository::update_cluster_full(
+        &ctx.state.db,
+        &cluster_id,
+        None,
+        None,
+        None,
+        Some(payload.failover_enabled),
+        Some(payload.failover_target.as_deref()),
+        Some(payload.health_check_interval_ms as i64),
+        Some(payload.timeout_ms as i64),
+    )
+    .map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "cluster.create",
+        Some(&format!("cluster:{}", cluster_id)),
+        Some(&payload.name),
+    );
+
+    Ok(MessageBody::ClusterCreateResponseBody(
+        tentaflow_protocol::ClusterCreateResponse { cluster_id },
+    ))
+}
 
 #[handler(variant = "ClusterUpdateRequest", since = (1, 0))]
 #[policy(Admin)]
@@ -823,15 +1303,44 @@ pub fn cluster_update(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ClusterUpdateRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ClusterUpdateRequestBody")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ClusterUpdateRequestBody",
+            ))
+        }
     };
 
-    repository::update_cluster(
+    if repository::get_cluster(&ctx.state.db, &payload.cluster_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Ok(MessageBody::ClusterUpdateResponseBody(
+            tentaflow_protocol::ClusterUpdateResponse { ok: false },
+        ));
+    }
+
+    if let Some(s) = &payload.strategy {
+        let allowed = ["distributed", "replicated", "primary_replica"];
+        if !allowed.contains(&s.as_str()) {
+            return Err(ProtocolError::bad_request(
+                "strategy must be distributed/replicated/primary_replica",
+            ));
+        }
+    }
+
+    repository::update_cluster_full(
         &ctx.state.db,
         &payload.cluster_id,
-        &payload.name,
-        payload.description.as_deref().unwrap_or(""),
-        "round_robin",
+        payload.name.as_deref(),
+        payload.description.as_deref(),
+        payload.strategy.as_deref(),
+        payload.failover_enabled,
+        // Convertujemy Option<String> na Option<Option<&str>> — Some(None) NIE oznacza
+        // tutaj wyczyszczenia (rkyv encoding nie odroznia "missing" od "set to null").
+        // Aktualizujemy failover_target tylko gdy klient go podal.
+        payload.failover_target.as_ref().map(|s| Some(s.as_str())),
+        payload.health_check_interval_ms.map(|v| v as i64),
+        payload.timeout_ms.map(|v| v as i64),
     )
     .map_err(db_err)?;
 
@@ -842,15 +1351,159 @@ pub fn cluster_update(
         None,
         "cluster.update",
         Some(&format!("cluster:{}", payload.cluster_id)),
-        Some(&payload.name),
+        payload.name.as_deref(),
         None,
         Some(&ctx.state.local_node_id),
     );
 
-    Ok(MessageBody::ClusterUpdateResponseBody(ClusterUpdateResponse {
-        cluster_id: payload.cluster_id.clone(),
-        updated_at_epoch: chrono::Utc::now().timestamp() as u64,
-    }))
+    Ok(MessageBody::ClusterUpdateResponseBody(
+        tentaflow_protocol::ClusterUpdateResponse { ok: true },
+    ))
+}
+
+#[handler(variant = "ClusterDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn cluster_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ClusterDeleteRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ClusterDeleteRequestBody",
+            ))
+        }
+    };
+
+    if repository::get_cluster(&ctx.state.db, &payload.cluster_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Ok(MessageBody::ClusterDeleteResponseBody(
+            tentaflow_protocol::ClusterDeleteResponse { ok: false },
+        ));
+    }
+
+    repository::delete_cluster(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        user_id,
+        None,
+        "cluster.delete",
+        Some(&format!("cluster:{}", payload.cluster_id)),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+
+    Ok(MessageBody::ClusterDeleteResponseBody(
+        tentaflow_protocol::ClusterDeleteResponse { ok: true },
+    ))
+}
+
+#[handler(variant = "ClusterAddMemberRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn cluster_add_member(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ClusterAddMemberRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ClusterAddMemberRequestBody",
+            ))
+        }
+    };
+
+    if repository::get_cluster(&ctx.state.db, &payload.cluster_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Err(ProtocolError::not_found("cluster not found"));
+    }
+
+    repository::add_cluster_member(
+        &ctx.state.db,
+        &payload.cluster_id,
+        &payload.node_id,
+        "worker",
+        "",
+        "",
+        payload.interface_speed_mbps.map(|v| v as i64).unwrap_or(0),
+        payload.interface_type.as_deref().unwrap_or(""),
+    )
+    .map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        user_id,
+        None,
+        "cluster.add_member",
+        Some(&format!(
+            "cluster:{}/node:{}",
+            payload.cluster_id, payload.node_id
+        )),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+
+    Ok(MessageBody::ClusterAddMemberResponseBody(
+        tentaflow_protocol::ClusterAddMemberResponse { ok: true },
+    ))
+}
+
+#[handler(variant = "ClusterRemoveMemberRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn cluster_remove_member(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ClusterRemoveMemberRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ClusterRemoveMemberRequestBody",
+            ))
+        }
+    };
+
+    if repository::get_cluster(&ctx.state.db, &payload.cluster_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Err(ProtocolError::not_found("cluster not found"));
+    }
+
+    repository::remove_cluster_member(&ctx.state.db, &payload.cluster_id, &payload.node_id)
+        .map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        user_id,
+        None,
+        "cluster.remove_member",
+        Some(&format!(
+            "cluster:{}/node:{}",
+            payload.cluster_id, payload.node_id
+        )),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+
+    Ok(MessageBody::ClusterRemoveMemberResponseBody(
+        tentaflow_protocol::ClusterRemoveMemberResponse { ok: true },
+    ))
 }
 
 // =============================================================================
@@ -903,7 +1556,11 @@ pub fn mesh_pair_init(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MeshPairInitRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected MeshPairInitRequestBody")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MeshPairInitRequestBody",
+            ))
+        }
     };
 
     if payload.pin.len() != 6 || !payload.pin.chars().all(|c| c.is_ascii_digit()) {
@@ -932,10 +1589,12 @@ pub fn mesh_pair_init(
     // Real handshake (Ed25519+PIN) wykonuje IrohMeshManager — handler tu
     // tylko rejestruje intencje pair init. UI obserwuje peer status zmiany
     // przez MeshPeersList polling lub future subscription.
-    Ok(MessageBody::MeshPairInitResponseBody(MeshPairInitResponse {
-        pair_id,
-        expires_at_epoch: (chrono::Utc::now().timestamp() + 300) as u64,
-    }))
+    Ok(MessageBody::MeshPairInitResponseBody(
+        MeshPairInitResponse {
+            pair_id,
+            expires_at_epoch: (chrono::Utc::now().timestamp() + 300) as u64,
+        },
+    ))
 }
 
 // =============================================================================
@@ -978,7 +1637,11 @@ pub fn settings_update(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::SettingsUpdateRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected SettingsUpdateRequestBody")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SettingsUpdateRequestBody",
+            ))
+        }
     };
 
     let mut applied = 0u32;
@@ -1012,6 +1675,181 @@ pub fn settings_update(
     );
 
     Ok(MessageBody::SettingsUpdateResponse { applied })
+}
+
+// =============================================================================
+// SSO / TLS / NGC (FAZA 4 — REST → binary)
+// =============================================================================
+
+#[handler(variant = "SsoProvidersListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn sso_providers_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let providers = repository::list_sso_providers(&ctx.state.db).map_err(db_err)?;
+    let entries: Vec<tentaflow_protocol::SsoProviderEntry> = providers
+        .into_iter()
+        .map(|p| tentaflow_protocol::SsoProviderEntry {
+            id: p.id,
+            name: p.name,
+            provider_type: p.provider_type,
+            discovery_url: p.discovery_url,
+            enabled: p.enabled,
+            auto_create_users: p.auto_create_users,
+            default_group_id: p.default_group_id,
+            created_at: p.created_at,
+        })
+        .collect();
+    Ok(MessageBody::SsoProvidersListResponseBody(
+        tentaflow_protocol::SsoProvidersListResponse { providers: entries },
+    ))
+}
+
+#[handler(variant = "SsoProviderCreateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn sso_provider_create(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SsoProviderCreateRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SsoProviderCreateRequestBody",
+            ))
+        }
+    };
+
+    if payload.name.is_empty() || payload.client_id.is_empty() || payload.client_secret.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "name, client_id i client_secret sa wymagane",
+        ));
+    }
+    let valid_types = ["oidc", "azure_ad", "google", "adfs", "authentik"];
+    if !valid_types.contains(&payload.provider_type.as_str()) {
+        return Err(ProtocolError::bad_request(format!(
+            "Nieznany typ providera. Dostepne: {}",
+            valid_types.join(", ")
+        )));
+    }
+    if !payload.discovery_url.starts_with("http://")
+        && !payload.discovery_url.starts_with("https://")
+    {
+        return Err(ProtocolError::bad_request(
+            "Discovery URL musi zaczynac sie od http:// lub https://",
+        ));
+    }
+    if repository::get_sso_provider_by_name(&ctx.state.db, &payload.name)
+        .map_err(db_err)?
+        .is_some()
+    {
+        return Err(ProtocolError::bad_request(
+            "Provider o tej nazwie juz istnieje",
+        ));
+    }
+
+    let encrypted_secret = ctx
+        .state
+        .cipher
+        .encrypt(&payload.client_secret)
+        .map_err(|e| ProtocolError::internal(format!("blad szyfrowania: {}", e)))?;
+
+    let id = repository::create_sso_provider(
+        &ctx.state.db,
+        &payload.name,
+        &payload.provider_type,
+        &payload.client_id,
+        &encrypted_secret,
+        &payload.discovery_url,
+        payload.auto_create_users,
+        payload.default_group_id,
+    )
+    .map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "sso.provider.create",
+        Some(&payload.name),
+        Some(&format!("type={}", payload.provider_type)),
+    );
+
+    Ok(MessageBody::SsoProviderCreateResponseBody(
+        tentaflow_protocol::SsoProviderCreateResponse {
+            id,
+            name: payload.name.clone(),
+            provider_type: payload.provider_type.clone(),
+        },
+    ))
+}
+
+#[handler(variant = "SsoProviderDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn sso_provider_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::SsoProviderDeleteRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected SsoProviderDeleteRequestBody",
+            ))
+        }
+    };
+
+    let provider = repository::get_sso_provider(&ctx.state.db, payload.id).map_err(db_err)?;
+    let name = provider
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
+    repository::delete_sso_provider(&ctx.state.db, payload.id).map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(ctx, user_id, "sso.provider.delete", Some(&name), None);
+
+    Ok(MessageBody::SsoProviderDeleteResponseBody(
+        tentaflow_protocol::SsoProviderDeleteResponse {
+            deleted: provider.is_some(),
+        },
+    ))
+}
+
+#[handler(variant = "TlsStatusRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn tls_status(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let cert = repository::get_setting(&ctx.state.db, "tls_cert_pem")
+        .map_err(db_err)?
+        .unwrap_or_default();
+    let key = repository::get_setting(&ctx.state.db, "tls_key_pem")
+        .map_err(db_err)?
+        .unwrap_or_default();
+    Ok(MessageBody::TlsStatusResponseBody(
+        tentaflow_protocol::TlsStatusResponse {
+            has_cert: !cert.is_empty(),
+            has_key: !key.is_empty(),
+        },
+    ))
+}
+
+#[handler(variant = "NgcStatusRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn ngc_status(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let key = repository::get_setting(&ctx.state.db, "ngc_api_key")
+        .map_err(db_err)?
+        .unwrap_or_default();
+    Ok(MessageBody::NgcStatusResponseBody(
+        tentaflow_protocol::NgcStatusResponse {
+            configured: !key.is_empty(),
+        },
+    ))
 }
 
 // =============================================================================
@@ -1070,11 +1908,8 @@ pub fn service_list(
                     .find(|p| p.node_id == *nid)
                     .map(|p| p.hostname.clone())
             });
-            let (engine_id, model_id, deploy_method, endpoint_url) = extract_deploy_fields(
-                &s.service_type,
-                &s.strategy,
-                &s.config_json,
-            );
+            let (engine_id, model_id, deploy_method, endpoint_url) =
+                extract_deploy_fields(&s.service_type, &s.strategy, &s.config_json);
             ServiceSummary {
                 id: s.id.to_string(),
                 name: s.name,
@@ -1093,7 +1928,9 @@ pub fn service_list(
             }
         })
         .collect();
-    Ok(MessageBody::ServiceListResponse { services: summaries })
+    Ok(MessageBody::ServiceListResponse {
+        services: summaries,
+    })
 }
 
 /// Wyciaga pola specyficzne dla deployu silnika z config_json serwisu.
@@ -1104,7 +1941,12 @@ fn extract_deploy_fields(
     service_type: &str,
     strategy: &str,
     config_json: &str,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let parsed: serde_json::Value = match serde_json::from_str(config_json) {
         Ok(v) => v,
         Err(_) => return (None, None, None, None),
@@ -1147,7 +1989,11 @@ pub fn service_create(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ServiceCreateRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ServiceCreateRequestBody")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceCreateRequestBody",
+            ))
+        }
     };
 
     if payload.name.trim().is_empty() {
@@ -1202,9 +2048,7 @@ pub fn service_create(
         Some(&ctx.state.local_node_id),
     );
 
-    Ok(MessageBody::ServiceCreateResponse {
-        id: id.to_string(),
-    })
+    Ok(MessageBody::ServiceCreateResponse { id: id.to_string() })
 }
 
 #[handler(variant = "ServiceUpdateRequest", since = (1, 0))]
@@ -1216,7 +2060,11 @@ pub fn service_update(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ServiceUpdateRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ServiceUpdateRequestBody")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceUpdateRequestBody",
+            ))
+        }
     };
 
     let id: i64 = payload
@@ -1321,13 +2169,22 @@ pub fn service_deploy(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::ServiceDeployRequestBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected ServiceDeployRequestBody")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceDeployRequestBody",
+            ))
+        }
     };
 
     if payload.engine_id.is_empty() || payload.model_id.is_empty() {
-        return Err(ProtocolError::bad_request("engine_id and model_id required"));
+        return Err(ProtocolError::bad_request(
+            "engine_id and model_id required",
+        ));
     }
-    if !matches!(payload.deploy_method.as_str(), "docker" | "native" | "external") {
+    if !matches!(
+        payload.deploy_method.as_str(),
+        "docker" | "native" | "external"
+    ) {
         return Err(ProtocolError::bad_request(
             "deploy_method must be docker/native/external",
         ));
@@ -1376,10 +2233,7 @@ pub fn service_deploy(
 #[handler(variant = "ServiceStopRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn service_stop(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn service_stop(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let service_id_str = match req {
         MessageBody::ServiceStopRequest { service_id } => service_id,
         _ => return Err(ProtocolError::bad_request("expected ServiceStopRequest")),
@@ -1420,10 +2274,7 @@ pub fn service_stop(
 #[handler(variant = "PromptListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn prompt_list(
-    _req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn prompt_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let prompts = repository::list_prompts(&ctx.state.db, 0, 1000).map_err(db_err)?;
     let summaries: Vec<PromptSummary> = prompts
         .into_iter()
@@ -1661,8 +2512,7 @@ pub fn fast_path_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let patterns =
-        repository::list_fast_path_patterns(&ctx.state.db, 0, 1000).map_err(db_err)?;
+    let patterns = repository::list_fast_path_patterns(&ctx.state.db, 0, 1000).map_err(db_err)?;
     let summaries: Vec<tentaflow_protocol::FastPathPattern> = patterns
         .into_iter()
         .map(|p| tentaflow_protocol::FastPathPattern {
@@ -1678,3 +2528,1032 @@ pub fn fast_path_list(
 }
 
 // SubscribeResumeRequest jest streaming handlerem (patrz stream_handlers.rs).
+
+// =============================================================================
+// Mesh read-only views (FAZA 1a — REST → binary handlery)
+// =============================================================================
+
+use crate::mesh::peer_store::{MeshPeerInfo as StorePeerInfo, PeerGpuInfo as StoreGpu};
+
+fn first_non_loopback_ip_str(addresses: &[std::net::IpAddr]) -> Option<String> {
+    addresses
+        .iter()
+        .find(|a| a.is_ipv4() && !a.is_loopback())
+        .map(|a| a.to_string())
+}
+
+fn aggregate_gpu(gpus: &[StoreGpu]) -> Option<tentaflow_protocol::MeshNodeGpuInfo> {
+    if gpus.is_empty() {
+        return None;
+    }
+    // Pierwsze GPU jako "primary" — UI dashboardu pokazuje agregat.
+    let g = &gpus[0];
+    Some(tentaflow_protocol::MeshNodeGpuInfo {
+        vendor: if g.name.to_lowercase().contains("nvidia") {
+            "nvidia".to_string()
+        } else if g.name.to_lowercase().contains("amd") {
+            "amd".to_string()
+        } else {
+            "unknown".to_string()
+        },
+        name: g.name.clone(),
+        vram_total_mb: g.vram_total_mb,
+        vram_used_mb: Some(g.vram_used_mb),
+        temperature_c: Some(g.temperature_c as f32),
+        power_draw_w: g.power_draw_w,
+        utilization_percent: Some(g.usage_percent),
+        driver_version: None,
+        cuda_version: None,
+    })
+}
+
+fn store_peer_to_proto(
+    p: &StorePeerInfo,
+    local_node_id: &str,
+    is_trusted: bool,
+    route: Option<tentaflow_protocol::MeshNodeRoute>,
+) -> tentaflow_protocol::MeshNodeInfo {
+    let is_local = p.node_id == local_node_id;
+    let source = if is_local {
+        "local"
+    } else if is_trusted {
+        "trusted"
+    } else {
+        "discovered"
+    };
+
+    let interfaces: Vec<tentaflow_protocol::MeshNodeNetworkInterface> = p
+        .networks
+        .iter()
+        .map(|n| tentaflow_protocol::MeshNodeNetworkInterface {
+            name: n.name.clone(),
+            link_up: n.link_up,
+            speed_mbps: n.speed_mbps.map(|v| v as u32),
+            ipv4_address: if n.ipv4_address.is_empty() {
+                None
+            } else {
+                Some(n.ipv4_address.clone())
+            },
+            interface_type: if n.interface_type.is_empty() {
+                None
+            } else {
+                Some(n.interface_type.clone())
+            },
+            rdma_available: Some(n.rdma_available),
+            roce_available: None,
+            numa_node: n.numa_node,
+            rx_bytes_per_sec: Some(n.rx_bytes_per_sec),
+            tx_bytes_per_sec: Some(n.tx_bytes_per_sec),
+        })
+        .collect();
+
+    let models: Vec<tentaflow_protocol::MeshNodeModel> = p
+        .models
+        .iter()
+        .map(|m| tentaflow_protocol::MeshNodeModel {
+            alias: m.alias.clone(),
+            kind: if m.kind.is_empty() {
+                None
+            } else {
+                Some(m.kind.clone())
+            },
+            backend: if m.backend.is_empty() {
+                None
+            } else {
+                Some(m.backend.clone())
+            },
+            size_mb: if m.size_mb == 0 {
+                None
+            } else {
+                Some(m.size_mb)
+            },
+            loaded: m.loaded,
+        })
+        .collect();
+
+    let containers: Vec<tentaflow_protocol::MeshNodeContainer> = p
+        .containers
+        .iter()
+        .map(|c| tentaflow_protocol::MeshNodeContainer {
+            name: c.name.clone(),
+            image: c.image.clone(),
+            status: c.status.clone(),
+            cpu_percent: Some(c.cpu_percent),
+            memory_mb: Some(c.memory_mb),
+            memory_limit_mb: if c.memory_limit_mb == 0 {
+                None
+            } else {
+                Some(c.memory_limit_mb)
+            },
+        })
+        .collect();
+
+    // Sumaryczne VRAM po wszystkich GPU (UI dashboardu pokazuje tak ten zbior).
+    let (vram_total, vram_used, gpu_load) = if p.gpu_info.is_empty() {
+        (None, None, None)
+    } else {
+        let total: u64 = p.gpu_info.iter().map(|g| g.vram_total_mb).sum();
+        let used: u64 = p.gpu_info.iter().map(|g| g.vram_used_mb).sum();
+        let load: f32 =
+            p.gpu_info.iter().map(|g| g.usage_percent).sum::<f32>() / p.gpu_info.len() as f32;
+        (Some(total), Some(used), Some(load))
+    };
+
+    tentaflow_protocol::MeshNodeInfo {
+        node_id: p.node_id.clone(),
+        hostname: p.hostname.clone(),
+        ip: first_non_loopback_ip_str(&p.addresses),
+        status: p.status.clone(),
+        source: source.to_string(),
+        is_local,
+        uptime_secs: None,
+        gpu_info: aggregate_gpu(&p.gpu_info),
+        network_interfaces: interfaces,
+        cpu_count: Some(p.cpu_count),
+        cpu_usage_percent: Some(p.cpu_usage_percent),
+        ram_total_mb: Some(p.ram_total_mb),
+        ram_used_mb: Some(p.ram_used_mb),
+        vram_total_mb: vram_total,
+        vram_used_mb: vram_used,
+        gpu_load_percent: gpu_load,
+        models,
+        containers,
+        last_seen_epoch: Some(parse_ts(&p.discovered_at) as i64),
+        route,
+    }
+}
+
+fn is_loopback_or_local_dup(p: &StorePeerInfo, local_node_id: &str) -> bool {
+    if p.node_id == local_node_id {
+        return false;
+    }
+    if p.hostname == "127.0.0.1" || p.hostname == "::1" {
+        return true;
+    }
+    !p.addresses.is_empty() && p.addresses.iter().all(|a| a.is_loopback())
+}
+
+#[handler(variant = "MeshNodeListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_node_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let store = &ctx.state.mesh_peer_store;
+    let local_node_id = ctx.state.local_node_id.as_ref();
+    let peers = store.list();
+    let trusted_db = repository::list_trusted_nodes(&ctx.state.db).map_err(db_err)?;
+    let trusted_ids: std::collections::HashSet<String> =
+        trusted_db.iter().map(|t| t.node_id.clone()).collect();
+
+    let mut nodes: Vec<tentaflow_protocol::MeshNodeInfo> = peers
+        .iter()
+        .filter(|p| p.node_id == local_node_id || !is_loopback_or_local_dup(p, local_node_id))
+        .map(|p| {
+            let is_local = p.node_id == local_node_id;
+            let is_trusted = is_local
+                || trusted_ids.contains(&p.node_id)
+                || ctx
+                    .state
+                    .mesh_security
+                    .as_ref()
+                    .map_or(false, |s| s.is_trusted(&p.node_id));
+            let route = if is_local {
+                Some(tentaflow_protocol::MeshNodeRoute {
+                    hops: 0,
+                    direct: true,
+                    next_hop: None,
+                })
+            } else {
+                store
+                    .get_route(&p.node_id)
+                    .map(|r| tentaflow_protocol::MeshNodeRoute {
+                        hops: r.hops as u32,
+                        direct: r.direct,
+                        next_hop: if r.direct {
+                            None
+                        } else {
+                            Some(r.next_hop.clone())
+                        },
+                    })
+            };
+            store_peer_to_proto(p, local_node_id, is_trusted, route)
+        })
+        .collect();
+
+    let peer_ids: std::collections::HashSet<String> =
+        peers.iter().map(|p| p.node_id.clone()).collect();
+    for t in &trusted_db {
+        if t.node_id == local_node_id
+            || t.hostname == "127.0.0.1"
+            || t.hostname == "::1"
+            || peer_ids.contains(&t.node_id)
+        {
+            continue;
+        }
+        nodes.push(tentaflow_protocol::MeshNodeInfo {
+            node_id: t.node_id.clone(),
+            hostname: t.hostname.clone(),
+            ip: None,
+            status: if t.is_active { "offline" } else { "inactive" }.to_string(),
+            source: "trusted".to_string(),
+            is_local: false,
+            uptime_secs: None,
+            gpu_info: None,
+            network_interfaces: Vec::new(),
+            cpu_count: None,
+            cpu_usage_percent: None,
+            ram_total_mb: None,
+            ram_used_mb: None,
+            vram_total_mb: None,
+            vram_used_mb: None,
+            gpu_load_percent: None,
+            models: Vec::new(),
+            containers: Vec::new(),
+            last_seen_epoch: None,
+            route: None,
+        });
+    }
+
+    Ok(MessageBody::MeshNodeListResponseBody(
+        tentaflow_protocol::MeshNodeListResponse { nodes },
+    ))
+}
+
+#[handler(variant = "MeshNodeDetailRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_node_detail(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MeshNodeDetailRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MeshNodeDetailRequestBody",
+            ))
+        }
+    };
+
+    let store = &ctx.state.mesh_peer_store;
+    let local_node_id = ctx.state.local_node_id.as_ref();
+    let peer = store.get(&payload.node_id).ok_or_else(|| {
+        ProtocolError::not_found(format!("node '{}' nie znaleziony", payload.node_id))
+    })?;
+    let is_local = peer.node_id == local_node_id;
+    let trusted = repository::list_trusted_nodes(&ctx.state.db).map_err(db_err)?;
+    let is_trusted = is_local
+        || trusted.iter().any(|t| t.node_id == peer.node_id)
+        || ctx
+            .state
+            .mesh_security
+            .as_ref()
+            .map_or(false, |s| s.is_trusted(&peer.node_id));
+    let route = if is_local {
+        Some(tentaflow_protocol::MeshNodeRoute {
+            hops: 0,
+            direct: true,
+            next_hop: None,
+        })
+    } else {
+        store
+            .get_route(&peer.node_id)
+            .map(|r| tentaflow_protocol::MeshNodeRoute {
+                hops: r.hops as u32,
+                direct: r.direct,
+                next_hop: if r.direct {
+                    None
+                } else {
+                    Some(r.next_hop.clone())
+                },
+            })
+    };
+    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route);
+    Ok(MessageBody::MeshNodeDetailResponseBody(
+        tentaflow_protocol::MeshNodeDetailResponse { node: info },
+    ))
+}
+
+#[handler(variant = "MeshPendingListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_pending_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let _ = repository::cleanup_expired_pairings(&ctx.state.db);
+    let pairings = repository::list_pending_pairings(&ctx.state.db).map_err(db_err)?;
+    let pending: Vec<tentaflow_protocol::MeshPendingPair> = pairings
+        .into_iter()
+        .map(|p| tentaflow_protocol::MeshPendingPair {
+            pair_id: p.id.to_string(),
+            remote_node_id: p.remote_node_id,
+            remote_hostname: None,
+            remote_ip: None,
+            initiated_at: parse_ts(&p.expires_at) as i64,
+            state: p.direction,
+            pin: if p.pin_code.is_empty() {
+                None
+            } else {
+                Some(p.pin_code)
+            },
+        })
+        .collect();
+    Ok(MessageBody::MeshPendingListResponseBody(
+        tentaflow_protocol::MeshPendingListResponse { pending },
+    ))
+}
+
+#[handler(variant = "MeshIdentityRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_identity(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let sec = ctx
+        .state
+        .mesh_security
+        .as_ref()
+        .ok_or_else(|| ProtocolError::internal("MeshSecurity niedostepny"))?;
+    let addresses: Vec<String> = ctx
+        .state
+        .mesh_peer_store
+        .get(ctx.state.local_node_id.as_ref())
+        .map(|p| {
+            p.addresses
+                .iter()
+                .map(|a| format!("{}:{}", a, p.port))
+                .collect()
+        })
+        .unwrap_or_default();
+    let hostname = ctx
+        .state
+        .mesh_peer_store
+        .get(ctx.state.local_node_id.as_ref())
+        .map(|p| p.hostname)
+        .unwrap_or_default();
+    Ok(MessageBody::MeshIdentityResponseBody(
+        tentaflow_protocol::MeshIdentityResponse {
+            node_id: ctx.state.local_node_id.to_string(),
+            hostname,
+            public_key: sec.public_key_hex(),
+            addresses,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+    ))
+}
+
+#[handler(variant = "MeshServicesListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_services_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let services: Vec<tentaflow_protocol::MeshServicesEntry> = match &ctx.state.quic_mesh {
+        Some(qm) => qm
+            .service_registry()
+            .visible_services()
+            .into_iter()
+            .map(|s| tentaflow_protocol::MeshServicesEntry {
+                service_name: s.service_name,
+                node_id: s.node_id,
+                status: s.status,
+                endpoint: if s.quic_url.is_empty() {
+                    None
+                } else {
+                    Some(s.quic_url)
+                },
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(MessageBody::MeshServicesListResponseBody(
+        tentaflow_protocol::MeshServicesListResponse { services },
+    ))
+}
+
+#[handler(variant = "MeshTrustedListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn mesh_trusted_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let trusted = repository::list_trusted_nodes(&ctx.state.db).map_err(db_err)?;
+    let nodes: Vec<tentaflow_protocol::MeshTrustedNode> = trusted
+        .into_iter()
+        .map(|t| tentaflow_protocol::MeshTrustedNode {
+            node_id: t.node_id,
+            hostname: if t.hostname.is_empty() {
+                None
+            } else {
+                Some(t.hostname)
+            },
+            trusted_since_epoch: parse_ts(&t.approved_at) as i64,
+        })
+        .collect();
+    Ok(MessageBody::MeshTrustedListResponseBody(
+        tentaflow_protocol::MeshTrustedListResponse { trusted: nodes },
+    ))
+}
+
+// =============================================================================
+// Models unified + aliasy (FAZA 2 — REST → binary)
+// =============================================================================
+
+/// Mapuje `DbModelAlias` na `ModelAliasEntry` protokolu.
+fn db_alias_to_proto(a: crate::db::models::DbModelAlias) -> tentaflow_protocol::ModelAliasEntry {
+    tentaflow_protocol::ModelAliasEntry {
+        id: a.id,
+        alias: a.alias,
+        target_model: a.target_model,
+        is_active: a.is_active,
+        fallback_targets: a.fallback_targets,
+        strategy: a.strategy,
+    }
+}
+
+#[handler(variant = "ModelsUnifiedListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn models_unified_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let unified = crate::api::dashboard::api_models::collect_unified(&ctx.state.quic_mesh);
+    let models = unified
+        .into_iter()
+        .map(|m| tentaflow_protocol::UnifiedModel {
+            model_name: m.model_name,
+            service_type: m.service_type,
+            instances: m
+                .instances
+                .into_iter()
+                .map(|i| tentaflow_protocol::UnifiedModelInstance {
+                    node_id: i.node_id,
+                    node_hostname: if i.node_name.is_empty() {
+                        None
+                    } else {
+                        Some(i.node_name)
+                    },
+                    service_id: i.service_id,
+                    status: i.status,
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(MessageBody::ModelsUnifiedListResponseBody(
+        tentaflow_protocol::ModelsUnifiedListResponse { models },
+    ))
+}
+
+#[handler(variant = "ModelAliasListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn model_alias_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let items = crate::api::dashboard::api_models::list_aliases(&ctx.state.db).map_err(db_err)?;
+    let aliases = items.into_iter().map(db_alias_to_proto).collect();
+    Ok(MessageBody::ModelAliasListResponseBody(
+        tentaflow_protocol::ModelAliasListResponse { aliases },
+    ))
+}
+
+#[handler(variant = "ModelAliasCreateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_alias_create(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ModelAliasCreateRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelAliasCreateRequestBody",
+            ))
+        }
+    };
+
+    let id = crate::api::dashboard::api_models::create_alias(
+        &ctx.state.db,
+        &payload.alias,
+        &payload.target_model,
+        payload.strategy.as_deref(),
+        payload.fallback_targets.as_deref(),
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    crate::api::dashboard::api_models::broadcast_alias_mutation(
+        &ctx.state.db,
+        &ctx.state.router,
+        &ctx.state.quic_mesh,
+    );
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "model_alias_create",
+        Some(&payload.alias),
+        Some(&format!("target={}", payload.target_model)),
+    );
+
+    Ok(MessageBody::ModelAliasCreateResponseBody(
+        tentaflow_protocol::ModelAliasCreateResponse { id },
+    ))
+}
+
+#[handler(variant = "ModelAliasUpdateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_alias_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ModelAliasUpdateRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelAliasUpdateRequestBody",
+            ))
+        }
+    };
+
+    let updated = crate::api::dashboard::api_models::update_alias(
+        &ctx.state.db,
+        payload.id,
+        &payload.alias,
+        &payload.target_model,
+        payload.is_active.unwrap_or(true),
+        payload.strategy.as_deref(),
+        payload.fallback_targets.as_deref(),
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    if !updated {
+        return Err(ProtocolError::not_found(format!(
+            "Alias modelu o id {} nie istnieje",
+            payload.id
+        )));
+    }
+
+    crate::api::dashboard::api_models::broadcast_alias_mutation(
+        &ctx.state.db,
+        &ctx.state.router,
+        &ctx.state.quic_mesh,
+    );
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "model_alias_update",
+        Some(&payload.alias),
+        Some(&format!("target={}", payload.target_model)),
+    );
+
+    Ok(MessageBody::ModelAliasUpdateResponseBody(
+        tentaflow_protocol::ModelAliasUpdateResponse { ok: true },
+    ))
+}
+
+#[handler(variant = "ModelAliasDeleteRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn model_alias_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let id = match req {
+        MessageBody::ModelAliasDeleteRequestBody(p) => p.id,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ModelAliasDeleteRequestBody",
+            ))
+        }
+    };
+
+    let deleted =
+        crate::api::dashboard::api_models::delete_alias(&ctx.state.db, id).map_err(db_err)?;
+
+    if !deleted {
+        return Err(ProtocolError::not_found(format!(
+            "Alias modelu o id {} nie istnieje",
+            id
+        )));
+    }
+
+    crate::api::dashboard::api_models::broadcast_alias_mutation(
+        &ctx.state.db,
+        &ctx.state.router,
+        &ctx.state.quic_mesh,
+    );
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "model_alias_delete",
+        Some(&id.to_string()),
+        None,
+    );
+
+    Ok(MessageBody::ModelAliasDeleteResponseBody(
+        tentaflow_protocol::ModelAliasDeleteResponse { ok: true },
+    ))
+}
+
+// =============================================================================
+// FAZA 5 — katalog NIM + deploy silnika z manifestu (REST -> binary)
+// =============================================================================
+
+#[handler(variant = "NimCatalogListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub async fn nim_catalog_list(
+    _req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let result =
+        crate::api::dashboard::api_nim::fetch_catalog(&ctx.state.db, &ctx.state.settings_cipher)
+            .await
+            .map_err(|e| ProtocolError::internal(format!("nim catalog: {}", e)))?;
+
+    let containers = result
+        .containers
+        .into_iter()
+        .map(|c| tentaflow_protocol::NimContainerEntry {
+            name: c.name,
+            display_name: c.display_name,
+            description: c.description,
+            image: c.image,
+            latest_tag: c.latest_tag,
+            publisher: c.publisher,
+            category: c.category,
+            min_gpu_memory_gb: c.min_gpu_memory_gb,
+            updated_at: c.updated_at,
+            self_hostable: c.self_hostable,
+        })
+        .collect();
+
+    Ok(MessageBody::NimCatalogListResponseBody(
+        tentaflow_protocol::NimCatalogListResponse {
+            containers,
+            error: result.error,
+        },
+    ))
+}
+
+#[handler(variant = "ServiceManifestDeployRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn service_manifest_deploy(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceManifestDeployRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceManifestDeployRequestBody",
+            ))
+        }
+    };
+
+    if payload.engine_id.is_empty() || payload.node_id.is_empty() {
+        return Err(ProtocolError::bad_request("engine_id i node_id wymagane"));
+    }
+
+    use crate::api::dashboard::api_services_manifest::{
+        validate_deploy_target, DeployValidationError,
+    };
+    validate_deploy_target(&payload.engine_id, &payload.deploy_method).map_err(
+        |err| match err {
+            DeployValidationError::EngineNotFound => ProtocolError::not_found(format!(
+                "Silnik '{}' nie istnieje w manifescie",
+                payload.engine_id
+            )),
+            DeployValidationError::DeployMethodNotAvailable => ProtocolError::bad_request(format!(
+                "Silnik '{}' nie obsluguje trybu '{}'",
+                payload.engine_id, payload.deploy_method
+            )),
+            DeployValidationError::InvalidDeployMethod => {
+                ProtocolError::bad_request("deploy_method musi byc docker/native/external")
+            }
+        },
+    )?;
+
+    let deploy_id = uuid::Uuid::new_v4().to_string();
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.manifest.deploy",
+        Some(&payload.engine_id),
+        Some(&format!(
+            "method={} node={}",
+            payload.deploy_method, payload.node_id
+        )),
+    );
+
+    Ok(MessageBody::ServiceManifestDeployResponseBody(
+        tentaflow_protocol::ServiceManifestDeployResponse {
+            status: "started".to_string(),
+            deploy_id: deploy_id.clone(),
+            engine_id: payload.engine_id.clone(),
+            deploy_method: payload.deploy_method.clone(),
+            node_id: payload.node_id.clone(),
+            websocket_url: format!("/api/ws/deploy/{}", deploy_id),
+        },
+    ))
+}
+
+// =============================================================================
+// Addons + Users listy (FAZA 6 — REST → binary dla badge counts w nav)
+// =============================================================================
+
+#[handler(variant = "AddonsListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let user_id_bytes = require_user_id(ctx)?;
+    let user_id = user_id_to_i64(&user_id_bytes)
+        .ok_or_else(|| ProtocolError::internal("nie udalo sie zdekodowac user_id z sesji"))?;
+    let is_admin = matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    );
+
+    let rows = repository::list_addons(&ctx.state.db).map_err(db_err)?;
+    let mut addons: Vec<tentaflow_protocol::AddonInfo> = Vec::with_capacity(rows.len());
+    for a in rows.into_iter() {
+        // Non-admin: filtruj po widocznosci (admin_only + group-based).
+        if !is_admin
+            && !repository::is_addon_visible_to_user(&ctx.state.db, &a.addon_id, user_id)
+                .map_err(db_err)?
+        {
+            continue;
+        }
+        let badges = repository::get_addon_badges(&ctx.state.db, &a.addon_id).map_err(db_err)?;
+        let icon = if a.icon.is_empty() {
+            None
+        } else {
+            Some(a.icon)
+        };
+        let category = if a.category.is_empty() {
+            None
+        } else {
+            Some(a.category)
+        };
+        addons.push(tentaflow_protocol::AddonInfo {
+            addon_id: a.addon_id,
+            name: a.name,
+            version: a.version,
+            description: a.description,
+            author: a.author,
+            is_enabled: a.is_enabled,
+            is_system: a.is_system,
+            runtime: a.runtime,
+            oauth_mode: badges.oauth_mode,
+            visibility_scope: badges.visibility_scope,
+            declared_permissions_count: badges.declared_permissions_count,
+            users_with_oauth_count: badges.users_with_oauth_count,
+            icon,
+            category,
+            file_size_bytes: a.wasm_size_bytes,
+        });
+    }
+    Ok(MessageBody::AddonsListResponseBody(
+        tentaflow_protocol::AddonsListResponse { addons },
+    ))
+}
+
+// =============================================================================
+// Audit log screen (R-LIST + export CSV + cleanup) — Admin only
+// =============================================================================
+
+/// Konwertuje proto `AuditLogFilters` do DB `AuditLogFilters`. Pole `search`
+/// nie ma bezposredniego mappingu w DB modelu — stosujemy je jako dodatkowy
+/// post-filter nizej.
+fn proto_filters_to_db(
+    f: &tentaflow_protocol::AuditLogFilters,
+) -> crate::db::models::AuditLogFilters {
+    crate::db::models::AuditLogFilters {
+        user_id: f.user_id,
+        addon_id: f.addon_id.clone(),
+        action: f.action.clone(),
+        from_date: f.from_date.clone(),
+        to_date: f.to_date.clone(),
+    }
+}
+
+fn proto_entry_from_db(e: crate::db::models::AuditLogEntry) -> tentaflow_protocol::AuditLogEntry {
+    tentaflow_protocol::AuditLogEntry {
+        id: e.id,
+        timestamp: e.timestamp,
+        action: e.action,
+        user_id: e.user_id,
+        addon_id: e.addon_id,
+        resource: e.resource,
+        details: e.details,
+        ip_address: e.ip_address,
+        node_id: e.node_id,
+    }
+}
+
+/// Pelnotekstowe dopasowanie (LIKE) na action/resource/details.
+fn matches_search(entry: &crate::db::models::AuditLogEntry, needle: &str) -> bool {
+    let needle = needle.to_lowercase();
+    entry.action.to_lowercase().contains(&needle)
+        || entry
+            .resource
+            .as_deref()
+            .map(|s| s.to_lowercase().contains(&needle))
+            .unwrap_or(false)
+        || entry
+            .details
+            .as_deref()
+            .map(|s| s.to_lowercase().contains(&needle))
+            .unwrap_or(false)
+}
+
+fn escape_csv(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+#[handler(variant = "AuditLogListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn audit_log_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AuditLogListRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AuditLogListRequestBody",
+            ))
+        }
+    };
+
+    let db_filters = proto_filters_to_db(&payload.filters);
+    let limit = payload.limit.clamp(1, 1000) as i64;
+    let offset = payload.offset as i64;
+
+    let rows =
+        repository::list_audit_logs(&ctx.state.db, &db_filters, offset, limit).map_err(db_err)?;
+    let total = repository::count_audit_logs(&ctx.state.db, &db_filters).map_err(db_err)?;
+
+    let entries: Vec<_> = match payload.filters.search.as_deref() {
+        Some(q) if !q.is_empty() => rows
+            .into_iter()
+            .filter(|e| matches_search(e, q))
+            .map(proto_entry_from_db)
+            .collect(),
+        _ => rows.into_iter().map(proto_entry_from_db).collect(),
+    };
+
+    Ok(MessageBody::AuditLogListResponseBody(
+        tentaflow_protocol::AuditLogListResponse {
+            entries,
+            total_count: total,
+        },
+    ))
+}
+
+#[handler(variant = "AuditLogExportRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn audit_log_export(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AuditLogExportRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AuditLogExportRequestBody",
+            ))
+        }
+    };
+
+    let db_filters = proto_filters_to_db(&payload.filters);
+    let rows =
+        repository::list_audit_logs(&ctx.state.db, &db_filters, 0, 100_000).map_err(db_err)?;
+
+    let filtered: Vec<_> = match payload.filters.search.as_deref() {
+        Some(q) if !q.is_empty() => rows.into_iter().filter(|e| matches_search(e, q)).collect(),
+        _ => rows,
+    };
+
+    let mut csv =
+        String::from("id,timestamp,user_id,addon_id,action,resource,details,ip_address,node_id\n");
+    for e in &filtered {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            e.id,
+            e.timestamp,
+            e.user_id.map(|id| id.to_string()).unwrap_or_default(),
+            e.addon_id.as_deref().unwrap_or(""),
+            escape_csv(&e.action),
+            e.resource.as_deref().map(escape_csv).unwrap_or_default(),
+            e.details.as_deref().map(escape_csv).unwrap_or_default(),
+            e.ip_address.as_deref().unwrap_or(""),
+            e.node_id.as_deref().unwrap_or(""),
+        ));
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "audit.export",
+        None,
+        Some(&format!("rows={}", filtered.len())),
+    );
+
+    Ok(MessageBody::AuditLogExportResponseBody(
+        tentaflow_protocol::AuditLogExportResponse {
+            csv,
+            row_count: filtered.len() as u64,
+        },
+    ))
+}
+
+#[handler(variant = "AuditLogCleanupRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn audit_log_cleanup(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AuditLogCleanupRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AuditLogCleanupRequestBody",
+            ))
+        }
+    };
+    if payload.keep_days < 1 {
+        return Err(ProtocolError::bad_request("keep_days musi byc >= 1"));
+    }
+
+    let deleted =
+        repository::cleanup_audit_logs(&ctx.state.db, payload.keep_days as i64).map_err(db_err)?;
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "audit.cleanup",
+        None,
+        Some(&format!(
+            "keep_days={} deleted={}",
+            payload.keep_days, deleted
+        )),
+    );
+
+    Ok(MessageBody::AuditLogCleanupResponseBody(
+        tentaflow_protocol::AuditLogCleanupResponse {
+            deleted_count: deleted,
+        },
+    ))
+}
+
+#[handler(variant = "UsersListRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn users_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let rows = repository::list_user_accounts(&ctx.state.db).map_err(db_err)?;
+    let users: Vec<tentaflow_protocol::UserInfo> = rows
+        .into_iter()
+        .map(|u| tentaflow_protocol::UserInfo {
+            id: u.id,
+            username: u.username,
+            display_name: u.display_name,
+            email: u.email,
+            is_active: u.is_active,
+            is_admin: u.is_admin,
+            sso_provider: u.sso_provider,
+            last_login_at: u.last_login_at,
+            created_at: u.created_at,
+        })
+        .collect();
+    Ok(MessageBody::UsersListResponseBody(
+        tentaflow_protocol::UsersListResponse { users },
+    ))
+}

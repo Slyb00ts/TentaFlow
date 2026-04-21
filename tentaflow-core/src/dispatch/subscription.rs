@@ -287,7 +287,10 @@ mod tests {
 
         let e1 = rx1.recv().await.unwrap();
         let e2 = rx2.recv().await.unwrap();
-        assert!(matches!(e1, SubscriptionEvent::Chunk(MessageBody::NodeListRequest)));
+        assert!(matches!(
+            e1,
+            SubscriptionEvent::Chunk(MessageBody::NodeListRequest)
+        ));
         assert!(matches!(
             e2,
             SubscriptionEvent::Chunk(MessageBody::ModelListRequest)
@@ -324,7 +327,14 @@ mod tests {
         // Wypelnij kanal (capacity = 64) — _rx nie czyta wiec try_send blokuje.
         let mut accepted = 0;
         for i in 0..(DEFAULT_CHANNEL_CAPACITY + 5) {
-            if push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: i as u64 }).is_ok() {
+            if push_chunk(
+                &sub,
+                MessageBody::MetaHeartbeat {
+                    sent_at_epoch: i as u64,
+                },
+            )
+            .is_ok()
+            {
                 accepted += 1;
             } else {
                 break;

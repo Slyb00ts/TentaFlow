@@ -3,8 +3,8 @@
 // Opis: CRUD wzorcow szybkiej sciezki (fast path patterns).
 // =============================================================================
 
-use crate::db::{self, DbPool};
 use crate::db::models::UpdateFastPathPattern;
+use crate::db::{self, DbPool};
 use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
@@ -46,14 +46,20 @@ pub fn handle_list(pool: &DbPool, offset: i64, limit: i64) -> Result<(u16, Strin
 
 /// POST /api/fast-path-patterns - utworz wzorzec fast path
 pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateFastPathPatternRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: CreateFastPathPatternRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if req.module.trim().is_empty() {
-        return Ok((400, r#"{"error":"Pole 'module' nie moze byc puste"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Pole 'module' nie może być puste"}"#.to_string(),
+        ));
     }
     if let Err(e) = validate_pattern(&req.pattern, &req.match_type) {
-        return Ok((400, format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e)));
+        return Ok((
+            400,
+            format!(r#"{{"error":"Niepoprawne wyrażenie regularne: {}"}}"#, e),
+        ));
     }
 
     let result_json = req.result_json.as_deref().unwrap_or("{}");
@@ -75,17 +81,29 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
 pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
     let existing = db::repository::get_fast_path_pattern(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Wzorzec fast path o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(
+                r#"{{"error":"Wzorzec fast path o id {} nie istnieje"}}"#,
+                id
+            ),
+        ));
     }
 
-    let req: UpdateFastPathPatternRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: UpdateFastPathPatternRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if req.module.trim().is_empty() {
-        return Ok((400, r#"{"error":"Pole 'module' nie moze byc puste"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Pole 'module' nie może być puste"}"#.to_string(),
+        ));
     }
     if let Err(e) = validate_pattern(&req.pattern, &req.match_type) {
-        return Ok((400, format!(r#"{{"error":"Niepoprawne wyrazenie regularne: {}"}}"#, e)));
+        return Ok((
+            400,
+            format!(r#"{{"error":"Niepoprawne wyrażenie regularne: {}"}}"#, e),
+        ));
     }
 
     let result_json = req.result_json.as_deref().unwrap_or("{}");
@@ -110,7 +128,13 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
 pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     let existing = db::repository::get_fast_path_pattern(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Wzorzec fast path o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(
+                r#"{{"error":"Wzorzec fast path o id {} nie istnieje"}}"#,
+                id
+            ),
+        ));
     }
 
     db::repository::delete_fast_path_pattern(pool, id)?;

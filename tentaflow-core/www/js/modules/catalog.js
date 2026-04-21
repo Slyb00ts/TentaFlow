@@ -8,7 +8,8 @@
 //       Header pokazuje aktualny target + przycisk "Zmien".
 // =============================================================================
 
-import { byId, escapeHtml, escapeAttr, apiGet, toast } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
@@ -57,8 +58,8 @@ async function loadTargets() {
   while (attempt < 3) {
     try {
       const [nodesResp, clustersResp] = await Promise.all([
-        apiGet('/api/mesh/nodes'),
-        apiGet('/api/clusters').catch(() => []),
+        ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
+        ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => []),
       ]);
       const list = (nodesResp || []).filter((n) => n?.is_trusted === true || n?.is_local === true);
       if (list.length > 0) {
@@ -72,7 +73,7 @@ async function loadTargets() {
     attempt += 1;
     await new Promise((r) => setTimeout(r, 100 * attempt));
   }
-  throw new Error('Backend nie zwrocil local node — sprawdz log daemona');
+  throw new Error('Backend nie zwrócił local node — sprawdź log daemona');
 }
 
 // ---- Root rendering -------------------------------------------------------
@@ -409,14 +410,14 @@ async function loadNimCatalog() {
   }
 
   try {
-    const data = await apiGet('/api/nim/catalog');
+    const data = await ApiBinary.one('nimCatalogListRequest');
 
     if (data.error === 'ngc_api_key_not_configured') {
       container.innerHTML = renderNimNoApiKey();
       bindNimSettingsLink();
       return;
     }
-    if (data.error === 'ngc_auth_failed') {
+    if (data.error === 'ngc_auth_failed' || data.error === 'ngc_fetch_failed') {
       container.innerHTML = renderNimAuthFailed();
       bindNimSettingsLink();
       return;
@@ -431,7 +432,18 @@ async function loadNimCatalog() {
       return;
     }
 
-    nimContainers = data.containers || [];
+    nimContainers = (data.containers || []).map((c) => ({
+      name: c.name,
+      display_name: c.displayName,
+      description: c.description,
+      image: c.image,
+      latest_tag: c.latestTag,
+      publisher: c.publisher,
+      category: c.category,
+      min_gpu_memory_gb: c.minGpuMemoryGb,
+      updated_at: c.updatedAt,
+      self_hostable: c.selfHostable,
+    }));
     nimActiveCategory = 'all';
     nimSearchQuery = '';
     applyNimFilters();

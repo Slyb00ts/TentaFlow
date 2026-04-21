@@ -5,14 +5,14 @@
 //       (protocol-native), route_rerank_via_quic (reranking).
 // =============================================================================
 
-use crate::error::{Result, CoreError};
 use crate::api::openai::types::{
-    EmbeddingRequest, EmbeddingResponse, EmbeddingData, EmbeddingUsage, EmbeddingInput,
+    EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
 };
+use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
 
-use tentaflow_protocol::*;
 use std::sync::Arc;
+use tentaflow_protocol::*;
 use tracing::debug;
 
 impl Router {
@@ -38,25 +38,39 @@ impl Router {
                     match &handle {
                         BackendHandle::QuicEmbedding(name) => {
                             let quic_handle = {
-                                this.service_manager.quic_embedding_services.read().get(name).cloned()
-                            }.ok_or_else(|| anyhow::anyhow!("QUIC embedding serwis '{}' nie znaleziony", name))?;
-                            let quic_client = quic_handle.get_client().await
-                                .ok_or_else(|| anyhow::anyhow!("QUIC embedding serwis '{}' nie polaczony", name))?;
+                                this.service_manager
+                                    .quic_embedding_services
+                                    .read()
+                                    .get(name)
+                                    .cloned()
+                            }
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("QUIC embedding serwis '{}' nie znaleziony", name)
+                            })?;
+                            let quic_client = quic_handle.get_client().await.ok_or_else(|| {
+                                anyhow::anyhow!("QUIC embedding serwis '{}' nie polaczony", name)
+                            })?;
                             debug!("Routing embeddings przez QUIC: {}", name);
-                            this.route_embeddings_quic(quic_client, req, name.clone()).await
+                            this.route_embeddings_quic(quic_client, req, name.clone())
+                                .await
                         }
                         BackendHandle::Http(name) => {
-                            let backend = this.select_http_backend(name)
+                            let backend = this
+                                .select_http_backend(name)
                                 .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
                             debug!("Wybrany backend dla embeddings: {}", backend.url());
                             let response = backend.embeddings_request(req).await?;
-                            debug!("Embeddings zakonczone: {} embeddingow wygenerowanych", response.data.len());
+                            debug!(
+                                "Embeddings zakonczone: {} embeddingow wygenerowanych",
+                                response.data.len()
+                            );
                             Ok(response)
                         }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla embeddings")),
                     }
                 }
-            }).await?
+            })
+            .await?
         };
 
         Ok(route_result)
@@ -101,7 +115,10 @@ impl Router {
             session_id: None,
         };
 
-        debug!("Wysylam embeddings request przez QUIC: {} tekstow", text_count);
+        debug!(
+            "Wysylam embeddings request przez QUIC: {} tekstow",
+            text_count
+        );
 
         let model_response = quic_client.send_request(model_request).await?;
 
@@ -130,20 +147,26 @@ impl Router {
                     },
                 };
 
-                debug!("Embeddings QUIC: {} embeddingow wygenerowanych", response.data.len());
+                debug!(
+                    "Embeddings QUIC: {} embeddingow wygenerowanych",
+                    response.data.len()
+                );
 
                 Ok(response)
             }
-            ModelResult::Error(error_info) => {
-                Err(CoreError::InternalError {
-                    message: format!("Embeddings QUIC error ({}): {}", model_name, error_info.message),
-                    source: None,
-                }.into())
+            ModelResult::Error(error_info) => Err(CoreError::InternalError {
+                message: format!(
+                    "Embeddings QUIC error ({}): {}",
+                    model_name, error_info.message
+                ),
+                source: None,
             }
+            .into()),
             _ => Err(CoreError::InternalError {
                 message: "Unexpected response type from embeddings QUIC".to_string(),
                 source: None,
-            }.into()),
+            }
+            .into()),
         }
     }
 
@@ -157,17 +180,30 @@ impl Router {
 
         let model_name = self.resolve_model_alias(model);
 
-        debug!("route_embeddings_via_quic: resolved model={}, texts={}", model_name, texts.len());
+        debug!(
+            "route_embeddings_via_quic: resolved model={}, texts={}",
+            model_name,
+            texts.len()
+        );
 
-        let quic_handle = { self.service_manager.quic_embedding_services.read().get(&model_name).cloned() }
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: model_name.clone(),
-            })?;
+        let quic_handle = {
+            self.service_manager
+                .quic_embedding_services
+                .read()
+                .get(&model_name)
+                .cloned()
+        }
+        .ok_or_else(|| CoreError::ModelNotFound {
+            model_name: model_name.clone(),
+        })?;
 
-        let quic_client = quic_handle.get_client().await
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: model_name.clone(),
-            })?;
+        let quic_client =
+            quic_handle
+                .get_client()
+                .await
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: model_name.clone(),
+                })?;
 
         // Mapuj nazwe serwisu Router -> nazwe modelu w Embeddings Engine
         let embeddings_model_name = model_name
@@ -205,16 +241,25 @@ impl Router {
 
         let model_name = self.resolve_model_alias(&payload.model);
 
-        let rerank_quic_handle = { self.service_manager.quic_embedding_services.read().get(&model_name).cloned() };
+        let rerank_quic_handle = {
+            self.service_manager
+                .quic_embedding_services
+                .read()
+                .get(&model_name)
+                .cloned()
+        };
         let quic_client = if let Some(quic_handle) = rerank_quic_handle {
-            quic_handle.get_client().await
+            quic_handle
+                .get_client()
+                .await
                 .ok_or_else(|| CoreError::AllBackendsUnavailable {
                     model_name: model_name.clone(),
                 })?
         } else {
             return Err(CoreError::ModelNotFound {
                 model_name: model_name.clone(),
-            }.into());
+            }
+            .into());
         };
 
         let request_id = uuid::Uuid::new_v4().to_string();

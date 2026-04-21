@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -22,19 +22,16 @@ use tracing::{debug, error, info};
 use crate::config::NodeConfig;
 use crate::crypto::{generate_master_key, SecretsCipher, SettingsCipher};
 use crate::db;
-use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::iroh_manager::IrohMeshManager;
+use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::security::MeshSecurity;
 use crate::metrics::RouterMetrics;
-use crate::routing::Router;
 use crate::routing::service_manager::ServiceManager;
+use crate::routing::Router;
 
 /// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler
 pub fn is_openai_path(path: &str) -> bool {
-    path.starts_with("/v1/")
-        || path == "/health"
-        || path == "/ready"
-        || path == "/metrics"
+    path.starts_with("/v1/") || path == "/health" || path == "/ready" || path == "/metrics"
 }
 
 /// Uruchamia zunifikowany serwer HTTPS obslugujacy OpenAI API + Dashboard
@@ -58,7 +55,17 @@ pub fn start_unified_server(
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
 ) -> Result<()> {
-    start_unified_server_with_permissions(config, db, metrics, router, mesh_peer_store, quic_mesh, local_node_id, mesh_security, None)
+    start_unified_server_with_permissions(
+        config,
+        db,
+        metrics,
+        router,
+        mesh_peer_store,
+        quic_mesh,
+        local_node_id,
+        mesh_security,
+        None,
+    )
 }
 
 /// Zunifikowany serwer z opcjonalnym PermissionChecker do natychmiastowej invalidacji cache
@@ -93,15 +100,21 @@ pub fn start_unified_server_with_permissions(
     }
 
     // SecretsCipher (dla addonow) — encryption_master_key z bazy odszyfrowany przez SettingsCipher
-    let master_key = db::repository::get_setting_secure(db, "encryption_master_key", &settings_cipher)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| {
-            let key = generate_master_key();
-            let _ = db::repository::set_setting_secure(db, "encryption_master_key", &key, &settings_cipher);
-            info!("Wygenerowano nowy encryption_master_key i zapisano w bazie");
-            key
-        });
+    let master_key =
+        db::repository::get_setting_secure(db, "encryption_master_key", &settings_cipher)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                let key = generate_master_key();
+                let _ = db::repository::set_setting_secure(
+                    db,
+                    "encryption_master_key",
+                    &key,
+                    &settings_cipher,
+                );
+                info!("Wygenerowano nowy encryption_master_key i zapisano w bazie");
+                key
+            });
 
     let cipher = Arc::new(
         SecretsCipher::new(&master_key).expect("Nieprawidlowy encryption_master_key w bazie"),
@@ -137,6 +150,9 @@ pub fn start_unified_server_with_permissions(
         TlsAcceptor::from(Arc::new(tls_config))
     };
 
+    // OAuth pending-state TTL purge: run once at startup, then hourly.
+    crate::addon::oauth_cleanup::start_oauth_cleanup_task(db.clone());
+
     info!("Inicjalizacja unified HTTPS server na {}...", bind_addr);
 
     // Subskrybuj shutdown signal z ServiceManager — przy shutdown zamykamy
@@ -153,7 +169,10 @@ pub fn start_unified_server_with_permissions(
             }
         };
 
-        info!("Unified HTTPS server nasluchuje na {} (OpenAI API + Dashboard)", bind_addr);
+        info!(
+            "Unified HTTPS server nasluchuje na {} (OpenAI API + Dashboard)",
+            bind_addr
+        );
 
         loop {
             let accept = tokio::select! {
@@ -224,14 +243,19 @@ pub fn start_unified_server_with_permissions(
                         if is_openai_path(&path) {
                             // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
                             if path != "/health" && path != "/ready" {
-                                let api_key = req.headers().get("authorization")
+                                let api_key = req
+                                    .headers()
+                                    .get("authorization")
                                     .and_then(|v| v.to_str().ok())
                                     .and_then(|v| v.strip_prefix("Bearer "))
-                                    .or_else(|| req.headers().get("x-api-key").and_then(|v| v.to_str().ok()));
+                                    .or_else(|| {
+                                        req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
+                                    });
 
                                 let auth_error_msg = match api_key {
                                     Some(key) => {
-                                        let key_hash = crate::api::dashboard::auth::hash_api_key(key);
+                                        let key_hash =
+                                            crate::api::dashboard::auth::hash_api_key(key);
                                         if crate::db::repository::verify_api_key(&db, &key_hash)
                                             .ok()
                                             .flatten()
@@ -239,34 +263,51 @@ pub fn start_unified_server_with_permissions(
                                         {
                                             None // Klucz poprawny
                                         } else {
-                                            Some(r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#)
+                                            Some(
+                                                r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
+                                            )
                                         }
                                     }
-                                    None => {
-                                        Some(r#"{"error":{"type":"authentication_error","message":"Brak API key. Uzyj naglowka Authorization: Bearer <key> lub x-api-key","code":"missing_api_key"}}"#)
-                                    }
+                                    None => Some(
+                                        r#"{"error":{"type":"authentication_error","message":"Brak API key. Uzyj naglowka Authorization: Bearer <key> lub x-api-key","code":"missing_api_key"}}"#,
+                                    ),
                                 };
 
                                 if let Some(err_body) = auth_error_msg {
-                                    let full = http_body_util::Full::new(hyper::body::Bytes::from(err_body));
+                                    let full = http_body_util::Full::new(hyper::body::Bytes::from(
+                                        err_body,
+                                    ));
                                     let resp = hyper::Response::builder()
                                         .status(401)
                                         .header("Content-Type", "application/json")
-                                        .body(UnsyncBoxBody::new(full.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { match e {} })))
+                                        .body(UnsyncBoxBody::new(full.map_err(
+                                            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                                match e {}
+                                            },
+                                        )))
                                         .unwrap();
                                     return Ok(resp);
                                 }
                             }
 
-                            let resp = crate::api::openai::server::handle_request(req, router).await?;
+                            let resp =
+                                crate::api::openai::server::handle_request(req, router).await?;
                             let resp = resp.map(|body| {
-                                UnsyncBoxBody::new(body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) }))
+                                UnsyncBoxBody::new(body.map_err(
+                                    |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
+                                ))
                             });
                             Ok::<_, hyper::Error>(resp)
                         } else {
-                            let resp = crate::api::dashboard::server::handle_request(req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic, ra).await?;
+                            let resp = crate::api::dashboard::server::handle_request(
+                                req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc,
+                                lic, ra,
+                            )
+                            .await?;
                             let resp = resp.map(|body| {
-                                UnsyncBoxBody::new(body.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() }))
+                                UnsyncBoxBody::new(body.map_err(
+                                    |e| -> Box<dyn std::error::Error + Send + Sync> { e.into() },
+                                ))
                             });
                             Ok::<_, hyper::Error>(resp)
                         }

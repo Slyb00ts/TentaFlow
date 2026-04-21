@@ -316,11 +316,14 @@ impl MeshSecurity {
         hostname: &str,
         approved_by: &str,
     ) -> Result<()> {
-        let pending = db::repository::get_pending_pairing(&self.db, remote_node_id)?
-            .ok_or_else(|| anyhow::anyhow!("Brak oczekujacego parowania z nodem {}", remote_node_id))?;
+        let pending =
+            db::repository::get_pending_pairing(&self.db, remote_node_id)?.ok_or_else(|| {
+                anyhow::anyhow!("Brak oczekujacego parowania z nodem {}", remote_node_id)
+            })?;
 
-        let expires = chrono::NaiveDateTime::parse_from_str(&pending.expires_at, "%Y-%m-%d %H:%M:%S")
-            .context("Blad parsowania daty wygasniecia")?;
+        let expires =
+            chrono::NaiveDateTime::parse_from_str(&pending.expires_at, "%Y-%m-%d %H:%M:%S")
+                .context("Blad parsowania daty wygasniecia")?;
         let now = chrono::Utc::now().naive_utc();
         if now > expires {
             db::repository::delete_pending_pairing(&self.db, remote_node_id)?;
@@ -520,13 +523,7 @@ impl MeshSecurity {
 
         let vk = Self::parse_verifying_key(public_key_hex)?;
 
-        db::repository::add_trusted_node(
-            &self.db,
-            node_id,
-            public_key_hex,
-            hostname,
-            "mesh-sync",
-        )?;
+        db::repository::add_trusted_node(&self.db, node_id, public_key_hex, hostname, "mesh-sync")?;
 
         self.trusted_keys.write().insert(node_id.to_string(), vk);
         self.rebuild_trusted_snapshot();
@@ -548,7 +545,9 @@ impl MeshSecurity {
     /// Sprawdza limit prob PIN (3 proby w oknie 60 s).
     pub fn check_pin_rate_limit(&self, node_id: &str) -> bool {
         let mut attempts = self.pin_attempts.write();
-        let entry = attempts.entry(node_id.to_string()).or_insert((0, Instant::now()));
+        let entry = attempts
+            .entry(node_id.to_string())
+            .or_insert((0, Instant::now()));
 
         if Instant::now().duration_since(entry.1) > Duration::from_secs(60) {
             *entry = (0, Instant::now());
@@ -573,7 +572,6 @@ impl MeshSecurity {
     pub fn settings_cipher_ref(&self) -> &Arc<crate::crypto::SettingsCipher> {
         &self.settings_cipher
     }
-
 }
 
 #[cfg(test)]
@@ -681,7 +679,10 @@ mod tests {
             .derive_pin_proof(&sec_a.x25519_public_key_hex(), pin, node_b, node_a)
             .unwrap();
 
-        assert_eq!(proof_a, proof_b, "obie strony wyprowadzaja identyczny pin_proof");
+        assert_eq!(
+            proof_a, proof_b,
+            "obie strony wyprowadzaja identyczny pin_proof"
+        );
 
         let proof_wrong_pin = sec_a
             .derive_pin_proof(&sec_b.x25519_public_key_hex(), "000000", node_a, node_b)

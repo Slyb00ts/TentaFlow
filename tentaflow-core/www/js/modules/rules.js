@@ -56,7 +56,7 @@ async function loadTts(host) {
         <td><code>${escapeHtml(r.pattern)}</code></td>
         <td>${escapeHtml(r.voiceId)}</td>
         <td>${r.priority}</td>
-        <td><tf-button variant="danger" size="sm" data-rm="${escapeHtml(r.id)}">Usuń</tf-button></td>
+        <td style="text-align:right;"><tf-button variant="danger" size="sm" icon="trash" data-rm="${escapeHtml(r.id)}" title="Usuń"></tf-button></td>
       </tr>`).join('')}</tbody>
     </table>`;
   host.querySelectorAll('[data-rm]').forEach((b) => {

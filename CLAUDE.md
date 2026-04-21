@@ -95,10 +95,14 @@ mlx-models (Apple MLX inference bindings)
 **Protocol serialization**: All QUIC messages use rkyv (zero-copy binary), not JSON. Protocol types live in `tentaflow-protocol/src/`. Two ALPN protocols: `tentaflow` (client→node) and `tentaflow-mesh` (node↔node).
 
 **build.rs does two things**: (1) compiles WASM addons from `addons/` and `addons-pro/` to `wasm32-wasip1` and embeds them via `include_bytes!`, (2) embeds `wwwroot/` static files into the binary with MIME detection. Changes to `wwwroot/` require recompilation.
+Bundled addon updates at startup are driven by `bundle_hash` (computed from embedded addon payload), not only by manifest `version`, so manifest-only changes propagate to the installed DB state without a forced version bump.
 
 **Mesh security layers**: TLS 1.3 (transport) → Ed25519 identity → X25519 DH key exchange → ChaCha20-Poly1305 AEAD with epoch-based key rotation (24h interval, 7-day grace period) and replay protection (sequential nonce + sliding window).
 
-**Dashboard**: Vanilla JS/HTML/CSS SPA in `tentaflow-core/wwwroot/`, no framework. i18n via `i18n/pl.json` and `i18n/en.json`.
+**Dashboard**:
+- Stara warstwa statyczna nadal istnieje w `tentaflow-core/wwwroot/`, ale aktywnie rozwijana SPA dashboardu jest w `tentaflow-core/www/`.
+- Frontend `www/` używa vanilla JS + custom elements `tf-*` z `tentaflow-core/www/js/components/`.
+- Widok Addons (WASM) korzysta z komponentów `tf-chip`, `tf-searchbox`, `tf-toggle`, `tf-button`; układ i style modułu są trzymane w `tentaflow-core/www/css/addons.css`.
 
 ### Mesh Protocol Discriminants
 
@@ -226,12 +230,67 @@ Implementacja: `tentaflow-core/src/api/dashboard/api_services_manifest.rs`.
 
 ## Conventions
 
-- Comments in code: Polish only
+- Comments in code: English only
 - Variable/function names: English
 - Commit messages: English, format `[type]: description`
 - Rust: `rustfmt` defaults, `snake_case` functions, `PascalCase` types
 - JS/HTML/CSS: 2-space indent, `camelCase` JS, `kebab-case` CSS
 - C#: 4-space indent, `PascalCase` public, `_camelCase` private fields
+
+## Code quality rules (MANDATORY — apply to every change)
+
+These rules apply to humans AND to every AI agent working on this repo. No exceptions unless the user explicitly overrides a specific rule for a specific task.
+
+### 1. No stubs, placeholders, or TODOs
+- Every commit must be production-ready. If you cannot finish a feature in this pass, do not ship a partial implementation that pretends to work.
+- Forbidden: `todo!()`, `unimplemented!()`, `// TODO: implement`, empty function bodies that return defaults, mock responses, "we'll wire this up later" scaffolding.
+- If a dependency is missing, say so and stop. Do not fake it.
+
+### 2. No backward-compatibility shims, no fallbacks
+- When you change a function, change it in place. Do not keep the old version around "just in case".
+- No alias exports, no deprecated wrappers, no feature flags for old behavior, no `if let Some(old) = ... else { new_path }` fallback chains.
+- Exception: only when the user explicitly asks for compat (rare — assume never).
+
+### 3. No versioned function names
+- Forbidden: `process_request_v2`, `do_thing_new`, `calculate_ultrafast`, `handle_event_improved`, `user_check_permission_fixed`.
+- If you are improving an existing function, **edit it in place**. The git history is the version record; the code should have one name per concept.
+- If the signature change breaks callers, update the callers. That is the work.
+
+### 4. Check for existing functions before writing new ones
+- Before adding a new function, search the crate (or the relevant module) for something that already does this. Use Grep/ripgrep on likely names, likely signatures, and likely call sites.
+- If a similar function exists and almost fits, extend it (new parameter, new enum variant) rather than forking a parallel one.
+- This applies to Rust, JS, CSS, DB helpers — everywhere.
+
+### 5. Delete unused code as you go
+- When a refactor removes the last caller of a function, delete the function in the same commit. Do not leave dead code "in case we need it".
+- Same for unused imports, unused struct fields, unused CSS classes, unused i18n keys, unused SQL helpers.
+- `cargo check` warnings about unused items are bugs, not noise.
+
+### 6. Comments describe WHY, not WHAT
+- English only.
+- File headers stay: `// ============ File: <name> — <1-sentence purpose> ============`.
+- Inline comments only when the code's intent is not obvious from names — e.g. a workaround for a known bug, a non-obvious invariant, a performance trick. Do not narrate what the next line does.
+- Forbidden: meta-comments like `// CRITICAL:`, `// OPT-001`, `// Fixed in this PR`, `// Changed from X to Y`, `// OWASP-xxx`. Git blame carries history; comments carry intent.
+
+### 7. No cosmetic edits outside the task
+- Do not reorder imports, rewrap lines, fix unrelated whitespace, or rename unrelated symbols while making a feature change. Those belong in a separate formatting commit if at all.
+
+### 8. Always use project web components — never roll your own UI primitive
+
+Project components live under `tentaflow-core/www/js/components/` — currently: `tf-button`, `tf-chip`, `tf-input`, `tf-menu`, `tf-searchbox`, `tf-select`, `tf-table`, `tf-tabs`, `tf-toggle`, `tf-window`.
+
+**Rules:**
+- For every UI primitive (button, input, select, toggle, chip, tabs, window/modal, searchbox, menu, table) use the `tf-*` component. Zero `<button>`, `<input>`, `<select>`, hand-rolled `.tabs-bar`, hand-rolled modal overlays in feature modules. The only permitted raw `<input>` is `type="file"` (no tf-file-input exists yet).
+- If a `tf-*` component is missing a feature you need (animation, slot, event, variant, prop) — **extend the component**, don't build a one-off. Add the prop to the component's API, update its CSS, bump the demo if one exists.
+- If a pattern is repeated in feature code (e.g. an oauth-mode radio card pattern, or a permission matrix cell), consider adding a new `tf-*` component. Add it when the pattern appears in 2+ places OR the feature module exceeds ~30 lines of markup for the same element.
+- If a component's existing behavior is broken (no animation, wrong focus ring, missing keyboard handler), fix the component rather than working around it in the feature module.
+- Code review rejects any diff that renders a custom tab strip, custom toggle, custom select dropdown, custom modal, etc., when a `tf-*` component exists. "Slight visual difference" is not justification — change the component's CSS variant.
+
+**Why:** one-off UI primitives drift in look, accessibility, animation timing, and keyboard behavior. Users notice inconsistency. Components centralize the fixes.
+
+### Enforcement
+- Code review (human or `code-reviewer` agent) rejects any diff violating these rules.
+- If an agent reports "I added a stub because X" or "I kept the old function for compat" — that is a reject condition; the work goes back for a real implementation.
 
 ## gstack
 

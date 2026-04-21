@@ -21,11 +21,11 @@
 //!    - needs_memory_query (decyzja o Memory)
 //!    - context_for_llm (do wstrzyknięcia do głównego modelu)
 
-pub mod types;
 pub mod executor;
+pub mod types;
 
-pub use types::*;
 pub use executor::ToolExecutor;
+pub use types::*;
 
 use crate::prompt_registry::SharedPromptRegistry;
 use crate::routing::service_manager::ServiceManager;
@@ -121,14 +121,31 @@ impl IntentAnalyzer {
 
         // === POWITANIA ===
         let greetings = [
-            "cześć", "czesc", "hej", "hejka", "siema", "siemka",
-            "dzień dobry", "dzien dobry", "dobry wieczór", "dobry wieczor",
-            "witaj", "witam", "hello", "hi", "yo",
+            "cześć",
+            "czesc",
+            "hej",
+            "hejka",
+            "siema",
+            "siemka",
+            "dzień dobry",
+            "dzien dobry",
+            "dobry wieczór",
+            "dobry wieczor",
+            "witaj",
+            "witam",
+            "hello",
+            "hi",
+            "yo",
         ];
 
         for greeting in greetings {
             if msg_trimmed == greeting
-               || (msg_trimmed.starts_with(greeting) && msg_trimmed.as_bytes().get(greeting.len()).map_or(false, |&b| b == b' ' || b == b',')) {
+                || (msg_trimmed.starts_with(greeting)
+                    && msg_trimmed
+                        .as_bytes()
+                        .get(greeting.len())
+                        .map_or(false, |&b| b == b' ' || b == b','))
+            {
                 return Some(IntentAnalysisResult {
                     primary_intent: Some(Intent::Greeting),
                     reasoning: "Fast-path: greeting detected".to_string(),
@@ -139,8 +156,15 @@ impl IntentAnalyzer {
 
         // === POŻEGNANIA ===
         let farewells = [
-            "pa", "papa", "do widzenia", "do zobaczenia", "na razie",
-            "cześć", "bye", "goodbye", "dobranoc",
+            "pa",
+            "papa",
+            "do widzenia",
+            "do zobaczenia",
+            "na razie",
+            "cześć",
+            "bye",
+            "goodbye",
+            "dobranoc",
         ];
 
         // Tylko jeśli to CAŁOŚĆ wiadomości (nie "cześć" jako powitanie)
@@ -171,7 +195,9 @@ impl IntentAnalyzer {
 
     /// Buduje system prompt dla Bielika - czyta z rejestru promptow
     fn build_system_prompt(&self) -> String {
-        self.prompt_registry.require_content(crate::prompt_registry::main_llm::INTENT_ANALYZER_SYSTEM).to_string()
+        self.prompt_registry
+            .require_content(crate::prompt_registry::main_llm::INTENT_ANALYZER_SYSTEM)
+            .to_string()
     }
 
     /// Buduje user prompt z pełnym kontekstem
@@ -189,21 +215,43 @@ impl IntentAnalyzer {
 
         // Informacje o mówcy
         if let Some(name) = speaker_name {
-            let _ = write!(prompt, "ROZPOZNANY MÓWCA: {} (confidence: {:.2})\n",
-                name, speaker_confidence.unwrap_or(0.0));
+            let _ = write!(
+                prompt,
+                "ROZPOZNANY MÓWCA: {} (confidence: {:.2})\n",
+                name,
+                speaker_confidence.unwrap_or(0.0)
+            );
         } else if let Some(id) = speaker_id {
-            let _ = write!(prompt, "NIEZNANY MÓWCA (id: {}, confidence: {:.2})\n",
-                id, speaker_confidence.unwrap_or(0.0));
+            let _ = write!(
+                prompt,
+                "NIEZNANY MÓWCA (id: {}, confidence: {:.2})\n",
+                id,
+                speaker_confidence.unwrap_or(0.0)
+            );
         }
 
         // Multi-speaker info
         if let Some(speakers) = diarized_speakers {
             if speakers.len() > 1 {
-                let _ = write!(prompt, "\nMULTI-SPEAKER: Wykryto {} mówców:\n", speakers.len());
+                let _ = write!(
+                    prompt,
+                    "\nMULTI-SPEAKER: Wykryto {} mówców:\n",
+                    speakers.len()
+                );
                 for (i, speaker) in speakers.iter().enumerate() {
-                    let status = if speaker.is_known { "ZNANY" } else { "NIEZNANY" };
-                    let _ = write!(prompt, "  {}. [{}] {}: \"{}\"\n",
-                        i + 1, status, speaker.label, speaker.text.trim());
+                    let status = if speaker.is_known {
+                        "ZNANY"
+                    } else {
+                        "NIEZNANY"
+                    };
+                    let _ = write!(
+                        prompt,
+                        "  {}. [{}] {}: \"{}\"\n",
+                        i + 1,
+                        status,
+                        speaker.label,
+                        speaker.text.trim()
+                    );
                 }
             }
         }
@@ -237,7 +285,8 @@ impl IntentAnalyzer {
         let result = timeout(
             Duration::from_millis(self.config.timeout_ms),
             self.call_model_internal(system_prompt, user_prompt),
-        ).await;
+        )
+        .await;
 
         let elapsed = start.elapsed();
 
@@ -279,7 +328,10 @@ impl IntentAnalyzer {
             }
         })?;
 
-        info!("Intent Analyzer odpowiedź z Bielika: {} znaków", content.len());
+        info!(
+            "Intent Analyzer odpowiedź z Bielika: {} znaków",
+            content.len()
+        );
         debug!("Intent Analyzer RAW response:\n{}", content);
         Ok(content)
     }
@@ -323,24 +375,28 @@ impl IntentAnalyzer {
         }
 
         // Memory query
-        result.needs_memory_query = json.get("needs_memory_query")
+        result.needs_memory_query = json
+            .get("needs_memory_query")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
         // Memory search terms
         if let Some(terms) = json.get("memory_search_terms").and_then(|v| v.as_array()) {
-            result.memory_search_terms = terms.iter()
+            result.memory_search_terms = terms
+                .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
         }
 
         // Context for LLM
-        result.context_for_llm = json.get("context_for_llm")
+        result.context_for_llm = json
+            .get("context_for_llm")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
         // Reasoning
-        result.reasoning = json.get("reasoning")
+        result.reasoning = json
+            .get("reasoning")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -355,7 +411,10 @@ impl IntentAnalyzer {
         match intent_type {
             "introduction" => {
                 let name = json.get("name").and_then(|v| v.as_str())?.to_string();
-                let confidence = json.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                let confidence = json
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.8) as f32;
                 Some(Intent::Introduction { name, confidence })
             }
             "identity_question" => {
@@ -369,10 +428,23 @@ impl IntentAnalyzer {
                 Some(Intent::IdentityQuestion { question_type })
             }
             "name_correction" => {
-                let wrong_name = json.get("wrong_name").and_then(|v| v.as_str()).map(|s| s.to_string());
-                let correct_name = json.get("correct_name").and_then(|v| v.as_str())?.to_string();
-                let confidence = json.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
-                Some(Intent::NameCorrection { wrong_name, correct_name, confidence })
+                let wrong_name = json
+                    .get("wrong_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let correct_name = json
+                    .get("correct_name")
+                    .and_then(|v| v.as_str())?
+                    .to_string();
+                let confidence = json
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.8) as f32;
+                Some(Intent::NameCorrection {
+                    wrong_name,
+                    correct_name,
+                    confidence,
+                })
             }
             "tool_call" => {
                 // Tool call jest obsługiwany osobno w tool_calls array
@@ -390,14 +462,20 @@ impl IntentAnalyzer {
 
     /// Wyciąga string z pola JSON
     fn json_str(json: &JsonValue, key: &str) -> Option<String> {
-        json.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        json.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
 
     /// Wyciąga tablicę stringów z pola JSON
     fn json_str_array(json: &JsonValue, key: &str) -> Vec<String> {
         json.get(key)
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -406,64 +484,53 @@ impl IntentAnalyzer {
         let tool_type = json.get("tool_type").and_then(|v| v.as_str())?;
 
         match tool_type {
-            "calendar_add" => {
-                Some(ToolCall::CalendarAdd(CalendarAddParams {
-                    title: Self::json_str(json, "title"),
-                    date: Self::json_str(json, "date"),
-                    start_time: Self::json_str(json, "start_time"),
-                    end_time: Self::json_str(json, "end_time"),
-                    duration: Self::json_str(json, "duration"),
-                    location: Self::json_str(json, "location"),
-                    description: Self::json_str(json, "description"),
-                    attendees: Self::json_str_array(json, "attendees"),
-                    reminder: Self::json_str(json, "reminder"),
-                }))
-            }
-            "calendar_check" => {
-                Some(ToolCall::CalendarCheck(CalendarCheckParams {
-                    date: Self::json_str(json, "date"),
-                    date_range: Self::json_str(json, "date_range"),
-                    search_query: Self::json_str(json, "search_query"),
-                }))
-            }
-            "email_send" => {
-                Some(ToolCall::EmailSend(EmailSendParams {
-                    to: Self::json_str(json, "to"),
-                    subject: Self::json_str(json, "subject"),
-                    body: Self::json_str(json, "body"),
-                    cc: Self::json_str_array(json, "cc"),
-                    attachments: Self::json_str_array(json, "attachments"),
-                    priority: Self::json_str(json, "priority"),
-                }))
-            }
-            "web_search" => {
-                Some(ToolCall::WebSearch(WebSearchParams {
-                    query: Self::json_str(json, "query"),
-                    search_type: Self::json_str(json, "search_type"),
-                    language: Self::json_str(json, "language"),
-                    max_results: json.get("max_results").and_then(|v| v.as_u64()).map(|n| n as u32),
-                }))
-            }
-            "reminder_set" => {
-                Some(ToolCall::ReminderSet(ReminderSetParams {
-                    message: Self::json_str(json, "message"),
-                    when: Self::json_str(json, "when"),
-                    repeat: Self::json_str(json, "repeat"),
-                }))
-            }
-            "timer_set" => {
-                Some(ToolCall::TimerSet(TimerSetParams {
-                    duration: Self::json_str(json, "duration"),
-                    label: Self::json_str(json, "label"),
-                }))
-            }
-            "note_save" => {
-                Some(ToolCall::NoteSave(NoteSaveParams {
-                    content: Self::json_str(json, "content"),
-                    title: Self::json_str(json, "title"),
-                    tags: Self::json_str_array(json, "tags"),
-                }))
-            }
+            "calendar_add" => Some(ToolCall::CalendarAdd(CalendarAddParams {
+                title: Self::json_str(json, "title"),
+                date: Self::json_str(json, "date"),
+                start_time: Self::json_str(json, "start_time"),
+                end_time: Self::json_str(json, "end_time"),
+                duration: Self::json_str(json, "duration"),
+                location: Self::json_str(json, "location"),
+                description: Self::json_str(json, "description"),
+                attendees: Self::json_str_array(json, "attendees"),
+                reminder: Self::json_str(json, "reminder"),
+            })),
+            "calendar_check" => Some(ToolCall::CalendarCheck(CalendarCheckParams {
+                date: Self::json_str(json, "date"),
+                date_range: Self::json_str(json, "date_range"),
+                search_query: Self::json_str(json, "search_query"),
+            })),
+            "email_send" => Some(ToolCall::EmailSend(EmailSendParams {
+                to: Self::json_str(json, "to"),
+                subject: Self::json_str(json, "subject"),
+                body: Self::json_str(json, "body"),
+                cc: Self::json_str_array(json, "cc"),
+                attachments: Self::json_str_array(json, "attachments"),
+                priority: Self::json_str(json, "priority"),
+            })),
+            "web_search" => Some(ToolCall::WebSearch(WebSearchParams {
+                query: Self::json_str(json, "query"),
+                search_type: Self::json_str(json, "search_type"),
+                language: Self::json_str(json, "language"),
+                max_results: json
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32),
+            })),
+            "reminder_set" => Some(ToolCall::ReminderSet(ReminderSetParams {
+                message: Self::json_str(json, "message"),
+                when: Self::json_str(json, "when"),
+                repeat: Self::json_str(json, "repeat"),
+            })),
+            "timer_set" => Some(ToolCall::TimerSet(TimerSetParams {
+                duration: Self::json_str(json, "duration"),
+                label: Self::json_str(json, "label"),
+            })),
+            "note_save" => Some(ToolCall::NoteSave(NoteSaveParams {
+                content: Self::json_str(json, "content"),
+                title: Self::json_str(json, "title"),
+                tags: Self::json_str_array(json, "tags"),
+            })),
             _ => None,
         }
     }
@@ -503,9 +570,15 @@ impl IntentAnalyzer {
                 ctx.push_str("\n");
             }
             let hint = match question_type {
-                IdentityQuestionType::WhoAmI => "[IDENTITY] Użytkownik pyta kim jest. Sprawdź Memory i odpowiedz.",
-                IdentityQuestionType::WhatIsMyName => "[IDENTITY] Użytkownik pyta o swoje imię. Sprawdź Memory.",
-                IdentityQuestionType::WhatDoYouKnow => "[IDENTITY] Użytkownik pyta co o nim wiesz. Podsumuj z Memory.",
+                IdentityQuestionType::WhoAmI => {
+                    "[IDENTITY] Użytkownik pyta kim jest. Sprawdź Memory i odpowiedz."
+                }
+                IdentityQuestionType::WhatIsMyName => {
+                    "[IDENTITY] Użytkownik pyta o swoje imię. Sprawdź Memory."
+                }
+                IdentityQuestionType::WhatDoYouKnow => {
+                    "[IDENTITY] Użytkownik pyta co o nim wiesz. Podsumuj z Memory."
+                }
                 _ => "[IDENTITY] Użytkownik pyta o siebie. Sprawdź Memory.",
             };
             ctx.push_str(hint);
@@ -587,14 +660,26 @@ mod tests {
         for greeting in greetings {
             let msg_lower = greeting.to_lowercase().trim().to_string();
             let test_greetings = [
-                "cześć", "czesc", "hej", "hejka", "siema", "siemka",
-                "dzień dobry", "dzien dobry", "dobry wieczór", "dobry wieczor",
-                "witaj", "witam", "hello", "hi", "yo",
+                "cześć",
+                "czesc",
+                "hej",
+                "hejka",
+                "siema",
+                "siemka",
+                "dzień dobry",
+                "dzien dobry",
+                "dobry wieczór",
+                "dobry wieczor",
+                "witaj",
+                "witam",
+                "hello",
+                "hi",
+                "yo",
             ];
 
-            let is_greeting = test_greetings.iter().any(|g| {
-                msg_lower == *g || msg_lower.starts_with(&format!("{} ", g))
-            });
+            let is_greeting = test_greetings
+                .iter()
+                .any(|g| msg_lower == *g || msg_lower.starts_with(&format!("{} ", g)));
 
             assert!(is_greeting, "Should detect greeting: {}", greeting);
         }
