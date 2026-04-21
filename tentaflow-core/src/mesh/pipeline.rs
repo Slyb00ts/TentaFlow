@@ -187,6 +187,40 @@ pub async fn start_mesh_pipeline(
                 }
             }
 
+            // Reconnect loop — co 15s iteruje peer_store i dla kazdego peera
+            // ktory nie jest aktualnie polaczony (quic_connected=false) probuje
+            // `connect_to_peer`. Iroh rozwiazuje adres przez mDNS/DHT. Dzieki
+            // temu peer ktory padl (PeerDisconnected) zostanie automatycznie
+            // redialowany bez czekania na kolejny DiscoveryEvent.
+            {
+                let qm = quic_mesh.clone();
+                let store = mesh_peer_store.clone();
+                let self_id = node_id.clone();
+                tokio::spawn(async move {
+                    let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+                    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                    ticker.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Delay,
+                    );
+                    loop {
+                        ticker.tick().await;
+                        let peers = store.list();
+                        for p in peers.iter() {
+                            if p.node_id == self_id || p.quic_connected {
+                                continue;
+                            }
+                            let qm2 = qm.clone();
+                            let nid = p.node_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = qm2.connect_to_peer(&nid, dummy).await {
+                                    debug!(peer_id = %nid, "Reconnect loop: {}", e);
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+
             spawn_quic_event_handler(
                 quic_mesh.clone(),
                 mesh_peer_store.clone(),
