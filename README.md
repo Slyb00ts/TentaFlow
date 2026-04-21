@@ -184,10 +184,16 @@ vcpkg install openssl:x64-windows
 choco install openssl
 ```
 
-WASM addons require the WASI target:
+WASM addons require the WASI target, and the browser protocol glue requires an additional target plus `wasm-bindgen` CLI:
 ```bash
-rustup target add wasm32-wasip1
+rustup target add wasm32-wasip1           # for sandboxed addons
+rustup target add wasm32-unknown-unknown  # for tentaflow-protocol-wasm
+cargo install wasm-bindgen-cli --version 0.2.108 --locked
 ```
+
+Without `wasm-bindgen`, `build.rs` skips generating `www/js/protocol/wasm_glue.{js,wasm}` and the dashboard fails to load in the browser (`codec.js` import error).
+
+**One-shot install** (Linux + macOS): `./scripts/setup.sh` handles base dependencies, Rust toolchain, both WASM targets, and `wasm-bindgen-cli`.
 
 **TLS certificates** are generated automatically during build (self-signed, EC P-256, valid 10 years) if `certs/cert.pem` and `certs/key.pem` are not present. No external tools required — generation uses pure Rust (`rcgen`). To use custom certificates, place them in `certs/cert.pem` and `certs/key.pem` before building.
 

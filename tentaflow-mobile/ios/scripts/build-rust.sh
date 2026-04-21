@@ -27,37 +27,46 @@ if [ "$BUILD_MODE" = "release" ]; then
     OUTPUT_DIR="release"
 fi
 
-# Flagi kompilatora C/C++ — minimum iOS version + stack probe fix
+# Minimum iOS version — globalna, ale cc-rs aplikuje ja automatycznie
+# tylko do targetow Apple (nie do hostowych build scripts).
 export IPHONEOS_DEPLOYMENT_TARGET="$IOS_MIN_VERSION"
-export CFLAGS="-mios-version-min=$IOS_MIN_VERSION"
-export CXXFLAGS="-mios-version-min=$IOS_MIN_VERSION"
 
-# ___chkstk_darwin fix — ta funkcja nie istnieje na iOS,
-# ale jest generowana przez kompilator dla duzych ramek stosu.
-# Linkujemy z libclang_rt ktora ja dostarcza.
+# Per-target C/C++ flags. NIE ustawiaj globalnego CFLAGS/CXXFLAGS/RUSTFLAGS —
+# cargo stosuje te zmienne rowniez do build scriptow hostowych (np. ring, aws-lc-sys),
+# ktore kompiluja dla hosta macOS i dostaja konflikt:
+#   clang: error: invalid argument '-mmacosx-version-min=X' not allowed with '-mios-version-min=Y'
+# cc-rs czyta CFLAGS_<target> (myslnik → underscore) tylko dla tego konkretnego targetu.
+export CFLAGS_aarch64_apple_ios="-mios-version-min=$IOS_MIN_VERSION"
+export CXXFLAGS_aarch64_apple_ios="-mios-version-min=$IOS_MIN_VERSION"
+export CFLAGS_aarch64_apple_ios_sim="-mios-simulator-version-min=$IOS_MIN_VERSION"
+export CXXFLAGS_aarch64_apple_ios_sim="-mios-simulator-version-min=$IOS_MIN_VERSION"
+
+# ___chkstk_darwin fix — ta funkcja nie istnieje na iOS, ale jest generowana
+# przez kompilator dla duzych ramek stosu. Linkujemy z libclang_rt ktora ja dostarcza.
 SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
 CLANG_RT_DIR=$(dirname $(xcrun --toolchain default -f clang))/../lib/clang
 CLANG_VERSION=$(ls "$CLANG_RT_DIR" | sort -V | tail -1)
 CLANG_RT_LIB="$CLANG_RT_DIR/$CLANG_VERSION/lib/darwin/libclang_rt.ios.a"
 
-if [ -f "$CLANG_RT_LIB" ]; then
-    echo "Using clang_rt: $CLANG_RT_LIB"
-    export RUSTFLAGS="-C link-arg=$CLANG_RT_LIB -C link-arg=-mios-version-min=$IOS_MIN_VERSION"
-else
-    echo "WARNING: clang_rt.ios.a nie znalezione, szukam alternatywy..."
-    # Alternatywna sciezka dla nowszych Xcode
-    CLANG_RT_LIB2=$(find "$(xcode-select -p)" -name "libclang_rt.ios.a" 2>/dev/null | head -1)
-    if [ -n "$CLANG_RT_LIB2" ]; then
-        echo "Using clang_rt: $CLANG_RT_LIB2"
-        export RUSTFLAGS="-C link-arg=$CLANG_RT_LIB2 -C link-arg=-mios-version-min=$IOS_MIN_VERSION"
-    else
-        echo "WARNING: Brak libclang_rt.ios.a — ___chkstk_darwin moze byc undefined"
-        export RUSTFLAGS="-C link-arg=-mios-version-min=$IOS_MIN_VERSION"
-    fi
+if [ ! -f "$CLANG_RT_LIB" ]; then
+    CLANG_RT_LIB=$(find "$(xcode-select -p)" -name "libclang_rt.ios.a" 2>/dev/null | head -1)
 fi
 
+DEVICE_RUSTFLAGS="-C link-arg=-mios-version-min=$IOS_MIN_VERSION"
+if [ -n "$CLANG_RT_LIB" ] && [ -f "$CLANG_RT_LIB" ]; then
+    echo "Using clang_rt: $CLANG_RT_LIB"
+    DEVICE_RUSTFLAGS="-C link-arg=$CLANG_RT_LIB $DEVICE_RUSTFLAGS"
+else
+    echo "WARNING: Brak libclang_rt.ios.a — ___chkstk_darwin moze byc undefined"
+fi
+
+# Per-target RUSTFLAGS — stosowane tylko przy kompilacji tego targetu,
+# nie przy hostowych build scriptach.
+export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="$DEVICE_RUSTFLAGS"
+export CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS="-C link-arg=-mios-simulator-version-min=$IOS_MIN_VERSION"
+
 echo "IPHONEOS_DEPLOYMENT_TARGET=$IOS_MIN_VERSION"
-echo "RUSTFLAGS=$RUSTFLAGS"
+echo "CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS=$CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS"
 
 echo ""
 echo "Building for device ($DEVICE_TARGET)..."
