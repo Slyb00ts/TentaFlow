@@ -2,64 +2,117 @@
 id = "malicious-addon"
 name = "Malicious Test Addon"
 version = "1.0.0"
-description = "Addon probujacy lamac zabezpieczenia sandboxa"
+description = "Addon that deliberately tries to break sandbox security guarantees."
+category = "test"
+keywords = ["test", "security", "sandbox", "malicious"]
 author = "Security Tester"
+license = "Apache-2.0"
+homepage = ""
+icon = "shield"
+runtime = "wasmtime"
 platforms = ["linux", "macos", "windows"]
 wasm_file = "addon.wasm"
 
-[permissions]
-required = ["storage", "log"]
-optional = []
+# Deliberately requests high/critical permissions to exercise denial flows.
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Used to verify storage isolation between addons."
+risk = "low"
 
-# Celowo NIE deklaruje: http, secrets, network, llm, events, ui
+[[permission]]
+id = "http.request"
+display_name = "Perform HTTP requests"
+description = "Used to verify HTTP is denied without explicit user grant."
+risk = "high"
 
-[tools]
-[tools.try_steal_storage]
-description = "Proba odczytu storage innego addonu"
-[tools.try_steal_storage.parameters]
-type = "object"
+[[permission]]
+id = "secrets.read"
+display_name = "Read secrets"
+description = "Used to verify secrets are never exposed without grant."
+risk = "high"
 
-[tools.try_unauthorized_http]
-description = "Proba HTTP bez uprawnienia"
-[tools.try_unauthorized_http.parameters]
-type = "object"
+[[permission]]
+id = "network.tcp"
+display_name = "Open raw TCP sockets"
+description = "Used to verify raw TCP is denied without explicit network rule."
+risk = "critical"
 
-[tools.try_unauthorized_secrets]
-description = "Proba odczytu secrets bez uprawnienia"
-[tools.try_unauthorized_secrets.parameters]
-type = "object"
+[[permission]]
+id = "network.udp"
+display_name = "Open raw UDP sockets"
+description = "Used to verify raw UDP is denied without explicit network rule."
+risk = "critical"
 
-[tools.try_unauthorized_network]
-description = "Proba net_connect bez uprawnienia"
-[tools.try_unauthorized_network.parameters]
-type = "object"
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = false
 
-[tools.try_memory_escape]
-description = "Proba odczytu pamieci poza granicami"
-[tools.try_memory_escape.parameters]
-type = "object"
+[resources]
+memory_mb = 128
+storage_mb = 10
 
-[tools.try_stack_overflow]
-description = "Proba stack overflow"
-[tools.try_stack_overflow.parameters]
-type = "object"
+[lifecycle]
+background = false
+auto_start = false
 
-[tools.try_infinite_loop]
-description = "Proba infinite loop (fuel metering)"
-[tools.try_infinite_loop.parameters]
-type = "object"
+[[tool]]
+id = "try_steal_storage"
+display_name = "Attempt cross-addon storage read"
+description = "Attempt to read storage of another addon."
+keywords = ["test", "storage"]
 
-[tools.try_huge_alloc]
-description = "Proba alokacji ogromnej ilosci pamieci"
-[tools.try_huge_alloc.parameters]
-type = "object"
+[[tool]]
+id = "try_unauthorized_http"
+display_name = "Attempt HTTP without permission"
+description = "Attempt HTTP without runtime grant."
+keywords = ["test", "http"]
 
-[tools.try_storage_other_addon]
-description = "Proba odczytu storage z addon_id innego addonu"
-[tools.try_storage_other_addon.parameters]
-type = "object"
+[[tool]]
+id = "try_unauthorized_secrets"
+display_name = "Attempt secrets read without permission"
+description = "Attempt to read secrets without runtime grant."
+keywords = ["test", "secrets"]
 
-[tools.try_overwrite_memory]
-description = "Proba nadpisania pamieci hosta przez zle pointery"
-[tools.try_overwrite_memory.parameters]
-type = "object"
+[[tool]]
+id = "try_unauthorized_network"
+display_name = "Attempt raw network without permission"
+description = "Attempt net_connect without a matching network rule."
+keywords = ["test", "network"]
+
+[[tool]]
+id = "try_memory_escape"
+display_name = "Attempt out-of-bounds read"
+description = "Attempt to read memory outside guest bounds."
+keywords = ["test", "memory"]
+
+[[tool]]
+id = "try_stack_overflow"
+display_name = "Attempt stack overflow"
+description = "Attempt deep recursion to overflow the guest stack."
+keywords = ["test", "stack"]
+
+[[tool]]
+id = "try_infinite_loop"
+display_name = "Attempt infinite loop"
+description = "Attempt an infinite loop to exercise fuel metering."
+keywords = ["test", "fuel"]
+
+[[tool]]
+id = "try_huge_alloc"
+display_name = "Attempt huge allocation"
+description = "Attempt to allocate an excessive amount of guest memory."
+keywords = ["test", "alloc"]
+
+[[tool]]
+id = "try_storage_other_addon"
+display_name = "Attempt storage scope break"
+description = "Attempt to read storage with another addon_id."
+keywords = ["test", "storage"]
+
+[[tool]]
+id = "try_overwrite_memory"
+display_name = "Attempt host memory overwrite"
+description = "Attempt to corrupt host memory via bad pointers."
+keywords = ["test", "memory"]

@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: main.rs
 // Opis: Punkt wejscia generycznego sidecara TentaFlow. Laduje konfiguracje,
-//       uruchamia QUIC server i dispatchuje requesty do handlera wybranego
+//       uruchamia iroh endpoint i dispatchuje requesty do handlera wybranego
 //       przez `role` w config.toml.
 // =============================================================================
 
@@ -15,7 +15,7 @@ use tentaflow_sidecar::roles;
 
 #[derive(Parser, Debug)]
 #[command(name = "tentaflow-sidecar")]
-#[command(about = "Generyczny sidecar QUIC dla kontenerow TentaFlow")]
+#[command(about = "Generyczny sidecar iroh dla kontenerow TentaFlow")]
 struct Args {
     /// Sciezka do pliku konfiguracji. Jesli nie istnieje, probuje /data/config.toml
     /// a potem /app/config.default.toml.
@@ -25,10 +25,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Blad instalacji CryptoProvider");
-
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -40,7 +36,7 @@ async fn main() -> Result<()> {
     tracing::info!(path = %config_path.display(), "Laduje konfiguracje sidecara");
 
     let config = SidecarConfig::load(&config_path)?;
-    tracing::info!(service = %config.service_name, port = config.quic.port, "Sidecar start");
+    tracing::info!(service = %config.service_name, port = config.transport.port, "Sidecar start");
 
     match &config.role {
         Role::ReverseProxy { upstream_url, api, .. } => {

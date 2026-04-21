@@ -1,0 +1,34 @@
+# Manifest serwisu Whisper — wbudowany engine STT (whisper-rs) na wszystkie platformy.
+
+[engine]
+id = "whisper"
+category = "stt"
+name = "Whisper"
+description_pl = "Silnik STT od OpenAI. Multijezykowa transkrypcja audio → tekst."
+description_en = "OpenAI's STT engine. Multilingual audio-to-text transcription."
+homepage = "https://github.com/openai/whisper"
+license = "MIT"
+icon = "whisper"
+default_port = 5030
+api = "openai-compatible"
+version = "1.7.4"
+
+[deploy.docker]
+context_path = "stt/docker/whisper"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+feature_flag = "inference-whisper"
+
+[[model_preset]]
+id = "whisper-large-v3-turbo"
+display_name = "Whisper Large v3 Turbo"
+repo = "openai/whisper-large-v3-turbo"
+recommended = true
+
+[[model_preset]]
+id = "whisper-base"
+display_name = "Whisper Base"
+repo = "openai/whisper-base"

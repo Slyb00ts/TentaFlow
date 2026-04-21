@@ -73,6 +73,13 @@ pub struct MeshServiceInfo {
     pub models: Vec<String>,
     /// Obciazenie noda w procentach (0-100)
     pub load_percent: u8,
+    /// Engine serving these models (e.g. "llama-cpp", "vllm", "mlx", "whisper-rs").
+    #[serde(default)]
+    pub engine_id: Option<String>,
+    /// Parallel array to `models`: weights size in MB per entry (0 when unknown).
+    /// Empty when no size metadata is available.
+    #[serde(default)]
+    pub model_sizes_mb: Vec<u64>,
 }
 
 // =============================================================================
@@ -899,6 +906,8 @@ mod tests {
                 status: "running".to_string(),
                 models: vec!["llama3-8b".to_string(), "mistral-7b".to_string()],
                 load_percent: 35,
+                engine_id: None,
+                model_sizes_mb: Vec::new(),
             }],
         };
 
@@ -1362,6 +1371,8 @@ mod tests {
                 status: "running".to_string(),
                 models: vec!["llama3-70b".to_string()],
                 load_percent: 55,
+                engine_id: None,
+                model_sizes_mb: Vec::new(),
             }],
             crdt_operations: vec![CrdtSyncOp {
                 clock_time: 200,

@@ -17,12 +17,12 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::inference::{
-    EmbeddingParams, EmbeddingResult, GenerateParams, GenerateResult,
-    InferenceEngine, ModelInfo, StopReason, StreamToken,
+    EmbeddingParams, EmbeddingResult, GenerateParams, GenerateResult, InferenceEngine, ModelInfo,
+    StopReason, StreamToken,
 };
 
 /// Domyslny rozmiar kontekstu
@@ -106,11 +106,7 @@ impl LlamaCppEngine {
     }
 
     /// Laduje model z pliku GGUF (operacja synchroniczna)
-    fn load_model_sync(
-        model_path: &Path,
-        gpu_layers: u32,
-        ctx_size: u32,
-    ) -> Result<LoadedModel> {
+    fn load_model_sync(model_path: &Path, gpu_layers: u32, ctx_size: u32) -> Result<LoadedModel> {
         info!("Inicjalizacja backendu llama.cpp...");
 
         let backend = LlamaBackend::init().map_err(|e| {
@@ -123,8 +119,7 @@ impl LlamaCppEngine {
         // Przekierowanie logow llama.cpp do tracing
         llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
 
-        let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(gpu_layers);
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
 
         info!(
             "Ladowanie modelu GGUF: {} (gpu_layers={})",
@@ -154,12 +149,13 @@ impl LlamaCppEngine {
             .and_then(|name| {
                 // Typowe wzorce: model-Q4_K_M.gguf, model.Q5_K_S.gguf
                 let upper = name.to_uppercase();
-                ["Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S",
-                 "Q4_K_M", "Q5_0", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0",
-                 "F16", "F32"]
-                    .iter()
-                    .find(|q| upper.contains(*q))
-                    .map(|q| q.to_string())
+                [
+                    "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q5_0",
+                    "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0", "F16", "F32",
+                ]
+                .iter()
+                .find(|q| upper.contains(*q))
+                .map(|q| q.to_string())
             });
 
         let info = ModelInfo {
@@ -188,10 +184,7 @@ impl LlamaCppEngine {
     }
 
     /// Generuje tekst synchronicznie (wywoływane w spawn_blocking)
-    fn generate_sync(
-        state: &LoadedModel,
-        params: &GenerateParams,
-    ) -> Result<GenerateResult> {
+    fn generate_sync(state: &LoadedModel, params: &GenerateParams) -> Result<GenerateResult> {
         let start = Instant::now();
 
         // Polacz system prompt z promptem uzytkownika
@@ -201,25 +194,34 @@ impl LlamaCppEngine {
         };
 
         // Tokenizacja
-        let tokens = state.model.str_to_token(&full_prompt, AddBos::Always)
+        let tokens = state
+            .model
+            .str_to_token(&full_prompt, AddBos::Always)
             .map_err(|e| anyhow::anyhow!("Blad tokenizacji: {}", e))?;
 
         let prompt_tokens = tokens.len() as u32;
-        debug!("Prompt: {} znakow -> {} tokenow", full_prompt.len(), prompt_tokens);
+        debug!(
+            "Prompt: {} znakow -> {} tokenow",
+            full_prompt.len(),
+            prompt_tokens
+        );
 
         // Kontekst inferencji
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(state.ctx_size))
             .with_n_batch(BATCH_SIZE as u32);
 
-        let mut ctx = state.model.new_context(&state.backend, ctx_params)
+        let mut ctx = state
+            .model
+            .new_context(&state.backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc kontekstu: {}", e))?;
 
         // Batch z prompt tokenami
         let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
         let last_idx = tokens.len() - 1;
         for (i, token) in tokens.iter().enumerate() {
-            batch.add(*token, i as i32, &[0], i == last_idx)
+            batch
+                .add(*token, i as i32, &[0], i == last_idx)
                 .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
         }
 
@@ -247,7 +249,8 @@ impl LlamaCppEngine {
             }
 
             // Dekoduj token na tekst
-            let piece = state.model
+            let piece = state
+                .model
                 .token_to_piece(new_token, &mut decoder, false, None)
                 .unwrap_or_default();
 
@@ -255,7 +258,9 @@ impl LlamaCppEngine {
             generated_tokens += 1;
 
             // Sprawdz stop sequences
-            if let Some(matched) = Self::check_stop_sequence(&generated_text, &params.stop_sequences) {
+            if let Some(matched) =
+                Self::check_stop_sequence(&generated_text, &params.stop_sequences)
+            {
                 let trim_len = matched.len();
                 let new_len = generated_text.len() - trim_len;
                 generated_text.truncate(new_len);
@@ -271,7 +276,8 @@ impl LlamaCppEngine {
 
             // Przygotuj nastepny batch
             batch.clear();
-            batch.add(new_token, n_cur, &[0], true)
+            batch
+                .add(new_token, n_cur, &[0], true)
                 .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
             n_cur += 1;
 
@@ -308,27 +314,24 @@ impl InferenceEngine for LlamaCppEngine {
         vec!["gguf".to_string()]
     }
 
-    async fn load_model(
-        &self,
-        model_path: &Path,
-        gpu_layers: Option<u32>,
-    ) -> Result<ModelInfo> {
+    async fn load_model(&self, model_path: &Path, gpu_layers: Option<u32>) -> Result<ModelInfo> {
         let path = model_path.to_path_buf();
         let layers = gpu_layers.unwrap_or(DEFAULT_GPU_LAYERS);
         let ctx_size = DEFAULT_CTX_SIZE;
 
         info!(
             "Ladowanie modelu: {} (gpu_layers={}, ctx={})",
-            path.display(), layers, ctx_size,
+            path.display(),
+            layers,
+            ctx_size,
         );
 
         // Ladowanie w osobnym watku (operacja synchroniczna C FFI)
-        let loaded = tokio::task::spawn_blocking(move || {
-            Self::load_model_sync(&path, layers, ctx_size)
-        })
-        .await
-        .context("Blad w spawn_blocking podczas ladowania modelu")?
-        .context("Nie udalo sie zaladowac modelu")?;
+        let loaded =
+            tokio::task::spawn_blocking(move || Self::load_model_sync(&path, layers, ctx_size))
+                .await
+                .context("Blad w spawn_blocking podczas ladowania modelu")?
+                .context("Nie udalo sie zaladowac modelu")?;
 
         let info = loaded.info.clone();
         *self.state.lock().await = Some(loaded);
@@ -340,7 +343,10 @@ impl InferenceEngine for LlamaCppEngine {
     async fn unload_model(&self) -> Result<()> {
         let mut guard = self.state.lock().await;
         if guard.is_some() {
-            let name = guard.as_ref().map(|m| m.info.name.clone()).unwrap_or_default();
+            let name = guard
+                .as_ref()
+                .map(|m| m.info.name.clone())
+                .unwrap_or_default();
             *guard = None;
             info!("Model '{}' wyladowany z pamieci", name);
         } else {
@@ -351,9 +357,10 @@ impl InferenceEngine for LlamaCppEngine {
 
     fn model_info(&self) -> Option<ModelInfo> {
         // Probujem zdobyc lock bez blokowania — jesli nie uda sie, zwracamy None
-        self.state.try_lock().ok().and_then(|guard| {
-            guard.as_ref().map(|m| m.info.clone())
-        })
+        self.state
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|m| m.info.clone()))
     }
 
     async fn generate(&self, params: GenerateParams) -> Result<GenerateResult> {
@@ -371,7 +378,8 @@ impl InferenceEngine for LlamaCppEngine {
             // Blokujacy lock w watku spawn_blocking
             let rt = tokio::runtime::Handle::current();
             let guard = rt.block_on(state.lock());
-            let loaded = guard.as_ref()
+            let loaded = guard
+                .as_ref()
                 .context("Model zostal wyladowany w trakcie generowania")?;
 
             Self::generate_sync(loaded, &params_clone)
@@ -380,10 +388,7 @@ impl InferenceEngine for LlamaCppEngine {
         .context("Blad w spawn_blocking podczas generowania")?
     }
 
-    async fn generate_stream(
-        &self,
-        params: GenerateParams,
-    ) -> Result<mpsc::Receiver<StreamToken>> {
+    async fn generate_stream(&self, params: GenerateParams) -> Result<mpsc::Receiver<StreamToken>> {
         // Sprawdz czy model jest zaladowany
         {
             let guard = self.state.lock().await;
@@ -418,8 +423,7 @@ impl InferenceEngine for LlamaCppEngine {
 
     async fn embeddings(&self, params: EmbeddingParams) -> Result<EmbeddingResult> {
         let guard = self.state.lock().await;
-        let loaded = guard.as_ref()
-            .context("Model nie jest zaladowany")?;
+        let loaded = guard.as_ref().context("Model nie jest zaladowany")?;
 
         // Sprawdz czy model wspiera embeddingi
         // llama.cpp obsluguje embeddingi tylko dla modeli embedding
@@ -435,14 +439,17 @@ impl InferenceEngine for LlamaCppEngine {
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             let guard = rt.block_on(state.lock());
-            let loaded = guard.as_ref()
+            let loaded = guard
+                .as_ref()
                 .context("Model zostal wyladowany w trakcie obliczania embedddingow")?;
 
             let n_embd = loaded.model.n_embd() as usize;
             let mut all_embeddings = Vec::with_capacity(params.texts.len());
 
             for text in &params.texts {
-                let tokens = loaded.model.str_to_token(text, AddBos::Always)
+                let tokens = loaded
+                    .model
+                    .str_to_token(text, AddBos::Always)
                     .map_err(|e| anyhow::anyhow!("Blad tokenizacji: {}", e))?;
 
                 let ctx_params = LlamaContextParams::default()
@@ -450,13 +457,16 @@ impl InferenceEngine for LlamaCppEngine {
                     .with_n_batch(BATCH_SIZE as u32)
                     .with_embeddings(true);
 
-                let mut ctx = loaded.model.new_context(&loaded.backend, ctx_params)
+                let mut ctx = loaded
+                    .model
+                    .new_context(&loaded.backend, ctx_params)
                     .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc kontekstu: {}", e))?;
 
                 let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
                 let last_idx = tokens.len() - 1;
                 for (i, token) in tokens.iter().enumerate() {
-                    batch.add(*token, i as i32, &[0], i == last_idx)
+                    batch
+                        .add(*token, i as i32, &[0], i == last_idx)
                         .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
                 }
 
@@ -464,7 +474,8 @@ impl InferenceEngine for LlamaCppEngine {
                     .map_err(|e| anyhow::anyhow!("Blad dekodowania: {}", e))?;
 
                 // Pobierz embedding z ostatniego tokena
-                let embd = ctx.embeddings_seq_ith(0)
+                let embd = ctx
+                    .embeddings_seq_ith(0)
                     .map_err(|e| anyhow::anyhow!("Nie udalo sie pobrac embeddingu: {}", e))?;
 
                 let mut embedding: Vec<f32> = embd.to_vec();
@@ -506,24 +517,33 @@ impl LlamaCppEngine {
         };
 
         // Tokenizacja
-        let tokens = loaded.model.str_to_token(&full_prompt, AddBos::Always)
+        let tokens = loaded
+            .model
+            .str_to_token(&full_prompt, AddBos::Always)
             .map_err(|e| anyhow::anyhow!("Blad tokenizacji: {}", e))?;
 
-        debug!("Stream: prompt {} znakow -> {} tokenow", full_prompt.len(), tokens.len());
+        debug!(
+            "Stream: prompt {} znakow -> {} tokenow",
+            full_prompt.len(),
+            tokens.len()
+        );
 
         // Kontekst
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(loaded.ctx_size))
             .with_n_batch(BATCH_SIZE as u32);
 
-        let mut ctx = loaded.model.new_context(&loaded.backend, ctx_params)
+        let mut ctx = loaded
+            .model
+            .new_context(&loaded.backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc kontekstu: {}", e))?;
 
         // Batch z prompt tokenami
         let mut batch = LlamaBatch::new(BATCH_SIZE, 1);
         let last_idx = tokens.len() - 1;
         for (i, token) in tokens.iter().enumerate() {
-            batch.add(*token, i as i32, &[0], i == last_idx)
+            batch
+                .add(*token, i as i32, &[0], i == last_idx)
                 .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
         }
 
@@ -552,14 +572,17 @@ impl LlamaCppEngine {
             }
 
             // Dekoduj token
-            let piece = loaded.model
+            let piece = loaded
+                .model
                 .token_to_piece(new_token, &mut decoder, false, None)
                 .unwrap_or_default();
 
             generated_text.push_str(&piece);
 
             // Sprawdz stop sequences
-            if let Some(_matched) = Self::check_stop_sequence(&generated_text, &params.stop_sequences) {
+            if let Some(_matched) =
+                Self::check_stop_sequence(&generated_text, &params.stop_sequences)
+            {
                 let _ = tx.blocking_send(StreamToken {
                     text: String::new(),
                     is_final: true,
@@ -568,10 +591,13 @@ impl LlamaCppEngine {
             }
 
             // Wyslij token — jesli odbiorca zamknal kanal, konczymy
-            if tx.blocking_send(StreamToken {
-                text: piece,
-                is_final: false,
-            }).is_err() {
+            if tx
+                .blocking_send(StreamToken {
+                    text: piece,
+                    is_final: false,
+                })
+                .is_err()
+            {
                 return Ok(());
             }
 
@@ -586,7 +612,8 @@ impl LlamaCppEngine {
 
             // Przygotuj nastepny batch
             batch.clear();
-            batch.add(new_token, n_cur, &[0], true)
+            batch
+                .add(new_token, n_cur, &[0], true)
                 .map_err(|e| anyhow::anyhow!("Blad dodawania tokena do batch: {}", e))?;
             n_cur += 1;
 

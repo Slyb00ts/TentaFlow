@@ -1,0 +1,30 @@
+# Manifest serwisu Ollama — zewnetrzny daemon LLM lub Docker.
+
+[engine]
+id = "ollama"
+category = "llm"
+name = "Ollama"
+description_pl = "Lokalny daemon LLM z prostym API. Tryb external (zainstalowany przez usera) lub docker."
+description_en = "Local LLM daemon with simple API. External mode (user-installed) or docker."
+homepage = "https://ollama.com"
+license = "MIT"
+icon = "ollama"
+default_port = 11434
+api = "ollama-native"
+version = "0.4.0"
+
+[deploy.docker]
+context_path = "llm/docker/ollama"
+platforms = ["linux", "windows"]
+
+[deploy.external]
+platforms = ["linux", "macos", "windows"]
+detection_binary = "ollama"
+detection_endpoint = "http://localhost:11434"
+detection_health_path = "/api/tags"
+
+[[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen 3.5 0.8B"
+repo = "qwen3.5:0.8b"
+recommended = true

@@ -1,0 +1,29 @@
+# Manifest serwisu ComfyUI — node-based image generation pipeline.
+
+[engine]
+id = "comfyui"
+category = "image-gen"
+name = "ComfyUI"
+description_pl = "Silnik generowania obrazow oparty o graf wezlow. Stable Diffusion, Flux i inne."
+description_en = "Node-based image generation engine. Stable Diffusion, Flux and more."
+homepage = "https://github.com/comfyanonymous/ComfyUI"
+license = "GPL-3.0"
+icon = "comfyui"
+default_port = 5000
+api = "comfyui"
+version = "0.3.10"
+
+[deploy.docker]
+context_path = "image-gen/docker/comfyui"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "image-gen/python/comfyui"
+
+[[model_preset]]
+id = "sd-1-5"
+display_name = "Stable Diffusion 1.5"
+repo = "runwayml/stable-diffusion-v1-5"
+recommended = true

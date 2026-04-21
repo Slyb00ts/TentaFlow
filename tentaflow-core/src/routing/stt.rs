@@ -5,8 +5,8 @@
 //       route_speaker_operation, route_speaker_link_to_memory.
 // =============================================================================
 
-use crate::error::Result;
 use crate::api::openai::types::{TranscriptionRequest, TranscriptionResponse};
+use crate::error::Result;
 use crate::routing::router::Router;
 
 use tracing::{debug, error};
@@ -20,8 +20,8 @@ impl Router {
         &self,
         request: TranscriptionRequest,
     ) -> Result<crate::routing::RouteResult<TranscriptionResponse>> {
-        use tentaflow_protocol::*;
         use crate::routing::middleware::BackendHandle;
+        use tentaflow_protocol::*;
 
         debug!(
             "Routing audio transcription dla modelu: {}, plik: {}, rozmiar: {} bajtow",
@@ -152,7 +152,13 @@ impl Router {
         let request_id = uuid::Uuid::new_v4().to_string();
 
         match operation {
-            AudioOperation::TTS { model, input, voice, format, speed } => {
+            AudioOperation::TTS {
+                model,
+                input,
+                voice,
+                format,
+                speed,
+            } => {
                 debug!("Audio TTS: model={}, dlugosc_tekstu={}", model, input.len());
 
                 // Uzyj synthesize_speech() ktora obsluguje QUIC TTS (preferowany) i HTTP fallback
@@ -203,20 +209,25 @@ impl Router {
                 avg_logprob_threshold,
                 compression_ratio_threshold,
             } => {
-                debug!("Audio STT: model={}, rozmiar_audio={} bajtow, response_format={:?}",
-                    model, audio_data.len(), response_format);
+                debug!(
+                    "Audio STT: model={}, rozmiar_audio={} bajtow, response_format={:?}",
+                    model,
+                    audio_data.len(),
+                    response_format
+                );
 
                 // Jesli uzytkownik chce filtrowania, wymuszamy verbose_json aby dostac segmenty
                 let needs_segments = no_speech_threshold.is_some()
                     || avg_logprob_threshold.is_some()
                     || compression_ratio_threshold.is_some();
 
-                let effective_format = if needs_segments && response_format.as_deref() != Some("verbose_json") {
-                    debug!("Wymuszam verbose_json bo filtrowanie jest wlaczone");
-                    Some("verbose_json".to_string())
-                } else {
-                    response_format.clone()
-                };
+                let effective_format =
+                    if needs_segments && response_format.as_deref() != Some("verbose_json") {
+                        debug!("Wymuszam verbose_json bo filtrowanie jest wlaczone");
+                        Some("verbose_json".to_string())
+                    } else {
+                        response_format.clone()
+                    };
 
                 // Utworz request transkrypcji i przekaz do route_audio_transcription
                 let request = crate::api::openai::types::TranscriptionRequest {
@@ -276,7 +287,8 @@ impl Router {
                                     .collect();
 
                                 // Zrekonstruuj tekst z przefiltrowanych segmentow
-                                let filtered_text = filtered_segments.iter()
+                                let filtered_text = filtered_segments
+                                    .iter()
                                     .map(|seg| seg.text.as_str())
                                     .collect::<Vec<_>>()
                                     .join("");
@@ -284,31 +296,35 @@ impl Router {
                                 // Oblicz liczbe odfiltrowanych segmentow
                                 let filtered_count = original_count - filtered_segments.len();
 
-                                debug!("STT verbose: {} segmentow po filtracji (z {}), odrzucono {}",
+                                debug!(
+                                    "STT verbose: {} segmentow po filtracji (z {}), odrzucono {}",
                                     filtered_segments.len(),
                                     original_count,
-                                    filtered_count);
+                                    filtered_count
+                                );
 
                                 // Jesli user prosil o verbose_json, zwroc Detailed
                                 if response_format.as_deref() == Some("verbose_json") {
                                     // Konwertuj segmenty do Protocol format
-                                    let protocol_segments: Vec<TranscriptionSegment> = filtered_segments.iter()
-                                        .map(|seg| TranscriptionSegment {
-                                            id: seg.id,
-                                            seek: seg.seek,
-                                            start: seg.start,
-                                            end: seg.end,
-                                            text: seg.text.clone(),
-                                            tokens: Some(seg.tokens.clone()),
-                                            temperature: seg.temperature,
-                                            avg_logprob: seg.avg_logprob,
-                                            compression_ratio: seg.compression_ratio,
-                                            no_speech_prob: seg.no_speech_prob,
-                                            speaker_label: seg.speaker_label.clone(),
-                                            speaker_similarity: seg.speaker_similarity,
-                                            is_known_speaker: seg.is_known_speaker,
-                                        })
-                                        .collect();
+                                    let protocol_segments: Vec<TranscriptionSegment> =
+                                        filtered_segments
+                                            .iter()
+                                            .map(|seg| TranscriptionSegment {
+                                                id: seg.id,
+                                                seek: seg.seek,
+                                                start: seg.start,
+                                                end: seg.end,
+                                                text: seg.text.clone(),
+                                                tokens: Some(seg.tokens.clone()),
+                                                temperature: seg.temperature,
+                                                avg_logprob: seg.avg_logprob,
+                                                compression_ratio: seg.compression_ratio,
+                                                no_speech_prob: seg.no_speech_prob,
+                                                speaker_label: seg.speaker_label.clone(),
+                                                speaker_similarity: seg.speaker_similarity,
+                                                is_known_speaker: seg.is_known_speaker,
+                                            })
+                                            .collect();
 
                                     return Ok(ModelResponse {
                                         request_id,
@@ -316,9 +332,13 @@ impl Router {
                                             data: AudioResultData::Detailed {
                                                 text: filtered_text,
                                                 segments: protocol_segments,
-                                                language: transcription.language.unwrap_or_default(),
+                                                language: transcription
+                                                    .language
+                                                    .unwrap_or_default(),
                                                 duration: transcription.duration.unwrap_or(0.0),
-                                                filtered_segments_count: Some(filtered_count as u32),
+                                                filtered_segments_count: Some(
+                                                    filtered_count as u32,
+                                                ),
                                             },
                                             model: model.clone(),
                                         }),
@@ -365,14 +385,30 @@ impl Router {
 
             // === SPEAKER OPERATIONS ===
             // Forward to QUIC STT service which handles speaker enrollment/identification
-
-            AudioOperation::SpeakerEnroll { speaker_id, speaker_name, audio_samples, metadata: _metadata } => {
-                debug!("Speaker Enroll: id={}, name={}, samples={}", speaker_id, speaker_name, audio_samples.len());
+            AudioOperation::SpeakerEnroll {
+                speaker_id,
+                speaker_name,
+                audio_samples,
+                metadata: _metadata,
+            } => {
+                debug!(
+                    "Speaker Enroll: id={}, name={}, samples={}",
+                    speaker_id,
+                    speaker_name,
+                    audio_samples.len()
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::SpeakerAddSamples { speaker_id, audio_samples } => {
-                debug!("Speaker AddSamples: id={}, samples={}", speaker_id, audio_samples.len());
+            AudioOperation::SpeakerAddSamples {
+                speaker_id,
+                audio_samples,
+            } => {
+                debug!(
+                    "Speaker AddSamples: id={}, samples={}",
+                    speaker_id,
+                    audio_samples.len()
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
@@ -391,64 +427,134 @@ impl Router {
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::SpeakerIdentify { audio_data, threshold } => {
-                debug!("Speaker Identify: audio_size={}, threshold={:?}", audio_data.len(), threshold);
+            AudioOperation::SpeakerIdentify {
+                audio_data,
+                threshold,
+            } => {
+                debug!(
+                    "Speaker Identify: audio_size={}, threshold={:?}",
+                    audio_data.len(),
+                    threshold
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::SpeakerVerify { speaker_id, audio_data, threshold } => {
-                debug!("Speaker Verify: id={}, audio_size={}, threshold={:?}", speaker_id, audio_data.len(), threshold);
+            AudioOperation::SpeakerVerify {
+                speaker_id,
+                audio_data,
+                threshold,
+            } => {
+                debug!(
+                    "Speaker Verify: id={}, audio_size={}, threshold={:?}",
+                    speaker_id,
+                    audio_data.len(),
+                    threshold
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
             // === VOICE RECOGNITION FLOW OPERATIONS ===
-            AudioOperation::SpeakerIdentifyWithConfidence { audio_data, high_threshold, medium_threshold, audio_metadata: _audio_metadata } => {
+            AudioOperation::SpeakerIdentifyWithConfidence {
+                audio_data,
+                high_threshold,
+                medium_threshold,
+                audio_metadata: _audio_metadata,
+            } => {
                 debug!("Speaker IdentifyWithConfidence: audio_size={}, high_threshold={:?}, medium_threshold={:?}",
                     audio_data.len(), high_threshold, medium_threshold);
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::SpeakerConfirmIdentity { speaker_id, audio_data, add_sample, sample_metadata: _sample_metadata } => {
-                debug!("Speaker ConfirmIdentity: id={}, add_sample={}, has_audio={}",
-                    speaker_id, add_sample, audio_data.is_some());
+            AudioOperation::SpeakerConfirmIdentity {
+                speaker_id,
+                audio_data,
+                add_sample,
+                sample_metadata: _sample_metadata,
+            } => {
+                debug!(
+                    "Speaker ConfirmIdentity: id={}, add_sample={}, has_audio={}",
+                    speaker_id,
+                    add_sample,
+                    audio_data.is_some()
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::SpeakerLinkToMemory { speaker_id, memory_node_id, voice_id } => {
-                debug!("Speaker LinkToMemory: speaker_id={}, memory_node_id={}, voice_id={}",
-                    speaker_id, memory_node_id, voice_id);
+            AudioOperation::SpeakerLinkToMemory {
+                speaker_id,
+                memory_node_id,
+                voice_id,
+            } => {
+                debug!(
+                    "Speaker LinkToMemory: speaker_id={}, memory_node_id={}, voice_id={}",
+                    speaker_id, memory_node_id, voice_id
+                );
                 // To wymaga polaczenia z Memory - uzywamy route_speaker_operation
                 // ktore przekaze do STT, a STT moze wywolac Memory (lub Router robi to bezposrednio)
-                self.route_speaker_link_to_memory(speaker_id, *memory_node_id, voice_id, &request_id).await
+                self.route_speaker_link_to_memory(
+                    speaker_id,
+                    *memory_node_id,
+                    voice_id,
+                    &request_id,
+                )
+                .await
             }
 
             // =========================================================================
             // WAKE WORD DETECTION - routuje do STT service
             // =========================================================================
-
-            AudioOperation::WakeWordDetect { audio_data, wake_words, sensitivity, return_audio_after: _return_audio_after } => {
-                debug!("WakeWord Detect: audio_size={}, wake_words={:?}, sensitivity={:?}",
+            AudioOperation::WakeWordDetect {
+                audio_data,
+                wake_words,
+                sensitivity,
+                return_audio_after: _return_audio_after,
+            } => {
+                debug!(
+                    "WakeWord Detect: audio_size={}, wake_words={:?}, sensitivity={:?}",
                     audio_data.len(),
                     wake_words.as_ref().map(|w| w.len()),
-                    sensitivity);
+                    sensitivity
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::WakeWordConfigure { wake_words, sensitivity, min_detection_interval_ms: _min_detection_interval_ms, vad_enabled, vad_threshold: _vad_threshold } => {
-                debug!("WakeWord Configure: words={:?}, sensitivity={}, vad={}",
-                    wake_words, sensitivity, vad_enabled.unwrap_or(true));
+            AudioOperation::WakeWordConfigure {
+                wake_words,
+                sensitivity,
+                min_detection_interval_ms: _min_detection_interval_ms,
+                vad_enabled,
+                vad_threshold: _vad_threshold,
+            } => {
+                debug!(
+                    "WakeWord Configure: words={:?}, sensitivity={}, vad={}",
+                    wake_words,
+                    sensitivity,
+                    vad_enabled.unwrap_or(true)
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::WakeWordStreamStart { wake_words, sensitivity, vad_enabled } => {
-                debug!("WakeWord StreamStart: words={:?}, sensitivity={:?}, vad={:?}",
-                    wake_words, sensitivity, vad_enabled);
+            AudioOperation::WakeWordStreamStart {
+                wake_words,
+                sensitivity,
+                vad_enabled,
+            } => {
+                debug!(
+                    "WakeWord StreamStart: words={:?}, sensitivity={:?}, vad={:?}",
+                    wake_words, sensitivity, vad_enabled
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::WakeWordStreamChunk { audio_data, timestamp_ms } => {
-                debug!("WakeWord StreamChunk: audio_size={}, timestamp={}ms",
-                    audio_data.len(), timestamp_ms);
+            AudioOperation::WakeWordStreamChunk {
+                audio_data,
+                timestamp_ms,
+            } => {
+                debug!(
+                    "WakeWord StreamChunk: audio_size={}, timestamp={}ms",
+                    audio_data.len(),
+                    timestamp_ms
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
@@ -459,20 +565,32 @@ impl Router {
 
             // Conversation Session Operations - routed to STT service
             AudioOperation::ConversationStart { config } => {
-                debug!("Conversation Start: mode={:?}, wake_words={:?}",
-                    config.mode, config.wake_words);
+                debug!(
+                    "Conversation Start: mode={:?}, wake_words={:?}",
+                    config.mode, config.wake_words
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::ConversationAudio { session_id, audio_data, timestamp_ms } => {
-                debug!("Conversation Audio: session={}, audio_size={}, timestamp={}ms",
-                    session_id, audio_data.len(), timestamp_ms);
+            AudioOperation::ConversationAudio {
+                session_id,
+                audio_data,
+                timestamp_ms,
+            } => {
+                debug!(
+                    "Conversation Audio: session={}, audio_size={}, timestamp={}ms",
+                    session_id,
+                    audio_data.len(),
+                    timestamp_ms
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
             AudioOperation::ConversationEnd { session_id, reason } => {
-                debug!("Conversation End: session={}, reason={:?}",
-                    session_id, reason);
+                debug!(
+                    "Conversation End: session={}, reason={:?}",
+                    session_id, reason
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
 
@@ -481,8 +599,14 @@ impl Router {
                 self.route_speaker_operation(operation, &request_id).await
             }
 
-            AudioOperation::SpeakerUpdateName { speaker_id, new_name } => {
-                debug!("Speaker Update Name: speaker_id={}, new_name={}", speaker_id, new_name);
+            AudioOperation::SpeakerUpdateName {
+                speaker_id,
+                new_name,
+            } => {
+                debug!(
+                    "Speaker Update Name: speaker_id={}, new_name={}",
+                    speaker_id, new_name
+                );
                 self.route_speaker_operation(operation, &request_id).await
             }
         }
@@ -516,7 +640,8 @@ impl Router {
                     request_id: request_id.to_string(),
                     result: ModelResult::Error(ErrorInfo {
                         error_type: ErrorType::InternalError,
-                        message: "Serwis STT niedostepny - speaker operations wymagaja QUIC STT".to_string(),
+                        message: "Serwis STT niedostepny - speaker operations wymagaja QUIC STT"
+                            .to_string(),
                         details: None,
                     }),
                     metrics: None,
@@ -571,13 +696,21 @@ impl Router {
     ) -> Result<tentaflow_protocol::ModelResponse> {
         use tentaflow_protocol::*;
 
-        debug!("LinkToMemory: linking speaker_id={} -> memory_node_id={} with voice_id={}",
-            speaker_id, memory_node_id, voice_id);
+        debug!(
+            "LinkToMemory: linking speaker_id={} -> memory_node_id={} with voice_id={}",
+            speaker_id, memory_node_id, voice_id
+        );
 
         // Znajdz QUIC Memory client
         let quic_client = {
             let mut client = None;
-            let memory_handles: Vec<_> = self.service_manager.quic_memory_services.read().values().cloned().collect();
+            let memory_handles: Vec<_> = self
+                .service_manager
+                .quic_memory_services
+                .read()
+                .values()
+                .cloned()
+                .collect();
             for handle in memory_handles {
                 let client_guard = handle.client.read().await;
                 if let Some(c) = client_guard.as_ref() {
@@ -620,54 +753,44 @@ impl Router {
             Ok(response) => {
                 // Przekonwertuj MemoryResult na SpeakerLinkToMemoryResult
                 match response.result {
-                    ModelResult::Memory(memory_result) => {
-                        match memory_result.result_type {
-                            MemoryResultType::LinkVoice(link_result) => {
-                                Ok(ModelResponse {
-                                    request_id: request_id.to_string(),
-                                    result: ModelResult::Audio(AudioResult {
-                                        data: AudioResultData::SpeakerLinkToMemoryResult {
-                                            speaker_id: speaker_id.to_string(),
-                                            memory_node_id,
-                                            voice_id: voice_id.to_string(),
-                                            success: link_result.success,
-                                        },
-                                        model: "memory".to_string(),
-                                    }),
-                                    metrics: None,
-                                })
-                            }
-                            _ => {
-                                Ok(ModelResponse {
-                                    request_id: request_id.to_string(),
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: "Unexpected Memory result type".to_string(),
-                                        details: None,
-                                    }),
-                                    metrics: None,
-                                })
-                            }
-                        }
-                    }
-                    ModelResult::Error(err) => {
-                        Ok(ModelResponse {
+                    ModelResult::Memory(memory_result) => match memory_result.result_type {
+                        MemoryResultType::LinkVoice(link_result) => Ok(ModelResponse {
                             request_id: request_id.to_string(),
-                            result: ModelResult::Error(err),
+                            result: ModelResult::Audio(AudioResult {
+                                data: AudioResultData::SpeakerLinkToMemoryResult {
+                                    speaker_id: speaker_id.to_string(),
+                                    memory_node_id,
+                                    voice_id: voice_id.to_string(),
+                                    success: link_result.success,
+                                },
+                                model: "memory".to_string(),
+                            }),
                             metrics: None,
-                        })
-                    }
-                    _ => {
-                        Ok(ModelResponse {
+                        }),
+                        _ => Ok(ModelResponse {
                             request_id: request_id.to_string(),
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::InternalError,
-                                message: "Unexpected response type from Memory".to_string(),
+                                message: "Unexpected Memory result type".to_string(),
                                 details: None,
                             }),
                             metrics: None,
-                        })
-                    }
+                        }),
+                    },
+                    ModelResult::Error(err) => Ok(ModelResponse {
+                        request_id: request_id.to_string(),
+                        result: ModelResult::Error(err),
+                        metrics: None,
+                    }),
+                    _ => Ok(ModelResponse {
+                        request_id: request_id.to_string(),
+                        result: ModelResult::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: "Unexpected response type from Memory".to_string(),
+                            details: None,
+                        }),
+                        metrics: None,
+                    }),
                 }
             }
             Err(e) => {

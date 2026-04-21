@@ -1037,5 +1037,355 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
                 ON meeting_sessions(last_activity_at DESC);
         ",
     ),
+    (
+        35,
+        "flow_versions",
+        "
+            -- Historia wersji flow — snapshot poprzedniego stanu przy kazdej
+            -- aktualizacji. Umozliwia rollback do poprzedniej wersji. Per flow
+            -- przechowujemy 5 ostatnich wersji (starsze prunowane w handlerze).
+            CREATE TABLE IF NOT EXISTS flow_versions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                flow_id         INTEGER NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+                version_num     INTEGER NOT NULL,
+                flow_json       TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                description     TEXT,
+                status          TEXT,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                created_by      TEXT,
+                UNIQUE(flow_id, version_num)
+            );
+            CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_id
+                ON flow_versions(flow_id, version_num DESC);
+        ",
+    ),
+    (
+        36,
+        "cluster_failover_health_columns",
+        "
+            -- Pola failover + health-check + timeout dla klastrow.
+            -- Dotychczas trzymane wylacznie po stronie GUI; teraz persistowane w DB
+            -- by binary protocol mogl je serwowac w ClusterListResponse / ClusterDetailResponse.
+            ALTER TABLE clusters ADD COLUMN failover_enabled INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE clusters ADD COLUMN failover_target TEXT;
+            ALTER TABLE clusters ADD COLUMN health_check_interval_ms INTEGER NOT NULL DEFAULT 5000;
+            ALTER TABLE clusters ADD COLUMN timeout_ms INTEGER NOT NULL DEFAULT 10000;
+        ",
+    ),
+    (
+        37,
+        "drop_portainer_instances",
+        "
+            -- FAZA 4: Portainer usuwamy calkowicie. Tabela portainer_instances
+            -- byla uzywana przez ekran Ustawienia → Portainer i REST /api/portainer*.
+            DROP TABLE IF EXISTS portainer_instances;
+        ",
+    ),
+    (
+        38,
+        "addon_permissions_oauth",
+        "
+            -- Rozszerzenie addon_permissions o grant_mode (allow/deny/inherit).
+            -- Istniejace 'granted' zostaje dla kompatybilnosci; grant_mode zastepuje
+            -- docelowo (inherit = uzyj default/group).
+            ALTER TABLE addon_permissions ADD COLUMN grant_mode TEXT NOT NULL DEFAULT 'inherit'
+                CHECK(grant_mode IN ('allow','deny','inherit'));
+            ALTER TABLE addon_permissions ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'));
+
+            -- Domyslne uprawnienia na poziomie addonu (fallback gdy user/group nic nie ustawili).
+            CREATE TABLE IF NOT EXISTS addon_permission_defaults (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                addon_id TEXT NOT NULL,
+                permission_id TEXT NOT NULL,
+                grant_mode TEXT NOT NULL CHECK(grant_mode IN ('allow','deny')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(addon_id, permission_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addon_perm_defaults_addon
+                ON addon_permission_defaults(addon_id);
+
+            -- Widocznosc addonu per grupa uzytkownikow.
+            CREATE TABLE IF NOT EXISTS addon_visibility (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                addon_id TEXT NOT NULL,
+                group_id INTEGER NOT NULL REFERENCES user_groups(id) ON DELETE CASCADE,
+                visible INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(addon_id, group_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addon_visibility_addon ON addon_visibility(addon_id);
+            CREATE INDEX IF NOT EXISTS idx_addon_visibility_group ON addon_visibility(group_id);
+
+            -- Flaga admin_only na addons.
+            ALTER TABLE addons ADD COLUMN admin_only INTEGER NOT NULL DEFAULT 0;
+
+            -- Katalog uprawnien deklarowanych przez addon (dla UI — display_name, risk, sort).
+            CREATE TABLE IF NOT EXISTS addon_permission_catalog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                addon_id TEXT NOT NULL,
+                permission_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                risk TEXT NOT NULL DEFAULT 'low' CHECK(risk IN ('low','medium','high','critical')),
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(addon_id, permission_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addon_perm_catalog_addon
+                ON addon_permission_catalog(addon_id);
+
+            -- Deklarowani providerzy OAuth przez addon (z manifestu).
+            CREATE TABLE IF NOT EXISTS addon_oauth_providers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                addon_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                authorize_url TEXT NOT NULL,
+                token_url TEXT NOT NULL,
+                revoke_url TEXT,
+                scopes TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'individual'
+                    CHECK(mode IN ('global','individual','none')),
+                pkce INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(addon_id, provider_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addon_oauth_providers_addon
+                ON addon_oauth_providers(addon_id);
+
+            -- Konfiguracja OAuth (admin ustawia client_id/secret/redirect_uri).
+            CREATE TABLE IF NOT EXISTS addon_oauth_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                addon_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                client_id TEXT NOT NULL DEFAULT '',
+                client_secret_encrypted BLOB,
+                redirect_uri TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL,
+                UNIQUE(addon_id, provider_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_addon_oauth_config_addon
+                ON addon_oauth_config(addon_id);
+
+            -- Konta OAuth powiazane per user (individual) lub globalne (user_id NULL).
+            CREATE TABLE IF NOT EXISTS user_oauth_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER REFERENCES user_accounts(id) ON DELETE CASCADE,
+                addon_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                external_account_id TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                access_token_encrypted BLOB,
+                refresh_token_encrypted BLOB,
+                token_type TEXT NOT NULL DEFAULT 'Bearer',
+                scopes TEXT NOT NULL DEFAULT '',
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_used_at TEXT,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, addon_id, provider_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_user
+                ON user_oauth_accounts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_addon
+                ON user_oauth_accounts(addon_id);
+            CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_addon_provider
+                ON user_oauth_accounts(addon_id, provider_id);
+
+            -- Pending OAuth states (anti-CSRF, PKCE verifier).
+            CREATE TABLE IF NOT EXISTS oauth_pending_states (
+                state TEXT PRIMARY KEY,
+                user_id INTEGER REFERENCES user_accounts(id) ON DELETE CASCADE,
+                addon_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK(mode IN ('global','individual')),
+                code_verifier TEXT NOT NULL DEFAULT '',
+                redirect_after TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_pending_states_expires
+                ON oauth_pending_states(expires_at);
+        ",
+    ),
+    (
+        39,
+        "audit_updated_by_and_severity",
+        "
+            -- Kolumny sladu zmian dla uprawnien addonow — kto ostatnio zmodyfikowal.
+            ALTER TABLE addon_permissions
+                ADD COLUMN updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL;
+            ALTER TABLE addon_permission_defaults
+                ADD COLUMN updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL;
+            ALTER TABLE addon_visibility
+                ADD COLUMN updated_by INTEGER REFERENCES user_accounts(id) ON DELETE SET NULL;
+
+            -- Poziom wagi wpisu audytowego (info/warning/critical) — do filtrowania i alertow.
+            ALTER TABLE audit_log ADD COLUMN severity TEXT NOT NULL DEFAULT 'info';
+            CREATE INDEX IF NOT EXISTS idx_audit_log_severity ON audit_log(severity);
+        ",
+    ),
+    (
+        40,
+        "addon_lifecycle_tables",
+        "
+            -- Prosty model regul sieciowych addona (allowed/blocked hosts + tryb).
+            -- Rozny od addon_network_rules (per-rule protocol/host/port approval) — tutaj
+            -- trzymamy listy hostow w JSON dla wygodnego edytowania z GUI.
+            CREATE TABLE IF NOT EXISTS addon_network_config (
+                addon_id TEXT NOT NULL PRIMARY KEY,
+                allowed_hosts TEXT NOT NULL DEFAULT '[]',
+                blocked_hosts TEXT NOT NULL DEFAULT '[]',
+                mode TEXT NOT NULL DEFAULT 'strict' CHECK(mode IN ('strict','permissive')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_by INTEGER
+            );
+
+            -- Kolumny audytu dla addon_config — kto i kiedy ostatnio zmienil, czy sekret.
+            ALTER TABLE addon_config ADD COLUMN is_secret INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE addon_config ADD COLUMN updated_by INTEGER;
+        ",
+    ),
+    (
+        41,
+        "addon_oauth_mode_field",
+        "
+            -- Tryb OAuth (global/individual/none) przechowywany w addon_oauth_config,
+            -- aby admin mogl go realnie zmieniac z GUI. Wczesniej tryb byl tylko
+            -- w addon_oauth_providers (deklaracja z manifestu) i nie mogl byc nadpisany.
+            ALTER TABLE addon_oauth_config ADD COLUMN oauth_mode TEXT NOT NULL DEFAULT 'individual'
+                CHECK(oauth_mode IN ('global','individual','none'));
+
+            -- Skopiuj tryb z deklaracji manifestu do config dla juz istniejacych wpisow,
+            -- ktore nie byly jeszcze recznie ustawione (pozostaly przy 'individual' defaulcie).
+            UPDATE addon_oauth_config
+            SET oauth_mode = (
+                SELECT mode FROM addon_oauth_providers
+                WHERE addon_oauth_providers.addon_id = addon_oauth_config.addon_id
+                  AND addon_oauth_providers.provider_id = addon_oauth_config.provider_id
+            )
+            WHERE oauth_mode = 'individual'
+              AND EXISTS (
+                SELECT 1 FROM addon_oauth_providers
+                WHERE addon_oauth_providers.addon_id = addon_oauth_config.addon_id
+                  AND addon_oauth_providers.provider_id = addon_oauth_config.provider_id
+              );
+        ",
+    ),
+    (
+        42,
+        "addon_oauth_accounts_unique_fix",
+        "
+            -- SQLite traktuje NULL jako rozne wartosci w UNIQUE, wiec tabelowy
+            -- UNIQUE(user_id, addon_id, provider_id) NIE zapobiega duplikatom
+            -- tokenow globalnych (user_id=NULL). Zastepujemy go dwoma partial
+            -- unique indexes: jeden dla indywidualnych (user_id IS NOT NULL),
+            -- drugi dla globalnych (user_id IS NULL).
+            --
+            -- Tabelowy UNIQUE jest zaimplementowany jako sqlite_autoindex_*,
+            -- ktorego nie mozna DROP INDEX — dlatego rekonstruujemy tabele.
+
+            CREATE TABLE IF NOT EXISTS user_oauth_accounts_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER REFERENCES user_accounts(id) ON DELETE CASCADE,
+                addon_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                external_account_id TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                access_token_encrypted BLOB,
+                refresh_token_encrypted BLOB,
+                token_type TEXT NOT NULL DEFAULT 'Bearer',
+                scopes TEXT NOT NULL DEFAULT '',
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_used_at TEXT,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO user_oauth_accounts_new
+                (id, user_id, addon_id, provider_id, external_account_id, display_name,
+                 access_token_encrypted, refresh_token_encrypted, token_type, scopes,
+                 expires_at, created_at, updated_at, last_used_at, revoked)
+                SELECT id, user_id, addon_id, provider_id, external_account_id, display_name,
+                       access_token_encrypted, refresh_token_encrypted, token_type, scopes,
+                       expires_at, created_at, updated_at, last_used_at, revoked
+                FROM user_oauth_accounts;
+
+            DROP TABLE user_oauth_accounts;
+            ALTER TABLE user_oauth_accounts_new RENAME TO user_oauth_accounts;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_user_oauth_individual
+                ON user_oauth_accounts(user_id, addon_id, provider_id)
+                WHERE user_id IS NOT NULL;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_user_oauth_global
+                ON user_oauth_accounts(addon_id, provider_id)
+                WHERE user_id IS NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_user
+                ON user_oauth_accounts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_addon
+                ON user_oauth_accounts(addon_id);
+            CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_addon_provider
+                ON user_oauth_accounts(addon_id, provider_id);
+        ",
+    ),
+    (
+        43,
+        "addons_ui_metadata",
+        "
+            -- UI metadata surfaced on the admin addons list: sprite icon, category label,
+            -- runtime tag (wasmtime/wasmi) and compiled WASM size. Columns are created
+            -- defensively via separate ALTERs wrapped in a compatibility check below.
+            -- The addons.category column was historically introduced in migration 26 as
+            -- part of the disambiguation rollout; older databases without it get it here.
+
+            -- SQLite lacks 'ADD COLUMN IF NOT EXISTS'. Each ALTER is a no-op when the
+            -- column already exists (fails with 'duplicate column name'), which we
+            -- tolerate by executing the statements independently in Rust. But inside
+            -- this single SQL batch we only add columns that are guaranteed to be new
+            -- in this migration: icon, runtime, wasm_size_bytes.
+            ALTER TABLE addons ADD COLUMN icon TEXT;
+            ALTER TABLE addons ADD COLUMN runtime TEXT NOT NULL DEFAULT 'wasmtime';
+            ALTER TABLE addons ADD COLUMN wasm_size_bytes INTEGER NOT NULL DEFAULT 0;
+        ",
+    ),
+    (
+        44,
+        "addons_detail_metadata",
+        "
+            -- Metadata used by the addon detail header card (mockup addons-permissions):
+            -- license string (e.g. 'Apache-2.0') backfilled from manifest at install time,
+            -- and show_in_catalog flag (default ON) gating the \"Available apps\" listing
+            -- for non-privileged users. Idempotent ALTERs — dynamic version below handles
+            -- repeat installs. This inline batch expects first-time application.
+            ALTER TABLE addons ADD COLUMN license TEXT NOT NULL DEFAULT '';
+            ALTER TABLE addons ADD COLUMN show_in_catalog INTEGER NOT NULL DEFAULT 1;
+        ",
+    ),
+    (
+        46,
+        "notes_table",
+        "
+            -- Per-user notes backing the user-facing Notes app (left sidebar list,
+            -- right editor). Strictly user-scoped: every read/write in repository
+            -- includes user_id guard to prevent BOLA. Pinned notes sort first,
+            -- then by updated_at DESC (list order).
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id);
+            CREATE INDEX IF NOT EXISTS idx_notes_user_updated ON notes(user_id, updated_at DESC);
+        ",
+    ),
 ]
 }

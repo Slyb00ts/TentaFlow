@@ -2,58 +2,119 @@
 id = "test-addon"
 name = "Test Addon"
 version = "1.0.0"
-description = "Addon do testow integracyjnych — weryfikuje host functions, uprawnienia, limity"
+description = "Integration-test addon — exercises host functions, permissions and limits."
+category = "test"
+keywords = ["test"]
 author = "TentaFlow Tests"
+license = "Apache-2.0"
+homepage = ""
+icon = "shield"
+runtime = "wasmtime"
 platforms = ["linux", "macos", "windows", "ios", "android"]
 wasm_file = "addon.wasm"
 
-[permissions]
-required = ["storage", "log"]
-optional = ["http", "llm", "secrets"]
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Read key-value entries scoped to this addon."
+risk = "low"
 
-[[addon_permissions]]
-id = "test_read"
-name = "Odczyt testowy"
-description = "Testowe uprawnienie odczytu"
-category = "Test"
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Write key-value entries scoped to this addon."
+risk = "medium"
 
-[[addon_permissions]]
-id = "test_write"
-name = "Zapis testowy"
-description = "Testowe uprawnienie zapisu"
-category = "Test"
+[[permission]]
+id = "http.request"
+display_name = "Perform HTTP requests"
+description = "Issue outbound HTTP requests to allowed hosts."
+risk = "high"
 
-[config]
+[[permission]]
+id = "llm.generate"
+display_name = "Generate with LLM"
+description = "Call LLM models for completions."
+risk = "medium"
+
+[[permission]]
+id = "secrets.read"
+display_name = "Read secrets"
+description = "Read encrypted secrets bound to this addon."
+risk = "high"
+
+[[permission]]
+id = "events.publish"
+display_name = "Publish events"
+description = "Emit test events on the shared bus."
+risk = "low"
+
+[visibility]
+admin_only = true
+default_groups = []
+show_in_catalog = false
+
+[resources]
+memory_mb = 128
+storage_mb = 10
+
+[lifecycle]
+background = false
+auto_start = false
+
 [config.schema]
-test_value = { type = "string", label = "Wartosc testowa", default = "hello" }
+test_value = { type = "string", label = "Test value", default = "hello" }
 
-[tools]
-[tools.echo]
-description = "Zwraca przekazany tekst"
-[tools.echo.parameters]
-type = "object"
-required = ["text"]
-[tools.echo.parameters.properties.text]
-type = "string"
+[[tool]]
+id = "echo"
+display_name = "Echo"
+description = "Return the provided text."
+keywords = ["echo"]
 
-[tools.test_storage]
-description = "Testuje zapis i odczyt storage"
-[tools.test_storage.parameters]
-type = "object"
-required = ["key", "value"]
+[[tool.parameter]]
+name = "text"
+param_type = "string"
+description = "Text to echo."
+required = true
 
-[tools.test_permissions]
-description = "Testuje sprawdzanie uprawnien"
-[tools.test_permissions.parameters]
-type = "object"
-required = ["permission"]
+[[tool]]
+id = "test_storage"
+display_name = "Storage round-trip"
+description = "Test storage write and read."
+keywords = ["storage"]
 
-[tools.test_log]
-description = "Testuje logowanie"
-[tools.test_log.parameters]
-type = "object"
+[[tool.parameter]]
+name = "key"
+param_type = "string"
+description = "Storage key."
+required = true
 
-[tools.test_crash]
-description = "Testuje fuel metering — infinite loop"
-[tools.test_crash.parameters]
-type = "object"
+[[tool.parameter]]
+name = "value"
+param_type = "string"
+description = "Storage value."
+required = true
+
+[[tool]]
+id = "test_permissions"
+display_name = "Permission check"
+description = "Test permission checking via host function."
+keywords = ["permission"]
+
+[[tool.parameter]]
+name = "permission"
+param_type = "string"
+description = "Permission id to test."
+required = true
+
+[[tool]]
+id = "test_log"
+display_name = "Log test"
+description = "Test structured logging from the guest."
+keywords = ["log"]
+
+[[tool]]
+id = "test_crash"
+display_name = "Fuel metering test"
+description = "Run an infinite loop to exercise fuel metering."
+keywords = ["fuel", "crash"]

@@ -40,7 +40,9 @@ impl NodeAdapter for MemoryAnalyzerAdapter {
         let analyzer = MemoryAnalyzer::new(self.service_manager.clone(), None);
 
         // Zbierz kontekst sesji z node_results
-        let session_type = ctx.node_results.values()
+        let session_type = ctx
+            .node_results
+            .values()
             .find_map(|v| v.get("session_type").and_then(|s| s.as_str()))
             .unwrap_or("unknown")
             .to_string();
@@ -55,9 +57,13 @@ impl NodeAdapter for MemoryAnalyzerAdapter {
 
         match mode {
             "query_analysis" => {
-                match analyzer.analyze_query(&ctx.input, Some(&session_type), person_id.as_deref()).await {
+                match analyzer
+                    .analyze_query(&ctx.input, Some(&session_type), person_id.as_deref())
+                    .await
+                {
                     Ok(decision) => {
-                        let search_terms: Vec<Value> = decision.search_terms
+                        let search_terms: Vec<Value> = decision
+                            .search_terms
                             .iter()
                             .map(|t| Value::String(t.clone()))
                             .collect();
@@ -90,14 +96,12 @@ impl NodeAdapter for MemoryAnalyzerAdapter {
                     }
                 }
             }
-            _ => {
-                Ok(serde_json::json!({
-                    "text": ctx.input,
-                    "should_query": false,
-                    "query_type": "None",
-                    "search_terms": [],
-                }))
-            }
+            _ => Ok(serde_json::json!({
+                "text": ctx.input,
+                "should_query": false,
+                "query_type": "None",
+                "search_terms": [],
+            })),
         }
     }
 

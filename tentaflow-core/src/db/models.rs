@@ -152,6 +152,19 @@ pub struct DbCluster {
     pub total_cpu_cores: i64,
     pub bottleneck_speed_mbps: i64,
     pub interconnect_type: String,
+    pub failover_enabled: bool,
+    pub failover_target: Option<String>,
+    pub health_check_interval_ms: i64,
+    pub timeout_ms: i64,
+}
+
+/// Klaster z agregatami liczonymi w jednym SELECT JOIN — uzywany do
+/// `ClusterListResponse` aby uniknac N+1 query na liczbe czlonkow.
+#[derive(Debug, Clone)]
+pub struct DbClusterWithCounts {
+    pub cluster: DbCluster,
+    pub members_count: i64,
+    pub members_online: i64,
 }
 
 /// Czlonek klastra (node przypisany do klastra)
@@ -242,6 +255,22 @@ pub struct DbTtsCleaningRule {
     pub language: String,
     pub is_active: bool,
     pub priority: i64,
+}
+
+/// Snapshot wersji flow (historia zmian dla rollbacku)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbFlowVersion {
+    pub id: i64,
+    pub flow_id: i64,
+    pub version_num: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: Option<String>,
+    pub created_at: String,
+    pub created_by: Option<String>,
+    /// Pelna tresc flow_json — pomijana w liscie (tylko w szczegolach)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_json: Option<String>,
 }
 
 /// Rekord wykonania flow
@@ -489,6 +518,14 @@ pub struct Addon {
     pub is_system: bool,
     pub installed_at: String,
     pub updated_at: String,
+    /// Category label from manifest `[addon].category` (e.g. "communication").
+    pub category: String,
+    /// Sprite id from manifest `[addon].icon` (e.g. "i-meeting"). Empty when absent.
+    pub icon: String,
+    /// Runtime tag: "wasmtime" (desktop) or "wasmi" (mobile). Defaults to "wasmtime".
+    pub runtime: String,
+    /// Size of the compiled WASM module in bytes (captured at install/upgrade time).
+    pub wasm_size_bytes: i64,
 }
 
 /// Sekret addonu (zaszyfrowany per addon per user)
@@ -638,4 +675,3 @@ pub struct DbVoiceTempSpeaker {
     pub assigned_profile_id: Option<i64>,
     pub created_at: String,
 }
-

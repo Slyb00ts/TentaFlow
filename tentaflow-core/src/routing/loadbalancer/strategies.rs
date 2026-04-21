@@ -5,9 +5,9 @@
 //       indeks backendu z puli.
 // =============================================================================
 
+use crate::error::{CoreError, Result};
 use crate::routing::backend::BackendClient;
-use crate::error::{Result, CoreError};
-use rand::Rng;
+use rand::RngExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -114,9 +114,7 @@ impl LeastConnectionsStrategy {
     /// Parametry:
     /// - num_backends: Liczba backendow w pool
     pub fn new(num_backends: usize) -> Self {
-        let counters: Vec<AtomicUsize> = (0..num_backends)
-            .map(|_| AtomicUsize::new(0))
-            .collect();
+        let counters: Vec<AtomicUsize> = (0..num_backends).map(|_| AtomicUsize::new(0)).collect();
 
         Self {
             active_connections: Arc::from(counters),
@@ -151,7 +149,9 @@ impl LeastConnectionsStrategy {
                 Ok(prev) => {
                     debug!(
                         "Backend {} active connections: {} -> {}",
-                        backend_idx, prev, prev - 1
+                        backend_idx,
+                        prev,
+                        prev - 1
                     );
                 }
                 Err(_) => {
@@ -178,13 +178,21 @@ impl LoadBalancingStrategy for LeastConnectionsStrategy {
         validate_backends(backends)?;
 
         // Znajdz backend z najmniejsza liczba aktywnych polaczen
-        let first = self.active_connections.first().ok_or_else(|| CoreError::AllBackendsUnavailable {
-            model_name: "unknown".to_string(),
-        })?;
+        let first =
+            self.active_connections
+                .first()
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: "unknown".to_string(),
+                })?;
         let mut min_idx = 0;
         let mut min_active = first.load(Ordering::Relaxed);
 
-        for (idx, counter) in self.active_connections.iter().enumerate().take(backends.len()) {
+        for (idx, counter) in self
+            .active_connections
+            .iter()
+            .enumerate()
+            .take(backends.len())
+        {
             let active = counter.load(Ordering::Relaxed);
             if active < min_active {
                 min_idx = idx;
@@ -277,7 +285,7 @@ impl LoadBalancingStrategy for WeightedStrategy {
         validate_backends(backends)?;
 
         // Roulette wheel selection z binary search O(log n)
-        let random_value = rand::thread_rng().gen_range(0..self.total_weight);
+        let random_value = rand::rng().random_range(0..self.total_weight);
 
         // Binary search: znajdz pierwszy indeks gdzie cumulative_weight > random_value
         let idx = self

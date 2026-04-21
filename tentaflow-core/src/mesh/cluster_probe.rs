@@ -4,9 +4,9 @@
 //       Pre-filter subnetow, rownolegle proby, algorytm optymalnego przypisania.
 // =============================================================================
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use serde::{Serialize, Deserialize};
 
 /// Interfejs sieciowy noda
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,10 +68,22 @@ pub struct NodeAssignment {
 
 /// Sprawdz czy dwa IP sa w tym samym subnecie
 pub fn same_subnet(ip_a: &str, mask_a: &str, ip_b: &str, mask_b: &str) -> bool {
-    let a: Ipv4Addr = match ip_a.parse() { Ok(ip) => ip, Err(_) => return false };
-    let b: Ipv4Addr = match ip_b.parse() { Ok(ip) => ip, Err(_) => return false };
-    let m_a: Ipv4Addr = match mask_a.parse() { Ok(ip) => ip, Err(_) => return false };
-    let m_b: Ipv4Addr = match mask_b.parse() { Ok(ip) => ip, Err(_) => return false };
+    let a: Ipv4Addr = match ip_a.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    let b: Ipv4Addr = match ip_b.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    let m_a: Ipv4Addr = match mask_a.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    let m_b: Ipv4Addr = match mask_b.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
 
     // Uzyj bardziej restrykcyjnej maski (wieksze AND = wiecej jedynek)
     let mask = u32::from(m_a) & u32::from(m_b);
@@ -82,9 +94,7 @@ pub fn same_subnet(ip_a: &str, mask_a: &str, ip_b: &str, mask_b: &str) -> bool {
 }
 
 /// Filtruj pary interfejsow — zostaw tylko te w tym samym subnecie
-pub fn filter_reachable_pairs(
-    nodes: &[Vec<NodeInterface>],
-) -> Vec<(NodeInterface, NodeInterface)> {
+pub fn filter_reachable_pairs(nodes: &[Vec<NodeInterface>]) -> Vec<(NodeInterface, NodeInterface)> {
     let mut pairs = Vec::new();
 
     for i in 0..nodes.len() {
@@ -111,7 +121,8 @@ pub fn filter_reachable_pairs(
 pub fn rank_pairs_by_speed(
     reachable_pairs: &[(NodeInterface, NodeInterface)],
 ) -> HashMap<(String, String), Vec<(NodeInterface, NodeInterface)>> {
-    let mut grouped: HashMap<(String, String), Vec<(NodeInterface, NodeInterface, u64)>> = HashMap::new();
+    let mut grouped: HashMap<(String, String), Vec<(NodeInterface, NodeInterface, u64)>> =
+        HashMap::new();
 
     for (a, b) in reachable_pairs {
         let key = if a.node_id < b.node_id {
@@ -121,7 +132,10 @@ pub fn rank_pairs_by_speed(
         };
 
         let speed = std::cmp::min(a.speed_mbps, b.speed_mbps);
-        grouped.entry(key).or_default().push((a.clone(), b.clone(), speed));
+        grouped
+            .entry(key)
+            .or_default()
+            .push((a.clone(), b.clone(), speed));
     }
 
     let mut result = HashMap::new();
@@ -250,44 +264,62 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
 
         for r in probe_results.iter().filter(|r| r.reachable) {
             if r.node_a == *node_id {
-                iface_reaches.entry(r.interface_a.clone()).or_default().insert(r.node_b.clone());
+                iface_reaches
+                    .entry(r.interface_a.clone())
+                    .or_default()
+                    .insert(r.node_b.clone());
                 *iface_bandwidth.entry(r.interface_a.clone()).or_insert(0.0) += r.bandwidth_mbps;
             } else if r.node_b == *node_id {
-                iface_reaches.entry(r.interface_b.clone()).or_default().insert(r.node_a.clone());
+                iface_reaches
+                    .entry(r.interface_b.clone())
+                    .or_default()
+                    .insert(r.node_a.clone());
                 *iface_bandwidth.entry(r.interface_b.clone()).or_insert(0.0) += r.bandwidth_mbps;
             }
         }
 
         // Znajdz interfejs ktory widzi WSZYSTKIE inne nody
-        let full_reach: Vec<(&String, &f64)> = iface_bandwidth.iter()
+        let full_reach: Vec<(&String, &f64)> = iface_bandwidth
+            .iter()
             .filter(|(iface, _)| {
                 let reaches = iface_reaches.get(*iface);
                 reaches.map_or(false, |r| other_nodes.iter().all(|n| r.contains(*n)))
             })
             .collect();
 
-        tracing::info!("Per-node {}: interfejsy={:?}, full_reach={:?}",
+        tracing::info!(
+            "Per-node {}: interfejsy={:?}, full_reach={:?}",
             node_id,
             iface_bandwidth.keys().collect::<Vec<_>>(),
-            full_reach.iter().map(|(k, v)| (k.as_str(), *v)).collect::<Vec<_>>());
+            full_reach
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .collect::<Vec<_>>()
+        );
 
         let best_iface = if !full_reach.is_empty() {
             // Sposrod interfejsow ktore widza wszystkie, wybierz najszybszy
-            full_reach.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            full_reach
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(iface, _)| (*iface).clone())
         } else {
             // Brak interfejsu widocznego dla wszystkich — wybierz z najwyzsza suma bandwidth
-            iface_bandwidth.iter()
+            iface_bandwidth
+                .iter()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(iface, _)| iface.clone())
         };
 
         if let Some(iface) = best_iface {
-            per_node.insert(node_id.clone(), NodeAssignment {
-                interface: iface,
-                ip: String::new(),
-                speed_mbps: 0,
-            });
+            per_node.insert(
+                node_id.clone(),
+                NodeAssignment {
+                    interface: iface,
+                    ip: String::new(),
+                    speed_mbps: 0,
+                },
+            );
         }
     }
 
@@ -304,9 +336,12 @@ pub fn optimal_assignment(probe_results: &[PairProbeResult]) -> DetectionResult 
             (r.node_b.clone(), r.node_a.clone())
         };
         let entry = node_pairs_reachable.entry(key).or_insert(false);
-        if r.reachable { *entry = true; }
+        if r.reachable {
+            *entry = true;
+        }
     }
-    let all_node_pairs_reachable = !node_pairs_reachable.is_empty() && node_pairs_reachable.values().all(|v| *v);
+    let all_node_pairs_reachable =
+        !node_pairs_reachable.is_empty() && node_pairs_reachable.values().all(|v| *v);
 
     // "optimal" = kazda para nodow ma reachable link (najszybsza wspolna konfiguracja)
     // "partial" = jakas para nodow nie ma reachable linku
@@ -375,7 +410,12 @@ mod tests {
 
     #[test]
     fn test_same_subnet_invalid_ip() {
-        assert!(!same_subnet("invalid", "255.255.255.0", "192.168.1.1", "255.255.255.0"));
+        assert!(!same_subnet(
+            "invalid",
+            "255.255.255.0",
+            "192.168.1.1",
+            "255.255.255.0"
+        ));
     }
 
     #[test]

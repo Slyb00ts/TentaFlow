@@ -400,13 +400,31 @@ impl ToolCallResult {
     pub fn new(tool: ToolCall) -> Self {
         let call_id = uuid::Uuid::new_v4().to_string();
         let (is_complete, missing_params) = match &tool {
-            ToolCall::CalendarAdd(p) => (p.is_complete(), p.missing_required().iter().map(|s| s.to_string()).collect()),
+            ToolCall::CalendarAdd(p) => (
+                p.is_complete(),
+                p.missing_required().iter().map(|s| s.to_string()).collect(),
+            ),
             ToolCall::CalendarCheck(_) => (true, vec![]),
-            ToolCall::EmailSend(p) => (p.is_complete(), p.missing_required().iter().map(|s| s.to_string()).collect()),
-            ToolCall::WebSearch(p) => (p.is_complete(), p.missing_required().iter().map(|s| s.to_string()).collect()),
-            ToolCall::ReminderSet(p) => (p.is_complete(), p.missing_required().iter().map(|s| s.to_string()).collect()),
-            ToolCall::TimerSet(p) => (p.is_complete(), p.missing_required().iter().map(|s| s.to_string()).collect()),
-            ToolCall::NoteSave(p) => (p.is_complete(), p.missing_required().iter().map(|s| s.to_string()).collect()),
+            ToolCall::EmailSend(p) => (
+                p.is_complete(),
+                p.missing_required().iter().map(|s| s.to_string()).collect(),
+            ),
+            ToolCall::WebSearch(p) => (
+                p.is_complete(),
+                p.missing_required().iter().map(|s| s.to_string()).collect(),
+            ),
+            ToolCall::ReminderSet(p) => (
+                p.is_complete(),
+                p.missing_required().iter().map(|s| s.to_string()).collect(),
+            ),
+            ToolCall::TimerSet(p) => (
+                p.is_complete(),
+                p.missing_required().iter().map(|s| s.to_string()).collect(),
+            ),
+            ToolCall::NoteSave(p) => (
+                p.is_complete(),
+                p.missing_required().iter().map(|s| s.to_string()).collect(),
+            ),
         };
 
         let follow_up_question = if !is_complete {
@@ -449,9 +467,7 @@ impl ToolCallResult {
                     "Potrzebuję więcej informacji o mailu.".to_string()
                 }
             }
-            ToolCall::WebSearch(_) => {
-                "Czego mam poszukać w internecie?".to_string()
-            }
+            ToolCall::WebSearch(_) => "Czego mam poszukać w internecie?".to_string(),
             ToolCall::ReminderSet(_) => {
                 if missing.iter().any(|s| s == "message") && missing.iter().any(|s| s == "when") {
                     "O czym mam Ci przypomnieć i kiedy?".to_string()
@@ -461,13 +477,9 @@ impl ToolCallResult {
                     "Kiedy mam Ci o tym przypomnieć?".to_string()
                 }
             }
-            ToolCall::TimerSet(_) => {
-                "Na ile czasu mam ustawić timer?".to_string()
-            }
-            ToolCall::NoteSave(_) => {
-                "Co mam zapisać w notatce?".to_string()
-            }
-            _ => "Potrzebuję więcej informacji.".to_string()
+            ToolCall::TimerSet(_) => "Na ile czasu mam ustawić timer?".to_string(),
+            ToolCall::NoteSave(_) => "Co mam zapisać w notatce?".to_string(),
+            _ => "Potrzebuję więcej informacji.".to_string(),
         }
     }
 }

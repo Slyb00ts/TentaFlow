@@ -243,13 +243,9 @@ pub enum MessageContent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     /// Fragment tekstowy
-    Text {
-        text: String,
-    },
+    Text { text: String },
     /// URL do obrazu (dla vision)
-    ImageUrl {
-        image_url: ImageUrl,
-    },
+    ImageUrl { image_url: ImageUrl },
 }
 
 /// URL obrazu dla vision requests
@@ -370,7 +366,6 @@ pub struct ChatCompletionResponse {
     pub system_fingerprint: Option<String>,
 
     // === VOICE CONVERSATION FIELDS (z audio_input) ===
-
     /// Transkrybowany tekst z audio_input (jesli podano audio_input)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcribed_text: Option<String>,
@@ -388,7 +383,6 @@ pub struct ChatCompletionResponse {
     pub speaker_confidence: Option<f32>,
 
     // === INTENT ANALYZER FIELDS ===
-
     /// Wykryte intencje (z Intent Analyzer / Bielik 1.5B)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected_intent: Option<String>,
@@ -496,7 +490,6 @@ pub struct ChatCompletionChunk {
     pub audio: Option<String>,
 
     // === INTENT ANALYZER FIELDS (tylko pierwszy chunk) ===
-
     /// Wykryta intencja glowna (z Intent Analyzer / Bielik 1.5B)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detected_intent: Option<String>,
@@ -679,7 +672,6 @@ pub struct TranscriptionRequest {
     pub timestamp_granularities: Option<Vec<String>>,
 
     // === OPCJE FILTROWANIA ===
-
     /// Prog no_speech_prob do filtrowania halucynacji
     /// Segmenty z no_speech_prob >= threshold zostana odfiltrowane
     pub no_speech_threshold: Option<f32>,

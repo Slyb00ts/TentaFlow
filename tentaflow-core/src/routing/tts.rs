@@ -4,7 +4,7 @@
 //       i fallbackiem na jarvis voice.
 // =============================================================================
 
-use crate::error::{Result, CoreError};
+use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
 
 use tracing::debug;
@@ -23,8 +23,8 @@ impl Router {
         &self,
         request: &crate::api::openai::types::TTSRequest,
     ) -> Result<crate::routing::RouteResult<Vec<u8>>> {
-        use tentaflow_protocol::*;
         use crate::routing::middleware::BackendHandle;
+        use tentaflow_protocol::*;
 
         let model = &request.model;
         let input = &request.input;
@@ -32,7 +32,13 @@ impl Router {
         let speed = request.speed.unwrap_or(1.0);
         let format = request.response_format.as_deref().unwrap_or("wav");
 
-        debug!("synthesize_speech: model={}, voice={}, format={}, input_len={}", model, voice, format, input.len());
+        debug!(
+            "synthesize_speech: model={}, voice={}, format={}, input_len={}",
+            model,
+            voice,
+            format,
+            input.len()
+        );
 
         let tts_model = model.clone();
         let route_result = {
@@ -51,8 +57,13 @@ impl Router {
                 async move {
                     match &handle {
                         BackendHandle::QuicTts(name) => {
-                            let quic_client = this.service_manager.get_quic_tts_client(name).await
-                                .ok_or_else(|| anyhow::anyhow!("QUIC TTS service {} nie polaczony", name))?;
+                            let quic_client = this
+                                .service_manager
+                                .get_quic_tts_client(name)
+                                .await
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("QUIC TTS service {} nie polaczony", name)
+                                })?;
 
                             debug!("Using QUIC TTS backend: {}", name);
                             let request_id = uuid::Uuid::new_v4().to_string();
@@ -72,36 +83,44 @@ impl Router {
                                 session_id: None,
                             };
 
-                            let response = quic_client.send_request(model_request).await
+                            let response = quic_client
+                                .send_request(model_request)
+                                .await
                                 .map_err(|e| anyhow::anyhow!("QUIC TTS request failed: {}", e))?;
 
                             match response.result {
-                                ModelResult::Audio(audio_result) => {
-                                    match audio_result.data {
-                                        AudioResultData::Audio(audio_bytes) => {
-                                            debug!("QUIC TTS success: {} bytes", audio_bytes.len());
-                                            Ok(audio_bytes)
-                                        }
-                                        _ => Err(anyhow::anyhow!("QUIC TTS zwrocil nieoczekiwany typ wyniku")),
+                                ModelResult::Audio(audio_result) => match audio_result.data {
+                                    AudioResultData::Audio(audio_bytes) => {
+                                        debug!("QUIC TTS success: {} bytes", audio_bytes.len());
+                                        Ok(audio_bytes)
                                     }
-                                }
-                                ModelResult::Error(err) => {
-                                    Err(anyhow::anyhow!("QUIC TTS error: {:?} - {}", err.error_type, err.message))
-                                }
-                                _ => Err(anyhow::anyhow!("QUIC TTS zwrocil nieoczekiwany typ odpowiedzi")),
+                                    _ => Err(anyhow::anyhow!(
+                                        "QUIC TTS zwrocil nieoczekiwany typ wyniku"
+                                    )),
+                                },
+                                ModelResult::Error(err) => Err(anyhow::anyhow!(
+                                    "QUIC TTS error: {:?} - {}",
+                                    err.error_type,
+                                    err.message
+                                )),
+                                _ => Err(anyhow::anyhow!(
+                                    "QUIC TTS zwrocil nieoczekiwany typ odpowiedzi"
+                                )),
                             }
                         }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla TTS")),
                     }
                 }
-            }).await
+            })
+            .await
         };
 
         match route_result {
             Ok(result) => Ok(result),
             Err(_) => Err(CoreError::ModelNotFound {
                 model_name: format!("TTS nie znaleziono backendow dla modelu '{}'", tts_model),
-            }.into()),
+            }
+            .into()),
         }
     }
 }

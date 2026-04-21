@@ -8,9 +8,8 @@
 use tracing::info;
 
 use super::{
-    AddonState, ABI_OK, ABI_ERR_PERMISSION, ABI_ERR_OPERATION,
-    get_memory, read_guest_string, audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_string, AddonState, WasmCaller,
+    ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
 
 // =============================================================================
@@ -47,7 +46,14 @@ pub fn ui_render(
 
     // Sprawdz uprawnienie ui
     if !check_permission(caller.data(), "ui", None) {
-        audit_log(caller.data(), "ui.render", Some("ui"), Some(&panel_id), "denied", None);
+        audit_log(
+            caller.data(),
+            "ui.render",
+            Some("ui"),
+            Some(&panel_id),
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
@@ -56,7 +62,14 @@ pub fn ui_render(
         Ok(v) => v,
         Err(e) => {
             let msg = format!("Niepoprawny UI JSON: {}", e);
-            audit_log(caller.data(), "ui.render", Some("ui"), Some(&panel_id), "error", Some(&msg));
+            audit_log(
+                caller.data(),
+                "ui.render",
+                Some("ui"),
+                Some(&panel_id),
+                "error",
+                Some(&msg),
+            );
             return ABI_ERR_OPERATION;
         }
     };
@@ -68,7 +81,8 @@ pub fn ui_render(
     let panel = crate::addon::ui_framework::UiPanel {
         addon_id: addon_id.clone(),
         panel_id: panel_id.clone(),
-        title: ui_value.get("title")
+        title: ui_value
+            .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Addon Panel")
             .to_string(),
@@ -79,19 +93,29 @@ pub fn ui_render(
     let html = panel.to_html();
 
     // Wyslij event z wyrenderowanym UI
-    caller.data().event_bus.publish(crate::addon::event_bus::Event {
-        event_type: "ui.panel_rendered".to_string(),
-        source_addon: Some(addon_id.clone()),
-        source_user: caller.data().user_id,
-        payload: serde_json::json!({
-            "panel_id": &panel_id,
-            "html": &html,
-            "json": &ui_value,
-        }),
-        timestamp: chrono::Utc::now(),
-    });
+    caller
+        .data()
+        .event_bus
+        .publish(crate::addon::event_bus::Event {
+            event_type: "ui.panel_rendered".to_string(),
+            source_addon: Some(addon_id.clone()),
+            source_user: caller.data().user_id,
+            payload: serde_json::json!({
+                "panel_id": &panel_id,
+                "html": &html,
+                "json": &ui_value,
+            }),
+            timestamp: chrono::Utc::now(),
+        });
 
-    audit_log(caller.data(), "ui.render", Some("ui"), Some(&panel_id), "ok", None);
+    audit_log(
+        caller.data(),
+        "ui.render",
+        Some("ui"),
+        Some(&panel_id),
+        "ok",
+        None,
+    );
 
     ABI_OK
 }
@@ -141,27 +165,47 @@ pub fn ui_notify(
 
     // Sprawdz uprawnienie notifications
     if !check_permission(caller.data(), "notifications", None) {
-        audit_log(caller.data(), "ui.notify", Some("notifications"), None, "denied", None);
+        audit_log(
+            caller.data(),
+            "ui.notify",
+            Some("notifications"),
+            None,
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
     let addon_id = caller.data().addon_id.clone();
-    info!("ui_notify: addon='{}', level='{}', title='{}'", addon_id, level, title);
+    info!(
+        "ui_notify: addon='{}', level='{}', title='{}'",
+        addon_id, level, title
+    );
 
     // Wyslij event z notyfikacja
-    caller.data().event_bus.publish(crate::addon::event_bus::Event {
-        event_type: "ui.notification".to_string(),
-        source_addon: Some(addon_id.clone()),
-        source_user: caller.data().user_id,
-        payload: serde_json::json!({
-            "title": &title,
-            "body": &body,
-            "level": &level,
-        }),
-        timestamp: chrono::Utc::now(),
-    });
+    caller
+        .data()
+        .event_bus
+        .publish(crate::addon::event_bus::Event {
+            event_type: "ui.notification".to_string(),
+            source_addon: Some(addon_id.clone()),
+            source_user: caller.data().user_id,
+            payload: serde_json::json!({
+                "title": &title,
+                "body": &body,
+                "level": &level,
+            }),
+            timestamp: chrono::Utc::now(),
+        });
 
-    audit_log(caller.data(), "ui.notify", Some("notifications"), None, "ok", None);
+    audit_log(
+        caller.data(),
+        "ui.notify",
+        Some("notifications"),
+        None,
+        "ok",
+        None,
+    );
 
     ABI_OK
 }

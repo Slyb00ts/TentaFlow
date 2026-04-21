@@ -3,19 +3,17 @@
 // Opis: Endpointy chat playground - completions, TTS, STT, capabilities.
 // =============================================================================
 
+use crate::api::openai::types::{ChatCompletionRequest, TTSRequest, TranscriptionRequest};
 use crate::db::{self, DbPool};
 use crate::metrics::RouterMetrics;
-use crate::api::openai::types::{
-    ChatCompletionRequest, TTSRequest, TranscriptionRequest,
-};
 use crate::routing::router::Router;
 
-use http_body_util::{Full, Either, StreamBody};
+use futures::{Stream, StreamExt};
+use http_body_util::{Either, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::{Method, Response, StatusCode};
 use std::pin::Pin;
 use std::sync::Arc;
-use futures::{Stream, StreamExt};
 use tracing::{error, info, warn};
 
 type SseStream = Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send>>;
@@ -33,25 +31,51 @@ pub async fn route_chat_api(
     debug_route: bool,
 ) -> Response<DashboardBody> {
     match (method, path) {
-        (&Method::POST, "/api/chat/completions") => handle_completions(router, body, db, metrics, cors_origin, debug_route).await,
-        (&Method::POST, "/api/chat/tts") => handle_tts(router, body, cors_origin, debug_route).await,
-        (&Method::POST, "/api/chat/stt") => handle_stt(router, body, cors_origin, debug_route).await,
-        (&Method::POST, "/api/chat/stt/load") => handle_stt_load(router, body, db, cors_origin).await,
+        (&Method::POST, "/api/chat/completions") => {
+            handle_completions(router, body, db, metrics, cors_origin, debug_route).await
+        }
+        (&Method::POST, "/api/chat/tts") => {
+            handle_tts(router, body, cors_origin, debug_route).await
+        }
+        (&Method::POST, "/api/chat/stt") => {
+            handle_stt(router, body, cors_origin, debug_route).await
+        }
+        (&Method::POST, "/api/chat/stt/load") => {
+            handle_stt_load(router, body, db, cors_origin).await
+        }
         (&Method::POST, "/api/chat/stt/unload") => handle_stt_unload(router, db, cors_origin).await,
         (&Method::GET, "/api/chat/stt/models") => handle_stt_models(cors_origin).await,
-        (&Method::GET, "/api/chat/capabilities") => handle_capabilities(router, db, cors_origin).await,
+        (&Method::GET, "/api/chat/capabilities") => {
+            handle_capabilities(router, db, cors_origin).await
+        }
         _ => json_err(404, "Nieznany endpoint chat", cors_origin),
     }
 }
 
 /// POST /api/chat/completions - chat completion (streaming lub nie)
-async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, metrics: &Arc<RouterMetrics>, cors_origin: Option<&str>, debug_route: bool) -> Response<DashboardBody> {
+async fn handle_completions(
+    router: &Arc<Router>,
+    body: Bytes,
+    _db: &DbPool,
+    metrics: &Arc<RouterMetrics>,
+    cors_origin: Option<&str>,
+    debug_route: bool,
+) -> Response<DashboardBody> {
     let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(e) => return json_err(400, &format!("Blad parsowania requestu: {}", e), cors_origin),
+        Err(e) => {
+            return json_err(
+                400,
+                &format!("Blad parsowania requestu: {}", e),
+                cors_origin,
+            )
+        }
     };
 
-    info!("Chat completions: model='{}', stream={}", request.model, request.stream);
+    info!(
+        "Chat completions: model='{}', stream={}",
+        request.model, request.stream
+    );
 
     metrics.record_request();
 
@@ -71,23 +95,25 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
 
                 // SSE event route_info przed pierwszym chunkiem (tylko w trybie debug)
                 let route_info_event = if debug_route {
-                    serde_json::to_string(&metadata).ok().map(|json| {
-                        format!("event: route_info\ndata: {}\n\n", json)
-                    })
+                    serde_json::to_string(&metadata)
+                        .ok()
+                        .map(|json| format!("event: route_info\ndata: {}\n\n", json))
                 } else {
                     None
                 };
 
                 let prefix_stream = futures::stream::iter(
-                    route_info_event.into_iter().map(|event| {
-                        Ok(Frame::data(Bytes::from(event)))
-                    })
+                    route_info_event
+                        .into_iter()
+                        .map(|event| Ok(Frame::data(Bytes::from(event)))),
                 );
 
-                let sse_stream = prefix_stream.chain(chunk_stream.map(move |chunk_result| {
-                    match chunk_result {
+                let sse_stream = prefix_stream
+                    .chain(chunk_stream.map(move |chunk_result| match chunk_result {
                         Ok(chunk) => {
-                            let content_len = chunk.choices.first()
+                            let content_len = chunk
+                                .choices
+                                .first()
                                 .and_then(|c| c.delta.content.as_ref())
                                 .map(|s| s.len())
                                 .unwrap_or(0);
@@ -103,11 +129,11 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
                             let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", e);
                             Ok(Frame::data(Bytes::from(error_chunk)))
                         }
-                    }
-                })).chain(futures::stream::once(async move {
-                    metrics_done.record_request_done();
-                    Ok(Frame::data(Bytes::from("data: [DONE]\n\n")))
-                }));
+                    }))
+                    .chain(futures::stream::once(async move {
+                        metrics_done.record_request_done();
+                        Ok(Frame::data(Bytes::from("data: [DONE]\n\n")))
+                    }));
 
                 let boxed_stream: SseStream = Box::pin(sse_stream);
                 let mut builder = Response::builder()
@@ -118,8 +144,14 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
                 if let Some(origin) = cors_origin {
                     builder = builder
                         .header("Access-Control-Allow-Origin", origin)
-                        .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-                        .header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                        .header(
+                            "Access-Control-Allow-Methods",
+                            "GET, POST, PUT, DELETE, OPTIONS",
+                        )
+                        .header(
+                            "Access-Control-Allow-Headers",
+                            "Content-Type, Authorization",
+                        );
                 }
                 builder
                     .body(Either::Right(StreamBody::new(boxed_stream)))
@@ -138,7 +170,13 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
                 metrics.record_request_done();
                 let json = match serde_json::to_string(&route_result.response) {
                     Ok(j) => j,
-                    Err(e) => return json_err(500, &format!("Blad serializacji odpowiedzi: {}", e), cors_origin),
+                    Err(e) => {
+                        return json_err(
+                            500,
+                            &format!("Blad serializacji odpowiedzi: {}", e),
+                            cors_origin,
+                        )
+                    }
                 };
                 // Estymacja tokenow wyjsciowych z odpowiedzi
                 let out_estimate = (json.len() / 4).max(1) as u64;
@@ -148,7 +186,9 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
                     if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
                         resp.headers_mut().insert(
                             "X-TentaFlow-Route",
-                            meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                            meta_json
+                                .parse()
+                                .unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
                         );
                     }
                 }
@@ -165,10 +205,21 @@ async fn handle_completions(router: &Arc<Router>, body: Bytes, _db: &DbPool, met
 }
 
 /// POST /api/chat/tts - synteza mowy
-async fn handle_tts(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>, debug_route: bool) -> Response<DashboardBody> {
+async fn handle_tts(
+    router: &Arc<Router>,
+    body: Bytes,
+    cors_origin: Option<&str>,
+    debug_route: bool,
+) -> Response<DashboardBody> {
     let request: TTSRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(e) => return json_err(400, &format!("Blad parsowania requestu TTS: {}", e), cors_origin),
+        Err(e) => {
+            return json_err(
+                400,
+                &format!("Blad parsowania requestu TTS: {}", e),
+                cors_origin,
+            )
+        }
     };
 
     // Okresl content-type na podstawie response_format
@@ -188,7 +239,9 @@ async fn handle_tts(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
                 if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
                     resp.headers_mut().insert(
                         "X-TentaFlow-Route",
-                        meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                        meta_json
+                            .parse()
+                            .unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
                     );
                     resp.headers_mut().insert(
                         "Access-Control-Expose-Headers",
@@ -206,7 +259,12 @@ async fn handle_tts(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
 }
 
 /// POST /api/chat/stt - transkrypcja mowy na tekst
-async fn handle_stt(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>, debug_route: bool) -> Response<DashboardBody> {
+async fn handle_stt(
+    router: &Arc<Router>,
+    body: Bytes,
+    cors_origin: Option<&str>,
+    debug_route: bool,
+) -> Response<DashboardBody> {
     // Deserializacja JSON z danymi audio w base64
     #[derive(serde::Deserialize)]
     struct SttPayload {
@@ -222,14 +280,26 @@ async fn handle_stt(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
 
     let payload: SttPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
-        Err(e) => return json_err(400, &format!("Blad parsowania requestu STT: {}", e), cors_origin),
+        Err(e) => {
+            return json_err(
+                400,
+                &format!("Blad parsowania requestu STT: {}", e),
+                cors_origin,
+            )
+        }
     };
 
     // Dekodowanie base64 audio
     use base64::Engine;
     let decoded_bytes = match base64::engine::general_purpose::STANDARD.decode(&payload.audio) {
         Ok(bytes) => bytes,
-        Err(e) => return json_err(400, &format!("Blad dekodowania base64 audio: {}", e), cors_origin),
+        Err(e) => {
+            return json_err(
+                400,
+                &format!("Blad dekodowania base64 audio: {}", e),
+                cors_origin,
+            )
+        }
     };
 
     let request = TranscriptionRequest {
@@ -250,14 +320,22 @@ async fn handle_stt(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
         Ok(route_result) => {
             let json = match serde_json::to_string(&route_result.response) {
                 Ok(j) => j,
-                Err(e) => return json_err(500, &format!("Blad serializacji transkrypcji: {}", e), cors_origin),
+                Err(e) => {
+                    return json_err(
+                        500,
+                        &format!("Blad serializacji transkrypcji: {}", e),
+                        cors_origin,
+                    )
+                }
             };
             let mut resp = json_resp(200, json, cors_origin);
             if debug_route {
                 if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
                     resp.headers_mut().insert(
                         "X-TentaFlow-Route",
-                        meta_json.parse().unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
+                        meta_json
+                            .parse()
+                            .unwrap_or_else(|_| hyper::http::HeaderValue::from_static("")),
                     );
                     resp.headers_mut().insert(
                         "Access-Control-Expose-Headers",
@@ -275,13 +353,19 @@ async fn handle_stt(router: &Arc<Router>, body: Bytes, cors_origin: Option<&str>
 }
 
 /// POST /api/chat/stt/load - pobierz (jesli potrzeba) i zaladuj Whisper large-v3-turbo
-async fn handle_stt_load(router: &Arc<Router>, body: Bytes, db: &DbPool, cors_origin: Option<&str>) -> Response<DashboardBody> {
+async fn handle_stt_load(
+    router: &Arc<Router>,
+    body: Bytes,
+    db: &DbPool,
+    cors_origin: Option<&str>,
+) -> Response<DashboardBody> {
     #[derive(serde::Deserialize)]
     struct LoadPayload {
         device: Option<String>,
     }
 
-    let payload: LoadPayload = serde_json::from_slice(&body).unwrap_or(LoadPayload { device: None });
+    let payload: LoadPayload =
+        serde_json::from_slice(&body).unwrap_or(LoadPayload { device: None });
 
     info!("Ladowanie modelu Whisper large-v3-turbo");
 
@@ -303,18 +387,33 @@ async fn handle_stt_load(router: &Arc<Router>, body: Bytes, db: &DbPool, cors_or
                 .find(|s| s.name == "whisper-stt-native");
             if let Some(svc) = existing {
                 let _ = db::repository::update_service(
-                    db, svc.id, "whisper-stt-native", "stt", "single", None, "running", &config.to_string(),
+                    db,
+                    svc.id,
+                    "whisper-stt-native",
+                    "stt",
+                    "single",
+                    None,
+                    "running",
+                    &config.to_string(),
                 );
             } else {
                 let _ = db::repository::create_service(
-                    db, "whisper-stt-native", "stt", "single", None, &config.to_string(),
+                    db,
+                    "whisper-stt-native",
+                    "stt",
+                    "single",
+                    None,
+                    &config.to_string(),
                 );
             }
 
+            let size_mb = model_info.size_bytes / (1024 * 1024);
             router.register_native_service_in_mesh(
                 "whisper-stt-native",
                 "stt",
                 vec!["whisper-large-v3-turbo".to_string()],
+                Some(model_info.backend.clone()),
+                vec![size_mb],
             );
 
             let json = serde_json::to_string(&model_info).unwrap_or_default();
@@ -328,7 +427,11 @@ async fn handle_stt_load(router: &Arc<Router>, body: Bytes, db: &DbPool, cors_or
 }
 
 /// POST /api/chat/stt/unload - wyladuj model Whisper z pamieci
-async fn handle_stt_unload(router: &Arc<Router>, db: &DbPool, cors_origin: Option<&str>) -> Response<DashboardBody> {
+async fn handle_stt_unload(
+    router: &Arc<Router>,
+    db: &DbPool,
+    cors_origin: Option<&str>,
+) -> Response<DashboardBody> {
     let stt = crate::stt::shared_stt_manager();
     let mut mgr = stt.write().await;
     match mgr.unload_model().await {
@@ -340,7 +443,14 @@ async fn handle_stt_unload(router: &Arc<Router>, db: &DbPool, cors_origin: Optio
                 .find(|s| s.name == "whisper-stt-native");
             if let Some(svc) = existing {
                 let _ = db::repository::update_service(
-                    db, svc.id, "whisper-stt-native", "stt", "single", None, "stopped", &svc.config_json,
+                    db,
+                    svc.id,
+                    "whisper-stt-native",
+                    "stt",
+                    "single",
+                    None,
+                    "stopped",
+                    &svc.config_json,
                 );
             }
 
@@ -366,7 +476,11 @@ async fn handle_stt_models(cors_origin: Option<&str>) -> Response<DashboardBody>
 }
 
 /// GET /api/chat/capabilities - dostepne uslugi i modele
-async fn handle_capabilities(router: &Arc<Router>, db: &DbPool, cors_origin: Option<&str>) -> Response<DashboardBody> {
+async fn handle_capabilities(
+    router: &Arc<Router>,
+    db: &DbPool,
+    cors_origin: Option<&str>,
+) -> Response<DashboardBody> {
     let sm = router.service_manager();
 
     let has_llm = sm.has_service_backends();
@@ -378,13 +492,15 @@ async fn handle_capabilities(router: &Arc<Router>, db: &DbPool, cors_origin: Opt
         Ok(entries) => entries
             .into_iter()
             .filter(|m| m.is_active)
-            .map(|m| serde_json::json!({
-                "id": m.id,
-                "model_name": m.model_name,
-                "display_name": m.display_name,
-                "service_type": m.service_type,
-                "is_active": m.is_active,
-            }))
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "model_name": m.model_name,
+                    "display_name": m.display_name,
+                    "service_type": m.service_type,
+                    "is_active": m.is_active,
+                })
+            })
             .collect::<Vec<_>>(),
         Err(e) => {
             warn!("Nie udalo sie pobrac modeli: {}", e);
@@ -396,12 +512,14 @@ async fn handle_capabilities(router: &Arc<Router>, db: &DbPool, cors_origin: Opt
     let services = match db::repository::list_services(db) {
         Ok(svcs) => svcs
             .into_iter()
-            .map(|s| serde_json::json!({
-                "id": s.id,
-                "name": s.name,
-                "service_type": s.service_type,
-                "status": s.status,
-            }))
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "service_type": s.service_type,
+                    "status": s.status,
+                })
+            })
             .collect::<Vec<_>>(),
         Err(e) => {
             warn!("Nie udalo sie pobrac serwisow: {}", e);
@@ -412,9 +530,7 @@ async fn handle_capabilities(router: &Arc<Router>, db: &DbPool, cors_origin: Opt
     // Status lokalnego modelu STT (Whisper)
     let stt_mgr = crate::stt::shared_stt_manager();
     let stt_reader = stt_mgr.read().await;
-    let stt_local_info = stt_reader
-        .active_engine()
-        .and_then(|e| e.model_info());
+    let stt_local_info = stt_reader.active_engine().and_then(|e| e.model_info());
     let has_stt_local = stt_local_info.is_some();
     let stt_model_json = stt_local_info
         .map(|info| serde_json::to_value(&info).unwrap_or(serde_json::Value::Null))
@@ -446,8 +562,14 @@ fn json_resp(status: u16, body: String, cors_origin: Option<&str>) -> Response<D
     if let Some(origin) = cors_origin {
         builder = builder
             .header("Access-Control-Allow-Origin", origin)
-            .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            .header(
+                "Access-Control-Allow-Methods",
+                "GET, POST, PUT, DELETE, OPTIONS",
+            )
+            .header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization",
+            );
     }
     builder
         .body(Either::Left(Full::new(Bytes::from(body.into_bytes()))))
@@ -455,10 +577,19 @@ fn json_resp(status: u16, body: String, cors_origin: Option<&str>) -> Response<D
 }
 
 fn json_err(status: u16, msg: &str, cors_origin: Option<&str>) -> Response<DashboardBody> {
-    json_resp(status, serde_json::json!({"error": msg}).to_string(), cors_origin)
+    json_resp(
+        status,
+        serde_json::json!({"error": msg}).to_string(),
+        cors_origin,
+    )
 }
 
-fn binary_resp(status: u16, content_type: &str, data: Vec<u8>, cors_origin: Option<&str>) -> Response<DashboardBody> {
+fn binary_resp(
+    status: u16,
+    content_type: &str,
+    data: Vec<u8>,
+    cors_origin: Option<&str>,
+) -> Response<DashboardBody> {
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("Content-Type", content_type);

@@ -10,13 +10,12 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use super::{
-    SttEngine, SttModelInfo, TranscribeChunk, TranscribeParams, TranscribeResult,
-    TranscribeSegment,
+    SttEngine, SttModelInfo, TranscribeChunk, TranscribeParams, TranscribeResult, TranscribeSegment,
 };
 
 /// Zaladowany model Whisper ze wszystkimi zasobami
@@ -189,11 +188,7 @@ impl SttEngine for WhisperEngine {
         ]
     }
 
-    async fn load_model(
-        &self,
-        model_path: &Path,
-        device: Option<&str>,
-    ) -> Result<SttModelInfo> {
+    async fn load_model(&self, model_path: &Path, device: Option<&str>) -> Result<SttModelInfo> {
         let path = model_path.to_path_buf();
         let device_str = device.unwrap_or("cpu").to_string();
 
@@ -211,11 +206,11 @@ impl SttEngine for WhisperEngine {
                 ctx_params.use_gpu(true);
             }
 
-            let ctx = WhisperContext::new_with_params(
-                path.to_str().unwrap_or_default(),
-                ctx_params,
-            )
-            .map_err(|e| anyhow::anyhow!("Nie udalo sie zaladowac modelu Whisper: {}", e))?;
+            let ctx =
+                WhisperContext::new_with_params(path.to_str().unwrap_or_default(), ctx_params)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Nie udalo sie zaladowac modelu Whisper: {}", e)
+                    })?;
 
             // Odczytaj rozmiar pliku
             let metadata = std::fs::metadata(&path)
@@ -294,7 +289,11 @@ impl SttEngine for WhisperEngine {
         let pcm = super::audio::decode_to_pcm_f32(&params.audio_data)
             .context("Blad dekodowania audio do PCM")?;
 
-        debug!("Audio zdekodowane: {} probek ({:.2}s)", pcm.len(), pcm.len() as f64 / 16000.0);
+        debug!(
+            "Audio zdekodowane: {} probek ({:.2}s)",
+            pcm.len(),
+            pcm.len() as f64 / 16000.0
+        );
 
         let state = self.state.clone();
 

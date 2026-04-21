@@ -1,0 +1,19 @@
+language = "C"
+cpp_compat = true
+include_version = true
+
+[export]
+prefix = "tentaflow_"
+
+[export.rename]
+"TentaFlowClient" = "TfClient"
+"ClientConfig" = "TfClientConfig"
+"EmbeddingsResult" = "TfEmbeddingsResult"
+"ChatCompletionResult" = "TfChatCompletionResult"
+
+[enum]
+rename_variants = "UpperCase"
+prefix_with_name = true
+
+[parse]
+parse_deps = false

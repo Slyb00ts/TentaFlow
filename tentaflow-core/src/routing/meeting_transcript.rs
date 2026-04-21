@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use serde_json::json;
 use tokio::sync::watch;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 use crate::addon::event_bus::{Event, EventBus};
 use crate::net::quic::QuicClient;
@@ -55,15 +55,11 @@ async fn subscribe_meeting_transcripts(
 ) -> anyhow::Result<()> {
     info!("Rozpoczynam subskrypcje transkrypcji z meeting bot");
 
-    // Pobierz polaczenie QUIC
-    let conn = {
-        let conn_arc = quic_client.connection();
-        let conn_guard = conn_arc.lock().await;
-        conn_guard
-            .as_ref()
-            .cloned()
-            .context("Brak aktywnego polaczenia QUIC do meeting bot")?
-    };
+    // Pobierz aktywne polaczenie iroh (z auto-reconnect).
+    let conn = quic_client
+        .iroh_connection()
+        .await
+        .context("Brak aktywnego polaczenia iroh do meeting bot")?;
 
     // Otworz bidirektionalny stream
     let (mut send, mut recv) = conn
@@ -143,9 +139,9 @@ async fn subscribe_meeting_transcripts(
 /// Odczytuje pojedynczy chunk ze streamu QUIC (4-bajtowy length prefix + rkyv payload).
 /// Zwraca None jesli stream zostal zamkniety.
 async fn read_stream_chunk(
-    recv: &mut quinn::RecvStream,
+    recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<Option<tentaflow_protocol::ModelStreamChunk>> {
-    use quinn::ReadExactError;
+    use iroh::endpoint::ReadExactError;
 
     // Odczytaj 4 bajty dlugosci (big-endian)
     let mut len_buf = [0u8; 4];
@@ -190,10 +186,7 @@ async fn read_stream_chunk(
 ///
 /// Format TextDelta z sidecar: `[speaker]: text\n`
 /// Parsuje speaker i text, publikuje jako event "meeting.transcript".
-fn handle_transcript_chunk(
-    chunk: &tentaflow_protocol::ModelStreamChunk,
-    event_bus: &EventBus,
-) {
+fn handle_transcript_chunk(chunk: &tentaflow_protocol::ModelStreamChunk, event_bus: &EventBus) {
     match &chunk.chunk {
         tentaflow_protocol::StreamChunkType::TextDelta(delta) => {
             let (speaker, text) = parse_transcript_delta(delta);
@@ -252,9 +245,7 @@ fn parse_transcript_delta(delta: &str) -> (&str, &str) {
         if let Some(bracket_end) = rest.find(']') {
             let speaker = &rest[..bracket_end];
             let after_bracket = &rest[bracket_end + 1..];
-            let text = after_bracket
-                .strip_prefix(": ")
-                .unwrap_or(after_bracket);
+            let text = after_bracket.strip_prefix(": ").unwrap_or(after_bracket);
             return (speaker, text);
         }
     }

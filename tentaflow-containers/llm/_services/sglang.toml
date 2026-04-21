@@ -1,0 +1,29 @@
+# Manifest serwisu SGLang — serwer LLM z RadixAttention (Linux/Windows GPU).
+
+[engine]
+id = "sglang"
+category = "llm"
+name = "SGLang"
+description_pl = "Serwer LLM z RadixAttention i strukturalnym output. Szybsze od vLLM dla zlozonych zapytan."
+description_en = "LLM server with RadixAttention and structured output. Faster than vLLM for complex prompts."
+homepage = "https://github.com/sgl-project/sglang"
+license = "Apache-2.0"
+icon = "sglang"
+default_port = 30000
+api = "openai-compatible"
+version = "0.3.5"
+
+[deploy.docker]
+context_path = "llm/docker/sglang"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "llm/python/sglang"
+
+[[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen 3.5 0.8B"
+repo = "Qwen/Qwen3.5-0.8B"
+recommended = true

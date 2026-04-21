@@ -20,7 +20,9 @@ use tracing::{debug, info, warn};
 /// Blad przekroczenia limitu zasobow
 #[derive(Error, Debug)]
 pub enum RateLimitError {
-    #[error("Addon '{addon_id}' przekroczyl limit {resource_type}: {current}/{max} w oknie minutowym")]
+    #[error(
+        "Addon '{addon_id}' przekroczyl limit {resource_type}: {current}/{max} w oknie minutowym"
+    )]
     Exceeded {
         addon_id: String,
         resource_type: String,
@@ -85,7 +87,7 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_cpu_ms_per_minute: 30_000,     // 30s CPU na minute
+            max_cpu_ms_per_minute: 30_000, // 30s CPU na minute
             max_memory_mb: 256,
             max_storage_mb: 100,
             max_http_requests_per_minute: 600,
@@ -158,11 +160,11 @@ impl AddonRateLimiter {
     /// Zwraca Ok(()) jesli limit nie jest przekroczony, Err jesli tak.
     pub fn check(&self, addon_id: &str, resource_type: ResourceType) -> Result<(), RateLimitError> {
         let limits = self.limits.lock();
-        let limits_entry = limits.get(addon_id).ok_or_else(|| {
-            RateLimitError::NoLimits {
+        let limits_entry = limits
+            .get(addon_id)
+            .ok_or_else(|| RateLimitError::NoLimits {
                 addon_id: addon_id.to_string(),
-            }
-        })?;
+            })?;
 
         let mut usage = self.usage.lock();
         let usage_entry = usage.entry(addon_id.to_string()).or_default();
@@ -174,18 +176,9 @@ impl AddonRateLimiter {
 
         // Sprawdz limit dla danego typu zasobu
         let (current, max) = match resource_type {
-            ResourceType::CpuMs => (
-                usage_entry.cpu_ms_used,
-                limits_entry.max_cpu_ms_per_minute,
-            ),
-            ResourceType::MemoryMb => (
-                usage_entry.memory_mb_used,
-                limits_entry.max_memory_mb,
-            ),
-            ResourceType::StorageMb => (
-                usage_entry.storage_mb_used,
-                limits_entry.max_storage_mb,
-            ),
+            ResourceType::CpuMs => (usage_entry.cpu_ms_used, limits_entry.max_cpu_ms_per_minute),
+            ResourceType::MemoryMb => (usage_entry.memory_mb_used, limits_entry.max_memory_mb),
+            ResourceType::StorageMb => (usage_entry.storage_mb_used, limits_entry.max_storage_mb),
             ResourceType::HttpRequests => (
                 usage_entry.http_requests_count as u64,
                 limits_entry.max_http_requests_per_minute as u64,
@@ -237,7 +230,10 @@ impl AddonRateLimiter {
 
         debug!(
             "Addon '{}' — zuzycie {}: +{} (okno od {:?})",
-            addon_id, resource_type, amount, entry.window_start.elapsed()
+            addon_id,
+            resource_type,
+            amount,
+            entry.window_start.elapsed()
         );
     }
 

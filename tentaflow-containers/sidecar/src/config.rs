@@ -1,7 +1,8 @@
 // =============================================================================
 // Plik: config.rs
-// Opis: Konfiguracja sidecara — wybor roli + parametry per-rola. Ladowana
-//       z /data/config.toml (volume mount) z fallbackiem do config.default.toml.
+// Opis: Konfiguracja sidecara — wybor roli + parametry per-rola oraz bind
+//       iroh. Ladowana z /data/config.toml (volume mount) z fallbackiem do
+//       config.default.toml.
 // =============================================================================
 
 use anyhow::{Context, Result};
@@ -9,19 +10,19 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// Rola sidecara — okresla co robi z przychodzacymi requestami.
-/// Wszystkie role dzielą wspolny QUIC server i format ModelRequest/ModelResponse.
+/// Wszystkie role dziela wspolny iroh endpoint i format ModelRequest/ModelResponse.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Role {
     /// Forwarder do lokalnego HTTP API (vLLM, llama.cpp-server, sglang, sherpa-onnx-server).
-    /// Kontener uruchamia silnik na `upstream_url`, sidecar tluczymaczy QUIC ↔ HTTP.
+    /// Kontener uruchamia silnik na `upstream_url`, sidecar tlumaczy iroh ↔ HTTP.
     ReverseProxy {
         /// URL lokalnego HTTP API np. "http://127.0.0.1:8000/v1"
         upstream_url: String,
         /// Timeout requestow (ms)
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
-        /// Typ API — okresla format translacji QUIC → HTTP
+        /// Typ API — okresla format translacji iroh → HTTP
         api: UpstreamApi,
     },
     /// Inferencja ONNX lokalnie w procesie sidecara — dla lekkich modeli
@@ -58,14 +59,20 @@ pub enum OnnxTask {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct QuicConfig {
-    /// Port QUIC/UDP na ktorym sidecar nasluchuje
-    #[serde(default = "default_quic_port")]
+pub struct TransportConfig {
+    /// Port UDP na ktorym iroh endpoint nasluchuje.
+    #[serde(default = "default_transport_port")]
     pub port: u16,
-    /// Sciezka do certyfikatu TLS (PEM). Jesli brak — wygeneruje self-signed.
-    pub tls_cert: Option<String>,
-    /// Sciezka do klucza prywatnego TLS (PEM).
-    pub tls_key: Option<String>,
+    /// Sciezka do pliku z Ed25519 secret key (32 bajty, raw). Jesli brak —
+    /// generuje ephemeral i nadpisuje plik `/data/endpoint-key.bin` jesli zapis
+    /// mozliwy. `EndpointId` z tego klucza jest zglaszany routerowi.
+    pub secret_key_path: Option<String>,
+    /// Wlacz LAN mDNS (default: true).
+    #[serde(default = "default_true")]
+    pub enable_lan_discovery: bool,
+    /// Wlacz DHT pkarr-mainline (default: true).
+    #[serde(default = "default_true")]
+    pub enable_dht_discovery: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,17 +82,20 @@ pub struct SidecarConfig {
     /// Lista aliasow modeli obslugiwanych przez ten sidecar — do rejestracji w routerze.
     #[serde(default)]
     pub model_aliases: Vec<String>,
-    /// QUIC
-    pub quic: QuicConfig,
+    /// Transport iroh
+    pub transport: TransportConfig,
     /// Rola
     pub role: Role,
 }
 
-fn default_quic_port() -> u16 {
+fn default_transport_port() -> u16 {
     5000
 }
 fn default_timeout_ms() -> u64 {
     120_000
+}
+fn default_true() -> bool {
+    true
 }
 
 impl SidecarConfig {
@@ -108,7 +118,7 @@ mod tests {
 service_name = "llm-vllm-01"
 model_aliases = ["bielik-11b", "llama-3.1-8b"]
 
-[quic]
+[transport]
 port = 5000
 
 [role]
@@ -119,7 +129,7 @@ api = "open_ai"
         let cfg: SidecarConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.service_name, "llm-vllm-01");
         assert_eq!(cfg.model_aliases.len(), 2);
-        assert_eq!(cfg.quic.port, 5000);
+        assert_eq!(cfg.transport.port, 5000);
         match cfg.role {
             Role::ReverseProxy { upstream_url, api, .. } => {
                 assert_eq!(upstream_url, "http://127.0.0.1:8000/v1");
@@ -135,7 +145,7 @@ api = "open_ai"
 service_name = "embeddings-01"
 model_aliases = ["embedding-gemma"]
 
-[quic]
+[transport]
 port = 5000
 
 [role]
@@ -158,7 +168,7 @@ task = "embedding"
         let toml_str = r#"
 service_name = "teams-bot-01"
 
-[quic]
+[transport]
 port = 5000
 
 [role]

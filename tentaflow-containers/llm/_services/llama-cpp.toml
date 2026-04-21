@@ -1,0 +1,30 @@
+# Manifest serwisu llama.cpp — wbudowany engine LLM (GGUF) na wszystkie platformy.
+
+[engine]
+id = "llama-cpp"
+category = "llm"
+name = "llama.cpp"
+description_pl = "Lekki silnik LLM w C/C++. Obsluguje GGUF i embeddingi. Dziala wszedzie."
+description_en = "Lightweight C/C++ LLM engine. Supports GGUF and embeddings."
+homepage = "https://github.com/ggerganov/llama.cpp"
+license = "MIT"
+icon = "llama-cpp"
+default_port = 8080
+api = "openai-compatible"
+version = "b3974"
+
+[deploy.docker]
+context_path = "llm/docker/llama-cpp"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+feature_flag = "inference-llamacpp"
+
+[[model_preset]]
+id = "qwen3-5-0-8b-q4"
+display_name = "Qwen 3.5 0.8B Q4_K_M"
+repo = "Qwen/Qwen3.5-0.8B-GGUF"
+quantization = "Q4_K_M"
+recommended = true

@@ -13,27 +13,6 @@ const ServiceCatalog = (() => {
   let boundBackHandler = null;
   let cachedNodes = [];
 
-  // Katalog uslug
-  const SERVICES = [
-    { id: 'tts', name: 'Text to Speech', desc: 'Synteza mowy z tekstu (Sherpa-ONNX)', gpu: true, defaultPort: 5020 },
-    { id: 'stt', name: 'Speech to Text', desc: 'Transkrypcja audio na tekst (Whisper)', gpu: true, defaultPort: 5030 },
-    { id: 'embeddings', name: 'Embeddings', desc: 'Generowanie wektorow z tekstu', gpu: true, defaultPort: 5050 },
-    { id: 'reranker', name: 'Reranker', desc: 'Rerankowanie wynikow wyszukiwania', gpu: true, defaultPort: 5055 },
-    { id: 'rag', name: 'RAG Engine', desc: 'Retrieval Augmented Generation', gpu: false, defaultPort: 5040 },
-    { id: 'tools', name: 'Tools', desc: 'Narzedzia i integracje zewnetrzne', gpu: false, defaultPort: 5060 },
-    { id: 'memory', name: 'Memory', desc: 'Pamiec konwersacji i kontekstu', gpu: false, defaultPort: 5002 },
-    { id: 'comfyui', name: 'Image Generation', desc: 'Generowanie obrazow (ComfyUI)', gpu: true, defaultPort: 5000 },
-    { id: 'meeting-bot', name: 'Meeting Bot', desc: 'Bot AI do spotkan Teams — dolacza jako uczestnik, transkrybuje, odpowiada', gpu: false, defaultPort: 5000 },
-  ];
-
-  const LLM_SERVICE = {
-    id: 'llm',
-    name: 'LLM Server',
-    desc: 'Serwer modeli jezykowych',
-    gpu: true,
-    defaultPort: 5010,
-  };
-
   // Otwarcie katalogu uslug
   function show(nodeId, context) {
     sourceContext = context || 'mesh';
@@ -173,49 +152,129 @@ const ServiceCatalog = (() => {
     }
   }
 
-  // Zakladka TentaFlow - grid wszystkich uslug (w tym LLM)
+  // Zakladka TentaFlow - dynamiczny render z manifestu (12 kategorii).
+  // Zwraca placeholder; wypelnienie nastepuje asynchronicznie w mountTentaFlowTab().
   function renderTentaFlowTab() {
-    const cards = SERVICES.map(s => `
-      <div class="catalog-card" data-service-id="${Utils.escapeAttr(s.id)}">
-        <div class="catalog-card-header">
-          <div class="catalog-card-icon">${CatalogIcons.get(s.id)}</div>
-          <div>
-            <div class="catalog-card-title">${Utils.escapeHtml(s.name)}</div>
-            <div class="catalog-card-port">Port: ${Utils.escapeHtml(String(s.defaultPort))}</div>
-          </div>
-        </div>
-        <div class="catalog-card-desc">${Utils.escapeHtml(s.desc)}</div>
-        <div class="catalog-card-footer">
-          <div class="catalog-card-badges">
-            ${s.gpu
-              ? '<span class="badge catalog-badge catalog-badge-gpu">GPU</span>'
-              : '<span class="badge catalog-badge catalog-badge-cpu">CPU</span>'}
-          </div>
-          <button class="btn btn-primary btn-sm catalog-deploy-btn">Deploy</button>
-        </div>
-      </div>
-    `).join('');
+    return `<div id="tentaflow-catalog-container"><div class="empty-state">${I18n.t('common.loading')}</div></div>`;
+  }
 
-    const llmCard = `
-      <div class="catalog-card" data-service-id="llm">
+  // Asynchroniczne wypelnienie zakladki TentaFlow z manifestu.
+  async function mountTentaFlowTab() {
+    const container = document.getElementById('tentaflow-catalog-container');
+    if (!container) return;
+
+    try {
+      await ManifestStore.init();
+    } catch (err) {
+      console.error('[ServiceCatalog] init manifest blad:', err);
+    }
+
+    const hostOs = await detectHostOs();
+    const categories = ManifestStore.nonEmptyCategories();
+
+    if (categories.length === 0) {
+      container.innerHTML = `<p class="empty-state-hint">${I18n.t('catalog.noEngines')}</p>`;
+      return;
+    }
+
+    const html = categories.map(cat => {
+      const engines = ManifestStore.byCategory(cat)
+        .filter(e => ManifestStore.isEngineCompatible(e, hostOs));
+      if (engines.length === 0) return '';
+      const title = Utils.escapeHtml(I18n.t('category.' + cat));
+      const cards = engines.map(renderEngineCard).join('');
+      return `
+        <section class="catalog-section" style="margin-bottom: var(--spacing-lg);">
+          <h2 style="font-size: var(--font-size-md); margin-bottom: var(--spacing-sm);">${title}</h2>
+          <div class="catalog-grid">${cards}</div>
+        </section>
+      `;
+    }).join('');
+
+    if (!html.trim()) {
+      container.innerHTML = `<p class="empty-state-hint">${I18n.t('catalog.noEngines')}</p>`;
+      return;
+    }
+    container.innerHTML = html;
+
+    // Podpiecie klikow na kafelki silnikow
+    const cards = container.querySelectorAll('.catalog-card[data-engine-id]');
+    cards.forEach(card => {
+      const handler = () => {
+        const engId = card.dataset.engineId;
+        if (!engId) return;
+        EngineDeployWizard.open(engId, { nodeId: currentNodeId });
+      };
+      card.addEventListener('click', handler);
+    });
+  }
+
+  // Mapowanie kategoria -> klucz ikony (gdy engine.icon brak).
+  function categoryIconKey(category) {
+    const map = {
+      'llm': 'cpu',
+      'stt': 'mic',
+      'tts': 'speaker',
+      'embeddings': 'vector',
+      'reranker': 'sort',
+      'image-gen': 'image',
+      'agents': 'wrench',
+      'tools': 'wrench'
+    };
+    return map[category] || 'cpu';
+  }
+
+  // Wykrycie OS hosta — z /api/mesh/nodes (lokalny node) z fallbackiem na user-agent.
+  async function detectHostOs() {
+    try {
+      let nodes;
+      if (typeof ApiClient !== 'undefined' && typeof ApiClient.get === 'function') {
+        nodes = await ApiClient.get('/api/mesh/nodes');
+      } else {
+        const r = await fetch('/api/mesh/nodes');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        nodes = await r.json();
+      }
+      if (Array.isArray(nodes) && nodes.length > 0) {
+        const local = nodes.find(n => n && n.is_local === true) || nodes[0];
+        if (local) {
+          const os = local.os || (local.platform && local.platform.os);
+          if (os) return String(os).toLowerCase();
+        }
+      }
+    } catch (err) {
+      console.warn('[ServiceCatalog] detectHostOs fallback (UA):', err);
+    }
+    return defaultHostOs();
+  }
+
+  function defaultHostOs() {
+    const ua = (navigator.userAgent || '').toLowerCase();
+    if (ua.indexOf('mac') !== -1) return 'macos';
+    if (ua.indexOf('win') !== -1) return 'windows';
+    return 'linux';
+  }
+
+  // Pojedynczy kafelek silnika z manifestu — bez badge'y, bez statusow.
+  function renderEngineCard(service) {
+    const e = (service && service.engine) || {};
+    const iconKey = e.icon || categoryIconKey(e.category);
+    const iconHtml = (typeof CatalogIcons !== 'undefined' && CatalogIcons.render)
+      ? CatalogIcons.render(iconKey)
+      : '';
+    const desc = e.description_pl || e.description_en || '';
+
+    return `
+      <div class="catalog-card" data-engine-id="${Utils.escapeAttr(e.id || '')}">
         <div class="catalog-card-header">
-          <div class="catalog-card-icon">${CatalogIcons.get('llm')}</div>
+          <div class="catalog-card-icon">${iconHtml}</div>
           <div>
-            <div class="catalog-card-title">${Utils.escapeHtml(LLM_SERVICE.name)}</div>
-            <div class="catalog-card-port">Port: ${LLM_SERVICE.defaultPort}</div>
+            <div class="catalog-card-title">${Utils.escapeHtml(e.name || e.id || '')}</div>
           </div>
         </div>
-        <div class="catalog-card-desc">${Utils.escapeHtml(LLM_SERVICE.desc)}</div>
-        <div class="catalog-card-footer">
-          <div class="catalog-card-badges">
-            <span class="badge catalog-badge catalog-badge-gpu">GPU</span>
-          </div>
-          <button class="btn btn-primary btn-sm catalog-deploy-btn">Configure &amp; Deploy</button>
-        </div>
+        <div class="catalog-card-desc">${Utils.escapeHtml(desc)}</div>
       </div>
     `;
-
-    return `<div class="catalog-grid">${cards}${llmCard}</div>`;
   }
 
   // Stan katalogu NIM
@@ -859,30 +918,7 @@ ${envBlock ? '\n' + envBlock : ''}
       return;
     }
     if (activeTab === 'tentaflow') {
-      const cards = document.querySelectorAll('.catalog-card[data-service-id]');
-      cards.forEach(card => {
-        const btn = card.querySelector('.catalog-deploy-btn');
-        const handler = () => {
-          const serviceId = card.dataset.serviceId;
-          if (serviceId === 'llm') {
-            LLMDeployWizard.open(currentNodeId);
-          } else if (serviceId === 'stt') {
-            SttDeployWizard.open(currentNodeId);
-          } else {
-            const service = SERVICES.find(s => s.id === serviceId);
-            if (service) {
-              ServiceDeployModal.open(currentNodeId, service);
-            }
-          }
-        };
-        if (btn) {
-          btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            handler();
-          });
-        }
-        card.addEventListener('click', handler);
-      });
+      mountTentaFlowTab();
     }
   }
 

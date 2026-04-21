@@ -5,13 +5,28 @@
 //       aktualizacje metryk bez klonowania calej kolekcji.
 // =============================================================================
 
+use parking_lot::RwLock;
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use parking_lot::RwLock;
-use serde::{Serialize, Deserialize};
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use std::sync::Arc;
+
+/// Informacje o modelu zaladowanym na nodzie mesh
+#[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+pub struct PeerModelInfo {
+    /// Alias/nazwa modelu (np. "qwen3.5-0.8b", "whisper-large-v3")
+    pub alias: String,
+    /// Kategoria: "llm", "stt", "tts", "embeddings", "image", "vision"
+    pub kind: String,
+    /// Backend ktory serwuje model (np. "llama-cpp", "mlx", "vllm", "whisper-rs")
+    pub backend: String,
+    /// Rozmiar pliku wag w MB (0 jesli nieznany)
+    pub size_mb: u64,
+    /// Czy model jest zaladowany do pamieci i gotowy do inferencji
+    pub loaded: bool,
+}
 
 /// Informacje o pojedynczym peerze w sieci mesh
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +55,15 @@ pub struct MeshPeerInfo {
     pub docker_available: bool,
     /// Wersja Docker serwera (np. "27.5.1")
     pub docker_version: String,
+    /// Modele zaladowane / dostepne na nodzie (propagowane przez ModelsSync).
+    #[serde(default)]
+    pub models: Vec<PeerModelInfo>,
+    /// Liczba aktualnie obslugiwanych requestow (snapshot z heartbeat).
+    #[serde(default)]
+    pub active_requests: u32,
+    /// Wygenerowane tokenow/sekunde w ostatnim oknie metryk.
+    #[serde(default)]
+    pub tokens_per_sec: f32,
 }
 
 /// Informacje o GPU peera
@@ -110,6 +134,17 @@ pub struct HeartbeatMetrics {
     pub swap_used_mb: u64,
     /// Lista polaczonych peer_ids — do propagacji topologii mesh
     pub connected_peers: Vec<String>,
+    /// Aktualna liczba obslugiwanych requestow (inference, ingest, itp.)
+    pub active_requests: u32,
+    /// Wygenerowane tokeny/sekunde w oknie metrycznym (tylko LLM).
+    pub tokens_per_sec: f32,
+}
+
+/// Broadcast z lista modeli zaladowanych/dostepnych na nodzie. Wysylany co
+/// `models_sync_interval` (domyslnie 30s) oraz po kazdej zmianie listy modeli.
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+pub struct ModelsSync {
+    pub models: Vec<PeerModelInfo>,
 }
 
 /// Wpis w tabeli routingu — jak dotrzec do danego noda
@@ -173,7 +208,10 @@ impl MeshPeerStore {
                 .filter(|(_, existing)| {
                     !existing.quic_connected
                         && existing.port == peer.port
-                        && existing.addresses.iter().any(|a| peer.addresses.contains(a))
+                        && existing
+                            .addresses
+                            .iter()
+                            .any(|a| peer.addresses.contains(a))
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -196,7 +234,9 @@ impl MeshPeerStore {
 
     pub fn set_status(&self, node_id: &str, status: &str) {
         let mut peers = self.peers.write();
-        let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
         p.status = status.to_string();
         drop(peers);
         self.mark_dirty();
@@ -204,7 +244,9 @@ impl MeshPeerStore {
 
     pub fn set_quic_connected(&self, node_id: &str, connected: bool) {
         let mut peers = self.peers.write();
-        let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
         p.quic_connected = connected;
         drop(peers);
         self.mark_dirty();
@@ -266,7 +308,9 @@ impl MeshPeerStore {
 
     pub fn update_node_info(&self, node_id: &str, info: &NodeInfo) {
         let mut peers = self.peers.write();
-        let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
         p.hostname = info.hostname.clone();
         p.os_info = info.os_info.clone();
         p.cpu_count = info.cpu_count;
@@ -304,9 +348,25 @@ impl MeshPeerStore {
     }
 
     /// Aktualizuje biezace metryki peera (z heartbeatu)
-    pub fn update_metrics(&self, node_id: &str, cpu_usage: f32, ram_used: u64, gpus: Vec<PeerGpuInfo>, containers: Vec<PeerContainerInfo>, networks: Vec<PeerNetworkInfo>, platform: String, cpu_temperature_c: Option<f32>, swap_total_mb: u64, swap_used_mb: u64) {
+    pub fn update_metrics(
+        &self,
+        node_id: &str,
+        cpu_usage: f32,
+        ram_used: u64,
+        gpus: Vec<PeerGpuInfo>,
+        containers: Vec<PeerContainerInfo>,
+        networks: Vec<PeerNetworkInfo>,
+        platform: String,
+        cpu_temperature_c: Option<f32>,
+        swap_total_mb: u64,
+        swap_used_mb: u64,
+        active_requests: u32,
+        tokens_per_sec: f32,
+    ) {
         let mut peers = self.peers.write();
-        let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
         p.cpu_usage_percent = cpu_usage;
         p.ram_used_mb = ram_used;
         p.gpu_info = gpus;
@@ -315,6 +375,8 @@ impl MeshPeerStore {
         p.cpu_temperature_c = cpu_temperature_c;
         p.swap_total_mb = swap_total_mb;
         p.swap_used_mb = swap_used_mb;
+        p.active_requests = active_requests;
+        p.tokens_per_sec = tokens_per_sec;
         if !platform.is_empty() {
             p.platform = platform;
         }
@@ -322,11 +384,72 @@ impl MeshPeerStore {
         self.mark_dirty();
     }
 
+    /// Inicjalizuje wpis lokalnego noda — wywoływane przy starcie tentaflow
+    /// niezaleznie od config.mesh.enabled. Dzieki temu /api/mesh/nodes zawsze
+    /// zwraca przynajmniej local. node_info wypelnione przez node_info_collector.
+    pub fn seed_local(
+        &self,
+        node_id: &str,
+        hostname: String,
+        os_info: String,
+        platform: String,
+        cpu_count: u32,
+        ram_total_mb: u64,
+        gpu_info: Vec<PeerGpuInfo>,
+        addresses: Vec<IpAddr>,
+        docker_available: bool,
+        docker_version: String,
+    ) {
+        let mut peers = self.peers.write();
+        let entry = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
+        entry.hostname = hostname;
+        entry.os_info = os_info;
+        entry.platform = platform;
+        entry.cpu_count = cpu_count;
+        entry.ram_total_mb = ram_total_mb;
+        entry.gpu_info = gpu_info;
+        entry.addresses = addresses;
+        entry.docker_available = docker_available;
+        entry.docker_version = docker_version;
+        entry.role = if entry.role.is_empty() {
+            "router".to_string()
+        } else {
+            entry.role.clone()
+        };
+        entry.status = "connected".to_string();
+        entry.quic_connected = true;
+        drop(peers);
+        self.mark_dirty();
+    }
+
+    /// Aktualizuje liste modeli propagowanych przez ModelsSync. Nadpisuje
+    /// calkowicie — peer jest zrodlem prawdy dla swoich modeli.
+    pub fn update_models(&self, node_id: &str, models: Vec<PeerModelInfo>) {
+        let mut peers = self.peers.write();
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
+        p.models = models;
+        drop(peers);
+        self.mark_dirty();
+    }
+
     /// Aktualizuje wolno-zmienne dane lokalnego noda (adresy IP, Docker, OS info).
     /// Wywolywane co 60s przez background task w pipeline.
-    pub fn update_local_extras(&self, node_id: &str, addresses: Vec<IpAddr>, docker_available: bool, docker_version: String, os_info: String) {
+    pub fn update_local_extras(
+        &self,
+        node_id: &str,
+        addresses: Vec<IpAddr>,
+        docker_available: bool,
+        docker_version: String,
+        os_info: String,
+    ) {
         let mut peers = self.peers.write();
-        let p = peers.entry(node_id.to_string()).or_insert_with(|| Self::empty_peer(node_id));
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
         p.addresses = addresses;
         p.docker_available = docker_available;
         p.docker_version = docker_version;
@@ -339,7 +462,9 @@ impl MeshPeerStore {
 
     /// Aktualizuje topologie mesh — zapisuje liste bezposrednich peerow danego noda
     pub fn update_topology(&self, node_id: &str, connected_peers: Vec<String>) {
-        self.topology.write().insert(node_id.to_string(), connected_peers);
+        self.topology
+            .write()
+            .insert(node_id.to_string(), connected_peers);
     }
 
     /// Zwraca kopie calej topologii mesh
@@ -359,7 +484,8 @@ impl MeshPeerStore {
 
         // BFS od lokalnego noda
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut queue: std::collections::VecDeque<(String, String, u8)> = std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<(String, String, u8)> =
+            std::collections::VecDeque::new();
         // (node_id, next_hop, hops)
 
         visited.insert(local_node_id.to_string());
@@ -368,11 +494,14 @@ impl MeshPeerStore {
         if let Some(direct_peers) = topology.get(local_node_id) {
             for peer in direct_peers {
                 if visited.insert(peer.clone()) {
-                    routes.insert(peer.clone(), RoutingEntry {
-                        next_hop: peer.clone(),
-                        hops: 1,
-                        direct: true,
-                    });
+                    routes.insert(
+                        peer.clone(),
+                        RoutingEntry {
+                            next_hop: peer.clone(),
+                            hops: 1,
+                            direct: true,
+                        },
+                    );
                     queue.push_back((peer.clone(), peer.clone(), 1));
                 }
             }
@@ -380,15 +509,20 @@ impl MeshPeerStore {
 
         // BFS — max 4 hopy
         while let Some((current, first_hop, depth)) = queue.pop_front() {
-            if depth >= 4 { continue; }
+            if depth >= 4 {
+                continue;
+            }
             if let Some(peers) = topology.get(&current) {
                 for peer in peers {
                     if visited.insert(peer.clone()) {
-                        routes.insert(peer.clone(), RoutingEntry {
-                            next_hop: first_hop.clone(),
-                            hops: depth + 1,
-                            direct: false,
-                        });
+                        routes.insert(
+                            peer.clone(),
+                            RoutingEntry {
+                                next_hop: first_hop.clone(),
+                                hops: depth + 1,
+                                direct: false,
+                            },
+                        );
                         queue.push_back((peer.clone(), first_hop.clone(), depth + 1));
                     }
                 }
@@ -428,6 +562,9 @@ impl MeshPeerStore {
             swap_used_mb: 0,
             docker_available: false,
             docker_version: String::new(),
+            models: vec![],
+            active_requests: 0,
+            tokens_per_sec: 0.0,
         }
     }
 }

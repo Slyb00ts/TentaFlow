@@ -9,4 +9,7 @@ pub mod circuit_breaker;
 pub mod strategies;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
-pub use strategies::{LoadBalancingStrategy, RoundRobinStrategy, LeastConnectionsStrategy, WeightedStrategy, create_strategy};
+pub use strategies::{
+    create_strategy, LeastConnectionsStrategy, LoadBalancingStrategy, RoundRobinStrategy,
+    WeightedStrategy,
+};

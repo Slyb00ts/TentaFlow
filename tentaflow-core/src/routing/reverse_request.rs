@@ -5,8 +5,8 @@
 //       wyslac ModelRequest do routera (np. sidecar wola STT/TTS).
 // =============================================================================
 
-use crate::routing::Router;
 use crate::net::quic::QuicClient;
+use crate::routing::Router;
 
 use anyhow::Context;
 use std::sync::Arc;
@@ -40,14 +40,14 @@ async fn reverse_listener_loop(
     info!("Reverse listener '{}': uruchomiony", service_name);
 
     loop {
-        // Pobierz connection z klienta
-        let conn_arc = client.connection();
-        let conn_guard = conn_arc.lock().await;
-        let conn = match conn_guard.as_ref() {
-            Some(c) => c.clone(),
-            None => {
-                drop(conn_guard);
-                // Polaczenie jeszcze nie gotowe lub utracone — czekaj
+        // Pobierz aktywne polaczenie iroh (z auto-reconnect).
+        let conn = match client.iroh_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    "Reverse listener '{}': brak polaczenia: {}",
+                    service_name, e
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
                         continue;
@@ -62,7 +62,6 @@ async fn reverse_listener_loop(
                 continue;
             }
         };
-        drop(conn_guard);
 
         tokio::select! {
             result = conn.accept_bi() => {
@@ -74,11 +73,11 @@ async fn reverse_listener_loop(
                             handle_reverse_stream(send, recv, router_clone, name_clone).await;
                         });
                     }
-                    Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                    Err(iroh::endpoint::ConnectionError::ApplicationClosed { .. }) => {
                         info!("Reverse listener '{}': polaczenie zamkniete przez kontener", service_name);
                         break;
                     }
-                    Err(quinn::ConnectionError::ConnectionClosed { .. }) => {
+                    Err(iroh::endpoint::ConnectionError::ConnectionClosed { .. }) => {
                         info!("Reverse listener '{}': polaczenie zamkniete", service_name);
                         break;
                     }
@@ -103,8 +102,8 @@ async fn reverse_listener_loop(
 /// Obsluguje pojedynczy odwrotny strumien od kontenera.
 /// Czyta ModelRequest, routuje przez Router, odsyla ModelResponse.
 async fn handle_reverse_stream(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     router: Router,
     service_name: String,
 ) {
@@ -118,27 +117,33 @@ async fn handle_reverse_stream(
     };
 
     // Deserializacja rkyv
-    let request = match rkyv::access::<tentaflow_protocol::ArchivedModelRequest, rkyv::rancor::Error>(&data)
-        .context("Blad dostepu do ArchivedModelRequest")
-    {
-        Ok(archived) => {
-            match rkyv::deserialize::<tentaflow_protocol::ModelRequest, rkyv::rancor::Error>(archived) {
-                Ok(req) => req,
-                Err(e) => {
-                    error!("Reverse '{}': blad deserializacji: {}", service_name, e);
-                    return;
+    let request =
+        match rkyv::access::<tentaflow_protocol::ArchivedModelRequest, rkyv::rancor::Error>(&data)
+            .context("Blad dostepu do ArchivedModelRequest")
+        {
+            Ok(archived) => {
+                match rkyv::deserialize::<tentaflow_protocol::ModelRequest, rkyv::rancor::Error>(
+                    archived,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        error!("Reverse '{}': blad deserializacji: {}", service_name, e);
+                        return;
+                    }
                 }
             }
-        }
-        Err(e) => {
-            error!("Reverse '{}': blad dostepu rkyv: {}", service_name, e);
-            return;
-        }
-    };
+            Err(e) => {
+                error!("Reverse '{}': blad dostepu rkyv: {}", service_name, e);
+                return;
+            }
+        };
 
-    debug!("Reverse '{}': request_id={}, payload={:?}",
-        service_name, request.request_id,
-        std::mem::discriminant(&request.payload));
+    debug!(
+        "Reverse '{}': request_id={}, payload={:?}",
+        service_name,
+        request.request_id,
+        std::mem::discriminant(&request.payload)
+    );
 
     // Routuj request w zaleznosci od typu payload
     let response = dispatch_reverse_request(&router, request).await;
@@ -147,21 +152,30 @@ async fn handle_reverse_stream(
     match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
         Ok(resp_data) => {
             if let Err(e) = send.write_all(&resp_data).await {
-                error!("Reverse '{}': blad wysylania odpowiedzi: {}", service_name, e);
+                error!(
+                    "Reverse '{}': blad wysylania odpowiedzi: {}",
+                    service_name, e
+                );
                 return;
             }
             let _ = send.finish();
-            debug!("Reverse '{}': odpowiedz wyslana (request_id={})",
-                service_name, response.request_id);
+            debug!(
+                "Reverse '{}': odpowiedz wyslana (request_id={})",
+                service_name, response.request_id
+            );
         }
         Err(e) => {
-            error!("Reverse '{}': blad serializacji odpowiedzi: {}", service_name, e);
+            error!(
+                "Reverse '{}': blad serializacji odpowiedzi: {}",
+                service_name, e
+            );
         }
     }
 }
 
-/// Dispatchuje odwrotny request przez odpowiednia metode Routera.
-async fn dispatch_reverse_request(
+/// Dispatchuje odwrotny request przez odpowiednia metode Routera. Dostepne
+/// publicznie zeby forward handler mesh mogl uzyc tej samej sciezki.
+pub async fn dispatch_reverse_request(
     router: &Router,
     request: tentaflow_protocol::ModelRequest,
 ) -> tentaflow_protocol::ModelResponse {
@@ -174,25 +188,20 @@ async fn dispatch_reverse_request(
             // Meeting context — bot dopisuje "meeting_id" do ModelRequest.metadata
             // przy kazdym STT requescie. Router uzywa go jako klucza do
             // voice_temp_speakers i transcript_store.
-            let meeting_id: Option<String> = request
-                .metadata
-                .as_ref()
-                .and_then(|kv| {
-                    kv.iter()
-                        .find(|(k, _)| k == "meeting_id")
-                        .map(|(_, v)| v.clone())
-                });
+            let meeting_id: Option<String> = request.metadata.as_ref().and_then(|kv| {
+                kv.iter()
+                    .find(|(k, _)| k == "meeting_id")
+                    .map(|(_, v)| v.clone())
+            });
 
             // Uruchamiamy diarization *rownolegle* ze STT (nie seryjnie). Diarization
             // zjada kilkaset ms na CPU i bez tej paralelizacji dolozylaby sie wprost
             // do latencji whispera. spawn_blocking bo WeSpeaker forward jest CPU-bound.
             #[cfg(feature = "inference-diarization")]
             let diarization_handle = {
-                if let (AudioOperation::STT { audio_data, .. }, Some(ref mid), Some(pool)) = (
-                    &audio_payload.operation,
-                    &meeting_id,
-                    router.db.clone(),
-                ) {
+                if let (AudioOperation::STT { audio_data, .. }, Some(ref mid), Some(pool)) =
+                    (&audio_payload.operation, &meeting_id, router.db.clone())
+                {
                     let audio_clone = audio_data.clone();
                     let mid_clone = mid.clone();
                     Some(tokio::task::spawn_blocking(move || {
@@ -219,10 +228,7 @@ async fn dispatch_reverse_request(
                 (stt_res, ident)
             };
             #[cfg(not(feature = "inference-diarization"))]
-            let (stt_result, identify_result): (
-                _,
-                Option<crate::diarization::service::IdentifyResult>,
-            ) = (stt_future.await, None);
+            let (stt_result, identify_result): (_, Option<()>) = (stt_future.await, None);
 
             match stt_result {
                 Ok(response) => {
@@ -230,10 +236,11 @@ async fn dispatch_reverse_request(
                     if let ModelResult::Audio(ref audio_result) = response.result {
                         if let AudioResultData::Text(ref text) = audio_result.data {
                             if !text.trim().is_empty() {
-                                let mut builder = crate::routing::transcript_store::TranscriptBuilder::new(
-                                    text.clone(),
-                                    audio_result.model.clone(),
-                                );
+                                let mut builder =
+                                    crate::routing::transcript_store::TranscriptBuilder::new(
+                                        text.clone(),
+                                        audio_result.model.clone(),
+                                    );
                                 if let Some(ref mid) = meeting_id {
                                     builder = builder.meeting_id(mid.clone());
                                 }
@@ -251,7 +258,10 @@ async fn dispatch_reverse_request(
                                 }
                                 let display_speaker = builder.speaker.clone();
                                 crate::routing::transcript_store::push(builder);
-                                info!("Transcript [{}][{}]: {}", display_speaker, audio_result.model, text);
+                                info!(
+                                    "Transcript [{}][{}]: {}",
+                                    display_speaker, audio_result.model, text
+                                );
                             }
                         }
                     }
@@ -288,7 +298,10 @@ async fn dispatch_reverse_request(
                                     text,
                                     reasoning_content: None,
                                     model: route_result.response.model,
-                                    finish_reason: route_result.response.choices.first()
+                                    finish_reason: route_result
+                                        .response
+                                        .choices
+                                        .first()
                                         .and_then(|c| c.finish_reason.clone()),
                                     tool_calls: None,
                                     detected_intent: None,
@@ -300,7 +313,9 @@ async fn dispatch_reverse_request(
                                 metrics: None,
                             }
                         }
-                        Err(e) => make_error_response(request_id, &format!("Blad chat completion: {}", e)),
+                        Err(e) => {
+                            make_error_response(request_id, &format!("Blad chat completion: {}", e))
+                        }
                     }
                 }
                 Err(e) => make_error_response(request_id, &e),
@@ -308,18 +323,22 @@ async fn dispatch_reverse_request(
         }
 
         ModelPayload::Embeddings(ref emb_payload) => {
-            match router.route_embeddings_via_quic(&emb_payload.model, emb_payload.input.clone()).await {
+            match router
+                .route_embeddings_via_quic(&emb_payload.model, emb_payload.input.clone())
+                .await
+            {
                 Ok(response) => response,
                 Err(e) => make_error_response(request_id, &format!("Blad embeddings: {}", e)),
             }
         }
 
-        _ => {
-            make_error_response(request_id, &format!(
+        _ => make_error_response(
+            request_id,
+            &format!(
                 "Nieobslugiwany typ payload w reverse request: {:?}",
                 std::mem::discriminant(&request.payload)
-            ))
-        }
+            ),
+        ),
     }
 }
 
@@ -329,13 +348,15 @@ fn build_chat_request(
 ) -> Result<crate::api::openai::types::ChatCompletionRequest, String> {
     use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
 
-    let messages: Vec<Message> = payload.messages.iter().map(|m| {
-        Message {
+    let messages: Vec<Message> = payload
+        .messages
+        .iter()
+        .map(|m| Message {
             role: m.role.clone(),
             content: Some(MessageContent::Text(m.content.clone())),
             ..Default::default()
-        }
-    }).collect();
+        })
+        .collect();
 
     if messages.is_empty() {
         return Err("Brak wiadomosci w CompletionPayload".to_string());

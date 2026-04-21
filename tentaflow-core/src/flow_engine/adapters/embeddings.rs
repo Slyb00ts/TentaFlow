@@ -94,7 +94,13 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
         }
 
         // Sprawdz QUIC embedding client
-        let quic_handle = { self.service_manager.quic_embedding_services.read().get(&model_name).cloned() };
+        let quic_handle = {
+            self.service_manager
+                .quic_embedding_services
+                .read()
+                .get(&model_name)
+                .cloned()
+        };
         if let Some(quic_handle) = quic_handle {
             if let Some(quic_client) = quic_handle.get_client().await {
                 debug!("Embeddings adapter: uzywam QUIC backend: {}", model_name);
@@ -118,47 +124,53 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
                 };
 
                 match quic_client.send_request(model_request).await {
-                    Ok(response) => {
-                        match response.result {
-                            ModelResult::Embeddings(embeddings_result) => {
-                                if let Some(first_embedding) = embeddings_result.embeddings.first() {
-                                    let dimensions = first_embedding.len();
-                                    debug!(
-                                        "Embeddings adapter: wygenerowano wektor o {} wymiarach",
-                                        dimensions
-                                    );
-
-                                    return Ok(serde_json::json!({
-                                        "embedding": first_embedding,
-                                        "dimensions": dimensions,
-                                    }));
-                                } else {
-                                    bail!("Embeddings adapter: pusta odpowiedz z backendu");
-                                }
-                            }
-                            ModelResult::Error(err) => {
-                                bail!(
-                                    "Embeddings adapter QUIC error: {:?} - {}",
-                                    err.error_type,
-                                    err.message
+                    Ok(response) => match response.result {
+                        ModelResult::Embeddings(embeddings_result) => {
+                            if let Some(first_embedding) = embeddings_result.embeddings.first() {
+                                let dimensions = first_embedding.len();
+                                debug!(
+                                    "Embeddings adapter: wygenerowano wektor o {} wymiarach",
+                                    dimensions
                                 );
-                            }
-                            _ => {
-                                warn!("Embeddings adapter: nieoczekiwany typ wyniku");
+
+                                return Ok(serde_json::json!({
+                                    "embedding": first_embedding,
+                                    "dimensions": dimensions,
+                                }));
+                            } else {
+                                bail!("Embeddings adapter: pusta odpowiedz z backendu");
                             }
                         }
-                    }
+                        ModelResult::Error(err) => {
+                            bail!(
+                                "Embeddings adapter QUIC error: {:?} - {}",
+                                err.error_type,
+                                err.message
+                            );
+                        }
+                        _ => {
+                            warn!("Embeddings adapter: nieoczekiwany typ wyniku");
+                        }
+                    },
                     Err(e) => {
-                        warn!("Embeddings adapter: QUIC request failed: {} - probuje fallback", e);
+                        warn!(
+                            "Embeddings adapter: QUIC request failed: {} - probuje fallback",
+                            e
+                        );
                     }
                 }
             } else {
-                warn!("Embeddings adapter: QUIC serwis '{}' nie jest polaczony", model_name);
+                warn!(
+                    "Embeddings adapter: QUIC serwis '{}' nie jest polaczony",
+                    model_name
+                );
             }
         }
 
         // HTTP backend jako fallback
-        let backends = self.service_manager.get_service_backends_cloned(&model_name);
+        let backends = self
+            .service_manager
+            .get_service_backends_cloned(&model_name);
         if let Some(ref backends) = backends {
             if !backends.is_empty() {
                 let backend = &backends[0];

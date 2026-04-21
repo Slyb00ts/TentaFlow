@@ -3,12 +3,14 @@
 // Opis: Host functions User API — informacje o aktualnym uzytkowniku
 //       i sprawdzanie uprawnien. Addon moze sprawdzic kim jest uzytkownik
 //       i czy ma konkretne uprawnienie.
+// Uprawnienia: "user_info" (get_current). user_check_permission jest sam
+//              meta-zapytaniem i nie wymaga osobnego uprawnienia — zwraca
+//              wynik bez efektow ubocznych.
 // =============================================================================
 
 use super::{
-    AddonState, ABI_OK, ABI_ERR_PERMISSION, ABI_ERR_OPERATION, ABI_ERR_NOT_FOUND,
-    get_memory, read_guest_string, write_guest_output, audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_string, write_guest_output, AddonState,
+    WasmCaller, ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
 
 // =============================================================================
@@ -34,7 +36,14 @@ pub fn user_get_current(
 
     // Sprawdz uprawnienie user_info
     if !check_permission(caller.data(), "user_info", None) {
-        audit_log(caller.data(), "user.get_current", Some("user_info"), None, "denied", None);
+        audit_log(
+            caller.data(),
+            "user.get_current",
+            Some("user_info"),
+            None,
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
@@ -59,11 +68,13 @@ pub fn user_get_current(
         match caller.data().db.lock() {
             Ok(conn) => {
                 // Pobierz uzytkownika
-                let user_data: Option<(String, Option<String>, Option<String>)> = conn.query_row(
-                    "SELECT username, display_name, email FROM users WHERE id = ?1",
-                    rusqlite::params![user_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                ).ok();
+                let user_data: Option<(String, Option<String>, Option<String>)> = conn
+                    .query_row(
+                        "SELECT username, display_name, email FROM users WHERE id = ?1",
+                        rusqlite::params![user_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok();
 
                 match user_data {
                     Some((username, display_name, email)) => {
@@ -72,7 +83,7 @@ pub fn user_get_current(
                             let mut stmt = match conn.prepare(
                                 "SELECT g.name FROM groups g \
                                  JOIN user_groups ug ON g.id = ug.group_id \
-                                 WHERE ug.user_id = ?1"
+                                 WHERE ug.user_id = ?1",
                             ) {
                                 Ok(s) => s,
                                 Err(_) => return ABI_ERR_OPERATION,
@@ -102,7 +113,14 @@ pub fn user_get_current(
         Err(_) => return ABI_ERR_OPERATION,
     };
 
-    audit_log(caller.data(), "user.get_current", Some("user_info"), None, "ok", None);
+    audit_log(
+        caller.data(),
+        "user.get_current",
+        Some("user_info"),
+        None,
+        "ok",
+        None,
+    );
 
     write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, &bytes)
 }
@@ -132,10 +150,11 @@ pub fn user_check_permission(
         None => return ABI_ERR_OPERATION,
     };
 
-    let permission_type = match read_guest_string(&memory, &caller, permission_type_ptr, permission_type_len) {
-        Some(s) => s.to_string(),
-        None => return ABI_ERR_OPERATION,
-    };
+    let permission_type =
+        match read_guest_string(&memory, &caller, permission_type_ptr, permission_type_len) {
+            Some(s) => s.to_string(),
+            None => return ABI_ERR_OPERATION,
+        };
 
     let resource = if resource_ptr != 0 && resource_len > 0 {
         read_guest_string(&memory, &caller, resource_ptr, resource_len).map(|s| s.to_string())
@@ -158,12 +177,20 @@ pub fn user_check_permission(
         None => return ABI_OK, // Systemowe wywolanie — zawsze przyznane
     };
 
-    let granted = caller.data().permission_checker.check(
-        &caller.data().addon_id,
-        user_id,
-        &permission_type,
-        resource.as_deref(),
-    ).is_granted();
+    let granted = caller
+        .data()
+        .permission_checker
+        .check(
+            &caller.data().addon_id,
+            user_id,
+            &permission_type,
+            resource.as_deref(),
+        )
+        .is_granted();
 
-    if granted { ABI_OK } else { ABI_ERR_PERMISSION }
+    if granted {
+        ABI_OK
+    } else {
+        ABI_ERR_PERMISSION
+    }
 }

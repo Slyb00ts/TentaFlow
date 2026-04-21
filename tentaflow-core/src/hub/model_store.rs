@@ -5,8 +5,8 @@
 //       tych samych plikow. Obsluga pobierania z HF z raportem postepu.
 // =============================================================================
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -52,7 +52,10 @@ impl ModelStore {
     pub fn model_dir(&self, model_id: &str) -> PathBuf {
         let parts: Vec<&str> = model_id.splitn(2, '/').collect();
         if parts.len() == 2 {
-            self.base_dir.join("huggingface").join(parts[0]).join(parts[1])
+            self.base_dir
+                .join("huggingface")
+                .join(parts[0])
+                .join(parts[1])
         } else {
             self.base_dir.join("huggingface").join(model_id)
         }
@@ -168,12 +171,11 @@ impl ModelStore {
             .map_err(|e| format!("Download client error: {}", e))?;
 
         // Lista plikow z HF API
-        let url = format!(
-            "https://huggingface.co/api/models/{}/tree/main",
-            model_id
-        );
+        let url = format!("https://huggingface.co/api/models/{}/tree/main", model_id);
 
-        let mut req = api_client.get(&url).header("User-Agent", "TentaFlow-AI/1.0");
+        let mut req = api_client
+            .get(&url)
+            .header("User-Agent", "TentaFlow-AI/1.0");
         if let Some(token) = hf_token {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
@@ -237,10 +239,7 @@ impl ModelStore {
             }
 
             // Sprawdz czy plik juz czesciowo/calkowicie pobrany
-            let existing_size = file_path
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let existing_size = file_path.metadata().map(|m| m.len()).unwrap_or(0);
 
             // Plik kompletny — pomijamy
             if existing_size == file_size && file_size > 0 {
@@ -306,7 +305,8 @@ impl ModelStore {
             use tokio::io::AsyncWriteExt;
 
             while let Some(chunk_result) = stream.next().await {
-                let chunk = chunk_result.map_err(|e: reqwest::Error| format!("Download stream error: {}", e))?;
+                let chunk = chunk_result
+                    .map_err(|e: reqwest::Error| format!("Download stream error: {}", e))?;
                 file.write_all(&chunk)
                     .await
                     .map_err(|e| format!("Write error: {}", e))?;
@@ -406,12 +406,7 @@ fn default_model_dir() -> PathBuf {
 fn has_files_with_ext(dir: &std::path::Path, ext: &str) -> bool {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry
-                .path()
-                .extension()
-                .map(|e| e == ext)
-                .unwrap_or(false)
-            {
+            if entry.path().extension().map(|e| e == ext).unwrap_or(false) {
                 return true;
             }
         }

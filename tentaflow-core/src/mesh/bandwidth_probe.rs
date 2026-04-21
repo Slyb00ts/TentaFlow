@@ -5,11 +5,11 @@
 //       Latency mierzona jako RTT ping-pong na pierwszym strumieniu.
 // =============================================================================
 
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout, Duration, Instant};
+use anyhow::{anyhow, Result};
 use std::net::SocketAddr;
-use anyhow::{Result, anyhow};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::time::{timeout, Duration, Instant};
 
 const NONCE_SIZE: usize = 32;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -114,7 +114,9 @@ async fn run_server(
 
     for _ in 0..num_streams {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() { break; }
+        if remaining.is_zero() {
+            break;
+        }
 
         match timeout(remaining, listener.accept()).await {
             Ok(Ok((stream, _addr))) => {

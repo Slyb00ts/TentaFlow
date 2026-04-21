@@ -1,0 +1,28 @@
+# Manifest serwisu NVIDIA NeMo Parakeet — szybki ASR.
+
+[engine]
+id = "parakeet"
+category = "stt"
+name = "Parakeet"
+description_pl = "Szybki ASR od NVIDIA (NeMo). Niska latencja, dobra jakosc dla angielskiego."
+description_en = "NVIDIA's fast ASR (NeMo). Low latency, good quality for English."
+homepage = "https://github.com/NVIDIA/NeMo"
+license = "Apache-2.0"
+default_port = 5030
+api = "openai-compatible"
+version = "2.0.0"
+
+[deploy.docker]
+context_path = "stt/docker/parakeet"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "windows"]
+runtime = "python-bundle"
+bundle_path = "stt/python/parakeet"
+
+[[model_preset]]
+id = "parakeet-tdt-1-1b"
+display_name = "Parakeet TDT 1.1B"
+repo = "nvidia/parakeet-tdt-1.1b"
+recommended = true

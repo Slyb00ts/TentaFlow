@@ -157,6 +157,10 @@ const App = (() => {
   // Po udanym zalogowaniu
   function onLoginSuccess() {
     console.log('[App] onLoginSuccess wywolany');
+    // Wyczysc cache licencji - moze byc to inny user niz poprzednio
+    if (typeof LicenseBadge !== 'undefined' && typeof LicenseBadge.invalidate === 'function') {
+      LicenseBadge.invalidate();
+    }
     showAppScreen();
 
     // Ustaw nazwe uzytkownika
@@ -193,6 +197,10 @@ const App = (() => {
   function handleLogout() {
     ApiClient.logout();
     WsClient.disconnect();
+    // Wyczysc cache licencji - kolejny user moze miec inny tier
+    if (typeof LicenseBadge !== 'undefined' && typeof LicenseBadge.invalidate === 'function') {
+      LicenseBadge.invalidate();
+    }
     showLoginScreen();
   }
 

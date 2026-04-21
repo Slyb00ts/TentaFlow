@@ -247,7 +247,10 @@ impl PromptRegistry {
             count += 1;
         }
 
-        info!("PromptRegistry: Zaladowano {} promptow z bazy danych", count);
+        info!(
+            "PromptRegistry: Zaladowano {} promptow z bazy danych",
+            count
+        );
     }
 
     /// Pobiera tresc prompta - panic jesli nie znaleziono (prompty MUSZA byc w DB)
@@ -255,14 +258,22 @@ impl PromptRegistry {
         self.prompts
             .get(id)
             .map(|e| e.content.as_str())
-            .unwrap_or_else(|| panic!("Brak wymaganego prompta '{}' w rejestrze. Sprawdz seed bazy danych.", id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Brak wymaganego prompta '{}' w rejestrze. Sprawdz seed bazy danych.",
+                    id
+                )
+            })
     }
 
     /// Formatuje template - panic jesli nie znaleziono
     pub fn require_template(&self, id: &str, params: &HashMap<&str, &str>) -> String {
-        let entry = self.prompts
-            .get(id)
-            .unwrap_or_else(|| panic!("Brak wymaganego template '{}' w rejestrze. Sprawdz seed bazy danych.", id));
+        let entry = self.prompts.get(id).unwrap_or_else(|| {
+            panic!(
+                "Brak wymaganego template '{}' w rejestrze. Sprawdz seed bazy danych.",
+                id
+            )
+        });
 
         let mut result = entry.content.clone();
         for (key, value) in params {

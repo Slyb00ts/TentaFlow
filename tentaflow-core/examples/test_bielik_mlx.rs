@@ -32,8 +32,14 @@ async fn main() {
     println!("--- Test 2: Formatowanie ChatML ---");
     use tentaflow_core::routing::chat_template::ChatMessage;
     let messages = vec![
-        ChatMessage { role: "system".into(), content: "Jestes pomocnym polskim asystentem AI. Odpowiadaj krotko i zwiezle.".into() },
-        ChatMessage { role: "user".into(), content: "Czesc! Kim jestes?".into() },
+        ChatMessage {
+            role: "system".into(),
+            content: "Jestes pomocnym polskim asystentem AI. Odpowiadaj krotko i zwiezle.".into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: "Czesc! Kim jestes?".into(),
+        },
     ];
     let formatted = template.format_messages(&messages, true);
     println!("Sformatowany prompt:\n{}\n", formatted);
@@ -98,8 +104,14 @@ async fn main() {
     // Test 5: Drugie pytanie
     println!("--- Test 5: Drugie pytanie ---");
     let messages2 = vec![
-        ChatMessage { role: "system".into(), content: "Jestes pomocnym polskim asystentem AI.".into() },
-        ChatMessage { role: "user".into(), content: "Jakie sa pory roku w Polsce?".into() },
+        ChatMessage {
+            role: "system".into(),
+            content: "Jestes pomocnym polskim asystentem AI.".into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: "Jakie sa pory roku w Polsce?".into(),
+        },
     ];
     let formatted2 = template.format_messages(&messages2, true);
     println!("Prompt:\n{}\n", formatted2);

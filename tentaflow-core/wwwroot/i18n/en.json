@@ -64,7 +64,8 @@
     "back": "Back",
     "password": "Password",
     "preview": "Preview",
-    "language": "Language"
+    "language": "Language",
+    "deploy": "Deploy"
   },
   "dashboard": {
     "metrics": {
@@ -274,6 +275,7 @@
     "configure_deploy": "Configure & Deploy",
     "back_to_mesh": "Back to mesh",
     "port": "Port",
+    "noEngines": "No engines in manifest",
     "empty_hint": "Integration with NVIDIA NIM catalog coming soon. Models optimized for NVIDIA GPUs.",
     "items": {
       "tts": {
@@ -1029,5 +1031,55 @@
     "badge_enrolled": "known",
     "badge_temp": "temp",
     "download_transcripts": "Download transcripts"
+  },
+  "wizard": {
+    "title": "Deploying engine",
+    "step1": "Deployment method",
+    "step2": "Select model",
+    "step3": "Configure",
+    "selectNode": "Select target node",
+    "selectMethod": "Select deployment method",
+    "selectModel": "Select model",
+    "configureRuntime": "Configure runtime",
+    "fromPreset": "From preset",
+    "searchHuggingface": "Search on HuggingFace",
+    "huggingfaceToken": "HuggingFace token (optional)",
+    "noPresets": "No recommended models — use HuggingFace search",
+    "presetHint": "Select a recommended model for this engine",
+    "hfSearchHint": "Type at least 2 characters to search",
+    "hfSearchPlaceholder": "e.g. qwen, llama, mistral...",
+    "noMethodsAvailable": "No deployment methods available for platform {os}.",
+    "containerName": "Container name",
+    "port": "Port",
+    "modelLabel": "Model",
+    "method": {
+      "docker": "Docker",
+      "native": "Native",
+      "external": "External",
+      "dockerDesc": "Container with resource isolation",
+      "nativeDesc": "Fastest, runs directly on host",
+      "externalDesc": "Connects to an already running installation"
+    },
+    "startDeploy": "Start deploy",
+    "cancel": "Cancel",
+    "next": "Next",
+    "back": "Back",
+    "deployStarted": "Deploy started: {id}",
+    "deployFailed": "Deploy failed: {error}",
+    "engineNotFound": "Engine \"{id}\" not found in manifest"
+  },
+  "category": {
+    "llm": "Language Models (LLM)",
+    "stt": "Speech to Text (STT)",
+    "tts": "Text to Speech (TTS)",
+    "embeddings": "Embeddings",
+    "reranker": "Reranker",
+    "vision": "Computer Vision",
+    "image-gen": "Image Generation",
+    "video-gen": "Video Generation",
+    "music-gen": "Music Generation",
+    "model-3d-gen": "3D Model Generation",
+    "agents": "Agents",
+    "tools": "Tools"
   }
 }

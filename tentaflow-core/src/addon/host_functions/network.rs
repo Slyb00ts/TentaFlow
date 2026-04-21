@@ -3,20 +3,20 @@
 // Opis: Host functions sieciowe — proxy TCP/UDP z walidacja regul, auditlogiem.
 //       Addon nie laczy sie bezposrednio z siecią — Core proxy sprawdza reguly,
 //       zatwierdzenia, waliduje DNS/IP (SSRF) i loguje kazda operacje.
+// Uprawnienia: "network" (connect/send/recv/close). Fail-closed — brak
+//              uprawnienia blokuje operacje zanim dotknie socketu.
 // =============================================================================
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, UdpSocket, ToSocketAddrs, IpAddr};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use tracing::{info, warn};
 
 use super::{
-    AddonState, ABI_OK, ABI_ERR_PERMISSION, ABI_ERR_OPERATION,
-    get_memory, read_guest_string, read_guest_bytes, write_guest_bytes,
-    audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_bytes, read_guest_string,
+    write_guest_bytes, AddonState, WasmCaller, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
 
 // =============================================================================
@@ -142,7 +142,8 @@ fn is_safe_ip(ip: &IpAddr) -> bool {
             }
             // IPv4-mapped IPv6 (::ffff:x.x.x.x) — sprawdz wewnetrzny IPv4
             if let Some(v4) = v6.to_ipv4_mapped() {
-                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0 {
+                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0
+                {
                     return false;
                 }
             }
@@ -195,8 +196,12 @@ pub fn host_net_connect(
     // 2. Sprawdz uprawnienie "network"
     if !check_permission(caller.data(), "network", None) {
         audit_log(
-            caller.data(), "net.connect", Some("network"),
-            Some(&rule_id), "denied", Some("brak uprawnienia 'network'"),
+            caller.data(),
+            "net.connect",
+            Some("network"),
+            Some(&rule_id),
+            "denied",
+            Some("brak uprawnienia 'network'"),
         );
         return ABI_ERR_PERMISSION;
     }
@@ -206,10 +211,17 @@ pub fn host_net_connect(
     let rule = match manifest.network_rules.iter().find(|r| r.id == rule_id) {
         Some(r) => r.clone(),
         None => {
-            warn!("net_connect: regula '{}' nie znaleziona w manifescie", rule_id);
+            warn!(
+                "net_connect: regula '{}' nie znaleziona w manifescie",
+                rule_id
+            );
             audit_log(
-                caller.data(), "net.connect", Some("network"),
-                Some(&rule_id), "error", Some("regula nie znaleziona w manifescie"),
+                caller.data(),
+                "net.connect",
+                Some("network"),
+                Some(&rule_id),
+                "error",
+                Some("regula nie znaleziona w manifescie"),
             );
             return ABI_ERR_NETWORK_RULE_NOT_FOUND;
         }
@@ -219,19 +231,23 @@ pub fn host_net_connect(
     let approved = {
         let addon_id = caller.data().addon_id.clone();
         match caller.data().db.lock() {
-            Ok(conn) => {
-                conn.query_row(
+            Ok(conn) => conn
+                .query_row(
                     "SELECT approved FROM addon_network_rules \
                      WHERE addon_id = ?1 AND rule_id = ?2",
                     rusqlite::params![&addon_id, &rule_id],
                     |row| row.get::<_, i32>(0),
-                ).unwrap_or(0)
-            }
+                )
+                .unwrap_or(0),
             Err(_) => {
                 // Fail-closed — blokuj przy bledzie DB
                 audit_log(
-                    caller.data(), "net.connect", Some("network"),
-                    Some(&rule_id), "error", Some("blad dostepu do DB"),
+                    caller.data(),
+                    "net.connect",
+                    Some("network"),
+                    Some(&rule_id),
+                    "error",
+                    Some("blad dostepu do DB"),
                 );
                 return ABI_ERR_OPERATION;
             }
@@ -241,8 +257,12 @@ pub fn host_net_connect(
     if approved != 1 {
         warn!("net_connect: regula '{}' nie jest zatwierdzona", rule_id);
         audit_log(
-            caller.data(), "net.connect", Some("network"),
-            Some(&rule_id), "denied", Some("regula nie zatwierdzona (approved=0)"),
+            caller.data(),
+            "net.connect",
+            Some("network"),
+            Some(&rule_id),
+            "denied",
+            Some("regula nie zatwierdzona (approved=0)"),
         );
         return ABI_ERR_NETWORK_RULE_NOT_APPROVED;
     }
@@ -253,9 +273,15 @@ pub fn host_net_connect(
         let mgr = net_manager.lock();
         if mgr.connection_count() >= MAX_CONNECTIONS_PER_ADDON {
             audit_log(
-                caller.data(), "net.connect", Some("network"),
-                Some(&rule_id), "error",
-                Some(&format!("limit polaczen przekroczony (max {})", MAX_CONNECTIONS_PER_ADDON)),
+                caller.data(),
+                "net.connect",
+                Some("network"),
+                Some(&rule_id),
+                "error",
+                Some(&format!(
+                    "limit polaczen przekroczony (max {})",
+                    MAX_CONNECTIONS_PER_ADDON
+                )),
             );
             return ABI_ERR_MAX_CONNECTIONS;
         }
@@ -268,8 +294,11 @@ pub fn host_net_connect(
         Err(e) => {
             warn!("net_connect: blad DNS resolve '{}': {}", addr_str, e);
             audit_log(
-                caller.data(), "net.connect", Some("network"),
-                Some(&rule_id), "error",
+                caller.data(),
+                "net.connect",
+                Some("network"),
+                Some(&rule_id),
+                "error",
                 Some(&format!("blad DNS resolve: {}", e)),
             );
             return ABI_ERR_CONNECTION_FAILED;
@@ -278,8 +307,12 @@ pub fn host_net_connect(
 
     if addrs.is_empty() {
         audit_log(
-            caller.data(), "net.connect", Some("network"),
-            Some(&rule_id), "error", Some("DNS resolve zwrocil 0 adresow"),
+            caller.data(),
+            "net.connect",
+            Some("network"),
+            Some(&rule_id),
+            "error",
+            Some("DNS resolve zwrocil 0 adresow"),
         );
         return ABI_ERR_CONNECTION_FAILED;
     }
@@ -287,10 +320,16 @@ pub fn host_net_connect(
     // Walidacja IP — blokuj adresy prywatne/loopback
     for addr in &addrs {
         if !is_safe_ip(&addr.ip()) {
-            warn!("net_connect: zablokowany adres prywatny/loopback: {}", addr.ip());
+            warn!(
+                "net_connect: zablokowany adres prywatny/loopback: {}",
+                addr.ip()
+            );
             audit_log(
-                caller.data(), "net.connect", Some("network"),
-                Some(&rule_id), "denied",
+                caller.data(),
+                "net.connect",
+                Some("network"),
+                Some(&rule_id),
+                "denied",
                 Some(&format!("SSRF: adres {} jest prywatny/loopback", addr.ip())),
             );
             return ABI_ERR_PERMISSION;
@@ -307,11 +346,20 @@ pub fn host_net_connect(
                     // VULN-043: Sprawdz peer_addr po polaczeniu — ochrona przed DNS rebinding
                     if let Ok(peer) = stream.peer_addr() {
                         if is_private_ip(&peer.ip()) {
-                            warn!("net_connect: peer_addr {} prywatny po polaczeniu (DNS rebinding)", peer);
+                            warn!(
+                                "net_connect: peer_addr {} prywatny po polaczeniu (DNS rebinding)",
+                                peer
+                            );
                             audit_log(
-                                caller.data(), "net.connect", Some("network"),
-                                Some(&rule_id), "denied",
-                                Some(&format!("SSRF/DNS-rebinding: peer_addr {} jest prywatny", peer)),
+                                caller.data(),
+                                "net.connect",
+                                Some("network"),
+                                Some(&rule_id),
+                                "denied",
+                                Some(&format!(
+                                    "SSRF/DNS-rebinding: peer_addr {} jest prywatny",
+                                    peer
+                                )),
                             );
                             return ABI_ERR_PERMISSION;
                         }
@@ -326,8 +374,11 @@ pub fn host_net_connect(
                 Err(e) => {
                     warn!("net_connect: blad TCP connect '{}': {}", addr_str, e);
                     audit_log(
-                        caller.data(), "net.connect", Some("network"),
-                        Some(&rule_id), "error",
+                        caller.data(),
+                        "net.connect",
+                        Some("network"),
+                        Some(&rule_id),
+                        "error",
                         Some(&format!("blad TCP connect: {}", e)),
                     );
                     return ABI_ERR_CONNECTION_FAILED;
@@ -341,8 +392,11 @@ pub fn host_net_connect(
                     if let Err(e) = socket.connect(target_addr) {
                         warn!("net_connect: blad UDP connect '{}': {}", addr_str, e);
                         audit_log(
-                            caller.data(), "net.connect", Some("network"),
-                            Some(&rule_id), "error",
+                            caller.data(),
+                            "net.connect",
+                            Some("network"),
+                            Some(&rule_id),
+                            "error",
                             Some(&format!("blad UDP connect: {}", e)),
                         );
                         return ABI_ERR_CONNECTION_FAILED;
@@ -354,8 +408,11 @@ pub fn host_net_connect(
                 Err(e) => {
                     warn!("net_connect: blad UDP bind: {}", e);
                     audit_log(
-                        caller.data(), "net.connect", Some("network"),
-                        Some(&rule_id), "error",
+                        caller.data(),
+                        "net.connect",
+                        Some("network"),
+                        Some(&rule_id),
+                        "error",
                         Some(&format!("blad UDP bind: {}", e)),
                     );
                     return ABI_ERR_CONNECTION_FAILED;
@@ -365,8 +422,11 @@ pub fn host_net_connect(
         other => {
             warn!("net_connect: nieobslugiwany protokol '{}'", other);
             audit_log(
-                caller.data(), "net.connect", Some("network"),
-                Some(&rule_id), "error",
+                caller.data(),
+                "net.connect",
+                Some("network"),
+                Some(&rule_id),
+                "error",
                 Some(&format!("nieobslugiwany protokol: {}", other)),
             );
             return ABI_ERR_OPERATION;
@@ -388,12 +448,19 @@ pub fn host_net_connect(
 
     info!(
         "net_connect: addon='{}' polaczono {}://{}:{} (conn_id={})",
-        caller.data().addon_id, rule.protocol, rule.host, rule.port, conn_id
+        caller.data().addon_id,
+        rule.protocol,
+        rule.host,
+        rule.port,
+        conn_id
     );
 
     audit_log(
-        caller.data(), "net.connect", Some("network"),
-        Some(&rule_id), "ok",
+        caller.data(),
+        "net.connect",
+        Some("network"),
+        Some(&rule_id),
+        "ok",
         None,
     );
 
@@ -421,13 +488,35 @@ pub fn host_net_send(
         None => return ABI_ERR_OPERATION,
     };
 
+    // Fail-closed: sprawdz uprawnienie "network" zanim dotkniemy socketu lub pamieci guest
+    if !check_permission(caller.data(), "network", None) {
+        audit_log(
+            caller.data(),
+            "net.send",
+            Some("network"),
+            Some(&conn_id.to_string()),
+            "denied",
+            Some("brak uprawnienia 'network'"),
+        );
+        return ABI_ERR_PERMISSION;
+    }
+
     // VULN-047: Sprawdz limit rozmiaru danych przed odczytem z pamieci guest
     if data_len as usize > MAX_SEND_SIZE {
-        warn!("net_send: rozmiar danych {} przekracza limit {}", data_len, MAX_SEND_SIZE);
+        warn!(
+            "net_send: rozmiar danych {} przekracza limit {}",
+            data_len, MAX_SEND_SIZE
+        );
         audit_log(
-            caller.data(), "net.send", Some("network"),
-            Some(&conn_id.to_string()), "error",
-            Some(&format!("rozmiar danych {} przekracza limit {}", data_len, MAX_SEND_SIZE)),
+            caller.data(),
+            "net.send",
+            Some("network"),
+            Some(&conn_id.to_string()),
+            "error",
+            Some(&format!(
+                "rozmiar danych {} przekracza limit {}",
+                data_len, MAX_SEND_SIZE
+            )),
         );
         return ABI_ERR_OPERATION;
     }
@@ -449,8 +538,12 @@ pub fn host_net_send(
             Some(c) => c.rule_id.clone(),
             None => {
                 audit_log(
-                    caller.data(), "net.send", Some("network"),
-                    Some(&conn_id.to_string()), "error", Some("polaczenie nie znalezione"),
+                    caller.data(),
+                    "net.send",
+                    Some("network"),
+                    Some(&conn_id.to_string()),
+                    "error",
+                    Some("polaczenie nie znalezione"),
                 );
                 return ABI_ERR_CONNECTION_NOT_FOUND;
             }
@@ -461,23 +554,32 @@ pub fn host_net_send(
     {
         let addon_id = caller.data().addon_id.clone();
         let approved = match caller.data().db.lock() {
-            Ok(conn) => {
-                conn.query_row(
+            Ok(conn) => conn
+                .query_row(
                     "SELECT approved FROM addon_network_rules WHERE addon_id = ?1 AND rule_id = ?2",
                     rusqlite::params![&addon_id, &conn_rule_id],
                     |row| row.get::<_, i32>(0),
-                ).unwrap_or(0)
-            }
+                )
+                .unwrap_or(0),
             Err(_) => 0,
         };
         if approved != 1 {
-            warn!("net_send: regula '{}' nie jest juz zatwierdzona — zamykam polaczenie {}", conn_rule_id, conn_id);
+            warn!(
+                "net_send: regula '{}' nie jest juz zatwierdzona — zamykam polaczenie {}",
+                conn_rule_id, conn_id
+            );
             // VULN-048: Zamknij polaczenie przy cofnietej regule
             net_manager.lock().connections.remove(&conn_id_u32);
             audit_log(
-                caller.data(), "net.send", Some("network"),
-                Some(&conn_id.to_string()), "denied",
-                Some(&format!("regula '{}' cofnieta — polaczenie zamkniete", conn_rule_id)),
+                caller.data(),
+                "net.send",
+                Some("network"),
+                Some(&conn_id.to_string()),
+                "denied",
+                Some(&format!(
+                    "regula '{}' cofnieta — polaczenie zamkniete",
+                    conn_rule_id
+                )),
             );
             return ABI_ERR_NETWORK_RULE_NOT_APPROVED;
         }
@@ -488,47 +590,57 @@ pub fn host_net_send(
         Some(c) => c,
         None => {
             audit_log(
-                caller.data(), "net.send", Some("network"),
-                Some(&conn_id.to_string()), "error", Some("polaczenie nie znalezione"),
+                caller.data(),
+                "net.send",
+                Some("network"),
+                Some(&conn_id.to_string()),
+                "error",
+                Some("polaczenie nie znalezione"),
             );
             return ABI_ERR_CONNECTION_NOT_FOUND;
         }
     };
 
     let bytes_sent = match &mut connection.transport {
-        NetTransport::Tcp(ref mut stream) => {
-            match stream.write_all(&data) {
-                Ok(()) => data.len(),
-                Err(e) => {
-                    warn!("net_send: blad TCP write (conn_id={}): {}", conn_id, e);
-                    audit_log(
-                        caller.data(), "net.send", Some("network"),
-                        Some(&conn_id.to_string()), "error",
-                        Some(&format!("blad TCP write: {}", e)),
-                    );
-                    return ABI_ERR_OPERATION;
-                }
+        NetTransport::Tcp(ref mut stream) => match stream.write_all(&data) {
+            Ok(()) => data.len(),
+            Err(e) => {
+                warn!("net_send: blad TCP write (conn_id={}): {}", conn_id, e);
+                audit_log(
+                    caller.data(),
+                    "net.send",
+                    Some("network"),
+                    Some(&conn_id.to_string()),
+                    "error",
+                    Some(&format!("blad TCP write: {}", e)),
+                );
+                return ABI_ERR_OPERATION;
             }
-        }
-        NetTransport::Udp(ref socket) => {
-            match socket.send(&data) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!("net_send: blad UDP send (conn_id={}): {}", conn_id, e);
-                    audit_log(
-                        caller.data(), "net.send", Some("network"),
-                        Some(&conn_id.to_string()), "error",
-                        Some(&format!("blad UDP send: {}", e)),
-                    );
-                    return ABI_ERR_OPERATION;
-                }
+        },
+        NetTransport::Udp(ref socket) => match socket.send(&data) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("net_send: blad UDP send (conn_id={}): {}", conn_id, e);
+                audit_log(
+                    caller.data(),
+                    "net.send",
+                    Some("network"),
+                    Some(&conn_id.to_string()),
+                    "error",
+                    Some(&format!("blad UDP send: {}", e)),
+                );
+                return ABI_ERR_OPERATION;
             }
-        }
+        },
     };
 
     audit_log(
-        caller.data(), "net.send", Some("network"),
-        Some(&conn_id.to_string()), "ok", None,
+        caller.data(),
+        "net.send",
+        Some("network"),
+        Some(&conn_id.to_string()),
+        "ok",
+        None,
     );
 
     bytes_sent as i32
@@ -562,6 +674,19 @@ pub fn host_net_recv(
         return (ABI_ERR_OPERATION as i64) << 32;
     }
 
+    // Fail-closed: sprawdz uprawnienie "network" zanim odczytamy z socketu
+    if !check_permission(caller.data(), "network", None) {
+        audit_log(
+            caller.data(),
+            "net.recv",
+            Some("network"),
+            Some(&conn_id.to_string()),
+            "denied",
+            Some("brak uprawnienia 'network'"),
+        );
+        return (ABI_ERR_PERMISSION as i64) << 32;
+    }
+
     let net_manager = caller.data().net_manager.clone();
     let conn_id_u32 = conn_id as u32;
 
@@ -572,8 +697,12 @@ pub fn host_net_recv(
             Some(c) => c.rule_id.clone(),
             None => {
                 audit_log(
-                    caller.data(), "net.recv", Some("network"),
-                    Some(&conn_id.to_string()), "error", Some("polaczenie nie znalezione"),
+                    caller.data(),
+                    "net.recv",
+                    Some("network"),
+                    Some(&conn_id.to_string()),
+                    "error",
+                    Some("polaczenie nie znalezione"),
                 );
                 return (ABI_ERR_CONNECTION_NOT_FOUND as i64) << 32;
             }
@@ -583,22 +712,31 @@ pub fn host_net_recv(
     {
         let addon_id = caller.data().addon_id.clone();
         let approved = match caller.data().db.lock() {
-            Ok(conn) => {
-                conn.query_row(
+            Ok(conn) => conn
+                .query_row(
                     "SELECT approved FROM addon_network_rules WHERE addon_id = ?1 AND rule_id = ?2",
                     rusqlite::params![&addon_id, &conn_rule_id],
                     |row| row.get::<_, i32>(0),
-                ).unwrap_or(0)
-            }
+                )
+                .unwrap_or(0),
             Err(_) => 0,
         };
         if approved != 1 {
-            warn!("net_recv: regula '{}' nie jest juz zatwierdzona — zamykam polaczenie {}", conn_rule_id, conn_id);
+            warn!(
+                "net_recv: regula '{}' nie jest juz zatwierdzona — zamykam polaczenie {}",
+                conn_rule_id, conn_id
+            );
             net_manager.lock().connections.remove(&conn_id_u32);
             audit_log(
-                caller.data(), "net.recv", Some("network"),
-                Some(&conn_id.to_string()), "denied",
-                Some(&format!("regula '{}' cofnieta — polaczenie zamkniete", conn_rule_id)),
+                caller.data(),
+                "net.recv",
+                Some("network"),
+                Some(&conn_id.to_string()),
+                "denied",
+                Some(&format!(
+                    "regula '{}' cofnieta — polaczenie zamkniete",
+                    conn_rule_id
+                )),
             );
             return (ABI_ERR_NETWORK_RULE_NOT_APPROVED as i64) << 32;
         }
@@ -614,8 +752,12 @@ pub fn host_net_recv(
             Some(c) => c,
             None => {
                 audit_log(
-                    caller.data(), "net.recv", Some("network"),
-                    Some(&conn_id.to_string()), "error", Some("polaczenie nie znalezione"),
+                    caller.data(),
+                    "net.recv",
+                    Some("network"),
+                    Some(&conn_id.to_string()),
+                    "error",
+                    Some("polaczenie nie znalezione"),
                 );
                 return (ABI_ERR_CONNECTION_NOT_FOUND as i64) << 32;
             }
@@ -634,8 +776,11 @@ pub fn host_net_recv(
                         } else {
                             warn!("net_recv: blad TCP read (conn_id={}): {}", conn_id, e);
                             audit_log(
-                                caller.data(), "net.recv", Some("network"),
-                                Some(&conn_id.to_string()), "error",
+                                caller.data(),
+                                "net.recv",
+                                Some("network"),
+                                Some(&conn_id.to_string()),
+                                "error",
                                 Some(&format!("blad TCP read: {}", e)),
                             );
                             return (ABI_ERR_OPERATION as i64) << 32;
@@ -643,33 +788,38 @@ pub fn host_net_recv(
                     }
                 }
             }
-            NetTransport::Udp(ref socket) => {
-                match socket.recv(&mut buf) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut
-                        {
-                            0
-                        } else {
-                            warn!("net_recv: blad UDP recv (conn_id={}): {}", conn_id, e);
-                            audit_log(
-                                caller.data(), "net.recv", Some("network"),
-                                Some(&conn_id.to_string()), "error",
-                                Some(&format!("blad UDP recv: {}", e)),
-                            );
-                            return (ABI_ERR_OPERATION as i64) << 32;
-                        }
+            NetTransport::Udp(ref socket) => match socket.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                    {
+                        0
+                    } else {
+                        warn!("net_recv: blad UDP recv (conn_id={}): {}", conn_id, e);
+                        audit_log(
+                            caller.data(),
+                            "net.recv",
+                            Some("network"),
+                            Some(&conn_id.to_string()),
+                            "error",
+                            Some(&format!("blad UDP recv: {}", e)),
+                        );
+                        return (ABI_ERR_OPERATION as i64) << 32;
                     }
                 }
-            }
+            },
         }
     };
 
     // Zapisz dane do pamieci guest
     if bytes_read > 0 {
         let written = write_guest_bytes(
-            &memory, &mut caller, out_ptr, out_capacity, &buf[..bytes_read],
+            &memory,
+            &mut caller,
+            out_ptr,
+            out_capacity,
+            &buf[..bytes_read],
         );
         if written < 0 {
             return (ABI_ERR_OPERATION as i64) << 32;
@@ -677,8 +827,12 @@ pub fn host_net_recv(
     }
 
     audit_log(
-        caller.data(), "net.recv", Some("network"),
-        Some(&conn_id.to_string()), "ok", None,
+        caller.data(),
+        "net.recv",
+        Some("network"),
+        Some(&conn_id.to_string()),
+        "ok",
+        None,
     );
 
     // Packed result: (ABI_OK << 32) | bytes_read
@@ -696,10 +850,20 @@ pub fn host_net_recv(
 /// - Zwraca: ABI_OK (0) lub kod bledu (<0)
 ///
 /// Usuniecie z ConnectionManager powoduje drop socketu (automatyczne zamkniecie).
-pub fn host_net_close(
-    caller: WasmCaller<'_, AddonState>,
-    conn_id: i32,
-) -> i32 {
+pub fn host_net_close(caller: WasmCaller<'_, AddonState>, conn_id: i32) -> i32 {
+    // Fail-closed: bez uprawnienia "network" addon nie moze zarzadzac polaczeniami
+    if !check_permission(caller.data(), "network", None) {
+        audit_log(
+            caller.data(),
+            "net.close",
+            Some("network"),
+            Some(&conn_id.to_string()),
+            "denied",
+            Some("brak uprawnienia 'network'"),
+        );
+        return ABI_ERR_PERMISSION;
+    }
+
     let net_manager = caller.data().net_manager.clone();
     let conn_id_u32 = conn_id as u32;
 
@@ -710,18 +874,114 @@ pub fn host_net_close(
 
     if !removed {
         audit_log(
-            caller.data(), "net.close", Some("network"),
-            Some(&conn_id.to_string()), "error", Some("polaczenie nie znalezione"),
+            caller.data(),
+            "net.close",
+            Some("network"),
+            Some(&conn_id.to_string()),
+            "error",
+            Some("polaczenie nie znalezione"),
         );
         return ABI_ERR_CONNECTION_NOT_FOUND;
     }
 
-    info!("net_close: addon='{}' zamknieto conn_id={}", caller.data().addon_id, conn_id);
+    info!(
+        "net_close: addon='{}' zamknieto conn_id={}",
+        caller.data().addon_id,
+        conn_id
+    );
 
     audit_log(
-        caller.data(), "net.close", Some("network"),
-        Some(&conn_id.to_string()), "ok", None,
+        caller.data(),
+        "net.close",
+        Some("network"),
+        Some(&conn_id.to_string()),
+        "ok",
+        None,
     );
 
     ABI_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::addon::event_bus::EventBus;
+    use crate::addon::host_functions::check_permission;
+    use crate::addon::permissions::PermissionChecker;
+    use crate::addon::AddonManifest;
+    use parking_lot::Mutex;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Tworzy in-memory DB z pelnym schematem do testow
+    fn create_test_db() -> crate::db::DbPool {
+        crate::db::init(Path::new(":memory:")).expect("Nie udalo sie utworzyc test DB")
+    }
+
+    /// Tworzy minimalny AddonState do testowania check_permission w host_net_*
+    fn make_state(permissions: Vec<String>, is_system_call: bool) -> AddonState {
+        let db = create_test_db();
+        let event_bus = Arc::new(EventBus::new());
+        let permission_checker = Arc::new(PermissionChecker::new(db.clone()));
+        let settings_cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+
+        AddonState {
+            addon_id: "net-test-addon".to_string(),
+            instance_id: "test-instance".to_string(),
+            user_id: None,
+            db,
+            permissions,
+            event_bus,
+            permission_checker,
+            fuel_consumed: 0,
+            is_system_call,
+            rate_limiter: None,
+            net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
+            settings_cipher,
+            manifest: Arc::new(AddonManifest::default()),
+            memory_limit: 64 * 1024 * 1024,
+            oauth_refresh_guard: std::sync::Arc::new(
+                crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
+            ),
+            router: None,
+        }
+    }
+
+    #[test]
+    fn net_send_denied_without_network_permission() {
+        // Addon bez "network" w permissions nie moze wywolac net_send.
+        let state = make_state(vec!["llm".to_string()], true);
+        assert!(!check_permission(&state, "network", None),
+            "Brak 'network' → check_permission zwraca false (host_net_send zwroci ABI_ERR_PERMISSION)");
+    }
+
+    #[test]
+    fn net_recv_denied_without_network_permission() {
+        // Addon bez "network" nie moze wywolac net_recv — fail-closed.
+        let state = make_state(vec![], true);
+        assert!(
+            !check_permission(&state, "network", None),
+            "Brak deklaracji 'network' blokuje recv"
+        );
+    }
+
+    #[test]
+    fn net_close_denied_without_network_permission() {
+        // Addon bez "network" nie moze nawet zamknac polaczenia.
+        let state = make_state(vec!["storage".to_string()], true);
+        assert!(
+            !check_permission(&state, "network", None),
+            "net_close rowniez wymaga 'network'"
+        );
+    }
+
+    #[test]
+    fn net_allowed_when_network_permission_declared() {
+        // Pozytywna sciezka: addon z "network" i is_system_call=true dostaje Granted.
+        let state = make_state(vec!["network".to_string()], true);
+        assert!(
+            check_permission(&state, "network", None),
+            "Addon z zadeklarowanym 'network' (system call) powinien przejsc"
+        );
+    }
 }

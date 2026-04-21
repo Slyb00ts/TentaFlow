@@ -4,18 +4,20 @@
 //       przez Portainer, po udanym deploy automatycznie rejestruje serwis.
 // =============================================================================
 
-use crate::api::dashboard::auto_register::{DeployProgress, DeployedServiceInfo, auto_register_deployed_service};
+use crate::api::dashboard::auto_register::{
+    auto_register_deployed_service, DeployProgress, DeployedServiceInfo,
+};
 use crate::crypto::SettingsCipher;
 use crate::db::DbPool;
 use crate::routing::Router;
 
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+use tracing::{error, info, warn};
 
 /// Request deploy przychodzacy z frontendu
 #[derive(Deserialize)]
@@ -71,17 +73,20 @@ pub async fn handle_ws_connection<S>(
 
     // Czekaj na pierwsza wiadomosc z danymi deploy
     let mut deploy_req: DeployRequest = match stream.next().await {
-        Some(Ok(Message::Text(text))) => {
-            match serde_json::from_str(&text) {
-                Ok(req) => req,
-                Err(e) => {
-                    let _ = send_ws_progress(&mut sink, DeployProgress::done(false, &format!("Niepoprawny JSON: {}", e))).await;
-                    return;
-                }
+        Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+            Ok(req) => req,
+            Err(e) => {
+                let _ = send_ws_progress(
+                    &mut sink,
+                    DeployProgress::done(false, &format!("Niepoprawny JSON: {}", e)),
+                )
+                .await;
+                return;
             }
-        }
+        },
         _ => {
-            let _ = send_ws_progress(&mut sink, DeployProgress::done(false, "Brak danych deploy")).await;
+            let _ = send_ws_progress(&mut sink, DeployProgress::done(false, "Brak danych deploy"))
+                .await;
             return;
         }
     };
@@ -89,7 +94,8 @@ pub async fn handle_ws_connection<S>(
     let config: DeployConfig = serde_json::from_str(&deploy_req.config_json).unwrap_or_default();
 
     // Sanityzacja stack name — Docker Compose wymaga lowercase alphanumeric + hyphen + underscore
-    deploy_req.stack_name = deploy_req.stack_name
+    deploy_req.stack_name = deploy_req
+        .stack_name
         .to_lowercase()
         .replace('/', "-")
         .replace('\\', "-")
@@ -106,19 +112,21 @@ pub async fn handle_ws_connection<S>(
     );
 
     // Faza 1: Deploy stack przez Portainer lub lokalne Docker API
-    let _ = send_ws_progress(&mut sink, DeployProgress::phase("deploying", "Wdrazanie kontenera...")).await;
+    let _ = send_ws_progress(
+        &mut sink,
+        DeployProgress::phase("deploying", "Wdrazanie kontenera..."),
+    )
+    .await;
 
-    let deploy_result = deploy_stack(
-        &db,
-        &cipher,
-        &deploy_req,
-        &config,
-        &local_node_id,
-    ).await;
+    let deploy_result = deploy_stack(&db, &cipher, &deploy_req, &config, &local_node_id).await;
 
     match deploy_result {
         Ok(()) => {
-            let _ = send_ws_progress(&mut sink, DeployProgress::phase("deployed", "Kontener wdrozony")).await;
+            let _ = send_ws_progress(
+                &mut sink,
+                DeployProgress::phase("deployed", "Kontener wdrozony"),
+            )
+            .await;
         }
         Err(e) => {
             let err_str = e.to_string();
@@ -141,18 +149,32 @@ pub async fn handle_ws_connection<S>(
 
     // Faza 2: Auto-rejestracja serwisu
     let port = if config.port > 0 { config.port } else { 8000 };
-    let service_type = if config.service_type.is_empty() { "llm".to_string() } else { config.service_type.clone() };
+    let service_type = if config.service_type.is_empty() {
+        "llm".to_string()
+    } else {
+        config.service_type.clone()
+    };
 
-    let protocol = if config.protocol.is_empty() { "http".to_string() } else { config.protocol.clone() };
+    let protocol = if config.protocol.is_empty() {
+        "http".to_string()
+    } else {
+        config.protocol.clone()
+    };
 
     let info = DeployedServiceInfo {
         service_name: deploy_req.service_name.clone(),
         service_type,
         port,
-        deployed_model: if config.model_id.is_empty() { None } else { Some(config.model_id.clone()) },
+        deployed_model: if config.model_id.is_empty() {
+            None
+        } else {
+            Some(config.model_id.clone())
+        },
         node_id: deploy_req.node_id.clone(),
         node_ip: None,
         protocol,
+        engine_id: config.engine.clone(),
+        model_size_mb: 0,
     };
 
     // Kanal postepu — przekazuj do WebSocket
@@ -163,7 +185,8 @@ pub async fn handle_ws_connection<S>(
     let info_clone = info.clone();
 
     let register_handle = tokio::spawn(async move {
-        auto_register_deployed_service(pool_clone, router_clone, info_clone, Some(progress_tx)).await
+        auto_register_deployed_service(pool_clone, router_clone, info_clone, Some(progress_tx))
+            .await
     });
 
     // Przekazuj progress do WebSocket
@@ -180,11 +203,16 @@ pub async fn handle_ws_connection<S>(
         }
         Ok(Err(e)) => {
             warn!("Auto-rejestracja nieudana: {}", e);
-            let _ = send_ws_progress(&mut sink, DeployProgress::done(false, &format!("Rejestracja nieudana: {}", e))).await;
+            let _ = send_ws_progress(
+                &mut sink,
+                DeployProgress::done(false, &format!("Rejestracja nieudana: {}", e)),
+            )
+            .await;
         }
         Err(e) => {
             error!("Auto-rejestracja panic: {}", e);
-            let _ = send_ws_progress(&mut sink, DeployProgress::done(false, "Blad wewnetrzny")).await;
+            let _ =
+                send_ws_progress(&mut sink, DeployProgress::done(false, "Blad wewnetrzny")).await;
         }
     }
 }
@@ -247,7 +275,9 @@ async fn deploy_stack(
     }
 
     // TODO: deploy na zdalny node przez MeshCommand
-    Err(anyhow::anyhow!("Deploy na zdalnym nodzie wymaga MeshCommand (jeszcze niezaimplementowane)"))
+    Err(anyhow::anyhow!(
+        "Deploy na zdalnym nodzie wymaga MeshCommand (jeszcze niezaimplementowane)"
+    ))
 }
 
 /// Buduje obraz z embedowanego kontekstu Dockera i uruchamia kontener.
@@ -268,15 +298,21 @@ async fn deploy_bundled_container(
     let mut ports = parsed.ports;
     if ports.is_empty() {
         let port = if config.port > 0 { config.port } else { 5000 };
-        let proto_suffix = if config.protocol == "quic" { "/udp" } else { "/tcp" };
+        let proto_suffix = if config.protocol == "quic" {
+            "/udp"
+        } else {
+            "/tcp"
+        };
         ports.push((format!("{}", port), format!("5000{}", proto_suffix)));
     }
 
     // Env: laczymy compose_yaml + MODEL/MODEL_ID z config.model_id
     let mut env: HashMap<String, String> = parsed.env;
     if !config.model_id.is_empty() {
-        env.entry("MODEL".to_string()).or_insert_with(|| config.model_id.clone());
-        env.entry("MODEL_ID".to_string()).or_insert_with(|| config.model_id.clone());
+        env.entry("MODEL".to_string())
+            .or_insert_with(|| config.model_id.clone());
+        env.entry("MODEL_ID".to_string())
+            .or_insert_with(|| config.model_id.clone());
     }
 
     let instance_name = if !parsed.container_name.is_empty() {
@@ -296,14 +332,21 @@ async fn deploy_bundled_container(
     let container_path = crate::paths::CONTAINER_MODELS_PATH; // "/data/models"
     let mut volumes = parsed.volumes;
     if !volumes.iter().any(|(_, c)| c == container_path) {
-        volumes.push((models_root.display().to_string(), container_path.to_string()));
+        volumes.push((
+            models_root.display().to_string(),
+            container_path.to_string(),
+        ));
     }
     // HF_HOME points AT the mount root; HF itself manages `hub/models--*`.
     // TORCH_HOME gets a subdir so torch's `hub/` can't collide with HF's.
-    env.entry("HF_HOME".into()).or_insert_with(|| container_path.to_string());
-    env.entry("HUGGINGFACE_HUB_CACHE".into()).or_insert_with(|| container_path.to_string());
-    env.entry("TRANSFORMERS_CACHE".into()).or_insert_with(|| container_path.to_string());
-    env.entry("TORCH_HOME".into()).or_insert_with(|| format!("{}/torch", container_path));
+    env.entry("HF_HOME".into())
+        .or_insert_with(|| container_path.to_string());
+    env.entry("HUGGINGFACE_HUB_CACHE".into())
+        .or_insert_with(|| container_path.to_string());
+    env.entry("TRANSFORMERS_CACHE".into())
+        .or_insert_with(|| container_path.to_string());
+    env.entry("TORCH_HOME".into())
+        .or_insert_with(|| format!("{}/torch", container_path));
 
     let deploy_req = crate::deploy::docker::DeployRequest {
         container: bundle_name.to_string(),
@@ -355,7 +398,11 @@ fn parse_compose_for_bundle(yaml: &str) -> Option<ComposeParsed> {
                 Some((h, r)) => (h.trim().to_string(), r.trim().to_string()),
                 None => continue,
             };
-            let container = if rest.contains('/') { rest } else { format!("{}/tcp", rest) };
+            let container = if rest.contains('/') {
+                rest
+            } else {
+                format!("{}/tcp", rest)
+            };
             out.ports.push((host, container));
         }
     }
@@ -366,7 +413,8 @@ fn parse_compose_for_bundle(yaml: &str) -> Option<ComposeParsed> {
             // format "HOST:CONTAINER" lub "HOST:CONTAINER:ro"
             let parts: Vec<&str> = s.splitn(3, ':').collect();
             if parts.len() >= 2 {
-                out.volumes.push((parts[0].to_string(), parts[1].to_string()));
+                out.volumes
+                    .push((parts[0].to_string(), parts[1].to_string()));
             }
         }
     }
@@ -374,7 +422,12 @@ fn parse_compose_for_bundle(yaml: &str) -> Option<ComposeParsed> {
     if let Some(envs) = svc.get("environment").and_then(|v| v.as_sequence()) {
         let mut map = HashMap::new();
         for e in envs {
-            let s = e.as_str().unwrap_or("").trim().trim_start_matches("- ").trim();
+            let s = e
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches("- ")
+                .trim();
             if let Some((k, v)) = s.split_once('=') {
                 map.insert(k.trim().to_string(), v.trim().to_string());
             }
@@ -413,7 +466,9 @@ fn parse_compose_for_bundle(yaml: &str) -> Option<ComposeParsed> {
 
     // shm_size jako env (bollard nie ma osobnego pola, pass through dla referencji)
     if let Some(shm) = svc.get("shm_size").and_then(|v| v.as_str()) {
-        out.env.entry("SHM_SIZE".to_string()).or_insert_with(|| shm.to_string());
+        out.env
+            .entry("SHM_SIZE".to_string())
+            .or_insert_with(|| shm.to_string());
     }
 
     Some(out)
@@ -493,6 +548,46 @@ services:
     }
 
     #[test]
+    fn parse_compose_handles_gpu_none_mode_omits_reservations() {
+        // gpu_select_mode='none' w wizardzie -> generator pomija deploy.resources
+        let yaml = r#"
+services:
+  rag:
+    image: x
+    container_name: x
+    ports:
+      - "5000:5000"
+networks:
+  tentaflow-ai:
+    name: tentaflow-ai
+"#;
+        let p = parse_compose_for_bundle(yaml).expect("parse");
+        assert!(!p.gpu);
+        assert!(!p.env.contains_key("NVIDIA_VISIBLE_DEVICES"));
+    }
+
+    #[test]
+    fn parse_compose_specific_device_ids_multi() {
+        // gpu_select_mode='specific', gpu_ids=['1','3'] -> device_ids: ['1','3']
+        let yaml = r#"
+services:
+  llm:
+    image: x
+    container_name: x
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1', '3']
+              capabilities: [gpu]
+"#;
+        let p = parse_compose_for_bundle(yaml).expect("parse");
+        assert!(p.gpu);
+        assert_eq!(p.env.get("NVIDIA_VISIBLE_DEVICES").unwrap(), "1,3");
+    }
+
+    #[test]
     fn parse_compose_handles_gpu_all() {
         let yaml = r#"
 services:
@@ -537,16 +632,16 @@ async fn deploy_bundled_container(
     ))
 }
 
-/// Mapuje silnik wizarda na nazwe bundla Pythona w `tentaflow-containers/python-bundles/`.
+/// Mapuje silnik wizarda na nazwe bundla Pythona w `tentaflow-containers/<kategoria>/python/`.
 fn engine_to_python_bundle(engine: &str) -> Option<&'static str> {
     match engine {
-        "vllm"               => Some("vllm"),
-        "sglang"             => Some("sglang"),
-        "xtts"               => Some("xtts"),
-        "voxcpm"             => Some("voxcpm"),
-        "parakeet"           => Some("parakeet"),
-        "qwen-asr"           => Some("qwen-asr"),
-        "comfyui"            => Some("comfyui"),
+        "vllm" => Some("vllm"),
+        "sglang" => Some("sglang"),
+        "xtts" => Some("xtts"),
+        "voxcpm" => Some("voxcpm"),
+        "parakeet" => Some("parakeet"),
+        "qwen-asr" => Some("qwen-asr"),
+        "comfyui" => Some("comfyui"),
         _ => None,
     }
 }
@@ -595,9 +690,8 @@ async fn deploy_native_python(
 
     // python_venv::deploy() jest blocking (spawnuje procesy, pobiera archiwa) —
     // uruchamiamy na blocking threadpool zeby nie blokowac tokio runtime.
-    let handle = tokio::task::spawn_blocking(move || {
-        crate::deploy::python_venv::deploy(&native_req)
-    });
+    let handle =
+        tokio::task::spawn_blocking(move || crate::deploy::python_venv::deploy(&native_req));
     let running = handle.await??;
     info!(
         engine = %running.engine,
@@ -620,13 +714,19 @@ async fn deploy_with_docker_cli(
     use tokio::process::Command;
 
     // Pobierz NGC API key z DB i deszyfruj
-    let ngc_key = crate::db::repository::get_setting_secure(db, "ngc_api_key", cipher)?
-        .unwrap_or_default();
+    let ngc_key =
+        crate::db::repository::get_setting_secure(db, "ngc_api_key", cipher)?.unwrap_or_default();
 
     // Zaloguj Docker do nvcr.io jesli mamy klucz NGC
     if !ngc_key.is_empty() {
         let login_output = Command::new("docker")
-            .args(["login", "nvcr.io", "--username", "$oauthtoken", "--password-stdin"])
+            .args([
+                "login",
+                "nvcr.io",
+                "--username",
+                "$oauthtoken",
+                "--password-stdin",
+            ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -655,7 +755,15 @@ async fn deploy_with_docker_cli(
     tokio::fs::write(&compose_path, compose_yaml).await?;
 
     let output = Command::new("docker")
-        .args(["compose", "-f", compose_path.to_str().unwrap_or(""), "-p", stack_name, "up", "-d"])
+        .args([
+            "compose",
+            "-f",
+            compose_path.to_str().unwrap_or(""),
+            "-p",
+            stack_name,
+            "up",
+            "-d",
+        ])
         .env("NGC_API_KEY", &ngc_key)
         .output()
         .await?;

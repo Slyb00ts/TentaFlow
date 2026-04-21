@@ -3,13 +3,13 @@
 // Opis: Obsluga WebSocket do streamowania metryk dashboardu co sekunde.
 // =============================================================================
 
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-use futures::{SinkExt, StreamExt};
 use crate::metrics::RouterMetrics;
+use futures::{SinkExt, StreamExt};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use serde::Serialize;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 /// Wiadomosc wysylana do frontendu przez WebSocket.
@@ -50,7 +50,7 @@ where
         tokio::select! {
             // Ping co 15s — utrzymuje polaczenie przy zyciu przez proxy/load balancery
             _ = ping_ticker.tick() => {
-                if sink.send(Message::Ping(vec![1, 2, 3, 4])).await.is_err() {
+                if sink.send(Message::Ping(vec![1, 2, 3, 4].into())).await.is_err() {
                     break;
                 }
             }
@@ -79,7 +79,7 @@ where
                 };
 
                 let json = serde_json::to_string(&msg).unwrap_or_default();
-                if sink.send(Message::Text(json)).await.is_err() {
+                if sink.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
             }

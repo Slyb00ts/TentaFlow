@@ -14,16 +14,16 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use mlx_rs::Array;
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::Array;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::inference::{
-    EmbeddingParams, EmbeddingResult, GenerateParams, GenerateResult,
-    InferenceEngine, ModelInfo, StopReason, StreamToken,
+    EmbeddingParams, EmbeddingResult, GenerateParams, GenerateResult, InferenceEngine, ModelInfo,
+    StopReason, StreamToken,
 };
-use crate::routing::chat_template::{ChatTemplate, detect_chat_template};
+use crate::routing::chat_template::{detect_chat_template, ChatTemplate};
 
 /// Domyslny rozmiar kontekstu dla modeli MLX
 const DEFAULT_CTX_SIZE: u32 = 4096;
@@ -96,14 +96,18 @@ unsafe impl Sync for MlxModelsForwardPass {}
 
 impl MlxForwardPass for MlxModelsForwardPass {
     fn forward(&mut self, input_ids: &Array) -> Result<Array> {
-        let output = self.model.forward(input_ids, None, &mut self.cache)
+        let output = self
+            .model
+            .forward(input_ids, None, &mut self.cache)
             .map_err(|e| anyhow::anyhow!("Blad forward pass MLX: {}", e))?;
         Ok(output)
     }
 
     fn hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
         // Dla embedddingow uzywamy forward pass i bierzemy output przed lm_head
-        let output = self.model.forward(input_ids, None, &mut self.cache)
+        let output = self
+            .model
+            .forward(input_ids, None, &mut self.cache)
             .map_err(|e| anyhow::anyhow!("Blad forward pass MLX (hidden states): {}", e))?;
         Ok(output)
     }
@@ -185,7 +189,10 @@ fn mlx_sender() -> &'static std::sync::mpsc::Sender<MlxTask> {
         std::thread::Builder::new()
             .name("mlx-metal".to_string())
             .spawn(move || {
-                info!("Dedykowany watek MLX Metal uruchomiony (tid={:?})", std::thread::current().id());
+                info!(
+                    "Dedykowany watek MLX Metal uruchomiony (tid={:?})",
+                    std::thread::current().id()
+                );
 
                 // Test: czy Metal GPU dziala na tym watku?
                 let test = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
@@ -197,35 +204,32 @@ fn mlx_sender() -> &'static std::sync::mpsc::Sender<MlxTask> {
                                 let data = result.as_slice::<f32>();
                                 debug!("Test Metal OK: {:?}", data);
 
-                // Test 2: wieksza operacja — matmul 256x256
-                let big = Array::from_slice(&vec![1.0f32; 256 * 256], &[256, 256]);
-                match big.matmul(&big) {
-                    Ok(result) => {
-                        match result.eval() {
-                            Ok(_) => {
-                                let s = result.as_slice::<f32>();
-                                debug!("Test Metal 2 OK: matmul wynik[0]={}", s[0]);
-                            }
-                            Err(e) => debug!("Test Metal 2 eval FAILED: {}", e),
-                        }
-                    }
-                    Err(e) => debug!("Test Metal 2 matmul FAILED: {}", e),
-                }
+                                // Test 2: wieksza operacja — matmul 256x256
+                                let big = Array::from_slice(&vec![1.0f32; 256 * 256], &[256, 256]);
+                                match big.matmul(&big) {
+                                    Ok(result) => match result.eval() {
+                                        Ok(_) => {
+                                            let s = result.as_slice::<f32>();
+                                            debug!("Test Metal 2 OK: matmul wynik[0]={}", s[0]);
+                                        }
+                                        Err(e) => debug!("Test Metal 2 eval FAILED: {}", e),
+                                    },
+                                    Err(e) => debug!("Test Metal 2 matmul FAILED: {}", e),
+                                }
 
-                // Test 3: duza operacja — matmul 2048x2048
-                let huge = Array::from_slice(&vec![0.01f32; 2048 * 2048], &[2048, 2048]);
-                match huge.matmul(&huge) {
-                    Ok(result) => {
-                        match result.eval() {
-                            Ok(_) => {
-                                let s = result.as_slice::<f32>();
-                                debug!("Test Metal 3 OK: matmul wynik[0]={}", s[0]);
-                            }
-                            Err(e) => debug!("Test Metal 3 eval FAILED: {}", e),
-                        }
-                    }
-                    Err(e) => debug!("Test Metal 3 matmul FAILED: {}", e),
-                }
+                                // Test 3: duza operacja — matmul 2048x2048
+                                let huge =
+                                    Array::from_slice(&vec![0.01f32; 2048 * 2048], &[2048, 2048]);
+                                match huge.matmul(&huge) {
+                                    Ok(result) => match result.eval() {
+                                        Ok(_) => {
+                                            let s = result.as_slice::<f32>();
+                                            debug!("Test Metal 3 OK: matmul wynik[0]={}", s[0]);
+                                        }
+                                        Err(e) => debug!("Test Metal 3 eval FAILED: {}", e),
+                                    },
+                                    Err(e) => debug!("Test Metal 3 matmul FAILED: {}", e),
+                                }
                             }
                             Err(e) => debug!("Test Metal eval FAILED: {}", e),
                         }
@@ -262,7 +266,11 @@ fn mlx_sender() -> &'static std::sync::mpsc::Sender<MlxTask> {
                             };
                             let _ = result_tx.send(result);
                         }
-                        MlxTask::GenerateStream { params, token_tx, result_tx } => {
+                        MlxTask::GenerateStream {
+                            params,
+                            token_tx,
+                            result_tx,
+                        } => {
                             debug!("GenerateStream: max_tokens={}", params.max_tokens);
                             let result = match loaded.as_mut() {
                                 Some(m) => MlxEngine::stream_tokens(m, &params, &token_tx),
@@ -322,11 +330,10 @@ impl MlxEngine {
             Some(serde_json::Value::Number(n)) => {
                 n.as_u64().map(|v| vec![v as u32]).unwrap_or_default()
             }
-            Some(serde_json::Value::Array(arr)) => {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u32))
-                    .collect()
-            }
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect(),
             _ => vec![2], // domyslny EOS token
         }
     }
@@ -336,20 +343,21 @@ impl MlxEngine {
         let config_path = model_dir.join("config.json");
         let content = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Nie udalo sie wczytac {}", config_path.display()))?;
-        let config: ModelConfig = serde_json::from_str(&content)
-            .with_context(|| "Blad parsowania config.json")?;
+        let config: ModelConfig =
+            serde_json::from_str(&content).with_context(|| "Blad parsowania config.json")?;
         Ok(config)
     }
 
     /// Wczytuje tokenizer BPE z tokenizer.json
     fn load_tokenizer(model_dir: &Path) -> Result<tokenizers::Tokenizer> {
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!(
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!(
                 "Nie udalo sie wczytac tokenizera z {}: {}",
                 tokenizer_path.display(),
                 e
-            ))?;
+            )
+        })?;
 
         info!(
             "Tokenizer zaladowany: vocab_size={}",
@@ -379,8 +387,9 @@ impl MlxEngine {
                 let config_path = model_dir.join("config.json");
                 let config_file = std::fs::File::open(&config_path)
                     .with_context(|| format!("Brak config.json w {}", model_dir.display()))?;
-                let qwen3_args: mlx_models::qwen3_next::Qwen3NextModelArgs = serde_json::from_reader(config_file)
-                    .with_context(|| "Blad parsowania Qwen3-Next config.json")?;
+                let qwen3_args: mlx_models::qwen3_next::Qwen3NextModelArgs =
+                    serde_json::from_reader(config_file)
+                        .with_context(|| "Blad parsowania Qwen3-Next config.json")?;
                 let mut model = mlx_models::Qwen3NextCausalLM::new(qwen3_args)
                     .map_err(|e| anyhow::anyhow!("Blad tworzenia modelu Qwen3-Next: {}", e))?;
                 mlx_models::load_safetensors_weights(&mut model, model_dir)
@@ -400,16 +409,23 @@ impl MlxEngine {
             }
         };
 
-        info!("Model MLX zaladowany pomyslnie (architektura: {})", detected);
+        info!(
+            "Model MLX zaladowany pomyslnie (architektura: {})",
+            detected
+        );
 
         Ok(MlxModel {
-            inner: Box::new(MlxModelsForwardPass { model: any_model, cache }),
+            inner: Box::new(MlxModelsForwardPass {
+                model: any_model,
+                cache,
+            }),
         })
     }
 
     /// Tokenizuje tekst do tablicy token IDs
     fn tokenize(tokenizer: &tokenizers::Tokenizer, text: &str, add_bos: bool) -> Result<Vec<u32>> {
-        let encoding = tokenizer.encode(text, add_bos)
+        let encoding = tokenizer
+            .encode(text, add_bos)
             .map_err(|e| anyhow::anyhow!("Blad tokenizacji: {}", e))?;
         Ok(encoding.get_ids().to_vec())
     }
@@ -422,7 +438,9 @@ impl MlxEngine {
         all_generated_ids: &[u32],
         prev_text: &str,
     ) -> String {
-        let full = tokenizer.decode(all_generated_ids, true).unwrap_or_default();
+        let full = tokenizer
+            .decode(all_generated_ids, true)
+            .unwrap_or_default();
         if full.len() > prev_text.len() && full.is_char_boundary(prev_text.len()) {
             full[prev_text.len()..].to_string()
         } else if full.len() > prev_text.len() {
@@ -448,11 +466,15 @@ impl MlxEngine {
 
         // Softmax z temperature
         let mut sum = 0.0f32;
-        let mut probs: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &l)| {
-            let p = ((l - max_val) * inv_temp).exp();
-            sum += p;
-            (i, p)
-        }).collect();
+        let mut probs: Vec<(usize, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| {
+                let p = ((l - max_val) * inv_temp).exp();
+                sum += p;
+                (i, p)
+            })
+            .collect();
 
         // Normalizacja
         for p in &mut probs {
@@ -461,10 +483,16 @@ impl MlxEngine {
 
         // Top-P (nucleus) — filtrowanie
         if top_p < 1.0 {
-            probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            probs.sort_unstable_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
             let mut cumsum = 0.0f32;
-            let cutoff = probs.iter()
-                .position(|&(_, p)| { cumsum += p; cumsum >= top_p })
+            let cutoff = probs
+                .iter()
+                .position(|&(_, p)| {
+                    cumsum += p;
+                    cumsum >= top_p
+                })
                 .map(|i| i + 1)
                 .unwrap_or(probs.len());
             probs.truncate(cutoff);
@@ -508,25 +536,25 @@ impl MlxEngine {
                 let vocab = shape[2];
                 let seq_len = shape[1];
                 let last_pos = logits_array.index((0, seq_len - 1));
-                last_pos.reshape(&[1, vocab])
+                last_pos
+                    .reshape(&[1, vocab])
                     .context("Blad reshape logits do [1, vocab]")?
             }
             2 => {
                 let vocab = shape[1];
                 let seq_len = shape[0];
                 let last_pos = logits_array.index(seq_len - 1);
-                last_pos.reshape(&[1, vocab])
+                last_pos
+                    .reshape(&[1, vocab])
                     .context("Blad reshape logits do [1, vocab]")?
             }
-            _ => anyhow::bail!(
-                "Nieoczekiwany ksztalt tensora logits: {:?}",
-                shape,
-            ),
+            _ => anyhow::bail!("Nieoczekiwany ksztalt tensora logits: {:?}", shape,),
         };
 
         // Konwertuj Bfloat16 -> Float32 (sampling wymaga f32)
         if sliced.dtype() != mlx_rs::Dtype::Float32 {
-            sliced.as_dtype(mlx_rs::Dtype::Float32)
+            sliced
+                .as_dtype(mlx_rs::Dtype::Float32)
                 .context("Blad konwersji logits na Float32")
         } else {
             Ok(sliced)
@@ -549,8 +577,11 @@ impl MlxEngine {
         let config = Self::load_config(model_dir)?;
         info!(
             "Konfiguracja modelu: type={:?}, hidden_size={}, layers={}, heads={}, vocab={}",
-            config.model_type, config.hidden_size, config.num_hidden_layers,
-            config.num_attention_heads, config.vocab_size,
+            config.model_type,
+            config.hidden_size,
+            config.num_hidden_layers,
+            config.num_attention_heads,
+            config.vocab_size,
         );
 
         // Wczytaj tokenizer BPE
@@ -660,7 +691,12 @@ impl MlxEngine {
         // OPT-4: Uzywaj &params.prompt bezposrednio — bez klonowania
         let input_tokens = Self::tokenize(&loaded.tokenizer, &params.prompt, true)?;
         let prompt_tokens = input_tokens.len() as u32;
-        debug!("generate_loop: prompt {} znakow -> {} tokenow, max_tokens={}", params.prompt.len(), prompt_tokens, max_tokens);
+        debug!(
+            "generate_loop: prompt {} znakow -> {} tokenow, max_tokens={}",
+            params.prompt.len(),
+            prompt_tokens,
+            max_tokens
+        );
 
         // OPT-4: Zamiast current_tokens: Vec<u32> sledzmy tylko licznik i ostatni token
         let mut total_token_count: usize = input_tokens.len();
@@ -700,7 +736,10 @@ impl MlxEngine {
             let _shape = logits_array.shape();
 
             if step == 0 {
-                debug!("prefill DONE w {:.1}ms", start.elapsed().as_secs_f64() * 1000.0);
+                debug!(
+                    "prefill DONE w {:.1}ms",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
 
             // Wyciagnij logits z ostatniej pozycji
@@ -715,8 +754,9 @@ impl MlxEngine {
 
             // GPU sampling — mlx_models::sample dziala calkowicie na GPU
             // Unikamy as_slice() bo na iOS moze wisiec przy transferze 32k floatow
-            let token_array = mlx_models::sample(&penalized_logits, params.temperature, params.top_p)
-                .map_err(|e| anyhow::anyhow!("Blad samplowania GPU: {}", e))?;
+            let token_array =
+                mlx_models::sample(&penalized_logits, params.temperature, params.top_p)
+                    .map_err(|e| anyhow::anyhow!("Blad samplowania GPU: {}", e))?;
             // item() kopiuje tylko 1 skalar GPU->CPU (4 bajty zamiast 128KB)
             let next_token: u32 = if params.temperature <= 0.0 {
                 token_array.item::<i32>() as u32
@@ -741,7 +781,9 @@ impl MlxEngine {
             // SentencePiece moze zmieniac wczesniejszy tekst przy dodaniu kontekstu,
             // wiec zawsze pelny dekod jest zrodlem prawdy
             generated_ids.push(next_token);
-            let full_decoded = loaded.tokenizer.decode(&generated_ids, true)
+            let full_decoded = loaded
+                .tokenizer
+                .decode(&generated_ids, true)
                 .unwrap_or_default();
             let piece = if full_decoded.len() >= prev_decoded.len()
                 && full_decoded.is_char_boundary(prev_decoded.len())
@@ -751,11 +793,18 @@ impl MlxEngine {
             } else if full_decoded.len() > prev_decoded.len() {
                 // SentencePiece zmienil wczesniejszy tekst lub granica UTF-8
                 // Szukaj wspolnego prefiksu i emituj roznice
-                let common = prev_decoded.chars().zip(full_decoded.chars())
+                let common = prev_decoded
+                    .chars()
+                    .zip(full_decoded.chars())
                     .take_while(|(a, b)| a == b)
                     .count();
-                let common_bytes: usize = full_decoded.chars().take(common).map(|c| c.len_utf8()).sum();
-                if common_bytes < full_decoded.len() && full_decoded.is_char_boundary(common_bytes) {
+                let common_bytes: usize = full_decoded
+                    .chars()
+                    .take(common)
+                    .map(|c| c.len_utf8())
+                    .sum();
+                if common_bytes < full_decoded.len() && full_decoded.is_char_boundary(common_bytes)
+                {
                     full_decoded[common_bytes..].to_string()
                 } else {
                     String::new()
@@ -782,7 +831,9 @@ impl MlxEngine {
             }
 
             // Sprawdz stop sequences
-            if let Some(matched) = Self::check_stop_sequence(&generated_text, &params.stop_sequences) {
+            if let Some(matched) =
+                Self::check_stop_sequence(&generated_text, &params.stop_sequences)
+            {
                 let trim_len = matched.len();
                 let new_len = generated_text.len() - trim_len;
                 generated_text.truncate(new_len);
@@ -870,10 +921,7 @@ impl MlxEngine {
 
     /// Generuje tekst synchronicznie — deleguje do generate_loop z pustym callbackiem.
     /// Wolane TYLKO z dedykowanego watku mlx-metal.
-    fn generate_sync(
-        loaded: &mut LoadedModel,
-        params: &GenerateParams,
-    ) -> Result<GenerateResult> {
+    fn generate_sync(loaded: &mut LoadedModel, params: &GenerateParams) -> Result<GenerateResult> {
         Self::generate_loop(loaded, params, |_token_id, _piece| true)
     }
 
@@ -889,7 +937,8 @@ impl MlxEngine {
             tx.blocking_send(StreamToken {
                 text: piece.to_string(),
                 is_final: false,
-            }).is_ok()
+            })
+            .is_ok()
         })?;
 
         // Wyslij koncowy token
@@ -901,8 +950,7 @@ impl MlxEngine {
         // Loguj wynik streamingu
         debug!(
             "Stream zakonczony: {} tokenow, powod: {:?}",
-            result.tokens_generated,
-            result.stop_reason,
+            result.tokens_generated, result.stop_reason,
         );
 
         Ok(())
@@ -926,26 +974,28 @@ impl MlxEngine {
             let input_array = Self::tokens_to_array(&tokens)?;
 
             // Forward pass — pobranie hidden states
-            let output = loaded.model.inner.hidden_states(&input_array)
+            let output = loaded
+                .model
+                .inner
+                .hidden_states(&input_array)
                 .with_context(|| "Blad forward pass dla embedddingow")?;
 
             // Mean pooling po wymiarze sekwencji
             let shape = output.shape();
             let embedding = if shape.len() == 3 {
                 // [batch, seq_len, hidden_size] — usredniamy po seq_len
-                let mean = output.mean_axes(&[1], false)
+                let mean = output
+                    .mean_axes(&[1], false)
                     .map_err(|e| anyhow::anyhow!("Blad mean pooling: {}", e))?;
                 mean.as_slice::<f32>().to_vec()
             } else if shape.len() == 2 {
                 // [seq_len, hidden_size]
-                let mean = output.mean_axes(&[0], false)
+                let mean = output
+                    .mean_axes(&[0], false)
                     .map_err(|e| anyhow::anyhow!("Blad mean pooling: {}", e))?;
                 mean.as_slice::<f32>().to_vec()
             } else {
-                anyhow::bail!(
-                    "Nieoczekiwany ksztalt hidden states: {:?}",
-                    shape,
-                );
+                anyhow::bail!("Nieoczekiwany ksztalt hidden states: {:?}", shape,);
             };
 
             // Normalizacja L2 jesli wymagana
@@ -979,11 +1029,7 @@ impl InferenceEngine for MlxEngine {
         vec!["safetensors".to_string(), "mlx".to_string()]
     }
 
-    async fn load_model(
-        &self,
-        model_path: &Path,
-        _gpu_layers: Option<u32>,
-    ) -> Result<ModelInfo> {
+    async fn load_model(&self, model_path: &Path, _gpu_layers: Option<u32>) -> Result<ModelInfo> {
         let path = model_path.to_path_buf();
 
         // Walidacja: czy to katalog z wymaganymi plikami
@@ -1013,7 +1059,8 @@ impl InferenceEngine for MlxEngine {
             })
             .map_err(|_| anyhow::anyhow!("Watek MLX Metal nie odpowiada — kanal zamkniety"))?;
 
-        let info = rx.await
+        let info = rx
+            .await
             .context("Watek MLX Metal zakonczyl sie nieoczekiwanie podczas ladowania modelu")?
             .context("Nie udalo sie zaladowac modelu MLX")?;
 
@@ -1051,14 +1098,18 @@ impl InferenceEngine for MlxEngine {
         };
 
         if mlx_sender()
-            .send(MlxTask::GetModelInfo { result_tx: oneshot_tx })
+            .send(MlxTask::GetModelInfo {
+                result_tx: oneshot_tx,
+            })
             .is_err()
         {
             return None;
         }
 
         // Czekamy max 1 sekunde na odpowiedz
-        rx.recv_timeout(std::time::Duration::from_secs(1)).ok().flatten()
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .ok()
+            .flatten()
     }
 
     async fn generate(&self, params: GenerateParams) -> Result<GenerateResult> {
@@ -1074,10 +1125,7 @@ impl InferenceEngine for MlxEngine {
             .context("Watek MLX Metal zakonczyl sie nieoczekiwanie podczas generowania")?
     }
 
-    async fn generate_stream(
-        &self,
-        params: GenerateParams,
-    ) -> Result<mpsc::Receiver<StreamToken>> {
+    async fn generate_stream(&self, params: GenerateParams) -> Result<mpsc::Receiver<StreamToken>> {
         let (token_tx, token_rx) = mpsc::channel::<StreamToken>(STREAM_CHANNEL_SIZE);
         let (done_tx, _done_rx) = tokio::sync::oneshot::channel();
 
@@ -1103,7 +1151,8 @@ impl InferenceEngine for MlxEngine {
             })
             .map_err(|_| anyhow::anyhow!("Watek MLX Metal nie odpowiada — kanal zamkniety"))?;
 
-        rx.await
-            .context("Watek MLX Metal zakonczyl sie nieoczekiwanie podczas obliczania embedddingow")?
+        rx.await.context(
+            "Watek MLX Metal zakonczyl sie nieoczekiwanie podczas obliczania embedddingow",
+        )?
     }
 }

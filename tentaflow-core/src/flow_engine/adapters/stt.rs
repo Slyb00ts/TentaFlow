@@ -66,7 +66,9 @@ impl NodeAdapter for SttNodeAdapter {
             Some(data) if !data.is_empty() => {
                 // Sprobuj QUIC STT
                 if self.service_manager.has_quic_stt_service(&model_name) {
-                    if let Some(quic_client) = self.service_manager.get_quic_stt_client(&model_name).await {
+                    if let Some(quic_client) =
+                        self.service_manager.get_quic_stt_client(&model_name).await
+                    {
                         debug!("STT adapter: uzywam QUIC backend: {}", model_name);
 
                         let request_id = uuid::Uuid::new_v4().to_string();
@@ -94,29 +96,35 @@ impl NodeAdapter for SttNodeAdapter {
                         match quic_client.send_request(model_request).await {
                             Ok(response) => {
                                 match response.result {
-                                    ModelResult::Audio(audio_result) => {
-                                        match audio_result.data {
-                                            AudioResultData::Text(text) => {
-                                                debug!("STT adapter: transkrypcja OK, {} znakow", text.len());
-                                                return Ok(serde_json::json!({
-                                                    "text": text,
-                                                    "language": language.unwrap_or_else(|| "pl".to_string()),
-                                                    "duration": 0,
-                                                }));
-                                            }
-                                            AudioResultData::Detailed { text, language: lang, duration, .. } => {
-                                                debug!("STT adapter: transkrypcja OK (detailed), {} znakow", text.len());
-                                                return Ok(serde_json::json!({
-                                                    "text": text,
-                                                    "language": lang,
-                                                    "duration": duration,
-                                                }));
-                                            }
-                                            _ => {
-                                                warn!("STT adapter: nieoczekiwany typ wyniku audio");
-                                            }
+                                    ModelResult::Audio(audio_result) => match audio_result.data {
+                                        AudioResultData::Text(text) => {
+                                            debug!(
+                                                "STT adapter: transkrypcja OK, {} znakow",
+                                                text.len()
+                                            );
+                                            return Ok(serde_json::json!({
+                                                "text": text,
+                                                "language": language.unwrap_or_else(|| "pl".to_string()),
+                                                "duration": 0,
+                                            }));
                                         }
-                                    }
+                                        AudioResultData::Detailed {
+                                            text,
+                                            language: lang,
+                                            duration,
+                                            ..
+                                        } => {
+                                            debug!("STT adapter: transkrypcja OK (detailed), {} znakow", text.len());
+                                            return Ok(serde_json::json!({
+                                                "text": text,
+                                                "language": lang,
+                                                "duration": duration,
+                                            }));
+                                        }
+                                        _ => {
+                                            warn!("STT adapter: nieoczekiwany typ wyniku audio");
+                                        }
+                                    },
                                     ModelResult::Error(err) => {
                                         bail!(
                                             "STT adapter QUIC error: {:?} - {}",
@@ -134,12 +142,17 @@ impl NodeAdapter for SttNodeAdapter {
                             }
                         }
                     } else {
-                        warn!("STT adapter: QUIC serwis '{}' nie jest polaczony", model_name);
+                        warn!(
+                            "STT adapter: QUIC serwis '{}' nie jest polaczony",
+                            model_name
+                        );
                     }
                 }
 
                 // HTTP backend jako fallback
-                let backends = self.service_manager.get_service_backends_cloned(&model_name);
+                let backends = self
+                    .service_manager
+                    .get_service_backends_cloned(&model_name);
                 if let Some(ref backends) = backends {
                     if !backends.is_empty() {
                         debug!("STT adapter: uzywam HTTP backend (fallback)");
@@ -175,10 +188,9 @@ impl SttNodeAdapter {
         if let Some(audio_var) = node_config.get("audio_variable").and_then(|v| v.as_str()) {
             if let Some(val) = ctx.variables.get(audio_var) {
                 if let Some(b64) = val.as_str() {
-                    if let Ok(decoded) = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        b64,
-                    ) {
+                    if let Ok(decoded) =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    {
                         return Some(decoded);
                     }
                 }
@@ -187,10 +199,9 @@ impl SttNodeAdapter {
 
         if let Some(val) = ctx.variables.get("audio_input") {
             if let Some(b64) = val.as_str() {
-                if let Ok(decoded) = base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    b64,
-                ) {
+                if let Ok(decoded) =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                {
                     return Some(decoded);
                 }
             }
@@ -199,10 +210,9 @@ impl SttNodeAdapter {
         if let Some(input_from) = node_config.get("input_from").and_then(|v| v.as_str()) {
             if let Some(prev_result) = ctx.node_results.get(input_from) {
                 if let Some(b64) = prev_result.get("audio_base64").and_then(|v| v.as_str()) {
-                    if let Ok(decoded) = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        b64,
-                    ) {
+                    if let Ok(decoded) =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    {
                         return Some(decoded);
                     }
                 }

@@ -49,8 +49,7 @@ impl PortainerClient {
         // Normalizuj URL - usun trailing slash i /api
         normalized.base_url = normalized.base_url.trim_end_matches('/').to_string();
         if normalized.base_url.ends_with("/api") {
-            normalized.base_url =
-                normalized.base_url[..normalized.base_url.len() - 4].to_string();
+            normalized.base_url = normalized.base_url[..normalized.base_url.len() - 4].to_string();
         }
 
         let client = reqwest::Client::builder()
@@ -162,10 +161,7 @@ impl PortainerClient {
 
         // Wykryj redirect (URL odpowiedzi rozni sie od URL requestu)
         if final_url != url {
-            warn!(
-                "Portainer: nastapil redirect {} -> {}",
-                url, final_url
-            );
+            warn!("Portainer: nastapil redirect {} -> {}", url, final_url);
         }
 
         let error_body = response.text().await.unwrap_or_default();
@@ -179,7 +175,11 @@ impl PortainerClient {
                 anyhow::bail!(
                     "Portainer: brak autoryzacji ({}) - {}. URL: {}",
                     status,
-                    if error_body.is_empty() { "sprawdz klucz API".to_string() } else { error_body },
+                    if error_body.is_empty() {
+                        "sprawdz klucz API".to_string()
+                    } else {
+                        error_body
+                    },
                     final_url
                 );
             }

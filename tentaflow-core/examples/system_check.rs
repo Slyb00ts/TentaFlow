@@ -5,28 +5,41 @@
 // =============================================================================
 
 fn main() {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
     let caps = tentaflow_core::system_check::collect();
 
     println!("=== Platforma ===");
     println!("OS:   {} ({})", caps.platform, caps.arch);
-    println!("CPU:  {} logical, avx2={}, avx512={}, neon={}",
+    println!(
+        "CPU:  {} logical, avx2={}, avx512={}, neon={}",
         caps.cpu_features.logical_cores,
-        caps.cpu_features.avx2, caps.cpu_features.avx512, caps.cpu_features.neon);
-    println!("RAM:  {} MB total ({} available)",
-        caps.memory.total_mb, caps.memory.available_mb);
+        caps.cpu_features.avx2,
+        caps.cpu_features.avx512,
+        caps.cpu_features.neon
+    );
+    println!(
+        "RAM:  {} MB total ({} available)",
+        caps.memory.total_mb, caps.memory.available_mb
+    );
 
     println!("\n=== GPU ===");
     println!("Preferowany backend: {:?}", caps.gpu.preferred_backend);
     if !caps.gpu.nvidia.is_empty() {
         for g in &caps.gpu.nvidia {
-            println!("  NVIDIA [{}]: {} ({} MB, CC {:?}, driver {:?}, CUDA {:?})",
-                g.index, g.name, g.vram_mb, g.compute_capability, g.driver_version, g.cuda_version);
+            println!(
+                "  NVIDIA [{}]: {} ({} MB, CC {:?}, driver {:?}, CUDA {:?})",
+                g.index, g.name, g.vram_mb, g.compute_capability, g.driver_version, g.cuda_version
+            );
         }
     }
     if !caps.gpu.amd.is_empty() {
         for g in &caps.gpu.amd {
-            println!("  AMD [{}]: {} (ROCm {:?})", g.index, g.name, g.rocm_version);
+            println!(
+                "  AMD [{}]: {} (ROCm {:?})",
+                g.index, g.name, g.rocm_version
+            );
         }
     }
     if !caps.gpu.intel.is_empty() {
@@ -46,7 +59,10 @@ fn main() {
     println!("\n=== Silniki ===");
     for e in &caps.supported_engines {
         let mark = if e.available { "OK " } else { "--" };
-        println!(" [{}] {:<16} ({}): {}", mark, e.engine, e.category, e.reason);
+        println!(
+            " [{}] {:<16} ({}): {}",
+            mark, e.engine, e.category, e.reason
+        );
     }
 
     println!("\n=== Deploy backendy ===");

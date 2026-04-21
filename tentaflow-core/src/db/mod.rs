@@ -36,7 +36,9 @@ pub fn global_pool() -> Option<DbPool> {
 /// bazy i obciąż WAL. Wolac przy shutdown zeby nie zostawiac niesfl ushowanych
 /// zmian (wazne szczegolnie po SIGKILL).
 pub fn checkpoint_wal(pool: &DbPool) -> Result<()> {
-    let conn = pool.lock().map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
+    let conn = pool
+        .lock()
+        .map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
     conn.pragma_update(None, "optimize", "0x10002")?;
     info!("WAL checkpoint + optimize wykonane");

@@ -20,9 +20,9 @@ pub fn handle_list_engines(query: &str, mesh_peer_store: &MeshPeerStore) -> Resu
         // Frontend przekazuje node_id w formacie "mesh-{node_id}" — stripuj prefix
         let node_id = nid.strip_prefix("mesh-").unwrap_or(nid);
         let peers = mesh_peer_store.list();
-        let peer = peers
-            .iter()
-            .find(|p| p.node_id == node_id || p.hostname == node_id || p.node_id == *nid || p.hostname == *nid);
+        let peer = peers.iter().find(|p| {
+            p.node_id == node_id || p.hostname == node_id || p.node_id == *nid || p.hostname == *nid
+        });
 
         if let Some(peer) = peer {
             // Rola "mobile" oznacza iOS/Android — System::name() zwraca "Darwin" na obu

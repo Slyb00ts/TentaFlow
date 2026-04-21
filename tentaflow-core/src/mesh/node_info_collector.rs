@@ -12,11 +12,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::mesh::peer_store::{NodeInfo, PeerContainerInfo, PeerGpuInfo, PeerNetworkInfo};
 use parking_lot::Mutex;
-use sysinfo::{Networks, System};
 use std::net::IpAddr;
+use sysinfo::{Networks, System};
 use tracing::warn;
-use crate::mesh::peer_store::{NodeInfo, PeerGpuInfo, PeerContainerInfo, PeerNetworkInfo};
 
 lazy_static::lazy_static! {
     /// Wspoldzielona instancja System — trzymana miedzy wywolaniami
@@ -48,7 +48,8 @@ lazy_static::lazy_static! {
 
 /// GPU z wgpu — enumerowane w tle. NIE blokuje startu mesh.
 /// None = jeszcze nie gotowe lub nie zainicjalizowane, Some = wynik.
-static WGPU_RESULT: std::sync::OnceLock<Mutex<Option<Vec<PeerGpuInfo>>>> = std::sync::OnceLock::new();
+static WGPU_RESULT: std::sync::OnceLock<Mutex<Option<Vec<PeerGpuInfo>>>> =
+    std::sync::OnceLock::new();
 
 /// Startuje wgpu enumeration w tle — wywolaj raz przy starcie aplikacji.
 /// Nie blokuje — wynik bedzie dostepny pozniej.
@@ -60,9 +61,7 @@ fn start_wgpu_enumeration() {
     }
 
     std::thread::spawn(|| {
-        let result = std::panic::catch_unwind(|| {
-            detect_gpus_wgpu()
-        });
+        let result = std::panic::catch_unwind(|| detect_gpus_wgpu());
         let gpus = result.unwrap_or_else(|_| {
             warn!("wgpu enumerate_adapters panic");
             vec![]
@@ -86,13 +85,18 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     let handle = std::thread::spawn(move || {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
         });
 
-        // Zbierz adaptery ze wszystkich backendow
-        let all_adapters: Vec<wgpu::AdapterInfo> = instance.enumerate_adapters(wgpu::Backends::all())
+        // Zbierz adaptery ze wszystkich backendow — wgpu 29 zwraca Future
+        let adapters: Vec<wgpu::Adapter> =
+            futures::executor::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        let all_adapters: Vec<wgpu::AdapterInfo> = adapters
             .into_iter()
             .map(|a| a.get_info())
             .filter(|info| info.device_type != wgpu::DeviceType::Cpu)
@@ -106,13 +110,23 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
             wgpu::Backend::Metal,
             wgpu::Backend::Dx12,
             wgpu::Backend::Gl,
-        ].iter().find(|&&b| all_adapters.iter().any(|a| a.backend == b)).copied();
+        ]
+        .iter()
+        .find(|&&b| all_adapters.iter().any(|a| a.backend == b))
+        .copied();
 
-        let mut gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
-            all_adapters.iter()
+        let gpus: Vec<PeerGpuInfo> = if let Some(backend) = preferred_backend {
+            all_adapters
+                .iter()
                 .filter(|a| a.backend == backend)
                 .map(|info| {
-                    let clean_name = info.name.split('/').next().unwrap_or(&info.name).trim().to_string();
+                    let clean_name = info
+                        .name
+                        .split('/')
+                        .next()
+                        .unwrap_or(&info.name)
+                        .trim()
+                        .to_string();
                     PeerGpuInfo {
                         name: clean_name,
                         vram_total_mb: 0,
@@ -195,12 +209,20 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
         // iOS: System::host_name() zwraca "localhost" — probuj pobrac nazwe urzadzenia przez FFI
         #[cfg(target_os = "ios")]
         {
-            extern "C" { fn tentaflow_get_device_name() -> *mut std::ffi::c_char; }
+            extern "C" {
+                fn tentaflow_get_device_name() -> *mut std::ffi::c_char;
+            }
             let ptr = unsafe { tentaflow_get_device_name() };
             if !ptr.is_null() {
-                let name = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().to_string();
-                extern "C" { fn free(ptr: *mut std::ffi::c_void); }
-                unsafe { free(ptr as *mut std::ffi::c_void); }
+                let name = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .to_string();
+                extern "C" {
+                    fn free(ptr: *mut std::ffi::c_void);
+                }
+                unsafe {
+                    free(ptr as *mut std::ffi::c_void);
+                }
                 if !name.is_empty() {
                     hostname = name;
                 }
@@ -215,11 +237,15 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
         // System::name() zwraca "Darwin" zarowno na macOS jak i iOS —
         // na iOS nadpisujemy na "iOS" zeby parse_platform poprawnie rozpoznal platforme
         #[cfg(target_os = "ios")]
-        { os_name = "iOS".to_string(); }
+        {
+            os_name = "iOS".to_string();
+        }
 
         // Analogicznie dla Androida
         #[cfg(target_os = "android")]
-        { os_name = "Android".to_string(); }
+        {
+            os_name = "Android".to_string();
+        }
 
         let os_info = format!("{} {} ({})", os_name, os_version, arch);
         let cpu_count = sys.cpus().len() as u32;
@@ -554,7 +580,10 @@ fn enrich_amd_live(gpus: &mut [PeerGpuInfo]) {
         .filter(|(_, g)| g.vram_total_mb == 0 && g.usage_percent == 0.0)
         .filter(|(_, g)| {
             let name = g.name.to_lowercase();
-            name.contains("amd") || name.contains("radeon") || name.contains("navi") || name.contains("vega")
+            name.contains("amd")
+                || name.contains("radeon")
+                || name.contains("navi")
+                || name.contains("vega")
         })
         .map(|(i, _)| i)
         .collect();
@@ -615,7 +644,9 @@ fn enrich_amd_from_amdsmi(gpus: &mut [PeerGpuInfo], amd_indices: &[usize]) -> bo
         if let Some(vram_used) = entry.get("VRAM_USED").and_then(|v| v.as_u64()) {
             gpu.vram_used_mb = vram_used;
         }
-        if let Some(temp) = entry.get("TEMPERATURE_HOTSPOT").and_then(|v| v.as_u64())
+        if let Some(temp) = entry
+            .get("TEMPERATURE_HOTSPOT")
+            .and_then(|v| v.as_u64())
             .or_else(|| entry.get("TEMPERATURE_EDGE").and_then(|v| v.as_u64()))
         {
             gpu.temperature_c = temp as u32;
@@ -670,10 +701,14 @@ fn enrich_amd_from_sysfs(gpus: &mut [PeerGpuInfo], amd_indices: &[usize]) {
         }
 
         // VRAM total/used (bajty -> MB)
-        if let Some(vram_total) = read_sysfs_value::<u64>(&format!("{}/mem_info_vram_total", device_path)) {
+        if let Some(vram_total) =
+            read_sysfs_value::<u64>(&format!("{}/mem_info_vram_total", device_path))
+        {
             gpu.vram_total_mb = vram_total / (1024 * 1024);
         }
-        if let Some(vram_used) = read_sysfs_value::<u64>(&format!("{}/mem_info_vram_used", device_path)) {
+        if let Some(vram_used) =
+            read_sysfs_value::<u64>(&format!("{}/mem_info_vram_used", device_path))
+        {
             gpu.vram_used_mb = vram_used / (1024 * 1024);
         }
 
@@ -718,7 +753,10 @@ fn enrich_intel_live(gpus: &mut [PeerGpuInfo]) {
         .filter(|(_, g)| g.vram_total_mb == 0 && g.usage_percent == 0.0)
         .filter(|(_, g)| {
             let name = g.name.to_lowercase();
-            name.contains("intel") || name.contains("iris") || name.contains("uhd") || name.contains("arc")
+            name.contains("intel")
+                || name.contains("iris")
+                || name.contains("uhd")
+                || name.contains("arc")
         })
         .map(|(i, _)| i)
         .collect();
@@ -802,10 +840,9 @@ fn enrich_android_live(gpus: &mut [PeerGpuInfo]) {
             if let Ok(content) = std::fs::read_to_string(format!("{}/gpubusy", adreno_path)) {
                 let parts: Vec<&str> = content.trim().split_whitespace().collect();
                 if parts.len() >= 2 {
-                    if let (Ok(busy), Ok(total)) = (
-                        parts[0].parse::<f64>(),
-                        parts[1].parse::<f64>(),
-                    ) {
+                    if let (Ok(busy), Ok(total)) =
+                        (parts[0].parse::<f64>(), parts[1].parse::<f64>())
+                    {
                         if total > 0.0 {
                             gpu.usage_percent = (busy / total * 100.0) as f32;
                         }
@@ -908,7 +945,12 @@ fn enrich_ios_live(gpus: &mut [PeerGpuInfo]) {
 
 fn detect_containers() -> Vec<PeerContainerInfo> {
     let ps_output = match std::process::Command::new("docker")
-        .args(["ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"])
+        .args([
+            "ps",
+            "-a",
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+        ])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -916,7 +958,12 @@ fn detect_containers() -> Vec<PeerContainerInfo> {
     };
 
     let stats_output = std::process::Command::new("docker")
-        .args(["stats", "--no-stream", "--format", "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}"])
+        .args([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+        ])
         .output()
         .ok();
 
@@ -944,10 +991,8 @@ fn detect_containers() -> Vec<PeerContainerInfo> {
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() >= 4 {
                 let id = parts[0].to_string();
-                let (cpu_percent, memory_mb, memory_limit_mb) = stats_map
-                    .get(&id)
-                    .copied()
-                    .unwrap_or((0.0, 0, 0));
+                let (cpu_percent, memory_mb, memory_limit_mb) =
+                    stats_map.get(&id).copied().unwrap_or((0.0, 0, 0));
 
                 Some(PeerContainerInfo {
                     id,
@@ -970,7 +1015,10 @@ fn parse_mem_usage(s: &str) -> (u64, u64) {
     if parts.len() != 2 {
         return (0, 0);
     }
-    (parse_mem_value(parts[0].trim()), parse_mem_value(parts[1].trim()))
+    (
+        parse_mem_value(parts[0].trim()),
+        parse_mem_value(parts[1].trim()),
+    )
 }
 
 fn parse_mem_value(s: &str) -> u64 {
@@ -1006,7 +1054,12 @@ fn detect_cpu_temperature() -> Option<f32> {
     let mut count = 0u32;
     for c in &components {
         let label = c.label().to_lowercase();
-        if label.contains("cpu") || label.contains("core") || label.contains("package") || label.contains("tctl") || label.contains("tdie") {
+        if label.contains("cpu")
+            || label.contains("core")
+            || label.contains("package")
+            || label.contains("tctl")
+            || label.contains("tdie")
+        {
             if let Some(temp) = c.temperature() {
                 if temp > 0.0 {
                     sum += temp;
@@ -1178,7 +1231,9 @@ fn detect_rdma_available(name: &str) -> bool {
 /// Pobiera PIERWSZY adres IPv4 i maske interfejsu z sysinfo::Networks
 fn detect_ipv4_info(name: &str, nets: &Networks) -> (String, String) {
     let all = detect_all_ipv4_info(name, nets);
-    all.into_iter().next().unwrap_or((String::new(), String::new()))
+    all.into_iter()
+        .next()
+        .unwrap_or((String::new(), String::new()))
 }
 
 /// Pobiera WSZYSTKIE adresy IPv4 interfejsu (bridge moze miec wiele adresow)
@@ -1232,7 +1287,9 @@ fn detect_gateway(name: &str) -> String {
                                 parts.iter().position(|&p| p == "via"),
                                 parts.iter().position(|&p| p == "dev"),
                             ) {
-                                if let (Some(gw), Some(dev)) = (parts.get(via_idx + 1), parts.get(dev_idx + 1)) {
+                                if let (Some(gw), Some(dev)) =
+                                    (parts.get(via_idx + 1), parts.get(dev_idx + 1))
+                                {
                                     gateways.insert(dev.to_string(), gw.to_string());
                                 }
                             }
@@ -1264,7 +1321,12 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
         .iter()
         .filter_map(|(name, data)| -> Option<Vec<PeerNetworkInfo>> {
             // Pomijaj loopback i Docker bridge
-            if name == "lo" || name == "lo0" || name.starts_with("docker") || name.starts_with("br-") || name.starts_with("veth") {
+            if name == "lo"
+                || name == "lo0"
+                || name.starts_with("docker")
+                || name.starts_with("br-")
+                || name.starts_with("veth")
+            {
                 return None;
             }
 
@@ -1297,7 +1359,9 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
 
             // Jesli interfejs ma wiele IP (np. bridge), tworz osobny wpis per IP
             if all_ips.len() <= 1 {
-                let (ipv4_address, ipv4_netmask) = all_ips.into_iter().next()
+                let (ipv4_address, ipv4_netmask) = all_ips
+                    .into_iter()
+                    .next()
                     .unwrap_or((String::new(), String::new()));
                 Some(vec![PeerNetworkInfo {
                     name: iface_name,
@@ -1316,24 +1380,27 @@ fn detect_networks() -> Vec<PeerNetworkInfo> {
                     numa_node,
                 }])
             } else {
-                Some(all_ips.into_iter().map(|(ip, mask)| {
-                    PeerNetworkInfo {
-                        name: iface_name.clone(),
-                        rx_bytes: rx,
-                        tx_bytes: tx,
-                        rx_bytes_per_sec: rx_per_sec,
-                        tx_bytes_per_sec: tx_per_sec,
-                        link_up,
-                        ipv4_address: ip,
-                        ipv4_netmask: mask,
-                        ipv4_gateway: ipv4_gateway.clone(),
-                        mac_address: mac_address.clone(),
-                        interface_type: interface_type.clone(),
-                        rdma_available,
-                        speed_mbps,
-                        numa_node,
-                    }
-                }).collect())
+                Some(
+                    all_ips
+                        .into_iter()
+                        .map(|(ip, mask)| PeerNetworkInfo {
+                            name: iface_name.clone(),
+                            rx_bytes: rx,
+                            tx_bytes: tx,
+                            rx_bytes_per_sec: rx_per_sec,
+                            tx_bytes_per_sec: tx_per_sec,
+                            link_up,
+                            ipv4_address: ip,
+                            ipv4_netmask: mask,
+                            ipv4_gateway: ipv4_gateway.clone(),
+                            mac_address: mac_address.clone(),
+                            interface_type: interface_type.clone(),
+                            rdma_available,
+                            speed_mbps,
+                            numa_node,
+                        })
+                        .collect(),
+                )
             }
         })
         .flatten()
@@ -1385,7 +1452,9 @@ pub fn collect_os_distro() -> String {
             return long_os_version;
         }
         if !distribution.is_empty() && distribution != "linux" {
-            return format!("{} {}", distribution, os_version).trim().to_string();
+            return format!("{} {}", distribution, os_version)
+                .trim()
+                .to_string();
         }
     }
 
