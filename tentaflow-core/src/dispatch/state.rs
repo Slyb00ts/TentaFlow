@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use crate::config::RouterConfig;
 use crate::crypto::{SecretsCipher, SettingsCipher};
-use crate::license::StaticLicenseChecker;
 use crate::db::DbPool;
 use crate::license::LicenseChecker;
+use crate::license::StaticLicenseChecker;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
 use crate::routing::router::Router;

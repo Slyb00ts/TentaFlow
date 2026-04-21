@@ -13,9 +13,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::MeshConfig;
 // use crate::mesh::discovery::{MdnsDiscovery, PeerEvent}; — usuniete wraz z mesh/discovery.rs
+use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
-use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::security::MeshSecurity;
 use crate::routing::live_metrics;
 
@@ -85,7 +85,10 @@ pub async fn start_mesh_pipeline(
     let mesh_security: Option<Arc<MeshSecurity>> = if let Some(ref pool) = db_pool {
         match MeshSecurity::new(pool.clone(), settings_cipher.clone()) {
             Ok(sec) => {
-                info!("MeshSecurity zainicjalizowany (klucz publiczny: {}...)", &sec.public_key_hex()[..16]);
+                info!(
+                    "MeshSecurity zainicjalizowany (klucz publiczny: {}...)",
+                    &sec.public_key_hex()[..16]
+                );
                 Some(Arc::new(sec))
             }
             Err(e) => {
@@ -121,7 +124,11 @@ pub async fn start_mesh_pipeline(
         quic_connected: true,
         discovered_at: chrono::Utc::now().to_rfc3339(),
         hostname: local_hostname,
-        os_info: if local_os_distro.is_empty() { local_node_info.os_info.clone() } else { local_os_distro },
+        os_info: if local_os_distro.is_empty() {
+            local_node_info.os_info.clone()
+        } else {
+            local_os_distro
+        },
         cpu_count: local_node_info.cpu_count,
         ram_total_mb: local_node_info.ram_total_mb,
         cpu_usage_percent: 0.0,
@@ -255,7 +262,8 @@ fn spawn_mdns_handler(
                     if let Some(existing) = peer_store.get(&peer.node_id) {
                         if existing.quic_connected {
                             // Zaktualizuj hostname jesli brakowal przy pierwszym discovery
-                            let new_hostname = peer.properties.get("hostname").cloned().unwrap_or_default();
+                            let new_hostname =
+                                peer.properties.get("hostname").cloned().unwrap_or_default();
                             if !new_hostname.is_empty() && existing.hostname.is_empty() {
                                 peer_store.update_hostname(&peer.node_id, &new_hostname);
                             }
@@ -264,11 +272,15 @@ fn spawn_mdns_handler(
                     }
 
                     // Filtruj adresy: IPv4, nie-loopback, nie-Docker-bridge, nie-link-local
-                    let mut addrs: Vec<IpAddr> = peer.addresses.iter()
+                    let mut addrs: Vec<IpAddr> = peer
+                        .addresses
+                        .iter()
                         .filter(|a| {
                             if let IpAddr::V4(v4) = a {
                                 !v4.is_loopback()
-                                    && !(v4.octets()[0] == 172 && v4.octets()[1] >= 16 && v4.octets()[1] <= 31)
+                                    && !(v4.octets()[0] == 172
+                                        && v4.octets()[1] >= 16
+                                        && v4.octets()[1] <= 31)
                                     && !v4.is_link_local()
                             } else {
                                 false
@@ -277,7 +289,12 @@ fn spawn_mdns_handler(
                         .copied()
                         .collect();
                     if addrs.is_empty() {
-                        addrs = peer.addresses.iter().filter(|a| a.is_ipv4()).copied().collect();
+                        addrs = peer
+                            .addresses
+                            .iter()
+                            .filter(|a| a.is_ipv4())
+                            .copied()
+                            .collect();
                     }
 
                     // Pomijaj peery bez adresow — czekaj na re-announce z adresami
@@ -366,7 +383,8 @@ fn spawn_quic_event_handler(
     let mut event_rx = quic_mesh.subscribe();
 
     tokio::spawn(async move {
-        let mut last_sync_sent: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+        let mut last_sync_sent: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
         const SYNC_COOLDOWN_SECS: u64 = 30;
 
         loop {
@@ -410,7 +428,8 @@ fn spawn_quic_event_handler(
                         None => false, // Zero trust — bez MeshSecurity nie wysylaj danych
                     };
                     if should_send {
-                        if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_node_info)
+                        if let Ok(info_bytes) =
+                            rkyv::to_bytes::<rkyv::rancor::Error>(&local_node_info)
                         {
                             if let Err(e) = qm_events.send_node_info(&node_id, &info_bytes).await {
                                 warn!("Blad wysylania NodeInfo do {}: {}", node_id, e);
@@ -419,23 +438,39 @@ fn spawn_quic_event_handler(
 
                         // Synchronizacja zaufanych kluczy przy reconnect (z cooldownem)
                         if let Some(ref sec) = mesh_security {
-                            let should_sync = last_sync_sent.get(&node_id)
-                                .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(SYNC_COOLDOWN_SECS));
+                            let should_sync = last_sync_sent.get(&node_id).map_or(true, |t| {
+                                t.elapsed() >= std::time::Duration::from_secs(SYNC_COOLDOWN_SECS)
+                            });
 
                             if should_sync {
                                 let all_keys = sec.get_all_trusted_keys();
                                 if !all_keys.is_empty() {
-                                    let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
-                                        .iter()
-                                        .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                                            node_id: nid.clone(),
-                                            public_key_hex: pk.clone(),
-                                        })
-                                        .collect();
-                                    let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
-                                    if let Ok(sync_data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
-                                        if let Err(e) = qm_events.send_trusted_keys_sync(&node_id, &sync_data).await {
-                                            warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
+                                    let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> =
+                                        all_keys
+                                            .iter()
+                                            .map(|(nid, pk)| {
+                                                tentaflow_protocol::mesh::TrustedKeyEntry {
+                                                    node_id: nid.clone(),
+                                                    public_key_hex: pk.clone(),
+                                                }
+                                            })
+                                            .collect();
+                                    let payload =
+                                        tentaflow_protocol::mesh::TrustedKeysSyncPayload {
+                                            keys: entries,
+                                        };
+                                    if let Ok(sync_data) =
+                                        rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                            .map(|v| v.to_vec())
+                                    {
+                                        if let Err(e) = qm_events
+                                            .send_trusted_keys_sync(&node_id, &sync_data)
+                                            .await
+                                        {
+                                            warn!(
+                                                "Blad wysylania TrustedKeysSync do {}: {}",
+                                                node_id, e
+                                            );
                                         }
                                     }
                                 }
@@ -447,8 +482,17 @@ fn spawn_quic_event_handler(
                                         revoked_node_id: revoked_id.clone(),
                                         from_node_id: local_node_id.clone(),
                                     };
-                                    if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec()) {
-                                        let _ = qm_events.send_to_peer(&node_id, tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED, &data).await;
+                                    if let Ok(data) =
+                                        rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                            .map(|v| v.to_vec())
+                                    {
+                                        let _ = qm_events
+                                            .send_to_peer(
+                                                &node_id,
+                                                tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
+                                                &data,
+                                            )
+                                            .await;
                                     }
                                 }
 
@@ -464,11 +508,15 @@ fn spawn_quic_event_handler(
                         if sec.is_trusted(&node_id) {
                             if let Some(peer_info) = peer_store.get(&node_id) {
                                 if !peer_info.addresses.is_empty() && peer_info.port > 0 {
-                                    let addr_str = peer_info.addresses.iter()
+                                    let addr_str = peer_info
+                                        .addresses
+                                        .iter()
                                         .map(|ip| format!("{}:{}", ip, peer_info.port))
                                         .collect::<Vec<_>>()
                                         .join(",");
-                                    let _ = crate::db::repository::update_trusted_node_addresses(&sec.db, &node_id, &addr_str);
+                                    let _ = crate::db::repository::update_trusted_node_addresses(
+                                        &sec.db, &node_id, &addr_str,
+                                    );
                                 }
                             }
                         }
@@ -501,10 +549,15 @@ fn spawn_quic_event_handler(
                         // Fallback: adresy z DB
                         if addrs.is_empty() {
                             if let Some(ref sec) = mesh_security {
-                                if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
-                                    if let Some(tn) = trusted.iter().find(|t| t.node_id == node_id) {
+                                if let Ok(trusted) =
+                                    crate::db::repository::list_trusted_nodes(&sec.db)
+                                {
+                                    if let Some(tn) = trusted.iter().find(|t| t.node_id == node_id)
+                                    {
                                         for part in tn.last_addresses.split(',') {
-                                            if let Ok(addr) = part.trim().parse::<std::net::SocketAddr>() {
+                                            if let Ok(addr) =
+                                                part.trim().parse::<std::net::SocketAddr>()
+                                            {
                                                 addrs.push(addr);
                                             }
                                         }
@@ -568,7 +621,9 @@ fn spawn_quic_event_handler(
                                 }
                                 let pin = val["pin"].as_str().unwrap_or("");
                                 let public_key = val["public_key"].as_str().unwrap_or("");
-                                if let Err(e) = sec.receive_pairing_request(from_node_id, pin, public_key) {
+                                if let Err(e) =
+                                    sec.receive_pairing_request(from_node_id, pin, public_key)
+                                {
                                     warn!("Blad zapisu PairingRequest od {}: {}", peer_id, e);
                                 } else {
                                     info!("PairingRequest od {} zapisany — oczekuje na potwierdzenie PIN", from_node_id);
@@ -593,21 +648,37 @@ fn spawn_quic_event_handler(
                                 // Weryfikuj PIN — inicjator sprawdza czy receiver podal poprawny PIN
                                 if let Ok(Some(expected_pin)) = sec.get_pending_pin(from_node_id) {
                                     if !received_pin.is_empty() && received_pin != expected_pin {
-                                        warn!("PairingConfirm od {} — nieprawidlowy PIN", from_node_id);
+                                        warn!(
+                                            "PairingConfirm od {} — nieprawidlowy PIN",
+                                            from_node_id
+                                        );
                                         continue;
                                     }
                                 }
 
-                                if let Err(e) = sec.confirm_pairing(from_node_id, public_key, hostname, "mesh-quic") {
+                                if let Err(e) = sec.confirm_pairing(
+                                    from_node_id,
+                                    public_key,
+                                    hostname,
+                                    "mesh-quic",
+                                ) {
                                     warn!("Blad potwierdzenia parowania od {}: {}", peer_id, e);
                                 } else {
                                     info!("Otrzymano PairingConfirm od {} — node zaufany", peer_id);
 
                                     // Po sparowaniu — wyslij NodeInfo do nowo zaufanego peera
                                     let target_node_id = from_node_id.to_string();
-                                    if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_node_info) {
-                                        if let Err(e) = qm_events.send_node_info(&target_node_id, &info_bytes).await {
-                                            warn!("Blad wysylania NodeInfo po sparowaniu do {}: {}", target_node_id, e);
+                                    if let Ok(info_bytes) =
+                                        rkyv::to_bytes::<rkyv::rancor::Error>(&local_node_info)
+                                    {
+                                        if let Err(e) = qm_events
+                                            .send_node_info(&target_node_id, &info_bytes)
+                                            .await
+                                        {
+                                            warn!(
+                                                "Blad wysylania NodeInfo po sparowaniu do {}: {}",
+                                                target_node_id, e
+                                            );
                                         } else {
                                             info!(peer_id = %target_node_id, "Wyslano NodeInfo do nowo zaufanego peera");
                                         }
@@ -616,19 +687,33 @@ fn spawn_quic_event_handler(
                                     // Wyslij TrustedKeysSync z naszymi zaufanymi kluczami
                                     let all_keys = sec.get_all_trusted_keys();
                                     if !all_keys.is_empty() {
-                                        let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+                                        let entries: Vec<
+                                            tentaflow_protocol::mesh::TrustedKeyEntry,
+                                        > = all_keys
                                             .iter()
-                                            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                                                node_id: nid.clone(),
-                                                public_key_hex: pk.clone(),
+                                            .map(|(nid, pk)| {
+                                                tentaflow_protocol::mesh::TrustedKeyEntry {
+                                                    node_id: nid.clone(),
+                                                    public_key_hex: pk.clone(),
+                                                }
                                             })
                                             .collect();
-                                        let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
-                                        let sync_data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                                            .map(|v| v.to_vec())
-                                            .unwrap_or_default();
-                                        if let Err(e) = qm_events.send_trusted_keys_sync(&target_node_id, &sync_data).await {
-                                            warn!("Blad wysylania TrustedKeysSync do {}: {}", target_node_id, e);
+                                        let payload =
+                                            tentaflow_protocol::mesh::TrustedKeysSyncPayload {
+                                                keys: entries,
+                                            };
+                                        let sync_data =
+                                            rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                                .map(|v| v.to_vec())
+                                                .unwrap_or_default();
+                                        if let Err(e) = qm_events
+                                            .send_trusted_keys_sync(&target_node_id, &sync_data)
+                                            .await
+                                        {
+                                            warn!(
+                                                "Blad wysylania TrustedKeysSync do {}: {}",
+                                                target_node_id, e
+                                            );
                                         } else {
                                             info!(peer_id = %target_node_id, count = all_keys.len(), "Wyslano TrustedKeysSync");
                                         }
@@ -637,17 +722,25 @@ fn spawn_quic_event_handler(
                                     // Rozglosz zaktualizowana liste kluczy do WSZYSTKICH zaufanych peerow
                                     let updated_keys = sec.get_all_trusted_keys();
                                     if updated_keys.len() > 1 {
-                                        let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = updated_keys
+                                        let entries: Vec<
+                                            tentaflow_protocol::mesh::TrustedKeyEntry,
+                                        > = updated_keys
                                             .iter()
-                                            .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                                                node_id: nid.clone(),
-                                                public_key_hex: pk.clone(),
+                                            .map(|(nid, pk)| {
+                                                tentaflow_protocol::mesh::TrustedKeyEntry {
+                                                    node_id: nid.clone(),
+                                                    public_key_hex: pk.clone(),
+                                                }
                                             })
                                             .collect();
-                                        let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
-                                        let broadcast_data = rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                                            .map(|v| v.to_vec())
-                                            .unwrap_or_default();
+                                        let payload =
+                                            tentaflow_protocol::mesh::TrustedKeysSyncPayload {
+                                                keys: entries,
+                                            };
+                                        let broadcast_data =
+                                            rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
+                                                .map(|v| v.to_vec())
+                                                .unwrap_or_default();
                                         // Broadcast do wszystkich trusted — pomija nowo sparowanego (juz dostal wyzej)
                                         let results = qm_events.broadcast_to_trusted(
                                             tentaflow_protocol::mesh::MESH_MSG_TRUSTED_KEYS_SYNC,
@@ -656,7 +749,10 @@ fn spawn_quic_event_handler(
                                         ).await;
                                         for (pid, res) in &results {
                                             if let Err(e) = res {
-                                                warn!("Blad broadcast TrustedKeysSync do {}: {}", pid, e);
+                                                warn!(
+                                                    "Blad broadcast TrustedKeysSync do {}: {}",
+                                                    pid, e
+                                                );
                                             }
                                         }
                                     }
@@ -686,7 +782,10 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(IrohMeshEvent::TrustRevokedReceived { node_id, revoked_node_id }) => {
+                Ok(IrohMeshEvent::TrustRevokedReceived {
+                    node_id,
+                    revoked_node_id,
+                }) => {
                     if let Some(ref sec) = mesh_security {
                         let sender_trusted = sec.is_trusted(&node_id);
                         let i_am_revoked = revoked_node_id == local_node_id;
@@ -699,13 +798,24 @@ fn spawn_quic_event_handler(
                             }
                             info!(
                                 "Odlaczony z mesh przez {} — usunieto {} kluczy",
-                                node_id, all_trusted.len()
+                                node_id,
+                                all_trusted.len()
                             );
 
-                            let details = format!("Odlaczony z mesh przez {} — {} kluczy usunietych", node_id, all_trusted.len());
+                            let details = format!(
+                                "Odlaczony z mesh przez {} — {} kluczy usunietych",
+                                node_id,
+                                all_trusted.len()
+                            );
                             let _ = crate::db::repository::log_audit(
-                                &sec.db, None, None, "removed_from_mesh", None,
-                                Some(&details), None, Some(&node_id),
+                                &sec.db,
+                                None,
+                                None,
+                                "removed_from_mesh",
+                                None,
+                                Some(&details),
+                                None,
+                                Some(&node_id),
                             );
                             continue;
                         }
@@ -713,12 +823,23 @@ fn spawn_quic_event_handler(
                         // Przypadek 2: ktos inny zostal odlaczony — usun TYLKO jego klucz
                         if sender_trusted && sec.is_trusted(&revoked_node_id) {
                             let _ = sec.unpair(&revoked_node_id);
-                            info!("Usunieto {} z mesh (propagacja od {})", revoked_node_id, node_id);
+                            info!(
+                                "Usunieto {} z mesh (propagacja od {})",
+                                revoked_node_id, node_id
+                            );
 
                             let _ = crate::db::repository::log_audit(
-                                &sec.db, None, None, "trust_revoked_propagation", None,
-                                Some(&format!("Usunieto {} propagacja od {}", revoked_node_id, node_id)),
-                                None, Some(&revoked_node_id),
+                                &sec.db,
+                                None,
+                                None,
+                                "trust_revoked_propagation",
+                                None,
+                                Some(&format!(
+                                    "Usunieto {} propagacja od {}",
+                                    revoked_node_id, node_id
+                                )),
+                                None,
+                                Some(&revoked_node_id),
                             );
                         } else if !sender_trusted && !i_am_revoked {
                             warn!("Odrzucono TrustRevoked od niezaufanego noda {}", node_id);
@@ -773,15 +894,25 @@ fn spawn_quic_event_handler(
                         if added > 0 {
                             info!(from = %node_id, added, "TrustedKeysSync przetworzony");
                             // Audit log
-                            let details = format!("Dodano {} kluczy z TrustedKeysSync od {}", added, node_id);
+                            let details =
+                                format!("Dodano {} kluczy z TrustedKeysSync od {}", added, node_id);
                             let _ = crate::db::repository::log_audit(
-                                &sec.db, None, None, "trusted_keys_sync", None,
-                                Some(&details), None, Some(&node_id),
+                                &sec.db,
+                                None,
+                                None,
+                                "trusted_keys_sync",
+                                None,
+                                Some(&details),
+                                None,
+                                Some(&node_id),
                             );
                         }
                     }
                 }
-                Ok(IrohMeshEvent::RelayFrameReceived { from_node_id: _, frame }) => {
+                Ok(IrohMeshEvent::RelayFrameReceived {
+                    from_node_id: _,
+                    frame,
+                }) => {
                     // Sprawdz TTL
                     if frame.ttl == 0 {
                         warn!(source = %frame.source_node_id, dest = %frame.destination_node_id, "Relay frame TTL wyczerpany — odrzucam");
@@ -803,11 +934,17 @@ fn spawn_quic_event_handler(
                         let mut forwarded_frame = frame;
                         forwarded_frame.ttl -= 1;
 
-                        if let Some(route) = peer_store.get_route(&forwarded_frame.destination_node_id) {
-                            let frame_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&forwarded_frame)
-                                .map(|v| v.to_vec())
-                                .unwrap_or_default();
-                            if let Err(e) = qm_events.send_relay_frame(&route.next_hop, &frame_bytes).await {
+                        if let Some(route) =
+                            peer_store.get_route(&forwarded_frame.destination_node_id)
+                        {
+                            let frame_bytes =
+                                rkyv::to_bytes::<rkyv::rancor::Error>(&forwarded_frame)
+                                    .map(|v| v.to_vec())
+                                    .unwrap_or_default();
+                            if let Err(e) = qm_events
+                                .send_relay_frame(&route.next_hop, &frame_bytes)
+                                .await
+                            {
                                 warn!(
                                     dest = %forwarded_frame.destination_node_id,
                                     next_hop = %route.next_hop,
@@ -827,12 +964,19 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(IrohMeshEvent::MeshCommandReceived { from_node_id, command }) => {
+                Ok(IrohMeshEvent::MeshCommandReceived {
+                    from_node_id,
+                    command,
+                }) => {
                     info!(from = %from_node_id, "Otrzymano MeshCommand — przekazuje do executora");
-                    qm_events.handle_command_received(&from_node_id, &command).await;
+                    qm_events
+                        .handle_command_received(&from_node_id, &command)
+                        .await;
                 }
                 Ok(IrohMeshEvent::MeshCommandResponseReceived { from_node_id, data }) => {
-                    qm_events.handle_command_response_received(&from_node_id, &data).await;
+                    qm_events
+                        .handle_command_response_received(&from_node_id, &data)
+                        .await;
                 }
                 Ok(IrohMeshEvent::CrdtDeltaReceived { node_id, .. }) => {
                     // Safety net — przetwarzaj CRDT delta TYLKO od trusted peerow
@@ -859,7 +1003,9 @@ fn spawn_quic_event_handler(
                 Ok(IrohMeshEvent::ModelListUpdate { node_id, data }) => {
                     // ModelsSync — nadpisuje liste modeli danego peera.
                     // Format: rkyv-zakodowany `ModelsSync { models: Vec<PeerModelInfo> }`.
-                    match rkyv::from_bytes::<crate::mesh::peer_store::ModelsSync, rkyv::rancor::Error>(&data) {
+                    match rkyv::from_bytes::<crate::mesh::peer_store::ModelsSync, rkyv::rancor::Error>(
+                        &data,
+                    ) {
                         Ok(sync) => {
                             debug!(
                                 node_id = %node_id,
@@ -885,20 +1031,18 @@ fn spawn_quic_event_handler(
 
 fn spawn_docker_cache() -> Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>>
 {
-    let docker_cache: Arc<
-        tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>,
-    > = Arc::new(tokio::sync::RwLock::new(vec![]));
+    let docker_cache: Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>> =
+        Arc::new(tokio::sync::RwLock::new(vec![]));
 
     let dc = docker_cache.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let containers = tokio::task::spawn_blocking(|| {
-                node_info_collector::collect_docker_containers()
-            })
-            .await
-            .unwrap_or_default();
+            let containers =
+                tokio::task::spawn_blocking(|| node_info_collector::collect_docker_containers())
+                    .await
+                    .unwrap_or_default();
             *dc.write().await = containers;
         }
     });
@@ -921,10 +1065,8 @@ fn spawn_heartbeat_sender(
         let mut heartbeat_count: u64 = 0;
         loop {
             interval.tick().await;
-            let metrics = tokio::task::spawn_blocking(|| {
-                node_info_collector::collect_fast_metrics()
-            })
-            .await;
+            let metrics =
+                tokio::task::spawn_blocking(|| node_info_collector::collect_fast_metrics()).await;
             if let Ok(m) = metrics {
                 let containers = docker_cache.read().await.clone();
                 let connected_peers = quic_mesh.connected_peer_ids().await;
@@ -998,32 +1140,31 @@ fn spawn_heartbeat_sender(
 /// Buduje liste `PeerModelInfo` z lokalnego service_registry. Tylko LOKALNE
 /// serwisy (te na biezacym nodzie) — modele z peerow przychodza przez
 /// ModelsSync od ich wlascicieli.
-fn collect_local_models(quic_mesh: &Arc<IrohMeshManager>) -> Vec<crate::mesh::peer_store::PeerModelInfo> {
+fn collect_local_models(
+    quic_mesh: &Arc<IrohMeshManager>,
+) -> Vec<crate::mesh::peer_store::PeerModelInfo> {
     let registry = quic_mesh.service_registry();
     registry
         .local_services()
         .into_iter()
         .flat_map(|svc| {
             let kind = svc.service_type.clone();
-            svc.models.into_iter().map(move |alias| {
-                crate::mesh::peer_store::PeerModelInfo {
+            svc.models
+                .into_iter()
+                .map(move |alias| crate::mesh::peer_store::PeerModelInfo {
                     alias,
                     kind: kind.clone(),
                     backend: kind.clone(),
                     size_mb: 0,
                     loaded: true,
-                }
-            })
+                })
         })
         .collect()
 }
 
 /// Slow refresh — co 60s odswiezaj wolno-zmienne dane lokalnego noda:
 /// adresy IP, Docker availability/version, OS distro.
-fn spawn_slow_refresh(
-    peer_store: MeshPeerStore,
-    local_node_id: String,
-) {
+fn spawn_slow_refresh(peer_store: MeshPeerStore, local_node_id: String) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {

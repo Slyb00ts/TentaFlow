@@ -12,6 +12,7 @@ import { Router } from '/js/router.js';
 import { byId, escapeHtml } from '/js/utils.js';
 import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import '/js/components/index.js';
+import '/js/lib/block-zoom.js';
 
 import LoginScreen from '/js/modules/login.js';
 import FaceBackground from '/js/modules/faceBackground.js';
@@ -22,6 +23,7 @@ import CatalogScreen from '/js/modules/catalog.js';
 import MeshScreen from '/js/modules/mesh.js';
 import ClustersScreen from '/js/modules/clusters.js';
 import FlowsScreen from '/js/modules/flows.js';
+import FlowBuilderScreen from '/js/modules/flows-builder.js';
 import ChatScreen from '/js/modules/chat.js';
 import PromptsScreen from '/js/modules/prompts.js';
 import RegistriesScreen from '/js/modules/registries.js';
@@ -30,6 +32,16 @@ import ApiKeysScreen from '/js/modules/apikeys.js';
 import UsersScreen from '/js/modules/users.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
+import AddonsScreen from '/js/modules/addons.js';
+import MyAccountsScreen from '/js/modules/my-accounts.js';
+import AppsHomeScreen from '/js/modules/apps-home.js';
+import ProfileScreen from '/js/modules/profile.js';
+import SettingsUserScreen from '/js/modules/settings-user.js';
+import FlowsUserScreen from '/js/modules/flows-user.js';
+import PromptsUserScreen from '/js/modules/prompts-user.js';
+import TranslateScreen from '/js/modules/translate.js';
+import NotesScreen from '/js/modules/notes.js';
+import { makeComingSoonScreen } from '/js/modules/coming-soon.js';
 
 // Helper: SVG <use> reference do inline sprite.
 function sprite(id) {
@@ -71,14 +83,14 @@ const ADMIN_NAV = [
     headingKey: 'nav.section_integrations',
     icon: 'puzzle',
     items: [
-      { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
+      { id: 'catalog', labelKey: 'nav.catalog', icon: 'catalog' },
     ],
   },
   {
     headingKey: 'nav.section_management',
     icon: 'management',
     items: [
-      { id: 'applications', labelKey: 'nav.applications', icon: 'apps' },
+      { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
     ],
@@ -93,12 +105,12 @@ const USER_NAV = [
     items: [
       { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
       { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
-      { id: 'images', labelKey: 'nav.images', icon: 'image' },
-      { id: 'notes', labelKey: 'nav.notes', icon: 'mic', badge: 'soon' },
-      { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
+      { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
+      { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
+      { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting', badge: 'soon' },
       { id: 'flows-user', labelKey: 'nav.flows_user', icon: 'workflow-app' },
       { id: 'prompts-user', labelKey: 'nav.prompts_user', icon: 'star' },
-      { id: 'tts', labelKey: 'nav.tts', icon: 'speaker' },
+      { id: 'tts', labelKey: 'nav.tts', icon: 'speaker', badge: 'soon' },
       { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
       { id: 'search-app', labelKey: 'nav.search_app', icon: 'search', badge: 'soon' },
     ],
@@ -107,8 +119,8 @@ const USER_NAV = [
     headingKey: 'nav.section_network',
     icon: 'network',
     items: [
-      { id: 'mesh-user', labelKey: 'nav.mesh_user', icon: 'network' },
-      { id: 'tailscale-user', labelKey: 'nav.tailscale_user', icon: 'zap' },
+      { id: 'mesh-user', labelKey: 'nav.mesh_user', icon: 'network', badge: 'soon' },
+      { id: 'tailscale-user', labelKey: 'nav.tailscale_user', icon: 'zap', badge: 'soon' },
     ],
   },
   {
@@ -116,6 +128,7 @@ const USER_NAV = [
     icon: 'user',
     items: [
       { id: 'profile', labelKey: 'nav.profile', icon: 'user' },
+      { id: 'my-accounts', labelKey: 'nav.my_accounts', icon: 'share' },
       { id: 'settings-user', labelKey: 'nav.settings_user', icon: 'settings' },
     ],
   },
@@ -187,6 +200,7 @@ async function renderApp() {
                   <div class="nav-item" data-view="${it.id}">
                     ${sprite(it.icon)}
                     <span>${escapeHtml(I18n.t(it.labelKey))}</span>
+                    <span class="nav-count" data-count-for="${it.id}" hidden></span>
                     ${it.badge ? `<span class="badge ${it.badge === 'soon' ? 'soon' : ''}">${escapeHtml(it.badge)}</span>` : ''}
                   </div>
                 `).join('')}
@@ -299,6 +313,7 @@ async function renderApp() {
   Router.register('catalog', CatalogScreen);
   Router.register('prompts', PromptsScreen);
   Router.register('flows', FlowsScreen);
+  Router.register('flow-builder', FlowBuilderScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
   Router.register('apikeys', ApiKeysScreen);
@@ -307,6 +322,22 @@ async function renderApp() {
   Router.register('registries', RegistriesScreen);
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);
+  Router.register('addons', AddonsScreen);
+  Router.register('my-accounts', MyAccountsScreen);
+  Router.register('apps-home', AppsHomeScreen);
+  Router.register('profile', ProfileScreen);
+  Router.register('settings-user', SettingsUserScreen);
+  Router.register('flows-user', FlowsUserScreen);
+  Router.register('prompts-user', PromptsUserScreen);
+  Router.register('notes', NotesScreen);
+  // Apps whose binary handlers are not yet wired — honest placeholder, not a stub feature.
+  Router.register('images',         makeComingSoonScreen('images',    'image'));
+  Router.register('meeting',        makeComingSoonScreen('meeting',   'meeting'));
+  Router.register('tts',            makeComingSoonScreen('tts',       'speaker'));
+  Router.register('translate',      TranslateScreen);
+  Router.register('search-app',     makeComingSoonScreen('search',    'search'));
+  Router.register('mesh-user',      makeComingSoonScreen('mesh_user', 'network'));
+  Router.register('tailscale-user', makeComingSoonScreen('tailscale', 'zap'));
 
   paint();
 
@@ -322,6 +353,42 @@ async function renderApp() {
   Router.init(isAdmin ? 'dashboard' : 'apps-home');
   const initial = document.querySelector(`[data-view="${isAdmin ? 'dashboard' : 'apps-home'}"]`);
   if (initial) initial.classList.add('active');
+
+  // Liczniki w sidebar menu — pobieramy po zamontowaniu shellu i odswiezamy
+  // co 30s. Gdy jakis endpoint nie odpowie, silently pomijamy (dedupe toastow
+  // w utils.js i tak uchroni przed spam'em bledow).
+  refreshNavCounts();
+  setInterval(refreshNavCounts, 30000);
+}
+
+async function refreshNavCounts() {
+  const setCount = (id, n) => {
+    const el = document.querySelector(`.nav-count[data-count-for="${id}"]`);
+    if (!el) return;
+    if (typeof n === 'number' && n > 0) {
+      el.textContent = String(n);
+      el.hidden = false;
+    } else {
+      el.hidden = true;
+      el.textContent = '';
+    }
+  };
+  const len = (v) => Array.isArray(v) ? v.length : (v?.length ?? 0);
+  // Wszystkie 5 zapytan przez binary WS — zero REST w refreshNavCounts.
+  // Handler UsersListRequest wymaga policy Admin: dla zwyklych userow
+  // serwer odpowie bledem i catch zwroci null (badge nie pokaze sie).
+  const [svc, mesh, clusters, addons, users] = await Promise.all([
+    ApiBinary.list('serviceListRequest').catch(() => null),
+    ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => null),
+    ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => null),
+    ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => null),
+    ApiBinary.list('usersListRequest', { arrayKey: 'users' }).catch(() => null),
+  ]);
+  if (svc !== null) setCount('services', len(svc));
+  if (mesh !== null) setCount('mesh', len(mesh));
+  if (clusters !== null) setCount('clusters', len(clusters));
+  if (addons !== null) setCount('addons', len(addons));
+  if (users !== null) setCount('users', len(users));
 }
 
 window.addEventListener('error', (e) => {

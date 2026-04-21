@@ -55,8 +55,8 @@ pub fn handle_list(pool: &DbPool) -> Result<(u16, String)> {
 
 /// POST /api/services - utworz nowy serwis
 pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateServiceRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: CreateServiceRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let config = req.config_json.as_deref().unwrap_or("{}");
 
@@ -77,11 +77,14 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
 pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
     let existing = db::repository::get_service(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Serwis o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Serwis o id {} nie istnieje"}}"#, id),
+        ));
     }
 
-    let req: UpdateServiceRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: UpdateServiceRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let config = req.config_json.as_deref().unwrap_or("{}");
 
@@ -104,7 +107,10 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
 pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     let existing = db::repository::get_service(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Serwis o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Serwis o id {} nie istnieje"}}"#, id),
+        ));
     }
 
     db::repository::delete_service(pool, id)?;
@@ -157,8 +163,8 @@ pub fn handle_list_backends(pool: &DbPool, service_id: i64) -> Result<(u16, Stri
 
 /// POST /api/services/:id/backends - utworz nowy backend
 pub fn handle_create_backend(pool: &DbPool, service_id: i64, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateBackendRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: CreateBackendRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let config = req.config_json.as_deref().unwrap_or("{}");
     let backend = db::models::NewBackend {
@@ -180,15 +186,21 @@ pub fn handle_create_backend(pool: &DbPool, service_id: i64, body: &[u8]) -> Res
 /// PUT /api/backends/:id - aktualizuj backend
 pub fn handle_update_backend(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
     if db::repository::get_backend(pool, id)?.is_none() {
-        return Ok((404, format!(r#"{{"error":"Backend o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Backend o id {} nie istnieje"}}"#, id),
+        ));
     }
 
-    let req: UpdateBackendRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: UpdateBackendRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let config = req.config_json.as_deref().unwrap_or("{}");
     db::repository::update_backend(
-        pool, id, &req.connection_type, config,
+        pool,
+        id,
+        &req.connection_type,
+        config,
         req.max_concurrent.unwrap_or(50),
         req.timeout_ms.unwrap_or(120000),
         req.weight.unwrap_or(1),
@@ -204,7 +216,10 @@ pub fn handle_update_backend(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16
 /// DELETE /api/backends/:id - usun backend
 pub fn handle_delete_backend(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     if db::repository::get_backend(pool, id)?.is_none() {
-        return Ok((404, format!(r#"{{"error":"Backend o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Backend o id {} nie istnieje"}}"#, id),
+        ));
     }
     db::repository::delete_backend(pool, id)?;
     Ok((200, r#"{"ok":true}"#.to_string()))

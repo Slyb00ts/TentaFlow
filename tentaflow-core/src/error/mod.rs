@@ -91,7 +91,6 @@ pub enum CoreError {
     // =========================================================================
     // Bledy gossip protocol
     // =========================================================================
-
     /// Blad propagacji wiadomosci gossip (serializacja, dostarczenie, duplikat)
     #[error("Blad gossip protocol: {message}")]
     GossipError {
@@ -103,7 +102,6 @@ pub enum CoreError {
     // =========================================================================
     // Bledy CRDT
     // =========================================================================
-
     /// Blad synchronizacji CRDT (merge conflict, niepoprawny stan, niezgodnosc wersji)
     #[error("Blad CRDT sync: {message}")]
     CrdtError {
@@ -115,7 +113,6 @@ pub enum CoreError {
     // =========================================================================
     // Bledy peer discovery/connection
     // =========================================================================
-
     /// Blad odkrywania lub polaczenia z peerem (mDNS, QUIC handshake, autoryzacja)
     #[error("Blad peer '{peer_id}': {message}")]
     PeerError {
@@ -128,7 +125,6 @@ pub enum CoreError {
     // =========================================================================
     // Bledy lokalnej inferencji
     // =========================================================================
-
     /// Blad lokalnej inferencji (ladowanie modelu, generowanie, brak pamieci GPU)
     #[error("Blad inferencji '{model_path}': {message}")]
     InferenceError {

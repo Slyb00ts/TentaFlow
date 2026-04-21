@@ -2,14 +2,15 @@
 // Plik: addon/host_functions/events.rs
 // Opis: Host functions Event API — subskrypcja i publikacja eventow.
 //       Addon subskrybuje eventy; Core wywola guest export on_event() przy dostarczeniu.
+// Uprawnienia: "events" z resource=<event_type> (per-typ event). Fail-closed —
+//              brak uprawnienia blokuje zarowno subscribe jak i publish.
 // =============================================================================
 
 use tracing::info;
 
 use super::{
-    AddonState, ABI_OK, ABI_ERR_PERMISSION, ABI_ERR_OPERATION,
-    get_memory, read_guest_string, audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_string, AddonState, WasmCaller,
+    ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_OK,
 };
 use crate::addon::event_bus::EventSubscriber;
 
@@ -65,7 +66,10 @@ pub fn event_subscribe(
     let addon_id = caller.data().addon_id.clone();
     let instance_id = caller.data().instance_id.clone();
 
-    info!("event_subscribe: addon='{}', event_type='{}'", addon_id, event_type);
+    info!(
+        "event_subscribe: addon='{}', event_type='{}'",
+        addon_id, event_type
+    );
 
     // Zarejestruj subskrypcje w event bus
     let subscriber = EventSubscriber {
@@ -160,7 +164,10 @@ pub fn event_publish(
     let addon_id = caller.data().addon_id.clone();
     let user_id = caller.data().user_id;
 
-    info!("event_publish: addon='{}', event_type='{}'", addon_id, event_type);
+    info!(
+        "event_publish: addon='{}', event_type='{}'",
+        addon_id, event_type
+    );
 
     // Opublikuj event
     let event = crate::addon::event_bus::Event {
@@ -183,4 +190,51 @@ pub fn event_publish(
     );
 
     ABI_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::addon::event_bus::EventBus;
+    use crate::addon::host_functions::check_permission;
+    use crate::addon::host_functions::network::NetworkConnectionManager;
+    use crate::addon::permissions::PermissionChecker;
+    use crate::addon::AddonManifest;
+    use parking_lot::Mutex;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn make_state(permissions: Vec<String>) -> AddonState {
+        let db = crate::db::init(Path::new(":memory:")).unwrap();
+        AddonState {
+            addon_id: "events-test-addon".to_string(),
+            instance_id: "t".to_string(),
+            user_id: None,
+            db: db.clone(),
+            permissions,
+            event_bus: Arc::new(EventBus::new()),
+            permission_checker: Arc::new(PermissionChecker::new(db)),
+            fuel_consumed: 0,
+            is_system_call: true,
+            rate_limiter: None,
+            net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
+            settings_cipher: Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32])),
+            manifest: Arc::new(AddonManifest::default()),
+            memory_limit: 64 * 1024 * 1024,
+            oauth_refresh_guard: std::sync::Arc::new(
+                crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
+            ),
+            router: None,
+        }
+    }
+
+    #[test]
+    fn events_publish_denied_without_permission() {
+        // Addon bez "events" nie moze publish ani subscribe.
+        let state = make_state(vec!["llm".to_string()]);
+        assert!(
+            !check_permission(&state, "events", Some("chat.message")),
+            "Brak 'events' w permissions → Denied"
+        );
+    }
 }

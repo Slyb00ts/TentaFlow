@@ -125,15 +125,17 @@ export function createVirtualList(host, opts) {
   }
 
   function onScrollHandler() {
-    // Update pinned state — jesli user scrollnie w gore o > 50px, odpinamy
+    // Recompute pinned state: <30px from bottom counts as "still pinned".
     const scrollTop = host.scrollTop;
     const distanceFromBottom = totalHeight - (scrollTop + host.clientHeight);
-    pinned = distanceFromBottom < 30;
+    const nextPinned = distanceFromBottom < 30;
+    const changed = nextPinned !== pinned;
+    pinned = nextPinned;
     if (rafId == null) {
       rafId = requestAnimationFrame(() => {
         rafId = null;
         render();
-        onScroll?.(scrollTop, distanceFromBottom);
+        onScroll?.(scrollTop, distanceFromBottom, { pinned, changed });
       });
     }
   }
@@ -191,6 +193,30 @@ export function createVirtualList(host, opts) {
     });
   }
 
+  // Incremental tail update: only the last item changed (streaming case).
+  // Recomputes height of items[len-1], patches offset table in O(1), and
+  // re-renders the visible window. Avoids O(n) full recompute per chunk.
+  function updateTail() {
+    const len = items.length;
+    if (len === 0) return;
+    const lastIdx = len - 1;
+    const newH = getItemHeight(lastIdx, items[lastIdx]);
+    const prevH = heightCache[lastIdx] || 0;
+    if (newH === prevH) {
+      // Height unchanged — still need to re-render the visible text.
+      render();
+      if (pinned) host.scrollTop = host.scrollHeight;
+      return;
+    }
+    heightCache[lastIdx] = newH;
+    totalHeight = offsetCache[lastIdx] + newH;
+    offsetCache[len] = totalHeight;
+    spacer.style.height = `${totalHeight}px`;
+    lastRenderRange = { start: -1, end: -1 };
+    render();
+    if (pinned) host.scrollTop = host.scrollHeight;
+  }
+
   function scrollToIndex(idx) {
     if (idx < 0 || idx >= items.length) return;
     host.scrollTop = offsetCache[idx];
@@ -209,6 +235,7 @@ export function createVirtualList(host, opts) {
     setItems,
     append,
     appendBatch,
+    updateTail,
     scrollToBottom,
     scrollToIndex,
     destroy,

@@ -4,7 +4,7 @@
 //       i zwraca audio bytes gotowe do streaming do klienta.
 // =============================================================================
 
-use crate::error::{Result, CoreError};
+use crate::error::{CoreError, Result};
 
 // TODO: Przeniesc TTSRequest z protocols::openai::types do Core
 //       lub dodac zaleznosc na crate z protokolami.
@@ -74,20 +74,19 @@ impl TTSClient {
         let api_key = if let Some(ref key) = config.api_key {
             key.clone()
         } else if let Some(ref env_var) = config.api_key_env {
-            std::env::var(env_var).map_err(|_| {
-                CoreError::ConfigError {
-                    message: format!(
-                        "Zmienna srodowiskowa '{}' nie jest ustawiona (TTS API key)",
-                        env_var
-                    ),
-                    source: anyhow::anyhow!("Missing TTS API key env var"),
-                }
+            std::env::var(env_var).map_err(|_| CoreError::ConfigError {
+                message: format!(
+                    "Zmienna srodowiskowa '{}' nie jest ustawiona (TTS API key)",
+                    env_var
+                ),
+                source: anyhow::anyhow!("Missing TTS API key env var"),
             })?
         } else {
             return Err(CoreError::ConfigError {
                 message: "Brak api_key ani api_key_env w konfiguracji TTS".to_string(),
                 source: anyhow::anyhow!("No TTS API key configured"),
-            }.into());
+            }
+            .into());
         };
 
         // Utwórz reqwest::Client z timeout
@@ -148,7 +147,10 @@ impl TTSClient {
 
         debug!(
             "Synteza mowy: {} znakow, voice={}, format={} -> {}",
-            text.len(), voice, format, self.base_url
+            text.len(),
+            voice,
+            format,
+            self.base_url
         );
 
         // Utwórz TTS request
@@ -202,13 +204,14 @@ impl TTSClient {
         }
 
         // Przeczytaj audio bytes
-        let audio_bytes = response.bytes().await.map_err(|e| {
-            CoreError::BackendError {
+        let audio_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| CoreError::BackendError {
                 backend_url: self.config.url.clone(),
                 message: format!("Nie mozna przeczytac audio bytes: {}", e),
                 source: Some(e.into()),
-            }
-        })?;
+            })?;
 
         debug!(
             "TTS synteza OK: {} bajtow audio (format: {})",

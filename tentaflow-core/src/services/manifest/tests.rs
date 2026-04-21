@@ -125,7 +125,10 @@ platforms = ["linux"]
     assert!(parsed.deploy.docker.is_some());
     assert!(parsed.deploy.native.is_none());
     assert!(parsed.deploy.external.is_none());
-    assert_eq!(parsed.deploy.docker.as_ref().unwrap().platforms, vec![TargetOs::Linux]);
+    assert_eq!(
+        parsed.deploy.docker.as_ref().unwrap().platforms,
+        vec![TargetOs::Linux]
+    );
 }
 
 /// A2: Pelny TOML z wszystkimi sekcjami deploy + model_presets.
@@ -211,7 +214,12 @@ detection_endpoint = "http://localhost:1234"
 "#;
     let parsed: ServiceManifest = toml::from_str(toml_src).unwrap();
     assert_eq!(
-        parsed.deploy.external.as_ref().unwrap().detection_health_path,
+        parsed
+            .deploy
+            .external
+            .as_ref()
+            .unwrap()
+            .detection_health_path,
         "/"
     );
 }
@@ -303,7 +311,11 @@ fn validate_native_embedded_without_feature_flag_fails() {
     native.feature_flag = None;
     let manifest = make_manifest(
         make_engine("e", Category::Llm),
-        DeploySection { docker: None, native: Some(native), external: None },
+        DeploySection {
+            docker: None,
+            native: Some(native),
+            external: None,
+        },
     );
     let errs = validate_engine(&manifest, None).expect_err("blad oczekiwany");
     assert!(errs
@@ -318,7 +330,11 @@ fn validate_native_embedded_with_binary_path_fails() {
     native.binary_path = Some("foo".to_string());
     let manifest = make_manifest(
         make_engine("e", Category::Llm),
-        DeploySection { docker: None, native: Some(native), external: None },
+        DeploySection {
+            docker: None,
+            native: Some(native),
+            external: None,
+        },
     );
     let errs = validate_engine(&manifest, None).expect_err("blad oczekiwany");
     assert!(errs
@@ -333,7 +349,10 @@ fn validate_native_binary_consistent_passes() {
         make_engine("e", Category::Tts),
         DeploySection {
             docker: None,
-            native: Some(native_binary(vec![TargetOs::Linux], "tts/native/sherpa-onnx")),
+            native: Some(native_binary(
+                vec![TargetOs::Linux],
+                "tts/native/sherpa-onnx",
+            )),
             external: None,
         },
     );
@@ -347,7 +366,11 @@ fn validate_native_binary_with_feature_flag_fails() {
     native.feature_flag = Some("foo".to_string());
     let manifest = make_manifest(
         make_engine("e", Category::Llm),
-        DeploySection { docker: None, native: Some(native), external: None },
+        DeploySection {
+            docker: None,
+            native: Some(native),
+            external: None,
+        },
     );
     let errs = validate_engine(&manifest, None).expect_err("blad oczekiwany");
     assert!(errs
@@ -362,7 +385,10 @@ fn validate_native_python_bundle_consistent_passes() {
         make_engine("e", Category::Llm),
         DeploySection {
             docker: None,
-            native: Some(native_python_bundle(vec![TargetOs::Linux], "llm/python/vllm")),
+            native: Some(native_python_bundle(
+                vec![TargetOs::Linux],
+                "llm/python/vllm",
+            )),
             external: None,
         },
     );
@@ -376,7 +402,11 @@ fn validate_native_python_bundle_without_path_fails() {
     native.bundle_path = None;
     let manifest = make_manifest(
         make_engine("e", Category::Llm),
-        DeploySection { docker: None, native: Some(native), external: None },
+        DeploySection {
+            docker: None,
+            native: Some(native),
+            external: None,
+        },
     );
     let errs = validate_engine(&manifest, None).expect_err("blad oczekiwany");
     assert!(errs
@@ -458,7 +488,10 @@ fn make_sample_engines() -> Vec<ServiceManifest> {
     let llm_manifest = make_manifest(
         llm,
         DeploySection {
-            docker: Some(docker_deploy("llm/docker/x", vec![TargetOs::Linux, TargetOs::Windows])),
+            docker: Some(docker_deploy(
+                "llm/docker/x",
+                vec![TargetOs::Linux, TargetOs::Windows],
+            )),
             native: None,
             external: None,
         },
@@ -480,7 +513,10 @@ fn make_sample_engines() -> Vec<ServiceManifest> {
         make_engine("test-tts", Category::Tts),
         DeploySection {
             docker: None,
-            native: Some(native_binary(vec![TargetOs::Linux], "tts/native/sherpa-onnx")),
+            native: Some(native_binary(
+                vec![TargetOs::Linux],
+                "tts/native/sherpa-onnx",
+            )),
             external: None,
         },
     );
@@ -488,7 +524,10 @@ fn make_sample_engines() -> Vec<ServiceManifest> {
     let agents_manifest = make_manifest(
         make_engine("test-agent", Category::Agents),
         DeploySection {
-            docker: Some(docker_deploy("agents/docker/teams-bot", vec![TargetOs::Linux])),
+            docker: Some(docker_deploy(
+                "agents/docker/teams-bot",
+                vec![TargetOs::Linux],
+            )),
             native: None,
             external: None,
         },
@@ -507,7 +546,13 @@ fn make_sample_engines() -> Vec<ServiceManifest> {
         },
     );
 
-    vec![llm_manifest, stt_manifest, tts_manifest, agents_manifest, ext_manifest]
+    vec![
+        llm_manifest,
+        stt_manifest,
+        tts_manifest,
+        agents_manifest,
+        ext_manifest,
+    ]
 }
 
 /// Lekka kopia ManifestRegistry uzywana w testach (replikuje API).
@@ -519,7 +564,10 @@ impl TestRegistry {
         self.engines.iter().find(|e| e.engine.id == id)
     }
     fn by_category(&self, cat: Category) -> Vec<&ServiceManifest> {
-        self.engines.iter().filter(|e| e.engine.category == cat).collect()
+        self.engines
+            .iter()
+            .filter(|e| e.engine.category == cat)
+            .collect()
     }
     fn compatible_for(&self, os: TargetOs) -> Vec<&ServiceManifest> {
         self.engines
@@ -528,7 +576,9 @@ impl TestRegistry {
                 let d = &m.deploy;
                 d.docker.as_ref().is_some_and(|x| x.platforms.contains(&os))
                     || d.native.as_ref().is_some_and(|x| x.platforms.contains(&os))
-                    || d.external.as_ref().is_some_and(|x| x.platforms.contains(&os))
+                    || d.external
+                        .as_ref()
+                        .is_some_and(|x| x.platforms.contains(&os))
             })
             .collect()
     }
@@ -546,21 +596,27 @@ impl TestRegistry {
 /// D1: by_id istniejacego silnika zwraca Some.
 #[test]
 fn registry_by_id_existing_returns_some() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     assert_eq!(reg.by_id("test-llm").unwrap().engine.id, "test-llm");
 }
 
 /// D2: by_id nieistniejacego silnika zwraca None.
 #[test]
 fn registry_by_id_missing_returns_none() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     assert!(reg.by_id("nope").is_none());
 }
 
 /// D3: by_category zwraca silniki tylko z danej kategorii.
 #[test]
 fn registry_by_category_filters() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     let llms = reg.by_category(Category::Llm);
     assert_eq!(llms.len(), 2);
     let stts = reg.by_category(Category::Stt);
@@ -570,7 +626,9 @@ fn registry_by_category_filters() {
 /// D4: compatible_for(linux) zwraca silniki z linux na liscie platforms.
 #[test]
 fn registry_compatible_for_linux() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     let comp = reg.compatible_for(TargetOs::Linux);
     let ids: Vec<&str> = comp.iter().map(|m| m.engine.id.as_str()).collect();
     assert!(ids.contains(&"test-llm"));
@@ -583,7 +641,9 @@ fn registry_compatible_for_linux() {
 /// D5: compatible_for(macos) — tylko silniki z macos.
 #[test]
 fn registry_compatible_for_macos() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     let comp = reg.compatible_for(TargetOs::Macos);
     let ids: Vec<&str> = comp.iter().map(|m| m.engine.id.as_str()).collect();
     assert!(ids.contains(&"test-stt"));
@@ -594,7 +654,9 @@ fn registry_compatible_for_macos() {
 /// D6: compatible_for(windows) — silnik LLM (docker) i ext.
 #[test]
 fn registry_compatible_for_windows() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     let comp = reg.compatible_for(TargetOs::Windows);
     let ids: Vec<&str> = comp.iter().map(|m| m.engine.id.as_str()).collect();
     assert!(ids.contains(&"test-llm"));
@@ -604,7 +666,9 @@ fn registry_compatible_for_windows() {
 /// D7: compatible_for(ios) — tylko stt (embedded whisper).
 #[test]
 fn registry_compatible_for_ios() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     let comp = reg.compatible_for(TargetOs::Ios);
     let ids: Vec<&str> = comp.iter().map(|m| m.engine.id.as_str()).collect();
     assert_eq!(ids, vec!["test-stt"]);
@@ -613,7 +677,9 @@ fn registry_compatible_for_ios() {
 /// D8: compatible_for(android) — pusta lista (zaden sample manifest nie wspiera androida).
 #[test]
 fn registry_compatible_for_android_empty() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     let comp = reg.compatible_for(TargetOs::Android);
     assert!(comp.is_empty());
 }
@@ -621,7 +687,9 @@ fn registry_compatible_for_android_empty() {
 /// D9: non_empty_categories zwraca tylko kategorie z silnikami (Llm, Stt, Tts, Agents).
 #[test]
 fn registry_non_empty_categories_only_used() {
-    let reg = TestRegistry { engines: make_sample_engines() };
+    let reg = TestRegistry {
+        engines: make_sample_engines(),
+    };
     let cats = reg.non_empty_categories();
     assert!(cats.contains(&Category::Llm));
     assert!(cats.contains(&Category::Stt));
@@ -675,7 +743,14 @@ fn loaded_manifest_engine_ids_unique() {
 #[test]
 fn loaded_manifest_contains_known_llm_engines() {
     let reg = super::registry::registry();
-    for id in &["llama-cpp", "mlx", "vllm", "sglang", "ollama", "tensorrt-llm"] {
+    for id in &[
+        "llama-cpp",
+        "mlx",
+        "vllm",
+        "sglang",
+        "ollama",
+        "tensorrt-llm",
+    ] {
         assert!(
             reg.by_id(id).is_some(),
             "Brak silnika '{id}' w embedded manifescie"
@@ -688,7 +763,11 @@ fn loaded_manifest_contains_known_llm_engines() {
 fn loaded_manifest_has_5_non_empty_categories() {
     let reg = super::registry::registry();
     let cats = reg.non_empty_categories();
-    assert_eq!(cats.len(), 5, "Oczekiwano 5 niepustych kategorii, znaleziono {cats:?}");
+    assert_eq!(
+        cats.len(),
+        5,
+        "Oczekiwano 5 niepustych kategorii, znaleziono {cats:?}"
+    );
     assert!(cats.contains(&Category::Llm));
     assert!(cats.contains(&Category::Stt));
     assert!(cats.contains(&Category::Tts));

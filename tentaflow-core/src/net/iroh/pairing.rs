@@ -206,10 +206,7 @@ impl PairingHandler {
 }
 
 impl ProtocolHandler for PairingHandler {
-    async fn accept(
-        &self,
-        connection: Connection,
-    ) -> Result<(), iroh::protocol::AcceptError> {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let (send, recv) = match connection.accept_bi().await {
             Ok(v) => v,
             Err(e) => {

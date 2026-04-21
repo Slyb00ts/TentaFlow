@@ -6,23 +6,21 @@
 //       protocol-native completion, memory store.
 // =============================================================================
 
+use crate::api::openai::types::{
+    ChatCompletionRequest, ChatCompletionResponse, Choice, Message, MessageContent,
+    TranscriptionRequest, Usage,
+};
 use crate::config::RouterConfig;
-use crate::error::{Result, CoreError};
+use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
 use crate::flow_engine::types::FlowExecutionResult;
-use crate::api::openai::types::{
-    ChatCompletionRequest, ChatCompletionResponse,
-    Choice, Message, MessageContent, Usage,
-    TranscriptionRequest,
-};
 use crate::routing::router::{
-    Router, RequestMetrics, SpeakerIdentifyResult, DiarizedSpeaker,
-    VoiceInfo, SttWithDiarization,
+    DiarizedSpeaker, RequestMetrics, Router, SpeakerIdentifyResult, SttWithDiarization, VoiceInfo,
 };
 use crate::routing::service_manager::ServiceManager;
 
-use tentaflow_protocol::*;
 use std::sync::Arc;
+use tentaflow_protocol::*;
 use tracing::{debug, error, info, warn};
 
 impl Router {
@@ -76,7 +74,8 @@ impl Router {
         }
 
         // === MEMORY INTEGRATION (QUERY) ===
-        let (request, query_decision, mem_timings) = self.memory_integration.process_request(request).await?;
+        let (request, query_decision, mem_timings) =
+            self.memory_integration.process_request(request).await?;
         metrics.query_analysis_ms = mem_timings.query_analysis_ms;
         metrics.memory_query_ms = mem_timings.memory_query_ms;
 
@@ -96,14 +95,13 @@ impl Router {
                             debug!("Routing do lokalnej inferencji in-process");
                             this.local_inference.handle_chat_completion(&req).await
                         }
-                        BackendHandle::Rag(name) => {
-                            this.route_to_rag(name.clone(), req).await
-                        }
+                        BackendHandle::Rag(name) => this.route_to_rag(name.clone(), req).await,
                         BackendHandle::QuicLlm(name) => {
                             this.route_to_quic_llm(name.clone(), req, None, None).await
                         }
                         BackendHandle::Http(name) => {
-                            let backend = this.select_http_backend(name)
+                            let backend = this
+                                .select_http_backend(name)
                                 .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
                             Ok(backend.chat_completion(req).await?)
                         }
@@ -113,7 +111,8 @@ impl Router {
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla chat")),
                     }
                 }
-            }).await?
+            })
+            .await?
         };
         let mut response = route_result.response;
         let route_metadata = route_result.metadata;
@@ -134,7 +133,10 @@ impl Router {
         // === LOG TIMING TABLE ===
         info!("\n{}", metrics.format_table());
 
-        Ok(crate::routing::RouteResult { response, metadata: route_metadata })
+        Ok(crate::routing::RouteResult {
+            response,
+            metadata: route_metadata,
+        })
     }
 
     /// Helper do asynchronicznego zapisu do Memory po odpowiedzi modelu
@@ -150,7 +152,8 @@ impl Router {
             return;
         }
 
-        self.memory_integration.process_response_async(request, &response_text, query_decision);
+        self.memory_integration
+            .process_response_async(request, &response_text, query_decision);
     }
 
     /// Przetwarza audio_input: STT + speaker identification z confidence levels.
@@ -177,7 +180,10 @@ impl Router {
 
         debug!("STT transkrypcja: {}", transcribed_text);
         if diarized_speakers.len() > 1 {
-            info!("Wykryto {} mowcow w audio (process_audio_input)", diarized_speakers.len());
+            info!(
+                "Wykryto {} mowcow w audio (process_audio_input)",
+                diarized_speakers.len()
+            );
         }
 
         // === KROK 2: Speaker Identification z confidence levels ===
@@ -185,8 +191,10 @@ impl Router {
 
         debug!(
             "Speaker identify: id={:?}, name={:?}, confidence={:?}, level={}",
-            speaker_result.speaker_id, speaker_result.speaker_name,
-            speaker_result.similarity, speaker_result.confidence_level
+            speaker_result.speaker_id,
+            speaker_result.speaker_name,
+            speaker_result.similarity,
+            speaker_result.confidence_level
         );
 
         // === KROK 2.5: Zbieraj dodatkowe probki glosu dla nowo-zarejestrowanych mowcow ===
@@ -297,7 +305,9 @@ impl Router {
             } else if speaker_result.is_medium_confidence() {
                 memory_opts.speaker_confidence = speaker_result.similarity;
                 if let Some(ref name) = speaker_result.speaker_name {
-                    let confirmation_hint = speaker_result.confirmation_message.clone()
+                    let confirmation_hint = speaker_result
+                        .confirmation_message
+                        .clone()
                         .unwrap_or_else(|| format!("Czy to ty, {}?", name));
                     memory_opts.session_context = Some(format!(
                         "SPEAKER_CANDIDATE: id={}, name={}, confidence={:.2}, ask: {}",
@@ -336,8 +346,14 @@ impl Router {
     }
 
     /// Helper: STT dla voice conversation z diarization.
-    pub(crate) async fn process_stt_for_voice(&self, audio_data: &[u8]) -> Result<SttWithDiarization> {
-        let stt_client = self.service_manager.get_first_quic_stt_client().await
+    pub(crate) async fn process_stt_for_voice(
+        &self,
+        audio_data: &[u8],
+    ) -> Result<SttWithDiarization> {
+        let stt_client = self
+            .service_manager
+            .get_first_quic_stt_client()
+            .await
             .ok_or_else(|| CoreError::ModelNotFound {
                 model_name: "stt-service".to_string(),
             })?;
@@ -366,72 +382,87 @@ impl Router {
             stream: false,
         };
 
-        let response = stt_client.send_request(stt_request).await
-            .map_err(|e| CoreError::NetworkError {
-                message: format!("STT request failed: {}", e),
-                source: anyhow::anyhow!("{}", e),
-            })?;
+        let response =
+            stt_client
+                .send_request(stt_request)
+                .await
+                .map_err(|e| CoreError::NetworkError {
+                    message: format!("STT request failed: {}", e),
+                    source: anyhow::anyhow!("{}", e),
+                })?;
 
         match response.result {
-            ModelResult::Audio(result) => {
-                match result.data {
-                    AudioResultData::Text(text) => Ok(SttWithDiarization {
-                        text,
-                        speakers: vec![],
-                    }),
-                    AudioResultData::Detailed { text, segments, .. } => {
-                        let mut speaker_texts: std::collections::HashMap<String, (bool, Option<f32>, Vec<String>)> = std::collections::HashMap::new();
+            ModelResult::Audio(result) => match result.data {
+                AudioResultData::Text(text) => Ok(SttWithDiarization {
+                    text,
+                    speakers: vec![],
+                }),
+                AudioResultData::Detailed { text, segments, .. } => {
+                    let mut speaker_texts: std::collections::HashMap<
+                        String,
+                        (bool, Option<f32>, Vec<String>),
+                    > = std::collections::HashMap::new();
 
-                        for seg in segments {
-                            let label = seg.speaker_label.clone().unwrap_or_else(|| "SPEAKER_00".to_string());
-                            let is_known = seg.is_known_speaker.unwrap_or(false);
-                            let similarity = seg.speaker_similarity;
+                    for seg in segments {
+                        let label = seg
+                            .speaker_label
+                            .clone()
+                            .unwrap_or_else(|| "SPEAKER_00".to_string());
+                        let is_known = seg.is_known_speaker.unwrap_or(false);
+                        let similarity = seg.speaker_similarity;
 
-                            let entry = speaker_texts.entry(label.clone()).or_insert((is_known, similarity, vec![]));
-                            entry.2.push(seg.text.clone());
-                        }
-
-                        let speakers: Vec<DiarizedSpeaker> = speaker_texts
-                            .into_iter()
-                            .map(|(label, (is_known, similarity, texts))| DiarizedSpeaker {
-                                label,
-                                is_known,
-                                similarity,
-                                text: texts.join(" "),
-                            })
-                            .collect();
-
-                        if speakers.len() > 1 {
-                            debug!("Diarization wykryla {} mowcow", speakers.len());
-                            for s in &speakers {
-                                debug!("  - {}: {} (known={})", s.label, s.text, s.is_known);
-                            }
-                        }
-
-                        Ok(SttWithDiarization { text, speakers })
+                        let entry = speaker_texts.entry(label.clone()).or_insert((
+                            is_known,
+                            similarity,
+                            vec![],
+                        ));
+                        entry.2.push(seg.text.clone());
                     }
-                    _ => Err(CoreError::InternalError {
-                        message: "Unexpected audio result type (expected Text)".to_string(),
-                        source: None,
-                    }.into()),
+
+                    let speakers: Vec<DiarizedSpeaker> = speaker_texts
+                        .into_iter()
+                        .map(|(label, (is_known, similarity, texts))| DiarizedSpeaker {
+                            label,
+                            is_known,
+                            similarity,
+                            text: texts.join(" "),
+                        })
+                        .collect();
+
+                    if speakers.len() > 1 {
+                        debug!("Diarization wykryla {} mowcow", speakers.len());
+                        for s in &speakers {
+                            debug!("  - {}: {} (known={})", s.label, s.text, s.is_known);
+                        }
+                    }
+
+                    Ok(SttWithDiarization { text, speakers })
                 }
-            }
-            ModelResult::Error(e) => {
-                Err(CoreError::InternalError {
-                    message: format!("STT error: {}", e.message),
+                _ => Err(CoreError::InternalError {
+                    message: "Unexpected audio result type (expected Text)".to_string(),
                     source: None,
-                }.into())
+                }
+                .into()),
+            },
+            ModelResult::Error(e) => Err(CoreError::InternalError {
+                message: format!("STT error: {}", e.message),
+                source: None,
             }
+            .into()),
             _ => Err(CoreError::InternalError {
                 message: "Unexpected STT response type".to_string(),
                 source: None,
-            }.into()),
+            }
+            .into()),
         }
     }
 
     /// Helper: Speaker identification.
     /// Zwraca informacje o rozpoznaniu mowcy z poziomem pewnosci.
-    pub(crate) async fn process_speaker_identify(&self, audio_data: &[u8]) -> SpeakerIdentifyResult {
+    pub(crate) async fn process_speaker_identify(
+        &self,
+        audio_data: &[u8],
+    ) -> SpeakerIdentifyResult {
         let stt_client = match self.service_manager.get_first_quic_stt_client().await {
             Some(client) => client,
             None => {
@@ -468,67 +499,77 @@ impl Router {
         };
 
         match response.result {
-            ModelResult::Audio(audio_result) => {
-                match audio_result.data {
-                    AudioResultData::SpeakerIdentifyWithConfidenceResult {
-                        is_match,
-                        speaker_id,
-                        speaker_name,
-                        similarity,
-                        confidence_level,
-                        needs_confirmation,
-                        confirmation_message,
-                        ..
-                    } => {
-                        if is_match {
-                            let valid_id = speaker_id.filter(|s| !s.is_empty());
-                            let valid_name = speaker_name.filter(|s| !s.is_empty());
+            ModelResult::Audio(audio_result) => match audio_result.data {
+                AudioResultData::SpeakerIdentifyWithConfidenceResult {
+                    is_match,
+                    speaker_id,
+                    speaker_name,
+                    similarity,
+                    confidence_level,
+                    needs_confirmation,
+                    confirmation_message,
+                    ..
+                } => {
+                    if is_match {
+                        let valid_id = speaker_id.filter(|s| !s.is_empty());
+                        let valid_name = speaker_name.filter(|s| !s.is_empty());
 
-                            debug!("Speaker identified: id={:?}, name={:?}, confidence={}, level={}",
-                                  valid_id, valid_name, similarity, confidence_level);
+                        debug!(
+                            "Speaker identified: id={:?}, name={:?}, confidence={}, level={}",
+                            valid_id, valid_name, similarity, confidence_level
+                        );
 
-                            SpeakerIdentifyResult {
-                                speaker_id: valid_id,
-                                speaker_name: valid_name,
-                                similarity: Some(similarity),
-                                confidence_level,
-                                needs_confirmation,
-                                confirmation_message,
-                            }
-                        } else {
-                            debug!("Speaker not recognized (similarity={}, level={})", similarity, confidence_level);
-                            SpeakerIdentifyResult {
-                                speaker_id: None,
-                                speaker_name: None,
-                                similarity: Some(similarity),
-                                confidence_level: "LOW".to_string(),
-                                needs_confirmation: false,
-                                confirmation_message: None,
-                            }
+                        SpeakerIdentifyResult {
+                            speaker_id: valid_id,
+                            speaker_name: valid_name,
+                            similarity: Some(similarity),
+                            confidence_level,
+                            needs_confirmation,
+                            confirmation_message,
+                        }
+                    } else {
+                        debug!(
+                            "Speaker not recognized (similarity={}, level={})",
+                            similarity, confidence_level
+                        );
+                        SpeakerIdentifyResult {
+                            speaker_id: None,
+                            speaker_name: None,
+                            similarity: Some(similarity),
+                            confidence_level: "LOW".to_string(),
+                            needs_confirmation: false,
+                            confirmation_message: None,
                         }
                     }
-                    AudioResultData::SpeakerIdentifyResult { is_match, speaker_id, speaker_name, similarity, .. } => {
-                        if is_match {
-                            let valid_id = speaker_id.filter(|s| !s.is_empty());
-                            let valid_name = speaker_name.filter(|s| !s.is_empty());
-                            SpeakerIdentifyResult {
-                                speaker_id: valid_id,
-                                speaker_name: valid_name,
-                                similarity: Some(similarity),
-                                confidence_level: if similarity >= 0.78 { "HIGH" } else { "MEDIUM" }.to_string(),
-                                needs_confirmation: similarity < 0.78,
-                                confirmation_message: None,
-                            }
-                        } else {
-                            SpeakerIdentifyResult::unknown()
+                }
+                AudioResultData::SpeakerIdentifyResult {
+                    is_match,
+                    speaker_id,
+                    speaker_name,
+                    similarity,
+                    ..
+                } => {
+                    if is_match {
+                        let valid_id = speaker_id.filter(|s| !s.is_empty());
+                        let valid_name = speaker_name.filter(|s| !s.is_empty());
+                        SpeakerIdentifyResult {
+                            speaker_id: valid_id,
+                            speaker_name: valid_name,
+                            similarity: Some(similarity),
+                            confidence_level: if similarity >= 0.78 { "HIGH" } else { "MEDIUM" }
+                                .to_string(),
+                            needs_confirmation: similarity < 0.78,
+                            confirmation_message: None,
                         }
-                    }
-                    _ => {
-                        warn!("Unexpected audio result type for speaker identify");
+                    } else {
                         SpeakerIdentifyResult::unknown()
                     }
                 }
-            }
+                _ => {
+                    warn!("Unexpected audio result type for speaker identify");
+                    SpeakerIdentifyResult::unknown()
+                }
+            },
             ModelResult::Error(e) => {
                 warn!("Speaker identify error: {}", e.message);
                 SpeakerIdentifyResult::unknown()
@@ -548,15 +589,24 @@ impl Router {
     ) -> Result<ChatCompletionResponse> {
         debug!("Routing to RAG engine: {}", rag_engine_name);
 
-        let rag_handle = { self.service_manager.rag_services.read().get(&rag_engine_name).cloned() }
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: rag_engine_name.clone(),
-            })?;
+        let rag_handle = {
+            self.service_manager
+                .rag_services
+                .read()
+                .get(&rag_engine_name)
+                .cloned()
+        }
+        .ok_or_else(|| CoreError::ModelNotFound {
+            model_name: rag_engine_name.clone(),
+        })?;
 
-        let rag_client = rag_handle.get_client().await
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: rag_engine_name.clone(),
-            })?;
+        let rag_client =
+            rag_handle
+                .get_client()
+                .await
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: rag_engine_name.clone(),
+                })?;
 
         let query = request
             .messages
@@ -589,7 +639,8 @@ impl Router {
             None
         };
 
-        let (rag_payload, requires_llm, requires_audio) = crate::routing::build_rag_payload(&request, query, context);
+        let (rag_payload, requires_llm, requires_audio) =
+            crate::routing::build_rag_payload(&request, query, context);
 
         debug!(
             "Sending RAGPayload (llm: {}, audio: {}, modes: {:?})",
@@ -608,20 +659,17 @@ impl Router {
         let content = if rag_result.requires_llm_processing {
             debug!("RAG wymaga przetworzenia przez LLM - routing do LLM backend");
 
-            let llm_model_name = rag_result
-                .llm_model
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("RAG result requires_llm_processing=true ale llm_model=None"))?;
+            let llm_model_name = rag_result.llm_model.clone().ok_or_else(|| {
+                anyhow::anyhow!("RAG result requires_llm_processing=true ale llm_model=None")
+            })?;
 
-            let llm_backend = self.select_http_backend(&llm_model_name)
-                .ok_or_else(|| CoreError::ModelNotFound {
+            let llm_backend = self.select_http_backend(&llm_model_name).ok_or_else(|| {
+                CoreError::ModelNotFound {
                     model_name: llm_model_name.clone(),
-                })?;
+                }
+            })?;
 
-            debug!(
-                "Wybrany LLM backend: {}",
-                llm_backend.url()
-            );
+            debug!("Wybrany LLM backend: {}", llm_backend.url());
 
             let llm_request = ChatCompletionRequest {
                 model: llm_model_name.clone(),
@@ -717,9 +765,16 @@ impl Router {
     ) -> Result<ChatCompletionResponse> {
         use tentaflow_protocol::*;
 
-        debug!("Routing to QUIC LLM: {}, prompt_override={:?}", llm_name, prompt_override.as_ref().map(|p| p.len()));
+        debug!(
+            "Routing to QUIC LLM: {}, prompt_override={:?}",
+            llm_name,
+            prompt_override.as_ref().map(|p| p.len())
+        );
 
-        let quic_client = self.service_manager.get_quic_llm_client(&llm_name).await
+        let quic_client = self
+            .service_manager
+            .get_quic_llm_client(&llm_name)
+            .await
             .ok_or_else(|| CoreError::AllBackendsUnavailable {
                 model_name: llm_name.clone(),
             })?;
@@ -758,7 +813,9 @@ impl Router {
 
         match model_response.result {
             ModelResult::Completion(completion_result) => {
-                let cleaned_text = self.response_middleware.clean_text(&completion_result.text)?;
+                let cleaned_text = self
+                    .response_middleware
+                    .clean_text(&completion_result.text)?;
                 let cleaned_reasoning = if let Some(ref rc) = completion_result.reasoning_content {
                     Some(self.response_middleware.clean_text(rc)?)
                 } else {
@@ -774,7 +831,9 @@ impl Router {
                         index: 0,
                         message: crate::api::openai::types::Message {
                             role: "assistant".to_string(),
-                            content: Some(crate::api::openai::types::MessageContent::Text(cleaned_text)),
+                            content: Some(crate::api::openai::types::MessageContent::Text(
+                                cleaned_text,
+                            )),
                             reasoning_content: cleaned_reasoning,
                             ..Default::default()
                         },
@@ -782,10 +841,23 @@ impl Router {
                         logprobs: None,
                     }],
                     usage: model_response.metrics.map(|m| {
-                        if let Some(DetailedMetrics::Completion { prompt_tokens, completion_tokens, total_tokens }) = m.detailed {
-                            Usage { prompt_tokens, completion_tokens, total_tokens }
+                        if let Some(DetailedMetrics::Completion {
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                        }) = m.detailed
+                        {
+                            Usage {
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens,
+                            }
                         } else {
-                            Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                            Usage {
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                                total_tokens: 0,
+                            }
                         }
                     }),
                     system_fingerprint: None,
@@ -797,25 +869,32 @@ impl Router {
                     detected_tools: None,
                 };
 
-                debug!("QUIC LLM response received: {} chars", chat_response.choices.first().map(|c| {
-                    match &c.message.content {
-                        Some(crate::api::openai::types::MessageContent::Text(t)) => t.len(),
-                        _ => 0,
-                    }
-                }).unwrap_or(0));
+                debug!(
+                    "QUIC LLM response received: {} chars",
+                    chat_response
+                        .choices
+                        .first()
+                        .map(|c| {
+                            match &c.message.content {
+                                Some(crate::api::openai::types::MessageContent::Text(t)) => t.len(),
+                                _ => 0,
+                            }
+                        })
+                        .unwrap_or(0)
+                );
 
                 Ok(chat_response)
             }
-            ModelResult::Error(error_info) => {
-                Err(CoreError::InternalError {
-                    message: format!("QUIC LLM error: {}", error_info.message),
-                    source: None,
-                }.into())
+            ModelResult::Error(error_info) => Err(CoreError::InternalError {
+                message: format!("QUIC LLM error: {}", error_info.message),
+                source: None,
             }
+            .into()),
             _ => Err(CoreError::InternalError {
                 message: "Unexpected response type from QUIC LLM".to_string(),
                 source: None,
-            }.into()),
+            }
+            .into()),
         }
     }
 
@@ -867,9 +946,19 @@ impl Router {
             ModelPayload::Embeddings(embeddings_payload) => {
                 let model = embeddings_payload.model.clone();
                 let input = embeddings_payload.input.clone();
-                debug!("Embedding callback: model={}, {} tekstow", model, input.len());
+                debug!(
+                    "Embedding callback: model={}, {} tekstow",
+                    model,
+                    input.len()
+                );
 
-                let emb_handle = { service_manager.quic_embedding_services.read().get(&model).cloned() };
+                let emb_handle = {
+                    service_manager
+                        .quic_embedding_services
+                        .read()
+                        .get(&model)
+                        .cloned()
+                };
                 if let Some(quic_handle) = emb_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla embeddingow: {}", model);
@@ -901,7 +990,10 @@ impl Router {
                             }
                         }
                     } else {
-                        warn!("QUIC embedding client '{}' nie jest polaczony, fallback do HTTP", model);
+                        warn!(
+                            "QUIC embedding client '{}' nie jest polaczony, fallback do HTTP",
+                            model
+                        );
                     }
                 }
 
@@ -939,7 +1031,10 @@ impl Router {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::InternalError,
-                                message: format!("Brak strategii load balancing dla modelu '{}'", model),
+                                message: format!(
+                                    "Brak strategii load balancing dla modelu '{}'",
+                                    model
+                                ),
                                 details: None,
                             }),
                             metrics: None,
@@ -966,7 +1061,9 @@ impl Router {
 
                 debug!(
                     "Wybrany backend ({}): {} [{}]",
-                    strategy.name(), backend.url(), backend_idx
+                    strategy.name(),
+                    backend.url(),
+                    backend_idx
                 );
 
                 match backend.embedding(input).await {
@@ -1008,10 +1105,18 @@ impl Router {
 
                 debug!(
                     "Completion callback: model={}, {} wiadomosci, prompt_len={:?}",
-                    model, messages.len(), prompt.as_ref().map(|p| p.len())
+                    model,
+                    messages.len(),
+                    prompt.as_ref().map(|p| p.len())
                 );
 
-                let llm_handle = { service_manager.quic_llm_services.read().get(&model).cloned() };
+                let llm_handle = {
+                    service_manager
+                        .quic_llm_services
+                        .read()
+                        .get(&model)
+                        .cloned()
+                };
                 if let Some(quic_handle) = llm_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla LLM: {}", model);
@@ -1058,23 +1163,27 @@ impl Router {
                             }
                         }
                     } else {
-                        warn!("QUIC LLM client '{}' nie jest polaczony, fallback do HTTP", model);
+                        warn!(
+                            "QUIC LLM client '{}' nie jest polaczony, fallback do HTTP",
+                            model
+                        );
                     }
                 }
 
                 let backends = match service_manager.service_backends.get(&model) {
                     Some(b) => b,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::ModelNotFound,
-                                message: format!("Model LLM '{}' nie znaleziony w konfiguracji (ani QUIC ani HTTP)", model),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
+                    None => return ModelResponse {
+                        request_id,
+                        result: ModelResult::Error(ErrorInfo {
+                            error_type: ErrorType::ModelNotFound,
+                            message: format!(
+                                "Model LLM '{}' nie znaleziony w konfiguracji (ani QUIC ani HTTP)",
+                                model
+                            ),
+                            details: None,
+                        }),
+                        metrics: None,
+                    },
                 };
 
                 if backends.is_empty() {
@@ -1096,7 +1205,10 @@ impl Router {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::InternalError,
-                                message: format!("Brak strategii load balancing dla modelu '{}'", model),
+                                message: format!(
+                                    "Brak strategii load balancing dla modelu '{}'",
+                                    model
+                                ),
                                 details: None,
                             }),
                             metrics: None,
@@ -1123,7 +1235,9 @@ impl Router {
 
                 debug!(
                     "Callback ChatCompletion - wybrany backend ({}): {} [{}]",
-                    strategy.name(), backend.url(), backend_idx
+                    strategy.name(),
+                    backend.url(),
+                    backend_idx
                 );
 
                 let openai_messages: Vec<Message> = messages
@@ -1183,17 +1297,15 @@ impl Router {
                             metrics: None,
                         }
                     }
-                    Err(e) => {
-                        ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Backend error: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
+                    Err(e) => ModelResponse {
+                        request_id,
+                        result: ModelResult::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: format!("Backend error: {}", e),
+                            details: Some(e.to_string()),
+                        }),
+                        metrics: None,
+                    },
                 }
             }
 
@@ -1238,7 +1350,11 @@ impl Router {
                         avg_logprob_threshold,
                         compression_ratio_threshold,
                     } => {
-                        debug!("Processing AudioSTT callback: model={}, audio_size={} bytes", model, audio_data.len());
+                        debug!(
+                            "Processing AudioSTT callback: model={}, audio_size={} bytes",
+                            model,
+                            audio_data.len()
+                        );
 
                         let backends = match service_manager.service_backends.get(&model) {
                             Some(b) => b,
@@ -1274,7 +1390,10 @@ impl Router {
                                     request_id,
                                     result: ModelResult::Error(ErrorInfo {
                                         error_type: ErrorType::InternalError,
-                                        message: format!("Brak strategii load balancing dla modelu '{}'", model),
+                                        message: format!(
+                                            "Brak strategii load balancing dla modelu '{}'",
+                                            model
+                                        ),
                                         details: None,
                                     }),
                                     metrics: None,
@@ -1305,7 +1424,9 @@ impl Router {
                             || avg_logprob_threshold.is_some()
                             || compression_ratio_threshold.is_some();
 
-                        let effective_format = if needs_segments && response_format.as_deref() != Some("verbose_json") {
+                        let effective_format = if needs_segments
+                            && response_format.as_deref() != Some("verbose_json")
+                        {
                             Some("verbose_json".to_string())
                         } else {
                             response_format.clone()
@@ -1327,11 +1448,13 @@ impl Router {
 
                         match backend.audio_transcription(transcription_request).await {
                             Ok(transcription) => {
-                                let is_verbose = effective_format.as_deref() == Some("verbose_json");
+                                let is_verbose =
+                                    effective_format.as_deref() == Some("verbose_json");
 
                                 if is_verbose {
                                     if let Some(segments) = transcription.segments {
-                                        let filtered_segments: Vec<_> = segments.into_iter()
+                                        let filtered_segments: Vec<_> = segments
+                                            .into_iter()
                                             .filter(|seg| {
                                                 if let Some(threshold) = no_speech_threshold {
                                                     if seg.no_speech_prob >= threshold {
@@ -1343,7 +1466,8 @@ impl Router {
                                                         return false;
                                                     }
                                                 }
-                                                if let Some(threshold) = compression_ratio_threshold {
+                                                if let Some(threshold) = compression_ratio_threshold
+                                                {
                                                     if seg.compression_ratio > threshold {
                                                         return false;
                                                     }
@@ -1352,7 +1476,8 @@ impl Router {
                                             })
                                             .collect();
 
-                                        let filtered_text = filtered_segments.iter()
+                                        let filtered_text = filtered_segments
+                                            .iter()
                                             .map(|seg| seg.text.as_str())
                                             .collect::<Vec<_>>()
                                             .join("");
@@ -1417,7 +1542,8 @@ impl Router {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::InvalidRequest,
-                                message: "Speaker operations are not supported in RAG callbacks".to_string(),
+                                message: "Speaker operations are not supported in RAG callbacks"
+                                    .to_string(),
                                 details: None,
                             }),
                             metrics: None,
@@ -1430,7 +1556,11 @@ impl Router {
                 let model = vision_payload.model;
                 let messages = vision_payload.messages;
                 let max_tokens = vision_payload.max_tokens;
-                debug!("Processing Vision callback: model={}, messages={}", model, messages.len());
+                debug!(
+                    "Processing Vision callback: model={}, messages={}",
+                    model,
+                    messages.len()
+                );
 
                 let backends = match service_manager.service_backends.get(&model) {
                     Some(b) => b,
@@ -1466,7 +1596,10 @@ impl Router {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::InternalError,
-                                message: format!("Brak strategii load balancing dla modelu '{}'", model),
+                                message: format!(
+                                    "Brak strategii load balancing dla modelu '{}'",
+                                    model
+                                ),
                                 details: None,
                             }),
                             metrics: None,
@@ -1491,15 +1624,15 @@ impl Router {
 
                 let backend = &backends[backend_idx];
 
-                match backend.vision(model.clone(), messages.clone(), max_tokens).await {
+                match backend
+                    .vision(model.clone(), messages.clone(), max_tokens)
+                    .await
+                {
                     Ok(text) => {
                         debug!("Vision callback success: {} znaki tekstu", text.len());
                         ModelResponse {
                             request_id,
-                            result: ModelResult::Vision(VisionResult {
-                                text,
-                                model,
-                            }),
+                            result: ModelResult::Vision(VisionResult { text, model }),
                             metrics: None,
                         }
                     }
@@ -1533,9 +1666,19 @@ impl Router {
 
             ModelPayload::Rerank(rerank_payload) => {
                 let model = rerank_payload.model.clone();
-                debug!("Rerank callback: model={}, {} dokumentow", model, rerank_payload.documents.len());
+                debug!(
+                    "Rerank callback: model={}, {} dokumentow",
+                    model,
+                    rerank_payload.documents.len()
+                );
 
-                let rerank_handle = { service_manager.quic_embedding_services.read().get(&model).cloned() };
+                let rerank_handle = {
+                    service_manager
+                        .quic_embedding_services
+                        .read()
+                        .get(&model)
+                        .cloned()
+                };
                 if let Some(quic_handle) = rerank_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla rerankingu: {}", model);
@@ -1587,8 +1730,12 @@ impl Router {
                     request_id,
                     result: ModelResult::Error(ErrorInfo {
                         error_type: ErrorType::InvalidRequest,
-                        message: "Memory callbacks should use Embeddings payload, not Memory payload".to_string(),
-                        details: Some("Memory Engine uses Router for embeddings callbacks only".to_string()),
+                        message:
+                            "Memory callbacks should use Embeddings payload, not Memory payload"
+                                .to_string(),
+                        details: Some(
+                            "Memory Engine uses Router for embeddings callbacks only".to_string(),
+                        ),
                     }),
                     metrics: None,
                 }
@@ -1601,7 +1748,10 @@ impl Router {
                     result: ModelResult::Error(ErrorInfo {
                         error_type: ErrorType::InvalidRequest,
                         message: "PrefixCacheInit is not valid in callbacks".to_string(),
-                        details: Some("PrefixCacheInit is sent from Router to LLM, not in callbacks".to_string()),
+                        details: Some(
+                            "PrefixCacheInit is sent from Router to LLM, not in callbacks"
+                                .to_string(),
+                        ),
                     }),
                     metrics: None,
                 }
@@ -1614,17 +1764,30 @@ impl Router {
         &self,
         request: tentaflow_protocol::IngestRequest,
     ) -> Result<tentaflow_protocol::IngestResponse> {
-        let rag_handle = { self.service_manager.rag_services.read().values().next().cloned() }
-            .ok_or_else(|| CoreError::ModelNotFound {
-                model_name: "rag".to_string(),
-            })?;
+        let rag_handle = {
+            self.service_manager
+                .rag_services
+                .read()
+                .values()
+                .next()
+                .cloned()
+        }
+        .ok_or_else(|| CoreError::ModelNotFound {
+            model_name: "rag".to_string(),
+        })?;
 
-        let rag_client = rag_handle.get_client().await
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: "rag".to_string(),
-            })?;
+        let rag_client =
+            rag_handle
+                .get_client()
+                .await
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: "rag".to_string(),
+                })?;
 
-        debug!("Wysylanie IngestRequest do RAG: doc_id={}", request.document_id);
+        debug!(
+            "Wysylanie IngestRequest do RAG: doc_id={}",
+            request.document_id
+        );
 
         let response = rag_client.send_ingest_request(request).await?;
 
@@ -1647,26 +1810,40 @@ impl Router {
     ) -> Result<tentaflow_protocol::ModelResponse> {
         use tentaflow_protocol::*;
 
-        debug!("route_rag_payload: query={}, search_modes={:?}",
+        debug!(
+            "route_rag_payload: query={}, search_modes={:?}",
             rag_payload.query.chars().take(50).collect::<String>(),
-            rag_payload.search_modes);
+            rag_payload.search_modes
+        );
 
-        let (rag_name, rag_handle) = { self.service_manager.rag_services.read().iter().next().map(|(n, h)| (n.clone(), h.clone())) }
-            .ok_or_else(|| CoreError::InternalError {
-                message: "Brak skonfigurowanego RAG engine".to_string(),
-                source: None,
-            })?;
+        let (rag_name, rag_handle) = {
+            self.service_manager
+                .rag_services
+                .read()
+                .iter()
+                .next()
+                .map(|(n, h)| (n.clone(), h.clone()))
+        }
+        .ok_or_else(|| CoreError::InternalError {
+            message: "Brak skonfigurowanego RAG engine".to_string(),
+            source: None,
+        })?;
 
-        let rag_client = rag_handle.get_client().await
-            .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                model_name: rag_name.clone(),
-            })?;
+        let rag_client =
+            rag_handle
+                .get_client()
+                .await
+                .ok_or_else(|| CoreError::AllBackendsUnavailable {
+                    model_name: rag_name.clone(),
+                })?;
 
         debug!("route_rag_payload: uzywam RAG engine: {}", rag_name);
 
         let rag_result = rag_client.send_request(rag_payload).await?;
 
-        let cleaned_context = self.response_middleware.clean_text(&rag_result.context_text)?;
+        let cleaned_context = self
+            .response_middleware
+            .clean_text(&rag_result.context_text)?;
 
         let request_id = uuid::Uuid::new_v4().to_string();
 
@@ -1723,10 +1900,18 @@ impl Router {
         use tentaflow_protocol::*;
 
         let route = self.resolve_route(model);
-        let model_name = route.targets.first().cloned().unwrap_or_else(|| model.to_string());
+        let model_name = route
+            .targets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| model.to_string());
 
-        debug!("route_completion_via_protocol: model={}, messages={}, prompt_len={:?}",
-               model_name, messages.len(), prompt.as_ref().map(|p| p.len()));
+        debug!(
+            "route_completion_via_protocol: model={}, messages={}, prompt_len={:?}",
+            model_name,
+            messages.len(),
+            prompt.as_ref().map(|p| p.len())
+        );
 
         let start_time = std::time::Instant::now();
 
@@ -1765,51 +1950,57 @@ impl Router {
             let req = request.clone();
             let prompt_c = prompt.clone();
             let stop_c = stop.clone();
-            let route_result = self.dispatch_with_fallback(model, 0, |handle| {
-                let this = this.clone();
-                let req = req.clone();
-                let prompt_c = prompt_c.clone();
-                let stop_c = stop_c.clone();
-                let handle = handle.clone();
-                async move {
-                    match &handle {
-                        BackendHandle::QuicLlm(name) => {
-                            this.route_to_quic_llm(name.clone(), req, prompt_c, stop_c).await
+            let route_result = self
+                .dispatch_with_fallback(model, 0, |handle| {
+                    let this = this.clone();
+                    let req = req.clone();
+                    let prompt_c = prompt_c.clone();
+                    let stop_c = stop_c.clone();
+                    let handle = handle.clone();
+                    async move {
+                        match &handle {
+                            BackendHandle::QuicLlm(name) => {
+                                this.route_to_quic_llm(name.clone(), req, prompt_c, stop_c)
+                                    .await
+                            }
+                            BackendHandle::LocalLlm => {
+                                this.local_inference.handle_chat_completion(&req).await
+                            }
+                            BackendHandle::Rag(name) => this.route_to_rag(name.clone(), req).await,
+                            BackendHandle::Http(name) => {
+                                let backend = this.select_http_backend(name).ok_or_else(|| {
+                                    anyhow::anyhow!("Brak backendow dla {}", name)
+                                })?;
+                                Ok(backend.chat_completion(req).await?)
+                            }
+                            _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla completion")),
                         }
-                        BackendHandle::LocalLlm => {
-                            this.local_inference.handle_chat_completion(&req).await
-                        }
-                        BackendHandle::Rag(name) => {
-                            this.route_to_rag(name.clone(), req).await
-                        }
-                        BackendHandle::Http(name) => {
-                            let backend = this.select_http_backend(name)
-                                .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
-                            Ok(backend.chat_completion(req).await?)
-                        }
-                        _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla completion")),
                     }
-                }
-            }).await?;
+                })
+                .await?;
             route_result.response
         };
 
         let content = crate::routing::extract_response_text(&response);
 
-        let reasoning_content = response.choices.first()
+        let reasoning_content = response
+            .choices
+            .first()
             .and_then(|c| c.message.reasoning_content.clone());
 
-        let tool_calls = response.choices.first()
+        let tool_calls = response
+            .choices
+            .first()
             .and_then(|c| c.message.tool_calls.as_ref())
             .map(|tcs| {
-                tcs.iter().map(|tc| {
-                    ToolCallResult {
+                tcs.iter()
+                    .map(|tc| ToolCallResult {
                         id: tc.id.clone(),
                         tool_type: tc.tool_type.clone(),
                         function_name: tc.function.name.clone(),
                         arguments: tc.function.arguments.clone(),
-                    }
-                }).collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
             });
 
         let cleaned_content = self.response_middleware.clean_text(&content)?;
@@ -1820,7 +2011,9 @@ impl Router {
             None
         };
 
-        let finish_reason = response.choices.first()
+        let finish_reason = response
+            .choices
+            .first()
             .and_then(|c| c.finish_reason.clone());
 
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -1873,11 +2066,20 @@ impl Router {
     ) -> Result<tentaflow_protocol::ModelResponse> {
         use tentaflow_protocol::*;
 
-        debug!("route_memory_via_quic: START operation={:?}", std::mem::discriminant(&payload.operation));
+        debug!(
+            "route_memory_via_quic: START operation={:?}",
+            std::mem::discriminant(&payload.operation)
+        );
 
         let quic_client = {
             let mut client = None;
-            let memory_handles: Vec<_> = self.service_manager.quic_memory_services.read().values().cloned().collect();
+            let memory_handles: Vec<_> = self
+                .service_manager
+                .quic_memory_services
+                .read()
+                .values()
+                .cloned()
+                .collect();
             for handle in memory_handles {
                 if let Some(c) = handle.get_client().await {
                     client = Some(c);
@@ -1915,20 +2117,28 @@ impl Router {
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let route = self.resolve_route(&payload.model);
-        let model_name = route.targets.first().cloned().unwrap_or_else(|| payload.model.clone());
+        let model_name = route
+            .targets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| payload.model.clone());
 
-        debug!("Vision: model={}, liczba_wiadomosci={}", model_name, payload.messages.len());
+        debug!(
+            "Vision: model={}, liczba_wiadomosci={}",
+            model_name,
+            payload.messages.len()
+        );
 
-        let openai_messages: Vec<crate::api::openai::types::Message> = payload.messages
+        let openai_messages: Vec<crate::api::openai::types::Message> = payload
+            .messages
             .iter()
             .map(|vm| {
-                let parts: Vec<crate::api::openai::types::ContentPart> = vm.content
+                let parts: Vec<crate::api::openai::types::ContentPart> = vm
+                    .content
                     .iter()
                     .map(|part| match part {
                         VisionContentPart::Text { text } => {
-                            crate::api::openai::types::ContentPart::Text {
-                                text: text.clone(),
-                            }
+                            crate::api::openai::types::ContentPart::Text { text: text.clone() }
                         }
                         VisionContentPart::ImageUrl { url, detail } => {
                             crate::api::openai::types::ContentPart::ImageUrl {
@@ -1976,7 +2186,9 @@ impl Router {
 
                 let cleaned_content = self.response_middleware.clean_text(&content)?;
 
-                let finish_reason = response.choices.first()
+                let finish_reason = response
+                    .choices
+                    .first()
                     .and_then(|c| c.finish_reason.clone());
 
                 let metrics = response.usage.map(|usage| ModelMetrics {
@@ -2039,13 +2251,19 @@ impl Router {
             ImageOperation::Variation { model, .. } => (model.clone(), "Wariacja"),
         };
 
-        warn!("Operacja {} na obrazie niezaimplementowana dla modelu: {}", op_name, model);
+        warn!(
+            "Operacja {} na obrazie niezaimplementowana dla modelu: {}",
+            op_name, model
+        );
 
         Ok(ModelResponse {
             request_id,
             result: ModelResult::Error(ErrorInfo {
                 error_type: ErrorType::InternalError,
-                message: format!("Operacja {} na obrazie niezaimplementowana - wymaga ImageClient", op_name),
+                message: format!(
+                    "Operacja {} na obrazie niezaimplementowana - wymaga ImageClient",
+                    op_name
+                ),
                 details: None,
             }),
             metrics: None,
@@ -2054,7 +2272,10 @@ impl Router {
 }
 
 /// Konwertuje wynik flow engine na standardowy ChatCompletionResponse.
-pub(crate) fn flow_result_to_chat_response(result: FlowExecutionResult, model: &str) -> ChatCompletionResponse {
+pub(crate) fn flow_result_to_chat_response(
+    result: FlowExecutionResult,
+    model: &str,
+) -> ChatCompletionResponse {
     let json_value = converter::flow_result_to_chat_response(&result, model);
     serde_json::from_value(json_value).unwrap_or_else(|_| {
         let text = result

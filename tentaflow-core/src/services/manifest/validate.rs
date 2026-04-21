@@ -57,9 +57,7 @@ pub enum ValidationError {
     )]
     PythonBundleRequiresBundlePath { engine_id: String },
 
-    #[error(
-        "Engine '{engine_id}': sciezka {field} = '{path}' nie istnieje na dysku"
-    )]
+    #[error("Engine '{engine_id}': sciezka {field} = '{path}' nie istnieje na dysku")]
     PathMissing {
         engine_id: String,
         field: &'static str,
@@ -130,7 +128,13 @@ pub fn validate_engine(
     // Reguła 4: sciezki na dysku (sprawdzana tylko build-time).
     if let Some(root) = containers_root {
         if let Some(d) = &deploy.docker {
-            check_path(root, &d.context_path, "deploy.docker.context_path", eid, &mut errors);
+            check_path(
+                root,
+                &d.context_path,
+                "deploy.docker.context_path",
+                eid,
+                &mut errors,
+            );
         }
         if let Some(n) = &deploy.native {
             if let Some(p) = &n.binary_path {

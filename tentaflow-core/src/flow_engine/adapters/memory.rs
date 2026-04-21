@@ -32,7 +32,13 @@ impl MemoryNodeAdapter {
 
     /// Pobiera pierwszego dostepnego klienta QUIC Memory
     async fn get_memory_client(&self) -> Result<Arc<crate::net::quic::QuicClient>> {
-        let handles: Vec<_> = self.service_manager.quic_memory_services.read().values().cloned().collect();
+        let handles: Vec<_> = self
+            .service_manager
+            .quic_memory_services
+            .read()
+            .values()
+            .cloned()
+            .collect();
         for handle in handles {
             if let Some(client) = handle.get_client().await {
                 return Ok(client);
@@ -90,11 +96,7 @@ impl MemoryNodeAdapter {
     }
 
     /// Wykonuje zapytanie do Memory (tryb "query")
-    async fn execute_query(
-        &self,
-        node_config: &Value,
-        ctx: &FlowContext,
-    ) -> Result<Value> {
+    async fn execute_query(&self, node_config: &Value, ctx: &FlowContext) -> Result<Value> {
         let quic_client = self.get_memory_client().await?;
 
         let query = self.resolve_query_text(node_config, ctx);
@@ -143,69 +145,65 @@ impl MemoryNodeAdapter {
         let response = quic_client.send_request(model_request).await?;
 
         match response.result {
-            ModelResult::Memory(memory_result) => {
-                match memory_result.result_type {
-                    MemoryResultType::Query(query_result) => {
-                        let memories: Vec<Value> = query_result
-                            .answers
-                            .iter()
-                            .map(|answer| {
-                                serde_json::json!({
-                                    "id": answer.node_id,
-                                    "label": answer.label,
-                                    "node_type": answer.node_type,
-                                    "score": answer.score,
-                                })
+            ModelResult::Memory(memory_result) => match memory_result.result_type {
+                MemoryResultType::Query(query_result) => {
+                    let memories: Vec<Value> = query_result
+                        .answers
+                        .iter()
+                        .map(|answer| {
+                            serde_json::json!({
+                                "id": answer.node_id,
+                                "label": answer.label,
+                                "node_type": answer.node_type,
+                                "score": answer.score,
                             })
-                            .collect();
+                        })
+                        .collect();
 
-                        let avg_relevance = if !query_result.answers.is_empty() {
-                            query_result.answers.iter()
-                                .map(|a| a.score)
-                                .sum::<f32>()
-                                / query_result.answers.len() as f32
-                        } else {
-                            0.0
-                        };
+                    let avg_relevance = if !query_result.answers.is_empty() {
+                        query_result.answers.iter().map(|a| a.score).sum::<f32>()
+                            / query_result.answers.len() as f32
+                    } else {
+                        0.0
+                    };
 
-                        let context_text: String = query_result
-                            .answers
-                            .iter()
-                            .filter(|a| a.score >= 0.5)
-                            .map(|a| a.label.clone())
-                            .collect::<Vec<_>>()
-                            .join("; ");
+                    let context_text: String = query_result
+                        .answers
+                        .iter()
+                        .filter(|a| a.score >= 0.5)
+                        .map(|a| a.label.clone())
+                        .collect::<Vec<_>>()
+                        .join("; ");
 
-                        let reasoning_count = query_result
-                            .reasoning_paths
-                            .as_ref()
-                            .map(|p| p.len())
-                            .unwrap_or(0);
+                    let reasoning_count = query_result
+                        .reasoning_paths
+                        .as_ref()
+                        .map(|p| p.len())
+                        .unwrap_or(0);
 
-                        debug!(
-                            "Memory adapter: otrzymano {} odpowiedzi, {} sciezek rozumowania",
-                            query_result.answers.len(),
-                            reasoning_count
-                        );
+                    debug!(
+                        "Memory adapter: otrzymano {} odpowiedzi, {} sciezek rozumowania",
+                        query_result.answers.len(),
+                        reasoning_count
+                    );
 
-                        Ok(serde_json::json!({
-                            "memories": memories,
-                            "relevance": avg_relevance,
-                            "text": context_text,
-                            "answers_count": query_result.answers.len(),
-                            "reasoning_paths_count": reasoning_count,
-                        }))
-                    }
-                    _ => {
-                        warn!("Memory adapter: nieoczekiwany typ wyniku Memory");
-                        Ok(serde_json::json!({
-                            "memories": [],
-                            "relevance": 0,
-                            "text": "",
-                        }))
-                    }
+                    Ok(serde_json::json!({
+                        "memories": memories,
+                        "relevance": avg_relevance,
+                        "text": context_text,
+                        "answers_count": query_result.answers.len(),
+                        "reasoning_paths_count": reasoning_count,
+                    }))
                 }
-            }
+                _ => {
+                    warn!("Memory adapter: nieoczekiwany typ wyniku Memory");
+                    Ok(serde_json::json!({
+                        "memories": [],
+                        "relevance": 0,
+                        "text": "",
+                    }))
+                }
+            },
             ModelResult::Error(err) => {
                 bail!(
                     "Memory adapter query error: {:?} - {}",
@@ -243,11 +241,7 @@ impl MemoryNodeAdapter {
     }
 
     /// Wykonuje zapis do Memory (tryb "store")
-    async fn execute_store(
-        &self,
-        node_config: &Value,
-        ctx: &FlowContext,
-    ) -> Result<Value> {
+    async fn execute_store(&self, node_config: &Value, ctx: &FlowContext) -> Result<Value> {
         let quic_client = self.get_memory_client().await?;
 
         let session_id = node_config
@@ -268,20 +262,33 @@ impl MemoryNodeAdapter {
 
         if let Some(facts_arr) = facts_json.and_then(|v| v.as_array()) {
             for fact in facts_arr {
-                let subject = fact.get("subject").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let relation = fact.get("relation")
+                let subject = fact
+                    .get("subject")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let relation = fact
+                    .get("relation")
                     .or_else(|| fact.get("predicate"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let object = fact.get("object").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let object = fact
+                    .get("object")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
                 if !subject.is_empty() && !relation.is_empty() && !object.is_empty() {
                     facts.push(MemoryFact {
                         subject,
                         relation,
                         object,
-                        confidence: fact.get("confidence").and_then(|v| v.as_f64()).map(|c| c as f32).unwrap_or(1.0),
+                        confidence: fact
+                            .get("confidence")
+                            .and_then(|v| v.as_f64())
+                            .map(|c| c as f32)
+                            .unwrap_or(1.0),
                         source: Some("flow_engine".to_string()),
                         metadata: None,
                     });
@@ -323,30 +330,28 @@ impl MemoryNodeAdapter {
         };
 
         match quic_client.send_request(model_request).await {
-            Ok(response) => {
-                match response.result {
-                    ModelResult::Memory(_) => {
-                        debug!("Memory adapter: zapisano {} faktow", facts.len());
-                        Ok(serde_json::json!({
-                            "stored": true,
-                            "facts_count": facts.len(),
-                        }))
-                    }
-                    ModelResult::Error(err) => {
-                        bail!(
-                            "Memory adapter store error: {:?} - {}",
-                            err.error_type,
-                            err.message
-                        );
-                    }
-                    _ => {
-                        warn!("Memory adapter: nieoczekiwany typ odpowiedzi store");
-                        Ok(serde_json::json!({
-                            "stored": false,
-                        }))
-                    }
+            Ok(response) => match response.result {
+                ModelResult::Memory(_) => {
+                    debug!("Memory adapter: zapisano {} faktow", facts.len());
+                    Ok(serde_json::json!({
+                        "stored": true,
+                        "facts_count": facts.len(),
+                    }))
                 }
-            }
+                ModelResult::Error(err) => {
+                    bail!(
+                        "Memory adapter store error: {:?} - {}",
+                        err.error_type,
+                        err.message
+                    );
+                }
+                _ => {
+                    warn!("Memory adapter: nieoczekiwany typ odpowiedzi store");
+                    Ok(serde_json::json!({
+                        "stored": false,
+                    }))
+                }
+            },
             Err(e) => {
                 bail!("Memory adapter: QUIC store request failed: {}", e);
             }
@@ -365,17 +370,21 @@ impl NodeAdapter for MemoryNodeAdapter {
             "query" => {
                 let result = self.execute_query(node_config, ctx).await?;
 
-                let inject = node_config.get("inject_to_messages")
+                let inject = node_config
+                    .get("inject_to_messages")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
                 if inject {
                     if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
                         if !text.is_empty() {
-                            let prompt_id = node_config.get("context_prompt_id")
+                            let prompt_id = node_config
+                                .get("context_prompt_id")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("memory_context_template");
-                            let template = self.service_manager.prompt_registry
+                            let template = self
+                                .service_manager
+                                .prompt_registry
                                 .get_content(prompt_id)
                                 .map(|s| s.replace("{context}", text))
                                 .unwrap_or_else(|| format!("Kontekst z pamieci:\n{}", text));

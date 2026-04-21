@@ -114,9 +114,7 @@ impl NodeAdapter for RagNodeAdapter {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.7) as f32;
 
-        let use_reranking = node_config
-            .get("use_reranking")
-            .and_then(|v| v.as_bool());
+        let use_reranking = node_config.get("use_reranking").and_then(|v| v.as_bool());
 
         let search_modes = self.parse_search_modes(node_config);
 
@@ -131,23 +129,22 @@ impl NodeAdapter for RagNodeAdapter {
 
         // Pobierz handle serwisu RAG
         let rag_handle = {
-            self.service_manager.rag_services.read().get(&engine_name).cloned()
-        }.ok_or_else(|| {
+            self.service_manager
+                .rag_services
+                .read()
+                .get(&engine_name)
+                .cloned()
+        }
+        .ok_or_else(|| {
             anyhow::anyhow!(
                 "RAG adapter: serwis '{}' nie jest skonfigurowany",
                 engine_name
             )
         })?;
 
-        let rag_client = rag_handle
-            .get_client()
-            .await
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "RAG adapter: serwis '{}' nie jest polaczony",
-                    engine_name
-                )
-            })?;
+        let rag_client = rag_handle.get_client().await.ok_or_else(|| {
+            anyhow::anyhow!("RAG adapter: serwis '{}' nie jest polaczony", engine_name)
+        })?;
 
         // Zbuduj RAGPayload
         let rag_payload = RAGPayload {
@@ -183,7 +180,11 @@ impl NodeAdapter for RagNodeAdapter {
             .collect();
 
         let avg_score = if !rag_result.metadata.is_empty() {
-            rag_result.metadata.iter().map(|c| c.similarity_score).sum::<f32>()
+            rag_result
+                .metadata
+                .iter()
+                .map(|c| c.similarity_score)
+                .sum::<f32>()
                 / rag_result.metadata.len() as f32
         } else {
             0.0

@@ -8,15 +8,15 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use super::runtime::{WasmEngine, WasmInstance, WasmModule, WasmStore};
 use anyhow::Result;
 use parking_lot::Mutex;
 use tracing::{info, warn};
-use super::runtime::{WasmEngine, WasmModule, WasmStore, WasmInstance};
 
-use super::{AddonInstance, AddonState};
 use super::event_bus::EventBus;
 use super::host_functions;
 use super::permissions::PermissionChecker;
+use super::{AddonInstance, AddonState};
 use crate::db::DbPool;
 
 // =============================================================================
@@ -39,6 +39,8 @@ pub struct InstancePool {
     declared_permissions: Vec<String>,
     /// Router do routowania requestow LLM
     router: Option<Arc<crate::routing::router::Router>>,
+    /// Per-account mutex map for OAuth refresh deduplication.
+    oauth_refresh_guard: Arc<super::oauth_refresh_guard::OAuthRefreshGuard>,
 }
 
 /// Wpis w puli — gotowa instancja WASM
@@ -83,6 +85,7 @@ impl InstancePool {
             settings_cipher,
             declared_permissions,
             router,
+            oauth_refresh_guard: Arc::new(super::oauth_refresh_guard::OAuthRefreshGuard::new()),
         };
 
         // Pre-warm instancje
@@ -103,7 +106,10 @@ impl InstancePool {
             Some(e) => (e.store, e.instance),
             None => {
                 // Pula pusta — tworzymy nowa instancje na zywo
-                warn!("InstancePool[{}]: pula wyczerpana, tworzenie instancji on-demand", self.addon_id);
+                warn!(
+                    "InstancePool[{}]: pula wyczerpana, tworzenie instancji on-demand",
+                    self.addon_id
+                );
                 self.create_instance(user_id)?
             }
         };
@@ -122,7 +128,8 @@ impl InstancePool {
                 "SELECT fuel_limit FROM addon_resource_limits WHERE addon_id = ?1",
                 rusqlite::params![&self.addon_id],
                 |row| row.get::<_, i64>(0),
-            ).unwrap_or(0)
+            )
+            .unwrap_or(0)
         };
         let effective_fuel = if fuel_limit > 0 {
             fuel_limit as u64
@@ -163,7 +170,11 @@ impl InstancePool {
         }
 
         // Resetuj stan
-        let AddonInstance { mut store, instance, .. } = addon_instance;
+        let AddonInstance {
+            mut store,
+            instance,
+            ..
+        } = addon_instance;
 
         // CR-007: Wyzeruj guest memory przed zwroceniem do puli
         // Zapobiega wyciekowi danych (sekretow, kontekstu uzytkownika) miedzy sesjami
@@ -183,7 +194,9 @@ impl InstancePool {
 
         info!(
             "InstancePool[{}]: instancja zwrocona do puli ({}/{})",
-            self.addon_id, pool.len(), self.pool_size
+            self.addon_id,
+            pool.len(),
+            self.pool_size
         );
     }
 
@@ -214,44 +227,36 @@ impl InstancePool {
 
         info!(
             "InstancePool[{}]: pre-warmed {} instancji (total {}/{})",
-            self.addon_id, needed, pool.len(), self.pool_size
+            self.addon_id,
+            needed,
+            pool.len(),
+            self.pool_size
         );
 
         Ok(())
     }
 
     /// Tworzy nowa instancje WASM (store + instance)
-    fn create_instance(&self, user_id: Option<i64>) -> Result<(WasmStore<AddonState>, WasmInstance)> {
+    fn create_instance(
+        &self,
+        user_id: Option<i64>,
+    ) -> Result<(WasmStore<AddonState>, WasmInstance)> {
         // Zaladuj manifest z DB (potrzebny do walidacji regul sieciowych)
         let manifest = {
             let conn = self.db.lock().unwrap();
-            let manifest_content: String = conn.query_row(
-                "SELECT manifest_json FROM addons WHERE addon_id = ?1",
-                rusqlite::params![&self.addon_id],
-                |row| row.get(0),
-            ).unwrap_or_else(|_| "{}".to_string());
-            super::lifecycle::parse_manifest_toml(&manifest_content)
-                .unwrap_or_else(|_| super::AddonManifest {
+            let manifest_content: String = conn
+                .query_row(
+                    "SELECT manifest_json FROM addons WHERE addon_id = ?1",
+                    rusqlite::params![&self.addon_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| "{}".to_string());
+            super::lifecycle::parse_manifest_toml(&manifest_content).unwrap_or_else(|_| {
+                super::AddonManifest {
                     addon_id: self.addon_id.clone(),
-                    version: String::new(),
-                    display_name: String::new(),
-                    description: None,
-                    author: None,
-                    permissions: Vec::new(),
-                    platforms: Vec::new(),
-                    wasm_file: String::new(),
-                    skill_file: None,
-                    blocks_file: None,
-                    icon_file: None,
-                    resource_limits: None,
-                    keywords: Vec::new(),
-                    category: None,
-                    tools: Vec::new(),
-                    declared_permissions: Vec::new(),
-                    network_rules: Vec::new(),
-                    disambiguation: Vec::new(),
-                    resources: None,
-                })
+                    ..Default::default()
+                }
+            })
         };
 
         let state = AddonState {
@@ -272,6 +277,7 @@ impl InstancePool {
             manifest: Arc::new(manifest),
             memory_limit: super::DEFAULT_MEMORY_LIMIT_BYTES,
             router: self.router.clone(),
+            oauth_refresh_guard: self.oauth_refresh_guard.clone(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             store_limits: wasmi::StoreLimitsBuilder::new()
                 .memory_size(super::DEFAULT_MEMORY_LIMIT_BYTES)

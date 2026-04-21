@@ -77,7 +77,8 @@ impl RouterMetrics {
     /// Rejestruje zuzycie tokenow (wejsciowe i wyjsciowe).
     pub fn record_tokens(&self, input: u64, output: u64) {
         self.total_input_tokens.fetch_add(input, Ordering::Relaxed);
-        self.total_output_tokens.fetch_add(output, Ordering::Relaxed);
+        self.total_output_tokens
+            .fetch_add(output, Ordering::Relaxed);
     }
 
     /// Ustawia liczbe aktywnych serwisow

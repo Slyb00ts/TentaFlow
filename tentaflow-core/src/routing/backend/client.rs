@@ -6,7 +6,7 @@
 // =============================================================================
 
 use crate::config::ServiceBackend;
-use crate::error::{Result, CoreError};
+use crate::error::{CoreError, Result};
 use crate::routing::loadbalancer::{CircuitBreaker, CircuitBreakerConfig};
 
 // TODO: typy OpenAI API nie sa jeszcze przeniesione do Core
@@ -77,51 +77,53 @@ impl BackendClient {
     ///
     /// Zwraca: Instancje BackendClient
     /// Bledy: ConfigError jesli ConnectionType nie jest OpenAIApi lub API key nie jest ustawiony
-    pub fn new(config: ServiceBackend, circuit_breaker_config: Option<CircuitBreakerConfig>) -> Result<Self> {
+    pub fn new(
+        config: ServiceBackend,
+        circuit_breaker_config: Option<CircuitBreakerConfig>,
+    ) -> Result<Self> {
         use crate::config::ConnectionType;
 
         // Ekstraktuj pola z ConnectionType::OpenAIApi
-        let (url, api_key_opt, api_key_env_opt, custom_endpoint, request_format) = match &config.connection {
-            ConnectionType::OpenAIApi {
-                url,
-                api_key,
-                api_key_env,
-                custom_endpoint,
-                request_format,
-                ..
-            } => (
-                url.clone(),
-                api_key.clone(),
-                api_key_env.clone(),
-                custom_endpoint.clone(),
-                request_format.clone(),
-            ),
-            ConnectionType::QUIC { .. } => {
-                return Err(CoreError::ConfigError {
-                    message: "BackendClient wymaga ConnectionType::OpenAIApi, otrzymano QUIC".to_string(),
-                    source: anyhow::anyhow!("Invalid connection type for BackendClient"),
-                }.into());
-            }
-        };
+        let (url, api_key_opt, api_key_env_opt, custom_endpoint, request_format) =
+            match &config.connection {
+                ConnectionType::OpenAIApi {
+                    url,
+                    api_key,
+                    api_key_env,
+                    custom_endpoint,
+                    request_format,
+                    ..
+                } => (
+                    url.clone(),
+                    api_key.clone(),
+                    api_key_env.clone(),
+                    custom_endpoint.clone(),
+                    request_format.clone(),
+                ),
+                ConnectionType::QUIC { .. } => {
+                    return Err(CoreError::ConfigError {
+                        message: "BackendClient wymaga ConnectionType::OpenAIApi, otrzymano QUIC"
+                            .to_string(),
+                        source: anyhow::anyhow!("Invalid connection type for BackendClient"),
+                    }
+                    .into());
+                }
+            };
 
         // Wczytaj API key: priorytet dla direct key, fallback do env var
         let api_key = if let Some(key) = api_key_opt {
             key
         } else if let Some(env_var) = api_key_env_opt {
-            std::env::var(&env_var).map_err(|_| {
-                CoreError::ConfigError {
-                    message: format!(
-                        "Zmienna srodowiskowa '{}' nie jest ustawiona",
-                        env_var
-                    ),
-                    source: anyhow::anyhow!("Missing API key env var"),
-                }
+            std::env::var(&env_var).map_err(|_| CoreError::ConfigError {
+                message: format!("Zmienna srodowiskowa '{}' nie jest ustawiona", env_var),
+                source: anyhow::anyhow!("Missing API key env var"),
             })?
         } else {
             return Err(CoreError::ConfigError {
                 message: "Brak api_key ani api_key_env w konfiguracji backend".to_string(),
                 source: anyhow::anyhow!("No API key configured"),
-            }.into());
+            }
+            .into());
         };
 
         // Utworz reqwest::Client z timeout
@@ -178,7 +180,8 @@ impl BackendClient {
                 backend_url: self.url.clone(),
                 message: "Circuit breaker OPEN - backend unavailable".to_string(),
                 source: None,
-            }.into());
+            }
+            .into());
         }
         Ok(())
     }
@@ -235,7 +238,6 @@ impl BackendClient {
 
         // Sprawdz status code
         if !status.is_success() {
-
             // 4xx (client errors) NIE powinny triggerowac circuit breakera
             if status.is_server_error() {
                 self.circuit_breaker.record_failure();
@@ -246,14 +248,13 @@ impl BackendClient {
         // Parsuj JSON response
         // Jesli backend wymaga transformacji odpowiedzi (np. PaddleOCR), parsuj jako Value i transformuj
         let completion = if self.request_format.as_deref() == Some("paddleocr") {
-            let response_value = response
-                .json::<serde_json::Value>()
-                .await
-                .map_err(|e| CoreError::BackendError {
+            let response_value = response.json::<serde_json::Value>().await.map_err(|e| {
+                CoreError::BackendError {
                     backend_url: self.url.clone(),
                     message: format!("Nie mozna sparsowac odpowiedzi: {}", e),
                     source: Some(e.into()),
-                })?;
+                }
+            })?;
 
             self.transform_response(&response_value)?
         } else {
@@ -275,7 +276,6 @@ impl BackendClient {
                 .map(|u| u.total_tokens)
                 .unwrap_or(0)
         );
-
 
         self.circuit_breaker.record_success();
 
@@ -319,7 +319,6 @@ impl BackendClient {
 
         // Sprawdz status code
         if !status.is_success() {
-
             if status.is_server_error() {
                 self.circuit_breaker.record_failure();
             }
@@ -329,7 +328,8 @@ impl BackendClient {
                 backend_url: self.url.clone(),
                 message: format!("Backend zwrocil blad HTTP {}: {}", status, error_body),
                 source: None,
-            }.into());
+            }
+            .into());
         }
 
         // Konwertuj response na byte stream
@@ -379,14 +379,20 @@ impl BackendClient {
                         debug!("Raw SSE JSON: {}", json_str);
                         match serde_json::from_str::<ChatCompletionChunk>(json_str) {
                             Ok(chunk) => {
-                                debug!("Parsed chunk: id={}, choices={} deltas", chunk.id, chunk.choices.len());
+                                debug!(
+                                    "Parsed chunk: id={}, choices={} deltas",
+                                    chunk.id,
+                                    chunk.choices.len()
+                                );
                                 if let Some(first_choice) = chunk.choices.first() {
-                                    debug!("   Delta content: {:?}, reasoning: {:?}",
+                                    debug!(
+                                        "   Delta content: {:?}, reasoning: {:?}",
                                         first_choice.delta.content,
-                                        first_choice.delta.reasoning_content);
+                                        first_choice.delta.reasoning_content
+                                    );
                                 }
                                 results.push(Ok(chunk))
-                            },
+                            }
                             Err(e) => {
                                 warn!("Nie mozna sparsowac chunk: {} - blad: {}", json_str, e);
                                 results.push(Err(CoreError::BackendError {
@@ -444,20 +450,19 @@ impl BackendClient {
         let error_body = response.text().await.unwrap_or_else(|_| String::new());
 
         // Probuj sparsowac jako ErrorResponse
-        let error_message = if let Ok(error_response) =
-            serde_json::from_str::<ErrorResponse>(&error_body)
-        {
-            format!(
-                "Backend error: {} ({})",
-                error_response.error.message, error_response.error.error_type
-            )
-        } else {
-            format!(
-                "Backend zwrocil blad HTTP {}: {}",
-                status,
-                error_body.chars().take(200).collect::<String>()
-            )
-        };
+        let error_message =
+            if let Ok(error_response) = serde_json::from_str::<ErrorResponse>(&error_body) {
+                format!(
+                    "Backend error: {} ({})",
+                    error_response.error.message, error_response.error.error_type
+                )
+            } else {
+                format!(
+                    "Backend zwrocil blad HTTP {}: {}",
+                    status,
+                    error_body.chars().take(200).collect::<String>()
+                )
+            };
 
         error!("{}", error_message);
 
@@ -516,7 +521,6 @@ impl BackendClient {
 
         // Sprawdz status code
         if !status.is_success() {
-
             if status.is_server_error() {
                 self.circuit_breaker.record_failure();
             }
@@ -530,14 +534,15 @@ impl BackendClient {
         }
 
         // Parsuj JSON response
-        let embedding_response = response
-            .json::<EmbeddingResponse>()
-            .await
-            .map_err(|e| CoreError::BackendError {
-                backend_url: self.url.clone(),
-                message: format!("Nie mozna sparsowac embedding response: {}", e),
-                source: Some(e.into()),
-            })?;
+        let embedding_response =
+            response
+                .json::<EmbeddingResponse>()
+                .await
+                .map_err(|e| CoreError::BackendError {
+                    backend_url: self.url.clone(),
+                    message: format!("Nie mozna sparsowac embedding response: {}", e),
+                    source: Some(e.into()),
+                })?;
 
         // Sortuj embeddingi po index (na wypadek gdyby byly w innej kolejnosci)
         let mut data = embedding_response.data;
@@ -547,7 +552,6 @@ impl BackendClient {
         let embeddings: Vec<Vec<f32>> = data.into_iter().map(|d| d.embedding).collect();
 
         debug!("Otrzymano {} embeddingow", embeddings.len());
-
 
         self.circuit_breaker.record_success();
 
@@ -569,8 +573,7 @@ impl BackendClient {
 
         debug!(
             "Wysylanie embeddings request do: {} (model: {})",
-            url,
-            request.model
+            url, request.model
         );
 
         // Wyslij POST request
@@ -606,17 +609,20 @@ impl BackendClient {
         }
 
         // Parsuj JSON response
-        let embedding_response = response
-            .json::<EmbeddingResponse>()
-            .await
-            .map_err(|e| CoreError::BackendError {
-                backend_url: self.url.clone(),
-                message: format!("Nie mozna sparsowac embeddings response: {}", e),
-                source: Some(e.into()),
-            })?;
+        let embedding_response =
+            response
+                .json::<EmbeddingResponse>()
+                .await
+                .map_err(|e| CoreError::BackendError {
+                    backend_url: self.url.clone(),
+                    message: format!("Nie mozna sparsowac embeddings response: {}", e),
+                    source: Some(e.into()),
+                })?;
 
-        debug!("Otrzymano embeddings response: {} embeddingow", embedding_response.data.len());
-
+        debug!(
+            "Otrzymano embeddings response: {} embeddingow",
+            embedding_response.data.len()
+        );
 
         self.circuit_breaker.record_success();
 
@@ -657,7 +663,10 @@ impl BackendClient {
             .text("model", request.model.clone());
 
         // Dodaj opcjonalne parametry
-        debug!("Audio transcription params: model={}, language={:?}", request.model, request.language);
+        debug!(
+            "Audio transcription params: model={}, language={:?}",
+            request.model, request.language
+        );
         if let Some(language) = request.language {
             debug!("Adding language to form: {}", language);
             form = form.text("language", language);
@@ -711,23 +720,20 @@ impl BackendClient {
         }
 
         // Parsuj JSON response
-        let transcription_response = response
-            .json::<TranscriptionResponse>()
-            .await
-            .map_err(|e| CoreError::BackendError {
-                backend_url: self.url.clone(),
-                message: format!(
-                    "Nie mozna sparsowac audio transcription response: {}",
-                    e
-                ),
-                source: Some(e.into()),
-            })?;
+        let transcription_response =
+            response
+                .json::<TranscriptionResponse>()
+                .await
+                .map_err(|e| CoreError::BackendError {
+                    backend_url: self.url.clone(),
+                    message: format!("Nie mozna sparsowac audio transcription response: {}", e),
+                    source: Some(e.into()),
+                })?;
 
         debug!(
             "Audio transcription zakonczona: {} znakow",
             transcription_response.text.len()
         );
-
 
         self.circuit_breaker.record_success();
 
@@ -744,7 +750,7 @@ impl BackendClient {
         messages: Vec<tentaflow_protocol::VisionMessage>,
         max_tokens: Option<u32>,
     ) -> Result<String> {
-        use crate::api::openai::types::{Message, MessageContent, ContentPart, ImageUrl};
+        use crate::api::openai::types::{ContentPart, ImageUrl, Message, MessageContent};
 
         self.check_circuit_breaker()?;
         self.apply_model_override(&mut model);
@@ -774,7 +780,7 @@ impl BackendClient {
                                 image_url: ImageUrl {
                                     url,
                                     detail: detail.or_else(|| Some("auto".to_string())),
-                                }
+                                },
                             }
                         }
                     })
@@ -839,7 +845,6 @@ impl BackendClient {
 
         // Sprawdz status code
         if !status.is_success() {
-
             if status.is_server_error() {
                 self.circuit_breaker.record_failure();
             }
@@ -854,14 +859,13 @@ impl BackendClient {
 
         // Parsuj JSON response
         let completion = if self.request_format.as_deref() == Some("paddleocr") {
-            let response_value = response
-                .json::<serde_json::Value>()
-                .await
-                .map_err(|e| CoreError::BackendError {
+            let response_value = response.json::<serde_json::Value>().await.map_err(|e| {
+                CoreError::BackendError {
                     backend_url: self.url.clone(),
                     message: format!("Nie mozna sparsowac vision response: {}", e),
                     source: Some(e.into()),
-                })?;
+                }
+            })?;
 
             self.transform_response(&response_value)?
         } else {
@@ -880,26 +884,29 @@ impl BackendClient {
             .choices
             .first()
             .and_then(|choice| {
-                choice.message.content.as_ref().and_then(|content| match content {
-                    MessageContent::Text(t) => Some(t.clone()),
-                    MessageContent::Parts(parts) => {
-                        let mut result = String::new();
-                        for part in parts {
-                            if let ContentPart::Text { text } = part {
-                                if !result.is_empty() {
-                                    result.push('\n');
+                choice
+                    .message
+                    .content
+                    .as_ref()
+                    .and_then(|content| match content {
+                        MessageContent::Text(t) => Some(t.clone()),
+                        MessageContent::Parts(parts) => {
+                            let mut result = String::new();
+                            for part in parts {
+                                if let ContentPart::Text { text } = part {
+                                    if !result.is_empty() {
+                                        result.push('\n');
+                                    }
+                                    result.push_str(text);
                                 }
-                                result.push_str(text);
                             }
+                            Some(result)
                         }
-                        Some(result)
-                    }
-                })
+                    })
             })
             .unwrap_or_default();
 
         debug!("Vision zakonczone: {} znakow", text.len());
-
 
         self.circuit_breaker.record_success();
 
@@ -913,8 +920,7 @@ impl BackendClient {
 
     /// Zwraca true jesli request wymaga transformacji (np. PaddleOCR)
     fn needs_transform(&self) -> bool {
-        self.request_format.as_deref() != Some("openai")
-            && self.request_format.is_some()
+        self.request_format.as_deref() != Some("openai") && self.request_format.is_some()
     }
 
     /// Transformuje request do formatu oczekiwanego przez backend.
@@ -922,10 +928,7 @@ impl BackendClient {
     /// Dla roznych backendow (np. PaddleOCR) moze byc potrzebna transformacja
     /// formatu requestu z OpenAI API na niestandardowy format.
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<serde_json::Value> {
-        let format = self
-            .request_format
-            .as_deref()
-            .unwrap_or("openai");
+        let format = self.request_format.as_deref().unwrap_or("openai");
 
         match format {
             "paddleocr" => {
@@ -936,20 +939,23 @@ impl BackendClient {
                 debug!("Transformacja requestu: OpenAI -> PaddleOCR");
 
                 // Wyciagnij content z pierwszej wiadomosci
-                let first_message = request.messages.first().ok_or_else(|| {
-                    CoreError::InternalError {
-                        message: "Brak wiadomosci w request".to_string(),
-                        source: None,
-                    }
-                })?;
+                let first_message =
+                    request
+                        .messages
+                        .first()
+                        .ok_or_else(|| CoreError::InternalError {
+                            message: "Brak wiadomosci w request".to_string(),
+                            source: None,
+                        })?;
 
                 // Przeksztalc content do JSON Value
-                let mut input_content = serde_json::to_value(&first_message.content).map_err(|e| {
-                    CoreError::InternalError {
-                        message: format!("Nie mozna serializowac content: {}", e),
-                        source: Some(e.into()),
-                    }
-                })?;
+                let mut input_content =
+                    serde_json::to_value(&first_message.content).map_err(|e| {
+                        CoreError::InternalError {
+                            message: format!("Nie mozna serializowac content: {}", e),
+                            source: Some(e.into()),
+                        }
+                    })?;
 
                 // Jesli content jest arrayem, przefiltruj i splaszcz strukture image_url
                 if let Some(arr) = input_content.as_array_mut() {
@@ -963,7 +969,9 @@ impl BackendClient {
                             // PaddleOCR akceptuje tylko image_url, pomijamy text
                             if item_type == Some("image_url") {
                                 // Jesli element ma pole "image_url" z zagniezdzonym "url"
-                                if let Some(image_url) = obj.get("image_url").and_then(|v| v.as_object()) {
+                                if let Some(image_url) =
+                                    obj.get("image_url").and_then(|v| v.as_object())
+                                {
                                     if let Some(url) = image_url.get("url") {
                                         // Przenieaz url na poziom wyzej
                                         obj.insert("url".to_string(), url.clone());
@@ -1007,7 +1015,10 @@ impl BackendClient {
     ///
     /// Obsluguje:
     /// - "paddleocr": PaddleOCR -> OpenAI format
-    fn transform_response(&self, response_value: &serde_json::Value) -> Result<ChatCompletionResponse> {
+    fn transform_response(
+        &self,
+        response_value: &serde_json::Value,
+    ) -> Result<ChatCompletionResponse> {
         debug!("Transformacja odpowiedzi: PaddleOCR -> OpenAI");
 
         // Wyciagnij dane z PaddleOCR response
@@ -1047,7 +1058,11 @@ impl BackendClient {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            model: self.config.model_name_override.clone().unwrap_or_else(|| "paddleocr".to_string()),
+            model: self
+                .config
+                .model_name_override
+                .clone()
+                .unwrap_or_else(|| "paddleocr".to_string()),
             choices: vec![Choice {
                 index: 0,
                 message: Message {

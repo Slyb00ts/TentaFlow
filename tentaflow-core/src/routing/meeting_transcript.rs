@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use serde_json::json;
 use tokio::sync::watch;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 use crate::addon::event_bus::{Event, EventBus};
 use crate::net::quic::QuicClient;
@@ -186,10 +186,7 @@ async fn read_stream_chunk(
 ///
 /// Format TextDelta z sidecar: `[speaker]: text\n`
 /// Parsuje speaker i text, publikuje jako event "meeting.transcript".
-fn handle_transcript_chunk(
-    chunk: &tentaflow_protocol::ModelStreamChunk,
-    event_bus: &EventBus,
-) {
+fn handle_transcript_chunk(chunk: &tentaflow_protocol::ModelStreamChunk, event_bus: &EventBus) {
     match &chunk.chunk {
         tentaflow_protocol::StreamChunkType::TextDelta(delta) => {
             let (speaker, text) = parse_transcript_delta(delta);
@@ -248,9 +245,7 @@ fn parse_transcript_delta(delta: &str) -> (&str, &str) {
         if let Some(bracket_end) = rest.find(']') {
             let speaker = &rest[..bracket_end];
             let after_bracket = &rest[bracket_end + 1..];
-            let text = after_bracket
-                .strip_prefix(": ")
-                .unwrap_or(after_bracket);
+            let text = after_bracket.strip_prefix(": ").unwrap_or(after_bracket);
             return (speaker, text);
         }
     }

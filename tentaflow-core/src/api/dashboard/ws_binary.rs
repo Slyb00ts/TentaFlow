@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tentaflow_protocol::{
     envelope::{Envelope, EnvelopeFlags, Routing},
     message_body::{MessageBody, ProtocolError, ProtocolErrorCode},
-    SCHEMA_VERSION, SessionAuth,
+    SessionAuth, SCHEMA_VERSION,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::Message;
@@ -21,7 +21,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 
 use crate::dispatch::{
-    self, audit_broadcast, resume_token,
+    self, addon_perm_broadcast, audit_broadcast, resume_token,
     subscription::{self, SubscriptionEvent},
     AppState, HandlerContext,
 };
@@ -126,6 +126,26 @@ pub async fn handle_ws_connection<S>(
         });
     }
 
+    // Spawnuj task pushujacy AddonPermissionChangedEvent jako unsolicited frames.
+    {
+        let sink_perm = Arc::clone(&sink);
+        let seq_perm = Arc::clone(&next_server_sequence);
+        let mut perm_rx = addon_perm_broadcast::subscribe();
+        tokio::spawn(async move {
+            while let Ok(event) = perm_rx.recv().await {
+                let _ = send_body(
+                    &sink_perm,
+                    0,
+                    next_seq(&seq_perm),
+                    tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
+                    &Mb::AddonPermissionChangedEventBody(event),
+                    EnvelopeFlags::empty(),
+                )
+                .await;
+            }
+        });
+    }
+
     while let Some(msg) = source.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -196,23 +216,22 @@ pub async fn handle_ws_connection<S>(
                 }
                 last_client_sequence = envelope.sequence;
 
-                let body = match rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(
-                    &envelope.body,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("binary-WS: malformed body: {}", e);
-                        let _ = send_protocol_error(
-                            &sink,
-                            envelope.correlation_id,
-                            next_seq(&next_server_sequence),
-                            ProtocolErrorCode::InvalidFrame,
-                            "malformed body",
-                        )
-                        .await;
-                        continue;
-                    }
-                };
+                let body =
+                    match rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&envelope.body) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("binary-WS: malformed body: {}", e);
+                            let _ = send_protocol_error(
+                                &sink,
+                                envelope.correlation_id,
+                                next_seq(&next_server_sequence),
+                                ProtocolErrorCode::InvalidFrame,
+                                "malformed body",
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
 
                 if !handshake_done {
                     match body {
@@ -329,8 +348,8 @@ pub async fn handle_ws_connection<S>(
                                         EnvelopeFlags::empty(),
                                     )
                                     .await;
-                                    let body = final_body
-                                        .unwrap_or_else(|| MessageBody::MetaCancelStream);
+                                    let body =
+                                        final_body.unwrap_or_else(|| MessageBody::MetaCancelStream);
                                     let _ = send_body(
                                         &sink_clone,
                                         correlation_id,
@@ -362,8 +381,8 @@ pub async fn handle_ws_connection<S>(
                     continue;
                 }
 
-                // Sync handler — pojedyncza odpowiedz.
-                let (resp_body, is_error) = dispatch::dispatch(&body, &ctx);
+                // Zunifikowany async dispatch — sync handlery wrapowane przez makro.
+                let (resp_body, is_error) = dispatch::dispatch(&body, &ctx).await;
                 let flags = if is_error {
                     EnvelopeFlags::IS_ERROR
                 } else {
@@ -380,7 +399,10 @@ pub async fn handle_ws_connection<S>(
                 .await;
             }
             Message::Text(t) => {
-                warn!("binary-WS: otrzymano text frame ({} bajtow) — zamykam", t.len());
+                warn!(
+                    "binary-WS: otrzymano text frame ({} bajtow) — zamykam",
+                    t.len()
+                );
                 let mut guard = sink.lock().await;
                 let _ = guard
                     .send(Message::Close(Some(close_frame(

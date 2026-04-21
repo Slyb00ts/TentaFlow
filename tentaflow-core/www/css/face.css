@@ -99,8 +99,9 @@ body.has-face-bg .login-card {
   transform:
     translate(var(--tf-ui-offset-x, 0), var(--tf-ui-offset-y, 0))
     scale(var(--tf-ui-scale, 0.01));
+  opacity: var(--tf-ui-opacity, 0);
   transition: none;
-  will-change: transform;
+  will-change: transform, opacity;
 }
 
 @media (prefers-reduced-motion: reduce) {

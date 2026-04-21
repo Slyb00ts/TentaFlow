@@ -111,10 +111,7 @@ impl<T: Clone + Eq + Hash> OrSet<T> {
 
     /// Usun element ze zbioru
     pub fn remove(&mut self, element: &T, clock: LamportClock) {
-        let dominated_by_add = self
-            .elements
-            .get(element)
-            .map_or(false, |ts| *ts > clock);
+        let dominated_by_add = self.elements.get(element).map_or(false, |ts| *ts > clock);
 
         if !dominated_by_add {
             self.elements.remove(element);
@@ -435,12 +432,32 @@ impl CrdtOperation {
             Self::UpsertGroup { name, .. } | Self::DeleteGroup { name, .. } => {
                 format!("group:{name}")
             }
-            Self::AddGroupMember { group_name, username, .. }
-            | Self::RemoveGroupMember { group_name, username, .. } => {
+            Self::AddGroupMember {
+                group_name,
+                username,
+                ..
+            }
+            | Self::RemoveGroupMember {
+                group_name,
+                username,
+                ..
+            } => {
                 format!("group_member:{group_name}:{username}")
             }
-            Self::SetPermission { addon_id, subject_type, subject_name, resource, .. }
-            | Self::DeletePermission { addon_id, subject_type, subject_name, resource, .. } => {
+            Self::SetPermission {
+                addon_id,
+                subject_type,
+                subject_name,
+                resource,
+                ..
+            }
+            | Self::DeletePermission {
+                addon_id,
+                subject_type,
+                subject_name,
+                resource,
+                ..
+            } => {
                 format!("perm:{addon_id}:{subject_type}:{subject_name}:{resource}")
             }
             Self::SyncAddon { addon_id, .. } | Self::DeleteAddon { addon_id, .. } => {
@@ -449,16 +466,34 @@ impl CrdtOperation {
             Self::SetAddonConfig { addon_id, key, .. } => {
                 format!("addon_config:{addon_id}:{key}")
             }
-            Self::SetSecret { addon_id, username, key, .. }
-            | Self::DeleteSecret { addon_id, username, key, .. } => {
+            Self::SetSecret {
+                addon_id,
+                username,
+                key,
+                ..
+            }
+            | Self::DeleteSecret {
+                addon_id,
+                username,
+                key,
+                ..
+            } => {
                 let uname = username.as_deref().unwrap_or("_global_");
                 format!("secret:{addon_id}:{uname}:{key}")
             }
             Self::UpsertSsoProvider { name, .. } | Self::DeleteSsoProvider { name, .. } => {
                 format!("sso:{name}")
             }
-            Self::SetSyncExclusion { group_name, resource_type, .. }
-            | Self::DeleteSyncExclusion { group_name, resource_type, .. } => {
+            Self::SetSyncExclusion {
+                group_name,
+                resource_type,
+                ..
+            }
+            | Self::DeleteSyncExclusion {
+                group_name,
+                resource_type,
+                ..
+            } => {
                 format!("sync_excl:{group_name}:{resource_type}")
             }
             Self::AddTrustedNode { node_id, .. }

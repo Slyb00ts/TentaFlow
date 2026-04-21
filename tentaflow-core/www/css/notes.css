@@ -1,0 +1,166 @@
+/* =============================================================================
+   File: notes.css — Per-user Notes app: sidebar list + right editor layout.
+   ============================================================================= */
+
+.notes-page {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: calc(100vh - 100px);
+  gap: 0;
+}
+
+@media (max-width: 768px) {
+  .notes-page {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+}
+
+.notes-sidebar {
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.notes-sidebar-header {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.notes-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.note-item {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.12s;
+  position: relative;
+}
+
+.note-item:hover {
+  background: var(--bg-3);
+}
+
+.note-item.active {
+  background: var(--accent-glow);
+  border-left: 3px solid var(--accent-1);
+}
+
+.note-item .note-title {
+  font-weight: 700;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-item .note-preview {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 4px;
+  line-height: 1.4;
+  max-height: 2.8em;
+  overflow: hidden;
+}
+
+.note-item .note-time {
+  font-size: 10px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+
+.note-item .note-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: none;
+  gap: 4px;
+}
+
+.note-item:hover .note-actions {
+  display: inline-flex;
+}
+
+.notes-editor {
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.notes-editor-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0;
+  flex-wrap: wrap;
+}
+
+.notes-editor tf-textarea {
+  flex: 1;
+  min-height: 200px;
+}
+
+.notes-editor-footer {
+  padding: 8px 0;
+  color: var(--text-3);
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.notes-empty {
+  padding: 60px 20px;
+  text-align: center;
+  color: var(--text-3);
+}
+
+.notes-editor-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-3);
+  text-align: center;
+  padding: 20px;
+}
+
+.notes-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.notes-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+
+.notes-status.saving .notes-status-dot {
+  background: var(--accent-2, var(--accent-1));
+}
+
+.notes-status.saved .notes-status-dot {
+  background: #22c55e;
+}
+
+.notes-status.error .notes-status-dot {
+  background: #ef4444;
+}

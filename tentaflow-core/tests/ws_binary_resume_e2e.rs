@@ -37,7 +37,10 @@ async fn streaming_handler_emits_chunks_and_end() {
         max_tokens: None,
     });
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+        session: SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: None,
+        },
         correlation_id: 100,
         resume_secret: Some(Arc::new(b"e2e-secret".to_vec())),
         state: tentaflow_core::dispatch::state::AppState::for_test(),
@@ -78,7 +81,10 @@ async fn resume_token_round_trip_through_subscribe_resume_handler() {
         resume_token: token_bytes,
     };
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id, role: None },
+        session: SessionAuth::UserSession {
+            user_id,
+            role: None,
+        },
         correlation_id: 200,
         resume_secret: Some(secret.clone()),
         state: tentaflow_core::dispatch::state::AppState::for_test(),
@@ -115,7 +121,10 @@ async fn invalid_resume_token_results_in_negative_ack() {
         resume_token: bad_token,
     };
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+        session: SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: None,
+        },
         correlation_id: 300,
         resume_secret: Some(secret),
         state: tentaflow_core::dispatch::state::AppState::for_test(),
@@ -168,7 +177,10 @@ async fn recorder_round_trip_with_dispatch() {
     let _ = recorder::init(&path);
 
     let ctx = HandlerContext {
-        session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+        session: SessionAuth::UserSession {
+            user_id: [0u8; 16],
+            role: None,
+        },
         correlation_id: 999,
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),

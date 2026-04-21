@@ -75,6 +75,12 @@ impl Parse for HandlerArgs {
 
 /// Rejestruje funkcje jako handler MessageBody variantu.
 ///
+/// Obsluguje zarowno `fn` (sync) jak i `async fn` (async) — macro generuje
+/// wrapper `__tentaflow_dispatch_<fn>` ktory zawsze zwraca boxed future
+/// o zunifikowanej signaturze `HandlerDispatchFn`. Sync fn sa wolane
+/// synchronicznie i owijane w `async move { ... }`; async fn sa po prostu
+/// `.await`-owane. Brak `block_on` / `Handle::current`.
+///
 /// Wymaga jednoczesnie obecnosci `#[policy]` i `#[observed]` na tej samej funkcji —
 /// bez nich expansion generuje referencje do nieistniejacych symboli (compile error).
 #[proc_macro_attribute]
@@ -85,12 +91,21 @@ pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
     let variant = &args.variant;
     let since_major = args.since_major;
     let since_minor = args.since_minor;
+    let is_async = input_fn.sig.asyncness.is_some();
 
     // Symbole generowane przez #[policy] / #[observed]. Ich brak = compile error.
     let policy_marker = format_ident!("__tentaflow_policy_{}", fn_name);
     let observed_marker = format_ident!("__tentaflow_observed_{}", fn_name);
     let registration_fn = format_ident!("__tentaflow_register_{}", fn_name);
+    let dispatch_wrapper = format_ident!("__tentaflow_dispatch_{}", fn_name);
     let metric_name = format!("tentaflow_ws_handler_{}", variant);
+
+    // Wewnatrz async bloku wolamy orig fn synchronicznie lub z .await.
+    let call_expr = if is_async {
+        quote! { #fn_name(__req, __ctx).await }
+    } else {
+        quote! { #fn_name(__req, __ctx) }
+    };
 
     let output = quote! {
         #input_fn
@@ -103,6 +118,17 @@ pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
             let _check_observed = #observed_marker;
         };
 
+        // Zunifikowany wrapper — zawsze zwraca boxed future zgodny z HandlerDispatchFn.
+        // Signatura `for<'a> fn(&'a MessageBody, &'a HandlerContext) -> HandlerFuture<'a>`.
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #dispatch_wrapper<'a>(
+            __req: &'a ::tentaflow_protocol::MessageBody,
+            __ctx: &'a ::tentaflow_core::dispatch::HandlerContext,
+        ) -> ::tentaflow_core::dispatch::HandlerFuture<'a> {
+            ::std::boxed::Box::pin(async move { #call_expr })
+        }
+
         // Inventory registration. Wola sie raz przy load, linker zbiera wszystkie entries.
         ::inventory::submit! {
             ::tentaflow_core::dispatch::HandlerMeta {
@@ -111,7 +137,7 @@ pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
                 since_minor: #since_minor,
                 required_auth: #policy_marker,
                 metric_name: #metric_name,
-                dispatch_fn: #fn_name,
+                dispatch_fn: #dispatch_wrapper,
             }
         }
 

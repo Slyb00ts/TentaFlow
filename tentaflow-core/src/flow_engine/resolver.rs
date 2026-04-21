@@ -18,11 +18,7 @@ use tracing::debug;
 /// 2. Sprawdz model_registry czy model ma przypisany flow_id
 /// 3. Uzyj domyslnego flow dla service_type
 /// 4. Jesli nic nie znaleziono - zwroc None (uzyj hardcoded pipeline)
-pub fn resolve_flow(
-    pool: &DbPool,
-    model_name: &str,
-    service_type: &str,
-) -> Result<Option<DbFlow>> {
+pub fn resolve_flow(pool: &DbPool, model_name: &str, service_type: &str) -> Result<Option<DbFlow>> {
     // 1. Binding modelu w flow_model_bindings (pattern matching, np. "bielik-*")
     if let Some(flow) = repository::get_flow_for_model(pool, model_name)? {
         debug!(

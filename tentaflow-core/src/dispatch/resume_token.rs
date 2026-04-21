@@ -175,10 +175,18 @@ mod tests {
 
     #[test]
     fn issue_and_verify_round_trip() {
-        let token = issue(0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0u128, 42, ALICE, TEST_SECRET);
+        let token = issue(
+            0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0u128,
+            42,
+            ALICE,
+            TEST_SECRET,
+        );
         assert_eq!(token.len(), TOKEN_LEN);
         let decoded = verify(&token, &ALICE, TEST_SECRET).unwrap();
-        assert_eq!(decoded.subscription_id, 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0u128);
+        assert_eq!(
+            decoded.subscription_id,
+            0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0u128
+        );
         assert_eq!(decoded.last_sequence, 42);
         assert_eq!(decoded.originating_user_id, ALICE);
     }
@@ -256,7 +264,11 @@ mod tests {
     fn p0_same_user_succeeds() {
         let token = issue(0x42, 7, ALICE, TEST_SECRET);
         let result = verify(&token, &ALICE, TEST_SECRET);
-        assert!(result.is_ok(), "P0: same user must succeed, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "P0: same user must succeed, got {:?}",
+            result
+        );
     }
 
     #[test]

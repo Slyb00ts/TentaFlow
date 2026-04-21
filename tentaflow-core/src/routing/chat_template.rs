@@ -61,10 +61,7 @@ impl ChatTemplate {
             ChatTemplate::ChatML => vec!["<|im_end|>".to_string()],
             ChatTemplate::Llama3 => vec!["<|eot_id|>".to_string()],
             ChatTemplate::Mistral => vec!["[/INST]".to_string()],
-            ChatTemplate::Alpaca => vec![
-                "### Instruction:".to_string(),
-                "### Input:".to_string(),
-            ],
+            ChatTemplate::Alpaca => vec!["### Instruction:".to_string(), "### Input:".to_string()],
             ChatTemplate::Plain => vec![],
         }
     }
@@ -250,7 +247,10 @@ pub fn detect_chat_template(model_dir: &Path) -> ChatTemplate {
     let config: serde_json::Value = match serde_json::from_str(&config_content) {
         Ok(v) => v,
         Err(e) => {
-            warn!("Blad parsowania tokenizer_config.json: {} — uzywam Plain", e);
+            warn!(
+                "Blad parsowania tokenizer_config.json: {} — uzywam Plain",
+                e
+            );
             return ChatTemplate::Plain;
         }
     };
@@ -321,8 +321,14 @@ mod tests {
     #[test]
     fn test_chatml_format() {
         let messages = vec![
-            ChatMessage { role: "system".into(), content: "Jestes pomocnym asystentem.".into() },
-            ChatMessage { role: "user".into(), content: "Czesc!".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "Jestes pomocnym asystentem.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Czesc!".into(),
+            },
         ];
 
         let result = ChatTemplate::ChatML.format_messages(&messages, true);
@@ -333,9 +339,10 @@ mod tests {
 
     #[test]
     fn test_chatml_without_generation_prompt() {
-        let messages = vec![
-            ChatMessage { role: "user".into(), content: "Test".into() },
-        ];
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Test".into(),
+        }];
 
         let result = ChatTemplate::ChatML.format_messages(&messages, false);
         assert!(!result.contains("<|im_start|>assistant"));
@@ -345,8 +352,14 @@ mod tests {
     #[test]
     fn test_llama3_format() {
         let messages = vec![
-            ChatMessage { role: "system".into(), content: "System.".into() },
-            ChatMessage { role: "user".into(), content: "Pytanie.".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "System.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Pytanie.".into(),
+            },
         ];
 
         let result = ChatTemplate::Llama3.format_messages(&messages, true);
@@ -359,8 +372,14 @@ mod tests {
     #[test]
     fn test_plain_format() {
         let messages = vec![
-            ChatMessage { role: "system".into(), content: "Instrukcja.".into() },
-            ChatMessage { role: "user".into(), content: "Hej.".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "Instrukcja.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hej.".into(),
+            },
         ];
 
         let result = ChatTemplate::Plain.format_messages(&messages, true);

@@ -3,13 +3,13 @@
 // Opis: Rozpoznawanie mowy (Speech-to-Text) — trait SttEngine i manager.
 // =============================================================================
 
-pub mod whisper;
 pub mod audio;
+pub mod whisper;
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
 
@@ -253,16 +253,16 @@ impl SttManager {
     }
 
     /// Pobierz model Whisper z HF (jesli brak w cache) i zaladuj go
-    pub async fn ensure_and_load(
-        &mut self,
-        device: Option<&str>,
-    ) -> anyhow::Result<SttModelInfo> {
+    pub async fn ensure_and_load(&mut self, device: Option<&str>) -> anyhow::Result<SttModelInfo> {
         let filename = WHISPER_MODEL_FILENAME;
         let models_dir = Self::whisper_models_dir();
         let model_path = models_dir.join(filename);
 
         if !model_path.exists() {
-            info!("Pobieranie modelu Whisper '{}' z HuggingFace...", WHISPER_MODEL_NAME);
+            info!(
+                "Pobieranie modelu Whisper '{}' z HuggingFace...",
+                WHISPER_MODEL_NAME
+            );
             let repo_id = WHISPER_HF_REPO.to_string();
             let fname = filename.to_string();
             let hf_path = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
@@ -273,7 +273,10 @@ impl SttManager {
             })
             .await??;
             std::fs::copy(&hf_path, &model_path)?;
-            info!("Model Whisper '{}' pobrany: {:?}", WHISPER_MODEL_NAME, model_path);
+            info!(
+                "Model Whisper '{}' pobrany: {:?}",
+                WHISPER_MODEL_NAME, model_path
+            );
         }
 
         self.load_model(&model_path, device, None).await

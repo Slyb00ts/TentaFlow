@@ -1,13 +1,18 @@
 // =============================================================================
 // Plik: api/dashboard/api_models.rs
-// Opis: CRUD rejestru modeli AI oraz aliasow modeli.
+// Opis: CRUD rejestru modeli AI oraz aliasow modeli. REST handlery dla
+//       `/api/models` i `/api/models/:id` (wciaz REST). Aliasy + unified
+//       zmigrowane do binary protocol w FAZA 2 — domain logic ponizej
+//       (`collect_unified`, `create_alias`, `update_alias`, `delete_alias`,
+//       `list_aliases`) jest wspoldzielona przez handlery binarne.
 // =============================================================================
 
 use std::sync::Arc;
 
+use crate::db::models::{DbModelAlias, NewModelEntry, UpdateModelEntry};
 use crate::db::{self, DbPool};
-use crate::db::models::{NewModelEntry, UpdateModelEntry};
 use crate::mesh::iroh_manager::IrohMeshManager;
+use crate::mesh::service_registry::UnifiedModelInfo;
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -35,23 +40,6 @@ pub struct UpdateModelEntryRequest {
     pub config_json: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct CreateModelAliasRequest {
-    pub alias: String,
-    pub target_model: String,
-    pub fallback_targets: Option<String>,
-    pub strategy: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateModelAliasRequest {
-    pub alias: String,
-    pub target_model: String,
-    pub is_active: Option<bool>,
-    pub fallback_targets: Option<String>,
-    pub strategy: Option<String>,
-}
-
 /// GET /api/models - lista wpisow rejestru modeli z paginacja
 pub fn handle_list_entries(pool: &DbPool, offset: i64, limit: i64) -> Result<(u16, String)> {
     let items = db::repository::list_model_entries(pool, offset, limit)?;
@@ -62,17 +50,23 @@ pub fn handle_list_entries(pool: &DbPool, offset: i64, limit: i64) -> Result<(u1
 pub fn handle_get_entry(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     match db::repository::get_model_entry(pool, id)? {
         Some(item) => Ok((200, serde_json::to_string(&item)?)),
-        None => Ok((404, format!(r#"{{"error":"Model o id {} nie istnieje"}}"#, id))),
+        None => Ok((
+            404,
+            format!(r#"{{"error":"Model o id {} nie istnieje"}}"#, id),
+        )),
     }
 }
 
 /// POST /api/models - utworz wpis modelu
 pub fn handle_create_entry(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateModelEntryRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: CreateModelEntryRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     if req.model_name.trim().is_empty() {
-        return Ok((400, r#"{"error":"Pole 'model_name' nie moze byc puste"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"Pole 'model_name' nie może być puste"}"#.to_string(),
+        ));
     }
 
     let config = req.config_json.as_deref().unwrap_or("{}");
@@ -97,11 +91,14 @@ pub fn handle_create_entry(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> 
 pub fn handle_update_entry(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
     let existing = db::repository::get_model_entry(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Model o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Model o id {} nie istnieje"}}"#, id),
+        ));
     }
 
-    let req: UpdateModelEntryRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
+    let req: UpdateModelEntryRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
 
     let config = req.config_json.as_deref().unwrap_or("{}");
 
@@ -126,70 +123,101 @@ pub fn handle_update_entry(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, 
 pub fn handle_delete_entry(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     let existing = db::repository::get_model_entry(pool, id)?;
     if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Model o id {} nie istnieje"}}"#, id)));
+        return Ok((
+            404,
+            format!(r#"{{"error":"Model o id {} nie istnieje"}}"#, id),
+        ));
     }
 
     db::repository::delete_model_entry(pool, id)?;
     Ok((200, r#"{"ok":true}"#.to_string()))
 }
 
-/// GET /api/model-aliases - lista aliasow modeli
-pub fn handle_list_aliases(pool: &DbPool) -> Result<(u16, String)> {
-    let items = db::repository::list_model_aliases(pool)?;
-    Ok((200, serde_json::to_string(&items)?))
+// =============================================================================
+// Domain logic aliasow (FAZA 2: uzywane przez binary handlery w
+// `dispatch::handlers`). Zwraca DbModelAlias zamiast JSON — caller formatuje.
+// =============================================================================
+
+/// Lista wszystkich aliasow z DB.
+pub fn list_aliases(pool: &DbPool) -> Result<Vec<DbModelAlias>> {
+    db::repository::list_model_aliases(pool)
 }
 
-/// POST /api/model-aliases - utworz alias modelu
-pub fn handle_create_alias(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
-    let req: CreateModelAliasRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
-
-    if req.alias.trim().is_empty() || req.target_model.trim().is_empty() {
-        return Ok((400, r#"{"error":"Alias i model docelowy nie moga byc puste"}"#.to_string()));
+/// Utworz alias. Walidacja: alias i target_model musza byc nie-puste.
+pub fn create_alias(
+    pool: &DbPool,
+    alias: &str,
+    target_model: &str,
+    strategy: Option<&str>,
+    fallback_targets: Option<&str>,
+) -> Result<i64> {
+    if alias.trim().is_empty() || target_model.trim().is_empty() {
+        anyhow::bail!("Alias i model docelowy nie moga byc puste");
     }
-
-    let id = db::repository::create_model_alias(pool, &req.alias, &req.target_model, req.fallback_targets.as_deref(), req.strategy.as_deref())?;
-    let item = db::repository::get_model_alias(pool, id)?;
-    Ok((201, serde_json::to_string(&item)?))
+    db::repository::create_model_alias(pool, alias, target_model, fallback_targets, strategy)
 }
 
-/// PUT /api/model-aliases/:id - aktualizuj alias modelu
-pub fn handle_update_alias(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String)> {
-    let existing = db::repository::get_model_alias(pool, id)?;
-    if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Alias modelu o id {} nie istnieje"}}"#, id)));
+/// Aktualizacja aliasu po id. Zwraca `Ok(false)` gdy rekord nie istnieje.
+pub fn update_alias(
+    pool: &DbPool,
+    id: i64,
+    alias: &str,
+    target_model: &str,
+    is_active: bool,
+    strategy: Option<&str>,
+    fallback_targets: Option<&str>,
+) -> Result<bool> {
+    if db::repository::get_model_alias(pool, id)?.is_none() {
+        return Ok(false);
     }
-
-    let req: UpdateModelAliasRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {}", e))?;
-
-    if req.alias.trim().is_empty() || req.target_model.trim().is_empty() {
-        return Ok((400, r#"{"error":"Alias i model docelowy nie moga byc puste"}"#.to_string()));
+    if alias.trim().is_empty() || target_model.trim().is_empty() {
+        anyhow::bail!("Alias i model docelowy nie moga byc puste");
     }
-
-    db::repository::update_model_alias(pool, id, &req.alias, &req.target_model, req.is_active.unwrap_or(true), req.fallback_targets.as_deref(), req.strategy.as_deref())?;
-    let item = db::repository::get_model_alias(pool, id)?;
-    Ok((200, serde_json::to_string(&item)?))
+    db::repository::update_model_alias(
+        pool,
+        id,
+        alias,
+        target_model,
+        is_active,
+        fallback_targets,
+        strategy,
+    )?;
+    Ok(true)
 }
 
-/// DELETE /api/model-aliases/:id - usun alias modelu
-pub fn handle_delete_alias(pool: &DbPool, id: i64) -> Result<(u16, String)> {
-    let existing = db::repository::get_model_alias(pool, id)?;
-    if existing.is_none() {
-        return Ok((404, format!(r#"{{"error":"Alias modelu o id {} nie istnieje"}}"#, id)));
+/// Usuniecie aliasu po id. Zwraca `Ok(false)` gdy rekord nie istnieje.
+pub fn delete_alias(pool: &DbPool, id: i64) -> Result<bool> {
+    if db::repository::get_model_alias(pool, id)?.is_none() {
+        return Ok(false);
     }
-
     db::repository::delete_model_alias(pool, id)?;
-    Ok((200, r#"{"ok":true}"#.to_string()))
+    Ok(true)
 }
 
-/// GET /api/models/unified — unikalne modele ze wszystkich nodow mesh
-pub fn handle_unified_models(quic_mesh: &Option<Arc<IrohMeshManager>>) -> Result<(u16, String)> {
+/// Unikalne modele z mesh service registry. Pusty `Vec` gdy mesh niedostepny.
+pub fn collect_unified(quic_mesh: &Option<Arc<IrohMeshManager>>) -> Vec<UnifiedModelInfo> {
     match quic_mesh {
-        Some(ref qm) => {
-            let models = qm.service_registry().unique_models();
-            Ok((200, serde_json::to_string(&models)?))
+        Some(qm) => qm.service_registry().unique_models(),
+        None => Vec::new(),
+    }
+}
+
+/// Synchronizacja router cache + broadcast alias sync do meshu po mutacji.
+/// Wolane z handlerow binarnych po udanym create/update/delete.
+pub fn broadcast_alias_mutation(
+    pool: &DbPool,
+    router: &Arc<crate::routing::router::Router>,
+    quic_mesh: &Option<Arc<IrohMeshManager>>,
+) {
+    router.reload_alias_cache();
+    if let Some(qm) = quic_mesh {
+        if let Ok(aliases) = db::repository::list_model_aliases(pool) {
+            if let Ok(json) = serde_json::to_vec(&aliases) {
+                let qm = Arc::clone(qm);
+                tokio::spawn(async move {
+                    qm.broadcast_alias_sync(json).await;
+                });
+            }
         }
-        None => Ok((200, "[]".to_string())),
     }
 }

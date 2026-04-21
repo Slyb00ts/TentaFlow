@@ -31,13 +31,16 @@ mod tests {
 
     /// Warm path: dispatchuj 10 roznych wariantow 10_000 razy.
     /// Oczekiwany koszt: ~100 ns per dispatch (HashMap find + fn pointer call + match).
-    #[test]
+    #[tokio::test]
     #[ignore = "benchmark — run manually with --ignored --release"]
-    fn bench_warm_dispatch_roundtrip() {
+    async fn bench_warm_dispatch_roundtrip() {
         let _ = find("NodeListRequest"); // warm-up
 
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            },
             correlation_id: 1,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
@@ -57,7 +60,7 @@ mod tests {
         let start = Instant::now();
         for i in 0..ITERATIONS {
             let body = &variants[i % variants.len()];
-            let (_resp, _is_err) = dispatch(body, &ctx);
+            let (_resp, _is_err) = dispatch(body, &ctx).await;
         }
         let elapsed = start.elapsed();
         let ns_per = elapsed.as_nanos() as f64 / ITERATIONS as f64;

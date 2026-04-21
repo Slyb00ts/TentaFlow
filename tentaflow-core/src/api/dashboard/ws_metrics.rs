@@ -3,13 +3,13 @@
 // Opis: Obsluga WebSocket do streamowania metryk dashboardu co sekunde.
 // =============================================================================
 
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-use futures::{SinkExt, StreamExt};
 use crate::metrics::RouterMetrics;
+use futures::{SinkExt, StreamExt};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use serde::Serialize;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 /// Wiadomosc wysylana do frontendu przez WebSocket.

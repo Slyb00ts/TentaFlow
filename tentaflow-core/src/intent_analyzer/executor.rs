@@ -42,21 +42,40 @@ impl ToolExecutor {
             return ToolExecutionResult {
                 call_id: tool_result.call_id.clone(),
                 success: false,
-                message: tool_result.follow_up_question.clone()
+                message: tool_result
+                    .follow_up_question
+                    .clone()
                     .unwrap_or_else(|| "Brakujące parametry".to_string()),
                 data: None,
-                error: Some(format!("Missing required parameters: {:?}", tool_result.missing_params)),
+                error: Some(format!(
+                    "Missing required parameters: {:?}",
+                    tool_result.missing_params
+                )),
             };
         }
 
         match &tool_result.tool {
-            ToolCall::CalendarAdd(params) => Self::execute_calendar_add(&tool_result.call_id, params).await,
-            ToolCall::CalendarCheck(params) => Self::execute_calendar_check(&tool_result.call_id, params).await,
-            ToolCall::EmailSend(params) => Self::execute_email_send(&tool_result.call_id, params).await,
-            ToolCall::WebSearch(params) => Self::execute_web_search(&tool_result.call_id, params).await,
-            ToolCall::ReminderSet(params) => Self::execute_reminder_set(&tool_result.call_id, params).await,
-            ToolCall::TimerSet(params) => Self::execute_timer_set(&tool_result.call_id, params).await,
-            ToolCall::NoteSave(params) => Self::execute_note_save(&tool_result.call_id, params).await,
+            ToolCall::CalendarAdd(params) => {
+                Self::execute_calendar_add(&tool_result.call_id, params).await
+            }
+            ToolCall::CalendarCheck(params) => {
+                Self::execute_calendar_check(&tool_result.call_id, params).await
+            }
+            ToolCall::EmailSend(params) => {
+                Self::execute_email_send(&tool_result.call_id, params).await
+            }
+            ToolCall::WebSearch(params) => {
+                Self::execute_web_search(&tool_result.call_id, params).await
+            }
+            ToolCall::ReminderSet(params) => {
+                Self::execute_reminder_set(&tool_result.call_id, params).await
+            }
+            ToolCall::TimerSet(params) => {
+                Self::execute_timer_set(&tool_result.call_id, params).await
+            }
+            ToolCall::NoteSave(params) => {
+                Self::execute_note_save(&tool_result.call_id, params).await
+            }
         }
     }
 
@@ -70,7 +89,10 @@ impl ToolExecutor {
     // ZAŚLEPKI - tylko logują do konsoli
     // ========================================================================
 
-    async fn execute_calendar_add(call_id: &str, params: &CalendarAddParams) -> ToolExecutionResult {
+    async fn execute_calendar_add(
+        call_id: &str,
+        params: &CalendarAddParams,
+    ) -> ToolExecutionResult {
         info!(call_id = %call_id, tool = "CALENDAR_ADD", "(STUB)");
         debug!("title: {:?}, date: {:?}, start_time: {:?}, end_time: {:?}, duration: {:?}, location: {:?}, attendees: {:?}",
             params.title, params.date, params.start_time, params.end_time,
@@ -94,12 +116,19 @@ impl ToolExecutor {
         }
     }
 
-    async fn execute_calendar_check(call_id: &str, params: &CalendarCheckParams) -> ToolExecutionResult {
+    async fn execute_calendar_check(
+        call_id: &str,
+        params: &CalendarCheckParams,
+    ) -> ToolExecutionResult {
         info!(call_id = %call_id, tool = "CALENDAR_CHECK", "(STUB)");
-        debug!("date: {:?}, date_range: {:?}, search_query: {:?}",
-            params.date, params.date_range, params.search_query);
+        debug!(
+            "date: {:?}, date_range: {:?}, search_query: {:?}",
+            params.date, params.date_range, params.search_query
+        );
 
-        let date = params.date.as_deref()
+        let date = params
+            .date
+            .as_deref()
             .or(params.date_range.as_deref())
             .unwrap_or("dziś");
 
@@ -118,10 +147,14 @@ impl ToolExecutor {
 
     async fn execute_email_send(call_id: &str, params: &EmailSendParams) -> ToolExecutionResult {
         info!(call_id = %call_id, tool = "EMAIL_SEND", "(STUB)");
-        debug!("to: {:?}, subject: {:?}, body_len: {}, cc: {:?}, priority: {:?}",
-            params.to, params.subject,
+        debug!(
+            "to: {:?}, subject: {:?}, body_len: {}, cc: {:?}, priority: {:?}",
+            params.to,
+            params.subject,
             params.body.as_ref().map_or(0, |b| b.len()),
-            params.cc, params.priority);
+            params.cc,
+            params.priority
+        );
 
         let to = params.to.as_deref().unwrap_or("?");
         let subject = params.subject.as_deref().unwrap_or("(bez tematu)");
@@ -142,8 +175,10 @@ impl ToolExecutor {
 
     async fn execute_web_search(call_id: &str, params: &WebSearchParams) -> ToolExecutionResult {
         info!(call_id = %call_id, tool = "WEB_SEARCH", "(STUB)");
-        debug!("query: {:?}, search_type: {:?}, language: {:?}, max_results: {:?}",
-            params.query, params.search_type, params.language, params.max_results);
+        debug!(
+            "query: {:?}, search_type: {:?}, language: {:?}, max_results: {:?}",
+            params.query, params.search_type, params.language, params.max_results
+        );
 
         let query = params.query.as_deref().unwrap_or("?");
 
@@ -172,10 +207,15 @@ impl ToolExecutor {
         }
     }
 
-    async fn execute_reminder_set(call_id: &str, params: &ReminderSetParams) -> ToolExecutionResult {
+    async fn execute_reminder_set(
+        call_id: &str,
+        params: &ReminderSetParams,
+    ) -> ToolExecutionResult {
         info!(call_id = %call_id, tool = "REMINDER_SET", "(STUB)");
-        debug!("message: {:?}, when: {:?}, repeat: {:?}",
-            params.message, params.when, params.repeat);
+        debug!(
+            "message: {:?}, when: {:?}, repeat: {:?}",
+            params.message, params.when, params.repeat
+        );
 
         let message = params.message.as_deref().unwrap_or("przypomnienie");
         let when = params.when.as_deref().unwrap_or("?");
@@ -217,10 +257,12 @@ impl ToolExecutor {
 
     async fn execute_note_save(call_id: &str, params: &NoteSaveParams) -> ToolExecutionResult {
         info!(call_id = %call_id, tool = "NOTE_SAVE", "(STUB)");
-        debug!("title: {:?}, content_len: {}, tags: {:?}",
+        debug!(
+            "title: {:?}, content_len: {}, tags: {:?}",
             params.title,
             params.content.as_ref().map_or(0, |c| c.len()),
-            params.tags);
+            params.tags
+        );
 
         let title = params.title.as_deref().unwrap_or("Notatka");
 

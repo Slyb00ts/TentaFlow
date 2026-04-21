@@ -181,7 +181,10 @@ pub fn push(builder: TranscriptBuilder) {
 
 /// Klucz aktualnej sesji (do widoku/pobrania w GUI).
 pub fn active_session_key() -> Option<String> {
-    active_session().lock().as_ref().map(|s| s.meeting_key.clone())
+    active_session()
+        .lock()
+        .as_ref()
+        .map(|s| s.meeting_key.clone())
 }
 
 /// DB id aktualnej sesji.

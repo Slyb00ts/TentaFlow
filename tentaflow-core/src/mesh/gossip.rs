@@ -319,7 +319,11 @@ impl GossipEngine {
     /// Lokalny PeerSummary do wysylania w wiadomosciach
     async fn local_summary(&self) -> PeerSummary {
         let services = self.local_services.read().await;
-        make_local_summary(&self.config, &services, self.incarnation.load(Ordering::Relaxed))
+        make_local_summary(
+            &self.config,
+            &services,
+            self.incarnation.load(Ordering::Relaxed),
+        )
     }
 
     fn next_seq(&self) -> u64 {
@@ -529,9 +533,7 @@ impl GossipEngine {
                             let guard = peers.read().await;
                             guard
                                 .values()
-                                .filter(|p| {
-                                    p.address != target && p.state == PeerState::Alive
-                                })
+                                .filter(|p| p.address != target && p.state == PeerState::Alive)
                                 .map(|p| p.address)
                                 .collect()
                         };
@@ -811,7 +813,10 @@ impl GossipEngine {
                 if let Some(peer) = guard.get_mut(node_id) {
                     if *node_id == self.config.node_id {
                         let new_inc = self.incarnation.fetch_add(1, Ordering::Relaxed) + 1;
-                        info!(incarnation = new_inc, "Obrona przed suspect — zwiekszona incarnation");
+                        info!(
+                            incarnation = new_inc,
+                            "Obrona przed suspect — zwiekszona incarnation"
+                        );
                         drop(guard);
                         self.broadcast_alive().await;
                         return;
@@ -948,11 +953,7 @@ impl GossipEngine {
 // =============================================================================
 
 /// Buduje lokalny PeerSummary z poszczegolnych pol
-fn make_local_summary(
-    config: &GossipConfig,
-    services: &[String],
-    incarnation: u64,
-) -> PeerSummary {
+fn make_local_summary(config: &GossipConfig, services: &[String], incarnation: u64) -> PeerSummary {
     PeerSummary {
         node_id: config.node_id.clone(),
         address: config.listen_addr,
@@ -970,11 +971,10 @@ async fn do_send_message(
     msg: &GossipMessage,
     to: SocketAddr,
 ) -> Result<(), crate::error::CoreError> {
-    let data =
-        serde_json::to_vec(msg).map_err(|e| crate::error::CoreError::GossipError {
-            message: format!("Blad serializacji: {}", e),
-            source: Some(e.into()),
-        })?;
+    let data = serde_json::to_vec(msg).map_err(|e| crate::error::CoreError::GossipError {
+        message: format!("Blad serializacji: {}", e),
+        source: Some(e.into()),
+    })?;
 
     sock.send_to(&data, to)
         .await
@@ -1103,7 +1103,11 @@ struct GossipEngineRef {
 impl GossipEngineRef {
     async fn local_summary(&self) -> PeerSummary {
         let services = self.local_services.read().await;
-        make_local_summary(&self.config, &services, self.incarnation.load(Ordering::Relaxed))
+        make_local_summary(
+            &self.config,
+            &services,
+            self.incarnation.load(Ordering::Relaxed),
+        )
     }
 
     async fn get_socket(&self) -> Option<Arc<UdpSocket>> {
