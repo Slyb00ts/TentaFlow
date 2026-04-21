@@ -2993,15 +2993,21 @@ pub fn models_unified_list(
             instances: m
                 .instances
                 .into_iter()
-                .map(|i| tentaflow_protocol::UnifiedModelInstance {
-                    node_id: i.node_id,
-                    node_hostname: if i.node_name.is_empty() {
-                        None
-                    } else {
-                        Some(i.node_name)
-                    },
-                    service_id: i.service_id,
-                    status: i.status,
+                .map(|i| {
+                    let loaded = matches!(i.status.as_str(), "running" | "ready");
+                    tentaflow_protocol::UnifiedModelInstance {
+                        node_id: i.node_id,
+                        node_hostname: if i.node_name.is_empty() {
+                            None
+                        } else {
+                            Some(i.node_name)
+                        },
+                        service_id: i.service_id,
+                        status: i.status,
+                        backend: i.backend,
+                        size_mb: i.size_mb,
+                        loaded,
+                    }
                 })
                 .collect(),
         })

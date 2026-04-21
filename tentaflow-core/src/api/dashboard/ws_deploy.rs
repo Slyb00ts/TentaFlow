@@ -173,6 +173,8 @@ pub async fn handle_ws_connection<S>(
         node_id: deploy_req.node_id.clone(),
         node_ip: None,
         protocol,
+        engine_id: config.engine.clone(),
+        model_size_mb: 0,
     };
 
     // Kanal postepu — przekazuj do WebSocket
