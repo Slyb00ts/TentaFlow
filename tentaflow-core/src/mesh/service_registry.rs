@@ -32,6 +32,8 @@ pub struct ModelInstance {
     pub node_name: String,
     pub service_id: String,
     pub status: String,
+    pub backend: Option<String>,
+    pub size_mb: Option<u64>,
 }
 
 // =============================================================================
@@ -156,13 +158,16 @@ impl MeshServiceRegistry {
         let mut model_map: HashMap<(String, String), Vec<ModelInstance>> = HashMap::new();
 
         for svc in &all_services {
-            for model_name in &svc.models {
+            for (idx, model_name) in svc.models.iter().enumerate() {
                 let key = (model_name.clone(), svc.service_type.clone());
+                let size_mb = svc.model_sizes_mb.get(idx).copied().filter(|v| *v > 0);
                 model_map.entry(key).or_default().push(ModelInstance {
                     node_id: svc.node_id.clone(),
                     node_name: svc.service_name.clone(),
                     service_id: svc.service_id.clone(),
                     status: svc.status.clone(),
+                    backend: svc.engine_id.clone(),
+                    size_mb,
                 });
             }
         }
@@ -289,6 +294,8 @@ mod tests {
             status: "running".to_string(),
             models: models.into_iter().map(String::from).collect(),
             load_percent: 10,
+            engine_id: None,
+            model_sizes_mb: Vec::new(),
         }
     }
 

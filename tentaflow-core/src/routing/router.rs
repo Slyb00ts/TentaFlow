@@ -562,10 +562,13 @@ impl Router {
                 match load_result {
                     Ok(Ok(stt_info)) => {
                         info!("Przywrocono STT '{}' ({})", stt_info.name, stt_info.device);
+                        let size_mb = stt_info.size_bytes / (1024 * 1024);
                         self.register_native_service_in_mesh(
                             &svc.name,
                             "stt",
                             vec!["whisper-large-v3-turbo".to_string()],
+                            Some(stt_info.backend.clone()),
+                            vec![size_mb],
                         );
                     }
                     Ok(Err(e)) => {
@@ -649,7 +652,14 @@ impl Router {
                         model_info.vram_used_mb,
                         model_info.context_length
                     );
-                    self.register_native_service_in_mesh(&svc.name, "llm", vec![model_id.clone()]);
+                    let size_mb = model_info.size_bytes / (1024 * 1024);
+                    self.register_native_service_in_mesh(
+                        &svc.name,
+                        "llm",
+                        vec![model_id.clone()],
+                        Some(model_info.backend.clone()),
+                        vec![size_mb],
+                    );
                 }
                 Ok(Err(e)) => {
                     warn!("Blad ladowania modelu '{}': {}", model_id, e);
@@ -679,6 +689,8 @@ impl Router {
         service_name: &str,
         service_type: &str,
         models: Vec<String>,
+        engine_id: Option<String>,
+        model_sizes_mb: Vec<u64>,
     ) {
         let mesh_guard = self.mesh_manager.read();
         let mesh = match mesh_guard.as_ref() {
@@ -699,6 +711,8 @@ impl Router {
             status: "running".to_string(),
             models,
             load_percent: 0,
+            engine_id,
+            model_sizes_mb,
         };
 
         mesh.service_registry().register_local(service_info);
