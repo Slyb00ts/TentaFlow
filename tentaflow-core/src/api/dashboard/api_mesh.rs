@@ -183,7 +183,17 @@ pub fn handle_confirm_pairing(
     quic_mesh: &Option<Arc<IrohMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
+    info!(
+        remote_node_id = %remote_node_id,
+        len = remote_node_id.len(),
+        "handle_confirm_pairing: start"
+    );
     if !is_valid_id(remote_node_id) {
+        warn!(
+            "handle_confirm_pairing: is_valid_id rejected remote_node_id={:?} bytes={:?}",
+            remote_node_id,
+            remote_node_id.as_bytes()
+        );
         return Ok((400, json_error("Niepoprawny node_id")));
     }
 
