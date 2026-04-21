@@ -175,6 +175,8 @@ impl MeshCommandExecutor {
 
                         // Server negotiates its own RDMA listener port locally; it's a different
                         // value from the caller-supplied `rdma_port` (which is a client-side hint).
+                        // Mutacja tylko w cfg(rdma-probe); bez tego feature'u `mut` jest nieuzywany.
+                        #[allow(unused_mut)]
                         let mut server_rdma_port: u16 = 0;
                         #[cfg(feature = "rdma-probe")]
                         if let Some(rdma_dev) =
