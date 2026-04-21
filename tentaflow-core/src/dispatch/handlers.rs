@@ -2542,29 +2542,32 @@ fn first_non_loopback_ip_str(addresses: &[std::net::IpAddr]) -> Option<String> {
         .map(|a| a.to_string())
 }
 
-fn aggregate_gpu(gpus: &[StoreGpu]) -> Option<tentaflow_protocol::MeshNodeGpuInfo> {
-    if gpus.is_empty() {
-        return None;
-    }
-    // Pierwsze GPU jako "primary" — UI dashboardu pokazuje agregat.
-    let g = &gpus[0];
-    Some(tentaflow_protocol::MeshNodeGpuInfo {
-        vendor: if g.name.to_lowercase().contains("nvidia") {
-            "nvidia".to_string()
-        } else if g.name.to_lowercase().contains("amd") {
-            "amd".to_string()
-        } else {
-            "unknown".to_string()
-        },
-        name: g.name.clone(),
-        vram_total_mb: g.vram_total_mb,
-        vram_used_mb: Some(g.vram_used_mb),
-        temperature_c: Some(g.temperature_c as f32),
-        power_draw_w: g.power_draw_w,
-        utilization_percent: Some(g.usage_percent),
-        driver_version: None,
-        cuda_version: None,
-    })
+fn all_gpus_to_proto(gpus: &[StoreGpu]) -> Vec<tentaflow_protocol::MeshNodeGpuInfo> {
+    gpus.iter()
+        .map(|g| {
+            let name_lc = g.name.to_lowercase();
+            let vendor = if name_lc.contains("nvidia") {
+                "nvidia"
+            } else if name_lc.contains("amd") || name_lc.contains("radeon") {
+                "amd"
+            } else if name_lc.contains("intel") {
+                "intel"
+            } else {
+                "unknown"
+            };
+            tentaflow_protocol::MeshNodeGpuInfo {
+                vendor: vendor.to_string(),
+                name: g.name.clone(),
+                vram_total_mb: g.vram_total_mb,
+                vram_used_mb: Some(g.vram_used_mb),
+                temperature_c: Some(g.temperature_c as f32),
+                power_draw_w: g.power_draw_w,
+                utilization_percent: Some(g.usage_percent),
+                driver_version: None,
+                cuda_version: None,
+            }
+        })
+        .collect()
 }
 
 fn store_peer_to_proto(
@@ -2667,7 +2670,7 @@ fn store_peer_to_proto(
         source: source.to_string(),
         is_local,
         uptime_secs: None,
-        gpu_info: aggregate_gpu(&p.gpu_info),
+        gpus: all_gpus_to_proto(&p.gpu_info),
         network_interfaces: interfaces,
         cpu_count: Some(p.cpu_count),
         cpu_usage_percent: Some(p.cpu_usage_percent),
@@ -2760,7 +2763,7 @@ pub fn mesh_node_list(
             source: "trusted".to_string(),
             is_local: false,
             uptime_secs: None,
-            gpu_info: None,
+            gpus: Vec::new(),
             network_interfaces: Vec::new(),
             cpu_count: None,
             cpu_usage_percent: None,

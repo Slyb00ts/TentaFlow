@@ -168,7 +168,7 @@ function renderTargetCard(node, kind) {
   const nodeId = node.node_id || node.id;
   const hostname = node.hostname || nodeId?.slice(0, 12) || I18n.t('mesh.unknown_host');
   const os = (node.platform || node.os || '').toLowerCase();
-  const gpus = node.gpu_info || node.gpus || [];
+  const gpus = Array.isArray(node.gpus) ? node.gpus : [];
   const gpuNames = gpus.map((g) => g.name || '').filter(Boolean);
   const hasNvidia = gpus.some((g) => /nvidia|geforce|rtx|gtx|tesla|a100|h100|h200|l40|dgx|grace|blackwell|hopper|gb10|gh200|b200|b100/i.test(g.name || ''));
 
@@ -249,7 +249,7 @@ function bindTargetPicker() {
       };
     } else {
       const n = nodes.find((x) => (x.node_id || x.id) === id);
-      const gpus = n?.gpu_info || n?.gpus || [];
+      const gpus = Array.isArray(n?.gpus) ? n.gpus : [];
       target = {
         kind: n?.is_local ? 'local' : 'node',
         id,

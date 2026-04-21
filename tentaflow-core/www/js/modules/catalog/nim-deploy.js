@@ -105,13 +105,16 @@ export async function openNimDeployModal(container, preselectedNode = null) {
     try {
       const data = await ApiBinary.one('meshNodeDetailRequest', { nodeId });
       const node = data?.node;
-      const gpu = node?.gpuInfo;
-      if (gpu) {
+      const gpus = Array.isArray(node?.gpus) ? node.gpus : [];
+      if (gpus.length > 0) {
         const inner = gpuSelect.querySelector('select');
         if (!inner) return;
-        const vram = gpu.vramTotalMb ? Math.round(gpu.vramTotalMb / 1024) + ' GB' : '';
-        inner.innerHTML = '<option value="all">All GPUs</option>' +
-          `<option value="0">GPU 0: ${escapeHtml(gpu.name || '')}${vram ? ` (${vram})` : ''}</option>`;
+        const options = ['<option value="all">All GPUs</option>'];
+        gpus.forEach((gpu, idx) => {
+          const vram = gpu.vramTotalMb ? Math.round(gpu.vramTotalMb / 1024) + ' GB' : '';
+          options.push(`<option value="${idx}">GPU ${idx}: ${escapeHtml(gpu.name || '')}${vram ? ` (${vram})` : ''}</option>`);
+        });
+        inner.innerHTML = options.join('');
         gpuSelect.setAttribute('value', 'all');
       }
     } catch {

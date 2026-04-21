@@ -3765,19 +3765,6 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "isLocal", n.is_local.into());
     set(&obj, "is_local", n.is_local.into());
     if let Some(v) = n.uptime_secs { set(&obj, "uptimeSecs", (v as f64).into()); }
-    if let Some(g) = n.gpu_info.clone() {
-        let gpu = js_sys::Object::new();
-        set(&gpu, "vendor", g.vendor.into());
-        set(&gpu, "name", g.name.into());
-        set(&gpu, "vramTotalMb", (g.vram_total_mb as f64).into());
-        if let Some(v) = g.vram_used_mb { set(&gpu, "vramUsedMb", (v as f64).into()); }
-        if let Some(v) = g.temperature_c { set(&gpu, "temperatureC", (v as f64).into()); }
-        if let Some(v) = g.power_draw_w { set(&gpu, "powerDrawW", (v as f64).into()); }
-        if let Some(v) = g.utilization_percent { set(&gpu, "utilizationPercent", (v as f64).into()); }
-        if let Some(v) = g.driver_version { set(&gpu, "driverVersion", v.into()); }
-        if let Some(v) = g.cuda_version { set(&gpu, "cudaVersion", v.into()); }
-        set(&obj, "gpuInfo", gpu.into());
-    }
     let ifs = js_sys::Array::new();
     let mut total_rx: u64 = 0;
     let mut total_tx: u64 = 0;
@@ -3855,28 +3842,42 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         set(&obj, "gpuLoadPercent", (v as f64).into());
         set(&obj, "gpu_load_percent", (v as f64).into());
     }
-    // Aggregat gpu_info dla starszego frontendu — lista pojedynczych GPU
-    // z polami snake_case kompatybilnymi z dotychczasowym REST shape.
+    // Per-GPU list — emitted in both camelCase and snake_case variants so
+    // callers can render individual cards and per-GPU deploy targeting.
     let gpu_arr = js_sys::Array::new();
-    if let Some(g) = n.gpu_info.clone() {
+    for g in &n.gpus {
         let item = js_sys::Object::new();
+        set(&item, "vendor", g.vendor.clone().into());
         set(&item, "name", g.name.clone().into());
+        set(&item, "vramTotalMb", (g.vram_total_mb as f64).into());
         set(&item, "vram_total_mb", (g.vram_total_mb as f64).into());
         if let Some(v) = g.vram_used_mb {
+            set(&item, "vramUsedMb", (v as f64).into());
             set(&item, "vram_used_mb", (v as f64).into());
         }
         if let Some(v) = g.utilization_percent {
+            set(&item, "utilizationPercent", (v as f64).into());
             set(&item, "usage_percent", (v as f64).into());
         }
         if let Some(v) = g.temperature_c {
+            set(&item, "temperatureC", (v as f64).into());
             set(&item, "temperature_c", (v as f64).into());
         }
         if let Some(v) = g.power_draw_w {
+            set(&item, "powerDrawW", (v as f64).into());
             set(&item, "power_draw_w", (v as f64).into());
+        }
+        if let Some(ref v) = g.driver_version {
+            set(&item, "driverVersion", v.clone().into());
+            set(&item, "driver_version", v.clone().into());
+        }
+        if let Some(ref v) = g.cuda_version {
+            set(&item, "cudaVersion", v.clone().into());
+            set(&item, "cuda_version", v.clone().into());
         }
         gpu_arr.push(&item.into());
     }
-    set(&obj, "gpu_info", gpu_arr.clone().into());
+    set(&obj, "gpus", gpu_arr.clone().into());
     set(&obj, "gpu_count", (gpu_arr.length() as u32).into());
     let models = js_sys::Array::new();
     for m in n.models {

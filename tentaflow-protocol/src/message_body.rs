@@ -704,7 +704,7 @@ pub struct MeshNodeInfo {
     pub source: String,
     pub is_local: bool,
     pub uptime_secs: Option<u64>,
-    pub gpu_info: Option<MeshNodeGpuInfo>,
+    pub gpus: Vec<MeshNodeGpuInfo>,
     pub network_interfaces: Vec<MeshNodeNetworkInterface>,
     pub cpu_count: Option<u32>,
     pub cpu_usage_percent: Option<f32>,

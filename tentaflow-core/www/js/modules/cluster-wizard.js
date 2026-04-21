@@ -219,7 +219,7 @@ function renderStep2() {
   const rows = availableNodes.map(n => {
     const id = n.node_id || n.id;
     const checked = selectedIds.has(id) ? 'checked' : '';
-    const gpus = Array.isArray(n.gpu_info) ? n.gpu_info : [];
+    const gpus = Array.isArray(n.gpus) ? n.gpus : [];
     const vramTotal = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
     const ramTotal = n.ram_total_mb || 0;
     const online = isOnline(n);
