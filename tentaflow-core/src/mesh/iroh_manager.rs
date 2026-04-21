@@ -236,7 +236,8 @@ impl IrohMeshManager {
         }))
     }
 
-    /// Startuje accept loop + heartbeat loop. Zwraca JoinHandles do monitorowania.
+    /// Startuje accept loop + heartbeat loop + discovery loop (LAN mDNS).
+    /// Zwraca JoinHandles do monitorowania.
     pub fn start(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
         let mut handles = Vec::new();
 
@@ -250,7 +251,66 @@ impl IrohMeshManager {
             me.run_heartbeat_loop().await;
         }));
 
+        let me = Arc::clone(self);
+        handles.push(tokio::spawn(async move {
+            Self::run_discovery_loop(me).await;
+        }));
+
         handles
+    }
+
+    /// Konsumuje strumien `DiscoveryEvent` z iroh mDNS. Dla kazdego swiezo
+    /// odkrytego peera (nie-self, nie-juz-polaczonego) wola `connect_to_peer`
+    /// po EndpointId — iroh sam rozwiazuje adres. To jest brakujacy most
+    /// pomiedzy warstwa odkrywania a warstwa mesh: bez niego SWIM gossip ma
+    /// puste seed peers.
+    async fn run_discovery_loop(self_arc: Arc<Self>) {
+        use futures::StreamExt;
+
+        let mut events = match self_arc.endpoint.mdns_discovery_events().await {
+            Some(s) => s,
+            None => {
+                info!("iroh_mesh: LAN discovery wylaczone — discovery loop pominietа");
+                return;
+            }
+        };
+
+        let self_hex = self_arc.local_node_id.read().clone();
+        info!(self_id = %self_hex, "iroh_mesh: discovery loop wystartowal");
+
+        loop {
+            tokio::select! {
+                _ = self_arc.shutdown.cancelled() => {
+                    info!("iroh_mesh: discovery loop shutdown");
+                    return;
+                }
+                ev = events.next() => {
+                    let Some(ev) = ev else {
+                        info!("iroh_mesh: discovery stream zamkniety");
+                        return;
+                    };
+                    use iroh::address_lookup::DiscoveryEvent;
+                    if let DiscoveryEvent::Discovered { endpoint_info, .. } = ev {
+                        let peer_id = endpoint_info.endpoint_id;
+                        let peer_hex = hex::encode(peer_id.as_bytes());
+                        if peer_hex == self_hex {
+                            continue;
+                        }
+                        if self_arc.is_connected(&peer_hex).await {
+                            continue;
+                        }
+                        info!(peer = %peer_hex, "iroh_mesh: odkryty nowy peer na LAN — dial");
+                        let me = Arc::clone(&self_arc);
+                        tokio::spawn(async move {
+                            let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+                            if let Err(e) = me.connect_to_peer(&peer_hex, dummy).await {
+                                warn!(peer = %peer_hex, "iroh_mesh: dial po discovery nieudany: {}", e);
+                            }
+                        });
+                    }
+                }
+            }
+        }
     }
 
     async fn run_accept_loop(self_arc: Arc<Self>) {
