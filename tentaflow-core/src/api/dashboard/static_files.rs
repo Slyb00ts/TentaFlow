@@ -26,13 +26,26 @@ pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>) {
     }
 
     if let Some((content_type, data)) = wwwroot_lookup(clean_path) {
+        return (200, content_type, data.to_vec());
+    }
+
+    // SPA fallback tylko dla sciezek-routes (bez rozszerzenia lub .html).
+    // Dla assetow (.js, .css, .wasm, .png itd.) zwracamy 404, zeby przegladarka
+    // nie dostala HTML pod zadanie modulu JS (co lami MIME checking ES modules).
+    let is_asset = clean_path
+        .rsplit('/')
+        .next()
+        .and_then(|f| f.rsplit_once('.'))
+        .map(|(_, ext)| !ext.eq_ignore_ascii_case("html"))
+        .unwrap_or(false);
+
+    if is_asset {
+        return (404, "text/plain", b"Not Found".to_vec());
+    }
+
+    if let Some((content_type, data)) = wwwroot_lookup("index.html") {
         (200, content_type, data.to_vec())
     } else {
-        // SPA fallback — jesli nie znaleziono pliku, serwuj index.html
-        if let Some((content_type, data)) = wwwroot_lookup("index.html") {
-            (200, content_type, data.to_vec())
-        } else {
-            (404, "text/plain", b"Not Found".to_vec())
-        }
+        (404, "text/plain", b"Not Found".to_vec())
     }
 }
