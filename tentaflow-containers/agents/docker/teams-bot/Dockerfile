@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpulse-dev \
         libssl-dev \
         protobuf-compiler \
+        cmake \
+        g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -40,15 +42,16 @@ WORKDIR /build
 #
 # Binary kopiujemy POZA /build/target (cache mount znika po RUN) do /artifacts.
 COPY tentaflow-protocol/ tentaflow-protocol/
+COPY tentaflow-transport/ tentaflow-transport/
 COPY tentaflow-voice/ tentaflow-voice/
-COPY tentaflow-containers/agents/docker/teams-bot/ tentaflow-containers/teams-bot/
+COPY tentaflow-containers/agents/docker/teams-bot/ tentaflow-containers/agents/docker/teams-bot/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --manifest-path tentaflow-containers/teams-bot/Cargo.toml \
+    cargo build --release --manifest-path tentaflow-containers/agents/docker/teams-bot/Cargo.toml \
     && mkdir -p /artifacts \
-    && cp /build/tentaflow-containers/teams-bot/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
+    && cp /build/tentaflow-containers/agents/docker/teams-bot/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
     && strip /artifacts/tentaflow-meeting
 
 # ---------------------------------------------------------------------------
