@@ -1576,7 +1576,21 @@
     "deployFailed": "Déploiement échoué : {error}",
     "engineNotFound": "Moteur \"{id}\" n'existe pas dans le manifeste",
     "recommended": "Recommandé",
-    "targetNode": "Nœud cible"
+    "targetNode": "Nœud cible",
+    "step_gpu": "GPU",
+    "gpu_title": "Sélectionner les GPU sur {node}",
+    "gpu_subtitle": "Choisissez les GPU que ce déploiement utilisera sur le nœud sélectionné.",
+    "gpu_mode_all": "Utiliser tous les GPU ({n})",
+    "gpu_mode_specific": "Choisir des GPU spécifiques",
+    "gpu_mode_none": "Ne pas utiliser de GPU (CPU uniquement)",
+    "gpu_mode_all_hint": "Expose tous les GPU visibles au conteneur.",
+    "gpu_mode_specific_hint": "Seuls les indices de GPU sélectionnés seront transmis.",
+    "gpu_mode_none_hint": "Le conteneur s'exécute sur CPU ; aucune ressource GPU ne sera demandée.",
+    "gpu_empty_on_node": "Ce nœud ne signale aucun GPU.",
+    "gpu_select_at_least_one": "Sélectionnez au moins un GPU ou changez de mode.",
+    "gpu_summary_specific": "{n} GPU sélectionné(s) · {total_vram} VRAM au total",
+    "gpu_summary_all": "Tous les GPU du nœud seront utilisés",
+    "gpu_summary_none": "Aucun GPU ne sera utilisé"
   },
   "category": {
     "llm": "Modèles de langage (LLM)",

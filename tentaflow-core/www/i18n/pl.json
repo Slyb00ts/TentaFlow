@@ -1475,7 +1475,21 @@
     "deployFailed": "Deploy nieudany: {error}",
     "engineNotFound": "Silnik \"{id}\" nie istnieje w manifeście",
     "recommended": "Rekomendowany",
-    "targetNode": "Węzeł docelowy"
+    "targetNode": "Węzeł docelowy",
+    "step_gpu": "GPU",
+    "gpu_title": "Wybierz GPU na węźle {node}",
+    "gpu_subtitle": "Zdecyduj, z których kart GPU skorzysta ten deployment na wybranym węźle.",
+    "gpu_mode_all": "Użyj wszystkich GPU ({n})",
+    "gpu_mode_specific": "Wybierz konkretne GPU",
+    "gpu_mode_none": "Nie używaj GPU (tylko CPU)",
+    "gpu_mode_all_hint": "Udostępnij kontenerowi wszystkie widoczne karty GPU.",
+    "gpu_mode_specific_hint": "Do kontenera trafią tylko zaznaczone indeksy GPU.",
+    "gpu_mode_none_hint": "Kontener uruchomi się na CPU; żadne GPU nie zostanie zarezerwowane.",
+    "gpu_empty_on_node": "Ten węzeł nie zgłasza żadnego GPU.",
+    "gpu_select_at_least_one": "Wybierz co najmniej jedno GPU albo zmień tryb.",
+    "gpu_summary_specific": "Wybrano {n} GPU · łącznie {total_vram} VRAM",
+    "gpu_summary_all": "Zostaną użyte wszystkie GPU na węźle",
+    "gpu_summary_none": "GPU nie zostanie użyte"
   },
   "category": {
     "llm": "Modele językowe (LLM)",

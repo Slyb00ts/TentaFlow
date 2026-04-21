@@ -1576,7 +1576,21 @@
     "deployFailed": "Deploy fehlgeschlagen: {error}",
     "engineNotFound": "Engine \"{id}\" existiert nicht im Manifest",
     "recommended": "Empfohlen",
-    "targetNode": "Zielknoten"
+    "targetNode": "Zielknoten",
+    "step_gpu": "GPU-Auswahl",
+    "gpu_title": "GPUs auf {node} auswählen",
+    "gpu_subtitle": "Legen Sie fest, welche GPUs dieses Deployment auf dem Zielknoten verwenden soll.",
+    "gpu_mode_all": "Alle GPUs verwenden ({n})",
+    "gpu_mode_specific": "Bestimmte GPUs auswählen",
+    "gpu_mode_none": "Keine GPU (nur CPU)",
+    "gpu_mode_all_hint": "Alle sichtbaren GPUs werden dem Container zugewiesen.",
+    "gpu_mode_specific_hint": "Nur die ausgewählten GPU-Indizes werden durchgereicht.",
+    "gpu_mode_none_hint": "Der Container läuft auf der CPU; es werden keine GPU-Ressourcen angefordert.",
+    "gpu_empty_on_node": "Dieser Knoten meldet keine GPUs.",
+    "gpu_select_at_least_one": "Mindestens eine GPU auswählen oder einen anderen Modus wählen.",
+    "gpu_summary_specific": "{n} GPU(s) ausgewählt · {total_vram} VRAM gesamt",
+    "gpu_summary_all": "Alle GPUs des Knotens werden verwendet",
+    "gpu_summary_none": "GPU wird nicht verwendet"
   },
   "category": {
     "llm": "Sprachmodelle (LLM)",
