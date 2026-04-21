@@ -1362,6 +1362,767 @@ pub struct ServiceManifestDeployResponse {
 /// Enum wariantow tresci. Bootstrap (#29) zawieral 10; #36 dokladuje 10 kolejnych
 /// pokrywajacych wszystkie 7 archetypow (R-ONE, R-LIST, R-STREAM, W-CREATE,
 /// W-UPDATE, W-DELETE, W-ACTION). Dla kazdego variantu MUSI istniec wpis w
+// =============================================================================
+// Addons — list/detail/toggle/install/uninstall/reload + config + logs + tools
+// + resources + network rules + visibility + permissions + OAuth (migration 38).
+// =============================================================================
+
+/// Summary wiersz dla listy addonow (kafelki w dashboard / catalog).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonInfo {
+    pub addon_id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    pub is_enabled: bool,
+    pub is_system: bool,
+    pub runtime: String,
+    pub oauth_mode: Option<String>,
+    pub visibility_scope: String,
+    pub declared_permissions_count: i32,
+    pub users_with_oauth_count: i32,
+    pub icon: Option<String>,
+    pub category: Option<String>,
+    pub file_size_bytes: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonsListResponse {
+    pub addons: Vec<AddonInfo>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonDetailRequest {
+    pub addon_id: String,
+}
+
+/// Deklaracja uprawnienia (z manifestu addona).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionDecl {
+    pub permission_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub risk: String,
+    pub sort_order: i32,
+}
+
+/// Deklaracja providera OAuth (z manifestu).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthProviderDecl {
+    pub addon_id: String,
+    pub provider_id: String,
+    pub display_name: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub revoke_url: Option<String>,
+    pub scopes: Vec<String>,
+    pub mode: String,
+    pub pkce: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonDetailResponse {
+    pub addon_id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    pub is_enabled: bool,
+    pub is_system: bool,
+    pub admin_only: bool,
+    pub category: String,
+    pub permissions: Vec<AddonPermissionDecl>,
+    pub oauth_providers: Vec<AddonOAuthProviderDecl>,
+    pub license: String,
+    pub file_size_bytes: i64,
+    pub runtime: String,
+    pub icon: Option<String>,
+    pub oauth_mode: Option<String>,
+    pub visibility_groups_visible: i32,
+    pub visibility_groups_total: i32,
+    pub tools_count: i32,
+    pub linked_accounts_count: i32,
+    pub show_in_catalog: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonToggleRequest {
+    pub addon_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonToggleResponse {
+    pub ok: bool,
+    pub enabled: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonInstallRequest {
+    pub filename: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonInstallResponse {
+    pub ok: bool,
+    pub addon_id: Option<String>,
+    pub version: Option<String>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonUninstallRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonUninstallResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonReloadRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonReloadResponse {
+    pub ok: bool,
+    pub message: Option<String>,
+}
+
+/// Pojedyncze pole konfiguracji addona (z manifestu).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonConfigField {
+    pub id: String,
+    pub label: String,
+    pub field_type: String,
+    pub description: String,
+    pub default_value: String,
+    pub options: Vec<String>,
+    pub required: bool,
+    pub secret: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonConfigGetRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonConfigGetResponse {
+    pub schema: Vec<AddonConfigField>,
+    pub values: Vec<(String, String)>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonConfigSetRequest {
+    pub addon_id: String,
+    pub values: Vec<(String, String)>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonConfigSetResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonLogsRequest {
+    pub addon_id: String,
+    pub limit: i64,
+    pub offset: i64,
+    pub level: Option<String>,
+    pub search: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonLogEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub level: String,
+    pub action: String,
+    pub message: String,
+    pub user_id: Option<i64>,
+    pub user_name: Option<String>,
+    pub details: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonLogsResponse {
+    pub entries: Vec<AddonLogEntry>,
+    pub total: i64,
+}
+
+/// Parametr pojedynczego narzedzia deklarowanego przez addon.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonToolParam {
+    pub name: String,
+    pub param_type: String,
+    pub description: String,
+    pub required: bool,
+    pub default_value: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonToolDecl {
+    pub name: String,
+    pub description: String,
+    pub parameters: Vec<AddonToolParam>,
+    pub return_type: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonToolsRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonToolsResponse {
+    pub tools: Vec<AddonToolDecl>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonResourcesGetRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonResourcesGetResponse {
+    pub max_instances: i32,
+    pub cpu_limit_pct: i32,
+    pub ram_mb: i32,
+    pub storage_mb: i32,
+    pub http_requests_per_min: i32,
+    pub llm_tokens_per_min: i32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonResourcesSetRequest {
+    pub addon_id: String,
+    pub max_instances: i32,
+    pub cpu_limit_pct: i32,
+    pub ram_mb: i32,
+    pub storage_mb: i32,
+    pub http_requests_per_min: i32,
+    pub llm_tokens_per_min: i32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonResourcesSetResponse {
+    pub ok: bool,
+}
+
+/// Zmergowana regula sieciowa zadeklarowana w manifescie + status pokrycia.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonNetworkRuleDecl {
+    pub host: String,
+    pub port: Option<i32>,
+    pub mode: String,
+    pub status: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonNetworkRulesGetRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonNetworkRulesGetResponse {
+    pub allowed_hosts: Vec<String>,
+    pub blocked_hosts: Vec<String>,
+    pub mode: String,
+    pub declared_rules: Vec<AddonNetworkRuleDecl>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonNetworkRulesSetRequest {
+    pub addon_id: String,
+    pub allowed_hosts: Vec<String>,
+    pub blocked_hosts: Vec<String>,
+    pub mode: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonNetworkRulesSetResponse {
+    pub ok: bool,
+}
+
+/// Wiersz widocznosci addona per grupa.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonVisibilityRow {
+    pub addon_id: String,
+    pub group_id: i64,
+    pub group_name: String,
+    pub visible: bool,
+    pub group_description: String,
+    pub user_count: i32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonVisibilityListRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonVisibilityListResponse {
+    pub addon_id: String,
+    pub rows: Vec<AddonVisibilityRow>,
+    pub show_in_catalog: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonVisibilitySetRequest {
+    pub addon_id: String,
+    pub group_id: i64,
+    pub visible: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonVisibilitySetResponse {
+    pub addon_id: String,
+    pub group_id: i64,
+    pub visible: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonAdminOnlySetRequest {
+    pub addon_id: String,
+    pub admin_only: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonAdminOnlySetResponse {
+    pub addon_id: String,
+    pub admin_only: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonShowInCatalogSetRequest {
+    pub addon_id: String,
+    pub show_in_catalog: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonShowInCatalogSetResponse {
+    pub addon_id: String,
+    pub show_in_catalog: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionCatalogRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionCatalogResponse {
+    pub addon_id: String,
+    pub entries: Vec<AddonPermissionDecl>,
+}
+
+/// Explicit allow/deny/inherit per subject (user|group) + permission.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionRow {
+    pub addon_id: String,
+    pub subject_type: String,
+    pub subject_id: i64,
+    pub permission_id: String,
+    pub grant_mode: String,
+    pub updated_at_epoch: u64,
+}
+
+/// Default grant per addon + permission.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionDefault {
+    pub addon_id: String,
+    pub permission_id: String,
+    pub grant_mode: String,
+    pub updated_at_epoch: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionMatrixRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionMatrixResponse {
+    pub addon_id: String,
+    pub rows: Vec<AddonPermissionRow>,
+    pub defaults: Vec<AddonPermissionDefault>,
+    pub last_change_by: String,
+    pub last_change_at_epoch: u64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionSetRequest {
+    pub addon_id: String,
+    pub subject_type: String,
+    pub subject_id: i64,
+    pub permission_id: String,
+    pub grant_mode: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionSetResponse {
+    pub addon_id: String,
+    pub subject_type: String,
+    pub subject_id: i64,
+    pub permission_id: String,
+    pub grant_mode: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionDefaultSetRequest {
+    pub addon_id: String,
+    pub permission_id: String,
+    pub grant_mode: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionDefaultSetResponse {
+    pub addon_id: String,
+    pub permission_id: String,
+    pub grant_mode: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionCheckRequest {
+    pub addon_id: String,
+    pub permission_id: String,
+    pub user_id: Option<i64>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionCheckResponse {
+    pub addon_id: String,
+    pub permission_id: String,
+    pub allowed: bool,
+    pub reason: String,
+}
+
+/// Server-push event wysylany gdy admin zmieni grant/visibility/default.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonPermissionChangedEvent {
+    pub addon_id: String,
+    pub subject_type: Option<String>,
+    pub subject_id: Option<i64>,
+    pub permission_id: Option<String>,
+}
+
+/// Konfiguracja OAuth per (addon, provider) — bez sekretow.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthConfigRow {
+    pub addon_id: String,
+    pub provider_id: String,
+    pub client_id: String,
+    pub client_secret_set: bool,
+    pub redirect_uri: String,
+    pub enabled: bool,
+    pub updated_at_epoch: u64,
+    pub oauth_mode: String,
+    pub linked_accounts_count: i32,
+    pub shared_account_email: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthConfigListRequest {
+    pub addon_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthConfigListResponse {
+    pub addon_id: String,
+    pub configs: Vec<AddonOAuthConfigRow>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthConfigSetRequest {
+    pub addon_id: String,
+    pub provider_id: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub enabled: bool,
+    pub oauth_mode: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthConfigSetResponse {
+    pub addon_id: String,
+    pub provider_id: String,
+    pub client_secret_set: bool,
+    pub enabled: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthConfigClearSecretRequest {
+    pub addon_id: String,
+    pub provider_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthConfigClearSecretResponse {
+    pub addon_id: String,
+    pub provider_id: String,
+    pub cleared: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthAuthorizeStartRequest {
+    pub addon_id: String,
+    pub provider_id: String,
+    pub mode: String,
+    pub redirect_after: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthAuthorizeStartResponse {
+    pub authorize_url: String,
+    pub state: String,
+}
+
+/// Metadane konta OAuth (tokeny nigdy nie wychodza poza core).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct UserOAuthAccountRow {
+    pub id: i64,
+    pub user_id: Option<i64>,
+    pub addon_id: String,
+    pub provider_id: String,
+    pub external_account_id: String,
+    pub display_name: String,
+    pub token_type: String,
+    pub scopes: Vec<String>,
+    pub expires_at_epoch: Option<u64>,
+    pub created_at_epoch: u64,
+    pub last_used_at_epoch: Option<u64>,
+    pub revoked: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthLinkedAccountsRequest {
+    pub addon_id: String,
+    pub scope: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthLinkedAccountsResponse {
+    pub addon_id: String,
+    pub accounts: Vec<UserOAuthAccountRow>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthRevokeRequest {
+    pub account_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthRevokeResponse {
+    pub account_id: i64,
+    pub revoked: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthReauthorizeRequest {
+    pub account_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthReauthorizeResponse {
+    pub authorize_url: String,
+    pub state: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthTestConnectionRequest {
+    pub addon_id: String,
+    pub provider_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct AddonOAuthTestConnectionResponse {
+    pub ok: bool,
+    pub message: Option<String>,
+    pub account_email: Option<String>,
+}
+
+/// Wpis widoku "Moje polaczone konta" (per uzytkownik).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MyOAuthEntry {
+    pub addon_id: String,
+    pub addon_name: String,
+    pub addon_icon: Option<String>,
+    pub addon_description: String,
+    pub addon_version: String,
+    pub provider_id: String,
+    pub provider_display_name: String,
+    pub status: String,
+    pub account_id: Option<i64>,
+    pub account_email: String,
+    pub account_display_name: String,
+    pub scopes: Vec<String>,
+    pub connected_at_epoch: i64,
+    pub last_used_at_epoch: i64,
+    pub expires_at_epoch: i64,
+}
+
+/// Unit request (bez pol) — jawna struct aby trzymac Body(T) pattern.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MyOAuthAccountsListRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MyOAuthAccountsListResponse {
+    pub accounts: Vec<MyOAuthEntry>,
+}
+
+// =============================================================================
+// Notes (per-user) — inner-enum multiplex zeby nie przekroczyc 256 variantow
+// MessageBody. Payloady opakowane w strukty (nawet puste) dla spojnego wzorca.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NotesListRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteEntry {
+    pub id: i64,
+    pub title: String,
+    pub body_preview: String,
+    pub pinned: bool,
+    pub created_at_epoch: i64,
+    pub updated_at_epoch: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NotesListResponse {
+    pub notes: Vec<NoteEntry>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteDetailRequest {
+    pub note_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteDetailResponse {
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    pub pinned: bool,
+    pub created_at_epoch: i64,
+    pub updated_at_epoch: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteCreateRequest {
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteCreateResponse {
+    pub id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteUpdateRequest {
+    pub note_id: i64,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteUpdateResponse {
+    pub ok: bool,
+    pub updated_at_epoch: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteSetPinnedRequest {
+    pub note_id: i64,
+    pub pinned: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteSetPinnedResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteDeleteRequest {
+    pub note_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NoteDeleteResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum NotesRequest {
+    List(NotesListRequest),
+    Detail(NoteDetailRequest),
+    Create(NoteCreateRequest),
+    Update(NoteUpdateRequest),
+    SetPinned(NoteSetPinnedRequest),
+    Delete(NoteDeleteRequest),
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum NotesResponse {
+    List(NotesListResponse),
+    Detail(NoteDetailResponse),
+    Create(NoteCreateResponse),
+    Update(NoteUpdateResponse),
+    SetPinned(NoteSetPinnedResponse),
+    Delete(NoteDeleteResponse),
+}
+
+// =============================================================================
+// Translate (LLM-backed translator w user app).
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct TranslateRequest {
+    pub source_text: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub tone: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct TranslateResponse {
+    pub translated_text: String,
+    pub detected_source_lang: Option<String>,
+    pub model_used: String,
+    pub tokens_used: i32,
+}
+
+// =============================================================================
+// Users list (Admin only) — rozszerzone metadane konta z last_login.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct UserInfo {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub email: String,
+    pub is_active: bool,
+    pub is_admin: bool,
+    pub sso_provider: Option<String>,
+    pub last_login_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct UsersListResponse {
+    pub users: Vec<UserInfo>,
+}
+
 /// policy table (`#[policy]` proc-macro z #26).
 ///
 /// Kazda nowa pozycja = additive change i bump `SCHEMA_VERSION`.
@@ -1626,6 +2387,93 @@ pub enum MessageBody {
     NimCatalogListResponseBody(NimCatalogListResponse),
     ServiceManifestDeployRequestBody(ServiceManifestDeployRequest),
     ServiceManifestDeployResponseBody(ServiceManifestDeployResponse),
+
+    // ---- Addons: list / detail / toggle / lifecycle ----
+    AddonsListRequest,
+    AddonsListResponseBody(AddonsListResponse),
+    AddonDetailRequestBody(AddonDetailRequest),
+    AddonDetailResponseBody(AddonDetailResponse),
+    AddonToggleRequestBody(AddonToggleRequest),
+    AddonToggleResponseBody(AddonToggleResponse),
+    AddonInstallRequestBody(AddonInstallRequest),
+    AddonInstallResponseBody(AddonInstallResponse),
+    AddonUninstallRequestBody(AddonUninstallRequest),
+    AddonUninstallResponseBody(AddonUninstallResponse),
+    AddonReloadRequestBody(AddonReloadRequest),
+    AddonReloadResponseBody(AddonReloadResponse),
+    AddonConfigGetRequestBody(AddonConfigGetRequest),
+    AddonConfigGetResponseBody(AddonConfigGetResponse),
+    AddonConfigSetRequestBody(AddonConfigSetRequest),
+    AddonConfigSetResponseBody(AddonConfigSetResponse),
+    AddonLogsRequestBody(AddonLogsRequest),
+    AddonLogsResponseBody(AddonLogsResponse),
+    AddonToolsRequestBody(AddonToolsRequest),
+    AddonToolsResponseBody(AddonToolsResponse),
+    AddonResourcesGetRequestBody(AddonResourcesGetRequest),
+    AddonResourcesGetResponseBody(AddonResourcesGetResponse),
+    AddonResourcesSetRequestBody(AddonResourcesSetRequest),
+    AddonResourcesSetResponseBody(AddonResourcesSetResponse),
+    AddonNetworkRulesGetRequestBody(AddonNetworkRulesGetRequest),
+    AddonNetworkRulesGetResponseBody(AddonNetworkRulesGetResponse),
+    AddonNetworkRulesSetRequestBody(AddonNetworkRulesSetRequest),
+    AddonNetworkRulesSetResponseBody(AddonNetworkRulesSetResponse),
+
+    // ---- Addons: visibility ----
+    AddonVisibilityListRequestBody(AddonVisibilityListRequest),
+    AddonVisibilityListResponseBody(AddonVisibilityListResponse),
+    AddonVisibilitySetRequestBody(AddonVisibilitySetRequest),
+    AddonVisibilitySetResponseBody(AddonVisibilitySetResponse),
+    AddonAdminOnlySetRequestBody(AddonAdminOnlySetRequest),
+    AddonAdminOnlySetResponseBody(AddonAdminOnlySetResponse),
+    AddonShowInCatalogSetRequestBody(AddonShowInCatalogSetRequest),
+    AddonShowInCatalogSetResponseBody(AddonShowInCatalogSetResponse),
+
+    // ---- Addons: permissions ----
+    AddonPermissionCatalogRequestBody(AddonPermissionCatalogRequest),
+    AddonPermissionCatalogResponseBody(AddonPermissionCatalogResponse),
+    AddonPermissionMatrixRequestBody(AddonPermissionMatrixRequest),
+    AddonPermissionMatrixResponseBody(AddonPermissionMatrixResponse),
+    AddonPermissionSetRequestBody(AddonPermissionSetRequest),
+    AddonPermissionSetResponseBody(AddonPermissionSetResponse),
+    AddonPermissionDefaultSetRequestBody(AddonPermissionDefaultSetRequest),
+    AddonPermissionDefaultSetResponseBody(AddonPermissionDefaultSetResponse),
+    AddonPermissionCheckRequestBody(AddonPermissionCheckRequest),
+    AddonPermissionCheckResponseBody(AddonPermissionCheckResponse),
+    AddonPermissionChangedEventBody(AddonPermissionChangedEvent),
+
+    // ---- Addons: OAuth ----
+    AddonOAuthConfigListRequestBody(AddonOAuthConfigListRequest),
+    AddonOAuthConfigListResponseBody(AddonOAuthConfigListResponse),
+    AddonOAuthConfigSetRequestBody(AddonOAuthConfigSetRequest),
+    AddonOAuthConfigSetResponseBody(AddonOAuthConfigSetResponse),
+    AddonOAuthConfigClearSecretRequestBody(AddonOAuthConfigClearSecretRequest),
+    AddonOAuthConfigClearSecretResponseBody(AddonOAuthConfigClearSecretResponse),
+    AddonOAuthAuthorizeStartRequestBody(AddonOAuthAuthorizeStartRequest),
+    AddonOAuthAuthorizeStartResponseBody(AddonOAuthAuthorizeStartResponse),
+    AddonOAuthLinkedAccountsRequestBody(AddonOAuthLinkedAccountsRequest),
+    AddonOAuthLinkedAccountsResponseBody(AddonOAuthLinkedAccountsResponse),
+    AddonOAuthRevokeRequestBody(AddonOAuthRevokeRequest),
+    AddonOAuthRevokeResponseBody(AddonOAuthRevokeResponse),
+    AddonOAuthReauthorizeRequestBody(AddonOAuthReauthorizeRequest),
+    AddonOAuthReauthorizeResponseBody(AddonOAuthReauthorizeResponse),
+    AddonOAuthTestConnectionRequestBody(AddonOAuthTestConnectionRequest),
+    AddonOAuthTestConnectionResponseBody(AddonOAuthTestConnectionResponse),
+
+    // ---- My OAuth accounts (user-facing) ----
+    MyOAuthAccountsListRequestBody(MyOAuthAccountsListRequest),
+    MyOAuthAccountsListResponseBody(MyOAuthAccountsListResponse),
+
+    // ---- Notes (inner-enum multiplex) ----
+    NotesRequestBody(NotesRequest),
+    NotesResponseBody(NotesResponse),
+
+    // ---- Translate (LLM-backed) ----
+    TranslateRequestBody(TranslateRequest),
+    TranslateResponseBody(TranslateResponse),
+
+    // ---- Users list (Admin) ----
+    UsersListRequest,
+    UsersListResponseBody(UsersListResponse),
 
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
