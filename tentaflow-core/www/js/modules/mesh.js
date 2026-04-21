@@ -122,7 +122,7 @@ function updateSubheader() {
   if (!sub) return;
   const total = nodes.length;
   const online = nodes.filter(n => isOnline(n)).length;
-  const pendingIncoming = pending.filter(p => p.direction === 'incoming').length;
+  const pendingIncoming = pending.filter(p => p.state === 'incoming').length;
   const parts = [
     `${total} ${pluralize(total, 'mesh.count_node', 'mesh.count_nodes')}`,
     `${online} ${escapeHtml(I18n.t('mesh.online'))}`,
@@ -198,7 +198,7 @@ function renderListSections() {
   const local = nodes.filter(n => n.is_local || n.source === 'local');
   const trusted = nodes.filter(n => !n.is_local && n.source === 'trusted');
   const discovered = nodes.filter(n => !n.is_local && n.source === 'discovered');
-  const pendingIncoming = pending.filter(p => p.direction === 'incoming');
+  const pendingIncoming = pending.filter(p => p.state === 'incoming');
 
   let html = '';
   if (local.length > 0) {
