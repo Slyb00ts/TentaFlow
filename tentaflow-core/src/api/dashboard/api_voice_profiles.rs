@@ -20,8 +20,8 @@
 // =============================================================================
 
 use crate::db::DbPool;
-use hyper::Method;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use hyper::Method;
 use serde::{Deserialize, Serialize};
 
 fn json_error(msg: &str) -> String {
@@ -260,7 +260,12 @@ fn handle_append(db: &DbPool, profile_id: i64, body: &[u8]) -> (u16, String) {
         &pcm_bytes,
         req.meeting_id.as_deref(),
     ) {
-        Ok(added) => (200, json_ok(AppendResponse { samples_added: added })),
+        Ok(added) => (
+            200,
+            json_ok(AppendResponse {
+                samples_added: added,
+            }),
+        ),
         Err(e) => (400, json_error(&e)),
     }
 }
@@ -350,7 +355,10 @@ fn handle_rename(db: &DbPool, id: i64, body: &[u8]) -> (u16, String) {
     };
 
     // Merge incoming changes nad istniejacym profilem
-    let new_first = req.first_name.as_deref().map(str::trim)
+    let new_first = req
+        .first_name
+        .as_deref()
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(&existing.first_name)
         .to_string();
@@ -358,7 +366,11 @@ fn handle_rename(db: &DbPool, id: i64, body: &[u8]) -> (u16, String) {
     let new_last: Option<String> = match req.last_name {
         Some(Some(v)) => {
             let trimmed = v.trim().to_string();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
         }
         Some(None) => None, // explicit null → clear
         None => existing.last_name.clone(),
@@ -367,7 +379,11 @@ fn handle_rename(db: &DbPool, id: i64, body: &[u8]) -> (u16, String) {
     let new_nick: Option<String> = match req.nickname {
         Some(Some(v)) => {
             let trimmed = v.trim().to_string();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
         }
         Some(None) => None,
         None => existing.nickname.clone(),
@@ -459,7 +475,8 @@ fn handle_assign_temp_speaker(db: &DbPool, profile_id: i64, body: &[u8]) -> (u16
         return (404, json_error("profile not found"));
     }
 
-    match crate::db::repository::assign_temp_speaker_to_profile(db, req.temp_speaker_id, profile_id) {
+    match crate::db::repository::assign_temp_speaker_to_profile(db, req.temp_speaker_id, profile_id)
+    {
         Ok(()) => (200, json_ok(serde_json::json!({"ok": true}))),
         Err(e) => (500, json_error(&format!("assign failed: {}", e))),
     }

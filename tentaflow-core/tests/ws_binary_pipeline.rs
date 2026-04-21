@@ -19,20 +19,24 @@ use tentaflow_protocol::{
 
 /// Helper: encode klient -> serwer frame.
 fn encode_request(correlation_id: u64, body: MessageBody) -> Vec<u8> {
-    let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).unwrap().to_vec();
+    let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)
+        .unwrap()
+        .to_vec();
     let env = Envelope::new_direct(correlation_id, 1, message_kind::META_HEARTBEAT, body_bytes);
-    rkyv::to_bytes::<rkyv::rancor::Error>(&env).unwrap().to_vec()
+    rkyv::to_bytes::<rkyv::rancor::Error>(&env)
+        .unwrap()
+        .to_vec()
 }
 
 /// Helper: serwer-side flow — decode envelope + body, dispatch, encode response.
 fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
-    let env = rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(request_bytes)
-        .expect("decode envelope");
+    let env =
+        rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(request_bytes).expect("decode envelope");
     assert!(matches!(env.routing, Routing::Direct));
     assert_eq!(env.schema_version, tentaflow_protocol::SCHEMA_VERSION);
 
-    let body = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&env.body)
-        .expect("decode body");
+    let body =
+        rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&env.body).expect("decode body");
 
     let ctx = HandlerContext {
         session,
@@ -45,12 +49,8 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
     let resp_body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resp_body)
         .unwrap()
         .to_vec();
-    let mut resp_env = Envelope::new_direct(
-        env.correlation_id,
-        1,
-        env.message_kind,
-        resp_body_bytes,
-    );
+    let mut resp_env =
+        Envelope::new_direct(env.correlation_id, 1, env.message_kind, resp_body_bytes);
     if is_error {
         resp_env.flags = EnvelopeFlags::IS_ERROR;
     }
@@ -109,10 +109,9 @@ fn anonymous_session_denied_for_admin_handler() {
     let (env, body) = decode_response(&resp);
     assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
     match body {
-        MessageBody::Error(e) => assert_eq!(
-            e.code,
-            tentaflow_protocol::ProtocolErrorCode::PolicyDenied
-        ),
+        MessageBody::Error(e) => {
+            assert_eq!(e.code, tentaflow_protocol::ProtocolErrorCode::PolicyDenied)
+        }
         other => panic!("expected Error(PolicyDenied), got {:?}", other),
     }
 }
@@ -132,10 +131,9 @@ fn auth_login_with_unknown_user_rejected() {
     let (env, login_body) = decode_response(&login_resp);
     assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
     match login_body {
-        MessageBody::Error(e) => assert_eq!(
-            e.code,
-            tentaflow_protocol::ProtocolErrorCode::AuthRequired
-        ),
+        MessageBody::Error(e) => {
+            assert_eq!(e.code, tentaflow_protocol::ProtocolErrorCode::AuthRequired)
+        }
         other => panic!("expected AuthRequired, got {:?}", other),
     }
 }
@@ -155,10 +153,9 @@ fn auth_me_without_proper_user_id_format_fails() {
     let (env, body) = decode_response(&me_resp);
     assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
     match body {
-        MessageBody::Error(e) => assert_eq!(
-            e.code,
-            tentaflow_protocol::ProtocolErrorCode::Internal
-        ),
+        MessageBody::Error(e) => {
+            assert_eq!(e.code, tentaflow_protocol::ProtocolErrorCode::Internal)
+        }
         other => panic!("expected Internal error, got {:?}", other),
     }
 }
@@ -219,10 +216,9 @@ fn settings_update_requires_admin() {
     let (env, body) = decode_response(&resp);
     assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
     match body {
-        MessageBody::Error(e) => assert_eq!(
-            e.code,
-            tentaflow_protocol::ProtocolErrorCode::PolicyDenied
-        ),
+        MessageBody::Error(e) => {
+            assert_eq!(e.code, tentaflow_protocol::ProtocolErrorCode::PolicyDenied)
+        }
         other => panic!("expected PolicyDenied, got {:?}", other),
     }
 }

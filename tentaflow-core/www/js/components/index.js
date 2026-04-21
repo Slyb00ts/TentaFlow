@@ -8,6 +8,7 @@
 
 import './tf-button.js';
 import './tf-input.js';
+import './tf-textarea.js';
 import './tf-searchbox.js';
 import './tf-select.js';
 import './tf-toggle.js';
@@ -19,6 +20,7 @@ import './tf-window.js';
 
 export { TfButton } from './tf-button.js';
 export { TfInput } from './tf-input.js';
+export { TfTextarea } from './tf-textarea.js';
 export { TfSearchbox } from './tf-searchbox.js';
 export { TfSelect } from './tf-select.js';
 export { TfToggle } from './tf-toggle.js';

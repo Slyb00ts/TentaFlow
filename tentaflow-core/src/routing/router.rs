@@ -5,22 +5,22 @@
 //       streaming, embeddings, tts, stt.
 // =============================================================================
 
-use crate::routing::backend::BackendClient;
 use crate::config::RouterConfig;
 use crate::db::DbPool;
 use crate::error::Result;
 use crate::flow_engine::dispatcher::FlowDispatcher;
+use crate::intent_analyzer::IntentAnalyzer;
 use crate::middleware::ResponseMiddleware;
+use crate::routing::backend::BackendClient;
 use crate::routing::loadbalancer::LoadBalancingStrategy;
 use crate::routing::memory_integration::MemoryIntegration;
 use crate::routing::service_manager::ServiceManager;
 use crate::services::rag::RAGClient;
 use crate::services::tts::TTSClient;
-use crate::intent_analyzer::IntentAnalyzer;
 
-use tentaflow_protocol::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tentaflow_protocol::*;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -53,7 +53,8 @@ pub struct Router {
 
     /// Mowcy potrzebujacy dodatkowych sampli glosu (speaker_id -> remaining_samples)
     /// Po enrollment zbieramy 3 dodatkowe probki zeby wzmocnic model glosu
-    pub(crate) pending_voice_samples: Arc<tokio::sync::RwLock<std::collections::HashMap<String, u8>>>,
+    pub(crate) pending_voice_samples:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, u8>>>,
 
     /// Flow Engine dispatcher - opcjonalny, aktywny gdy DB jest dostepna
     pub(crate) flow_dispatcher: Option<Arc<FlowDispatcher>>,
@@ -68,10 +69,13 @@ pub struct Router {
     pub(crate) local_stt: Arc<super::local_stt::LocalSttHandler>,
 
     /// Mesh manager — do forwardowania requestow do zdalnych nodow
-    pub(crate) mesh_manager: Arc<parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>>,
+    pub(crate) mesh_manager:
+        Arc<parking_lot::RwLock<Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>>>,
 
     /// Cache aliasow modeli z DB (alias -> DbModelAlias)
-    pub(crate) alias_cache: Arc<parking_lot::RwLock<std::collections::HashMap<String, crate::db::models::DbModelAlias>>>,
+    pub(crate) alias_cache: Arc<
+        parking_lot::RwLock<std::collections::HashMap<String, crate::db::models::DbModelAlias>>,
+    >,
 
     /// Globalny counter do round-robin w middleware routing
     pub(crate) route_counter: Arc<std::sync::atomic::AtomicUsize>,
@@ -211,7 +215,10 @@ impl RequestMetrics {
     pub fn format_table(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("┌─────────────────────────────────────┐"));
-        lines.push(format!("│ REQUEST TIMING {:>20} │", self.model_name.as_deref().unwrap_or("-")));
+        lines.push(format!(
+            "│ REQUEST TIMING {:>20} │",
+            self.model_name.as_deref().unwrap_or("-")
+        ));
         lines.push(format!("├─────────────────────────────────────┤"));
 
         if let Some(ms) = self.stt_ms {
@@ -237,7 +244,10 @@ impl RequestMetrics {
         }
 
         lines.push(format!("├─────────────────────────────────────┤"));
-        lines.push(format!("│ TOTAL            {:>10} ms     │", self.total_ms()));
+        lines.push(format!(
+            "│ TOTAL            {:>10} ms     │",
+            self.total_ms()
+        ));
         lines.push(format!("└─────────────────────────────────────┘"));
 
         lines.join("\n")
@@ -273,9 +283,7 @@ impl Router {
         info!("Router: Inicjalizacja (non-blocking)...");
 
         // === KROK 1: UTWORZ SERVICE MANAGER ===
-        let service_manager = Arc::new(
-            ServiceManager::new(config.clone(), db.clone())?
-        );
+        let service_manager = Arc::new(ServiceManager::new(config.clone(), db.clone())?);
 
         // === KROK 2: INICJALIZUJ MODEL POOL Z DB ===
         if let Some(ref pool) = db {
@@ -293,16 +301,10 @@ impl Router {
         ));
 
         // === KROK 4: INICJALIZUJ MEMORY INTEGRATION ===
-        let memory_integration = Arc::new(MemoryIntegration::new(
-            service_manager.clone(),
-            None,
-        ));
+        let memory_integration = Arc::new(MemoryIntegration::new(service_manager.clone(), None));
 
         // === KROK 5: INICJALIZUJ INTENT ANALYZER ===
-        let intent_analyzer = Arc::new(IntentAnalyzer::new(
-            service_manager.clone(),
-            None,
-        ));
+        let intent_analyzer = Arc::new(IntentAnalyzer::new(service_manager.clone(), None));
 
         // === KROK 6: INICJALIZUJ FLOW DISPATCHER ===
         let db_clone = db.clone();
@@ -315,18 +317,14 @@ impl Router {
         });
 
         // === KROK 7: INICJALIZUJ LOKALNA INFERENCJE ===
-        let local_inference = Arc::new(
-            super::local_inference::LocalInferenceHandler::new(
-                crate::inference::shared_inference_manager()
-            )
-        );
+        let local_inference = Arc::new(super::local_inference::LocalInferenceHandler::new(
+            crate::inference::shared_inference_manager(),
+        ));
 
         // === KROK 8: INICJALIZUJ LOKALNE STT ===
-        let local_stt = Arc::new(
-            super::local_stt::LocalSttHandler::new(
-                crate::stt::shared_stt_manager()
-            )
-        );
+        let local_stt = Arc::new(super::local_stt::LocalSttHandler::new(
+            crate::stt::shared_stt_manager(),
+        ));
 
         info!("Router: Inicjalizacja zakonczona (QUIC connections spawning in background)");
 
@@ -338,7 +336,9 @@ impl Router {
             response_middleware,
             memory_integration,
             intent_analyzer,
-            pending_voice_samples: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            pending_voice_samples: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             flow_dispatcher,
             db: db_clone,
             local_inference,
@@ -400,14 +400,20 @@ impl Router {
         let sm = &self.service_manager;
         match crate::db::repository::list_services(db) {
             Ok(services) => {
-                info!("load_db_services: znaleziono {} serwisow w DB", services.len());
+                info!(
+                    "load_db_services: znaleziono {} serwisow w DB",
+                    services.len()
+                );
                 let mut loaded = 0;
                 for svc in &services {
-                    info!("load_db_services: przetwarzam '{}' (typ={})", svc.name, svc.service_type);
+                    info!(
+                        "load_db_services: przetwarzam '{}' (typ={})",
+                        svc.name, svc.service_type
+                    );
                     let svc_config: serde_json::Value =
                         serde_json::from_str(&svc.config_json).unwrap_or_default();
-                    let backends =
-                        crate::db::repository::list_backends_for_service(db, svc.id).unwrap_or_default();
+                    let backends = crate::db::repository::list_backends_for_service(db, svc.id)
+                        .unwrap_or_default();
                     let mut registered = false;
 
                     for backend in &backends {
@@ -435,11 +441,17 @@ impl Router {
                             format!("quic://{}:{}", host, quic_port)
                         };
 
-                        let tls_ca = config["tls_ca"].as_str().map(|s| s.to_string())
-                            .or_else(|| crate::db::repository::get_setting(db, "tls_cert_pem").ok().flatten());
-                        let server_name = svc_config["agent_domain"]
-                            .as_str()
-                            .map(|s| s.to_string());
+                        let tls_ca =
+                            config["tls_ca"]
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    crate::db::repository::get_setting(db, "tls_cert_pem")
+                                        .ok()
+                                        .flatten()
+                                });
+                        let server_name =
+                            svc_config["agent_domain"].as_str().map(|s| s.to_string());
 
                         info!(
                             "DB service '{}' (typ={}) -> {} (SNI: {:?})",
@@ -494,7 +506,10 @@ impl Router {
             }
         };
 
-        info!("restore_native_services: znaleziono {} serwisow w DB", services.len());
+        info!(
+            "restore_native_services: znaleziono {} serwisow w DB",
+            services.len()
+        );
         for svc in &services {
             info!("  serwis '{}': config={}", svc.name, svc.config_json);
             let config: serde_json::Value =
@@ -519,11 +534,19 @@ impl Router {
                 let model_path = std::path::PathBuf::from(model_path_str);
 
                 if !model_path.exists() {
-                    warn!("Natywny STT '{}': sciezka modelu nie istnieje: {}", svc.name, model_path.display());
+                    warn!(
+                        "Natywny STT '{}': sciezka modelu nie istnieje: {}",
+                        svc.name,
+                        model_path.display()
+                    );
                     continue;
                 }
 
-                info!("Przywracanie natywnego STT '{}': model={}", svc.name, model_path.display());
+                info!(
+                    "Przywracanie natywnego STT '{}': model={}",
+                    svc.name,
+                    model_path.display()
+                );
 
                 let shared_stt = crate::stt::shared_stt_manager();
                 let mp = model_path.clone();
@@ -533,7 +556,8 @@ impl Router {
                         let mut mgr = shared_stt.write().await;
                         mgr.load_model(&mp, None, None).await
                     })
-                }).await;
+                })
+                .await;
 
                 match load_result {
                     Ok(Ok(stt_info)) => {
@@ -574,18 +598,26 @@ impl Router {
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
                         .join("TentaFlow.AI");
                     let rebuilt = data_dir.join(&relative[1..]); // usun wiodacy "/"
-                    debug!("Sciezka nie istnieje, probuje przebudowac: {}", rebuilt.display());
+                    debug!(
+                        "Sciezka nie istnieje, probuje przebudowac: {}",
+                        rebuilt.display()
+                    );
                     if rebuilt.exists() {
                         model_path = rebuilt;
                     }
                 }
             }
 
-            debug!("model_path={}, exists={}", model_path.display(), model_path.exists());
+            debug!(
+                "model_path={}, exists={}",
+                model_path.display(),
+                model_path.exists()
+            );
             if !model_path.exists() {
                 warn!(
                     "Natywny serwis '{}': sciezka modelu nie istnieje: {}",
-                    svc.name, model_path.display()
+                    svc.name,
+                    model_path.display()
                 );
                 continue;
             }
@@ -605,20 +637,19 @@ impl Router {
                     let mut mgr = shared.write().await;
                     mgr.load_model(&mp, None, Some(&eng)).await
                 })
-            }).await;
+            })
+            .await;
 
             match load_result {
                 Ok(Ok(model_info)) => {
                     info!(
                         "Przywrocono model '{}' ({}, {}MB, ctx={})",
-                        model_info.name, model_info.backend,
-                        model_info.vram_used_mb, model_info.context_length
+                        model_info.name,
+                        model_info.backend,
+                        model_info.vram_used_mb,
+                        model_info.context_length
                     );
-                    self.register_native_service_in_mesh(
-                        &svc.name,
-                        "llm",
-                        vec![model_id.clone()],
-                    );
+                    self.register_native_service_in_mesh(&svc.name, "llm", vec![model_id.clone()]);
                 }
                 Ok(Err(e)) => {
                     warn!("Blad ladowania modelu '{}': {}", model_id, e);
@@ -631,9 +662,12 @@ impl Router {
             }
 
             // Rejestruj w service_manager
-            self.service_manager.register_model_mapping(&model_id, &svc.name);
-            self.service_manager.register_local_inference_model(&model_id);
-            self.service_manager.register_local_inference_model(&svc.name);
+            self.service_manager
+                .register_model_mapping(&model_id, &svc.name);
+            self.service_manager
+                .register_local_inference_model(&model_id);
+            self.service_manager
+                .register_local_inference_model(&svc.name);
             info!("Natywny serwis '{}' przywrocony pomyslnie", svc.name);
         }
     }
@@ -668,7 +702,10 @@ impl Router {
         };
 
         mesh.service_registry().register_local(service_info);
-        info!("Zarejestrowano natywny serwis '{}' ({}) w mesh", service_name, service_type);
+        info!(
+            "Zarejestrowano natywny serwis '{}' ({}) w mesh",
+            service_name, service_type
+        );
     }
 
     /// Wyrejestrowuje natywny serwis z mesh registry.
@@ -681,13 +718,20 @@ impl Router {
     }
 
     /// Pobierz backend clients dla serwisu (HTTP backends — statyczne lub dynamiczne)
-    pub(crate) fn get_service_backends(&self, service_name: &str) -> Option<&Vec<Arc<BackendClient>>> {
+    pub(crate) fn get_service_backends(
+        &self,
+        service_name: &str,
+    ) -> Option<&Vec<Arc<BackendClient>>> {
         self.service_manager.get_service_backends(service_name)
     }
 
     /// Pobierz backend clients (statyczne lub dynamiczne) — klonuje Arc referencje
-    pub(crate) fn get_service_backends_cloned(&self, service_name: &str) -> Option<Vec<Arc<BackendClient>>> {
-        self.service_manager.get_service_backends_cloned(service_name)
+    pub(crate) fn get_service_backends_cloned(
+        &self,
+        service_name: &str,
+    ) -> Option<Vec<Arc<BackendClient>>> {
+        self.service_manager
+            .get_service_backends_cloned(service_name)
     }
 
     /// Sprawdza czy serwis ma HTTP backends (statyczne lub dynamiczne)
@@ -723,7 +767,10 @@ impl Router {
     }
 
     /// Pobierz load balancing strategy dla serwisu
-    pub(crate) fn get_strategy(&self, service_name: &str) -> Option<&Box<dyn LoadBalancingStrategy>> {
+    pub(crate) fn get_strategy(
+        &self,
+        service_name: &str,
+    ) -> Option<&Box<dyn LoadBalancingStrategy>> {
         self.service_manager.get_strategy(service_name)
     }
 
@@ -735,8 +782,13 @@ impl Router {
 
     /// Pobierz QUIC embedding client (async - sprawdza czy polaczony)
     #[allow(dead_code)]
-    pub(crate) async fn get_quic_embedding_client(&self, service_name: &str) -> Option<Arc<crate::net::quic::QuicClient>> {
-        self.service_manager.get_quic_embedding_client(service_name).await
+    pub(crate) async fn get_quic_embedding_client(
+        &self,
+        service_name: &str,
+    ) -> Option<Arc<crate::net::quic::QuicClient>> {
+        self.service_manager
+            .get_quic_embedding_client(service_name)
+            .await
     }
 
     /// Pobierz TTS client po nazwie serwisu
@@ -750,11 +802,16 @@ impl Router {
         if let Some(client) = self.service_manager.get_tts_client(model) {
             return Some((*client).clone());
         }
-        self.service_manager.get_first_tts_client().map(|c| (*c).clone())
+        self.service_manager
+            .get_first_tts_client()
+            .map(|c| (*c).clone())
     }
 
     /// Pobierz callback receiver dla RAG
-    pub(crate) fn get_callback_rx(&self) -> Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(ModelRequest, mpsc::Sender<ModelResponse>)>>> {
+    pub(crate) fn get_callback_rx(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(ModelRequest, mpsc::Sender<ModelResponse>)>>>
+    {
         self.service_manager.get_callback_rx()
     }
 
@@ -812,12 +869,10 @@ impl Router {
         let target_node_id = if let Some(model) = model_name {
             match self.service_manager.find_service(service_type, model) {
                 Some(ServiceLocation::MeshNode { node_id }) => node_id,
-                _ => {
-                    match self.service_manager.find_service_by_type(service_type) {
-                        Some(ServiceLocation::MeshNode { node_id }) => node_id,
-                        _ => return None,
-                    }
-                }
+                _ => match self.service_manager.find_service_by_type(service_type) {
+                    Some(ServiceLocation::MeshNode { node_id }) => node_id,
+                    _ => return None,
+                },
             }
         } else {
             match self.service_manager.find_service_by_type(service_type) {
@@ -839,17 +894,25 @@ impl Router {
             service_type, model_name, target_node_id
         );
 
-        match self.route_through_mesh(&target_node_id, &request_bytes).await {
+        match self
+            .route_through_mesh(&target_node_id, &request_bytes)
+            .await
+        {
             Ok(response_bytes) => {
                 match rkyv::access::<tentaflow_protocol::ArchivedModelResponse, rkyv::rancor::Error>(
                     &response_bytes,
                 ) {
                     Ok(archived_resp) => {
-                        match rkyv::deserialize::<tentaflow_protocol::ModelResponse, rkyv::rancor::Error>(
-                            archived_resp,
-                        ) {
+                        match rkyv::deserialize::<
+                            tentaflow_protocol::ModelResponse,
+                            rkyv::rancor::Error,
+                        >(archived_resp)
+                        {
                             Ok(response) => {
-                                debug!("Mesh forward: odpowiedz z noda '{}' odebrana", target_node_id);
+                                debug!(
+                                    "Mesh forward: odpowiedz z noda '{}' odebrana",
+                                    target_node_id
+                                );
                                 Some(response)
                             }
                             Err(e) => {
@@ -871,7 +934,10 @@ impl Router {
                 }
             }
             Err(e) => {
-                warn!("Mesh forward: blad forwardowania do noda '{}': {}", target_node_id, e);
+                warn!(
+                    "Mesh forward: blad forwardowania do noda '{}': {}",
+                    target_node_id, e
+                );
                 None
             }
         }
@@ -927,14 +993,21 @@ impl Router {
             let text = match &msg.content {
                 Some(crate::api::openai::types::MessageContent::Text(s)) => Some(s.clone()),
                 Some(crate::api::openai::types::MessageContent::Parts(parts)) => {
-                    let texts: Vec<String> = parts.iter().filter_map(|p| {
-                        if let crate::api::openai::types::ContentPart::Text { text } = p {
-                            Some(text.clone())
-                        } else {
-                            None
-                        }
-                    }).collect();
-                    if texts.is_empty() { None } else { Some(texts.join(" ")) }
+                    let texts: Vec<String> = parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let crate::api::openai::types::ContentPart::Text { text } = p {
+                                Some(text.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if texts.is_empty() {
+                        None
+                    } else {
+                        Some(texts.join(" "))
+                    }
                 }
                 None => None,
             };

@@ -18,8 +18,8 @@ use crate::config::MeshConfig;
 use crate::error::CoreError;
 use crate::mesh::crdt::{CrdtOperation, CrdtState, LamportClock};
 use crate::mesh::gossip::{GossipEngine, GossipEvent, PeerState};
-use crate::mesh::peer_store::{PeerContainerInfo, PeerGpuInfo};
 use crate::mesh::iroh_manager::{IrohMeshEvent, IrohMeshManager};
+use crate::mesh::peer_store::{PeerContainerInfo, PeerGpuInfo};
 
 // Progi czasowe dla maintenance loop
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
@@ -216,8 +216,7 @@ impl PeerManager {
         peers
             .values()
             .filter(|p| {
-                p.state == PeerState::Alive
-                    && p.capabilities.iter().any(|c| c == capability)
+                p.state == PeerState::Alive && p.capabilities.iter().any(|c| c == capability)
             })
             .cloned()
             .collect()
@@ -228,10 +227,7 @@ impl PeerManager {
         let peers = self.known_peers.read();
         peers
             .values()
-            .filter(|p| {
-                p.state == PeerState::Alive
-                    && p.services.iter().any(|s| s == service_name)
-            })
+            .filter(|p| p.state == PeerState::Alive && p.services.iter().any(|s| s == service_name))
             .cloned()
             .collect()
     }
@@ -459,7 +455,10 @@ impl PeerManager {
     /// Zwraca liczbe zywych peerow
     pub fn alive_peer_count(&self) -> usize {
         let peers = self.known_peers.read();
-        peers.values().filter(|p| p.state == PeerState::Alive).count()
+        peers
+            .values()
+            .filter(|p| p.state == PeerState::Alive)
+            .count()
     }
 
     /// Uruchamia background loop: nasluchuje gossip events, QUIC events i ogarnia maintenance
@@ -528,12 +527,16 @@ impl PeerManager {
             }
             IrohMeshEvent::PeerDisconnected { node_id } => {
                 self.set_quic_connected(&node_id, false);
-                let _ = self.event_tx.send(MeshEvent::QuicDisconnected(node_id.clone()));
+                let _ = self
+                    .event_tx
+                    .send(MeshEvent::QuicDisconnected(node_id.clone()));
 
                 // Trigger reconnect jesli peer nadal zyje w gossip
                 let should_reconnect = {
                     let peers = self.known_peers.read();
-                    peers.get(&node_id).map_or(false, |p| p.state == PeerState::Alive)
+                    peers
+                        .get(&node_id)
+                        .map_or(false, |p| p.state == PeerState::Alive)
                 };
 
                 if should_reconnect {
@@ -575,7 +578,9 @@ impl PeerManager {
                 } else {
                     warn!(peer_id = %node_id, "Nie udalo sie zdeserializowac heartbeatu");
                 }
-                let _ = self.event_tx.send(MeshEvent::HeartbeatReceived { from: node_id });
+                let _ = self
+                    .event_tx
+                    .send(MeshEvent::HeartbeatReceived { from: node_id });
             }
             IrohMeshEvent::FullStateReceived { node_id, state } => {
                 // Deserializuj FullState z rkyv i zaktualizuj modele + kontenery + CRDT
@@ -674,7 +679,10 @@ impl PeerManager {
                                 status: c.get("status")?.as_str()?.to_string(),
                                 cpu_percent: c.get("cpu_percent")?.as_f64()? as f32,
                                 memory_mb: c.get("memory_mb")?.as_u64()?,
-                                memory_limit_mb: c.get("memory_limit_mb").and_then(|v| v.as_u64()).unwrap_or(0),
+                                memory_limit_mb: c
+                                    .get("memory_limit_mb")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
                             })
                         })
                         .collect();
@@ -1009,20 +1017,32 @@ mod tests {
             id: 1,
             name: "svc-remote".to_string(),
             data_json: "{}".to_string(),
-            clock: LamportClock { time: 5, node_id_hash: 999 },
+            clock: LamportClock {
+                time: 5,
+                node_id_hash: 999,
+            },
         };
         let op2 = CrdtOperation::UpsertAlias {
             alias: "gpt4".to_string(),
             target: "openai/gpt-4".to_string(),
-            clock: LamportClock { time: 6, node_id_hash: 999 },
+            clock: LamportClock {
+                time: 6,
+                node_id_hash: 999,
+            },
         };
 
         mgr.sync_state("remote-node", vec![op1, op2]).unwrap();
 
-        let delta = mgr.get_delta(LamportClock { time: 4, node_id_hash: 0 });
+        let delta = mgr.get_delta(LamportClock {
+            time: 4,
+            node_id_hash: 0,
+        });
         assert_eq!(delta.len(), 2);
 
-        let delta2 = mgr.get_delta(LamportClock { time: 6, node_id_hash: 999 });
+        let delta2 = mgr.get_delta(LamportClock {
+            time: 6,
+            node_id_hash: 999,
+        });
         assert_eq!(delta2.len(), 0);
     }
 
@@ -1030,7 +1050,12 @@ mod tests {
     fn sync_empty_operations_is_noop() {
         let mgr = make_manager();
         mgr.sync_state("remote", vec![]).unwrap();
-        assert!(mgr.get_delta(LamportClock { time: 0, node_id_hash: 0 }).is_empty());
+        assert!(mgr
+            .get_delta(LamportClock {
+                time: 0,
+                node_id_hash: 0
+            })
+            .is_empty());
     }
 
     #[test]
@@ -1093,8 +1118,10 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:5001".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:5002".parse().unwrap();
 
-        mgr.add_peer("p1".to_string(), addr1, "router", vec![], vec![]).unwrap();
-        mgr.add_peer("p2".to_string(), addr2, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("p1".to_string(), addr1, "router", vec![], vec![])
+            .unwrap();
+        mgr.add_peer("p2".to_string(), addr2, "router", vec![], vec![])
+            .unwrap();
 
         assert_eq!(mgr.alive_peer_count(), 2);
 
@@ -1113,7 +1140,8 @@ mod tests {
         let mut rx = mgr.subscribe();
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![])
+            .unwrap();
 
         let event = rx.try_recv().unwrap();
         assert!(matches!(event, MeshEvent::PeerJoined(id) if id == "peer-1"));
@@ -1124,7 +1152,8 @@ mod tests {
         let mgr = make_manager();
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![])
+            .unwrap();
 
         let peer = mgr.get_peer("peer-1").unwrap();
         assert!(!peer.quic_connected);
@@ -1138,7 +1167,8 @@ mod tests {
         let mgr = make_manager();
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![])
+            .unwrap();
         assert!(!mgr.get_peer("peer-1").unwrap().quic_connected);
 
         mgr.set_quic_connected("peer-1", true);
@@ -1153,7 +1183,8 @@ mod tests {
         let mgr = make_manager();
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![])
+            .unwrap();
 
         let gpus = vec![PeerGpuInfo {
             name: "GPU 0".to_string(),
@@ -1180,7 +1211,8 @@ mod tests {
         let mgr = make_manager();
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![])
+            .unwrap();
 
         let models = vec![PeerModelInfo {
             name: "llama3-8b".to_string(),
@@ -1217,8 +1249,10 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:5001".parse().unwrap();
         let addr2: SocketAddr = "127.0.0.1:5002".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr1, "router", vec![], vec![]).unwrap();
-        mgr.add_peer("peer-2".to_string(), addr2, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr1, "router", vec![], vec![])
+            .unwrap();
+        mgr.add_peer("peer-2".to_string(), addr2, "router", vec![], vec![])
+            .unwrap();
 
         // Oba maja model, oba quic connected
         mgr.set_quic_connected("peer-1", true);
@@ -1248,7 +1282,8 @@ mod tests {
         let mgr = make_manager();
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![])
+            .unwrap();
 
         let model = PeerModelInfo {
             name: "llama3".to_string(),
@@ -1294,11 +1329,28 @@ mod tests {
         let mgr = make_manager();
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![]).unwrap();
+        mgr.add_peer("peer-1".to_string(), addr, "router", vec![], vec![])
+            .unwrap();
 
         let gpus = vec![
-            PeerGpuInfo { name: "GPU 0".to_string(), usage_percent: 50.0, vram_used_mb: 10000, vram_total_mb: 24000, temperature_c: 60, power_draw_w: None, power_limit_w: None },
-            PeerGpuInfo { name: "GPU 1".to_string(), usage_percent: 70.0, vram_used_mb: 15000, vram_total_mb: 24000, temperature_c: 65, power_draw_w: None, power_limit_w: None },
+            PeerGpuInfo {
+                name: "GPU 0".to_string(),
+                usage_percent: 50.0,
+                vram_used_mb: 10000,
+                vram_total_mb: 24000,
+                temperature_c: 60,
+                power_draw_w: None,
+                power_limit_w: None,
+            },
+            PeerGpuInfo {
+                name: "GPU 1".to_string(),
+                usage_percent: 70.0,
+                vram_used_mb: 15000,
+                vram_total_mb: 24000,
+                temperature_c: 65,
+                power_draw_w: None,
+                power_limit_w: None,
+            },
         ];
         mgr.update_peer_metrics("peer-1", 30.0, 8000, 16000, gpus, 2.0, 5);
 

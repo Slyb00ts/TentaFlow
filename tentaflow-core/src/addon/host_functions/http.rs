@@ -3,15 +3,16 @@
 // Opis: Host function HTTP API — proxy HTTP request z audit logowaniem.
 //       Addon nie wykonuje requestow bezposrednio — Core proxy sprawdza
 //       uprawnienia (dozwolone domeny), waliduje URL (SSRF) i loguje kazdy request.
+// Uprawnienia: "http" z resource=<domain> (per-domain whitelist). Fail-closed —
+//              brak uprawnienia blokuje request zanim opusci proces Core.
 // =============================================================================
 
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
 use super::{
-    AddonState, ABI_ERR_PERMISSION, ABI_ERR_OPERATION,
-    get_memory, read_guest_string, write_guest_output, audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_string, write_guest_output, AddonState,
+    WasmCaller, ABI_ERR_OPERATION, ABI_ERR_PERMISSION,
 };
 
 use crate::addon::rate_limiter::ResourceType;
@@ -55,9 +56,14 @@ fn is_safe_url(url: &str) -> bool {
 
     // Blokuj znane hosty lokalne
     let blocked_hosts = [
-        "localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]", "0",
-        "169.254.169.254",            // AWS/GCP metadata
-        "metadata.google.internal",   // GCP metadata
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "[::1]",
+        "0",
+        "169.254.169.254",          // AWS/GCP metadata
+        "metadata.google.internal", // GCP metadata
     ];
     if blocked_hosts.contains(&host.as_str()) {
         return false;
@@ -90,7 +96,11 @@ fn is_safe_url(url: &str) -> bool {
                 }
                 // IPv4-mapped IPv6 (::ffff:x.x.x.x) — sprawdz wewnetrzny IPv4
                 if let Some(v4) = v6.to_ipv4_mapped() {
-                    if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0 {
+                    if v4.is_loopback()
+                        || v4.is_private()
+                        || v4.is_link_local()
+                        || v4.octets()[0] == 0
+                    {
                         return false;
                     }
                 }
@@ -98,7 +108,10 @@ fn is_safe_url(url: &str) -> bool {
         }
     } else {
         // Host nie jest poprawnym IP — sprawdz czy to numeryczny host (bypass jak 0x7f000001)
-        if host.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'x' || c == 'X') {
+        if host
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == 'x' || c == 'X')
+        {
             return false; // Blokuj potencjalnie zakodowane IP
         }
     }
@@ -131,7 +144,8 @@ pub fn http_request(
     };
 
     // Odczytaj request JSON z guest memory
-    let request_str = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len) {
+    let request_str = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len)
+    {
         Some(s) => s.to_string(),
         None => return ABI_ERR_OPERATION,
     };
@@ -144,7 +158,10 @@ pub fn http_request(
         }
     };
 
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+    let method = request
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("GET");
     let url = match request.get("url").and_then(|v| v.as_str()) {
         Some(u) => u.to_string(),
         None => {
@@ -187,7 +204,14 @@ pub fn http_request(
     if let Some(ref rate_limiter) = caller.data().rate_limiter {
         let addon_id = caller.data().addon_id.clone();
         if let Err(_) = rate_limiter.check(&addon_id, ResourceType::HttpRequests) {
-            audit_log(caller.data(), "http.request", Some("http"), Some(&url), "error", Some("rate limit exceeded"));
+            audit_log(
+                caller.data(),
+                "http.request",
+                Some("http"),
+                Some(&url),
+                "error",
+                Some("rate limit exceeded"),
+            );
             return super::ABI_ERR_RATE_LIMIT;
         }
         // Zarejestruj uzycie
@@ -196,13 +220,21 @@ pub fn http_request(
         // Fallback: sprawdz rate limit przez DB (stary mechanizm)
         let within_rate_limit = check_http_rate_limit(caller.data());
         if !within_rate_limit {
-            audit_log(caller.data(), "http.request", Some("http"), Some(&url), "error", Some("rate limit exceeded"));
+            audit_log(
+                caller.data(),
+                "http.request",
+                Some("http"),
+                Some(&url),
+                "error",
+                Some("rate limit exceeded"),
+            );
             return super::ABI_ERR_RATE_LIMIT;
         }
     }
 
     let addon_id = caller.data().addon_id.clone();
-    let _timeout_ms = request.get("timeout_ms")
+    let _timeout_ms = request
+        .get("timeout_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(30_000);
 
@@ -225,7 +257,14 @@ pub fn http_request(
         None,
     );
 
-    write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, &response_bytes)
+    write_guest_output(
+        &memory,
+        &mut caller,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        &response_bytes,
+    )
 }
 
 // =============================================================================
@@ -264,13 +303,15 @@ fn check_http_rate_limit(state: &AddonState) -> bool {
             ).unwrap_or(600);
 
             // Policz requesty z ostatniej minuty
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM audit_log \
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log \
                  WHERE addon_id = ?1 AND action = 'http.request' AND result = 'ok' \
                  AND created_at >= datetime('now', '-1 minute')",
-                rusqlite::params![&state.addon_id],
-                |row| row.get(0),
-            ).unwrap_or(0);
+                    rusqlite::params![&state.addon_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
 
             count < limit
         }
@@ -280,11 +321,7 @@ fn check_http_rate_limit(state: &AddonState) -> bool {
 }
 
 /// Wykonuje HTTP request (synchronicznie) uzywajac globalnego klienta HTTP (K1)
-fn execute_http_request(
-    request: &serde_json::Value,
-    url: &str,
-    method: &str,
-) -> serde_json::Value {
+fn execute_http_request(request: &serde_json::Value, url: &str, method: &str) -> serde_json::Value {
     let client = get_http_client();
 
     let request_builder = match method.to_uppercase().as_str() {
@@ -321,11 +358,15 @@ fn execute_http_request(
     };
 
     // Nadpisz timeout jesli podano w requeście
-    let timeout_ms = request.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+    let timeout_ms = request
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30_000);
     let request_builder = request_builder.timeout(std::time::Duration::from_millis(timeout_ms));
 
     // Dodaj headery z requestu
-    let request_builder = if let Some(headers) = request.get("headers").and_then(|v| v.as_object()) {
+    let request_builder = if let Some(headers) = request.get("headers").and_then(|v| v.as_object())
+    {
         let mut rb = request_builder;
         for (key, value) in headers {
             if let Some(val_str) = value.as_str() {
@@ -340,11 +381,10 @@ fn execute_http_request(
     match request_builder.send() {
         Ok(response) => {
             let status = response.status().as_u16();
-            let headers: std::collections::HashMap<String, String> = response.headers()
+            let headers: std::collections::HashMap<String, String> = response
+                .headers()
                 .iter()
-                .filter_map(|(k, v)| {
-                    v.to_str().ok().map(|val| (k.to_string(), val.to_string()))
-                })
+                .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
                 .collect();
             let body = response.text().unwrap_or_default();
 
@@ -361,5 +401,52 @@ fn execute_http_request(
                 "body": format!("Blad HTTP: {}", e),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::addon::event_bus::EventBus;
+    use crate::addon::host_functions::check_permission;
+    use crate::addon::host_functions::network::NetworkConnectionManager;
+    use crate::addon::permissions::PermissionChecker;
+    use crate::addon::AddonManifest;
+    use parking_lot::Mutex;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn make_state(permissions: Vec<String>) -> AddonState {
+        let db = crate::db::init(Path::new(":memory:")).unwrap();
+        AddonState {
+            addon_id: "http-test-addon".to_string(),
+            instance_id: "t".to_string(),
+            user_id: None,
+            db: db.clone(),
+            permissions,
+            event_bus: Arc::new(EventBus::new()),
+            permission_checker: Arc::new(PermissionChecker::new(db)),
+            fuel_consumed: 0,
+            is_system_call: true,
+            rate_limiter: None,
+            net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
+            settings_cipher: Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32])),
+            manifest: Arc::new(AddonManifest::default()),
+            memory_limit: 64 * 1024 * 1024,
+            oauth_refresh_guard: std::sync::Arc::new(
+                crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
+            ),
+            router: None,
+        }
+    }
+
+    #[test]
+    fn http_request_denied_without_permission() {
+        // Addon bez uprawnienia "http" — fail-closed, gatekeeper odrzuca.
+        let state = make_state(vec!["storage".to_string()]);
+        assert!(
+            !check_permission(&state, "http", Some("example.com")),
+            "Brak 'http' w permissions → Denied"
+        );
     }
 }

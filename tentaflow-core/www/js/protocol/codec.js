@@ -152,6 +152,21 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::TranslateRequest { sourceText, sourceLang, targetLang, tone? }
+   * Zwraca pojedynczy TranslateResponse (nie stream).
+   */
+  translateRequest(correlationId, { sourceText, sourceLang, targetLang, tone = null }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTranslateRequest(sourceText, sourceLang, targetLang, tone ?? undefined);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ApiKeyRevokeRequest { key_id } */
   apiKeyRevokeRequest(correlationId, { keyId }, sequence = 1) {
     assertReady();
@@ -200,10 +215,296 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ClusterUpdateRequest { cluster_id, name, description } */
-  clusterUpdateRequest(correlationId, { clusterId, name, description }, sequence = 1) {
+  /** MessageBody::MeshNodeListRequest (unit). */
+  meshNodeListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterUpdateRequest(clusterId, name, description ?? null);
+    const body = _wasm.encodeMeshNodeListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MeshNodeDetailRequest { nodeId } */
+  meshNodeDetailRequest(correlationId, { nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshNodeDetailRequest(nodeId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MeshPendingListRequest (unit). */
+  meshPendingListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshPendingListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MeshIdentityRequest (unit). */
+  meshIdentityRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshIdentityRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MeshServicesListRequest (unit). */
+  meshServicesListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshServicesListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MeshTrustedListRequest (unit). */
+  meshTrustedListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshTrustedListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // ---- Mesh write ops (FAZA 1b) ----
+
+  /** MeshPairingStartRequest { remoteAddress } */
+  meshPairingStartRequest(correlationId, { remoteAddress }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshPairingStartRequest(remoteAddress);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MeshPairingConfirmRequest { pairId, pin } */
+  meshPairingConfirmRequest(correlationId, { pairId, pin }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshPairingConfirmRequest(pairId, pin);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MeshPairingRejectRequest { pairId } */
+  meshPairingRejectRequest(correlationId, { pairId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshPairingRejectRequest(pairId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MeshTrustRevokeRequest { nodeId } */
+  meshTrustRevokeRequest(correlationId, { nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshTrustRevokeRequest(nodeId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MeshTrustRetrustRequest { nodeId } */
+  meshTrustRetrustRequest(correlationId, { nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshTrustRetrustRequest(nodeId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MeshConnectRequest { address } */
+  meshConnectRequest(correlationId, { address }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshConnectRequest(address);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MeshNodeCommandRequest { nodeId, command, args } */
+  meshNodeCommandRequest(correlationId, { nodeId, command, args = [] }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshNodeCommandRequest(nodeId, command, args);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MeshNodeNetworkConfigRequest { nodeId, interfaceName, configJson } */
+  meshNodeNetworkConfigRequest(correlationId, { nodeId, interfaceName, configJson }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshNodeNetworkConfigRequest(nodeId, interfaceName, configJson);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterListRequest (unit). */
+  clusterListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterDetailRequest { clusterId } */
+  clusterDetailRequest(correlationId, { clusterId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterDetailRequest(clusterId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterCreateRequest. */
+  clusterCreateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterCreateRequest(
+      payload.name,
+      payload.description ?? null,
+      payload.strategy ?? 'distributed',
+      !!payload.failoverEnabled,
+      payload.failoverTarget ?? null,
+      (payload.healthCheckIntervalMs ?? 5000) >>> 0,
+      (payload.timeoutMs ?? 10000) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterDeleteRequest { clusterId } */
+  clusterDeleteRequest(correlationId, { clusterId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterDeleteRequest(clusterId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterAddMemberRequest. */
+  clusterAddMemberRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterAddMemberRequest(
+      payload.clusterId,
+      payload.nodeId,
+      payload.interfaceType ?? null,
+      payload.interfaceSpeedMbps ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterRemoveMemberRequest { clusterId, nodeId } */
+  clusterRemoveMemberRequest(correlationId, { clusterId, nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterRemoveMemberRequest(clusterId, nodeId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterProbeStreamRequest { nodeIds: string[] } */
+  clusterProbeStreamRequest(correlationId, { nodeIds }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeClusterProbeStreamRequest(nodeIds);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ClusterUpdateRequest — wszystkie pola opcjonalne. */
+  clusterUpdateRequest(correlationId, opts, sequence = 1) {
+    assertReady();
+    const {
+      clusterId,
+      name,
+      description,
+      strategy,
+      failoverEnabled,
+      failoverTarget,
+      healthCheckIntervalMs,
+      timeoutMs,
+    } = opts;
+    const body = _wasm.encodeClusterUpdateRequest(
+      clusterId,
+      name ?? null,
+      description ?? null,
+      strategy ?? null,
+      failoverEnabled ?? null,
+      failoverTarget ?? null,
+      healthCheckIntervalMs ?? null,
+      timeoutMs ?? null,
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -264,6 +565,78 @@ export const encode = {
   modelDetailRequest(correlationId, { modelId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeModelDetailRequest(modelId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelsUnifiedListRequest — unikalne modele ze wszystkich nodow mesh. */
+  modelsUnifiedListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelsUnifiedListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelAliasListRequest — lista aliasow modeli. */
+  modelAliasListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelAliasListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelAliasCreateRequest { alias, targetModel, strategy?, fallbackTargets? } */
+  modelAliasCreateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelAliasCreateRequest(
+      payload.alias,
+      payload.targetModel,
+      payload.strategy ?? null,
+      payload.fallbackTargets ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelAliasUpdateRequest { id, alias, targetModel, isActive?, strategy?, fallbackTargets? } */
+  modelAliasUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelAliasUpdateRequest(
+      Number(payload.id),
+      payload.alias,
+      payload.targetModel,
+      payload.isActive ?? null,
+      payload.strategy ?? null,
+      payload.fallbackTargets ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelAliasDeleteRequest { id } */
+  modelAliasDeleteRequest(correlationId, { id }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelAliasDeleteRequest(Number(id));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -380,6 +753,72 @@ export const encode = {
   flowExecutionsListRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeFlowExecutionsListRequest(flowId);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::FlowUpdateRequest — partial update flow. */
+  flowUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeFlowUpdateRequest(
+      String(payload.flowId),
+      payload.name ?? null,
+      payload.description ?? null,
+      payload.flowJson ?? null,
+      payload.status ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::FlowNodeTemplatesListRequest (unit). */
+  flowNodeTemplatesListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeFlowNodeTemplatesListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::FlowVersionListRequest { flowId } */
+  flowVersionListRequest(correlationId, { flowId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeFlowVersionListRequest(String(flowId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::FlowVersionGetRequest { flowId, versionId } */
+  flowVersionGetRequest(correlationId, { flowId, versionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeFlowVersionGetRequest(String(flowId), String(versionId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::FlowVersionRestoreRequest { flowId, versionId } */
+  flowVersionRestoreRequest(correlationId, { flowId, versionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeFlowVersionRestoreRequest(String(flowId), String(versionId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -516,6 +955,82 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Notes
+  // -------------------------------------------------------------------------
+
+  /** NotesRequest::List — no payload. */
+  notesListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNotesListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** NotesRequest::Detail { noteId } */
+  noteDetailRequest(correlationId, { noteId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNoteDetailRequest(Number(noteId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** NotesRequest::Create { title, body } */
+  noteCreateRequest(correlationId, { title, body }, sequence = 1) {
+    assertReady();
+    const payload = _wasm.encodeNoteCreateRequest(title ?? '', body ?? '');
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      payload,
+    );
+  },
+
+  /** NotesRequest::Update { noteId, title, body } */
+  noteUpdateRequest(correlationId, { noteId, title, body }, sequence = 1) {
+    assertReady();
+    const payload = _wasm.encodeNoteUpdateRequest(Number(noteId), title ?? '', body ?? '');
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      payload,
+    );
+  },
+
+  /** NotesRequest::SetPinned { noteId, pinned } */
+  noteSetPinnedRequest(correlationId, { noteId, pinned }, sequence = 1) {
+    assertReady();
+    const payload = _wasm.encodeNoteSetPinnedRequest(Number(noteId), !!pinned);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      payload,
+    );
+  },
+
+  /** NotesRequest::Delete { noteId } */
+  noteDeleteRequest(correlationId, { noteId }, sequence = 1) {
+    assertReady();
+    const payload = _wasm.encodeNoteDeleteRequest(Number(noteId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      payload,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Registries
   // -------------------------------------------------------------------------
 
@@ -629,6 +1144,673 @@ export const encode = {
     const values = entries.map((e) => String(e.value));
     const isSecrets = new Uint8Array(entries.map((e) => (e.isSecret ? 1 : 0)));
     const body = _wasm.encodeSettingsUpdateBatch(keys, values, isSecrets);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
+  // SSO / TLS / NGC (FAZA 4)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::SsoProvidersListRequest (unit). */
+  ssoProvidersListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSsoProvidersListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::SsoProviderCreateRequest — pelne dane providera. */
+  ssoProviderCreateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSsoProviderCreateRequest(
+      String(payload.name ?? ''),
+      String(payload.providerType ?? ''),
+      String(payload.clientId ?? ''),
+      String(payload.clientSecret ?? ''),
+      String(payload.discoveryUrl ?? ''),
+      !!payload.autoCreateUsers,
+      payload.defaultGroupId == null ? undefined : Number(payload.defaultGroupId),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::SsoProviderDeleteRequest { id }. */
+  ssoProviderDeleteRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeSsoProviderDeleteRequest(Number(payload.id));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::TlsStatusRequest (unit). */
+  tlsStatusRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTlsStatusRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NgcStatusRequest (unit). */
+  ngcStatusRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNgcStatusRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
+  // Katalog: NIM + manifest deploy (FAZA 5)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::NimCatalogListRequest (unit). */
+  nimCatalogListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNimCatalogListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::ServiceManifestDeployRequest { engineId, deployMethod, nodeId, configJson }.
+   * `configJson` jest stringify'owanym JSON-em z wizarda (model preset, port itp.).
+   */
+  serviceManifestDeployRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceManifestDeployRequest(
+      String(payload.engineId ?? ''),
+      String(payload.deployMethod ?? ''),
+      String(payload.nodeId ?? ''),
+      String(payload.configJson ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonsListRequest (unit) — lista zainstalowanych addonow. */
+  addonsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
+  usersListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeUsersListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::AuditLogListRequest — Admin. Lista logow audytowych z
+   * filtrami + paginacja. Wszystkie pola filter sa optional.
+   * payload: { userId?, addonId?, action?, fromDate?, toDate?, search?, offset?, limit? }
+   */
+  auditLogListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAuditLogListRequest(
+      payload.userId ?? null,
+      payload.addonId ?? null,
+      payload.action ?? null,
+      payload.fromDate ?? null,
+      payload.toDate ?? null,
+      payload.search ?? null,
+      Number(payload.offset ?? 0),
+      Number(payload.limit ?? 100) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::AuditLogExportRequest — Admin. Eksport CSV z filtrami
+   * (max 100_000 wierszy). payload: { userId?, addonId?, action?, fromDate?, toDate?, search? }
+   */
+  auditLogExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAuditLogExportRequest(
+      payload.userId ?? null,
+      payload.addonId ?? null,
+      payload.action ?? null,
+      payload.fromDate ?? null,
+      payload.toDate ?? null,
+      payload.search ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::AuditLogCleanupRequest — Admin. Usuwa wpisy starsze niz
+   * `keepDays` dni. payload: { keepDays }
+   */
+  auditLogCleanupRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAuditLogCleanupRequest(Number(payload.keepDays ?? 90) >>> 0);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // =============================================================================
+  // Addon permissions + OAuth (migracja 38)
+  // =============================================================================
+
+  /** MessageBody::AddonDetailRequest — szczegoly addona (perms + oauth providers). */
+  addonDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonDetailRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonVisibilityListRequest — widocznosc per grupa. */
+  addonVisibilityListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonVisibilityListRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonVisibilitySetRequest — ustawia widocznosc per grupa. */
+  addonVisibilitySetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonVisibilitySetRequest(
+      String(payload.addonId ?? ''),
+      Number(payload.groupId ?? 0),
+      Boolean(payload.visible),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonAdminOnlySetRequest — przelacza admin_only dla addona. */
+  addonAdminOnlySetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonAdminOnlySetRequest(
+      String(payload.addonId ?? ''),
+      Boolean(payload.adminOnly),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonShowInCatalogSetRequest — przelacza show_in_catalog. */
+  addonShowInCatalogSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonShowInCatalogSetRequest(
+      String(payload.addonId ?? ''),
+      Boolean(payload.showInCatalog),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonPermissionCatalogRequest — lista deklaracji uprawnien. */
+  addonPermissionCatalogRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonPermissionCatalogRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonPermissionMatrixRequest — aktualna macierz grantow + defaults. */
+  addonPermissionMatrixRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonPermissionMatrixRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonPermissionSetRequest — set grant dla (user|group). */
+  addonPermissionSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonPermissionSetRequest(
+      String(payload.addonId ?? ''),
+      String(payload.subjectType ?? 'user'),
+      Number(payload.subjectId ?? 0),
+      String(payload.permissionId ?? ''),
+      String(payload.grantMode ?? 'inherit'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonPermissionDefaultSetRequest — domyslny grant dla addona. */
+  addonPermissionDefaultSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonPermissionDefaultSetRequest(
+      String(payload.addonId ?? ''),
+      String(payload.permissionId ?? ''),
+      String(payload.grantMode ?? 'deny'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonPermissionCheckRequest — sprawdz efektywny grant. */
+  addonPermissionCheckRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const userId = payload.userId == null ? null : Number(payload.userId);
+    const body = _wasm.encodeAddonPermissionCheckRequest(
+      String(payload.addonId ?? ''),
+      String(payload.permissionId ?? ''),
+      userId,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthConfigListRequest — lista konfiguracji (zero secretow). */
+  addonOAuthConfigListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonOAuthConfigListRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthConfigSetRequest — zapis konfiguracji (secret opcjonalny). */
+  addonOAuthConfigSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const secret = payload.clientSecret == null ? null : String(payload.clientSecret);
+    const body = _wasm.encodeAddonOAuthConfigSetRequest(
+      String(payload.addonId ?? ''),
+      String(payload.providerId ?? ''),
+      String(payload.clientId ?? ''),
+      secret,
+      String(payload.redirectUri ?? ''),
+      Boolean(payload.enabled),
+      String(payload.oauthMode ?? payload.oauth_mode ?? 'individual'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthConfigClearSecretRequest — usun wylacznie secret. */
+  addonOAuthConfigClearSecretRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonOAuthConfigClearSecretRequest(
+      String(payload.addonId ?? ''),
+      String(payload.providerId ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthAuthorizeStartRequest — inicjuje flow autoryzacji. */
+  addonOAuthAuthorizeStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const redirectAfter = payload.redirectAfter == null ? null : String(payload.redirectAfter);
+    const body = _wasm.encodeAddonOAuthAuthorizeStartRequest(
+      String(payload.addonId ?? ''),
+      String(payload.providerId ?? ''),
+      String(payload.mode ?? 'individual'),
+      redirectAfter,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthLinkedAccountsRequest — lista polaczonych kont. */
+  addonOAuthLinkedAccountsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonOAuthLinkedAccountsRequest(
+      String(payload.addonId ?? ''),
+      String(payload.scope ?? 'mine'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthRevokeRequest — unieważnij konto. */
+  addonOAuthRevokeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonOAuthRevokeRequest(Number(payload.accountId ?? 0));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthReauthorizeRequest — nowy flow dla istniejacego konta. */
+  addonOAuthReauthorizeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonOAuthReauthorizeRequest(Number(payload.accountId ?? 0));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonOAuthTestConnectionRequest — admin probes provider. */
+  addonOAuthTestConnectionRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonOAuthTestConnectionRequest(
+      String(payload.addonId ?? payload.addon_id ?? ''),
+      String(payload.providerId ?? payload.provider_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MyOAuthAccountsListRequest (unit) — konta biezacego usera. */
+  myOAuthAccountsListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMyOAuthAccountsListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // =============================================================================
+  // Addon lifecycle (toggle/install/uninstall/config/logs/tools/resources/network/reload)
+  // =============================================================================
+
+  /** MessageBody::AddonToggleRequest — wlacza/wylacza addon. */
+  addonToggleRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonToggleRequest(
+      String(payload.addonId ?? ''),
+      Boolean(payload.enabled),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonInstallRequest — instaluje addon z ZIP (Uint8Array content). */
+  addonInstallRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const content = payload.content instanceof Uint8Array
+      ? payload.content
+      : new Uint8Array(payload.content ?? []);
+    const body = _wasm.encodeAddonInstallRequest(
+      String(payload.filename ?? 'addon.zip'),
+      content,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonUninstallRequest — odinstalowuje addon. */
+  addonUninstallRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonUninstallRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonConfigGetRequest — schema + values (secret pola puste). */
+  addonConfigGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonConfigGetRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonConfigSetRequest — zapisuje wartosci konfiguracji. */
+  addonConfigSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    // payload.values = { key: value } lub tablica [[k,v],...] — normalizujemy.
+    const entries = Array.isArray(payload.values)
+      ? payload.values
+      : Object.entries(payload.values ?? {});
+    const keys = entries.map((e) => String(e[0]));
+    const vals = entries.map((e) => String(e[1]));
+    const body = _wasm.encodeAddonConfigSetRequest(
+      String(payload.addonId ?? ''),
+      keys,
+      vals,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonLogsRequest — per-addon wpisy audytu z paginacja. */
+  addonLogsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonLogsRequest(
+      String(payload.addonId ?? ''),
+      Number(payload.limit ?? 50),
+      Number(payload.offset ?? 0),
+      payload.level == null ? undefined : String(payload.level),
+      payload.search == null ? undefined : String(payload.search),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonToolsRequest — deklaracje narzedzi z manifestu. */
+  addonToolsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonToolsRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonResourcesGetRequest — pobiera limity zasobow. */
+  addonResourcesGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonResourcesGetRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonResourcesSetRequest — zapisuje limity zasobow. */
+  addonResourcesSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonResourcesSetRequest(
+      String(payload.addonId ?? ''),
+      Number(payload.maxInstances ?? 0),
+      Number(payload.cpuLimitPct ?? 0),
+      Number(payload.ramMb ?? 0),
+      Number(payload.storageMb ?? 0),
+      Number(payload.httpRequestsPerMin ?? 0),
+      Number(payload.llmTokensPerMin ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonNetworkRulesGetRequest — allowed/blocked + mode. */
+  addonNetworkRulesGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonNetworkRulesGetRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonNetworkRulesSetRequest — zapisuje listy hostow + mode. */
+  addonNetworkRulesSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const allowed = Array.isArray(payload.allowedHosts)
+      ? payload.allowedHosts.map((h) => String(h))
+      : [];
+    const blocked = Array.isArray(payload.blockedHosts)
+      ? payload.blockedHosts.map((h) => String(h))
+      : [];
+    const body = _wasm.encodeAddonNetworkRulesSetRequest(
+      String(payload.addonId ?? ''),
+      allowed,
+      blocked,
+      String(payload.mode ?? 'strict'),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonReloadRequest — re-inicjalizuje instance pool addona. */
+  addonReloadRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonReloadRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

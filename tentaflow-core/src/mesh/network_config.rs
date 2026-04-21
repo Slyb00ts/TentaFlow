@@ -67,22 +67,21 @@ pub fn build_config_command(
         }
     }
 
-    let prefix = netmask
-        .map(netmask_to_prefix)
-        .transpose()?
-        .unwrap_or(24);
+    let prefix = netmask.map(netmask_to_prefix).transpose()?.unwrap_or(24);
 
     match manager {
         NetworkManager::NetworkManager => build_nm_command(interface, ipv4, prefix, gateway, dhcp),
         NetworkManager::SystemdNetworkd => {
             build_systemd_networkd_command(interface, ipv4, prefix, gateway, dhcp)
         }
-        NetworkManager::Netplan => {
-            build_netplan_command(interface, ipv4, prefix, gateway, dhcp)
-        }
-        NetworkManager::Ifupdown => {
-            build_ifupdown_command(interface, ipv4, netmask.unwrap_or("255.255.255.0"), gateway, dhcp)
-        }
+        NetworkManager::Netplan => build_netplan_command(interface, ipv4, prefix, gateway, dhcp),
+        NetworkManager::Ifupdown => build_ifupdown_command(
+            interface,
+            ipv4,
+            netmask.unwrap_or("255.255.255.0"),
+            gateway,
+            dhcp,
+        ),
         NetworkManager::MacOS => build_macos_command(interface, ipv4, netmask, gateway, dhcp),
         NetworkManager::Windows => build_windows_command(interface, ipv4, prefix, gateway, dhcp),
         NetworkManager::Unknown => bail!("Nie wykryto network managera na tym systemie"),
@@ -256,10 +255,7 @@ fn build_systemd_networkd_command(
 ) -> Result<String> {
     let network_file = format!("/etc/systemd/network/99-tentaflow-{}.network", interface);
     let content = if dhcp {
-        format!(
-            "[Match]\nName={}\n\n[Network]\nDHCP=yes\n",
-            interface
-        )
+        format!("[Match]\nName={}\n\n[Network]\nDHCP=yes\n", interface)
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
         let mut net = format!(
@@ -323,10 +319,7 @@ fn build_ifupdown_command(
 ) -> Result<String> {
     let iface_file = format!("/etc/network/interfaces.d/tentaflow-{}", interface);
     let content = if dhcp {
-        format!(
-            "auto {}\niface {} inet dhcp\n",
-            interface, interface
-        )
+        format!("auto {}\niface {} inet dhcp\n", interface, interface)
     } else {
         let ip = ipv4.ok_or_else(|| anyhow::anyhow!("Adres IPv4 wymagany dla trybu static"))?;
         let mut c = format!(

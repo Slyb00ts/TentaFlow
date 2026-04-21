@@ -5,9 +5,9 @@
 //       rejestracja w service_manager i mesh.
 // =============================================================================
 
-use crate::db::{self, DbPool};
-use crate::db::models::NewBackend;
 use crate::config::{ConnectionType, ServiceBackend};
+use crate::db::models::NewBackend;
+use crate::db::{self, DbPool};
 use crate::routing::backend::BackendClient;
 use crate::routing::Router;
 use anyhow::{Context, Result};
@@ -47,12 +47,24 @@ pub async fn auto_register_deployed_service(
     let base_url = resolve_base_url(&info, &router);
 
     // 1. Health check polling
-    send_progress(&progress_tx, DeployProgress::phase("health_check_waiting", "Oczekiwanie na kontener...")).await;
+    send_progress(
+        &progress_tx,
+        DeployProgress::phase("health_check_waiting", "Oczekiwanie na kontener..."),
+    )
+    .await;
     wait_for_health(&base_url).await?;
-    send_progress(&progress_tx, DeployProgress::phase("health_check_ready", "Kontener gotowy")).await;
+    send_progress(
+        &progress_tx,
+        DeployProgress::phase("health_check_ready", "Kontener gotowy"),
+    )
+    .await;
 
     // 2. Odpytaj modele
-    send_progress(&progress_tx, DeployProgress::phase("discovering_models", "Wykrywanie modeli...")).await;
+    send_progress(
+        &progress_tx,
+        DeployProgress::phase("discovering_models", "Wykrywanie modeli..."),
+    )
+    .await;
     let model_name = discover_model(&base_url, info.deployed_model.as_deref()).await?;
     info!("Wykryty model: {}", model_name);
 
@@ -60,20 +72,32 @@ pub async fn auto_register_deployed_service(
     let existing = db::repository::list_services(&pool)?;
     let found = existing.iter().find(|s| s.name == info.service_name);
     if let Some(existing_svc) = found {
-        info!("Serwis '{}' juz istnieje (id={}), pomijam tworzenie", info.service_name, existing_svc.id);
-        send_progress(&progress_tx, DeployProgress::done(true, &format!("Serwis juz istnieje: {}", model_name))).await;
+        info!(
+            "Serwis '{}' juz istnieje (id={}), pomijam tworzenie",
+            info.service_name, existing_svc.id
+        );
+        send_progress(
+            &progress_tx,
+            DeployProgress::done(true, &format!("Serwis juz istnieje: {}", model_name)),
+        )
+        .await;
         return Ok(model_name);
     }
 
     // 4. Utworz service w DB
-    send_progress(&progress_tx, DeployProgress::phase("registering_service", "Rejestracja serwisu...")).await;
+    send_progress(
+        &progress_tx,
+        DeployProgress::phase("registering_service", "Rejestracja serwisu..."),
+    )
+    .await;
 
     let config_json = serde_json::json!({
         "deployed_model": model_name,
         "deploy_mode": "docker",
         "port": info.port,
         "node_id": info.node_id,
-    }).to_string();
+    })
+    .to_string();
 
     let service_id = db::repository::create_service(
         &pool,
@@ -83,12 +107,16 @@ pub async fn auto_register_deployed_service(
         None,
         &config_json,
     )?;
-    info!("Utworzono serwis '{}' (id={})", info.service_name, service_id);
+    info!(
+        "Utworzono serwis '{}' (id={})",
+        info.service_name, service_id
+    );
 
     // 5. Utworz backend w DB
     let backend_config = serde_json::json!({
         "url": format!("{}/v1", base_url),
-    }).to_string();
+    })
+    .to_string();
 
     let new_backend = NewBackend {
         service_id,
@@ -101,7 +129,10 @@ pub async fn auto_register_deployed_service(
         health_check_path: Some("/v1/health/ready"),
     };
     let backend_id = db::repository::create_backend(&pool, &new_backend)?;
-    info!("Utworzono backend (id={}) dla serwisu '{}'", backend_id, info.service_name);
+    info!(
+        "Utworzono backend (id={}) dla serwisu '{}'",
+        backend_id, info.service_name
+    );
 
     // 6. Zarejestruj w service_manager (dynamiczny HTTP backend)
     let backend_url = format!("{}/v1", base_url);
@@ -125,7 +156,9 @@ pub async fn auto_register_deployed_service(
     match BackendClient::new(service_backend, None) {
         Ok(client) => {
             let client = Arc::new(client);
-            router.service_manager.register_dynamic_http_backend(&info.service_name, client);
+            router
+                .service_manager
+                .register_dynamic_http_backend(&info.service_name, client);
         }
         Err(e) => {
             warn!("Nie udalo sie utworzyc BackendClient: {}", e);
@@ -133,7 +166,9 @@ pub async fn auto_register_deployed_service(
     }
 
     // 7. Zarejestruj w model_pool
-    router.service_manager.register_model_mapping(&model_name, &info.service_name);
+    router
+        .service_manager
+        .register_model_mapping(&model_name, &info.service_name);
 
     // Ustaw service_type w model_pool
     {
@@ -150,8 +185,15 @@ pub async fn auto_register_deployed_service(
         vec![model_name.clone()],
     );
 
-    send_progress(&progress_tx, DeployProgress::done(true, &format!("Serwis zarejestrowany: {}", model_name))).await;
-    info!("Auto-rejestracja zakonczona: serwis='{}', model='{}'", info.service_name, model_name);
+    send_progress(
+        &progress_tx,
+        DeployProgress::done(true, &format!("Serwis zarejestrowany: {}", model_name)),
+    )
+    .await;
+    info!(
+        "Auto-rejestracja zakonczona: serwis='{}', model='{}'",
+        info.service_name, model_name
+    );
 
     Ok(model_name)
 }
@@ -168,12 +210,22 @@ async fn auto_register_quic_service(
     let quic_url = format!("quic://{}:{}", quic_host, info.port);
 
     // 1. QUIC health check — probuj nawiazac polaczenie
-    send_progress(&progress_tx, DeployProgress::phase("health_check_waiting", "Oczekiwanie na kontener QUIC...")).await;
+    send_progress(
+        &progress_tx,
+        DeployProgress::phase("health_check_waiting", "Oczekiwanie na kontener QUIC..."),
+    )
+    .await;
     wait_for_quic_health(&quic_url).await?;
-    send_progress(&progress_tx, DeployProgress::phase("health_check_ready", "Kontener QUIC gotowy")).await;
+    send_progress(
+        &progress_tx,
+        DeployProgress::phase("health_check_ready", "Kontener QUIC gotowy"),
+    )
+    .await;
 
     // Nazwa modelu — dla meeting-bot uzywamy service_name
-    let model_name = info.deployed_model.clone()
+    let model_name = info
+        .deployed_model
+        .clone()
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| info.service_name.clone());
 
@@ -181,13 +233,24 @@ async fn auto_register_quic_service(
     let existing = db::repository::list_services(&pool)?;
     let found = existing.iter().find(|s| s.name == info.service_name);
     if let Some(existing_svc) = found {
-        info!("Serwis QUIC '{}' juz istnieje (id={}), pomijam tworzenie", info.service_name, existing_svc.id);
-        send_progress(&progress_tx, DeployProgress::done(true, &format!("Serwis juz istnieje: {}", model_name))).await;
+        info!(
+            "Serwis QUIC '{}' juz istnieje (id={}), pomijam tworzenie",
+            info.service_name, existing_svc.id
+        );
+        send_progress(
+            &progress_tx,
+            DeployProgress::done(true, &format!("Serwis juz istnieje: {}", model_name)),
+        )
+        .await;
         return Ok(model_name);
     }
 
     // 3. Utworz service w DB
-    send_progress(&progress_tx, DeployProgress::phase("registering_service", "Rejestracja serwisu QUIC...")).await;
+    send_progress(
+        &progress_tx,
+        DeployProgress::phase("registering_service", "Rejestracja serwisu QUIC..."),
+    )
+    .await;
 
     let config_json = serde_json::json!({
         "deployed_model": model_name,
@@ -195,7 +258,8 @@ async fn auto_register_quic_service(
         "protocol": "quic",
         "port": info.port,
         "node_id": info.node_id,
-    }).to_string();
+    })
+    .to_string();
 
     let service_id = db::repository::create_service(
         &pool,
@@ -205,13 +269,17 @@ async fn auto_register_quic_service(
         None,
         &config_json,
     )?;
-    info!("Utworzono serwis QUIC '{}' (id={})", info.service_name, service_id);
+    info!(
+        "Utworzono serwis QUIC '{}' (id={})",
+        info.service_name, service_id
+    );
 
     // 4. Utworz backend w DB (QUIC)
     let backend_config = serde_json::json!({
         "quic_url": quic_url,
         "protocol": "quic",
-    }).to_string();
+    })
+    .to_string();
 
     let new_backend = NewBackend {
         service_id,
@@ -224,7 +292,10 @@ async fn auto_register_quic_service(
         health_check_path: None,
     };
     let backend_id = db::repository::create_backend(&pool, &new_backend)?;
-    info!("Utworzono backend QUIC (id={}) dla serwisu '{}'", backend_id, info.service_name);
+    info!(
+        "Utworzono backend QUIC (id={}) dla serwisu '{}'",
+        backend_id, info.service_name
+    );
 
     // 5. Zarejestruj w service_manager jako QUIC
     router.service_manager.register_quic_service(
@@ -236,7 +307,9 @@ async fn auto_register_quic_service(
     );
 
     // 6. Zarejestruj w model_pool
-    router.service_manager.register_model_mapping(&model_name, &info.service_name);
+    router
+        .service_manager
+        .register_model_mapping(&model_name, &info.service_name);
     {
         let mut pool_guard = router.service_manager.model_pool.write();
         if let Some(entry) = pool_guard.get_mut(&model_name) {
@@ -251,8 +324,15 @@ async fn auto_register_quic_service(
         vec![model_name.clone()],
     );
 
-    send_progress(&progress_tx, DeployProgress::done(true, &format!("Serwis QUIC zarejestrowany: {}", model_name))).await;
-    info!("Auto-rejestracja QUIC zakonczona: serwis='{}', model='{}'", info.service_name, model_name);
+    send_progress(
+        &progress_tx,
+        DeployProgress::done(true, &format!("Serwis QUIC zarejestrowany: {}", model_name)),
+    )
+    .await;
+    info!(
+        "Auto-rejestracja QUIC zakonczona: serwis='{}', model='{}'",
+        info.service_name, model_name
+    );
 
     Ok(model_name)
 }
@@ -303,7 +383,10 @@ async fn wait_for_quic_health(quic_url: &str) -> Result<()> {
             }
             Err(e) => {
                 if attempt % 10 == 0 {
-                    info!("QUIC health check proba {}/{}: {}", attempt, max_attempts, e);
+                    info!(
+                        "QUIC health check proba {}/{}: {}",
+                        attempt, max_attempts, e
+                    );
                 }
             }
         }
@@ -311,7 +394,9 @@ async fn wait_for_quic_health(quic_url: &str) -> Result<()> {
     }
 
     let _ = shutdown_tx.send(true);
-    Err(anyhow::anyhow!("QUIC health check timeout — kontener nie odpowiedzial w ciagu 5 minut"))
+    Err(anyhow::anyhow!(
+        "QUIC health check timeout — kontener nie odpowiedzial w ciagu 5 minut"
+    ))
 }
 
 /// Okresla bazowy URL na podstawie node_id
@@ -352,7 +437,12 @@ async fn wait_for_health(base_url: &str) -> Result<()> {
             }
             Ok(resp) => {
                 if attempt % 10 == 0 {
-                    info!("Health check proba {}/{}: status {}", attempt, max_attempts, resp.status());
+                    info!(
+                        "Health check proba {}/{}: status {}",
+                        attempt,
+                        max_attempts,
+                        resp.status()
+                    );
                 }
             }
             Err(e) => {
@@ -364,7 +454,9 @@ async fn wait_for_health(base_url: &str) -> Result<()> {
         tokio::time::sleep(interval).await;
     }
 
-    Err(anyhow::anyhow!("Health check timeout — kontener nie odpowiedzial w ciagu 5 minut"))
+    Err(anyhow::anyhow!(
+        "Health check timeout — kontener nie odpowiedzial w ciagu 5 minut"
+    ))
 }
 
 /// Odpytuje /v1/models i zwraca nazwe modelu
@@ -378,7 +470,9 @@ async fn discover_model(base_url: &str, deployed_model: Option<&str>) -> Result<
 
     match client.get(&models_url).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await
+            let body: serde_json::Value = resp
+                .json()
+                .await
                 .context("Blad parsowania odpowiedzi /v1/models")?;
 
             if let Some(models) = body.get("data").and_then(|d| d.as_array()) {
@@ -404,7 +498,9 @@ async fn discover_model(base_url: &str, deployed_model: Option<&str>) -> Result<
         }
     }
 
-    Err(anyhow::anyhow!("Nie udalo sie wykryc modelu — brak odpowiedzi z /v1/models"))
+    Err(anyhow::anyhow!(
+        "Nie udalo sie wykryc modelu — brak odpowiedzi z /v1/models"
+    ))
 }
 
 /// Wiadomosc postepu deploy
@@ -433,7 +529,11 @@ impl DeployProgress {
             phase: "done".to_string(),
             message: message.to_string(),
             success: Some(success),
-            error: if success { None } else { Some(message.to_string()) },
+            error: if success {
+                None
+            } else {
+                Some(message.to_string())
+            },
         }
     }
 }

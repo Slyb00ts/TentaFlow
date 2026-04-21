@@ -168,8 +168,11 @@ prometheus = { version = "0.14.0", optional = true }
 # WASM runtime — wasmtime na Desktop/Router, wasmi na Mobile (iOS/Android)
 # Target-specific dependencies ponizej
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.52"
 
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]

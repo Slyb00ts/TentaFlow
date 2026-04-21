@@ -20,7 +20,11 @@ struct TokensWindow {
 }
 
 fn window() -> &'static Mutex<TokensWindow> {
-    TOKENS_WINDOW.get_or_init(|| Mutex::new(TokensWindow { samples: Vec::new() }))
+    TOKENS_WINDOW.get_or_init(|| {
+        Mutex::new(TokensWindow {
+            samples: Vec::new(),
+        })
+    })
 }
 
 /// Guard RAII — zwieksza licznik active przy tworzeniu, zmniejsza przy drop.

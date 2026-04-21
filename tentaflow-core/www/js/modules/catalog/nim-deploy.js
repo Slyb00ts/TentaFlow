@@ -5,7 +5,8 @@
 //       Obsluguje blad EULA z linkiem do akceptacji licencji + retry.
 // =============================================================================
 
-import { escapeHtml, escapeAttr, toast, apiGet } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 
 /// Otwiera modal deploy dla wybranego kontenera NIM (z `/api/nim/catalog`).
@@ -16,7 +17,7 @@ export async function openNimDeployModal(container, preselectedNode = null) {
 
   let nodes = [];
   try {
-    const resp = await apiGet('/api/mesh/nodes');
+    const resp = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
     nodes = (resp || []).filter((n) => n.is_trusted === true || n.is_local === true);
   } catch {
     // ignore
@@ -102,17 +103,15 @@ export async function openNimDeployModal(container, preselectedNode = null) {
   async function loadNodeGpus(nodeId) {
     if (!nodeId) return;
     try {
-      const data = await apiGet(`/api/mesh/nodes/${encodeURIComponent(nodeId)}`);
-      const gpus = Array.isArray(data?.gpu_info) ? data.gpu_info : [];
-      if (gpus.length > 0) {
+      const data = await ApiBinary.one('meshNodeDetailRequest', { nodeId });
+      const node = data?.node;
+      const gpu = node?.gpuInfo;
+      if (gpu) {
         const inner = gpuSelect.querySelector('select');
         if (!inner) return;
+        const vram = gpu.vramTotalMb ? Math.round(gpu.vramTotalMb / 1024) + ' GB' : '';
         inner.innerHTML = '<option value="all">All GPUs</option>' +
-          gpus.map((g, i) => {
-            const idx = g.index ?? i;
-            const vram = g.vram_total_mb ? Math.round(g.vram_total_mb / 1024) + ' GB' : '';
-            return `<option value="${idx}">GPU ${idx}: ${escapeHtml(g.name || '')}${vram ? ` (${vram})` : ''}</option>`;
-          }).join('');
+          `<option value="0">GPU 0: ${escapeHtml(gpu.name || '')}${vram ? ` (${vram})` : ''}</option>`;
         gpuSelect.setAttribute('value', 'all');
       }
     } catch {

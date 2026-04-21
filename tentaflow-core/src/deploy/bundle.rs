@@ -27,7 +27,8 @@ pub fn extract_to(target: &Path) -> Result<()> {
 
     let decoder = flate2::read::GzDecoder::new(CONTAINER_BUNDLE);
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(target)
+    archive
+        .unpack(target)
         .with_context(|| format!("rozpakowanie bundle do {}", target.display()))?;
     Ok(())
 }

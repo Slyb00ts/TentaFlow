@@ -120,10 +120,7 @@ impl IrohServiceClient {
 
     /// Wysyla `ModelRequest` i czeka na pelny `ModelResponse`.
     pub async fn send_request(&self, request: ModelRequest) -> Result<ModelResponse, CoreError> {
-        self.inner
-            .request(request)
-            .await
-            .map_err(map_transport_err)
+        self.inner.request(request).await.map_err(map_transport_err)
     }
 
     /// Otwiera bidi stream do peera, wysyla `ModelRequest`, zwraca oba strumienie.
@@ -132,10 +129,7 @@ impl IrohServiceClient {
         &self,
         request: ModelRequest,
     ) -> Result<(SendStream, RecvStream), CoreError> {
-        self.inner
-            .open_bi(request)
-            .await
-            .map_err(map_transport_err)
+        self.inner.open_bi(request).await.map_err(map_transport_err)
     }
 
     /// Wysyla `ModelRequest` i zwraca `Stream` kolejnych `ModelStreamChunk` (STT,
@@ -214,7 +208,10 @@ impl IrohServiceClient {
             .map_err(map_transport_err)
     }
 
-    pub async fn send_and_wait_legacy_bytes(&self, _payload: Vec<u8>) -> Result<Vec<u8>, CoreError> {
+    pub async fn send_and_wait_legacy_bytes(
+        &self,
+        _payload: Vec<u8>,
+    ) -> Result<Vec<u8>, CoreError> {
         Err(CoreError::InternalError {
             message: "legacy raw-bytes API nie jest wspierane — uzywaj `send_request`".into(),
             source: None,
@@ -229,12 +226,10 @@ fn map_transport_err(e: TransportError) -> CoreError {
             message: msg.clone(),
             source: anyhow::anyhow!(msg),
         },
-        TransportError::Serialize(_) | TransportError::Deserialize(_) => {
-            CoreError::InternalError {
-                message: msg,
-                source: None,
-            }
-        }
+        TransportError::Serialize(_) | TransportError::Deserialize(_) => CoreError::InternalError {
+            message: msg,
+            source: None,
+        },
         _ => CoreError::NetworkError {
             message: msg.clone(),
             source: anyhow::anyhow!(msg),

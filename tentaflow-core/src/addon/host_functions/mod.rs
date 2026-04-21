@@ -5,21 +5,22 @@
 //       do audit trail i operuje na liniowej pamieci WASM.
 // =============================================================================
 
-pub mod llm;
-pub mod storage;
-pub mod http;
 pub mod events;
-pub mod ui;
-pub mod user;
-pub mod secrets;
+pub mod http;
+pub mod llm;
 pub mod log;
 pub mod network;
+pub mod oauth;
+pub mod secrets;
 pub mod service;
+pub mod storage;
+pub mod ui;
+pub mod user;
 
 use anyhow::Result;
 
+use super::runtime::{AsContext, AsContextMut, WasmCaller, WasmLinker, WasmMemory};
 use super::AddonState;
-use super::runtime::{WasmLinker, WasmCaller, WasmMemory, AsContext, AsContextMut};
 
 // =============================================================================
 // Kody bledow ABI (zwracane przez host functions)
@@ -48,140 +49,132 @@ pub const ABI_ERR_BUFFER_TOO_SMALL: i32 = -6;
 /// Kazda funkcja jest dostepna dla addonu pod namespace "tentaflow".
 pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()> {
     // --- LLM API ---
-    linker.func_wrap(
-        "tentaflow", "llm_generate",
-        llm::llm_generate,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja llm_generate: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "llm_generate", llm::llm_generate)
+        .map_err(|e| anyhow::anyhow!("Rejestracja llm_generate: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "llm_generate_stream_start",
-        llm::llm_generate_stream_start,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_start: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "llm_generate_stream_start",
+            llm::llm_generate_stream_start,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_start: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "llm_generate_stream_next",
-        llm::llm_generate_stream_next,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_next: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "llm_generate_stream_next",
+            llm::llm_generate_stream_next,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_next: {e}"))?;
 
     // --- Storage API ---
-    linker.func_wrap(
-        "tentaflow", "storage_get",
-        storage::storage_get,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_get: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "storage_get", storage::storage_get)
+        .map_err(|e| anyhow::anyhow!("Rejestracja storage_get: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "storage_set",
-        storage::storage_set,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_set: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "storage_set", storage::storage_set)
+        .map_err(|e| anyhow::anyhow!("Rejestracja storage_set: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "storage_delete",
-        storage::storage_delete,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_delete: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "storage_delete", storage::storage_delete)
+        .map_err(|e| anyhow::anyhow!("Rejestracja storage_delete: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "storage_list",
-        storage::storage_list,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja storage_list: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "storage_list", storage::storage_list)
+        .map_err(|e| anyhow::anyhow!("Rejestracja storage_list: {e}"))?;
 
     // --- HTTP API ---
-    linker.func_wrap(
-        "tentaflow", "http_request",
-        http::http_request,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja http_request: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "http_request", http::http_request)
+        .map_err(|e| anyhow::anyhow!("Rejestracja http_request: {e}"))?;
 
     // --- Event API ---
-    linker.func_wrap(
-        "tentaflow", "event_subscribe",
-        events::event_subscribe,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja event_subscribe: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "event_subscribe", events::event_subscribe)
+        .map_err(|e| anyhow::anyhow!("Rejestracja event_subscribe: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "event_publish",
-        events::event_publish,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja event_publish: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "event_publish", events::event_publish)
+        .map_err(|e| anyhow::anyhow!("Rejestracja event_publish: {e}"))?;
 
     // --- UI API ---
-    linker.func_wrap(
-        "tentaflow", "ui_render",
-        ui::ui_render,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja ui_render: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "ui_render", ui::ui_render)
+        .map_err(|e| anyhow::anyhow!("Rejestracja ui_render: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "ui_notify",
-        ui::ui_notify,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja ui_notify: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "ui_notify", ui::ui_notify)
+        .map_err(|e| anyhow::anyhow!("Rejestracja ui_notify: {e}"))?;
 
     // --- User API ---
-    linker.func_wrap(
-        "tentaflow", "user_get_current",
-        user::user_get_current,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja user_get_current: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "user_get_current", user::user_get_current)
+        .map_err(|e| anyhow::anyhow!("Rejestracja user_get_current: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "user_check_permission",
-        user::user_check_permission,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja user_check_permission: {e}"))?;
+    linker
+        .func_wrap(
+            "tentaflow",
+            "user_check_permission",
+            user::user_check_permission,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja user_check_permission: {e}"))?;
 
     // --- Secrets API ---
-    linker.func_wrap(
-        "tentaflow", "secret_get",
-        secrets::secret_get,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja secret_get: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "secret_get", secrets::secret_get)
+        .map_err(|e| anyhow::anyhow!("Rejestracja secret_get: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "secret_set",
-        secrets::secret_set,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja secret_set: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "secret_set", secrets::secret_set)
+        .map_err(|e| anyhow::anyhow!("Rejestracja secret_set: {e}"))?;
 
     // --- Log API ---
-    linker.func_wrap(
-        "tentaflow", "log_info",
-        log::log_info,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja log_info: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "log_info", log::log_info)
+        .map_err(|e| anyhow::anyhow!("Rejestracja log_info: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "log_warn",
-        log::log_warn,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja log_warn: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "log_warn", log::log_warn)
+        .map_err(|e| anyhow::anyhow!("Rejestracja log_warn: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "log_error",
-        log::log_error,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja log_error: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "log_error", log::log_error)
+        .map_err(|e| anyhow::anyhow!("Rejestracja log_error: {e}"))?;
 
     // --- Tool API ---
-    linker.func_wrap(
-        "tentaflow", "tool_register",
-        tool_register,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja tool_register: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "tool_register", tool_register)
+        .map_err(|e| anyhow::anyhow!("Rejestracja tool_register: {e}"))?;
 
     // --- Network API (proxy TCP/UDP) ---
-    linker.func_wrap(
-        "tentaflow", "net_connect",
-        network::host_net_connect,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja net_connect: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "net_connect", network::host_net_connect)
+        .map_err(|e| anyhow::anyhow!("Rejestracja net_connect: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "net_send",
-        network::host_net_send,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja net_send: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "net_send", network::host_net_send)
+        .map_err(|e| anyhow::anyhow!("Rejestracja net_send: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "net_recv",
-        network::host_net_recv,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja net_recv: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "net_recv", network::host_net_recv)
+        .map_err(|e| anyhow::anyhow!("Rejestracja net_recv: {e}"))?;
 
-    linker.func_wrap(
-        "tentaflow", "net_close",
-        network::host_net_close,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja net_close: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "net_close", network::host_net_close)
+        .map_err(|e| anyhow::anyhow!("Rejestracja net_close: {e}"))?;
 
     // --- Service API (QUIC proxy do zarejestrowanych serwisow) ---
-    linker.func_wrap(
-        "tentaflow", "service_request",
-        service::service_request,
-    ).map_err(|e| anyhow::anyhow!("Rejestracja service_request: {e}"))?;
+    linker
+        .func_wrap("tentaflow", "service_request", service::service_request)
+        .map_err(|e| anyhow::anyhow!("Rejestracja service_request: {e}"))?;
+
+    // --- OAuth API ---
+    linker
+        .func_wrap("tentaflow", "oauth_get_token", oauth::oauth_get_token)
+        .map_err(|e| anyhow::anyhow!("Rejestracja oauth_get_token: {e}"))?;
 
     Ok(())
 }
@@ -314,11 +307,7 @@ fn fnv1a_hash(s: &str) -> i64 {
 /// Uprawnienia sa boolean (przyznane/nieprzyznane) — bez poziomow dostepu.
 /// CR-006: Brak user_id nie powoduje automatycznego przyznania uprawnien —
 /// wymaga jawnego ustawienia flagi is_system_call.
-pub fn check_permission(
-    state: &AddonState,
-    permission_type: &str,
-    resource: Option<&str>,
-) -> bool {
+pub fn check_permission(state: &AddonState, permission_type: &str, resource: Option<&str>) -> bool {
     // Najpierw sprawdz czy addon deklaruje to uprawnienie
     if !state.permissions.iter().any(|p| p == permission_type) {
         return false;
@@ -334,12 +323,10 @@ pub fn check_permission(
         }
     };
 
-    state.permission_checker.check(
-        &state.addon_id,
-        user_id,
-        permission_type,
-        resource,
-    ).is_granted()
+    state
+        .permission_checker
+        .check(&state.addon_id, user_id, permission_type, resource)
+        .is_granted()
 }
 
 // =============================================================================
@@ -373,13 +360,17 @@ fn tool_register(
     // Zapisz narzedzie w DB
     if let Ok(conn) = state.db.lock() {
         let tool_name = tool_def.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let description = tool_def.get("description").and_then(|v| v.as_str()).unwrap_or("");
-        let params_schema = tool_def.get("parameters_schema")
+        let description = tool_def
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let params_schema = tool_def
+            .get("parameters_schema")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "{}".to_string());
-        let return_schema = tool_def.get("return_schema")
-            .map(|v| v.to_string());
-        let keywords_json = tool_def.get("keywords")
+        let return_schema = tool_def.get("return_schema").map(|v| v.to_string());
+        let keywords_json = tool_def
+            .get("keywords")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "[]".to_string());
 
@@ -390,7 +381,14 @@ fn tool_register(
         );
     }
 
-    audit_log(caller.data(), "tool.register", Some("tool"), None, "ok", None);
+    audit_log(
+        caller.data(),
+        "tool.register",
+        Some("tool"),
+        None,
+        "ok",
+        None,
+    );
 
     ABI_OK
 }

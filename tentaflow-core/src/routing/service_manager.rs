@@ -7,9 +7,9 @@
 // =============================================================================
 
 use crate::config::{ConnectionType, RouterConfig, ServiceType};
-use crate::routing::backend::BackendClient;
-use crate::routing::loadbalancer::{CircuitBreakerConfig, LoadBalancingStrategy, create_strategy};
 use crate::error::Result;
+use crate::routing::backend::BackendClient;
+use crate::routing::loadbalancer::{create_strategy, CircuitBreakerConfig, LoadBalancingStrategy};
 
 /// Tworzy konfiguracje circuit breakera na podstawie ustawien routera
 fn make_circuit_breaker_config(config: &RouterConfig) -> Option<CircuitBreakerConfig> {
@@ -29,7 +29,7 @@ use crate::services::rag::client::{RAGClient, RAGEngineConfigCompat};
 // TODO: Przeniesc TTSClient i TTSConfigCompat do crate::services::tts::client
 use crate::services::tts::client::{TTSClient, TTSConfigCompat};
 // TODO: Przeniesc SharedPromptRegistry i create_shared_registry do crate::prompt_registry
-use crate::prompt_registry::{SharedPromptRegistry, create_shared_registry};
+use crate::prompt_registry::{create_shared_registry, SharedPromptRegistry};
 // TODO: Przeniesc ConversationCache do crate::routing::memory_integration
 use crate::routing::memory_integration::ConversationCache;
 
@@ -230,7 +230,10 @@ impl ModelPoolEntry {
         if self.service_names.is_empty() {
             return None;
         }
-        let idx = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.service_names.len();
+        let idx = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.service_names.len();
         Some(&self.service_names[idx])
     }
 }
@@ -254,7 +257,9 @@ pub struct ServiceManager {
     pub service_backends: HashMap<String, Vec<Arc<BackendClient>>>,
 
     /// Dynamicznie rejestrowane HTTP backends (po deploy kontenera)
-    pub dynamic_backends: parking_lot::RwLock<HashMap<String, (Vec<Arc<BackendClient>>, Box<dyn LoadBalancingStrategy>)>>,
+    pub dynamic_backends: parking_lot::RwLock<
+        HashMap<String, (Vec<Arc<BackendClient>>, Box<dyn LoadBalancingStrategy>)>,
+    >,
 
     /// Load balancing strategies
     pub load_balancing_strategies: HashMap<String, Box<dyn LoadBalancingStrategy>>,
@@ -284,8 +289,18 @@ pub struct ServiceManager {
     pub local_inference_models: parking_lot::RwLock<std::collections::HashSet<String>>,
 
     /// Callback channel dla RAG
-    callback_tx: mpsc::UnboundedSender<(tentaflow_protocol::ModelRequest, mpsc::Sender<tentaflow_protocol::ModelResponse>)>,
-    callback_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(tentaflow_protocol::ModelRequest, mpsc::Sender<tentaflow_protocol::ModelResponse>)>>>,
+    callback_tx: mpsc::UnboundedSender<(
+        tentaflow_protocol::ModelRequest,
+        mpsc::Sender<tentaflow_protocol::ModelResponse>,
+    )>,
+    callback_rx: Arc<
+        tokio::sync::Mutex<
+            mpsc::UnboundedReceiver<(
+                tentaflow_protocol::ModelRequest,
+                mpsc::Sender<tentaflow_protocol::ModelResponse>,
+            )>,
+        >,
+    >,
 
     /// Shutdown signal
     shutdown_tx: watch::Sender<bool>,
@@ -317,20 +332,25 @@ impl ServiceManager {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let mut service_backends: HashMap<String, Vec<Arc<BackendClient>>> = HashMap::new();
-        let mut load_balancing_strategies: HashMap<String, Box<dyn LoadBalancingStrategy>> = HashMap::new();
+        let mut load_balancing_strategies: HashMap<String, Box<dyn LoadBalancingStrategy>> =
+            HashMap::new();
         let mut rag_services: HashMap<String, Arc<RAGServiceHandle>> = HashMap::new();
         let mut quic_embedding_services: HashMap<String, Arc<QuicServiceHandle>> = HashMap::new();
         let mut tts_clients: HashMap<String, Arc<TTSClient>> = HashMap::new();
         let mut quic_tts_services: HashMap<String, Arc<QuicServiceHandle>> = HashMap::new();
         let mut quic_llm_services: HashMap<String, Arc<QuicServiceHandle>> = HashMap::new();
-        let mut llm_model_categories: HashMap<String, crate::config::LlmModelCategory> = HashMap::new();
+        let mut llm_model_categories: HashMap<String, crate::config::LlmModelCategory> =
+            HashMap::new();
         let mut quic_stt_services: HashMap<String, Arc<QuicServiceHandle>> = HashMap::new();
         let mut quic_memory_services: HashMap<String, Arc<QuicServiceHandle>> = HashMap::new();
         let model_pool: HashMap<String, ModelPoolEntry> = HashMap::new();
 
         // Inicjalizacja Prompt Registry dla KV cache (z fallbackiem do DB)
         let prompt_registry = create_shared_registry(db_pool);
-        info!("PromptRegistry: Zaladowano {} promptow", prompt_registry.all_ids().len());
+        info!(
+            "PromptRegistry: Zaladowano {} promptow",
+            prompt_registry.all_ids().len()
+        );
 
         let conversation_cache = Arc::new(ConversationCache::new());
 
@@ -344,7 +364,10 @@ impl ServiceManager {
 
                     for backend in &service.backends {
                         if let ConnectionType::OpenAIApi { .. } = &backend.connection {
-                            let client = BackendClient::new(backend.clone(), make_circuit_breaker_config(&config))?;
+                            let client = BackendClient::new(
+                                backend.clone(),
+                                make_circuit_breaker_config(&config),
+                            )?;
                             clients.push(Arc::new(client));
                         }
                     }
@@ -356,7 +379,11 @@ impl ServiceManager {
                         service_backends.insert(service.name.clone(), clients);
                         load_balancing_strategies.insert(service.name.clone(), strategy);
 
-                        info!("  {} (Vision) - {} backends ready", service.name, service.backends.len());
+                        info!(
+                            "  {} (Vision) - {} backends ready",
+                            service.name,
+                            service.backends.len()
+                        );
                     }
                 }
 
@@ -367,10 +394,20 @@ impl ServiceManager {
                     for backend in &service.backends {
                         match &backend.connection {
                             ConnectionType::OpenAIApi { .. } => {
-                                let client = BackendClient::new(backend.clone(), make_circuit_breaker_config(&config))?;
+                                let client = BackendClient::new(
+                                    backend.clone(),
+                                    make_circuit_breaker_config(&config),
+                                )?;
                                 clients.push(Arc::new(client));
                             }
-                            ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } => {
+                            ConnectionType::QUIC {
+                                quic_url,
+                                tls_ca,
+                                auto_reconnect,
+                                reconnect_interval_ms,
+                                keepalive_interval_ms,
+                                ..
+                            } => {
                                 let quic_config = crate::net::quic::QuicConfig {
                                     name: service.name.clone(),
                                     url: quic_url.clone(),
@@ -386,9 +423,13 @@ impl ServiceManager {
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
                                 quic_llm_services.insert(service.name.clone(), handle);
-                                llm_model_categories.insert(service.name.clone(), service.model_category);
+                                llm_model_categories
+                                    .insert(service.name.clone(), service.model_category);
 
-                                info!("  {} (LLM QUIC, category: {:?}) - connecting in background...", service.name, service.model_category);
+                                info!(
+                                    "  {} (LLM QUIC, category: {:?}) - connecting in background...",
+                                    service.name, service.model_category
+                                );
                                 break;
                             }
                         }
@@ -402,7 +443,10 @@ impl ServiceManager {
                         service_backends.insert(service.name.clone(), clients);
                         load_balancing_strategies.insert(service.name.clone(), strategy);
 
-                        info!("  {} (LLM OpenAI) - {} backends ready", service.name, clients_count);
+                        info!(
+                            "  {} (LLM OpenAI) - {} backends ready",
+                            service.name, clients_count
+                        );
                     }
                 }
 
@@ -413,10 +457,20 @@ impl ServiceManager {
                     for backend in &service.backends {
                         match &backend.connection {
                             ConnectionType::OpenAIApi { .. } => {
-                                let client = BackendClient::new(backend.clone(), make_circuit_breaker_config(&config))?;
+                                let client = BackendClient::new(
+                                    backend.clone(),
+                                    make_circuit_breaker_config(&config),
+                                )?;
                                 clients.push(Arc::new(client));
                             }
-                            ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } => {
+                            ConnectionType::QUIC {
+                                quic_url,
+                                tls_ca,
+                                auto_reconnect,
+                                reconnect_interval_ms,
+                                keepalive_interval_ms,
+                                ..
+                            } => {
                                 let quic_config = crate::net::quic::QuicConfig {
                                     name: service.name.clone(),
                                     url: quic_url.clone(),
@@ -433,7 +487,10 @@ impl ServiceManager {
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
                                 quic_stt_services.insert(service.name.clone(), handle);
 
-                                info!("  {} (STT QUIC) - connecting in background...", service.name);
+                                info!(
+                                    "  {} (STT QUIC) - connecting in background...",
+                                    service.name
+                                );
                                 break;
                             }
                         }
@@ -447,14 +504,25 @@ impl ServiceManager {
                         service_backends.insert(service.name.clone(), clients);
                         load_balancing_strategies.insert(service.name.clone(), strategy);
 
-                        info!("  {} (STT OpenAI) - {} backends ready", service.name, clients_count);
+                        info!(
+                            "  {} (STT OpenAI) - {} backends ready",
+                            service.name, clients_count
+                        );
                     }
                 }
 
                 // ===== RAG - QUIC (asynchroniczne, background connection) =====
                 ServiceType::RAG => {
                     for backend in &service.backends {
-                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                        if let ConnectionType::QUIC {
+                            quic_url,
+                            tls_ca,
+                            auto_reconnect,
+                            reconnect_interval_ms,
+                            keepalive_interval_ms,
+                            ..
+                        } = &backend.connection
+                        {
                             let rag_config = RAGEngineConfigCompat {
                                 name: service.name.clone(),
                                 quic_url: quic_url.clone(),
@@ -482,10 +550,20 @@ impl ServiceManager {
                     for backend in &service.backends {
                         match &backend.connection {
                             ConnectionType::OpenAIApi { .. } => {
-                                let client = BackendClient::new(backend.clone(), make_circuit_breaker_config(&config))?;
+                                let client = BackendClient::new(
+                                    backend.clone(),
+                                    make_circuit_breaker_config(&config),
+                                )?;
                                 clients.push(Arc::new(client));
                             }
-                            ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } => {
+                            ConnectionType::QUIC {
+                                quic_url,
+                                tls_ca,
+                                auto_reconnect,
+                                reconnect_interval_ms,
+                                keepalive_interval_ms,
+                                ..
+                            } => {
                                 let quic_config = crate::net::quic::QuicConfig {
                                     name: service.name.clone(),
                                     url: quic_url.clone(),
@@ -502,7 +580,10 @@ impl ServiceManager {
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
                                 quic_embedding_services.insert(service.name.clone(), handle);
 
-                                info!("  {} (Embedding QUIC) - connecting in background...", service.name);
+                                info!(
+                                    "  {} (Embedding QUIC) - connecting in background...",
+                                    service.name
+                                );
                                 break;
                             }
                         }
@@ -516,7 +597,10 @@ impl ServiceManager {
                         service_backends.insert(service.name.clone(), clients);
                         load_balancing_strategies.insert(service.name.clone(), strategy);
 
-                        info!("  {} (Embedding OpenAI) - {} backends ready", service.name, clients_count);
+                        info!(
+                            "  {} (Embedding OpenAI) - {} backends ready",
+                            service.name, clients_count
+                        );
                     }
                 }
 
@@ -525,14 +609,29 @@ impl ServiceManager {
                     for backend in &service.backends {
                         match &backend.connection {
                             // HTTP backend (OpenAI TTS API)
-                            ConnectionType::OpenAIApi { url, api_key, api_key_env, tts_config, .. } => {
+                            ConnectionType::OpenAIApi {
+                                url,
+                                api_key,
+                                api_key_env,
+                                tts_config,
+                                ..
+                            } => {
                                 let tts_cfg = TTSConfigCompat {
                                     url: url.clone(),
                                     api_key: api_key.clone(),
                                     api_key_env: api_key_env.clone(),
-                                    model: tts_config.as_ref().map(|c| c.model.clone()).unwrap_or_else(|| "tts-1".to_string()),
-                                    voice: tts_config.as_ref().map(|c| c.voice.clone()).unwrap_or_else(|| "alloy".to_string()),
-                                    response_format: tts_config.as_ref().map(|c| c.response_format.clone()).unwrap_or_else(|| "opus".to_string()),
+                                    model: tts_config
+                                        .as_ref()
+                                        .map(|c| c.model.clone())
+                                        .unwrap_or_else(|| "tts-1".to_string()),
+                                    voice: tts_config
+                                        .as_ref()
+                                        .map(|c| c.voice.clone())
+                                        .unwrap_or_else(|| "alloy".to_string()),
+                                    response_format: tts_config
+                                        .as_ref()
+                                        .map(|c| c.response_format.clone())
+                                        .unwrap_or_else(|| "opus".to_string()),
                                     speed: tts_config.as_ref().map(|c| c.speed).unwrap_or(1.0),
                                     timeout_ms: backend.timeout_ms,
                                 };
@@ -544,7 +643,14 @@ impl ServiceManager {
                                 break;
                             }
                             // QUIC backend (TentaFlow.TTS z rkyv)
-                            ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } => {
+                            ConnectionType::QUIC {
+                                quic_url,
+                                tls_ca,
+                                auto_reconnect,
+                                reconnect_interval_ms,
+                                keepalive_interval_ms,
+                                ..
+                            } => {
                                 let quic_config = crate::net::quic::QuicConfig {
                                     name: service.name.clone(),
                                     url: quic_url.clone(),
@@ -561,7 +667,10 @@ impl ServiceManager {
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
                                 quic_tts_services.insert(service.name.clone(), handle);
 
-                                info!("  {} (TTS QUIC) - connecting in background...", service.name);
+                                info!(
+                                    "  {} (TTS QUIC) - connecting in background...",
+                                    service.name
+                                );
                                 break;
                             }
                         }
@@ -571,7 +680,15 @@ impl ServiceManager {
                 // ===== Memory - QUIC only (graf wiedzy, entity storage) =====
                 ServiceType::Memory => {
                     for backend in &service.backends {
-                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                        if let ConnectionType::QUIC {
+                            quic_url,
+                            tls_ca,
+                            auto_reconnect,
+                            reconnect_interval_ms,
+                            keepalive_interval_ms,
+                            ..
+                        } = &backend.connection
+                        {
                             let quic_config = crate::net::quic::QuicConfig {
                                 name: service.name.clone(),
                                 url: quic_url.clone(),
@@ -582,13 +699,16 @@ impl ServiceManager {
                                 auto_reconnect: *auto_reconnect,
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
-                                    skip_tls_verify: false,
+                                skip_tls_verify: false,
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
                             quic_memory_services.insert(service.name.clone(), handle);
 
-                            info!("  {} (Memory QUIC) - connecting in background...", service.name);
+                            info!(
+                                "  {} (Memory QUIC) - connecting in background...",
+                                service.name
+                            );
                             break;
                         }
                     }
@@ -597,7 +717,15 @@ impl ServiceManager {
                 // ===== Meeting Bot - QUIC only (sidecar do spotkan) =====
                 ServiceType::MeetingBot => {
                     for backend in &service.backends {
-                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                        if let ConnectionType::QUIC {
+                            quic_url,
+                            tls_ca,
+                            auto_reconnect,
+                            reconnect_interval_ms,
+                            keepalive_interval_ms,
+                            ..
+                        } = &backend.connection
+                        {
                             let quic_config = crate::net::quic::QuicConfig {
                                 name: service.name.clone(),
                                 url: quic_url.clone(),
@@ -614,7 +742,10 @@ impl ServiceManager {
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
                             quic_llm_services.insert(service.name.clone(), handle);
 
-                            info!("  {} (Meeting Bot QUIC) - connecting in background...", service.name);
+                            info!(
+                                "  {} (Meeting Bot QUIC) - connecting in background...",
+                                service.name
+                            );
                             break;
                         }
                     }
@@ -623,7 +754,15 @@ impl ServiceManager {
                 // ===== Reranker =====
                 ServiceType::Reranker => {
                     for backend in &service.backends {
-                        if let ConnectionType::QUIC { quic_url, tls_ca, auto_reconnect, reconnect_interval_ms, keepalive_interval_ms, .. } = &backend.connection {
+                        if let ConnectionType::QUIC {
+                            quic_url,
+                            tls_ca,
+                            auto_reconnect,
+                            reconnect_interval_ms,
+                            keepalive_interval_ms,
+                            ..
+                        } = &backend.connection
+                        {
                             let quic_config = crate::net::quic::QuicConfig {
                                 name: service.name.clone(),
                                 url: quic_url.clone(),
@@ -640,7 +779,10 @@ impl ServiceManager {
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
                             quic_embedding_services.insert(service.name.clone(), handle);
 
-                            info!("  {} (Reranker QUIC) - connecting in background...", service.name);
+                            info!(
+                                "  {} (Reranker QUIC) - connecting in background...",
+                                service.name
+                            );
                             break;
                         }
                     }
@@ -703,7 +845,8 @@ impl ServiceManager {
                 }
 
                 // Parsuj config_json backendu
-                let config: serde_json::Value = serde_json::from_str(&backend.config_json).unwrap_or_default();
+                let config: serde_json::Value =
+                    serde_json::from_str(&backend.config_json).unwrap_or_default();
                 let quic_url = match config.get("quic_url").and_then(|v| v.as_str()) {
                     Some(u) => u.to_string(),
                     None => continue,
@@ -714,7 +857,10 @@ impl ServiceManager {
                     continue;
                 }
 
-                info!("Ladowanie serwisu QUIC z DB: '{}' (typ={}, url={})", service.name, service.service_type, quic_url);
+                info!(
+                    "Ladowanie serwisu QUIC z DB: '{}' (typ={}, url={})",
+                    service.name, service.service_type, quic_url
+                );
 
                 self.register_quic_service(
                     service.name.clone(),
@@ -731,8 +877,12 @@ impl ServiceManager {
         info!("Spawning background connection tasks...");
 
         // Spawn RAG connection tasks
-        let rag_entries: Vec<_> = self.rag_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let rag_entries: Vec<_> = self
+            .rag_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in rag_entries {
             let callback_tx = self.callback_tx.clone();
             let shutdown_rx = self.shutdown_rx.clone();
@@ -743,32 +893,58 @@ impl ServiceManager {
         }
 
         // Spawn QUIC Embedding connection tasks
-        let embedding_entries: Vec<_> = self.quic_embedding_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let embedding_entries: Vec<_> = self
+            .quic_embedding_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in embedding_entries {
             let shutdown_rx = self.shutdown_rx.clone();
             let reverse_router = self.reverse_router.read().clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding", reverse_router).await;
+                Self::quic_service_connection_loop(
+                    name,
+                    handle,
+                    shutdown_rx,
+                    "Embedding",
+                    reverse_router,
+                )
+                .await;
             });
         }
 
         // Spawn QUIC TTS connection tasks
-        let tts_entries: Vec<_> = self.quic_tts_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let tts_entries: Vec<_> = self
+            .quic_tts_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in tts_entries {
             let shutdown_rx = self.shutdown_rx.clone();
             let reverse_router = self.reverse_router.read().clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS", reverse_router).await;
+                Self::quic_service_connection_loop(
+                    name,
+                    handle,
+                    shutdown_rx,
+                    "TTS",
+                    reverse_router,
+                )
+                .await;
             });
         }
 
         // Spawn QUIC LLM + Meeting Bot connection tasks
-        let llm_entries: Vec<_> = self.quic_llm_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let llm_entries: Vec<_> = self
+            .quic_llm_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in llm_entries {
             let shutdown_rx = self.shutdown_rx.clone();
 
@@ -777,32 +953,66 @@ impl ServiceManager {
                 let event_bus = self.event_bus.read().clone();
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus, reverse_router).await;
+                    Self::meeting_bot_connection_loop(
+                        name,
+                        handle,
+                        shutdown_rx,
+                        event_bus,
+                        reverse_router,
+                    )
+                    .await;
                 });
             } else {
                 let prompt_registry = self.prompt_registry.clone();
-                let model_category = self.llm_model_categories.read().get(&name).copied().unwrap_or_default();
+                let model_category = self
+                    .llm_model_categories
+                    .read()
+                    .get(&name)
+                    .copied()
+                    .unwrap_or_default();
                 tokio::spawn(async move {
-                    Self::quic_llm_connection_loop(name, handle, shutdown_rx, prompt_registry, model_category).await;
+                    Self::quic_llm_connection_loop(
+                        name,
+                        handle,
+                        shutdown_rx,
+                        prompt_registry,
+                        model_category,
+                    )
+                    .await;
                 });
             }
         }
 
         // Spawn QUIC STT connection tasks
-        let stt_entries: Vec<_> = self.quic_stt_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let stt_entries: Vec<_> = self
+            .quic_stt_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in stt_entries {
             let shutdown_rx = self.shutdown_rx.clone();
             let reverse_router = self.reverse_router.read().clone();
 
             tokio::spawn(async move {
-                Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT", reverse_router).await;
+                Self::quic_service_connection_loop(
+                    name,
+                    handle,
+                    shutdown_rx,
+                    "STT",
+                    reverse_router,
+                )
+                .await;
             });
         }
 
         // Spawn QUIC Memory connection tasks (z obsluga callbacks)
-        let memory_entries: Vec<_> = self.quic_memory_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let memory_entries: Vec<_> = self
+            .quic_memory_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in memory_entries {
             let callback_tx = self.callback_tx.clone();
             let shutdown_rx = self.shutdown_rx.clone();
@@ -849,7 +1059,10 @@ impl ServiceManager {
                         name.clone(),
                         srv_shutdown,
                     );
-                    info!("Reverse listener uruchomiony dla istniejacego serwisu: {}", name);
+                    info!(
+                        "Reverse listener uruchomiony dla istniejacego serwisu: {}",
+                        name
+                    );
                 }
             }
         }
@@ -866,19 +1079,29 @@ impl ServiceManager {
     async fn rag_connection_loop(
         name: String,
         handle: Arc<RAGServiceHandle>,
-        callback_tx: mpsc::UnboundedSender<(tentaflow_protocol::ModelRequest, mpsc::Sender<tentaflow_protocol::ModelResponse>)>,
+        callback_tx: mpsc::UnboundedSender<(
+            tentaflow_protocol::ModelRequest,
+            mpsc::Sender<tentaflow_protocol::ModelResponse>,
+        )>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
-        let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
+        let reconnect_interval =
+            std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
         let mut per_service_rx = handle.shutdown_rx.clone();
 
         loop {
             if *shutdown_rx.borrow() || *per_service_rx.borrow() {
-                info!("RAG '{}': Shutdown signal received, stopping connection loop", name);
+                info!(
+                    "RAG '{}': Shutdown signal received, stopping connection loop",
+                    name
+                );
                 break;
             }
 
-            info!("RAG '{}': Attempting connection to {}...", name, handle.config.quic_url);
+            info!(
+                "RAG '{}': Attempting connection to {}...",
+                name, handle.config.quic_url
+            );
 
             let config = handle.config.clone();
             let callback_tx_clone = callback_tx.clone();
@@ -915,7 +1138,10 @@ impl ServiceManager {
                     }
                 }
                 Err(e) => {
-                    warn!("RAG '{}': Connection failed: {}. Retrying in {:?}...", name, e, reconnect_interval);
+                    warn!(
+                        "RAG '{}': Connection failed: {}. Retrying in {:?}...",
+                        name, e, reconnect_interval
+                    );
                     handle.set_disconnected(e.to_string()).await;
                 }
             }
@@ -947,7 +1173,8 @@ impl ServiceManager {
         service_type: &'static str,
         reverse_router: Option<crate::routing::Router>,
     ) {
-        let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
+        let reconnect_interval =
+            std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
         let mut per_service_rx = handle.shutdown_rx.clone();
 
         loop {
@@ -956,7 +1183,10 @@ impl ServiceManager {
                 break;
             }
 
-            info!("{} QUIC '{}': Attempting connection to {}...", service_type, name, handle.config.url);
+            info!(
+                "{} QUIC '{}': Attempting connection to {}...",
+                service_type, name, handle.config.url
+            );
 
             let config = handle.config.clone();
             let shutdown_rx_clone = shutdown_rx.clone();
@@ -969,7 +1199,10 @@ impl ServiceManager {
 
                     // Uruchom reverse listener jesli router jest dostepny
                     let reverse_task = reverse_router.as_ref().map(|router| {
-                        info!("{} QUIC '{}': Uruchamiam reverse listener", service_type, name);
+                        info!(
+                            "{} QUIC '{}': Uruchamiam reverse listener",
+                            service_type, name
+                        );
                         crate::routing::reverse_request::spawn_reverse_listener(
                             client,
                             router.clone(),
@@ -1003,11 +1236,18 @@ impl ServiceManager {
                         }
                     };
 
-                    if let Some(task) = reverse_task { task.abort(); }
-                    if should_return { return; }
+                    if let Some(task) = reverse_task {
+                        task.abort();
+                    }
+                    if should_return {
+                        return;
+                    }
                 }
                 Err(e) => {
-                    warn!("{} QUIC '{}': Connection failed: {}. Retrying in {:?}...", service_type, name, e, reconnect_interval);
+                    warn!(
+                        "{} QUIC '{}': Connection failed: {}. Retrying in {:?}...",
+                        service_type, name, e, reconnect_interval
+                    );
                     handle.set_disconnected(e.to_string()).await;
                 }
             }
@@ -1038,7 +1278,8 @@ impl ServiceManager {
         reverse_router: Option<crate::routing::Router>,
     ) {
         let _ = event_bus;
-        let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
+        let reconnect_interval =
+            std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
         let mut per_service_rx = handle.shutdown_rx.clone();
 
         loop {
@@ -1047,7 +1288,10 @@ impl ServiceManager {
                 break;
             }
 
-            info!("MeetingBot QUIC '{}': Attempting connection to {}...", name, handle.config.url);
+            info!(
+                "MeetingBot QUIC '{}': Attempting connection to {}...",
+                name, handle.config.url
+            );
 
             let config = handle.config.clone();
             let shutdown_rx_clone = shutdown_rx.clone();
@@ -1099,12 +1343,21 @@ impl ServiceManager {
                         }
                     };
 
-                    if let Some(task) = transcript_task { task.abort(); }
-                    if let Some(task) = reverse_task { task.abort(); }
-                    if should_return { return; }
+                    if let Some(task) = transcript_task {
+                        task.abort();
+                    }
+                    if let Some(task) = reverse_task {
+                        task.abort();
+                    }
+                    if should_return {
+                        return;
+                    }
                 }
                 Err(e) => {
-                    warn!("MeetingBot QUIC '{}': Connection failed: {}. Retrying in {:?}...", name, e, reconnect_interval);
+                    warn!(
+                        "MeetingBot QUIC '{}': Connection failed: {}. Retrying in {:?}...",
+                        name, e, reconnect_interval
+                    );
                     handle.set_disconnected(e.to_string()).await;
                 }
             }
@@ -1143,11 +1396,17 @@ impl ServiceManager {
         use crate::prompt_registry::ModelCategory;
 
         let (registry_category, protocol_category) = match config_category {
-            crate::config::LlmModelCategory::Main => (ModelCategory::MainLlm, PrefixCacheModelCategory::MainLlm),
-            crate::config::LlmModelCategory::Analyzer => (ModelCategory::AnalyzerLlm, PrefixCacheModelCategory::AnalyzerLlm),
+            crate::config::LlmModelCategory::Main => {
+                (ModelCategory::MainLlm, PrefixCacheModelCategory::MainLlm)
+            }
+            crate::config::LlmModelCategory::Analyzer => (
+                ModelCategory::AnalyzerLlm,
+                PrefixCacheModelCategory::AnalyzerLlm,
+            ),
         };
 
-        let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
+        let reconnect_interval =
+            std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
         let mut per_service_rx = handle.shutdown_rx.clone();
 
         loop {
@@ -1156,7 +1415,10 @@ impl ServiceManager {
                 break;
             }
 
-            info!("LLM QUIC '{}': Attempting connection to {}...", name, handle.config.url);
+            info!(
+                "LLM QUIC '{}': Attempting connection to {}...",
+                name, handle.config.url
+            );
 
             let config = handle.config.clone();
             let shutdown_rx_clone = shutdown_rx.clone();
@@ -1168,7 +1430,8 @@ impl ServiceManager {
                     handle.set_connected(client.clone()).await;
 
                     let prompt_set = prompt_registry.get_prompt_set(registry_category);
-                    let prompts: Vec<_> = prompt_set.prompts.iter().map(|p| p.to_protocol()).collect();
+                    let prompts: Vec<_> =
+                        prompt_set.prompts.iter().map(|p| p.to_protocol()).collect();
 
                     if !prompts.is_empty() {
                         let init_request = PrefixCacheInitRequest {
@@ -1178,7 +1441,11 @@ impl ServiceManager {
                             prompts,
                         };
 
-                        info!("LLM '{}': Wysylam {} promptow do prefix cache...", name, init_request.prompts.len());
+                        info!(
+                            "LLM '{}': Wysylam {} promptow do prefix cache...",
+                            name,
+                            init_request.prompts.len()
+                        );
 
                         match client.send_prefix_cache_init(init_request).await {
                             Ok(response) => {
@@ -1230,7 +1497,10 @@ impl ServiceManager {
                     }
                 }
                 Err(e) => {
-                    warn!("LLM QUIC '{}': Connection failed: {}. Retrying in {:?}...", name, e, reconnect_interval);
+                    warn!(
+                        "LLM QUIC '{}': Connection failed: {}. Retrying in {:?}...",
+                        name, e, reconnect_interval
+                    );
                     handle.set_disconnected(e.to_string()).await;
                 }
             }
@@ -1261,13 +1531,17 @@ impl ServiceManager {
     async fn memory_connection_loop(
         name: String,
         handle: Arc<QuicServiceHandle>,
-        callback_tx: mpsc::UnboundedSender<(tentaflow_protocol::ModelRequest, mpsc::Sender<tentaflow_protocol::ModelResponse>)>,
+        callback_tx: mpsc::UnboundedSender<(
+            tentaflow_protocol::ModelRequest,
+            mpsc::Sender<tentaflow_protocol::ModelResponse>,
+        )>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
-        use tracing::{debug, error};
         use anyhow::Context;
+        use tracing::{debug, error};
 
-        let reconnect_interval = std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
+        let reconnect_interval =
+            std::time::Duration::from_millis(handle.config.reconnect_interval_ms);
         let mut per_service_rx = handle.shutdown_rx.clone();
 
         loop {
@@ -1276,7 +1550,10 @@ impl ServiceManager {
                 break;
             }
 
-            info!("Memory QUIC '{}': Attempting connection to {}...", name, handle.config.url);
+            info!(
+                "Memory QUIC '{}': Attempting connection to {}...",
+                name, handle.config.url
+            );
 
             let config = handle.config.clone();
             let shutdown_rx_clone = shutdown_rx.clone();
@@ -1426,7 +1703,10 @@ impl ServiceManager {
                     }
                 }
                 Err(e) => {
-                    warn!("Memory QUIC '{}': Connection failed: {}. Retrying in {:?}...", name, e, reconnect_interval);
+                    warn!(
+                        "Memory QUIC '{}': Connection failed: {}. Retrying in {:?}...",
+                        name, e, reconnect_interval
+                    );
                     handle.set_disconnected(e.to_string()).await;
                 }
             }
@@ -1458,25 +1738,41 @@ impl ServiceManager {
     }
 
     /// Pobierz QUIC Embedding client jesli dostepny (non-blocking)
-    pub async fn get_quic_embedding_client(&self, service_name: &str) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handle = self.quic_embedding_services.read().get(service_name).cloned()?;
+    pub async fn get_quic_embedding_client(
+        &self,
+        service_name: &str,
+    ) -> Option<Arc<crate::net::quic::QuicClient>> {
+        let handle = self
+            .quic_embedding_services
+            .read()
+            .get(service_name)
+            .cloned()?;
         handle.get_client().await
     }
 
     /// Pobierz QUIC TTS client jesli dostepny (non-blocking)
-    pub async fn get_quic_tts_client(&self, service_name: &str) -> Option<Arc<crate::net::quic::QuicClient>> {
+    pub async fn get_quic_tts_client(
+        &self,
+        service_name: &str,
+    ) -> Option<Arc<crate::net::quic::QuicClient>> {
         let handle = self.quic_tts_services.read().get(service_name).cloned()?;
         handle.get_client().await
     }
 
     /// Pobierz QUIC LLM client jesli dostepny (non-blocking)
-    pub async fn get_quic_llm_client(&self, service_name: &str) -> Option<Arc<crate::net::quic::QuicClient>> {
+    pub async fn get_quic_llm_client(
+        &self,
+        service_name: &str,
+    ) -> Option<Arc<crate::net::quic::QuicClient>> {
         let handle = self.quic_llm_services.read().get(service_name).cloned()?;
         handle.get_client().await
     }
 
     /// Pobierz QUIC STT client jesli dostepny (non-blocking)
-    pub async fn get_quic_stt_client(&self, service_name: &str) -> Option<Arc<crate::net::quic::QuicClient>> {
+    pub async fn get_quic_stt_client(
+        &self,
+        service_name: &str,
+    ) -> Option<Arc<crate::net::quic::QuicClient>> {
         let handle = self.quic_stt_services.read().get(service_name).cloned()?;
         handle.get_client().await
     }
@@ -1496,12 +1792,17 @@ impl ServiceManager {
     }
 
     /// Pobierz backend clients (statyczne lub dynamiczne) — klonuje Arc referencje
-    pub fn get_service_backends_cloned(&self, service_name: &str) -> Option<Vec<Arc<BackendClient>>> {
+    pub fn get_service_backends_cloned(
+        &self,
+        service_name: &str,
+    ) -> Option<Vec<Arc<BackendClient>>> {
         if let Some(v) = self.service_backends.get(service_name) {
             return Some(v.clone());
         }
         let dyn_map = self.dynamic_backends.read();
-        dyn_map.get(service_name).map(|(backends, _)| backends.clone())
+        dyn_map
+            .get(service_name)
+            .map(|(backends, _)| backends.clone())
     }
 
     /// Pobierz load balancing strategy
@@ -1510,21 +1811,27 @@ impl ServiceManager {
     }
 
     /// Dynamicznie rejestruje HTTP backend (po deploy kontenera)
-    pub fn register_dynamic_http_backend(
-        &self,
-        service_name: &str,
-        backend: Arc<BackendClient>,
-    ) {
-        let strategy = create_strategy("single", &[backend.clone()], vec![1])
-            .unwrap_or_else(|_| create_strategy("round_robin", &[backend.clone()], vec![1]).unwrap());
+    pub fn register_dynamic_http_backend(&self, service_name: &str, backend: Arc<BackendClient>) {
+        let strategy =
+            create_strategy("single", &[backend.clone()], vec![1]).unwrap_or_else(|_| {
+                create_strategy("round_robin", &[backend.clone()], vec![1]).unwrap()
+            });
 
         let mut dyn_map = self.dynamic_backends.write();
-        let entry = dyn_map.entry(service_name.to_string())
+        let entry = dyn_map
+            .entry(service_name.to_string())
             .or_insert_with(|| (Vec::new(), strategy));
-        if !entry.0.iter().any(|b| std::ptr::eq(b.as_ref(), backend.as_ref())) {
+        if !entry
+            .0
+            .iter()
+            .any(|b| std::ptr::eq(b.as_ref(), backend.as_ref()))
+        {
             entry.0.push(backend);
         }
-        info!("Zarejestrowano dynamiczny HTTP backend dla '{}'", service_name);
+        info!(
+            "Zarejestrowano dynamiczny HTTP backend dla '{}'",
+            service_name
+        );
     }
 
     /// Pobierz TTS client
@@ -1533,7 +1840,16 @@ impl ServiceManager {
     }
 
     /// Pobierz callback receiver
-    pub fn get_callback_rx(&self) -> Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(tentaflow_protocol::ModelRequest, mpsc::Sender<tentaflow_protocol::ModelResponse>)>>> {
+    pub fn get_callback_rx(
+        &self,
+    ) -> Arc<
+        tokio::sync::Mutex<
+            mpsc::UnboundedReceiver<(
+                tentaflow_protocol::ModelRequest,
+                mpsc::Sender<tentaflow_protocol::ModelResponse>,
+            )>,
+        >,
+    > {
         self.callback_rx.clone()
     }
 
@@ -1562,12 +1878,15 @@ impl ServiceManager {
 
     /// Sprawdz czy serwis QUIC embedding istnieje
     pub fn has_quic_embedding_service(&self, service_name: &str) -> bool {
-        self.quic_embedding_services.read().contains_key(service_name)
+        self.quic_embedding_services
+            .read()
+            .contains_key(service_name)
     }
 
     /// Sprawdz czy serwis TTS istnieje (HTTP lub QUIC)
     pub fn has_tts_service(&self, service_name: &str) -> bool {
-        self.tts_clients.contains_key(service_name) || self.quic_tts_services.read().contains_key(service_name)
+        self.tts_clients.contains_key(service_name)
+            || self.quic_tts_services.read().contains_key(service_name)
     }
 
     /// Sprawdz czy serwis QUIC TTS istnieje
@@ -1587,8 +1906,13 @@ impl ServiceManager {
 
     /// Rejestruje model jako obslugiwany lokalnie (in-process MLX/llama.cpp)
     pub fn register_local_inference_model(&self, model_name: &str) {
-        self.local_inference_models.write().insert(model_name.to_string());
-        info!("LocalInference: zarejestrowano model '{}' do obslugi in-process", model_name);
+        self.local_inference_models
+            .write()
+            .insert(model_name.to_string());
+        info!(
+            "LocalInference: zarejestrowano model '{}' do obslugi in-process",
+            model_name
+        );
     }
 
     /// Sprawdz czy serwis QUIC STT istnieje
@@ -1598,17 +1922,23 @@ impl ServiceManager {
 
     /// Sprawdz czy serwis LLM istnieje (HTTP lub QUIC)
     pub fn has_llm_service(&self, service_name: &str) -> bool {
-        self.service_backends.contains_key(service_name) || self.quic_llm_services.read().contains_key(service_name)
+        self.service_backends.contains_key(service_name)
+            || self.quic_llm_services.read().contains_key(service_name)
     }
 
     /// Sprawdz czy serwis STT istnieje (HTTP lub QUIC)
     pub fn has_stt_service(&self, service_name: &str) -> bool {
-        self.service_backends.contains_key(service_name) || self.quic_stt_services.read().contains_key(service_name)
+        self.service_backends.contains_key(service_name)
+            || self.quic_stt_services.read().contains_key(service_name)
     }
 
     /// Pobierz nazwe pierwszego serwisu TTS (dla fallback) - preferuje QUIC
     pub fn get_first_tts_service_name(&self) -> Option<String> {
-        self.quic_tts_services.read().keys().next().cloned()
+        self.quic_tts_services
+            .read()
+            .keys()
+            .next()
+            .cloned()
             .or_else(|| self.tts_clients.keys().next().cloned())
     }
 
@@ -1619,7 +1949,8 @@ impl ServiceManager {
 
     /// Pobierz pierwszy dostepny QUIC TTS client (async, dla fallback)
     pub async fn get_first_quic_tts_client(&self) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handles: Vec<Arc<QuicServiceHandle>> = self.quic_tts_services.read().values().cloned().collect();
+        let handles: Vec<Arc<QuicServiceHandle>> =
+            self.quic_tts_services.read().values().cloned().collect();
         for handle in handles {
             if let Some(client) = handle.get_client().await {
                 return Some(client);
@@ -1635,7 +1966,8 @@ impl ServiceManager {
 
     /// Pobierz pierwszy dostepny QUIC STT client (async, dla fallback)
     pub async fn get_first_quic_stt_client(&self) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handles: Vec<Arc<QuicServiceHandle>> = self.quic_stt_services.read().values().cloned().collect();
+        let handles: Vec<Arc<QuicServiceHandle>> =
+            self.quic_stt_services.read().values().cloned().collect();
         for handle in handles {
             if let Some(client) = handle.get_client().await {
                 return Some(client);
@@ -1671,7 +2003,11 @@ impl ServiceManager {
 
     /// Clone QUIC embedding services handles (dla callback handler - zwraca nazwy)
     pub fn quic_embedding_service_names(&self) -> Vec<String> {
-        self.quic_embedding_services.read().keys().cloned().collect()
+        self.quic_embedding_services
+            .read()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Clone load balancing strategies (dla callback handler)
@@ -1697,8 +2033,12 @@ impl ServiceManager {
             status.insert(name.clone(), "ready (HTTP)".to_string());
         }
 
-        let rag_entries: Vec<_> = self.rag_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let rag_entries: Vec<_> = self
+            .rag_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in rag_entries {
             let state = handle.state.read().await;
             let state_str = match &*state {
@@ -1710,8 +2050,12 @@ impl ServiceManager {
             status.insert(name, state_str);
         }
 
-        let embedding_entries: Vec<_> = self.quic_embedding_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let embedding_entries: Vec<_> = self
+            .quic_embedding_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in embedding_entries {
             let state = handle.state.read().await;
             let state_str = match &*state {
@@ -1727,41 +2071,65 @@ impl ServiceManager {
             status.insert(name.clone(), "ready (TTS HTTP)".to_string());
         }
 
-        let tts_entries: Vec<_> = self.quic_tts_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let tts_entries: Vec<_> = self
+            .quic_tts_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in tts_entries {
             let state = handle.state.read().await;
             let state_str = match &*state {
                 QuicServiceState::Connecting => "connecting... (TTS QUIC)".to_string(),
                 QuicServiceState::Connected => "connected (TTS QUIC)".to_string(),
-                QuicServiceState::Disconnected { reason } => format!("disconnected (TTS QUIC): {}", reason),
-                QuicServiceState::ConfigError { message } => format!("config error (TTS QUIC): {}", message),
+                QuicServiceState::Disconnected { reason } => {
+                    format!("disconnected (TTS QUIC): {}", reason)
+                }
+                QuicServiceState::ConfigError { message } => {
+                    format!("config error (TTS QUIC): {}", message)
+                }
             };
             status.insert(name, state_str);
         }
 
-        let llm_entries: Vec<_> = self.quic_llm_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let llm_entries: Vec<_> = self
+            .quic_llm_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in llm_entries {
             let state = handle.state.read().await;
             let state_str = match &*state {
                 QuicServiceState::Connecting => "connecting... (LLM QUIC)".to_string(),
                 QuicServiceState::Connected => "connected (LLM QUIC)".to_string(),
-                QuicServiceState::Disconnected { reason } => format!("disconnected (LLM QUIC): {}", reason),
-                QuicServiceState::ConfigError { message } => format!("config error (LLM QUIC): {}", message),
+                QuicServiceState::Disconnected { reason } => {
+                    format!("disconnected (LLM QUIC): {}", reason)
+                }
+                QuicServiceState::ConfigError { message } => {
+                    format!("config error (LLM QUIC): {}", message)
+                }
             };
             status.insert(name, state_str);
         }
 
-        let stt_entries: Vec<_> = self.quic_stt_services.read().iter()
-            .map(|(n, h)| (n.clone(), h.clone())).collect();
+        let stt_entries: Vec<_> = self
+            .quic_stt_services
+            .read()
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect();
         for (name, handle) in stt_entries {
             let state = handle.state.read().await;
             let state_str = match &*state {
                 QuicServiceState::Connecting => "connecting... (STT QUIC)".to_string(),
                 QuicServiceState::Connected => "connected (STT QUIC)".to_string(),
-                QuicServiceState::Disconnected { reason } => format!("disconnected (STT QUIC): {}", reason),
-                QuicServiceState::ConfigError { message } => format!("config error (STT QUIC): {}", message),
+                QuicServiceState::Disconnected { reason } => {
+                    format!("disconnected (STT QUIC): {}", reason)
+                }
+                QuicServiceState::ConfigError { message } => {
+                    format!("config error (STT QUIC): {}", message)
+                }
             };
             status.insert(name, state_str);
         }
@@ -1789,7 +2157,9 @@ impl ServiceManager {
                     || self.has_local_inference_service(model_name)
             }
             "embedding" => self.has_quic_embedding_service(model_name),
-            "tts" => self.has_quic_tts_service(model_name) || self.tts_clients.contains_key(model_name),
+            "tts" => {
+                self.has_quic_tts_service(model_name) || self.tts_clients.contains_key(model_name)
+            }
             "stt" => self.has_quic_stt_service(model_name),
             "rag" => self.has_rag_service(model_name),
             "memory" => self.quic_memory_services.read().contains_key(model_name),
@@ -1845,54 +2215,106 @@ impl ServiceManager {
             skip_tls_verify: is_self_signed,
         };
 
-        info!("Zarejestrowano dynamiczny serwis QUIC: {} (typ={}, SNI={:?})", name, service_type, quic_config.server_name);
+        info!(
+            "Zarejestrowano dynamiczny serwis QUIC: {} (typ={}, SNI={:?})",
+            name, service_type, quic_config.server_name
+        );
 
         let handle = Arc::new(QuicServiceHandle::new(quic_config));
         let shutdown_rx = self.shutdown_rx.clone();
 
         match service_type {
             "llm" => {
-                self.quic_llm_services.write().insert(name.clone(), handle.clone());
-                self.llm_model_categories.write().insert(name.clone(), crate::config::LlmModelCategory::Main);
+                self.quic_llm_services
+                    .write()
+                    .insert(name.clone(), handle.clone());
+                self.llm_model_categories
+                    .write()
+                    .insert(name.clone(), crate::config::LlmModelCategory::Main);
                 let prompt_registry = self.prompt_registry.clone();
                 tokio::spawn(async move {
-                    Self::quic_llm_connection_loop(name, handle, shutdown_rx, prompt_registry, crate::config::LlmModelCategory::Main).await;
+                    Self::quic_llm_connection_loop(
+                        name,
+                        handle,
+                        shutdown_rx,
+                        prompt_registry,
+                        crate::config::LlmModelCategory::Main,
+                    )
+                    .await;
                 });
             }
             "tts" => {
-                self.quic_tts_services.write().insert(name.clone(), handle.clone());
+                self.quic_tts_services
+                    .write()
+                    .insert(name.clone(), handle.clone());
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "TTS", reverse_router).await;
+                    Self::quic_service_connection_loop(
+                        name,
+                        handle,
+                        shutdown_rx,
+                        "TTS",
+                        reverse_router,
+                    )
+                    .await;
                 });
             }
             "stt" => {
-                self.quic_stt_services.write().insert(name.clone(), handle.clone());
+                self.quic_stt_services
+                    .write()
+                    .insert(name.clone(), handle.clone());
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "STT", reverse_router).await;
+                    Self::quic_service_connection_loop(
+                        name,
+                        handle,
+                        shutdown_rx,
+                        "STT",
+                        reverse_router,
+                    )
+                    .await;
                 });
             }
             "embedding" => {
-                self.quic_embedding_services.write().insert(name.clone(), handle.clone());
+                self.quic_embedding_services
+                    .write()
+                    .insert(name.clone(), handle.clone());
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::quic_service_connection_loop(name, handle, shutdown_rx, "Embedding", reverse_router).await;
+                    Self::quic_service_connection_loop(
+                        name,
+                        handle,
+                        shutdown_rx,
+                        "Embedding",
+                        reverse_router,
+                    )
+                    .await;
                 });
             }
             "memory" => {
-                self.quic_memory_services.write().insert(name.clone(), handle.clone());
+                self.quic_memory_services
+                    .write()
+                    .insert(name.clone(), handle.clone());
                 let callback_tx = self.callback_tx.clone();
                 tokio::spawn(async move {
                     Self::memory_connection_loop(name, handle, callback_tx, shutdown_rx).await;
                 });
             }
             "meeting-bot" => {
-                self.quic_llm_services.write().insert(name.clone(), handle.clone());
+                self.quic_llm_services
+                    .write()
+                    .insert(name.clone(), handle.clone());
                 let event_bus = self.event_bus.read().clone();
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
-                    Self::meeting_bot_connection_loop(name, handle, shutdown_rx, event_bus, reverse_router).await;
+                    Self::meeting_bot_connection_loop(
+                        name,
+                        handle,
+                        shutdown_rx,
+                        event_bus,
+                        reverse_router,
+                    )
+                    .await;
                 });
             }
             _ => {
@@ -1942,7 +2364,10 @@ impl ServiceManager {
             }
             _ => {}
         }
-        info!("Usunieto dynamiczny serwis QUIC: {} (typ={})", name, service_type);
+        info!(
+            "Usunieto dynamiczny serwis QUIC: {} (typ={})",
+            name, service_type
+        );
     }
 
     // ========================================================================
@@ -1952,10 +2377,17 @@ impl ServiceManager {
     /// Rejestruje mapowanie model -> serwis. Jesli model juz istnieje, dodaje serwis do puli.
     pub fn register_model_mapping(&self, model_name: &str, service_name: &str) {
         let mut pool = self.model_pool.write();
-        let entry = pool.entry(model_name.to_string()).or_insert_with(ModelPoolEntry::new);
+        let entry = pool
+            .entry(model_name.to_string())
+            .or_insert_with(ModelPoolEntry::new);
         if !entry.service_names.contains(&service_name.to_string()) {
             entry.service_names.push(service_name.to_string());
-            info!("ModelPool: '{}' -> dodano serwis '{}' (lacznie: {})", model_name, service_name, entry.service_names.len());
+            info!(
+                "ModelPool: '{}' -> dodano serwis '{}' (lacznie: {})",
+                model_name,
+                service_name,
+                entry.service_names.len()
+            );
         }
     }
 
@@ -1987,7 +2419,12 @@ impl ServiceManager {
                 pool.remove(model_name);
                 info!("ModelPool: '{}' -> usunieto (brak serwisow)", model_name);
             } else {
-                info!("ModelPool: '{}' -> usunieto serwis '{}' (pozostalo: {})", model_name, service_name, entry.service_names.len());
+                info!(
+                    "ModelPool: '{}' -> usunieto serwis '{}' (pozostalo: {})",
+                    model_name,
+                    service_name,
+                    entry.service_names.len()
+                );
             }
         }
     }
@@ -1997,7 +2434,10 @@ impl ServiceManager {
         let mut pool = self.model_pool.write();
         if let Some(entry) = pool.get_mut(model_name) {
             entry.strategy = strategy;
-            info!("ModelPool: '{}' -> strategia zmieniona na {:?}", model_name, strategy);
+            info!(
+                "ModelPool: '{}' -> strategia zmieniona na {:?}",
+                model_name, strategy
+            );
             true
         } else {
             false
@@ -2007,18 +2447,31 @@ impl ServiceManager {
     /// Ustawia liste serwisow dla modelu w puli (zastepuje istniejace)
     pub fn set_model_services(&self, model_name: &str, service_names: Vec<String>) {
         let mut pool = self.model_pool.write();
-        let entry = pool.entry(model_name.to_string()).or_insert_with(ModelPoolEntry::new);
+        let entry = pool
+            .entry(model_name.to_string())
+            .or_insert_with(ModelPoolEntry::new);
         entry.service_names = service_names;
-        info!("ModelPool: '{}' -> ustawiono {} serwisow", model_name, entry.service_names.len());
+        info!(
+            "ModelPool: '{}' -> ustawiono {} serwisow",
+            model_name,
+            entry.service_names.len()
+        );
     }
 
     /// Zwraca informacje o model_pool (do diagnostyki/API)
     pub fn get_model_pool_info(&self) -> Vec<(String, Vec<String>, String, String)> {
         let pool = self.model_pool.read();
-        pool.iter().map(|(name, entry)| {
-            let strategy = entry.strategy.to_string();
-            (name.clone(), entry.service_names.clone(), strategy, entry.service_type.clone())
-        }).collect()
+        pool.iter()
+            .map(|(name, entry)| {
+                let strategy = entry.strategy.to_string();
+                (
+                    name.clone(),
+                    entry.service_names.clone(),
+                    strategy,
+                    entry.service_type.clone(),
+                )
+            })
+            .collect()
     }
 
     /// Inicjalizuje model_pool z bazy danych (skanuje serwisy po deployed_model w config_json)
@@ -2026,7 +2479,8 @@ impl ServiceManager {
         if let Ok(services) = crate::db::repository::list_services(db) {
             for svc in &services {
                 if let Ok(config) = serde_json::from_str::<serde_json::Value>(&svc.config_json) {
-                    if let Some(model_name) = config.get("deployed_model").and_then(|v| v.as_str()) {
+                    if let Some(model_name) = config.get("deployed_model").and_then(|v| v.as_str())
+                    {
                         if !model_name.is_empty() {
                             self.register_model_mapping(model_name, &svc.name);
                             let mut pool = self.model_pool.write();

@@ -171,7 +171,9 @@ pub fn render_prometheus() -> String {
     let mut out = String::new();
     let snap = snapshot_all();
 
-    out.push_str("# HELP tentaflow_ws_handler_calls_total Total dispatch calls per MessageBody variant.\n");
+    out.push_str(
+        "# HELP tentaflow_ws_handler_calls_total Total dispatch calls per MessageBody variant.\n",
+    );
     out.push_str("# TYPE tentaflow_ws_handler_calls_total counter\n");
     for (name, s) in &snap {
         out.push_str(&format!(
@@ -180,7 +182,9 @@ pub fn render_prometheus() -> String {
         ));
     }
 
-    out.push_str("# HELP tentaflow_ws_handler_errors_total Total dispatch errors per MessageBody variant.\n");
+    out.push_str(
+        "# HELP tentaflow_ws_handler_errors_total Total dispatch errors per MessageBody variant.\n",
+    );
     out.push_str("# TYPE tentaflow_ws_handler_errors_total counter\n");
     for (name, s) in &snap {
         out.push_str(&format!(
@@ -189,7 +193,9 @@ pub fn render_prometheus() -> String {
         ));
     }
 
-    out.push_str("# HELP tentaflow_ws_handler_duration_us_avg Average handler duration in microseconds.\n");
+    out.push_str(
+        "# HELP tentaflow_ws_handler_duration_us_avg Average handler duration in microseconds.\n",
+    );
     out.push_str("# TYPE tentaflow_ws_handler_duration_us_avg gauge\n");
     for (name, s) in &snap {
         out.push_str(&format!(

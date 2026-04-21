@@ -3,14 +3,15 @@
 // Opis: Host function Service API — wysylanie requestow do zarejestrowanych
 //       serwisow (kontenerow Docker) przez infrastrukture QUIC routera.
 //       Addon podaje nazwe serwisu i JSON payload, Core routuje przez QUIC.
+// Uprawnienia: "service" (globalny) oraz "service" z resource=<service_name>
+//              (per-service whitelist). Obydwa musza byc przyznane — fail-closed.
 // =============================================================================
 
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use super::{
-    AddonState, ABI_ERR_PERMISSION, ABI_ERR_OPERATION, ABI_ERR_NOT_FOUND, ABI_ERR_RATE_LIMIT,
-    get_memory, read_guest_string, write_guest_output, audit_log, check_permission,
-    WasmCaller,
+    audit_log, check_permission, get_memory, read_guest_string, write_guest_output, AddonState,
+    WasmCaller, ABI_ERR_NOT_FOUND, ABI_ERR_OPERATION, ABI_ERR_PERMISSION, ABI_ERR_RATE_LIMIT,
 };
 
 use crate::addon::rate_limiter::ResourceType;
@@ -43,7 +44,8 @@ pub fn service_request(
     };
 
     // Odczytaj nazwe serwisu z pamieci WASM
-    let service_name = match read_guest_string(&memory, &caller, service_name_ptr, service_name_len) {
+    let service_name = match read_guest_string(&memory, &caller, service_name_ptr, service_name_len)
+    {
         Some(s) => s.to_string(),
         None => {
             warn!("service_request: niepoprawny wskaznik service_name");
@@ -52,7 +54,8 @@ pub fn service_request(
     };
 
     // Odczytaj request JSON z pamieci WASM
-    let request_json = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len) {
+    let request_json = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len)
+    {
         Some(s) => s.to_string(),
         None => {
             warn!("service_request: niepoprawny wskaznik request_json");
@@ -62,7 +65,14 @@ pub fn service_request(
 
     // Sprawdz uprawnienie "service"
     if !check_permission(caller.data(), "service", None) {
-        audit_log(caller.data(), "service.request", Some("service"), Some(&service_name), "denied", None);
+        audit_log(
+            caller.data(),
+            "service.request",
+            Some("service"),
+            Some(&service_name),
+            "denied",
+            None,
+        );
         return ABI_ERR_PERMISSION;
     }
 
@@ -80,12 +90,27 @@ pub fn service_request(
     }
 
     let addon_id = caller.data().addon_id.clone();
-    info!("service_request: addon='{}', service='{}', payload_len={}", addon_id, service_name, request_json.len());
+    info!(
+        "service_request: addon='{}', service='{}', payload_len={}",
+        addon_id,
+        service_name,
+        request_json.len()
+    );
 
     // Sprawdz rate limit
     if let Some(ref rate_limiter) = caller.data().rate_limiter {
-        if rate_limiter.check(&addon_id, ResourceType::HttpRequests).is_err() {
-            audit_log(caller.data(), "service.request", Some("service"), Some(&service_name), "error", Some("rate limit exceeded"));
+        if rate_limiter
+            .check(&addon_id, ResourceType::HttpRequests)
+            .is_err()
+        {
+            audit_log(
+                caller.data(),
+                "service.request",
+                Some("service"),
+                Some(&service_name),
+                "error",
+                Some("rate limit exceeded"),
+            );
             return ABI_ERR_RATE_LIMIT;
         }
         rate_limiter.record_usage(&addon_id, ResourceType::HttpRequests, 1);
@@ -95,8 +120,18 @@ pub fn service_request(
     let router = match caller.data().router.as_ref() {
         Some(r) => r.clone(),
         None => {
-            warn!("service_request: router niedostepny dla addon='{}'", addon_id);
-            audit_log(caller.data(), "service.request", Some("service"), Some(&service_name), "error", Some("router unavailable"));
+            warn!(
+                "service_request: router niedostepny dla addon='{}'",
+                addon_id
+            );
+            audit_log(
+                caller.data(),
+                "service.request",
+                Some("service"),
+                Some(&service_name),
+                "error",
+                Some("router unavailable"),
+            );
             return ABI_ERR_OPERATION;
         }
     };
@@ -123,7 +158,14 @@ pub fn service_request(
                 None,
             );
 
-            write_guest_output(&memory, &mut caller, out_ptr, out_cap, out_len_ptr, response_bytes)
+            write_guest_output(
+                &memory,
+                &mut caller,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+                response_bytes,
+            )
         }
         Err(err_code) => {
             let err_msg = match err_code {
@@ -131,7 +173,14 @@ pub fn service_request(
                 _ => format!("blad wysylania do serwisu '{}'", service_name),
             };
             error!("service_request: addon='{}': {}", addon_id, err_msg);
-            audit_log(caller.data(), "service.request", Some("service"), Some(&service_name), "error", Some(&err_msg));
+            audit_log(
+                caller.data(),
+                "service.request",
+                Some("service"),
+                Some(&service_name),
+                "error",
+                Some(&err_msg),
+            );
             err_code
         }
     }
@@ -148,15 +197,22 @@ async fn dispatch_to_service(
     use tentaflow_protocol::*;
 
     // Szukaj QUIC client w kolejnosci: LLM, Embedding, TTS, STT
-    let quic_client = service_manager.get_quic_llm_client(service_name).await
-        .or(service_manager.get_quic_embedding_client(service_name).await)
+    let quic_client = service_manager
+        .get_quic_llm_client(service_name)
+        .await
+        .or(service_manager
+            .get_quic_embedding_client(service_name)
+            .await)
         .or(service_manager.get_quic_tts_client(service_name).await)
         .or(service_manager.get_quic_stt_client(service_name).await);
 
     let quic_client = match quic_client {
         Some(c) => c,
         None => {
-            warn!("service_request: brak QUIC klienta dla serwisu '{}'", service_name);
+            warn!(
+                "service_request: brak QUIC klienta dla serwisu '{}'",
+                service_name
+            );
             return Err(ABI_ERR_NOT_FOUND);
         }
     };
@@ -168,12 +224,10 @@ async fn dispatch_to_service(
         payload: ModelPayload::Completion(CompletionPayload {
             model: service_name.to_string(),
             prompt: Some(request_json.to_string()),
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: request_json.to_string(),
-                },
-            ],
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: request_json.to_string(),
+            }],
             temperature: None,
             max_tokens: None,
             top_p: None,
@@ -187,17 +241,14 @@ async fn dispatch_to_service(
             prefix_text: None,
         }),
         stream: false,
-        metadata: Some(vec![
-            ("addon_id".to_string(), addon_id.to_string()),
-        ]),
+        metadata: Some(vec![("addon_id".to_string(), addon_id.to_string())]),
         session_id: None,
     };
 
-    let model_response = quic_client.send_request(model_request).await
-        .map_err(|e| {
-            error!("service_request: blad QUIC dla '{}': {}", service_name, e);
-            ABI_ERR_OPERATION
-        })?;
+    let model_response = quic_client.send_request(model_request).await.map_err(|e| {
+        error!("service_request: blad QUIC dla '{}': {}", service_name, e);
+        ABI_ERR_OPERATION
+    })?;
 
     // Serializuj cala odpowiedz jako JSON
     let response = match model_response.result {
@@ -234,9 +285,9 @@ async fn dispatch_to_service(
 mod tests {
     use super::*;
     use crate::addon::event_bus::EventBus;
-    use crate::addon::permissions::PermissionChecker;
     use crate::addon::host_functions::check_permission;
     use crate::addon::host_functions::network::NetworkConnectionManager;
+    use crate::addon::permissions::PermissionChecker;
     use crate::addon::AddonManifest;
     use parking_lot::Mutex;
     use std::path::Path;
@@ -274,6 +325,9 @@ mod tests {
             settings_cipher,
             manifest: Arc::new(AddonManifest::default()),
             memory_limit: 64 * 1024 * 1024,
+            oauth_refresh_guard: std::sync::Arc::new(
+                crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
+            ),
             router: None,
         }
     }
@@ -291,8 +345,10 @@ mod tests {
         );
 
         // Act & Assert
-        assert!(!check_permission(&state, "service", None),
-            "Addon bez 'service' w permissions powinien byc odrzucony");
+        assert!(
+            !check_permission(&state, "service", None),
+            "Addon bez 'service' w permissions powinien byc odrzucony"
+        );
     }
 
     #[test]
@@ -308,8 +364,10 @@ mod tests {
         );
 
         // Act & Assert
-        assert!(check_permission(&state, "service", None),
-            "Addon z 'service' i is_system_call=true powinien miec uprawnienie");
+        assert!(
+            check_permission(&state, "service", None),
+            "Addon z 'service' i is_system_call=true powinien miec uprawnienie"
+        );
     }
 
     #[test]
@@ -317,16 +375,14 @@ mod tests {
         // Addon z uprawnieniem "service" ale bez user_id i is_system_call=false
 
         // Arrange
-        let state = create_test_addon_state(
-            "untrusted-addon",
-            vec!["service".to_string()],
-            None,
-            false,
-        );
+        let state =
+            create_test_addon_state("untrusted-addon", vec!["service".to_string()], None, false);
 
         // Act & Assert
-        assert!(!check_permission(&state, "service", None),
-            "Addon bez user_id i is_system_call=false powinien byc odrzucony");
+        assert!(
+            !check_permission(&state, "service", None),
+            "Addon bez user_id i is_system_call=false powinien byc odrzucony"
+        );
     }
 
     #[test]
@@ -334,16 +390,13 @@ mod tests {
         // Addon bez "service" w permissions — nawet z nazwa serwisu nie przejdzie
 
         // Arrange
-        let state = create_test_addon_state(
-            "test-addon",
-            vec!["llm".to_string()],
-            None,
-            true,
-        );
+        let state = create_test_addon_state("test-addon", vec!["llm".to_string()], None, true);
 
         // Act & Assert
-        assert!(!check_permission(&state, "service", Some("teams-stt")),
-            "Addon bez 'service' nie powinien miec dostepu do zadnego serwisu");
+        assert!(
+            !check_permission(&state, "service", Some("teams-stt")),
+            "Addon bez 'service' nie powinien miec dostepu do zadnego serwisu"
+        );
     }
 
     #[test]
@@ -351,12 +404,7 @@ mod tests {
         // Addon bez zadnych uprawnien
 
         // Arrange
-        let state = create_test_addon_state(
-            "empty-addon",
-            vec![],
-            None,
-            true,
-        );
+        let state = create_test_addon_state("empty-addon", vec![], None, true);
 
         // Act & Assert
         assert!(!check_permission(&state, "service", None));

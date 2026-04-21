@@ -28,7 +28,7 @@
 //   });
 // =============================================================================
 
-import { adoptControlsInto } from './shared-styles.js';
+import { adoptControlsInto, injectSpriteIntoShadow } from './shared-styles.js';
 import { Sfx } from '/js/lib/sfx.js';
 
 let _zCounter = 1000;
@@ -56,6 +56,9 @@ class TfWindow extends HTMLElement {
 
     this._drag = null;
     this._resize = null;
+    this._userMoved = false;
+    this._centerMode = { x: true, y: true };
+    this._resizeObserver = null;
 
     this._onControlClick = this._onControlClick.bind(this);
     this._onHeaderPointerDown = this._onHeaderPointerDown.bind(this);
@@ -66,6 +69,8 @@ class TfWindow extends HTMLElement {
     this._onFooterClick = this._onFooterClick.bind(this);
     this._onActionsClick = this._onActionsClick.bind(this);
     this._onPointerDownFront = this._onPointerDownFront.bind(this);
+    this._onViewportResize = this._onViewportResize.bind(this);
+    this._onWinResize = this._onWinResize.bind(this);
   }
 
   connectedCallback() {
@@ -77,11 +82,26 @@ class TfWindow extends HTMLElement {
     this._win.classList.add('tf-window-opening');
     this._win.addEventListener('animationend', this._onOpenAnimEnd, { once: true });
     Sfx.play('window-open');
+
+    // Observe inner-size changes (content fills in, body loads async, etc.)
+    // and recenter while the user has not taken manual control.
+    if (typeof ResizeObserver !== 'undefined') {
+      this._resizeObserver = new ResizeObserver(this._onWinResize);
+      this._resizeObserver.observe(this._win);
+    }
+    window.addEventListener('resize', this._onViewportResize);
+    window.addEventListener('orientationchange', this._onViewportResize);
   }
 
   disconnectedCallback() {
     window.removeEventListener('pointermove', this._onPointerMove);
     window.removeEventListener('pointerup', this._onPointerUp);
+    window.removeEventListener('resize', this._onViewportResize);
+    window.removeEventListener('orientationchange', this._onViewportResize);
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
   }
 
   attributeChangedCallback() {
@@ -90,6 +110,7 @@ class TfWindow extends HTMLElement {
 
   _build() {
     adoptControlsInto(this._shadow);
+    injectSpriteIntoShadow(this._shadow);
 
     const win = document.createElement('div');
     win.className = 'tf-window';
@@ -245,23 +266,59 @@ class TfWindow extends HTMLElement {
     const ix = this.getAttribute('initial-x');
     const iy = this.getAttribute('initial-y');
 
-    const w = this._win.offsetWidth || parseInt(this.getAttribute('width'), 10) || 480;
-    const h = this._win.offsetHeight || parseInt(this.getAttribute('height'), 10) || 360;
+    this._centerMode = {
+      x: ix == null || ix === 'center',
+      y: iy == null || iy === 'center',
+    };
 
-    let left;
-    let top;
-    if (ix === 'center' || ix == null) {
-      left = Math.max(12, Math.floor((window.innerWidth - w) / 2));
-    } else {
-      left = parseInt(ix, 10) || 12;
+    // Immediate placement using best-known dimensions. For axes with an
+    // explicit numeric position, honour it; for centered axes compute
+    // against the current layout (may still be stale if content loads
+    // async — ResizeObserver will correct it on next layout).
+    if (!this._centerMode.x) {
+      const left = parseInt(ix, 10);
+      this._win.style.left = `${Number.isFinite(left) ? left : 12}px`;
     }
-    if (iy === 'center' || iy == null) {
-      top = Math.max(12, Math.floor((window.innerHeight - h) / 2));
-    } else {
-      top = parseInt(iy, 10) || 12;
+    if (!this._centerMode.y) {
+      const top = parseInt(iy, 10);
+      this._win.style.top = `${Number.isFinite(top) ? top : 12}px`;
     }
-    this._win.style.left = `${left}px`;
-    this._win.style.top = `${top}px`;
+
+    // Wait for layout so offsetWidth/Height reflect final size, then center.
+    requestAnimationFrame(() => this._recenterIfNeeded());
+  }
+
+  // Recenter the window on centered axes unless the user has moved it.
+  // Uses current rendered size so it works even when content loads async.
+  _recenterIfNeeded() {
+    if (!this._win || !this.isConnected) return;
+    if (this._userMoved) return;
+    if (this._win.classList.contains('maximized') || this._win.classList.contains('minimized')) return;
+
+    // Use offset metrics — they ignore CSS transforms, so the open-animation
+    // scale/translate does not distort centering math.
+    const w = this._win.offsetWidth;
+    const h = this._win.offsetHeight;
+    if (!w || !h) return;
+
+    const pad = 8;
+    if (this._centerMode.x) {
+      const left = Math.max(pad, Math.floor((window.innerWidth - w) / 2));
+      this._win.style.left = `${left}px`;
+    }
+    if (this._centerMode.y) {
+      const top = Math.max(pad, Math.floor((window.innerHeight - h) / 2));
+      this._win.style.top = `${top}px`;
+    }
+  }
+
+  _onWinResize() {
+    // Inner window size changed (content flowed in, resized layout).
+    this._recenterIfNeeded();
+  }
+
+  _onViewportResize() {
+    this._recenterIfNeeded();
   }
 
   _bringToFront() {
@@ -391,9 +448,11 @@ class TfWindow extends HTMLElement {
       const ny = this._drag.origY + (e.clientY - this._drag.startY);
       this._win.style.left = `${nx}px`;
       this._win.style.top = `${ny}px`;
+      this._userMoved = true;
       return;
     }
     if (this._resize) {
+      this._userMoved = true;
       const minW = parseInt(this.getAttribute('min-width'), 10) || 320;
       const minH = parseInt(this.getAttribute('min-height'), 10) || 200;
       const nw = Math.max(minW, this._resize.origW + (e.clientX - this._resize.startX));

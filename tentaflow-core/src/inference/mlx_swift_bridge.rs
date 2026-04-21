@@ -10,13 +10,13 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tracing::debug;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use crate::inference::{
-    EmbeddingParams, EmbeddingResult, GenerateParams, GenerateResult,
-    InferenceEngine, ModelInfo, StopReason, StreamToken,
+    EmbeddingParams, EmbeddingResult, GenerateParams, GenerateResult, InferenceEngine, ModelInfo,
+    StopReason, StreamToken,
 };
 
 // =============================================================================
@@ -43,11 +43,8 @@ type GenerateFn = extern "C" fn(
 ) -> i32;
 
 /// Callback wolany przez Swift dla kazdego wygenerowanego tokena
-type TokenCallbackFn = extern "C" fn(
-    token_text: *const c_char,
-    is_final: bool,
-    callback_context: *mut c_void,
-);
+type TokenCallbackFn =
+    extern "C" fn(token_text: *const c_char, is_final: bool, callback_context: *mut c_void);
 
 /// Callback: pobierz info o modelu (nazwa, backend, rozmiar). Zwraca JSON C string (caller musi zwolnic)
 type ModelInfoFn = extern "C" fn(context: *mut c_void) -> *mut c_char;
@@ -218,35 +215,33 @@ impl InferenceEngine for MlxSwiftEngine {
         .context("Blad watku ladowania modelu")?;
 
         if result < 0 {
-            anyhow::bail!(
-                "Swift MLX: blad ladowania modelu (kod: {})",
-                result
-            );
+            anyhow::bail!("Swift MLX: blad ladowania modelu (kod: {})", result);
         }
 
         // Wykryj chat template z tokenizer_config.json (tak samo jak mlx.rs na macOS)
         let chat_template = crate::routing::chat_template::detect_chat_template(model_path);
-        debug!("[mlx-bridge] Wykryty chat template: {:?}", chat_template.name());
+        debug!(
+            "[mlx-bridge] Wykryty chat template: {:?}",
+            chat_template.name()
+        );
 
         // Pobierz info o zaladowanym modelu — nadpisz chat_template wykrytym z pliku
-        let mut info = self
-            .model_info()
-            .unwrap_or_else(|| ModelInfo {
-                name: model_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-                path: model_path.to_string_lossy().to_string(),
-                size_bytes: 0,
-                parameters: String::new(),
-                quantization: None,
-                context_length: 32768,
-                loaded: true,
-                vram_used_mb: 0,
-                backend: "mlx".to_string(),
-                chat_template: Some(chat_template.name().to_string()),
-            });
+        let mut info = self.model_info().unwrap_or_else(|| ModelInfo {
+            name: model_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            path: model_path.to_string_lossy().to_string(),
+            size_bytes: 0,
+            parameters: String::new(),
+            quantization: None,
+            context_length: 32768,
+            loaded: true,
+            vram_used_mb: 0,
+            backend: "mlx".to_string(),
+            chat_template: Some(chat_template.name().to_string()),
+        });
 
         // Zawsze nadpisz chat_template wykrytym z pliku (Swift nie przekazuje tego)
         info.chat_template = Some(chat_template.name().to_string());
@@ -337,10 +332,7 @@ impl InferenceEngine for MlxSwiftEngine {
         .context("Blad watku generowania")?;
 
         if gen_result < 0 {
-            anyhow::bail!(
-                "Swift MLX: blad generowania (kod: {})",
-                gen_result
-            );
+            anyhow::bail!("Swift MLX: blad generowania (kod: {})", gen_result);
         }
 
         // Zbierz wszystkie tokeny w jeden string
@@ -357,8 +349,8 @@ impl InferenceEngine for MlxSwiftEngine {
         }
 
         let total_elapsed = start.elapsed();
-        let time_to_first_token_ms = first_token_time
-            .map(|t| t.duration_since(start).as_millis() as u64);
+        let time_to_first_token_ms =
+            first_token_time.map(|t| t.duration_since(start).as_millis() as u64);
 
         // Oblicz tokeny na sekunde (bez prefill — od pierwszego tokena)
         let decode_duration = first_token_time

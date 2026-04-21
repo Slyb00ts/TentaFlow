@@ -17,7 +17,7 @@ use tentaflow_protocol::{ChatStreamChunk, ChatStreamEnd, MessageBody, SessionAut
 
 use super::recorder;
 use super::resume_token::{self, ResumeError};
-use super::subscription::{push_chunk, push_end, Subscription, StreamHandlerMeta};
+use super::subscription::{push_chunk, push_end, StreamHandlerMeta, Subscription};
 use super::{HandlerContext, SessionAuthKind};
 
 // =============================================================================
@@ -55,6 +55,201 @@ inventory::submit! {
         variant_name: "ChatStreamRequest",
         required_auth: SessionAuthKind::UserSession,
         handler_fn: chat_stream_handler,
+    }
+}
+
+// =============================================================================
+// ClusterProbeStreamRequest — streaming probe miedzy nodami klastra.
+// Wysyla "started" → seria "probing_pair"/"result" → "complete" + End z agregatami.
+// =============================================================================
+
+fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    use tentaflow_protocol::{
+        ClusterProbeStreamChunk, ClusterProbeStreamEnd, ClusterProbeStreamRequest,
+    };
+
+    tokio::spawn(async move {
+        let payload: ClusterProbeStreamRequest = match req {
+            MessageBody::ClusterProbeStreamRequestBody(p) => p,
+            _ => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::ClusterProbeStreamEndBody(
+                        ClusterProbeStreamEnd {
+                            total_pairs: 0,
+                            successful: 0,
+                            failed: 0,
+                        },
+                    )),
+                );
+                return;
+            }
+        };
+
+        // Walidacja minimum 2 nody.
+        if payload.node_ids.len() < 2 {
+            let _ = push_chunk(
+                &sub,
+                MessageBody::ClusterProbeStreamChunkBody(ClusterProbeStreamChunk {
+                    event_type: "complete".into(),
+                    source_node: None,
+                    target_node: None,
+                    success: None,
+                    latency_ms: None,
+                    bandwidth_mbps: None,
+                    interface_type: None,
+                    message: Some("minimum 2 nodes required".into()),
+                }),
+            );
+            let _ = push_end(
+                &sub,
+                Some(MessageBody::ClusterProbeStreamEndBody(
+                    ClusterProbeStreamEnd {
+                        total_pairs: 0,
+                        successful: 0,
+                        failed: 0,
+                    },
+                )),
+            );
+            return;
+        }
+
+        // Started.
+        if push_chunk(
+            &sub,
+            MessageBody::ClusterProbeStreamChunkBody(ClusterProbeStreamChunk {
+                event_type: "started".into(),
+                source_node: None,
+                target_node: None,
+                success: None,
+                latency_ms: None,
+                bandwidth_mbps: None,
+                interface_type: None,
+                message: Some(format!("probing {} nodes", payload.node_ids.len())),
+            }),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let qm = ctx.state.quic_mesh.clone();
+        let local_id = ctx.state.local_node_id.to_string();
+
+        let mut total_pairs: u32 = 0;
+        let mut successful: u32 = 0;
+        let mut failed: u32 = 0;
+
+        // Iteruj po wszystkich uporzadkowanych parach (i, j) i = a, j = b.
+        for i in 0..payload.node_ids.len() {
+            for j in (i + 1)..payload.node_ids.len() {
+                let a = payload.node_ids[i].clone();
+                let b = payload.node_ids[j].clone();
+                total_pairs += 1;
+
+                // probing_pair event.
+                if push_chunk(
+                    &sub,
+                    MessageBody::ClusterProbeStreamChunkBody(ClusterProbeStreamChunk {
+                        event_type: "probing_pair".into(),
+                        source_node: Some(a.clone()),
+                        target_node: Some(b.clone()),
+                        success: None,
+                        latency_ms: None,
+                        bandwidth_mbps: None,
+                        interface_type: None,
+                        message: None,
+                    }),
+                )
+                .is_err()
+                {
+                    return;
+                }
+
+                // Probe — uzyj QUIC RTT z iroh manager jako proxy dla latency
+                // i odswiezonej peer info dla speed/interface_type.
+                let (success, latency_ms, bandwidth_mbps, interface_type) = match &qm {
+                    Some(qm) => {
+                        let a_local = a == local_id;
+                        let b_local = b == local_id;
+                        let other = if a_local { b.clone() } else { a.clone() };
+                        let connected = a_local || b_local || qm.is_connected(&other).await;
+                        if !connected {
+                            (false, None, None, None)
+                        } else {
+                            let rtt_us = qm.get_peer_rtt_us(&other).await.unwrap_or(0);
+                            let lat_ms = ((rtt_us as f64) / 1000.0).round() as u32;
+                            let peer = ctx.state.mesh_peer_store.get(&other);
+                            let iface = peer.as_ref().and_then(|_p| {
+                                // Peer_store nie trzyma typu interfejsu — wrocimy
+                                // ethernet jako rozsadny default dla connected peer.
+                                Some("ethernet".to_string())
+                            });
+                            (true, Some(lat_ms), None, iface)
+                        }
+                    }
+                    None => (false, None, None, None),
+                };
+
+                if success {
+                    successful += 1;
+                } else {
+                    failed += 1;
+                }
+
+                if push_chunk(
+                    &sub,
+                    MessageBody::ClusterProbeStreamChunkBody(ClusterProbeStreamChunk {
+                        event_type: "result".into(),
+                        source_node: Some(a),
+                        target_node: Some(b),
+                        success: Some(success),
+                        latency_ms,
+                        bandwidth_mbps,
+                        interface_type,
+                        message: None,
+                    }),
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        // Complete chunk + End z agregatami.
+        let _ = push_chunk(
+            &sub,
+            MessageBody::ClusterProbeStreamChunkBody(ClusterProbeStreamChunk {
+                event_type: "complete".into(),
+                source_node: None,
+                target_node: None,
+                success: None,
+                latency_ms: None,
+                bandwidth_mbps: None,
+                interface_type: None,
+                message: None,
+            }),
+        );
+
+        let _ = push_end(
+            &sub,
+            Some(MessageBody::ClusterProbeStreamEndBody(
+                ClusterProbeStreamEnd {
+                    total_pairs,
+                    successful,
+                    failed,
+                },
+            )),
+        );
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "ClusterProbeStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: cluster_probe_stream_handler,
     }
 }
 
@@ -176,9 +371,9 @@ fn subscribe_resume_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
             match rec.outgoing_after(target_correlation, token.last_sequence as i64) {
                 Ok(frames) => {
                     for frame in frames {
-                        if let Ok(body) = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(
-                            &frame.body_bytes,
-                        ) {
+                        if let Ok(body) =
+                            rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&frame.body_bytes)
+                        {
                             if push_chunk(&sub, body).is_err() {
                                 return;
                             }
@@ -217,7 +412,9 @@ inventory::submit! {
 
 #[cfg(test)]
 mod tests {
-    use super::super::subscription::{find_stream_handler, stream_handler_count, SubscriptionEvent};
+    use super::super::subscription::{
+        find_stream_handler, stream_handler_count, SubscriptionEvent,
+    };
     use super::super::SessionAuthKind;
 
     #[test]
@@ -257,7 +454,10 @@ mod tests {
             resume_token: alice_token,
         };
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: bob, role: None },
+            session: SessionAuth::UserSession {
+                user_id: bob,
+                role: None,
+            },
             correlation_id: 99,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
@@ -294,7 +494,10 @@ mod tests {
             resume_token: vec![0u8; 80],
         };
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            },
             correlation_id: 1,
             resume_secret: Some(Arc::new(b"test-secret".to_vec())),
             state: super::super::state::AppState::for_test(),
@@ -335,7 +538,10 @@ mod tests {
             resume_token: token,
         };
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id, role: None },
+            session: SessionAuth::UserSession {
+                user_id,
+                role: None,
+            },
             correlation_id: 2,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
@@ -348,7 +554,10 @@ mod tests {
             SubscriptionEvent::Chunk(MessageBody::SubscribeResumeAck { accepted, error: _ }) => {
                 assert!(accepted);
             }
-            other => panic!("expected Chunk(SubscribeResumeAck accepted), got {:?}", other),
+            other => panic!(
+                "expected Chunk(SubscribeResumeAck accepted), got {:?}",
+                other
+            ),
         }
         // Drugi event: End (brak recorder = brak replay frames).
         let event2 = rx.recv().await.unwrap();
@@ -375,7 +584,10 @@ mod tests {
             max_tokens: None,
         });
         let ctx = HandlerContext {
-            session: SessionAuth::UserSession { user_id: [0u8; 16], role: None },
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            },
             correlation_id: 1,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),

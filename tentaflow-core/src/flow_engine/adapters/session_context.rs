@@ -34,10 +34,16 @@ impl SessionContextAdapter {
         if trimmed.len() < 3 {
             return true;
         }
-        if trimmed.chars().all(|c| c.is_ascii_digit() || c.is_whitespace()) {
+        if trimmed
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_whitespace())
+        {
             return true;
         }
-        if trimmed.chars().all(|c| c.is_ascii_punctuation() || c.is_whitespace()) {
+        if trimmed
+            .chars()
+            .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+        {
             return true;
         }
         false
@@ -60,7 +66,9 @@ impl NodeAdapter for SessionContextAdapter {
             .unwrap_or("session_unclear");
 
         // Sprawdz czy to pierwsza wiadomosc (z wyniku conversation_history)
-        let is_first_message = ctx.node_results.values()
+        let is_first_message = ctx
+            .node_results
+            .values()
             .find_map(|v| v.get("is_first_message").and_then(|f| f.as_bool()))
             .unwrap_or(true);
 
@@ -76,7 +84,9 @@ impl NodeAdapter for SessionContextAdapter {
         };
 
         // Pobierz tresc promptu z rejestru
-        let suffix = self.service_manager.prompt_registry
+        let suffix = self
+            .service_manager
+            .prompt_registry
             .get_content(prompt_id)
             .map(|s| s.to_string())
             .unwrap_or_default();

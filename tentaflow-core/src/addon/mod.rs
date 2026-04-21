@@ -4,28 +4,33 @@
 //       zarzadzajacy cyklem zycia addonow, instancjami i eventami.
 // =============================================================================
 
-pub mod runtime;
+pub mod bundled;
+pub mod event_bus;
+pub mod flow_blocks;
 pub mod host_functions;
 pub mod instance_pool;
-pub mod permissions;
 pub mod lifecycle;
-pub mod ui_framework;
-pub mod event_bus;
-pub mod tool_dispatch;
-pub mod flow_blocks;
+pub mod oauth;
+pub mod oauth_cleanup;
+pub mod oauth_crypto;
+pub mod oauth_master_key;
+pub mod oauth_refresh_guard;
+pub mod permissions;
 pub mod rate_limiter;
+pub mod runtime;
+pub mod tool_dispatch;
+pub mod ui_framework;
 pub mod utils;
-pub mod bundled;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use parking_lot::{Mutex, RwLock};
+use runtime::{WasmEngine, WasmInstance, WasmModule, WasmStore};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use runtime::{WasmEngine, WasmModule, WasmStore, WasmInstance};
 
 use crate::db::DbPool;
 use event_bus::{Event, EventBus};
@@ -45,91 +50,91 @@ const DEFAULT_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 // AddonManifest — parsowany z manifest.toml
 // =============================================================================
 
-/// Manifest addonu odczytany z manifest.toml w katalogu addonu
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Manifest addonu odczytany z manifest.toml. Mapuje kanoniczny format
+/// z sekcja [addon], tablicami [[permission]], [[oauth_provider]], [[tool]],
+/// [[network_rule]] oraz sekcjami [visibility], [resources], [lifecycle],
+/// [config.schema]. Inne formaty (stare [permissions] z listami kategorii,
+/// [[addon_permissions]], [permissions.llm]) sa odrzucane przez parser.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AddonManifest {
     pub addon_id: String,
     pub version: String,
     pub display_name: String,
     pub description: Option<String>,
     pub author: Option<String>,
-    /// Wymagane uprawnienia
-    pub permissions: Vec<ManifestPermission>,
     /// Platformy docelowe (puste = wszystkie)
     pub platforms: Vec<String>,
     /// Sciezka do pliku WASM wzgledem katalogu addonu
     pub wasm_file: String,
-    /// Opcjonalny plik SKILL.md (prompt dla LLM)
-    pub skill_file: Option<String>,
-    /// Opcjonalny plik blocks.json (bloczki flow builder)
-    pub blocks_file: Option<String>,
-    /// Opcjonalny plik ikony
-    pub icon_file: Option<String>,
-    /// Limity zasobow (opcjonalne, domyslne z tabeli addon_resource_limits)
-    pub resource_limits: Option<ManifestResourceLimits>,
     /// Slowa kluczowe addona (PL+EN) do semantic retrieval
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// Kategoria addona (np. "komunikacja", "pliki", "ai")
+    /// Kategoria addona (np. "communication", "rag", "storage", "ai")
     pub category: Option<String>,
-    /// Definicje narzedzi dla LLM tool calling
+    /// Identyfikator ikony sprite (np. "meeting") z pola `[addon].icon`.
+    pub icon: Option<String>,
+    /// Runtime wykonawczy: `wasmtime` (desktop) lub `wasmi` (mobile).
+    pub runtime: Option<String>,
+    /// Narzedzia LLM (tool calling) z [[tool]]
+    #[serde(default)]
     pub tools: Vec<ManifestTool>,
-    /// Granularne uprawnienia deklarowane przez addon (z [[addon_permissions]])
+    /// Granularne uprawnienia addona z [[permission]] — jedyne zrodlo prawdy.
     #[serde(default)]
     pub declared_permissions: Vec<AddonDeclaredPermission>,
-    /// Reguly sieciowe TCP/UDP deklarowane przez addon (z [[network_rules]])
+    /// Reguly sieciowe TCP/UDP z [[network_rule]]
     #[serde(default)]
     pub network_rules: Vec<ManifestNetworkRule>,
     /// Reguly disambiguation — rozstrzyganie niejednoznacznych zapytan
     #[serde(default)]
     pub disambiguation: Vec<DisambiguationRule>,
-    /// Wymagania zasobow deklarowane w sekcji [resources] manifestu
+    /// Wymagania zasobow deklarowane w sekcji [resources]
     pub resources: Option<ResourceRequirements>,
+    /// Sekcja [visibility] — ograniczenia widocznosci addona w GUI
+    #[serde(default)]
+    pub visibility: Option<AddonVisibilitySection>,
+    /// Deklaracje providerow OAuth z [[oauth_provider]]
+    #[serde(default)]
+    pub oauth_provider: Vec<AddonOAuthProviderSection>,
+    /// Identyfikator licencji addona (np. "Apache-2.0").
+    pub license: Option<String>,
+    /// Flaga widocznosci w katalogu "Available apps" (default true w lifecycle).
+    pub show_in_catalog: Option<bool>,
 }
 
-impl Default for AddonManifest {
-    fn default() -> Self {
-        Self {
-            addon_id: String::new(),
-            version: String::new(),
-            display_name: String::new(),
-            description: None,
-            author: None,
-            permissions: Vec::new(),
-            platforms: Vec::new(),
-            wasm_file: String::new(),
-            skill_file: None,
-            blocks_file: None,
-            icon_file: None,
-            resource_limits: None,
-            keywords: Vec::new(),
-            category: None,
-            tools: Vec::new(),
-            declared_permissions: Vec::new(),
-            network_rules: Vec::new(),
-            disambiguation: Vec::new(),
-            resources: None,
-        }
-    }
+/// Sekcja [visibility] manifestu — kontrola widocznosci addona w GUI.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AddonVisibilitySection {
+    #[serde(default)]
+    pub admin_only: bool,
+    #[serde(default)]
+    pub default_groups: Vec<String>,
+    /// Domyslna widocznosc w katalogu "Available apps" (default true).
+    #[serde(default)]
+    pub show_in_catalog: Option<bool>,
 }
 
-/// Uprawnienie deklarowane w manifescie
+/// Deklaracja providera OAuth w manifescie ([[oauth_provider]]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestPermission {
-    pub permission_type: String,
-    pub resource_pattern: Option<String>,
-    pub access_level: String,
-    pub reason: Option<String>,
-    pub required: bool,
+pub struct AddonOAuthProviderSection {
+    pub id: String,
+    pub display_name: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub revoke_url: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Tryb uwierzytelnienia: "global"|"individual"|"none"
+    pub mode: String,
+    #[serde(default = "default_true")]
+    pub pkce: bool,
 }
 
-/// Limity zasobow z manifestu
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifestResourceLimits {
-    pub max_instances: Option<i64>,
-    pub cpu_limit_millicores: Option<i64>,
-    pub ram_limit_mb: Option<i64>,
-    pub storage_limit_mb: Option<i64>,
+fn default_true() -> bool {
+    true
+}
+fn default_risk() -> String {
+    "low".to_string()
 }
 
 /// Wymagania zasobow deklarowane w sekcji [resources] manifestu addonu.
@@ -150,15 +155,33 @@ pub struct ResourceRequirements {
     pub fuel_limit: Option<u64>,
 }
 
-/// Definicja narzedzia z manifestu
+/// Definicja narzedzia w sekcji [[tool]] — id, display_name, opis + lista
+/// parametrow z [[tool.parameter]]. `parameters_schema` jest skladane do
+/// JSON Schema przez parser (tool_dispatch/host functions wymagaja tej formy).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestTool {
+    /// Identyfikator narzedzia (stabilny, uzywany przez LLM function calling)
     pub name: String,
+    /// Opis widoczny dla LLM
     pub description: String,
+    /// JSON Schema zbudowany z parametrow — host functions uzywaja go bezposrednio
     pub parameters_schema: serde_json::Value,
+    /// Opcjonalny schemat wyniku
     pub return_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub keywords: Vec<String>,
+}
+
+/// Parametr narzedzia z [[tool.parameter]] — skladany do `parameters_schema`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestToolParameter {
+    pub name: String,
+    /// Typ parametru w JSON Schema: "string"|"number"|"boolean"|"array"|"object"
+    pub param_type: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// Regula disambiguation — rozstrzyganie niejednoznacznych zapytan
@@ -187,17 +210,20 @@ pub struct ManifestNetworkRule {
     pub required: bool,
 }
 
-/// Granularne uprawnienie deklarowane przez addon w [[addon_permissions]]
+/// Granularne uprawnienie deklarowane przez addon w [[permission]].
+/// Id zgodne z konwencja host-function (np. "storage.read", "http.request",
+/// "llm.generate") lub domenowe (np. "teams.join_meeting").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddonDeclaredPermission {
-    /// Unikalny identyfikator uprawnienia (np. "chat_read", "files_write")
+    /// Unikalny identyfikator uprawnienia
     pub id: String,
-    /// Nazwa wyswietlana (np. "Odczyt czatow")
-    pub name: String,
-    /// Opis uprawnienia widoczny w panelu administracyjnym
+    /// Nazwa wyswietlana w panelu administracyjnym (angielski)
+    pub display_name: String,
+    /// Krotki opis uprawnienia (angielski)
     pub description: String,
-    /// Kategoria grupujaca uprawnienia (np. "Komunikacja", "Pliki")
-    pub category: String,
+    /// Poziom ryzyka uprawnienia: "low"|"medium"|"high"|"critical"
+    #[serde(default = "default_risk")]
+    pub risk: String,
 }
 
 // =============================================================================
@@ -245,6 +271,8 @@ pub struct AddonState {
     pub memory_limit: usize,
     /// Router do routowania requestow LLM (ustawiany po inicjalizacji)
     pub router: Option<Arc<crate::routing::router::Router>>,
+    /// Per-account mutex map used to serialize OAuth refresh_token calls.
+    pub oauth_refresh_guard: Arc<oauth_refresh_guard::OAuthRefreshGuard>,
     /// Limiter zasobow wasmi (iOS/Android) — pole uzywane przez Store::limiter()
     #[cfg(any(target_os = "ios", target_os = "android"))]
     pub store_limits: wasmi::StoreLimits,
@@ -277,6 +305,8 @@ pub struct AddonManager {
     settings_cipher: Arc<crate::crypto::SettingsCipher>,
     /// Skompilowane moduly WASM — cache po addon_id
     compiled_modules: Arc<RwLock<HashMap<String, WasmModule>>>,
+    /// Per-account mutex map used to serialize OAuth refresh_token calls.
+    oauth_refresh_guard: Arc<oauth_refresh_guard::OAuthRefreshGuard>,
     /// Zarejestrowane narzedzia ze wszystkich addonow
     registered_tools: Arc<RwLock<Vec<ToolDefinition>>>,
     /// Router do routowania requestow LLM z addonow
@@ -297,14 +327,6 @@ impl AddonManager {
         // Uruchom background refresh co 5 minut
         permission_checker.start_background_refresh();
 
-        // Uzupelnij reguly sieciowe HTTP domains dla juz zainstalowanych addonow
-        {
-            let conn = db.lock().unwrap();
-            if let Err(e) = lifecycle::ensure_http_domain_rules(&conn) {
-                tracing::warn!("Blad uzupelniania regul HTTP: {}", e);
-            }
-        }
-
         info!("AddonManager zainicjalizowany");
 
         Ok(Self {
@@ -315,6 +337,7 @@ impl AddonManager {
             permission_checker,
             settings_cipher,
             compiled_modules: Arc::new(RwLock::new(HashMap::new())),
+            oauth_refresh_guard: Arc::new(oauth_refresh_guard::OAuthRefreshGuard::new()),
             registered_tools: Arc::new(RwLock::new(Vec::new())),
             router: Arc::new(RwLock::new(None)),
         })
@@ -342,7 +365,10 @@ impl AddonManager {
             self.activate_teams_aliases();
         }
 
-        info!("Addon '{}' v{} zainstalowany pomyslnie", manifest.addon_id, manifest.version);
+        info!(
+            "Addon '{}' v{} zainstalowany pomyslnie",
+            manifest.addon_id, manifest.version
+        );
         Ok(())
     }
 
@@ -353,7 +379,8 @@ impl AddonManager {
         // Zatrzymaj wszystkie instancje tego addonu
         let instance_ids: Vec<String> = {
             let instances = self.instances.read();
-            instances.get(addon_id)
+            instances
+                .get(addon_id)
                 .map(|v| v.iter().map(|i| i.instance_id.clone()).collect())
                 .unwrap_or_default()
         };
@@ -368,7 +395,9 @@ impl AddonManager {
         self.compiled_modules.write().remove(addon_id);
 
         // Usun zarejestrowane narzedzia
-        self.registered_tools.write().retain(|t| t.addon_id != addon_id);
+        self.registered_tools
+            .write()
+            .retain(|t| t.addon_id != addon_id);
 
         // Usun z DB
         lifecycle::uninstall(addon_id, &self.db)?;
@@ -387,7 +416,10 @@ impl AddonManager {
 
     /// Uruchamia addon — tworzy instancje WASM, zwraca instance_id
     pub fn start_addon(&self, addon_id: &str, user_id: Option<i64>) -> Result<String> {
-        info!("Uruchamianie addonu '{}' dla user_id={:?}", addon_id, user_id);
+        info!(
+            "Uruchamianie addonu '{}' dla user_id={:?}",
+            addon_id, user_id
+        );
 
         // Pobierz lub skompiluj modul WASM
         let module = self.get_or_compile_module(addon_id)?;
@@ -412,11 +444,14 @@ impl AddonManager {
             fuel_consumed: 0,
             is_system_call: user_id.is_none(),
             rate_limiter: None,
-            net_manager: Arc::new(Mutex::new(host_functions::network::NetworkConnectionManager::new())),
+            net_manager: Arc::new(Mutex::new(
+                host_functions::network::NetworkConnectionManager::new(),
+            )),
             settings_cipher: self.settings_cipher.clone(),
             manifest: Arc::new(manifest),
             memory_limit: DEFAULT_MEMORY_LIMIT_BYTES,
             router: self.router.read().clone(),
+            oauth_refresh_guard: self.oauth_refresh_guard.clone(),
             #[cfg(any(target_os = "ios", target_os = "android"))]
             store_limits: wasmi::StoreLimitsBuilder::new()
                 .memory_size(DEFAULT_MEMORY_LIMIT_BYTES)
@@ -438,8 +473,12 @@ impl AddonManager {
         let instance = runtime::instantiate(&linker, &mut store, &module)?;
 
         // Wywolaj on_start() jesli addon go eksportuje
-        if let Some(on_start) = instance.get_typed_func::<(), i32>(&mut store, "on_start").ok() {
-            let result = on_start.call(&mut store, ())
+        if let Some(on_start) = instance
+            .get_typed_func::<(), i32>(&mut store, "on_start")
+            .ok()
+        {
+            let result = on_start
+                .call(&mut store, ())
                 .map_err(|e| anyhow::anyhow!("Blad wywolania on_start(): {e}"))?;
             if result != 0 {
                 bail!("on_start() zwrocil blad: {}", result);
@@ -465,7 +504,8 @@ impl AddonManager {
         };
 
         // Dodaj do mapy instancji
-        self.instances.write()
+        self.instances
+            .write()
             .entry(addon_id.to_string())
             .or_default()
             .push(addon_instance);
@@ -487,7 +527,10 @@ impl AddonManager {
             self.activate_teams_aliases();
         }
 
-        info!("Addon '{}' uruchomiony, instance_id={}", addon_id, instance_id);
+        info!(
+            "Addon '{}' uruchomiony, instance_id={}",
+            addon_id, instance_id
+        );
         Ok(instance_id)
     }
 
@@ -500,14 +543,17 @@ impl AddonManager {
         // Znajdz addon_id i indeks instancji
         let mut found = None;
         for (addon_id, addon_instances) in instances.iter_mut() {
-            if let Some(pos) = addon_instances.iter().position(|i| i.instance_id == instance_id) {
+            if let Some(pos) = addon_instances
+                .iter()
+                .position(|i| i.instance_id == instance_id)
+            {
                 found = Some((addon_id.clone(), pos));
                 break;
             }
         }
 
-        let (addon_id, pos) = found
-            .ok_or_else(|| anyhow::anyhow!("Instancja '{}' nie znaleziona", instance_id))?;
+        let (addon_id, pos) =
+            found.ok_or_else(|| anyhow::anyhow!("Instancja '{}' nie znaleziona", instance_id))?;
 
         // Pobierz instancje
         let mut addon_instance = instances.get_mut(&addon_id).unwrap().remove(pos);
@@ -519,12 +565,16 @@ impl AddonManager {
             let count = mgr.connection_count();
             mgr.close_all();
             if count > 0 {
-                info!("stop_addon '{}': zamknieto {} polaczen sieciowych", addon_id, count);
+                info!(
+                    "stop_addon '{}': zamknieto {} polaczen sieciowych",
+                    addon_id, count
+                );
             }
         }
 
         // Wywolaj on_stop() jesli addon go eksportuje
-        if let Some(on_stop) = addon_instance.instance
+        if let Some(on_stop) = addon_instance
+            .instance
             .get_typed_func::<(), i32>(&mut addon_instance.store, "on_stop")
             .ok()
         {
@@ -579,24 +629,30 @@ impl AddonManager {
         params: serde_json::Value,
         user_id: i64,
     ) -> Result<serde_json::Value> {
-        info!("Wywolanie narzedzia '{}.{}' przez user_id={}", addon_id, tool_name, user_id);
+        info!(
+            "Wywolanie narzedzia '{}.{}' przez user_id={}",
+            addon_id, tool_name, user_id
+        );
 
         // Sprawdz uprawnienia uzytkownika
-        let perm_result = self.permission_checker.check(
-            addon_id,
-            user_id,
-            "llm",
-            None,
-        );
+        let perm_result = self
+            .permission_checker
+            .check(addon_id, user_id, "llm", None);
         if !perm_result.is_granted() {
-            bail!("Brak uprawnien do wywolania narzedzia '{}.{}' dla user_id={}", addon_id, tool_name, user_id);
+            bail!(
+                "Brak uprawnien do wywolania narzedzia '{}.{}' dla user_id={}",
+                addon_id,
+                tool_name,
+                user_id
+            );
         }
 
         // K4: Wez instancje z mapy pod write lockiem (krotko)
         let mut addon_instance = {
             let mut instances = self.instances.write();
-            let addon_instances = instances.get_mut(addon_id)
-                .ok_or_else(|| anyhow::anyhow!("Addon '{}' nie ma uruchomionych instancji", addon_id))?;
+            let addon_instances = instances.get_mut(addon_id).ok_or_else(|| {
+                anyhow::anyhow!("Addon '{}' nie ma uruchomionych instancji", addon_id)
+            })?;
 
             if addon_instances.is_empty() {
                 bail!("Brak dostepnych instancji addonu '{}'", addon_id);
@@ -617,12 +673,14 @@ impl AddonManager {
         // Wykonaj WASM poza lockiem
         let result = (|| -> Result<serde_json::Value> {
             // Pobierz alloc z guest
-            let alloc_fn = addon_instance.instance
+            let alloc_fn = addon_instance
+                .instance
                 .get_typed_func::<i32, i32>(&mut addon_instance.store, "alloc")
                 .map_err(|e| anyhow::anyhow!("Addon nie eksportuje funkcji alloc(): {e}"))?;
 
             // Alokuj bufor wejsciowy w guest memory
-            let input_ptr = alloc_fn.call(&mut addon_instance.store, request_bytes.len() as i32)
+            let input_ptr = alloc_fn
+                .call(&mut addon_instance.store, request_bytes.len() as i32)
                 .map_err(|e| anyhow::anyhow!("Blad alokacji pamieci guest: {e}"))?;
 
             // CR-004: Sprawdz poprawnosc wskaznika
@@ -631,49 +689,75 @@ impl AddonManager {
             }
 
             // Zapisz dane do guest memory
-            let memory = addon_instance.instance
+            let memory = addon_instance
+                .instance
                 .get_memory(&mut addon_instance.store, "memory")
                 .ok_or_else(|| anyhow::anyhow!("Brak eksportu 'memory' w module WASM"))?;
 
             // CR-005: Sprawdz granice pamieci z checked_add
             let input_end = (input_ptr as usize)
                 .checked_add(request_bytes.len())
-                .ok_or_else(|| anyhow::anyhow!("Przepelnienie przy obliczaniu konca bufora wejsciowego"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Przepelnienie przy obliczaniu konca bufora wejsciowego")
+                })?;
             let mem_size = memory.data(&addon_instance.store).len();
             if input_end > mem_size {
-                bail!("Bufor wejsciowy wykracza poza pamiec guest ({} > {})", input_end, mem_size);
+                bail!(
+                    "Bufor wejsciowy wykracza poza pamiec guest ({} > {})",
+                    input_end,
+                    mem_size
+                );
             }
 
-            memory.data_mut(&mut addon_instance.store)
-                [input_ptr as usize..input_end]
+            memory.data_mut(&mut addon_instance.store)[input_ptr as usize..input_end]
                 .copy_from_slice(&request_bytes);
 
             // Alokuj bufor wyjsciowy (64KB)
             let out_cap: i32 = 65536;
-            let out_ptr = alloc_fn.call(&mut addon_instance.store, out_cap)
+            let out_ptr = alloc_fn
+                .call(&mut addon_instance.store, out_cap)
                 .map_err(|e| anyhow::anyhow!("Blad alokacji bufora wyjsciowego: {e}"))?;
 
             if out_ptr < 0 {
-                bail!("alloc() zwrocil niepoprawny wskaznik wyjsciowy: {}", out_ptr);
+                bail!(
+                    "alloc() zwrocil niepoprawny wskaznik wyjsciowy: {}",
+                    out_ptr
+                );
             }
 
             // Alokuj miejsce na dlugosc wyniku (4 bajty)
-            let out_len_ptr = alloc_fn.call(&mut addon_instance.store, 4)
+            let out_len_ptr = alloc_fn
+                .call(&mut addon_instance.store, 4)
                 .map_err(|e| anyhow::anyhow!("Blad alokacji out_len: {e}"))?;
 
             if out_len_ptr < 0 {
-                bail!("alloc() zwrocil niepoprawny wskaznik out_len: {}", out_len_ptr);
+                bail!(
+                    "alloc() zwrocil niepoprawny wskaznik out_len: {}",
+                    out_len_ptr
+                );
             }
 
             // Wywolaj on_request w guest
-            let on_request = addon_instance.instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut addon_instance.store, "on_request")
+            let on_request = addon_instance
+                .instance
+                .get_typed_func::<(i32, i32, i32, i32, i32), i32>(
+                    &mut addon_instance.store,
+                    "on_request",
+                )
                 .map_err(|e| anyhow::anyhow!("Addon nie eksportuje funkcji on_request(): {e}"))?;
 
-            let result_code = on_request.call(
-                &mut addon_instance.store,
-                (input_ptr, request_bytes.len() as i32, out_ptr, out_cap, out_len_ptr),
-            ).map_err(|e| anyhow::anyhow!("Blad wywolania on_request(): {e}"))?;
+            let result_code = on_request
+                .call(
+                    &mut addon_instance.store,
+                    (
+                        input_ptr,
+                        request_bytes.len() as i32,
+                        out_ptr,
+                        out_cap,
+                        out_len_ptr,
+                    ),
+                )
+                .map_err(|e| anyhow::anyhow!("Blad wywolania on_request(): {e}"))?;
 
             if result_code != 0 {
                 bail!("on_request() zwrocil blad: {}", result_code);
@@ -691,7 +775,12 @@ impl AddonManager {
             }
 
             let out_len_bytes = &mem_data[out_len_ptr as usize..out_len_end];
-            let out_len = i32::from_le_bytes([out_len_bytes[0], out_len_bytes[1], out_len_bytes[2], out_len_bytes[3]]);
+            let out_len = i32::from_le_bytes([
+                out_len_bytes[0],
+                out_len_bytes[1],
+                out_len_bytes[2],
+                out_len_bytes[3],
+            ]);
 
             if out_len < 0 {
                 bail!("out_len jest ujemny: {}", out_len);
@@ -702,19 +791,28 @@ impl AddonManager {
                 .checked_add(out_len as usize)
                 .ok_or_else(|| anyhow::anyhow!("Przepelnienie przy obliczaniu konca wyniku"))?;
             if result_end > mem_data.len() {
-                bail!("Bufor wyniku wykracza poza pamiec guest ({} > {})", result_end, mem_data.len());
+                bail!(
+                    "Bufor wyniku wykracza poza pamiec guest ({} > {})",
+                    result_end,
+                    mem_data.len()
+                );
             }
 
             // Odczytaj wynik
             let result_bytes = &mem_data[out_ptr as usize..result_end];
-            let result: serde_json::Value = serde_json::from_slice(result_bytes)
-                .map_err(|e| anyhow::anyhow!("Nie udalo sie zdekodowac odpowiedzi z addonu: {e}"))?;
+            let result: serde_json::Value = serde_json::from_slice(result_bytes).map_err(|e| {
+                anyhow::anyhow!("Nie udalo sie zdekodowac odpowiedzi z addonu: {e}")
+            })?;
 
             // Zwolnij pamiec guest
-            if let Ok(dealloc_fn) = addon_instance.instance
+            if let Ok(dealloc_fn) = addon_instance
+                .instance
                 .get_typed_func::<(i32, i32), ()>(&mut addon_instance.store, "dealloc")
             {
-                let _ = dealloc_fn.call(&mut addon_instance.store, (input_ptr, request_bytes.len() as i32));
+                let _ = dealloc_fn.call(
+                    &mut addon_instance.store,
+                    (input_ptr, request_bytes.len() as i32),
+                );
                 let _ = dealloc_fn.call(&mut addon_instance.store, (out_ptr, out_cap));
                 let _ = dealloc_fn.call(&mut addon_instance.store, (out_len_ptr, 4));
             }
@@ -757,7 +855,8 @@ impl AddonManager {
             let mut instances = self.instances.write();
             for subscriber in &subscribers {
                 if let Some(addon_instances) = instances.get_mut(&subscriber.addon_id) {
-                    if let Some(pos) = addon_instances.iter()
+                    if let Some(pos) = addon_instances
+                        .iter()
                         .position(|i| i.instance_id == subscriber.instance_id)
                     {
                         let inst = addon_instances.remove(pos);
@@ -770,30 +869,42 @@ impl AddonManager {
 
         // Wykonaj WASM poza lockiem
         for (addon_id, _pos, ref mut addon_instance) in &mut extracted {
-            if let Ok(on_event) = addon_instance.instance
+            if let Ok(on_event) = addon_instance
+                .instance
                 .get_typed_func::<(i32, i32), i32>(&mut addon_instance.store, "on_event")
             {
-                if let Ok(alloc_fn) = addon_instance.instance
+                if let Ok(alloc_fn) = addon_instance
+                    .instance
                     .get_typed_func::<i32, i32>(&mut addon_instance.store, "alloc")
                 {
-                    if let Ok(ptr) = alloc_fn.call(&mut addon_instance.store, event_json.len() as i32) {
+                    if let Ok(ptr) =
+                        alloc_fn.call(&mut addon_instance.store, event_json.len() as i32)
+                    {
                         // CR-004: Sprawdz poprawnosc wskaznika
                         if ptr < 0 {
                             warn!("alloc() zwrocil niepoprawny wskaznik dla eventu: {}", ptr);
                             continue;
                         }
-                        if let Some(memory) = addon_instance.instance.get_memory(&mut addon_instance.store, "memory") {
+                        if let Some(memory) = addon_instance
+                            .instance
+                            .get_memory(&mut addon_instance.store, "memory")
+                        {
                             let mem = memory.data_mut(&mut addon_instance.store);
                             // CR-005: Sprawdz granice z checked_add
                             let end = match (ptr as usize).checked_add(event_json.len()) {
                                 Some(e) if e <= mem.len() => e,
                                 _ => {
-                                    warn!("Event buffer wykracza poza pamiec guest dla '{}'", addon_id);
+                                    warn!(
+                                        "Event buffer wykracza poza pamiec guest dla '{}'",
+                                        addon_id
+                                    );
                                     continue;
                                 }
                             };
                             mem[ptr as usize..end].copy_from_slice(&event_json);
-                            if let Err(e) = on_event.call(&mut addon_instance.store, (ptr, event_json.len() as i32)) {
+                            if let Err(e) = on_event
+                                .call(&mut addon_instance.store, (ptr, event_json.len() as i32))
+                            {
                                 warn!("Blad wywolania on_event() dla '{}': {}", addon_id, e);
                             }
                         }
@@ -806,10 +917,7 @@ impl AddonManager {
         {
             let mut instances = self.instances.write();
             for (addon_id, _pos, inst) in extracted {
-                instances
-                    .entry(addon_id)
-                    .or_default()
-                    .push(inst);
+                instances.entry(addon_id).or_default().push(inst);
             }
         }
 
@@ -852,14 +960,17 @@ impl AddonManager {
                 "SELECT wasm_bytes FROM addon_wasm WHERE addon_id = ?1",
                 rusqlite::params![addon_id],
                 |row| row.get(0),
-            ).context(format!("Nie znaleziono WASM dla addonu '{}'", addon_id))?
+            )
+            .context(format!("Nie znaleziono WASM dla addonu '{}'", addon_id))?
         };
 
         // Kompiluj modul
         let module = runtime::compile_module(&self.engine, &wasm_bytes)?;
 
         // Zapisz w cache
-        self.compiled_modules.write().insert(addon_id.to_string(), module.clone());
+        self.compiled_modules
+            .write()
+            .insert(addon_id.to_string(), module.clone());
 
         Ok(module)
     }
@@ -867,28 +978,39 @@ impl AddonManager {
     /// Laduje manifest addonu z DB (z kolumny manifest_json)
     fn load_addon_manifest(&self, addon_id: &str) -> Result<AddonManifest> {
         let conn = self.db.lock().unwrap();
-        let manifest_content: String = conn.query_row(
-            "SELECT manifest_json FROM addons WHERE addon_id = ?1",
-            rusqlite::params![addon_id],
-            |row| row.get(0),
-        ).context(format!("Nie znaleziono manifestu dla addonu '{}'", addon_id))?;
+        let manifest_content: String = conn
+            .query_row(
+                "SELECT manifest_json FROM addons WHERE addon_id = ?1",
+                rusqlite::params![addon_id],
+                |row| row.get(0),
+            )
+            .context(format!(
+                "Nie znaleziono manifestu dla addonu '{}'",
+                addon_id
+            ))?;
 
-        lifecycle::parse_manifest_toml(&manifest_content)
-            .context(format!("Nie udalo sie sparsowac manifestu addonu '{}'", addon_id))
+        lifecycle::parse_manifest_toml(&manifest_content).context(format!(
+            "Nie udalo sie sparsowac manifestu addonu '{}'",
+            addon_id
+        ))
     }
 
-    /// Laduje uprawnienia addonu z DB
+    /// Zwraca kategorie uprawnien (prefix przed kropka) deklarowane przez addon.
+    /// Host functions przy `check_permission` podaja kategorie (np. "storage",
+    /// "http", "llm"), a permission id w manifescie ma forme "kategoria.akcja"
+    /// (np. "storage.read"). Tutaj wyciagamy deduplikowany zbior kategorii z
+    /// manifestu — jedyne zrodlo prawdy.
     fn load_addon_permissions(&self, addon_id: &str) -> Result<Vec<String>> {
-        let conn = self.db.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT permission_type FROM addon_declared_permissions WHERE addon_id = ?1"
-        )?;
-        let permissions: Vec<String> = stmt.query_map(
-            rusqlite::params![addon_id],
-            |row| row.get(0),
-        )?.filter_map(|r| r.ok()).collect();
-
-        Ok(permissions)
+        let manifest = self.load_addon_manifest(addon_id)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(manifest.declared_permissions.len());
+        for perm in &manifest.declared_permissions {
+            let category = perm.id.split('.').next().unwrap_or(perm.id.as_str());
+            if seen.insert(category.to_string()) {
+                out.push(category.to_string());
+            }
+        }
+        Ok(out)
     }
 
     /// Rejestruje narzedzia z manifestu addonu
@@ -918,7 +1040,11 @@ impl AddonManager {
         resource_id: Option<&str>,
         error_message: Option<&str>,
     ) {
-        let result_str = if error_message.is_some() { "error" } else { "ok" };
+        let result_str = if error_message.is_some() {
+            "error"
+        } else {
+            "ok"
+        };
         let action_hash = fnv1a_hash(action);
 
         if let Ok(conn) = self.db.lock() {
@@ -931,18 +1057,22 @@ impl AddonManager {
     }
 
     /// Aliasy STT/TTS powiazane z addonem teams-bot
-    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 2] = [
-        ("teams-stt", "whisper-1"),
-        ("teams-tts", "tts-1"),
-    ];
+    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 2] =
+        [("teams-stt", "whisper-1"), ("teams-tts", "tts-1")];
 
     /// Tworzy lub reaktywuje aliasy teams-stt / teams-tts i odswieza cache routera
     fn activate_teams_aliases(&self) {
         for (alias, default_target) in &Self::TEAMS_BOT_ALIASES {
             if let Err(e) = crate::db::repository::create_or_reactivate_model_alias(
-                &self.db, alias, default_target, "first_available",
+                &self.db,
+                alias,
+                default_target,
+                "first_available",
             ) {
-                warn!("Nie udalo sie utworzyc/reaktywowac aliasu '{}': {}", alias, e);
+                warn!(
+                    "Nie udalo sie utworzyc/reaktywowac aliasu '{}': {}",
+                    alias, e
+                );
             }
         }
         self.reload_router_alias_cache();

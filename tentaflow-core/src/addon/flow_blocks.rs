@@ -120,12 +120,19 @@ pub fn load_blocks_from_addon(addon_id: &str, addon_dir: &Path) -> Result<Vec<Ad
     let blocks_path = addon_dir.join("blocks.json");
 
     if !blocks_path.exists() {
-        debug!("Addon '{}' nie ma pliku blocks.json — brak bloczkow flow", addon_id);
+        debug!(
+            "Addon '{}' nie ma pliku blocks.json — brak bloczkow flow",
+            addon_id
+        );
         return Ok(Vec::new());
     }
 
-    let content = std::fs::read_to_string(&blocks_path)
-        .with_context(|| format!("Nie udalo sie odczytac blocks.json dla addonu '{}'", addon_id))?;
+    let content = std::fs::read_to_string(&blocks_path).with_context(|| {
+        format!(
+            "Nie udalo sie odczytac blocks.json dla addonu '{}'",
+            addon_id
+        )
+    })?;
 
     parse_blocks_json(addon_id, &content)
 }
@@ -166,7 +173,8 @@ pub fn parse_blocks_json(addon_id: &str, json_content: &str) -> Result<Vec<Addon
 
     info!(
         "Zaladowano {} bloczkow flow z addonu '{}'",
-        blocks.len(), addon_id
+        blocks.len(),
+        addon_id
     );
 
     Ok(blocks)
@@ -185,37 +193,45 @@ fn parse_ports(
         legacy_format
     };
 
-    source.iter().filter_map(|val| {
-        match val {
-            // Nowy format: obiekt z polami name, type, required
-            Value::Object(obj) => {
-                let name = obj.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unnamed")
-                    .to_string();
-                let port_type = obj.get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("any")
-                    .to_string();
-                let required = obj.get("required")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(is_input);
-                Some(BlockPort { name, port_type, required })
-            }
-            // Legacy format: sam string z nazwa portu
-            Value::String(name) => {
-                Some(BlockPort {
+    source
+        .iter()
+        .filter_map(|val| {
+            match val {
+                // Nowy format: obiekt z polami name, type, required
+                Value::Object(obj) => {
+                    let name = obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unnamed")
+                        .to_string();
+                    let port_type = obj
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("any")
+                        .to_string();
+                    let required = obj
+                        .get("required")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(is_input);
+                    Some(BlockPort {
+                        name,
+                        port_type,
+                        required,
+                    })
+                }
+                // Legacy format: sam string z nazwa portu
+                Value::String(name) => Some(BlockPort {
                     name: name.clone(),
                     port_type: "any".to_string(),
                     required: is_input,
-                })
+                }),
+                _ => {
+                    warn!("Nieobslugiwany format portu: {:?}", val);
+                    None
+                }
             }
-            _ => {
-                warn!("Nieobslugiwany format portu: {:?}", val);
-                None
-            }
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -247,7 +263,10 @@ impl AddonFlowRegistry {
         let count = blocks.len();
         all_blocks.extend(blocks);
 
-        info!("Zarejestrowano {} bloczkow flow z addonu '{}'", count, addon_id);
+        info!(
+            "Zarejestrowano {} bloczkow flow z addonu '{}'",
+            count, addon_id
+        );
     }
 
     /// Wyrejestrowuje wszystkie bloczki addonu
@@ -257,7 +276,10 @@ impl AddonFlowRegistry {
         blocks.retain(|b| b.addon_id != addon_id);
         let removed = before - blocks.len();
         if removed > 0 {
-            info!("Wyrejestrowano {} bloczkow flow addonu '{}'", removed, addon_id);
+            info!(
+                "Wyrejestrowano {} bloczkow flow addonu '{}'",
+                removed, addon_id
+            );
         }
     }
 
@@ -268,7 +290,8 @@ impl AddonFlowRegistry {
 
     /// Zwraca bloczki z konkretnego addonu
     pub fn list_blocks_for_addon(&self, addon_id: &str) -> Vec<AddonFlowBlock> {
-        self.blocks.read()
+        self.blocks
+            .read()
             .iter()
             .filter(|b| b.addon_id == addon_id)
             .cloned()
@@ -277,7 +300,8 @@ impl AddonFlowRegistry {
 
     /// Znajduje bloczek po pelnym typie (np. "addon.teams.send_message")
     pub fn find_block(&self, block_type: &str) -> Option<AddonFlowBlock> {
-        self.blocks.read()
+        self.blocks
+            .read()
             .iter()
             .find(|b| b.block_type == block_type)
             .cloned()
@@ -286,9 +310,11 @@ impl AddonFlowRegistry {
     /// Zwraca bloczki pogrupowane po kategorii (dla UI flow builder)
     pub fn blocks_by_category(&self) -> std::collections::HashMap<String, Vec<AddonFlowBlock>> {
         let blocks = self.blocks.read();
-        let mut groups: std::collections::HashMap<String, Vec<AddonFlowBlock>> = std::collections::HashMap::new();
+        let mut groups: std::collections::HashMap<String, Vec<AddonFlowBlock>> =
+            std::collections::HashMap::new();
         for block in blocks.iter() {
-            groups.entry(block.category.clone())
+            groups
+                .entry(block.category.clone())
                 .or_default()
                 .push(block.clone());
         }
@@ -298,26 +324,29 @@ impl AddonFlowRegistry {
     /// Serializuje bloczki do formatu JSON dla frontendu flow builder
     pub fn to_flow_builder_json(&self) -> serde_json::Value {
         let blocks = self.blocks.read();
-        let json_blocks: Vec<Value> = blocks.iter().map(|b| {
-            serde_json::json!({
-                "type": b.block_type,
-                "addon_id": b.addon_id,
-                "category": b.category,
-                "label": b.label,
-                "description": b.description,
-                "icon": b.icon,
-                "inputs": b.inputs.iter().map(|p| serde_json::json!({
-                    "name": p.name,
-                    "type": p.port_type,
-                    "required": p.required,
-                })).collect::<Vec<_>>(),
-                "outputs": b.outputs.iter().map(|p| serde_json::json!({
-                    "name": p.name,
-                    "type": p.port_type,
-                })).collect::<Vec<_>>(),
-                "config_schema": b.config_schema,
+        let json_blocks: Vec<Value> = blocks
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "type": b.block_type,
+                    "addon_id": b.addon_id,
+                    "category": b.category,
+                    "label": b.label,
+                    "description": b.description,
+                    "icon": b.icon,
+                    "inputs": b.inputs.iter().map(|p| serde_json::json!({
+                        "name": p.name,
+                        "type": p.port_type,
+                        "required": p.required,
+                    })).collect::<Vec<_>>(),
+                    "outputs": b.outputs.iter().map(|p| serde_json::json!({
+                        "name": p.name,
+                        "type": p.port_type,
+                    })).collect::<Vec<_>>(),
+                    "config_schema": b.config_schema,
+                })
             })
-        }).collect();
+            .collect();
 
         serde_json::json!({
             "addon_blocks": json_blocks
@@ -344,10 +373,7 @@ pub struct AddonNodeAdapter {
 
 impl AddonNodeAdapter {
     /// Tworzy nowy adapter
-    pub fn new(
-        addon_manager: Arc<AddonManager>,
-        flow_registry: Arc<AddonFlowRegistry>,
-    ) -> Self {
+    pub fn new(addon_manager: Arc<AddonManager>, flow_registry: Arc<AddonFlowRegistry>) -> Self {
         Self {
             addon_manager,
             flow_registry,
@@ -371,31 +397,30 @@ impl NodeAdapter for AddonNodeAdapter {
     /// 3. Przygotuj parametry z konfiguracji wezla i kontekstu flow
     /// 4. Wywolaj addon przez AddonManager
     /// 5. Zapisz wynik w kontekscie flow
-    async fn execute(
-        &self,
-        node_config: &Value,
-        ctx: &mut FlowContext,
-    ) -> Result<Value> {
+    async fn execute(&self, node_config: &Value, ctx: &mut FlowContext) -> Result<Value> {
         // Pobierz typ wezla z konfiguracji
-        let node_type = node_config.get("_node_type")
+        let node_type = node_config
+            .get("_node_type")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Brak _node_type w konfiguracji wezla addon"))?;
 
-        let (addon_id, block_type) = Self::parse_addon_node_type(node_type)
-            .ok_or_else(|| anyhow::anyhow!(
+        let (addon_id, block_type) = Self::parse_addon_node_type(node_type).ok_or_else(|| {
+            anyhow::anyhow!(
                 "Niepoprawny typ wezla addon: '{}'. Oczekiwany format: 'addon.addon_id.block_type'",
                 node_type
-            ))?;
+            )
+        })?;
 
         info!("Wykonanie bloczka addon: {}.{}", addon_id, block_type);
 
         // Sprawdz czy bloczek jest zarejestrowany
         let full_type = format!("addon.{}.{}", addon_id, block_type);
-        let _block_def = self.flow_registry.find_block(&full_type)
-            .ok_or_else(|| anyhow::anyhow!(
+        let _block_def = self.flow_registry.find_block(&full_type).ok_or_else(|| {
+            anyhow::anyhow!(
                 "Bloczek '{}' nie jest zarejestrowany w flow registry",
                 full_type
-            ))?;
+            )
+        })?;
 
         // Przygotuj parametry — polacz config wezla z danymi wejsciowymi z flow
         let mut params = node_config.clone();
@@ -418,18 +443,24 @@ impl NodeAdapter for AddonNodeAdapter {
         }
 
         // User ID — uzywamy 0 jesli brak (systemowe wywolanie)
-        let user_id: i64 = ctx.variables.get("user_id")
+        let user_id: i64 = ctx
+            .variables
+            .get("user_id")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
 
         // Wywolaj addon
-        let result = self.addon_manager.call_tool(addon_id, block_type, params, user_id)
-            .with_context(|| format!(
-                "Blad wywolania bloczka addon '{}.{}'",
-                addon_id, block_type
-            ))?;
+        let result = self
+            .addon_manager
+            .call_tool(addon_id, block_type, params, user_id)
+            .with_context(|| {
+                format!("Blad wywolania bloczka addon '{}.{}'", addon_id, block_type)
+            })?;
 
-        debug!("Bloczek addon '{}.{}' zakonczony pomyslnie", addon_id, block_type);
+        debug!(
+            "Bloczek addon '{}.{}' zakonczony pomyslnie",
+            addon_id, block_type
+        );
 
         Ok(result)
     }
@@ -525,38 +556,30 @@ mod tests {
             AddonNodeAdapter::parse_addon_node_type("addon.my_addon.do_thing"),
             Some(("my_addon", "do_thing"))
         );
-        assert_eq!(
-            AddonNodeAdapter::parse_addon_node_type("llm"),
-            None
-        );
-        assert_eq!(
-            AddonNodeAdapter::parse_addon_node_type("addon."),
-            None
-        );
+        assert_eq!(AddonNodeAdapter::parse_addon_node_type("llm"), None);
+        assert_eq!(AddonNodeAdapter::parse_addon_node_type("addon."), None);
     }
 
     #[test]
     fn test_addon_flow_registry() {
         let registry = AddonFlowRegistry::new();
 
-        let blocks = vec![
-            AddonFlowBlock {
-                block_type: "addon.test.hello".to_string(),
-                addon_id: "test".to_string(),
-                original_type: "hello".to_string(),
-                category: "utility".to_string(),
-                label: "Hello".to_string(),
-                description: "Test".to_string(),
-                icon: None,
-                inputs: vec![],
-                outputs: vec![BlockPort {
-                    name: "msg".to_string(),
-                    port_type: "string".to_string(),
-                    required: false,
-                }],
-                config_schema: serde_json::json!({}),
-            },
-        ];
+        let blocks = vec![AddonFlowBlock {
+            block_type: "addon.test.hello".to_string(),
+            addon_id: "test".to_string(),
+            original_type: "hello".to_string(),
+            category: "utility".to_string(),
+            label: "Hello".to_string(),
+            description: "Test".to_string(),
+            icon: None,
+            inputs: vec![],
+            outputs: vec![BlockPort {
+                name: "msg".to_string(),
+                port_type: "string".to_string(),
+                required: false,
+            }],
+            config_schema: serde_json::json!({}),
+        }];
 
         registry.register_addon_blocks("test", blocks);
 

@@ -68,15 +68,50 @@ function ensureToastContainer() {
   return toastContainer;
 }
 
+// Dedupe: identyczne komunikaty w oknie 6s sa mergowane — istniejacy toast
+// dostaje odnowiony timer oraz licznik "× N" zamiast tworzyc nowy. Bez tego
+// przy rozlaczeniu serwera dostajemy sciane 50+ toastow "Failed to fetch".
+const activeToasts = new Map(); // key = `${kind}|${message}` → { el, count, hideTimer, removeTimer }
+
 export function toast(message, kind = 'info', timeoutMs = 4000) {
   const cn = ensureToastContainer();
+  const key = `${kind}|${message}`;
+  const existing = activeToasts.get(key);
+
+  if (existing) {
+    existing.count += 1;
+    const cntEl = existing.el.querySelector('.toast-count');
+    if (cntEl) cntEl.textContent = `× ${existing.count}`;
+    else {
+      const span = document.createElement('span');
+      span.className = 'toast-count';
+      span.style.cssText = 'margin-left:8px;opacity:0.7;font-size:11px;font-weight:700;';
+      span.textContent = `× ${existing.count}`;
+      existing.el.appendChild(span);
+    }
+    // Odnow timery
+    if (existing.hideTimer) clearTimeout(existing.hideTimer);
+    if (existing.removeTimer) clearTimeout(existing.removeTimer);
+    scheduleHide(existing, key, timeoutMs);
+    return;
+  }
+
   const t = document.createElement('div');
   t.className = `toast toast-${kind}`;
   t.textContent = message;
   cn.appendChild(t);
-  setTimeout(() => {
-    t.style.opacity = '0';
-    setTimeout(() => t.remove(), 200);
+  const entry = { el: t, count: 1, hideTimer: null, removeTimer: null };
+  activeToasts.set(key, entry);
+  scheduleHide(entry, key, timeoutMs);
+}
+
+function scheduleHide(entry, key, timeoutMs) {
+  entry.hideTimer = setTimeout(() => {
+    entry.el.style.opacity = '0';
+    entry.removeTimer = setTimeout(() => {
+      entry.el.remove();
+      activeToasts.delete(key);
+    }, 200);
   }, timeoutMs);
 }
 
@@ -121,6 +156,24 @@ export async function apiPost(path, body) {
   return ct.includes('application/json') ? resp.json() : resp.text();
 }
 
+/// REST PUT z JSON body i JWT.
+export async function apiPut(path, body) {
+  const jwt = localStorage.getItem(JWT_STORAGE_KEY);
+  const headers = { 'Content-Type': 'application/json' };
+  if (jwt) headers.Authorization = `Bearer ${jwt}`;
+  const resp = await fetch(path, {
+    method: 'PUT',
+    headers,
+    body: body != null ? JSON.stringify(body) : undefined,
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`${resp.status} ${resp.statusText}${text ? `: ${text}` : ''}`);
+  }
+  const ct = resp.headers.get('content-type') || '';
+  return ct.includes('application/json') ? resp.json() : resp.text();
+}
+
 /// REST DELETE.
 export async function apiDelete(path) {
   const jwt = localStorage.getItem(JWT_STORAGE_KEY);
@@ -153,4 +206,33 @@ export function formatMb(mb) {
   if (mb == null) return '—';
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
   return `${Math.round(mb)} MB`;
+}
+
+// Guard used to distinguish local-origin mutations from remote ones.
+// When a handler applies an optimistic update and fires a request, the
+// server typically broadcasts an event back. Without a guard the listener
+// would reload the whole view for an update we already applied. Call
+// markLocal(key) at the moment of the local change; the echo arriving
+// within windowMs is ignored by isOwnEcho(key).
+export function createEchoGuard(windowMs = 1500) {
+  const record = new Map();
+  return {
+    markLocal(key) {
+      record.set(String(key), Date.now() + windowMs);
+    },
+    isOwnEcho(key) {
+      const k = String(key);
+      const exp = record.get(k);
+      if (exp == null) return false;
+      if (Date.now() > exp) {
+        record.delete(k);
+        return false;
+      }
+      record.delete(k);
+      return true;
+    },
+    clear() {
+      record.clear();
+    },
+  };
 }

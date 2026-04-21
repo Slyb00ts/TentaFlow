@@ -62,9 +62,8 @@ pub struct ibv_context_ops {
     pub bind_mw: *mut c_void,
     pub dealloc_mw: *mut c_void,
     pub _compat_create_cq: *mut c_void,
-    pub poll_cq: Option<
-        unsafe extern "C" fn(cq: *mut ibv_cq, num_entries: c_int, wc: *mut ibv_wc) -> c_int,
-    >,
+    pub poll_cq:
+        Option<unsafe extern "C" fn(cq: *mut ibv_cq, num_entries: c_int, wc: *mut ibv_wc) -> c_int>,
     pub req_notify_cq: *mut c_void,
     pub _compat_cq_event: *mut c_void,
     pub _compat_resize_cq: *mut c_void,
@@ -143,9 +142,9 @@ pub struct ibv_qp {
     pub srq: *mut ibv_srq,
     pub handle: u32,
     pub qp_num: u32,
-    pub state: c_uint,   // ibv_qp_state
+    pub state: c_uint, // ibv_qp_state
     pub qp_type: c_uint, // ibv_qp_type
-    // pthread_mutex_t, cond, events_completed — pomijamy
+                       // pthread_mutex_t, cond, events_completed — pomijamy
 }
 
 // =============================================================================
@@ -169,9 +168,9 @@ pub struct ibv_mr {
 
 #[repr(C)]
 pub struct ibv_port_attr {
-    pub state: c_uint,       // ibv_port_state
-    pub max_mtu: c_uint,     // ibv_mtu
-    pub active_mtu: c_uint,  // ibv_mtu
+    pub state: c_uint,      // ibv_port_state
+    pub max_mtu: c_uint,    // ibv_mtu
+    pub active_mtu: c_uint, // ibv_mtu
     pub gid_tbl_len: c_int,
     pub port_cap_flags: u32,
     pub max_msg_sz: u32,
