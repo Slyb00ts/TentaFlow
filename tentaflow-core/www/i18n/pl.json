@@ -1125,6 +1125,7 @@
     "pending_pairings": "Oczekujące parowania",
     "confirm_pin_title": "Potwierdź parowanie",
     "confirm_pin_hint": "Wpisz PIN wyświetlony na nodzie, który wysłał żądanie",
+    "pair_pin_label": "PIN (6 cyfr)",
     "cpu_temp": "Temperatura CPU",
     "swap": "Swap",
     "gpu_usage": "Użycie GPU",
