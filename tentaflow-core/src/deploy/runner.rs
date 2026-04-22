@@ -201,15 +201,18 @@ async fn do_docker_deploy(
         &format!("rozpakowywanie bundle kontenerów → {}", context_path),
     );
 
-    // Rozpakuj tar.gz z bundle (wbudowany w binarce) do tmpdir.
+    // Rozpakuj tar.gz z bundle (wbudowany w binarce) do tmpdir. Bundle zawiera
+    // katalog `tentaflow-containers/` na najwyższym poziomie — `context_path`
+    // z manifestu jest względem niego, więc dokleiamy prefix.
     let workdir = tempfile::tempdir().context("tmpdir dla kontekstu build")?;
     crate::deploy::extract_to(workdir.path()).context("extract container bundle")?;
-    let dockerfile_rel = format!("{}/Dockerfile", context_path);
+    let dockerfile_rel = format!("tentaflow-containers/{}/Dockerfile", context_path);
     let dockerfile_abs = workdir.path().join(&dockerfile_rel);
     if !dockerfile_abs.exists() {
         return Err(anyhow!(
-            "Dockerfile nie znaleziony w bundle: {}",
-            dockerfile_rel
+            "Dockerfile nie znaleziony w bundle: {} (cwd={})",
+            dockerfile_rel,
+            workdir.path().display()
         ));
     }
 
