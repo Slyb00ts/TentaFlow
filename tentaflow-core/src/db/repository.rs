@@ -2050,12 +2050,29 @@ fn row_to_user_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserAccount>
         last_login_at: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        role: row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "user".to_string()),
     })
 }
 
 const USER_ACCOUNT_COLS: &str =
     "id, username, password_hash, display_name, email, is_active, is_admin, must_change_password, \
-     sso_provider, sso_subject, last_login_at, created_at, updated_at";
+     sso_provider, sso_subject, last_login_at, created_at, updated_at, role";
+
+/// Ustaw role usera. Akceptuje tylko 'user' | 'power_user' | 'admin'.
+/// is_admin jest synchronizowany automatycznie (role='admin' → is_admin=1).
+pub fn set_user_role(pool: &DbPool, user_id: i64, role: &str) -> Result<()> {
+    let role = match role {
+        "user" | "power_user" | "admin" => role,
+        _ => anyhow::bail!("Nieprawidlowa rola: {}", role),
+    };
+    let is_admin = role == "admin";
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE user_accounts SET role = ?1, is_admin = ?2, updated_at = datetime('now') WHERE id = ?3",
+        rusqlite::params![role, is_admin, user_id],
+    )?;
+    Ok(())
+}
 
 /// Tworzy nowego uzytkownika w tabeli user_accounts.
 /// Zwraca ID nowo utworzonego wiersza.
@@ -2249,6 +2266,51 @@ pub fn get_user_groups(pool: &DbPool, user_id: i64) -> Result<Vec<UserGroup>> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Aktualizuje nazwe i opis grupy.
+pub fn update_group(pool: &DbPool, id: i64, name: &str, description: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE user_groups SET name = ?1, description = ?2 WHERE id = ?3",
+        rusqlite::params![name, description, id],
+    )?;
+    Ok(())
+}
+
+/// Lista czlonkow grupy (user accounts).
+pub fn list_group_members(pool: &DbPool, group_id: i64) -> Result<Vec<UserAccount>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM user_accounts u \
+         JOIN group_members gm ON u.id = gm.user_id \
+         WHERE gm.group_id = ?1 ORDER BY u.id",
+        USER_ACCOUNT_COLS
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![group_id], row_to_user_account)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Pobiera grupe po id.
+pub fn get_group_by_id(pool: &DbPool, id: i64) -> Result<Option<UserGroup>> {
+    let conn = acquire(pool)?;
+    let result = conn
+        .query_row(
+            "SELECT id, name, description, created_at FROM user_groups WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                Ok(UserGroup {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
 }
 
 /// Usuwa grupe uzytkownikow (kaskadowo czlonkostwa).
@@ -8056,6 +8118,186 @@ pub mod deployments {
             [],
         )?;
         Ok(n as u32)
+    }
+}
+
+pub mod resource_permissions {
+    // =========================================================================
+    // resource_permissions — generyczna ACL dla modeli/flowow/addonow.
+    // Priorytet: user_deny > user_allow > group_deny > group_allow > default_allow.
+    // =========================================================================
+
+    use crate::db::DbPool;
+    use anyhow::Result;
+
+    #[derive(Debug, Clone)]
+    pub struct ResourcePermission {
+        pub id: i64,
+        pub resource_type: String,
+        pub resource_id: String,
+        pub subject_type: String, // "user" | "group"
+        pub subject_id: i64,
+        pub access_level: String, // "allow" | "deny"
+    }
+
+    /// Upsert permission — INSERT albo UPDATE gdy (type,id,subj,sid) istnieje.
+    pub fn set(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: i64,
+        access_level: &str,
+    ) -> Result<()> {
+        if !matches!(access_level, "allow" | "deny") {
+            anyhow::bail!("access_level must be 'allow' or 'deny'");
+        }
+        if !matches!(subject_type, "user" | "group") {
+            anyhow::bail!("subject_type must be 'user' or 'group'");
+        }
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO resource_permissions
+                (resource_type, resource_id, subject_type, subject_id, access_level)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(resource_type, resource_id, subject_type, subject_id)
+             DO UPDATE SET access_level = excluded.access_level",
+            rusqlite::params![resource_type, resource_id, subject_type, subject_id, access_level],
+        )?;
+        Ok(())
+    }
+
+    /// Usun wpis (reset do default-allow).
+    pub fn clear(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: i64,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "DELETE FROM resource_permissions
+             WHERE resource_type = ?1 AND resource_id = ?2
+               AND subject_type = ?3 AND subject_id = ?4",
+            rusqlite::params![resource_type, resource_id, subject_type, subject_id],
+        )?;
+        Ok(())
+    }
+
+    /// Lista wszystkich wpisow dla konkretnego zasobu — dla UI
+    /// "kto ma jaki dostep do gpt-4o".
+    pub fn list_for_resource(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<Vec<ResourcePermission>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
+             FROM resource_permissions
+             WHERE resource_type = ?1 AND resource_id = ?2
+             ORDER BY subject_type, subject_id",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![resource_type, resource_id], |row| {
+                Ok(ResourcePermission {
+                    id: row.get(0)?,
+                    resource_type: row.get(1)?,
+                    resource_id: row.get(2)?,
+                    subject_type: row.get(3)?,
+                    subject_id: row.get(4)?,
+                    access_level: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Lista wszystkich wpisow dla user/group — dla UI "co user X ma zabronione".
+    pub fn list_for_subject(
+        pool: &DbPool,
+        subject_type: &str,
+        subject_id: i64,
+    ) -> Result<Vec<ResourcePermission>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, resource_type, resource_id, subject_type, subject_id, access_level
+             FROM resource_permissions
+             WHERE subject_type = ?1 AND subject_id = ?2
+             ORDER BY resource_type, resource_id",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![subject_type, subject_id], |row| {
+                Ok(ResourcePermission {
+                    id: row.get(0)?,
+                    resource_type: row.get(1)?,
+                    resource_id: row.get(2)?,
+                    subject_type: row.get(3)?,
+                    subject_id: row.get(4)?,
+                    access_level: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Sprawdza czy user ma dostep do zasobu. Priorytet:
+    /// 1. Admin rola → zawsze allow.
+    /// 2. Explicit user-level deny → deny.
+    /// 3. Explicit user-level allow → allow.
+    /// 4. Any group-level deny dla grup usera → deny.
+    /// 5. Any group-level allow → allow.
+    /// 6. Default: allow (public by default).
+    pub fn check(
+        pool: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+        user_id: i64,
+        user_role: &str,
+    ) -> Result<bool> {
+        // 1. Admin zawsze moze.
+        if user_role == "admin" {
+            return Ok(true);
+        }
+
+        let conn = pool.lock().unwrap();
+
+        // 2. + 3. User-level override.
+        let user_level: Option<String> = conn
+            .query_row(
+                "SELECT access_level FROM resource_permissions
+                 WHERE resource_type = ?1 AND resource_id = ?2
+                   AND subject_type = 'user' AND subject_id = ?3",
+                rusqlite::params![resource_type, resource_id, user_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(level) = user_level {
+            return Ok(level == "allow");
+        }
+
+        // 4. + 5. Group-level check — any deny wygrywa nad allow.
+        let mut stmt = conn.prepare(
+            "SELECT access_level FROM resource_permissions rp
+             JOIN group_members gm ON rp.subject_id = gm.group_id
+             WHERE rp.resource_type = ?1 AND rp.resource_id = ?2
+               AND rp.subject_type = 'group' AND gm.user_id = ?3",
+        )?;
+        let levels: Vec<String> = stmt
+            .query_map(rusqlite::params![resource_type, resource_id, user_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if levels.iter().any(|l| l == "deny") {
+            return Ok(false);
+        }
+        if levels.iter().any(|l| l == "allow") {
+            return Ok(true);
+        }
+
+        // 6. Default = allow (public by default).
+        Ok(true)
     }
 }
 

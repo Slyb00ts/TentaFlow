@@ -466,7 +466,13 @@ pub struct UserAccount {
     pub last_login_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Rola: "user" | "power_user" | "admin". Migracja 50 doda kolumne,
+    /// is_admin=1 → "admin", reszta → "user". Power user mozna przypisac UI.
+    #[serde(default = "default_role")]
+    pub role: String,
 }
+
+fn default_role() -> String { "user".to_string() }
 
 /// Grupa uzytkownikow
 #[derive(Debug, Clone, Serialize, Deserialize)]
