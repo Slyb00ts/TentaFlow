@@ -793,6 +793,10 @@ pub struct MeshTrustedListResponse {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeshPairingStartRequest {
     pub remote_address: String,
+    /// Opcjonalny PIN z QR — gdy podany, initiate uzywa go zamiast generowac
+    /// losowy. Pozwala nodowi B (skanujacemu) uzyc invite PIN-u nodu A, co
+    /// triggeruje auto-confirm po stronie A bez user-interakcji.
+    pub pin_hint: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]

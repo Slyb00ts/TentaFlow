@@ -1322,7 +1322,12 @@
     "pair_qr_hex_label": "Hex Node ID",
     "pair_qr_pin_label": "PIN (60s gültig)",
     "pair_qr_refresh_in": "Aktualisiert in",
-    "pair_id_hint": "Verwenden Sie dies, wenn mDNS blockiert ist (VLANs, Firewall, WLAN Client-Isolation). Den Hex finden Sie auf dem anderen Node unter Koppeln · QR scannen."
+    "pair_id_hint": "Verwenden Sie dies, wenn mDNS blockiert ist (VLANs, Firewall, WLAN Client-Isolation). Den Hex finden Sie auf dem anderen Node unter Koppeln · QR scannen.",
+    "pair_scan_camera": "Mit Kamera scannen",
+    "qr_scanner_title": "QR-Code scannen",
+    "qr_scanner_hint": "Richten Sie die Kamera auf den QR-Code am anderen Gerät",
+    "qr_scan_invalid": "Dieser QR-Code ist kein gültiger TentaFlow-Code",
+    "qr_scan_failed": "QR-Scan fehlgeschlagen"
   },
   "clusters": {
     "title": "Clusters",

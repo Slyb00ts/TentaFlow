@@ -275,9 +275,19 @@ impl MeshSecurity {
         matches
     }
 
-    /// Zapisuje zaproszenie z lokalnej strony (wygenerowany PIN) i zwraca go
-    /// do wyswietlenia w UI.
+    /// Backward-compat: stary `initiate_pairing` — generuje losowy PIN.
     pub fn initiate_pairing(&self, remote_node_id: &str) -> Result<String> {
+        self.initiate_pairing_with_pin(remote_node_id, "")
+    }
+
+    /// Zapisuje zaproszenie z lokalnej strony (wygenerowany PIN) i zwraca go
+    /// do wyswietlenia w UI. Gdy `pin_hint` niepusty — uzywamy go zamiast
+    /// generowac nowy (flow QR scan: drugi nod ma PIN z QR invite).
+    pub fn initiate_pairing_with_pin(
+        &self,
+        remote_node_id: &str,
+        pin_hint: &str,
+    ) -> Result<String> {
         let pending_count = db::repository::list_pending_pairings(&self.db)?;
         if pending_count.len() > 10 {
             bail!("Zbyt wiele oczekujacych parowan (max 10). Usun lub zatwierdz istniejace.");
@@ -289,7 +299,11 @@ impl MeshSecurity {
 
         self.pin_attempts.write().remove(remote_node_id);
 
-        let pin = Self::generate_pin();
+        let pin = if !pin_hint.is_empty() && pin_hint.len() == 6 && pin_hint.chars().all(|c| c.is_ascii_digit()) {
+            pin_hint.to_string()
+        } else {
+            Self::generate_pin()
+        };
         let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
         let expires_str = expires.format("%Y-%m-%d %H:%M:%S").to_string();
 
