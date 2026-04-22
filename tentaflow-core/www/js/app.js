@@ -163,6 +163,46 @@ async function bootstrap() {
     ApiBinary.clearSession();
     renderLogin();
   }
+
+  // Protocol handler — gdy aplikacja jest zainstalowana jako PWA i user
+  // klika link tentaflow-pair://<hex>?pin=<pin>, przegladarka otwiera nas
+  // z /?pair=<encoded-uri>. Parsujemy query i otwieramy pair flow z
+  // auto-submitem. Sesja uzytkownika musi byc zalogowana.
+  handlePairDeepLink();
+
+  // Service Worker registration — offline cache shell + install prompt.
+  if ('serviceWorker' in navigator && window.location.protocol !== 'file:') {
+    navigator.serviceWorker.register('/sw.js').catch((e) => {
+      console.debug('[app] SW register failed:', e?.message);
+    });
+  }
+}
+
+async function handlePairDeepLink() {
+  const params = new URLSearchParams(window.location.search);
+  const pairRaw = params.get('pair');
+  if (!pairRaw) return;
+  if (!ApiBinary.hasJwt()) return; // musi byc zalogowany
+  try {
+    const qrScanner = await import('/js/modules/qr-scanner.js');
+    const parsed = qrScanner.parsePairUri(decodeURIComponent(pairRaw));
+    if (!parsed) return;
+    // Wywolaj pairing start z pin_hint — backend drugiego noda auto-confirm.
+    const resp = await ApiBinary.action('meshPairingStartRequest', {
+      remoteAddress: parsed.hex,
+      pinHint: parsed.pin || '',
+    });
+    if (resp?.pin) {
+      // Nie musimy nic wyswietlac — auto-confirm po drugiej stronie.
+      console.info('[pair-deep-link] pairing started, PIN sent:', resp.pin);
+    }
+    // Wyczysc query string zeby przy F5 nie robilo sie znowu.
+    const url = new URL(window.location.href);
+    url.searchParams.delete('pair');
+    window.history.replaceState({}, '', url.pathname + url.hash);
+  } catch (e) {
+    console.warn('[pair-deep-link]', e?.message);
+  }
 }
 
 function renderLogin() {

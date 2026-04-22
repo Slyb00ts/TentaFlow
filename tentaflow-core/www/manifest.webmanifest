@@ -1,0 +1,23 @@
+{
+  "name": "TentaFlow",
+  "short_name": "TentaFlow",
+  "description": "TentaFlow — lokalny orkiestrator AI, mesh sieci serwisów LLM/TTS/STT, chat, flows.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#050818",
+  "theme_color": "#6366f1",
+  "lang": "pl",
+  "dir": "ltr",
+  "icons": [
+    { "src": "/tentaflow.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "protocol_handlers": [
+    {
+      "protocol": "web+tentaflow-pair",
+      "url": "/?pair=%s"
+    }
+  ],
+  "categories": ["productivity", "developer-tools", "utilities"]
+}
