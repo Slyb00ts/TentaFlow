@@ -54,6 +54,13 @@ icon = "vllm"                              # OPTIONAL: klucz w CatalogIcons.js
 default_port = 8000                        # REQUIRED: u16 (1..65535)
 api = "openai-compatible"                  # REQUIRED: enum API
 version = "0.6.3"                          # REQUIRED: wersja referencyjna
+# requires_model = true                    # OPTIONAL: czy wizard ma pokazać krok
+                                           # "wybór modelu" (HF/preset). Domyślnie
+                                           # dedukowane z category: llm/stt/tts/
+                                           # embeddings/vision/*-gen → true;
+                                           # agents/tools → false. Jawnie wpisz
+                                           # gdy agent potrzebuje modelu lub LLM
+                                           # nie pobiera (embedded weights).
 
 # Sekcja [deploy.docker] — opcjonalna; jeśli obecna, w wizardzie pojawi się
 # przycisk "Docker".
