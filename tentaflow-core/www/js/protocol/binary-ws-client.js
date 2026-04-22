@@ -48,10 +48,19 @@ export class BinaryWsClient {
     this.onOpen = opts.onOpen ?? noop;
     this.onClose = opts.onClose ?? noop;
     this.onProtocolError = opts.onProtocolError ?? noop;
+    // Nowe callbacki dla connection-overlay i pre-login UX:
+    // onReconnectScheduled({ attempt, delayMs, reason }) — nastepna proba za X ms.
+    // onReconnectAttempt({ attempt }) — faktycznie probujemy teraz.
+    // onDisconnected({ reason }) — transport upadl (moze byc aborted by user).
+    this.onReconnectScheduled = opts.onReconnectScheduled ?? noop;
+    this.onReconnectAttempt = opts.onReconnectAttempt ?? noop;
+    this.onDisconnected = opts.onDisconnected ?? noop;
     // P2c FIX: lista listenerow dla unsolicited frame (kazda screen moze
     // dodac swoj). Stare onUnsolicited (single) zachowane jako shortcut.
     this._unsolicitedListeners = [];
     if (opts.onUnsolicited) this._unsolicitedListeners.push(opts.onUnsolicited);
+    this._reconnectTimer = null;
+    this._lastHeartbeatReplyAt = 0;
   }
 
   /**
@@ -91,8 +100,13 @@ export class BinaryWsClient {
       this.connected = true;
       this.reconnectAttempt = 0;
       this._transportUnsub = this.transport.onMessage((bytes) => this._handleBytes(bytes));
+      // Podpinaj onClose — kiedy transport padnie, natychmiast reconnect.
+      if (this.transport.onClose) {
+        this._transportCloseUnsub = this.transport.onClose((info) => this._onTransportClose(info));
+      }
       console.info(`[ws] transport: ${this.transport.kind}`);
       await this._handshake();
+      this._lastHeartbeatReplyAt = Date.now();
       this._startHeartbeat();
       this._drainOutbox();
       this.onOpen();
@@ -100,8 +114,35 @@ export class BinaryWsClient {
       this.connected = false;
       if (this.transport) this.transport.close();
       this.transport = null;
+      // W razie bledu na starcie — schedule reconnect jesli nie zostal explicite
+      // zamkniety przez close().
+      if (!this.closed) {
+        this.onDisconnected({ reason: String(err?.message ?? err) });
+        this._scheduleReconnect(String(err?.message ?? err));
+      }
       throw err;
     }
+  }
+
+  /**
+   * Wywolywany gdy transport.onClose wypali — zaplanuj reconnect
+   * (chyba ze client zostal zamkniety rescznie przez close()).
+   */
+  _onTransportClose(info) {
+    if (this.closed) return;
+    if (!this.connected && !this.transport) return;
+    console.warn('[ws] transport closed:', info);
+    this.connected = false;
+    this._stopHeartbeat();
+    this._rejectAllPending(new Error(`transport closed: ${info?.reason ?? 'unknown'}`));
+    if (this._transportUnsub) this._transportUnsub();
+    if (this._transportCloseUnsub) this._transportCloseUnsub();
+    this.transport = null;
+    this.onDisconnected({ reason: info?.reason ?? 'unknown', code: info?.code });
+    this.onClose(info);
+    // Reset sequence — serwer po reconnect traktuje polaczenie jako nowe.
+    this.nextSequence = 1n;
+    this._scheduleReconnect(info?.reason ?? 'closed');
   }
 
   /**
@@ -110,9 +151,33 @@ export class BinaryWsClient {
   close() {
     this.closed = true;
     this._stopHeartbeat();
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this._transportUnsub) this._transportUnsub();
+    if (this._transportCloseUnsub) this._transportCloseUnsub();
     if (this.transport) this.transport.close();
     this.transport = null;
+    this.connected = false;
+  }
+
+  /**
+   * Force-close + natychmiastowy reconnect. Uzywane przez "Spróbuj teraz" button
+   * w connection-overlay — przerywa backoff i proboxuje od zera.
+   */
+  reconnectNow() {
+    if (this.closed) return;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+    this.reconnectAttempt = 0;
+    if (this.transport) {
+      try { this.transport.close(); } catch { /* ignore */ }
+      this.transport = null;
+    }
+    this.connect().catch((e) => console.warn('[ws] manual reconnect failed:', e?.message));
   }
 
   /**
@@ -287,14 +352,24 @@ export class BinaryWsClient {
     this.pending.clear();
   }
 
-  _scheduleReconnect() {
+  _scheduleReconnect(reason) {
+    if (this.closed) return;
+    if (this._reconnectTimer) return; // juz zaplanowany
     const delay = Math.min(
       RECONNECT_BASE_MS * 2 ** this.reconnectAttempt,
       RECONNECT_MAX_MS,
     );
-    this.reconnectAttempt += 1;
-    setTimeout(() => {
-      if (!this.closed) this.connect().catch(() => {});
+    const attempt = this.reconnectAttempt + 1;
+    this.reconnectAttempt = attempt;
+    this.onReconnectScheduled({ attempt, delayMs: delay, reason });
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      if (this.closed) return;
+      this.onReconnectAttempt({ attempt });
+      this.connect().catch((err) => {
+        // Reconnect nieudany — connect() samo zaplanuje kolejny.
+        console.debug('[ws] reconnect attempt failed:', err?.message);
+      });
     }, delay);
   }
 }

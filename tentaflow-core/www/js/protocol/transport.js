@@ -60,7 +60,16 @@ async function openWebTransport(baseUrl, jwtToken) {
   await wt.ready;
 
   const listeners = new Set();
+  const closeListeners = new Set();
   let closed = false;
+
+  const fireClose = (reason) => {
+    if (closed) return;
+    closed = true;
+    for (const cb of closeListeners) {
+      try { cb(reason); } catch (e) { console.error('[transport] close listener threw:', e); }
+    }
+  };
 
   // Incoming unidirectional streams — tutaj serwer wysyla event/response frames.
   (async () => {
@@ -79,10 +88,13 @@ async function openWebTransport(baseUrl, jwtToken) {
         }
       }
     }
+    fireClose({ code: 0, reason: 'stream ended' });
   })();
 
-  wt.closed.then(() => {
-    closed = true;
+  wt.closed.then((info) => {
+    fireClose({ code: info?.closeCode ?? 0, reason: info?.reason ?? 'wt closed' });
+  }).catch((err) => {
+    fireClose({ code: -1, reason: String(err?.message ?? err) });
   });
 
   return {
@@ -97,12 +109,16 @@ async function openWebTransport(baseUrl, jwtToken) {
       listeners.add(cb);
       return () => listeners.delete(cb);
     },
+    onClose(cb) {
+      closeListeners.add(cb);
+      return () => closeListeners.delete(cb);
+    },
     close() {
+      if (closed) return;
       closed = true;
-      try {
-        wt.close();
-      } catch {
-        // ignore
+      try { wt.close(); } catch { /* ignore */ }
+      for (const cb of closeListeners) {
+        try { cb({ code: 1000, reason: 'client close' }); } catch { /* ignore */ }
       }
     },
     isOpen() {
@@ -145,10 +161,12 @@ async function openWebSocket(baseUrl, jwtToken) {
 
   await new Promise((resolve, reject) => {
     ws.onopen = () => resolve();
-    ws.onerror = (e) => reject(new Error('WebSocket connection failed'));
+    ws.onerror = (_e) => reject(new Error('WebSocket connection failed'));
   });
 
   const listeners = new Set();
+  const closeListeners = new Set();
+  let localClosed = false;
 
   ws.onmessage = (evt) => {
     const bytes = new Uint8Array(evt.data);
@@ -161,6 +179,23 @@ async function openWebSocket(baseUrl, jwtToken) {
     }
   };
 
+  // Propaguj close do warstwy wyzszej — binary-ws-client uzywa tego do reconnectu.
+  ws.onclose = (evt) => {
+    const info = {
+      code: evt?.code ?? 1006,
+      reason: evt?.reason || 'ws closed',
+      wasClean: !!evt?.wasClean,
+      local: localClosed,
+    };
+    for (const cb of closeListeners) {
+      try { cb(info); } catch (e) { console.error('[transport] close listener threw:', e); }
+    }
+  };
+
+  // `onerror` przed `onopen` wywola reject promisa, ale moze tez zdarzyc sie pozniej —
+  // wtedy ws i tak wywola onclose, wiec nie duplikujemy listener.
+  ws.onerror = (_e) => { /* nastepnie onclose wyemituje szczegoly */ };
+
   return {
     kind: TRANSPORT_WEBSOCKET,
     async send(bytes) {
@@ -171,12 +206,13 @@ async function openWebSocket(baseUrl, jwtToken) {
       listeners.add(cb);
       return () => listeners.delete(cb);
     },
+    onClose(cb) {
+      closeListeners.add(cb);
+      return () => closeListeners.delete(cb);
+    },
     close() {
-      try {
-        ws.close();
-      } catch {
-        // ignore
-      }
+      localClosed = true;
+      try { ws.close(1000, 'client close'); } catch { /* ignore */ }
     },
     isOpen() {
       return ws.readyState === WebSocket.OPEN;

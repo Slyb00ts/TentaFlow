@@ -1,0 +1,222 @@
+/* =============================================================================
+   Plik: connection-overlay.css
+   Opis: Styl dla connection-overlay (utracono polaczenie z serwerem).
+   ============================================================================= */
+
+.app-blurred {
+  filter: blur(6px) saturate(0.7);
+  pointer-events: none;
+  transition: filter 0.3s ease;
+}
+
+.conn-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 9999;
+  background: rgba(5, 8, 24, 0.55);
+  backdrop-filter: blur(2px);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.3s ease, visibility 0s linear 0.3s;
+}
+.conn-overlay.visible {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0.3s ease, visibility 0s linear 0s;
+}
+
+.conn-overlay-card {
+  width: 100%;
+  max-width: 480px;
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  box-shadow: var(--tf-shadow-lg);
+  overflow: hidden;
+  animation: connCardIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes connCardIn {
+  from { opacity: 0; transform: translateY(20px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+
+.conn-overlay-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 18px;
+  background: var(--tf-bg-2);
+  border-bottom: 1px solid var(--tf-border);
+}
+.conn-overlay-head .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--tf-danger);
+  animation: connDotPulse 1.6s ease-in-out infinite;
+}
+@keyframes connDotPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50%  { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+.conn-overlay-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--tf-text);
+}
+
+.conn-overlay-body {
+  padding: 28px 24px 20px;
+  text-align: center;
+}
+
+.conn-overlay-icon {
+  width: 68px;
+  height: 68px;
+  margin: 0 auto 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  color: var(--tf-danger);
+  position: relative;
+}
+.conn-overlay-icon::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 2px solid var(--tf-danger);
+  opacity: 0.4;
+  animation: connRingPulse 2.2s ease-out infinite;
+}
+@keyframes connRingPulse {
+  0%   { transform: scale(0.92); opacity: 0.4; }
+  70%  { transform: scale(1.25); opacity: 0; }
+  100% { transform: scale(1.25); opacity: 0; }
+}
+.conn-overlay-icon svg {
+  width: 30px;
+  height: 30px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.conn-overlay-heading {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--tf-text);
+  margin-bottom: 8px;
+}
+.conn-overlay-desc {
+  color: var(--tf-text-2);
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 22px;
+}
+
+.conn-retry {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 16px;
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  margin-bottom: 14px;
+  text-align: left;
+}
+.conn-retry-ring {
+  position: relative;
+  width: 46px;
+  height: 46px;
+  flex-shrink: 0;
+}
+.conn-retry-ring svg {
+  transform: rotate(-90deg);
+  width: 100%;
+  height: 100%;
+}
+.conn-retry-ring circle {
+  fill: none;
+  stroke-width: 3;
+}
+.conn-retry-ring .track { stroke: var(--tf-border); }
+.conn-retry-ring .fill {
+  stroke: var(--tf-info);
+  transition: stroke-dashoffset 0.2s linear;
+}
+.conn-retry-ring .countdown {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', 'Menlo', monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--tf-info);
+}
+.conn-retry-info .line-1 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tf-text);
+  margin-bottom: 2px;
+}
+.conn-retry-info .line-2 {
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.conn-log {
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  padding: 10px 12px;
+  margin-bottom: 18px;
+  text-align: left;
+  font-family: 'JetBrains Mono', 'Menlo', monospace;
+  font-size: 11px;
+  color: var(--tf-text-3);
+  max-height: 124px;
+  overflow-y: auto;
+}
+.conn-log-entry {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+}
+.conn-log-entry .ts {
+  color: var(--tf-text-3);
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+.conn-log-entry .msg {
+  flex: 1;
+  color: var(--tf-text-2);
+  word-break: break-word;
+}
+.conn-log-entry.err .msg { color: var(--tf-danger); }
+.conn-log-entry.warn .msg { color: var(--tf-warning); }
+.conn-log-entry.ok .msg { color: var(--tf-success); }
+.conn-log-entry.info .msg { color: var(--tf-text-2); }
+
+.conn-overlay-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 18px;
+  background: var(--tf-bg-2);
+  border-top: 1px solid var(--tf-border);
+}

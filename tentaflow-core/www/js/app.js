@@ -13,6 +13,8 @@ import { byId, escapeHtml } from '/js/utils.js';
 import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import '/js/components/index.js';
 import '/js/lib/block-zoom.js';
+import * as ConnectionOverlay from '/js/modules/connection-overlay.js';
+import { initTransport } from '/js/protocol/api-binary-shim.js';
 
 import LoginScreen from '/js/modules/login.js';
 import FaceBackground from '/js/modules/faceBackground.js';
@@ -137,6 +139,14 @@ const USER_NAV = [
 
 async function bootstrap() {
   await Promise.all([codecReady, I18n.init()]);
+
+  // Overlay init przed otwarciem WS — zeby wszystkie lifecycle events byly
+  // przechwycone od pierwszej chwili.
+  ConnectionOverlay.init();
+
+  // Otworz WS natychmiast (anonymous jesli brak JWT). Serwer akceptuje i
+  // pozwala tylko na authLogin + schema + heartbeat przed zalogowaniem.
+  initTransport().catch((e) => console.warn('[app] initTransport:', e?.message));
 
   if (!ApiBinary.hasJwt()) {
     renderLogin();
