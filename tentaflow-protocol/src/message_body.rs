@@ -2439,11 +2439,96 @@ pub struct UserInfo {
     pub sso_provider: Option<String>,
     pub last_login_at: Option<String>,
     pub created_at: String,
+    /// "user" | "power_user" | "admin". Default "user" przy deserializacji
+    /// starego payloadu.
+    pub role: String,
+    pub group_ids: Vec<i64>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct UsersListResponse {
     pub users: Vec<UserInfo>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct GroupInfo {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub member_count: u32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PermissionEntry {
+    pub resource_type: String,
+    pub resource_id: String,
+    pub subject_type: String,
+    pub subject_id: i64,
+    pub access_level: String,
+}
+
+/// Inner-enum pack dla calego Identity & Access Management —
+/// users + groups + resource permissions. Jeden slot w MessageBody (IamBody).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum IamPayload {
+    // ---- Users ----
+    ReqListUsers,
+    ResListUsers { users: Vec<UserInfo> },
+    ReqGetUser { user_id: i64 },
+    ResGetUser { user: UserInfo },
+    ReqCreateUser {
+        username: String,
+        password: String,
+        display_name: String,
+        email: String,
+        role: String,
+        group_ids: Vec<i64>,
+    },
+    ResCreateUser { user_id: i64 },
+    ReqUpdateUser {
+        user_id: i64,
+        display_name: String,
+        email: String,
+        is_active: bool,
+        role: String,
+    },
+    ReqDeleteUser { user_id: i64 },
+    ReqSetUserGroups { user_id: i64, group_ids: Vec<i64> },
+    ReqResetUserPassword { user_id: i64, new_password: String },
+
+    // ---- Groups ----
+    ReqListGroups,
+    ResListGroups { groups: Vec<GroupInfo> },
+    ReqCreateGroup { name: String, description: String },
+    ResCreateGroup { group_id: i64 },
+    ReqUpdateGroup { group_id: i64, name: String, description: String },
+    ReqDeleteGroup { group_id: i64 },
+    ReqGroupMembers { group_id: i64 },
+    ResGroupMembers { members: Vec<UserInfo> },
+
+    // ---- Resource permissions (generyczna ACL) ----
+    /// resource_type: 'model' | 'flow' | 'addon' | ...
+    /// subject_type: 'user' | 'group'
+    /// access_level: 'allow' | 'deny'
+    ReqSetPermission {
+        resource_type: String,
+        resource_id: String,
+        subject_type: String,
+        subject_id: i64,
+        access_level: String,
+    },
+    ReqClearPermission {
+        resource_type: String,
+        resource_id: String,
+        subject_type: String,
+        subject_id: i64,
+    },
+    ReqListPermsForResource { resource_type: String, resource_id: String },
+    ReqListPermsForSubject { subject_type: String, subject_id: i64 },
+    ResListPermissions { entries: Vec<PermissionEntry> },
+
+    // Generic OK dla mutacji (delete/update/set) bez specyficznego response.
+    ResOk,
 }
 
 /// policy table (`#[policy]` proc-macro z #26).
@@ -2806,8 +2891,8 @@ pub enum MessageBody {
     TranslateResponseBody(TranslateResponse),
 
     // ---- Users list (Admin) ----
-    UsersListRequest,
-    UsersListResponseBody(UsersListResponse),
+    // UsersList* consolidated into IamBody (below) jako ReqListUsers/ResListUsers.
+    IamBody(IamPayload),
 
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.

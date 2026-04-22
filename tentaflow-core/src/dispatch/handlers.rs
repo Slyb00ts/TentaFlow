@@ -3899,26 +3899,209 @@ pub fn audit_log_cleanup(
     ))
 }
 
-#[handler(variant = "UsersListRequest", since = (1, 0))]
+// =============================================================================
+// IAM — users + groups + resource permissions. Jeden top-level variant
+// IamBody z inner enum IamPayload (zeby zmiescic sie w 256-variant rkyv limit).
+// Wszystkie operacje mutujace wymagaja policy(Admin).
+// =============================================================================
+
+fn user_to_info(u: crate::db::models::UserAccount, group_ids: Vec<i64>) -> tentaflow_protocol::UserInfo {
+    tentaflow_protocol::UserInfo {
+        id: u.id,
+        username: u.username,
+        display_name: u.display_name,
+        email: u.email,
+        is_active: u.is_active,
+        is_admin: u.is_admin,
+        sso_provider: u.sso_provider,
+        last_login_at: u.last_login_at,
+        created_at: u.created_at,
+        role: u.role,
+        group_ids,
+    }
+}
+
+fn iam_err(e: anyhow::Error) -> ProtocolError {
+    ProtocolError::internal(format!("IAM: {}", e))
+}
+
+#[handler(variant = "IamBody", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn users_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let rows = repository::list_user_accounts(&ctx.state.db).map_err(db_err)?;
-    let users: Vec<tentaflow_protocol::UserInfo> = rows
-        .into_iter()
-        .map(|u| tentaflow_protocol::UserInfo {
-            id: u.id,
-            username: u.username,
-            display_name: u.display_name,
-            email: u.email,
-            is_active: u.is_active,
-            is_admin: u.is_admin,
-            sso_provider: u.sso_provider,
-            last_login_at: u.last_login_at,
-            created_at: u.created_at,
-        })
-        .collect();
-    Ok(MessageBody::UsersListResponseBody(
-        tentaflow_protocol::UsersListResponse { users },
-    ))
+pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::IamPayload as P;
+    let payload = match req {
+        MessageBody::IamBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected IamBody")),
+    };
+    let db = &ctx.state.db;
+
+    let res = match payload {
+        // ---- Users ----
+        P::ReqListUsers => {
+            let rows = repository::list_user_accounts(db).map_err(db_err)?;
+            let users: Vec<_> = rows
+                .into_iter()
+                .map(|u| {
+                    let gs = repository::get_user_groups(db, u.id)
+                        .ok()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g| g.id)
+                        .collect();
+                    user_to_info(u, gs)
+                })
+                .collect();
+            P::ResListUsers { users }
+        }
+        P::ReqGetUser { user_id } => {
+            let u = repository::get_user_account_by_id(db, *user_id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::not_found("user"))?;
+            let gs = repository::get_user_groups(db, *user_id)
+                .map_err(db_err)?
+                .into_iter()
+                .map(|g| g.id)
+                .collect();
+            P::ResGetUser { user: user_to_info(u, gs) }
+        }
+        P::ReqCreateUser { username, password, display_name, email, role, group_ids } => {
+            let hash = crate::crypto::hash_password(password)
+                .map_err(|e| iam_err(anyhow::anyhow!("hash: {}", e)))?;
+            let user_id = repository::create_user_account(db, username, &hash, display_name, email)
+                .map_err(db_err)?;
+            repository::set_user_role(db, user_id, role).map_err(iam_err)?;
+            for gid in group_ids {
+                let _ = repository::add_user_to_group(db, *gid, user_id);
+            }
+            P::ResCreateUser { user_id }
+        }
+        P::ReqUpdateUser { user_id, display_name, email, is_active, role } => {
+            repository::update_user_account(db, *user_id, display_name, email, *is_active).map_err(db_err)?;
+            repository::set_user_role(db, *user_id, role).map_err(iam_err)?;
+            P::ResOk
+        }
+        P::ReqDeleteUser { user_id } => {
+            repository::delete_user_account(db, *user_id).map_err(db_err)?;
+            P::ResOk
+        }
+        P::ReqSetUserGroups { user_id, group_ids } => {
+            // Prosty diff — remove z nieobecnych, add brakujace.
+            let current: std::collections::HashSet<i64> = repository::get_user_groups(db, *user_id)
+                .map_err(db_err)?
+                .into_iter()
+                .map(|g| g.id)
+                .collect();
+            let target: std::collections::HashSet<i64> = group_ids.iter().copied().collect();
+            for gid in current.difference(&target) {
+                let _ = repository::remove_user_from_group(db, *gid, *user_id);
+            }
+            for gid in target.difference(&current) {
+                let _ = repository::add_user_to_group(db, *gid, *user_id);
+            }
+            P::ResOk
+        }
+        P::ReqResetUserPassword { user_id, new_password } => {
+            let hash = crate::crypto::hash_password(new_password)
+                .map_err(|e| iam_err(anyhow::anyhow!("hash: {}", e)))?;
+            repository::update_user_account_password(db, *user_id, &hash).map_err(db_err)?;
+            P::ResOk
+        }
+
+        // ---- Groups ----
+        P::ReqListGroups => {
+            let groups = repository::list_groups(db).map_err(db_err)?;
+            let infos: Vec<_> = groups
+                .into_iter()
+                .map(|g| {
+                    let count = repository::list_group_members(db, g.id)
+                        .ok()
+                        .map(|m| m.len() as u32)
+                        .unwrap_or(0);
+                    tentaflow_protocol::GroupInfo {
+                        id: g.id,
+                        name: g.name,
+                        description: g.description,
+                        member_count: count,
+                    }
+                })
+                .collect();
+            P::ResListGroups { groups: infos }
+        }
+        P::ReqCreateGroup { name, description } => {
+            let group_id = repository::create_group(db, name, description).map_err(db_err)?;
+            P::ResCreateGroup { group_id }
+        }
+        P::ReqUpdateGroup { group_id, name, description } => {
+            repository::update_group(db, *group_id, name, description).map_err(db_err)?;
+            P::ResOk
+        }
+        P::ReqDeleteGroup { group_id } => {
+            repository::delete_group(db, *group_id).map_err(db_err)?;
+            P::ResOk
+        }
+        P::ReqGroupMembers { group_id } => {
+            let rows = repository::list_group_members(db, *group_id).map_err(db_err)?;
+            let members: Vec<_> = rows
+                .into_iter()
+                .map(|u| {
+                    let gs = repository::get_user_groups(db, u.id)
+                        .ok()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g| g.id)
+                        .collect();
+                    user_to_info(u, gs)
+                })
+                .collect();
+            P::ResGroupMembers { members }
+        }
+
+        // ---- Resource permissions ----
+        P::ReqSetPermission { resource_type, resource_id, subject_type, subject_id, access_level } => {
+            repository::resource_permissions::set(
+                db, resource_type, resource_id, subject_type, *subject_id, access_level,
+            ).map_err(iam_err)?;
+            P::ResOk
+        }
+        P::ReqClearPermission { resource_type, resource_id, subject_type, subject_id } => {
+            repository::resource_permissions::clear(
+                db, resource_type, resource_id, subject_type, *subject_id,
+            ).map_err(db_err)?;
+            P::ResOk
+        }
+        P::ReqListPermsForResource { resource_type, resource_id } => {
+            let rows = repository::resource_permissions::list_for_resource(db, resource_type, resource_id)
+                .map_err(db_err)?;
+            let entries = rows.into_iter().map(|r| tentaflow_protocol::PermissionEntry {
+                resource_type: r.resource_type,
+                resource_id: r.resource_id,
+                subject_type: r.subject_type,
+                subject_id: r.subject_id,
+                access_level: r.access_level,
+            }).collect();
+            P::ResListPermissions { entries }
+        }
+        P::ReqListPermsForSubject { subject_type, subject_id } => {
+            let rows = repository::resource_permissions::list_for_subject(db, subject_type, *subject_id)
+                .map_err(db_err)?;
+            let entries = rows.into_iter().map(|r| tentaflow_protocol::PermissionEntry {
+                resource_type: r.resource_type,
+                resource_id: r.resource_id,
+                subject_type: r.subject_type,
+                subject_id: r.subject_id,
+                access_level: r.access_level,
+            }).collect();
+            P::ResListPermissions { entries }
+        }
+
+        // Response-only variants nie powinny byc requestowane przez klienta.
+        P::ResListUsers { .. } | P::ResGetUser { .. } | P::ResCreateUser { .. }
+        | P::ResListGroups { .. } | P::ResCreateGroup { .. }
+        | P::ResGroupMembers { .. } | P::ResListPermissions { .. } | P::ResOk => {
+            return Err(ProtocolError::bad_request("response variant in request"));
+        }
+    };
+
+    Ok(MessageBody::IamBody(res))
 }
