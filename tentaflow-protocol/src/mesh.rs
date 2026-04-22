@@ -661,6 +661,12 @@ pub const MESH_MSG_HELLO: u8 = 0x19;
 /// do swoich bezposrednich sasiadow (oprocz nadawcy). Dzieki temu mainpc dowiaduje sie
 /// o spark-002 przez spark-001 — z nazwa, platforma i lista uslug.
 pub const MESH_MSG_TOPOLOGY_ANNOUNCE: u8 = 0x1A;
+/// Lekki anons 'oto kogo znam' — wysylany do nowo podlaczonego peera bez
+/// wymagania zaufania. Rozwiazuje scenariusz 3 nodow na VLAN gdzie mDNS
+/// multicast jest blokowany miedzy czescia klientow (typowe na enterprise
+/// switches z IGMP snooping / client isolation). Tylko node_id + hostname +
+/// adresy — bez uslug/modeli (pre-pairing = pre-trust).
+pub const MESH_MSG_KNOWN_PEERS: u8 = 0x1B;
 pub const MESH_MSG_PAIRING_REQUEST: u8 = 0x20;
 pub const MESH_MSG_PAIRING_CONFIRM: u8 = 0x21;
 pub const MESH_MSG_PAIRING_REJECT: u8 = 0x22;
@@ -766,6 +772,26 @@ pub struct TopologyEntry {
     pub models: Vec<ModelSummary>,
     pub direct_addrs: Vec<String>,
     pub port: u16,
+}
+
+/// Pojedynczy wpis w KnownPeersPayload — minimalne dane potrzebne zeby
+/// spoznionemu nodowi udalo sie dial'nac peera bez polegania na mDNS.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct KnownPeerEntry {
+    pub node_id: String,
+    pub hostname: String,
+    pub direct_addrs: Vec<String>,
+    pub port: u16,
+}
+
+/// Payload KnownPeers — wysylany po PeerConnected przez nowo podlaczonego
+/// peera. Zawiera liste wszystkich aktualnie polaczonych peerow, zeby odbiorca
+/// mogl proboxac sie z nimi polaczyc bez mDNS.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct KnownPeersPayload {
+    pub peers: Vec<KnownPeerEntry>,
 }
 
 /// Payload gossip topologii — floodowany z dedupem.
