@@ -110,5 +110,6 @@ pub use message_body::{
     MeetingSummaryGenerateRequest, MeetingSummaryGenerateResponse, MeetingTranscriptEntry,
     MeetingTranscriptsListRequest, MeetingTranscriptsListResponse,
     SystemEventPayload,
+    GroupInfo, IamPayload, PermissionEntry,
     TranslateRequest, TranslateResponse, UserInfo, UserOAuthAccountRow, UsersListResponse,
 };
