@@ -28,7 +28,7 @@ fn main() {
     // (po wygenerowaniu services-manifest.js, zeby trafil do embed).
     generate_wwwroot_embed(&out_dir_env);
 
-    // Pakuj kontekst dockerow (tentaflow-containers + tentaflow-protocol)
+    // Pakuj kontekst dockerow (tentaflow-containers + shared Rust crates)
     // jako tar.gz wbudowany w binarce — deploy module rozpakowuje to do tmpdir
     // i robi `docker build` bez wymagania zewnetrznych zrodel.
     pack_container_contexts(&out_dir_env);
@@ -525,7 +525,7 @@ fn guess_mime(path: &str) -> &'static str {
 }
 
 // =============================================================================
-// Pakowanie kontekstu Docker (tentaflow-containers + tentaflow-protocol)
+// Pakowanie kontekstu Docker (tentaflow-containers + shared Rust crates)
 // w tar.gz wbudowany w binarce. Pozwala na deploy bez zewnetrznych zrodel.
 // =============================================================================
 
@@ -537,12 +537,20 @@ fn pack_container_contexts(out_dir: &Path) {
         .unwrap_or_else(|_| PathBuf::from(".."));
     let containers_dir = workspace_root.join("tentaflow-containers");
     let protocol_dir = workspace_root.join("tentaflow-protocol");
+    let transport_dir = workspace_root.join("tentaflow-transport");
+    let voice_dir = workspace_root.join("tentaflow-voice");
 
-    if !containers_dir.exists() || !protocol_dir.exists() {
+    if !containers_dir.exists()
+        || !protocol_dir.exists()
+        || !transport_dir.exists()
+        || !voice_dir.exists()
+    {
         println!(
-            "cargo:warning=pack_container_contexts: brak {} albo {} — embed pominiety",
+            "cargo:warning=pack_container_contexts: brak jednego z wymaganych katalogow: {}, {}, {}, {} — embed pominiety",
             containers_dir.display(),
-            protocol_dir.display()
+            protocol_dir.display(),
+            transport_dir.display(),
+            voice_dir.display()
         );
         // Stworz pusty plik zeby include_bytes! nie padlo
         std::fs::write(out_dir.join("container_bundle.tar.gz"), b"").ok();
@@ -552,6 +560,8 @@ fn pack_container_contexts(out_dir: &Path) {
     // Zmiany w kontekstach trigerują rebuild
     println!("cargo:rerun-if-changed={}", containers_dir.display());
     println!("cargo:rerun-if-changed={}", protocol_dir.display());
+    println!("cargo:rerun-if-changed={}", transport_dir.display());
+    println!("cargo:rerun-if-changed={}", voice_dir.display());
 
     let bundle_path = out_dir.join("container_bundle.tar.gz");
 
@@ -567,6 +577,8 @@ fn pack_container_contexts(out_dir: &Path) {
         .arg(&workspace_root)
         .arg("tentaflow-containers")
         .arg("tentaflow-protocol")
+        .arg("tentaflow-transport")
+        .arg("tentaflow-voice")
         .status();
 
     match status {
