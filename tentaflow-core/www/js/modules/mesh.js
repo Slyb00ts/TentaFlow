@@ -525,13 +525,13 @@ function handleCardClick(e) {
 // ---- Pair flow ------------------------------------------------------------
 
 // Generyczny helper do stworzenia okna pairingu (tf-window + backdrop).
-function createPairWindow({ title, bodyHtml, submitLabel, submitAction, onSubmit }) {
+function createPairWindow({ title, bodyHtml, submitLabel, submitAction, onSubmit, width, minWidth }) {
   const win = document.createElement('tf-window');
   win.setAttribute('title', title);
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
-  win.setAttribute('min-width', '420');
-  win.setAttribute('width', '460');
+  win.setAttribute('min-width', String(minWidth ?? 420));
+  win.setAttribute('width', String(width ?? 460));
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
 
@@ -636,6 +636,8 @@ function openPairModal() {
     bodyHtml,
     submitLabel: I18n.t('mesh.pair'),
     submitAction: 'pair',
+    width: 680,
+    minWidth: 560,
     onSubmit: async (winEl) => {
       const activeTab = winEl.querySelector('#pair-tabs-nav')?.value || 'qr';
       if (activeTab === 'qr') {

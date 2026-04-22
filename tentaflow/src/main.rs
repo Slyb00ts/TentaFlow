@@ -406,10 +406,24 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 fn setup_logging(verbose: bool) -> Result<()> {
     use tracing_subscriber::{fmt, EnvFilter};
 
+    // Wyciszamy glosne biblioteki ktore spamuja WARN/INFO na disconnect/rediscovery
+    // peerow:
+    //   iroh::socket::remote_map — 'Address Lookup failed' dla niedostepnych peerow
+    //   iroh::address_lookup::pkarr::dht — 'resolving X from DHT' dla kazdej proby
+    //   iroh-relay — MaxPathIdReached gdy zbyt wiele polaczen przez relay
+    //   mdns_sd — internal chatter
+    //   wgpu — compile warnings
+    const BASE_FILTER: &str = "iroh::socket::remote_map=error,\
+        iroh::address_lookup=warn,\
+        iroh::socket::remote_map::remote_state=error,\
+        iroh_relay=error,\
+        mdns_sd=off,\
+        wgpu_hal=error,\
+        wgpu_core=error";
     let filter = if verbose {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug,mdns_sd=off,wgpu_hal=error,wgpu_core=error"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("debug,{}", BASE_FILTER)))
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=off,wgpu_hal=error,wgpu_core=error"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("info,{}", BASE_FILTER)))
     };
 
     fmt()
