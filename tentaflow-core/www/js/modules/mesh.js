@@ -627,6 +627,10 @@ function openPairModal() {
     </div>
     <div class="pair-tab-panel" data-tab="id" hidden>
       <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="64"></tf-input>
+      <button type="button" class="pair-scan-btn" id="pair-scan-btn" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+        <span>${escapeHtml(I18n.t('mesh.pair_scan_camera'))}</span>
+      </button>
       <div class="pair-id-hint">${escapeHtml(I18n.t('mesh.pair_id_hint'))}</div>
       <div class="form-error" hidden></div>
     </div>
@@ -701,6 +705,59 @@ async function wireUpPairTabs(winEl) {
       setTimeout(() => { btn.textContent = orig; }, 1200);
     });
   });
+
+  // Przycisk "Zeskanuj kamerą" na zakladce "Wpisz ID" — pokazujemy TYLKO gdy
+  // urzadzenie wspiera BarcodeDetector (telefon / tablet / nowoczesny laptop
+  // z kamera). Kliknicie otwiera fullscreen overlay z kamera, po odczycie
+  // QR auto-parse + submit.
+  const scanBtn = winEl.querySelector('#pair-scan-btn');
+  if (scanBtn) {
+    try {
+      const qrScanner = await import('/js/modules/qr-scanner.js');
+      if (await qrScanner.isScannerSupported()) {
+        scanBtn.hidden = false;
+        scanBtn.addEventListener('click', async () => {
+          try {
+            const raw = await qrScanner.scanQr();
+            if (!raw) return;
+            const parsed = qrScanner.parsePairUri(raw);
+            if (!parsed) {
+              toast(I18n.t('mesh.qr_scan_invalid'), 'error');
+              return;
+            }
+            // Wklej hex do inputu zeby user widzial co sie dzieje.
+            const input = winEl.querySelector('#pair-node-id');
+            if (input) input.value = parsed.hex;
+            // Auto-submit: wyslij pairing start z odczytanym PIN jako hint.
+            // Backend auto-confirm zadziala po stronie QR-owcy gdy PIN zgadza.
+            try {
+              const resp = await ApiBinary.action('meshPairingStartRequest', {
+                remoteAddress: parsed.hex,
+                ...(parsed.pin ? { pin: parsed.pin } : {}),
+              });
+              if (resp?.pin) {
+                openPinDisplayModal(parsed.hex, resp.pin);
+              } else {
+                toast(I18n.t('mesh.pair_success'), 'success');
+              }
+              if (winEl.isConnected) winEl.remove();
+              document.querySelectorAll('.tf-window-backdrop').forEach((b) => b.remove());
+              await loadData();
+              renderActiveTab();
+            } catch (e) {
+              toast(e.message || I18n.t('mesh.pair_failed'), 'error');
+            }
+          } catch (e) {
+            console.warn('[pair-scan]', e?.message);
+            toast(I18n.t('mesh.qr_scan_failed'), 'error');
+          }
+        });
+      }
+    } catch (e) {
+      // Jak import zawiedzie, zostawiamy button ukryty (hidden domyslnie w HTML).
+      console.debug('[pair-scan] scanner module unavailable:', e?.message);
+    }
+  }
 
   // Pobierz identity + invite PIN, narysuj QR, odliczaj 60s, odswiezaj.
   const QR = await import('/js/lib/qrcode.js').catch(() => null);

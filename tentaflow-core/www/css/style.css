@@ -1075,6 +1075,111 @@ input, textarea, select {
 }
 .pair-pin-timer b { color: var(--text-2); font-weight: 600; font-family: 'JetBrains Mono', ui-monospace, monospace; }
 @keyframes pairRingSpin { to { transform: rotate(360deg); } }
+.pair-scan-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin-top: 10px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-hover);
+  background: var(--bg-3);
+  color: var(--text);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  width: 100%;
+  justify-content: center;
+}
+.pair-scan-btn:hover {
+  border-color: var(--accent-1);
+  background: var(--bg-card-hover);
+  color: var(--accent-2);
+}
+.pair-scan-btn svg {
+  width: 16px; height: 16px;
+  stroke: currentColor; fill: none; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* QR Scanner overlay — fullscreen kamera + viewfinder z animowana linia skanu */
+.qr-scanner-overlay {
+  position: fixed; inset: 0;
+  z-index: 10000;
+  background: #000;
+  display: flex; flex-direction: column;
+  animation: qrScannerIn 0.18s ease-out;
+}
+.qr-scanner-overlay.closing { animation: qrScannerOut 0.18s ease-in forwards; }
+@keyframes qrScannerIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes qrScannerOut { from { opacity: 1; } to { opacity: 0; } }
+
+.qr-scanner-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px;
+  color: #fff;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(6px);
+  z-index: 2;
+}
+.qr-scanner-title { font-size: 15px; font-weight: 700; }
+.qr-scanner-close {
+  background: transparent; border: 0; cursor: pointer;
+  width: 36px; height: 36px; border-radius: 50%;
+  color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.15s;
+}
+.qr-scanner-close:hover { background: rgba(255,255,255,0.12); }
+.qr-scanner-close svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+
+.qr-scanner-viewport {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.qr-scanner-viewport video {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+}
+
+.qr-scanner-frame {
+  position: relative;
+  width: min(70vw, 320px);
+  aspect-ratio: 1 / 1;
+  box-shadow: 0 0 0 9999px rgba(0,0,0,0.55);
+  border-radius: 16px;
+}
+.qr-scanner-frame .corner {
+  position: absolute;
+  width: 30px; height: 30px;
+  border: 3px solid var(--accent-1);
+}
+.qr-scanner-frame .corner.tl { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 10px; }
+.qr-scanner-frame .corner.tr { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 10px; }
+.qr-scanner-frame .corner.bl { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 10px; }
+.qr-scanner-frame .corner.br { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 10px; }
+.qr-scanner-frame .scan-line {
+  position: absolute; left: 8%; right: 8%; top: 20%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent-2), transparent);
+  box-shadow: 0 0 12px rgba(167,139,250,0.6);
+  animation: qrScanLine 2.5s ease-in-out infinite;
+}
+@keyframes qrScanLine {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(calc(min(70vw, 320px) * 0.6)); }
+}
+
+.qr-scanner-hint {
+  padding: 16px 18px 24px;
+  color: rgba(255,255,255,0.85);
+  font-size: 13px;
+  text-align: center;
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(6px);
+}
+
 .pair-id-hint {
   color: var(--text-2); font-size: 12px; line-height: 1.55;
   padding: 10px 12px;

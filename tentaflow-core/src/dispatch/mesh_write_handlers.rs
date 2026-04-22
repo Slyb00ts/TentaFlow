@@ -87,7 +87,7 @@ pub async fn mesh_pairing_start(
             ))
         }
     };
-    let MeshPairingStartRequest { remote_address } = payload;
+    let MeshPairingStartRequest { remote_address, pin_hint } = payload;
 
     let security = require_mesh_security(ctx)?;
 
@@ -101,6 +101,7 @@ pub async fn mesh_pairing_start(
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
         &ctx.state.mesh_peer_store,
+        pin_hint,
     )
     .await
     .map_err(|e| ProtocolError::internal(format!("pairing start failed: {}", e)))?;
