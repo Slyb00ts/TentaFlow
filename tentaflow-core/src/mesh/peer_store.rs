@@ -568,9 +568,9 @@ impl MeshPeerStore {
             }
         }
 
-        // BFS — max 4 hopy
+        // BFS — max 5 hopow (wymagane dla multi-hop mesh).
         while let Some((current, first_hop, depth)) = queue.pop_front() {
-            if depth >= 4 {
+            if depth >= 5 {
                 continue;
             }
             if let Some(peers) = topology.get(&current) {
@@ -596,6 +596,44 @@ impl MeshPeerStore {
     /// Pelna tabela routingu (do debugowania/API)
     pub fn get_routing_table(&self) -> HashMap<String, RoutingEntry> {
         self.routing_table.read().clone()
+    }
+
+    /// Upsert minimalnego wpisu peera z TopologyAnnounce — tworzy `MeshPeerInfo`
+    /// jesli nieistnieje, ale NIE nadpisuje metryk/GPU/usluge jesli peer juz znany
+    /// z bezposredniej komunikacji. Sluzy do widocznosci nodow osiagalnych przez relay.
+    pub fn upsert_gossip_peer(
+        &self,
+        node_id: &str,
+        hostname: &str,
+        platform: &str,
+        os_info: &str,
+        addresses: Vec<std::net::IpAddr>,
+        port: u16,
+    ) {
+        let mut peers = self.peers.write();
+        let entry = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
+        if !hostname.is_empty() && entry.hostname.is_empty() {
+            entry.hostname = hostname.to_string();
+        }
+        if !platform.is_empty() && entry.platform.is_empty() {
+            entry.platform = platform.to_string();
+        }
+        if !os_info.is_empty() && entry.os_info.is_empty() {
+            entry.os_info = os_info.to_string();
+        }
+        if entry.addresses.is_empty() && !addresses.is_empty() {
+            entry.addresses = addresses;
+        }
+        if entry.port == 0 && port != 0 {
+            entry.port = port;
+        }
+        if entry.status == "disconnected" || entry.status.is_empty() {
+            entry.status = "reachable".to_string();
+        }
+        drop(peers);
+        self.mark_dirty();
     }
 
     /// Tworzy pusty wpis peera — uzywany gdy QUIC polaczyl sie przed mDNS discovery

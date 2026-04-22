@@ -1,9 +1,9 @@
 // =============================================================================
 // Plik: deploy/bundle.rs
 // Opis: Embedowany bundle kontenerow (wbudowany przez build.rs jako tar.gz).
-//       extract_to(target) rozpakowuje tentaflow-containers/ i
-//       tentaflow-protocol/ do podanego katalogu — typowo tmpdir w trakcie
-//       deployu.
+//       extract_to(target) rozpakowuje tentaflow-containers/ oraz wspolne
+//       crate'y Rust wymagane przez wybrane Dockerfile do podanego katalogu
+//       — typowo tmpdir w trakcie deployu.
 // =============================================================================
 
 use anyhow::{Context, Result};
@@ -14,8 +14,9 @@ const CONTAINER_BUNDLE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/container_bundle.tar.gz"));
 
 /// Rozpakowuje wbudowany kontekst kontenerow do podanego katalogu.
-/// Po rozpakowaniu w `target` znajdziesz `tentaflow-containers/` i
-/// `tentaflow-protocol/`. Bezpieczne dla deploy do tmpdir.
+/// Po rozpakowaniu w `target` znajdziesz `tentaflow-containers/`,
+/// `tentaflow-protocol/`, `tentaflow-transport/` i `tentaflow-voice/`.
+/// Bezpieczne dla deploy do tmpdir.
 pub fn extract_to(target: &Path) -> Result<()> {
     if CONTAINER_BUNDLE.is_empty() {
         anyhow::bail!(
@@ -145,5 +146,7 @@ mod tests {
         extract_to(dir.path()).expect("extract");
         assert!(dir.path().join("tentaflow-containers").exists());
         assert!(dir.path().join("tentaflow-protocol").exists());
+        assert!(dir.path().join("tentaflow-transport").exists());
+        assert!(dir.path().join("tentaflow-voice").exists());
     }
 }

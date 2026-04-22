@@ -711,7 +711,8 @@ impl PeerManager {
             | IrohMeshEvent::RelayFrameReceived { .. }
             | IrohMeshEvent::AliasSyncReceived { .. }
             | IrohMeshEvent::PeerDiscovered { .. }
-            | IrohMeshEvent::HelloReceived { .. } => {
+            | IrohMeshEvent::HelloReceived { .. }
+            | IrohMeshEvent::TopologyAnnounceReceived { .. } => {
                 // Obslugiwane w pipeline.rs
             }
         }

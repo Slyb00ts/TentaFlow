@@ -280,6 +280,12 @@ fn spawn_quic_event_handler(
             std::collections::HashMap::new();
         const SYNC_COOLDOWN_SECS: u64 = 30;
 
+        // Dedup cache dla TopologyAnnounce — klucz (origin_node_id, epoch).
+        // Max 512 wpisow, FIFO eviction. Zapobiega zapetleniom przy flood rebroadcast.
+        let mut topo_seen: std::collections::VecDeque<(String, u64)> =
+            std::collections::VecDeque::with_capacity(512);
+        const TOPO_SEEN_CAP: usize = 512;
+
         loop {
             match event_rx.recv().await {
                 Ok(IrohMeshEvent::HelloReceived { node_id, data }) => {
@@ -303,6 +309,134 @@ fn spawn_quic_event_handler(
                         }
                         Err(e) => {
                             warn!(peer_id = %node_id, "Blad deserializacji Hello: {}", e);
+                        }
+                    }
+                }
+                Ok(IrohMeshEvent::TopologyAnnounceReceived { from_node_id, data }) => {
+                    // Gossip multi-hop — wprowadza nody osiagalne przez relay.
+                    // Akceptujemy TYLKO od trusted peerow (bezpieczenstwo).
+                    let sender_trusted = match &mesh_security {
+                        Some(sec) => sec.is_trusted(&from_node_id),
+                        None => false,
+                    };
+                    if !sender_trusted {
+                        debug!(peer = %from_node_id, "Pomijam TopologyAnnounce od niezaufanego peera");
+                        continue;
+                    }
+
+                    use tentaflow_protocol::mesh::TopologyAnnouncePayload;
+                    let payload = match rkyv::from_bytes::<TopologyAnnouncePayload, rkyv::rancor::Error>(&data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "Blad deserializacji TopologyAnnounce: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Dedup po (origin, epoch)
+                    let key = (payload.origin_node_id.clone(), payload.epoch);
+                    if topo_seen.iter().any(|k| *k == key) {
+                        continue;
+                    }
+                    topo_seen.push_back(key);
+                    if topo_seen.len() > TOPO_SEEN_CAP {
+                        topo_seen.pop_front();
+                    }
+
+                    // Aktualizuj peer_store + topologie dla kazdego wpisu
+                    for entry in &payload.entries {
+                        if entry.node_id == local_node_id {
+                            continue;
+                        }
+                        let addrs: Vec<std::net::IpAddr> = entry
+                            .direct_addrs
+                            .iter()
+                            .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+                            .map(|sa| sa.ip())
+                            .collect();
+                        peer_store.upsert_gossip_peer(
+                            &entry.node_id,
+                            &entry.hostname,
+                            &entry.platform,
+                            &entry.os_info,
+                            addrs,
+                            entry.port,
+                        );
+                        peer_store.update_topology(&entry.node_id, entry.connected_to.clone());
+                        // Modele jako PeerModelInfo — przepisujemy z ModelSummary
+                        if !entry.models.is_empty() {
+                            let models: Vec<crate::mesh::peer_store::PeerModelInfo> = entry
+                                .models
+                                .iter()
+                                .map(|m| crate::mesh::peer_store::PeerModelInfo {
+                                    alias: m.alias.clone(),
+                                    kind: String::new(),
+                                    backend: m.backend.clone(),
+                                    size_mb: 0,
+                                    loaded: m.loaded,
+                                })
+                                .collect();
+                            peer_store.update_models(&entry.node_id, models);
+                        }
+                        // Uslugi — wpisujemy do service_registry jako remote
+                        // (pozwala GUI mesh-service browserowi pokazac spark-002 uslugi).
+                        if !entry.services.is_empty() {
+                            let services: Vec<tentaflow_protocol::mesh::MeshServiceInfo> = entry
+                                .services
+                                .iter()
+                                .map(|s| tentaflow_protocol::mesh::MeshServiceInfo {
+                                    service_id: format!("{}-{}", entry.node_id, s.name),
+                                    service_name: s.name.clone(),
+                                    service_type: s.service_type.clone(),
+                                    node_id: entry.node_id.clone(),
+                                    quic_port: entry.port,
+                                    quic_url: String::new(),
+                                    status: if s.ready { "ready".to_string() } else { "stopped".to_string() },
+                                    models: Vec::new(),
+                                    load_percent: 0,
+                                    engine_id: None,
+                                    model_sizes_mb: Vec::new(),
+                                })
+                                .collect();
+                            qm_events.service_registry().update_remote(&entry.node_id, services);
+                        }
+                    }
+                    peer_store.recalculate_routes(&local_node_id);
+
+                    // Flood-rebroadcast — TTL - 1, pomijamy nadawce i origin.
+                    if payload.ttl > 1 {
+                        let mut forwarded = payload.clone();
+                        forwarded.ttl -= 1;
+                        if let Ok(forwarded_bytes) =
+                            rkyv::to_bytes::<rkyv::rancor::Error>(&forwarded)
+                        {
+                            let bytes_vec = forwarded_bytes.to_vec();
+                            let skip_from = from_node_id.clone();
+                            let skip_origin = payload.origin_node_id.clone();
+                            for peer in peer_store.list() {
+                                if !peer.quic_connected {
+                                    continue;
+                                }
+                                if peer.node_id == skip_from || peer.node_id == skip_origin {
+                                    continue;
+                                }
+                                if peer.node_id == local_node_id {
+                                    continue;
+                                }
+                                let trusted = match &mesh_security {
+                                    Some(sec) => sec.is_trusted(&peer.node_id),
+                                    None => false,
+                                };
+                                if !trusted {
+                                    continue;
+                                }
+                                if let Err(e) = qm_events
+                                    .send_topology_announce(&peer.node_id, &bytes_vec)
+                                    .await
+                                {
+                                    debug!(peer = %peer.node_id, "Blad rebroadcast TopologyAnnounce: {}", e);
+                                }
+                            }
                         }
                     }
                 }
@@ -859,7 +993,7 @@ fn spawn_quic_event_handler(
                         info!(
                             source = %frame.source_node_id,
                             disc = frame.discriminant,
-                            hops = 4u8.saturating_sub(frame.ttl) + 1,
+                            hops = 5u8.saturating_sub(frame.ttl) + 1,
                             "Otrzymano relay frame (multi-hop)"
                         );
                     } else {
@@ -1059,7 +1193,7 @@ fn spawn_heartbeat_sender(
                 );
 
                 // Aktualizuj topologie lokalnego noda
-                peer_store.update_topology(&local_node_id, connected_peers);
+                peer_store.update_topology(&local_node_id, connected_peers.clone());
 
                 // Serializuj RAZ — broadcast do wszystkich peerow uzywa tych samych bajtow
                 if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&hb) {
@@ -1080,6 +1214,76 @@ fn spawn_heartbeat_sender(
                     let sync = crate::mesh::peer_store::ModelsSync { models };
                     if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&sync) {
                         quic_mesh.send_models_sync_data(&data).await;
+                    }
+                }
+
+                // TopologyAnnounce — gossip co 60 heartbeatow (~30s).
+                // Kazdy node anonsuje SIEBIE: hostname + platform + bezposredni sasiedzi
+                // + modele + uslugi. Flooding z dedupem (origin, epoch) dociera az do 5 hopow.
+                if heartbeat_count % 60 == 30 {
+                    let services: Vec<tentaflow_protocol::mesh::ServiceSummary> = quic_mesh
+                        .service_registry()
+                        .local_services()
+                        .into_iter()
+                        .map(|s| tentaflow_protocol::mesh::ServiceSummary {
+                            name: s.service_name,
+                            service_type: s.service_type,
+                            ready: matches!(s.status.as_str(), "running" | "ready"),
+                        })
+                        .collect();
+                    let models_summary: Vec<tentaflow_protocol::mesh::ModelSummary> =
+                        collect_local_models(&quic_mesh)
+                            .into_iter()
+                            .map(|m| tentaflow_protocol::mesh::ModelSummary {
+                                alias: m.alias,
+                                backend: m.backend,
+                                loaded: m.loaded,
+                            })
+                            .collect();
+                    let self_info = peer_store.get(&local_node_id);
+                    let hostname = self_info.as_ref().map(|p| p.hostname.clone()).unwrap_or_default();
+                    let platform = node_info_collector::detect_platform();
+                    let os_info = self_info.as_ref().map(|p| p.os_info.clone()).unwrap_or_default();
+                    let port = self_info.as_ref().map(|p| p.port).unwrap_or(0);
+                    let direct_addrs: Vec<String> = self_info
+                        .as_ref()
+                        .map(|p| {
+                            p.addresses
+                                .iter()
+                                .map(|ip| format!("{}:{}", ip, port))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let entry = tentaflow_protocol::mesh::TopologyEntry {
+                        node_id: local_node_id.clone(),
+                        hostname,
+                        platform,
+                        os_info,
+                        connected_to: connected_peers.clone(),
+                        services,
+                        models: models_summary,
+                        direct_addrs,
+                        port,
+                    };
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(heartbeat_count);
+                    let payload = tentaflow_protocol::mesh::TopologyAnnouncePayload {
+                        origin_node_id: local_node_id.clone(),
+                        epoch,
+                        ttl: 5,
+                        entries: vec![entry],
+                    };
+                    if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                        let bv = bytes.to_vec();
+                        for peer_id in &connected_peers {
+                            if let Err(e) =
+                                quic_mesh.send_topology_announce(peer_id, &bv).await
+                            {
+                                debug!(peer = %peer_id, "Blad wysylania TopologyAnnounce: {}", e);
+                            }
+                        }
                     }
                 }
             }
