@@ -9,12 +9,25 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { measureItemHeight, getDefaultFont, getDefaultLineHeight } from '/js/lib/text-measure.js';
+import { createVirtualList } from '/js/lib/virtual-list.js';
+
+// Wirtualizacja transkryptów — pretext text-measure + VirtualList. Pozwala
+// renderować >10k wpisów bez spowalniania DOM. Heights mierzone per-row.
+// T_ROW_CHROME = meta row (20) + item padding 7+7 (14) + bottom spacing (16).
+const T_ROW_CHROME = 50;
+const T_TEXT_MAX_WIDTH = 0.80;   // % szerokości kolumny dla tekstu wypowiedzi
+const T_MIN_ROW = 64;            // avatar 36 + padding 14 + meta 14
 
 let activeSession = null;
 let activeScreen = 'join'; // join | joining | active | vnc | history | settings | error
 let activeTab = 'transcript'; // active screen sub-tab: transcript | actions | summary
 let transcripts = [];
 let lastTimestampMs = 0;
+let liveVlist = null;
+let historyVlist = null;
+let liveListWidth = 800;
+let historyListWidth = 800;
 let sessions = [];
 let selectedHistoryId = null;
 let historyDetail = null;
@@ -383,6 +396,32 @@ function renderJoiningScreen() {
     </div>`;
 }
 
+function measureRowHeight(t, listWidth) {
+  const textWidth = Math.max(120, Math.floor(listWidth * T_TEXT_MAX_WIDTH));
+  const txtH = measureItemHeight(t.text || ' ', {
+    font: getDefaultFont(),
+    maxWidth: textWidth,
+    lineHeight: getDefaultLineHeight(),
+  });
+  // AI rows mają dashed border + padding 12+14 po obu stronach.
+  const aiPad = ((t.speaker || '').toLowerCase() === 'tentaflow') ? 26 : 0;
+  return Math.max(T_MIN_ROW, txtH + T_ROW_CHROME + aiPad);
+}
+
+function destroyLiveVlist() {
+  if (liveVlist) {
+    try { liveVlist.destroy(); } catch {}
+    liveVlist = null;
+  }
+}
+
+function destroyHistoryVlist() {
+  if (historyVlist) {
+    try { historyVlist.destroy(); } catch {}
+    historyVlist = null;
+  }
+}
+
 function renderTranscriptRow(t) {
   const color = speakerColor(t.speaker);
   const initials = speakerInitials(t.speaker);
@@ -429,38 +468,93 @@ function renderActiveBody() {
   const mount = byId('meeting-active-body');
   if (!mount) return;
   if (activeScreen !== 'active' || !activeSession) return;
-  const live = transcripts.length
-    ? transcripts.map(renderTranscriptRow).join('')
-    : `<div class="meeting-empty-hint" style="padding: 24px;">${escapeHtml(I18n.t('meeting.waiting_transcripts'))}</div>`;
-  mount.innerHTML = `
-    <div class="meeting-body">
-      <div class="transcript-col">
-        <div class="transcript-toolbar">
-          <div class="tabs">
-            <div class="tab ${activeTab === 'transcript' ? 'active' : ''}" data-active-tab="transcript">${escapeHtml(I18n.t('meeting.tab_transcript'))}</div>
-            <div class="tab ${activeTab === 'summary' ? 'active' : ''}" data-active-tab="summary">${escapeHtml(I18n.t('meeting.tab_summary'))}</div>
+
+  // Re-mount całego body gdy struktura tabów się zmienia albo pierwsze renderowanie.
+  // Virtual list przeżywa między pollami (appendBatch w miejscu), niszczymy go tylko
+  // gdy przełączamy tab z transcript → summary.
+  const needsShell = !mount.querySelector('.meeting-body');
+  if (needsShell) {
+    mount.innerHTML = `
+      <div class="meeting-body">
+        <div class="transcript-col">
+          <div class="transcript-toolbar">
+            <div class="tabs">
+              <div class="tab" data-active-tab="transcript">${escapeHtml(I18n.t('meeting.tab_transcript'))}</div>
+              <div class="tab" data-active-tab="summary">${escapeHtml(I18n.t('meeting.tab_summary'))}</div>
+            </div>
+            <span class="count-chip" id="meeting-count-chip">0 ${escapeHtml(I18n.t('meeting.entries'))}</span>
           </div>
-          <span class="count-chip">${transcripts.length} ${escapeHtml(I18n.t('meeting.entries'))}</span>
+          <div class="transcript-list" id="meeting-transcript-list"></div>
+          <div class="live-bar">
+            <span class="pulse-dot"></span>
+            <span>${escapeHtml(I18n.t('meeting.live_footer'))}</span>
+            <span style="margin-left:auto; font-family:'JetBrains Mono',monospace; font-size:11px;">${escapeHtml(settings.stt_alias || 'whisper-large-v3')}</span>
+          </div>
         </div>
-        <div class="transcript-list" id="meeting-transcript-list">${activeTab === 'transcript' ? live : renderInlineSummary()}</div>
-        <div class="live-bar">
-          <span class="pulse-dot"></span>
-          <span>${escapeHtml(I18n.t('meeting.live_footer'))}</span>
-          <span style="margin-left:auto; font-family:'JetBrains Mono',monospace; font-size:11px;">${escapeHtml(settings.stt_alias || 'whisper-large-v3')}</span>
-        </div>
-      </div>
-      <aside class="side-col">
-        ${renderParticipantsPanel()}
-        ${renderConfigPanel()}
-      </aside>
-    </div>`;
-  // Rebind tabs
-  mount.querySelectorAll('[data-active-tab]').forEach((el) => {
-    el.addEventListener('click', () => {
-      activeTab = el.dataset.activeTab;
-      renderActiveBody();
+        <aside class="side-col" id="meeting-side-col"></aside>
+      </div>`;
+    mount.querySelectorAll('[data-active-tab]').forEach((el) => {
+      el.addEventListener('click', () => {
+        if (activeTab === el.dataset.activeTab) return;
+        activeTab = el.dataset.activeTab;
+        destroyLiveVlist();
+        renderActiveBody();
+      });
     });
+  }
+
+  // Tabs active class
+  mount.querySelectorAll('[data-active-tab]').forEach((el) => {
+    el.classList.toggle('active', el.dataset.activeTab === activeTab);
   });
+
+  // Count chip
+  const countChip = mount.querySelector('#meeting-count-chip');
+  if (countChip) countChip.textContent = `${transcripts.length} ${I18n.t('meeting.entries')}`;
+
+  // Side column — participants + config zmieniają się z każdym pollem
+  const side = mount.querySelector('#meeting-side-col');
+  if (side) side.innerHTML = renderParticipantsPanel() + renderConfigPanel();
+
+  // Transcript list — virtual list lub summary placeholder
+  const listHost = mount.querySelector('#meeting-transcript-list');
+  if (!listHost) return;
+
+  if (activeTab === 'summary') {
+    destroyLiveVlist();
+    listHost.innerHTML = renderInlineSummary();
+    byId('meeting-gen-summary-btn')?.addEventListener('click', () => onGenerateSummary(true));
+    return;
+  }
+
+  if (transcripts.length === 0) {
+    destroyLiveVlist();
+    listHost.innerHTML = `<div class="meeting-empty-hint" style="padding: 24px;">${escapeHtml(I18n.t('meeting.waiting_transcripts'))}</div>`;
+    return;
+  }
+
+  // Live transcript virtual list — mount jeśli nie istnieje, append nowe wpisy gdy tak.
+  liveListWidth = listHost.clientWidth || liveListWidth;
+  if (!liveVlist) {
+    listHost.innerHTML = '';
+    liveVlist = createVirtualList(listHost, {
+      items: transcripts.slice(),
+      pinToBottom: true,
+      overscan: 8,
+      getItemHeight: (_i, entry) => measureRowHeight(entry, liveListWidth),
+      renderItem: (_i, entry) => renderTranscriptRow(entry),
+    });
+  } else {
+    // Diff — vlist.items trzyma referencję wewnętrzną, appendBatch dodaje tylko
+    // nowe. Sprawdzamy po id wpisu.
+    const current = liveVlist.items;
+    if (transcripts.length > current.length) {
+      const added = transcripts.slice(current.length);
+      liveVlist.appendBatch(added);
+    } else if (transcripts.length < current.length) {
+      liveVlist.setItems(transcripts.slice());
+    }
+  }
 }
 
 function renderInlineSummary() {
@@ -597,11 +691,12 @@ function renderHistoryDetail() {
       <div class="hd-tab ${historyTab === 'summary' ? 'active' : ''}" data-history-tab="summary">${escapeHtml(I18n.t('meeting.tab_summary'))}</div>
       <div class="hd-tab ${historyTab === 'transcript' ? 'active' : ''}" data-history-tab="transcript">${escapeHtml(I18n.t('meeting.tab_transcript'))}</div>
     </div>`;
+  // Transcript tab — virtualizowana lista (vlist montowany po wstawieniu shell
+  // do DOM, patrz bindEvents → history detail mount).
   const body =
     historyTab === 'summary'
       ? renderHistorySummary(historyDetail)
-      : (historyDetail.transcripts || []).map(renderTranscriptRow).join('') ||
-        `<div class="meeting-empty-hint">${escapeHtml(I18n.t('meeting.no_transcripts'))}</div>`;
+      : `<div class="transcript-list" id="meeting-history-transcript-list" style="height: 560px; overflow-y: auto;"></div>`;
   return `
     <div class="hd-head">
       <div>
@@ -777,8 +872,35 @@ function render() {
       ? renderErrorScreen()
       : renderJoinScreen();
   host.innerHTML = `<div class="meeting-app-root">${content}</div>`;
+  // Re-mount vlisty na odpowiednich ekranach. Żywa sesja → live vlist,
+  // historia + tab=transcript → history vlist, inne ekrany → zniszcz oba.
+  if (activeScreen !== 'active') destroyLiveVlist();
+  if (activeScreen !== 'history') destroyHistoryVlist();
   if (activeScreen === 'active') renderActiveBody();
+  if (activeScreen === 'history' && historyDetail && historyTab === 'transcript') {
+    mountHistoryVlist(historyDetail.transcripts || []);
+  } else {
+    destroyHistoryVlist();
+  }
   bindEvents();
+}
+
+function mountHistoryVlist(entries) {
+  const host = byId('meeting-history-transcript-list');
+  if (!host) return;
+  destroyHistoryVlist();
+  if (!entries.length) {
+    host.innerHTML = `<div class="meeting-empty-hint" style="padding: 24px;">${escapeHtml(I18n.t('meeting.no_transcripts'))}</div>`;
+    return;
+  }
+  historyListWidth = host.clientWidth || historyListWidth;
+  historyVlist = createVirtualList(host, {
+    items: entries,
+    pinToBottom: false,
+    overscan: 10,
+    getItemHeight: (_i, e) => measureRowHeight(e, historyListWidth),
+    renderItem: (_i, e) => renderTranscriptRow(e),
+  });
 }
 
 function bindEvents() {
@@ -835,6 +957,14 @@ function bindEvents() {
       selectHistorySession(id);
     });
   });
+  // History detail tabs
+  document.querySelectorAll('[data-history-tab]').forEach((el) => {
+    el.addEventListener('click', () => {
+      if (historyTab === el.dataset.historyTab) return;
+      historyTab = el.dataset.historyTab;
+      render();
+    });
+  });
 }
 
 async function onRegenHistorySummary() {
@@ -884,6 +1014,8 @@ const MeetingScreen = {
   },
   unmount() {
     stopPolling();
+    destroyLiveVlist();
+    destroyHistoryVlist();
     if (sessionListTimer) {
       clearInterval(sessionListTimer);
       sessionListTimer = null;
