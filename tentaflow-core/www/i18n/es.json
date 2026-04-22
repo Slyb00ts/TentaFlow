@@ -1500,7 +1500,20 @@
     "edit": "Editar",
     "delete": "Eliminar",
     "confirm_delete_user": "Eliminar usuario {name}?",
-    "confirm_delete_group": "Eliminar grupo {name}?"
+    "confirm_delete_group": "Eliminar grupo {name}?",
+    "tab_info": "Info",
+    "tab_members": "Miembros",
+    "tab_perms": "Permisos",
+    "no_members": "Sin miembros",
+    "perm_hint": "Permisos de este grupo. Auto = predeterminado, Permitir = explicit, Denegar = explicit.",
+    "perm_models": "Modelos",
+    "perm_flows": "Flujos",
+    "perm_addons": "Addons",
+    "perm_auto": "Auto",
+    "perm_allow": "Permitir",
+    "perm_deny": "Denegar",
+    "perm_saved": "Permiso guardado",
+    "perm_save_failed": "Error guardando permiso"
   },
   "groups": {
     "title": "Grupos",

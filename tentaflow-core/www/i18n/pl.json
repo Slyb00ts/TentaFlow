@@ -1406,7 +1406,20 @@
     "edit": "Edytuj",
     "delete": "Usuń",
     "confirm_delete_user": "Usunąć użytkownika {name}?",
-    "confirm_delete_group": "Usunąć grupę {name}?"
+    "confirm_delete_group": "Usunąć grupę {name}?",
+    "tab_info": "Informacje",
+    "tab_members": "Członkowie",
+    "tab_perms": "Uprawnienia",
+    "no_members": "Brak członków",
+    "perm_hint": "Zmień uprawnienia tej grupy do poszczególnych zasobów. Auto = domyślny dostęp (zezwolono), Zezwól = explicit allow, Odmów = explicit deny. Priorytet: User > Grupa > Default.",
+    "perm_models": "Modele",
+    "perm_flows": "Flowy",
+    "perm_addons": "Addony",
+    "perm_auto": "Auto",
+    "perm_allow": "Zezwól",
+    "perm_deny": "Odmów",
+    "perm_saved": "Uprawnienie zapisane",
+    "perm_save_failed": "Nie udało się zapisać uprawnienia"
   },
   "groups": {
     "title": "Grupy",

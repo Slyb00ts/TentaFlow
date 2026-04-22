@@ -1406,7 +1406,20 @@
     "edit": "Edit",
     "delete": "Delete",
     "confirm_delete_user": "Delete user {name}?",
-    "confirm_delete_group": "Delete group {name}?"
+    "confirm_delete_group": "Delete group {name}?",
+    "tab_info": "Info",
+    "tab_members": "Members",
+    "tab_perms": "Permissions",
+    "no_members": "No members",
+    "perm_hint": "Change this group permissions for resources. Auto = default access (allow), Zezwól = explicit allow, Odmów = explicit deny. Priority: User > Group > Default.",
+    "perm_models": "Models",
+    "perm_flows": "Flows",
+    "perm_addons": "Addons",
+    "perm_auto": "Auto",
+    "perm_allow": "Allow",
+    "perm_deny": "Deny",
+    "perm_saved": "Permission saved",
+    "perm_save_failed": "Failed to save permission"
   },
   "groups": {
     "title": "Groups",

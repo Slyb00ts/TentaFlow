@@ -686,7 +686,7 @@ pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 }
 
 #[handler(variant = "FlowCreateRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
@@ -726,7 +726,7 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
 }
 
 #[handler(variant = "FlowDeleteRequest", since = (1, 0))]
-#[policy(UserSession)]
+#[policy(PowerUser)]
 #[observed]
 pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let flow_id_str = match req {

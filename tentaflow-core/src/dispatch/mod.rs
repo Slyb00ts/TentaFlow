@@ -70,9 +70,10 @@ pub enum SessionAuthKind {
     Anonymous,
     ApiKey,
     UserSession,
-    /// Admin = UserSession z rola "admin" w JWT claims. Bootstrap traktuje
-    /// rownoznacznie z UserSession — finalna RBAC z claim parsing przyjdzie
-    /// w #36 phase 2 razem z auth/session.rs.
+    /// PowerUser = UserSession z rola "power_user" LUB "admin".
+    /// Flow Builder, reguly TTS/PII, prompty.
+    PowerUser,
+    /// Admin = UserSession z rola "admin".
     Admin,
     MeshTrust,
 }
@@ -83,6 +84,7 @@ impl SessionAuthKind {
     /// - Anonymous: KAZDA sesja OK (publiczne endpointy, np. ModelList).
     /// - ApiKey: wymaga ApiKey LUB UserSession LUB MeshTrust.
     /// - UserSession: wymaga UserSession (dowolny role).
+    /// - PowerUser: wymaga UserSession z role="power_user" albo "admin".
     /// - Admin: wymaga UserSession z role="admin" (Zero Trust, role z DB).
     /// - MeshTrust: wymaga MeshTrust (mesh peer-only).
     pub fn session_satisfies(&self, session: &SessionAuth) -> bool {
@@ -95,6 +97,10 @@ impl SessionAuthKind {
                     | SessionAuth::MeshTrust { .. }
             ),
             SessionAuthKind::UserSession => matches!(session, SessionAuth::UserSession { .. }),
+            SessionAuthKind::PowerUser => matches!(
+                session,
+                SessionAuth::UserSession { role: Some(r), .. } if r == "admin" || r == "power_user"
+            ),
             SessionAuthKind::Admin => matches!(
                 session,
                 SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
