@@ -348,6 +348,115 @@ install_ios_targets() {
     log_ok "iOS targety gotowe"
 }
 
+# --- Metal Toolchain (macOS only) ---
+
+# Xcode 16 wydzielil Metal Toolchain jako osobny komponent. Bez niego
+# mlx-sys pada przy kompilacji shaderow (.air) z bledem:
+#   "cannot execute tool 'metal' due to missing Metal Toolchain"
+# MLX jest wlaczone domyslnie na macOS (feature inference-mlx), wiec
+# ten krok jest konieczny do buildu glownej binarki na Apple Silicon.
+install_metal_toolchain() {
+    if [[ "$DISTRO" != "macos" ]]; then
+        return
+    fi
+
+    log_section "Xcode Metal Toolchain"
+
+    if ! xcode-select -p &>/dev/null; then
+        log_warn "Xcode Command Line Tools niezainstalowane — pomijam Metal Toolchain."
+        log_warn "Zainstaluj recznie: xcode-select --install  (lub Xcode z App Store)"
+        return
+    fi
+
+    # Narzedzie 'metal' dzialajace = toolchain jest pobrany.
+    if xcrun metal --version &>/dev/null; then
+        log_ok "Metal Toolchain juz zainstalowany"
+        return
+    fi
+
+    # xcodebuild -downloadComponent wymaga pelnego Xcode (nie samego CLT).
+    local xcode_dev
+    xcode_dev=$(xcode-select -p)
+    if [[ "$xcode_dev" != *"Xcode.app"* ]]; then
+        log_warn "Aktywne Developer Dir: $xcode_dev"
+        log_warn "Metal Toolchain wymaga pelnego Xcode. Zainstaluj Xcode i przelacz:"
+        log_warn "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+        log_warn "Potem uruchom: xcodebuild -downloadComponent MetalToolchain"
+        return
+    fi
+
+    log_info "Metal Toolchain brakuje. Pobieram komponent (moze potrwac, kilkaset MB)..."
+    if xcodebuild -downloadComponent MetalToolchain; then
+        if xcrun metal --version &>/dev/null; then
+            log_ok "Metal Toolchain zainstalowany"
+            INSTALLED+=("metal-toolchain")
+        else
+            log_warn "Pobranie zakonczone, ale 'xcrun metal' wciaz nie dziala."
+            log_warn "Sprobuj recznie: xcodebuild -downloadComponent MetalToolchain"
+        fi
+    else
+        log_warn "Nie udalo sie pobrac Metal Toolchain."
+        log_warn "Uruchom recznie: xcodebuild -downloadComponent MetalToolchain"
+    fi
+}
+
+# --- iOS Platform (macOS only) ---
+
+# Xcode 16 traktuje platformy (iOS, watchOS, tvOS) jako osobne komponenty.
+# Bez pobranej platformy iOS brakuje m.in. libclang_rt.ios.a, co wywala
+# linker przy buildzie tentaflow-mobile/ios. Pobranie jest spore (~5-8 GB),
+# ale wymagane do kompilacji i symulatora iOS.
+install_ios_platform() {
+    if [[ "$DISTRO" != "macos" ]]; then
+        return
+    fi
+
+    log_section "Xcode iOS Platform (libclang_rt.ios.a + SDK)"
+
+    if ! xcode-select -p &>/dev/null; then
+        log_warn "Xcode Command Line Tools niezainstalowane — pomijam iOS platform."
+        return
+    fi
+
+    local xcode_dev
+    xcode_dev=$(xcode-select -p)
+    if [[ "$xcode_dev" != *"Xcode.app"* ]]; then
+        log_warn "Aktywne Developer Dir: $xcode_dev"
+        log_warn "iOS Platform wymaga pelnego Xcode. Przelacz:"
+        log_warn "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+        log_warn "Potem uruchom: xcodebuild -downloadPlatform iOS"
+        return
+    fi
+
+    # Sprawdzamy faktyczna obecnosc iOS runtime w aktywnym toolchain.
+    # libclang_rt.ios.a siedzi pod ../usr/lib/clang/<ver>/lib/darwin/ —
+    # numer wersji clang sie zmienia, wiec find/glob.
+    local rt_lib
+    rt_lib=$(find "$xcode_dev/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang" \
+        -name "libclang_rt.ios.a" 2>/dev/null | head -n1)
+
+    if [[ -n "$rt_lib" ]] && xcrun --show-sdk-path --sdk iphoneos &>/dev/null; then
+        log_ok "iOS Platform juz zainstalowana"
+        return
+    fi
+
+    log_info "iOS Platform brakuje. Pobieram (moze potrwac, ~5-8 GB)..."
+    if xcodebuild -downloadPlatform iOS; then
+        rt_lib=$(find "$xcode_dev/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang" \
+            -name "libclang_rt.ios.a" 2>/dev/null | head -n1)
+        if [[ -n "$rt_lib" ]]; then
+            log_ok "iOS Platform zainstalowana"
+            INSTALLED+=("ios-platform")
+        else
+            log_warn "Pobranie zakonczone, ale libclang_rt.ios.a wciaz nie widoczne."
+            log_warn "Sprobuj: sudo xcodebuild -runFirstLaunch"
+        fi
+    else
+        log_warn "Nie udalo sie pobrac iOS Platform."
+        log_warn "Uruchom recznie: xcodebuild -downloadPlatform iOS"
+    fi
+}
+
 # --- CUDA ---
 
 install_cuda() {
@@ -592,6 +701,26 @@ verify_installation() {
                 log_warn "$t: BRAK (wymagany do buildu mobile/ios)"
             fi
         done
+
+        # Metal Toolchain — wymagany przez mlx-sys przy kompilacji shaderow.
+        if xcrun metal --version &>/dev/null; then
+            log_ok "Metal Toolchain: dostepny"
+        else
+            log_warn "Metal Toolchain: BRAK (wymagany do MLX)"
+            log_warn "  Pobierz: xcodebuild -downloadComponent MetalToolchain"
+        fi
+
+        # iOS Platform — wymagana do buildu tentaflow-mobile/ios.
+        local xcode_dev
+        xcode_dev=$(xcode-select -p 2>/dev/null || true)
+        if [[ -n "$xcode_dev" ]] && \
+           find "$xcode_dev/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang" \
+                -name "libclang_rt.ios.a" 2>/dev/null | grep -q .; then
+            log_ok "iOS Platform: dostepna"
+        else
+            log_warn "iOS Platform: BRAK (wymagana do buildu mobile/ios)"
+            log_warn "  Pobierz: xcodebuild -downloadPlatform iOS"
+        fi
     fi
 
     # pkg-config
@@ -678,6 +807,8 @@ main() {
     install_wasm_target
     install_wasm_bindgen_cli
     install_ios_targets
+    install_metal_toolchain
+    install_ios_platform
 
     if [[ "$INSTALL_CUDA" == true ]]; then
         install_cuda

@@ -188,7 +188,7 @@
 					"$(PROJECT_DIR)",
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/debug",
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
-					"$(TOOLCHAIN_DIR)/usr/lib/clang/17/lib/darwin",
+					"$(TOOLCHAIN_DIR)/usr/lib/clang/21/lib/darwin",
 				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
@@ -208,7 +208,7 @@
 					Security,
 					"-framework",
 					SystemConfiguration,
-					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin/libclang_rt.ios.a,
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.ios.a,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = ai.tentaflow.mobile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -237,7 +237,7 @@
 					"$(PROJECT_DIR)",
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/debug",
 					"$(PROJECT_DIR)/../target/aarch64-apple-ios/release",
-					"$(TOOLCHAIN_DIR)/usr/lib/clang/17/lib/darwin",
+					"$(TOOLCHAIN_DIR)/usr/lib/clang/21/lib/darwin",
 				);
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
@@ -257,7 +257,7 @@
 					Security,
 					"-framework",
 					SystemConfiguration,
-					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/17/lib/darwin/libclang_rt.ios.a,
+					/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.ios.a,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = ai.tentaflow.mobile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
