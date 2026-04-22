@@ -51,6 +51,11 @@ pub struct MeshSecurity {
     revoking_nodes: RwLock<HashSet<String>>,
     /// Rate limit prob PIN per node_id: (count, last_attempt).
     pin_attempts: RwLock<HashMap<String, (u32, Instant)>>,
+    /// Aktywne zaproszenie QR — (pin, expiry). Jeden naraz, rotowany co 60s.
+    /// Uzywany w flow: nod A pokazuje QR z (hex, pin), nod B skanuje i inicjuje
+    /// parowanie uzywajac tego pinu. Nod A gdy dostanie PairingRequest z tym
+    /// pinem → auto-confirm bez user-confirmu.
+    invite: RwLock<Option<(String, Instant)>>,
     /// Pool bazy danych.
     pub db: DbPool,
     /// Szyfr do szyfrowania kluczy prywatnych w `settings`.
@@ -76,6 +81,7 @@ impl MeshSecurity {
             revoked_nodes: RwLock::new(HashSet::new()),
             revoking_nodes: RwLock::new(HashSet::new()),
             pin_attempts: RwLock::new(HashMap::new()),
+            invite: RwLock::new(None),
             db,
             settings_cipher,
         };
@@ -233,6 +239,40 @@ impl MeshSecurity {
     pub fn generate_pin() -> String {
         let pin: u32 = rand::rng().random_range(100_000..=999_999);
         format!("{:06}", pin)
+    }
+
+    /// Generuje (lub odswieza) QR invite PIN. Zwraca (pin, seconds_to_expiry).
+    /// Expires po 60s — klient powinien co 50s odswiezac.
+    pub fn generate_invite_pin(&self) -> (String, u32) {
+        let pin = Self::generate_pin();
+        let expiry = Instant::now() + Duration::from_secs(60);
+        *self.invite.write() = Some((pin.clone(), expiry));
+        (pin, 60)
+    }
+
+    /// Zwraca aktualny invite PIN (jesli wciaz wazny). Do sprawdzenia przez
+    /// `handle_pairing_request` — jesli przychodzacy PIN matchuje, auto-confirm.
+    pub fn peek_invite_pin(&self) -> Option<String> {
+        let guard = self.invite.read();
+        let (pin, expiry) = guard.as_ref()?;
+        if Instant::now() < *expiry {
+            Some(pin.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Skonsumuj invite PIN jesli matchuje — zapobiega reuse.
+    pub fn consume_invite_pin(&self, candidate: &str) -> bool {
+        let mut guard = self.invite.write();
+        let matches = guard
+            .as_ref()
+            .map(|(p, exp)| p == candidate && Instant::now() < *exp)
+            .unwrap_or(false);
+        if matches {
+            *guard = None;
+        }
+        matches
     }
 
     /// Zapisuje zaproszenie z lokalnej strony (wygenerowany PIN) i zwraca go

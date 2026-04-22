@@ -148,7 +148,9 @@
     "language": "Język",
     "deploy": "Wdroż",
     "confirm": "Potwierdź",
-    "change": "Zmień"
+    "change": "Zmień",
+    "copy": "Kopiuj",
+    "copied": "Skopiowano"
   },
   "dashboard": {
     "metrics": {
@@ -1163,7 +1165,7 @@
     "network_invalid_gateway": "Nieprawidłowa brama",
     "network_gateway_subnet": "Brama musi być w tej samej podsieci",
     "network_password_required": "Hasło sudo jest wymagane",
-    "pair_new": "Paruj nowy node",
+    "pair_new": "Paruj",
     "tab_list": "Lista nodów",
     "tab_diagram": "Diagram połączeń",
     "legend_local": "Lokalny",
@@ -1219,7 +1221,14 @@
     "unloaded": "nie załadowany",
     "no_link": "brak linku",
     "diagram_empty": "Brak nodów do wyświetlenia",
-    "diagram_hint": "Kliknij węzeł aby otworzyć szczegóły · linia ciągła = direct · przerywana = relay"
+    "diagram_hint": "Kliknij węzeł aby otworzyć szczegóły · linia ciągła = direct · przerywana = relay",
+    "pair_tab_qr": "Zeskanuj kodem",
+    "pair_tab_id": "Wpisz ID",
+    "pair_qr_hint": "Zeskanuj ten kod aplikacją TentaFlow na innym urządzeniu — parowanie nawiąże się automatycznie.",
+    "pair_qr_hex_label": "Hex node ID",
+    "pair_qr_pin_label": "PIN (ważny 60s)",
+    "pair_qr_refresh_in": "Odświeża się za",
+    "pair_id_hint": "Użyj jak mDNS nie działa (różne VLAN-y, firewall, WiFi z izolacją klientów). Hex znajdziesz na drugim nodzie w zakładce Paruj · Zeskanuj kodem."
   },
   "clusters": {
     "title": "Clusters",

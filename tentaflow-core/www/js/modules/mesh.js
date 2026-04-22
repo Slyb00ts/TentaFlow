@@ -42,7 +42,7 @@ const MeshScreen = {
             <div class="sub" id="mesh-sub"></div>
           </div>
           <div class="actions">
-            <tf-button variant="secondary" icon="plus" id="btn-pair-new">${escapeHtml(I18n.t('mesh.pair_new'))}</tf-button>
+            <tf-button variant="primary" icon="plus" id="btn-pair-new">${escapeHtml(I18n.t('mesh.pair_new'))}</tf-button>
           </div>
         </div>
 
@@ -587,23 +587,69 @@ function createPairWindow({ title, bodyHtml, submitLabel, submitAction, onSubmit
 }
 
 function openPairModal() {
-  // Modal: tylko NodeID. Backend generuje PIN, UI wyswietla go w kolejnym
-  // modalu do odczytania uzytkownikowi na drugim urzadzeniu.
+  // Modal z dwoma zakladkami:
+  //   QR — pokaz QR + hex + PIN (drugi nod skanuje albo wpisuje recznie)
+  //   ID — wpisz hex drugiego noda recznie (fallback, stare flow)
   const bodyHtml = `
-    <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="64"></tf-input>
-    <div class="form-error" hidden></div>
+    <div class="pair-tabs">
+      <tf-tabs variant="underline" value="qr" id="pair-tabs-nav">
+        <tf-tab id="qr">${escapeHtml(I18n.t('mesh.pair_tab_qr'))}</tf-tab>
+        <tf-tab id="id">${escapeHtml(I18n.t('mesh.pair_tab_id'))}</tf-tab>
+      </tf-tabs>
+    </div>
+    <div class="pair-tab-panel" data-tab="qr">
+      <div class="pair-qr-grid">
+        <div class="pair-qr-box" id="pair-qr-box">
+          <div class="pair-qr-loading">${escapeHtml(I18n.t('common.loading'))}</div>
+        </div>
+        <div class="pair-qr-info">
+          <p class="pair-qr-hint">${escapeHtml(I18n.t('mesh.pair_qr_hint'))}</p>
+          <div class="pair-cred-block">
+            <div class="pair-cred-label">
+              <span>${escapeHtml(I18n.t('mesh.pair_qr_hex_label'))}</span>
+              <button type="button" class="pair-copy-btn" data-copy="hex">${escapeHtml(I18n.t('common.copy'))}</button>
+            </div>
+            <div class="pair-cred-value" id="pair-invite-hex">—</div>
+          </div>
+          <div class="pair-cred-block">
+            <div class="pair-cred-label">
+              <span>${escapeHtml(I18n.t('mesh.pair_qr_pin_label'))}</span>
+              <button type="button" class="pair-copy-btn" data-copy="pin">${escapeHtml(I18n.t('common.copy'))}</button>
+            </div>
+            <div class="pair-cred-value pin" id="pair-invite-pin">—</div>
+          </div>
+          <div class="pair-pin-timer">
+            <div class="ring"></div>
+            <span>${escapeHtml(I18n.t('mesh.pair_qr_refresh_in'))} <b id="pair-invite-countdown">60s</b></span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="pair-tab-panel" data-tab="id" hidden>
+      <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="64"></tf-input>
+      <div class="pair-id-hint">${escapeHtml(I18n.t('mesh.pair_id_hint'))}</div>
+      <div class="form-error" hidden></div>
+    </div>
   `;
-  createPairWindow({
+  const win = createPairWindow({
     title: I18n.t('mesh.pair_title'),
     bodyHtml,
     submitLabel: I18n.t('mesh.pair'),
     submitAction: 'pair',
-    onSubmit: async (win) => {
-      const idHex = (win.querySelector('#pair-node-id')?.value || '').trim().toLowerCase();
-      const errBox = win.querySelector('.form-error');
+    onSubmit: async (winEl) => {
+      const activeTab = winEl.querySelector('#pair-tabs-nav')?.value || 'qr';
+      if (activeTab === 'qr') {
+        // Na zakladce QR "Paruj" tylko zamyka — pairing inicjuje drugi nod po
+        // zeskanowaniu kodu. User moze skopiowac dane i robic recznie.
+        return true;
+      }
+      const idHex = (winEl.querySelector('#pair-node-id')?.value || '').trim().toLowerCase();
+      const errBox = winEl.querySelector('[data-tab="id"] .form-error');
       if (!/^[0-9a-f]{64}$/.test(idHex)) {
-        errBox.textContent = I18n.t('mesh.pair_invalid_node_id');
-        errBox.hidden = false;
+        if (errBox) {
+          errBox.textContent = I18n.t('mesh.pair_invalid_node_id');
+          errBox.hidden = false;
+        }
         return false;
       }
       try {
@@ -615,12 +661,82 @@ function openPairModal() {
         }
         return true;
       } catch (e) {
-        errBox.textContent = e.message || I18n.t('mesh.pair_failed');
-        errBox.hidden = false;
+        if (errBox) {
+          errBox.textContent = e.message || I18n.t('mesh.pair_failed');
+          errBox.hidden = false;
+        }
         return false;
       }
     },
   });
+  // Tab switch + QR populate
+  wireUpPairTabs(win);
+}
+
+/// Podepnij tab-switch + poll invite identity dla QR widoku.
+async function wireUpPairTabs(winEl) {
+  if (!winEl) return;
+  const nav = winEl.querySelector('#pair-tabs-nav');
+  const panels = winEl.querySelectorAll('.pair-tab-panel');
+  if (nav) {
+    nav.addEventListener('change', () => {
+      const val = nav.value;
+      panels.forEach((p) => {
+        p.hidden = p.dataset.tab !== val;
+      });
+    });
+  }
+  // Copy buttons
+  winEl.querySelectorAll('.pair-copy-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const which = btn.dataset.copy;
+      const src = winEl.querySelector(which === 'hex' ? '#pair-invite-hex' : '#pair-invite-pin');
+      const txt = (src?.textContent || '').replace(/\s/g, '');
+      if (!txt || txt === '—') return;
+      try { await navigator.clipboard.writeText(txt); } catch { /* ignore */ }
+      const orig = btn.textContent;
+      btn.textContent = I18n.t('common.copied') || 'OK';
+      setTimeout(() => { btn.textContent = orig; }, 1200);
+    });
+  });
+
+  // Pobierz identity + invite PIN, narysuj QR, odliczaj 60s, odswiezaj.
+  const QR = await import('/js/lib/qrcode.js').catch(() => null);
+  const refresh = async () => {
+    if (!winEl.isConnected) return;
+    try {
+      const resp = await ApiBinary.one('meshIdentityRequest');
+      const hex = resp?.nodeId || resp?.node_id || '';
+      const pin = resp?.invitePin || resp?.invite_pin || '';
+      const host = resp?.hostname || '';
+      const hexEl = winEl.querySelector('#pair-invite-hex');
+      const pinEl = winEl.querySelector('#pair-invite-pin');
+      if (hexEl) hexEl.textContent = hex;
+      if (pinEl) pinEl.textContent = pin ? pin.replace(/(\d{3})(\d{3})/, '$1 $2') : '—';
+      if (QR && hex) {
+        const payload = `tentaflow-pair://${hex}?pin=${encodeURIComponent(pin || '')}&host=${encodeURIComponent(host || '')}&ver=1`;
+        const svg = await QR.renderQrSvg(payload, { size: 220, errorCorrectionLevel: 'M' });
+        const box = winEl.querySelector('#pair-qr-box');
+        if (box) box.innerHTML = svg;
+      }
+    } catch (e) {
+      console.warn('[pair-qr] identity fetch:', e?.message);
+    }
+  };
+  await refresh();
+
+  // Countdown — co sekunde. Odswiezamy identity co 50s (server TTL=60s).
+  let remaining = 50;
+  const countdownEl = winEl.querySelector('#pair-invite-countdown');
+  const iv = setInterval(async () => {
+    if (!winEl.isConnected) { clearInterval(iv); return; }
+    remaining -= 1;
+    if (countdownEl) countdownEl.textContent = `${remaining}s`;
+    if (remaining <= 0) {
+      remaining = 50;
+      await refresh();
+    }
+  }, 1000);
 }
 
 function openPinModal(nodeId) {

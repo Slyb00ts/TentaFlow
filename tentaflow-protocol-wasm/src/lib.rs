@@ -2990,7 +2990,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::MeshIdentityResponseBody(resp) => {
             set(&obj, "variant", "MeshIdentityResponse".into());
-            set(&obj, "nodeId", resp.node_id.into());
+            set(&obj, "nodeId", resp.node_id.clone().into());
+            set(&obj, "node_id", resp.node_id.into());
             set(&obj, "hostname", resp.hostname.into());
             set(&obj, "publicKey", resp.public_key.into());
             let addrs = js_sys::Array::new();
@@ -2999,6 +3000,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "addresses", addrs.into());
             set(&obj, "version", resp.version.into());
+            set(&obj, "invitePin", resp.invite_pin.clone().into());
+            set(&obj, "invite_pin", resp.invite_pin.into());
+            set(&obj, "invitePinExpiresSec", (resp.invite_pin_expires_sec as f64).into());
+            set(&obj, "invite_pin_expires_sec", (resp.invite_pin_expires_sec as f64).into());
         }
         MessageBody::MeshServicesListRequest => {
             set(&obj, "variant", "MeshServicesListRequest".into());
