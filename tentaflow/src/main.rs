@@ -335,7 +335,8 @@ async fn run_server(args: Args) -> Result<()> {
     // meeting_sessions ze status=active/joining dostają ended_at, porty sa zwalniane,
     // docker containers z labelem tentaflow.kind=meeting-bot force-removed.
     {
-        let meeting_mgr = tentaflow_core::meeting::MeetingManager::new(db.clone());
+        // Cleanup nie potrzebuje ServiceManagera — tylko DB i Docker API.
+        let meeting_mgr = tentaflow_core::meeting::MeetingManager::new(db.clone(), None);
         if let Err(e) = meeting_mgr.cleanup_on_startup().await {
             warn!("Meeting Bot cleanup_on_startup: {}", e);
         }
