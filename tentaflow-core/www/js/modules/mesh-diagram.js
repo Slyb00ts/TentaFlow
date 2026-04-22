@@ -72,13 +72,18 @@ export function renderDiagram(nodes) {
   placeCircular(onlinePeers, 200);
   placeCircular(offlinePeers, 250);
 
-  // Krawedzie
+  // Krawedzie — RYSUJEMY TYLKO miedzy zaufanymi (sparowanymi) nodami.
+  // Discovered-but-not-paired pokazuja sie jako pojedyncze kropki bez krawedzi.
+  // Wieloskok: hop (posredni) TEZ musi byc trusted, inaczej nie ma sparowanej sciezki.
+  const isTrusted = (n) => n && (n.source === 'trusted' || n.is_local || n.source === 'local');
   const edges = [];
   for (const p of peers) {
+    if (!isTrusted(p)) continue;
     const to = positions.get(p.node_id);
     if (!to) continue;
     const route = p.route;
     if (!route || route.hops == null) continue;
+    const nextHop = route.nextHop || route.next_hop;
     if (route.direct || route.hops <= 1) {
       if (!local) continue;
       const from = positions.get(local.node_id);
@@ -89,8 +94,9 @@ export function renderDiagram(nodes) {
         label: null,
         color: isOnline(p) ? 'var(--accent-1, #6366f1)' : 'var(--text-3, #6a7196)',
       });
-    } else if (route.next_hop) {
-      const hop = nodes.find(n => n.node_id === route.next_hop);
+    } else if (nextHop) {
+      const hop = nodes.find(n => n.node_id === nextHop);
+      if (!isTrusted(hop)) continue;
       const hopPos = hop ? positions.get(hop.node_id) : (local ? positions.get(local.node_id) : null);
       if (hopPos && local) {
         edges.push({

@@ -503,6 +503,48 @@ fn spawn_quic_event_handler(
                     }
                     peer_store.recalculate_routes(&local_node_id);
 
+                    // Auto-dial fallback: jesli gossip anonsuje trusted peera ktorego
+                    // mDNS/DHT nie zlapal (2 nody na LAN nie widza sie przez multicast),
+                    // probujemy sie polaczyc z niego przez direct_addrs z TopologyEntry.
+                    // Iroh sam zajmie sie NAT traversal i relay gdy direct addr nie dziala.
+                    if let Some(ref sec) = mesh_security {
+                        for entry in &payload.entries {
+                            if entry.node_id == local_node_id {
+                                continue;
+                            }
+                            if !sec.is_trusted(&entry.node_id) {
+                                continue;
+                            }
+                            if peer_store.is_quic_connected(&entry.node_id) {
+                                continue;
+                            }
+                            let target = entry.node_id.clone();
+                            let qm = qm_events.clone();
+                            let addrs: Vec<std::net::SocketAddr> = entry
+                                .direct_addrs
+                                .iter()
+                                .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+                                .collect();
+                            tokio::spawn(async move {
+                                let dial_addr = addrs
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                                match qm.connect_to_peer(&target, dial_addr).await {
+                                    Ok(_) => debug!(
+                                        peer = %target,
+                                        "Auto-dial z TopologyAnnounce udany — iroh polaczony"
+                                    ),
+                                    Err(e) => debug!(
+                                        peer = %target,
+                                        "Auto-dial z TopologyAnnounce nie zadzialal: {}",
+                                        e
+                                    ),
+                                }
+                            });
+                        }
+                    }
+
                     // Flood-rebroadcast — TTL - 1, pomijamy nadawce i origin.
                     if payload.ttl > 1 {
                         let mut forwarded = payload.clone();
