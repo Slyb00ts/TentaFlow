@@ -102,7 +102,7 @@ pub async fn run_deployment(
             )
             .await
             {
-                fail(&db, &deploy_id, &tx, start_ms, &e.to_string()).await;
+                fail(&db, &deploy_id, &tx, start_ms, &format!("{:#}", e)).await;
             }
         }
         "native" => {
@@ -118,7 +118,7 @@ pub async fn run_deployment(
             )
             .await
             {
-                fail(&db, &deploy_id, &tx, start_ms, &e.to_string()).await;
+                fail(&db, &deploy_id, &tx, start_ms, &format!("{:#}", e)).await;
             }
         }
         "external" => {
@@ -217,11 +217,14 @@ async fn do_docker_deploy(
     }
 
     // Spakuj cały workdir do tar in-memory dla bollard (taki format wymaga API).
+    // Manualny walk — pomijamy symlinki i typowe artefakty buildów (target/,
+    // node_modules/, .git/) żeby nie wysypać się na dangling symlinkach z lokalnego
+    // cargo build w katalogu kontenera.
     log_line(db, deploy_id, tx, "log", "pakowanie kontekstu do tar...");
     let mut tar_builder = tar::Builder::new(Vec::new());
-    tar_builder
-        .append_dir_all(".", workdir.path())
-        .context("tar archive")?;
+    tar_builder.follow_symlinks(false);
+    pack_dir_into_tar(&mut tar_builder, workdir.path(), std::path::Path::new(""))
+        .with_context(|| format!("pakowanie tar z {}", workdir.path().display()))?;
     let tar_bytes = tar_builder.into_inner()?;
 
     phase(db, deploy_id, tx, "building", 10, "docker build");
@@ -565,6 +568,44 @@ async fn finish_success(
     // Daj szansę subscriberom otrzymać End zanim zamkniemy kanał.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     log_bus::close(deploy_id);
+}
+
+/// Pakuje `root` do `tar_builder`, pomijając symlinki i foldery target/,
+/// node_modules/, .git/. Dangling symlinki w lokalnym kontenerze (np. z cargo
+/// build-u deweloperskiego) byłyby inaczej przyczyną "tar archive" na poziomie
+/// append_dir_all.
+fn pack_dir_into_tar(
+    tar_builder: &mut tar::Builder<Vec<u8>>,
+    root: &std::path::Path,
+    rel: &std::path::Path,
+) -> std::io::Result<()> {
+    let full = root.join(rel);
+    for entry in std::fs::read_dir(&full)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == "target" || name_str == "node_modules" || name_str == ".git" {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let sub_rel = rel.join(&name);
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            pack_dir_into_tar(tar_builder, root, &sub_rel)?;
+        } else if file_type.is_file() {
+            let path = entry.path();
+            let mut f = std::fs::File::open(&path)?;
+            tar_builder.append_file(&sub_rel, &mut f).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("tar append {}: {}", sub_rel.display(), e),
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 async fn fail(

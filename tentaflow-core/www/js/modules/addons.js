@@ -123,13 +123,15 @@ const AddonsScreen = {
 
         <div class="addons-toolbar">
           <tf-searchbox class="addons-search" id="addons-search" placeholder="${escapeAttr(I18n.t('addons.search_placeholder'))}" debounce="200"></tf-searchbox>
-          <tf-chip class="filter-chip" clickable active data-f="all">${escapeHtml(I18n.t('addons.filter_all'))}</tf-chip>
-          <tf-chip class="filter-chip" clickable data-f="enabled">${escapeHtml(I18n.t('addons.enabled'))}</tf-chip>
-          <tf-chip class="filter-chip" clickable data-f="disabled">${escapeHtml(I18n.t('addons.disabled'))}</tf-chip>
-          <tf-chip class="filter-chip" clickable icon="globe" data-f="oauth_global">${escapeHtml(I18n.t('addons.oauth_global_filter'))}</tf-chip>
-          <tf-chip class="filter-chip" clickable icon="user" data-f="oauth_individual">${escapeHtml(I18n.t('addons.oauth_individual_filter'))}</tf-chip>
-          <tf-chip class="filter-chip" clickable icon="chip" data-f="runtime_wasmtime">${escapeHtml(I18n.t('addons.badges.runtime_wasmtime'))}</tf-chip>
-          <tf-chip class="filter-chip" clickable icon="chip" data-f="runtime_wasmi">${escapeHtml(I18n.t('addons.badges.runtime_wasmi'))}</tf-chip>
+          <div class="tf-filter-group" role="tablist">
+            <tf-chip class="filter-chip" clickable active data-f="all">${escapeHtml(I18n.t('addons.filter_all'))}</tf-chip>
+            <tf-chip class="filter-chip" clickable data-f="enabled">${escapeHtml(I18n.t('addons.enabled'))}</tf-chip>
+            <tf-chip class="filter-chip" clickable data-f="disabled">${escapeHtml(I18n.t('addons.disabled'))}</tf-chip>
+            <tf-chip class="filter-chip" clickable icon="globe" data-f="oauth_global">${escapeHtml(I18n.t('addons.oauth_global_filter'))}</tf-chip>
+            <tf-chip class="filter-chip" clickable icon="user" data-f="oauth_individual">${escapeHtml(I18n.t('addons.oauth_individual_filter'))}</tf-chip>
+            <tf-chip class="filter-chip" clickable icon="chip" data-f="runtime_wasmtime">${escapeHtml(I18n.t('addons.badges.runtime_wasmtime'))}</tf-chip>
+            <tf-chip class="filter-chip" clickable icon="chip" data-f="runtime_wasmi">${escapeHtml(I18n.t('addons.badges.runtime_wasmi'))}</tf-chip>
+          </div>
         </div>
 
         <div id="addons-grid" class="addon-grid"></div>
