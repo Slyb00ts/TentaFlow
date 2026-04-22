@@ -985,6 +985,41 @@ fn spawn_quic_event_handler(
                                     warn!("Blad zapisu PairingRequest od {}: {}", peer_id, e);
                                 } else {
                                     info!("PairingRequest od {} zapisany — oczekuje na potwierdzenie PIN", from_node_id);
+                                    // Auto-confirm jesli PIN pochodzi z naszego QR invite —
+                                    // user na drugim nodzie juz zeskanowal kod i jego intent
+                                    // jest jednoznaczny. Zadna dodatkowa akcja po stronie
+                                    // wlasciciela tego noda nie jest potrzebna.
+                                    if sec.consume_invite_pin(pin) {
+                                        info!(
+                                            from = %from_node_id,
+                                            "PairingRequest PIN zgodny z QR invite — auto-confirm"
+                                        );
+                                        let body_json = serde_json::json!({
+                                            "pin": pin,
+                                            "hostname": "",
+                                        })
+                                        .to_string();
+                                        let quic_mesh_clone = Some(qm_events.clone());
+                                        let res =
+                                            crate::api::dashboard::api_mesh::handle_confirm_pairing(
+                                                sec,
+                                                from_node_id,
+                                                body_json.as_bytes(),
+                                                &quic_mesh_clone,
+                                                &local_node_id,
+                                            );
+                                        match res {
+                                            Ok((status, _body)) if status == 200 => {
+                                                info!(from = %from_node_id, "Auto-confirm OK");
+                                            }
+                                            Ok((status, body)) => {
+                                                warn!(from = %from_node_id, status, body = %body, "Auto-confirm: non-200");
+                                            }
+                                            Err(e) => {
+                                                warn!(from = %from_node_id, "Auto-confirm: {}", e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {

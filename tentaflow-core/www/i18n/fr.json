@@ -148,7 +148,9 @@
     "language": "Langue",
     "deploy": "Déployer",
     "confirm": "Confirmer",
-    "change": "Modifier"
+    "change": "Modifier",
+    "copy": "Copier",
+    "copied": "Copié"
   },
   "dashboard": {
     "metrics": {
@@ -1261,7 +1263,7 @@
     "network_invalid_gateway": "Passerelle invalide",
     "network_gateway_subnet": "La passerelle doit être dans le même sous-réseau",
     "network_password_required": "Le mot de passe sudo est obligatoire",
-    "pair_new": "Appairer un nouveau nœud",
+    "pair_new": "Appairer",
     "tab_list": "Liste des nœuds",
     "tab_diagram": "Diagramme de connexions",
     "legend_local": "Local",
@@ -1313,7 +1315,14 @@
     "diagram_empty": "Aucun nœud à afficher",
     "diagram_hint": "Cliquer un nœud pour voir les détails · ligne continue = direct · pointillée = relais",
     "no_nodes": "Aucun nœud trouvé",
-    "pair_pin_label": "PIN"
+    "pair_pin_label": "PIN",
+    "pair_tab_qr": "Scanner QR",
+    "pair_tab_id": "Saisir ID",
+    "pair_qr_hint": "Scannez ce code avec TentaFlow sur un autre appareil — l’appairage se fera automatiquement.",
+    "pair_qr_hex_label": "Hex du node",
+    "pair_qr_pin_label": "PIN (valable 60s)",
+    "pair_qr_refresh_in": "Rafraîchit dans",
+    "pair_id_hint": "À utiliser quand mDNS ne marche pas (VLAN, pare-feu, isolation WiFi). Le hex est sur l’autre node sous Appairer · Scanner QR."
   },
   "clusters": {
     "title": "Clusters",
