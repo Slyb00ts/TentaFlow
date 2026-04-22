@@ -98,5 +98,13 @@ pub use message_body::{
     NoteCreateResponse, NoteDeleteRequest, NoteDeleteResponse, NoteDetailRequest,
     NoteDetailResponse, NoteEntry, NoteSetPinnedRequest, NoteSetPinnedResponse, NoteUpdateRequest,
     NoteUpdateResponse, NotesListRequest, NotesListResponse, NotesRequest, NotesResponse,
+    MeetingActiveSessionRequest, MeetingActiveSessionResponse, MeetingPayload,
+    MeetingSessionDescriptor, MeetingSessionDetailRequest, MeetingSessionDetailResponse,
+    MeetingSessionLeaveRequest, MeetingSessionLeaveResponse, MeetingSessionListRequest,
+    MeetingSessionListResponse, MeetingSessionStartRequest, MeetingSessionStartResponse,
+    MeetingSessionSummaryEntry, MeetingSettingKv, MeetingSettingsGetRequest,
+    MeetingSettingsGetResponse, MeetingSettingsUpdateRequest, MeetingSettingsUpdateResponse,
+    MeetingSummaryGenerateRequest, MeetingSummaryGenerateResponse, MeetingTranscriptEntry,
+    MeetingTranscriptsListRequest, MeetingTranscriptsListResponse,
     TranslateRequest, TranslateResponse, UserInfo, UserOAuthAccountRow, UsersListResponse,
 };
