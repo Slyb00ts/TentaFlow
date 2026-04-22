@@ -526,9 +526,15 @@ pub fn encode_mesh_trusted_list_request() -> Result<Vec<u8>, JsError> {
 // ---- Mesh write ops (FAZA 1b — pairing/trust/connect/command/network-config) ----
 
 #[wasm_bindgen(js_name = encodeMeshPairingStartRequest)]
-pub fn encode_mesh_pairing_start_request(remote_address: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_mesh_pairing_start_request(
+    remote_address: String,
+    pin_hint: Option<String>,
+) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MeshPairingStartRequestBody(
-        MeshPairingStartRequest { remote_address },
+        MeshPairingStartRequest {
+            remote_address,
+            pin_hint: pin_hint.unwrap_or_default(),
+        },
     ))
     .map_err(|e| JsError::new(&e))
 }
