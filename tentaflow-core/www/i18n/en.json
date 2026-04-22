@@ -2080,5 +2080,19 @@
     "relative_hours_ago": "{n}h ago",
     "relative_days_ago": "{n}d ago",
     "word_count": "{n} words"
+  },
+  "connection": {
+    "title": "Connection to server lost",
+    "heading": "Daemon is not responding",
+    "description": "The TentaFlow server stopped responding. We're trying to reconnect — do not close this tab.",
+    "next_attempt": "Next attempt shortly",
+    "attempt_hint": "Attempt {attempt} • backoff grows exponentially, max 30s",
+    "btn_retry_now": "Try now",
+    "btn_logout": "Log out",
+    "log_lost": "WebSocket closed: {reason}",
+    "log_retry_scheduled": "Reconnect #{attempt} scheduled in {delay}s",
+    "log_retry_attempt": "Reconnect #{attempt} — connecting...",
+    "log_manual_retry": "Manual reconnect — trying now",
+    "log_restored": "Connection restored"
   }
 }
