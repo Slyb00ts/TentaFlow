@@ -32,6 +32,7 @@ pub struct AppState {
     pub mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     pub permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     pub license: Arc<dyn LicenseChecker>,
+    pub meeting_manager: Arc<crate::meeting::MeetingManager>,
 }
 
 impl AppState {
@@ -58,6 +59,7 @@ impl AppState {
         let service_manager = router.service_manager().clone();
         let mesh_peer_store = MeshPeerStore::new();
 
+        let meeting_manager = crate::meeting::MeetingManager::new(db.clone());
         Arc::new(Self {
             db,
             router,
@@ -71,6 +73,7 @@ impl AppState {
             mesh_security: None,
             permission_checker: None,
             license: Arc::new(StaticLicenseChecker::free()),
+            meeting_manager,
         })
     }
 }
