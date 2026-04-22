@@ -758,6 +758,11 @@ pub struct MeshIdentityResponse {
     pub public_key: String,
     pub addresses: Vec<String>,
     pub version: String,
+    /// Aktywny invite PIN dla QR. Empty string gdy disabled.
+    /// Frontend odswieza co 50s (co kazdy re-fetch identity).
+    pub invite_pin: String,
+    /// Ile sekund do wygasniecia invite PIN (0 = brak).
+    pub invite_pin_expires_sec: u32,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]

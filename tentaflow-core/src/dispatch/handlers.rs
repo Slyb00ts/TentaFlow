@@ -2900,6 +2900,9 @@ pub fn mesh_identity(
         .get(ctx.state.local_node_id.as_ref())
         .map(|p| p.hostname)
         .unwrap_or_default();
+    // Generuj fresh invite PIN dla QR code (60s TTL). Frontend co 50s re-fetchuje
+    // identity zeby odswiezyc PIN, wiec zawsze w QR jest wazny kod.
+    let (invite_pin, invite_pin_expires_sec) = sec.generate_invite_pin();
     Ok(MessageBody::MeshIdentityResponseBody(
         tentaflow_protocol::MeshIdentityResponse {
             node_id: ctx.state.local_node_id.to_string(),
@@ -2907,6 +2910,8 @@ pub fn mesh_identity(
             public_key: sec.public_key_hex(),
             addresses,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            invite_pin,
+            invite_pin_expires_sec,
         },
     ))
 }
@@ -3083,7 +3088,11 @@ fn merge_peer_store_models(
             } else {
                 format!("peer-{}-{}", &peer.node_id, pm.alias)
             };
-            let size_mb = if pm.size_mb > 0 { Some(pm.size_mb) } else { None };
+            let size_mb = if pm.size_mb > 0 {
+                Some(pm.size_mb)
+            } else {
+                None
+            };
             let backend = if pm.backend.is_empty() {
                 None
             } else {
@@ -3169,10 +3178,7 @@ fn merge_service_manager_models(
         // We use the first mapped service; pool entries for a single model
         // share backend and point at the same model file. If no DB service
         // matches, the pool entry is stale (service deleted) — skip it.
-        let svc = match service_names
-            .iter()
-            .find_map(|name| db_services.get(name))
-        {
+        let svc = match service_names.iter().find_map(|name| db_services.get(name)) {
             Some(s) => s,
             None => continue,
         };

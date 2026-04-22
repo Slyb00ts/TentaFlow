@@ -148,7 +148,9 @@
     "language": "Language",
     "deploy": "Deploy",
     "confirm": "Confirm",
-    "change": "Change"
+    "change": "Change",
+    "copy": "Copy",
+    "copied": "Copied"
   },
   "dashboard": {
     "metrics": {
@@ -1163,7 +1165,7 @@
     "network_invalid_gateway": "Invalid gateway",
     "network_gateway_subnet": "Gateway must be in the same subnet",
     "network_password_required": "Sudo password is required",
-    "pair_new": "Pair new node",
+    "pair_new": "Pair",
     "tab_list": "Node list",
     "tab_diagram": "Connection diagram",
     "legend_local": "Local",
@@ -1219,7 +1221,14 @@
     "unloaded": "unloaded",
     "no_link": "no link",
     "diagram_empty": "No nodes to display",
-    "diagram_hint": "Click a node for details · solid line = direct · dashed = relay"
+    "diagram_hint": "Click a node for details · solid line = direct · dashed = relay",
+    "pair_tab_qr": "Scan QR",
+    "pair_tab_id": "Enter ID",
+    "pair_qr_hint": "Scan this code with TentaFlow on another device — pairing happens automatically.",
+    "pair_qr_hex_label": "Hex node ID",
+    "pair_qr_pin_label": "PIN (valid 60s)",
+    "pair_qr_refresh_in": "Refreshes in",
+    "pair_id_hint": "Use this when mDNS is blocked (different VLANs, firewall, WiFi client isolation). You can find the hex on the other node under Pair · Scan QR."
   },
   "clusters": {
     "title": "Clusters",

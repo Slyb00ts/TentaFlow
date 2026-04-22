@@ -148,7 +148,9 @@
     "language": "Sprache",
     "deploy": "Bereitstellen",
     "confirm": "Bestätigen",
-    "change": "Ändern"
+    "change": "Ändern",
+    "copy": "Kopieren",
+    "copied": "Kopiert"
   },
   "dashboard": {
     "metrics": {
@@ -1261,7 +1263,7 @@
     "network_invalid_gateway": "Ungültiges Gateway",
     "network_gateway_subnet": "Gateway muss im gleichen Subnetz sein",
     "network_password_required": "Sudo-Passwort ist erforderlich",
-    "pair_new": "Neuen Knoten koppeln",
+    "pair_new": "Koppeln",
     "tab_list": "Knotenliste",
     "tab_diagram": "Verbindungsdiagramm",
     "legend_local": "Lokal",
@@ -1313,7 +1315,14 @@
     "diagram_empty": "Keine Knoten zum Anzeigen",
     "diagram_hint": "Knoten klicken für Details · durchgezogen = direkt · gestrichelt = Relay",
     "no_nodes": "Keine Knoten gefunden",
-    "pair_pin_label": "PIN"
+    "pair_pin_label": "PIN",
+    "pair_tab_qr": "QR scannen",
+    "pair_tab_id": "ID eingeben",
+    "pair_qr_hint": "Scannen Sie diesen Code mit TentaFlow auf einem anderen Gerät — die Kopplung läuft automatisch.",
+    "pair_qr_hex_label": "Hex Node ID",
+    "pair_qr_pin_label": "PIN (60s gültig)",
+    "pair_qr_refresh_in": "Aktualisiert in",
+    "pair_id_hint": "Verwenden Sie dies, wenn mDNS blockiert ist (VLANs, Firewall, WLAN Client-Isolation). Den Hex finden Sie auf dem anderen Node unter Koppeln · QR scannen."
   },
   "clusters": {
     "title": "Clusters",

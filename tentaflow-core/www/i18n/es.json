@@ -148,7 +148,9 @@
     "language": "Idioma",
     "deploy": "Desplegar",
     "confirm": "Confirmar",
-    "change": "Cambiar"
+    "change": "Cambiar",
+    "copy": "Copiar",
+    "copied": "Copiado"
   },
   "dashboard": {
     "metrics": {
@@ -1261,7 +1263,7 @@
     "network_invalid_gateway": "Puerta de enlace inválida",
     "network_gateway_subnet": "La puerta de enlace debe estar en la misma subred",
     "network_password_required": "La contraseña sudo es obligatoria",
-    "pair_new": "Emparejar nuevo nodo",
+    "pair_new": "Emparejar",
     "tab_list": "Lista de nodos",
     "tab_diagram": "Diagrama de conexiones",
     "legend_local": "Local",
@@ -1313,7 +1315,14 @@
     "diagram_empty": "No hay nodos para mostrar",
     "diagram_hint": "Haz clic en un nodo para ver detalles · línea continua = directo · discontinua = relay",
     "no_nodes": "No hay nodos",
-    "pair_pin_label": "PIN"
+    "pair_pin_label": "PIN",
+    "pair_tab_qr": "Escanear QR",
+    "pair_tab_id": "Introducir ID",
+    "pair_qr_hint": "Escanea este código con TentaFlow en otro dispositivo — el emparejamiento se hará automáticamente.",
+    "pair_qr_hex_label": "Hex del nodo",
+    "pair_qr_pin_label": "PIN (válido 60s)",
+    "pair_qr_refresh_in": "Se refresca en",
+    "pair_id_hint": "Úsalo cuando mDNS no funciona (VLANs, firewall, aislamiento WiFi). El hex está en el otro nodo en Emparejar · Escanear QR."
   },
   "clusters": {
     "title": "Clusters",
