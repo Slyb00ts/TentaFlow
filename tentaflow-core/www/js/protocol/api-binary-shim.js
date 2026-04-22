@@ -60,12 +60,19 @@ async function getClient() {
   if (_client && _client.connected) return _client;
   if (_connectingPromise) return _connectingPromise;
 
+  // Jesli backoff pending (client zyje, ma zaplanowany reconnect) — NIE wolno
+  // wolac connect() recznie, bo kazdy throw emituje onDisconnected i zasmieca
+  // log. Poczekaj az timer odpali reconnect i state wroci do connected albo
+  // rzuc wiedzialnym bledem zeby dispatch mogl skrocic timeout.
+  if (_client && !_client.connected && _client._reconnectTimer) {
+    throw new Error('offline: reconnect in progress');
+  }
+
   _connectingPromise = (async () => {
     await codecReady;
     if (!_client) {
       _client = buildClient();
     }
-    // Jesli client istnieje ale nie jest connected, reconnectNow go ustawi.
     if (!_client.connected) {
       await _client.connect();
     }
