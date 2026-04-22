@@ -1621,7 +1621,14 @@
     "gpu_select_at_least_one": "Wybierz co najmniej jedno GPU albo zmień tryb.",
     "gpu_summary_specific": "Wybrano {n} GPU · łącznie {total_vram} VRAM",
     "gpu_summary_all": "Zostaną użyte wszystkie GPU na węźle",
-    "gpu_summary_none": "GPU nie zostanie użyte"
+    "gpu_summary_none": "GPU nie zostanie użyte",
+    "gpu_mode_all_title": "Użyj wszystkich",
+    "gpu_mode_all_desc": "Deployment dostanie pełen dostęp do wszystkich kart GPU na wybranym węźle.",
+    "gpu_mode_specific_title": "Wybierz konkretne",
+    "gpu_mode_specific_desc": "Sam wskaż które karty GPU mają być zaalokowane dla tego deployu.",
+    "gpu_mode_none_title": "Tylko CPU",
+    "gpu_mode_none_desc": "Deployment nie dotknie GPU — cała inferencja na procesorze.",
+    "gpu_list_hint": "Dostępne GPU ({n})"
   },
   "category": {
     "llm": "Modele językowe (LLM)",
