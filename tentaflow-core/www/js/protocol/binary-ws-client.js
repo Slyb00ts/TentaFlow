@@ -61,6 +61,9 @@ export class BinaryWsClient {
     if (opts.onUnsolicited) this._unsolicitedListeners.push(opts.onUnsolicited);
     this._reconnectTimer = null;
     this._lastHeartbeatReplyAt = 0;
+    // Dedup: emit onDisconnected tylko raz na kazdy prawdziwy disconnect,
+    // nie per failed reconnect attempt.
+    this._disconnectEmitted = false;
   }
 
   /**
@@ -99,6 +102,7 @@ export class BinaryWsClient {
       this.transport = await openTransport({ jwtToken: this.jwtToken });
       this.connected = true;
       this.reconnectAttempt = 0;
+      this._disconnectEmitted = false;
       this._transportUnsub = this.transport.onMessage((bytes) => this._handleBytes(bytes));
       // Podpinaj onClose — kiedy transport padnie, natychmiast reconnect.
       if (this.transport.onClose) {
@@ -114,11 +118,15 @@ export class BinaryWsClient {
       this.connected = false;
       if (this.transport) this.transport.close();
       this.transport = null;
-      // W razie bledu na starcie — schedule reconnect jesli nie zostal explicite
-      // zamkniety przez close().
       if (!this.closed) {
-        this.onDisconnected({ reason: String(err?.message ?? err) });
-        this._scheduleReconnect(String(err?.message ?? err));
+        // Emituj onDisconnected TYLKO przy pierwszej niudanej probie (transition).
+        // Kolejne failed attempts leca tylko jako reconnect-attempt logi.
+        const reason = String(err?.message ?? err);
+        if (!this._disconnectEmitted) {
+          this._disconnectEmitted = true;
+          this.onDisconnected({ reason });
+        }
+        this._scheduleReconnect(reason);
       }
       throw err;
     }
@@ -138,9 +146,11 @@ export class BinaryWsClient {
     if (this._transportUnsub) this._transportUnsub();
     if (this._transportCloseUnsub) this._transportCloseUnsub();
     this.transport = null;
-    this.onDisconnected({ reason: info?.reason ?? 'unknown', code: info?.code });
+    if (!this._disconnectEmitted) {
+      this._disconnectEmitted = true;
+      this.onDisconnected({ reason: info?.reason ?? 'unknown', code: info?.code });
+    }
     this.onClose(info);
-    // Reset sequence — serwer po reconnect traktuje polaczenie jako nowe.
     this.nextSequence = 1n;
     this._scheduleReconnect(info?.reason ?? 'closed');
   }
@@ -173,6 +183,8 @@ export class BinaryWsClient {
       this._reconnectTimer = null;
     }
     this.reconnectAttempt = 0;
+    // Reset dedup, zeby manual retry odnotowal sie w overlay jesli padnie.
+    this._disconnectEmitted = false;
     if (this.transport) {
       try { this.transport.close(); } catch { /* ignore */ }
       this.transport = null;
