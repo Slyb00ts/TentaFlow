@@ -282,6 +282,30 @@ fn spawn_quic_event_handler(
 
         loop {
             match event_rx.recv().await {
+                Ok(IrohMeshEvent::HelloReceived { node_id, data }) => {
+                    // Hello przyjmujemy od KAZDEGO peera — to tylko identyfikacja
+                    // (hostname + platform), bez metryk. Daje GUI czytelna nazwe
+                    // na karcie discovered przed pairingiem.
+                    use tentaflow_protocol::mesh::MeshHelloPayload;
+                    match rkyv::from_bytes::<MeshHelloPayload, rkyv::rancor::Error>(&data) {
+                        Ok(hello) => {
+                            info!(
+                                peer_id = %node_id,
+                                hostname = %hello.hostname,
+                                platform = %hello.platform,
+                                "Otrzymano Hello od peera"
+                            );
+                            peer_store.set_hostname(&node_id, &hello.hostname);
+                            peer_store.set_platform(&node_id, &hello.platform);
+                            if !hello.os_info.is_empty() {
+                                peer_store.set_os_info(&node_id, &hello.os_info);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(peer_id = %node_id, "Blad deserializacji Hello: {}", e);
+                        }
+                    }
+                }
                 Ok(IrohMeshEvent::NodeInfoReceived { node_id, data }) => {
                     // Safety net — przetwarzaj NodeInfo TYLKO od trusted peerow
                     let is_trusted = match &mesh_security {
@@ -314,6 +338,22 @@ fn spawn_quic_event_handler(
                     info!(peer_id = %node_id, "QUIC peer polaczony");
                     peer_store.set_quic_connected(&node_id, true);
                     peer_store.set_status(&node_id, "connected");
+
+                    // Wyslij minimalne Hello (hostname + platform) niezaleznie od trust —
+                    // GUI potrzebuje rozpoznawalnej nazwy na karcie discovered przed
+                    // zakonczeniem pairingu. To tylko info identyfikujace, bez metryk.
+                    let hello = tentaflow_protocol::mesh::MeshHelloPayload {
+                        hostname: local_node_info.hostname.clone(),
+                        platform: node_info_collector::detect_platform(),
+                        os_info: local_node_info.os_info.clone(),
+                    };
+                    if let Ok(hello_bytes) =
+                        rkyv::to_bytes::<rkyv::rancor::Error>(&hello)
+                    {
+                        if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
+                            warn!("Blad wysylania Hello do {}: {}", node_id, e);
+                        }
+                    }
 
                     // Wyslij swoje NodeInfo do nowego peera — TYLKO jesli zaufany
                     let should_send = match &mesh_security {

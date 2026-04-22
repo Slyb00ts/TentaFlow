@@ -10,6 +10,8 @@
 pub mod docker;
 
 pub mod bundle;
+pub mod log_bus;
 pub mod python_venv;
+pub mod runner;
 
 pub use bundle::{extract_to, list_containers, ContainerInfo};

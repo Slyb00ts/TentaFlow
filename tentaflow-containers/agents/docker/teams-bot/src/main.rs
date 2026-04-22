@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
     let transport_config = quic_server::ContainerTransportConfig {
         port: config.transport_port,
         secret_key_path: config.secret_key_path.clone(),
+        secret_key_hex: config.secret_key_hex.clone(),
         enable_lan_discovery: config.enable_lan_discovery,
         enable_dht_discovery: config.enable_dht_discovery,
     };
@@ -350,12 +351,20 @@ async fn main() -> Result<()> {
                         speech_buffer.clear();
                         vad_detector.reset();
 
-                        // Wygeneruj unikalne meeting_id i ustaw na RouterClient
-                        // — kazdy kolejny STT request bedzie je dopisywac do metadata
-                        // ModelRequestu, router uzyje do klucza voice_temp_speakers
-                        // i transcript_store.
-                        let meeting_id = uuid::Uuid::new_v4().to_string();
-                        tracing::info!(meeting_id = %meeting_id, "Nowe meeting_id wygenerowane");
+                        // meeting_id: gdy MeetingManager na hoscie pasuje env MEETING_ID
+                        // (config.meeting_id_override), uzywamy go — dzieki temu router
+                        // zapisuje transkrypty pod ta sama sesja ktora manager utworzyl
+                        // w meeting_sessions. Gdy brak env — fallback do uuid (stand-alone
+                        // tryb, bez host manager).
+                        let meeting_id = config
+                            .meeting_id_override
+                            .clone()
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        tracing::info!(
+                            meeting_id = %meeting_id,
+                            from_host = config.meeting_id_override.is_some(),
+                            "meeting_id ustawione"
+                        );
                         {
                             let client = router_client_handle.lock().await;
                             if let Some(ref c) = *client {
