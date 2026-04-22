@@ -23,6 +23,15 @@ pub struct MeetingConfig {
     /// Sciezka do pliku z Ed25519 secret key (32 bajty raw). None = ephemeral.
     pub secret_key_path: Option<String>,
 
+    /// Ed25519 secret key w formacie hex (64 znaki) — priorytet nad secret_key_path.
+    /// Uzywany przez MeetingManager ktory generuje klucz i przekazuje env-em do kontenera.
+    pub secret_key_hex: Option<String>,
+
+    /// Stały klucz sesji/meeting_id przekazywany przez host. Uzywany do dopasowania
+    /// sesji w `meeting_sessions` tworzonej przez MeetingManager — router zapisze
+    /// transkrypty pod tym kluczem. None = bot wygeneruje uuid przy kazdym join.
+    pub meeting_id_override: Option<String>,
+
     /// Wlacza LAN mDNS discovery.
     #[serde(default = "default_true")]
     pub enable_lan_discovery: bool,
@@ -113,6 +122,8 @@ impl MeetingConfig {
             transport_port: std::env::var("TRANSPORT_PORT")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(5000),
             secret_key_path: std::env::var("SECRET_KEY_PATH").ok(),
+            secret_key_hex: std::env::var("BOT_SECRET_KEY_HEX").ok(),
+            meeting_id_override: std::env::var("MEETING_ID").ok(),
             enable_lan_discovery: std::env::var("ENABLE_LAN_DISCOVERY")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(true),
             enable_dht_discovery: std::env::var("ENABLE_DHT_DISCOVERY")

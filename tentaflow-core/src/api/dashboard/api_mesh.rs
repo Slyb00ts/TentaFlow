@@ -183,7 +183,17 @@ pub fn handle_confirm_pairing(
     quic_mesh: &Option<Arc<IrohMeshManager>>,
     local_node_id: &str,
 ) -> Result<(u16, String)> {
+    info!(
+        remote_node_id = %remote_node_id,
+        len = remote_node_id.len(),
+        "handle_confirm_pairing: start"
+    );
     if !is_valid_id(remote_node_id) {
+        warn!(
+            "handle_confirm_pairing: is_valid_id rejected remote_node_id={:?} bytes={:?}",
+            remote_node_id,
+            remote_node_id.as_bytes()
+        );
         return Ok((400, json_error("Niepoprawny node_id")));
     }
 
@@ -230,8 +240,12 @@ pub fn handle_confirm_pairing(
             // Wyslij PairingConfirm + NodeInfo przez QUIC w tle
             if let Some(ref qm) = quic_mesh {
                 let pin_for_confirm = req.pin.clone().unwrap_or_default();
+                // from_node_id MUSI byc Ed25519 pubkey hex — inicjator rozpoznaje peera
+                // po iroh endpoint_id (= Ed25519 pubkey hex). UUID lokalnego noda nie
+                // matchuje sie z zadnym wpisem w trusted_nodes po stronie inicjatora.
+                let local_ed25519 = security.ed25519_public_key_hex();
                 let payload = serde_json::json!({
-                    "from_node_id": local_node_id,
+                    "from_node_id": &local_ed25519,
                     "public_key": security.public_key_hex(),
                     "hostname": hostname,
                     "pin": pin_for_confirm,
@@ -318,10 +332,12 @@ pub fn handle_reject_pairing(
 
     security.reject_pairing(remote_node_id)?;
 
-    // Wyslij PairingReject przez QUIC w tle
+    // Wyslij PairingReject przez QUIC w tle. from_node_id = Ed25519 pubkey hex,
+    // zeby peer rozpoznal nas po iroh endpoint_id.
     if let Some(ref qm) = quic_mesh {
+        let _ = local_node_id;
         let payload = serde_json::json!({
-            "from_node_id": local_node_id,
+            "from_node_id": security.ed25519_public_key_hex(),
         });
         let qm = qm.clone();
         let node_id = remote_node_id.to_string();
@@ -361,9 +377,11 @@ pub fn handle_revoke_trust(
     );
 
     if let Some(ref qm) = quic_mesh {
+        // from_node_id = Ed25519 pubkey hex (identyfikator iroh).
+        let _ = local_node_id;
         let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
             revoked_node_id: node_id.to_string(),
-            from_node_id: local_node_id.to_string(),
+            from_node_id: security.ed25519_public_key_hex(),
         };
         let qm = qm.clone();
         let sec = security.clone();

@@ -652,6 +652,10 @@ pub const MESH_MSG_MODEL_LIST: u8 = 0x15;
 pub const MESH_MSG_CONTAINER_LIST: u8 = 0x16;
 pub const MESH_MSG_SERVICE_ANNOUNCE: u8 = 0x17;
 pub const MESH_MSG_NODE_INFO: u8 = 0x18;
+/// Minimal hello — hostname + platform. Wysylany przy kazdym PeerConnected
+/// (trusted LUB discovered), zeby GUI mogl pokazac ludzka nazwe (spark-002)
+/// zamiast skrotu hex przed zakonczeniem pairingu.
+pub const MESH_MSG_HELLO: u8 = 0x19;
 pub const MESH_MSG_PAIRING_REQUEST: u8 = 0x20;
 pub const MESH_MSG_PAIRING_CONFIRM: u8 = 0x21;
 pub const MESH_MSG_PAIRING_REJECT: u8 = 0x22;
@@ -701,6 +705,17 @@ pub struct KeyRotationResponsePayload {
 pub struct TrustedKeyEntry {
     pub node_id: String,
     pub public_key_hex: String,
+}
+
+/// Minimal payload dla `MESH_MSG_HELLO` — tylko hostname + platform + OS.
+/// Wysylany do kazdego peera (trusted/discovered) po nawiazaniu polaczenia,
+/// zeby GUI mogl pokazac nazwe hosta przed zakończeniem pairingu.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshHelloPayload {
+    pub hostname: String,
+    pub platform: String,
+    pub os_info: String,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]

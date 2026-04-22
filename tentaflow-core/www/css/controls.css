@@ -330,6 +330,11 @@ tf-window [slot="footer"] {
   width: 16px;
   height: 16px;
   color: var(--tf-text-3);
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
   pointer-events: none;
   transition: color 0.15s;
 }

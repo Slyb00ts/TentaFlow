@@ -3946,6 +3946,27 @@ pub mod transcripts {
         pub started_at: String,
         pub last_activity_at: String,
         pub entry_count: i64,
+        pub status: String,
+        pub ended_at: Option<String>,
+        pub container_id: Option<String>,
+        pub container_name: Option<String>,
+        pub quic_port: Option<i64>,
+        pub vnc_port: Option<i64>,
+        pub novnc_port: Option<i64>,
+        pub bot_endpoint_id: Option<String>,
+        pub platform: Option<String>,
+        pub owner_user_id: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct SessionSummaryRow {
+        pub session_id: i64,
+        pub tldr: String,
+        pub decisions: String,
+        pub action_items_json: String,
+        pub open_questions: String,
+        pub model: String,
+        pub generated_at: String,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -3962,6 +3983,7 @@ pub mod transcripts {
     }
 
     /// Zwraca id istniejacej sesji o podanym meeting_key lub tworzy nowa.
+    /// Nowe sesje startuja w status='idle' (caller zmieni na 'joining' po spawnie).
     pub fn get_or_create_session(
         pool: &DbPool,
         meeting_key: &str,
@@ -3980,11 +4002,39 @@ pub mod transcripts {
             return Ok(id);
         }
         conn.execute(
-            "INSERT INTO meeting_sessions (meeting_key, meeting_url, title)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO meeting_sessions (meeting_key, meeting_url, title, status)
+             VALUES (?1, ?2, ?3, 'idle')",
             rusqlite::params![meeting_key, meeting_url, title],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    const SESSION_COLS: &str =
+        "s.id, s.meeting_key, s.meeting_url, s.title, s.started_at, s.last_activity_at, \
+         (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id), \
+         s.status, s.ended_at, s.container_id, s.container_name, \
+         s.quic_port, s.vnc_port, s.novnc_port, s.bot_endpoint_id, s.platform, s.owner_user_id";
+
+    fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+        Ok(SessionRow {
+            id: row.get(0)?,
+            meeting_key: row.get(1)?,
+            meeting_url: row.get(2)?,
+            title: row.get(3)?,
+            started_at: row.get(4)?,
+            last_activity_at: row.get(5)?,
+            entry_count: row.get(6)?,
+            status: row.get(7)?,
+            ended_at: row.get(8)?,
+            container_id: row.get(9)?,
+            container_name: row.get(10)?,
+            quic_port: row.get(11)?,
+            vnc_port: row.get(12)?,
+            novnc_port: row.get(13)?,
+            bot_endpoint_id: row.get(14)?,
+            platform: row.get(15)?,
+            owner_user_id: row.get(16)?,
+        })
     }
 
     /// Wstawia jeden wpis transkrypcji i aktualizuje last_activity_at sesji.
@@ -4016,27 +4066,49 @@ pub mod transcripts {
         Ok(())
     }
 
-    /// Lista sesji posortowana po last_activity_at malejaco.
-    pub fn list_sessions(pool: &DbPool) -> Result<Vec<SessionRow>> {
+    /// Lista sesji posortowana po last_activity_at malejaco. Opcjonalny filtr po owner_user_id.
+    pub fn list_sessions(pool: &DbPool, owner_user_id: Option<i64>) -> Result<Vec<SessionRow>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT s.id, s.meeting_key, s.meeting_url, s.title, s.started_at, s.last_activity_at,
-                    (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id) AS entry_count
-             FROM meeting_sessions s
+        let sql_all = format!(
+            "SELECT {} FROM meeting_sessions s ORDER BY s.last_activity_at DESC",
+            SESSION_COLS
+        );
+        let sql_owner = format!(
+            "SELECT {} FROM meeting_sessions s WHERE s.owner_user_id = ?1 OR s.owner_user_id IS NULL \
              ORDER BY s.last_activity_at DESC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(SessionRow {
-                id: row.get(0)?,
-                meeting_key: row.get(1)?,
-                meeting_url: row.get(2)?,
-                title: row.get(3)?,
-                started_at: row.get(4)?,
-                last_activity_at: row.get(5)?,
-                entry_count: row.get(6)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            SESSION_COLS
+        );
+        match owner_user_id {
+            Some(uid) => {
+                let mut stmt = conn.prepare(&sql_owner)?;
+                let rows = stmt.query_map(rusqlite::params![uid], row_to_session)?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            }
+            None => {
+                let mut stmt = conn.prepare(&sql_all)?;
+                let rows = stmt.query_map([], row_to_session)?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            }
+        }
+    }
+
+    /// Aktywna (joining/active) sesja dla uzytkownika. Zwraca None jesli brak.
+    /// Uzywane przez frontend do odnowienia UI po refresh (jesli bot wciaz lata).
+    pub fn active_session_for_user(
+        pool: &DbPool,
+        owner_user_id: i64,
+    ) -> Result<Option<SessionRow>> {
+        let conn = pool.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM meeting_sessions s \
+             WHERE s.owner_user_id = ?1 AND s.status IN ('joining','active','leaving') \
+             ORDER BY s.last_activity_at DESC LIMIT 1",
+            SESSION_COLS
+        );
+        let row = conn
+            .query_row(&sql, rusqlite::params![owner_user_id], row_to_session)
+            .ok();
+        Ok(row)
     }
 
     /// Wszystkie wpisy transkrypcji dla sesji w kolejnosci chronologicznej.
@@ -4068,26 +4140,249 @@ pub mod transcripts {
     /// Pobiera pojedyncza sesje po id.
     pub fn get_session(pool: &DbPool, id: i64) -> Result<Option<SessionRow>> {
         let conn = pool.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM meeting_sessions s WHERE s.id = ?1",
+            SESSION_COLS
+        );
+        let row = conn
+            .query_row(&sql, rusqlite::params![id], row_to_session)
+            .ok();
+        Ok(row)
+    }
+
+    // =========================================================================
+    // Lifecycle updates
+    // =========================================================================
+
+    /// Pełne wypełnienie sesji po udanym spawnie kontenera.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_session_spawned(
+        pool: &DbPool,
+        id: i64,
+        container_id: &str,
+        container_name: &str,
+        quic_port: u16,
+        vnc_port: u16,
+        novnc_port: u16,
+        bot_endpoint_id: &str,
+        bot_secret_key_hex: &str,
+        platform: &str,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET status = 'joining',
+                 container_id = ?2, container_name = ?3,
+                 quic_port = ?4, vnc_port = ?5, novnc_port = ?6,
+                 bot_endpoint_id = ?7, bot_secret_key_hex = ?8,
+                 platform = ?9, owner_user_id = COALESCE(owner_user_id, ?10),
+                 last_activity_at = datetime('now'),
+                 ended_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                container_id,
+                container_name,
+                quic_port as i64,
+                vnc_port as i64,
+                novnc_port as i64,
+                bot_endpoint_id,
+                bot_secret_key_hex,
+                platform,
+                owner_user_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_session_status(pool: &DbPool, id: i64, status: &str) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions SET status = ?2, last_activity_at = datetime('now')
+             WHERE id = ?1",
+            rusqlite::params![id, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_session_ended(pool: &DbPool, id: i64) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions SET status = 'ended', ended_at = datetime('now'),
+                 last_activity_at = datetime('now'),
+                 container_id = NULL, container_name = NULL,
+                 quic_port = NULL, vnc_port = NULL, novnc_port = NULL
+             WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Sesje oznaczone 'active'/'joining' po crashu (zostaly po unclean shutdown).
+    /// Caller powinien je zwolnic (stop container jesli istnieje, release ports, mark ended).
+    pub fn list_stale_sessions(pool: &DbPool) -> Result<Vec<SessionRow>> {
+        let conn = pool.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM meeting_sessions s \
+             WHERE s.status IN ('joining','active','leaving')",
+            SESSION_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], row_to_session)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // =========================================================================
+    // Port allocations
+    // =========================================================================
+
+    /// Atomowo rezerwuje port danego rodzaju. Zwraca true jesli nowy wpis wstawiono,
+    /// false jesli port byl juz zajęty (wywolanie powinno probowac kolejny).
+    pub fn try_reserve_port(
+        pool: &DbPool,
+        port: u16,
+        kind: &str,
+        session_id: i64,
+    ) -> Result<bool> {
+        let conn = pool.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO meeting_port_allocations (port, kind, session_id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![port as i64, kind, session_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn release_session_ports(pool: &DbPool, session_id: i64) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "DELETE FROM meeting_port_allocations WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_reserved_ports(pool: &DbPool, kind: &str) -> Result<Vec<u16>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT port FROM meeting_port_allocations WHERE kind = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![kind], |row| {
+            let p: i64 = row.get(0)?;
+            Ok(p as u16)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // =========================================================================
+    // Summaries
+    // =========================================================================
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_session_summary(
+        pool: &DbPool,
+        session_id: i64,
+        tldr: &str,
+        decisions: &str,
+        action_items_json: &str,
+        open_questions: &str,
+        model: &str,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meeting_session_summaries
+                (session_id, tldr, decisions, action_items_json, open_questions, model, generated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+             ON CONFLICT(session_id) DO UPDATE SET
+                tldr = excluded.tldr,
+                decisions = excluded.decisions,
+                action_items_json = excluded.action_items_json,
+                open_questions = excluded.open_questions,
+                model = excluded.model,
+                generated_at = excluded.generated_at",
+            rusqlite::params![
+                session_id,
+                tldr,
+                decisions,
+                action_items_json,
+                open_questions,
+                model
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session_summary(
+        pool: &DbPool,
+        session_id: i64,
+    ) -> Result<Option<SessionSummaryRow>> {
+        let conn = pool.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT s.id, s.meeting_key, s.meeting_url, s.title, s.started_at, s.last_activity_at,
-                        (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id)
-                 FROM meeting_sessions s WHERE s.id = ?1",
-                rusqlite::params![id],
+                "SELECT session_id, tldr, decisions, action_items_json, open_questions, model, generated_at
+                 FROM meeting_session_summaries WHERE session_id = ?1",
+                rusqlite::params![session_id],
                 |row| {
-                    Ok(SessionRow {
-                        id: row.get(0)?,
-                        meeting_key: row.get(1)?,
-                        meeting_url: row.get(2)?,
-                        title: row.get(3)?,
-                        started_at: row.get(4)?,
-                        last_activity_at: row.get(5)?,
-                        entry_count: row.get(6)?,
+                    Ok(SessionSummaryRow {
+                        session_id: row.get(0)?,
+                        tldr: row.get(1)?,
+                        decisions: row.get(2)?,
+                        action_items_json: row.get(3)?,
+                        open_questions: row.get(4)?,
+                        model: row.get(5)?,
+                        generated_at: row.get(6)?,
                     })
                 },
             )
             .ok();
         Ok(row)
+    }
+
+    // =========================================================================
+    // Per-user settings
+    // =========================================================================
+
+    pub fn get_user_setting(pool: &DbPool, user_id: i64, key: &str) -> Result<Option<String>> {
+        let conn = pool.lock().unwrap();
+        let val = conn
+            .query_row(
+                "SELECT value FROM meeting_settings WHERE user_id = ?1 AND key = ?2",
+                rusqlite::params![user_id, key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        Ok(val)
+    }
+
+    pub fn list_user_settings(
+        pool: &DbPool,
+        user_id: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM meeting_settings WHERE user_id = ?1 ORDER BY key ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn set_user_setting(
+        pool: &DbPool,
+        user_id: i64,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meeting_settings (user_id, key, value, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))
+             ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            rusqlite::params![user_id, key, value],
+        )?;
+        Ok(())
     }
 }
 
@@ -6155,6 +6450,8 @@ mod alias_resolve_tests {
             .expect("Utworzenie aliasu teams-stt powinno sie udac");
         create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
             .expect("Utworzenie aliasu teams-tts powinno sie udac");
+        create_or_reactivate_model_alias(&db, "teams-summary", "", "first_available")
+            .expect("Utworzenie aliasu teams-summary powinno sie udac (pusty target)");
 
         // Assert 1 — aliasy istnieja i sa aktywne
         let stt = resolve_model_alias(&db, "teams-stt").unwrap();
@@ -6168,6 +6465,15 @@ mod alias_resolve_tests {
         let tts = tts.unwrap();
         assert_eq!(tts.target_model, "tts-1");
         assert!(tts.is_active);
+
+        let summary = resolve_model_alias(&db, "teams-summary").unwrap();
+        assert!(summary.is_some(), "Alias teams-summary powinien istniec");
+        let summary = summary.unwrap();
+        assert_eq!(
+            summary.target_model, "",
+            "teams-summary ma pusty target — admin uzupelnia recznie"
+        );
+        assert!(summary.is_active);
 
         // Act 2 — dezaktywacja (symulacja zatrzymania addonu)
         set_model_alias_active(&db, "teams-stt", false)
@@ -7534,5 +7840,230 @@ mod notes_tests {
         // And the table is usable.
         let uid = mk_user(&db, "alice");
         create_note(&db, uid, "t", "b").unwrap();
+    }
+}
+
+// =============================================================================
+// Deployments (migration 48) — deploy lifecycle tracking with streaming log tail
+// =============================================================================
+
+pub mod deployments {
+    use super::DbPool;
+    use anyhow::Result;
+    use rusqlite::params;
+    use serde::Serialize;
+
+    /// Maksymalna liczba linii logu trzymana w kolumnie log_tail. Starsze linie
+    /// są kasowane przy każdym append. 200 linii = ~15 KB tekstu, łatwo mieszczi
+    /// się w rkyv response nawet dla wielu deployów na liście.
+    pub const LOG_TAIL_MAX_LINES: usize = 200;
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct DeploymentRow {
+        pub id: i64,
+        pub deploy_id: String,
+        pub engine_id: String,
+        pub deploy_method: String,
+        pub node_id: String,
+        pub status: String,
+        pub phase: String,
+        pub progress_pct: i64,
+        pub image_tag: String,
+        pub container_name: String,
+        pub config_json: String,
+        pub user_id: Option<i64>,
+        pub started_at: String,
+        pub finished_at: Option<String>,
+        pub error_message: Option<String>,
+        pub log_tail: String,
+    }
+
+    const COLS: &str = "id, deploy_id, engine_id, deploy_method, node_id, status, phase, \
+                        progress_pct, image_tag, container_name, config_json, user_id, \
+                        started_at, finished_at, error_message, log_tail";
+
+    fn row_to_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
+        Ok(DeploymentRow {
+            id: row.get(0)?,
+            deploy_id: row.get(1)?,
+            engine_id: row.get(2)?,
+            deploy_method: row.get(3)?,
+            node_id: row.get(4)?,
+            status: row.get(5)?,
+            phase: row.get(6)?,
+            progress_pct: row.get(7)?,
+            image_tag: row.get(8)?,
+            container_name: row.get(9)?,
+            config_json: row.get(10)?,
+            user_id: row.get(11)?,
+            started_at: row.get(12)?,
+            finished_at: row.get(13)?,
+            error_message: row.get(14)?,
+            log_tail: row.get(15)?,
+        })
+    }
+
+    /// Tworzy wiersz deployment w status='queued'. Caller (runner) zmienia
+    /// status → 'building' → ... → 'success'/'failure'.
+    pub fn create(
+        pool: &DbPool,
+        deploy_id: &str,
+        engine_id: &str,
+        deploy_method: &str,
+        node_id: &str,
+        config_json: &str,
+        user_id: Option<i64>,
+    ) -> Result<i64> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, config_json, user_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![deploy_id, engine_id, deploy_method, node_id, config_json, user_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn set_status(
+        pool: &DbPool,
+        deploy_id: &str,
+        status: &str,
+        phase: &str,
+        progress_pct: u32,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET status = ?2, phase = ?3, progress_pct = ?4 WHERE deploy_id = ?1",
+            params![deploy_id, status, phase, progress_pct as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_image_tag(pool: &DbPool, deploy_id: &str, image_tag: &str) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET image_tag = ?2 WHERE deploy_id = ?1",
+            params![deploy_id, image_tag],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_container_name(pool: &DbPool, deploy_id: &str, name: &str) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET container_name = ?2 WHERE deploy_id = ?1",
+            params![deploy_id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_finished(
+        pool: &DbPool,
+        deploy_id: &str,
+        final_status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET status = ?2, finished_at = datetime('now'),
+                 progress_pct = CASE WHEN ?2 = 'success' THEN 100 ELSE progress_pct END,
+                 error_message = ?3 WHERE deploy_id = ?1",
+            params![deploy_id, final_status, error_message],
+        )?;
+        Ok(())
+    }
+
+    /// Dopisuje linię do log_tail, trzymając nie więcej niż LOG_TAIL_MAX_LINES.
+    /// Przy wielu równoległych deployach transakcja SQLite serializuje zapisy,
+    /// więc nie musimy dodatkowego locka.
+    pub fn append_log_line(pool: &DbPool, deploy_id: &str, line: &str) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        let current: String = conn
+            .query_row(
+                "SELECT log_tail FROM deployments WHERE deploy_id = ?1",
+                params![deploy_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        let mut lines: Vec<&str> = current.split('\n').filter(|l| !l.is_empty()).collect();
+        lines.push(line);
+        if lines.len() > LOG_TAIL_MAX_LINES {
+            let drop_n = lines.len() - LOG_TAIL_MAX_LINES;
+            lines.drain(0..drop_n);
+        }
+        let new_tail = lines.join("\n");
+        conn.execute(
+            "UPDATE deployments SET log_tail = ?2 WHERE deploy_id = ?1",
+            params![deploy_id, new_tail],
+        )?;
+        Ok(())
+    }
+
+    pub fn get(pool: &DbPool, deploy_id: &str) -> Result<Option<DeploymentRow>> {
+        let conn = pool.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM deployments WHERE deploy_id = ?1",
+            COLS
+        );
+        let row = conn
+            .query_row(&sql, params![deploy_id], row_to_deployment)
+            .ok();
+        Ok(row)
+    }
+
+    /// Lista deployów z filtrem po engine_id / status / user_id. Każdy filter
+    /// opcjonalny. Sortowanie started_at DESC. Default limit 100.
+    pub fn list(
+        pool: &DbPool,
+        engine_id: Option<&str>,
+        status: Option<&str>,
+        user_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<DeploymentRow>> {
+        let conn = pool.lock().unwrap();
+        let mut where_clauses = Vec::new();
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(eid) = engine_id {
+            where_clauses.push("engine_id = ?");
+            bind_params.push(Box::new(eid.to_string()));
+        }
+        if let Some(st) = status {
+            where_clauses.push("status = ?");
+            bind_params.push(Box::new(st.to_string()));
+        }
+        if let Some(uid) = user_id {
+            where_clauses.push("user_id = ?");
+            bind_params.push(Box::new(uid));
+        }
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_clauses.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT {} FROM deployments{} ORDER BY started_at DESC LIMIT {}",
+            COLS,
+            where_sql,
+            limit.max(1).min(500)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            bind_params.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_deployment)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Deployy w stanie 'queued' lub 'running'-ish zostawione przez crash.
+    /// Startup cleanup oznacza je jako 'failure' z error='aborted by shutdown'.
+    pub fn reset_stale(pool: &DbPool) -> Result<u32> {
+        let conn = pool.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE deployments
+             SET status = 'failure',
+                 finished_at = datetime('now'),
+                 error_message = 'aborted by tentaflow shutdown'
+             WHERE status NOT IN ('success', 'failure', 'cancelled')",
+            [],
+        )?;
+        Ok(n as u32)
     }
 }

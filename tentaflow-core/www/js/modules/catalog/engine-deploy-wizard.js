@@ -44,7 +44,7 @@ const gpuListByNode = new Map();
 // navigation time by filtering out steps whose skip() returns true.
 const STEPS = [
   { id: 'method' },
-  { id: 'model' },
+  { id: 'model', skip: shouldSkipModelStep },
   { id: 'gpu', skip: shouldSkipGpuStep },
   { id: 'runtime' },
 ];
@@ -465,6 +465,23 @@ function renderStepRuntime() {
 
 // ---- Step 3: GPUs ---------------------------------------------------------
 
+// Model selection step ma sens tylko dla engines gdzie deploy wymaga modelu —
+// LLM, STT, TTS, embeddings, vision, image-gen itd. Agenty (teams-bot) i tools
+// są self-contained — nie pobierają modeli HuggingFace przy deploy. Manifest
+// może jawnie wymusić przez `engine.requires_model = true/false`; bez tego
+// heurystyka po category + obecności [[model_preset]].
+function shouldSkipModelStep() {
+  const eng = engineEntry?.engine;
+  if (!eng) return false;
+  if (eng.requires_model === false) return true;
+  if (eng.requires_model === true) return false;
+  const category = String(eng.category || '').toLowerCase();
+  const modelOptional = new Set(['agents', 'tools']);
+  if (!modelOptional.has(category)) return false;
+  const presets = Manifest.modelPresets(engineEntry);
+  return !presets || presets.length === 0;
+}
+
 // The GPU step is skipped when there are no GPUs on the selected node. The
 // engine manifest may opt out via `engine.gpu_supported === false`; by default
 // (field absent) we assume the engine can use GPUs if the node has any.
@@ -808,9 +825,18 @@ async function startDeploy() {
       nodeId: selection.nodeId,
       configJson,
     });
-    const id = data?.deployId || '?';
+    const id = data?.deployId || '';
+    if (!id) throw new Error('brak deployId w odpowiedzi serwera');
     toast(I18n.t('wizard.deployStarted').replace('{id}', id), 'success');
-    setTimeout(close, 1200);
+    // Zamknij wizard i pokaż live progress modal. Progress subscribes do
+    // deploymentLogStreamRequest i pokazuje pasek + tail logów do zakończenia.
+    close();
+    const mod = await import('/js/modules/catalog/deploy-progress-modal.js');
+    mod.openDeployProgressModal({
+      deployId: id,
+      engineId: eng.id,
+      deployMethod: selection.deployMethod,
+    });
   } catch (err) {
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
     if (btn) btn.removeAttribute('disabled');

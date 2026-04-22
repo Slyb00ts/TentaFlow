@@ -41,6 +41,7 @@ import FlowsUserScreen from '/js/modules/flows-user.js';
 import PromptsUserScreen from '/js/modules/prompts-user.js';
 import TranslateScreen from '/js/modules/translate.js';
 import NotesScreen from '/js/modules/notes.js';
+import MeetingScreen from '/js/modules/meeting.js';
 import { makeComingSoonScreen } from '/js/modules/coming-soon.js';
 
 // Helper: SVG <use> reference do inline sprite.
@@ -107,7 +108,7 @@ const USER_NAV = [
       { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
       { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
       { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
-      { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting', badge: 'soon' },
+      { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
       { id: 'flows-user', labelKey: 'nav.flows_user', icon: 'workflow-app' },
       { id: 'prompts-user', labelKey: 'nav.prompts_user', icon: 'star' },
       { id: 'tts', labelKey: 'nav.tts', icon: 'speaker', badge: 'soon' },
@@ -333,7 +334,7 @@ async function renderApp() {
   Router.register('notes', NotesScreen);
   // Apps whose binary handlers are not yet wired — honest placeholder, not a stub feature.
   Router.register('images',         makeComingSoonScreen('images',    'image'));
-  Router.register('meeting',        makeComingSoonScreen('meeting',   'meeting'));
+  Router.register('meeting', MeetingScreen);
   Router.register('tts',            makeComingSoonScreen('tts',       'speaker'));
   Router.register('translate',      TranslateScreen);
   Router.register('search-app',     makeComingSoonScreen('search',    'search'));
