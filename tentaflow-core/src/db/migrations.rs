@@ -1508,5 +1508,39 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
                 ON mesh_topology(last_seen_ms DESC);
         ",
     ),
+    (
+        50,
+        "user_roles_and_resource_permissions",
+        "
+            -- 3 role: user / power_user / admin. Migrujemy z is_admin (bool) na
+            -- role text column. User accounts z is_admin=1 dostaja 'admin',
+            -- reszta 'user'. Power user mozna ustawic recznie przez UI.
+            ALTER TABLE user_accounts ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
+            UPDATE user_accounts SET role = 'admin' WHERE is_admin = 1;
+
+            -- Generyczna tabela ACL — dla modeli, flowow, addonow i przyszlych
+            -- zasobow. (resource_type, resource_id) identyfikuje konkretny zasob,
+            -- (subject_type, subject_id) konto albo grupe. access_level:
+            --   allow — explicit zezwolono
+            --   deny  — explicit odmowa (wygrywa nad default i grupa deny)
+            -- Brak wpisu = default (zezwolono dla wszystkich).
+            -- Priorytet rozstrzygania: user_deny > user_allow > group_deny >
+            -- group_allow > default_allow.
+            CREATE TABLE IF NOT EXISTS resource_permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject_id INTEGER NOT NULL,
+                access_level TEXT NOT NULL CHECK(access_level IN ('allow','deny')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(resource_type, resource_id, subject_type, subject_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_resperm_subject
+                ON resource_permissions(subject_type, subject_id);
+            CREATE INDEX IF NOT EXISTS idx_resperm_resource
+                ON resource_permissions(resource_type, resource_id);
+        ",
+    ),
 ]
 }
