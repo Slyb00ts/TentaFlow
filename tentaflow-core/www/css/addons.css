@@ -26,27 +26,40 @@
   min-width: 240px;
 }
 
+.tf-filter-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--bg-input, var(--tf-bg-input));
+  border: 1px solid var(--border, var(--tf-border));
+  border-radius: 999px;
+}
+
+.tf-filter-group tf-chip.filter-chip > .tf-chip,
 tf-chip.filter-chip > .tf-chip {
-  padding: 5px 10px;
-  border-radius: 14px;
-  background: var(--bg-3);
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: transparent;
   color: var(--text-2);
-  border: 1px solid var(--border);
+  border: 0;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0;
   text-transform: none;
+  transition: background 0.15s, color 0.15s;
 }
 
+.tf-filter-group tf-chip.filter-chip > .tf-chip.clickable:hover,
 tf-chip.filter-chip > .tf-chip.clickable:hover {
-  border-color: var(--border-hover);
+  background: var(--bg-card-hover, rgba(255, 255, 255, 0.04));
   color: var(--text);
 }
 
+.tf-filter-group tf-chip.filter-chip[active] > .tf-chip,
 tf-chip.filter-chip[active] > .tf-chip {
-  background: var(--accent-glow);
-  color: var(--accent-2);
-  border-color: var(--accent-1);
+  background: var(--accent-glow, var(--tf-accent-glow));
+  color: var(--accent-2, var(--tf-accent-2));
 }
 
 .addon-grid {
