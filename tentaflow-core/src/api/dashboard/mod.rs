@@ -26,6 +26,7 @@ pub mod auto_register;
 pub mod handlers_addon_lifecycle;
 pub mod handlers_addon_oauth;
 pub mod handlers_addon_permissions;
+pub mod handlers_meeting;
 pub mod handlers_my_accounts;
 pub mod handlers_notes;
 pub mod handlers_translate;

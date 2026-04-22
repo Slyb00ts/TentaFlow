@@ -490,6 +490,7 @@ pub async fn handle_request(
         );
 
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
+        let meeting_manager = crate::meeting::MeetingManager::new(db.clone());
         let app_state = std::sync::Arc::new(crate::dispatch::AppState {
             db: db.clone(),
             router: router.clone(),
@@ -503,6 +504,7 @@ pub async fn handle_request(
             mesh_security: mesh_security.clone(),
             permission_checker: permission_checker.clone(),
             license: license.clone(),
+            meeting_manager,
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
