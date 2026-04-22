@@ -267,7 +267,7 @@ function renderDiscoveredCard(node) {
 }
 
 function renderPendingCard(pairing) {
-  const nodeId = pairing.remote_node_id || '';
+  const nodeId = pairing.remoteNodeId || pairing.remote_node_id || '';
   const shortId = nodeId.slice(0, 16);
   return `
     <div class="mesh-card pending">
