@@ -408,18 +408,32 @@ function openCreateGroupModal() {
   });
 }
 
-function openEditGroupModal(g) {
+async function openEditGroupModal(g) {
   const win = document.createElement('tf-window');
   win.setAttribute('title', `${I18n.t('users.modal_edit_group')} — ${g.name}`);
   win.setAttribute('buttons', 'close');
-  win.setAttribute('width', '440');
+  win.setAttribute('width', '720');
+  win.setAttribute('min-width', '560');
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
   const body = document.createElement('div');
   body.slot = 'body';
   body.innerHTML = `
-    <div class="form-row"><tf-input id="g-name" label="${escapeAttr(I18n.t('users.field_group_name'))}" value="${escapeAttr(g.name || '')}"></tf-input></div>
-    <div class="form-row"><tf-input id="g-descr" label="${escapeAttr(I18n.t('users.field_group_desc'))}" value="${escapeAttr(g.description || '')}"></tf-input></div>
+    <tf-tabs variant="underline" value="info" id="g-tabs">
+      <tf-tab id="info">${escapeHtml(I18n.t('users.tab_info'))}</tf-tab>
+      <tf-tab id="members">${escapeHtml(I18n.t('users.tab_members'))}</tf-tab>
+      <tf-tab id="perms">${escapeHtml(I18n.t('users.tab_perms'))}</tf-tab>
+    </tf-tabs>
+    <div class="g-panel" data-tab="info">
+      <div class="form-row"><tf-input id="g-name" label="${escapeAttr(I18n.t('users.field_group_name'))}" value="${escapeAttr(g.name || '')}"></tf-input></div>
+      <div class="form-row"><tf-input id="g-descr" label="${escapeAttr(I18n.t('users.field_group_desc'))}" value="${escapeAttr(g.description || '')}"></tf-input></div>
+    </div>
+    <div class="g-panel" data-tab="members" hidden>
+      <div id="g-members-list" class="user-list"><div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div></div>
+    </div>
+    <div class="g-panel" data-tab="perms" hidden>
+      <div id="g-perms-body"><div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div></div>
+    </div>
     <div class="form-error" hidden></div>
   `;
   win.appendChild(body);
@@ -431,6 +445,23 @@ function openEditGroupModal(g) {
   backdrop.className = 'tf-window-backdrop';
   document.body.append(backdrop, win);
   const cleanup = () => { win.remove(); backdrop.remove(); };
+
+  const tabsEl = body.querySelector('#g-tabs');
+  const panels = body.querySelectorAll('.g-panel');
+  let membersLoaded = false;
+  let permsLoaded = false;
+  tabsEl.addEventListener('change', async (e) => {
+    const val = e.detail?.value;
+    panels.forEach((p) => { p.hidden = p.dataset.tab !== val; });
+    if (val === 'members' && !membersLoaded) {
+      await loadGroupMembers(g.id, body.querySelector('#g-members-list'));
+      membersLoaded = true;
+    } else if (val === 'perms' && !permsLoaded) {
+      await loadGroupPermissions(g.id, body.querySelector('#g-perms-body'));
+      permsLoaded = true;
+    }
+  });
+
   win.addEventListener('action', async (e) => {
     const a = e.detail?.action;
     if (a === 'cancel') return cleanup();
@@ -451,6 +482,121 @@ function openEditGroupModal(g) {
       }
     }
   });
+}
+
+async function loadGroupMembers(groupId, host) {
+  try {
+    const resp = await ApiBinary.action('iamGroupMembersRequest', { groupId });
+    const members = resp?.members || [];
+    if (members.length === 0) {
+      host.innerHTML = `<div style="color:var(--tf-text-3); padding:20px; text-align:center;">${escapeHtml(I18n.t('users.no_members'))}</div>`;
+      return;
+    }
+    host.innerHTML = members.map(renderUserRow).join('');
+  } catch (err) {
+    host.innerHTML = `<div style="color:var(--tf-danger); padding:20px;">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ---- Permissions matrix per grupa ----
+// Dla kazdego typu zasobu (model/flow/addon) pokazujemy wszystkie dostepne
+// zasoby + segmented toggle Auto/Zezwól/Odmów. Auto = brak wpisu (default allow).
+async function loadGroupPermissions(groupId, host) {
+  try {
+    const [permsResp, modelsResp, flowsResp, addonsResp] = await Promise.all([
+      ApiBinary.action('iamListPermsForSubjectRequest', { subjectType: 'group', subjectId: groupId }),
+      ApiBinary.list('modelListRequest').catch(() => []),
+      ApiBinary.list('flowListRequest').catch(() => []),
+      ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => []),
+    ]);
+    const entries = permsResp?.entries || [];
+    // Zmapuj per resource_type → resource_id → access_level.
+    const byResource = {};
+    for (const e of entries) {
+      byResource[e.resourceType] = byResource[e.resourceType] || {};
+      byResource[e.resourceType][e.resourceId] = e.accessLevel;
+    }
+
+    const modelItems = (modelsResp || []).map((m) => ({
+      id: String(m.id || m.name || m.alias || ''),
+      name: String(m.name || m.id || m.alias || ''),
+      descr: String(m.description || m.backend || ''),
+    }));
+    const flowItems = (flowsResp || []).map((f) => ({
+      id: String(f.id || f.name || ''),
+      name: String(f.name || f.id || ''),
+      descr: String(f.description || ''),
+    }));
+    const addonItems = (addonsResp || []).map((a) => ({
+      id: String(a.id || a.addonId || ''),
+      name: String(a.name || a.displayName || a.id || ''),
+      descr: String(a.description || ''),
+    }));
+
+    const renderSection = (label, type, items) => {
+      if (items.length === 0) return '';
+      const rows = items.map((item) => {
+        const current = byResource[type]?.[item.id] || 'auto';
+        return renderPermRow(type, item, current, groupId);
+      }).join('');
+      return `
+        <div class="perm-section">
+          <div class="perm-section-head"><span>${escapeHtml(label)}</span><span class="counter">${items.length}</span></div>
+          ${rows}
+        </div>`;
+    };
+
+    host.innerHTML = `
+      <div class="perm-header-hint">${escapeHtml(I18n.t('users.perm_hint'))}</div>
+      ${renderSection(I18n.t('users.perm_models'), 'model', modelItems)}
+      ${renderSection(I18n.t('users.perm_flows'), 'flow', flowItems)}
+      ${renderSection(I18n.t('users.perm_addons'), 'addon', addonItems)}
+    `;
+
+    host.addEventListener('change', async (e) => {
+      const seg = e.target.closest('tf-segmented[data-resource-type]');
+      if (!seg) return;
+      const resourceType = seg.dataset.resourceType;
+      const resourceId = seg.dataset.resourceId;
+      const level = e.detail?.value;
+      try {
+        if (level === 'auto') {
+          await ApiBinary.action('iamClearPermissionRequest', {
+            resourceType, resourceId, subjectType: 'group', subjectId: groupId,
+          });
+        } else {
+          await ApiBinary.action('iamSetPermissionRequest', {
+            resourceType, resourceId, subjectType: 'group', subjectId: groupId,
+            accessLevel: level,
+          });
+        }
+        const row = seg.closest('.perm-row');
+        if (row) row.classList.toggle('denied', level === 'deny');
+        toast(I18n.t('users.perm_saved'), 'success');
+      } catch (err) {
+        toast(err.message || I18n.t('users.perm_save_failed'), 'error');
+      }
+    });
+  } catch (err) {
+    host.innerHTML = `<div style="color:var(--tf-danger); padding:20px;">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderPermRow(resourceType, item, current, _groupId) {
+  const isDeny = current === 'deny';
+  return `
+    <div class="perm-row${isDeny ? ' denied' : ''}">
+      <div class="meta">
+        <div class="name">${escapeHtml(item.name)}</div>
+        ${item.descr ? `<div class="descr">${escapeHtml(item.descr)}</div>` : ''}
+      </div>
+      <tf-segmented size="sm" value="${escapeAttr(current)}" data-resource-type="${escapeAttr(resourceType)}" data-resource-id="${escapeAttr(item.id)}">
+        <option value="auto" variant="neutral">${escapeHtml(I18n.t('users.perm_auto'))}</option>
+        <option value="allow" variant="ok">${escapeHtml(I18n.t('users.perm_allow'))}</option>
+        <option value="deny" variant="err">${escapeHtml(I18n.t('users.perm_deny'))}</option>
+      </tf-segmented>
+    </div>
+  `;
 }
 
 function confirmDeleteGroup(g) {

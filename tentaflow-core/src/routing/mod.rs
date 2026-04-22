@@ -4,6 +4,7 @@
 //       Eksportuje wszystkie podmoduly routera.
 // =============================================================================
 
+pub mod acl;
 pub mod backend;
 pub mod chat;
 pub mod chat_template;

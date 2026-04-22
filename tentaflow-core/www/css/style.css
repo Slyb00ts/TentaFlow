@@ -1059,6 +1059,53 @@ input, textarea, select {
 }
 .user-row:hover .user-row-actions { opacity: 1; }
 
+/* Permission matrix — per grupa macierz dostepow do zasobow */
+.perm-header-hint {
+  padding: 10px 12px;
+  background: rgba(96, 165, 250, 0.06);
+  border: 1px solid rgba(96, 165, 250, 0.2);
+  border-radius: 10px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+.perm-section { margin-bottom: 16px; }
+.perm-section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 0 6px;
+  font-size: 11px; font-weight: 700;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.perm-section-head .counter {
+  color: var(--text-3); font-weight: 600;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  text-transform: none;
+}
+.perm-row {
+  display: grid; grid-template-columns: 1fr auto;
+  gap: 14px; align-items: center;
+  padding: 10px 14px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 6px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.perm-row .meta .name {
+  font-weight: 700; font-size: 13px; color: var(--text);
+}
+.perm-row .meta .descr {
+  font-size: 11px; color: var(--text-3); margin-top: 2px;
+}
+.perm-row.denied {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.04);
+}
+.perm-row.denied .meta .name { color: #fca5a5; }
+
 /* Pairing modal z tabami QR + ID */
 .pair-tabs { margin-bottom: 16px; }
 .pair-tab-panel { padding: 4px 0; }
