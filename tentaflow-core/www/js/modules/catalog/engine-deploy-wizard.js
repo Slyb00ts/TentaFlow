@@ -535,6 +535,13 @@ function renderStepGpu() {
   const gpus = nodeGpus(selection.nodeId);
   const mode = selection.gpuSelectMode || 'all';
   const selectedSet = new Set(selection.gpuIds);
+  const nodeName = escapeHtml(nodeDisplayName(selection.nodeId));
+
+  // Option cards — zastepuja natywne radio buttony. Aktywna karta ma gradient
+  // accent jako checkmark + tint tla + inner box-shadow.
+  const icoAll = `<svg viewBox="0 0 24 24"><rect x="3" y="8" width="8" height="8" rx="1"/><rect x="13" y="8" width="8" height="8" rx="1"/><line x1="3" y1="3" x2="3" y2="6"/><line x1="21" y1="3" x2="21" y2="6"/><line x1="7" y1="4" x2="7" y2="7"/><line x1="17" y1="4" x2="17" y2="7"/></svg>`;
+  const icoSpec = `<svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>`;
+  const icoCpu = `<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>`;
 
   const rows = gpus.map((g, idx) => {
     const meta = [
@@ -542,54 +549,67 @@ function renderStepGpu() {
       g.usage_percent != null ? `util ${Math.round(g.usage_percent)}%` : '',
       g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '',
       g.driver_version ? `driver ${escapeHtml(String(g.driver_version))}` : '',
-    ].filter(Boolean).join(' · ');
-    const checked = selectedSet.has(String(idx)) ? 'checked' : '';
-    const vendor = g.vendor || '—';
+    ].filter(Boolean);
+    const metaHtml = meta.map((m, i) => i < meta.length - 1 ? `<span>${escapeHtml(m)}</span><span class="sep">·</span>` : `<span>${escapeHtml(m)}</span>`).join(' ');
+    const selected = selectedSet.has(String(idx));
+    const vendor = String(g.vendor || '').toLowerCase();
+    let brandClass = 'other';
+    if (vendor.includes('nvidia')) brandClass = 'nvidia';
+    else if (vendor.includes('amd') || vendor.includes('radeon')) brandClass = 'amd';
+    else if (vendor.includes('intel')) brandClass = 'intel';
+    const brandLabel = g.vendor || '—';
     return `
-      <label class="gpu-row">
-        <input type="checkbox" value="${idx}" ${checked}>
+      <div class="gpu-row${selected ? ' selected' : ''}" data-gpu-idx="${idx}" role="checkbox" aria-checked="${selected}" tabindex="0">
+        <div class="gpu-check"></div>
         <div class="gpu-info">
-          <div class="gpu-name">GPU ${idx} · ${escapeHtml(String(g.name || ''))}</div>
-          <div class="gpu-meta">${meta}</div>
+          <div class="gpu-name"><span class="gpu-idx">GPU ${idx} ·</span> ${escapeHtml(String(g.name || ''))}</div>
+          <div class="gpu-meta">${metaHtml}</div>
         </div>
-        <tf-chip status="${escapeAttr(vendorStatus(vendor))}">${escapeHtml(String(vendor))}</tf-chip>
-      </label>
+        <span class="gpu-brand ${brandClass}">${escapeHtml(String(brandLabel))}</span>
+      </div>
     `;
   }).join('');
 
   const listHidden = mode !== 'specific' ? 'hidden' : '';
-  const nodeName = escapeHtml(nodeDisplayName(selection.nodeId));
+  const iconSummary = `<svg viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>`;
 
   return `
     <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.gpu_title', { node: nodeName }))}</h4>
     <p class="form-hint">${escapeHtml(I18n.t('wizard.gpu_subtitle'))}</p>
 
-    <div class="gpu-mode-group">
-      <label>
-        <input type="radio" name="gpu-mode" value="all" ${mode === 'all' ? 'checked' : ''}>
-        <span>${escapeHtml(I18n.t('wizard.gpu_mode_all', { n: gpus.length }))}</span>
-      </label>
-      <label>
-        <input type="radio" name="gpu-mode" value="specific" ${mode === 'specific' ? 'checked' : ''}>
-        <span>${escapeHtml(I18n.t('wizard.gpu_mode_specific'))}</span>
-      </label>
-      <label>
-        <input type="radio" name="gpu-mode" value="none" ${mode === 'none' ? 'checked' : ''}>
-        <span>${escapeHtml(I18n.t('wizard.gpu_mode_none'))}</span>
-      </label>
+    <div class="gpu-mode-cards">
+      <button type="button" class="gpu-mode-card all${mode === 'all' ? ' active' : ''}" data-gpu-mode="all" aria-pressed="${mode === 'all'}">
+        <span class="gpu-mode-ico">${icoAll}</span>
+        <span class="gpu-mode-title">${escapeHtml(I18n.t('wizard.gpu_mode_all_title'))}<span class="gpu-mode-tag">${gpus.length}</span></span>
+        <span class="gpu-mode-desc">${escapeHtml(I18n.t('wizard.gpu_mode_all_desc'))}</span>
+      </button>
+      <button type="button" class="gpu-mode-card specific${mode === 'specific' ? ' active' : ''}" data-gpu-mode="specific" aria-pressed="${mode === 'specific'}">
+        <span class="gpu-mode-ico">${icoSpec}</span>
+        <span class="gpu-mode-title">${escapeHtml(I18n.t('wizard.gpu_mode_specific_title'))}</span>
+        <span class="gpu-mode-desc">${escapeHtml(I18n.t('wizard.gpu_mode_specific_desc'))}</span>
+      </button>
+      <button type="button" class="gpu-mode-card none${mode === 'none' ? ' active' : ''}" data-gpu-mode="none" aria-pressed="${mode === 'none'}">
+        <span class="gpu-mode-ico">${icoCpu}</span>
+        <span class="gpu-mode-title">${escapeHtml(I18n.t('wizard.gpu_mode_none_title'))}</span>
+        <span class="gpu-mode-desc">${escapeHtml(I18n.t('wizard.gpu_mode_none_desc'))}</span>
+      </button>
     </div>
 
-    <div class="gpu-list" ${listHidden}>${rows}</div>
+    <div class="gpu-list" ${listHidden}>
+      <div class="gpu-list-hint">${escapeHtml(I18n.t('wizard.gpu_list_hint', { n: gpus.length }))}</div>
+      ${rows}
+    </div>
 
-    <div class="gpu-summary form-hint">${escapeHtml(gpuSummaryText(gpus))}</div>
+    <div class="gpu-summary">${iconSummary}<span>${escapeHtml(gpuSummaryText(gpus))}</span></div>
   `;
 }
 
 function bindStepGpuInputs() {
-  document.querySelectorAll('input[name="gpu-mode"]').forEach((radio) => {
-    radio.addEventListener('change', () => {
-      if (!radio.checked) return;
-      const mode = radio.value;
+  // Option cards — klik wybiera tryb.
+  document.querySelectorAll('.gpu-mode-card[data-gpu-mode]').forEach((card) => {
+    card.addEventListener('click', () => {
+      const mode = card.dataset.gpuMode;
+      if (!mode) return;
       selection.gpuSelectMode = mode;
       if (mode === 'all' || mode === 'none') {
         selection.gpuIds = [];
@@ -601,14 +621,24 @@ function bindStepGpuInputs() {
     });
   });
 
-  document.querySelectorAll('.gpu-list input[type="checkbox"]').forEach((cb) => {
-    cb.addEventListener('change', () => {
-      const id = String(cb.value);
-      const set = new Set(selection.gpuIds);
-      if (cb.checked) set.add(id); else set.delete(id);
-      selection.gpuIds = Array.from(set).sort((a, b) => Number(a) - Number(b));
-      const box = document.querySelector('.gpu-summary');
-      if (box) box.textContent = gpuSummaryText(nodeGpus(selection.nodeId));
+  // GPU cards — klik toggle selected.
+  const toggleGpu = (row) => {
+    const idx = String(row.dataset.gpuIdx);
+    const set = new Set(selection.gpuIds);
+    if (set.has(idx)) set.delete(idx); else set.add(idx);
+    selection.gpuIds = Array.from(set).sort((a, b) => Number(a) - Number(b));
+    row.classList.toggle('selected', set.has(idx));
+    row.setAttribute('aria-checked', set.has(idx) ? 'true' : 'false');
+    const box = document.querySelector('.gpu-summary span:last-child');
+    if (box) box.textContent = gpuSummaryText(nodeGpus(selection.nodeId));
+  };
+  document.querySelectorAll('.gpu-list .gpu-row[data-gpu-idx]').forEach((row) => {
+    row.addEventListener('click', () => toggleGpu(row));
+    row.addEventListener('keydown', (e) => {
+      if (e.key === ' ' || e.key === 'Enter') {
+        e.preventDefault();
+        toggleGpu(row);
+      }
     });
   });
 }
