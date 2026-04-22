@@ -311,14 +311,18 @@ function renderNodeCard(node, kind) {
     statusChip = `<tf-chip status="offline" dot>${escapeHtml(I18n.t('mesh.offline'))}</tf-chip>`;
   }
 
-  // Relay chip — jesli routed przez inny node
+  // Relay chip — jesli routed przez inny node. Pokazuje 'via <hostname>' inline,
+  // a tooltip daje pelny opis (hopsLabel + 'via' + nazwa). Uzywamy camelCase
+  // lub snake_case (obydwa sa setowane przez wasm — patrz protocol/wasm bindings).
   let relayChip = '';
   const route = node.route;
-  if (route && route.direct === false && route.hops != null && route.next_hop) {
+  const nextHop = route && (route.nextHop || route.next_hop);
+  if (route && route.direct === false && route.hops != null && nextHop) {
     const hopsLabel = route.hops === 1 ? I18n.t('mesh.hop_one') : I18n.t('mesh.hop_many', { count: route.hops });
-    const nextHopNode = nodes.find(n => (n.node_id || '') === route.next_hop);
-    const nextHopName = (nextHopNode && nextHopNode.hostname) || route.next_hop.slice(0, 8);
-    relayChip = `<tf-chip status="info" title="${escapeAttr(hopsLabel + ' via ' + nextHopName)}">${escapeHtml(hopsLabel)}</tf-chip>`;
+    const nextHopNode = nodes.find(n => (n.node_id || '') === nextHop);
+    const nextHopName = (nextHopNode && nextHopNode.hostname) || nextHop.slice(0, 8);
+    const viaLabel = I18n.t('mesh.via_peer', { peer: nextHopName });
+    relayChip = `<tf-chip status="info" title="${escapeAttr(hopsLabel + ' · ' + viaLabel)}">${escapeHtml(hopsLabel)} · ${escapeHtml(viaLabel)}</tf-chip>`;
   }
 
   // Details row — IP + (uptime | RTT) + protocol

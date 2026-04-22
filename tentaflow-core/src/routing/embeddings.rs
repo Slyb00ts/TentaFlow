@@ -66,6 +66,34 @@ impl Router {
                             );
                             Ok(response)
                         }
+                        BackendHandle::MeshForward(node_id, svc) => {
+                            // Zdalny embedding serwis w mesh — iroh obsluguje relay multi-hop
+                            // transparentnie przez endpoint routing. Uzywamy tego samego
+                            // mechanizmu co dla bezposredniego peera.
+                            debug!(
+                                target_node = %node_id,
+                                service = %svc,
+                                "MeshForward embeddings do zdalnej uslugi"
+                            );
+                            let quic_handle = {
+                                this.service_manager
+                                    .quic_embedding_services
+                                    .read()
+                                    .get(svc)
+                                    .cloned()
+                            }
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Mesh embedding serwis '{}' na nodzie {} nie zarejestrowany lokalnie",
+                                    svc, node_id
+                                )
+                            })?;
+                            let quic_client = quic_handle.get_client().await.ok_or_else(|| {
+                                anyhow::anyhow!("Mesh embedding serwis '{}' nie polaczony", svc)
+                            })?;
+                            this.route_embeddings_quic(quic_client, req, svc.clone())
+                                .await
+                        }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla embeddings")),
                     }
                 }
