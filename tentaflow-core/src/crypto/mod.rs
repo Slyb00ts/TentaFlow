@@ -171,10 +171,15 @@ const ENCRYPTED_SETTING_KEYS: &[&str] = &[
     "ngc_api_key",
 ];
 
-/// Okresla sciezke do master key — priorytet: custom_dir, home_dir, data_dir
+/// Okresla sciezke do master key — priorytet: custom_dir, document_dir (iOS sandbox), home_dir, data_dir
 pub fn master_key_path(custom_dir: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
     if let Some(dir) = custom_dir {
         return Ok(dir.join("master.key"));
+    }
+    // Na iOS home_dir wskazuje na root sandboxa, ale zapis dozwolony jest tylko
+    // wewnatrz Documents/ — uzywamy document_dir zeby uniknac "Operation not permitted".
+    if let Some(docs) = dirs::document_dir() {
+        return Ok(docs.join("tentaflow-ai").join("master.key"));
     }
     if let Some(home) = dirs::home_dir() {
         return Ok(home.join(MASTER_KEY_PATH));

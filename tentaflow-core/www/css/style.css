@@ -1817,7 +1817,7 @@ input, textarea, select {
   .sidebar-backdrop { display: none; }
 
   /* Page content padding */
-  .main { padding-bottom: env(safe-area-inset-bottom); }
+  .main { padding: 12px 14px; padding-bottom: env(safe-area-inset-bottom); }
   .mesh-shell, .catalog-shell { padding: 12px 14px; }
   .page-header { flex-direction: column; align-items: flex-start; gap: 10px; }
   .page-header .actions { width: 100%; }
