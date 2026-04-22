@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::db::{repository, DbPool};
+use crate::routing::service_manager::ServiceManager;
 
 use super::container::{self, SpawnRequest};
 use super::port_pool;
@@ -62,11 +63,25 @@ pub struct SessionSummary {
 #[derive(Clone)]
 pub struct MeetingManager {
     db: DbPool,
+    /// Opcjonalny — cleanup path (startup) nie potrzebuje ServiceManagera.
+    /// Production start_session wywołany przez handler zawsze dostaje Some.
+    service_manager: Option<Arc<ServiceManager>>,
 }
 
 impl MeetingManager {
-    pub fn new(db: DbPool) -> Arc<Self> {
-        Arc::new(Self { db })
+    pub fn new(db: DbPool, service_manager: Option<Arc<ServiceManager>>) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            service_manager,
+        })
+    }
+
+    /// Nazwa serwisu używana przy register_quic_service — zawiera session_id dla
+    /// unikalności. Substring "meeting-bot" wymuszany przez spawn_connection_tasks
+    /// żeby trafić do dedykowanego `meeting_bot_connection_loop` (reverse listener
+    /// + transcript subscriber).
+    fn service_name(session_id: i64) -> String {
+        format!("meeting-bot-{}", session_id)
     }
 
     /// Startuje nową sesję Meeting Bot. Flow:
@@ -168,13 +183,40 @@ impl MeetingManager {
             }
         }
 
+        // Rejestracja w ServiceManager — router spawnuje meeting_bot_connection_loop
+        // który łączy się do bota przez iroh. Direct addr 127.0.0.1:<quic_port>
+        // omija LAN discovery (bridge network nie widoczna przez mDNS hosta).
+        if let Some(ref sm) = self.service_manager {
+            let service_name = Self::service_name(session_id);
+            let iroh_url = format!("iroh://{}", bot_endpoint_id);
+            let direct_addrs = vec![format!("127.0.0.1:{}", ports.quic)];
+            sm.register_quic_service_with_addrs(
+                service_name,
+                "meeting-bot",
+                iroh_url,
+                None,
+                None,
+                direct_addrs,
+            );
+        } else {
+            warn!(
+                session = session_id,
+                "brak ServiceManager — kontener uruchomiony ale router nie połączy się"
+            );
+        }
+
         self.session_detail(session_id)?
             .ok_or_else(|| anyhow!("nie udalo sie pobrac sesji po spawnie"))
     }
 
-    /// Zatrzymuje sesję: stop+rm kontener, release portów, status=ended.
+    /// Zatrzymuje sesję: wyrejestruj z ServiceManager → stop+rm kontener →
+    /// release portów → status=ended. Kolejność: najpierw odłącz router
+    /// (żeby nie walił reconnect loopem w umierający kontener), potem stop.
     pub async fn leave_session(&self, session_id: i64) -> Result<()> {
         repository::transcripts::set_session_status(&self.db, session_id, "leaving")?;
+        if let Some(ref sm) = self.service_manager {
+            sm.remove_quic_service(&Self::service_name(session_id), "meeting-bot");
+        }
         let _ = container::stop(session_id).await;
         port_pool::release_for_session(&self.db, session_id)?;
         repository::transcripts::mark_session_ended(&self.db, session_id)?;

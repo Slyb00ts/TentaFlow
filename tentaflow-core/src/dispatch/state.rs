@@ -59,7 +59,8 @@ impl AppState {
         let service_manager = router.service_manager().clone();
         let mesh_peer_store = MeshPeerStore::new();
 
-        let meeting_manager = crate::meeting::MeetingManager::new(db.clone());
+        let meeting_manager =
+            crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
         Arc::new(Self {
             db,
             router,
