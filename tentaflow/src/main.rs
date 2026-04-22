@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tentaflow_core::config::NodeConfig;
 use tentaflow_core::db;
@@ -330,6 +330,26 @@ async fn run_server(args: Args) -> Result<()> {
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
     collector.start(router.service_manager().shutdown_rx.clone()).await;
+
+    // Sprzątanie ephemeral kontenerów Meeting Bot po unclean shutdown — stare wiersze
+    // meeting_sessions ze status=active/joining dostają ended_at, porty sa zwalniane,
+    // docker containers z labelem tentaflow.kind=meeting-bot force-removed.
+    {
+        // Cleanup nie potrzebuje ServiceManagera — tylko DB i Docker API.
+        let meeting_mgr = tentaflow_core::meeting::MeetingManager::new(db.clone(), None);
+        if let Err(e) = meeting_mgr.cleanup_on_startup().await {
+            warn!("Meeting Bot cleanup_on_startup: {}", e);
+        }
+    }
+
+    // Reset stale deploymentów po unclean shutdown — wiersze pozostawione jako
+    // 'building'/'running' dostają status='failure' z error='aborted'. Runner
+    // tokio-task który je produkował nie żyje po restarcie.
+    match tentaflow_core::db::repository::deployments::reset_stale(&db) {
+        Ok(n) if n > 0 => info!("Deployments cleanup: {} stale rows marked as failure", n),
+        Ok(_) => {}
+        Err(e) => warn!("Deployments cleanup: {}", e),
+    }
 
     // Uruchom serwer HTTPS (OpenAI API + Dashboard na jednym porcie) — z Core
     tentaflow_core::api::unified_server::start_unified_server(&config, &db, &metrics, &router, &mesh_peer_store, quic_mesh_for_server, local_node_id_for_server, mesh_security_for_server)?;

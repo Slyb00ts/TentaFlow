@@ -85,6 +85,10 @@ pub enum IrohMeshEvent {
         node_id: String,
         data: Vec<u8>,
     },
+    HelloReceived {
+        node_id: String,
+        data: Vec<u8>,
+    },
     CrdtDeltaReceived {
         node_id: String,
         data: Vec<u8>,
@@ -609,6 +613,11 @@ impl IrohMeshManager {
             .await
     }
 
+    pub async fn send_hello(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(node_id, tentaflow_protocol::mesh::MESH_MSG_HELLO, data)
+            .await
+    }
+
     pub async fn send_pairing_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
         self.send_to_peer(
             node_id,
@@ -984,6 +993,10 @@ impl IrohMeshManagerRef {
                 heartbeat: payload,
             },
             x if x == MESH_MSG_NODE_INFO => IrohMeshEvent::NodeInfoReceived {
+                node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_HELLO => IrohMeshEvent::HelloReceived {
                 node_id: remote_hex,
                 data: payload,
             },

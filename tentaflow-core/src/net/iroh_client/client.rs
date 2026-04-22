@@ -42,6 +42,12 @@ pub struct IrohServiceConfig {
     pub keepalive_interval_ms: u64,
     pub tls_ca: Option<String>,
     pub skip_tls_verify: bool,
+    /// Jawne direct addresses (jako stringi "ip:port") przekazywane do iroh
+    /// `EndpointAddr` obok `EndpointId`. Używane gdy peer nie jest discoverable
+    /// przez LAN mDNS/DHT — np. MeetingBot ephemeral kontener w docker bridge
+    /// network, gdzie host łączy się pod `127.0.0.1:<mapped_quic_port>`. Pusta
+    /// lista = polegaj na discovery (domyślne zachowanie dla reszty serwisów).
+    pub direct_addrs: Vec<String>,
 }
 
 impl Default for IrohServiceConfig {
@@ -57,6 +63,7 @@ impl Default for IrohServiceConfig {
             keepalive_interval_ms: 10_000,
             tls_ca: None,
             skip_tls_verify: false,
+            direct_addrs: Vec::new(),
         }
     }
 }
@@ -91,6 +98,11 @@ impl IrohServiceClient {
         svc_cfg.request_timeout = Duration::from_millis(config.timeout_ms);
         svc_cfg.auto_reconnect = config.auto_reconnect;
         svc_cfg.reconnect_interval = Duration::from_millis(config.reconnect_interval_ms.max(500));
+        svc_cfg.direct_addrs = config
+            .direct_addrs
+            .iter()
+            .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+            .collect();
 
         let inner = ServiceClient::connect(endpoint.clone(), svc_cfg, shutdown_rx.clone())
             .await

@@ -272,6 +272,47 @@ impl MeshPeerStore {
         self.mark_dirty();
     }
 
+    /// Hostname — ustawiany na podstawie Hello payload od peera lub seed_local.
+    /// Nigdy nie nadpisuje niepustej wartosci pustym stringiem.
+    pub fn set_hostname(&self, node_id: &str, hostname: &str) {
+        if hostname.is_empty() {
+            return;
+        }
+        let mut peers = self.peers.write();
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
+        p.hostname = hostname.to_string();
+        drop(peers);
+        self.mark_dirty();
+    }
+
+    pub fn set_platform(&self, node_id: &str, platform: &str) {
+        if platform.is_empty() {
+            return;
+        }
+        let mut peers = self.peers.write();
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
+        p.platform = platform.to_string();
+        drop(peers);
+        self.mark_dirty();
+    }
+
+    pub fn set_os_info(&self, node_id: &str, os_info: &str) {
+        if os_info.is_empty() {
+            return;
+        }
+        let mut peers = self.peers.write();
+        let p = peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id));
+        p.os_info = os_info.to_string();
+        drop(peers);
+        self.mark_dirty();
+    }
+
     pub fn remove(&self, node_id: &str) {
         self.peers.write().remove(node_id);
         self.mark_dirty();

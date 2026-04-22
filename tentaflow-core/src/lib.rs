@@ -37,5 +37,6 @@ pub mod dispatch;
 pub mod addon;
 pub mod deploy;
 pub mod license;
+pub mod meeting;
 pub mod paths;
 pub mod system_check;

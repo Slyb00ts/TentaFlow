@@ -490,6 +490,10 @@ pub async fn handle_request(
         );
 
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
+        let meeting_manager = crate::meeting::MeetingManager::new(
+            db.clone(),
+            Some(service_manager.clone()),
+        );
         let app_state = std::sync::Arc::new(crate::dispatch::AppState {
             db: db.clone(),
             router: router.clone(),
@@ -503,6 +507,7 @@ pub async fn handle_request(
             mesh_security: mesh_security.clone(),
             permission_checker: permission_checker.clone(),
             license: license.clone(),
+            meeting_manager,
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
@@ -1121,7 +1126,7 @@ pub async fn handle_request(
 
     // Lista sesji rozmow z DB (kazda sesja = jedna rozmowa).
     if path == "/api/meeting-bot/sessions" && method == Method::GET {
-        let sessions = crate::db::repository::transcripts::list_sessions(&db).unwrap_or_default();
+        let sessions = crate::db::repository::transcripts::list_sessions(&db, None).unwrap_or_default();
         let active_id = crate::routing::transcript_store::active_session_id();
         let payload = serde_json::json!({
             "sessions": sessions,

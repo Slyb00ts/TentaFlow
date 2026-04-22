@@ -267,7 +267,7 @@ function renderDiscoveredCard(node) {
 }
 
 function renderPendingCard(pairing) {
-  const nodeId = pairing.remote_node_id || '';
+  const nodeId = pairing.remoteNodeId || pairing.remote_node_id || '';
   const shortId = nodeId.slice(0, 16);
   return `
     <div class="mesh-card pending">
@@ -650,7 +650,7 @@ function openPinDisplayModal(targetNodeId, pin) {
       <div class="pair-pin-steps">${escapeHtml(I18n.t('mesh.pair_pin_display_steps'))}</div>
     </div>
   `;
-  createPairWindow({
+  const win = createPairWindow({
     title: I18n.t('mesh.pair_pin_display_title'),
     bodyHtml,
     submitLabel: I18n.t('common.close') || 'Zamknij',
@@ -665,13 +665,38 @@ function openPinDisplayModal(targetNodeId, pin) {
     if (el) el.textContent = String(remaining);
     if (remaining <= 0 || !el) clearInterval(iv);
   }, 1000);
+  // Poll — po sparowaniu inicjator usuwa outgoing pending entry. Kiedy nasz
+  // entry znika (albo node pojawia sie jako trusted), zamykamy modal automatycznie.
+  const pollIv = setInterval(async () => {
+    if (!win.isConnected) {
+      clearInterval(pollIv);
+      return;
+    }
+    try {
+      const pendingResp = await ApiBinary.list('meshPendingListRequest', { arrayKey: 'pending' });
+      const stillPending = Array.isArray(pendingResp)
+        && pendingResp.some(p => (p.remoteNodeId || p.remote_node_id) === targetNodeId);
+      if (!stillPending) {
+        clearInterval(pollIv);
+        clearInterval(iv);
+        if (win.isConnected) win.remove();
+        document.querySelectorAll('.tf-window-backdrop').forEach(b => b.remove());
+        toast(I18n.t('mesh.pair_confirm_success'), 'success');
+        await loadData();
+        renderActiveTab();
+      }
+    } catch (_e) {
+      // sil — poll probuje ponownie
+    }
+  }, 2000);
 }
 
 function openConfirmPinModal(nodeId) {
-  // PIN dla incoming pairing confirm.
+  // PIN dla incoming pairing confirm — OTP-style 6 cell input.
   const bodyHtml = `
-    <tf-input id="confirm-pin-input" label="${escapeAttr(I18n.t('mesh.pair_pin_label'))}" placeholder="000000" maxlength="6" inputmode="numeric" hint="${escapeAttr(I18n.t('mesh.confirm_pin_hint'))}"></tf-input>
-    <div class="form-error" hidden></div>
+    <div class="pair-pin-hint">${escapeHtml(I18n.t('mesh.confirm_pin_hint'))}</div>
+    <tf-pin-input id="confirm-pin-input" length="6" group-size="3" autofocus></tf-pin-input>
+    <div class="form-error" hidden style="text-align:center;"></div>
   `;
   createPairWindow({
     title: I18n.t('mesh.confirm_pin_title'),
@@ -679,17 +704,38 @@ function openConfirmPinModal(nodeId) {
     submitLabel: I18n.t('mesh.confirm_pairing'),
     submitAction: 'confirm',
     onSubmit: async (win) => {
-      const pin = (win.querySelector('#confirm-pin-input')?.value || '').trim();
+      const pinEl = win.querySelector('#confirm-pin-input');
+      const pin = pinEl?.value || '';
       const errBox = win.querySelector('.form-error');
-      if (!/^\d{6}$/.test(pin)) {
+      if (pin.length !== 6) {
         errBox.textContent = I18n.t('mesh.pair_invalid_pin');
         errBox.hidden = false;
+        pinEl?.setAttribute('error', '');
+        setTimeout(() => pinEl?.removeAttribute('error'), 400);
         return false;
       }
-      await ApiBinary.action('meshPairingConfirmRequest', { pairId: nodeId, pin });
-      toast(I18n.t('mesh.pair_confirm_success'), 'success');
-      return true;
+      try {
+        await ApiBinary.action('meshPairingConfirmRequest', { pairId: nodeId, pin });
+        pinEl?.setAttribute('success', '');
+        toast(I18n.t('mesh.pair_confirm_success'), 'success');
+        return true;
+      } catch (e) {
+        errBox.textContent = e?.message || I18n.t('mesh.pair_invalid_pin');
+        errBox.hidden = false;
+        pinEl?.setAttribute('error', '');
+        setTimeout(() => pinEl?.removeAttribute('error'), 400);
+        return false;
+      }
     },
+  });
+  // Enter na kompletnym PIN auto-submituje (submit event z tf-pin-input).
+  queueMicrotask(() => {
+    const pinEl = document.querySelector('#confirm-pin-input');
+    if (!pinEl) return;
+    pinEl.addEventListener('submit', () => {
+      const win = pinEl.closest('tf-window');
+      win?.querySelector('[data-action="confirm"]')?.click();
+    });
   });
 }
 

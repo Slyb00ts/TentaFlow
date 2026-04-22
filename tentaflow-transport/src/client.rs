@@ -6,6 +6,7 @@
 //       sidecarami) oraz tentaflow-client/native (komunikacja z nodem).
 // =============================================================================
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,11 @@ pub struct ServiceClientConfig {
     pub auto_reconnect: bool,
     /// Interwal miedzy probami reconnect gdy polaczenia nie ma.
     pub reconnect_interval: Duration,
+    /// Jawne direct addresses (IP:port) — używane gdy peer nie jest discoverable
+    /// przez LAN mDNS/DHT. Przykład: MeetingBot ephemeral kontener w bridge
+    /// network dockera — host podaje 127.0.0.1:<mapped_port>. Pusta lista =
+    /// polegaj wyłącznie na discovery (domyślne dla zewnętrznych serwisów).
+    pub direct_addrs: Vec<SocketAddr>,
 }
 
 impl ServiceClientConfig {
@@ -49,8 +55,18 @@ impl ServiceClientConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             auto_reconnect: true,
             reconnect_interval: Duration::from_secs(2),
+            direct_addrs: Vec::new(),
         }
     }
+}
+
+/// Buduje EndpointAddr z EndpointId + opcjonalną listą direct addresses.
+fn build_endpoint_addr(id: EndpointId, direct_addrs: &[SocketAddr]) -> EndpointAddr {
+    let mut addr = EndpointAddr::new(id);
+    for sa in direct_addrs {
+        addr = addr.with_ip_addr(*sa);
+    }
+    addr
 }
 
 /// Klient iroh dla pojedynczego peera (sidecar albo node).
@@ -71,7 +87,7 @@ impl ServiceClient {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Result<Self, TransportError> {
         let config = Arc::new(config);
-        let addr = EndpointAddr::new(config.endpoint_id);
+        let addr = build_endpoint_addr(config.endpoint_id, &config.direct_addrs);
         let connection = endpoint
             .connect(addr, &config.alpn)
             .await
@@ -157,7 +173,7 @@ impl ServiceClient {
             }
         }
 
-        let addr = EndpointAddr::new(self.config.endpoint_id);
+        let addr = build_endpoint_addr(self.config.endpoint_id, &self.config.direct_addrs);
         let new_conn = self
             .endpoint
             .connect(addr, &self.config.alpn)
@@ -201,7 +217,7 @@ impl ServiceClient {
                         }
                     }
 
-                    let addr = EndpointAddr::new(config.endpoint_id);
+                    let addr = build_endpoint_addr(config.endpoint_id, &config.direct_addrs);
                     match endpoint.connect(addr, &config.alpn).await {
                         Ok(new_conn) => {
                             *connection.lock() = Some(new_conn);
