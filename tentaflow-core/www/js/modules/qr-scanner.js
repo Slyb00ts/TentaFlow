@@ -61,12 +61,17 @@ export async function scanQr() {
       </div>
       <div class="qr-scanner-viewport">
         <video autoplay playsinline muted></video>
-        <div class="qr-scanner-frame">
+        <div class="qr-scanner-frame" hidden>
           <span class="corner tl"></span>
           <span class="corner tr"></span>
           <span class="corner bl"></span>
           <span class="corner br"></span>
           <span class="scan-line"></span>
+        </div>
+        <div class="qr-scanner-status">
+          <div class="qr-scanner-spinner"></div>
+          <div class="qr-scanner-msg">${escapeHtml(I18n.t('mesh.qr_scanner_waiting'))}</div>
+          <div class="qr-scanner-error" hidden></div>
         </div>
       </div>
       <div class="qr-scanner-hint">${escapeHtml(I18n.t('mesh.qr_scanner_hint'))}</div>
@@ -75,6 +80,9 @@ export async function scanQr() {
 
     const video = overlay.querySelector('video');
     const closeBtn = overlay.querySelector('.qr-scanner-close');
+    const frameEl = overlay.querySelector('.qr-scanner-frame');
+    const statusEl = overlay.querySelector('.qr-scanner-status');
+    const errorEl = overlay.querySelector('.qr-scanner-error');
     let stream = null;
     let rafId = null;
     let closed = false;
@@ -93,10 +101,15 @@ export async function scanQr() {
       resolve(result);
     };
 
+    const showError = (msg) => {
+      if (statusEl) statusEl.classList.add('error');
+      if (errorEl) {
+        errorEl.textContent = msg;
+        errorEl.hidden = false;
+      }
+    };
+
     closeBtn.addEventListener('click', () => cleanup(null));
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) cleanup(null);
-    });
     // ESC closes
     const onKey = (e) => {
       if (e.key === 'Escape') {
@@ -106,6 +119,12 @@ export async function scanQr() {
     };
     document.addEventListener('keydown', onKey);
 
+    // Sprawdzamy secure context — getUserMedia wymaga HTTPS albo localhost.
+    if (!window.isSecureContext) {
+      showError(I18n.t('mesh.qr_scan_insecure'));
+      return;
+    }
+
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -113,10 +132,17 @@ export async function scanQr() {
       });
       video.srcObject = stream;
       await video.play();
+      if (statusEl) statusEl.hidden = true;
+      if (frameEl) frameEl.hidden = false;
     } catch (err) {
       console.warn('[qr-scanner] getUserMedia:', err);
-      cleanup(null);
-      throw err;
+      let msg = I18n.t('mesh.qr_scan_failed');
+      if (err?.name === 'NotAllowedError') msg = I18n.t('mesh.qr_scan_denied');
+      else if (err?.name === 'NotFoundError') msg = I18n.t('mesh.qr_scan_no_camera');
+      else if (err?.name === 'NotReadableError') msg = I18n.t('mesh.qr_scan_busy');
+      else if (err?.message) msg = `${I18n.t('mesh.qr_scan_failed')}: ${err.message}`;
+      showError(msg);
+      return;
     }
 
     // Preferuj BarcodeDetector, fallback na jsQR przez canvas pixel read.
