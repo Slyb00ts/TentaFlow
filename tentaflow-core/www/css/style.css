@@ -1180,6 +1180,73 @@ input, textarea, select {
   backdrop-filter: blur(6px);
 }
 
+/* Status panel (czekam na kamere / error) */
+.qr-scanner-status {
+  position: absolute;
+  inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 16px;
+  padding: 40px 24px;
+  color: #fff;
+  z-index: 3;
+  pointer-events: none;
+}
+.qr-scanner-status[hidden] { display: none; }
+.qr-scanner-spinner {
+  width: 48px; height: 48px;
+  border: 3px solid rgba(255,255,255,0.2);
+  border-top-color: var(--accent-2, #a78bfa);
+  border-radius: 50%;
+  animation: qrScannerSpin 0.9s linear infinite;
+}
+.qr-scanner-status.error .qr-scanner-spinner {
+  display: none;
+}
+@keyframes qrScannerSpin { to { transform: rotate(360deg); } }
+.qr-scanner-msg {
+  font-size: 14px; font-weight: 600;
+  text-align: center;
+}
+.qr-scanner-error {
+  padding: 10px 14px;
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 10px;
+  color: #fca5a5;
+  font-size: 13px;
+  text-align: center;
+  max-width: 320px;
+  line-height: 1.45;
+  pointer-events: auto;
+}
+
+/* Mobile — pair modal body: QR kolumny zwijamy + mniejsze rozmiary */
+@media (max-width: 640px) {
+  .pair-qr-grid {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .pair-qr-box {
+    max-width: 260px;
+    margin: 0 auto;
+    min-height: auto;
+  }
+  .pair-qr-box svg {
+    width: 220px; height: 220px;
+  }
+  .pair-cred-value {
+    font-size: 11px;
+  }
+  .pair-cred-value.pin {
+    font-size: 20px;
+  }
+  /* tf-window header/footer scale down dla male telefony */
+  tf-window [slot="footer"] {
+    padding: 12px 14px;
+  }
+}
+
 .pair-id-hint {
   color: var(--text-2); font-size: 12px; line-height: 1.55;
   padding: 10px 12px;
