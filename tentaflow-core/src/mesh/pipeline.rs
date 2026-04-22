@@ -279,6 +279,7 @@ pub async fn start_mesh_pipeline(
                 mesh_peer_store.clone(),
                 quic_mesh.clone(),
                 node_id.clone(),
+                mesh_security.clone(),
             );
 
             if let Some(ref sec) = mesh_security {
@@ -345,7 +346,7 @@ fn spawn_quic_event_handler(
                     use tentaflow_protocol::mesh::MeshHelloPayload;
                     match rkyv::from_bytes::<MeshHelloPayload, rkyv::rancor::Error>(&data) {
                         Ok(hello) => {
-                            info!(
+                            debug!(
                                 peer_id = %node_id,
                                 hostname = %hello.hostname,
                                 platform = %hello.platform,
@@ -836,7 +837,7 @@ fn spawn_quic_event_handler(
                             }
                         }
                     } else {
-                        info!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
+                        debug!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
                     }
 
                     // Persist adresy trusted peera do DB (do reconnectu po restarcie)
@@ -927,17 +928,19 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::HeartbeatReceived { node_id, heartbeat }) => {
-                    // Safety net — przetwarzaj heartbeat TYLKO od trusted peerow
+                    // Odnotuj heartbeat dla liveness timera ZAWSZE — sama ramka =
+                    // peer zyje, niezaleznie od trust. Inaczej liveness bedzie
+                    // wywalac wszystkich niezaufanych peerow co 15s.
+                    peer_store.mark_heartbeat(&node_id);
+                    // Safety net — przetwarzaj CONTENT heartbeatu TYLKO od trusted.
                     let is_trusted = match &mesh_security {
                         Some(sec) => sec.is_trusted(&node_id),
-                        None => false, // Zero trust — bez MeshSecurity nie przetwarzaj danych
+                        None => false,
                     };
                     if !is_trusted {
-                        debug!(peer_id = %node_id, "Pomijam heartbeat od niezaufanego peera (safety net)");
+                        debug!(peer_id = %node_id, "Pomijam content heartbeatu od niezaufanego peera (safety net)");
                         continue;
                     }
-                    // Odnotuj heartbeat dla liveness timera — sama ramka = peer zyje.
-                    peer_store.mark_heartbeat(&node_id);
                     if let Ok(metrics) =
                         rkyv::from_bytes::<HeartbeatMetrics, rkyv::rancor::Error>(&heartbeat)
                     {
@@ -1686,19 +1689,30 @@ fn spawn_liveness_timer(
     peer_store: MeshPeerStore,
     quic_mesh: Arc<IrohMeshManager>,
     local_node_id: String,
+    mesh_security: Option<Arc<MeshSecurity>>,
 ) {
     tokio::spawn(async move {
         // Progi dobrane z zapasem — iroh multi-path czasem opuszcza heartbeat
-        // podczas reroutingu. 15s offline to pol-minuta do detekcji worst case,
-        // ale jednoczesnie nie flickeruje przy normalnych wahaniach sieci.
-        const DEGRADED_MS: i64 = 5000;
-        const OFFLINE_MS: i64 = 15000;
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        // podczas reroutingu. Liveness timer dziala TYLKO na zaufanych peerach
+        // (dla nich gwarantujemy stabilny heartbeat co 500ms). Dla discovered/
+        // unpaired iroh sam zarzadza zyciem polaczenia — nie wtracamy sie.
+        const DEGRADED_MS: i64 = 10_000;
+        const OFFLINE_MS: i64 = 30_000;
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
             let ages = peer_store.heartbeat_ages();
             for (node_id, age_ms) in ages {
                 if node_id == local_node_id {
+                    continue;
+                }
+                // Tylko trusted peery — niezaufane moga sie laczyc/rozlaczac
+                // po uznaniu iroh (multi-path, NAT rebinding, relay rotacja).
+                let is_trusted = match &mesh_security {
+                    Some(sec) => sec.is_trusted(&node_id),
+                    None => false,
+                };
+                if !is_trusted {
                     continue;
                 }
                 let peer = match peer_store.get(&node_id) {
@@ -1712,7 +1726,7 @@ fn spawn_liveness_timer(
                     warn!(
                         peer = %node_id,
                         age_ms,
-                        "Liveness timer: peer nieaktywny > 5s — force disconnect"
+                        "Liveness timer: trusted peer nieaktywny > 30s — force disconnect"
                     );
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "offline");
@@ -1721,7 +1735,7 @@ fn spawn_liveness_timer(
                         &node_id,
                         &peer.hostname,
                         "offline",
-                        "heartbeat timeout >5s",
+                        "heartbeat timeout",
                     );
                     let qm = quic_mesh.clone();
                     let nid = node_id.clone();
