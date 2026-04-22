@@ -3232,7 +3232,13 @@ textarea {
   font-size: 11px; color: var(--text-3);
   padding: 3px 8px; border-radius: 6px; background: var(--bg-input);
 }
-.transcript-list { flex: 1; overflow-y: auto; padding: 20px 28px 24px; display: flex; flex-direction: column; gap: 14px; }
+/* transcript-list pelni role hosta dla VirtualList — pretext/virtual-list
+   wymaga block-level kontenera z overflow-y + jawną wysokością. Padding dajemy
+   na vlist-item aby spacer odzwierciedlał pełną przestrzeń wpisów. */
+.transcript-list { flex: 1; overflow-y: auto; min-height: 0; padding: 0; background: var(--bg-2); }
+.transcript-list .vlist-item { padding: 7px 28px; }
+.transcript-list .vlist-item:first-child { padding-top: 20px; }
+.transcript-list .vlist-item:last-child { padding-bottom: 24px; }
 
 .t-row { display: flex; gap: 14px; animation: meeting-slide 0.3s ease; }
 @keyframes meeting-slide { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
