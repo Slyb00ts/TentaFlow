@@ -656,6 +656,11 @@ pub const MESH_MSG_NODE_INFO: u8 = 0x18;
 /// (trusted LUB discovered), zeby GUI mogl pokazac ludzka nazwe (spark-002)
 /// zamiast skrotu hex przed zakonczeniem pairingu.
 pub const MESH_MSG_HELLO: u8 = 0x19;
+/// Gossip topologii mesh — floodowany z dedupem (origin, epoch) i TTL.
+/// Kazdy zaufany peer broadcastuje swoj wpis co 30s; kazdy odbiorca rebroadcastuje
+/// do swoich bezposrednich sasiadow (oprocz nadawcy). Dzieki temu mainpc dowiaduje sie
+/// o spark-002 przez spark-001 — z nazwa, platforma i lista uslug.
+pub const MESH_MSG_TOPOLOGY_ANNOUNCE: u8 = 0x1A;
 pub const MESH_MSG_PAIRING_REQUEST: u8 = 0x20;
 pub const MESH_MSG_PAIRING_CONFIRM: u8 = 0x21;
 pub const MESH_MSG_PAIRING_REJECT: u8 = 0x22;
@@ -728,6 +733,51 @@ pub struct TrustedKeysSyncPayload {
 #[rkyv(derive(Debug))]
 pub struct NodeLeavingPayload {
     pub node_id: String,
+}
+
+/// Podsumowanie uslugi dostepnej na zdalnym nodzie — wysylane w TopologyAnnounce.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct ServiceSummary {
+    pub name: String,
+    pub service_type: String,
+    pub ready: bool,
+}
+
+/// Podsumowanie modelu zaladowanego na zdalnym nodzie — wysylane w TopologyAnnounce.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct ModelSummary {
+    pub alias: String,
+    pub backend: String,
+    pub loaded: bool,
+}
+
+/// Jeden wpis w TopologyAnnounce — metadane noda + jego bezposredni sasiedzi + uslugi.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct TopologyEntry {
+    pub node_id: String,
+    pub hostname: String,
+    pub platform: String,
+    pub os_info: String,
+    pub connected_to: Vec<String>,
+    pub services: Vec<ServiceSummary>,
+    pub models: Vec<ModelSummary>,
+    pub direct_addrs: Vec<String>,
+    pub port: u16,
+}
+
+/// Payload gossip topologii — floodowany z dedupem.
+/// `origin_node_id` + `epoch` identyfikuja unikalna wersje wiadomosci.
+/// `ttl` zmniejszane przy kazdym rebroadcascie (start 5, drop przy 0).
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct TopologyAnnouncePayload {
+    pub origin_node_id: String,
+    pub epoch: u64,
+    pub ttl: u8,
+    pub entries: Vec<TopologyEntry>,
 }
 
 /// Ramka relay do multi-hop routingu — payload zaszyfrowany end-to-end kluczem docelowego noda.

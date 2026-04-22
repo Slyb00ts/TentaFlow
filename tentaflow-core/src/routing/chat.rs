@@ -105,8 +105,17 @@ impl Router {
                                 .ok_or_else(|| anyhow::anyhow!("Brak backendow dla {}", name))?;
                             Ok(backend.chat_completion(req).await?)
                         }
-                        BackendHandle::MeshForward(_node_id, _svc) => {
-                            Err(anyhow::anyhow!("Mesh forward nie zaimplementowany"))
+                        BackendHandle::MeshForward(node_id, svc) => {
+                            // Uslugi z mesh sa rejestrowane w service_manager jako zdalne
+                            // QUIC LLM (adres iroh endpoint peera). Iroh obsluguje multi-hop
+                            // routing przez relay automatycznie — wywolanie `route_to_quic_llm`
+                            // z nazwa uslugi dziala tak samo jak dla direct peera.
+                            debug!(
+                                target_node = %node_id,
+                                service = %svc,
+                                "MeshForward — wysyłam chat request do zdalnej uslugi mesh"
+                            );
+                            this.route_to_quic_llm(svc.clone(), req, None, None).await
                         }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla chat")),
                     }

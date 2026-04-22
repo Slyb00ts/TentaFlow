@@ -89,6 +89,10 @@ pub enum IrohMeshEvent {
         node_id: String,
         data: Vec<u8>,
     },
+    TopologyAnnounceReceived {
+        from_node_id: String,
+        data: Vec<u8>,
+    },
     CrdtDeltaReceived {
         node_id: String,
         data: Vec<u8>,
@@ -618,6 +622,17 @@ impl IrohMeshManager {
             .await
     }
 
+    /// Wysyla TopologyAnnounce do jednego zaufanego peera (unicast).
+    /// Broadcast realizuje pipeline przez iteracje listy peerow.
+    pub async fn send_topology_announce(&self, node_id: &str, data: &[u8]) -> Result<()> {
+        self.send_to_peer(
+            node_id,
+            tentaflow_protocol::mesh::MESH_MSG_TOPOLOGY_ANNOUNCE,
+            data,
+        )
+        .await
+    }
+
     pub async fn send_pairing_request(&self, node_id: &str, data: &[u8]) -> Result<()> {
         self.send_to_peer(
             node_id,
@@ -998,6 +1013,10 @@ impl IrohMeshManagerRef {
             },
             x if x == MESH_MSG_HELLO => IrohMeshEvent::HelloReceived {
                 node_id: remote_hex,
+                data: payload,
+            },
+            x if x == MESH_MSG_TOPOLOGY_ANNOUNCE => IrohMeshEvent::TopologyAnnounceReceived {
+                from_node_id: remote_hex,
                 data: payload,
             },
             x if x == MESH_MSG_CRDT_DELTA => IrohMeshEvent::CrdtDeltaReceived {
