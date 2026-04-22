@@ -1056,9 +1056,15 @@ impl AddonManager {
         }
     }
 
-    /// Aliasy STT/TTS powiazane z addonem teams-bot
-    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 2] =
-        [("teams-stt", "whisper-1"), ("teams-tts", "tts-1")];
+    /// Aliasy STT/TTS/Summary powiazane z addonem teams-bot.
+    /// `teams-summary` ma pusty default target — admin musi recznie wskazac model
+    /// (qwen/gpt-oss/etc) w Models. Jesli pusty, meeting summary handler zwraca
+    /// "not configured" error zamiast generowac udawana odpowiedz.
+    const TEAMS_BOT_ALIASES: [(&'static str, &'static str); 3] = [
+        ("teams-stt", "whisper-1"),
+        ("teams-tts", "tts-1"),
+        ("teams-summary", ""),
+    ];
 
     /// Tworzy lub reaktywuje aliasy teams-stt / teams-tts i odswieza cache routera
     fn activate_teams_aliases(&self) {

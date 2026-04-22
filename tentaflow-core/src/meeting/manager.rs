@@ -80,13 +80,12 @@ impl MeetingManager {
         &self,
         req: StartSessionRequest,
     ) -> Result<SessionDescriptor> {
-        // meeting_key = hash url + nanos, żeby ponowne dołączanie do tego samego
-        // URL nie kolidowało (każde spotkanie = nowa sesja).
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let meeting_key = format!("mtg-{}", nanos);
+        // meeting_key — UUID zapewnia unikalność, przekazywany przez env MEETING_ID
+        // do kontenera. Bot umieszcza ten sam string w `meeting_id` każdego STT
+        // responsu, przez co router zapisuje transkrypty pod tą samą sesją
+        // (meeting_sessions.meeting_key) którą tu tworzymy. Jedna sesja w DB, nie
+        // dwie jak przed naprawą.
+        let meeting_key = format!("mtg-{}", uuid::Uuid::new_v4());
 
         let session_id = repository::transcripts::get_or_create_session(
             &self.db,
@@ -136,6 +135,7 @@ impl MeetingManager {
         let spawn_req = SpawnRequest {
             session_id,
             meeting_url: req.meeting_url.clone(),
+            meeting_key: meeting_key.clone(),
             ports,
             secret_key_hex: secret_key_hex.clone(),
             bot_name: req.bot_name.clone(),

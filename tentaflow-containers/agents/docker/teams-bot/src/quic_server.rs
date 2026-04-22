@@ -172,6 +172,7 @@ impl RouterClient {
 pub struct ContainerTransportConfig {
     pub port: u16,
     pub secret_key_path: Option<String>,
+    pub secret_key_hex: Option<String>,
     pub enable_lan_discovery: bool,
     pub enable_dht_discovery: bool,
 }
@@ -181,6 +182,7 @@ impl Default for ContainerTransportConfig {
         Self {
             port: 5000,
             secret_key_path: None,
+            secret_key_hex: None,
             enable_lan_discovery: true,
             enable_dht_discovery: true,
         }
@@ -229,7 +231,11 @@ impl MeetingQuicServer {
 
     /// Uruchamia iroh endpoint i nasluchuje na polaczenia od routera.
     pub async fn run(&self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let secret_key = load_or_generate_secret_key(self.config.secret_key_path.as_deref())?;
+        let secret_key = if let Some(hex) = self.config.secret_key_hex.as_deref() {
+            load_secret_key_from_hex(hex)?
+        } else {
+            load_or_generate_secret_key(self.config.secret_key_path.as_deref())?
+        };
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", self.config.port)
             .parse()
             .context("Nieprawidlowy bind addr")?;
@@ -558,6 +564,23 @@ impl MeetingQuicServer {
 
 /// Laduje Ed25519 `SecretKey` z pliku albo generuje nowy (i zapisuje, jesli
 /// `path` podana). Brak `path` = ephemeral — po restarcie nowy `EndpointId`.
+/// Dekoduje Ed25519 secret key z 64-znakowego hex. Używany gdy env
+/// `BOT_SECRET_KEY_HEX` jest ustawione (np. kontener odpalony z MeetingManagera).
+fn load_secret_key_from_hex(hex: &str) -> Result<SecretKey> {
+    let trimmed = hex.trim();
+    if trimmed.len() != 64 {
+        anyhow::bail!(
+            "BOT_SECRET_KEY_HEX ma {} znakow, wymagane 64 (32 bajty hex)",
+            trimmed.len()
+        );
+    }
+    let bytes = hex::decode(trimmed).context("dekodowanie BOT_SECRET_KEY_HEX")?;
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    info!("Wczytano Ed25519 secret key z env BOT_SECRET_KEY_HEX");
+    Ok(SecretKey::from_bytes(&arr))
+}
+
 fn load_or_generate_secret_key(path: Option<&str>) -> Result<SecretKey> {
     let Some(path) = path else {
         warn!("Brak secret_key_path — generuje ephemeral key");

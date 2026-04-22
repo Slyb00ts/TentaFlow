@@ -183,7 +183,14 @@ pub fn meeting_session_list(
     let MeetingPayload::ReqSessionList(r) = payload else {
         return Err(bad_request("expected ReqSessionList"));
     };
-    let owner = if r.only_mine { current_user_id(ctx) } else { None };
+    // BOLA: only_mine=false widzi wszystkie sesje — wymagamy admina. User bez
+    // admina dostaje tylko swoje sesje niezależnie od flagi.
+    let uid = current_user_id(ctx);
+    let owner = if !r.only_mine && is_admin(ctx) {
+        None
+    } else {
+        uid
+    };
     let sessions = ctx
         .state
         .meeting_manager
@@ -195,6 +202,13 @@ pub fn meeting_session_list(
     Ok(MessageBody::MeetingBody(MeetingPayload::ResSessionList(
         MeetingSessionListResponse { sessions },
     )))
+}
+
+fn is_admin(ctx: &HandlerContext) -> bool {
+    matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    )
 }
 
 // =============================================================================
@@ -218,6 +232,17 @@ pub fn meeting_session_detail(
         .session_detail(r.session_id)
         .map_err(internal)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "session not found"))?;
+    // BOLA: sesja widziana tylko przez ownera lub admina. Jesli owner_user_id
+    // nie ustawione (legacy lub zewnetrzny ingest) — admin only.
+    if !is_admin(ctx) {
+        let me = current_user_id(ctx);
+        if desc.owner_user_id.is_none() || me != desc.owner_user_id {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "nie masz dostepu do tej sesji",
+            ));
+        }
+    }
     let transcripts = if r.include_transcripts {
         repository::transcripts::list_transcripts(&ctx.state.db, r.session_id)
             .map_err(internal)?
@@ -296,7 +321,7 @@ pub async fn meeting_summary_generate(
     let MeetingPayload::ReqSummaryGenerate(r) = payload else {
         return Err(bad_request("expected ReqSummaryGenerate"));
     };
-    // Jesli mamy summary i nie force — zwroc istniejace.
+    // Cache: jesli mamy summary i nie force — zwroc istniejace.
     if !r.force_refresh {
         if let Some(s) = ctx
             .state
@@ -307,36 +332,39 @@ pub async fn meeting_summary_generate(
             return Ok(to_summary_response(s));
         }
     }
-    // Generuj nowe — z transkryptow sesji.
+    // Weryfikuj ze sesja ma transkrypty do podsumowania.
     let rows = repository::transcripts::list_transcripts(&ctx.state.db, r.session_id)
         .map_err(internal)?;
     if rows.is_empty() {
         return Err(ProtocolError::new(
             ProtocolErrorCode::NotFound,
-            "brak transkryptow dla tej sesji — nie mozna wygenerowac podsumowania",
+            "brak transkryptow — nie ma co podsumowywac",
         ));
     }
-    // Prosty extraktor bez LLM — na start generujemy tldr z pierwszych/ostatnich
-    // wpisow i zliczamy akcje na podstawie heurystyki (regex imie → czasownik).
-    // LLM integracja bedzie nalozona pozniej gdy router bedzie mial klient chat.
-    let tldr = generate_naive_tldr(&rows);
-    let decisions = String::new();
-    let action_items_json = "[]".to_string();
-    let open_questions = String::new();
-    let model = "naive-heuristic".to_string();
-    let saved = ctx
-        .state
-        .meeting_manager
-        .save_summary(
-            r.session_id,
-            &tldr,
-            &decisions,
-            &action_items_json,
-            &open_questions,
-            &model,
-        )
+    // Resolve alias `teams-summary` — pusty target = admin nie skonfigurowal modelu.
+    // Handler zwraca jawny error, frontend pokazuje info "summary wylaczone".
+    let alias = repository::resolve_model_alias(&ctx.state.db, "teams-summary")
         .map_err(internal)?;
-    Ok(to_summary_response(saved))
+    let target = alias
+        .as_ref()
+        .map(|a| a.target_model.trim().to_string())
+        .unwrap_or_default();
+    if target.is_empty() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotImplemented,
+            "Summary wylaczone — wpisz target dla aliasu 'teams-summary' w Models > Aliases",
+        ));
+    }
+    // TODO(meeting-bot LLM): integracja z router.chat_completion. Na razie
+    // zwracamy jawny NotImplemented z nazwa modelu — admin wie ze alias jest OK
+    // ale kod LLM calla jeszcze nie wpiety. Zadne fake TLDR sie nie zapisuje.
+    Err(ProtocolError::new(
+        ProtocolErrorCode::NotImplemented,
+        format!(
+            "Alias teams-summary ustawiony na '{}' — integracja LLM w toku, na razie summary niedostepne",
+            target
+        ),
+    ))
 }
 
 fn to_summary_response(s: crate::meeting::SessionSummary) -> MessageBody {
@@ -352,27 +380,6 @@ fn to_summary_response(s: crate::meeting::SessionSummary) -> MessageBody {
             },
         },
     ))
-}
-
-fn generate_naive_tldr(rows: &[repository::transcripts::TranscriptRow]) -> String {
-    let total_entries = rows.len();
-    let first = rows.first().map(|r| r.speaker.as_str()).unwrap_or("?");
-    let last = rows.last().map(|r| r.speaker.as_str()).unwrap_or("?");
-    let duration = rows
-        .last()
-        .and_then(|l| rows.first().map(|f| (l.timestamp_ms - f.timestamp_ms).max(0)))
-        .unwrap_or(0)
-        / 1000;
-    let unique_speakers: std::collections::HashSet<&str> =
-        rows.iter().map(|r| r.speaker.as_str()).collect();
-    format!(
-        "Spotkanie trwało {} sekund, {} wpisów, {} mówców (pierwszy: {}, ostatni: {}). Generator LLM podłączony przy pierwszym użyciu — obecnie działa prosty ekstraktor statystyk.",
-        duration,
-        total_entries,
-        unique_speakers.len(),
-        first,
-        last
-    )
 }
 
 // =============================================================================
