@@ -14,6 +14,7 @@ import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import '/js/components/index.js';
 import '/js/lib/block-zoom.js';
 import * as ConnectionOverlay from '/js/modules/connection-overlay.js';
+import * as SystemEvents from '/js/modules/system-events.js';
 import { initTransport } from '/js/protocol/api-binary-shim.js';
 
 import LoginScreen from '/js/modules/login.js';
@@ -147,6 +148,7 @@ async function bootstrap() {
   // Otworz WS natychmiast (anonymous jesli brak JWT). Serwer akceptuje i
   // pozwala tylko na authLogin + schema + heartbeat przed zalogowaniem.
   initTransport().catch((e) => console.warn('[app] initTransport:', e?.message));
+  SystemEvents.init();
 
   if (!ApiBinary.hasJwt()) {
     renderLogin();

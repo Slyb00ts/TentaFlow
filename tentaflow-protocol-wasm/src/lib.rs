@@ -3594,6 +3594,37 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "accounts", arr.into());
         }
+        MessageBody::SystemEventBody(evt) => {
+            match evt {
+                tentaflow_protocol::SystemEventPayload::ServiceStatusChanged {
+                    service_name,
+                    service_type,
+                    status,
+                    message,
+                } => {
+                    set(&obj, "variant", "ServiceStatusChanged".into());
+                    set(&obj, "serviceName", service_name.clone().into());
+                    set(&obj, "service_name", service_name.into());
+                    set(&obj, "serviceType", service_type.clone().into());
+                    set(&obj, "service_type", service_type.into());
+                    set(&obj, "status", status.into());
+                    set(&obj, "message", message.into());
+                }
+                tentaflow_protocol::SystemEventPayload::MeshPeerStatusChanged {
+                    node_id,
+                    hostname,
+                    status,
+                    message,
+                } => {
+                    set(&obj, "variant", "MeshPeerStatusChanged".into());
+                    set(&obj, "nodeId", node_id.clone().into());
+                    set(&obj, "node_id", node_id.into());
+                    set(&obj, "hostname", hostname.into());
+                    set(&obj, "status", status.into());
+                    set(&obj, "message", message.into());
+                }
+            }
+        }
         MessageBody::AddonPermissionChangedEventBody(evt) => {
             set(&obj, "variant", "AddonPermissionChangedEvent".into());
             set(&obj, "addonId", evt.addon_id.clone().into());

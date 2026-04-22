@@ -163,14 +163,42 @@ impl QuicServiceHandle {
     }
 
     pub async fn set_connected(&self, client: Arc<crate::net::quic::QuicClient>) {
+        let prev = self.state.read().await.clone();
         *self.client.write().await = Some(client);
         *self.state.write().await = QuicServiceState::Connected;
+        // Emituj tylko na realna zmiane stanu (Connecting/Disconnected → Connected).
+        if !matches!(prev, QuicServiceState::Connected) {
+            crate::dispatch::system_event_broadcast::publish_service_status(
+                &self.config.name,
+                &service_type_from_alpn(&self.config.alpn),
+                "connected",
+                "",
+            );
+        }
     }
 
     pub async fn set_disconnected(&self, reason: String) {
+        let prev = self.state.read().await.clone();
         *self.client.write().await = None;
-        *self.state.write().await = QuicServiceState::Disconnected { reason };
+        *self.state.write().await = QuicServiceState::Disconnected {
+            reason: reason.clone(),
+        };
+        if !matches!(prev, QuicServiceState::Disconnected { .. }) {
+            crate::dispatch::system_event_broadcast::publish_service_status(
+                &self.config.name,
+                &service_type_from_alpn(&self.config.alpn),
+                "disconnected",
+                &reason,
+            );
+        }
     }
+}
+
+/// Z ALPN typu "tentaflow-llm" / "tentaflow-tts" wyjmij czysta kategorie.
+fn service_type_from_alpn(alpn: &str) -> String {
+    alpn.strip_prefix("tentaflow-")
+        .unwrap_or(alpn)
+        .to_string()
 }
 
 // ============================================================================
@@ -419,7 +447,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
-                                direct_addrs: Vec::new(),
+                                    direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -483,7 +511,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
-                                direct_addrs: Vec::new(),
+                                    direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -577,7 +605,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
-                                direct_addrs: Vec::new(),
+                                    direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -665,7 +693,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
-                                direct_addrs: Vec::new(),
+                                    direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -704,7 +732,7 @@ impl ServiceManager {
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
                                 skip_tls_verify: false,
-                            direct_addrs: Vec::new(),
+                                direct_addrs: Vec::new(),
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -742,7 +770,7 @@ impl ServiceManager {
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
                                 skip_tls_verify: tls_ca.is_none(),
-                            direct_addrs: Vec::new(),
+                                direct_addrs: Vec::new(),
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -780,7 +808,7 @@ impl ServiceManager {
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
                                 skip_tls_verify: false,
-                            direct_addrs: Vec::new(),
+                                direct_addrs: Vec::new(),
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));

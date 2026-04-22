@@ -275,6 +275,11 @@ pub async fn start_mesh_pipeline(
                 docker_cache,
             );
             spawn_slow_refresh(mesh_peer_store.clone(), node_id.clone());
+            spawn_liveness_timer(
+                mesh_peer_store.clone(),
+                quic_mesh.clone(),
+                node_id.clone(),
+            );
 
             if let Some(ref sec) = mesh_security {
                 spawn_pairing_cleanup(sec.clone());
@@ -357,7 +362,9 @@ fn spawn_quic_event_handler(
                     // Akceptujemy od KAZDEGO peera bo to tylko info dyskawerii, bez
                     // wrazliwych danych. Probujemy sie polaczyc z kazdym nieznanym.
                     use tentaflow_protocol::mesh::KnownPeersPayload;
-                    let payload = match rkyv::from_bytes::<KnownPeersPayload, rkyv::rancor::Error>(&data) {
+                    let payload = match rkyv::from_bytes::<KnownPeersPayload, rkyv::rancor::Error>(
+                        &data,
+                    ) {
                         Ok(p) => p,
                         Err(e) => {
                             warn!(peer = %from_node_id, "Blad deserializacji KnownPeers: {}", e);
@@ -583,10 +590,9 @@ fn spawn_quic_event_handler(
                                 .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                                 .collect();
                             tokio::spawn(async move {
-                                let dial_addr = addrs
-                                    .into_iter()
-                                    .next()
-                                    .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                                let dial_addr = addrs.into_iter().next().unwrap_or_else(|| {
+                                    std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+                                });
                                 match qm.connect_to_peer(&target, dial_addr).await {
                                     Ok(_) => debug!(
                                         peer = %target,
@@ -671,6 +677,19 @@ fn spawn_quic_event_handler(
                     info!(peer_id = %node_id, "QUIC peer polaczony");
                     peer_store.set_quic_connected(&node_id, true);
                     peer_store.set_status(&node_id, "connected");
+                    peer_store.mark_heartbeat(&node_id);
+
+                    // Emit event do GUI — toast "peer connected" + refresh mesh view.
+                    let hostname_ev = peer_store
+                        .get(&node_id)
+                        .map(|p| p.hostname)
+                        .unwrap_or_default();
+                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
+                        &node_id,
+                        &hostname_ev,
+                        "online",
+                        "",
+                    );
 
                     // Wyslij minimalne Hello (hostname + platform) niezaleznie od trust —
                     // GUI potrzebuje rozpoznawalnej nazwy na karcie discovered przed
@@ -821,6 +840,19 @@ fn spawn_quic_event_handler(
                     info!(peer_id = %node_id, "QUIC peer rozlaczony");
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "disconnected");
+                    peer_store.clear_heartbeat(&node_id);
+
+                    // Emituj event do GUI — pokazuje toast + odswieza karty mesh.
+                    let hostname = peer_store
+                        .get(&node_id)
+                        .map(|p| p.hostname)
+                        .unwrap_or_default();
+                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
+                        &node_id,
+                        &hostname,
+                        "offline",
+                        "QUIC disconnect",
+                    );
 
                     // Przelicz routing po rozlaczeniu peera
                     peer_store.recalculate_routes(&local_node_id);
@@ -872,6 +904,8 @@ fn spawn_quic_event_handler(
                         debug!(peer_id = %node_id, "Pomijam heartbeat od niezaufanego peera (safety net)");
                         continue;
                     }
+                    // Odnotuj heartbeat dla liveness timera — sama ramka = peer zyje.
+                    peer_store.mark_heartbeat(&node_id);
                     if let Ok(metrics) =
                         rkyv::from_bytes::<HeartbeatMetrics, rkyv::rancor::Error>(&heartbeat)
                     {
@@ -1570,6 +1604,69 @@ fn spawn_slow_refresh(peer_store: MeshPeerStore, local_node_id: String) {
                     docker_version,
                     os_info,
                 );
+            }
+        }
+    });
+}
+
+/// Liveness timer — co 1s sprawdza ile czasu minelo od ostatniego heartbeatu
+/// dla kazdego trusted peera. Heartbeaty leca co 500ms, wiec:
+///  - age < 2000ms  → OK, nic nie rob
+///  - 2000..5000ms  → status='degraded', emit event (jesli byl 'connected')
+///  - age > 5000ms  → status='offline', force disconnect, clear heartbeat,
+///                     emit event 'offline' (auto-reconnect loop sie zaopiekuje).
+fn spawn_liveness_timer(
+    peer_store: MeshPeerStore,
+    quic_mesh: Arc<IrohMeshManager>,
+    local_node_id: String,
+) {
+    tokio::spawn(async move {
+        const DEGRADED_MS: i64 = 2000;
+        const OFFLINE_MS: i64 = 5000;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let ages = peer_store.heartbeat_ages();
+            for (node_id, age_ms) in ages {
+                if node_id == local_node_id {
+                    continue;
+                }
+                let peer = match peer_store.get(&node_id) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if !peer.quic_connected {
+                    continue;
+                }
+                if age_ms > OFFLINE_MS {
+                    warn!(
+                        peer = %node_id,
+                        age_ms,
+                        "Liveness timer: peer nieaktywny > 5s — force disconnect"
+                    );
+                    peer_store.set_quic_connected(&node_id, false);
+                    peer_store.set_status(&node_id, "offline");
+                    peer_store.clear_heartbeat(&node_id);
+                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
+                        &node_id,
+                        &peer.hostname,
+                        "offline",
+                        "heartbeat timeout >5s",
+                    );
+                    let qm = quic_mesh.clone();
+                    let nid = node_id.clone();
+                    tokio::spawn(async move {
+                        qm.disconnect_peer(&nid).await;
+                    });
+                } else if age_ms > DEGRADED_MS && peer.status != "degraded" {
+                    peer_store.set_status(&node_id, "degraded");
+                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
+                        &node_id,
+                        &peer.hostname,
+                        "degraded",
+                        "slow heartbeats",
+                    );
+                }
             }
         }
     });

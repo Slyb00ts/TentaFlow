@@ -2093,5 +2093,12 @@
     "log_retry_attempt": "Reconexión #{attempt} — conectando...",
     "log_manual_retry": "Reconexión manual — intentando ahora",
     "log_restored": "Conexión restaurada"
+  },
+  "system_events": {
+    "service_connected": "Servicio {name} ({type}) de nuevo en línea",
+    "service_disconnected": "Servicio {name} ({type}) desconectado",
+    "peer_online": "Peer {host} en línea",
+    "peer_offline": "Peer {host} desconectado",
+    "peer_degraded": "Peer {host} — heartbeats lentos"
   }
 }
