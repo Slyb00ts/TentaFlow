@@ -2080,5 +2080,19 @@
     "relative_hours_ago": "{n} godz. temu",
     "relative_days_ago": "{n} dni temu",
     "word_count": "{n} słów"
+  },
+  "connection": {
+    "title": "Utracono połączenie z serwerem",
+    "heading": "Daemon nie odpowiada",
+    "description": "Serwer TentaFlow przestał odpowiadać. Próbujemy ponownie nawiązać połączenie — nie zamykaj karty.",
+    "next_attempt": "Następna próba za chwilę",
+    "attempt_hint": "Próba {attempt} • backoff rośnie wykładniczo, max 30s",
+    "btn_retry_now": "Spróbuj teraz",
+    "btn_logout": "Wyloguj",
+    "log_lost": "WebSocket zamknięty: {reason}",
+    "log_retry_scheduled": "Reconnect #{attempt} zaplanowany za {delay}s",
+    "log_retry_attempt": "Reconnect #{attempt} — łączenie...",
+    "log_manual_retry": "Ręczny reconnect — próba teraz",
+    "log_restored": "Połączenie przywrócone"
   }
 }

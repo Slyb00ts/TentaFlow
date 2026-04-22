@@ -560,6 +560,33 @@ tf-tabs {
   position: relative;
   z-index: 1;
 }
+/* =============================================================================
+   .tf-scroll — spojny thin scrollbar (WebKit + Firefox).
+   Uzywaj na dowolnym overflow-owym kontenerze zeby dostac ten sam wyglad co
+   sidebar-nav / main content.
+   ============================================================================= */
+.tf-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--tf-border-hover) transparent;
+}
+.tf-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.tf-scroll::-webkit-scrollbar-track { background: transparent; }
+.tf-scroll::-webkit-scrollbar-thumb {
+  background: var(--tf-border);
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background 0.15s;
+}
+.tf-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--tf-border-hover);
+  background-clip: padding-box;
+}
+.tf-scroll::-webkit-scrollbar-corner { background: transparent; }
+
 /* SVG sprite symbols referenced via <use> don't inherit stroke/fill from sprite defs,
    so components rendering icons without an explicit class need stroke:currentColor + fill:none
    at the container level. Apply to tabs, menu items, and anywhere else that uses
