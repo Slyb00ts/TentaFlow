@@ -11,6 +11,24 @@ import { toast } from '/js/utils.js';
 
 let installed = false;
 
+// Rate-limit — jeden toast per (kategoria, id, status) co 10s. Zapobiega spamowi
+// gdy peer flickeruje (multi-path iroh) albo deploy ma burst statusow.
+const lastToastAt = new Map();
+const TOAST_COOLDOWN_MS = 10_000;
+
+function shouldToast(kind, id, status) {
+  const key = `${kind}:${id}:${status}`;
+  const now = Date.now();
+  const last = lastToastAt.get(key) || 0;
+  if (now - last < TOAST_COOLDOWN_MS) return false;
+  lastToastAt.set(key, now);
+  // GC — usun stare entries > 60s
+  for (const [k, t] of lastToastAt) {
+    if (now - t > 60_000) lastToastAt.delete(k);
+  }
+  return true;
+}
+
 export function init() {
   if (installed) return;
   installed = true;
@@ -31,9 +49,9 @@ function handleServiceStatus(ev) {
   const status = String(ev.status || '').toLowerCase();
   const type = ev.serviceType || ev.service_type || '';
 
-  if (status === 'connected') {
+  if (status === 'connected' && shouldToast('svc', name, status)) {
     toast(I18n.t('system_events.service_connected', { name, type }), 'success');
-  } else if (status === 'disconnected') {
+  } else if (status === 'disconnected' && shouldToast('svc', name, status)) {
     const msg = ev.message ? ` — ${ev.message}` : '';
     toast(I18n.t('system_events.service_disconnected', { name, type }) + msg, 'warn');
   }
@@ -43,12 +61,13 @@ function handleServiceStatus(ev) {
 function handleMeshPeerStatus(ev) {
   const host = ev.hostname || (ev.nodeId || ev.node_id || '').slice(0, 12) || '?';
   const status = String(ev.status || '').toLowerCase();
+  const id = ev.nodeId || ev.node_id || host;
 
-  if (status === 'online') {
+  if (status === 'online' && shouldToast('peer', id, status)) {
     toast(I18n.t('system_events.peer_online', { host }), 'success');
-  } else if (status === 'offline') {
+  } else if (status === 'offline' && shouldToast('peer', id, status)) {
     toast(I18n.t('system_events.peer_offline', { host }), 'warn');
-  } else if (status === 'degraded') {
+  } else if (status === 'degraded' && shouldToast('peer', id, status)) {
     toast(I18n.t('system_events.peer_degraded', { host }), 'warn');
   }
   window.dispatchEvent(new CustomEvent('tf:mesh-peer-status', { detail: ev }));

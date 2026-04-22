@@ -145,12 +145,21 @@ function build() {
   raf = requestAnimationFrame(tick);
 }
 
+function targetEl() {
+  // Blurujemy TYLKO #app-root (albo .main-app). Nie wolno blurowac body —
+  // overlay tez zyje w body i sam by sie zrobil rozmyty.
+  return (
+    document.getElementById('app-root')
+    || document.querySelector('.main-app')
+    || null
+  );
+}
+
 function show() {
   if (!el) return;
   el.classList.add('visible');
-  // Blur glownej aplikacji — najlepiej przez klase na root (#app) albo body.
-  const app = document.getElementById('app') || document.body;
-  app.classList.add('app-blurred');
+  const app = targetEl();
+  if (app) app.classList.add('app-blurred');
   if (hideTimer) {
     clearTimeout(hideTimer);
     hideTimer = null;
@@ -159,12 +168,11 @@ function show() {
 
 function hide() {
   if (!el) return;
-  // Fade out po delayu (zeby "Reconnected" animacja mogla sie zrobic).
   if (hideTimer) clearTimeout(hideTimer);
   hideTimer = setTimeout(() => {
     el.classList.remove('visible');
-    const app = document.getElementById('app') || document.body;
-    app.classList.remove('app-blurred');
+    const app = targetEl();
+    if (app) app.classList.remove('app-blurred');
   }, AUTO_HIDE_DELAY_MS);
 }
 
