@@ -8,19 +8,35 @@
 
 import { I18n } from '/js/i18n.js';
 
+let _jsqrPromise = null;
+function loadJsQR() {
+  if (globalThis.jsQR) return Promise.resolve(globalThis.jsQR);
+  if (_jsqrPromise) return _jsqrPromise;
+  _jsqrPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = '/js/lib/jsqr.min.js';
+    s.async = true;
+    s.onload = () => resolve(globalThis.jsQR);
+    s.onerror = () => reject(new Error('jsQR fetch failed'));
+    document.head.appendChild(s);
+  });
+  return _jsqrPromise;
+}
+
 /**
- * Czy przeglądarka wspiera skanowanie QR przez BarcodeDetector.
- * Sprawdza tez czy urzadzenie ma jakakolwiek kamere.
+ * Sprawdza czy można użyć skanera QR — BarcodeDetector (natywne) albo jsQR
+ * (canvas pixel scan, fallback dla Firefox/starszych Safari). Wymaga kamery.
  */
 export async function isScannerSupported() {
-  if (typeof BarcodeDetector === 'undefined') return false;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
-  try {
-    const formats = await BarcodeDetector.getSupportedFormats();
-    if (!formats.includes('qr_code')) return false;
-  } catch {
-    return false;
+  // Preferuj native
+  if (typeof BarcodeDetector !== 'undefined') {
+    try {
+      const formats = await BarcodeDetector.getSupportedFormats();
+      if (formats.includes('qr_code')) return true;
+    } catch { /* fall through */ }
   }
+  // Fallback — jsQR dziala wszedzie, potrzebuje tylko canvas + video.
   return true;
 }
 
@@ -103,22 +119,55 @@ export async function scanQr() {
       throw err;
     }
 
-    // eslint-disable-next-line no-undef
-    const detector = new BarcodeDetector({ formats: ['qr_code'] });
+    // Preferuj BarcodeDetector, fallback na jsQR przez canvas pixel read.
+    const useNative = typeof BarcodeDetector !== 'undefined';
+    let detector = null;
+    let jsqrFn = null;
+    let canvas = null;
+    let ctx = null;
+
+    if (useNative) {
+      // eslint-disable-next-line no-undef
+      try { detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch { /* fall */ }
+    }
+    if (!detector) {
+      try { jsqrFn = await loadJsQR(); } catch (e) {
+        console.warn('[qr-scanner] jsQR load failed:', e);
+        cleanup(null);
+        return;
+      }
+      canvas = document.createElement('canvas');
+      ctx = canvas.getContext('2d', { willReadFrequently: true });
+    }
 
     const tick = async () => {
       if (closed) return;
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
         try {
-          const results = await detector.detect(video);
-          if (results && results.length > 0) {
-            const raw = results[0].rawValue;
-            if (raw) {
-              cleanup(raw);
-              return;
+          if (detector) {
+            const results = await detector.detect(video);
+            if (results && results.length > 0) {
+              const raw = results[0].rawValue;
+              if (raw) { cleanup(raw); return; }
+            }
+          } else if (jsqrFn && ctx) {
+            // jsQR fallback — grab klatke do canvas + scan pixel.
+            const w = video.videoWidth;
+            const h = video.videoHeight;
+            if (w > 0 && h > 0) {
+              // Downsample do max 640px dla szybkosci na telefonach.
+              const scale = Math.min(1, 640 / Math.max(w, h));
+              const cw = Math.floor(w * scale);
+              const ch = Math.floor(h * scale);
+              if (canvas.width !== cw) canvas.width = cw;
+              if (canvas.height !== ch) canvas.height = ch;
+              ctx.drawImage(video, 0, 0, cw, ch);
+              const imageData = ctx.getImageData(0, 0, cw, ch);
+              const code = jsqrFn(imageData.data, cw, ch, { inversionAttempts: 'dontInvert' });
+              if (code && code.data) { cleanup(code.data); return; }
             }
           }
-        } catch (e) {
+        } catch (_e) {
           // continue scanning
         }
       }

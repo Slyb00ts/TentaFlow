@@ -1,0 +1,28 @@
+{
+  "appId": "ai.tentaflow.app",
+  "appName": "TentaFlow",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "server": {
+    "iosScheme": "tentaflow",
+    "androidScheme": "https",
+    "cleartext": false,
+    "allowNavigation": ["*"]
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    },
+    "Camera": {
+      "permissions": ["camera"]
+    }
+  },
+  "android": {
+    "allowMixedContent": false,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  },
+  "ios": {
+    "contentInset": "automatic"
+  }
+}
