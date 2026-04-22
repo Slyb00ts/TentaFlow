@@ -1031,6 +1031,74 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Meeting Bot
+  // -------------------------------------------------------------------------
+
+  meetingSessionStartRequest(correlationId, { meetingUrl, title, platform, botName, sttAlias, ttsAlias, llmAlias }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingSessionStartRequest(
+      meetingUrl ?? '',
+      title ?? '',
+      platform ?? 'teams',
+      botName ?? '',
+      sttAlias ?? '',
+      ttsAlias ?? '',
+      llmAlias ?? '',
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  meetingSessionLeaveRequest(correlationId, { sessionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingSessionLeaveRequest(Number(sessionId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  meetingSessionListRequest(correlationId, { onlyMine } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingSessionListRequest(!!onlyMine);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  meetingSessionDetailRequest(correlationId, { sessionId, includeTranscripts }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingSessionDetailRequest(Number(sessionId), !!includeTranscripts);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  meetingTranscriptsListRequest(correlationId, { sessionId, sinceMs = 0 }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingTranscriptsListRequest(Number(sessionId), Number(sinceMs));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  meetingSummaryGenerateRequest(correlationId, { sessionId, forceRefresh = false }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingSummaryGenerateRequest(Number(sessionId), !!forceRefresh);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  meetingActiveSessionRequest(correlationId, _args, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingActiveSessionRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  meetingSettingsGetRequest(correlationId, _args, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingSettingsGetRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** settings: Record<string,string> or Array<[key,value]> */
+  meetingSettingsUpdateRequest(correlationId, { settings }, sequence = 1) {
+    assertReady();
+    const pairs = Array.isArray(settings) ? settings : Object.entries(settings ?? {});
+    const body = _wasm.encodeMeetingSettingsUpdateRequest(pairs);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // -------------------------------------------------------------------------
   // Registries
   // -------------------------------------------------------------------------
 

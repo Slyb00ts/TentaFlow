@@ -1467,6 +1467,143 @@ pub fn encode_note_delete_request(note_id: f64) -> Result<Vec<u8>, JsError> {
     .map_err(|e| JsError::new(&e))
 }
 
+// --- Meeting Bot ----------------------------------------------------------
+
+use tentaflow_protocol::{
+    MeetingActiveSessionRequest, MeetingPayload, MeetingSessionDetailRequest,
+    MeetingSessionLeaveRequest, MeetingSessionListRequest, MeetingSessionStartRequest,
+    MeetingSettingKv, MeetingSettingsGetRequest, MeetingSettingsUpdateRequest,
+    MeetingSummaryGenerateRequest, MeetingTranscriptsListRequest,
+};
+
+#[wasm_bindgen(js_name = encodeMeetingSessionStartRequest)]
+pub fn encode_meeting_session_start(
+    meeting_url: String,
+    title: String,
+    platform: String,
+    bot_name: String,
+    stt_alias: String,
+    tts_alias: String,
+    llm_alias: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSessionStart(
+        MeetingSessionStartRequest {
+            meeting_url,
+            title,
+            platform,
+            bot_name,
+            stt_alias,
+            tts_alias,
+            llm_alias,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingSessionLeaveRequest)]
+pub fn encode_meeting_session_leave(session_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSessionLeave(
+        MeetingSessionLeaveRequest {
+            session_id: session_id as i64,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingSessionListRequest)]
+pub fn encode_meeting_session_list(only_mine: bool) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSessionList(
+        MeetingSessionListRequest { only_mine },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingSessionDetailRequest)]
+pub fn encode_meeting_session_detail(
+    session_id: f64,
+    include_transcripts: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSessionDetail(
+        MeetingSessionDetailRequest {
+            session_id: session_id as i64,
+            include_transcripts,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingTranscriptsListRequest)]
+pub fn encode_meeting_transcripts_list(
+    session_id: f64,
+    since_ms: f64,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqTranscriptsList(
+        MeetingTranscriptsListRequest {
+            session_id: session_id as i64,
+            since_ms: since_ms as i64,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingSummaryGenerateRequest)]
+pub fn encode_meeting_summary_generate(
+    session_id: f64,
+    force_refresh: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSummaryGenerate(
+        MeetingSummaryGenerateRequest {
+            session_id: session_id as i64,
+            force_refresh,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingActiveSessionRequest)]
+pub fn encode_meeting_active_session() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqActiveSession(
+        MeetingActiveSessionRequest {},
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingSettingsGetRequest)]
+pub fn encode_meeting_settings_get() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSettingsGet(
+        MeetingSettingsGetRequest {},
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `settings` jest JS Array<[key, value]>. Konwertujemy pary do Vec<MeetingSettingKv>.
+#[wasm_bindgen(js_name = encodeMeetingSettingsUpdateRequest)]
+pub fn encode_meeting_settings_update(settings: JsValue) -> Result<Vec<u8>, JsError> {
+    let arr: js_sys::Array = settings
+        .dyn_into()
+        .map_err(|_| JsError::new("settings musi byc Array<[key, value]>"))?;
+    let mut kvs: Vec<MeetingSettingKv> = Vec::new();
+    for i in 0..arr.length() {
+        let pair: js_sys::Array = arr
+            .get(i)
+            .dyn_into()
+            .map_err(|_| JsError::new("element musi byc [key, value]"))?;
+        let key = pair
+            .get(0)
+            .as_string()
+            .ok_or_else(|| JsError::new("key musi byc string"))?;
+        let value = pair
+            .get(1)
+            .as_string()
+            .ok_or_else(|| JsError::new("value musi byc string"))?;
+        kvs.push(MeetingSettingKv { key, value });
+    }
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSettingsUpdate(
+        MeetingSettingsUpdateRequest { settings: kvs },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
 // --- Registries -----------------------------------------------------------
 
 /// MessageBody::RegistryListRequest (unit).
@@ -3660,8 +3797,130 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "message", m.into());
             }
         }
+        MessageBody::MeetingBody(p) => {
+            meeting_payload_to_js(&obj, p);
+        }
     }
     Ok(obj.into())
+}
+
+fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "sessionId", (s.session_id as f64).into());
+    set(&o, "meetingKey", s.meeting_key.into());
+    set(&o, "meetingUrl", s.meeting_url.into());
+    set(&o, "title", s.title.into());
+    set(&o, "status", s.status.into());
+    set(&o, "startedAt", s.started_at.into());
+    set(&o, "lastActivityAt", s.last_activity_at.into());
+    set(&o, "endedAt", s.ended_at.into());
+    set(&o, "platform", s.platform.into());
+    set(&o, "entryCount", (s.entry_count as f64).into());
+    set(&o, "quicPort", s.quic_port.into());
+    set(&o, "vncPort", s.vnc_port.into());
+    set(&o, "novncPort", s.novnc_port.into());
+    set(&o, "botEndpointId", s.bot_endpoint_id.into());
+    set(&o, "containerName", s.container_name.into());
+    set(&o, "ownerUserId", (s.owner_user_id as f64).into());
+    o
+}
+
+fn meeting_entry_to_js(e: tentaflow_protocol::MeetingTranscriptEntry) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "id", (e.id as f64).into());
+    set(&o, "sessionId", (e.session_id as f64).into());
+    set(&o, "timestampMs", (e.timestamp_ms as f64).into());
+    set(&o, "speaker", e.speaker.into());
+    set(&o, "profileId", (e.profile_id as f64).into());
+    set(&o, "confidence", (e.confidence as f64).into());
+    set(&o, "isEnrolled", e.is_enrolled.into());
+    set(&o, "text", e.text.into());
+    set(&o, "model", e.model.into());
+    o
+}
+
+fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPayload) {
+    use tentaflow_protocol::MeetingPayload as MP;
+    match p {
+        MP::ReqSessionStart(_) => set(obj, "variant", "MeetingSessionStartRequest".into()),
+        MP::ResSessionStart(r) => {
+            set(obj, "variant", "MeetingSessionStartResponse".into());
+            set(obj, "session", meeting_session_to_js(r.session).into());
+        }
+        MP::ReqSessionLeave(_) => set(obj, "variant", "MeetingSessionLeaveRequest".into()),
+        MP::ResSessionLeave(r) => {
+            set(obj, "variant", "MeetingSessionLeaveResponse".into());
+            set(obj, "ok", r.ok.into());
+        }
+        MP::ReqSessionList(_) => set(obj, "variant", "MeetingSessionListRequest".into()),
+        MP::ResSessionList(r) => {
+            set(obj, "variant", "MeetingSessionListResponse".into());
+            let arr = js_sys::Array::new();
+            for s in r.sessions {
+                arr.push(&meeting_session_to_js(s).into());
+            }
+            set(obj, "sessions", arr.into());
+        }
+        MP::ReqSessionDetail(_) => set(obj, "variant", "MeetingSessionDetailRequest".into()),
+        MP::ResSessionDetail(r) => {
+            set(obj, "variant", "MeetingSessionDetailResponse".into());
+            set(obj, "session", meeting_session_to_js(r.session).into());
+            let arr = js_sys::Array::new();
+            for e in r.transcripts {
+                arr.push(&meeting_entry_to_js(e).into());
+            }
+            set(obj, "transcripts", arr.into());
+            set(obj, "summaryTldr", r.summary_tldr.into());
+            set(obj, "summaryDecisions", r.summary_decisions.into());
+            set(obj, "summaryActionItemsJson", r.summary_action_items_json.into());
+            set(obj, "summaryOpenQuestions", r.summary_open_questions.into());
+            set(obj, "summaryModel", r.summary_model.into());
+            set(obj, "summaryGeneratedAt", r.summary_generated_at.into());
+        }
+        MP::ReqTranscriptsList(_) => set(obj, "variant", "MeetingTranscriptsListRequest".into()),
+        MP::ResTranscriptsList(r) => {
+            set(obj, "variant", "MeetingTranscriptsListResponse".into());
+            let arr = js_sys::Array::new();
+            for e in r.entries {
+                arr.push(&meeting_entry_to_js(e).into());
+            }
+            set(obj, "entries", arr.into());
+        }
+        MP::ReqSummaryGenerate(_) => set(obj, "variant", "MeetingSummaryGenerateRequest".into()),
+        MP::ResSummaryGenerate(r) => {
+            set(obj, "variant", "MeetingSummaryGenerateResponse".into());
+            let s = r.summary;
+            set(obj, "tldr", s.tldr.into());
+            set(obj, "decisions", s.decisions.into());
+            set(obj, "actionItemsJson", s.action_items_json.into());
+            set(obj, "openQuestions", s.open_questions.into());
+            set(obj, "model", s.model.into());
+            set(obj, "generatedAt", s.generated_at.into());
+        }
+        MP::ReqActiveSession(_) => set(obj, "variant", "MeetingActiveSessionRequest".into()),
+        MP::ResActiveSession(r) => {
+            set(obj, "variant", "MeetingActiveSessionResponse".into());
+            set(obj, "hasActive", r.has_active.into());
+            set(obj, "session", meeting_session_to_js(r.session).into());
+        }
+        MP::ReqSettingsGet(_) => set(obj, "variant", "MeetingSettingsGetRequest".into()),
+        MP::ResSettingsGet(r) => {
+            set(obj, "variant", "MeetingSettingsGetResponse".into());
+            let arr = js_sys::Array::new();
+            for kv in r.settings {
+                let o = js_sys::Object::new();
+                set(&o, "key", kv.key.into());
+                set(&o, "value", kv.value.into());
+                arr.push(&o.into());
+            }
+            set(obj, "settings", arr.into());
+        }
+        MP::ReqSettingsUpdate(_) => set(obj, "variant", "MeetingSettingsUpdateRequest".into()),
+        MP::ResSettingsUpdate(r) => {
+            set(obj, "variant", "MeetingSettingsUpdateResponse".into());
+            set(obj, "ok", r.ok.into());
+        }
+    }
 }
 
 fn flow_node_template_to_js(t: tentaflow_protocol::message_body::FlowNodeTemplate) -> js_sys::Object {

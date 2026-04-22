@@ -2089,6 +2089,189 @@ pub enum NotesResponse {
 }
 
 // =============================================================================
+// Meeting Bot (per-meeting container, live transcript, AI summary).
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionDescriptor {
+    pub session_id: i64,
+    pub meeting_key: String,
+    pub meeting_url: String,
+    pub title: String,
+    pub status: String,
+    pub started_at: String,
+    pub last_activity_at: String,
+    pub ended_at: String,
+    pub platform: String,
+    pub entry_count: i64,
+    pub quic_port: i32,
+    pub vnc_port: i32,
+    pub novnc_port: i32,
+    pub bot_endpoint_id: String,
+    pub container_name: String,
+    pub owner_user_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionStartRequest {
+    pub meeting_url: String,
+    pub title: String,
+    pub platform: String,
+    pub bot_name: String,
+    pub stt_alias: String,
+    pub tts_alias: String,
+    pub llm_alias: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionStartResponse {
+    pub session: MeetingSessionDescriptor,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionLeaveRequest {
+    pub session_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionLeaveResponse {
+    pub ok: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionListRequest {
+    /// true = tylko moje sesje, false = wszystkie (admin)
+    pub only_mine: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionListResponse {
+    pub sessions: Vec<MeetingSessionDescriptor>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeetingTranscriptEntry {
+    pub id: i64,
+    pub session_id: i64,
+    pub timestamp_ms: i64,
+    pub speaker: String,
+    pub profile_id: i64,
+    pub confidence: f32,
+    pub is_enrolled: bool,
+    pub text: String,
+    pub model: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionDetailRequest {
+    pub session_id: i64,
+    pub include_transcripts: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSessionSummaryEntry {
+    pub tldr: String,
+    pub decisions: String,
+    pub action_items_json: String,
+    pub open_questions: String,
+    pub model: String,
+    pub generated_at: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeetingSessionDetailResponse {
+    pub session: MeetingSessionDescriptor,
+    pub transcripts: Vec<MeetingTranscriptEntry>,
+    pub summary_tldr: String,
+    pub summary_decisions: String,
+    pub summary_action_items_json: String,
+    pub summary_open_questions: String,
+    pub summary_model: String,
+    pub summary_generated_at: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingTranscriptsListRequest {
+    pub session_id: i64,
+    /// Zwroc tylko wpisy z timestamp_ms > since_ms. 0 = wszystko.
+    pub since_ms: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeetingTranscriptsListResponse {
+    pub entries: Vec<MeetingTranscriptEntry>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummaryGenerateRequest {
+    pub session_id: i64,
+    pub force_refresh: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummaryGenerateResponse {
+    pub summary: MeetingSessionSummaryEntry,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActiveSessionRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActiveSessionResponse {
+    /// session_id = 0 jesli brak aktywnej sesji.
+    pub session: MeetingSessionDescriptor,
+    pub has_active: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSettingKv {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSettingsGetRequest;
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSettingsGetResponse {
+    pub settings: Vec<MeetingSettingKv>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSettingsUpdateRequest {
+    pub settings: Vec<MeetingSettingKv>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSettingsUpdateResponse {
+    pub ok: bool,
+}
+
+/// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
+/// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub enum MeetingPayload {
+    ReqSessionStart(MeetingSessionStartRequest),
+    ResSessionStart(MeetingSessionStartResponse),
+    ReqSessionLeave(MeetingSessionLeaveRequest),
+    ResSessionLeave(MeetingSessionLeaveResponse),
+    ReqSessionList(MeetingSessionListRequest),
+    ResSessionList(MeetingSessionListResponse),
+    ReqSessionDetail(MeetingSessionDetailRequest),
+    ResSessionDetail(MeetingSessionDetailResponse),
+    ReqTranscriptsList(MeetingTranscriptsListRequest),
+    ResTranscriptsList(MeetingTranscriptsListResponse),
+    ReqSummaryGenerate(MeetingSummaryGenerateRequest),
+    ResSummaryGenerate(MeetingSummaryGenerateResponse),
+    ReqActiveSession(MeetingActiveSessionRequest),
+    ResActiveSession(MeetingActiveSessionResponse),
+    ReqSettingsGet(MeetingSettingsGetRequest),
+    ResSettingsGet(MeetingSettingsGetResponse),
+    ReqSettingsUpdate(MeetingSettingsUpdateRequest),
+    ResSettingsUpdate(MeetingSettingsUpdateResponse),
+}
+
+// =============================================================================
 // Translate (LLM-backed translator w user app).
 // =============================================================================
 
@@ -2473,6 +2656,9 @@ pub enum MessageBody {
     // ---- Notes (inner-enum multiplex) ----
     NotesRequestBody(NotesRequest),
     NotesResponseBody(NotesResponse),
+
+    // ---- Meeting Bot (single-variant, req+res w inner enum) ----
+    MeetingBody(MeetingPayload),
 
     // ---- Translate (LLM-backed) ----
     TranslateRequestBody(TranslateRequest),
