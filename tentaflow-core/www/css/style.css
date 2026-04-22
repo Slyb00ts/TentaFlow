@@ -3407,3 +3407,35 @@ textarea {
   .side-col { border-left: none; border-top: 1px solid var(--border); }
   .meeting-history-layout { grid-template-columns: 1fr; }
 }
+
+/* Deploy progress modal — live build log + progress bar + phase label. */
+.deploy-progress { display: flex; flex-direction: column; gap: 12px; padding: 4px; }
+.deploy-progress-head { display: flex; justify-content: space-between; align-items: flex-start; }
+.deploy-progress-engine { font-size: 15px; font-weight: 700; color: var(--text); }
+.deploy-progress-meta { font-size: 11px; color: var(--text-3); display: flex; gap: 6px; align-items: center; margin-top: 3px; }
+.deploy-progress-meta code { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--accent-2); }
+.deploy-progress-phase {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; color: var(--text-2); font-weight: 600;
+}
+.deploy-progress-track {
+  height: 6px; background: var(--bg-input, #0b0e22);
+  border: 1px solid var(--border); border-radius: 999px; overflow: hidden;
+}
+.deploy-progress-bar {
+  height: 100%; background: var(--gradient-accent, linear-gradient(135deg,#6366f1,#a78bfa));
+  transition: width 0.3s ease;
+}
+.deploy-log-box {
+  max-height: 280px; min-height: 180px; overflow-y: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; line-height: 1.5;
+  color: var(--text-2); background: var(--bg-input, #0b0e22);
+  border: 1px solid var(--border); border-radius: var(--radius, 10px);
+  padding: 12px 14px; margin: 0; white-space: pre-wrap; word-break: break-all;
+}
+.deploy-progress-error {
+  padding: 12px 14px; border-radius: var(--radius, 10px);
+  background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.3);
+  color: var(--danger, #ef4444); font-size: 12px; line-height: 1.6;
+}

@@ -1355,14 +1355,19 @@
     "select_user": "Select user"
   },
   "deploy": {
-    "gpu_devices": "GPU Devices",
-    "container_name": "Container name",
-    "progress": {
-      "deploying": "Deploying"
-    },
-    "validation": {
-      "service_required": "Service name is required"
-    }
+    "progress_title": "Deploy progress",
+    "status_queued": "Queued",
+    "status_building": "Building",
+    "status_pulling": "Pulling",
+    "status_running": "Running",
+    "status_registering": "Registering",
+    "status_success": "Success",
+    "status_failure": "Failed",
+    "status_cancelled": "Cancelled",
+    "status_ended": "Ended",
+    "success": "Deploy succeeded",
+    "failed": "Deploy failed",
+    "err_generic": "Unknown error"
   },
   "chat": {
     "title": "Chat",

@@ -7842,3 +7842,228 @@ mod notes_tests {
         create_note(&db, uid, "t", "b").unwrap();
     }
 }
+
+// =============================================================================
+// Deployments (migration 48) — deploy lifecycle tracking with streaming log tail
+// =============================================================================
+
+pub mod deployments {
+    use super::DbPool;
+    use anyhow::Result;
+    use rusqlite::params;
+    use serde::Serialize;
+
+    /// Maksymalna liczba linii logu trzymana w kolumnie log_tail. Starsze linie
+    /// są kasowane przy każdym append. 200 linii = ~15 KB tekstu, łatwo mieszczi
+    /// się w rkyv response nawet dla wielu deployów na liście.
+    pub const LOG_TAIL_MAX_LINES: usize = 200;
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct DeploymentRow {
+        pub id: i64,
+        pub deploy_id: String,
+        pub engine_id: String,
+        pub deploy_method: String,
+        pub node_id: String,
+        pub status: String,
+        pub phase: String,
+        pub progress_pct: i64,
+        pub image_tag: String,
+        pub container_name: String,
+        pub config_json: String,
+        pub user_id: Option<i64>,
+        pub started_at: String,
+        pub finished_at: Option<String>,
+        pub error_message: Option<String>,
+        pub log_tail: String,
+    }
+
+    const COLS: &str = "id, deploy_id, engine_id, deploy_method, node_id, status, phase, \
+                        progress_pct, image_tag, container_name, config_json, user_id, \
+                        started_at, finished_at, error_message, log_tail";
+
+    fn row_to_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
+        Ok(DeploymentRow {
+            id: row.get(0)?,
+            deploy_id: row.get(1)?,
+            engine_id: row.get(2)?,
+            deploy_method: row.get(3)?,
+            node_id: row.get(4)?,
+            status: row.get(5)?,
+            phase: row.get(6)?,
+            progress_pct: row.get(7)?,
+            image_tag: row.get(8)?,
+            container_name: row.get(9)?,
+            config_json: row.get(10)?,
+            user_id: row.get(11)?,
+            started_at: row.get(12)?,
+            finished_at: row.get(13)?,
+            error_message: row.get(14)?,
+            log_tail: row.get(15)?,
+        })
+    }
+
+    /// Tworzy wiersz deployment w status='queued'. Caller (runner) zmienia
+    /// status → 'building' → ... → 'success'/'failure'.
+    pub fn create(
+        pool: &DbPool,
+        deploy_id: &str,
+        engine_id: &str,
+        deploy_method: &str,
+        node_id: &str,
+        config_json: &str,
+        user_id: Option<i64>,
+    ) -> Result<i64> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, config_json, user_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![deploy_id, engine_id, deploy_method, node_id, config_json, user_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn set_status(
+        pool: &DbPool,
+        deploy_id: &str,
+        status: &str,
+        phase: &str,
+        progress_pct: u32,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET status = ?2, phase = ?3, progress_pct = ?4 WHERE deploy_id = ?1",
+            params![deploy_id, status, phase, progress_pct as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_image_tag(pool: &DbPool, deploy_id: &str, image_tag: &str) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET image_tag = ?2 WHERE deploy_id = ?1",
+            params![deploy_id, image_tag],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_container_name(pool: &DbPool, deploy_id: &str, name: &str) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET container_name = ?2 WHERE deploy_id = ?1",
+            params![deploy_id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_finished(
+        pool: &DbPool,
+        deploy_id: &str,
+        final_status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE deployments SET status = ?2, finished_at = datetime('now'),
+                 progress_pct = CASE WHEN ?2 = 'success' THEN 100 ELSE progress_pct END,
+                 error_message = ?3 WHERE deploy_id = ?1",
+            params![deploy_id, final_status, error_message],
+        )?;
+        Ok(())
+    }
+
+    /// Dopisuje linię do log_tail, trzymając nie więcej niż LOG_TAIL_MAX_LINES.
+    /// Przy wielu równoległych deployach transakcja SQLite serializuje zapisy,
+    /// więc nie musimy dodatkowego locka.
+    pub fn append_log_line(pool: &DbPool, deploy_id: &str, line: &str) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        let current: String = conn
+            .query_row(
+                "SELECT log_tail FROM deployments WHERE deploy_id = ?1",
+                params![deploy_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        let mut lines: Vec<&str> = current.split('\n').filter(|l| !l.is_empty()).collect();
+        lines.push(line);
+        if lines.len() > LOG_TAIL_MAX_LINES {
+            let drop_n = lines.len() - LOG_TAIL_MAX_LINES;
+            lines.drain(0..drop_n);
+        }
+        let new_tail = lines.join("\n");
+        conn.execute(
+            "UPDATE deployments SET log_tail = ?2 WHERE deploy_id = ?1",
+            params![deploy_id, new_tail],
+        )?;
+        Ok(())
+    }
+
+    pub fn get(pool: &DbPool, deploy_id: &str) -> Result<Option<DeploymentRow>> {
+        let conn = pool.lock().unwrap();
+        let sql = format!(
+            "SELECT {} FROM deployments WHERE deploy_id = ?1",
+            COLS
+        );
+        let row = conn
+            .query_row(&sql, params![deploy_id], row_to_deployment)
+            .ok();
+        Ok(row)
+    }
+
+    /// Lista deployów z filtrem po engine_id / status / user_id. Każdy filter
+    /// opcjonalny. Sortowanie started_at DESC. Default limit 100.
+    pub fn list(
+        pool: &DbPool,
+        engine_id: Option<&str>,
+        status: Option<&str>,
+        user_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<DeploymentRow>> {
+        let conn = pool.lock().unwrap();
+        let mut where_clauses = Vec::new();
+        let mut bind_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(eid) = engine_id {
+            where_clauses.push("engine_id = ?");
+            bind_params.push(Box::new(eid.to_string()));
+        }
+        if let Some(st) = status {
+            where_clauses.push("status = ?");
+            bind_params.push(Box::new(st.to_string()));
+        }
+        if let Some(uid) = user_id {
+            where_clauses.push("user_id = ?");
+            bind_params.push(Box::new(uid));
+        }
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_clauses.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT {} FROM deployments{} ORDER BY started_at DESC LIMIT {}",
+            COLS,
+            where_sql,
+            limit.max(1).min(500)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            bind_params.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_deployment)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Deployy w stanie 'queued' lub 'running'-ish zostawione przez crash.
+    /// Startup cleanup oznacza je jako 'failure' z error='aborted by shutdown'.
+    pub fn reset_stale(pool: &DbPool) -> Result<u32> {
+        let conn = pool.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE deployments
+             SET status = 'failure',
+                 finished_at = datetime('now'),
+                 error_message = 'aborted by tentaflow shutdown'
+             WHERE status NOT IN ('success', 'failure', 'cancelled')",
+            [],
+        )?;
+        Ok(n as u32)
+    }
+}

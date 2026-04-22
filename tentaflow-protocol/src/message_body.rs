@@ -2089,6 +2089,106 @@ pub enum NotesResponse {
 }
 
 // =============================================================================
+// Deployments — real build/run pipeline with streaming progress + log tail.
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentSummary {
+    pub deploy_id: String,
+    pub engine_id: String,
+    pub deploy_method: String,
+    pub node_id: String,
+    pub status: String,
+    pub phase: String,
+    pub progress_pct: i32,
+    pub image_tag: String,
+    pub container_name: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub error_message: String,
+    pub log_tail: String,
+    pub user_id: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentStatusRequest {
+    pub deploy_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentStatusResponse {
+    pub deployment: DeploymentSummary,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentListRequest {
+    /// "" = wszystkie engines; inaczej filtr exact match.
+    pub engine_id: String,
+    /// "" = wszystkie; inaczej: "queued"/"building"/"pulling"/"running"/"registering"/"success"/"failure"/"cancelled".
+    pub status: String,
+    /// true = tylko moje; false = wszystkie (wymaga admin).
+    pub only_mine: bool,
+    /// 0 = default 100.
+    pub limit: i32,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentListResponse {
+    pub deployments: Vec<DeploymentSummary>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentLogStreamRequest {
+    pub deploy_id: String,
+    /// Czy emitować historyczne log_tail zanim stream zacznie live.
+    pub replay_tail: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentStreamChunk {
+    pub deploy_id: String,
+    /// "log" = linia build output, "phase" = zmiana fazy, "progress" = update %.
+    pub kind: String,
+    pub line: String,
+    pub phase: String,
+    pub progress_pct: i32,
+    /// Epoch ms wyemitowania chunka (do sort / debug).
+    pub ts_ms: i64,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentStreamEnd {
+    pub deploy_id: String,
+    /// "success" | "failure" | "cancelled".
+    pub final_status: String,
+    pub image_tag: String,
+    pub container_name: String,
+    pub error_message: String,
+    pub duration_ms: i64,
+}
+
+/// Zbiorczy payload deployment (req + res + stream chunks). Jeden wariant
+/// `MessageBody::DeploymentBody` kosztuje 1 slot w 256-limicie — inner enum
+/// rozgalezia sie lokalnie. Stream handler emituje `StreamChunk`/`StreamEnd`
+/// przez SubscriptionEvent::Chunk/End tak samo jak ChatStream.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum DeploymentPayload {
+    /// Start deploymentu — odpowiednik starego top-level
+    /// `ServiceManifestDeployRequestBody`, przeniesiony tu żeby zmieścić się
+    /// w 256-variant limicie rkyv (jedna top-level `DeploymentBody` zamiast
+    /// dwóch osobnych Req/Res).
+    ReqStart(ServiceManifestDeployRequest),
+    ResStart(ServiceManifestDeployResponse),
+    ReqStatus(DeploymentStatusRequest),
+    ResStatus(DeploymentStatusResponse),
+    ReqList(DeploymentListRequest),
+    ResList(DeploymentListResponse),
+    ReqLogStream(DeploymentLogStreamRequest),
+    StreamChunk(DeploymentStreamChunk),
+    StreamEnd(DeploymentStreamEnd),
+}
+
+// =============================================================================
 // Meeting Bot (per-meeting container, live transcript, AI summary).
 // =============================================================================
 
@@ -2575,8 +2675,8 @@ pub enum MessageBody {
     ModelAliasDeleteResponseBody(ModelAliasDeleteResponse),
     NimCatalogListRequest,
     NimCatalogListResponseBody(NimCatalogListResponse),
-    ServiceManifestDeployRequestBody(ServiceManifestDeployRequest),
-    ServiceManifestDeployResponseBody(ServiceManifestDeployResponse),
+    // ServiceManifestDeployRequest/Response przeniesione do DeploymentPayload
+    // (ReqStart/ResStart). Oszczędza 1 slot w 256-variant limicie rkyv.
 
     // ---- Addons: list / detail / toggle / lifecycle ----
     AddonsListRequest,
@@ -2659,6 +2759,9 @@ pub enum MessageBody {
 
     // ---- Meeting Bot (single-variant, req+res w inner enum) ----
     MeetingBody(MeetingPayload),
+
+    // ---- Deployments (single-variant, req+res+stream w inner enum) ----
+    DeploymentBody(DeploymentPayload),
 
     // ---- Translate (LLM-backed) ----
     TranslateRequestBody(TranslateRequest),
