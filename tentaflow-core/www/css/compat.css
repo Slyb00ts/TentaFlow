@@ -190,3 +190,6 @@
 .lang-select:hover { border-color: var(--border-hover); }
 .lang-select:focus { outline: none; border-color: var(--accent-1); }
 
+@media (max-width: 767px) {
+  .form-row { grid-template-columns: 1fr; gap: 4px; }
+}

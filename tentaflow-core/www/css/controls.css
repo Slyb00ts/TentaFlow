@@ -891,6 +891,14 @@ tf-tabs {
     margin-top: 4px;
   }
   .tf-table td.actions::before { display: none; }
+
+  .tf-window {
+    min-width: 0;
+    width: calc(100vw - 16px) !important;
+    max-width: 100vw;
+    left: 8px !important;
+    right: 8px !important;
+  }
 }
 
 /* =============================================================================

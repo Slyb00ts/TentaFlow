@@ -1265,6 +1265,10 @@ tf-chip.addon-badge.state-off > .tf-chip {
     grid-template-columns: 1fr;
   }
 
+  .myapps-grid {
+    grid-template-columns: 1fr;
+  }
+
   .addons-screen .page-header {
     margin-bottom: 16px;
   }
