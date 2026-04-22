@@ -330,6 +330,12 @@ fn spawn_quic_event_handler(
             std::collections::VecDeque::with_capacity(512);
         const TOPO_SEEN_CAP: usize = 512;
 
+        // Cooldown na auto-dial z KnownPeers — zapobiega dial stormow gdy peer
+        // wysyla wielokrotnie KnownPeers w jednej sekundzie (iroh multi-path).
+        let mut last_dial_at: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        const DIAL_COOLDOWN_SECS: u64 = 30;
+
         loop {
             match event_rx.recv().await {
                 Ok(IrohMeshEvent::HelloReceived { node_id, data }) => {
@@ -371,10 +377,10 @@ fn spawn_quic_event_handler(
                             continue;
                         }
                     };
-                    info!(
+                    debug!(
                         from = %from_node_id,
                         count = payload.peers.len(),
-                        "Otrzymano KnownPeers — dial fallback dla mesh discovery"
+                        "Otrzymano KnownPeers"
                     );
                     for entry in &payload.peers {
                         if entry.node_id == local_node_id {
@@ -383,6 +389,17 @@ fn spawn_quic_event_handler(
                         if peer_store.is_quic_connected(&entry.node_id) {
                             continue;
                         }
+                        // Cooldown — nie probuj ponownie przez 30s nawet jesli ten
+                        // sam peer zostanie anonsowany znowu.
+                        let recent = last_dial_at
+                            .get(&entry.node_id)
+                            .map(|t| t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS))
+                            .unwrap_or(false);
+                        if recent {
+                            continue;
+                        }
+                        last_dial_at.insert(entry.node_id.clone(), std::time::Instant::now());
+
                         let addrs: Vec<std::net::IpAddr> = entry
                             .direct_addrs
                             .iter()
@@ -409,7 +426,7 @@ fn spawn_quic_event_handler(
                             .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                         tokio::spawn(async move {
                             match qm.connect_to_peer(&target, dial_addr).await {
-                                Ok(_) => info!(peer = %target, "Auto-dial (KnownPeers): polaczony"),
+                                Ok(_) => debug!(peer = %target, "Auto-dial (KnownPeers): OK"),
                                 Err(e) => debug!(peer = %target, "Auto-dial (KnownPeers): {}", e),
                             }
                         });
@@ -674,10 +691,18 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::PeerConnected { node_id }) => {
-                    info!(peer_id = %node_id, "QUIC peer polaczony");
+                    // Deduplikuj — iroh czesto generuje wiele PeerConnected dla tego
+                    // samego peera (direct + relay path). Toast/event emitujemy tylko
+                    // na prawdziwa transitioned offline→online.
+                    let was_connected = peer_store.is_quic_connected(&node_id);
                     peer_store.set_quic_connected(&node_id, true);
                     peer_store.set_status(&node_id, "connected");
                     peer_store.mark_heartbeat(&node_id);
+                    if was_connected {
+                        debug!(peer_id = %node_id, "QUIC peer — duplicate connected event (iroh multi-path)");
+                        continue;
+                    }
+                    info!(peer_id = %node_id, "QUIC peer polaczony");
 
                     // Emit event do GUI — toast "peer connected" + refresh mesh view.
                     let hostname_ev = peer_store
@@ -837,10 +862,17 @@ fn spawn_quic_event_handler(
                     peer_store.recalculate_routes(&local_node_id);
                 }
                 Ok(IrohMeshEvent::PeerDisconnected { node_id }) => {
-                    info!(peer_id = %node_id, "QUIC peer rozlaczony");
+                    // Dedup — iroh multi-path moze emitowac kilka disconnect dla tego
+                    // samego peera. Emit event tylko na transition connected→offline.
+                    let was_connected = peer_store.is_quic_connected(&node_id);
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "disconnected");
                     peer_store.clear_heartbeat(&node_id);
+                    if !was_connected {
+                        debug!(peer_id = %node_id, "QUIC peer — duplicate disconnect event");
+                        continue;
+                    }
+                    info!(peer_id = %node_id, "QUIC peer rozlaczony");
 
                     // Emituj event do GUI — pokazuje toast + odswieza karty mesh.
                     let hostname = peer_store
@@ -1621,9 +1653,12 @@ fn spawn_liveness_timer(
     local_node_id: String,
 ) {
     tokio::spawn(async move {
-        const DEGRADED_MS: i64 = 2000;
-        const OFFLINE_MS: i64 = 5000;
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        // Progi dobrane z zapasem — iroh multi-path czasem opuszcza heartbeat
+        // podczas reroutingu. 15s offline to pol-minuta do detekcji worst case,
+        // ale jednoczesnie nie flickeruje przy normalnych wahaniach sieci.
+        const DEGRADED_MS: i64 = 5000;
+        const OFFLINE_MS: i64 = 15000;
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
             interval.tick().await;
             let ages = peer_store.heartbeat_ages();
