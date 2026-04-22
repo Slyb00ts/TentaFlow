@@ -7,6 +7,11 @@ CORE_DIR="$PROJECT_ROOT/core"
 
 echo "=== Building TentaFlow Mobile (Rust core) ==="
 
+# Synchronizuj wersje clang w pbxproj z aktywnym Xcode. Po major upgrade Xcode
+# hardcoded sciezki do libclang_rt.ios.a pokazuja na starsza wersje clang i
+# linker sypie 'No such file or directory'. Skrypt jest idempotentny.
+"$SCRIPT_DIR/fix-clang-version.sh" || echo "WARN: fix-clang-version.sh failed, buduje dalej"
+
 # Targets
 DEVICE_TARGET="aarch64-apple-ios"
 SIMULATOR_TARGET="aarch64-apple-ios-sim"
