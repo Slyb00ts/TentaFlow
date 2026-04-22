@@ -130,6 +130,49 @@ impl Router {
                             debug!("Audio transcription zakonczona: {} znakow tekstu", response.text.len());
                             Ok(response)
                         }
+                        BackendHandle::MeshForward(node_id, svc) => {
+                            // Mesh-remote STT — iroh transparentnie obsluguje relay multi-hop.
+                            debug!(target_node = %node_id, service = %svc, "MeshForward STT");
+                            let quic_client = this.service_manager.get_quic_stt_client(svc).await
+                                .ok_or_else(|| anyhow::anyhow!("Mesh STT serwis '{}' na nodzie {} nie polaczony", svc, node_id))?;
+                            let request_id = uuid::Uuid::new_v4().to_string();
+                            let model_request = ModelRequest {
+                                request_id: request_id.clone(),
+                                payload: ModelPayload::Audio(AudioPayload {
+                                    operation: AudioOperation::STT {
+                                        model: svc.clone(),
+                                        audio_data: req.file.clone(),
+                                        language: req.language.clone(),
+                                        response_format: req.response_format.clone(),
+                                        prompt: req.prompt.clone(),
+                                        temperature: req.temperature,
+                                        timestamp_granularities: req.timestamp_granularities.clone(),
+                                        no_speech_threshold: None,
+                                        avg_logprob_threshold: None,
+                                        compression_ratio_threshold: None,
+                                    },
+                                }),
+                                stream: false,
+                                metadata: None,
+                                session_id: None,
+                            };
+                            let response = quic_client.send_request(model_request).await
+                                .map_err(|e| anyhow::anyhow!("Mesh STT request failed: {}", e))?;
+                            match response.result {
+                                ModelResult::Audio(audio_result) => match audio_result.data {
+                                    AudioResultData::Text(text) => Ok(TranscriptionResponse {
+                                        text,
+                                        task: Some("transcribe".to_string()),
+                                        language: None,
+                                        duration: None,
+                                        segments: None,
+                                    }),
+                                    _ => Err(anyhow::anyhow!("Mesh STT zwrocil nieoczekiwany typ wyniku")),
+                                },
+                                ModelResult::Error(err) => Err(anyhow::anyhow!("Mesh STT error: {}", err.message)),
+                                _ => Err(anyhow::anyhow!("Mesh STT zwrocil nieoczekiwany typ odpowiedzi")),
+                            }
+                        }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla STT")),
                     }
                 }

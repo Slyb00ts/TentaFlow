@@ -108,6 +108,57 @@ impl Router {
                                 )),
                             }
                         }
+                        BackendHandle::MeshForward(node_id, svc) => {
+                            // Mesh-remote TTS — iroh robi relay multi-hop automatycznie.
+                            debug!(target_node = %node_id, service = %svc, "MeshForward TTS");
+                            let quic_client = this
+                                .service_manager
+                                .get_quic_tts_client(svc)
+                                .await
+                                .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Mesh TTS serwis '{}' na nodzie {} nie polaczony",
+                                    svc,
+                                    node_id
+                                )
+                            })?;
+                            let request_id = uuid::Uuid::new_v4().to_string();
+                            let model_request = ModelRequest {
+                                request_id: request_id.clone(),
+                                payload: ModelPayload::Audio(AudioPayload {
+                                    operation: AudioOperation::TTS {
+                                        model: model_c,
+                                        input: input_c,
+                                        voice: voice_c,
+                                        format: Some(format_c),
+                                        speed: Some(speed),
+                                    },
+                                }),
+                                stream: false,
+                                metadata: None,
+                                session_id: None,
+                            };
+                            let response = quic_client
+                                .send_request(model_request)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Mesh TTS request failed: {}", e))?;
+                            match response.result {
+                                ModelResult::Audio(audio_result) => match audio_result.data {
+                                    AudioResultData::Audio(audio_bytes) => Ok(audio_bytes),
+                                    _ => Err(anyhow::anyhow!(
+                                        "Mesh TTS zwrocil nieoczekiwany typ wyniku"
+                                    )),
+                                },
+                                ModelResult::Error(err) => Err(anyhow::anyhow!(
+                                    "Mesh TTS error: {:?} - {}",
+                                    err.error_type,
+                                    err.message
+                                )),
+                                _ => Err(anyhow::anyhow!(
+                                    "Mesh TTS zwrocil nieoczekiwany typ odpowiedzi"
+                                )),
+                            }
+                        }
                         _ => Err(anyhow::anyhow!("Nieobslugiwany backend dla TTS")),
                     }
                 }

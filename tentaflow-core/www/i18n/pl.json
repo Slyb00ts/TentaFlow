@@ -1190,6 +1190,7 @@
     "fingerprint": "Fingerprint",
     "hop_one": "1 hop",
     "hop_many": "{count} hops",
+    "via_peer": "przez {peer}",
     "hops_label": "{count} hops",
     "gpu_util": "GPU",
     "gpu_avg_of": "śr. z {count}",

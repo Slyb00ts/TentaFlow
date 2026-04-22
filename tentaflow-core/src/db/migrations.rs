@@ -1484,5 +1484,29 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX IF NOT EXISTS idx_deployments_started ON deployments(started_at DESC);
         ",
     ),
+    (
+        49,
+        "mesh_topology_snapshot",
+        "
+            -- Persystencja topologii mesh odbieranej przez TopologyAnnounce. Sluzy
+            -- do bootstrapu peer_store po restarcie noda zanim gossip przyniesie
+            -- aktualne dane. Upsert po kazdym odbiorze; TTL 7 dni (cleanup przy starcie).
+            CREATE TABLE IF NOT EXISTS mesh_topology (
+                node_id TEXT PRIMARY KEY,
+                hostname TEXT NOT NULL DEFAULT '',
+                platform TEXT NOT NULL DEFAULT '',
+                os_info TEXT NOT NULL DEFAULT '',
+                connected_to TEXT NOT NULL DEFAULT '[]',
+                direct_addrs TEXT NOT NULL DEFAULT '[]',
+                port INTEGER NOT NULL DEFAULT 0,
+                services_json TEXT NOT NULL DEFAULT '[]',
+                models_json TEXT NOT NULL DEFAULT '[]',
+                last_epoch INTEGER NOT NULL DEFAULT 0,
+                last_seen_ms INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_mesh_topology_last_seen
+                ON mesh_topology(last_seen_ms DESC);
+        ",
+    ),
 ]
 }

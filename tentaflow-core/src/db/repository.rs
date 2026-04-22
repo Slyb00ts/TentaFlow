@@ -4239,12 +4239,7 @@ pub mod transcripts {
 
     /// Atomowo rezerwuje port danego rodzaju. Zwraca true jesli nowy wpis wstawiono,
     /// false jesli port byl juz zajęty (wywolanie powinno probowac kolejny).
-    pub fn try_reserve_port(
-        pool: &DbPool,
-        port: u16,
-        kind: &str,
-        session_id: i64,
-    ) -> Result<bool> {
+    pub fn try_reserve_port(pool: &DbPool, port: u16, kind: &str, session_id: i64) -> Result<bool> {
         let conn = pool.lock().unwrap();
         let changed = conn.execute(
             "INSERT OR IGNORE INTO meeting_port_allocations (port, kind, session_id)
@@ -4265,9 +4260,7 @@ pub mod transcripts {
 
     pub fn list_reserved_ports(pool: &DbPool, kind: &str) -> Result<Vec<u16>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT port FROM meeting_port_allocations WHERE kind = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT port FROM meeting_port_allocations WHERE kind = ?1")?;
         let rows = stmt.query_map(rusqlite::params![kind], |row| {
             let p: i64 = row.get(0)?;
             Ok(p as u16)
@@ -4355,10 +4348,7 @@ pub mod transcripts {
         Ok(val)
     }
 
-    pub fn list_user_settings(
-        pool: &DbPool,
-        user_id: i64,
-    ) -> Result<Vec<(String, String)>> {
+    pub fn list_user_settings(pool: &DbPool, user_id: i64) -> Result<Vec<(String, String)>> {
         let conn = pool.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT key, value FROM meeting_settings WHERE user_id = ?1 ORDER BY key ASC",
@@ -4369,12 +4359,7 @@ pub mod transcripts {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn set_user_setting(
-        pool: &DbPool,
-        user_id: i64,
-        key: &str,
-        value: &str,
-    ) -> Result<()> {
+    pub fn set_user_setting(pool: &DbPool, user_id: i64, key: &str, value: &str) -> Result<()> {
         let conn = pool.lock().unwrap();
         conn.execute(
             "INSERT INTO meeting_settings (user_id, key, value, updated_at)
@@ -6308,7 +6293,10 @@ pub fn update_note(
         rusqlite::params![note_id, user_id, title, body],
     )?;
     if affected == 0 {
-        return Err(anyhow::anyhow!("note {} not found or not owned by user", note_id));
+        return Err(anyhow::anyhow!(
+            "note {} not found or not owned by user",
+            note_id
+        ));
     }
     Ok(())
 }
@@ -6321,7 +6309,10 @@ pub fn set_note_pinned(pool: &DbPool, note_id: i64, user_id: i64, pinned: bool) 
         rusqlite::params![note_id, user_id, if pinned { 1 } else { 0 }],
     )?;
     if affected == 0 {
-        return Err(anyhow::anyhow!("note {} not found or not owned by user", note_id));
+        return Err(anyhow::anyhow!(
+            "note {} not found or not owned by user",
+            note_id
+        ));
     }
     Ok(())
 }
@@ -6333,7 +6324,10 @@ pub fn delete_note(pool: &DbPool, note_id: i64, user_id: i64) -> Result<()> {
         rusqlite::params![note_id, user_id],
     )?;
     if affected == 0 {
-        return Err(anyhow::anyhow!("note {} not found or not owned by user", note_id));
+        return Err(anyhow::anyhow!(
+            "note {} not found or not owned by user",
+            note_id
+        ));
     }
     Ok(())
 }
@@ -8000,10 +7994,7 @@ pub mod deployments {
 
     pub fn get(pool: &DbPool, deploy_id: &str) -> Result<Option<DeploymentRow>> {
         let conn = pool.lock().unwrap();
-        let sql = format!(
-            "SELECT {} FROM deployments WHERE deploy_id = ?1",
-            COLS
-        );
+        let sql = format!("SELECT {} FROM deployments WHERE deploy_id = ?1", COLS);
         let row = conn
             .query_row(&sql, params![deploy_id], row_to_deployment)
             .ok();
@@ -8063,6 +8054,120 @@ pub mod deployments {
                  error_message = 'aborted by tentaflow shutdown'
              WHERE status NOT IN ('success', 'failure', 'cancelled')",
             [],
+        )?;
+        Ok(n as u32)
+    }
+}
+
+pub mod mesh_topology {
+    // =========================================================================
+    // mesh_topology repo — persystencja TopologyAnnounce dla bootstrapu peer_store
+    // po restarcie. Cleanup wpisow starszych niz 7 dni przy starcie.
+    // =========================================================================
+
+    use crate::db::DbPool;
+    use anyhow::Result;
+
+    #[derive(Debug, Clone)]
+    pub struct TopologySnapshot {
+        pub node_id: String,
+        pub hostname: String,
+        pub platform: String,
+        pub os_info: String,
+        pub connected_to: Vec<String>,
+        pub direct_addrs: Vec<String>,
+        pub port: u16,
+        pub last_epoch: u64,
+        pub last_seen_ms: i64,
+    }
+
+    /// Upsert snapshot topologii. epoch monotoniczny per origin — pomija update
+    /// jesli aktualny wpis ma nowszy epoch (antypamieciowe anti-replay).
+    pub fn upsert(
+        pool: &DbPool,
+        node_id: &str,
+        hostname: &str,
+        platform: &str,
+        os_info: &str,
+        connected_to: &[String],
+        direct_addrs: &[String],
+        port: u16,
+        services_json: &str,
+        models_json: &str,
+        epoch: u64,
+        now_ms: i64,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        let ct = serde_json::to_string(connected_to).unwrap_or_else(|_| "[]".to_string());
+        let addrs = serde_json::to_string(direct_addrs).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "INSERT INTO mesh_topology
+               (node_id, hostname, platform, os_info, connected_to, direct_addrs,
+                port, services_json, models_json, last_epoch, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(node_id) DO UPDATE SET
+                hostname = excluded.hostname,
+                platform = excluded.platform,
+                os_info = excluded.os_info,
+                connected_to = excluded.connected_to,
+                direct_addrs = excluded.direct_addrs,
+                port = excluded.port,
+                services_json = excluded.services_json,
+                models_json = excluded.models_json,
+                last_epoch = excluded.last_epoch,
+                last_seen_ms = excluded.last_seen_ms
+             WHERE excluded.last_epoch >= mesh_topology.last_epoch",
+            rusqlite::params![
+                node_id,
+                hostname,
+                platform,
+                os_info,
+                ct,
+                addrs,
+                port as i64,
+                services_json,
+                models_json,
+                epoch as i64,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_all(pool: &DbPool) -> Result<Vec<TopologySnapshot>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, hostname, platform, os_info, connected_to, direct_addrs,
+                    port, last_epoch, last_seen_ms
+             FROM mesh_topology",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let ct: String = row.get(4)?;
+                let addrs: String = row.get(5)?;
+                Ok(TopologySnapshot {
+                    node_id: row.get(0)?,
+                    hostname: row.get(1)?,
+                    platform: row.get(2)?,
+                    os_info: row.get(3)?,
+                    connected_to: serde_json::from_str(&ct).unwrap_or_default(),
+                    direct_addrs: serde_json::from_str(&addrs).unwrap_or_default(),
+                    port: row.get::<_, i64>(6)? as u16,
+                    last_epoch: row.get::<_, i64>(7)? as u64,
+                    last_seen_ms: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Czyści wpisy starsze niz 7 dni. Wolane przy starcie.
+    pub fn cleanup_stale(pool: &DbPool, now_ms: i64) -> Result<u32> {
+        let cutoff = now_ms - 7 * 24 * 60 * 60 * 1000;
+        let conn = pool.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM mesh_topology WHERE last_seen_ms < ?1",
+            rusqlite::params![cutoff],
         )?;
         Ok(n as u32)
     }
