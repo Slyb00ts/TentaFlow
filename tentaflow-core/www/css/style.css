@@ -3139,31 +3139,172 @@ textarea {
 }
 
 
-/* Engine deploy wizard — GPU selection step */
-.gpu-mode-group { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
-.gpu-mode-group label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
-.gpu-mode-group input[type="radio"] { accent-color: var(--accent-1); width: 16px; height: 16px; }
-
-.gpu-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-left: 24px; }
-.gpu-list[hidden] { display: none; }
-
-.gpu-row {
+/* Engine deploy wizard — GPU selection step.
+   Option cards (zastepujace natywne radio) + GPU list z custom checkbox. */
+.gpu-mode-cards {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: repeat(3, 1fr);
   gap: 10px;
-  align-items: center;
-  padding: 10px 12px;
+  margin: 12px 0 16px;
+}
+@media (max-width: 640px) {
+  .gpu-mode-cards { grid-template-columns: 1fr; }
+}
+.gpu-mode-card {
+  position: relative;
   background: var(--bg-input);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
+  padding: 16px 14px 14px;
   cursor: pointer;
+  transition: all 0.18s var(--tf-spring-smooth, cubic-bezier(0.32,0.72,0,1));
+  display: flex; flex-direction: column; gap: 6px;
+  min-height: 118px;
+  text-align: left;
+  font-family: inherit;
+  color: var(--text);
 }
-.gpu-row:hover { border-color: var(--border-hover); }
-.gpu-row input[type="checkbox"] { accent-color: var(--accent-1); width: 16px; height: 16px; }
-.gpu-info { min-width: 0; }
-.gpu-name { font-weight: 600; font-size: 13px; }
-.gpu-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; }
-.gpu-summary { margin-top: 12px; }
+.gpu-mode-card:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-card-hover);
+  transform: translateY(-1px);
+}
+.gpu-mode-card.active {
+  border-color: var(--accent-1);
+  background: rgba(99, 102, 241, 0.08);
+  box-shadow: 0 0 0 1px var(--accent-1), 0 4px 14px rgba(99, 102, 241, 0.25);
+}
+.gpu-mode-card.active::before {
+  content: '';
+  position: absolute; top: 10px; right: 10px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--gradient-accent, linear-gradient(135deg, var(--accent-1), var(--accent-2)));
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.gpu-mode-card .gpu-mode-ico {
+  width: 38px; height: 38px;
+  border-radius: 10px;
+  background: rgba(99, 102, 241, 0.12);
+  color: var(--accent-2);
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 4px;
+}
+.gpu-mode-card .gpu-mode-ico svg {
+  width: 18px; height: 18px;
+  stroke: currentColor; fill: none; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.gpu-mode-card .gpu-mode-title {
+  font-size: 13.5px; font-weight: 700; color: var(--text);
+  display: flex; align-items: center; gap: 6px;
+}
+.gpu-mode-card .gpu-mode-title .gpu-mode-tag {
+  font-size: 10px; font-weight: 700; padding: 2px 6px;
+  background: rgba(99, 102, 241, 0.15); color: var(--accent-2);
+  border-radius: 999px; letter-spacing: 0.04em;
+}
+.gpu-mode-card .gpu-mode-desc {
+  font-size: 11.5px; color: var(--text-3); line-height: 1.45;
+}
+/* Tryb 'all' — zielony akcent */
+.gpu-mode-card.all .gpu-mode-ico { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+.gpu-mode-card.all.active {
+  border-color: var(--success);
+  background: rgba(34, 197, 94, 0.06);
+  box-shadow: 0 0 0 1px var(--success), 0 4px 14px rgba(34, 197, 94, 0.2);
+}
+.gpu-mode-card.all.active::before {
+  background: var(--success);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2);
+}
+/* Tryb 'none' (CPU) — niebieski akcent */
+.gpu-mode-card.none .gpu-mode-ico { background: rgba(96, 165, 250, 0.12); color: var(--info); }
+.gpu-mode-card.none.active {
+  border-color: var(--info);
+  background: rgba(96, 165, 250, 0.06);
+  box-shadow: 0 0 0 1px var(--info), 0 4px 14px rgba(96, 165, 250, 0.2);
+}
+.gpu-mode-card.none.active::before {
+  background: var(--info);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.2);
+}
+
+/* Lista GPU — zastepuje stare .gpu-row */
+.gpu-list { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.gpu-list[hidden] { display: none; }
+.gpu-list-hint {
+  font-size: 11px; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  font-weight: 700; margin-bottom: 6px;
+}
+.gpu-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.gpu-row:hover { border-color: var(--border-hover); background: var(--bg-card-hover); }
+.gpu-row.selected {
+  border-color: var(--accent-1);
+  background: rgba(99, 102, 241, 0.06);
+  box-shadow: 0 0 0 1px var(--accent-1);
+}
+.gpu-row .gpu-check {
+  width: 18px; height: 18px; border-radius: 5px;
+  border: 2px solid var(--border-hover);
+  background: var(--bg-3);
+  flex-shrink: 0; position: relative;
+  transition: all 0.15s;
+}
+.gpu-row.selected .gpu-check {
+  background: var(--gradient-accent, linear-gradient(135deg, var(--accent-1), var(--accent-2)));
+  border-color: transparent;
+}
+.gpu-row.selected .gpu-check::after {
+  content: '';
+  position: absolute; inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.gpu-info { flex: 1; min-width: 0; }
+.gpu-name { font-weight: 700; font-size: 13px; color: var(--text); display: flex; align-items: baseline; gap: 6px; }
+.gpu-name .gpu-idx { color: var(--text-3); font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; font-weight: 600; }
+.gpu-meta { font-size: 11px; color: var(--text-3); margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap; }
+.gpu-meta .sep { opacity: 0.5; }
+.gpu-brand {
+  font-size: 10px; font-weight: 700; padding: 3px 8px;
+  border-radius: 999px; letter-spacing: 0.06em;
+  text-transform: uppercase; white-space: nowrap;
+}
+.gpu-brand.nvidia { background: rgba(118, 185, 0, 0.14); color: #76b900; border: 1px solid rgba(118, 185, 0, 0.3); }
+.gpu-brand.amd { background: rgba(237, 28, 36, 0.14); color: #ed1c24; border: 1px solid rgba(237, 28, 36, 0.3); }
+.gpu-brand.intel { background: rgba(0, 104, 181, 0.16); color: #60a5fa; border: 1px solid rgba(96, 165, 250, 0.3); }
+.gpu-brand.other { background: var(--bg-3); color: var(--text-3); border: 1px solid var(--border); }
+
+.gpu-summary {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: rgba(99, 102, 241, 0.06);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  font-size: 12px;
+  color: var(--accent-2);
+  display: flex; align-items: center; gap: 8px;
+}
+.gpu-summary svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 
 /* =============================================================================
    Meeting Bot — per-meeting container app

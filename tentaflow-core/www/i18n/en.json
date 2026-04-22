@@ -1621,7 +1621,14 @@
     "gpu_select_at_least_one": "Select at least one GPU or choose a different mode.",
     "gpu_summary_specific": "Selected {n} GPU(s) · {total_vram} total VRAM",
     "gpu_summary_all": "Will use all GPUs on the node",
-    "gpu_summary_none": "Will not use GPU"
+    "gpu_summary_none": "Will not use GPU",
+    "gpu_mode_all_title": "Use all",
+    "gpu_mode_all_desc": "Deployment gets full access to every GPU on the selected node.",
+    "gpu_mode_specific_title": "Pick specific",
+    "gpu_mode_specific_desc": "Choose which GPUs to allocate for this deployment.",
+    "gpu_mode_none_title": "CPU only",
+    "gpu_mode_none_desc": "Deployment will not touch GPUs — inference runs on CPU.",
+    "gpu_list_hint": "Available GPUs ({n})"
   },
   "category": {
     "llm": "Language Models (LLM)",

@@ -1715,7 +1715,14 @@
     "gpu_select_at_least_one": "Mindestens eine GPU auswählen oder einen anderen Modus wählen.",
     "gpu_summary_specific": "{n} GPU(s) ausgewählt · {total_vram} VRAM gesamt",
     "gpu_summary_all": "Alle GPUs des Knotens werden verwendet",
-    "gpu_summary_none": "GPU wird nicht verwendet"
+    "gpu_summary_none": "GPU wird nicht verwendet",
+    "gpu_mode_all_title": "Alle verwenden",
+    "gpu_mode_all_desc": "Deployment erhält vollen Zugriff auf alle GPU-Karten des ausgewählten Knotens.",
+    "gpu_mode_specific_title": "Bestimmte auswählen",
+    "gpu_mode_specific_desc": "Wählen Sie welche GPUs für dieses Deployment reserviert werden.",
+    "gpu_mode_none_title": "Nur CPU",
+    "gpu_mode_none_desc": "Deployment ignoriert GPUs — Inferenz läuft auf der CPU.",
+    "gpu_list_hint": "Verfügbare GPUs ({n})"
   },
   "category": {
     "llm": "Sprachmodelle (LLM)",
