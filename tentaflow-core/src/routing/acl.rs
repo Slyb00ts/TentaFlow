@@ -9,6 +9,26 @@
 use crate::db::DbPool;
 use anyhow::Result;
 
+/// Kontekst uzytkownika propagowany przez warstwe routingu — pozwala ACL
+/// check-om na zasoby (modele, flowy, addony) na zidentyfikowanie wlasciciela
+/// requestu. `None` = internal caller (np. flow engine wewnetrzne,
+/// reverse_request), ACL jest wtedy skipowane (fail-open).
+#[derive(Debug, Clone)]
+pub struct UserContext {
+    pub user_id: i64,
+    pub role: String,
+}
+
+impl UserContext {
+    pub fn new(user_id: i64, role: impl Into<String>) -> Self {
+        Self { user_id, role: role.into() }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
+}
+
 /// Sprawdza czy user moze uzyc zasobu `(resource_type, resource_id)`.
 /// user_role pobrane z HandlerContext (JWT claims) — admin omija ACL.
 pub fn check_access(
