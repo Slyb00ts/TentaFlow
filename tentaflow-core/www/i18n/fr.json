@@ -1327,7 +1327,12 @@
     "qr_scanner_title": "Scan du code QR",
     "qr_scanner_hint": "Pointez la caméra vers le QR affiché sur l’autre appareil",
     "qr_scan_invalid": "Ce QR n’est pas un code TentaFlow valide",
-    "qr_scan_failed": "Échec du scan QR"
+    "qr_scan_failed": "Échec du scan QR",
+    "qr_scanner_waiting": "Demande d acces a la camera...",
+    "qr_scan_denied": "Acces a la camera refuse. Verifiez les autorisations du navigateur.",
+    "qr_scan_no_camera": "Aucune camera trouvee sur cet appareil.",
+    "qr_scan_busy": "La camera est utilisee par une autre application.",
+    "qr_scan_insecure": "Le scan requiert HTTPS. Ouvrez l app via https://"
   },
   "clusters": {
     "title": "Clusters",
