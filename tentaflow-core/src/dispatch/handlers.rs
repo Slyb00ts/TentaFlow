@@ -3425,10 +3425,10 @@ pub fn service_manifest_deploy(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
-        MessageBody::ServiceManifestDeployRequestBody(p) => p,
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqStart(p)) => p,
         _ => {
             return Err(ProtocolError::bad_request(
-                "expected ServiceManifestDeployRequestBody",
+                "expected DeploymentBody::ReqStart",
             ))
         }
     };
@@ -3470,15 +3470,168 @@ pub fn service_manifest_deploy(
         )),
     );
 
-    Ok(MessageBody::ServiceManifestDeployResponseBody(
-        tentaflow_protocol::ServiceManifestDeployResponse {
-            status: "started".to_string(),
-            deploy_id: deploy_id.clone(),
-            engine_id: payload.engine_id.clone(),
-            deploy_method: payload.deploy_method.clone(),
-            node_id: payload.node_id.clone(),
-            websocket_url: format!("/api/ws/deploy/{}", deploy_id),
-        },
+    // Record deployment row in DB + spawn background runner. Runner streams
+    // log lines to the subscription associated with deploy_id through the
+    // deployment log bus (see deploy/runner.rs + deploy/log_bus.rs).
+    let user_id_i64 = user_id;
+    let config_json = if payload.config_json.is_empty() {
+        "{}".to_string()
+    } else {
+        payload.config_json.clone()
+    };
+    if let Err(e) = repository::deployments::create(
+        &ctx.state.db,
+        &deploy_id,
+        &payload.engine_id,
+        &payload.deploy_method,
+        &payload.node_id,
+        &config_json,
+        user_id_i64,
+    ) {
+        return Err(ProtocolError::internal(format!(
+            "failed to persist deployment: {}",
+            e
+        )));
+    }
+
+    let db_clone = ctx.state.db.clone();
+    let service_manager = ctx.state.service_manager.clone();
+    let deploy_id_task = deploy_id.clone();
+    let engine_id_task = payload.engine_id.clone();
+    let method_task = payload.deploy_method.clone();
+    let node_id_task = payload.node_id.clone();
+    let config_json_task = config_json.clone();
+    tokio::spawn(async move {
+        crate::deploy::runner::run_deployment(
+            db_clone,
+            service_manager,
+            deploy_id_task,
+            engine_id_task,
+            method_task,
+            node_id_task,
+            config_json_task,
+        )
+        .await;
+    });
+
+    Ok(MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ResStart(
+            tentaflow_protocol::ServiceManifestDeployResponse {
+                status: "started".to_string(),
+                deploy_id: deploy_id.clone(),
+                engine_id: payload.engine_id.clone(),
+                deploy_method: payload.deploy_method.clone(),
+                node_id: payload.node_id.clone(),
+                websocket_url: String::new(),
+            },
+        ),
+    ))
+}
+
+// =============================================================================
+// Deployments — status + list (stream handler w stream_handlers.rs)
+// =============================================================================
+
+fn deployment_row_to_summary(
+    r: repository::deployments::DeploymentRow,
+) -> tentaflow_protocol::DeploymentSummary {
+    tentaflow_protocol::DeploymentSummary {
+        deploy_id: r.deploy_id,
+        engine_id: r.engine_id,
+        deploy_method: r.deploy_method,
+        node_id: r.node_id,
+        status: r.status,
+        phase: r.phase,
+        progress_pct: r.progress_pct as i32,
+        image_tag: r.image_tag,
+        container_name: r.container_name,
+        started_at: r.started_at,
+        finished_at: r.finished_at.unwrap_or_default(),
+        error_message: r.error_message.unwrap_or_default(),
+        log_tail: r.log_tail,
+        user_id: r.user_id.unwrap_or(0),
+    }
+}
+
+#[handler(variant = "DeploymentStatusRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn deployment_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let deploy_id = match req {
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqStatus(r)) => {
+            r.deploy_id.clone()
+        }
+        _ => return Err(ProtocolError::bad_request("expected ReqStatus")),
+    };
+    let row = repository::deployments::get(&ctx.state.db, &deploy_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ProtocolErrorCode::NotFound,
+                format!("deployment '{}' nieznany", deploy_id),
+            )
+        })?;
+    Ok(MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ResStatus(
+            tentaflow_protocol::DeploymentStatusResponse {
+                deployment: deployment_row_to_summary(row),
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "DeploymentListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn deployment_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqList(r)) => r,
+        _ => return Err(ProtocolError::bad_request("expected ReqList")),
+    };
+    let is_admin = matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    );
+    let uid = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let filter_user_id = if payload.only_mine || !is_admin {
+        uid
+    } else {
+        None
+    };
+    let engine_id_filter = if payload.engine_id.is_empty() {
+        None
+    } else {
+        Some(payload.engine_id.as_str())
+    };
+    let status_filter = if payload.status.is_empty() {
+        None
+    } else {
+        Some(payload.status.as_str())
+    };
+    let limit = if payload.limit <= 0 {
+        100
+    } else {
+        payload.limit as i64
+    };
+    let rows = repository::deployments::list(
+        &ctx.state.db,
+        engine_id_filter,
+        status_filter,
+        filter_user_id,
+        limit,
+    )
+    .map_err(db_err)?;
+    let deployments = rows.into_iter().map(deployment_row_to_summary).collect();
+    Ok(MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ResList(
+            tentaflow_protocol::DeploymentListResponse { deployments },
+        ),
     ))
 }
 

@@ -1449,14 +1449,19 @@
     "select_user": "Sélectionner un utilisateur"
   },
   "deploy": {
-    "gpu_devices": "Périphériques GPU",
-    "container_name": "Nom du conteneur",
-    "progress": {
-      "deploying": "Déploiement en cours"
-    },
-    "validation": {
-      "service_required": "Le nom du service est obligatoire"
-    }
+    "progress_title": "Progression du déploiement",
+    "status_queued": "En file",
+    "status_building": "Construction",
+    "status_pulling": "Téléchargement",
+    "status_running": "Exécution",
+    "status_registering": "Enregistrement",
+    "status_success": "Terminé",
+    "status_failure": "Échoué",
+    "status_cancelled": "Annulé",
+    "status_ended": "Terminé",
+    "success": "Déploiement réussi",
+    "failed": "Déploiement échoué",
+    "err_generic": "Erreur inconnue"
   },
   "chat": {
     "title": "Chat",

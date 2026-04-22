@@ -1034,6 +1034,26 @@ export const encode = {
   // Meeting Bot
   // -------------------------------------------------------------------------
 
+  // Deployment status/list polling.
+  deploymentStatusRequest(correlationId, { deployId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeDeploymentStatusRequest(String(deployId || ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  deploymentListRequest(correlationId, { engineId = '', status = '', onlyMine = true, limit = 0 } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeDeploymentListRequest(String(engineId), String(status), !!onlyMine, Number(limit));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Subscribe streaming log/progress — wywołuj przez ApiBinary.subscribe(...) */
+  deploymentLogStreamRequest(correlationId, { deployId, replayTail = true }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeDeploymentLogStreamRequest(String(deployId || ''), !!replayTail);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   meetingSessionStartRequest(correlationId, { meetingUrl, title, platform, botName, sttAlias, ttsAlias, llmAlias }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeMeetingSessionStartRequest(

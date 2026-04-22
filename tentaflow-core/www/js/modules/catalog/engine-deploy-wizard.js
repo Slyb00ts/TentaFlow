@@ -825,9 +825,18 @@ async function startDeploy() {
       nodeId: selection.nodeId,
       configJson,
     });
-    const id = data?.deployId || '?';
+    const id = data?.deployId || '';
+    if (!id) throw new Error('brak deployId w odpowiedzi serwera');
     toast(I18n.t('wizard.deployStarted').replace('{id}', id), 'success');
-    setTimeout(close, 1200);
+    // Zamknij wizard i pokaż live progress modal. Progress subscribes do
+    // deploymentLogStreamRequest i pokazuje pasek + tail logów do zakończenia.
+    close();
+    const mod = await import('/js/modules/catalog/deploy-progress-modal.js');
+    mod.openDeployProgressModal({
+      deployId: id,
+      engineId: eng.id,
+      deployMethod: selection.deployMethod,
+    });
   } catch (err) {
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
     if (btn) btn.removeAttribute('disabled');

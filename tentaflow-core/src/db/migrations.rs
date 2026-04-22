@@ -1451,5 +1451,38 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             UPDATE meeting_sessions SET status = 'ended' WHERE status IS NULL OR status = '';
         ",
     ),
+    (
+        48,
+        "deployments_tracking",
+        "
+            -- Każde wywołanie ServiceManifestDeployRequest tworzy wiersz. Status
+            -- updatowany z background task przez cały lifecycle: queued → building
+            -- → pulling → running → registering → success/failure. Log tail
+            -- (ostatnie 200 linii) trzymany w kolumnie żeby frontend mógł odzyskać
+            -- stan po reconnect/refresh bez zależności od subscription.
+            CREATE TABLE IF NOT EXISTS deployments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                deploy_id TEXT NOT NULL UNIQUE,
+                engine_id TEXT NOT NULL,
+                deploy_method TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                phase TEXT NOT NULL DEFAULT '',
+                progress_pct INTEGER NOT NULL DEFAULT 0,
+                image_tag TEXT NOT NULL DEFAULT '',
+                container_name TEXT NOT NULL DEFAULT '',
+                config_json TEXT NOT NULL DEFAULT '{}',
+                user_id INTEGER,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at TEXT,
+                error_message TEXT,
+                log_tail TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_deployments_user ON deployments(user_id);
+            CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);
+            CREATE INDEX IF NOT EXISTS idx_deployments_engine ON deployments(engine_id);
+            CREATE INDEX IF NOT EXISTS idx_deployments_started ON deployments(started_at DESC);
+        ",
+    ),
 ]
 }
