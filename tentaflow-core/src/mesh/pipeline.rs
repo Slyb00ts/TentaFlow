@@ -351,6 +351,63 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
+                Ok(IrohMeshEvent::KnownPeersReceived { from_node_id, data }) => {
+                    // Pre-trust discovery gossip — peer X polaczyl sie z nami i przekazuje
+                    // liste peerow ktorych on widzi (tj. jest z nimi polaczony QUIC-iem).
+                    // Akceptujemy od KAZDEGO peera bo to tylko info dyskawerii, bez
+                    // wrazliwych danych. Probujemy sie polaczyc z kazdym nieznanym.
+                    use tentaflow_protocol::mesh::KnownPeersPayload;
+                    let payload = match rkyv::from_bytes::<KnownPeersPayload, rkyv::rancor::Error>(&data) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(peer = %from_node_id, "Blad deserializacji KnownPeers: {}", e);
+                            continue;
+                        }
+                    };
+                    info!(
+                        from = %from_node_id,
+                        count = payload.peers.len(),
+                        "Otrzymano KnownPeers — dial fallback dla mesh discovery"
+                    );
+                    for entry in &payload.peers {
+                        if entry.node_id == local_node_id {
+                            continue;
+                        }
+                        if peer_store.is_quic_connected(&entry.node_id) {
+                            continue;
+                        }
+                        let addrs: Vec<std::net::IpAddr> = entry
+                            .direct_addrs
+                            .iter()
+                            .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+                            .map(|sa| sa.ip())
+                            .collect();
+                        if !addrs.is_empty() {
+                            peer_store.set_addresses(&entry.node_id, addrs);
+                        }
+                        if !entry.hostname.is_empty() {
+                            peer_store.set_hostname(&entry.node_id, &entry.hostname);
+                        }
+                        peer_store.set_status(&entry.node_id, "discovered");
+
+                        // Auto-dial — iroh sam zajmuje sie NAT traversal + relay gdy
+                        // direct addr nie dziala.
+                        let target = entry.node_id.clone();
+                        let qm = qm_events.clone();
+                        let dial_addr = entry
+                            .direct_addrs
+                            .iter()
+                            .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+                            .next()
+                            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                        tokio::spawn(async move {
+                            match qm.connect_to_peer(&target, dial_addr).await {
+                                Ok(_) => info!(peer = %target, "Auto-dial (KnownPeers): polaczony"),
+                                Err(e) => debug!(peer = %target, "Auto-dial (KnownPeers): {}", e),
+                            }
+                        });
+                    }
+                }
                 Ok(IrohMeshEvent::TopologyAnnounceReceived { from_node_id, data }) => {
                     // Gossip multi-hop — wprowadza nody osiagalne przez relay.
                     // Akceptujemy TYLKO od trusted peerow (bezpieczenstwo).
@@ -626,6 +683,34 @@ fn spawn_quic_event_handler(
                     if let Ok(hello_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&hello) {
                         if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
                             warn!("Blad wysylania Hello do {}: {}", node_id, e);
+                        }
+                    }
+
+                    // Wyslij KnownPeers — liste wszystkich aktualnie polaczonych peerow,
+                    // zeby nowy peer mogl sie z nimi polaczyc bez mDNS (ratuje scenariusz
+                    // enterprise VLAN z zablokowanym inter-client multicast).
+                    let known: Vec<tentaflow_protocol::mesh::KnownPeerEntry> = peer_store
+                        .list()
+                        .into_iter()
+                        .filter(|p| p.node_id != node_id && p.node_id != local_node_id)
+                        .filter(|p| p.quic_connected && !p.addresses.is_empty())
+                        .map(|p| tentaflow_protocol::mesh::KnownPeerEntry {
+                            node_id: p.node_id.clone(),
+                            hostname: p.hostname.clone(),
+                            direct_addrs: p
+                                .addresses
+                                .iter()
+                                .map(|ip| format!("{}:{}", ip, p.port))
+                                .collect(),
+                            port: p.port,
+                        })
+                        .collect();
+                    if !known.is_empty() {
+                        let payload = tentaflow_protocol::mesh::KnownPeersPayload { peers: known };
+                        if let Ok(kp_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+                            if let Err(e) = qm_events.send_known_peers(&node_id, &kp_bytes).await {
+                                debug!("Blad wysylania KnownPeers do {}: {}", node_id, e);
+                            }
                         }
                     }
 
