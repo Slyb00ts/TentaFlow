@@ -490,7 +490,10 @@ pub async fn handle_request(
         );
 
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
-        let meeting_manager = crate::meeting::MeetingManager::new(db.clone());
+        let meeting_manager = crate::meeting::MeetingManager::new(
+            db.clone(),
+            Some(service_manager.clone()),
+        );
         let app_state = std::sync::Arc::new(crate::dispatch::AppState {
             db: db.clone(),
             router: router.clone(),

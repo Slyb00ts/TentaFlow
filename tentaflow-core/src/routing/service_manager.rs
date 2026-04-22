@@ -419,6 +419,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
+                                direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -482,6 +483,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
+                                direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -575,6 +577,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
+                                direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -662,6 +665,7 @@ impl ServiceManager {
                                     reconnect_interval_ms: *reconnect_interval_ms,
                                     keepalive_interval_ms: *keepalive_interval_ms,
                                     skip_tls_verify: false,
+                                direct_addrs: Vec::new(),
                                 };
 
                                 let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -700,6 +704,7 @@ impl ServiceManager {
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
                                 skip_tls_verify: false,
+                            direct_addrs: Vec::new(),
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -737,6 +742,7 @@ impl ServiceManager {
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
                                 skip_tls_verify: tls_ca.is_none(),
+                            direct_addrs: Vec::new(),
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -774,6 +780,7 @@ impl ServiceManager {
                                 reconnect_interval_ms: *reconnect_interval_ms,
                                 keepalive_interval_ms: *keepalive_interval_ms,
                                 skip_tls_verify: false,
+                            direct_addrs: Vec::new(),
                             };
 
                             let handle = Arc::new(QuicServiceHandle::new(quic_config));
@@ -2200,6 +2207,30 @@ impl ServiceManager {
         tls_ca: Option<String>,
         server_name: Option<String>,
     ) {
+        self.register_quic_service_with_addrs(
+            name,
+            service_type,
+            quic_url,
+            tls_ca,
+            server_name,
+            Vec::new(),
+        );
+    }
+
+    /// Wariant `register_quic_service` z jawnymi direct addresses. Używany przez
+    /// MeetingManager gdy spawnuje ephemeralny kontener w docker bridge network:
+    /// host podaje `127.0.0.1:<mapped_quic_port>` obok EndpointId, bo kontener
+    /// nie jest discoverable przez LAN mDNS/DHT hosta. Pusty `direct_addrs` =
+    /// polegaj na discovery (równoważne starej sygnaturze).
+    pub fn register_quic_service_with_addrs(
+        &self,
+        name: String,
+        service_type: &str,
+        quic_url: String,
+        tls_ca: Option<String>,
+        server_name: Option<String>,
+        direct_addrs: Vec<String>,
+    ) {
         let is_self_signed = tls_ca.is_none();
         let quic_config = crate::net::quic::QuicConfig {
             name: name.clone(),
@@ -2212,6 +2243,7 @@ impl ServiceManager {
             reconnect_interval_ms: 5000,
             keepalive_interval_ms: 30000,
             skip_tls_verify: is_self_signed,
+            direct_addrs,
         };
 
         info!(
