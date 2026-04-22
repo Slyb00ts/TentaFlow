@@ -561,6 +561,57 @@ tf-tabs {
   z-index: 1;
 }
 /* =============================================================================
+   tf-segmented — N-stanowy segmented control (np. Auto/Zezwól/Odmów).
+   Variants per opcja: ok|warn|err|accent|info|neutral.
+   ============================================================================= */
+.tf-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--tf-bg-3);
+  border: 1px solid var(--tf-border);
+  border-radius: 999px;
+}
+.tf-segmented .tf-seg-opt {
+  background: transparent;
+  border: 0;
+  padding: 6px 12px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--tf-text-3);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, transform 0.15s;
+}
+.tf-segmented .tf-seg-opt:hover:not(.active):not([disabled]) {
+  color: var(--tf-text);
+}
+.tf-segmented .tf-seg-opt.active {
+  color: white;
+  transform: translateY(-0.5px);
+}
+/* Variant colors when active */
+.tf-segmented .tf-seg-opt.active[data-variant="ok"]      { background: var(--tf-success); }
+.tf-segmented .tf-seg-opt.active[data-variant="warn"]    { background: var(--tf-warning); color: #0a0d24; }
+.tf-segmented .tf-seg-opt.active[data-variant="err"]     { background: var(--tf-danger); }
+.tf-segmented .tf-seg-opt.active[data-variant="accent"]  { background: var(--tf-accent-1); }
+.tf-segmented .tf-seg-opt.active[data-variant="info"]    { background: var(--tf-info); color: #0a0d24; }
+.tf-segmented .tf-seg-opt.active[data-variant="neutral"] {
+  background: var(--tf-bg-card-hover);
+  color: var(--tf-accent-2);
+}
+.tf-segmented.tf-segmented-sm .tf-seg-opt { padding: 4px 10px; font-size: 10px; }
+.tf-segmented.tf-segmented-disabled { opacity: 0.5; pointer-events: none; }
+.tf-segmented .tf-seg-opt:focus-visible {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 2px;
+}
+
+/* =============================================================================
    .tf-scroll — spojny thin scrollbar (WebKit + Firefox).
    Uzywaj na dowolnym overflow-owym kontenerze zeby dostac ten sam wyglad co
    sidebar-nav / main content.

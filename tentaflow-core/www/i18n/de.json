@@ -1500,7 +1500,20 @@
     "edit": "Bearbeiten",
     "delete": "Loeschen",
     "confirm_delete_user": "Benutzer {name} loeschen?",
-    "confirm_delete_group": "Gruppe {name} loeschen?"
+    "confirm_delete_group": "Gruppe {name} loeschen?",
+    "tab_info": "Info",
+    "tab_members": "Mitglieder",
+    "tab_perms": "Berechtigungen",
+    "no_members": "Keine Mitglieder",
+    "perm_hint": "Berechtigungen dieser Gruppe fuer Ressourcen. Auto = Standard, Allow = explicit, Deny = explicit.",
+    "perm_models": "Modelle",
+    "perm_flows": "Flows",
+    "perm_addons": "Addons",
+    "perm_auto": "Auto",
+    "perm_allow": "Erlauben",
+    "perm_deny": "Verweigern",
+    "perm_saved": "Berechtigung gespeichert",
+    "perm_save_failed": "Fehler beim Speichern"
   },
   "groups": {
     "title": "Gruppen",
