@@ -1,0 +1,23 @@
+{
+  "name": "tentaflow-mobile-wrapper",
+  "version": "0.1.0",
+  "description": "Capacitor wrapper dla TentaFlow PWA — buduje natywny Android APK + iOS IPA z wwwroot tentaflow-core.",
+  "private": true,
+  "scripts": {
+    "sync": "node scripts/sync-www.mjs && cap sync",
+    "android:open": "npm run sync && cap open android",
+    "android:build": "npm run sync && cd android && ./gradlew assembleDebug",
+    "android:release": "npm run sync && cd android && ./gradlew assembleRelease",
+    "ios:open": "npm run sync && cap open ios",
+    "ios:build": "npm run sync && cd ios/App && pod install && xcodebuild -workspace App.xcworkspace -scheme App -configuration Release",
+    "add:android": "cap add android",
+    "add:ios": "cap add ios"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/camera": "^6.0.0",
+    "@capacitor/cli": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/ios": "^6.0.0"
+  }
+}
