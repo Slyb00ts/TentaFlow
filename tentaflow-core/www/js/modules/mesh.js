@@ -650,7 +650,7 @@ function openPinDisplayModal(targetNodeId, pin) {
       <div class="pair-pin-steps">${escapeHtml(I18n.t('mesh.pair_pin_display_steps'))}</div>
     </div>
   `;
-  createPairWindow({
+  const win = createPairWindow({
     title: I18n.t('mesh.pair_pin_display_title'),
     bodyHtml,
     submitLabel: I18n.t('common.close') || 'Zamknij',
@@ -665,6 +665,30 @@ function openPinDisplayModal(targetNodeId, pin) {
     if (el) el.textContent = String(remaining);
     if (remaining <= 0 || !el) clearInterval(iv);
   }, 1000);
+  // Poll — po sparowaniu inicjator usuwa outgoing pending entry. Kiedy nasz
+  // entry znika (albo node pojawia sie jako trusted), zamykamy modal automatycznie.
+  const pollIv = setInterval(async () => {
+    if (!win.isConnected) {
+      clearInterval(pollIv);
+      return;
+    }
+    try {
+      const pendingResp = await ApiBinary.list('meshPendingListRequest', { arrayKey: 'pending' });
+      const stillPending = Array.isArray(pendingResp)
+        && pendingResp.some(p => (p.remoteNodeId || p.remote_node_id) === targetNodeId);
+      if (!stillPending) {
+        clearInterval(pollIv);
+        clearInterval(iv);
+        if (win.isConnected) win.remove();
+        document.querySelectorAll('.tf-window-backdrop').forEach(b => b.remove());
+        toast(I18n.t('mesh.pair_confirm_success'), 'success');
+        await loadData();
+        renderActiveTab();
+      }
+    } catch (_e) {
+      // sil — poll probuje ponownie
+    }
+  }, 2000);
 }
 
 function openConfirmPinModal(nodeId) {
