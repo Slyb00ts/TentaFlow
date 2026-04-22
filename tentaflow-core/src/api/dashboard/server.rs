@@ -490,10 +490,8 @@ pub async fn handle_request(
         );
 
         // AppState dla handlerow — wszystkie shared resources serwera w jednym Arc.
-        let meeting_manager = crate::meeting::MeetingManager::new(
-            db.clone(),
-            Some(service_manager.clone()),
-        );
+        let meeting_manager =
+            crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
         let app_state = std::sync::Arc::new(crate::dispatch::AppState {
             db: db.clone(),
             router: router.clone(),
@@ -854,6 +852,15 @@ pub async fn handle_request(
             let _ = req.collect().await?;
             Bytes::new()
         };
+        // ACL context — pobierz aktualna role z DB (Zero Trust, JWT nie ma role).
+        let user_ctx = {
+            let role = db::repository::get_user_account_by_id(&db, claims.user_id)
+                .ok()
+                .flatten()
+                .map(|u| u.role)
+                .unwrap_or_else(|| "user".to_string());
+            Some(crate::routing::acl::UserContext::new(claims.user_id, role))
+        };
         return Ok(super::api_chat::route_chat_api(
             &method,
             &path,
@@ -863,6 +870,7 @@ pub async fn handle_request(
             &metrics,
             cors_origin.as_deref(),
             debug_route,
+            user_ctx,
         )
         .await);
     }
@@ -1126,7 +1134,8 @@ pub async fn handle_request(
 
     // Lista sesji rozmow z DB (kazda sesja = jedna rozmowa).
     if path == "/api/meeting-bot/sessions" && method == Method::GET {
-        let sessions = crate::db::repository::transcripts::list_sessions(&db, None).unwrap_or_default();
+        let sessions =
+            crate::db::repository::transcripts::list_sessions(&db, None).unwrap_or_default();
         let active_id = crate::routing::transcript_store::active_session_id();
         let payload = serde_json::json!({
             "sessions": sessions,
@@ -1290,14 +1299,8 @@ pub async fn handle_request(
         ));
     }
 
-    let (status, response_body) = route_api(
-        &method,
-        &path,
-        &query_string,
-        &db,
-        &claims,
-        &body_bytes,
-    );
+    let (status, response_body) =
+        route_api(&method, &path, &query_string, &db, &claims, &body_bytes);
 
     Ok(json_response_cors(
         status,

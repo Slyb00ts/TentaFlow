@@ -29,10 +29,11 @@ pub async fn route_chat_api(
     metrics: &Arc<RouterMetrics>,
     cors_origin: Option<&str>,
     debug_route: bool,
+    user_ctx: Option<crate::routing::acl::UserContext>,
 ) -> Response<DashboardBody> {
     match (method, path) {
         (&Method::POST, "/api/chat/completions") => {
-            handle_completions(router, body, db, metrics, cors_origin, debug_route).await
+            handle_completions(router, body, db, metrics, cors_origin, debug_route, user_ctx).await
         }
         (&Method::POST, "/api/chat/tts") => {
             handle_tts(router, body, cors_origin, debug_route).await
@@ -60,6 +61,7 @@ async fn handle_completions(
     metrics: &Arc<RouterMetrics>,
     cors_origin: Option<&str>,
     debug_route: bool,
+    user_ctx: Option<crate::routing::acl::UserContext>,
 ) -> Response<DashboardBody> {
     let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -86,7 +88,7 @@ async fn handle_completions(
     let stream = request.stream;
 
     if stream {
-        match router.route_chat_completion_stream(request).await {
+        match router.route_chat_completion_stream_for_user(request, user_ctx.clone()).await {
             Ok(route_result) => {
                 let metadata = route_result.metadata;
                 let chunk_stream = route_result.response;
@@ -165,7 +167,7 @@ async fn handle_completions(
             }
         }
     } else {
-        match router.route_chat_completion(request).await {
+        match router.route_chat_completion_for_user(request, user_ctx.clone()).await {
             Ok(route_result) => {
                 metrics.record_request_done();
                 let json = match serde_json::to_string(&route_result.response) {

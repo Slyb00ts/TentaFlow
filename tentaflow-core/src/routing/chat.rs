@@ -33,6 +33,64 @@ impl Router {
     /// 4. Wybierz backend z pool (load balancing)
     /// 5. Wyslij request do backendu/RAG
     /// 6. Zwroc response
+    /// Wariant streaming z user context — te same ACL reguly co non-stream.
+    pub async fn route_chat_completion_stream_for_user(
+        &self,
+        request: ChatCompletionRequest,
+        user: Option<crate::routing::acl::UserContext>,
+    ) -> Result<
+        crate::routing::RouteResult<
+            std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::api::openai::types::ChatCompletionChunk>> + Send>>,
+        >,
+    > {
+        if let Some(ref u) = user {
+            if let Some(ref db) = self.db {
+                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                    tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied model access (stream)");
+                    return Err(crate::error::CoreError::AllBackendsUnavailable {
+                        model_name: request.model.clone(),
+                    }.into());
+                }
+            }
+        }
+        self.route_chat_completion_stream(request).await
+    }
+
+    /// Wariant z user context — sprawdza ACL przed wywolaniem backendu.
+    /// Admin zawsze przechodzi, zwykly user dostaje `AllBackendsUnavailable`
+    /// (maskujemy jako ten sam blad co 'model not found' zeby nie ujawniac
+    /// ktore modele istnieja ale sa zablokowane).
+    pub async fn route_chat_completion_for_user(
+        &self,
+        request: ChatCompletionRequest,
+        user: Option<crate::routing::acl::UserContext>,
+    ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
+        if let Some(ref u) = user {
+            let db = match &self.db {
+                Some(d) => d,
+                None => return self.route_chat_completion(request).await,
+            };
+            if !crate::routing::acl::check_access_safe(
+                db,
+                "model",
+                &request.model,
+                u.user_id,
+                &u.role,
+            ) {
+                tracing::warn!(
+                    user_id = u.user_id,
+                    model = %request.model,
+                    "ACL denied model access"
+                );
+                return Err(crate::error::CoreError::AllBackendsUnavailable {
+                    model_name: request.model.clone(),
+                }
+                .into());
+            }
+        }
+        self.route_chat_completion(request).await
+    }
+
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
@@ -1181,18 +1239,20 @@ impl Router {
 
                 let backends = match service_manager.service_backends.get(&model) {
                     Some(b) => b,
-                    None => return ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::ModelNotFound,
-                            message: format!(
+                    None => {
+                        return ModelResponse {
+                            request_id,
+                            result: ModelResult::Error(ErrorInfo {
+                                error_type: ErrorType::ModelNotFound,
+                                message: format!(
                                 "Model LLM '{}' nie znaleziony w konfiguracji (ani QUIC ani HTTP)",
                                 model
                             ),
-                            details: None,
-                        }),
-                        metrics: None,
-                    },
+                                details: None,
+                            }),
+                            metrics: None,
+                        }
+                    }
                 };
 
                 if backends.is_empty() {
