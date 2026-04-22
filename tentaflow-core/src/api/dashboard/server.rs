@@ -1121,7 +1121,7 @@ pub async fn handle_request(
 
     // Lista sesji rozmow z DB (kazda sesja = jedna rozmowa).
     if path == "/api/meeting-bot/sessions" && method == Method::GET {
-        let sessions = crate::db::repository::transcripts::list_sessions(&db).unwrap_or_default();
+        let sessions = crate::db::repository::transcripts::list_sessions(&db, None).unwrap_or_default();
         let active_id = crate::routing::transcript_store::active_session_id();
         let payload = serde_json::json!({
             "sessions": sessions,

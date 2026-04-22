@@ -1387,5 +1387,69 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX IF NOT EXISTS idx_notes_user_updated ON notes(user_id, updated_at DESC);
         ",
     ),
+    (
+        47,
+        "meeting_bot_lifecycle",
+        "
+            -- Extend meeting_sessions with lifecycle + container metadata. Each
+            -- meeting now spawns an ephemeral docker container with dedicated
+            -- ports, tracked here for lookup + cleanup on restart.
+            ALTER TABLE meeting_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'ended';
+            ALTER TABLE meeting_sessions ADD COLUMN ended_at TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN container_id TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN container_name TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN quic_port INTEGER;
+            ALTER TABLE meeting_sessions ADD COLUMN vnc_port INTEGER;
+            ALTER TABLE meeting_sessions ADD COLUMN novnc_port INTEGER;
+            ALTER TABLE meeting_sessions ADD COLUMN bot_endpoint_id TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN bot_secret_key_hex TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN platform TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN owner_user_id INTEGER;
+
+            CREATE INDEX IF NOT EXISTS idx_meeting_sessions_status ON meeting_sessions(status);
+            CREATE INDEX IF NOT EXISTS idx_meeting_sessions_owner ON meeting_sessions(owner_user_id);
+
+            -- Port allocations — atomic reservation per session. Row exists while
+            -- port is taken; deleted when session ends. UNIQUE(port, kind) prevents
+            -- double-allocation across concurrent session_start calls.
+            CREATE TABLE IF NOT EXISTS meeting_port_allocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                port INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                session_id INTEGER NOT NULL REFERENCES meeting_sessions(id) ON DELETE CASCADE,
+                allocated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(port, kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_meeting_port_allocations_session
+                ON meeting_port_allocations(session_id);
+
+            -- AI summaries generated post-meeting by LLM (qwen). One row per
+            -- session, re-generated on demand if user clicks 'refresh summary'.
+            CREATE TABLE IF NOT EXISTS meeting_session_summaries (
+                session_id INTEGER PRIMARY KEY REFERENCES meeting_sessions(id) ON DELETE CASCADE,
+                tldr TEXT NOT NULL DEFAULT '',
+                decisions TEXT NOT NULL DEFAULT '',
+                action_items_json TEXT NOT NULL DEFAULT '[]',
+                open_questions TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                generated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- User-level meeting bot settings. Key-value per user. Missing rows
+            -- fall back to defaults handled in application code.
+            CREATE TABLE IF NOT EXISTS meeting_settings (
+                user_id INTEGER NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, key)
+            );
+
+            -- Mark any sessions left 'active' by an unclean shutdown as ended —
+            -- old rows before this migration have no status column value and
+            -- DEFAULT 'ended' covers them; no-op if already ended.
+            UPDATE meeting_sessions SET status = 'ended' WHERE status IS NULL OR status = '';
+        ",
+    ),
 ]
 }
