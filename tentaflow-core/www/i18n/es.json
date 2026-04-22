@@ -1282,6 +1282,7 @@
     "fingerprint": "Huella",
     "hop_one": "1 salto",
     "hop_many": "{count} saltos",
+    "via_peer": "vía {peer}",
     "hops_label": "{count} saltos",
     "gpu_util": "GPU",
     "gpu_avg_of": "prom. de {count}",

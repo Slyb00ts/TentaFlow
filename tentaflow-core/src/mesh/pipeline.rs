@@ -199,9 +199,7 @@ pub async fn start_mesh_pipeline(
                 tokio::spawn(async move {
                     let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
                     let mut ticker = tokio::time::interval(Duration::from_secs(15));
-                    ticker.set_missed_tick_behavior(
-                        tokio::time::MissedTickBehavior::Delay,
-                    );
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         ticker.tick().await;
                         let peers = store.list();
@@ -221,12 +219,52 @@ pub async fn start_mesh_pipeline(
                 });
             }
 
+            // Bootstrap peer_store z persistowanych snapshotow mesh_topology
+            // (pozwala widziec znane nody zaraz po starcie, zanim przyjdzie gossip).
+            if let Some(ref pool) = db_pool {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let _ = crate::db::repository::mesh_topology::cleanup_stale(pool, now_ms);
+                if let Ok(snaps) = crate::db::repository::mesh_topology::list_all(pool) {
+                    for s in &snaps {
+                        if s.node_id == *node_id {
+                            continue;
+                        }
+                        let addrs: Vec<std::net::IpAddr> = s
+                            .direct_addrs
+                            .iter()
+                            .filter_map(|a| a.parse::<std::net::SocketAddr>().ok())
+                            .map(|sa| sa.ip())
+                            .collect();
+                        mesh_peer_store.upsert_gossip_peer(
+                            &s.node_id,
+                            &s.hostname,
+                            &s.platform,
+                            &s.os_info,
+                            addrs,
+                            s.port,
+                        );
+                        mesh_peer_store.update_topology(&s.node_id, s.connected_to.clone());
+                    }
+                    if !snaps.is_empty() {
+                        mesh_peer_store.recalculate_routes(node_id);
+                        info!(
+                            "Bootstrap: zaladowano {} snapshot(ow) mesh_topology z DB",
+                            snaps.len()
+                        );
+                    }
+                }
+            }
+
             spawn_quic_event_handler(
                 quic_mesh.clone(),
                 mesh_peer_store.clone(),
                 local_node_info.clone(),
                 mesh_security.clone(),
                 node_id.clone(),
+                db_pool.clone(),
             );
 
             let docker_cache = spawn_docker_cache();
@@ -271,6 +309,7 @@ fn spawn_quic_event_handler(
     local_node_info: NodeInfo,
     mesh_security: Option<Arc<MeshSecurity>>,
     local_node_id: String,
+    db_pool: Option<crate::db::DbPool>,
 ) {
     let qm_events = quic_mesh.clone();
     let mut event_rx = quic_mesh.subscribe();
@@ -325,7 +364,11 @@ fn spawn_quic_event_handler(
                     }
 
                     use tentaflow_protocol::mesh::TopologyAnnouncePayload;
-                    let payload = match rkyv::from_bytes::<TopologyAnnouncePayload, rkyv::rancor::Error>(&data) {
+                    let payload = match rkyv::from_bytes::<
+                        TopologyAnnouncePayload,
+                        rkyv::rancor::Error,
+                    >(&data)
+                    {
                         Ok(p) => p,
                         Err(e) => {
                             warn!(peer = %from_node_id, "Blad deserializacji TopologyAnnounce: {}", e);
@@ -391,14 +434,71 @@ fn spawn_quic_event_handler(
                                     node_id: entry.node_id.clone(),
                                     quic_port: entry.port,
                                     quic_url: String::new(),
-                                    status: if s.ready { "ready".to_string() } else { "stopped".to_string() },
+                                    status: if s.ready {
+                                        "ready".to_string()
+                                    } else {
+                                        "stopped".to_string()
+                                    },
                                     models: Vec::new(),
                                     load_percent: 0,
                                     engine_id: None,
                                     model_sizes_mb: Vec::new(),
                                 })
                                 .collect();
-                            qm_events.service_registry().update_remote(&entry.node_id, services);
+                            qm_events
+                                .service_registry()
+                                .update_remote(&entry.node_id, services);
+                        }
+                        // Persystuj snapshot do DB — bootstrap po restarcie.
+                        if let Some(ref pool) = db_pool {
+                            let services_json = serde_json::to_string(
+                                &entry
+                                    .services
+                                    .iter()
+                                    .map(|s| {
+                                        serde_json::json!({
+                                            "name": s.name,
+                                            "service_type": s.service_type,
+                                            "ready": s.ready,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                            .unwrap_or_else(|_| "[]".to_string());
+                            let models_json = serde_json::to_string(
+                                &entry
+                                    .models
+                                    .iter()
+                                    .map(|m| {
+                                        serde_json::json!({
+                                            "alias": m.alias,
+                                            "backend": m.backend,
+                                            "loaded": m.loaded,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                            .unwrap_or_else(|_| "[]".to_string());
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            if let Err(e) = crate::db::repository::mesh_topology::upsert(
+                                pool,
+                                &entry.node_id,
+                                &entry.hostname,
+                                &entry.platform,
+                                &entry.os_info,
+                                &entry.connected_to,
+                                &entry.direct_addrs,
+                                entry.port,
+                                &services_json,
+                                &models_json,
+                                payload.epoch,
+                                now_ms,
+                            ) {
+                                debug!(node = %entry.node_id, "mesh_topology upsert: {}", e);
+                            }
                         }
                     }
                     peer_store.recalculate_routes(&local_node_id);
@@ -481,9 +581,7 @@ fn spawn_quic_event_handler(
                         platform: node_info_collector::detect_platform(),
                         os_info: local_node_info.os_info.clone(),
                     };
-                    if let Ok(hello_bytes) =
-                        rkyv::to_bytes::<rkyv::rancor::Error>(&hello)
-                    {
+                    if let Ok(hello_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&hello) {
                         if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
                             warn!("Blad wysylania Hello do {}: {}", node_id, e);
                         }
@@ -1097,8 +1195,7 @@ fn spawn_quic_event_handler(
                     if peer_store.is_quic_connected(&node_id) {
                         continue;
                     }
-                    let ips: Vec<std::net::IpAddr> =
-                        addresses.iter().map(|sa| sa.ip()).collect();
+                    let ips: Vec<std::net::IpAddr> = addresses.iter().map(|sa| sa.ip()).collect();
                     peer_store.set_addresses(&node_id, ips);
                     peer_store.set_status(&node_id, "discovered");
                     debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
@@ -1241,9 +1338,15 @@ fn spawn_heartbeat_sender(
                             })
                             .collect();
                     let self_info = peer_store.get(&local_node_id);
-                    let hostname = self_info.as_ref().map(|p| p.hostname.clone()).unwrap_or_default();
+                    let hostname = self_info
+                        .as_ref()
+                        .map(|p| p.hostname.clone())
+                        .unwrap_or_default();
                     let platform = node_info_collector::detect_platform();
-                    let os_info = self_info.as_ref().map(|p| p.os_info.clone()).unwrap_or_default();
+                    let os_info = self_info
+                        .as_ref()
+                        .map(|p| p.os_info.clone())
+                        .unwrap_or_default();
                     let port = self_info.as_ref().map(|p| p.port).unwrap_or(0);
                     let direct_addrs: Vec<String> = self_info
                         .as_ref()
@@ -1278,9 +1381,7 @@ fn spawn_heartbeat_sender(
                     if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                         let bv = bytes.to_vec();
                         for peer_id in &connected_peers {
-                            if let Err(e) =
-                                quic_mesh.send_topology_announce(peer_id, &bv).await
-                            {
+                            if let Err(e) = quic_mesh.send_topology_announce(peer_id, &bv).await {
                                 debug!(peer = %peer_id, "Blad wysylania TopologyAnnounce: {}", e);
                             }
                         }
@@ -1306,16 +1407,15 @@ fn collect_local_models(
             let backend = svc.engine_id.clone().unwrap_or_default();
             let sizes = svc.model_sizes_mb.clone();
             let loaded = matches!(svc.status.as_str(), "running" | "ready");
-            svc.models
-                .into_iter()
-                .enumerate()
-                .map(move |(idx, alias)| crate::mesh::peer_store::PeerModelInfo {
+            svc.models.into_iter().enumerate().map(move |(idx, alias)| {
+                crate::mesh::peer_store::PeerModelInfo {
                     alias,
                     kind: kind.clone(),
                     backend: backend.clone(),
                     size_mb: sizes.get(idx).copied().unwrap_or(0),
                     loaded,
-                })
+                }
+            })
         })
         .collect()
 }
