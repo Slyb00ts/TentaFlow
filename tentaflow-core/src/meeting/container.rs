@@ -22,6 +22,9 @@ pub const IMAGE_TAG: &str = "tentaflow/teams-bot:latest";
 pub struct SpawnRequest {
     pub session_id: i64,
     pub meeting_url: String,
+    /// Klucz sesji = meeting_sessions.meeting_key. Przekazywany botowi jako env
+    /// MEETING_ID — każdy transkrypt router zapisze pod tym samym session_id.
+    pub meeting_key: String,
     pub ports: AllocatedPorts,
     /// Ed25519 secret key bota (hex, 64 znaki). Host używa go żeby obliczyć
     /// EndpointId i połączyć się do bota via iroh.
@@ -246,6 +249,9 @@ pub async fn cleanup_stale_containers() -> Result<()> {
 fn build_env(req: &SpawnRequest) -> Vec<String> {
     let mut env = vec![
         format!("MEETING_URL={}", req.meeting_url),
+        // Klucz sesji — bot kopiuje do każdego transkrypt eventu, router zapisuje
+        // pod tym kluczem do meeting_sessions (get_or_create znajdzie naszą sesję).
+        format!("MEETING_ID={}", req.meeting_key),
         // Wewnątrz kontenera bot nasluchuje na 5000/udp niezależnie od portu
         // hosta — port-binding tylko mapuje zewnątrz.
         "TRANSPORT_PORT=5000".to_string(),

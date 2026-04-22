@@ -6450,6 +6450,8 @@ mod alias_resolve_tests {
             .expect("Utworzenie aliasu teams-stt powinno sie udac");
         create_or_reactivate_model_alias(&db, "teams-tts", "tts-1", "first_available")
             .expect("Utworzenie aliasu teams-tts powinno sie udac");
+        create_or_reactivate_model_alias(&db, "teams-summary", "", "first_available")
+            .expect("Utworzenie aliasu teams-summary powinno sie udac (pusty target)");
 
         // Assert 1 — aliasy istnieja i sa aktywne
         let stt = resolve_model_alias(&db, "teams-stt").unwrap();
@@ -6463,6 +6465,15 @@ mod alias_resolve_tests {
         let tts = tts.unwrap();
         assert_eq!(tts.target_model, "tts-1");
         assert!(tts.is_active);
+
+        let summary = resolve_model_alias(&db, "teams-summary").unwrap();
+        assert!(summary.is_some(), "Alias teams-summary powinien istniec");
+        let summary = summary.unwrap();
+        assert_eq!(
+            summary.target_model, "",
+            "teams-summary ma pusty target — admin uzupelnia recznie"
+        );
+        assert!(summary.is_active);
 
         // Act 2 — dezaktywacja (symulacja zatrzymania addonu)
         set_model_alias_active(&db, "teams-stt", false)

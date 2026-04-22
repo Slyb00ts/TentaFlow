@@ -3965,6 +3965,7 @@ dependencies = [
  "chromiumoxide",
  "clap",
  "futures",
+ "hex",
  "iroh",
  "parking_lot",
  "rkyv",

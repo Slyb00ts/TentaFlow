@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tentaflow_core::config::NodeConfig;
 use tentaflow_core::db;
@@ -330,6 +330,16 @@ async fn run_server(args: Args) -> Result<()> {
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
     collector.start(router.service_manager().shutdown_rx.clone()).await;
+
+    // Sprzątanie ephemeral kontenerów Meeting Bot po unclean shutdown — stare wiersze
+    // meeting_sessions ze status=active/joining dostają ended_at, porty sa zwalniane,
+    // docker containers z labelem tentaflow.kind=meeting-bot force-removed.
+    {
+        let meeting_mgr = tentaflow_core::meeting::MeetingManager::new(db.clone());
+        if let Err(e) = meeting_mgr.cleanup_on_startup().await {
+            warn!("Meeting Bot cleanup_on_startup: {}", e);
+        }
+    }
 
     // Uruchom serwer HTTPS (OpenAI API + Dashboard na jednym porcie) — z Core
     tentaflow_core::api::unified_server::start_unified_server(&config, &db, &metrics, &router, &mesh_peer_store, quic_mesh_for_server, local_node_id_for_server, mesh_security_for_server)?;
