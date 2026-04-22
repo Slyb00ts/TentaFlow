@@ -174,6 +174,9 @@ pub struct MeshPeerStore {
     topology: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Tabela routingu — obliczana z topologii BFS
     routing_table: Arc<RwLock<HashMap<String, RoutingEntry>>>,
+    /// Ostatni odebrany heartbeat per peer (unix millis). Liveness timer sprawdza
+    /// aktualnosc — >2s = degraded, >5s = offline + force disconnect.
+    last_heartbeat_ms: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl MeshPeerStore {
@@ -184,7 +187,37 @@ impl MeshPeerStore {
             dirty: Arc::new(AtomicBool::new(false)),
             topology: Arc::new(RwLock::new(HashMap::new())),
             routing_table: Arc::new(RwLock::new(HashMap::new())),
+            last_heartbeat_ms: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Odnotuj odebrany heartbeat od peera (uzywane przez liveness timer).
+    pub fn mark_heartbeat(&self, node_id: &str) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.last_heartbeat_ms
+            .write()
+            .insert(node_id.to_string(), now_ms);
+    }
+
+    /// Snapshot ostatnich heartbeatow — (node_id, age_ms).
+    pub fn heartbeat_ages(&self) -> Vec<(String, i64)> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.last_heartbeat_ms
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), now_ms - v))
+            .collect()
+    }
+
+    /// Usun wpis heartbeat (po PeerDisconnected).
+    pub fn clear_heartbeat(&self, node_id: &str) {
+        self.last_heartbeat_ms.write().remove(node_id);
     }
 
     /// [OPT] Oznacza cache jako nieaktualny — nastepne list() odbuduje.

@@ -126,6 +126,28 @@ pub async fn handle_ws_connection<S>(
         });
     }
 
+    // Spawnuj task pushujacy SystemEvent jako unsolicited frames — service status
+    // + mesh peer status. GUI nasluchuje przez ApiBinary.onUnsolicited i pokazuje
+    // toasty/odswieza karty bez pollowania.
+    {
+        let sink_sys = Arc::clone(&sink);
+        let seq_sys = Arc::clone(&next_server_sequence);
+        let mut sys_rx = crate::dispatch::system_event_broadcast::subscribe();
+        tokio::spawn(async move {
+            while let Ok(event) = sys_rx.recv().await {
+                let _ = send_body(
+                    &sink_sys,
+                    0,
+                    next_seq(&seq_sys),
+                    tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
+                    &Mb::SystemEventBody(event),
+                    EnvelopeFlags::empty(),
+                )
+                .await;
+            }
+        });
+    }
+
     // Spawnuj task pushujacy AddonPermissionChangedEvent jako unsolicited frames.
     {
         let sink_perm = Arc::clone(&sink);

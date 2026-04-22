@@ -2167,6 +2167,30 @@ pub struct DeploymentStreamEnd {
     pub duration_ms: i64,
 }
 
+/// System events — push-only, wysylane przez serwer jako unsolicited frames.
+/// Jeden wariant `MessageBody::SystemEventBody` oszczedza sloty dla kazdego
+/// typu eventu (service status, mesh peer status, cokolwiek dalej).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum SystemEventPayload {
+    /// Zmiana stanu uslugi QUIC (LLM/TTS/STT/embeddings). Emitowany gdy
+    /// ConnectionStatus transitions: Disconnected→Connected lub odwrotnie.
+    /// Frontend moze pokazac toast + odswiezyc karty na Dashboard/Services.
+    ServiceStatusChanged {
+        service_name: String,
+        service_type: String,
+        status: String,
+        message: String,
+    },
+    /// Zmiana stanu peer-a mesh. Emitowany gdy peer przechodzi w offline/degraded
+    /// (liveness timer) albo wraca online po reconnect.
+    MeshPeerStatusChanged {
+        node_id: String,
+        hostname: String,
+        status: String,
+        message: String,
+    },
+}
+
 /// Zbiorczy payload deployment (req + res + stream chunks). Jeden wariant
 /// `MessageBody::DeploymentBody` kosztuje 1 slot w 256-limicie — inner enum
 /// rozgalezia sie lokalnie. Stream handler emituje `StreamChunk`/`StreamEnd`
@@ -2762,6 +2786,11 @@ pub enum MessageBody {
 
     // ---- Deployments (single-variant, req+res+stream w inner enum) ----
     DeploymentBody(DeploymentPayload),
+
+    // ---- System events (single-variant, push-only unsolicited w inner enum) ----
+    // Oszczedza sloty variantowe — dla wszystkich server-push eventow systemowych
+    // (service status, mesh peer status, deployment progress summary itd.).
+    SystemEventBody(SystemEventPayload),
 
     // ---- Translate (LLM-backed) ----
     TranslateRequestBody(TranslateRequest),
