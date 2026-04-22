@@ -1355,14 +1355,19 @@
     "select_user": "Wybierz użytkownika"
   },
   "deploy": {
-    "gpu_devices": "Urządzenia GPU",
-    "container_name": "Nazwa kontenera",
-    "progress": {
-      "deploying": "Wdrażanie"
-    },
-    "validation": {
-      "service_required": "Nazwa usługi jest wymagana"
-    }
+    "progress_title": "Postęp deployu",
+    "status_queued": "W kolejce",
+    "status_building": "Buduje obraz",
+    "status_pulling": "Pobieranie",
+    "status_running": "Uruchamia",
+    "status_registering": "Rejestracja",
+    "status_success": "Gotowe",
+    "status_failure": "Niepowodzenie",
+    "status_cancelled": "Anulowane",
+    "status_ended": "Zakończone",
+    "success": "Deploy zakończony sukcesem",
+    "failed": "Deploy nieudany",
+    "err_generic": "Nieznany błąd"
   },
   "chat": {
     "title": "Chat",

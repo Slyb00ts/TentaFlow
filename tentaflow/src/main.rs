@@ -342,6 +342,15 @@ async fn run_server(args: Args) -> Result<()> {
         }
     }
 
+    // Reset stale deploymentów po unclean shutdown — wiersze pozostawione jako
+    // 'building'/'running' dostają status='failure' z error='aborted'. Runner
+    // tokio-task który je produkował nie żyje po restarcie.
+    match tentaflow_core::db::repository::deployments::reset_stale(&db) {
+        Ok(n) if n > 0 => info!("Deployments cleanup: {} stale rows marked as failure", n),
+        Ok(_) => {}
+        Err(e) => warn!("Deployments cleanup: {}", e),
+    }
+
     // Uruchom serwer HTTPS (OpenAI API + Dashboard na jednym porcie) — z Core
     tentaflow_core::api::unified_server::start_unified_server(&config, &db, &metrics, &router, &mesh_peer_store, quic_mesh_for_server, local_node_id_for_server, mesh_security_for_server)?;
 

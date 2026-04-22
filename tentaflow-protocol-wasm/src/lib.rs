@@ -760,8 +760,11 @@ pub fn encode_nim_catalog_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::NimCatalogListRequest).map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ServiceManifestDeployRequest — inicjuje deploy silnika z manifestu.
+/// MessageBody::DeploymentBody(ReqStart) — inicjuje deploy silnika z manifestu.
 /// `config_json` przyjmujemy jako stringify JSON z GUI (elastyczna struktura).
+/// Nazwa wasm-bindgen `encodeServiceManifestDeployRequest` zachowana dla
+/// kompatybilności z frontend codec.js — pod spodem opakowujemy w
+/// DeploymentBody::ReqStart (po konsolidacji na inner enum).
 #[wasm_bindgen(js_name = encodeServiceManifestDeployRequest)]
 pub fn encode_service_manifest_deploy_request(
     engine_id: String,
@@ -769,14 +772,57 @@ pub fn encode_service_manifest_deploy_request(
     node_id: String,
     config_json: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ServiceManifestDeployRequestBody(
-        ServiceManifestDeployRequest {
+    encode_body_inner(&MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ReqStart(ServiceManifestDeployRequest {
             engine_id,
             deploy_method,
             node_id,
             config_json,
-        },
+        }),
     ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeDeploymentStatusRequest)]
+pub fn encode_deployment_status_request(deploy_id: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{DeploymentPayload, DeploymentStatusRequest};
+    encode_body_inner(&MessageBody::DeploymentBody(DeploymentPayload::ReqStatus(
+        DeploymentStatusRequest { deploy_id },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeDeploymentListRequest)]
+pub fn encode_deployment_list_request(
+    engine_id: String,
+    status: String,
+    only_mine: bool,
+    limit: i32,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{DeploymentListRequest, DeploymentPayload};
+    encode_body_inner(&MessageBody::DeploymentBody(DeploymentPayload::ReqList(
+        DeploymentListRequest {
+            engine_id,
+            status,
+            only_mine,
+            limit,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeDeploymentLogStreamRequest)]
+pub fn encode_deployment_log_stream_request(
+    deploy_id: String,
+    replay_tail: bool,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{DeploymentLogStreamRequest, DeploymentPayload};
+    encode_body_inner(&MessageBody::DeploymentBody(DeploymentPayload::ReqLogStream(
+        DeploymentLogStreamRequest {
+            deploy_id,
+            replay_tail,
+        },
+    )))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2226,21 +2272,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "error", err.into());
             }
         }
-        MessageBody::ServiceManifestDeployRequestBody(req) => {
-            set(&obj, "variant", "ServiceManifestDeployRequest".into());
-            set(&obj, "engineId", req.engine_id.into());
-            set(&obj, "deployMethod", req.deploy_method.into());
-            set(&obj, "nodeId", req.node_id.into());
-            set(&obj, "configJson", req.config_json.into());
-        }
-        MessageBody::ServiceManifestDeployResponseBody(resp) => {
-            set(&obj, "variant", "ServiceManifestDeployResponse".into());
-            set(&obj, "status", resp.status.into());
-            set(&obj, "deployId", resp.deploy_id.into());
-            set(&obj, "engineId", resp.engine_id.into());
-            set(&obj, "deployMethod", resp.deploy_method.into());
-            set(&obj, "nodeId", resp.node_id.into());
-            set(&obj, "websocketUrl", resp.websocket_url.into());
+        MessageBody::DeploymentBody(p) => {
+            deployment_payload_to_js(&obj, p);
         }
         // ---- Addons + Users (FAZA 6) ----
         MessageBody::AddonsListRequest => {
@@ -3802,6 +3835,93 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
     }
     Ok(obj.into())
+}
+
+fn deployment_summary_to_js(s: tentaflow_protocol::DeploymentSummary) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "deployId", s.deploy_id.into());
+    set(&o, "engineId", s.engine_id.into());
+    set(&o, "deployMethod", s.deploy_method.into());
+    set(&o, "nodeId", s.node_id.into());
+    set(&o, "status", s.status.into());
+    set(&o, "phase", s.phase.into());
+    set(&o, "progressPct", s.progress_pct.into());
+    set(&o, "imageTag", s.image_tag.into());
+    set(&o, "containerName", s.container_name.into());
+    set(&o, "startedAt", s.started_at.into());
+    set(&o, "finishedAt", s.finished_at.into());
+    set(&o, "errorMessage", s.error_message.into());
+    set(&o, "logTail", s.log_tail.into());
+    set(&o, "userId", (s.user_id as f64).into());
+    o
+}
+
+fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::DeploymentPayload) {
+    use tentaflow_protocol::DeploymentPayload as DP;
+    match p {
+        DP::ReqStart(req) => {
+            set(obj, "variant", "ServiceManifestDeployRequest".into());
+            set(obj, "engineId", req.engine_id.into());
+            set(obj, "deployMethod", req.deploy_method.into());
+            set(obj, "nodeId", req.node_id.into());
+            set(obj, "configJson", req.config_json.into());
+        }
+        DP::ResStart(resp) => {
+            set(obj, "variant", "ServiceManifestDeployResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "deployId", resp.deploy_id.into());
+            set(obj, "engineId", resp.engine_id.into());
+            set(obj, "deployMethod", resp.deploy_method.into());
+            set(obj, "nodeId", resp.node_id.into());
+            set(obj, "websocketUrl", resp.websocket_url.into());
+        }
+        DP::ReqStatus(req) => {
+            set(obj, "variant", "DeploymentStatusRequest".into());
+            set(obj, "deployId", req.deploy_id.into());
+        }
+        DP::ResStatus(resp) => {
+            set(obj, "variant", "DeploymentStatusResponse".into());
+            set(obj, "deployment", deployment_summary_to_js(resp.deployment).into());
+        }
+        DP::ReqList(req) => {
+            set(obj, "variant", "DeploymentListRequest".into());
+            set(obj, "engineId", req.engine_id.into());
+            set(obj, "status", req.status.into());
+            set(obj, "onlyMine", req.only_mine.into());
+            set(obj, "limit", req.limit.into());
+        }
+        DP::ResList(resp) => {
+            set(obj, "variant", "DeploymentListResponse".into());
+            let arr = js_sys::Array::new();
+            for d in resp.deployments {
+                arr.push(&deployment_summary_to_js(d).into());
+            }
+            set(obj, "deployments", arr.into());
+        }
+        DP::ReqLogStream(req) => {
+            set(obj, "variant", "DeploymentLogStreamRequest".into());
+            set(obj, "deployId", req.deploy_id.into());
+            set(obj, "replayTail", req.replay_tail.into());
+        }
+        DP::StreamChunk(c) => {
+            set(obj, "variant", "DeploymentStreamChunk".into());
+            set(obj, "deployId", c.deploy_id.into());
+            set(obj, "kind", c.kind.into());
+            set(obj, "line", c.line.into());
+            set(obj, "phase", c.phase.into());
+            set(obj, "progressPct", c.progress_pct.into());
+            set(obj, "tsMs", (c.ts_ms as f64).into());
+        }
+        DP::StreamEnd(e) => {
+            set(obj, "variant", "DeploymentStreamEnd".into());
+            set(obj, "deployId", e.deploy_id.into());
+            set(obj, "finalStatus", e.final_status.into());
+            set(obj, "imageTag", e.image_tag.into());
+            set(obj, "containerName", e.container_name.into());
+            set(obj, "errorMessage", e.error_message.into());
+            set(obj, "durationMs", (e.duration_ms as f64).into());
+        }
+    }
 }
 
 fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_sys::Object {

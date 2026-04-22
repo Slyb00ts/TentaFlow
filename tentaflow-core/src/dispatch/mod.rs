@@ -385,6 +385,17 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::NotesResponse::SetPinned(_) => "NoteSetPinnedResponse",
             tentaflow_protocol::NotesResponse::Delete(_) => "NoteDeleteResponse",
         },
+        MessageBody::DeploymentBody(p) => match p {
+            tentaflow_protocol::DeploymentPayload::ReqStart(_) => "ServiceManifestDeployRequest",
+            tentaflow_protocol::DeploymentPayload::ResStart(_) => "ServiceManifestDeployResponse",
+            tentaflow_protocol::DeploymentPayload::ReqStatus(_) => "DeploymentStatusRequest",
+            tentaflow_protocol::DeploymentPayload::ResStatus(_) => "DeploymentStatusResponse",
+            tentaflow_protocol::DeploymentPayload::ReqList(_) => "DeploymentListRequest",
+            tentaflow_protocol::DeploymentPayload::ResList(_) => "DeploymentListResponse",
+            tentaflow_protocol::DeploymentPayload::ReqLogStream(_) => "DeploymentLogStreamRequest",
+            tentaflow_protocol::DeploymentPayload::StreamChunk(_) => "DeploymentStreamChunk",
+            tentaflow_protocol::DeploymentPayload::StreamEnd(_) => "DeploymentStreamEnd",
+        },
         MessageBody::MeetingBody(p) => match p {
             tentaflow_protocol::MeetingPayload::ReqSessionStart(_) => "MeetingSessionStartRequest",
             tentaflow_protocol::MeetingPayload::ResSessionStart(_) => "MeetingSessionStartResponse",
@@ -494,8 +505,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::NgcStatusResponseBody(_) => "NgcStatusResponse",
         MessageBody::NimCatalogListRequest => "NimCatalogListRequest",
         MessageBody::NimCatalogListResponseBody(_) => "NimCatalogListResponse",
-        MessageBody::ServiceManifestDeployRequestBody(_) => "ServiceManifestDeployRequest",
-        MessageBody::ServiceManifestDeployResponseBody(_) => "ServiceManifestDeployResponse",
+        // ServiceManifestDeploy przeniesione do DeploymentPayload::ReqStart/ResStart.
         MessageBody::AddonsListRequest => "AddonsListRequest",
         MessageBody::AddonsListResponseBody(_) => "AddonsListResponse",
         MessageBody::UsersListRequest => "UsersListRequest",

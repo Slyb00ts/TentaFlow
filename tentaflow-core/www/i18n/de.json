@@ -1449,14 +1449,19 @@
     "select_user": "Benutzer auswählen"
   },
   "deploy": {
-    "gpu_devices": "GPU-Geräte",
-    "container_name": "Container-Name",
-    "progress": {
-      "deploying": "Wird bereitgestellt"
-    },
-    "validation": {
-      "service_required": "Servicename ist erforderlich"
-    }
+    "progress_title": "Deploy-Fortschritt",
+    "status_queued": "In Warteschlange",
+    "status_building": "Baut",
+    "status_pulling": "Lädt",
+    "status_running": "Startet",
+    "status_registering": "Registriert",
+    "status_success": "Fertig",
+    "status_failure": "Fehlgeschlagen",
+    "status_cancelled": "Abgebrochen",
+    "status_ended": "Beendet",
+    "success": "Deploy erfolgreich",
+    "failed": "Deploy fehlgeschlagen",
+    "err_generic": "Unbekannter Fehler"
   },
   "chat": {
     "title": "Chat",

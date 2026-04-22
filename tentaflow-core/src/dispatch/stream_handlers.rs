@@ -407,6 +407,165 @@ inventory::submit! {
 }
 
 // =============================================================================
+// DeploymentLogStream — real-time log tail + phase/progress events.
+// =============================================================================
+// Frontend subscribes przez ApiBinary.subscribe('deploymentLogStreamRequest',
+// { deployId, replayTail: true }). Handler:
+//   1. Replay log_tail z DB jako serię StreamChunk {kind='log'}.
+//   2. Subscribe do global log_bus (broadcast channel per deploy_id).
+//   3. Dla każdego BusMessage::Line emit StreamChunk, dla End emit StreamEnd + End.
+//   4. Gdy bus channel zamknięty (runner skończył): emit StreamEnd z aktualnym
+//      statusem z DB + push_end.
+
+fn deployment_log_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    use tentaflow_protocol::{
+        DeploymentLogStreamRequest, DeploymentPayload, DeploymentStreamChunk, DeploymentStreamEnd,
+    };
+
+    let payload = match req {
+        MessageBody::DeploymentBody(DeploymentPayload::ReqLogStream(p)) => p,
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+    let DeploymentLogStreamRequest {
+        deploy_id,
+        replay_tail,
+    } = payload;
+
+    let db = ctx.state.db.clone();
+    tokio::spawn(async move {
+        // Replay historycznych linii z DB.
+        if replay_tail {
+            if let Ok(Some(row)) = crate::db::repository::deployments::get(&db, &deploy_id) {
+                for (idx, line) in row.log_tail.split('\n').enumerate() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let chunk = DeploymentStreamChunk {
+                        deploy_id: deploy_id.clone(),
+                        kind: "log".to_string(),
+                        line: line.to_string(),
+                        phase: row.phase.clone(),
+                        progress_pct: row.progress_pct as i32,
+                        ts_ms: idx as i64,
+                    };
+                    if push_chunk(
+                        &sub,
+                        MessageBody::DeploymentBody(DeploymentPayload::StreamChunk(chunk)),
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                // Jeśli deployment już zakończony → emit End od razu i koniec.
+                if matches!(
+                    row.status.as_str(),
+                    "success" | "failure" | "cancelled"
+                ) {
+                    let end = DeploymentStreamEnd {
+                        deploy_id: deploy_id.clone(),
+                        final_status: row.status.clone(),
+                        image_tag: row.image_tag.clone(),
+                        container_name: row.container_name.clone(),
+                        error_message: row.error_message.unwrap_or_default(),
+                        duration_ms: 0,
+                    };
+                    let _ = push_end(
+                        &sub,
+                        Some(MessageBody::DeploymentBody(DeploymentPayload::StreamEnd(
+                            end,
+                        ))),
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Live tail z log_bus.
+        let mut rx = match crate::deploy::log_bus::subscribe(&deploy_id) {
+            Some(r) => r,
+            None => {
+                // Kanał już zamknięty — deployment albo skończony albo nie istnieje.
+                // Rolę fallback pełni replay powyżej; tu po prostu end.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let chunk = DeploymentStreamChunk {
+                        deploy_id: line.deploy_id,
+                        kind: line.kind,
+                        line: line.line,
+                        phase: line.phase,
+                        progress_pct: line.progress_pct as i32,
+                        ts_ms: line.ts_ms,
+                    };
+                    if push_chunk(
+                        &sub,
+                        MessageBody::DeploymentBody(DeploymentPayload::StreamChunk(chunk)),
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    deploy_id: did,
+                    final_status,
+                    image_tag,
+                    container_name,
+                    error_message,
+                    duration_ms,
+                }) => {
+                    let end = DeploymentStreamEnd {
+                        deploy_id: did,
+                        final_status,
+                        image_tag,
+                        container_name,
+                        error_message,
+                        duration_ms,
+                    };
+                    let _ = push_end(
+                        &sub,
+                        Some(MessageBody::DeploymentBody(DeploymentPayload::StreamEnd(
+                            end,
+                        ))),
+                    );
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Subscriber za wolny — skip.
+                    continue;
+                }
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "DeploymentLogStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: deployment_log_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 
