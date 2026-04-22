@@ -1090,20 +1090,19 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   will-change: transform, width, height, filter;
   overflow: hidden;
 }
-/* Mobile — niech tf-window wypelni ekran zamiast centralnie fixed-width. */
+/* Mobile — tf-window miesci sie w szerokosc ekranu (minus 16px margin),
+   wysokosc auto ale max 90vh ze scrollem w body. Wciaz centered jako dialog. */
 @media (max-width: 640px) {
   .tf-window {
-    top: 0 !important;
-    left: 0 !important;
-    right: 0;
-    bottom: 0;
-    width: 100vw !important;
-    height: 100dvh !important;
-    max-width: 100vw !important;
-    max-height: 100dvh !important;
-    min-width: 100vw !important;
-    border-radius: 0;
-    transform: none !important;
+    left: 8px !important;
+    right: 8px !important;
+    width: calc(100vw - 16px) !important;
+    max-width: calc(100vw - 16px) !important;
+    min-width: 0 !important;
+    max-height: 90dvh !important;
+    /* Center vertically — tf-window uzywa top z JS, nadpisujemy auto + transform */
+    top: 50% !important;
+    transform: translateY(-50%) !important;
   }
 }
 .tf-window.tf-window-opening {
