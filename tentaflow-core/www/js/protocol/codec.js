@@ -1907,6 +1907,102 @@ export const encode = {
       body,
     );
   },
+
+  // ==== IAM (users + groups + permissions) ====
+  iamListUsersRequest(correlationId, _payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamListUsersRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamGetUserRequest(correlationId, { userId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamGetUserRequest(Number(userId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamCreateUserRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const csv = Array.isArray(p.groupIds) ? p.groupIds.join(',') : String(p.groupIds ?? '');
+    const body = _wasm.encodeIamCreateUserRequest(
+      String(p.username ?? ''), String(p.password ?? ''), String(p.displayName ?? ''),
+      String(p.email ?? ''), String(p.role ?? 'user'), csv,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamUpdateUserRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamUpdateUserRequest(
+      Number(p.userId), String(p.displayName ?? ''), String(p.email ?? ''),
+      !!p.isActive, String(p.role ?? 'user'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamDeleteUserRequest(correlationId, { userId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamDeleteUserRequest(Number(userId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamSetUserGroupsRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const csv = Array.isArray(p.groupIds) ? p.groupIds.join(',') : String(p.groupIds ?? '');
+    const body = _wasm.encodeIamSetUserGroupsRequest(Number(p.userId), csv);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamResetUserPasswordRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamResetUserPasswordRequest(Number(p.userId), String(p.newPassword ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamListGroupsRequest(correlationId, _payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamListGroupsRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamCreateGroupRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamCreateGroupRequest(String(p.name ?? ''), String(p.description ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamUpdateGroupRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamUpdateGroupRequest(Number(p.groupId), String(p.name ?? ''), String(p.description ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamDeleteGroupRequest(correlationId, { groupId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamDeleteGroupRequest(Number(groupId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamGroupMembersRequest(correlationId, { groupId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamGroupMembersRequest(Number(groupId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamSetPermissionRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamSetPermissionRequest(
+      String(p.resourceType), String(p.resourceId),
+      String(p.subjectType), Number(p.subjectId), String(p.accessLevel),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamClearPermissionRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamClearPermissionRequest(
+      String(p.resourceType), String(p.resourceId),
+      String(p.subjectType), Number(p.subjectId),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamListPermsForResourceRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamListPermsForResourceRequest(String(p.resourceType), String(p.resourceId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+  iamListPermsForSubjectRequest(correlationId, p, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeIamListPermsForSubjectRequest(String(p.subjectType), Number(p.subjectId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
 };
 
 // =============================================================================

@@ -840,10 +840,10 @@ pub fn encode_addons_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonsListRequest).map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::UsersListRequest (unit variant, Admin only).
+/// LEGACY UsersListRequest — zastapione przez encodeIamListUsersRequest.
 #[wasm_bindgen(js_name = encodeUsersListRequest)]
 pub fn encode_users_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::UsersListRequest).map_err(|e| JsError::new(&e))
+    encode_iam(IamPayload::ReqListUsers)
 }
 
 // =============================================================================
@@ -2329,9 +2329,91 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
             set(&obj, "addons", arr.into());
         }
-        MessageBody::UsersListRequest => {
-            set(&obj, "variant", "UsersListRequest".into());
+        MessageBody::IamBody(p) => {
+            use tentaflow_protocol::IamPayload as IP;
+            match p {
+                IP::ReqListUsers => set(&obj, "variant", "IamListUsersRequest".into()),
+                IP::ResListUsers { users } => {
+                    set(&obj, "variant", "IamListUsersResponse".into());
+                    let arr = js_sys::Array::new();
+                    for u in users {
+                        arr.push(&user_info_to_js(u).into());
+                    }
+                    set(&obj, "users", arr.into());
+                }
+                IP::ReqGetUser { user_id } => {
+                    set(&obj, "variant", "IamGetUserRequest".into());
+                    set(&obj, "userId", (*user_id as f64).into());
+                }
+                IP::ResGetUser { user } => {
+                    set(&obj, "variant", "IamGetUserResponse".into());
+                    set(&obj, "user", user_info_to_js(user).into());
+                }
+                IP::ReqCreateUser { .. } => set(&obj, "variant", "IamCreateUserRequest".into()),
+                IP::ResCreateUser { user_id } => {
+                    set(&obj, "variant", "IamCreateUserResponse".into());
+                    set(&obj, "userId", (*user_id as f64).into());
+                }
+                IP::ReqUpdateUser { .. } => set(&obj, "variant", "IamUpdateUserRequest".into()),
+                IP::ReqDeleteUser { .. } => set(&obj, "variant", "IamDeleteUserRequest".into()),
+                IP::ReqSetUserGroups { .. } => set(&obj, "variant", "IamSetUserGroupsRequest".into()),
+                IP::ReqResetUserPassword { .. } => set(&obj, "variant", "IamResetUserPasswordRequest".into()),
+                IP::ReqListGroups => set(&obj, "variant", "IamListGroupsRequest".into()),
+                IP::ResListGroups { groups } => {
+                    set(&obj, "variant", "IamListGroupsResponse".into());
+                    let arr = js_sys::Array::new();
+                    for g in groups {
+                        let item = js_sys::Object::new();
+                        set(&item, "id", (g.id as f64).into());
+                        set(&item, "name", g.name.clone().into());
+                        set(&item, "description", g.description.clone().into());
+                        set(&item, "memberCount", (g.member_count as f64).into());
+                        set(&item, "member_count", (g.member_count as f64).into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "groups", arr.into());
+                }
+                IP::ReqCreateGroup { .. } => set(&obj, "variant", "IamCreateGroupRequest".into()),
+                IP::ResCreateGroup { group_id } => {
+                    set(&obj, "variant", "IamCreateGroupResponse".into());
+                    set(&obj, "groupId", (*group_id as f64).into());
+                }
+                IP::ReqUpdateGroup { .. } => set(&obj, "variant", "IamUpdateGroupRequest".into()),
+                IP::ReqDeleteGroup { .. } => set(&obj, "variant", "IamDeleteGroupRequest".into()),
+                IP::ReqGroupMembers { .. } => set(&obj, "variant", "IamGroupMembersRequest".into()),
+                IP::ResGroupMembers { members } => {
+                    set(&obj, "variant", "IamGroupMembersResponse".into());
+                    let arr = js_sys::Array::new();
+                    for u in members { arr.push(&user_info_to_js(u).into()); }
+                    set(&obj, "members", arr.into());
+                }
+                IP::ReqSetPermission { .. } => set(&obj, "variant", "IamSetPermissionRequest".into()),
+                IP::ReqClearPermission { .. } => set(&obj, "variant", "IamClearPermissionRequest".into()),
+                IP::ReqListPermsForResource { .. } => set(&obj, "variant", "IamListPermsForResourceRequest".into()),
+                IP::ReqListPermsForSubject { .. } => set(&obj, "variant", "IamListPermsForSubjectRequest".into()),
+                IP::ResListPermissions { entries } => {
+                    set(&obj, "variant", "IamListPermissionsResponse".into());
+                    let arr = js_sys::Array::new();
+                    for e in entries {
+                        let item = js_sys::Object::new();
+                        set(&item, "resourceType", e.resource_type.clone().into());
+                        set(&item, "resource_type", e.resource_type.clone().into());
+                        set(&item, "resourceId", e.resource_id.clone().into());
+                        set(&item, "resource_id", e.resource_id.clone().into());
+                        set(&item, "subjectType", e.subject_type.clone().into());
+                        set(&item, "subject_type", e.subject_type.clone().into());
+                        set(&item, "subjectId", (e.subject_id as f64).into());
+                        set(&item, "subject_id", (e.subject_id as f64).into());
+                        set(&item, "accessLevel", e.access_level.clone().into());
+                        set(&item, "access_level", e.access_level.clone().into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "entries", arr.into());
+                }
+                IP::ResOk => set(&obj, "variant", "IamOkResponse".into()),
+            }
         }
+
         // ---- Audit log screen ----
         MessageBody::AuditLogListRequestBody(_) => {
             set(&obj, "variant", "AuditLogListRequest".into());
@@ -3879,6 +3961,34 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
     Ok(obj.into())
 }
 
+fn user_info_to_js(u: &tentaflow_protocol::UserInfo) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "id", (u.id as f64).into());
+    set(&o, "username", u.username.clone().into());
+    set(&o, "displayName", u.display_name.clone().into());
+    set(&o, "display_name", u.display_name.clone().into());
+    set(&o, "email", u.email.clone().into());
+    set(&o, "isActive", u.is_active.into());
+    set(&o, "is_active", u.is_active.into());
+    set(&o, "isAdmin", u.is_admin.into());
+    set(&o, "is_admin", u.is_admin.into());
+    set(&o, "role", u.role.clone().into());
+    if let Some(p) = &u.sso_provider {
+        set(&o, "ssoProvider", p.clone().into());
+        set(&o, "sso_provider", p.clone().into());
+    }
+    if let Some(ts) = &u.last_login_at {
+        set(&o, "lastLoginAt", ts.clone().into());
+        set(&o, "last_login_at", ts.clone().into());
+    }
+    set(&o, "createdAt", u.created_at.clone().into());
+    set(&o, "created_at", u.created_at.clone().into());
+    let gs = js_sys::Array::new();
+    for gid in &u.group_ids { gs.push(&(*gid as f64).into()); }
+    set(&o, "groupIds", gs.into());
+    o
+}
+
 fn deployment_summary_to_js(s: tentaflow_protocol::DeploymentSummary) -> js_sys::Object {
     let o = js_sys::Object::new();
     set(&o, "deployId", s.deploy_id.into());
@@ -4840,4 +4950,137 @@ mod tests {
             assert!(!name.is_empty());
         }
     }
+}
+
+// =============================================================================
+// IAM encoders (users + groups + resource permissions). Zwracaja MessageBody
+// bytes gotowe do envelope wrap. Kazdy encoder bierze typed args, buduje
+// IamPayload i encoduje.
+// =============================================================================
+
+use tentaflow_protocol::IamPayload;
+
+fn encode_iam(payload: IamPayload) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::IamBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeIamListUsersRequest)]
+pub fn encode_iam_list_users() -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqListUsers)
+}
+
+#[wasm_bindgen(js_name = encodeIamGetUserRequest)]
+pub fn encode_iam_get_user(user_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqGetUser { user_id: user_id as i64 })
+}
+
+#[wasm_bindgen(js_name = encodeIamCreateUserRequest)]
+pub fn encode_iam_create_user(
+    username: String,
+    password: String,
+    display_name: String,
+    email: String,
+    role: String,
+    group_ids_csv: String,
+) -> Result<Vec<u8>, JsError> {
+    let group_ids: Vec<i64> = group_ids_csv
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect();
+    encode_iam(IamPayload::ReqCreateUser {
+        username, password, display_name, email, role, group_ids,
+    })
+}
+
+#[wasm_bindgen(js_name = encodeIamUpdateUserRequest)]
+pub fn encode_iam_update_user(
+    user_id: f64,
+    display_name: String,
+    email: String,
+    is_active: bool,
+    role: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqUpdateUser {
+        user_id: user_id as i64, display_name, email, is_active, role,
+    })
+}
+
+#[wasm_bindgen(js_name = encodeIamDeleteUserRequest)]
+pub fn encode_iam_delete_user(user_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqDeleteUser { user_id: user_id as i64 })
+}
+
+#[wasm_bindgen(js_name = encodeIamSetUserGroupsRequest)]
+pub fn encode_iam_set_user_groups(user_id: f64, group_ids_csv: String) -> Result<Vec<u8>, JsError> {
+    let group_ids: Vec<i64> = group_ids_csv
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect();
+    encode_iam(IamPayload::ReqSetUserGroups { user_id: user_id as i64, group_ids })
+}
+
+#[wasm_bindgen(js_name = encodeIamResetUserPasswordRequest)]
+pub fn encode_iam_reset_password(user_id: f64, new_password: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqResetUserPassword { user_id: user_id as i64, new_password })
+}
+
+#[wasm_bindgen(js_name = encodeIamListGroupsRequest)]
+pub fn encode_iam_list_groups() -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqListGroups)
+}
+
+#[wasm_bindgen(js_name = encodeIamCreateGroupRequest)]
+pub fn encode_iam_create_group(name: String, description: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqCreateGroup { name, description })
+}
+
+#[wasm_bindgen(js_name = encodeIamUpdateGroupRequest)]
+pub fn encode_iam_update_group(group_id: f64, name: String, description: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqUpdateGroup { group_id: group_id as i64, name, description })
+}
+
+#[wasm_bindgen(js_name = encodeIamDeleteGroupRequest)]
+pub fn encode_iam_delete_group(group_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqDeleteGroup { group_id: group_id as i64 })
+}
+
+#[wasm_bindgen(js_name = encodeIamGroupMembersRequest)]
+pub fn encode_iam_group_members(group_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqGroupMembers { group_id: group_id as i64 })
+}
+
+#[wasm_bindgen(js_name = encodeIamSetPermissionRequest)]
+pub fn encode_iam_set_permission(
+    resource_type: String,
+    resource_id: String,
+    subject_type: String,
+    subject_id: f64,
+    access_level: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqSetPermission {
+        resource_type, resource_id, subject_type,
+        subject_id: subject_id as i64, access_level,
+    })
+}
+
+#[wasm_bindgen(js_name = encodeIamClearPermissionRequest)]
+pub fn encode_iam_clear_permission(
+    resource_type: String,
+    resource_id: String,
+    subject_type: String,
+    subject_id: f64,
+) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqClearPermission {
+        resource_type, resource_id, subject_type, subject_id: subject_id as i64,
+    })
+}
+
+#[wasm_bindgen(js_name = encodeIamListPermsForResourceRequest)]
+pub fn encode_iam_list_perms_resource(resource_type: String, resource_id: String) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqListPermsForResource { resource_type, resource_id })
+}
+
+#[wasm_bindgen(js_name = encodeIamListPermsForSubjectRequest)]
+pub fn encode_iam_list_perms_subject(subject_type: String, subject_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_iam(IamPayload::ReqListPermsForSubject { subject_type, subject_id: subject_id as i64 })
 }

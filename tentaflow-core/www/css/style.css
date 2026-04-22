@@ -1004,6 +1004,61 @@ input, textarea, select {
 .pair-pin-timer { font-size: 13px; color: var(--warning, #f59e0b); font-weight: 600; }
 .pair-pin-steps { font-size: 11px; color: var(--text-3); text-align: center; line-height: 1.6; white-space: pre-line; }
 
+/* Users & groups admin screen */
+.users-screen .user-list {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 16px;
+}
+.user-row {
+  display: grid;
+  grid-template-columns: 44px 1fr auto auto;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.user-row:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--border-hover);
+  transform: translateY(-1px);
+}
+.user-row .user-avatar {
+  width: 44px; height: 44px; border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent-1, #6366f1), var(--accent-2, #a78bfa));
+  color: white; font-weight: 800; font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.user-row .user-main { min-width: 0; }
+.user-row .user-title {
+  font-weight: 700; font-size: 14px; color: var(--text);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.user-row .user-sub {
+  font-size: 12px; color: var(--text-3); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.user-row .user-groups {
+  display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;
+}
+.user-row .user-groups .group-tag {
+  padding: 2px 8px;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.28);
+  color: var(--accent-2);
+  border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+}
+.user-row .user-row-actions {
+  display: flex; gap: 4px;
+  opacity: 0; transition: opacity 0.15s;
+}
+.user-row:hover .user-row-actions { opacity: 1; }
+
 /* Pairing modal z tabami QR + ID */
 .pair-tabs { margin-bottom: 16px; }
 .pair-tab-panel { padding: 4px 0; }
