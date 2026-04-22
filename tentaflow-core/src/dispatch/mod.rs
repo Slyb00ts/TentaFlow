@@ -25,6 +25,7 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
+pub mod system_event_broadcast;
 pub mod handlers;
 pub mod mesh_write_handlers;
 pub mod metrics;
@@ -396,6 +397,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::DeploymentPayload::StreamChunk(_) => "DeploymentStreamChunk",
             tentaflow_protocol::DeploymentPayload::StreamEnd(_) => "DeploymentStreamEnd",
         },
+        MessageBody::SystemEventBody(p) => match p {
+            tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
+                "ServiceStatusChanged"
+            }
+            tentaflow_protocol::SystemEventPayload::MeshPeerStatusChanged { .. } => {
+                "MeshPeerStatusChanged"
+            }
+        },
         MessageBody::MeetingBody(p) => match p {
             tentaflow_protocol::MeetingPayload::ReqSessionStart(_) => "MeetingSessionStartRequest",
             tentaflow_protocol::MeetingPayload::ResSessionStart(_) => "MeetingSessionStartResponse",
@@ -403,18 +412,38 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MeetingPayload::ResSessionLeave(_) => "MeetingSessionLeaveResponse",
             tentaflow_protocol::MeetingPayload::ReqSessionList(_) => "MeetingSessionListRequest",
             tentaflow_protocol::MeetingPayload::ResSessionList(_) => "MeetingSessionListResponse",
-            tentaflow_protocol::MeetingPayload::ReqSessionDetail(_) => "MeetingSessionDetailRequest",
-            tentaflow_protocol::MeetingPayload::ResSessionDetail(_) => "MeetingSessionDetailResponse",
-            tentaflow_protocol::MeetingPayload::ReqTranscriptsList(_) => "MeetingTranscriptsListRequest",
-            tentaflow_protocol::MeetingPayload::ResTranscriptsList(_) => "MeetingTranscriptsListResponse",
-            tentaflow_protocol::MeetingPayload::ReqSummaryGenerate(_) => "MeetingSummaryGenerateRequest",
-            tentaflow_protocol::MeetingPayload::ResSummaryGenerate(_) => "MeetingSummaryGenerateResponse",
-            tentaflow_protocol::MeetingPayload::ReqActiveSession(_) => "MeetingActiveSessionRequest",
-            tentaflow_protocol::MeetingPayload::ResActiveSession(_) => "MeetingActiveSessionResponse",
+            tentaflow_protocol::MeetingPayload::ReqSessionDetail(_) => {
+                "MeetingSessionDetailRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResSessionDetail(_) => {
+                "MeetingSessionDetailResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqTranscriptsList(_) => {
+                "MeetingTranscriptsListRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResTranscriptsList(_) => {
+                "MeetingTranscriptsListResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqSummaryGenerate(_) => {
+                "MeetingSummaryGenerateRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResSummaryGenerate(_) => {
+                "MeetingSummaryGenerateResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqActiveSession(_) => {
+                "MeetingActiveSessionRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResActiveSession(_) => {
+                "MeetingActiveSessionResponse"
+            }
             tentaflow_protocol::MeetingPayload::ReqSettingsGet(_) => "MeetingSettingsGetRequest",
             tentaflow_protocol::MeetingPayload::ResSettingsGet(_) => "MeetingSettingsGetResponse",
-            tentaflow_protocol::MeetingPayload::ReqSettingsUpdate(_) => "MeetingSettingsUpdateRequest",
-            tentaflow_protocol::MeetingPayload::ResSettingsUpdate(_) => "MeetingSettingsUpdateResponse",
+            tentaflow_protocol::MeetingPayload::ReqSettingsUpdate(_) => {
+                "MeetingSettingsUpdateRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResSettingsUpdate(_) => {
+                "MeetingSettingsUpdateResponse"
+            }
         },
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",

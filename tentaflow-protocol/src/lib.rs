@@ -109,5 +109,6 @@ pub use message_body::{
     MeetingSettingsGetResponse, MeetingSettingsUpdateRequest, MeetingSettingsUpdateResponse,
     MeetingSummaryGenerateRequest, MeetingSummaryGenerateResponse, MeetingTranscriptEntry,
     MeetingTranscriptsListRequest, MeetingTranscriptsListResponse,
+    SystemEventPayload,
     TranslateRequest, TranslateResponse, UserInfo, UserOAuthAccountRow, UsersListResponse,
 };
