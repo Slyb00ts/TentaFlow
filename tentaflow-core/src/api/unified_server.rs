@@ -241,6 +241,7 @@ pub fn start_unified_server_with_permissions(
                         let path = req.uri().path().to_string();
 
                         if is_openai_path(&path) {
+                            let mut owner_user_ctx: Option<crate::routing::acl::UserContext> = None;
                             // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
                             if path != "/health" && path != "/ready" {
                                 let api_key = req
@@ -256,16 +257,23 @@ pub fn start_unified_server_with_permissions(
                                     Some(key) => {
                                         let key_hash =
                                             crate::api::dashboard::auth::hash_api_key(key);
-                                        if crate::db::repository::verify_api_key(&db, &key_hash)
-                                            .ok()
-                                            .flatten()
-                                            .is_some()
-                                        {
-                                            None // Klucz poprawny
-                                        } else {
-                                            Some(
+                                        match crate::db::repository::verify_api_key(&db, &key_hash) {
+                                            Ok(Some(api_key_row)) => {
+                                                if let Some(uid) = api_key_row.owner_user_id {
+                                                    let role = crate::db::repository::get_user_account_by_id(&db, uid)
+                                                        .ok()
+                                                        .flatten()
+                                                        .map(|u| u.role)
+                                                        .unwrap_or_else(|| "user".to_string());
+                                                    owner_user_ctx = Some(
+                                                        crate::routing::acl::UserContext::new(uid, role)
+                                                    );
+                                                }
+                                                None
+                                            }
+                                            _ => Some(
                                                 r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
-                                            )
+                                            ),
                                         }
                                     }
                                     None => Some(
@@ -290,6 +298,13 @@ pub fn start_unified_server_with_permissions(
                                 }
                             }
 
+                            // Wstrzykuje UserContext do request extensions zeby
+                            // openai::server::handle_request mogl uzyc go w
+                            // route_*_for_user wariantach.
+                            let mut req = req;
+                            if let Some(uc) = owner_user_ctx {
+                                req.extensions_mut().insert(uc);
+                            }
                             let resp =
                                 crate::api::openai::server::handle_request(req, router).await?;
                             let resp = resp.map(|body| {
