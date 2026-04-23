@@ -79,6 +79,10 @@ export async function openDeployWizard(engineId, opts = {}) {
   }
 
   nodes = await fetchNodes();
+  if (nodes.length === 0) {
+    renderShell(`<div class="form-hint">${escapeHtml(I18n.t('wizard.noNodesAvailable'))}</div>`);
+    return;
+  }
   if (!selection.nodeId) {
     const local = nodes.find((n) => n?.is_local === true) || nodes[0];
     selection.nodeId = local ? (local.node_id || local.id) : null;
@@ -127,9 +131,9 @@ async function fetchNodes() {
       return resp.filter((n) => n && (n.is_trusted === true || n.is_local === true));
     }
   } catch (err) {
-    console.warn('[wizard] fetchNodes fallback:', err);
+    console.warn('[wizard] fetchNodes:', err);
   }
-  return [{ node_id: 'local', id: 'local', is_local: true, platform: defaultUaOs() }];
+  return [];
 }
 
 async function loadHfToken() {
