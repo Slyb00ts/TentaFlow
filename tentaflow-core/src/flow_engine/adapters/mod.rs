@@ -9,7 +9,6 @@ pub mod conversation_history;
 pub mod embeddings;
 pub mod llm;
 pub mod memory;
-pub mod memory_analyzer;
 pub mod rag;
 pub mod session_context;
 pub mod speaker_context;

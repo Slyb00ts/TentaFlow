@@ -10,7 +10,6 @@ use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapt
 use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
 use crate::flow_engine::adapters::llm::LlmNodeAdapter;
 use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
-use crate::flow_engine::adapters::memory_analyzer::MemoryAnalyzerAdapter;
 use crate::flow_engine::adapters::rag::RagNodeAdapter;
 use crate::flow_engine::adapters::session_context::SessionContextAdapter;
 use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
@@ -67,11 +66,7 @@ impl FlowDispatcher {
             service_manager.clone(),
             config.clone(),
         ));
-        registry.register(SpeakerContextAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(MemoryAnalyzerAdapter::new(service_manager, config));
+        registry.register(SpeakerContextAdapter::new(service_manager, config));
 
         Self {
             db,
