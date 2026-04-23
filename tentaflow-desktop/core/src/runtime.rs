@@ -16,6 +16,7 @@ use tentaflow_core::mesh::peer_store::MeshPeerStore;
 use tentaflow_core::mesh::pipeline::{
     start_mesh_pipeline, MeshPipelineConfig, MeshPipelineHandles,
 };
+use tentaflow_core::mesh::security::MeshSecurity;
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::routing::Router;
 use tentaflow_ui::state::{self as ui_state, SharedAppState, UiCommand};
@@ -58,6 +59,10 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     })?;
     info!("Baza danych zainicjalizowana");
 
+    // Czyszczenie osieroconego settings.node_id (legacy UUID) — zastapiony
+    // iroh EndpointId z MeshSecurity.public_key_hex().
+    let _ = db::repository::delete_setting(&db, "node_id");
+
     // Inicjalizacja routera
     info!("Inicjalizacja routera...");
     let router = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
@@ -83,25 +88,6 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     // Kanal komend UI → Core
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
-    // Ustaw stan poczatkowy + zaladuj seed data z bazy
-    // Persystentny node_id — generowany raz i zapisywany w bazie
-    let node_id = db::repository::get_setting(&db, "node_id")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| {
-            let id = uuid::Uuid::new_v4().to_string();
-            let _ = db::repository::set_setting(&db, "node_id", &id);
-            info!("Wygenerowano nowy node_id: {}", id);
-            id
-        });
-    {
-        let mut s = state.write().unwrap_or_else(|e| e.into_inner());
-        s.node_id = node_id.clone();
-        s.node_role = "desktop".to_string();
-        s.router_running = true;
-        s.set_command_sender(cmd_tx);
-    }
-
     // Ladowanie master key z pliku i inicjalizacja SettingsCipher
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
         .expect("Nie udalo sie zaladowac master key z pliku");
@@ -116,9 +102,29 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
         _ => {}
     }
 
+    // MeshSecurity — single source of truth dla tozsamosci. Ed25519 keypair
+    // zapisany zaszyfrowany w settings; iroh uzywa tego klucza jako EndpointId.
+    // public_key_hex() to nasz node_id wszedzie.
+    let mesh_security = Arc::new(
+        MeshSecurity::new(db.clone(), settings_cipher.clone())
+            .map_err(|e| {
+                error!("MeshSecurity init: {}", e);
+                e
+            })?,
+    );
+    let node_id = mesh_security.public_key_hex();
+    info!("Mesh identity: {}", &node_id[..16.min(node_id.len())]);
+
+    {
+        let mut s = state.write().unwrap_or_else(|e| e.into_inner());
+        s.node_id = node_id.clone();
+        s.node_role = "desktop".to_string();
+        s.router_running = true;
+        s.set_command_sender(cmd_tx);
+    }
+
     // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard i UI sync
     let mesh_peer_store = MeshPeerStore::new();
-    let mut local_mesh_node_id = node_id.clone();
 
     // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
     // PRZED Dashboard server, zeby Dashboard mial dostep do quic_mesh
@@ -137,16 +143,13 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
             &mesh_peer_store,
             Some(db.clone()),
             settings_cipher.clone(),
+            mesh_security.clone(),
         )
         .await
         {
             Ok(handles) => {
-                if let Some(ref qm) = handles.quic_mesh {
-                    local_mesh_node_id = qm.node_id();
-                }
                 {
                     let mut s = state.write().unwrap_or_else(|e| e.into_inner());
-                    s.node_id = local_mesh_node_id.clone();
                     s.mesh_connected = handles.quic_mesh.is_some();
                 }
                 mesh_handles = Some(handles);
@@ -168,7 +171,7 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     // Unified HTTPS server (OpenAI API + Dashboard na jednym porcie) — z Core
     let quic_mesh_for_server = mesh_handles.as_ref().and_then(|h| h.quic_mesh.clone());
     let mesh_security_for_server = mesh_handles.as_ref().and_then(|h| h.security.clone());
-    let local_node_id: Arc<str> = Arc::from(local_mesh_node_id.as_str());
+    let local_node_id: Arc<str> = Arc::from(node_id.as_str());
 
     tentaflow_core::api::unified_server::start_unified_server(
         &config,
