@@ -18,8 +18,16 @@ pub mod tts;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::pin::Pin;
 
+use crate::api::openai::types::ChatCompletionChunk;
 use crate::flow_engine::types::FlowContext;
+
+/// Strumien chunkow SSE zwracany przez streamujace adaptery. Konkretny typ
+/// `ChatCompletionChunk` (nie generyczny JSON) bo S4b obsluguje tylko chat SSE —
+/// dalsze typy output-portow dojda razem z ich konsumentami, nie na zapas.
+pub type AdapterChunkStream =
+    Pin<Box<dyn futures::Stream<Item = Result<ChatCompletionChunk>> + Send>>;
 
 /// Bazowy trait dla wszystkich adapterow wezlow.
 /// Adaptery tlumacza konfiguracje wezla DAG na wywolanie prawdziwego serwisu.
@@ -51,6 +59,17 @@ pub trait NodeAdapter: Send + Sync {
     fn supported_input_ports(&self) -> &'static [&'static str] {
         &["in"]
     }
+
+    /// Wariant streamujacy. Default `None` = adapter nie wspiera streamingu
+    /// i executor uzyje blocking `execute()`. Adaptery ktore deklaruja
+    /// `from_port="stream"` w `supported_output_ports()` musza implementowac.
+    fn execute_streaming(
+        &self,
+        _node_config: &Value,
+        _ctx: &mut FlowContext,
+    ) -> impl std::future::Future<Output = Option<Result<AdapterChunkStream>>> + Send {
+        async { None }
+    }
 }
 
 /// Rejestr adapterow - mapuje typ wezla na konkretny adapter.
@@ -75,6 +94,14 @@ pub trait NodeAdapterDyn: Send + Sync {
     fn supported_output_ports(&self) -> &'static [&'static str];
 
     fn supported_input_ports(&self) -> &'static [&'static str];
+
+    fn execute_streaming_dyn<'a>(
+        &'a self,
+        node_config: &'a Value,
+        ctx: &'a mut FlowContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<Result<AdapterChunkStream>>> + Send + 'a>,
+    >;
 }
 
 /// Automatyczna implementacja NodeAdapterDyn dla kazdego typu
@@ -102,6 +129,16 @@ impl<T: NodeAdapter> NodeAdapterDyn for T {
 
     fn supported_input_ports(&self) -> &'static [&'static str] {
         NodeAdapter::supported_input_ports(self)
+    }
+
+    fn execute_streaming_dyn<'a>(
+        &'a self,
+        node_config: &'a Value,
+        ctx: &'a mut FlowContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<Result<AdapterChunkStream>>> + Send + 'a>,
+    > {
+        Box::pin(NodeAdapter::execute_streaming(self, node_config, ctx))
     }
 }
 
@@ -182,6 +219,26 @@ mod tests {
         let a = DefaultsAdapter;
         assert_eq!(NodeAdapter::supported_output_ports(&a), &["full"]);
         assert_eq!(NodeAdapter::supported_input_ports(&a), &["in"]);
+    }
+
+    #[tokio::test]
+    async fn default_execute_streaming_returns_none() {
+        let a = DefaultsAdapter;
+        let mut ctx = FlowContext::default();
+        let out = NodeAdapter::execute_streaming(&a, &Value::Null, &mut ctx).await;
+        assert!(out.is_none(), "default must not pretend to stream");
+    }
+
+    #[tokio::test]
+    async fn default_execute_streaming_through_dyn_returns_none() {
+        let mut reg = AdapterRegistry::new();
+        reg.register(StreamyAdapter);
+        let dyn_adapter = reg.get("streamy").expect("adapter present");
+        let mut ctx = FlowContext::default();
+        let out = dyn_adapter
+            .execute_streaming_dyn(&Value::Null, &mut ctx)
+            .await;
+        assert!(out.is_none());
     }
 
     #[test]

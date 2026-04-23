@@ -5,7 +5,7 @@
 //       synchroniczny FlowEngine dla wezlow serwisowych (LLM, RAG, STT itd.).
 // =============================================================================
 
-use super::adapters::AdapterRegistry;
+use super::adapters::{AdapterChunkStream, AdapterRegistry};
 use super::types::{
     FlowContext, FlowDefinition, FlowEdge, FlowExecutionResult, FlowNode, FlowStepLog,
 };
@@ -358,6 +358,141 @@ impl FlowExecutorAsync {
         );
 
         Ok(execution_result)
+    }
+
+    /// Wykonuje flow w trybie streaming. Wymaga ze dokladnie jeden node w flow
+    /// jest producentem streamu (ma wychodzaca edge z `from_port="stream"`),
+    /// a jego adapter zaimplementuje `execute_streaming`. Nody przed producentem
+    /// (topologicznie) wykonuja sie blocking; nody za producentem na stream-path
+    /// musza byc pass-through (`output`/`end`/`stream_chunk`) — bo aktualnie
+    /// executor nie transformuje chunków per-node na stream.
+    ///
+    /// Zwraca strumien ChatCompletionChunk gotowy do wyslania do klienta SSE.
+    pub async fn execute_streaming_flow(
+        &self,
+        flow: &crate::db::models::DbFlow,
+        context: &mut FlowContext,
+    ) -> Result<AdapterChunkStream> {
+        let definition = Self::parse_flow(&flow.flow_json)?;
+        let execution_order = Self::topological_sort(&definition)?;
+
+        let node_map: HashMap<&str, &FlowNode> = definition
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n))
+            .collect();
+
+        let outgoing_edges: HashMap<&str, Vec<&FlowEdge>> = {
+            let mut map: HashMap<&str, Vec<&FlowEdge>> = HashMap::new();
+            for edge in &definition.edges {
+                map.entry(edge.from.as_str()).or_default().push(edge);
+            }
+            map
+        };
+
+        // Znajdz unikalnego producenta streamu — node ktory ma choc jedna wychodzaca
+        // edge from_port="stream". W tym S4b-cut wspieramy dokladnie jeden.
+        let mut stream_producers: Vec<&str> = Vec::new();
+        for node in &definition.nodes {
+            if let Some(edges) = outgoing_edges.get(node.id.as_str()) {
+                if edges.iter().any(|e| e.from_port == "stream") {
+                    stream_producers.push(node.id.as_str());
+                }
+            }
+        }
+        if stream_producers.is_empty() {
+            bail!("Flow nie zawiera edge z portem 'stream' — uzyj execute()");
+        }
+        if stream_producers.len() > 1 {
+            bail!(
+                "Flow ma wiecej niz jednego producenta streamu ({}) — multi-stream nie wspierany",
+                stream_producers.len()
+            );
+        }
+        let producer_id = stream_producers[0].to_string();
+
+        // Nody za producentem na stream path musza byc pass-through
+        let producer_outgoing = outgoing_edges
+            .get(producer_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        for edge in &producer_outgoing {
+            if edge.from_port != "stream" {
+                continue;
+            }
+            let target = node_map
+                .get(edge.to.as_str())
+                .ok_or_else(|| anyhow::anyhow!("stream edge wskazuje brakujacy node"))?;
+            if !is_stream_passthrough(&target.node_type) {
+                bail!(
+                    "Node '{}' typu '{}' na stream path nie jest pass-through — \
+                    streaming transformations nie sa wspierane w tym cut (S4b)",
+                    target.id,
+                    target.node_type
+                );
+            }
+        }
+
+        info!(
+            flow_id = flow.id,
+            flow_name = %flow.name,
+            producer = %producer_id,
+            "Streaming flow start"
+        );
+
+        // Pre-fix: wykonuj nody w kolejnosci topologicznej az dojdziemy do producenta.
+        // Producent sam sie NIE wykonuje blocking — wywolamy execute_streaming.
+        for node_id in &execution_order {
+            if node_id == &producer_id {
+                break;
+            }
+            let node = match node_map.get(node_id.as_str()) {
+                Some(n) => *n,
+                None => continue,
+            };
+            let step_start = Utc::now().to_rfc3339();
+            let result = self.execute_node(node, context).await;
+            match result {
+                Ok(output) => {
+                    context.node_results.insert(node_id.clone(), output);
+                    context.execution_log.push(FlowStepLog {
+                        node_id: node_id.clone(),
+                        node_type: node.node_type.clone(),
+                        started_at: step_start,
+                        finished_at: Some(Utc::now().to_rfc3339()),
+                        status: "completed".to_string(),
+                        output_preview: None,
+                    });
+                }
+                Err(e) => {
+                    bail!("pre-stream node '{}' failed: {}", node_id, e);
+                }
+            }
+        }
+
+        // Wywolaj producenta w trybie streaming
+        let producer_node = node_map
+            .get(producer_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("producer node zniknal z mapy"))?;
+        let adapter = self.registry.get(&producer_node.node_type).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Brak adaptera dla typu '{}' (producent streamu)",
+                producer_node.node_type
+            )
+        })?;
+
+        let stream_opt = adapter
+            .execute_streaming_dyn(&producer_node.config, context)
+            .await;
+
+        match stream_opt {
+            Some(Ok(stream)) => Ok(stream),
+            Some(Err(e)) => Err(e),
+            None => bail!(
+                "Adapter '{}' nie wspiera streamingu — walidacja flow powinna to zlapac",
+                producer_node.node_type
+            ),
+        }
     }
 
     /// Wykonuje pojedynczy wezel - typy wewnetrzne (trigger, condition, template,
@@ -733,6 +868,16 @@ impl FlowExecutorAsync {
 
         serde_json::Value::Null
     }
+}
+
+/// Czy dany typ node'a jest pass-through na stream path — executor w S4b
+/// zwraca stream bezposrednio do klienta bez transformacji per-node, wiec
+/// tylko sink-typy sa dozwolone za producentem streamu.
+fn is_stream_passthrough(node_type: &str) -> bool {
+    matches!(
+        node_type,
+        "output" | "end" | "http_response" | "quic_response" | "stream_chunk"
+    )
 }
 
 /// Rozwiazuje sciezke JSON z notacja kropkowa (np. "tokens.prompt")
@@ -1611,5 +1756,234 @@ mod tests {
             &serde_json::json!(5),
             |a, b| a > b
         ));
+    }
+
+    // === Streaming flow tests (S4b) ===
+
+    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
+    use crate::flow_engine::adapters::AdapterChunkStream;
+    use futures::stream::StreamExt;
+
+    /// Adapter ktory produkuje zdefiniowana liste chunkow na wywolanie streaming.
+    struct StreamingMockAdapter {
+        node_type_name: &'static str,
+        chunks: Vec<String>,
+    }
+
+    impl NodeAdapter for StreamingMockAdapter {
+        fn execute(
+            &self,
+            _c: &serde_json::Value,
+            _ctx: &mut FlowContext,
+        ) -> impl std::future::Future<Output = Result<serde_json::Value>> + Send {
+            async { Ok(serde_json::json!({"text": "blocking-fallback"})) }
+        }
+
+        fn node_type(&self) -> &'static str {
+            self.node_type_name
+        }
+
+        fn supported_output_ports(&self) -> &'static [&'static str] {
+            &["stream", "full"]
+        }
+
+        fn execute_streaming(
+            &self,
+            _node_config: &serde_json::Value,
+            _ctx: &mut FlowContext,
+        ) -> impl std::future::Future<Output = Option<Result<AdapterChunkStream>>> + Send {
+            let chunks = self.chunks.clone();
+            async move {
+                let items: Vec<Result<ChatCompletionChunk>> = chunks
+                    .into_iter()
+                    .map(|text| {
+                        Ok(ChatCompletionChunk {
+                            id: "test".to_string(),
+                            object: "chat.completion.chunk".to_string(),
+                            created: 0,
+                            model: "m".to_string(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: Delta {
+                                    role: None,
+                                    content: Some(text),
+                                    reasoning_content: None,
+                                    tool_calls: None,
+                                },
+                                finish_reason: None,
+                                logprobs: None,
+                            }],
+                            system_fingerprint: None,
+                            audio: None,
+                            detected_intent: None,
+                            detected_tools: None,
+                            transcribed_text: None,
+                            speaker_id: None,
+                            speaker_name: None,
+                        })
+                    })
+                    .collect();
+                let s = futures::stream::iter(items);
+                let boxed: AdapterChunkStream = Box::pin(s);
+                Some(Ok(boxed))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_forwarduje_chunki() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        registry.register(StreamingMockAdapter {
+            node_type_name: "llm",
+            chunks: vec!["Hel".to_string(), "lo".to_string(), "!".to_string()],
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "t1", "type": "trigger", "config": {}},
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "t1", "to": "llm1"},
+                {"from": "llm1", "to": "out", "from_port": "stream", "to_port": "in"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new(
+            "req-stream-1".to_string(),
+            "any".to_string(),
+            "Hej".to_string(),
+        );
+
+        let stream = executor
+            .execute_streaming_flow(&flow, &mut ctx)
+            .await
+            .expect("streaming flow should start");
+
+        let collected: Vec<_> = stream.collect().await;
+        assert_eq!(collected.len(), 3);
+        assert_eq!(
+            collected[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("Hel")
+        );
+        assert_eq!(
+            collected[2].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("!")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_odrzuca_flow_bez_stream_edge() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        registry.register(StreamingMockAdapter {
+            node_type_name: "llm",
+            chunks: vec![],
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "t1", "type": "trigger", "config": {}},
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "t1", "to": "llm1"},
+                {"from": "llm1", "to": "out"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
+
+        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("flow bez stream edge powinien dac blad"),
+        };
+        assert!(msg.contains("stream"), "error zawiera 'stream': {}", msg);
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_odrzuca_transforming_node_po_producencie() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        registry.register(StreamingMockAdapter {
+            node_type_name: "llm",
+            chunks: vec![],
+        });
+        // 'rag' to node nie-passthrough — nie moze lezec za producentem na stream
+        registry.register(MockAdapter {
+            node_type_name: "rag",
+            response: serde_json::json!({"text": "x"}),
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "rag1", "type": "rag", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "llm1", "to": "rag1", "from_port": "stream", "to_port": "in"},
+                {"from": "rag1", "to": "out"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
+
+        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("powinno zwrocic blad"),
+        };
+        assert!(
+            msg.contains("pass-through") || msg.contains("passthrough"),
+            "error dot. pass-through: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_odrzuca_adapter_bez_streamingu() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        // Mock adapter NIE implementuje execute_streaming — default None
+        registry.register(MockAdapter {
+            node_type_name: "llm",
+            response: serde_json::json!({"text": "x"}),
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "llm1", "to": "out", "from_port": "stream", "to_port": "in"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
+
+        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("powinno zwrocic blad"),
+        };
+        assert!(
+            msg.contains("nie wspiera streamingu"),
+            "error dot. braku streamingu: {}",
+            msg
+        );
     }
 }

@@ -5,16 +5,17 @@
 //       temperature, max_tokens i system prompt z definicji wezla.
 // =============================================================================
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
 use crate::config::RouterConfig;
-use crate::flow_engine::adapters::NodeAdapter;
+use crate::flow_engine::adapters::{AdapterChunkStream, NodeAdapter};
 use crate::flow_engine::types::FlowContext;
 use crate::routing::service_manager::ServiceManager;
+use crate::routing::stream_helpers::quic_stream_to_openai_chunks;
 
 /// Adapter wezla LLM - generowanie tekstu przez backend LLM.
 /// Trzyma Arc do ServiceManager i konfiguracji routera.
@@ -41,8 +42,14 @@ impl LlmNodeAdapter {
         model.to_string()
     }
 
-    /// Buduje ChatCompletionRequest z konfiguracji wezla i kontekstu flow
-    fn build_request(&self, node_config: &Value, ctx: &FlowContext) -> ChatCompletionRequest {
+    /// Buduje ChatCompletionRequest z konfiguracji wezla i kontekstu flow.
+    /// `streaming` steruje polem `request.stream` wysylanym do backendu.
+    fn build_request(
+        &self,
+        node_config: &Value,
+        ctx: &FlowContext,
+        streaming: bool,
+    ) -> ChatCompletionRequest {
         let use_messages_context = node_config
             .get("use_messages_context")
             .and_then(|v| v.as_bool())
@@ -165,7 +172,7 @@ impl LlmNodeAdapter {
             frequency_penalty: None,
             presence_penalty: None,
             stop: None,
-            stream: false,
+            stream: streaming,
             user: None,
             response_format: None,
             tools: None,
@@ -230,7 +237,7 @@ impl LlmNodeAdapter {
 
 impl NodeAdapter for LlmNodeAdapter {
     async fn execute(&self, node_config: &Value, ctx: &mut FlowContext) -> Result<Value> {
-        let request = self.build_request(node_config, ctx);
+        let request = self.build_request(node_config, ctx, false);
         let model_name = self.resolve_model_alias(&request.model);
 
         info!(
@@ -402,6 +409,101 @@ impl NodeAdapter for LlmNodeAdapter {
                     model_name
                 );
             }
+        }
+    }
+
+    async fn execute_streaming(
+        &self,
+        node_config: &Value,
+        ctx: &mut FlowContext,
+    ) -> Option<Result<AdapterChunkStream>> {
+        let request = self.build_request(node_config, ctx, true);
+        let model_name = self.resolve_model_alias(&request.model);
+
+        info!(
+            model = %model_name,
+            input_len = ctx.input.len(),
+            "LLM adapter: streaming"
+        );
+
+        if self.service_manager.has_quic_llm_service(&model_name) {
+            let quic_handle = {
+                self.service_manager
+                    .quic_llm_services
+                    .read()
+                    .get(&model_name)
+                    .cloned()
+            };
+            if let Some(quic_handle) = quic_handle {
+                if let Some(quic_client) = quic_handle.get_client().await {
+                    let protocol_messages: Vec<tentaflow_protocol::Message> = request
+                        .messages
+                        .iter()
+                        .map(|m| {
+                            let content = match &m.content {
+                                Some(MessageContent::Text(text)) => text.clone(),
+                                _ => String::new(),
+                            };
+                            tentaflow_protocol::Message {
+                                role: m.role.clone(),
+                                content,
+                            }
+                        })
+                        .collect();
+
+                    let model_request = tentaflow_protocol::ModelRequest {
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        payload: tentaflow_protocol::ModelPayload::Completion(
+                            tentaflow_protocol::CompletionPayload {
+                                model: model_name.clone(),
+                                prompt: None,
+                                messages: protocol_messages,
+                                temperature: request.temperature,
+                                max_tokens: request.max_tokens,
+                                top_p: request.top_p,
+                                stop: request.stop.clone(),
+                                presence_penalty: request.presence_penalty,
+                                frequency_penalty: request.frequency_penalty,
+                                tts_options: None,
+                                memory_options: None,
+                                audio_input: None,
+                                prefix_cache_id: None,
+                                prefix_text: None,
+                            },
+                        ),
+                        stream: true,
+                        metadata: None,
+                        session_id: None,
+                    };
+
+                    match quic_client.send_request_stream(model_request).await {
+                        Ok(stream) => {
+                            let converted =
+                                quic_stream_to_openai_chunks(stream, model_name.clone());
+                            return Some(Ok(converted));
+                        }
+                        Err(e) => {
+                            warn!("QUIC LLM stream failed: {} — fallback na HTTP", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let backends = self.service_manager.get_service_backends_cloned(&model_name);
+        match backends {
+            Some(backends) if !backends.is_empty() => {
+                let backend = backends[0].clone();
+                debug!("LLM adapter streaming: HTTP backend {}", backend.url());
+                match backend.chat_completion_stream(request).await {
+                    Ok(stream) => Some(Ok(stream)),
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            _ => Some(Err(anyhow!(
+                "LLM adapter (stream): brak backendu dla modelu '{}'",
+                model_name
+            ))),
         }
     }
 

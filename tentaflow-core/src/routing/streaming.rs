@@ -45,8 +45,36 @@ impl Router {
 
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
-            let ctx = crate::routing::build_flow_context(&request, true);
+            // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
+            let ctx_stream = crate::routing::build_flow_context(&request, true);
+            match dispatcher
+                .try_dispatch_streaming(&request.model, "chat", ctx_stream)
+                .await
+            {
+                Ok(Some(stream)) => {
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: stream_node_name.clone(),
+                        backend_type: "flow_engine_stream".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: 0,
+                        hop_count: 0,
+                        latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                    };
+                    return Ok(crate::routing::RouteResult {
+                        response: stream,
+                        metadata,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        "Flow Engine streaming error, fallback na blocking/stary pipeline: {}",
+                        e
+                    );
+                }
+            }
 
+            let ctx = crate::routing::build_flow_context(&request, true);
             match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
                 Ok(Some(result)) => {
                     let response = flow_result_to_chat_response(result, &request.model);
