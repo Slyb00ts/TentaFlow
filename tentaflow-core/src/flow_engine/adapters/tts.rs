@@ -172,4 +172,8 @@ impl NodeAdapter for TtsNodeAdapter {
     fn node_type(&self) -> &'static str {
         "tts"
     }
+
+    fn supported_output_ports(&self) -> &'static [&'static str] {
+        &["stream", "full"]
+    }
 }

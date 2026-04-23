@@ -336,6 +336,13 @@ impl Router {
         &self.service_manager
     }
 
+    /// Zwraca referencje do FlowDispatcher jesli Router zostal skonstruowany
+    /// z DB (produkcja ma zawsze, niektore testy nie). Handlery zapisu flow
+    /// uzywaja go do pobrania AdapterRegistry dla walidacji.
+    pub fn flow_dispatcher(&self) -> Option<&Arc<FlowDispatcher>> {
+        self.flow_dispatcher.as_ref()
+    }
+
     pub fn start(&self) {
         info!("Router: Starting callback handler...");
         self.spawn_callback_handler();
