@@ -317,36 +317,6 @@ pub fn create_shared_registry(db_pool: Option<crate::db::DbPool>) -> SharedPromp
     Arc::new(registry)
 }
 
-// ============================================================================
-// PROMPT IDs - Stałe dla wygody użycia w kodzie
-// ============================================================================
-
-/// ID promptów dla Main LLM
-pub mod main_llm {
-    pub const JARVIS_SYSTEM: &str = "jarvis_system";
-    pub const SESSION_START: &str = "session_start";
-    pub const SESSION_CONTINUE: &str = "session_continue";
-    pub const SESSION_UNCLEAR: &str = "session_unclear";
-    pub const UNKNOWN_USER: &str = "unknown_user";
-    pub const UNKNOWN_USER_STRONG: &str = "unknown_user_strong";
-    pub const PERSONALIZATION_TEMPLATE: &str = "personalization_template";
-    pub const PERSONALIZATION_FIRST_TEMPLATE: &str = "personalization_first_template";
-    pub const PERSONALIZATION_CONTINUE_TEMPLATE: &str = "personalization_continue_template";
-    pub const MEMORY_CONTEXT_TEMPLATE: &str = "memory_context_template";
-    pub const INTENT_ANALYZER_SYSTEM: &str = "intent_analyzer_system";
-    pub const NEW_VOICE_DURING_CONVERSATION: &str = "new_voice_during_conversation";
-    pub const NEW_SPEAKER_INTRODUCED_TEMPLATE: &str = "new_speaker_introduced_template";
-    pub const MEDIUM_CONFIDENCE_KNOWN_TEMPLATE: &str = "medium_confidence_known_template";
-    pub const MEDIUM_CONFIDENCE_UNKNOWN: &str = "medium_confidence_unknown";
-}
-
-/// ID promptów dla Analyzer LLM
-pub mod analyzer_llm {
-    pub const QUERY_ANALYSIS_SYSTEM: &str = "query_analysis_system";
-    pub const STORE_ANALYSIS_SYSTEM: &str = "store_analysis_system";
-    pub const DISAMBIGUATION_SYSTEM: &str = "disambiguation_system";
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,7 +324,7 @@ mod tests {
     #[test]
     fn test_empty_registry() {
         let registry = PromptRegistry::new();
-        assert!(registry.get(main_llm::JARVIS_SYSTEM).is_none());
+        assert!(registry.get("any_prompt").is_none());
     }
 
     #[test]

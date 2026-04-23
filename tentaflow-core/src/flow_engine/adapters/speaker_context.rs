@@ -122,94 +122,93 @@ impl NodeAdapter for SpeakerContextAdapter {
                 .unwrap_or_else(|| "Nieznany".to_string());
             person_name = name.clone();
 
+            // Prompt_id bierzemy wylacznie z node_config. Brak klucza => passthrough.
             if confidence >= high_threshold {
-                let prompt_id = if is_first_message {
-                    node_config
-                        .get("personalization_first_prompt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("personalization_first_template")
+                let prompt_key = if is_first_message {
+                    "personalization_first_prompt"
                 } else {
-                    node_config
-                        .get("personalization_continue_prompt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("personalization_continue_template")
+                    "personalization_continue_prompt"
                 };
-
-                if let Some(suffix) = self.resolve_prompt(prompt_id, &[("name", &name)]) {
-                    Self::append_to_system_message(&mut ctx.messages, &suffix);
-                }
-            } else {
-                let prompt_id = node_config
-                    .get("medium_confidence_known_prompt")
+                if let Some(prompt_id) = node_config
+                    .get(prompt_key)
                     .and_then(|v| v.as_str())
-                    .unwrap_or("medium_confidence_known_template");
-
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(suffix) = self.resolve_prompt(prompt_id, &[("name", &name)]) {
+                        Self::append_to_system_message(&mut ctx.messages, &suffix);
+                    }
+                }
+            } else if let Some(prompt_id) = node_config
+                .get("medium_confidence_known_prompt")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 if let Some(suffix) = self.resolve_prompt(prompt_id, &[("name", &name)]) {
                     Self::append_to_system_message(&mut ctx.messages, &suffix);
                 }
             }
-        } else {
-            if Self::is_noise(&ctx.input) {
-                debug!("SpeakerContext: szum, pomijam");
-            } else if Self::is_introduction(&ctx.input) {
-                let prompt_id = node_config
+        } else if Self::is_noise(&ctx.input) {
+            debug!("SpeakerContext: szum, pomijam");
+        } else if Self::is_introduction(&ctx.input) {
+            let extracted_name = ctx
+                .input
+                .trim()
+                .trim_start_matches("jestem ")
+                .trim_start_matches("Jestem ")
+                .trim_start_matches("mam na imię ")
+                .trim_start_matches("Mam na imię ")
+                .trim_start_matches("mam na imie ")
+                .trim_start_matches("nazywam się ")
+                .trim_start_matches("Nazywam się ")
+                .trim_start_matches("nazywam sie ")
+                .trim_start_matches("moje imię to ")
+                .trim_start_matches("moje imie to ")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(|c: char| c.is_ascii_punctuation());
+
+            if !extracted_name.is_empty() {
+                person_name = extracted_name.to_string();
+                if let Some(prompt_id) = node_config
                     .get("new_speaker_prompt")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("new_speaker_introduced_template");
-
-                let extracted_name = ctx
-                    .input
-                    .trim()
-                    .trim_start_matches("jestem ")
-                    .trim_start_matches("Jestem ")
-                    .trim_start_matches("mam na imię ")
-                    .trim_start_matches("Mam na imię ")
-                    .trim_start_matches("mam na imie ")
-                    .trim_start_matches("nazywam się ")
-                    .trim_start_matches("Nazywam się ")
-                    .trim_start_matches("nazywam sie ")
-                    .trim_start_matches("moje imię to ")
-                    .trim_start_matches("moje imie to ")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(|c: char| c.is_ascii_punctuation());
-
-                if !extracted_name.is_empty() {
-                    person_name = extracted_name.to_string();
+                    .filter(|s| !s.is_empty())
+                {
                     if let Some(suffix) =
                         self.resolve_prompt(prompt_id, &[("name", extracted_name)])
                     {
                         Self::append_to_system_message(&mut ctx.messages, &suffix);
                     }
                 }
-            } else if confidence >= medium_threshold {
-                let prompt_id = node_config
-                    .get("medium_confidence_unknown_prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("medium_confidence_unknown");
-
+            }
+        } else if confidence >= medium_threshold {
+            if let Some(prompt_id) = node_config
+                .get("medium_confidence_unknown_prompt")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 if let Some(suffix) = self.resolve_prompt(prompt_id, &[]) {
                     Self::append_to_system_message(&mut ctx.messages, &suffix);
                 }
-            } else if !is_first_message {
-                let prompt_id = node_config
-                    .get("new_voice_prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("new_voice_during_conversation");
-
+            }
+        } else if !is_first_message {
+            if let Some(prompt_id) = node_config
+                .get("new_voice_prompt")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 if let Some(suffix) = self.resolve_prompt(prompt_id, &[]) {
                     Self::append_to_system_message(&mut ctx.messages, &suffix);
                 }
-            } else {
-                let prompt_id = node_config
-                    .get("unknown_user_prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown_user_strong");
-
-                if let Some(suffix) = self.resolve_prompt(prompt_id, &[]) {
-                    Self::append_to_system_message(&mut ctx.messages, &suffix);
-                }
+            }
+        } else if let Some(prompt_id) = node_config
+            .get("unknown_user_prompt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(suffix) = self.resolve_prompt(prompt_id, &[]) {
+                Self::append_to_system_message(&mut ctx.messages, &suffix);
             }
         }
 

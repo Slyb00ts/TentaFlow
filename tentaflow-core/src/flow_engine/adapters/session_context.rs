@@ -52,20 +52,22 @@ impl SessionContextAdapter {
 
 impl NodeAdapter for SessionContextAdapter {
     async fn execute(&self, node_config: &Value, ctx: &mut FlowContext) -> Result<Value> {
+        // Prompt_id pobierane wylacznie z node_config — brak magicznych defaultow.
+        // Jesli dana gałąź nie ma ustawionego prompt_id, adapter nie wstrzykuje nic
+        // (passthrough) — flow_json w pełni definiuje zachowanie nodeu.
         let first_prompt_id = node_config
             .get("first_prompt_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("session_start");
+            .filter(|s| !s.is_empty());
         let continue_prompt_id = node_config
             .get("continue_prompt_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("session_continue");
+            .filter(|s| !s.is_empty());
         let unclear_prompt_id = node_config
             .get("unclear_prompt_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("session_unclear");
+            .filter(|s| !s.is_empty());
 
-        // Sprawdz czy to pierwsza wiadomosc (z wyniku conversation_history)
         let is_first_message = ctx
             .node_results
             .values()
@@ -74,7 +76,6 @@ impl NodeAdapter for SessionContextAdapter {
 
         let is_noise = Self::is_likely_noise(&ctx.input);
 
-        // Wybierz prompt
         let (session_type, prompt_id) = if is_noise && !is_first_message {
             ("unclear", unclear_prompt_id)
         } else if is_first_message {
@@ -83,15 +84,11 @@ impl NodeAdapter for SessionContextAdapter {
             ("continue", continue_prompt_id)
         };
 
-        // Pobierz tresc promptu z rejestru
-        let suffix = self
-            .service_manager
-            .prompt_registry
-            .get_content(prompt_id)
+        let suffix = prompt_id
+            .and_then(|pid| self.service_manager.prompt_registry.get_content(pid))
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        // Dopisz suffix do system message w ctx.messages
         if !suffix.is_empty() && !ctx.messages.is_empty() {
             if let Some(first_msg) = ctx.messages.first_mut() {
                 if first_msg.get("role").and_then(|r| r.as_str()) == Some("system") {
@@ -108,14 +105,14 @@ impl NodeAdapter for SessionContextAdapter {
 
         info!(
             session_type = session_type,
-            prompt_id = prompt_id,
+            prompt_id = prompt_id.unwrap_or(""),
             is_first = is_first_message,
             "SessionContext: ustawiono kontekst sesji"
         );
 
         Ok(serde_json::json!({
             "session_type": session_type,
-            "prompt_id": prompt_id,
+            "prompt_id": prompt_id.unwrap_or(""),
             "is_first_message": is_first_message,
         }))
     }
