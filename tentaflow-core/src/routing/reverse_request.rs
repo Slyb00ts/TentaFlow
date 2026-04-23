@@ -332,6 +332,19 @@ pub async fn dispatch_reverse_request(
             }
         }
 
+        ModelPayload::PromptFetch(req) => {
+            // Kontener (np. meeting-bot) pobiera treść promptu z DB routera —
+            // jedno źródło prawdy zamiast kopiowania seed-a po stronie obrazu.
+            let Some(ref pool) = router.db else {
+                return make_error_response(
+                    request_id,
+                    "PromptFetch: router bez DB",
+                );
+            };
+            handle_prompt_fetch(pool, request_id, req)
+        }
+
+
         ModelPayload::MeetingEvent(event) => {
             // Bot meetingowy otwiera reverse stream i pcha eventy summary/action
             // items. Router resolvuje meeting_key -> session_id przez get_or_create
@@ -427,6 +440,38 @@ fn make_error_response(request_id: String, message: &str) -> tentaflow_protocol:
             details: None,
         }),
         metrics: None,
+    }
+}
+
+/// Buduje `ModelResponse` dla `PromptFetch`. Wydzielone żeby test mógł uderzyć
+/// bezpośrednio w DB bez budowania pełnego Routera (mesh + QUIC to ciężki setup).
+fn handle_prompt_fetch(
+    pool: &crate::db::DbPool,
+    request_id: String,
+    req: tentaflow_protocol::PromptFetchRequest,
+) -> tentaflow_protocol::ModelResponse {
+    use tentaflow_protocol::*;
+    match crate::db::repository::find_prompt(pool, &req.prompt_id, &req.language) {
+        Ok(Some(prompt)) => ModelResponse {
+            request_id,
+            result: ModelResult::PromptFetched(PromptFetchResponse {
+                content: prompt.content,
+                name: prompt.name,
+                resolved_language: prompt.language,
+            }),
+            metrics: None,
+        },
+        Ok(None) => make_error_response(
+            request_id,
+            &format!(
+                "PromptFetch: prompt '{}' nie istnieje (language={})",
+                req.prompt_id, req.language
+            ),
+        ),
+        Err(e) => make_error_response(
+            request_id,
+            &format!("PromptFetch: blad DB: {}", e),
+        ),
     }
 }
 
@@ -734,6 +779,74 @@ mod tests {
         assert_eq!(rows.len(), 2, "dwa unikalne action items (dedup drugiego Alice)");
         let alice = rows.iter().find(|r| r.owner == "Alice").unwrap();
         assert_eq!(alice.deadline.as_deref(), Some("2026-05-10"), "deadline odswiezony");
+    }
+
+    // =========================================================================
+    // PromptFetch: testy handlera odczytu promptu z seedowanej DB.
+    // Świeża DB po `db::init` ma już 5 wariantów `transcription_summarization`.
+    // =========================================================================
+
+    #[test]
+    fn prompt_fetch_handler_returns_content_for_language() {
+        let db = setup_test_db();
+        let resp = handle_prompt_fetch(
+            &db,
+            "rid-1".to_string(),
+            PromptFetchRequest {
+                prompt_id: "transcription_summarization".to_string(),
+                language: "en".to_string(),
+            },
+        );
+        assert_eq!(resp.request_id, "rid-1");
+        match resp.result {
+            ModelResult::PromptFetched(p) => {
+                assert_eq!(p.resolved_language, "en");
+                assert!(!p.content.is_empty());
+                assert!(!p.name.is_empty());
+            }
+            _ => panic!("expected PromptFetched"),
+        }
+    }
+
+    #[test]
+    fn prompt_fetch_handler_falls_back_to_pl_when_language_missing() {
+        let db = setup_test_db();
+        // `it` nie jest seedowany — `find_prompt` ma zwrocic wariant `pl`.
+        let resp = handle_prompt_fetch(
+            &db,
+            "rid-2".to_string(),
+            PromptFetchRequest {
+                prompt_id: "transcription_summarization".to_string(),
+                language: "it".to_string(),
+            },
+        );
+        match resp.result {
+            ModelResult::PromptFetched(p) => {
+                assert_eq!(p.resolved_language, "pl", "fallback na pl gdy brak wariantu");
+                assert!(!p.content.is_empty());
+            }
+            _ => panic!("expected PromptFetched"),
+        }
+    }
+
+    #[test]
+    fn prompt_fetch_handler_returns_error_for_unknown_prompt() {
+        let db = setup_test_db();
+        let resp = handle_prompt_fetch(
+            &db,
+            "rid-3".to_string(),
+            PromptFetchRequest {
+                prompt_id: "does_not_exist".to_string(),
+                language: "pl".to_string(),
+            },
+        );
+        match resp.result {
+            ModelResult::Error(info) => {
+                assert!(info.message.contains("does_not_exist"));
+                assert!(matches!(info.error_type, ErrorType::InternalError));
+            }
+            _ => panic!("expected Error response for unknown prompt"),
+        }
     }
 
     #[test]

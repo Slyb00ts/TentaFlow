@@ -736,6 +736,25 @@ pub enum ModelPayload {
     /// Bot otwiera strumień reverse QUIC i wysyła ModelRequest z tym payloadem;
     /// router odbiera w `dispatch_reverse_request` i persistuje do DB.
     MeetingEvent(MeetingEventData),
+
+    /// PromptFetch - pobranie treści promptu z DB routera po `prompt_id` + język.
+    /// Używane przez kontenery (np. meeting-bot) żeby nie duplikować treści
+    /// promptów po stronie obrazów. Router odpowiada `ModelResult::PromptFetched`.
+    PromptFetch(PromptFetchRequest),
+}
+
+// ============================================================================
+// PROMPT FETCH PAYLOAD
+// ============================================================================
+
+/// Request odczytu promptu z DB routera. Router robi fallback na `pl`
+/// gdy wariant w żądanym języku nie istnieje (zgodnie z `repository::find_prompt`).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+pub struct PromptFetchRequest {
+    /// Identyfikator promptu (np. `transcription_summarization`).
+    pub prompt_id: String,
+    /// Kod języka ISO-639-1 (np. `pl`, `en`, `de`).
+    pub language: String,
 }
 
 // ============================================================================
@@ -1897,8 +1916,22 @@ pub enum ModelResult {
     /// PrefixCacheInit result
     PrefixCacheInit(PrefixCacheInitResponse),
 
+    /// PromptFetched - treść promptu odczytana z DB routera (wraz z
+    /// rozwiązanym językiem — może się różnić od żądanego jeśli zadziałał fallback).
+    PromptFetched(PromptFetchResponse),
+
     /// Error
     Error(ErrorInfo),
+}
+
+/// Odpowiedź na `PromptFetchRequest`. `resolved_language` mówi kontenerowi
+/// który wariant faktycznie został zwrócony — np. gdy żądał `de`, a DB ma
+/// tylko `pl`, tu będzie `pl`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+pub struct PromptFetchResponse {
+    pub content: String,
+    pub name: String,
+    pub resolved_language: String,
 }
 
 /// Result dla embeddings.
@@ -3566,6 +3599,60 @@ mod meeting_event_tests {
                 }
             }
             _ => panic!("expected MeetingEvent variant"),
+        }
+    }
+
+    // Roundtrip PromptFetchRequest przez rkyv — wariant ModelPayload::PromptFetch.
+    #[test]
+    fn rkyv_roundtrip_prompt_fetch_request() {
+        let request = ModelRequest {
+            request_id: "req-pf-1".to_string(),
+            payload: ModelPayload::PromptFetch(PromptFetchRequest {
+                prompt_id: "transcription_summarization".to_string(),
+                language: "en".to_string(),
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let decoded: ModelRequest =
+            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        match decoded.payload {
+            ModelPayload::PromptFetch(req) => {
+                assert_eq!(req.prompt_id, "transcription_summarization");
+                assert_eq!(req.language, "en");
+            }
+            _ => panic!("expected PromptFetch variant"),
+        }
+    }
+
+    // Roundtrip PromptFetchResponse — sprawdza wariant ModelResult::PromptFetched.
+    #[test]
+    fn rkyv_roundtrip_prompt_fetched_response() {
+        let response = ModelResponse {
+            request_id: "req-pf-2".to_string(),
+            result: ModelResult::PromptFetched(PromptFetchResponse {
+                content: "You are a meeting assistant.".to_string(),
+                name: "Transcription Summarization (EN)".to_string(),
+                resolved_language: "en".to_string(),
+            }),
+            metrics: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response).expect("encode");
+        let decoded: ModelResponse =
+            rkyv::from_bytes::<ModelResponse, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        match decoded.result {
+            ModelResult::PromptFetched(p) => {
+                assert_eq!(p.content, "You are a meeting assistant.");
+                assert_eq!(p.name, "Transcription Summarization (EN)");
+                assert_eq!(p.resolved_language, "en");
+            }
+            _ => panic!("expected PromptFetched variant"),
         }
     }
 }

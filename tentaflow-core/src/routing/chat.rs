@@ -1834,6 +1834,24 @@ impl Router {
                     metrics: None,
                 }
             }
+
+            // PromptFetch to payload odwrotnego żądania od kontenera — nie ma
+            // sensu w embedding callbacku. Obsługiwany wyłącznie w dispatch_reverse_request.
+            ModelPayload::PromptFetch(_) => {
+                warn!("Unexpected PromptFetch payload in chat embedding callback");
+                ModelResponse {
+                    request_id,
+                    result: ModelResult::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: "PromptFetch is not valid in chat callbacks".to_string(),
+                        details: Some(
+                            "PromptFetch is handled by dispatch_reverse_request only"
+                                .to_string(),
+                        ),
+                    }),
+                    metrics: None,
+                }
+            }
         }
     }
 
