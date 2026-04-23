@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -213,6 +214,7 @@ pub enum IrohMeshEvent {
 
 /// Aktywne polaczenie zalogowane przez manager.
 struct ActiveConnection {
+    id: u64,
     connection: Connection,
     remote_id_hex: String,
 }
@@ -243,6 +245,7 @@ pub struct IrohMeshManager {
     event_tx: broadcast::Sender<IrohMeshEvent>,
     shutdown: CancellationToken,
     local_node_id: RwLock<String>,
+    next_connection_id: AtomicU64,
     forward_handler: AsyncRwLock<Option<ForwardHandler>>,
     command_waiters:
         AsyncRwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>>,
@@ -277,6 +280,7 @@ impl IrohMeshManager {
             event_tx,
             shutdown: CancellationToken::new(),
             local_node_id: RwLock::new(local_id_hex),
+            next_connection_id: AtomicU64::new(1),
             forward_handler: AsyncRwLock::new(None),
             command_waiters: AsyncRwLock::new(HashMap::new()),
             service_reg,
@@ -410,14 +414,15 @@ impl IrohMeshManager {
 
         match alpn {
             a if a == ALPN_MESH => {
-                self.register_connection(remote_hex.clone(), connection.clone())
-                    .await;
+                let connection_id =
+                    self.register_connection(remote_hex.clone(), connection.clone()).await;
                 let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
                     node_id: remote_hex.clone(),
                 });
                 let me = self.clone_for_spawn();
                 tokio::spawn(async move {
-                    me.handle_mesh_connection(remote_hex, connection).await;
+                    me.handle_mesh_connection(remote_hex, connection, connection_id)
+                        .await;
                 });
             }
             a if a == ALPN_PAIRING => {
@@ -444,18 +449,30 @@ impl IrohMeshManager {
         Ok(())
     }
 
-    async fn register_connection(&self, remote_hex: String, conn: Connection) {
+    async fn register_connection(&self, remote_hex: String, conn: Connection) -> u64 {
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let mut map = self.connections.write().await;
-        map.insert(
+        let previous = map.insert(
             remote_hex.clone(),
             ActiveConnection {
+                id: connection_id,
                 connection: conn,
                 remote_id_hex: remote_hex,
             },
         );
+        drop(map);
+        if let Some(active) = previous {
+            active.connection.close(0u32.into(), b"superseded");
+        }
+        connection_id
     }
 
-    async fn handle_mesh_connection(&self, remote_hex: String, connection: Connection) {
+    async fn handle_mesh_connection(
+        &self,
+        remote_hex: String,
+        connection: Connection,
+        connection_id: u64,
+    ) {
         // Petla odbierania uni streamow. Format: [1B disc][payload].
         loop {
             let recv = match connection.accept_uni().await {
@@ -473,10 +490,18 @@ impl IrohMeshManager {
                 }
             });
         }
-        self.connections.write().await.remove(&remote_hex);
-        let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
-            node_id: remote_hex,
-        });
+        let mut map = self.connections.write().await;
+        let is_current = map
+            .get(&remote_hex)
+            .map(|active| active.id == connection_id)
+            .unwrap_or(false);
+        if is_current {
+            map.remove(&remote_hex);
+            drop(map);
+            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
+                node_id: remote_hex,
+            });
+        }
     }
 
     async fn run_heartbeat_loop(&self) {
@@ -563,7 +588,8 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect: {e:?}"))?;
-        self.register_connection(node_id_hex.to_string(), connection.clone())
+        let connection_id = self
+            .register_connection(node_id_hex.to_string(), connection.clone())
             .await;
         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
             node_id: node_id_hex.to_string(),
@@ -571,7 +597,7 @@ impl IrohMeshManager {
         let me = self.clone_for_spawn();
         let id = node_id_hex.to_string();
         tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection).await;
+            me.handle_mesh_connection(id, connection, connection_id).await;
         });
         Ok(())
     }
@@ -595,7 +621,8 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect direct: {e:?}"))?;
-        self.register_connection(node_id_hex.to_string(), connection.clone())
+        let connection_id = self
+            .register_connection(node_id_hex.to_string(), connection.clone())
             .await;
         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
             node_id: node_id_hex.to_string(),
@@ -603,7 +630,7 @@ impl IrohMeshManager {
         let me = self.clone_for_spawn();
         let id = node_id_hex.to_string();
         tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection).await;
+            me.handle_mesh_connection(id, connection, connection_id).await;
         });
         Ok(())
     }
@@ -618,7 +645,8 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect hinted: {e:?}"))?;
-        self.register_connection(hints.node_id.clone(), connection.clone())
+        let connection_id = self
+            .register_connection(hints.node_id.clone(), connection.clone())
             .await;
         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
             node_id: hints.node_id.clone(),
@@ -626,7 +654,7 @@ impl IrohMeshManager {
         let me = self.clone_for_spawn();
         let id = hints.node_id.clone();
         tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection).await;
+            me.handle_mesh_connection(id, connection, connection_id).await;
         });
         Ok(())
     }
@@ -1084,7 +1112,12 @@ struct IrohMeshManagerRef {
 }
 
 impl IrohMeshManagerRef {
-    async fn handle_mesh_connection(&self, remote_hex: String, connection: Connection) {
+    async fn handle_mesh_connection(
+        &self,
+        remote_hex: String,
+        connection: Connection,
+        connection_id: u64,
+    ) {
         loop {
             let recv = match connection.accept_uni().await {
                 Ok(r) => r,
@@ -1101,10 +1134,18 @@ impl IrohMeshManagerRef {
                 }
             });
         }
-        self.connections.write().await.remove(&remote_hex);
-        let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
-            node_id: remote_hex,
-        });
+        let mut map = self.connections.write().await;
+        let is_current = map
+            .get(&remote_hex)
+            .map(|active| active.id == connection_id)
+            .unwrap_or(false);
+        if is_current {
+            map.remove(&remote_hex);
+            drop(map);
+            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
+                node_id: remote_hex,
+            });
+        }
     }
 
     async fn handle_mesh_uni(
