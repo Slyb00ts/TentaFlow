@@ -443,6 +443,30 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MeetingPayload::ResSettingsUpdate(_) => {
                 "MeetingSettingsUpdateResponse"
             }
+            tentaflow_protocol::MeetingPayload::ReqSummariesList(_) => {
+                "MeetingSummariesListRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResSummariesList(_) => {
+                "MeetingSummariesListResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqActionItemsList(_) => {
+                "MeetingActionItemsListRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResActionItemsList(_) => {
+                "MeetingActionItemsListResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqActionItemStatusUpdate(_) => {
+                "MeetingActionItemStatusUpdateRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResActionItemStatusUpdate(_) => {
+                "MeetingActionItemStatusUpdateResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqTranscriptExport(_) => {
+                "MeetingTranscriptExportRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResTranscriptExport(_) => {
+                "MeetingTranscriptExportResponse"
+            }
         },
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",
@@ -797,6 +821,10 @@ mod tests {
             "MeetingActiveSessionRequest",
             "MeetingSettingsGetRequest",
             "MeetingSettingsUpdateRequest",
+            "MeetingSummariesListRequest",
+            "MeetingActionItemsListRequest",
+            "MeetingActionItemStatusUpdateRequest",
+            "MeetingTranscriptExportRequest",
         ] {
             assert!(
                 find(name).is_some(),
