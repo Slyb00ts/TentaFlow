@@ -4329,6 +4329,31 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         set(&obj, "gpuLoadPercent", (v as f64).into());
         set(&obj, "gpu_load_percent", (v as f64).into());
     }
+    if let Some(connection) = &n.connection {
+        let connection_obj = js_sys::Object::new();
+        set(&connection_obj, "transport", connection.transport.clone().into());
+        if let Some(scope) = &connection.scope {
+            set(&connection_obj, "scope", scope.clone().into());
+        }
+        if let Some(address) = &connection.address {
+            set(&connection_obj, "address", address.clone().into());
+        }
+        if let Some(relay_url) = &connection.relay_url {
+            set(&connection_obj, "relayUrl", relay_url.clone().into());
+            set(&connection_obj, "relay_url", relay_url.clone().into());
+        }
+        let paths = js_sys::Array::new();
+        for path in &connection.paths {
+            let path_obj = js_sys::Object::new();
+            set(&path_obj, "transport", path.transport.clone().into());
+            set(&path_obj, "address", path.address.clone().into());
+            set(&path_obj, "selected", path.selected.into());
+            set(&path_obj, "closed", path.closed.into());
+            paths.push(&path_obj.into());
+        }
+        set(&connection_obj, "paths", paths.into());
+        set(&obj, "connection", connection_obj.into());
+    }
     // Per-GPU list — emitted in both camelCase and snake_case variants so
     // callers can render individual cards and per-GPU deploy targeting.
     let gpu_arr = js_sys::Array::new();
@@ -4843,7 +4868,7 @@ mod tests {
 
     #[test]
     fn protocol_schema_version_matches() {
-        assert_eq!(PROTOCOL_SCHEMA_VERSION, 7);
+        assert_eq!(PROTOCOL_SCHEMA_VERSION, tentaflow_protocol::SCHEMA_VERSION);
     }
 
     #[test]
