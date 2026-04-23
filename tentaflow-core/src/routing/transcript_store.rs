@@ -179,37 +179,6 @@ pub fn push(builder: TranscriptBuilder) {
     push_entry(builder.build());
 }
 
-/// Klucz aktualnej sesji (do widoku/pobrania w GUI).
-pub fn active_session_key() -> Option<String> {
-    active_session()
-        .lock()
-        .as_ref()
-        .map(|s| s.meeting_key.clone())
-}
-
-/// DB id aktualnej sesji.
-pub fn active_session_id() -> Option<i64> {
-    active_session().lock().as_ref().map(|s| s.session_id)
-}
-
-/// Ostatnie N wpisow z ring-buffera (od najnowszej) — dla widoku live.
-pub fn list(limit: usize) -> Vec<TranscriptEntry> {
-    let guard = store().read();
-    guard.iter().rev().take(limit).cloned().collect()
-}
-
-/// Wpisy dla konkretnego meeting_id z ring-buffera (live).
-pub fn list_for_meeting(meeting_id: &str, limit: usize) -> Vec<TranscriptEntry> {
-    let guard = store().read();
-    guard
-        .iter()
-        .rev()
-        .filter(|e| e.meeting_id.as_deref() == Some(meeting_id))
-        .take(limit)
-        .cloned()
-        .collect()
-}
-
 #[allow(dead_code)]
 pub fn clear() {
     store().write().clear();
@@ -229,11 +198,16 @@ mod tests {
         g
     }
 
+    /// Lokalny helper testowy — snapshot ring-buffera (od najnowszej).
+    fn snapshot() -> Vec<TranscriptEntry> {
+        store().read().iter().rev().cloned().collect()
+    }
+
     #[test]
     fn builder_defaults() {
         let _g = isolate();
         push(TranscriptBuilder::new("Hello", "whisper-1").speaker("SPEAKER_00"));
-        let entries = list(10);
+        let entries = snapshot();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].speaker, "SPEAKER_00");
         assert_eq!(entries[0].text, "Hello");
@@ -250,22 +224,10 @@ mod tests {
                 .confidence(0.91)
                 .meeting_id("meet-abc"),
         );
-        let entries = list(10);
+        let entries = snapshot();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].profile_id, Some(42));
         assert!(entries[0].is_enrolled);
-    }
-
-    #[test]
-    fn list_for_meeting_filters() {
-        let _g = isolate();
-        push(TranscriptBuilder::new("A", "w").meeting_id("meet-1"));
-        push(TranscriptBuilder::new("B", "w").meeting_id("meet-2"));
-        push(TranscriptBuilder::new("C", "w").meeting_id("meet-1"));
-        let m1 = list_for_meeting("meet-1", 10);
-        assert_eq!(m1.len(), 2);
-        assert_eq!(m1[0].text, "C");
-        assert_eq!(m1[1].text, "A");
     }
 
     #[test]
@@ -274,7 +236,7 @@ mod tests {
         for i in 0..(MAX_LIVE_TRANSCRIPTS + 50) {
             push(TranscriptBuilder::new(format!("msg-{}", i), "w"));
         }
-        let entries = list(MAX_LIVE_TRANSCRIPTS + 100);
+        let entries = snapshot();
         assert_eq!(entries.len(), MAX_LIVE_TRANSCRIPTS);
     }
 }
