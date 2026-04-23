@@ -9,11 +9,9 @@ use crate::config::RouterConfig;
 use crate::db::DbPool;
 use crate::error::Result;
 use crate::flow_engine::dispatcher::FlowDispatcher;
-use crate::intent_analyzer::IntentAnalyzer;
 use crate::middleware::ResponseMiddleware;
 use crate::routing::backend::BackendClient;
 use crate::routing::loadbalancer::LoadBalancingStrategy;
-use crate::routing::memory_integration::MemoryIntegration;
 use crate::routing::service_manager::ServiceManager;
 use crate::services::rag::RAGClient;
 use crate::services::tts::TTSClient;
@@ -44,12 +42,6 @@ pub struct Router {
 
     /// Response middleware dla filtrowania PII
     pub(crate) response_middleware: Arc<ResponseMiddleware>,
-
-    /// Memory Integration - integracja z TentaFlow.Memory
-    pub(crate) memory_integration: Arc<MemoryIntegration>,
-
-    /// Intent Analyzer - wykrywanie intencji uzywajac Bielika 11B
-    pub(crate) intent_analyzer: Arc<IntentAnalyzer>,
 
     /// Mowcy potrzebujacy dodatkowych sampli glosu (speaker_id -> remaining_samples)
     /// Po enrollment zbieramy 3 dodatkowe probki zeby wzmocnic model glosu
@@ -300,13 +292,7 @@ impl Router {
             config.middleware.response_filtering_enabled,
         ));
 
-        // === KROK 4: INICJALIZUJ MEMORY INTEGRATION ===
-        let memory_integration = Arc::new(MemoryIntegration::new(service_manager.clone(), None));
-
-        // === KROK 5: INICJALIZUJ INTENT ANALYZER ===
-        let intent_analyzer = Arc::new(IntentAnalyzer::new(service_manager.clone(), None));
-
-        // === KROK 6: INICJALIZUJ FLOW DISPATCHER ===
+        // === KROK 4: INICJALIZUJ FLOW DISPATCHER ===
         let db_clone = db.clone();
         let flow_dispatcher = db.map(|pool| {
             Arc::new(FlowDispatcher::new(
@@ -334,8 +320,6 @@ impl Router {
             config,
             service_manager,
             response_middleware,
-            memory_integration,
-            intent_analyzer,
             pending_voice_samples: Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1034,43 +1018,6 @@ impl Router {
                 };
                 context_parts.push(format!("{}: {}", role, truncated));
             }
-        }
-
-        if context_parts.is_empty() {
-            None
-        } else {
-            Some(context_parts.join("\n"))
-        }
-    }
-
-    /// Buduje kontekst konwersacji z historii w ConversationCache.
-    pub(crate) fn build_context_from_conversation_cache(
-        &self,
-        history: &[crate::routing::memory_integration::ConversationMessage],
-        max_turns: usize,
-    ) -> Option<String> {
-        if history.is_empty() {
-            return None;
-        }
-
-        let start = history.len().saturating_sub(max_turns);
-        let messages_to_use = &history[start..];
-
-        let mut context_parts = Vec::new();
-        for msg in messages_to_use {
-            let role = match msg.role.as_str() {
-                "assistant" => "ASSISTANT",
-                "user" => "USER",
-                "system" => continue,
-                _ => &msg.role,
-            };
-
-            let content = if msg.content.chars().count() > 200 {
-                format!("{}...", msg.content.chars().take(200).collect::<String>())
-            } else {
-                msg.content.clone()
-            };
-            context_parts.push(format!("{}: {}", role, content));
         }
 
         if context_parts.is_empty() {
