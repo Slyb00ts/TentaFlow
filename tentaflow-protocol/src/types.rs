@@ -763,7 +763,7 @@ pub struct PromptFetchRequest {
 
 /// Event od Meeting Bota do Routera. Niesie meeting_key (publiczny identyfikator
 /// sesji) + timestamp + typowy payload (summary albo action items).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct MeetingEventData {
     /// meeting_key z tabeli meeting_sessions. Router resolvuje do session_id.
     pub meeting_key: String,
@@ -775,7 +775,7 @@ pub struct MeetingEventData {
 
 /// Warianty eventów meeting. Każdy wariant niesie dane do tej samej sesji
 /// (adresowanej przez `MeetingEventData::meeting_key`).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum MeetingEventPayload {
     /// Nowe podsumowanie wygenerowane przez timer bota. Router insertuje
     /// do `meeting_summaries` (append-only historia).
@@ -839,11 +839,28 @@ pub enum MeetingEventPayload {
 }
 
 /// Pojedynczy action item przesyłany w `ActionItemsUpdate`.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeetingActionItemData {
     pub owner: String,
     pub task: String,
     pub deadline: Option<String>,
+}
+
+/// Frame pushowany przez binary-WS do dashboard GUI po każdym sukcesie
+/// `persist_meeting_event`. Zawiera ten sam payload co bot wysłał routerowi —
+/// subscriberzy po stronie GUI (live widok meetingu) renderują go bez
+/// konieczności odpytywania DB. Filtrowanie po ownership (user_id ↔
+/// meeting_sessions.owner_user_id) dzieje się server-side w writer task,
+/// więc frame nigdy nie dotrze do niepowołanego usera.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct MeetingLiveEvent {
+    /// meeting_key sesji — adresuje która sesja, GUI route’uje do widoku.
+    pub meeting_key: String,
+    /// Unix epoch ms w momencie oryginalnej emisji przez bota (reuse z
+    /// `MeetingEventData::timestamp_ms`).
+    pub timestamp_ms: i64,
+    /// Ten sam payload który przeszedł persist/log w routerze.
+    pub payload: MeetingEventPayload,
 }
 
 // ============================================================================
