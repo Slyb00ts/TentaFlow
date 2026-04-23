@@ -87,17 +87,23 @@ impl RouterClient {
     }
 
     /// Wysyla audio do STT przez router (alias podany w `model`).
+    /// `extra_metadata` — dodatkowe pary klucz/wartosc (roster, active_speaker,
+    /// timestamp_ms) — doklejane obok `meeting_id`.
     pub async fn transcribe(
         &self,
         audio_pcm: &[i16],
         model: &str,
         language: Option<String>,
+        extra_metadata: Vec<(String, String)>,
     ) -> Result<String> {
         let audio_bytes: Vec<u8> = audio_pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let metadata = self
-            .current_meeting_id()
-            .map(|mid| vec![("meeting_id".to_string(), mid)]);
+        let mut meta: Vec<(String, String)> = Vec::new();
+        if let Some(mid) = self.current_meeting_id() {
+            meta.push(("meeting_id".to_string(), mid));
+        }
+        meta.extend(extra_metadata);
+        let metadata = if meta.is_empty() { None } else { Some(meta) };
 
         let request = ModelRequest {
             request_id: uuid::Uuid::new_v4().to_string(),

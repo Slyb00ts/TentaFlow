@@ -27,3 +27,9 @@ id = "vits-piper-en-amy-medium"
 display_name = "VITS Piper en (Amy, medium)"
 repo = "rhasspy/piper-voices/en/en_US/amy/medium"
 recommended = true
+
+[[model_preset]]
+id = "vits-piper-pl_PL-jarvis_wg_glos-medium"
+display_name = "VITS Piper pl_PL (Jarvis, medium)"
+repo = "WitoldG/polish_piper_models"
+recommended = true

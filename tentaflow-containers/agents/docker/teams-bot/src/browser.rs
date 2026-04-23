@@ -118,21 +118,54 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // KROK 1: Dialog "Are you sure you don't want audio or video?"
-    // Button: "Continue without audio or video"
-    tracing::info!("Sprawdzanie dialogu audio/video");
-    let _ = click_when_present(
-        &page,
-        r#"
-        (function() {
-            const btn = Array.from(document.querySelectorAll('button'))
-                .find(el => el.textContent && el.textContent.trim() === 'Continue without audio or video');
-            if (btn) { btn.click(); return true; }
-            return false;
-        })()
-        "#,
-        Duration::from_secs(10),
-        "dialog 'Continue without audio or video'",
-    ).await;
+    // Gdy bot_video_enabled=true NIE klikamy "Continue without" — zamiast tego
+    // wlaczamy kamere w prejoin zeby MSTG video-track byl aktywny. Najpierw
+    // jednak pytamy JS czy MSTG/OffscreenCanvas faktycznie zostaly zainicjalizowane —
+    // w przeciwnym razie wlaczenie kamery w UI stworzy czarny strumien.
+    let video_available = if config.bot_video_enabled {
+        page.evaluate("!!window.__tentaflowVideoAvailable").await
+            .map(|v| v.into_value::<bool>().unwrap_or(false))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if config.bot_video_enabled && !video_available {
+        tracing::warn!("bot_video_enabled=true ale MSTG/OffscreenCanvas niedostepne — fallback na 'Continue without'");
+    }
+    if config.bot_video_enabled && video_available {
+        tracing::info!("bot_video_enabled=true — wlaczam kamere w prejoin");
+        let _ = click_when_present(
+            &page,
+            r#"
+            (function() {
+                const toggle = document.querySelector('[data-tid="toggle-video"]')
+                    || document.querySelector('button[aria-label*="camera" i]');
+                if (!toggle) return false;
+                const pressed = toggle.getAttribute('aria-pressed') === 'true'
+                    || toggle.getAttribute('aria-checked') === 'true';
+                if (!pressed) { toggle.click(); }
+                return true;
+            })()
+            "#,
+            Duration::from_secs(10),
+            "prejoin toggle camera ON",
+        ).await;
+    } else {
+        tracing::info!("bot_video_enabled=false — klikam 'Continue without audio or video'");
+        let _ = click_when_present(
+            &page,
+            r#"
+            (function() {
+                const btn = Array.from(document.querySelectorAll('button'))
+                    .find(el => el.textContent && el.textContent.trim() === 'Continue without audio or video');
+                if (btn) { btn.click(); return true; }
+                return false;
+            })()
+            "#,
+            Duration::from_secs(10),
+            "dialog 'Continue without audio or video'",
+        ).await;
+    }
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -263,26 +296,6 @@ async fn is_in_meeting(page: &Page) -> Result<bool> {
         .unwrap_or(false);
 
     Ok(in_meeting)
-}
-
-/// Pobiera nazwe aktywnego mowcy z DOM strony Teams
-pub async fn get_active_speaker(page: &Page) -> Result<Option<String>> {
-    // TODO: Scraping DOM Teams dla aktywnego mowcy
-    // Teams oznacza aktywnego mowce podswietleniem ramki wideo
-    // i wyswietleniem nazwy w elemencie z odpowiednia klasa CSS.
-    //
-    // Przykladowy selektor (moze wymagac aktualizacji):
-    //   [data-tid="active-speaker-name"]
-    //
-    // Alternatywa: monitorowanie zdarzen DOM przez MutationObserver
-    // wstrzykniety jako skrypt JavaScript.
-
-    let _result = page
-        .evaluate("document.querySelector('[data-tid=\"active-speaker-name\"]')?.textContent")
-        .await;
-
-    // Na razie zwracamy None — pelna implementacja wymaga testow z Teams
-    Ok(None)
 }
 
 /// Sprawdza czy Teams przekierowalo na strone logowania (sesja wygasla)
