@@ -23,6 +23,54 @@ use crate::audio::RosterEntry;
 use crate::config::MeetingConfig;
 use crate::summarizer::{TranscriptBuffer, TranscriptEntry};
 use crate::vad::VadResult;
+use tentaflow_protocol::MeetingEventPayload;
+
+/// Model diarization jest skonfigurowany hardcoded po stronie routera (mesh
+/// config — jeden pipeline pyannote w tej wersji). Bot nie wie który konkretnie
+/// jest używany, więc raportuje ustaloną nazwę — router przed broadcastem może
+/// ją podmienić jeśli kiedyś pojawi się wybór.
+const DIARIZATION_MODEL_NAME: &str = "pyannote-3.1";
+
+/// Wysyła jednorazowy MeetingEventPayload::BackendUpdate na start sesji tak,
+/// żeby dashboard pokazał jakie aliasy modeli są w grze. Pola opcjonalne
+/// (liczby) zostają `None` — router może je wypełnić przed broadcastem
+/// (enrolled_speakers z voice_profiles, total_participants z rostera).
+async fn send_backend_update(
+    router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+    meeting_id: &str,
+    config: &MeetingConfig,
+) {
+    let client = {
+        let guard = router.lock().await;
+        guard.as_ref().cloned()
+    };
+    let Some(client) = client else {
+        tracing::warn!("send_backend_update: router client niedostepny");
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = client
+        .send_meeting_event(
+            meeting_id,
+            ts,
+            MeetingEventPayload::BackendUpdate {
+                stt_model: config.stt_alias.clone(),
+                tts_model: config.tts_alias.clone(),
+                summarization_model: config.summarization_alias.clone(),
+                diarization_model: DIARIZATION_MODEL_NAME.to_string(),
+                streaming_latency_ms: None,
+                enrolled_speakers: None,
+                total_participants: None,
+            },
+        )
+        .await
+    {
+        tracing::warn!("send_meeting_event BackendUpdate failed: {}", e);
+    }
+}
 
 /// Uchwyt aktualnie uruchomionej petli summarizera dla sesji spotkania.
 /// Przy LeaveMeeting / nowym JoinMeeting stary handle jest zamykany, a w jego
@@ -188,10 +236,11 @@ async fn main() -> Result<()> {
         summarizer_handle = spawn_summarizer(
             transcript_buffer.clone(),
             router_client_handle.clone(),
-            meeting_id,
+            meeting_id.clone(),
             &config,
         )
         .await;
+        send_backend_update(&router_client_handle, &meeting_id, &config).await;
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
@@ -240,6 +289,7 @@ async fn main() -> Result<()> {
     }
     {
         let speaker_state = Arc::clone(&current_active_speaker);
+        let router_for_speaker = Arc::clone(&router_client_handle);
         tokio::spawn(async move {
             let mut none_count: u32 = 0;
             while let Some(name) = speaker_rx.rx.recv().await {
@@ -255,7 +305,47 @@ async fn main() -> Result<()> {
                 } else {
                     none_count = 0;
                 }
-                *speaker_state.write().await = name;
+                // Porównaj ze stanem poprzednim — emit ParticipantUpdate tylko
+                // przy realnej zmianie Some(X)->Some(Y) albo None->Some(Y).
+                // Przejście Some->None (opuszczenie mównicy) zostawiamy ciche —
+                // nie znamy speaker_id bez nowej wartości, a dashboard liczy
+                // "active_now" jako ostatni znany.
+                let prev = speaker_state.read().await.clone();
+                *speaker_state.write().await = name.clone();
+                if let Some(new_name) = name {
+                    if prev.as_deref() != Some(new_name.as_str()) {
+                        let client = {
+                            let guard = router_for_speaker.lock().await;
+                            guard.as_ref().cloned()
+                        };
+                        if let Some(client) = client {
+                            if let Some(meeting_id) = client.current_meeting_id() {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                if let Err(e) = client
+                                    .send_meeting_event(
+                                        &meeting_id,
+                                        ts,
+                                        MeetingEventPayload::ParticipantUpdate {
+                                            speaker_id: new_name.clone(),
+                                            speaker_name: Some(new_name.clone()),
+                                            status: "active_now".to_string(),
+                                            last_spoken_ago_sec: None,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "send_meeting_event ParticipantUpdate failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -509,6 +599,7 @@ async fn main() -> Result<()> {
                         silence_tail_samples = 0;
                         continue;
                     };
+                    let stt_started = std::time::Instant::now();
                     let stt_result = match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
                         client.transcribe(&speech_buffer, stt_alias, None, extra_meta),
@@ -519,9 +610,10 @@ async fn main() -> Result<()> {
                             Err(anyhow::anyhow!("STT timeout"))
                         }
                     };
+                    let stt_latency_ms = stt_started.elapsed().as_millis() as u64;
                     match stt_result {
                         Ok(text) if !text.is_empty() => {
-                            tracing::info!(text = %text, "STT zwrocilo transkrypt");
+                            tracing::info!(text = %text, latency_ms = stt_latency_ms, "STT zwrocilo transkrypt");
                             let _ = transcript_tx.send(("Nieznany".to_string(), text.clone(), timestamp_ms));
 
                             // Wpis do rolling bufferu summarizera. Speaker name
@@ -537,9 +629,43 @@ async fn main() -> Result<()> {
                                 let mut buf = transcript_buffer.lock().await;
                                 buf.push(TranscriptEntry {
                                     timestamp_ms: timestamp_ms as i64,
-                                    speaker_name: speaker_label,
+                                    speaker_name: speaker_label.clone(),
                                     text: text.clone(),
                                 });
+                            }
+
+                            // Live broadcast chunku transkryptu — router rozsyła
+                            // do dashboardu i może wzbogacić speaker_id (diarization
+                            // lookup z voice_profiles). Persist chunka do DB leci
+                            // osobno przez STT metadata `meeting_id` → transcript_store,
+                            // więc ten event nie duplikuje zapisu.
+                            if let Some(meeting_id) = client.current_meeting_id() {
+                                if let Err(e) = client
+                                    .send_meeting_event(
+                                        &meeting_id,
+                                        timestamp_ms as i64,
+                                        MeetingEventPayload::TranscriptEntry {
+                                            speaker_id: speaker_label.clone(),
+                                            speaker_name: if speaker_label == "Nieznany" {
+                                                None
+                                            } else {
+                                                Some(speaker_label.clone())
+                                            },
+                                            is_enrolled: false,
+                                            speaker_confidence: None,
+                                            text: text.clone(),
+                                            language: None,
+                                            resolved_stt_model: stt_alias.to_string(),
+                                            latency_ms: stt_latency_ms,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "send_meeting_event TranscriptEntry failed: {}",
+                                        e
+                                    );
+                                }
                             }
 
                             // TTS uruchamiamy TYLKO w echo_mode (tryb testowy). Bez tego
@@ -647,6 +773,12 @@ async fn main() -> Result<()> {
                                             transcript_buffer.clone(),
                                             router_client_handle.clone(),
                                             meeting_id.clone(),
+                                            &config,
+                                        )
+                                        .await;
+                                        send_backend_update(
+                                            &router_client_handle,
+                                            &meeting_id,
                                             &config,
                                         )
                                         .await;
