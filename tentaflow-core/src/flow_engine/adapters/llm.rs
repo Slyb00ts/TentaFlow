@@ -412,4 +412,8 @@ impl NodeAdapter for LlmNodeAdapter {
     fn supports_streaming(&self) -> bool {
         true
     }
+
+    fn supported_output_ports(&self) -> &'static [&'static str] {
+        &["stream", "full"]
+    }
 }

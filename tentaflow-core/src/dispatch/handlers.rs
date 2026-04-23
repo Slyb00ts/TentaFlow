@@ -95,6 +95,20 @@ fn audit(
     });
 }
 
+/// Waliduje flow_json semantycznie: parse + sprawdzenie ze porty krawedzi
+/// pasuja do metadata adapterow. Jesli Router nie ma FlowDispatcher (np.
+/// Router bez DB w niektorych test fixture) — walidacja jest pomijana, bo
+/// rejestr adapterow nie jest dostepny. W produkcji dispatcher istnieje zawsze.
+fn validate_flow_json_str(ctx: &HandlerContext, flow_json: &str) -> Result<(), ProtocolError> {
+    let Some(dispatcher) = ctx.state.router.flow_dispatcher() else {
+        return Ok(());
+    };
+    let parsed: crate::flow_engine::types::FlowDefinition = serde_json::from_str(flow_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid flow_json: {}", e)))?;
+    crate::flow_engine::validation::validate_flow(&parsed, dispatcher.registry())
+        .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
+}
+
 // =============================================================================
 // Meta — keepalive, cancel
 // =============================================================================
@@ -607,6 +621,8 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         return Err(ProtocolError::bad_request("flow name required"));
     }
 
+    validate_flow_json_str(ctx, &payload.graph_json)?;
+
     let params = db::models::FlowParams {
         name: &payload.name,
         description: payload.description.as_deref(),
@@ -745,9 +761,7 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         .flow_json
         .clone()
         .unwrap_or_else(|| existing.flow_json.clone());
-    if serde_json::from_str::<serde_json::Value>(&new_flow_json).is_err() {
-        return Err(ProtocolError::bad_request("invalid flow_json"));
-    }
+    validate_flow_json_str(ctx, &new_flow_json)?;
     let new_status = payload
         .status
         .clone()
@@ -950,6 +964,7 @@ pub fn flow_version_restore(
         .ok_or_else(|| ProtocolError::not_found("flow version not found"))?;
 
     let flow_json = version.flow_json.as_deref().unwrap_or("");
+    validate_flow_json_str(ctx, flow_json)?;
     let params = db::models::FlowParams {
         name: &version.name,
         description: version.description.as_deref(),
@@ -2484,6 +2499,7 @@ fn store_peer_to_proto(
     local_node_id: &str,
     is_trusted: bool,
     route: Option<tentaflow_protocol::MeshNodeRoute>,
+    connection: Option<crate::mesh::iroh_manager::ConnectionSnapshot>,
 ) -> tentaflow_protocol::MeshNodeInfo {
     let is_local = p.node_id == local_node_id;
     let effective_status = if is_local {
@@ -2603,6 +2619,22 @@ fn store_peer_to_proto(
         last_seen_epoch: Some(parse_ts(&p.discovered_at) as i64),
         route,
         platform: p.platform.clone(),
+        connection: connection.map(|c| tentaflow_protocol::MeshConnectionInfo {
+            transport: c.transport,
+            scope: c.scope,
+            address: c.address,
+            relay_url: c.relay_url,
+            paths: c
+                .paths
+                .into_iter()
+                .map(|p| tentaflow_protocol::MeshConnectionPathInfo {
+                    transport: p.transport,
+                    address: p.address,
+                    selected: p.selected,
+                    closed: p.closed,
+                })
+                .collect(),
+        }),
     }
 }
 
@@ -2626,6 +2658,12 @@ pub fn mesh_node_list(
     let store = &ctx.state.mesh_peer_store;
     let local_node_id = ctx.state.local_node_id.as_ref();
     let peers = store.list();
+    let connection_map = ctx
+        .state
+        .quic_mesh
+        .as_ref()
+        .map(|qm| qm.connection_snapshots())
+        .unwrap_or_default();
     let trusted_db = repository::list_trusted_nodes(&ctx.state.db).map_err(db_err)?;
     let trusted_ids: std::collections::HashSet<String> =
         trusted_db.iter().map(|t| t.node_id.clone()).collect();
@@ -2661,7 +2699,13 @@ pub fn mesh_node_list(
                         },
                     })
             };
-            store_peer_to_proto(p, local_node_id, is_trusted, route)
+            store_peer_to_proto(
+                p,
+                local_node_id,
+                is_trusted,
+                route,
+                connection_map.get(&p.node_id).cloned(),
+            )
         })
         .collect();
 
@@ -2697,6 +2741,7 @@ pub fn mesh_node_list(
             last_seen_epoch: None,
             route: None,
             platform: String::new(),
+            connection: None,
         });
     }
 
@@ -2754,7 +2799,12 @@ pub fn mesh_node_detail(
                 },
             })
     };
-    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route);
+    let connection = ctx
+        .state
+        .quic_mesh
+        .as_ref()
+        .and_then(|qm| qm.connection_snapshot(&payload.node_id));
+    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection);
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
     ))

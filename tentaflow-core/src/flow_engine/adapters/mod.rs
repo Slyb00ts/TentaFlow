@@ -38,6 +38,19 @@ pub trait NodeAdapter: Send + Sync {
     fn supports_streaming(&self) -> bool {
         false
     }
+
+    /// Lista dostepnych portow wyjsciowych tego typu node'a. Default tylko "full".
+    /// Adaptery streamujace (LLM, TTS) override'uja i dodaja "stream".
+    /// Uzywamy &'static [&'static str] zeby nie alokowac — listy sa statyczne
+    /// per adapter i walidacja wywoluje to przy kazdym save flow_json.
+    fn supported_output_ports(&self) -> &'static [&'static str] {
+        &["full"]
+    }
+
+    /// Lista dostepnych portow wejsciowych. Default tylko "in".
+    fn supported_input_ports(&self) -> &'static [&'static str] {
+        &["in"]
+    }
 }
 
 /// Rejestr adapterow - mapuje typ wezla na konkretny adapter.
@@ -58,6 +71,10 @@ pub trait NodeAdapterDyn: Send + Sync {
     fn node_type(&self) -> &'static str;
 
     fn supports_streaming(&self) -> bool;
+
+    fn supported_output_ports(&self) -> &'static [&'static str];
+
+    fn supported_input_ports(&self) -> &'static [&'static str];
 }
 
 /// Automatyczna implementacja NodeAdapterDyn dla kazdego typu
@@ -77,6 +94,14 @@ impl<T: NodeAdapter> NodeAdapterDyn for T {
 
     fn supports_streaming(&self) -> bool {
         NodeAdapter::supports_streaming(self)
+    }
+
+    fn supported_output_ports(&self) -> &'static [&'static str] {
+        NodeAdapter::supported_output_ports(self)
+    }
+
+    fn supported_input_ports(&self) -> &'static [&'static str] {
+        NodeAdapter::supported_input_ports(self)
     }
 }
 
@@ -112,5 +137,59 @@ impl AdapterRegistry {
 impl Default for AdapterRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow_engine::types::FlowContext;
+    use anyhow::Result;
+
+    struct DefaultsAdapter;
+    impl NodeAdapter for DefaultsAdapter {
+        fn execute(
+            &self,
+            _c: &Value,
+            _ctx: &mut FlowContext,
+        ) -> impl std::future::Future<Output = Result<Value>> + Send {
+            async { Ok(Value::Null) }
+        }
+        fn node_type(&self) -> &'static str {
+            "defaults"
+        }
+    }
+
+    struct StreamyAdapter;
+    impl NodeAdapter for StreamyAdapter {
+        fn execute(
+            &self,
+            _c: &Value,
+            _ctx: &mut FlowContext,
+        ) -> impl std::future::Future<Output = Result<Value>> + Send {
+            async { Ok(Value::Null) }
+        }
+        fn node_type(&self) -> &'static str {
+            "streamy"
+        }
+        fn supported_output_ports(&self) -> &'static [&'static str] {
+            &["stream", "full"]
+        }
+    }
+
+    #[test]
+    fn default_ports_full_and_in() {
+        let a = DefaultsAdapter;
+        assert_eq!(NodeAdapter::supported_output_ports(&a), &["full"]);
+        assert_eq!(NodeAdapter::supported_input_ports(&a), &["in"]);
+    }
+
+    #[test]
+    fn override_ports_propagate_through_dyn() {
+        let mut reg = AdapterRegistry::new();
+        reg.register(StreamyAdapter);
+        let dyn_adapter = reg.get("streamy").expect("adapter present");
+        assert_eq!(dyn_adapter.supported_output_ports(), &["stream", "full"]);
+        assert_eq!(dyn_adapter.supported_input_ports(), &["in"]);
     }
 }

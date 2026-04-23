@@ -911,6 +911,8 @@ mod tests {
             to: to.to_string(),
             label: None,
             condition: None,
+            from_port: "full".to_string(),
+            to_port: "in".to_string(),
         }
     }
 
