@@ -174,10 +174,6 @@ pub struct RequestMetrics {
     pub stt_ms: Option<u64>,
     /// Speaker identification
     pub speaker_id_ms: Option<u64>,
-    /// Memory Analyzer - query decision (bielik-1.5b)
-    pub query_analysis_ms: Option<u64>,
-    /// Memory query (QUIC do Memory Engine)
-    pub memory_query_ms: Option<u64>,
     /// Person context lookup
     pub person_context_ms: Option<u64>,
     /// Main LLM inference (bielik-11b)
@@ -218,12 +214,6 @@ impl RequestMetrics {
         }
         if let Some(ms) = self.speaker_id_ms {
             lines.push(format!("│ Speaker ID       {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.query_analysis_ms {
-            lines.push(format!("│ Query Analysis   {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.memory_query_ms {
-            lines.push(format!("│ Memory Query     {:>10} ms     │", ms));
         }
         if let Some(ms) = self.person_context_ms {
             lines.push(format!("│ Person Context   {:>10} ms     │", ms));
@@ -954,77 +944,6 @@ impl Router {
             }
         }
         model.to_string()
-    }
-
-    // ========================================================================
-    // CONVERSATION CONTEXT BUILDERS
-    // ========================================================================
-
-    /// Buduje kontekst rozmowy z ostatnich wiadomosci dla Intent Analyzera.
-    #[allow(dead_code)]
-    pub(crate) fn build_conversation_context_for_intent(
-        &self,
-        messages: &[crate::api::openai::types::Message],
-        max_turns: usize,
-    ) -> Option<String> {
-        if messages.is_empty() {
-            return None;
-        }
-
-        let skip_last = if messages.len() > 1 { 1 } else { 0 };
-        let start = messages.len().saturating_sub(max_turns + skip_last);
-        let end = messages.len().saturating_sub(skip_last);
-
-        if start >= end {
-            return None;
-        }
-
-        let mut context_parts = Vec::new();
-        for msg in &messages[start..end] {
-            let role = match msg.role.as_str() {
-                "assistant" => "ASSISTANT",
-                "user" => "USER",
-                "system" => continue,
-                _ => &msg.role,
-            };
-
-            let text = match &msg.content {
-                Some(crate::api::openai::types::MessageContent::Text(s)) => Some(s.clone()),
-                Some(crate::api::openai::types::MessageContent::Parts(parts)) => {
-                    let texts: Vec<String> = parts
-                        .iter()
-                        .filter_map(|p| {
-                            if let crate::api::openai::types::ContentPart::Text { text } = p {
-                                Some(text.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if texts.is_empty() {
-                        None
-                    } else {
-                        Some(texts.join(" "))
-                    }
-                }
-                None => None,
-            };
-
-            if let Some(content) = text {
-                let truncated = if content.chars().count() > 200 {
-                    format!("{}...", content.chars().take(200).collect::<String>())
-                } else {
-                    content
-                };
-                context_parts.push(format!("{}: {}", role, truncated));
-            }
-        }
-
-        if context_parts.is_empty() {
-            None
-        } else {
-            Some(context_parts.join("\n"))
-        }
     }
 
     // ========================================================================

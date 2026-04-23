@@ -76,7 +76,8 @@ impl MemoryNodeAdapter {
         ctx.input.clone()
     }
 
-    /// Rozwiazuje zapytanie do pamieci - preferuje search_terms z memory_analyzer
+    /// Rozwiazuje zapytanie do pamieci — preferuje search_terms wstrzyknięte przez
+    /// poprzedzający węzeł flow; w ich braku używa surowego inputu.
     fn resolve_query_text(&self, node_config: &Value, ctx: &FlowContext) -> String {
         for result in ctx.node_results.values() {
             if result.get("should_query").and_then(|v| v.as_bool()) == Some(true) {
@@ -85,7 +86,7 @@ impl MemoryNodeAdapter {
                     if !terms_str.is_empty() {
                         debug!(
                             terms_count = terms_str.len(),
-                            "Memory adapter: uzywam search_terms z memory_analyzer"
+                            "Memory adapter: uzywam search_terms z node_results"
                         );
                         return terms_str.join(" ");
                     }
