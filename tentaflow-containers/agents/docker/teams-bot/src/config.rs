@@ -91,6 +91,27 @@ pub struct MeetingConfig {
     /// przez glosniki/echo Teams i transkrybuje go ponownie.
     #[serde(default)]
     pub echo_mode: bool,
+
+    /// Co ile sekund summarizer generuje podsumowanie z rolling bufferu
+    /// transkrypcji i wysyla MeetingEvent do routera.
+    #[serde(default = "default_summarization_interval_sec")]
+    pub summarization_interval_sec: u64,
+
+    /// Ile minut historii transkrypcji trzymamy w rolling bufferze. Starsze wpisy
+    /// sa odrzucane. LLM dostaje okno z ostatnich N minut — bez tego dlugie
+    /// spotkania dawalyby context overflow.
+    #[serde(default = "default_transcript_buffer_minutes")]
+    pub transcript_buffer_minutes: u64,
+
+    /// Minimalna liczba wpisow transkrypcji w bufferze zanim summarizer
+    /// uruchomi LLM. Zapobiega generowaniu na pustce (1-2 zdania → slaby JSON).
+    #[serde(default = "default_summarization_min_entries")]
+    pub summarization_min_entries: usize,
+
+    /// Jezyk prompta transcription_summarization (pl/en/de/es/fr). Dopasowany
+    /// do seeda w DB — patrz tentaflow-core/src/db/seed.rs.
+    #[serde(default = "default_meeting_language")]
+    pub meeting_language: String,
 }
 
 fn default_transport_port() -> u16 {
@@ -131,6 +152,22 @@ fn default_tts_alias() -> String {
 
 fn default_flow_alias() -> String {
     "teams-flow".to_string()
+}
+
+fn default_summarization_interval_sec() -> u64 {
+    60
+}
+
+fn default_transcript_buffer_minutes() -> u64 {
+    10
+}
+
+fn default_summarization_min_entries() -> usize {
+    3
+}
+
+fn default_meeting_language() -> String {
+    "pl".to_string()
 }
 
 impl MeetingConfig {
@@ -189,6 +226,14 @@ impl MeetingConfig {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
             echo_mode: std::env::var("ECHO_MODE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
+            summarization_interval_sec: std::env::var("SUMMARIZATION_INTERVAL_SEC")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(60),
+            transcript_buffer_minutes: std::env::var("TRANSCRIPT_BUFFER_MINUTES")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(10),
+            summarization_min_entries: std::env::var("SUMMARIZATION_MIN_ENTRIES")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            meeting_language: std::env::var("MEETING_LANGUAGE")
+                .unwrap_or_else(|_| "pl".to_string()),
         };
 
         tracing::info!("Konfiguracja zaladowana ze zmiennych srodowiskowych");
