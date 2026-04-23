@@ -271,58 +271,6 @@ fn parse_summary_json(raw: &str) -> Option<SummaryJson> {
     serde_json::from_str::<SummaryJson>(&raw[start..=end]).ok()
 }
 
-/// Polski prompt fallback. Uzywany gdy bot jeszcze nie ma reverse handlera
-/// `PromptFetch` (planowane w Etap 2.3). Tresc jest lustrzanym odbiciem
-/// seeda `PROMPT_TRANSCRIPTION_SUMMARIZATION_PL` w `tentaflow-core/src/db/seed.rs`.
-/// Klucze JSON (`decisions`, `action_items`, `owner`, `task`, `deadline`,
-/// `summary_text`) musza pozostac zgodne miedzy prompt a parserem `SummaryJson`.
-pub const PROMPT_FALLBACK_PL: &str = r#"Jesteś asystentem spotkań biznesowych. Na podstawie poniższego fragmentu transkryptu spotkania wyciągnij strukturalne podsumowanie.
-
-Zwróć wyłącznie JSON w formacie:
-{
-  "decisions": "Krótki opis kluczowych decyzji podjętych w tym fragmencie (1-3 zdania, zwięźle).",
-  "action_items": [
-    {
-      "owner": "Imię osoby odpowiedzialnej (lub 'Nieokreślone' jeśli brak)",
-      "task": "Treść zadania do wykonania",
-      "deadline": "Termin w formie jaka padła w rozmowie (np. 'dziś 16:00', 'do piątku', 'po merge'). Wpisz 'brak daty' jeśli nie podano."
-    }
-  ],
-  "summary_text": "Zwięzłe podsumowanie fragmentu (2-4 zdania) obejmujące temat, obecny stan prac i najważniejsze problemy."
-}
-
-Format transkryptu wejściowego: każda wypowiedź poprzedzona jest etykietą mówcy w kwadratowych nawiasach, np. `[Jan Kowalski] Treść wypowiedzi.`. Mówcy nierozpoznani mają etykietę `[SPEAKER_00]`, `[SPEAKER_01]` itd.
-
-Nie dodawaj pól których brak w powyższym schemacie. Nie komentuj. Zwróć wyłącznie valid JSON."#;
-
-pub const PROMPT_FALLBACK_EN: &str = r#"You are a business meeting assistant. Based on the following meeting transcript fragment, extract a structured summary.
-
-Return only JSON in the format:
-{
-  "decisions": "Brief description of key decisions made in this fragment (1-3 sentences, concise).",
-  "action_items": [
-    {
-      "owner": "Name of the responsible person (or 'Unspecified' if missing)",
-      "task": "Content of the task to be done",
-      "deadline": "Deadline as stated in the conversation (e.g. 'today 4pm', 'by Friday', 'after merge'). Use 'no date' if none was given."
-    }
-  ],
-  "summary_text": "Concise summary of the fragment (2-4 sentences) covering the topic, current state of work, and most important issues."
-}
-
-Input transcript format: each utterance is prefixed with a speaker label in square brackets, e.g. `[John Smith] Utterance text.`. Unrecognized speakers are labelled `[SPEAKER_00]`, `[SPEAKER_01]`, etc.
-
-Do not add fields not present in the schema above. Do not comment. Return valid JSON only."#;
-
-/// Zwraca fallback prompt dla danego jezyka. Jesli jezyk nie jest wspierany —
-/// zwraca polski wariant (zgodnie z zachowaniem `find_prompt` w repository).
-pub fn fallback_prompt_for(language: &str) -> &'static str {
-    match language {
-        "en" => PROMPT_FALLBACK_EN,
-        _ => PROMPT_FALLBACK_PL,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,10 +361,4 @@ mod tests {
         assert_eq!(p.action_items[0].deadline, None);
     }
 
-    #[test]
-    fn fallback_prompt_returns_pl_for_unknown_lang() {
-        assert_eq!(fallback_prompt_for("pl"), PROMPT_FALLBACK_PL);
-        assert_eq!(fallback_prompt_for("en"), PROMPT_FALLBACK_EN);
-        assert_eq!(fallback_prompt_for("xx"), PROMPT_FALLBACK_PL);
-    }
 }
