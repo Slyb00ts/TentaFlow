@@ -479,8 +479,32 @@ pub fn model_list_request(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
+
+    // ACL filter — gdy zalogowany user nie-admin, ukrywamy modele do ktorych
+    // jego grupa lub on sam ma deny. Anonymous sees nothing additional (full
+    // list — fallback do legacy zachowania, niezalogowani na wewn. dashboardzie).
+    let user_acl = match &ctx.session {
+        crate::dispatch::SessionAuth::UserSession { user_id, role, .. } => {
+            let role_str = role.clone().unwrap_or_else(|| "user".to_string());
+            if role_str == "admin" {
+                None
+            } else if let Some(i64_id) = user_id_to_i64(user_id) {
+                Some((i64_id, role_str))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
     let models: Vec<ModelSummary> = services
         .into_iter()
+        .filter(|s| match &user_acl {
+            Some((uid, role)) => crate::routing::acl::check_access_safe(
+                &ctx.state.db, "model", &s.name, *uid, role,
+            ),
+            None => true,
+        })
         .map(|s| ModelSummary {
             id: s.name.clone(),
             category: s.model_category.clone().unwrap_or_else(|| "llm".into()),

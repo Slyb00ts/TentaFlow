@@ -164,6 +164,25 @@ impl FlowDispatcher {
         };
 
         let flow_id = flow.id;
+
+        // ACL — flow ma resource_type='flow', resource_id=flow.id (string).
+        // Skipujemy gdy ctx nie ma user_id (internal caller).
+        if let Some(uid) = ctx.user_id {
+            let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
+            if !crate::routing::acl::check_access_safe(
+                &self.db,
+                "flow",
+                &flow_id.to_string(),
+                uid,
+                &role,
+            ) {
+                tracing::warn!(user_id = uid, flow_id, "ACL denied flow execution");
+                // Skipujemy flow → fallback na stary pipeline (zachowanie identyczne
+                // jak gdy flow nie istnieje — user moze uzyc bezposredniego routingu).
+                return Ok(None);
+            }
+        }
+
         let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
         match timeout(
             Duration::from_secs(FLOW_TIMEOUT_SECS),

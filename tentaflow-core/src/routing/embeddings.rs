@@ -18,6 +18,27 @@ use tracing::debug;
 impl Router {
     /// Routuje embeddings request do odpowiedniego backendu.
     ///
+    /// Wariant z user context — sprawdza ACL ('model', request.model) zanim
+    /// uderzymy w backend. Maskujemy denied jako AllBackendsUnavailable
+    /// zeby nie ujawniac istnienia modelu.
+    pub async fn route_embeddings_for_user(
+        &self,
+        request: EmbeddingRequest,
+        user: Option<crate::routing::acl::UserContext>,
+    ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
+        if let Some(ref u) = user {
+            if let Some(ref db) = self.db {
+                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                    tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied embedding model");
+                    return Err(crate::error::CoreError::AllBackendsUnavailable {
+                        model_name: request.model.clone(),
+                    }.into());
+                }
+            }
+        }
+        self.route_embeddings(request).await
+    }
+
     /// Obsluguje zarowno Single jak i Multiple input, kieruje do backendu
     /// obslugujacego embeddings (QUIC preferowany, HTTP fallback).
     pub async fn route_embeddings(
