@@ -46,6 +46,13 @@ pub struct RouterClient {
     current_meeting_id: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
+/// Wynik wywolania `RouterClient::chat_completion` — text + rozwiazana nazwa
+/// modelu (po alias resolution po stronie routera).
+pub struct ChatCompletionResult {
+    pub content: String,
+    pub resolved_model: String,
+}
+
 impl RouterClient {
     pub fn new(connection: Connection) -> Self {
         Self {
@@ -135,6 +142,87 @@ impl RouterClient {
             },
             ModelResult::Error(e) => anyhow::bail!("STT blad: {}", e.message),
             _ => anyhow::bail!("Nieoczekiwany typ odpowiedzi STT"),
+        }
+    }
+
+    /// Wysyla chat.completions request przez router. Router rozwiazuje alias
+    /// -> konkretny model i zwraca wygenerowany tekst + rozwiazana nazwa modelu.
+    /// Uzywane przez summarizer do generowania podsumowan transkryptu.
+    pub async fn chat_completion(
+        &self,
+        model_alias: &str,
+        messages: Vec<(String, String)>,
+    ) -> Result<ChatCompletionResult> {
+        let msgs: Vec<Message> = messages
+            .into_iter()
+            .map(|(role, content)| Message { role, content })
+            .collect();
+
+        let mut meta: Vec<(String, String)> = Vec::new();
+        if let Some(mid) = self.current_meeting_id() {
+            meta.push(("meeting_id".to_string(), mid));
+        }
+        let metadata = if meta.is_empty() { None } else { Some(meta) };
+
+        let request = ModelRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            payload: ModelPayload::Completion(CompletionPayload {
+                model: model_alias.to_string(),
+                prompt: None,
+                messages: msgs,
+                temperature: Some(0.2),
+                max_tokens: Some(1024),
+                top_p: None,
+                stop: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                tts_options: None,
+                memory_options: None,
+                audio_input: None,
+                prefix_cache_id: None,
+                prefix_text: None,
+            }),
+            stream: false,
+            metadata,
+            session_id: None,
+        };
+
+        let response = self.send_request(&request).await?;
+        match response.result {
+            ModelResult::Completion(c) => Ok(ChatCompletionResult {
+                content: c.text,
+                resolved_model: c.model,
+            }),
+            ModelResult::Error(e) => anyhow::bail!("chat_completion blad: {}", e.message),
+            _ => anyhow::bail!("Nieoczekiwany typ odpowiedzi chat_completion"),
+        }
+    }
+
+    /// Wysyla MeetingEvent (SummaryUpdate albo ActionItemsUpdate) do routera.
+    /// Router persistuje w tabelach `meeting_summaries` / `meeting_action_items`
+    /// przez `persist_meeting_event` w reverse_request.rs.
+    pub async fn send_meeting_event(
+        &self,
+        meeting_key: &str,
+        timestamp_ms: i64,
+        payload: MeetingEventPayload,
+    ) -> Result<()> {
+        let request = ModelRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: meeting_key.to_string(),
+                timestamp_ms,
+                payload,
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let response = self.send_request(&request).await?;
+        match response.result {
+            ModelResult::Error(e) => anyhow::bail!("MeetingEvent blad: {}", e.message),
+            _ => Ok(()),
         }
     }
 

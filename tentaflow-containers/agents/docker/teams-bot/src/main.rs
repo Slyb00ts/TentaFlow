@@ -8,6 +8,7 @@ mod audio;
 mod browser;
 mod config;
 mod quic_server;
+mod summarizer;
 mod vad;
 
 use anyhow::{Context, Result};
@@ -20,7 +21,23 @@ use tracing_subscriber::EnvFilter;
 
 use crate::audio::RosterEntry;
 use crate::config::MeetingConfig;
+use crate::summarizer::{TranscriptBuffer, TranscriptEntry};
 use crate::vad::VadResult;
+
+/// Uchwyt aktualnie uruchomionej petli summarizera dla sesji spotkania.
+/// Przy LeaveMeeting / nowym JoinMeeting stary handle jest zamykany, a w jego
+/// miejsce spawnujemy nowy — meeting_key musi pasowac do biezacej sesji.
+struct SummarizerHandle {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl SummarizerHandle {
+    async fn stop(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.join.await;
+    }
+}
 
 /// Sidecar meeting bot — automatyzacja spotkan Teams z pipeline audio
 #[derive(Parser, Debug)]
@@ -81,6 +98,50 @@ async fn main() -> Result<()> {
     }
     tracing::info!("Router polaczony — STT/TTS dostepne");
 
+    // Rolling buffer transkrypcji — summarizer czyta go co N sekund.
+    // Trzymany tu, a nie w summarizerze, zeby main loop mogl pushowac wpisy
+    // niezaleznie od lifecycle summarizera (summarizer spawnuje sie per-session,
+    // buffer zyje caly czas).
+    let transcript_buffer: Arc<tokio::sync::Mutex<TranscriptBuffer>> = Arc::new(
+        tokio::sync::Mutex::new(TranscriptBuffer::new(
+            (config.transcript_buffer_minutes as i64).saturating_mul(60),
+        )),
+    );
+
+    // Handle summarizera dla aktywnej sesji — None gdy bot nie jest w spotkaniu.
+    let mut summarizer_handle: Option<SummarizerHandle> = None;
+
+    // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
+    // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
+    // Prompt fetch przez reverse QUIC nie istnieje jeszcze (handler `PromptFetch`
+    // jest planowany na Etap 2.3) — uzywamy hardcoded fallbacku zduplikowanego
+    // z seed DB (tentaflow-core/src/db/seed.rs). Gdy fetch bedzie gotowy,
+    // ten komentarz i `fallback_prompt_for` zostana zastapione wywolaniem
+    // `router.fetch_prompt("transcription_summarization", lang)`.
+    fn spawn_summarizer(
+        buffer: Arc<tokio::sync::Mutex<TranscriptBuffer>>,
+        router: Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+        meeting_key: String,
+        config: &MeetingConfig,
+    ) -> SummarizerHandle {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let prompt_content = summarizer::fallback_prompt_for(&config.meeting_language).to_string();
+        let alias = config.summarization_alias.clone();
+        let interval = config.summarization_interval_sec;
+        let min_entries = config.summarization_min_entries;
+        let join = tokio::spawn(summarizer::run_summarizer_loop(
+            buffer,
+            router,
+            interval,
+            min_entries,
+            meeting_key,
+            alias,
+            prompt_content,
+            rx,
+        ));
+        SummarizerHandle { shutdown_tx: tx, join }
+    }
+
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
     let mut _chromium: Option<chromiumoxide::browser::Browser> = None;
     let mut page = if !config.meeting_url.is_empty() {
@@ -88,6 +149,24 @@ async fn main() -> Result<()> {
         let p = browser::join_meeting(&browser, &config.meeting_url, &config).await?;
         _chromium = Some(browser);
         tracing::info!("Dolaczono do spotkania");
+        // Auto-join — ustaw meeting_id w RouterClient i spawn summarizer. Bez
+        // meeting_id router nie przypisze transkryptu/summary do sesji.
+        let meeting_id = config
+            .meeting_id_override
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        {
+            let guard = router_client_handle.lock().await;
+            if let Some(ref c) = *guard {
+                c.set_meeting_id(meeting_id.clone());
+            }
+        }
+        summarizer_handle = Some(spawn_summarizer(
+            transcript_buffer.clone(),
+            router_client_handle.clone(),
+            meeting_id,
+            &config,
+        ));
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
@@ -420,6 +499,24 @@ async fn main() -> Result<()> {
                             tracing::info!(text = %text, "STT zwrocilo transkrypt");
                             let _ = transcript_tx.send(("Nieznany".to_string(), text.clone(), timestamp_ms));
 
+                            // Wpis do rolling bufferu summarizera. Speaker name
+                            // pochodzi z active_speaker DOM (gdy dostepny) — bez
+                            // diarization po stronie bota uzywamy fallback "Nieznany",
+                            // ktory i tak pojdzie do prompta jako `[Nieznany]`.
+                            let speaker_label = current_active_speaker
+                                .read()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| "Nieznany".to_string());
+                            {
+                                let mut buf = transcript_buffer.lock().await;
+                                buf.push(TranscriptEntry {
+                                    timestamp_ms: timestamp_ms as i64,
+                                    speaker_name: speaker_label,
+                                    text: text.clone(),
+                                });
+                            }
+
                             // TTS uruchamiamy TYLKO w echo_mode (tryb testowy). Bez tego
                             // bot powtarza co uslyszal = nieskonczony feedback loop, nawet
                             // ze self-speaking guardem. Docelowo LLM response pojdzie osobnym
@@ -482,6 +579,13 @@ async fn main() -> Result<()> {
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
                         }
+                        // Zatrzymaj summarizer poprzedniej sesji — nowe spotkanie
+                        // dostanie swojego z nowym meeting_key. Buffer czyscimy zeby
+                        // transkrypty z poprzedniego spotkania nie trafily do promptu.
+                        if let Some(h) = summarizer_handle.take() {
+                            h.stop().await;
+                        }
+                        transcript_buffer.lock().await.clear();
                         speech_buffer.clear();
                         vad_detector.reset();
 
@@ -512,6 +616,14 @@ async fn main() -> Result<()> {
                                     Ok(p) => {
                                         _chromium = Some(browser);
                                         page = Some(p);
+                                        // Odpal summarizera dla nowej sesji —
+                                        // meeting_key == meeting_id po stronie routera.
+                                        summarizer_handle = Some(spawn_summarizer(
+                                            transcript_buffer.clone(),
+                                            router_client_handle.clone(),
+                                            meeting_id.clone(),
+                                            &config,
+                                        ));
                                         let _ = response_tx.send(format!(
                                             "OK: dolaczono do spotkania (meeting_id={})",
                                             meeting_id
@@ -543,6 +655,10 @@ async fn main() -> Result<()> {
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
                         }
+                        if let Some(h) = summarizer_handle.take() {
+                            h.stop().await;
+                        }
+                        transcript_buffer.lock().await.clear();
                         speech_buffer.clear();
                         vad_detector.reset();
 
@@ -577,6 +693,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(h) = summarizer_handle.take() {
+        h.stop().await;
+    }
     let _ = shutdown_tx.send(true);
     tracing::info!("Sidecar meeting bot zakonczony");
     Ok(())
