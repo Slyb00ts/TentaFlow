@@ -301,7 +301,11 @@ function renderNodeCard(node, kind) {
 
   // Ikona i kolor - zalezne od kind/status.
   const icoKind = kind === 'local' ? 'local' : kind === 'trusted' ? 'paired' : 'pending';
-  const icoChar = kind === 'local' ? '⌂' : kind === 'trusted' ? '◎' : '?';
+  const icoHtml = kind === 'local'
+    ? '<svg class="icon icon-lg" aria-hidden="true"><use href="#i-home"/></svg>'
+    : kind === 'trusted'
+      ? '<svg class="icon icon-lg" aria-hidden="true"><use href="#i-core"/></svg>'
+      : '?';
 
   // Status chip
   let statusChip = '';
@@ -354,7 +358,7 @@ function renderNodeCard(node, kind) {
   return `
     <div class="mesh-card${localClass}${offlineClass}" data-node-detail="${escapeAttr(nodeId)}">
       <div class="mesh-card-head">
-        <div class="mesh-card-ico ${icoKind}">${icoChar}</div>
+        <div class="mesh-card-ico ${icoKind}">${icoHtml}</div>
         <div class="mesh-card-title">
           <div class="name-t">${escapeHtml(hostname)}${statusChip}${relayChip}</div>
           <div class="details">${detailBits.join(' · ')}</div>

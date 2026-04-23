@@ -903,7 +903,7 @@ input, textarea, select {
   flex-shrink: 0;
   font-size: 26px; line-height: 1; font-weight: 600;
 }
-.mesh-card-ico .icon { width: 24px; height: 24px; }
+.mesh-card-ico .icon { width: 24px; height: 24px; display: block; }
 .mesh-card-ico.local { background: rgba(34,197,94,0.15); color: var(--success); }
 .mesh-card-ico.paired { background: var(--accent-glow); color: var(--accent-1); }
 .mesh-card-ico.tailscale { background: rgba(96,165,250,0.15); color: var(--info); }
