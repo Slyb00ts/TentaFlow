@@ -113,19 +113,43 @@ async fn main() -> Result<()> {
 
     // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
     // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
-    // Prompt fetch przez reverse QUIC nie istnieje jeszcze (handler `PromptFetch`
-    // jest planowany na Etap 2.3) — uzywamy hardcoded fallbacku zduplikowanego
-    // z seed DB (tentaflow-core/src/db/seed.rs). Gdy fetch bedzie gotowy,
-    // ten komentarz i `fallback_prompt_for` zostana zastapione wywolaniem
-    // `router.fetch_prompt("transcription_summarization", lang)`.
-    fn spawn_summarizer(
+    // Prompt pobierany jest z DB routera przez reverse QUIC (handler `PromptFetch`).
+    // Gdy fetch nie powiedzie sie — zwracamy `None`, caller kontynuuje sesje
+    // bez summarizera (transcript nadal dziala). Zadnego hardcoded fallbacku.
+    async fn spawn_summarizer(
         buffer: Arc<tokio::sync::Mutex<TranscriptBuffer>>,
         router: Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
         meeting_key: String,
         config: &MeetingConfig,
-    ) -> SummarizerHandle {
+    ) -> Option<SummarizerHandle> {
+        // Pobierz aktualny RouterClient do fetchu promptu.
+        let client = {
+            let guard = router.lock().await;
+            guard.as_ref().cloned()
+        };
+        let Some(client) = client else {
+            tracing::warn!(
+                "spawn_summarizer: router client niedostepny — skip summarizer"
+            );
+            return None;
+        };
+
+        let prompt_content = match client
+            .fetch_prompt("transcription_summarization", &config.meeting_language)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    lang = %config.meeting_language,
+                    "fetch_prompt nie powiodl sie — summarizer nie wystartuje w tej sesji"
+                );
+                return None;
+            }
+        };
+
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let prompt_content = summarizer::fallback_prompt_for(&config.meeting_language).to_string();
         let alias = config.summarization_alias.clone();
         let interval = config.summarization_interval_sec;
         let min_entries = config.summarization_min_entries;
@@ -139,7 +163,7 @@ async fn main() -> Result<()> {
             prompt_content,
             rx,
         ));
-        SummarizerHandle { shutdown_tx: tx, join }
+        Some(SummarizerHandle { shutdown_tx: tx, join })
     }
 
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
@@ -161,12 +185,13 @@ async fn main() -> Result<()> {
                 c.set_meeting_id(meeting_id.clone());
             }
         }
-        summarizer_handle = Some(spawn_summarizer(
+        summarizer_handle = spawn_summarizer(
             transcript_buffer.clone(),
             router_client_handle.clone(),
             meeting_id,
             &config,
-        ));
+        )
+        .await;
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
@@ -618,12 +643,13 @@ async fn main() -> Result<()> {
                                         page = Some(p);
                                         // Odpal summarizera dla nowej sesji —
                                         // meeting_key == meeting_id po stronie routera.
-                                        summarizer_handle = Some(spawn_summarizer(
+                                        summarizer_handle = spawn_summarizer(
                                             transcript_buffer.clone(),
                                             router_client_handle.clone(),
                                             meeting_id.clone(),
                                             &config,
-                                        ));
+                                        )
+                                        .await;
                                         let _ = response_tx.send(format!(
                                             "OK: dolaczono do spotkania (meeting_id={})",
                                             meeting_id

@@ -198,6 +198,30 @@ impl RouterClient {
         }
     }
 
+    /// Pobiera treść promptu z DB routera po `prompt_id` + język. Router robi
+    /// fallback na `pl` jeśli wariant w żądanym języku nie istnieje.
+    /// Zwraca treść promptu (pole `content`) — `name` i `resolved_language`
+    /// są ignorowane, bo bot potrzebuje tylko treści do system message.
+    pub async fn fetch_prompt(&self, prompt_id: &str, language: &str) -> Result<String> {
+        let request = ModelRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            payload: ModelPayload::PromptFetch(PromptFetchRequest {
+                prompt_id: prompt_id.to_string(),
+                language: language.to_string(),
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let response = self.send_request(&request).await?;
+        match response.result {
+            ModelResult::PromptFetched(p) => Ok(p.content),
+            ModelResult::Error(e) => anyhow::bail!("PromptFetch blad: {}", e.message),
+            _ => anyhow::bail!("Nieoczekiwany typ odpowiedzi PromptFetch"),
+        }
+    }
+
     /// Wysyla MeetingEvent (SummaryUpdate albo ActionItemsUpdate) do routera.
     /// Router persistuje w tabelach `meeting_summaries` / `meeting_action_items`
     /// przez `persist_meeting_event` w reverse_request.rs.
