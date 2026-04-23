@@ -55,15 +55,31 @@ struct TentaFlowWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
 
+        // Wspoldzielony process pool — reuzywa procesy WebKit prewarm w
+        // AppDelegate.didFinishLaunching. Bez tego kazdy WKWebView spawnuje
+        // swoje GPU/WebContent/Networking procesy (4.5s kazdy).
+        config.processPool = AppDelegate.sharedProcessPool
+
         // Wylacz cache WKWebView — pliki statyczne sa wkompilowane w binarke
         // i musza byc ladowane z serwera zawsze na swiezo po aktualizacji
         config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
 
+        // Kamera / mikrofon w JS (getUserMedia w dashboard QR scannerze).
+        // Bez tych dwoch flag WKWebView nie pozwoli odtworzyc strumienia video
+        // i wymaga gestu uzytkownika przed kazdym play().
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.isOpaque = false
         webView.backgroundColor = .black
         webView.scrollView.contentInsetAdjustmentBehavior = .never
+
+        // Zapamietaj instancje w Coordinator — potrzebna przy wake zeby
+        // zrobic webView.reload() z handlera tentaflowForegrounded.
+        context.coordinator.managedWebView = webView
 
         // Sprawdzaj gotowość serwera zanim załadujesz strone
         context.coordinator.pollServer(webView: webView)
@@ -76,12 +92,80 @@ struct TentaFlowWebView: UIViewRepresentable {
         Coordinator(parent: self)
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate, URLSessionDelegate {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, URLSessionDelegate {
         let parent: TentaFlowWebView
         private var attempts = 0
 
+        /// Referencja na realny WKWebView — potrzebna przy wake zeby wykonac
+        /// reload(). Weak zeby nie zatrzymywac view w pamieci po deinit.
+        weak var managedWebView: WKWebView?
+
         init(parent: TentaFlowWebView) {
             self.parent = parent
+            super.init()
+
+            // Subskrybuj event z AppDelegate — emitowany w applicationWillEnterForeground.
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleForegrounded(_:)),
+                name: .tentaflowForegrounded,
+                object: nil
+            )
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        @objc private func handleForegrounded(_ note: Notification) {
+            guard let webView = managedWebView else { return }
+            let elapsed = (note.userInfo?["elapsed"] as? TimeInterval) ?? -1
+            NSLog("[TentaFlow] foreground resume — sprawdzam serwer (suspend \(String(format: "%.1f", elapsed))s)")
+            refreshAfterResume(webView: webView)
+        }
+
+        /// Po wybudzeniu apki: szybki HTTPS probe 1.5s. Jesli serwer zywy ->
+        /// webView.reload() (odswieza stale SSE/WebSocket po suspendzie).
+        /// Jesli nie -> splash + pelny pollServer.
+        func refreshAfterResume(webView: WKWebView) {
+            let sessionConfig = URLSessionConfiguration.ephemeral
+            sessionConfig.timeoutIntervalForRequest = 1.5
+            let session = URLSession(configuration: sessionConfig, delegate: self, delegateQueue: nil)
+
+            guard let url = URL(string: "https://127.0.0.1:8090") else { return }
+            let task = session.dataTask(with: url) { [weak self] _, response, error in
+                guard let self = self else { return }
+
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode > 0 {
+                    DispatchQueue.main.async {
+                        NSLog("[TentaFlow] resume: serwer zywy, webView.reload()")
+                        webView.reload()
+                    }
+                } else {
+                    let desc = error?.localizedDescription ?? "brak odpowiedzi"
+                    NSLog("[TentaFlow] resume: serwer martwy (\(desc)) — pollServer")
+                    DispatchQueue.main.async {
+                        self.attempts = 0
+                        self.parent.isLoading = true
+                        self.parent.statusText = "Odnawianie polaczenia..."
+                        self.parent.retryCount = 0
+                        self.pollServer(webView: webView)
+                    }
+                }
+            }
+            task.resume()
+        }
+
+        // iOS 15+ — WKWebView kieruje wszystkie prosby o kamere/mikrofon do
+        // WKUIDelegate. Bez tej metody getUserMedia() dostaje NotAllowedError,
+        // nawet z NSCameraUsageDescription w Info.plist. Grantujemy bezwarunkowo,
+        // bo strona jest serwowana z localhost w naszej wlasnej binarce.
+        func webView(_ webView: WKWebView,
+                     requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                     initiatedByFrame frame: WKFrameInfo,
+                     type: WKMediaCaptureType,
+                     decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+            decisionHandler(.grant)
         }
 
         /// Sprawdza czy serwer HTTPS odpowiada zanim załadujemy WKWebView

@@ -5,6 +5,14 @@
 // =============================================================================
 
 import SwiftUI
+import WebKit
+
+/// Notyfikacja emitowana przez AppDelegate gdy applicationWillEnterForeground.
+/// ContentView/Coordinator nasluchuje i wykonuje recovery — WKWebView reload
+/// albo fallback do pollServer jesli HTTPS 8090 zdechl podczas suspendu.
+extension Notification.Name {
+    static let tentaflowForegrounded = Notification.Name("TentaFlowForegrounded")
+}
 
 @main
 struct TentaFlowAIApp: App {
@@ -18,8 +26,27 @@ struct TentaFlowAIApp: App {
 }
 
 class AppDelegate: NSObject, UIApplicationDelegate {
+    /// Wspoldzielony pool procesow WebKit — ten sam dla warmup webview
+    /// i dla realnego WKWebView w ContentView. Dzieki temu procesy
+    /// GPU/WebContent/Networking spawnowane w warmup zostaja zreuzywane
+    /// zamiast spawnowac sie od zera przy pierwszym load().
+    static let sharedProcessPool = WKProcessPool()
+
+    /// Warmup WKWebView — trzymany jako property zeby nie zostal zwolniony
+    /// przed zakonczeniem inicjalizacji procesow WebKit.
+    private var warmupWebView: WKWebView?
+
+    /// Timestamp wejscia w tlo — sluzy do policzenia czasu w suspendzie
+    /// przy powrocie (applicationWillEnterForeground).
+    private var lastBackgroundTime: Date?
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         NSLog("[TentaFlow] didFinishLaunching — start")
+
+        // KROK 1: Rozpocznij warmup WKWebView natychmiast. Spawn procesow
+        // GPU/WebContent/Networking (4.5s kazdy) odbywa sie rownolegle z
+        // inicjalizacja Rust core zamiast blokowac glowny render po logowaniu.
+        prewarmWebKit()
 
         // Rejestruj Swift MLX callbacks PRZED startem Rust core
         NSLog("[TentaFlow] Rejestracja MLX callbacks...")
@@ -43,6 +70,25 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         }
 
         return true
+    }
+
+    /// Pre-warmup WKWebView — rzuca niewidoczny loadHTMLString zeby spawnowac
+    /// procesy WebKit (GPU, WebContent, Networking) w tle, zanim user zobaczy
+    /// ekran dashboardu. Bez tego pierwszy load() w ContentView czeka ~4.5s
+    /// na kazdy z trzech procesow (widoczne jako zamrozony splash).
+    private func prewarmWebKit() {
+        NSLog("[TentaFlow] WebKit warmup start")
+        let config = WKWebViewConfiguration()
+        config.processPool = AppDelegate.sharedProcessPool
+        // Uzywamy tego samego typu data store co ContentView (nonPersistent),
+        // zeby procesy byly kompatybilne i dzielone.
+        config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
+
+        let web = WKWebView(frame: .zero, configuration: config)
+        // Minimalna strona — wystarczy zeby wymusic spawn procesow.
+        web.loadHTMLString("<html><body></body></html>", baseURL: nil)
+        warmupWebView = web
+        NSLog("[TentaFlow] WebKit warmup zlecony")
     }
 
     private func checkServerPort() {
@@ -75,11 +121,29 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
+        lastBackgroundTime = Date()
+        NSLog("[TentaFlow] didEnterBackground — Rust idzie w pause")
         tentaflow_on_pause()
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {
+        let elapsed: TimeInterval
+        if let t = lastBackgroundTime {
+            elapsed = Date().timeIntervalSince(t)
+        } else {
+            elapsed = -1
+        }
+        NSLog("[TentaFlow] willEnterForeground — po \(String(format: "%.1f", elapsed))s w tle")
+
         tentaflow_on_resume()
+
+        // Powiadom ContentView.Coordinator zeby sprawdzil serwer i
+        // zrobil reload WKWebView albo wypchnal splash + pollServer.
+        NotificationCenter.default.post(
+            name: .tentaflowForegrounded,
+            object: nil,
+            userInfo: ["elapsed": elapsed]
+        )
     }
 
     func applicationDidReceiveMemoryWarning(_ application: UIApplication) {

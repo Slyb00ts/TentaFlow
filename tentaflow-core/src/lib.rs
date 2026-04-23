@@ -37,6 +37,7 @@ pub mod dispatch;
 pub mod addon;
 pub mod deploy;
 pub mod license;
+pub mod lifecycle_signal;
 pub mod meeting;
 pub mod paths;
 pub mod system_check;

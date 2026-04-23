@@ -8,6 +8,8 @@
 pub mod lifecycle;
 mod platform;
 mod runtime;
+pub mod ffi_discovery;
+mod diagnostics;
 
 use anyhow::Result;
 use tentaflow_core::config::NodeConfig;
@@ -265,7 +267,11 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             enabled: true,
             port: 8090,
             static_peers: vec![],
-            mdns_enabled: true,
+            // iOS blokuje raw multicast bez Apple entitlementa — swarm-discovery
+            // dostaje EHOSTUNREACH. LAN discovery robi NativeDiscovery.swift
+            // przez systemowy mDNSResponder (NWBrowser/NetService) i karmi
+            // iroh przez FFI tentaflow_mobile_add_discovered_peer.
+            mdns_enabled: cfg!(not(target_os = "ios")),
             heartbeat_interval_ms: 500,
             peer_timeout_ms: 3000,
             cluster_name: "tentaflow".to_string(),
