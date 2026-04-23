@@ -489,7 +489,7 @@ fn build_engine_support(
     out.push(engine(
         "llm-ollama",
         "llm",
-        has_docker || true,
+        true,
         "Ollama ma wlasna natywna binarke",
         &["Docker lub Ollama binarka"],
         &[DeployBackend::Docker, DeployBackend::Native],

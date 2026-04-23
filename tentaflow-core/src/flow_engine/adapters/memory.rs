@@ -379,16 +379,17 @@ impl NodeAdapter for MemoryNodeAdapter {
                 if inject {
                     if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
                         if !text.is_empty() {
-                            let prompt_id = node_config
+                            // Brak prompt_id => wstrzykujemy surowy tekst kontekstu, bez
+                            // hardkodowanego szablonu — flow_json kontroluje formatowanie.
+                            let template = node_config
                                 .get("context_prompt_id")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("memory_context_template");
-                            let template = self
-                                .service_manager
-                                .prompt_registry
-                                .get_content(prompt_id)
+                                .filter(|s| !s.is_empty())
+                                .and_then(|pid| {
+                                    self.service_manager.prompt_registry.get_content(pid)
+                                })
                                 .map(|s| s.replace("{context}", text))
-                                .unwrap_or_else(|| format!("Kontekst z pamieci:\n{}", text));
+                                .unwrap_or_else(|| text.to_string());
                             Self::inject_memory_context(&mut ctx.messages, &template);
                         }
                     }
