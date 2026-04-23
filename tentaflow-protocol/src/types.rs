@@ -731,6 +731,54 @@ pub enum ModelPayload {
     /// PrefixCacheInit - inicjalizacja KV cache dla promptów systemowych
     /// Wysyłane przez Router przy połączeniu z LLM Engine
     PrefixCacheInit(PrefixCacheInitRequest),
+
+    /// MeetingEvent - eventy od Meeting Bota do Routera (summary, action items).
+    /// Bot otwiera strumień reverse QUIC i wysyła ModelRequest z tym payloadem;
+    /// router odbiera w `dispatch_reverse_request` i persistuje do DB.
+    MeetingEvent(MeetingEventData),
+}
+
+// ============================================================================
+// MEETING EVENT PAYLOAD
+// ============================================================================
+
+/// Event od Meeting Bota do Routera. Niesie meeting_key (publiczny identyfikator
+/// sesji) + timestamp + typowy payload (summary albo action items).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+pub struct MeetingEventData {
+    /// meeting_key z tabeli meeting_sessions. Router resolvuje do session_id.
+    pub meeting_key: String,
+    /// Unix epoch ms w momencie wygenerowania eventu po stronie bota.
+    pub timestamp_ms: i64,
+    /// Typ eventu + payload.
+    pub payload: MeetingEventPayload,
+}
+
+/// Warianty eventów meeting. Transcript/ParticipantUpdate/BackendUpdate celowo
+/// pominięte w tym etapie — dojdą razem z broadcast bez duplikacji transcript_store.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+pub enum MeetingEventPayload {
+    /// Nowe podsumowanie wygenerowane przez timer bota. Router insertuje
+    /// do `meeting_summaries` (append-only historia).
+    SummaryUpdate {
+        decisions_text: String,
+        summary_text: String,
+        /// Rozwiązany LLM model po alias resolution (nazwa silnika/modelu).
+        model: String,
+    },
+    /// Lista action items wykryta przez bota. Router upsertuje po content_hash
+    /// (owner+task), więc powtórzone pozycje tylko odświeżają deadline.
+    ActionItemsUpdate {
+        items: Vec<MeetingActionItemData>,
+    },
+}
+
+/// Pojedynczy action item przesyłany w `ActionItemsUpdate`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+pub struct MeetingActionItemData {
+    pub owner: String,
+    pub task: String,
+    pub deadline: Option<String>,
 }
 
 // ============================================================================
@@ -3418,5 +3466,106 @@ mod ingest_tests {
         assert_eq!(deserialized.metadata.len(), 2);
 
         println!("Roundtrip test: SUCCESS!");
+    }
+}
+
+#[cfg(test)]
+mod meeting_event_tests {
+    use super::*;
+
+    // Roundtrip SummaryUpdate przez rkyv — wariant ModelPayload::MeetingEvent
+    // musi encodować i decodować się zgodnie z archetypowym wzorcem innych variantów.
+    #[test]
+    fn rkyv_roundtrip_meeting_event_summary_update() {
+        let request = ModelRequest {
+            request_id: "req-1".to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: "mkey-abc".to_string(),
+                timestamp_ms: 1_700_000_000_000,
+                payload: MeetingEventPayload::SummaryUpdate {
+                    decisions_text: "Decyzja X".to_string(),
+                    summary_text: "Podsumowanie Y".to_string(),
+                    model: "qwen".to_string(),
+                },
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let decoded: ModelRequest =
+            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        match decoded.payload {
+            ModelPayload::MeetingEvent(ev) => {
+                assert_eq!(ev.meeting_key, "mkey-abc");
+                assert_eq!(ev.timestamp_ms, 1_700_000_000_000);
+                match ev.payload {
+                    MeetingEventPayload::SummaryUpdate {
+                        decisions_text,
+                        summary_text,
+                        model,
+                    } => {
+                        assert_eq!(decisions_text, "Decyzja X");
+                        assert_eq!(summary_text, "Podsumowanie Y");
+                        assert_eq!(model, "qwen");
+                    }
+                    _ => panic!("expected SummaryUpdate"),
+                }
+            }
+            _ => panic!("expected MeetingEvent variant"),
+        }
+    }
+
+    // Roundtrip ActionItemsUpdate z listą >1 item, żeby sprawdzić Vec w rkyv.
+    #[test]
+    fn rkyv_roundtrip_meeting_event_action_items_update() {
+        let request = ModelRequest {
+            request_id: "req-2".to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: "mkey-xyz".to_string(),
+                timestamp_ms: 1_700_000_001_000,
+                payload: MeetingEventPayload::ActionItemsUpdate {
+                    items: vec![
+                        MeetingActionItemData {
+                            owner: "Alice".to_string(),
+                            task: "prepare report".to_string(),
+                            deadline: Some("2026-05-01".to_string()),
+                        },
+                        MeetingActionItemData {
+                            owner: "Bob".to_string(),
+                            task: "ship PR".to_string(),
+                            deadline: None,
+                        },
+                    ],
+                },
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let decoded: ModelRequest =
+            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        match decoded.payload {
+            ModelPayload::MeetingEvent(ev) => {
+                assert_eq!(ev.meeting_key, "mkey-xyz");
+                match ev.payload {
+                    MeetingEventPayload::ActionItemsUpdate { items } => {
+                        assert_eq!(items.len(), 2);
+                        assert_eq!(items[0].owner, "Alice");
+                        assert_eq!(items[0].task, "prepare report");
+                        assert_eq!(items[0].deadline.as_deref(), Some("2026-05-01"));
+                        assert_eq!(items[1].owner, "Bob");
+                        assert_eq!(items[1].deadline, None);
+                    }
+                    _ => panic!("expected ActionItemsUpdate"),
+                }
+            }
+            _ => panic!("expected MeetingEvent variant"),
+        }
     }
 }
