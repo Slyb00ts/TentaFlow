@@ -816,7 +816,13 @@
     "unsaved_confirm": "Guardar y salir",
     "unsaved_cancel": "Descartar cambios",
     "canvas_hint": "Arrastra un nodo desde la paleta para empezar",
-    "node_error_tooltip": "Falta configuración obligatoria"
+    "node_error_tooltip": "Falta configuración obligatoria",
+    "port_stream": "Flujo de tokens",
+    "port_full": "Respuesta completa",
+    "port_in": "Entrada",
+    "invalid_port": "El puerto \"{port}\" no es compatible con {node_type}",
+    "edge_dangling": "La arista apunta a un nodo inexistente",
+    "cycle_detected": "Ciclo detectado en el grafo de flujo"
   },
   "flows_palette": {
     "title": "Paleta",

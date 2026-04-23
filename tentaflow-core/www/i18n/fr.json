@@ -816,7 +816,13 @@
     "unsaved_confirm": "Enregistrer et quitter",
     "unsaved_cancel": "Abandonner les modifications",
     "canvas_hint": "Glissez un nœud depuis la palette pour commencer",
-    "node_error_tooltip": "Configuration requise manquante"
+    "node_error_tooltip": "Configuration requise manquante",
+    "port_stream": "Flux de tokens",
+    "port_full": "Réponse complète",
+    "port_in": "Entrée",
+    "invalid_port": "Le port « {port} » n'est pas pris en charge par {node_type}",
+    "edge_dangling": "L'arête pointe vers un nœud inexistant",
+    "cycle_detected": "Cycle détecté dans le graphe de flux"
   },
   "flows_palette": {
     "title": "Palette",

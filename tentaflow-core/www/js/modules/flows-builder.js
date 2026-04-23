@@ -171,6 +171,9 @@ const FlowBuilderScreen = {
         if (zl) zl.textContent = `${Math.round(v.zoom * 100)}%`;
         this._renderMinimap();
       },
+      onInvalidConnection: (msg) => {
+        toast(msg, 'warning');
+      },
     });
     state.canvas.setTemplates(state.palette.getTemplates());
     state.canvas.setData(parsed.nodes || [], parsed.edges || []);
@@ -306,6 +309,15 @@ const FlowBuilderScreen = {
   async _save({ silent = false } = {}) {
     const s = this._state;
     if (!s || s.saving) return;
+    // Walidacja klient-side przed wyslaniem do backendu — porty, wiszace
+    // krawedzie, cykle. Backend ma swoj validate_flow_json_str, wiec to jest
+    // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
+    const errors = s.canvas.validate ? s.canvas.validate() : [];
+    if (errors.length > 0) {
+      this._setAutosave('error', I18n.t('flows_builder.autosave_error'));
+      if (!silent) toast(errors[0], 'error');
+      return;
+    }
     s.saving = true;
     try {
       const nameEl = s.root.querySelector('[data-role="name"]');

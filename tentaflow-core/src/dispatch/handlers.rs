@@ -818,16 +818,32 @@ pub fn flow_node_templates_list(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let rows = repository::list_flow_node_templates(&ctx.state.db).map_err(db_err)?;
+    // Rejestr adapterow jest autorytatywnym zrodlem portow — jesli dispatcher
+    // istnieje, czytamy supported_{input,output}_ports dla kazdego typu.
+    // Nodes bez zarejestrowanego adaptera dostaja puste listy, co GUI traktuje
+    // jako "adapter niewspierany" i blokuje wiazania do walidacji backendu.
+    let dispatcher = ctx.state.router.flow_dispatcher();
     let templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
         .into_iter()
-        .map(|t| tentaflow_protocol::FlowNodeTemplate {
-            id: t.id,
-            node_type: t.node_type,
-            category: t.category,
-            label: t.label,
-            description: t.description,
-            default_config: t.default_config,
-            icon: t.icon,
+        .map(|t| {
+            let (input_ports, output_ports) = match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
+                Some(adapter) => (
+                    adapter.supported_input_ports().iter().map(|s| s.to_string()).collect(),
+                    adapter.supported_output_ports().iter().map(|s| s.to_string()).collect(),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            tentaflow_protocol::FlowNodeTemplate {
+                id: t.id,
+                node_type: t.node_type,
+                category: t.category,
+                label: t.label,
+                description: t.description,
+                default_config: t.default_config,
+                icon: t.icon,
+                input_ports,
+                output_ports,
+            }
         })
         .collect();
     Ok(MessageBody::FlowNodeTemplatesListResponseBody(

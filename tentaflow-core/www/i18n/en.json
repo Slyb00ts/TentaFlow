@@ -812,7 +812,13 @@
     "unsaved_confirm": "Save and exit",
     "unsaved_cancel": "Discard changes",
     "canvas_hint": "Drag a node from the palette to start",
-    "node_error_tooltip": "Missing required configuration"
+    "node_error_tooltip": "Missing required configuration",
+    "port_stream": "Token stream",
+    "port_full": "Complete response",
+    "port_in": "Input",
+    "invalid_port": "Port \"{port}\" is not supported by {node_type}",
+    "edge_dangling": "Edge points to a non-existent node",
+    "cycle_detected": "Cycle detected in flow graph"
   },
   "flows_palette": {
     "title": "Palette",

@@ -812,7 +812,13 @@
     "unsaved_confirm": "Zapisz i wyjdź",
     "unsaved_cancel": "Odrzuć zmiany",
     "canvas_hint": "Przeciągnij node z palety, aby zacząć",
-    "node_error_tooltip": "Brak wymaganej konfiguracji"
+    "node_error_tooltip": "Brak wymaganej konfiguracji",
+    "port_stream": "Stream tokenów",
+    "port_full": "Kompletna odpowiedź",
+    "port_in": "Wejście",
+    "invalid_port": "Port „{port}” nie jest wspierany przez {node_type}",
+    "edge_dangling": "Krawędź prowadzi do nieistniejącego węzła",
+    "cycle_detected": "Wykryto cykl w grafie przepływu"
   },
   "flows_palette": {
     "title": "Paleta",

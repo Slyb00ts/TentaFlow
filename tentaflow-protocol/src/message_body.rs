@@ -1114,6 +1114,12 @@ pub struct FlowNodeTemplate {
     /// Default config JSON shoved into a new node when dropped on the canvas.
     pub default_config: String,
     pub icon: Option<String>,
+    /// Dostepne porty wejsciowe adaptera dla tego typu node'a. Pusta lista
+    /// oznacza "nieznany adapter" — GUI powinno odradzac wiazania takich nodow.
+    pub input_ports: Vec<String>,
+    /// Dostepne porty wyjsciowe adaptera. LLM: ["stream","full"], wiekszosc
+    /// innych: ["full"]. Pusta lista = nieznany adapter.
+    pub output_ports: Vec<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
