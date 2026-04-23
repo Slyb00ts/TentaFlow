@@ -2321,26 +2321,10 @@ pub struct MeetingSessionDetailRequest {
     pub include_transcripts: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct MeetingSessionSummaryEntry {
-    pub tldr: String,
-    pub decisions: String,
-    pub action_items_json: String,
-    pub open_questions: String,
-    pub model: String,
-    pub generated_at: String,
-}
-
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct MeetingSessionDetailResponse {
     pub session: MeetingSessionDescriptor,
     pub transcripts: Vec<MeetingTranscriptEntry>,
-    pub summary_tldr: String,
-    pub summary_decisions: String,
-    pub summary_action_items_json: String,
-    pub summary_open_questions: String,
-    pub summary_model: String,
-    pub summary_generated_at: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2353,17 +2337,6 @@ pub struct MeetingTranscriptsListRequest {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct MeetingTranscriptsListResponse {
     pub entries: Vec<MeetingTranscriptEntry>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct MeetingSummaryGenerateRequest {
-    pub session_id: i64,
-    pub force_refresh: bool,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct MeetingSummaryGenerateResponse {
-    pub summary: MeetingSessionSummaryEntry,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2414,8 +2387,6 @@ pub enum MeetingPayload {
     ResSessionDetail(MeetingSessionDetailResponse),
     ReqTranscriptsList(MeetingTranscriptsListRequest),
     ResTranscriptsList(MeetingTranscriptsListResponse),
-    ReqSummaryGenerate(MeetingSummaryGenerateRequest),
-    ResSummaryGenerate(MeetingSummaryGenerateResponse),
     ReqActiveSession(MeetingActiveSessionRequest),
     ResActiveSession(MeetingActiveSessionResponse),
     ReqSettingsGet(MeetingSettingsGetRequest),

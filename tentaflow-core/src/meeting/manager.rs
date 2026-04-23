@@ -64,17 +64,6 @@ pub struct SessionDescriptor {
     pub flow_alias: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionSummary {
-    pub session_id: i64,
-    pub tldr: String,
-    pub decisions: String,
-    pub action_items_json: String,
-    pub open_questions: String,
-    pub model: String,
-    pub generated_at: String,
-}
-
 #[derive(Clone)]
 pub struct MeetingManager {
     db: DbPool,
@@ -290,43 +279,6 @@ impl MeetingManager {
     pub fn active_for_user(&self, user_id: i64) -> Result<Option<SessionDescriptor>> {
         let row = repository::transcripts::active_session_for_user(&self.db, user_id)?;
         Ok(row.as_ref().map(row_to_descriptor))
-    }
-
-    pub fn summary(&self, session_id: i64) -> Result<Option<SessionSummary>> {
-        let row = repository::transcripts::get_session_summary(&self.db, session_id)?;
-        Ok(row.map(|r| SessionSummary {
-            session_id: r.session_id,
-            tldr: r.tldr,
-            decisions: r.decisions,
-            action_items_json: r.action_items_json,
-            open_questions: r.open_questions,
-            model: r.model,
-            generated_at: r.generated_at,
-        }))
-    }
-
-    /// Zapisuje wygenerowane summary. Caller (handler) jest odpowiedzialny za
-    /// wywołanie LLM i konstrukcję parsera action items.
-    pub fn save_summary(
-        &self,
-        session_id: i64,
-        tldr: &str,
-        decisions: &str,
-        action_items_json: &str,
-        open_questions: &str,
-        model: &str,
-    ) -> Result<SessionSummary> {
-        repository::transcripts::upsert_session_summary(
-            &self.db,
-            session_id,
-            tldr,
-            decisions,
-            action_items_json,
-            open_questions,
-            model,
-        )?;
-        self.summary(session_id)?
-            .ok_or_else(|| anyhow!("summary nie zapisane"))
     }
 
     pub fn db(&self) -> &DbPool {

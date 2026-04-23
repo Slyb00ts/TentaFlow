@@ -1084,12 +1084,6 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  meetingSummaryGenerateRequest(correlationId, { sessionId, forceRefresh = false }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeMeetingSummaryGenerateRequest(Number(sessionId), !!forceRefresh);
-    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
-  },
-
   meetingActiveSessionRequest(correlationId, _args, sequence = 1) {
     assertReady();
     const body = _wasm.encodeMeetingActiveSessionRequest();

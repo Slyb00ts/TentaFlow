@@ -225,21 +225,6 @@ async function onLeaveClick() {
   render();
 }
 
-async function onGenerateSummary(force = false) {
-  if (!activeSession) return;
-  try {
-    const resp = await ApiBinary.one('meetingSummaryGenerateRequest', {
-      sessionId: activeSession.sessionId,
-      forceRefresh: force,
-    });
-    toast(I18n.t('meeting.summary_generated'), 'success');
-    renderActiveBody();
-    return resp;
-  } catch (e) {
-    toast(`${I18n.t('meeting.summary_err')}: ${e?.message || ''}`, 'error');
-  }
-}
-
 async function onDownloadTranscript() {
   if (!activeSession) return;
   const lines = transcripts.map(
@@ -523,7 +508,6 @@ function renderActiveBody() {
   if (activeTab === 'summary') {
     destroyLiveVlist();
     listHost.innerHTML = renderInlineSummary();
-    byId('meeting-gen-summary-btn')?.addEventListener('click', () => onGenerateSummary(true));
     return;
   }
 
@@ -558,10 +542,11 @@ function renderActiveBody() {
 }
 
 function renderInlineSummary() {
+  // Summary + action items sa emitowane przez teams-bot jako MeetingEvent
+  // (Etap 2.2). GUI dla nich pojawi sie razem z nowymi endpointami listy.
   return `
     <div style="padding: 24px;">
-      <div class="meeting-empty-hint">${escapeHtml(I18n.t('meeting.summary_live_hint'))}</div>
-      <tf-button variant="primary" size="sm" icon="sparkles" id="meeting-gen-summary-btn" style="margin-top: 14px;">${escapeHtml(I18n.t('meeting.generate_summary'))}</tf-button>
+      <div class="meeting-empty-hint">${escapeHtml(I18n.t('meeting.summary_pending_backend'))}</div>
     </div>`;
 }
 
@@ -709,22 +694,20 @@ function renderHistoryDetail() {
       </div>
       <div style="display:flex; gap:8px;">
         <tf-button size="sm" icon="download" id="mt-download-history">${escapeHtml(I18n.t('meeting.download'))}</tf-button>
-        <tf-button variant="primary" size="sm" icon="sparkles" id="mt-regen-summary">${escapeHtml(I18n.t('meeting.regen_summary'))}</tf-button>
       </div>
     </div>
     ${tabs}
     <div class="history-body">${body}</div>`;
 }
 
-function renderHistorySummary(det) {
-  const tldr = det.summaryTldr || I18n.t('meeting.no_summary');
+function renderHistorySummary(_det) {
+  // Summary dla historii bedzie listowane z meeting_summaries + meeting_action_items
+  // przez nowe endpointy (Etap 2.2). Do tego czasu ekran pokazuje placeholder
+  // zamiast fantomowego "empty summary".
   return `
-    <div class="panel" style="margin-bottom: 16px;">
-      <div class="panel-head">${sprite('sparkles')} TL;DR · ${escapeHtml(det.summaryModel || 'naive')}</div>
-      <div class="panel-body" style="font-size: 13px; line-height: 1.75; color: var(--text-2);">${escapeHtml(tldr)}</div>
-    </div>
-    ${det.summaryDecisions ? `<div class="panel" style="margin-bottom: 16px;"><div class="panel-head">${escapeHtml(I18n.t('meeting.decisions'))}</div><div class="panel-body">${escapeHtml(det.summaryDecisions)}</div></div>` : ''}
-    ${det.summaryOpenQuestions ? `<div class="panel"><div class="panel-head">${escapeHtml(I18n.t('meeting.open_questions'))}</div><div class="panel-body">${escapeHtml(det.summaryOpenQuestions)}</div></div>` : ''}`;
+    <div class="panel">
+      <div class="panel-head">${sprite('sparkles')} ${escapeHtml(I18n.t('meeting.summary_pending_backend'))}</div>
+    </div>`;
 }
 
 function groupSessionsByDate(list) {
@@ -916,7 +899,6 @@ function bindEvents() {
     activeScreen = 'active';
     render();
   });
-  byId('meeting-gen-summary-btn')?.addEventListener('click', () => onGenerateSummary(true));
   byId('mt-nav-history')?.addEventListener('click', async () => {
     activeScreen = 'history';
     await loadSessions();
@@ -937,10 +919,6 @@ function bindEvents() {
     render();
   });
   byId('mt-save-settings')?.addEventListener('click', onSaveSettings);
-  byId('mt-regen-summary')?.addEventListener('click', async () => {
-    if (!selectedHistoryId) return;
-    await onRegenHistorySummary();
-  });
   byId('mt-download-history')?.addEventListener('click', onDownloadHistory);
   // URL input enter
   const urlInput = byId('meeting-url-input');
@@ -965,19 +943,6 @@ function bindEvents() {
       render();
     });
   });
-}
-
-async function onRegenHistorySummary() {
-  try {
-    await ApiBinary.one('meetingSummaryGenerateRequest', {
-      sessionId: selectedHistoryId,
-      forceRefresh: true,
-    });
-    await selectHistorySession(selectedHistoryId);
-    toast(I18n.t('meeting.summary_generated'), 'success');
-  } catch (e) {
-    toast(`${I18n.t('meeting.summary_err')}: ${e?.message || ''}`, 'error');
-  }
 }
 
 function onDownloadHistory() {

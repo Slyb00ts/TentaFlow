@@ -9,8 +9,8 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     MeetingActiveSessionResponse, MeetingPayload, MeetingSessionDescriptor,
     MeetingSessionDetailResponse, MeetingSessionLeaveResponse, MeetingSessionListResponse,
-    MeetingSessionStartResponse, MeetingSessionSummaryEntry, MeetingSettingKv,
-    MeetingSettingsGetResponse, MeetingSettingsUpdateResponse, MeetingSummaryGenerateResponse,
+    MeetingSessionStartResponse, MeetingSettingKv,
+    MeetingSettingsGetResponse, MeetingSettingsUpdateResponse,
     MeetingTranscriptEntry, MeetingTranscriptsListResponse, MessageBody, ProtocolError,
     ProtocolErrorCode, SessionAuth,
 };
@@ -288,35 +288,9 @@ pub fn meeting_session_detail(
     } else {
         Vec::new()
     };
-    let summary = ctx
-        .state
-        .meeting_manager
-        .summary(r.session_id)
-        .map_err(internal)?;
     let resp = MeetingSessionDetailResponse {
         session: desc_to_proto(desc),
         transcripts,
-        summary_tldr: summary.as_ref().map(|s| s.tldr.clone()).unwrap_or_default(),
-        summary_decisions: summary
-            .as_ref()
-            .map(|s| s.decisions.clone())
-            .unwrap_or_default(),
-        summary_action_items_json: summary
-            .as_ref()
-            .map(|s| s.action_items_json.clone())
-            .unwrap_or_else(|| "[]".into()),
-        summary_open_questions: summary
-            .as_ref()
-            .map(|s| s.open_questions.clone())
-            .unwrap_or_default(),
-        summary_model: summary
-            .as_ref()
-            .map(|s| s.model.clone())
-            .unwrap_or_default(),
-        summary_generated_at: summary
-            .as_ref()
-            .map(|s| s.generated_at.clone())
-            .unwrap_or_default(),
     };
     Ok(MessageBody::MeetingBody(MeetingPayload::ResSessionDetail(
         resp,
@@ -351,83 +325,7 @@ pub fn meeting_transcripts_list(
 }
 
 // =============================================================================
-// 6. Summary generate (LLM)
-// =============================================================================
-
-#[handler(variant = "MeetingSummaryGenerateRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub async fn meeting_summary_generate(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = meeting_payload(req)?;
-    let MeetingPayload::ReqSummaryGenerate(r) = payload else {
-        return Err(bad_request("expected ReqSummaryGenerate"));
-    };
-    // Cache: jesli mamy summary i nie force — zwroc istniejace.
-    if !r.force_refresh {
-        if let Some(s) = ctx
-            .state
-            .meeting_manager
-            .summary(r.session_id)
-            .map_err(internal)?
-        {
-            return Ok(to_summary_response(s));
-        }
-    }
-    // Weryfikuj ze sesja ma transkrypty do podsumowania.
-    let rows =
-        repository::transcripts::list_transcripts(&ctx.state.db, r.session_id).map_err(internal)?;
-    if rows.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotFound,
-            "brak transkryptow — nie ma co podsumowywac",
-        ));
-    }
-    // Resolve alias `teams-summary` — pusty target = admin nie skonfigurowal modelu.
-    // Handler zwraca jawny error, frontend pokazuje info "summary wylaczone".
-    let alias =
-        repository::resolve_model_alias(&ctx.state.db, "teams-summary").map_err(internal)?;
-    let target = alias
-        .as_ref()
-        .map(|a| a.target_model.trim().to_string())
-        .unwrap_or_default();
-    if target.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotImplemented,
-            "Summary wylaczone — wpisz target dla aliasu 'teams-summary' w Models > Aliases",
-        ));
-    }
-    // TODO(meeting-bot LLM): integracja z router.chat_completion. Na razie
-    // zwracamy jawny NotImplemented z nazwa modelu — admin wie ze alias jest OK
-    // ale kod LLM calla jeszcze nie wpiety. Zadne fake TLDR sie nie zapisuje.
-    Err(ProtocolError::new(
-        ProtocolErrorCode::NotImplemented,
-        format!(
-            "Alias teams-summary ustawiony na '{}' — integracja LLM w toku, na razie summary niedostepne",
-            target
-        ),
-    ))
-}
-
-fn to_summary_response(s: crate::meeting::SessionSummary) -> MessageBody {
-    MessageBody::MeetingBody(MeetingPayload::ResSummaryGenerate(
-        MeetingSummaryGenerateResponse {
-            summary: MeetingSessionSummaryEntry {
-                tldr: s.tldr,
-                decisions: s.decisions,
-                action_items_json: s.action_items_json,
-                open_questions: s.open_questions,
-                model: s.model,
-                generated_at: s.generated_at,
-            },
-        },
-    ))
-}
-
-// =============================================================================
-// 7. Active session — UI refresh helper
+// 6. Active session — UI refresh helper
 // =============================================================================
 
 #[handler(variant = "MeetingActiveSessionRequest", since = (1, 0))]
