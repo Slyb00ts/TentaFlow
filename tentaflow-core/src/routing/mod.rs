@@ -18,6 +18,7 @@ pub mod middleware;
 pub mod reverse_request;
 pub mod router;
 pub mod service_manager;
+pub mod stream_helpers;
 pub mod streaming;
 pub mod stt;
 pub mod transcript_store;
