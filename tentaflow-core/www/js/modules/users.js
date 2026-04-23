@@ -23,7 +23,7 @@ let detailEntityId = null;
 let detailTab = 'profile';
 
 const UsersScreen = {
-  title: 'Użytkownicy',
+  get title() { return I18n.t('users.title'); },
   render() {
     return `<div id="users-root"></div>`;
   },
@@ -109,12 +109,15 @@ function renderListScreen(root) {
       <div slot="breadcrumb" class="tf-breadcrumb">
         <span class="crumb current">${escapeHtml(title)}</span>
       </div>
-      <div slot="header" class="tf-page-header">
-        <div class="titles">
-          <h1>${escapeHtml(title)} <span style="color:var(--text-3);font-weight:600">· ${count}</span></h1>
-          <div class="sub">${escapeHtml(subtitle)}</div>
+      <div slot="header" class="tf-detail-header">
+        <div class="big-ico">
+          <svg viewBox="0 0 24 24"><use href="#i-${isUsers ? 'user' : 'users'}"/></svg>
         </div>
-        <div class="actions">
+        <div class="d-meta">
+          <div class="d-name">${escapeHtml(title)} <span style="color:var(--text-3);font-weight:600;font-size:15px;">· ${count}</span></div>
+          <div class="d-sub">${escapeHtml(subtitle)}</div>
+        </div>
+        <div class="d-actions">
           <tf-button variant="primary" icon="plus" id="${addId}">${escapeHtml(addLabel)}</tf-button>
         </div>
       </div>
@@ -670,9 +673,10 @@ function openCreateUserModal() {
       <div class="field"><tf-input id="u-email" type="email" label="${escapeAttr(I18n.t('users.field_email'))}" placeholder="adam@firma.com"></tf-input></div>
     </div>
     <div class="users-form-row">
-      <div class="field"><tf-input id="u-password" type="password" label="${escapeAttr(I18n.t('users.field_password'))}" required></tf-input></div>
+      <div class="field"><tf-input id="u-password" type="password" label="${escapeAttr(I18n.t('users.field_password_initial'))}" required></tf-input></div>
       <div class="field">
-        <tf-select id="u-role" label="${escapeAttr(I18n.t('users.field_role'))}" value="user">
+        <label class="field-label">${escapeHtml(I18n.t('users.field_role'))}</label>
+        <tf-select id="u-role" value="user">
           <option value="user">${escapeHtml(I18n.t('users.role_user'))}</option>
           <option value="power_user">${escapeHtml(I18n.t('users.role_power'))}</option>
           <option value="admin">${escapeHtml(I18n.t('users.role_admin'))}</option>
