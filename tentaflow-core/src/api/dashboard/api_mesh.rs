@@ -79,43 +79,114 @@ pub async fn handle_initiate_pairing(
             remote_hostname,
             peer_store,
         );
+        let can_use_existing_mesh = remote_addresses.is_empty()
+            && remote_relay_url.is_empty()
+            && remote_hostname.is_empty()
+            && qm.is_connected(remote_node_id).await;
 
-        info!(target_node = %remote_hints.node_id, "Parowanie: wysylam PairingRequest przez ALPN_PAIRING");
-        match initiate_pairing_over_iroh(
-            qm.endpoint(),
-            &remote_hints,
-            security.as_ref(),
-            &pin,
-            &local_hints.hostname,
-            local_hints.addresses.clone(),
-            local_hints.relay_url.clone(),
-        )
-        .await
-        {
-            Ok(PairingAttemptOutcome::Confirmed) => {
-                completed = true;
-            }
-            Ok(PairingAttemptOutcome::Pending) => {
-                if !pin_hint.is_empty() {
-                    let _ = delete_pending_contact_hints(&security.db, remote_node_id);
-                    let _ = db::repository::delete_pending_pairing(&security.db, remote_node_id);
-                    return Ok((
-                        409,
-                        json_error(
-                            "Zdalny node nie potwierdzil zaproszenia QR — sprawdz czy PIN i kod sa nadal aktualne",
-                        ),
-                    ));
-                }
-                store_pending_contact_hints(&security.db, remote_node_id, &remote_hints)?;
-            }
-            Err(e) => {
-                warn!(target_node = %remote_hints.node_id, "PairingRequest delivery failed: {}", e);
-                let _ = delete_pending_contact_hints(&security.db, remote_node_id);
+        if can_use_existing_mesh {
+            let payload = serde_json::json!({
+                "from_node_id": security.ed25519_public_key_hex(),
+                "public_key": security.public_key_hex(),
+                "pin": &pin,
+            });
+            let data = payload.to_string().into_bytes();
+            info!(target_node = %remote_hints.node_id, "Parowanie: wysylam PairingRequest przez istniejacy mesh stream");
+            if let Err(e) = qm.send_pairing_request(&remote_hints.node_id, &data).await {
+                warn!(target_node = %remote_hints.node_id, "PairingRequest przez mesh failed: {}", e);
                 let _ = db::repository::delete_pending_pairing(&security.db, remote_node_id);
                 return Ok((
                     502,
                     json_error("Nie udało się wysłać PairingRequest — node może nie być osiągalny"),
                 ));
+            }
+        } else {
+            info!(target_node = %remote_hints.node_id, "Parowanie: wysylam PairingRequest przez ALPN_PAIRING");
+            match initiate_pairing_over_iroh(
+                qm.endpoint(),
+                &remote_hints,
+                security.as_ref(),
+                &pin,
+                &local_hints.hostname,
+                local_hints.addresses.clone(),
+                local_hints.relay_url.clone(),
+            )
+            .await
+            {
+                Ok(PairingAttemptOutcome::Confirmed) => {
+                    if let Err(e) = qm.connect_to_peer_with_hints(&remote_hints).await {
+                        warn!(
+                            target_node = %remote_hints.node_id,
+                            "Pairing confirmed, ale mesh connect nieudany: {}",
+                            e
+                        );
+                    } else {
+                        let local_info = node_info_collector::collect_node_info(local_node_id);
+                        if let Ok(info_bytes) =
+                            rkyv::to_bytes::<rkyv::rancor::Error>(&local_info)
+                        {
+                            if let Err(e) =
+                                qm.send_node_info(&remote_hints.node_id, &info_bytes).await
+                            {
+                                warn!(
+                                    target_node = %remote_hints.node_id,
+                                    "Pairing confirmed, ale NodeInfo send nieudany: {}",
+                                    e
+                                );
+                            }
+                        }
+
+                        let all_keys = security.get_all_trusted_keys();
+                        if !all_keys.is_empty() {
+                            let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+                                .iter()
+                                .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                    node_id: nid.clone(),
+                                    public_key_hex: pk.clone(),
+                                })
+                                .collect();
+                            let payload =
+                                tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                            if let Ok(sync_data) =
+                                rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
+                            {
+                                if let Err(e) = qm
+                                    .send_trusted_keys_sync(&remote_hints.node_id, &sync_data)
+                                    .await
+                                {
+                                    warn!(
+                                        target_node = %remote_hints.node_id,
+                                        "Pairing confirmed, ale TrustedKeysSync send nieudany: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    completed = true;
+                }
+                Ok(PairingAttemptOutcome::Pending) => {
+                    if !pin_hint.is_empty() {
+                        let _ = delete_pending_contact_hints(&security.db, remote_node_id);
+                        let _ = db::repository::delete_pending_pairing(&security.db, remote_node_id);
+                        return Ok((
+                            409,
+                            json_error(
+                                "Zdalny node nie potwierdzil zaproszenia QR — sprawdz czy PIN i kod sa nadal aktualne",
+                            ),
+                        ));
+                    }
+                    store_pending_contact_hints(&security.db, remote_node_id, &remote_hints)?;
+                }
+                Err(e) => {
+                    warn!(target_node = %remote_hints.node_id, "PairingRequest delivery failed: {}", e);
+                    let _ = delete_pending_contact_hints(&security.db, remote_node_id);
+                    let _ = db::repository::delete_pending_pairing(&security.db, remote_node_id);
+                    return Ok((
+                        502,
+                        json_error("Nie udało się wysłać PairingRequest — node może nie być osiągalny"),
+                    ));
+                }
             }
         }
     } else {
@@ -384,11 +455,14 @@ fn remote_contact_hints(
             node_id: remote_node_id.to_string(),
             public_key_hex: remote_public_key.to_string(),
             hostname: peer.hostname,
-            addresses: peer
-                .addresses
-                .iter()
-                .map(|ip| format!("{}:{}", ip, peer.port))
-                .collect(),
+            addresses: if peer.port > 0 {
+                peer.addresses
+                    .iter()
+                    .map(|ip| format!("{}:{}", ip, peer.port))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             relay_url: remote_relay_url.to_string(),
         };
     }
