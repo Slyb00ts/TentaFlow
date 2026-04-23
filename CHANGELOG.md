@@ -6,6 +6,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+## [0.0.2-alpha] - 2026-04-23
+
+### Added
+- TBD — describe the changes before tagging.
+
+
 ### Added
 - Added the new `www/` dashboard SPA and migrated the app to the binary WebSocket protocol with generated browser codecs.
 - Added the service manifest registry, universal service catalog, and deploy wizard for Docker, native, and external engines.
