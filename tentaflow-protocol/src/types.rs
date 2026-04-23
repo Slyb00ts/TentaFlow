@@ -773,8 +773,8 @@ pub struct MeetingEventData {
     pub payload: MeetingEventPayload,
 }
 
-/// Warianty eventów meeting. Transcript/ParticipantUpdate/BackendUpdate celowo
-/// pominięte w tym etapie — dojdą razem z broadcast bez duplikacji transcript_store.
+/// Warianty eventów meeting. Każdy wariant niesie dane do tej samej sesji
+/// (adresowanej przez `MeetingEventData::meeting_key`).
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub enum MeetingEventPayload {
     /// Nowe podsumowanie wygenerowane przez timer bota. Router insertuje
@@ -789,6 +789,52 @@ pub enum MeetingEventPayload {
     /// (owner+task), więc powtórzone pozycje tylko odświeżają deadline.
     ActionItemsUpdate {
         items: Vec<MeetingActionItemData>,
+    },
+    /// Pojedynczy fragment transkrypcji wygenerowany przez STT na bocie.
+    /// Niesie metadane diarization/model surowo — router przed broadcastem
+    /// może wzbogacić `speaker_name`/`is_enrolled` z DB voice_profiles.
+    /// Persist chunków transkryptu leci osobną ścieżką przez transcript_store
+    /// (ModelRequest::Audio z metadata `meeting_id`), ten wariant służy live
+    /// broadcastowi do dashboardu.
+    TranscriptEntry {
+        /// Surowe id z diarization ("SPEAKER_00"…) albo profile_id po match.
+        speaker_id: String,
+        /// Display name jeśli dostępny (z Teams DOM albo z voice_profile).
+        speaker_name: Option<String>,
+        /// True gdy speaker_id pochodzi z enrolled voice_profile.
+        is_enrolled: bool,
+        /// Pewność dopasowania speaker_id (0.0..1.0) jeśli znana.
+        speaker_confidence: Option<f32>,
+        text: String,
+        /// ISO-639-1 (np. "pl", "en") jeśli STT zwrócił język.
+        language: Option<String>,
+        /// Rozwiązany model STT po alias resolution.
+        resolved_stt_model: String,
+        /// Czas end-to-end STT (wysłanie audio → otrzymanie tekstu) w ms.
+        latency_ms: u64,
+    },
+    /// Zmiana statusu uczestnika: dołączenie, wyjście, aktywny mówca.
+    /// `status` to stringified enum — bot wysyła `"joined"`, `"left"`,
+    /// `"active_now"`. Dashboard odfiltrowuje nieznane warianty bez błędu.
+    ParticipantUpdate {
+        speaker_id: String,
+        speaker_name: Option<String>,
+        status: String,
+        /// Sekundy od ostatniej mowy; `None` gdy jeszcze nie mówił.
+        last_spoken_ago_sec: Option<u32>,
+    },
+    /// Info o modelach używanych w sesji. Bot wysyła raz po join_meeting.
+    /// Router przed broadcastem rozwija aliasy (`teams-stt` → rzeczywisty
+    /// engine) — pola tu trzymają aliasy takie jak bot je dostał z configu.
+    BackendUpdate {
+        stt_model: String,
+        tts_model: String,
+        summarization_model: String,
+        /// Model diarization hardcoded w mesh configu routera (np. `pyannote-3.1`).
+        diarization_model: String,
+        streaming_latency_ms: Option<u32>,
+        enrolled_speakers: Option<u32>,
+        total_participants: Option<u32>,
     },
 }
 
@@ -3598,6 +3644,158 @@ mod meeting_event_tests {
                     _ => panic!("expected ActionItemsUpdate"),
                 }
             }
+            _ => panic!("expected MeetingEvent variant"),
+        }
+    }
+
+    // Roundtrip TranscriptEntry — sprawdza że wszystkie pola (Option<String>,
+    // Option<f32>, u64) enkodują się i dekodują stabilnie przez rkyv.
+    #[test]
+    fn rkyv_roundtrip_meeting_event_transcript_entry() {
+        let request = ModelRequest {
+            request_id: "req-te-1".to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: "mkey-te".to_string(),
+                timestamp_ms: 1_700_000_002_000,
+                payload: MeetingEventPayload::TranscriptEntry {
+                    speaker_id: "SPEAKER_00".to_string(),
+                    speaker_name: Some("Alice".to_string()),
+                    is_enrolled: true,
+                    speaker_confidence: Some(0.87),
+                    text: "Zaczynamy spotkanie".to_string(),
+                    language: Some("pl".to_string()),
+                    resolved_stt_model: "whisper-large-v3".to_string(),
+                    latency_ms: 412,
+                },
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let decoded: ModelRequest =
+            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        match decoded.payload {
+            ModelPayload::MeetingEvent(ev) => match ev.payload {
+                MeetingEventPayload::TranscriptEntry {
+                    speaker_id,
+                    speaker_name,
+                    is_enrolled,
+                    speaker_confidence,
+                    text,
+                    language,
+                    resolved_stt_model,
+                    latency_ms,
+                } => {
+                    assert_eq!(speaker_id, "SPEAKER_00");
+                    assert_eq!(speaker_name.as_deref(), Some("Alice"));
+                    assert!(is_enrolled);
+                    assert_eq!(speaker_confidence, Some(0.87));
+                    assert_eq!(text, "Zaczynamy spotkanie");
+                    assert_eq!(language.as_deref(), Some("pl"));
+                    assert_eq!(resolved_stt_model, "whisper-large-v3");
+                    assert_eq!(latency_ms, 412);
+                }
+                _ => panic!("expected TranscriptEntry"),
+            },
+            _ => panic!("expected MeetingEvent variant"),
+        }
+    }
+
+    // Roundtrip ParticipantUpdate — sprawdza warianty z/bez last_spoken_ago_sec.
+    #[test]
+    fn rkyv_roundtrip_meeting_event_participant_update() {
+        let request = ModelRequest {
+            request_id: "req-pu-1".to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: "mkey-pu".to_string(),
+                timestamp_ms: 1_700_000_003_000,
+                payload: MeetingEventPayload::ParticipantUpdate {
+                    speaker_id: "SPEAKER_02".to_string(),
+                    speaker_name: Some("Bob".to_string()),
+                    status: "active_now".to_string(),
+                    last_spoken_ago_sec: Some(3),
+                },
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let decoded: ModelRequest =
+            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        match decoded.payload {
+            ModelPayload::MeetingEvent(ev) => match ev.payload {
+                MeetingEventPayload::ParticipantUpdate {
+                    speaker_id,
+                    speaker_name,
+                    status,
+                    last_spoken_ago_sec,
+                } => {
+                    assert_eq!(speaker_id, "SPEAKER_02");
+                    assert_eq!(speaker_name.as_deref(), Some("Bob"));
+                    assert_eq!(status, "active_now");
+                    assert_eq!(last_spoken_ago_sec, Some(3));
+                }
+                _ => panic!("expected ParticipantUpdate"),
+            },
+            _ => panic!("expected MeetingEvent variant"),
+        }
+    }
+
+    // Roundtrip BackendUpdate — sprawdza wszystkie None w opcjonalnych liczbach,
+    // bo tak bot je wysyła zaraz po join (bez znajomości streaming_latency itp.).
+    #[test]
+    fn rkyv_roundtrip_meeting_event_backend_update() {
+        let request = ModelRequest {
+            request_id: "req-bu-1".to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: "mkey-bu".to_string(),
+                timestamp_ms: 1_700_000_004_000,
+                payload: MeetingEventPayload::BackendUpdate {
+                    stt_model: "teams-stt".to_string(),
+                    tts_model: "teams-tts".to_string(),
+                    summarization_model: "teams-summarization".to_string(),
+                    diarization_model: "pyannote-3.1".to_string(),
+                    streaming_latency_ms: None,
+                    enrolled_speakers: None,
+                    total_participants: None,
+                },
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&request).expect("encode");
+        let decoded: ModelRequest =
+            rkyv::from_bytes::<ModelRequest, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        match decoded.payload {
+            ModelPayload::MeetingEvent(ev) => match ev.payload {
+                MeetingEventPayload::BackendUpdate {
+                    stt_model,
+                    tts_model,
+                    summarization_model,
+                    diarization_model,
+                    streaming_latency_ms,
+                    enrolled_speakers,
+                    total_participants,
+                } => {
+                    assert_eq!(stt_model, "teams-stt");
+                    assert_eq!(tts_model, "teams-tts");
+                    assert_eq!(summarization_model, "teams-summarization");
+                    assert_eq!(diarization_model, "pyannote-3.1");
+                    assert_eq!(streaming_latency_ms, None);
+                    assert_eq!(enrolled_speakers, None);
+                    assert_eq!(total_participants, None);
+                }
+                _ => panic!("expected BackendUpdate"),
+            },
             _ => panic!("expected MeetingEvent variant"),
         }
     }
