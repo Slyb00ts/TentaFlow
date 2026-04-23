@@ -1542,5 +1542,17 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
                 ON resource_permissions(resource_type, resource_id);
         ",
     ),
+    (
+        51,
+        "api_keys_owner_user",
+        "
+            -- API keys dostaja owner_user_id zeby ACL na /v1/* moglo dzialac per-user.
+            -- Existing keys get NULL — traktowane jako admin-equivalent (legacy).
+            -- Nowe klucze tworzone z dashboard maja owner_user_id ustawione na
+            -- creator-a. Admin moze rotowac keys z innym owner_id.
+            ALTER TABLE api_keys ADD COLUMN owner_user_id INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_apikeys_owner ON api_keys(owner_user_id);
+        ",
+    ),
 ]
 }
