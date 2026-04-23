@@ -2373,6 +2373,79 @@ pub struct MeetingSettingsUpdateResponse {
     pub ok: bool,
 }
 
+// -----------------------------------------------------------------------------
+// Summaries / action items / transcript export (post-Etap 2.1).
+// -----------------------------------------------------------------------------
+
+/// Jedno podsumowanie sesji z `meeting_summaries`. Protokolowa forma bez
+/// content_hash — dedup jest szczegolem DB i nie jedzie po wire.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummaryItem {
+    pub id: i64,
+    pub created_at: String,
+    pub decisions_text: String,
+    pub summary_text: String,
+    pub model: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummariesListRequest {
+    pub meeting_key: String,
+    /// Limit najnowszych rekordow. `None` = domyslnie 20.
+    pub limit: Option<u32>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummariesListResponse {
+    pub items: Vec<MeetingSummaryItem>,
+}
+
+/// Action item wyekstrahowany przez LLM z transkryptu.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemItem {
+    pub id: i64,
+    pub owner: String,
+    pub task: String,
+    pub deadline: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemsListRequest {
+    pub meeting_key: String,
+    /// `None` = wszystkie; `Some("pending"|"done"|"cancelled")` = filtr po statusie.
+    pub status_filter: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemsListResponse {
+    pub items: Vec<MeetingActionItemItem>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemStatusUpdateRequest {
+    pub item_id: i64,
+    pub status: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemStatusUpdateResponse {
+    pub success: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingTranscriptExportRequest {
+    pub meeting_key: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingTranscriptExportResponse {
+    /// Sformatowany plain text gotowy do zapisu jako .txt (naglowek + linie).
+    pub content: String,
+}
+
 /// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
 /// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -2393,6 +2466,14 @@ pub enum MeetingPayload {
     ResSettingsGet(MeetingSettingsGetResponse),
     ReqSettingsUpdate(MeetingSettingsUpdateRequest),
     ResSettingsUpdate(MeetingSettingsUpdateResponse),
+    ReqSummariesList(MeetingSummariesListRequest),
+    ResSummariesList(MeetingSummariesListResponse),
+    ReqActionItemsList(MeetingActionItemsListRequest),
+    ResActionItemsList(MeetingActionItemsListResponse),
+    ReqActionItemStatusUpdate(MeetingActionItemStatusUpdateRequest),
+    ResActionItemStatusUpdate(MeetingActionItemStatusUpdateResponse),
+    ReqTranscriptExport(MeetingTranscriptExportRequest),
+    ResTranscriptExport(MeetingTranscriptExportResponse),
 }
 
 // =============================================================================
