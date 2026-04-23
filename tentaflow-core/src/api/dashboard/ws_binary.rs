@@ -2,8 +2,8 @@
 // Plik: api/dashboard/ws_binary.rs
 // Opis: Binary WebSocket handler dla nowego protokolu rkyv (Envelope + MessageBody).
 //       Zastapi REST w kolejnych fazach (#36). Na razie obsluguje handshake
-//       schema version + kilka bootstrap wariantow (NodeListRequest,
-//       ModelListRequest, MetaHeartbeat, MetaCancelStream, NodeInfoRequest).
+//       schema version + kilka bootstrap wariantow (ModelListRequest,
+//       MetaHeartbeat, MetaCancelStream).
 //       Pelny dispatch tablicy variantow dokonczy sie po #27 (proc-macro + inventory).
 // =============================================================================
 

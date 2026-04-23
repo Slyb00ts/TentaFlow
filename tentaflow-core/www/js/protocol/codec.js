@@ -6,7 +6,7 @@
 // Przyklad:
 //   import { codecReady, encode } from '/js/protocol/codec.js';
 //   await codecReady;
-//   const frame = encode.nodeListRequest(nextCorrelationId());
+//   const frame = encode.meshNodeListRequest(nextCorrelationId());
 //   ws.send(frame);
 // =============================================================================
 
@@ -56,18 +56,6 @@ export function messageKind() {
  * Zwracaja Uint8Array gotowy do `ws.send(bytes)`.
  */
 export const encode = {
-  /** MessageBody::NodeListRequest — lista nodow mesh. */
-  nodeListRequest(correlationId, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNodeListRequest();
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
   /** MessageBody::ModelListRequest — publiczny katalog modeli (Anonymous). */
   modelListRequest(correlationId, sequence = 1) {
     assertReady();
@@ -112,18 +100,6 @@ export const encode = {
       BigInt(correlationId),
       BigInt(sequence),
       _messageKind.META_CANCEL_STREAM,
-      body,
-    );
-  },
-
-  /** MessageBody::NodeInfoRequest — szczegoly konkretnego noda (32-byte node_id). */
-  nodeInfoRequest(correlationId, nodeId, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNodeInfoRequest(nodeId);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
       body,
     );
   },

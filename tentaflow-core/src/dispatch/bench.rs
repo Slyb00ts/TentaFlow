@@ -22,7 +22,7 @@ mod tests {
     #[ignore = "benchmark — run manually with --ignored --release"]
     fn bench_cold_registry_build() {
         let start = Instant::now();
-        let h = find("NodeListRequest");
+        let h = find("ModelListRequest");
         let elapsed = start.elapsed();
         assert!(h.is_some());
         println!("cold registry build + first find: {:?}", elapsed);
@@ -34,7 +34,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "benchmark — run manually with --ignored --release"]
     async fn bench_warm_dispatch_roundtrip() {
-        let _ = find("NodeListRequest"); // warm-up
+        let _ = find("ModelListRequest"); // warm-up
 
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
@@ -47,7 +47,6 @@ mod tests {
         };
 
         let variants = [
-            MessageBody::NodeListRequest,
             MessageBody::ModelListRequest,
             MessageBody::ApiKeyListRequest,
             MessageBody::AuthMeRequest,
@@ -75,10 +74,9 @@ mod tests {
     #[test]
     #[ignore = "benchmark — run manually with --ignored --release"]
     fn bench_registry_lookup_only() {
-        let _ = find("NodeListRequest"); // warm-up
+        let _ = find("ModelListRequest"); // warm-up
 
         let variants = [
-            "NodeListRequest",
             "ModelListRequest",
             "ApiKeyListRequest",
             "AuthMeRequest",
