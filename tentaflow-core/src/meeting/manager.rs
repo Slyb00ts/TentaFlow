@@ -91,10 +91,7 @@ impl MeetingManager {
     /// 4. Zaktualizuj sesję (status=joining, container info, ports, keys)
     /// 5. Spawn kontener z env
     /// Jeśli którykolwiek krok zawiedzie — cofnij i zwroc blad.
-    pub async fn start_session(
-        &self,
-        req: StartSessionRequest,
-    ) -> Result<SessionDescriptor> {
+    pub async fn start_session(&self, req: StartSessionRequest) -> Result<SessionDescriptor> {
         // meeting_key — UUID zapewnia unikalność, przekazywany przez env MEETING_ID
         // do kontenera. Bot umieszcza ten sam string w `meeting_id` każdego STT
         // responsu, przez co router zapisuje transkrypty pod tą samą sesją
@@ -248,10 +245,7 @@ impl MeetingManager {
         Ok(Some(row_to_descriptor(&row)))
     }
 
-    pub fn session_list(
-        &self,
-        owner_user_id: Option<i64>,
-    ) -> Result<Vec<SessionDescriptor>> {
+    pub fn session_list(&self, owner_user_id: Option<i64>) -> Result<Vec<SessionDescriptor>> {
         let rows = repository::transcripts::list_sessions(&self.db, owner_user_id)?;
         Ok(rows.iter().map(row_to_descriptor).collect())
     }

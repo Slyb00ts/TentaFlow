@@ -8,7 +8,7 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     MeetingActiveSessionResponse, MeetingPayload, MeetingSessionDescriptor,
-    MeetingSessionDetailResponse, MeetingSessionListResponse, MeetingSessionLeaveResponse,
+    MeetingSessionDetailResponse, MeetingSessionLeaveResponse, MeetingSessionListResponse,
     MeetingSessionStartResponse, MeetingSessionSummaryEntry, MeetingSettingKv,
     MeetingSettingsGetResponse, MeetingSettingsUpdateResponse, MeetingSummaryGenerateResponse,
     MeetingTranscriptEntry, MeetingTranscriptsListResponse, MessageBody, ProtocolError,
@@ -129,17 +129,48 @@ pub async fn meeting_session_start(
     let owner = current_user_id(ctx);
     let start = StartSessionRequest {
         meeting_url: r.meeting_url.clone(),
-        title: if r.title.is_empty() { None } else { Some(r.title.clone()) },
-        platform: if r.platform.is_empty() { "teams".into() } else { r.platform.clone() },
+        title: if r.title.is_empty() {
+            None
+        } else {
+            Some(r.title.clone())
+        },
+        platform: if r.platform.is_empty() {
+            "teams".into()
+        } else {
+            r.platform.clone()
+        },
         owner_user_id: owner,
-        bot_name: if r.bot_name.is_empty() { "TentaFlow Bot".into() } else { r.bot_name.clone() },
-        stt_alias: if r.stt_alias.is_empty() { None } else { Some(r.stt_alias.clone()) },
-        tts_alias: if r.tts_alias.is_empty() { None } else { Some(r.tts_alias.clone()) },
-        llm_alias: if r.llm_alias.is_empty() { None } else { Some(r.llm_alias.clone()) },
+        bot_name: if r.bot_name.is_empty() {
+            "TentaFlow Bot".into()
+        } else {
+            r.bot_name.clone()
+        },
+        stt_alias: if r.stt_alias.is_empty() {
+            None
+        } else {
+            Some(r.stt_alias.clone())
+        },
+        tts_alias: if r.tts_alias.is_empty() {
+            None
+        } else {
+            Some(r.tts_alias.clone())
+        },
+        llm_alias: if r.llm_alias.is_empty() {
+            None
+        } else {
+            Some(r.llm_alias.clone())
+        },
     };
-    let desc = ctx.state.meeting_manager.start_session(start).await.map_err(internal)?;
+    let desc = ctx
+        .state
+        .meeting_manager
+        .start_session(start)
+        .await
+        .map_err(internal)?;
     Ok(MessageBody::MeetingBody(MeetingPayload::ResSessionStart(
-        MeetingSessionStartResponse { session: desc_to_proto(desc) },
+        MeetingSessionStartResponse {
+            session: desc_to_proto(desc),
+        },
     )))
 }
 
@@ -261,7 +292,10 @@ pub fn meeting_session_detail(
         session: desc_to_proto(desc),
         transcripts,
         summary_tldr: summary.as_ref().map(|s| s.tldr.clone()).unwrap_or_default(),
-        summary_decisions: summary.as_ref().map(|s| s.decisions.clone()).unwrap_or_default(),
+        summary_decisions: summary
+            .as_ref()
+            .map(|s| s.decisions.clone())
+            .unwrap_or_default(),
         summary_action_items_json: summary
             .as_ref()
             .map(|s| s.action_items_json.clone())
@@ -270,13 +304,18 @@ pub fn meeting_session_detail(
             .as_ref()
             .map(|s| s.open_questions.clone())
             .unwrap_or_default(),
-        summary_model: summary.as_ref().map(|s| s.model.clone()).unwrap_or_default(),
+        summary_model: summary
+            .as_ref()
+            .map(|s| s.model.clone())
+            .unwrap_or_default(),
         summary_generated_at: summary
             .as_ref()
             .map(|s| s.generated_at.clone())
             .unwrap_or_default(),
     };
-    Ok(MessageBody::MeetingBody(MeetingPayload::ResSessionDetail(resp)))
+    Ok(MessageBody::MeetingBody(MeetingPayload::ResSessionDetail(
+        resp,
+    )))
 }
 
 // =============================================================================
@@ -294,16 +333,16 @@ pub fn meeting_transcripts_list(
     let MeetingPayload::ReqTranscriptsList(r) = payload else {
         return Err(bad_request("expected ReqTranscriptsList"));
     };
-    let all = repository::transcripts::list_transcripts(&ctx.state.db, r.session_id)
-        .map_err(internal)?;
+    let all =
+        repository::transcripts::list_transcripts(&ctx.state.db, r.session_id).map_err(internal)?;
     let entries: Vec<MeetingTranscriptEntry> = all
         .into_iter()
         .filter(|t| r.since_ms == 0 || t.timestamp_ms > r.since_ms)
         .map(row_to_entry)
         .collect();
-    Ok(MessageBody::MeetingBody(MeetingPayload::ResTranscriptsList(
-        MeetingTranscriptsListResponse { entries },
-    )))
+    Ok(MessageBody::MeetingBody(
+        MeetingPayload::ResTranscriptsList(MeetingTranscriptsListResponse { entries }),
+    ))
 }
 
 // =============================================================================
@@ -333,8 +372,8 @@ pub async fn meeting_summary_generate(
         }
     }
     // Weryfikuj ze sesja ma transkrypty do podsumowania.
-    let rows = repository::transcripts::list_transcripts(&ctx.state.db, r.session_id)
-        .map_err(internal)?;
+    let rows =
+        repository::transcripts::list_transcripts(&ctx.state.db, r.session_id).map_err(internal)?;
     if rows.is_empty() {
         return Err(ProtocolError::new(
             ProtocolErrorCode::NotFound,
@@ -343,8 +382,8 @@ pub async fn meeting_summary_generate(
     }
     // Resolve alias `teams-summary` — pusty target = admin nie skonfigurowal modelu.
     // Handler zwraca jawny error, frontend pokazuje info "summary wylaczone".
-    let alias = repository::resolve_model_alias(&ctx.state.db, "teams-summary")
-        .map_err(internal)?;
+    let alias =
+        repository::resolve_model_alias(&ctx.state.db, "teams-summary").map_err(internal)?;
     let target = alias
         .as_ref()
         .map(|a| a.target_model.trim().to_string())
@@ -411,7 +450,9 @@ pub fn meeting_active_session(
             session: empty_desc(),
         },
     };
-    Ok(MessageBody::MeetingBody(MeetingPayload::ResActiveSession(resp)))
+    Ok(MessageBody::MeetingBody(MeetingPayload::ResActiveSession(
+        resp,
+    )))
 }
 
 // =============================================================================
@@ -428,8 +469,7 @@ pub fn meeting_settings_get(
     let uid = current_user_id(ctx).ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "session missing user_id")
     })?;
-    let rows = repository::transcripts::list_user_settings(&ctx.state.db, uid)
-        .map_err(internal)?;
+    let rows = repository::transcripts::list_user_settings(&ctx.state.db, uid).map_err(internal)?;
     let settings = rows
         .into_iter()
         .map(|(k, v)| MeetingSettingKv { key: k, value: v })

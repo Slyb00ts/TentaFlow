@@ -13,10 +13,10 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     AddonConfigField, AddonConfigGetResponse, AddonConfigSetResponse, AddonInstallResponse,
     AddonLogEntry, AddonLogsResponse, AddonNetworkRuleDecl, AddonNetworkRulesGetResponse,
-    AddonNetworkRulesSetResponse,
-    AddonReloadResponse, AddonResourcesGetResponse, AddonResourcesSetResponse, AddonToggleResponse,
-    AddonToolDecl, AddonToolParam, AddonToolsResponse, AddonUninstallResponse, MessageBody,
-    ProtocolError, ProtocolErrorCode, SessionAuth,
+    AddonNetworkRulesSetResponse, AddonReloadResponse, AddonResourcesGetResponse,
+    AddonResourcesSetResponse, AddonToggleResponse, AddonToolDecl, AddonToolParam,
+    AddonToolsResponse, AddonUninstallResponse, MessageBody, ProtocolError, ProtocolErrorCode,
+    SessionAuth,
 };
 
 use crate::db::repository;
@@ -885,9 +885,11 @@ pub fn addon_network_rules_get(
     }
     let cfg =
         repository::get_addon_network_config(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
-    let declared_rows = repository::get_addon_declared_network_rules(&ctx.state.db, &payload.addon_id)
-        .map_err(db_err)?;
-    let declared_rules = compute_declared_status(&declared_rows, &cfg.allowed_hosts, &cfg.blocked_hosts);
+    let declared_rows =
+        repository::get_addon_declared_network_rules(&ctx.state.db, &payload.addon_id)
+            .map_err(db_err)?;
+    let declared_rules =
+        compute_declared_status(&declared_rows, &cfg.allowed_hosts, &cfg.blocked_hosts);
     Ok(MessageBody::AddonNetworkRulesGetResponseBody(
         AddonNetworkRulesGetResponse {
             allowed_hosts: cfg.allowed_hosts,

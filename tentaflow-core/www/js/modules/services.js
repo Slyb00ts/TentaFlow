@@ -270,11 +270,17 @@ function renderListTab() {
 function renderRow(s) {
   const cfg = parseConfig(s.configJson);
   const quicAddr = extractQuicAddr(cfg);
+  const deployMode = extractDeployMode(cfg);
   const nodeLabel = s.nodeHostname
     || (s.nodeId ? `${s.nodeId.slice(0, 12)}…` : I18n.t('services.deploy_local'));
   return `
     <tr data-key="svc-${escapeAttr(s.id)}">
-      <td data-label="${escapeAttr(I18n.t('services.col_name'))}"><strong style="color: var(--accent-2);">${escapeHtml(s.name)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_name'))}">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <strong style="color: var(--accent-2);">${escapeHtml(s.name)}</strong>
+          ${deployMode ? `<span class="scope-chip mesh-admin">${escapeHtml(deployMode)}</span>` : ''}
+        </div>
+      </td>
       <td data-label="${escapeAttr(I18n.t('services.col_type'))}"><span class="scope-chip ${typeChipClass(s.serviceType)}">${escapeHtml((s.serviceType || '').toUpperCase())}</span></td>
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}" style="font-size: 12px;">${escapeHtml(nodeLabel)}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddr ? `<code style="font-size:11px;">${escapeHtml(quicAddr)}</code>` : '<span style="color:var(--text-3);">—</span>'}</td>
@@ -766,6 +772,14 @@ function extractQuicAddr(cfg) {
   if (cfg.quic_url) return String(cfg.quic_url).replace(/^quic:\/\//, '');
   if (cfg.quic_port && cfg.agent_domain) return `${cfg.agent_domain}:${cfg.quic_port}`;
   return '';
+}
+
+function extractDeployMode(cfg) {
+  if (!cfg) return '';
+  const raw = String(cfg.deploy_mode || cfg.deployMode || cfg.deploy_method || cfg.deployMethod || '').toLowerCase();
+  if (!raw) return '';
+  const translated = I18n.t(`wizard.method.${raw}`);
+  return translated && translated !== `wizard.method.${raw}` ? translated : raw;
 }
 
 function typeChipClass(t) {

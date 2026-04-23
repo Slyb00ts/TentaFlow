@@ -17,6 +17,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -111,6 +112,11 @@ pub struct RunningEngine {
 /// Katalog cache tentaflow (`~/.cache/tentaflow/` na linux,
 /// `~/Library/Caches/tentaflow/` na macOS).
 pub fn cache_root() -> Result<PathBuf> {
+    if let Ok(override_dir) = std::env::var("TENTAFLOW_CACHE_DIR") {
+        let path = PathBuf::from(override_dir);
+        std::fs::create_dir_all(&path)?;
+        return Ok(path);
+    }
     dirs::cache_dir()
         .map(|c| c.join("tentaflow"))
         .ok_or_else(|| anyhow::anyhow!("nie mozna ustalic cache dir"))
@@ -187,16 +193,13 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
     let python_bin = ensure_python(&cache, &spec.bundle.python_version)?;
     let uv_bin = ensure_uv(&cache).ok();
 
-    let venv_dir = cache.join("envs").join(engine);
     let bundle_src = find_bundle_dir(extracted.path(), engine)
         .ok_or_else(|| anyhow::anyhow!(
             "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
             engine
         ))?;
 
-    create_venv(&python_bin, &venv_dir)?;
-    install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
-    copy_bundle_files(&bundle_src, &venv_dir)?;
+    let venv_dir = prepare_template_env(&cache, &python_bin, &uv_bin, &spec, variant, &bundle_src)?;
 
     Ok(BootstrappedEngine {
         engine: engine.to_string(),
@@ -225,22 +228,28 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
     let python_bin = ensure_python(&cache, &spec.bundle.python_version)?;
     let uv_bin = ensure_uv(&cache).ok();
 
-    let venv_dir = cache.join("envs").join(&req.engine);
     let bundle_src = find_bundle_dir(extracted.path(), &req.engine)
         .ok_or_else(|| anyhow::anyhow!(
             "brak katalogu bundla Pythona dla silnika '{}' w tentaflow-containers/<kategoria>/python/",
             req.engine
         ))?;
 
-    create_venv(&python_bin, &venv_dir)?;
-    install_deps(&venv_dir, &uv_bin, &spec, variant, &bundle_src)?;
-    copy_bundle_files(&bundle_src, &venv_dir)?;
-
-    let child = spawn_engine(&venv_dir, &spec, req)?;
     let instance_name = req
         .instance_name
         .clone()
         .unwrap_or_else(|| format!("tentaflow-{}-native", req.engine));
+    let template_venv =
+        prepare_template_env(&cache, &python_bin, &uv_bin, &spec, variant, &bundle_src)?;
+    let template_id = template_identity(&spec, variant, &bundle_src)?;
+    let venv_dir = prepare_instance_env(
+        &cache,
+        &req.engine,
+        &instance_name,
+        &template_venv,
+        &template_id,
+    )?;
+
+    let child = spawn_engine(&venv_dir, &spec, req)?;
 
     Ok(RunningEngine {
         engine: req.engine.clone(),
@@ -475,6 +484,221 @@ fn create_venv(python: &Path, venv: &Path) -> Result<()> {
     }
     std::fs::create_dir_all(venv.parent().unwrap()).ok();
     run(Command::new(python).args(["-m", "venv", venv.to_str().unwrap()])).context("tworzenie venv")
+}
+
+fn prepare_template_env(
+    cache: &Path,
+    python: &Path,
+    uv: &Option<PathBuf>,
+    spec: &BundleSpec,
+    variant: Option<&InstallVariant>,
+    bundle_src: &Path,
+) -> Result<PathBuf> {
+    let template_id = template_identity(spec, variant, bundle_src)?;
+    let template_dir = templates_root(cache)
+        .join(&spec.bundle.engine)
+        .join(template_id)
+        .join("venv");
+
+    if template_dir.join("pyvenv.cfg").exists() {
+        return Ok(template_dir);
+    }
+
+    std::fs::create_dir_all(template_dir.parent().unwrap()).ok();
+    if let Some(legacy) = legacy_env_dir(cache, &spec.bundle.engine) {
+        tracing::info!(
+            engine = %spec.bundle.engine,
+            source = %legacy.display(),
+            target = %template_dir.display(),
+            "Kopiuje legacy env do wersjonowanego template bundla"
+        );
+        copy_dir_recursive(&legacy, &template_dir)?;
+        let stale_clone = template_dir.join("src").join(&spec.bundle.engine);
+        if stale_clone.exists() {
+            std::fs::remove_dir_all(&stale_clone).with_context(|| {
+                format!(
+                    "usuwanie starego checkoutu {} przed odswiezeniem template",
+                    stale_clone.display()
+                )
+            })?;
+        }
+    } else {
+        create_venv(python, &template_dir)?;
+    }
+    install_deps(&template_dir, uv, spec, variant, bundle_src)?;
+    copy_bundle_files(bundle_src, &template_dir)?;
+    Ok(template_dir)
+}
+
+fn prepare_instance_env(
+    cache: &Path,
+    engine: &str,
+    instance_name: &str,
+    template_venv: &Path,
+    template_id: &str,
+) -> Result<PathBuf> {
+    let instance_dir = instances_root(cache)
+        .join(engine)
+        .join(sanitize_fs_name(instance_name));
+    let marker = instance_dir.join(".tentaflow-template-id");
+
+    if instance_dir.join("pyvenv.cfg").exists()
+        && std::fs::read_to_string(&marker).ok().as_deref() == Some(template_id)
+    {
+        return Ok(instance_dir);
+    }
+
+    if instance_dir.exists() {
+        std::fs::remove_dir_all(&instance_dir).with_context(|| {
+            format!("usuwanie starego env instancji {}", instance_dir.display())
+        })?;
+    }
+
+    copy_dir_recursive(template_venv, &instance_dir)?;
+    std::fs::write(&marker, template_id)?;
+    Ok(instance_dir)
+}
+
+fn template_identity(
+    spec: &BundleSpec,
+    variant: Option<&InstallVariant>,
+    bundle_src: &Path,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(spec.bundle.engine.as_bytes());
+    hasher.update(spec.bundle.python_version.as_bytes());
+    hasher.update(spec.bundle.source.as_bytes());
+
+    if let Some(pkg) = &spec.bundle.pypi_package {
+        hasher.update(pkg.as_bytes());
+    }
+    if let Some(repo) = &spec.bundle.git_repo {
+        hasher.update(repo.as_bytes());
+    }
+    if let Some(git_ref) = &spec.bundle.git_ref {
+        hasher.update(git_ref.as_bytes());
+    }
+    if let Some(subdir) = &spec.bundle.install_subdir {
+        hasher.update(subdir.as_bytes());
+    }
+    if let Some(mode) = &spec.bundle.install_mode {
+        hasher.update(mode.as_bytes());
+    }
+
+    if let Some(v) = variant {
+        hasher.update(v.backend.as_bytes());
+        if let Some(extra_index) = &v.extra_index {
+            hasher.update(extra_index.as_bytes());
+        }
+        for extra in &v.extras {
+            hasher.update(extra.as_bytes());
+        }
+        for extra in &v.extras_no_build_isolation {
+            hasher.update(extra.as_bytes());
+        }
+    }
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(bundle_src)?
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    for file in files {
+        hasher.update(
+            file.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hasher.update(std::fs::read(&file)?);
+    }
+
+    let digest = hasher.finalize();
+    Ok(hex::encode(&digest[..8]))
+}
+
+fn templates_root(cache: &Path) -> PathBuf {
+    cache.join("bundle-templates")
+}
+
+fn instances_root(cache: &Path) -> PathBuf {
+    cache.join("bundle-instances")
+}
+
+fn legacy_env_dir(cache: &Path, engine: &str) -> Option<PathBuf> {
+    let candidate = cache.join("envs").join(engine);
+    if candidate.join("pyvenv.cfg").exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn sanitize_fs_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-');
+    if out.is_empty() {
+        "instance".to_string()
+    } else {
+        out.to_string()
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&src_path)?;
+        let file_type = meta.file_type();
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+            continue;
+        }
+
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&src_path)?;
+            create_symlink(&target, &dst_path)?;
+            continue;
+        }
+
+        link_or_copy_file(&src_path, &dst_path)?;
+    }
+    Ok(())
+}
+
+fn link_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+    if std::fs::hard_link(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn create_symlink(target: &Path, link: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(target).ok();
+    if metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+        std::os::windows::fs::symlink_dir(target, link)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, link)?;
+    }
+    Ok(())
 }
 
 /// Instaluje zaleznosci przez `uv pip` lub klasyczny `pip`. Parametr
@@ -965,5 +1189,18 @@ mod tests {
         let should_pass = req.platforms.contains(&current);
         let ok = check_platform_compat(&req);
         assert_eq!(ok.is_ok(), should_pass);
+    }
+
+    #[test]
+    fn cache_root_respects_env_override() {
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("TENTAFLOW_CACHE_DIR", temp.path());
+        }
+        let root = cache_root().unwrap();
+        unsafe {
+            std::env::remove_var("TENTAFLOW_CACHE_DIR");
+        }
+        assert_eq!(root, temp.path());
     }
 }

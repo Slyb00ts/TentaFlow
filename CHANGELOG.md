@@ -6,11 +6,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
-## [0.0.1-alpha] - 2026-04-14
-
 ### Added
-- TBD — describe the changes before tagging.
+- Added the new `www/` dashboard SPA and migrated the app to the binary WebSocket protocol with generated browser codecs.
+- Added the service manifest registry, universal service catalog, and deploy wizard for Docker, native, and external engines.
+- Added embedded and bundled deployment flows for AI engines, including live deployment progress streaming and shared model storage.
+- Added a full meeting-bot stack with protocol support, database persistence, per-session container lifecycle, and dedicated frontend screens.
+- Added multi-hop mesh topology propagation, route awareness, peer liveness tracking, and richer model and service visibility across nodes.
+- Added QR-based pairing flows for mobile and tablet devices, including camera scanning and invite/PIN confirmation improvements.
+- Added mobile-focused improvements across iOS and Android, including native discovery integration, QR scanning fallback, and mobile web packaging groundwork.
+- Added installer and release automation, including GitHub Releases, packaged artifacts, and install scripts for Unix and Windows.
+- Added IAM foundations with users, groups, role metadata, and resource permission protocol and handler support.
 
+### Changed
+- Switched the main dashboard static asset pipeline from `wwwroot/` to `www/`.
+- Reworked deployment execution to use manifest-driven jobs and streamed deployment status instead of the older direct service deploy path.
+- Upgraded the deploy wizard UI from simple radio inputs to richer option cards and per-GPU selection controls.
+- Expanded mesh model and topology views so the UI can show backend, size, route, and peer-derived fallback data more consistently.
+
+### Fixed
+- Fixed native embedded deploys so `llama.cpp`, `MLX`, and `Whisper` create persistent service records, reappear in `Services`, and restore correctly after app restart.
+- Fixed iOS and Xcode build issues around toolchain setup, Metal platform support, and mobile startup behavior.
+- Fixed container bundle deployment path resolution and Docker build context handling for manifest-based deploys.
+- Fixed multiple mesh pairing and discovery regressions, including duplicate connect/disconnect events, pairing completion handling, peer identity propagation, and reconnect behavior.
+- Fixed mobile window sizing, fullscreen handling, and QR scanner error behavior.
 
 ## [0.0.1-alpha] - 2026-04-14
 

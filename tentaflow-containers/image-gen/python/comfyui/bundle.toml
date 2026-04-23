@@ -12,7 +12,7 @@ install_mode = "requirements_txt"
 command = "python"
 # Clone lezy w venv/src/comfyui/ — stad main.py
 args = ["${VENV_DIR}/src/comfyui/main.py",
-        "--listen", "127.0.0.1", "--port", "8188"]
+        "--listen", "127.0.0.1", "--port", "${PORT:-8188}"]
 internal_port = 8188
 
 [requires]

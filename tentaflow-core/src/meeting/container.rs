@@ -59,10 +59,7 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
     // Upewnij sie ze obraz istnieje — jesli nie, zwracamy wyraźny błąd żeby
     // frontend pokazał "addon nie wdrozony". Inaczej bollard sam spróbuje pullować
     // z Docker Hub i wisimy przez minute.
-    let image_exists = docker
-        .inspect_image(IMAGE_TAG)
-        .await
-        .is_ok();
+    let image_exists = docker.inspect_image(IMAGE_TAG).await.is_ok();
     if !image_exists {
         anyhow::bail!(
             "Obraz {} nie istnieje — zbuduj kontener teams-bot z Services (agents/teams-bot)",
@@ -123,7 +120,10 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
         host_config: Some(host_config),
         labels: Some({
             let mut m = HashMap::new();
-            m.insert("tentaflow.meeting_session".to_string(), req.session_id.to_string());
+            m.insert(
+                "tentaflow.meeting_session".to_string(),
+                req.session_id.to_string(),
+            );
             m.insert("tentaflow.kind".to_string(), "meeting-bot".to_string());
             m
         }),
@@ -201,7 +201,10 @@ pub async fn cleanup_stale_containers() -> Result<()> {
     use bollard::Docker;
     let docker = Docker::connect_with_local_defaults()?;
     let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-    filters.insert("label".to_string(), vec!["tentaflow.kind=meeting-bot".to_string()]);
+    filters.insert(
+        "label".to_string(),
+        vec!["tentaflow.kind=meeting-bot".to_string()],
+    );
     let opts = ListContainersOptions {
         all: true,
         filters: Some(filters),

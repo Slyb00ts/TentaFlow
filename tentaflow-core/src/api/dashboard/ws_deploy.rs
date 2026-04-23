@@ -664,11 +664,22 @@ async fn deploy_native_python(
         env.insert("MODEL".into(), config.model_id.clone());
         env.insert("MODEL_ID".into(), config.model_id.clone());
     }
+    if config.port != 0 {
+        env.insert("PORT".into(), config.port.to_string());
+    }
 
     // Parse compose_yaml zeby wyciagnac HF_TOKEN/GPU_MEMORY_UTILIZATION/itp.
     // (#[cfg(feature = "docker")] branch ma to zaimplementowane — reuzyj)
     #[cfg(feature = "docker")]
     if let Some(parsed) = parse_compose_for_bundle(&req.compose_yaml) {
+        if let Some((host_port, _)) = parsed
+            .ports
+            .iter()
+            .find(|(_, container)| container.ends_with("/tcp"))
+        {
+            env.entry("PORT".into())
+                .or_insert_with(|| host_port.clone());
+        }
         for (k, v) in parsed.env {
             env.entry(k).or_insert(v);
         }
