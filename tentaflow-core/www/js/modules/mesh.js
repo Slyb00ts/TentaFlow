@@ -456,6 +456,11 @@ function buildMeta(node) {
     parts.push(`<div class="meta-item"><span><strong>${escapeHtml(I18n.t('mesh.containers_short'))}:</strong> ${cRun} / ${cTot}</span></div>`);
   }
 
+  const connection = buildConnectionSummary(node);
+  if (connection) {
+    parts.push(connection);
+  }
+
   return `<div class="mesh-card-meta">${parts.join('')}</div>`;
 }
 
@@ -476,6 +481,39 @@ function isOnline(node) {
   const s = String(node.status || '').toLowerCase();
   if (node.is_local) return true;
   return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
+}
+
+function buildConnectionSummary(node) {
+  const connection = node.connection;
+  if (!connection || !connection.transport) return '';
+  const transport = connectionTransportLabel(connection.transport);
+  const scope = connection.scope ? connectionScopeLabel(connection.scope) : '';
+  const address = connection.address ? escapeHtml(connection.address) : '—';
+  const label = [transport, scope].filter(Boolean).join(' · ');
+  const paths = Array.isArray(connection.paths) ? connection.paths : [];
+  const tooltip = paths
+    .map((path) => {
+      const markers = [];
+      if (path.selected) markers.push(I18n.t('mesh.connection_selected'));
+      if (path.closed) markers.push(I18n.t('mesh.connection_closed'));
+      return `${connectionTransportLabel(path.transport)} · ${path.address}${markers.length ? ` · ${markers.join(' · ')}` : ''}`;
+    })
+    .join('\n');
+  const attrs = tooltip ? ` title="${escapeAttr(tooltip)}"` : '';
+  return `<div class="meta-item"${attrs}><span><strong>${escapeHtml(I18n.t('mesh.connection'))}:</strong> ${escapeHtml(label)} · ${address}</span></div>`;
+}
+
+function connectionTransportLabel(value) {
+  if (value === 'p2p') return I18n.t('mesh.connection_p2p');
+  if (value === 'relay') return I18n.t('mesh.connection_relay');
+  if (value === 'custom') return I18n.t('mesh.connection_custom');
+  return I18n.t('mesh.connection_unknown');
+}
+
+function connectionScopeLabel(value) {
+  if (value === 'lan') return I18n.t('mesh.connection_lan');
+  if (value === 'wan') return I18n.t('mesh.connection_wan');
+  return value || '';
 }
 
 function pctOr(value, fallback) {
