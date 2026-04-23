@@ -5,15 +5,20 @@
 //       wykonanie do odpowiedniego backendu (LLM, RAG, STT, TTS itd.).
 // =============================================================================
 
+pub mod condition;
 pub mod conversation_history;
 pub mod embeddings;
 pub mod llm;
 pub mod memory;
+pub mod output;
+pub mod pii_filter;
 pub mod rag;
 pub mod session_context;
 pub mod speaker_context;
 pub mod stt;
+pub mod trigger;
 pub mod tts;
+pub mod tts_clean;
 
 use anyhow::Result;
 use serde_json::Value;

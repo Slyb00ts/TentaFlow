@@ -240,14 +240,6 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "database",
         ),
         (
-            "template",
-            "transform",
-            "Szablon",
-            "Formatowanie tekstu z podstawianiem zmiennych",
-            r#"{"template":""}"#,
-            "file-text",
-        ),
-        (
             "pii_filter",
             "transform",
             "Filtr PII",
@@ -270,22 +262,6 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Rozgałęzienie warunkowe (if/else)",
             r#"{"field":"","operator":"equals","value":""}"#,
             "git-branch",
-        ),
-        (
-            "switch",
-            "logic",
-            "Przełącznik",
-            "Wielokrotny wybór (switch/case)",
-            r#"{"field":"","cases":[]}"#,
-            "list",
-        ),
-        (
-            "router",
-            "logic",
-            "Router",
-            "Przekazanie danych dalej",
-            "{}",
-            "send",
         ),
         (
             "output",
@@ -817,5 +793,74 @@ mod tests {
         // Nieistniejacy prompt -> None
         let none = crate::db::repository::find_prompt(&pool, "does_not_exist", "pl").unwrap();
         assert!(none.is_none());
+    }
+
+    /// Kazdy seedowany flow musi przechodzic walidacje AdapterRegistry
+    /// (zbudowanej z tym samym zestawem adapterow co FlowDispatcher). Chroni
+    /// przed regresja: dodanie node_type do seed'a bez adaptera w dispatcherze
+    /// blokowaloby zapis flow przez walidacje dispatch/handlers.rs.
+    #[test]
+    fn seeded_flows_pass_adapter_validation() {
+        use crate::config::RouterConfig;
+        use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
+        use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
+        use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
+        use crate::flow_engine::adapters::llm::LlmNodeAdapter;
+        use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
+        use crate::flow_engine::adapters::output::OutputNodeAdapter;
+        use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
+        use crate::flow_engine::adapters::rag::RagNodeAdapter;
+        use crate::flow_engine::adapters::session_context::SessionContextAdapter;
+        use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
+        use crate::flow_engine::adapters::stt::SttNodeAdapter;
+        use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
+        use crate::flow_engine::adapters::tts::TtsNodeAdapter;
+        use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
+        use crate::flow_engine::adapters::AdapterRegistry;
+        use crate::flow_engine::types::FlowDefinition;
+        use crate::flow_engine::validation::validate_flow;
+        use crate::routing::service_manager::ServiceManager;
+        use std::sync::Arc;
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let config = Arc::new(RouterConfig::default());
+        let sm = Arc::new(
+            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
+        );
+
+        let mut registry = AdapterRegistry::new();
+        registry.register(LlmNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(RagNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(SttNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(TtsNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(EmbeddingsNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(MemoryNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(ConversationHistoryAdapter::new(sm.clone(), config.clone()));
+        registry.register(SessionContextAdapter::new(sm.clone(), config.clone()));
+        registry.register(SpeakerContextAdapter::new(sm, config));
+        registry.register(TriggerNodeAdapter::new());
+        registry.register(OutputNodeAdapter::new());
+        registry.register(ConditionNodeAdapter::new());
+        registry.register(PiiFilterNodeAdapter::new(pool.clone()));
+        registry.register(TtsCleanNodeAdapter::new(pool.clone()));
+
+        let flow_jsons: Vec<(String, String)> = {
+            let conn = pool.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT name, flow_json FROM flows").unwrap();
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            rows
+        };
+
+        assert!(!flow_jsons.is_empty(), "seed nie wyprodukowal flows");
+        for (name, json) in &flow_jsons {
+            let parsed: FlowDefinition = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("flow '{}': nie parsuje: {}", name, e));
+            validate_flow(&parsed, &registry)
+                .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
+        }
     }
 }

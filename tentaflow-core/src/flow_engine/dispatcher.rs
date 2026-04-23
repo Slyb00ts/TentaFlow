@@ -6,15 +6,20 @@
 
 use crate::config::RouterConfig;
 use crate::db::{repository, DbPool};
+use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
 use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
 use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
 use crate::flow_engine::adapters::llm::LlmNodeAdapter;
 use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
+use crate::flow_engine::adapters::output::OutputNodeAdapter;
+use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
 use crate::flow_engine::adapters::rag::RagNodeAdapter;
 use crate::flow_engine::adapters::session_context::SessionContextAdapter;
 use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
 use crate::flow_engine::adapters::stt::SttNodeAdapter;
+use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
 use crate::flow_engine::adapters::tts::TtsNodeAdapter;
+use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
 use crate::flow_engine::adapters::{AdapterChunkStream, AdapterRegistry};
 use crate::flow_engine::cache::FlowCache;
 use crate::flow_engine::executor_async::FlowExecutorAsync;
@@ -67,6 +72,11 @@ impl FlowDispatcher {
             config.clone(),
         ));
         registry.register(SpeakerContextAdapter::new(service_manager, config));
+        registry.register(TriggerNodeAdapter::new());
+        registry.register(OutputNodeAdapter::new());
+        registry.register(ConditionNodeAdapter::new());
+        registry.register(PiiFilterNodeAdapter::new(db.clone()));
+        registry.register(TtsCleanNodeAdapter::new(db.clone()));
 
         Self {
             db,

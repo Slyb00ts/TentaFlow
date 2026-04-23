@@ -254,6 +254,65 @@ Implementacja: `tentaflow-core/src/api/dashboard/api_services_manifest.rs`.
 6. `cargo build` w `tentaflow-core/` — walidacja + auto-generacja Rust + JS rejestru
 7. Reload GUI — kafelek silnika pojawi się dynamicznie z manifestu
 
+## Chat pipeline po cleanup
+
+Router chat obsługuje dokładnie dwie ścieżki:
+
+1. **Flow-engine driven** — jeśli request model ma przypisany flow w `flow_model_bindings`
+   (albo jest domyślny flow dla `service_type="chat"`), request idzie przez `FlowDispatcher`
+   → `execute_flow` (blocking) albo `execute_streaming_flow` (dla SSE). Adaptery wykonują
+   pipeline krok po kroku. Streaming: tylko `llm` adapter eksponuje port `stream` (QUIC
+   `send_request_stream` lub HTTP `chat_completion_stream`); pozostałe node types pracują
+   w full/blocking mode.
+
+2. **Bare passthrough** — jeśli żaden flow nie pasuje, chat.rs/streaming.rs wywołuje
+   bezpośrednio backend LLM (QUIC/HTTP/local inference) bez żadnego pre/post-processingu
+   request'a.
+
+Usunięte moduły (były częścią starego "jarvis" pipeline'u):
+- `routing/memory_integration.rs` — wstrzykiwanie memory context, conversation cache,
+  voice-based personalization. Funkcjonalność można odtworzyć przez user-defined flow
+  z node'ami `conversation_history` + `memory` + `speaker_context`.
+- `memory_analyzer/` — LLM-based decision "czy odpytać memory engine". Obecnie: flow
+  user-defined albo brak.
+- `intent_analyzer/` — LLM-based klasyfikacja intencji + speaker enrollment trigger.
+  Obecnie: flow user-defined albo enrollment manualny przez dashboard.
+- 19 hardcoded prompt stałych w `prompt_registry/mod.rs` + 3 pliki `.txt` → prompty
+  dodawane przez dashboard (CRUD) i/lub seed pod konkretne use-case (obecnie jeden:
+  `transcription_summarization` w 5 językach).
+
+### Zarejestrowane node types i porty
+
+FlowDispatcher (`tentaflow-core/src/flow_engine/dispatcher.rs`) rejestruje adaptery dla
+wszystkich node types używanych w seedowanych flows. Walidacja flow_json przy save
+(`validate_flow_json_str` w `dispatch/handlers.rs`) odrzuca flows odwołujące się do
+niezarejestrowanych typów lub nieistniejących portów — więc każdy typ obecny w seed
+musi mieć adapter.
+
+| Node type | Adapter | supported_output_ports | Źródło |
+|-----------|---------|------------------------|--------|
+| `trigger` | `TriggerNodeAdapter` | `["full"]` | `adapters/trigger.rs` |
+| `output` | `OutputNodeAdapter` | `["full"]` | `adapters/output.rs` |
+| `condition` | `ConditionNodeAdapter` | `["full"]` | `adapters/condition.rs` |
+| `pii_filter` | `PiiFilterNodeAdapter` | `["full"]` | `adapters/pii_filter.rs` (reguły z `pii_rules`) |
+| `tts_clean` | `TtsCleanNodeAdapter` | `["full"]` | `adapters/tts_clean.rs` (reguły z `tts_cleaning_rules`) |
+| `llm` | `LlmNodeAdapter` | `["stream", "full"]` | `adapters/llm.rs` — real streaming |
+| `rag`, `stt`, `tts`, `embeddings`, `memory`, `conversation_history`, `session_context`, `speaker_context` | odpowiednie `*NodeAdapter` | `["full"]` | `adapters/*.rs` |
+
+Logika `trigger`/`output`/`condition`/`pii_filter`/`tts_clean` żyje w modułach adapterów
+jako `pub fn build_*` / `apply_*` — executor_async woła je dla szybkiej ścieżki
+wewnętrznej; adaptery wywołują te same funkcje. Zero duplikacji.
+
+`FlowEdge.from_port` i `to_port` (default `"full"` / `"in"`) określają który port
+node'a jest podpięty. Walidacja sprawdza że `from_port` ∈ `supported_output_ports` i
+`to_port` ∈ `supported_input_ports` po obu stronach edge'a.
+
+Seedowane flows (`db/seed.rs`): `Standardowy pipeline LLM`, `Standardowy pipeline TTS`,
+`teams-flow`. Test `seeded_flows_pass_adapter_validation` egzekwuje że każdy z nich
+parsuje i przechodzi walidację przy świeżej bazie.
+
+Test reference: `cargo test --lib seeded_flows_pass_adapter_validation`.
+
 ## Configuration
 
 `config.toml` at project root. Key sections: `[server]`, `[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default ports: HTTPS/QUIC on 8090, Prometheus on 9090.
