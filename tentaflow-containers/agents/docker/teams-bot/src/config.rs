@@ -1,6 +1,8 @@
 // =============================================================================
 // Plik: config.rs
-// Opis: Konfiguracja sidecara meeting bot, ladowana z pliku TOML.
+// Opis: Konfiguracja sidecara meeting bot, ladowana z pliku TOML lub env.
+//       Bot operuje na aliasach serwisow (stt/tts/summarization/flow) —
+//       rozwiazanie aliasu na konkretny silnik/voice/model wykonuje router.
 // =============================================================================
 
 use anyhow::{Context, Result};
@@ -46,14 +48,22 @@ pub struct MeetingConfig {
     /// Sciezka do modelu Silero VAD ONNX (None = prosty detektor RMS)
     pub vad_model_path: Option<String>,
 
-    /// Alias modelu STT w routerze (np. "teams-stt")
-    pub stt_model: Option<String>,
+    /// Alias serwisu STT w routerze.
+    #[serde(default = "default_stt_alias")]
+    pub stt_alias: String,
 
-    /// Alias modelu TTS w routerze (np. "teams-tts")
-    pub tts_model: Option<String>,
+    /// Alias serwisu summarization w routerze.
+    #[serde(default = "default_summarization_alias")]
+    pub summarization_alias: String,
 
-    /// Glos TTS (np. "alloy")
-    pub tts_voice: Option<String>,
+    /// Alias serwisu TTS w routerze.
+    #[serde(default = "default_tts_alias")]
+    pub tts_alias: String,
+
+    /// Alias flow w routerze (rezerwacja — flow jest rozwiazywany przez router,
+    /// bot trzyma pole dla spojnosci i przyszlego uzycia).
+    #[serde(default = "default_flow_alias")]
+    pub flow_alias: String,
 
     /// Nazwa bota wyswietlana w spotkaniu Teams
     #[serde(default = "default_bot_name")]
@@ -70,6 +80,17 @@ pub struct MeetingConfig {
     /// Prog RMS powyzej ktorego VAD uznaje za mowe (uzywany gdy brak modelu Silero)
     #[serde(default = "default_vad_rms_threshold")]
     pub vad_rms_threshold: f32,
+
+    /// Czy bot ma dolaczac z wlaczona kamerka (generowana z canvas przez MSTG).
+    /// Domyslnie false — power user wlacza swiadomie (wymaga MSTG + OffscreenCanvas).
+    #[serde(default)]
+    pub bot_video_enabled: bool,
+
+    /// Echo mode — gdy true, TTS wypowiada transkrypt ze STT (tryb testowy).
+    /// Domyslnie false, bo bez tego powstaje feedback loop: bot slyszy wlasny glos
+    /// przez glosniki/echo Teams i transkrybuje go ponownie.
+    #[serde(default)]
+    pub echo_mode: bool,
 }
 
 fn default_transport_port() -> u16 {
@@ -94,6 +115,22 @@ fn default_vad_rms_threshold() -> f32 {
 
 fn default_bot_name() -> String {
     "TentaFlow Jarvis".to_string()
+}
+
+fn default_stt_alias() -> String {
+    "teams-stt".to_string()
+}
+
+fn default_summarization_alias() -> String {
+    "teams-summarization".to_string()
+}
+
+fn default_tts_alias() -> String {
+    "teams-tts".to_string()
+}
+
+fn default_flow_alias() -> String {
+    "teams-flow".to_string()
 }
 
 impl MeetingConfig {
@@ -132,9 +169,14 @@ impl MeetingConfig {
             vad_model_path: std::env::var("VAD_MODEL_PATH")
                 .ok()
                 .or_else(|| Some("/opt/models/silero_vad.onnx".to_string())),
-            stt_model: std::env::var("STT_MODEL").ok(),
-            tts_model: std::env::var("TTS_MODEL").ok(),
-            tts_voice: std::env::var("TTS_VOICE").ok(),
+            stt_alias: std::env::var("STT_ALIAS")
+                .unwrap_or_else(|_| "teams-stt".to_string()),
+            summarization_alias: std::env::var("SUMMARIZATION_ALIAS")
+                .unwrap_or_else(|_| "teams-summarization".to_string()),
+            tts_alias: std::env::var("TTS_ALIAS")
+                .unwrap_or_else(|_| "teams-tts".to_string()),
+            flow_alias: std::env::var("FLOW_ALIAS")
+                .unwrap_or_else(|_| "teams-flow".to_string()),
             bot_name: std::env::var("BOT_NAME")
                 .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
@@ -143,6 +185,10 @@ impl MeetingConfig {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             vad_rms_threshold: std::env::var("VAD_RMS_THRESHOLD")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(100.0),
+            bot_video_enabled: std::env::var("BOT_VIDEO_ENABLED")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
+            echo_mode: std::env::var("ECHO_MODE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
         };
 
         tracing::info!("Konfiguracja zaladowana ze zmiennych srodowiskowych");
@@ -177,9 +223,10 @@ mod tests {
             silence_threshold_ms = 3000
             audio_device = "pulse_monitor"
             vad_model_path = "/models/silero.onnx"
-            stt_model = "whisper-large"
-            tts_model = "teams-tts"
-            tts_voice = "nova"
+            stt_alias = "custom-stt"
+            tts_alias = "custom-tts"
+            summarization_alias = "custom-sum"
+            flow_alias = "custom-flow"
             secret_key_path = "/data/endpoint-key.bin"
             bot_name = "Testowy Bot"
         "#;
@@ -191,9 +238,10 @@ mod tests {
         assert_eq!(config.silence_threshold_ms, 3000);
         assert_eq!(config.audio_device.as_deref(), Some("pulse_monitor"));
         assert_eq!(config.vad_model_path.as_deref(), Some("/models/silero.onnx"));
-        assert_eq!(config.stt_model.as_deref(), Some("whisper-large"));
-        assert_eq!(config.tts_model.as_deref(), Some("teams-tts"));
-        assert_eq!(config.tts_voice.as_deref(), Some("nova"));
+        assert_eq!(config.stt_alias, "custom-stt");
+        assert_eq!(config.tts_alias, "custom-tts");
+        assert_eq!(config.summarization_alias, "custom-sum");
+        assert_eq!(config.flow_alias, "custom-flow");
         assert_eq!(config.secret_key_path.as_deref(), Some("/data/endpoint-key.bin"));
     }
 
@@ -210,12 +258,15 @@ mod tests {
         assert_eq!(config.silence_threshold_ms, 500);
         assert!(config.audio_device.is_none());
         assert!(config.vad_model_path.is_none());
-        assert!(config.stt_model.is_none());
-        assert!(config.tts_model.is_none());
-        assert!(config.tts_voice.is_none());
+        assert_eq!(config.stt_alias, "teams-stt");
+        assert_eq!(config.tts_alias, "teams-tts");
+        assert_eq!(config.summarization_alias, "teams-summarization");
+        assert_eq!(config.flow_alias, "teams-flow");
         assert!(config.secret_key_path.is_none());
         assert!(config.enable_lan_discovery);
         assert!(config.enable_dht_discovery);
+        assert!(!config.bot_video_enabled, "bot_video_enabled domyslnie false");
+        assert!(!config.echo_mode, "echo_mode domyslnie false");
     }
 
     #[test]
@@ -309,53 +360,41 @@ mod tests {
             unknown_field = "should be ignored"
         "#;
 
-        // MeetingConfig nie ma deny_unknown_fields, wiec toml powinno zignorowac
         let result: Result<MeetingConfig, _> = toml::from_str(toml_str);
-        // Jesli toml domyslnie odrzuca nieznane pola — to tez OK
-        // Sprawdzamy ze nie panikuje
         let _ = result;
     }
 
     #[test]
-    fn parse_config_with_stt_and_tts_models() {
-        // Konfiguracja z ustawionymi modelami STT i TTS
+    fn parse_config_with_custom_aliases() {
+        // Konfiguracja z ustawionymi aliasami STT/TTS/summarization/flow
         let toml_str = r#"
             meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
             auth_cookies_path = "/tmp/cookies.json"
-            stt_model = "teams-stt"
-            tts_model = "teams-tts"
+            stt_alias = "prod-stt"
+            tts_alias = "prod-tts"
+            summarization_alias = "prod-sum"
+            flow_alias = "prod-flow"
         "#;
 
         let config: MeetingConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.stt_model.as_deref(), Some("teams-stt"));
-        assert_eq!(config.tts_model.as_deref(), Some("teams-tts"));
-        assert!(config.tts_voice.is_none());
+        assert_eq!(config.stt_alias, "prod-stt");
+        assert_eq!(config.tts_alias, "prod-tts");
+        assert_eq!(config.summarization_alias, "prod-sum");
+        assert_eq!(config.flow_alias, "prod-flow");
     }
 
     #[test]
-    fn parse_config_with_tts_voice() {
-        // Konfiguracja z ustawionym glosem TTS
-        let toml_str = r#"
-            meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
-            auth_cookies_path = "/tmp/cookies.json"
-            tts_voice = "shimmer"
-        "#;
-
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.tts_voice.as_deref(), Some("shimmer"));
-    }
-
-    #[test]
-    fn parse_minimal_config_stt_tts_default_none() {
-        // Minimalna konfiguracja — stt_model, tts_model, tts_voice domyslnie None
+    fn parse_minimal_config_aliases_use_defaults() {
+        // Minimalna konfiguracja — aliasy przyjmuja wartosci domyslne
         let toml_str = r#"
             meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
             auth_cookies_path = "/tmp/cookies.json"
         "#;
 
         let config: MeetingConfig = toml::from_str(toml_str).unwrap();
-        assert!(config.stt_model.is_none(), "stt_model domyslnie None");
-        assert!(config.tts_model.is_none(), "tts_model domyslnie None");
-        assert!(config.tts_voice.is_none(), "tts_voice domyslnie None");
+        assert_eq!(config.stt_alias, "teams-stt");
+        assert_eq!(config.tts_alias, "teams-tts");
+        assert_eq!(config.summarization_alias, "teams-summarization");
+        assert_eq!(config.flow_alias, "teams-flow");
     }
 }

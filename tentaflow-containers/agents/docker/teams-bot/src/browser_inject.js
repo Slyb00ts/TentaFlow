@@ -29,8 +29,25 @@
     return;
   }
 
-  window.__tentaflowBridge = true;
+  // Obiekt-bridge (nie boolean) — trzyma flagi dostepnosci feature'ow dla Rusta
+  // oraz marker setupDone zeby ponowny evaluate_on_new_document nie dublowal
+  // intervali/patchow.
+  window.__tentaflowBridge = { setupDone: false };
+  window.__tentaflowVideoAvailable = false;
   console.log('[tentaflow] Bridge audio startuje w', href);
+
+  // Lista aktywnych interwalow — posprzatamy je w cleanupTentaflow() gdy WS sie zamknie.
+  const __tfIntervals = [];
+  function registerInterval(id) {
+    __tfIntervals.push(id);
+    return id;
+  }
+  function cleanupTentaflow() {
+    while (__tfIntervals.length) {
+      const id = __tfIntervals.pop();
+      try { clearInterval(id); } catch (_) {}
+    }
+  }
 
   const WS_URL = 'ws://127.0.0.1:9999/bridge';
   const TARGET_RATE = 16000;
@@ -90,8 +107,9 @@
     };
 
     ws.onclose = () => {
-      console.warn('[tentaflow] WS zamkniety');
+      console.warn('[tentaflow] WS zamkniety — czyszcze interwaly');
       ws = null;
+      cleanupTentaflow();
       scheduleReconnect();
     };
 
@@ -422,9 +440,9 @@
     obs.observe(document.documentElement, { childList: true, subtree: true });
 
     // Re-scan co 1s — szybsza reakcja na podmiany srcObject (Teams renegocjacja).
-    setInterval(scanAndAttach, 1000);
+    registerInterval(setInterval(scanAndAttach, 1000));
     // Health check co 2s — jesli wszystkie sources umarly, force recover.
-    setInterval(healthCheck, 2000);
+    registerInterval(setInterval(healthCheck, 2000));
   }
 
   // --------------------------------------------------------------------------
@@ -433,6 +451,7 @@
   // zeby blad w naszym patchu nie wywalil calego Teams.
   // --------------------------------------------------------------------------
   function setupMicInjection() {
+    if (window.__tentaflowBridge && window.__tentaflowBridge.micSetupDone) return;
     // MediaStreamTrackGenerator dostepny w Chromium 94+ tylko po wlaczeniu
     // --enable-experimental-web-platform-features
     if (typeof MediaStreamTrackGenerator === 'undefined') {
@@ -456,27 +475,188 @@
     const origGum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getUserMedia = async function (constraints) {
       try {
-        if (!constraints || !constraints.audio) {
+        if (!constraints || (!constraints.audio && !constraints.video)) {
           return origGum(constraints);
         }
-        console.log('[tentaflow] Przechwycono getUserMedia — wstrzykuje bot mic');
-        if (constraints.video) {
-          try {
-            const videoStream = await origGum({ video: constraints.video });
-            const combined = new MediaStream();
-            videoStream.getVideoTracks().forEach((t) => combined.addTrack(t));
-            combined.addTrack(micGenerator);
-            return combined;
-          } catch (_) {
-            return new MediaStream([micGenerator]);
-          }
-        }
-        return new MediaStream([micGenerator]);
+        console.log('[tentaflow] Przechwycono getUserMedia audio:', !!constraints.audio,
+          'video:', !!constraints.video);
+        const combined = new MediaStream();
+        if (constraints.audio && micGenerator) combined.addTrack(micGenerator);
+        if (constraints.video && videoGenerator) combined.addTrack(videoGenerator);
+        if (combined.getTracks().length > 0) return combined;
+        return origGum(constraints);
       } catch (e) {
         console.warn('[tentaflow] getUserMedia patch blad, fallback na oryginalny', e);
         return origGum(constraints);
       }
     };
+    if (window.__tentaflowBridge) window.__tentaflowBridge.micSetupDone = true;
+  }
+
+  // --------------------------------------------------------------------------
+  // Roster scraping — lista uczestnikow spotkania
+  // Teams renderuje panel uczestnikow w [data-tid="roster-panel"]. Gdy panel
+  // jest zamkniety korzystamy z aria-label kafelkow video jako fallback.
+  // --------------------------------------------------------------------------
+  function getRosterList() {
+    const seen = new Map();
+    const rosterItems = document.querySelectorAll(
+      '[data-tid="roster-panel"] li[role="option"], [data-tid="roster-panel"] [role="treeitem"]'
+    );
+    rosterItems.forEach((item) => {
+      // Tylko dedykowane selektory — item.textContent zgarnialby caly widget
+      // z roli, statusem, odznakami itd., co psuje liste i metadata STT.
+      const nameEl = item.querySelector('.ts-tooltip-trigger, [data-tid="roster-participant-name"]');
+      if (!nameEl) return;
+      const name = (nameEl.textContent || '').trim();
+      if (!name) return;
+      const statusEl = item.querySelector('[data-tid="roster-participant-status"]');
+      const status = statusEl ? (statusEl.textContent || '').trim() : 'present';
+      if (!seen.has(name)) seen.set(name, { name, status });
+    });
+    if (seen.size === 0) {
+      // Fallback: kafelki video (gdy panel roster zamkniety)
+      document.querySelectorAll('[aria-label^="Video of"], [aria-label^="Video tile"]').forEach((tile) => {
+        const label = tile.getAttribute('aria-label') || '';
+        const m = label.match(/Video (?:of|tile, )\s*(.+?)(?:,|$)/i);
+        if (m && m[1]) {
+          const name = m[1].trim();
+          if (!seen.has(name)) seen.set(name, { name, status: 'present' });
+        }
+      });
+    }
+    return Array.from(seen.values());
+  }
+
+  function sendRoster() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const roster = getRosterList();
+      const json = JSON.stringify(roster);
+      const payload = new TextEncoder().encode(json);
+      const buf = new ArrayBuffer(1 + payload.byteLength);
+      const u8 = new Uint8Array(buf);
+      u8[0] = 0x03;
+      u8.set(payload, 1);
+      ws.send(buf);
+    } catch (e) {
+      console.warn('[tentaflow] sendRoster blad:', e);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Active speaker tracking — kto aktualnie mowi
+  // Teams oznacza aktywnego mowce klasa active-speaker na kafelku wideo oraz
+  // atrybutem [data-is-presenter="true"]. Dostepny tez aria-label "... is speaking".
+  // --------------------------------------------------------------------------
+  function getActiveSpeaker() {
+    const presenter = document.querySelector('[data-is-presenter="true"]');
+    if (presenter) {
+      const label = presenter.getAttribute('aria-label') || presenter.textContent || '';
+      const m = label.match(/^(.+?)(?:,|$)/);
+      if (m && m[1]) return m[1].trim();
+    }
+    const active = document.querySelector('.active-speaker, [data-tid="active-speaker"]');
+    if (active) {
+      const nameEl = active.querySelector('.ts-tooltip-trigger, [data-tid="participant-name"]');
+      if (nameEl) {
+        const name = (nameEl.textContent || '').trim();
+        if (name) return name;
+      }
+      const label = active.getAttribute('aria-label') || '';
+      const m = label.match(/^(.+?)(?:,|$)/);
+      if (m && m[1]) return m[1].trim();
+    }
+    const speakingEl = document.querySelector('[aria-label*="is speaking"]');
+    if (speakingEl) {
+      const label = speakingEl.getAttribute('aria-label') || '';
+      const m = label.match(/^(.+?)\s+is speaking/i);
+      if (m && m[1]) return m[1].trim();
+    }
+    return null;
+  }
+
+  let lastActiveSpeaker = null;
+  function sendActiveSpeakerIfChanged() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const current = getActiveSpeaker();
+      if (current === lastActiveSpeaker) return;
+      lastActiveSpeaker = current;
+      const payload = current ? new TextEncoder().encode(current) : new Uint8Array(0);
+      const buf = new ArrayBuffer(1 + payload.byteLength);
+      const u8 = new Uint8Array(buf);
+      u8[0] = 0x04;
+      if (payload.byteLength > 0) u8.set(payload, 1);
+      ws.send(buf);
+    } catch (e) {
+      console.warn('[tentaflow] sendActiveSpeakerIfChanged blad:', e);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Video injection — kamerka bota (avatar 640x480 @ 30fps)
+  // --------------------------------------------------------------------------
+  let videoGenerator = null;
+  let videoWriter = null;
+  function setupVideoInjection() {
+    if (window.__tentaflowBridge && window.__tentaflowBridge.videoSetupDone) return;
+    if (typeof MediaStreamTrackGenerator === 'undefined' ||
+        typeof OffscreenCanvas === 'undefined' ||
+        typeof VideoFrame === 'undefined') {
+      console.warn('[tentaflow] MSTG/OffscreenCanvas/VideoFrame niedostepne — video injection wylaczone');
+      videoGenerator = null;
+      window.__tentaflowVideoAvailable = false;
+      return;
+    }
+    try {
+      videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
+      videoWriter = videoGenerator.writable.getWriter();
+    } catch (e) {
+      console.warn('[tentaflow] Blad tworzenia video generator', e);
+      videoGenerator = null;
+      window.__tentaflowVideoAvailable = false;
+      return;
+    }
+    const canvas = new OffscreenCanvas(640, 480);
+    const ctx = canvas.getContext('2d');
+    let baseTs = 0;
+    // Statyczny avatar — 1 FPS wystarczy, oszczedza RAM w kontenerze. Teams
+    // i tak nie pokaze ruchu na tym kafelku, bo tresc jest identyczna ramka po ramce.
+    const FPS = 1;
+    const frameIntervalUs = Math.round(1_000_000 / FPS);
+    const drawAndWrite = async () => {
+      let bitmap = null;
+      let frame = null;
+      try {
+        ctx.fillStyle = '#1f6feb';
+        ctx.fillRect(0, 0, 640, 480);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 72px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('Bot', 320, 200);
+        ctx.font = '24px monospace';
+        ctx.fillText(new Date().toISOString().slice(11, 19), 320, 300);
+        bitmap = canvas.transferToImageBitmap();
+        frame = new VideoFrame(bitmap, { timestamp: baseTs });
+        baseTs += frameIntervalUs;
+        await videoWriter.write(frame);
+      } catch (e) {
+        // Writer zamkniety — przerwij caly pipeline i posprzataj interwaly
+        cleanupTentaflow();
+      } finally {
+        // VideoFrame i ImageBitmap trzymaja GPU/native pamiec — bez close()
+        // Chrome niszczy kontener po kilku minutach przy OOM.
+        if (frame) { try { frame.close(); } catch (_) {} }
+        if (bitmap && bitmap.close) { try { bitmap.close(); } catch (_) {} }
+      }
+    };
+    // Interval zamiast requestAnimationFrame — rAF jest throttled na tabach w tle.
+    registerInterval(setInterval(drawAndWrite, 1000 / FPS));
+    window.__tentaflowVideoAvailable = true;
+    if (window.__tentaflowBridge) window.__tentaflowBridge.videoSetupDone = true;
+    console.log('[tentaflow] Video injection zainicjalizowane (640x480 @ ' + FPS + 'fps)');
   }
 
   function handleMicPcm(i16) {
@@ -501,6 +681,10 @@
   // Bootstrap
   // --------------------------------------------------------------------------
   function bootstrap() {
+    if (window.__tentaflowBridge && window.__tentaflowBridge.setupDone) {
+      console.log('[tentaflow] bootstrap juz wykonany — pomijam');
+      return;
+    }
     // WAZNE: hook RTCPeerConnection musi byc ZANIM Teams stworzy pc.
     // Tutaj jestesmy w evaluate_on_new_document, przed jakimkolwiek JS strony,
     // wiec jestesmy bezpieczni.
@@ -508,6 +692,13 @@
       hookRTCPeerConnection();
     } catch (e) {
       console.warn('[tentaflow] hookRTCPeerConnection blad', e);
+    }
+    // Video setup PRZED hookRTCPeerConnection uzyciem, zeby flag
+    // __tentaflowVideoAvailable byl ustawiony zanim Rust odpyta o niego w prejoin.
+    try {
+      setupVideoInjection();
+    } catch (e) {
+      console.warn('[tentaflow] setupVideoInjection blad', e);
     }
     try {
       setupMicInjection();
@@ -521,6 +712,10 @@
       console.warn('[tentaflow] install observer blad', e);
     }
     connectWs();
+    // Polling roster (3s) i active-speaker (500ms)
+    registerInterval(setInterval(sendRoster, 3000));
+    registerInterval(setInterval(sendActiveSpeakerIfChanged, 500));
+    if (window.__tentaflowBridge) window.__tentaflowBridge.setupDone = true;
     console.log('[tentaflow] Bridge audio zainicjalizowany');
   }
 
