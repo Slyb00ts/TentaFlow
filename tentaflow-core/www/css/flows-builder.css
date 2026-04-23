@@ -539,6 +539,17 @@
 }
 .fb-port-in { left: -9px; }
 .fb-port-out { right: -9px; }
+
+/* Porty streamujace (LLM, TTS) — obramowanie przerywane zeby wizualnie
+   odroznic od pelnej odpowiedzi. Wypelnienie po hoverze zachowane. */
+.fb-port[data-port-kind="stream"] {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--node-color, #818cf8) 18%, transparent);
+}
+.fb-port[data-port-kind="full"] {
+  /* Pelne kolko — jawna klasa dla przewidywalnosci stylu nad heurystyka. */
+  border-style: solid;
+}
 .fb-port-label {
   position: absolute;
   top: 50%;

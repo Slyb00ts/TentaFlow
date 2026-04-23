@@ -816,7 +816,13 @@
     "unsaved_confirm": "Speichern und verlassen",
     "unsaved_cancel": "Änderungen verwerfen",
     "canvas_hint": "Node aus der Palette ziehen, um zu beginnen",
-    "node_error_tooltip": "Erforderliche Konfiguration fehlt"
+    "node_error_tooltip": "Erforderliche Konfiguration fehlt",
+    "port_stream": "Token-Stream",
+    "port_full": "Vollständige Antwort",
+    "port_in": "Eingang",
+    "invalid_port": "Port „{port}“ wird von {node_type} nicht unterstützt",
+    "edge_dangling": "Kante verweist auf einen nicht existierenden Knoten",
+    "cycle_detected": "Zyklus im Flow-Graph erkannt"
   },
   "flows_palette": {
     "title": "Palette",
