@@ -9,7 +9,7 @@ git_ref = "main"
 [launch]
 command = "uvicorn"
 args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
-        "--host", "127.0.0.1", "--port", "8082"]
+        "--host", "127.0.0.1", "--port", "${PORT:-8082}"]
 internal_port = 8082
 
 [requires]

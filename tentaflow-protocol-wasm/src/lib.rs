@@ -2336,23 +2336,23 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 IP::ResListUsers { users } => {
                     set(&obj, "variant", "IamListUsersResponse".into());
                     let arr = js_sys::Array::new();
-                    for u in users {
+                    for u in users.iter() {
                         arr.push(&user_info_to_js(u).into());
                     }
                     set(&obj, "users", arr.into());
                 }
                 IP::ReqGetUser { user_id } => {
                     set(&obj, "variant", "IamGetUserRequest".into());
-                    set(&obj, "userId", (*user_id as f64).into());
+                    set(&obj, "userId", (user_id as f64).into());
                 }
                 IP::ResGetUser { user } => {
                     set(&obj, "variant", "IamGetUserResponse".into());
-                    set(&obj, "user", user_info_to_js(user).into());
+                    set(&obj, "user", user_info_to_js(&user).into());
                 }
                 IP::ReqCreateUser { .. } => set(&obj, "variant", "IamCreateUserRequest".into()),
                 IP::ResCreateUser { user_id } => {
                     set(&obj, "variant", "IamCreateUserResponse".into());
-                    set(&obj, "userId", (*user_id as f64).into());
+                    set(&obj, "userId", (user_id as f64).into());
                 }
                 IP::ReqUpdateUser { .. } => set(&obj, "variant", "IamUpdateUserRequest".into()),
                 IP::ReqDeleteUser { .. } => set(&obj, "variant", "IamDeleteUserRequest".into()),
@@ -2376,7 +2376,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 IP::ReqCreateGroup { .. } => set(&obj, "variant", "IamCreateGroupRequest".into()),
                 IP::ResCreateGroup { group_id } => {
                     set(&obj, "variant", "IamCreateGroupResponse".into());
-                    set(&obj, "groupId", (*group_id as f64).into());
+                    set(&obj, "groupId", (group_id as f64).into());
                 }
                 IP::ReqUpdateGroup { .. } => set(&obj, "variant", "IamUpdateGroupRequest".into()),
                 IP::ReqDeleteGroup { .. } => set(&obj, "variant", "IamDeleteGroupRequest".into()),
@@ -2384,7 +2384,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 IP::ResGroupMembers { members } => {
                     set(&obj, "variant", "IamGroupMembersResponse".into());
                     let arr = js_sys::Array::new();
-                    for u in members { arr.push(&user_info_to_js(u).into()); }
+                    for u in members.iter() { arr.push(&user_info_to_js(u).into()); }
                     set(&obj, "members", arr.into());
                 }
                 IP::ReqSetPermission { .. } => set(&obj, "variant", "IamSetPermissionRequest".into()),
@@ -2464,28 +2464,6 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AuditLogCleanupResponseBody(resp) => {
             set(&obj, "variant", "AuditLogCleanupResponse".into());
             set(&obj, "deletedCount", (resp.deleted_count as f64).into());
-        }
-        MessageBody::UsersListResponseBody(resp) => {
-            set(&obj, "variant", "UsersListResponse".into());
-            let arr = js_sys::Array::new();
-            for u in resp.users {
-                let item = js_sys::Object::new();
-                set(&item, "id", (u.id as f64).into());
-                set(&item, "username", u.username.into());
-                set(&item, "displayName", u.display_name.into());
-                set(&item, "email", u.email.into());
-                set(&item, "isActive", u.is_active.into());
-                set(&item, "isAdmin", u.is_admin.into());
-                if let Some(sp) = u.sso_provider {
-                    set(&item, "ssoProvider", sp.into());
-                }
-                if let Some(ll) = u.last_login_at {
-                    set(&item, "lastLoginAt", ll.into());
-                }
-                set(&item, "createdAt", u.created_at.into());
-                arr.push(&item.into());
-            }
-            set(&obj, "users", arr.into());
         }
         MessageBody::ServiceListRequest => {
             set(&obj, "variant", "ServiceListRequest".into());

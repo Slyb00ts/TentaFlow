@@ -417,11 +417,7 @@ inventory::submit! {
 //   4. Gdy bus channel zamknięty (runner skończył): emit StreamEnd z aktualnym
 //      statusem z DB + push_end.
 
-fn deployment_log_stream_handler(
-    req: MessageBody,
-    ctx: HandlerContext,
-    sub: Arc<Subscription>,
-) {
+fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
     use tentaflow_protocol::{
         DeploymentLogStreamRequest, DeploymentPayload, DeploymentStreamChunk, DeploymentStreamEnd,
     };
@@ -465,10 +461,7 @@ fn deployment_log_stream_handler(
                     }
                 }
                 // Jeśli deployment już zakończony → emit End od razu i koniec.
-                if matches!(
-                    row.status.as_str(),
-                    "success" | "failure" | "cancelled"
-                ) {
+                if matches!(row.status.as_str(), "success" | "failure" | "cancelled") {
                     let end = DeploymentStreamEnd {
                         deploy_id: deploy_id.clone(),
                         final_status: row.status.clone(),

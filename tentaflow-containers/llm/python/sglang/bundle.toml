@@ -13,7 +13,7 @@ args = [
     "-m", "sglang.launch_server",
     "--model-path", "${MODEL}",
     "--host", "127.0.0.1",
-    "--port", "30000",
+    "--port", "${PORT:-30000}",
     "--tp", "${TP:-1}",
     "--mem-fraction-static", "${MEM_FRACTION:-0.85}",
 ]

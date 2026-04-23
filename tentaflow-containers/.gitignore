@@ -1,2 +1,3 @@
 output/
 */native/*/.build-*/
+__pycache__/

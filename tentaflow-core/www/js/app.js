@@ -171,7 +171,13 @@ async function bootstrap() {
   handlePairDeepLink();
 
   // Service Worker registration — offline cache shell + install prompt.
-  if ('serviceWorker' in navigator && window.location.protocol !== 'file:') {
+  // Chrome odrzuca SW na self-signed HTTPS z SSL cert error. TentaFlow
+  // defaultowo generuje self-signed, wiec rejestrujemy tylko na zaufanych
+  // originach: localhost (zawsze secure) albo gdy cert jest zaufany w OS
+  // (wykrywamy heurystycznie przez brak 'file:' + localhost hostname).
+  const host = window.location.hostname;
+  const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  if ('serviceWorker' in navigator && window.location.protocol === 'https:' && isLocalhost) {
     navigator.serviceWorker.register('/sw.js').catch((e) => {
       console.debug('[app] SW register failed:', e?.message);
     });

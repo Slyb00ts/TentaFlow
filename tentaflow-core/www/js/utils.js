@@ -39,6 +39,11 @@ export function byId(id) {
   return document.getElementById(id);
 }
 
+export function patchInner(host, html) {
+  if (!host) return;
+  host.innerHTML = html;
+}
+
 export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {

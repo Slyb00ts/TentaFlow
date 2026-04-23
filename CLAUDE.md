@@ -199,6 +199,16 @@ Manifest ma do trzech sekcji deploy (każda renderuje przycisk w wizardzie):
   - `python-bundle` — bundle Pythona w `bundle_path` (np. vllm, xtts, comfyui).
 - **`[deploy.external]`** — wykrycie zewnętrznego daemona w `PATH` z health-checkiem (np. ollama).
 
+### Native Python Bundles
+
+- Native `python-bundle` używa wspólnego katalogu modeli w `models/`; runner ustawia `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, `TRANSFORMERS_CACHE` i `TORCH_HOME` tak, żeby Docker i native widziały te same pliki modeli.
+- Cache runtime bundli można przenieść przez `TENTAFLOW_CACHE_DIR`, co jest przydatne na hostach gdzie `/tmp` jest `tmpfs` albo mało miejsca.
+- Runner tworzy wersjonowane template w `<cache>/bundle-templates/<engine>/<template_hash>/venv` i osobne instancje w `<cache>/bundle-instances/<engine>/<instance_name>/`.
+- Przy tworzeniu instancji runner próbuje najpierw zrobić hardlink plików z template; zwykła kopia jest tylko fallbackiem. To ogranicza zużycie miejsca dla ciężkich env typu `vllm`.
+- Bundla z wrapperem HTTP (`parakeet`, `qwen-asr`, `xtts`, `voxcpm`) muszą trzymać własne `requirements.lock` obok `bundle.toml`, bo upstream repo nie gwarantują `fastapi`/`uvicorn` ani zależności wrappera.
+- Native deploy wstrzykuje `PORT` z wizarda/compose do procesu Pythona; `bundle.toml` powinien używać `${PORT:-<domyślny_port>}` zamiast sztywnej wartości.
+- `ServiceManifestDeployRequest` dla `runtime=embedded` nie może kończyć się samym rekordem `deployment`: po udanym deployu musi też utworzyć/odświeżyć wpis w tabeli `services`, żeby backend przywracał taki serwis po restarcie i żeby ekran `Services` nie był pusty po natywnym deployu `llama.cpp` / `mlx` / `whisper`.
+
 ### Walidacja
 
 Build.rs sprawdza 4 reguły semantyczne przy każdym `cargo build`:
