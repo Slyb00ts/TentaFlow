@@ -332,6 +332,38 @@ pub async fn dispatch_reverse_request(
             }
         }
 
+        ModelPayload::MeetingEvent(event) => {
+            // Bot meetingowy otwiera reverse stream i pcha eventy summary/action
+            // items. Router resolvuje meeting_key -> session_id przez get_or_create
+            // (bot moze miec inny widok sesji niz DB, np. przy restarcie routera).
+            let Some(ref pool) = router.db else {
+                return make_error_response(
+                    request_id,
+                    "MeetingEvent persist: router bez DB",
+                );
+            };
+
+            match persist_meeting_event(pool, event) {
+                Ok(()) => ModelResponse {
+                    request_id,
+                    result: ModelResult::Completion(CompletionResult {
+                        text: String::new(),
+                        reasoning_content: None,
+                        model: String::new(),
+                        finish_reason: Some("stop".to_string()),
+                        tool_calls: None,
+                        detected_intent: None,
+                        detected_tools: None,
+                        transcribed_text: None,
+                        speaker_id: None,
+                        speaker_name: None,
+                    }),
+                    metrics: None,
+                },
+                Err(e) => make_error_response(request_id, &e),
+            }
+        }
+
         _ => make_error_response(
             request_id,
             &format!(
@@ -396,6 +428,65 @@ fn make_error_response(request_id: String, message: &str) -> tentaflow_protocol:
         }),
         metrics: None,
     }
+}
+
+/// Persistuje pojedynczy MeetingEvent do DB. Wydzielone zeby mozna testowac
+/// logike bez budowania calego Routera (Router + QUIC + mesh to ciezkie setup).
+fn persist_meeting_event(
+    pool: &crate::db::DbPool,
+    event: tentaflow_protocol::MeetingEventData,
+) -> std::result::Result<(), String> {
+    use tentaflow_protocol::MeetingEventPayload;
+
+    let session_id = crate::db::repository::transcripts::get_or_create_session(
+        pool,
+        &event.meeting_key,
+        None,
+        None,
+    )
+    .map_err(|e| format!("MeetingEvent: resolve session '{}' failed: {}", event.meeting_key, e))?;
+
+    match event.payload {
+        MeetingEventPayload::SummaryUpdate {
+            decisions_text,
+            summary_text,
+            model,
+        } => {
+            crate::db::repository::transcripts::insert_meeting_summary(
+                pool,
+                session_id,
+                &decisions_text,
+                &summary_text,
+                &model,
+            )
+            .map_err(|e| format!("MeetingEvent: insert_meeting_summary failed: {}", e))?;
+            info!(
+                "MeetingEvent SummaryUpdate: session_id={} model={} dec_len={} sum_len={}",
+                session_id,
+                model,
+                decisions_text.len(),
+                summary_text.len()
+            );
+        }
+        MeetingEventPayload::ActionItemsUpdate { items } => {
+            let count = items.len();
+            for item in items {
+                crate::db::repository::transcripts::upsert_meeting_action_item(
+                    pool,
+                    session_id,
+                    &item.owner,
+                    &item.task,
+                    item.deadline.as_deref(),
+                )
+                .map_err(|e| format!("MeetingEvent: upsert_meeting_action_item failed: {}", e))?;
+            }
+            info!(
+                "MeetingEvent ActionItemsUpdate: session_id={} items={}",
+                session_id, count
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -551,5 +642,124 @@ mod tests {
             }
             _ => panic!("Oczekiwano MessageContent::Text"),
         }
+    }
+
+    // =========================================================================
+    // Persist MeetingEvent: testy logiki wydzielonej z dispatch_reverse_request.
+    // Uzywamy in-memory SQLite, nie potrzeba Routera.
+    // =========================================================================
+
+    fn setup_test_db() -> crate::db::DbPool {
+        crate::db::init(std::path::Path::new(":memory:")).expect("init test DB")
+    }
+
+    #[test]
+    fn persist_handler_summary_insert_row() {
+        let db = setup_test_db();
+        // Sesja musi istniec zanim wstawimy summary — get_or_create utworzy.
+        let event = MeetingEventData {
+            meeting_key: "m-summary-1".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "D1".to_string(),
+                summary_text: "S1".to_string(),
+                model: "qwen".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist summary");
+
+        // Odczyt: session_id z klucza + lista summaries.
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db,
+            "m-summary-1",
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].decisions_text, "D1");
+        assert_eq!(rows[0].summary_text, "S1");
+        assert_eq!(rows[0].model, "qwen");
+    }
+
+    #[test]
+    fn persist_handler_action_items_upsert_dedup() {
+        let db = setup_test_db();
+        // Dwa razy ten sam owner+task — powinno byc dedup po content_hash.
+        let event1 = MeetingEventData {
+            meeting_key: "m-actions-1".to_string(),
+            timestamp_ms: 1,
+            payload: MeetingEventPayload::ActionItemsUpdate {
+                items: vec![
+                    MeetingActionItemData {
+                        owner: "Alice".to_string(),
+                        task: "prepare report".to_string(),
+                        deadline: Some("2026-05-01".to_string()),
+                    },
+                    MeetingActionItemData {
+                        owner: "Bob".to_string(),
+                        task: "ship PR".to_string(),
+                        deadline: None,
+                    },
+                ],
+            },
+        };
+        persist_meeting_event(&db, event1).expect("persist 1");
+
+        // Ponowny push tych samych owner+task — nie tworzy duplikatow.
+        let event2 = MeetingEventData {
+            meeting_key: "m-actions-1".to_string(),
+            timestamp_ms: 2,
+            payload: MeetingEventPayload::ActionItemsUpdate {
+                items: vec![MeetingActionItemData {
+                    owner: "Alice".to_string(),
+                    task: "prepare report".to_string(),
+                    deadline: Some("2026-05-10".to_string()),
+                }],
+            },
+        };
+        persist_meeting_event(&db, event2).expect("persist 2");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db,
+            "m-actions-1",
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "dwa unikalne action items (dedup drugiego Alice)");
+        let alice = rows.iter().find(|r| r.owner == "Alice").unwrap();
+        assert_eq!(alice.deadline.as_deref(), Some("2026-05-10"), "deadline odswiezony");
+    }
+
+    #[test]
+    fn persist_handler_unknown_meeting_key_creates_session() {
+        let db = setup_test_db();
+        // Klucz ktorego nie ma w DB — handler ma utworzyc nowa sesje idle.
+        let event = MeetingEventData {
+            meeting_key: "m-new-key".to_string(),
+            timestamp_ms: 42,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d".to_string(),
+                summary_text: "s".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist should create session");
+
+        // Sesja powinna istniec w meeting_sessions po call.
+        let conn = db.lock().unwrap();
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meeting_sessions WHERE meeting_key = ?1",
+                rusqlite::params!["m-new-key"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1);
     }
 }

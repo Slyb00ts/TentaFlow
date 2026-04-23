@@ -780,6 +780,30 @@ mod tests {
         }
     }
 
+    // Bug guard: wszystkie 8 meeting handlers (api/dashboard/handlers_meeting.rs)
+    // musi byc widocznych w dispatch registry — inaczej GUI dostaje HandlerNotFound
+    // na WSS i ekran meetingow nie dziala. Ten test lapie regresje gdyby ktos
+    // przypadkiem wylaczyl feature/module.
+    #[test]
+    fn registry_contains_meeting_handlers() {
+        for name in [
+            "MeetingSessionStartRequest",
+            "MeetingSessionLeaveRequest",
+            "MeetingSessionListRequest",
+            "MeetingSessionDetailRequest",
+            "MeetingTranscriptsListRequest",
+            "MeetingActiveSessionRequest",
+            "MeetingSettingsGetRequest",
+            "MeetingSettingsUpdateRequest",
+        ] {
+            assert!(
+                find(name).is_some(),
+                "meeting handler {} nie zarejestrowany",
+                name
+            );
+        }
+    }
+
     #[test]
     fn registry_is_populated_with_bootstrap_handlers() {
         let count = handler_count();

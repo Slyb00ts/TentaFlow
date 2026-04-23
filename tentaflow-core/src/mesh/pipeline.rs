@@ -28,6 +28,35 @@ fn routing_metrics_snapshot() -> (u32, f32) {
     live_metrics::snapshot()
 }
 
+fn local_mesh_addresses(peer_store: &MeshPeerStore, local_node_id: &str) -> Vec<std::net::IpAddr> {
+    peer_store
+        .get(local_node_id)
+        .map(|p| p.addresses)
+        .unwrap_or_default()
+}
+
+fn is_self_discovery_ip_set(
+    peer_store: &MeshPeerStore,
+    local_node_id: &str,
+    addrs: &[std::net::IpAddr],
+) -> bool {
+    let local_addrs = local_mesh_addresses(peer_store, local_node_id);
+    !addrs.is_empty()
+        && !local_addrs.is_empty()
+        && addrs
+            .iter()
+            .all(|addr| local_addrs.iter().any(|local| local == addr))
+}
+
+fn is_self_discovery_socket_set(
+    peer_store: &MeshPeerStore,
+    local_node_id: &str,
+    addrs: &[std::net::SocketAddr],
+) -> bool {
+    let ips: Vec<std::net::IpAddr> = addrs.iter().map(|addr| addr.ip()).collect();
+    is_self_discovery_ip_set(peer_store, local_node_id, &ips)
+}
+
 /// Konfiguracja mesh pipeline
 pub struct MeshPipelineConfig {
     /// Identyfikator tego noda
@@ -510,6 +539,15 @@ fn spawn_quic_event_handler(
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
+                        if is_self_discovery_ip_set(&peer_store, &local_node_id, &addrs) {
+                            debug!(
+                                peer = %entry.node_id,
+                                addrs = ?addrs,
+                                "Pomijam KnownPeers self-discovery po lokalnych adresach"
+                            );
+                            peer_store.remove(&entry.node_id);
+                            continue;
+                        }
                         if !addrs.is_empty() {
                             peer_store.set_addresses(&entry.node_id, addrs);
                         }
@@ -582,6 +620,15 @@ fn spawn_quic_event_handler(
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
+                        if is_self_discovery_ip_set(&peer_store, &local_node_id, &addrs) {
+                            debug!(
+                                peer = %entry.node_id,
+                                addrs = ?addrs,
+                                "Pomijam TopologyAnnounce self-discovery po lokalnych adresach"
+                            );
+                            peer_store.remove(&entry.node_id);
+                            continue;
+                        }
                         peer_store.upsert_gossip_peer(
                             &entry.node_id,
                             &entry.hostname,
@@ -1545,6 +1592,15 @@ fn spawn_quic_event_handler(
                     // peer_store zeby UI pokazal go jako "discovered" (dashed
                     // pending card), nawet jesli dial jeszcze nie wypalil.
                     if node_id == local_node_id {
+                        continue;
+                    }
+                    if is_self_discovery_socket_set(&peer_store, &local_node_id, &addresses) {
+                        debug!(
+                            peer = %node_id,
+                            addrs = ?addresses,
+                            "Pomijam PeerDiscovered wskazujacy na lokalny host"
+                        );
+                        peer_store.remove(&node_id);
                         continue;
                     }
                     if peer_store.is_quic_connected(&node_id) {

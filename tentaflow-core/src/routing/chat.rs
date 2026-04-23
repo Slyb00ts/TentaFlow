@@ -1816,6 +1816,24 @@ impl Router {
                     metrics: None,
                 }
             }
+
+            // MeetingEvent nie jest callbackiem embedding pipeline — bot wysyla
+            // je przez dispatch_reverse_request, nie przez chat routing.
+            ModelPayload::MeetingEvent(_) => {
+                warn!("Unexpected MeetingEvent payload in chat embedding callback");
+                ModelResponse {
+                    request_id,
+                    result: ModelResult::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: "MeetingEvent is not valid in chat callbacks".to_string(),
+                        details: Some(
+                            "MeetingEvent is handled by dispatch_reverse_request only"
+                                .to_string(),
+                        ),
+                    }),
+                    metrics: None,
+                }
+            }
         }
     }
 
