@@ -1642,13 +1642,13 @@ input, textarea, select {
   display: flex; gap: 8px; align-items: center;
   background: var(--bg-2);
 }
-.filter-chip {
+.trace-filters .filter-chip {
   padding: 5px 10px; background: var(--bg-3);
   border-radius: 16px; font-size: 11px; color: var(--text-2);
   border: 1px solid var(--border);
   cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
 }
-.filter-chip.active { background: var(--accent-glow); color: var(--accent-2); border-color: var(--accent-1); }
+.trace-filters .filter-chip.active { background: var(--accent-glow); color: var(--accent-2); border-color: var(--accent-1); }
 .trace-timeline {
   padding: 20px; height: 140px;
   border-bottom: 1px solid var(--border);
