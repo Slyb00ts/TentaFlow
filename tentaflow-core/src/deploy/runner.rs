@@ -318,6 +318,15 @@ async fn do_docker_deploy(
     // Dla agents/tools — build wystarczy. Kontener uruchamia MeetingManager /
     // tools-executor ad-hoc, nie zostawiamy persistent service.
     if matches!(engine.category.as_str(), "agents" | "tools") {
+        // Teams-bot wymaga domyślnych aliasów modeli (stt/summarization/tts) i flow
+        // żeby zadziałał out-of-the-box po deployu — best-effort, nie blokujemy deploy.
+        if engine.engine_id == "teams-bot" {
+            if let Err(e) = crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults(db).await {
+                warn!("ensure_teams_bot_defaults nie powiodło się: {}", e);
+            } else {
+                info!("domyślne aliasy i flow dla teams-bota zainicjalizowane");
+            }
+        }
         finish_success(
             db,
             deploy_id,

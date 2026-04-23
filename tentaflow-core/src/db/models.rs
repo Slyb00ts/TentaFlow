@@ -109,6 +109,13 @@ pub struct DbPrompt {
     pub cache_priority: i64,
     pub is_active: bool,
     pub version: i64,
+    /// Kod jezyka ISO 639-1 (pl, en, de, es, fr). Ten sam `prompt_id` moze
+    /// wystapic w wielu jezykach — runtime lookup wybiera wariant po lokalu.
+    pub language: String,
+    /// 1 = prompt seedowany (is_system), moze byc nadpisywany przy kolejnych
+    /// uruchomieniach. 0 = prompt edytowany/utworzony przez uzytkownika,
+    /// nie ruszamy go przy seed.
+    pub is_system: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -302,6 +309,7 @@ pub struct NewPrompt<'a> {
     pub default_model: Option<&'a str>,
     pub variables: Option<&'a str>,
     pub cache_priority: i64,
+    pub language: &'a str,
 }
 
 /// Parametry aktualizacji promptu
@@ -316,6 +324,7 @@ pub struct UpdatePrompt<'a> {
     pub variables: Option<&'a str>,
     pub cache_priority: i64,
     pub is_active: bool,
+    pub language: &'a str,
 }
 
 /// Parametry tworzenia wpisu rejestru modeli
