@@ -680,6 +680,23 @@ pub struct MeshNodeRoute {
     pub next_hop: Option<String>,
 }
 
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshConnectionPathInfo {
+    pub transport: String,
+    pub address: String,
+    pub selected: bool,
+    pub closed: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshConnectionInfo {
+    pub transport: String,
+    pub scope: Option<String>,
+    pub address: Option<String>,
+    pub relay_url: Option<String>,
+    pub paths: Vec<MeshConnectionPathInfo>,
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct MeshNodeInfo {
     pub node_id: String,
@@ -703,6 +720,7 @@ pub struct MeshNodeInfo {
     pub last_seen_epoch: Option<i64>,
     pub route: Option<MeshNodeRoute>,
     pub platform: String,
+    pub connection: Option<MeshConnectionInfo>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
