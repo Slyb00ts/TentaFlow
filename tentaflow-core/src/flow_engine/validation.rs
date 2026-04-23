@@ -271,6 +271,43 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_stream_port_on_tts_node() {
+        use crate::config::RouterConfig;
+        use crate::flow_engine::adapters::tts::TtsNodeAdapter;
+        use crate::routing::service_manager::ServiceManager;
+        use std::sync::Arc;
+
+        let config = Arc::new(RouterConfig::default());
+        let service_manager = Arc::new(
+            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
+        );
+
+        let mut registry = AdapterRegistry::new();
+        registry.register(FullOnlyAdapter);
+        registry.register(TtsNodeAdapter::new(service_manager, config));
+
+        let flow = FlowDefinition {
+            nodes: vec![node("t", "tts"), node("sink", "full_only")],
+            edges: vec![edge("t", "sink", "stream", "in")],
+        };
+        let err = validate_flow(&flow, &registry).unwrap_err();
+        match err {
+            FlowValidationError::InvalidOutputPort {
+                node_id,
+                node_type,
+                port,
+                available,
+            } => {
+                assert_eq!(node_id, "t");
+                assert_eq!(node_type, "tts");
+                assert_eq!(port, "stream");
+                assert_eq!(available, vec!["full"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_unknown_adapter() {
         let flow = FlowDefinition {
             nodes: vec![node("a", "nope"), node("b", "full_only")],
