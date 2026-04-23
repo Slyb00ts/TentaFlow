@@ -16,6 +16,25 @@ impl Router {
     ///
     /// Probuje QUIC STT (preferowany), potem fallback na HTTP backend.
     /// Obsluguje zarowno prosty tekst jak i verbose_json z segmentami.
+    /// Wariant z user context — ACL gate przed wywolaniem backendu.
+    pub async fn route_audio_transcription_for_user(
+        &self,
+        request: TranscriptionRequest,
+        user: Option<crate::routing::acl::UserContext>,
+    ) -> Result<crate::routing::RouteResult<TranscriptionResponse>> {
+        if let Some(ref u) = user {
+            if let Some(ref db) = self.db {
+                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                    tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied STT model");
+                    return Err(crate::error::CoreError::ModelNotFound {
+                        model_name: request.model.clone(),
+                    }.into());
+                }
+            }
+        }
+        self.route_audio_transcription(request).await
+    }
+
     pub async fn route_audio_transcription(
         &self,
         request: TranscriptionRequest,

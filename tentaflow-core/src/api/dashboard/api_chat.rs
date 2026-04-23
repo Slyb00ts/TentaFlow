@@ -36,10 +36,10 @@ pub async fn route_chat_api(
             handle_completions(router, body, db, metrics, cors_origin, debug_route, user_ctx).await
         }
         (&Method::POST, "/api/chat/tts") => {
-            handle_tts(router, body, cors_origin, debug_route).await
+            handle_tts(router, body, cors_origin, debug_route, user_ctx).await
         }
         (&Method::POST, "/api/chat/stt") => {
-            handle_stt(router, body, cors_origin, debug_route).await
+            handle_stt(router, body, cors_origin, debug_route, user_ctx).await
         }
         (&Method::POST, "/api/chat/stt/load") => {
             handle_stt_load(router, body, db, cors_origin).await
@@ -212,6 +212,7 @@ async fn handle_tts(
     body: Bytes,
     cors_origin: Option<&str>,
     debug_route: bool,
+    user_ctx: Option<crate::routing::acl::UserContext>,
 ) -> Response<DashboardBody> {
     let request: TTSRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -234,7 +235,7 @@ async fn handle_tts(
         _ => "audio/mpeg",
     };
 
-    match router.synthesize_speech(&request).await {
+    match router.synthesize_speech_for_user(&request, user_ctx).await {
         Ok(route_result) => {
             let mut resp = binary_resp(200, content_type, route_result.response, cors_origin);
             if debug_route {
@@ -266,6 +267,7 @@ async fn handle_stt(
     body: Bytes,
     cors_origin: Option<&str>,
     debug_route: bool,
+    user_ctx: Option<crate::routing::acl::UserContext>,
 ) -> Response<DashboardBody> {
     // Deserializacja JSON z danymi audio w base64
     #[derive(serde::Deserialize)]
@@ -318,7 +320,7 @@ async fn handle_stt(
         compression_ratio_threshold: None,
     };
 
-    match router.route_audio_transcription(request).await {
+    match router.route_audio_transcription_for_user(request, user_ctx).await {
         Ok(route_result) => {
             let json = match serde_json::to_string(&route_result.response) {
                 Ok(j) => j,

@@ -19,6 +19,25 @@ impl Router {
     ///
     /// Parametry:
     /// - `request`: TTSRequest z OpenAI API format (model, input, voice, format, speed)
+    /// Wariant z user context — ACL gate przed wywolaniem backendu.
+    pub async fn synthesize_speech_for_user(
+        &self,
+        request: &crate::api::openai::types::TTSRequest,
+        user: Option<crate::routing::acl::UserContext>,
+    ) -> Result<crate::routing::RouteResult<Vec<u8>>> {
+        if let Some(ref u) = user {
+            if let Some(ref db) = self.db {
+                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                    tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied TTS model");
+                    return Err(crate::error::CoreError::ModelNotFound {
+                        model_name: request.model.clone(),
+                    }.into());
+                }
+            }
+        }
+        self.synthesize_speech(request).await
+    }
+
     pub async fn synthesize_speech(
         &self,
         request: &crate::api::openai::types::TTSRequest,

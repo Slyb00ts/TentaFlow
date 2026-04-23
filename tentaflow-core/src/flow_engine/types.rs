@@ -72,6 +72,10 @@ pub struct FlowContext {
     pub speaker_name: Option<String>,
     /// Kontynuuj flow nawet gdy wezel zwroci blad (domyslnie false)
     pub continue_on_error: bool,
+    /// User context — sluzy ACL gateowi w try_dispatch przed uruchomieniem
+    /// flow oraz w wezlach LLM/embedding gdy wywoluja routing dla user-a.
+    pub user_id: Option<i64>,
+    pub user_role: Option<String>,
 }
 
 impl FlowContext {
