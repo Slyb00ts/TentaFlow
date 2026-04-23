@@ -530,6 +530,57 @@ fn persist_meeting_event(
                 session_id, count
             );
         }
+        // TranscriptEntry nie jest persistowany tym handlerem: chunki transkryptu
+        // trafiają do DB osobną ścieżką (STT ModelRequest z metadata meeting_id →
+        // transcript_store). Ten wariant istnieje wyłącznie po to, żeby dashboard
+        // dostał live broadcast (layer dopinany przez subskrybentów eventów;
+        // persist DB pozostaje pojedynczy punkt prawdy — transcript_store).
+        MeetingEventPayload::TranscriptEntry {
+            speaker_id,
+            text,
+            latency_ms,
+            resolved_stt_model,
+            ..
+        } => {
+            info!(
+                "MeetingEvent TranscriptEntry: session_id={} speaker={} model={} latency_ms={} text_len={}",
+                session_id,
+                speaker_id,
+                resolved_stt_model,
+                latency_ms,
+                text.len()
+            );
+        }
+        // ParticipantUpdate: brak tabeli participants per-session. Roster + active
+        // speaker to stan runtime'owy trzymany w pamięci bota i broadcastowany
+        // live. Zapis do DB nie jest potrzebny — rekonstrukcja możliwa z
+        // transcript_entries (DISTINCT speaker_name).
+        MeetingEventPayload::ParticipantUpdate {
+            speaker_id,
+            status,
+            ..
+        } => {
+            info!(
+                "MeetingEvent ParticipantUpdate: session_id={} speaker={} status={}",
+                session_id, speaker_id, status
+            );
+        }
+        // BackendUpdate: info o modelach sesji jest stanem runtime'owym (zmienia
+        // się tylko przy zmianie aliasów w configu bota między sesjami). DB ma już
+        // `model` w `meeting_summaries` dla historii, osobna tabela byłaby
+        // duplikacją. Ten event służy tylko live broadcastowi do UI.
+        MeetingEventPayload::BackendUpdate {
+            stt_model,
+            tts_model,
+            summarization_model,
+            diarization_model,
+            ..
+        } => {
+            info!(
+                "MeetingEvent BackendUpdate: session_id={} stt={} tts={} sum={} diar={}",
+                session_id, stt_model, tts_model, summarization_model, diarization_model
+            );
+        }
     }
     Ok(())
 }
@@ -874,5 +925,98 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cnt, 1);
+    }
+
+    // Handler musi akceptować TranscriptEntry bez błędu i bez wpisów do
+    // meeting_summaries / meeting_action_items — persist chunków leci przez
+    // transcript_store, nie przez ten handler.
+    #[test]
+    fn persist_handler_transcript_entry_is_noop_but_creates_session() {
+        let db = setup_test_db();
+        let event = MeetingEventData {
+            meeting_key: "m-te-1".to_string(),
+            timestamp_ms: 100,
+            payload: MeetingEventPayload::TranscriptEntry {
+                speaker_id: "SPEAKER_00".to_string(),
+                speaker_name: Some("Alice".to_string()),
+                is_enrolled: false,
+                speaker_confidence: Some(0.5),
+                text: "test".to_string(),
+                language: Some("pl".to_string()),
+                resolved_stt_model: "whisper".to_string(),
+                latency_ms: 250,
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist transcript entry");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db, "m-te-1", None, None,
+        )
+        .unwrap();
+        let summaries =
+            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
+        let actions =
+            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
+                .unwrap();
+        assert!(summaries.is_empty(), "TranscriptEntry nie wpisuje summary");
+        assert!(actions.is_empty(), "TranscriptEntry nie wpisuje action items");
+    }
+
+    // ParticipantUpdate: handler nie persistuje nigdzie — sprawdzamy że nie
+    // zwraca błędu i nie tworzy rekordów w tabelach zapisywanych.
+    #[test]
+    fn persist_handler_participant_update_is_noop() {
+        let db = setup_test_db();
+        let event = MeetingEventData {
+            meeting_key: "m-pu-1".to_string(),
+            timestamp_ms: 100,
+            payload: MeetingEventPayload::ParticipantUpdate {
+                speaker_id: "SPEAKER_02".to_string(),
+                speaker_name: Some("Bob".to_string()),
+                status: "active_now".to_string(),
+                last_spoken_ago_sec: None,
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist participant update");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db, "m-pu-1", None, None,
+        )
+        .unwrap();
+        let summaries =
+            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
+        let actions =
+            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
+                .unwrap();
+        assert!(summaries.is_empty());
+        assert!(actions.is_empty());
+    }
+
+    // BackendUpdate: to samo — stan runtime'owy, nic nie wpada do DB.
+    #[test]
+    fn persist_handler_backend_update_is_noop() {
+        let db = setup_test_db();
+        let event = MeetingEventData {
+            meeting_key: "m-bu-1".to_string(),
+            timestamp_ms: 100,
+            payload: MeetingEventPayload::BackendUpdate {
+                stt_model: "teams-stt".to_string(),
+                tts_model: "teams-tts".to_string(),
+                summarization_model: "teams-summarization".to_string(),
+                diarization_model: "pyannote-3.1".to_string(),
+                streaming_latency_ms: None,
+                enrolled_speakers: None,
+                total_participants: None,
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist backend update");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db, "m-bu-1", None, None,
+        )
+        .unwrap();
+        let summaries =
+            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
+        assert!(summaries.is_empty());
     }
 }
