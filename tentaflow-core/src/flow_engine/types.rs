@@ -15,10 +15,45 @@ pub struct FlowNode {
     pub node_type: String,
     #[serde(default)]
     pub config: serde_json::Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_position")]
     pub position: Option<(f64, f64)>,
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// Parsuje pole `position` — akceptuje zarowno format GUI (`{"x":0,"y":0}`)
+/// jak i tuple (`[0, 0]`) uzywane wewnetrznie w testach.
+fn deserialize_position<'de, D>(deserializer: D) -> Result<Option<(f64, f64)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(arr)) if arr.len() == 2 => {
+            let x = arr[0].as_f64().ok_or_else(|| {
+                serde::de::Error::custom("position[0] nie jest liczba")
+            })?;
+            let y = arr[1].as_f64().ok_or_else(|| {
+                serde::de::Error::custom("position[1] nie jest liczba")
+            })?;
+            Ok(Some((x, y)))
+        }
+        Some(serde_json::Value::Object(map)) => {
+            let x = map
+                .get("x")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| serde::de::Error::custom("position.x brak lub nie-liczba"))?;
+            let y = map
+                .get("y")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| serde::de::Error::custom("position.y brak lub nie-liczba"))?;
+            Ok(Some((x, y)))
+        }
+        _ => Err(serde::de::Error::custom(
+            "position musi byc {x,y} albo [x,y]",
+        )),
+    }
 }
 
 /// Krawedz (polaczenie) miedzy dwoma wezlami w DAG
