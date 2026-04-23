@@ -65,6 +65,28 @@ impl Router {
         request: ChatCompletionRequest,
         user: Option<crate::routing::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
+        // Najpierw spróbuj flow engine z user context (dispatcher sam sprawdzi
+        // ACL dla flow_id i albo wykona flow albo zwroci None — fallback na
+        // route_chat_completion ktorego potem wywolujemy z model-level ACL).
+        if let Some(ref u) = user {
+            if let Some(ref dispatcher) = self.flow_dispatcher {
+                let mut ctx = crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
+                let _ = ctx.user_id; // silenced
+                if let Ok(Some(result)) = dispatcher.try_dispatch(&request.model, "chat", ctx).await {
+                    use crate::routing::chat::flow_result_to_chat_response;
+                    let response = flow_result_to_chat_response(result, &request.model);
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "unknown".to_string()),
+                        backend_type: "flow_engine".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: 0,
+                        hop_count: 0,
+                        latency_ms: None,
+                    };
+                    return Ok(crate::routing::RouteResult { response, metadata });
+                }
+            }
+        }
         if let Some(ref u) = user {
             let db = match &self.db {
                 Some(d) => d,
