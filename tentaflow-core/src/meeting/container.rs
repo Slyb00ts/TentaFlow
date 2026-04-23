@@ -30,9 +30,12 @@ pub struct SpawnRequest {
     /// EndpointId i połączyć się do bota via iroh.
     pub secret_key_hex: String,
     pub bot_name: String,
-    pub stt_alias: Option<String>,
-    pub tts_alias: Option<String>,
-    pub llm_alias: Option<String>,
+    /// Aliasy router-side używane przez teams-bota (STT/TTS/summarization/flow).
+    /// Manager rozwiązuje defaulty przed spawnem, więc tu zawsze konkretne wartości.
+    pub stt_alias: String,
+    pub summarization_alias: String,
+    pub tts_alias: String,
+    pub flow_alias: String,
 }
 
 #[derive(Debug, Clone)]
@@ -249,8 +252,8 @@ pub async fn cleanup_stale_containers() -> Result<()> {
     Ok(())
 }
 
-fn build_env(req: &SpawnRequest) -> Vec<String> {
-    let mut env = vec![
+pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
+    vec![
         format!("MEETING_URL={}", req.meeting_url),
         // Klucz sesji — bot kopiuje do każdego transkrypt eventu, router zapisuje
         // pod tym kluczem do meeting_sessions (get_or_create znajdzie naszą sesję).
@@ -262,15 +265,61 @@ fn build_env(req: &SpawnRequest) -> Vec<String> {
         format!("BOT_NAME={}", req.bot_name),
         "DISPLAY=:99".to_string(),
         "XDG_RUNTIME_DIR=/tmp/runtime".to_string(),
-    ];
-    if let Some(v) = &req.stt_alias {
-        env.push(format!("STT_MODEL={}", v));
+        // Aliasy konsumowane przez teams-bota (tentaflow-containers/agents/docker/teams-bot/src/config.rs).
+        format!("STT_ALIAS={}", req.stt_alias),
+        format!("SUMMARIZATION_ALIAS={}", req.summarization_alias),
+        format!("TTS_ALIAS={}", req.tts_alias),
+        format!("FLOW_ALIAS={}", req.flow_alias),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meeting::port_pool::AllocatedPorts;
+
+    fn sample(stt: &str, sum: &str, tts: &str, flow: &str) -> SpawnRequest {
+        SpawnRequest {
+            session_id: 42,
+            meeting_url: "https://teams.example/meet".to_string(),
+            meeting_key: "mtg-xyz".to_string(),
+            ports: AllocatedPorts {
+                quic: 40001,
+                vnc: 40002,
+                novnc: 40003,
+            },
+            secret_key_hex: "deadbeef".to_string(),
+            bot_name: "TF Bot".to_string(),
+            stt_alias: stt.to_string(),
+            summarization_alias: sum.to_string(),
+            tts_alias: tts.to_string(),
+            flow_alias: flow.to_string(),
+        }
     }
-    if let Some(v) = &req.tts_alias {
-        env.push(format!("TTS_MODEL={}", v));
+
+    #[test]
+    fn build_env_emits_alias_keys_expected_by_bot() {
+        let req = sample("teams-stt", "teams-summarization", "teams-tts", "teams-flow");
+        let env = build_env(&req);
+        assert!(env.contains(&"STT_ALIAS=teams-stt".to_string()));
+        assert!(env.contains(&"SUMMARIZATION_ALIAS=teams-summarization".to_string()));
+        assert!(env.contains(&"TTS_ALIAS=teams-tts".to_string()));
+        assert!(env.contains(&"FLOW_ALIAS=teams-flow".to_string()));
+        assert!(env.contains(&"MEETING_URL=https://teams.example/meet".to_string()));
+        assert!(env.contains(&"MEETING_ID=mtg-xyz".to_string()));
     }
-    if let Some(v) = &req.llm_alias {
-        env.push(format!("LLM_MODEL={}", v));
+
+    #[test]
+    fn build_env_propagates_custom_alias_overrides() {
+        let req = sample("my-stt", "my-sum", "my-tts", "my-flow");
+        let env = build_env(&req);
+        assert!(env.contains(&"STT_ALIAS=my-stt".to_string()));
+        assert!(env.contains(&"SUMMARIZATION_ALIAS=my-sum".to_string()));
+        assert!(env.contains(&"TTS_ALIAS=my-tts".to_string()));
+        assert!(env.contains(&"FLOW_ALIAS=my-flow".to_string()));
+        // Stare klucze nie mogą powrócić — bot (T1.5) ich nie czyta.
+        assert!(!env.iter().any(|e| e.starts_with("STT_MODEL=")));
+        assert!(!env.iter().any(|e| e.starts_with("TTS_MODEL=")));
+        assert!(!env.iter().any(|e| e.starts_with("LLM_MODEL=")));
     }
-    env
 }

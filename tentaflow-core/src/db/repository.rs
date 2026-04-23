@@ -61,8 +61,10 @@ fn row_to_prompt(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbPrompt> {
         cache_priority: row.get(8)?,
         is_active: row.get(9)?,
         version: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        language: row.get(11)?,
+        is_system: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -669,7 +671,7 @@ pub fn clear_must_change_password(pool: &DbPool, user_id: i64) -> Result<()> {
 
 // --- Prompts ---
 
-const PROMPT_COLS: &str = "id, prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority, is_active, version, created_at, updated_at";
+const PROMPT_COLS: &str = "id, prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority, is_active, version, language, is_system, created_at, updated_at";
 
 pub fn list_prompts(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbPrompt>> {
     let conn = acquire(pool)?;
@@ -698,7 +700,7 @@ pub fn get_prompt(pool: &DbPool, id: i64) -> Result<Option<DbPrompt>> {
 pub fn get_prompt_by_prompt_id(pool: &DbPool, prompt_id: &str) -> Result<Option<DbPrompt>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM prompts WHERE prompt_id = ?1",
+        "SELECT {} FROM prompts WHERE prompt_id = ?1 ORDER BY (language = 'pl') DESC, language ASC LIMIT 1",
         PROMPT_COLS
     ))?;
     let result = stmt
@@ -707,11 +709,39 @@ pub fn get_prompt_by_prompt_id(pool: &DbPool, prompt_id: &str) -> Result<Option<
     Ok(result)
 }
 
+/// Runtime lookup z fallbackiem na `pl`. Uzywane przez bota gdy chcemy wariant
+/// per-jezyk, ale baza domyslnie ma polski seed wiec ten sam prompt zadziala
+/// gdy lokal nie jest przetlumaczony.
+pub fn find_prompt(
+    pool: &DbPool,
+    prompt_id: &str,
+    language: &str,
+) -> Result<Option<DbPrompt>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM prompts WHERE prompt_id = ?1 AND language = ?2",
+        PROMPT_COLS
+    ))?;
+    let exact = stmt
+        .query_row(rusqlite::params![prompt_id, language], row_to_prompt)
+        .optional()?;
+    if exact.is_some() {
+        return Ok(exact);
+    }
+    if language == "pl" {
+        return Ok(None);
+    }
+    let fallback = stmt
+        .query_row(rusqlite::params![prompt_id, "pl"], row_to_prompt)
+        .optional()?;
+    Ok(fallback)
+}
+
 pub fn create_prompt(pool: &DbPool, params: &NewPrompt<'_>) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
-        "INSERT INTO prompts (prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![params.prompt_id, params.name, params.description, params.content, params.prompt_type, params.default_model, params.variables, params.cache_priority],
+        "INSERT INTO prompts (prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority, language) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![params.prompt_id, params.name, params.description, params.content, params.prompt_type, params.default_model, params.variables, params.cache_priority, params.language],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -719,8 +749,8 @@ pub fn create_prompt(pool: &DbPool, params: &NewPrompt<'_>) -> Result<i64> {
 pub fn update_prompt(pool: &DbPool, params: &UpdatePrompt<'_>) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "UPDATE prompts SET name = ?2, description = ?3, content = ?4, prompt_type = ?5, default_model = ?6, variables = ?7, cache_priority = ?8, is_active = ?9, version = version + 1, updated_at = datetime('now') WHERE id = ?1",
-        rusqlite::params![params.id, params.name, params.description, params.content, params.prompt_type, params.default_model, params.variables, params.cache_priority, params.is_active],
+        "UPDATE prompts SET name = ?2, description = ?3, content = ?4, prompt_type = ?5, default_model = ?6, variables = ?7, cache_priority = ?8, is_active = ?9, language = ?10, version = version + 1, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![params.id, params.name, params.description, params.content, params.prompt_type, params.default_model, params.variables, params.cache_priority, params.is_active, params.language],
     )?;
     Ok(())
 }

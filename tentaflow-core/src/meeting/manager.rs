@@ -25,9 +25,18 @@ pub struct StartSessionRequest {
     pub owner_user_id: Option<i64>,
     pub bot_name: String,
     pub stt_alias: Option<String>,
+    pub summarization_alias: Option<String>,
     pub tts_alias: Option<String>,
-    pub llm_alias: Option<String>,
+    pub flow_alias: Option<String>,
 }
+
+/// Domyślne aliasy przekazywane do kontenera teams-bota, jeśli caller nie
+/// nadpisze. Zgodne z tymi zainicjalizowanymi przez `ensure_teams_bot_defaults`
+/// w batch T1.5 oraz z `config.rs` bota (odczytuje env `*_ALIAS`).
+pub const DEFAULT_STT_ALIAS: &str = "teams-stt";
+pub const DEFAULT_SUMMARIZATION_ALIAS: &str = "teams-summarization";
+pub const DEFAULT_TTS_ALIAS: &str = "teams-tts";
+pub const DEFAULT_FLOW_ALIAS: &str = "teams-flow";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDescriptor {
@@ -47,6 +56,12 @@ pub struct SessionDescriptor {
     pub bot_endpoint_id: Option<String>,
     pub container_name: Option<String>,
     pub owner_user_id: Option<i64>,
+    /// Aliasy przekazane do kontenera w env vars (efektywne — po zastosowaniu
+    /// defaultów). Widoczne w dashboardzie żeby user wiedział co bot używa.
+    pub stt_alias: String,
+    pub summarization_alias: String,
+    pub tts_alias: String,
+    pub flow_alias: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +107,15 @@ impl MeetingManager {
     /// 5. Spawn kontener z env
     /// Jeśli którykolwiek krok zawiedzie — cofnij i zwroc blad.
     pub async fn start_session(&self, req: StartSessionRequest) -> Result<SessionDescriptor> {
+        // User mógł usunąć alias w DB albo system jest świeżo po upgrade bazy —
+        // idempotentnie przywracamy domyślne aliasy i flow przed spawnem. Best-effort,
+        // błąd nie blokuje startu (bot może i tak działać z częściową konfiguracją).
+        if let Err(e) =
+            crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults(&self.db).await
+        {
+            warn!("ensure_teams_bot_defaults przy start_session: {}", e);
+        }
+
         // meeting_key — UUID zapewnia unikalność, przekazywany przez env MEETING_ID
         // do kontenera. Bot umieszcza ten sam string w `meeting_id` każdego STT
         // responsu, przez co router zapisuje transkrypty pod tą samą sesją
@@ -144,6 +168,9 @@ impl MeetingManager {
             req.owner_user_id,
         )?;
 
+        // Efektywne aliasy — nadpisanie od callera lub domyślne z T1.5.
+        let (stt_alias, summarization_alias, tts_alias, flow_alias) = resolve_aliases(&req);
+
         let spawn_req = SpawnRequest {
             session_id,
             meeting_url: req.meeting_url.clone(),
@@ -151,9 +178,10 @@ impl MeetingManager {
             ports,
             secret_key_hex: secret_key_hex.clone(),
             bot_name: req.bot_name.clone(),
-            stt_alias: req.stt_alias.clone(),
-            tts_alias: req.tts_alias.clone(),
-            llm_alias: req.llm_alias.clone(),
+            stt_alias: stt_alias.clone(),
+            summarization_alias: summarization_alias.clone(),
+            tts_alias: tts_alias.clone(),
+            flow_alias: flow_alias.clone(),
         };
 
         match container::spawn(&spawn_req).await {
@@ -202,8 +230,17 @@ impl MeetingManager {
             );
         }
 
-        self.session_detail(session_id)?
-            .ok_or_else(|| anyhow!("nie udalo sie pobrac sesji po spawnie"))
+        // Deskryptor budowany z DB + efektywnych aliasów (te nie są persystowane
+        // w meeting_sessions — pochodzą wyłącznie z env kontenera). Dzięki temu
+        // odpowiedź start_session zawiera wartości faktycznie przekazane botowi.
+        let mut desc = self
+            .session_detail(session_id)?
+            .ok_or_else(|| anyhow!("nie udalo sie pobrac sesji po spawnie"))?;
+        desc.stt_alias = stt_alias;
+        desc.summarization_alias = summarization_alias;
+        desc.tts_alias = tts_alias;
+        desc.flow_alias = flow_alias;
+        Ok(desc)
     }
 
     /// Zatrzymuje sesję: wyrejestruj z ServiceManager → stop+rm kontener →
@@ -315,5 +352,135 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
         bot_endpoint_id: row.bot_endpoint_id.clone(),
         container_name: row.container_name.clone(),
         owner_user_id: row.owner_user_id,
+        // Aliasy nie są persystowane w meeting_sessions — dla listy/detail
+        // zwracamy defaulty. Rzeczywiste wartości są znane tylko w odpowiedzi
+        // start_session (tuż po spawnie kontenera).
+        stt_alias: DEFAULT_STT_ALIAS.to_string(),
+        summarization_alias: DEFAULT_SUMMARIZATION_ALIAS.to_string(),
+        tts_alias: DEFAULT_TTS_ALIAS.to_string(),
+        flow_alias: DEFAULT_FLOW_ALIAS.to_string(),
+    }
+}
+
+/// Rozwiązuje aliasy z requesta do konkretnych stringów, używając domyślnych
+/// teams-* gdy caller nie nadpisze. Wyodrębnione żeby można było testować
+/// niezależnie od spawna kontenera.
+fn resolve_aliases(req: &StartSessionRequest) -> (String, String, String, String) {
+    (
+        req.stt_alias
+            .clone()
+            .unwrap_or_else(|| DEFAULT_STT_ALIAS.to_string()),
+        req.summarization_alias
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SUMMARIZATION_ALIAS.to_string()),
+        req.tts_alias
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TTS_ALIAS.to_string()),
+        req.flow_alias
+            .clone()
+            .unwrap_or_else(|| DEFAULT_FLOW_ALIAS.to_string()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_aliases, StartSessionRequest, DEFAULT_FLOW_ALIAS, DEFAULT_STT_ALIAS,
+        DEFAULT_SUMMARIZATION_ALIAS, DEFAULT_TTS_ALIAS,
+    };
+    use crate::db::migrations;
+    use crate::db::repository;
+    use crate::db::DbPool;
+    use crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults;
+    use rusqlite::Connection;
+    use std::sync::{Arc, Mutex};
+
+    fn make_req(
+        stt: Option<&str>,
+        sum: Option<&str>,
+        tts: Option<&str>,
+        flow: Option<&str>,
+    ) -> StartSessionRequest {
+        StartSessionRequest {
+            meeting_url: "https://teams.example/meet".to_string(),
+            title: None,
+            platform: "teams".to_string(),
+            owner_user_id: None,
+            bot_name: "TF Bot".to_string(),
+            stt_alias: stt.map(String::from),
+            summarization_alias: sum.map(String::from),
+            tts_alias: tts.map(String::from),
+            flow_alias: flow.map(String::from),
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_falls_back_to_teams_defaults() {
+        let req = make_req(None, None, None, None);
+        let (stt, sum, tts, flow) = resolve_aliases(&req);
+        assert_eq!(stt, DEFAULT_STT_ALIAS);
+        assert_eq!(sum, DEFAULT_SUMMARIZATION_ALIAS);
+        assert_eq!(tts, DEFAULT_TTS_ALIAS);
+        assert_eq!(flow, DEFAULT_FLOW_ALIAS);
+    }
+
+    #[test]
+    fn resolve_aliases_honors_caller_overrides() {
+        let req = make_req(Some("a"), Some("b"), Some("c"), Some("d"));
+        let (stt, sum, tts, flow) = resolve_aliases(&req);
+        assert_eq!(stt, "a");
+        assert_eq!(sum, "b");
+        assert_eq!(tts, "c");
+        assert_eq!(flow, "d");
+    }
+
+    #[test]
+    fn resolve_aliases_mixes_override_and_default() {
+        let req = make_req(Some("custom-stt"), None, None, Some("custom-flow"));
+        let (stt, sum, tts, flow) = resolve_aliases(&req);
+        assert_eq!(stt, "custom-stt");
+        assert_eq!(sum, DEFAULT_SUMMARIZATION_ALIAS);
+        assert_eq!(tts, DEFAULT_TTS_ALIAS);
+        assert_eq!(flow, "custom-flow");
+    }
+
+    fn setup_pool() -> DbPool {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrations::run(&conn).unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    // Symuluje scenariusz spawn-time: user ręcznie skasował alias między uruchomieniami.
+    // Defensive hook w start_session() musi odtworzyć brakujący wpis bez błędu.
+    #[tokio::test]
+    async fn defensive_init_restores_deleted_alias() {
+        let pool = setup_pool();
+
+        ensure_teams_bot_defaults(&pool).await.unwrap();
+        assert!(repository::resolve_model_alias(&pool, "teams-stt")
+            .unwrap()
+            .is_some());
+
+        {
+            let conn = pool.lock().unwrap();
+            let deleted = conn
+                .execute(
+                    "DELETE FROM model_aliases WHERE alias = ?1",
+                    rusqlite::params!["teams-stt"],
+                )
+                .unwrap();
+            assert_eq!(deleted, 1);
+        }
+        assert!(repository::resolve_model_alias(&pool, "teams-stt")
+            .unwrap()
+            .is_none());
+
+        ensure_teams_bot_defaults(&pool).await.unwrap();
+
+        let restored = repository::resolve_model_alias(&pool, "teams-stt")
+            .unwrap()
+            .expect("alias teams-stt powinien zostać odtworzony");
+        assert_eq!(restored.strategy.as_deref(), Some("first_available"));
     }
 }
