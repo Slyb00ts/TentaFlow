@@ -387,7 +387,7 @@ async fn wait_for_quic_health(quic_url: &str) -> Result<()> {
         reconnect_interval_ms: 0,
         keepalive_interval_ms: 0,
         skip_tls_verify: true,
-    direct_addrs: Vec::new(),
+        direct_addrs: Vec::new(),
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

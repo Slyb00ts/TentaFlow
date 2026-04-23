@@ -43,10 +43,11 @@ jobs:
             # cfg-target `macos` wpisie w tentaflow/Cargo.toml.
             features: "gpu-metal"
             cache_id: "macos-arm64-metal"
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            features: "gpu-cuda,gpu-vulkan"
-            cache_id: "windows-x64-cuda-vulkan"
+          # Tymczasowo wylaczone — build Windows ma byc pomijany w release.
+          # - target: x86_64-pc-windows-msvc
+          #   runner: windows-latest
+          #   features: "gpu-cuda,gpu-vulkan"
+          #   cache_id: "windows-x64-cuda-vulkan"
 
     env:
       CARGO_INCREMENTAL: 0

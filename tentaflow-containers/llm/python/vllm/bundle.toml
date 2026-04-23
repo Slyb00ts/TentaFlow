@@ -16,7 +16,7 @@ command = "python"
 args = [
     "-m", "vllm.entrypoints.openai.api_server",
     "--host", "127.0.0.1",
-    "--port", "8000",
+    "--port", "${PORT:-8000}",
     "--model", "${MODEL}",
     "--dtype", "auto",
     "--gpu-memory-utilization", "${GPU_MEMORY_UTILIZATION:-0.9}",
@@ -41,6 +41,6 @@ extras = []
 install_hint = "VLLM_TARGET_DEVICE=rocm"
 
 [[install_variants]]
-backend = "mlx"
+backend = "metal"
 extras = ["mlx-lm", "mlx"]
 install_hint = "VLLM_TARGET_DEVICE=mlx"

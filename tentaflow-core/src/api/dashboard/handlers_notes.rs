@@ -60,7 +60,10 @@ fn audit(ctx: &HandlerContext, action: &str, note_id: Option<i64>) {
 
 fn require_user(ctx: &HandlerContext) -> Result<i64, ProtocolError> {
     current_user_id(ctx).ok_or_else(|| {
-        ProtocolError::new(ProtocolErrorCode::AuthRequired, "missing user_id in session")
+        ProtocolError::new(
+            ProtocolErrorCode::AuthRequired,
+            "missing user_id in session",
+        )
     })
 }
 
@@ -116,9 +119,7 @@ pub fn notes_dispatch(
         NotesRequest::Detail(r) => {
             let note = repository::get_note(&ctx.state.db, r.note_id, uid)
                 .map_err(db_err)?
-                .ok_or_else(|| {
-                    ProtocolError::new(ProtocolErrorCode::NotFound, "note not found")
-                })?;
+                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "note not found"))?;
             NotesResponse::Detail(NoteDetailResponse {
                 id: note.id,
                 title: note.title,
@@ -139,9 +140,7 @@ pub fn notes_dispatch(
                 .map_err(not_found_err)?;
             let updated = repository::get_note(&ctx.state.db, r.note_id, uid)
                 .map_err(db_err)?
-                .ok_or_else(|| {
-                    ProtocolError::new(ProtocolErrorCode::NotFound, "note vanished")
-                })?;
+                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "note vanished"))?;
             audit(ctx, "note_update", Some(r.note_id));
             NotesResponse::Update(NoteUpdateResponse {
                 ok: true,

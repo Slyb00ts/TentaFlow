@@ -4129,3 +4129,40 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
 
     Ok(MessageBody::IamBody(res))
 }
+
+// variant_name_of() zwraca nazwy inner payloadu (np. "IamListUsersRequest"),
+// wiec musimy zarejestrowac iam_dispatch pod kazda z tych nazw. Macro
+// `#[handler]` zarejestrowalo juz entry pod "IamBody" (nieuzywana, ale
+// nieszkodliwa — HashMap i tak jej nie trafi). Wrapper __tentaflow_dispatch_iam_dispatch
+// jest file-private, wiec submit! musi byc w tym samym pliku.
+macro_rules! register_iam_variant {
+    ($variant:literal, $metric:literal) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: crate::dispatch::SessionAuthKind::Admin,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_iam_dispatch,
+            }
+        }
+    };
+}
+
+register_iam_variant!("IamListUsersRequest", "tentaflow_ws_handler_iam_list_users");
+register_iam_variant!("IamGetUserRequest", "tentaflow_ws_handler_iam_get_user");
+register_iam_variant!("IamCreateUserRequest", "tentaflow_ws_handler_iam_create_user");
+register_iam_variant!("IamUpdateUserRequest", "tentaflow_ws_handler_iam_update_user");
+register_iam_variant!("IamDeleteUserRequest", "tentaflow_ws_handler_iam_delete_user");
+register_iam_variant!("IamSetUserGroupsRequest", "tentaflow_ws_handler_iam_set_user_groups");
+register_iam_variant!("IamResetUserPasswordRequest", "tentaflow_ws_handler_iam_reset_user_password");
+register_iam_variant!("IamListGroupsRequest", "tentaflow_ws_handler_iam_list_groups");
+register_iam_variant!("IamCreateGroupRequest", "tentaflow_ws_handler_iam_create_group");
+register_iam_variant!("IamUpdateGroupRequest", "tentaflow_ws_handler_iam_update_group");
+register_iam_variant!("IamDeleteGroupRequest", "tentaflow_ws_handler_iam_delete_group");
+register_iam_variant!("IamGroupMembersRequest", "tentaflow_ws_handler_iam_group_members");
+register_iam_variant!("IamSetPermissionRequest", "tentaflow_ws_handler_iam_set_permission");
+register_iam_variant!("IamClearPermissionRequest", "tentaflow_ws_handler_iam_clear_permission");
+register_iam_variant!("IamListPermsForResourceRequest", "tentaflow_ws_handler_iam_list_perms_resource");
+register_iam_variant!("IamListPermsForSubjectRequest", "tentaflow_ws_handler_iam_list_perms_subject");

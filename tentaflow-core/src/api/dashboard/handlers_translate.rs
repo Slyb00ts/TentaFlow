@@ -99,7 +99,13 @@ fn current_user_id(ctx: &HandlerContext) -> Option<i64> {
     }
 }
 
-fn audit_translate(ctx: &HandlerContext, source_lang: &str, target_lang: &str, chars_in: usize, chars_out: usize) {
+fn audit_translate(
+    ctx: &HandlerContext,
+    source_lang: &str,
+    target_lang: &str,
+    chars_in: usize,
+    chars_out: usize,
+) {
     let user_id = current_user_id(ctx);
     let details = serde_json::json!({
         "source_lang": source_lang,
