@@ -193,14 +193,19 @@ async function handlePairDeepLink() {
     const qrScanner = await import('/js/modules/qr-scanner.js');
     const parsed = qrScanner.parsePairUri(decodeURIComponent(pairRaw));
     if (!parsed) return;
-    // Wywolaj pairing start z pin_hint — backend drugiego noda auto-confirm.
+    // Wywolaj pairing start z kompletem hintow transportowych z QR invite.
     const resp = await ApiBinary.action('meshPairingStartRequest', {
       remoteAddress: parsed.hex,
-      pinHint: parsed.pin || '',
+      pin: parsed.pin || '',
+      ...(parsed.publicKey ? { remotePublicKey: parsed.publicKey } : {}),
+      ...(parsed.addresses?.length ? { remoteAddresses: parsed.addresses } : {}),
+      ...(parsed.relayUrl ? { remoteRelayUrl: parsed.relayUrl } : {}),
+      ...(parsed.host ? { remoteHostname: parsed.host } : {}),
     });
-    if (resp?.pin) {
-      // Nie musimy nic wyswietlac — auto-confirm po drugiej stronie.
-      console.info('[pair-deep-link] pairing started, PIN sent:', resp.pin);
+    if (resp?.completed) {
+      console.info('[pair-deep-link] pairing completed:', parsed.hex);
+    } else if (resp?.pin) {
+      console.warn('[pair-deep-link] pairing did not auto-complete');
     }
     // Wyczysc query string zeby przy F5 nie robilo sie znowu.
     const url = new URL(window.location.href);

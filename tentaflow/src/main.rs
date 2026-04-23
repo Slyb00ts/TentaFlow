@@ -153,7 +153,7 @@ async fn run_server(args: Args) -> Result<()> {
 
     // MeshSecurity — single source of truth dla tozsamosci. Ed25519 keypair
     // zapisany zaszyfrowany w settings; iroh uzywa tego klucza jako EndpointId.
-    // public_key_hex() to nasz node_id wszedzie — w DB, w UI, w protokole mesh.
+    // Dashboard mesh i routing peerow uzywaja Ed25519 hex jako node_id.
     let mesh_security = Arc::new(
         tentaflow_core::mesh::security::MeshSecurity::new(db.clone(), settings_cipher.clone())
             .map_err(|e| {
@@ -161,7 +161,7 @@ async fn run_server(args: Args) -> Result<()> {
                 e
             })?,
     );
-    let local_node_id_str = mesh_security.public_key_hex();
+    let local_node_id_str = mesh_security.ed25519_public_key_hex();
     info!(
         "Mesh identity: {}",
         &local_node_id_str[..16.min(local_node_id_str.len())]
@@ -175,11 +175,7 @@ async fn run_server(args: Args) -> Result<()> {
     {
         use tentaflow_core::mesh::node_info_collector;
         let info = node_info_collector::collect_node_info(&local_node_id_str);
-        let hostname = if info.hostname.is_empty() {
-            "(local)".to_string()
-        } else {
-            format!("{} (local)", info.hostname)
-        };
+        let hostname = info.hostname.clone();
         let platform = node_info_collector::detect_platform();
         let os_info = node_info_collector::collect_os_distro();
         let (docker_available, docker_version) = node_info_collector::collect_docker_info();

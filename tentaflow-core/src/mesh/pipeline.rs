@@ -17,6 +17,7 @@ use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
 use crate::mesh::security::MeshSecurity;
+use crate::net::iroh::load_relay_url;
 use crate::routing::live_metrics;
 
 /// Snapshot live-metrics routera — zwracany do heartbeat.
@@ -88,10 +89,14 @@ pub async fn start_mesh_pipeline(
     // DHT wylaczony na mobile — mainline bootstrap spowalnia start, a LAN Bonjour
     // + iroh relay wystarczaja do discovery peerow.
     let enable_dht = cfg!(not(any(target_os = "ios", target_os = "android")));
+    let relay_url = db_pool
+        .as_ref()
+        .map(|db| load_relay_url(db, Some(mesh_config)))
+        .or_else(|| mesh_config.iroh_relay_url.parse().ok());
     let iroh_cfg = IrohMeshConfig {
         node_id: app_node_id.clone(),
         bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], mesh_port)),
-        relay_url: None,
+        relay_url,
         heartbeat_interval: Duration::from_millis(mesh_config.heartbeat_interval_ms),
         enable_lan_discovery: mesh_config.mdns_enabled,
         enable_dht_discovery: enable_dht,
@@ -295,11 +300,6 @@ fn upsert_local_peer(
     mesh_port: u16,
     local_node_info: &NodeInfo,
 ) {
-    let local_hostname = if local_node_info.hostname.is_empty() {
-        "(local)".to_string()
-    } else {
-        format!("{} (local)", local_node_info.hostname)
-    };
     let local_addresses = node_info_collector::collect_local_addresses();
     let local_os_distro = node_info_collector::collect_os_distro();
     let (docker_available, docker_version) = node_info_collector::collect_docker_info();
@@ -312,7 +312,7 @@ fn upsert_local_peer(
         status: "connected".to_string(),
         quic_connected: true,
         discovered_at: chrono::Utc::now().to_rfc3339(),
-        hostname: local_hostname,
+        hostname: local_node_info.hostname.clone(),
         os_info: if local_os_distro.is_empty() {
             local_node_info.os_info.clone()
         } else {
@@ -1094,6 +1094,10 @@ fn spawn_quic_event_handler(
                                 ) {
                                     warn!("Blad potwierdzenia parowania od {}: {}", peer_id, e);
                                 } else {
+                                    let _ = crate::net::iroh::pairing::delete_pending_contact_hints(
+                                        &sec.db,
+                                        from_node_id,
+                                    );
                                     info!("Otrzymano PairingConfirm od {} — node zaufany", peer_id);
 
                                     // Po sparowaniu — wyslij NodeInfo do nowo zaufanego peera
@@ -1203,6 +1207,10 @@ fn spawn_quic_event_handler(
                                 if let Err(e) = sec.reject_pairing(from_node_id) {
                                     warn!("Blad odrzucenia parowania od {}: {}", peer_id, e);
                                 } else {
+                                    let _ = crate::net::iroh::pairing::delete_pending_contact_hints(
+                                        &sec.db,
+                                        from_node_id,
+                                    );
                                     info!("Otrzymano PairingReject od {}", peer_id);
                                 }
                             }

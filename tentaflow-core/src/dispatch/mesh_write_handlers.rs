@@ -87,7 +87,14 @@ pub async fn mesh_pairing_start(
             ))
         }
     };
-    let MeshPairingStartRequest { remote_address, pin_hint } = payload;
+    let MeshPairingStartRequest {
+        remote_address,
+        pin_hint,
+        remote_public_key,
+        remote_addresses,
+        remote_relay_url,
+        remote_hostname,
+    } = payload;
 
     let security = require_mesh_security(ctx)?;
 
@@ -98,6 +105,10 @@ pub async fn mesh_pairing_start(
         &ctx.state.db,
         &security,
         remote_address,
+        remote_public_key,
+        remote_addresses,
+        remote_relay_url,
+        remote_hostname,
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
         &ctx.state.mesh_peer_store,
@@ -118,12 +129,20 @@ pub async fn mesh_pairing_start(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    let completed = parsed
+        .get("completed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Pair_id = node_id (mapowanie proste — pairing jednoznaczny per node).
     let pair_id = remote_address.clone();
 
     Ok(MessageBody::MeshPairingStartResponseBody(
-        MeshPairingStartResponse { pair_id, pin },
+        MeshPairingStartResponse {
+            pair_id,
+            pin,
+            completed,
+        },
     ))
 }
 
