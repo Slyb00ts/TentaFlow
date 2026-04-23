@@ -80,6 +80,12 @@ impl FlowDispatcher {
         }
     }
 
+    /// Udostepnia AdapterRegistry — uzywane przez handlery do walidacji
+    /// flow_json przed zapisem (porty krawedzi vs metadata adaptera).
+    pub fn registry(&self) -> &Arc<AdapterRegistry> {
+        &self.registry
+    }
+
     /// Sprawdza czy flow engine jest wlaczony (setting w DB, cache na 5s)
     async fn is_enabled(&self) -> bool {
         let should_refresh = {
