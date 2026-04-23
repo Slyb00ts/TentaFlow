@@ -1443,7 +1443,22 @@
     "col_description": "Description",
     "sub_active": "{n} active",
     "sub_inactive": "{n} inactive",
-    "sub_admin": "{n} admin"
+    "sub_admin": "{n} admin",
+    "back": "Back",
+    "tab_profile": "Profile",
+    "tab_memberships": "Memberships",
+    "stat_status": "Status",
+    "stat_source": "Source",
+    "stat_groups": "Groups",
+    "stat_last_login": "Last login",
+    "field_status": "Account status",
+    "status_active_desc": "Active — can log in and use the app",
+    "status_disabled_desc": "Disabled — exists but cannot log in",
+    "save_changes": "Save changes",
+    "delete_account": "Delete account",
+    "delete_group": "Delete group",
+    "group_label": "Group",
+    "perms_user_todo": "User permissions (override over groups) — next release."
   },
   "groups": {
     "title": "Groups",
