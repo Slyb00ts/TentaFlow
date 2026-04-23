@@ -185,7 +185,7 @@ async fn recorder_round_trip_with_dispatch() {
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),
     };
-    let _ = dispatch::dispatch(&MessageBody::NodeListRequest, &ctx);
+    let _ = dispatch::dispatch(&MessageBody::ModelListRequest, &ctx);
 
     if let Some(rec) = recorder::global() {
         let frames = rec.by_correlation(999).unwrap_or_default();
