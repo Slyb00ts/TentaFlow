@@ -10,12 +10,15 @@ mod config;
 mod quic_server;
 mod vad;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
+use crate::audio::RosterEntry;
 use crate::config::MeetingConfig;
 use crate::vad::VadResult;
 
@@ -68,15 +71,14 @@ async fn main() -> Result<()> {
 
     // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do STT/TTS)
     tracing::info!("Czekam na polaczenie routera...");
-    let router_client = loop {
-        {
-            let guard = router_client_handle.lock().await;
-            if let Some(ref client) = *guard {
-                break Arc::clone(client);
-            }
+    loop {
+        let guard = router_client_handle.lock().await;
+        if guard.is_some() {
+            break;
         }
+        drop(guard);
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    };
+    }
     tracing::info!("Router polaczony — STT/TTS dostepne");
 
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
@@ -95,8 +97,64 @@ async fn main() -> Result<()> {
     // 5. Uruchom most audio WebSocket (wstrzykniety JS w Chromium <-> Rust)
     // Zastepuje wczesniejsze parec/pacat — audio przechwytywane na poziomie
     // HTMLMediaElement w Chromium przez captureStream(), bez PulseAudio monitor.
-    let (mut audio_capture, _audio_playback) = audio::start_bridge().await?;
+    let (mut audio_capture, audio_playback, mut roster_rx, mut speaker_rx) =
+        audio::start_bridge().await?;
+    let audio_playback = Arc::new(audio_playback);
+    // Guard feedback-loop — gdy bot odtwarza TTS przez mic injection, capture
+    // (z HTMLMediaElement i pc.ontrack) moze ponownie zlapac ten sam glos
+    // przez echo konferencji. Bez tego STT zapetla sie na wlasnych odpowiedziach.
+    let is_bot_speaking = Arc::new(AtomicBool::new(false));
     tracing::info!("Most audio WebSocket uruchomiony na 127.0.0.1:9999");
+
+    // Stan rostera i aktywnego mowcy dzielony z taskami receiverow.
+    // Roster wysylany jest w metadata STT, active_speaker tak samo.
+    let current_roster: Arc<RwLock<Vec<RosterEntry>>> = Arc::new(RwLock::new(Vec::new()));
+    let current_active_speaker: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
+    {
+        let roster_state = Arc::clone(&current_roster);
+        tokio::spawn(async move {
+            // Telemetria selektorow — jesli DOM Teams sie zmieni, roster bedzie
+            // pusty; pod 3 pod rzad ostrzegamy (moze pomoc w diagnostyce bez SSH).
+            let mut empty_count: u32 = 0;
+            while let Some(list) = roster_rx.rx.recv().await {
+                if list.is_empty() {
+                    empty_count = empty_count.saturating_add(1);
+                    if empty_count >= 3 {
+                        tracing::warn!(
+                            empty_count,
+                            "roster empty {} times — Teams DOM may have changed",
+                            empty_count
+                        );
+                    }
+                } else {
+                    empty_count = 0;
+                }
+                *roster_state.write().await = list;
+            }
+        });
+    }
+    {
+        let speaker_state = Arc::clone(&current_active_speaker);
+        tokio::spawn(async move {
+            let mut none_count: u32 = 0;
+            while let Some(name) = speaker_rx.rx.recv().await {
+                if name.is_none() {
+                    none_count = none_count.saturating_add(1);
+                    if none_count == 10 {
+                        tracing::warn!(
+                            none_count,
+                            "active_speaker None {} times — check data-is-presenter selector",
+                            none_count
+                        );
+                    }
+                } else {
+                    none_count = 0;
+                }
+                *speaker_state.write().await = name;
+            }
+        });
+    }
 
     // 6. Inicjalizacja VAD
     let mut vad_detector = vad::VadDetector::new(
@@ -112,11 +170,10 @@ async fn main() -> Result<()> {
 
     // 7. Glowna petla: audio -> VAD -> STT (QUIC) -> streaming transcript -> TTS (QUIC)
     let mut speech_buffer: Vec<i16> = Vec::new();
-    let stt_model = config.stt_model.as_deref().unwrap_or("teams-stt");
-    let tts_model = config.tts_model.as_deref().unwrap_or("teams-tts");
-    let tts_voice = config.tts_voice.as_deref().unwrap_or("alloy");
+    let stt_alias = config.stt_alias.as_str();
+    let tts_alias = config.tts_alias.as_str();
 
-    tracing::info!("Pipeline audio uruchomiony (STT: {}, TTS: {})", stt_model, tts_model);
+    tracing::info!("Pipeline audio uruchomiony (STT alias: {}, TTS alias: {})", stt_alias, tts_alias);
 
     // Bulletproof audio segmentation dla STT + WeSpeaker diarization.
     //
@@ -178,6 +235,12 @@ async fn main() -> Result<()> {
                     tracing::warn!("Strumien audio zakonczony");
                     break;
                 };
+
+                // Gdy bot aktualnie odtwarza TTS, ignorujemy chunk — inaczej
+                // echo konferencji zamyka petle feedback: bot mowi -> slyszy siebie -> STT -> TTS.
+                if is_bot_speaking.load(Ordering::Relaxed) {
+                    continue;
+                }
 
                 chunk_count += 1;
 
@@ -290,38 +353,109 @@ async fn main() -> Result<()> {
                         samples = speech_buffer.len(),
                         duration_ms,
                         snr_db = snr,
-                        model = stt_model,
+                        model = stt_alias,
                         "Wysylam segment do STT"
                     );
 
-                    let current_client = router_client_handle.lock().await.clone();
-                    let stt_result = match current_client {
-                        Some(client) => {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(30),
-                                client.transcribe(&speech_buffer, stt_model, Some("pl".to_string())),
-                            ).await {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    tracing::warn!("STT timeout po 30s — router nie odpowiada");
-                                    Err(anyhow::anyhow!("STT timeout"))
-                                }
+                    // Doklej kontekst spotkania do metadata STT — router uzywa
+                    // go do diarization, logow i ewentualnej generacji odpowiedzi.
+                    // Sanityzacja: obcinamy znaki kontrolne i limitujemy dlugosc zeby
+                    // zlosliwa/zbugowana strona Teams nie wstrzyknela metadata-bomb.
+                    let mut extra_meta: Vec<(String, String)> = Vec::new();
+                    {
+                        let roster_snapshot = current_roster.read().await;
+                        let names: Vec<String> = roster_snapshot
+                            .iter()
+                            .take(50)
+                            .map(|r| r.name.chars()
+                                .filter(|c| !c.is_control())
+                                .take(128)
+                                .collect::<String>())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        drop(roster_snapshot);
+                        if !names.is_empty() {
+                            if let Ok(json) = serde_json::to_string(&names) {
+                                extra_meta.push(("roster".to_string(), json));
                             }
                         }
-                        None => {
-                            tracing::warn!("Router nie polaczony — pomijam STT");
-                            Err(anyhow::anyhow!("brak RouterClient"))
+                    }
+                    if let Some(ref speaker) = *current_active_speaker.read().await {
+                        let cleaned: String = speaker.chars()
+                            .filter(|c| !c.is_control())
+                            .take(128)
+                            .collect();
+                        if !cleaned.is_empty() {
+                            extra_meta.push(("active_speaker".to_string(), cleaned));
+                        }
+                    }
+                    extra_meta.push(("timestamp_ms".to_string(), timestamp_ms.to_string()));
+
+                    // Pobierz klienta raz dla calej iteracji (STT + opcjonalny TTS) —
+                    // osobny lock dla TTS moglby trafic na inny Arc jesli router sie
+                    // zrekonektowal miedzy wywolaniami.
+                    let client = {
+                        let guard = router_client_handle.lock().await;
+                        guard.as_ref().cloned()
+                    };
+                    let Some(client) = client else {
+                        tracing::warn!("router client not available, skipping STT");
+                        speech_buffer.clear();
+                        collecting_silence_tail = false;
+                        silence_tail_samples = 0;
+                        continue;
+                    };
+                    let stt_result = match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        client.transcribe(&speech_buffer, stt_alias, None, extra_meta),
+                    ).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            tracing::warn!("STT timeout po 30s — router nie odpowiada");
+                            Err(anyhow::anyhow!("STT timeout"))
                         }
                     };
                     match stt_result {
                         Ok(text) if !text.is_empty() => {
-                            // Speaker label jest wywnioskowany po stronie routera z
-                            // voice profiles + temp speaker tracker. Lokalny kanal
-                            // `transcript_tx` dostarcza tylko fallback "Nieznany"
-                            // bo nie wiemy po stronie bota jaki mowca byl — router
-                            // wpisuje do swojego transcript_store.
                             tracing::info!(text = %text, "STT zwrocilo transkrypt");
-                            let _ = transcript_tx.send(("Nieznany".to_string(), text, timestamp_ms));
+                            let _ = transcript_tx.send(("Nieznany".to_string(), text.clone(), timestamp_ms));
+
+                            // TTS uruchamiamy TYLKO w echo_mode (tryb testowy). Bez tego
+                            // bot powtarza co uslyszal = nieskonczony feedback loop, nawet
+                            // ze self-speaking guardem. Docelowo LLM response pojdzie osobnym
+                            // polem w ModelResponse i wtedy to bedzie branch na llm_response.
+                            if config.echo_mode {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    client.synthesize(&text, "", tts_alias),
+                                ).await {
+                                    Ok(Ok(audio_bytes)) => {
+                                        match audio::parse_audio_payload(audio_bytes)
+                                            .context("parse tts wav")
+                                        {
+                                            Ok(pcm) => {
+                                                // Zablokuj capture na czas odtwarzania (len bajtow / 2 bps / sr).
+                                                let duration_ms = (pcm.len() as u64) * 1000 / (2 * 16_000);
+                                                is_bot_speaking.store(true, Ordering::Relaxed);
+                                                if let Err(e) = audio_playback.send(pcm) {
+                                                    tracing::warn!("Nie udalo sie wyslac TTS do mic bota: {}", e);
+                                                    is_bot_speaking.store(false, Ordering::Relaxed);
+                                                } else {
+                                                    tracing::info!(duration_ms, "TTS wyslany do mikrofonu bota");
+                                                    let flag = Arc::clone(&is_bot_speaking);
+                                                    tokio::spawn(async move {
+                                                        tokio::time::sleep(std::time::Duration::from_millis(duration_ms + 250)).await;
+                                                        flag.store(false, Ordering::Relaxed);
+                                                    });
+                                                }
+                                            }
+                                            Err(e) => tracing::warn!("TTS WAV malformed: {:#}", e),
+                                        }
+                                    }
+                                    Ok(Err(e)) => tracing::warn!("Blad TTS: {}", e),
+                                    Err(_) => tracing::warn!("TTS timeout po 30s"),
+                                }
+                            }
                         }
                         Ok(_) => {
                             tracing::debug!("STT zwrocil pusty tekst — pomijam");

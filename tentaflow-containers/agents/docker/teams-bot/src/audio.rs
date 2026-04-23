@@ -6,11 +6,12 @@
 //       Zastepuje wczesniejsze podejscie z parec/pacat/PulseAudio monitor.
 // =============================================================================
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::Mutex as StdMutex;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 /// Adres mostu WebSocket — JS w Chromium laczy sie tutaj
@@ -18,6 +19,14 @@ pub const BRIDGE_ADDR: &str = "127.0.0.1:9999";
 
 /// Rozmiar bufora kanalu capture (liczba chunkow)
 const CAPTURE_BUFFER: usize = 64;
+
+/// Pojedynczy wpis listy uczestnikow spotkania
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RosterEntry {
+    pub name: String,
+    #[serde(default)]
+    pub status: String,
+}
 
 /// Odbiornik probek PCM z Chromium (monoton 16kHz i16, chunki ~256ms)
 pub struct AudioCapture {
@@ -31,21 +40,84 @@ impl AudioCapture {
     }
 }
 
-/// Wysylka probek PCM do Chromium (mic injection bota)
+/// Kanal odbioru aktualizacji rosteru (pelna lista przy kazdym tick 3s)
+pub struct RosterReceiver {
+    pub rx: mpsc::Receiver<Vec<RosterEntry>>,
+}
+
+/// Kanal odbioru zmian aktywnego mowcy (None = brak mowcy)
+pub struct ActiveSpeakerReceiver {
+    pub rx: mpsc::Receiver<Option<String>>,
+}
+
+/// Rozbija payload TTS na surowe bajty PCM i16 LE. Dla WAV parsuje chunki
+/// (fmt, data) zamiast slepo pomijac 44 bajty — naglowek moze miec dodatkowe
+/// chunki (LIST/INFO) i dane moga zaczynac sie pod innym offsetem.
+/// Dla WAV wymaga PCM mono 16 kHz 16-bit, w przeciwnym razie zwraca blad.
+pub fn parse_audio_payload(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Ok(bytes);
+    }
+    let mut cursor = 12usize;
+    let mut fmt_ok = false;
+    let mut data_start: Option<usize> = None;
+    while cursor + 8 <= bytes.len() {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_size = u32::from_le_bytes(
+            bytes[cursor + 4..cursor + 8].try_into().map_err(|_| anyhow!("WAV chunk size read"))?,
+        ) as usize;
+        let body = cursor + 8;
+        if chunk_id == b"fmt " && body + 16 <= bytes.len() {
+            let format = u16::from_le_bytes(bytes[body..body + 2].try_into().unwrap());
+            let channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().unwrap());
+            let sample_rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap());
+            let bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap());
+            if format != 1 || channels != 1 || sample_rate != 16000 || bits != 16 {
+                return Err(anyhow!(
+                    "unsupported WAV: fmt={} ch={} sr={} bits={}",
+                    format, channels, sample_rate, bits
+                ));
+            }
+            fmt_ok = true;
+        } else if chunk_id == b"data" {
+            data_start = Some(body);
+            break;
+        }
+        // chunk_size moze byc nieparzysty — spec wymaga pad byte
+        cursor = body + chunk_size + (chunk_size & 1);
+    }
+    if !fmt_ok {
+        return Err(anyhow!("WAV without fmt chunk"));
+    }
+    let start = data_start.ok_or_else(|| anyhow!("WAV without data chunk"))?;
+    Ok(bytes[start..].to_vec())
+}
+
+/// Wysylka probek PCM do Chromium (mic injection bota).
+/// Fire-and-forget: `send` jest sync i uzywa `try_send` — gdy bufor pelny,
+/// ramka jest dropowana z ostrzezeniem (backpressure zamiast blokowania pipeline).
 pub struct AudioPlayback {
-    tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    tx: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl AudioPlayback {
-    /// Wysyla dane PCM i16 16kHz mono do JS (ramka [0x01][payload])
-    pub fn send(&self, pcm_data: Vec<u8>) {
-        let tx_arc = Arc::clone(&self.tx);
-        tokio::spawn(async move {
-            let guard = tx_arc.lock().await;
-            if let Some(ref sender) = *guard {
-                let _ = sender.send(pcm_data).await;
+    /// Wysyla dane PCM i16 16kHz mono do JS (ramka [0x01][payload]).
+    /// Zwraca Err gdy JS bridge nie jest podlaczony; pelny bufor loguje warn i zwraca Ok.
+    pub fn send(&self, pcm_data: Vec<u8>) -> Result<()> {
+        let guard = self.tx.lock().map_err(|_| anyhow!("AudioPlayback mutex poisoned"))?;
+        let Some(sender) = guard.as_ref() else {
+            return Err(anyhow!("AudioPlayback: JS bridge niepodlaczony"));
+        };
+        match sender.try_send(pcm_data) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("playback buffer full, dropping PCM frame");
+                Ok(())
             }
-        });
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow!("AudioPlayback kanal zamkniety"))
+            }
+        }
     }
 }
 
@@ -53,9 +125,11 @@ impl AudioPlayback {
 /// polaczenie od wstrzyknietego JS (re-accept po rozlaczeniu).
 /// Zwraca AudioCapture i AudioPlayback ktore maja ten sam interfejs co poprzednia
 /// implementacja (zero zmian w main.rs pipeline).
-pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback)> {
+pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback, RosterReceiver, ActiveSpeakerReceiver)> {
     let (capture_tx, capture_rx) = mpsc::channel::<Vec<i16>>(CAPTURE_BUFFER);
-    let playback_tx_slot: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+    let (roster_tx, roster_rx) = mpsc::channel::<Vec<RosterEntry>>(8);
+    let (speaker_tx, speaker_rx) = mpsc::channel::<Option<String>>(32);
+    let playback_tx_slot: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(StdMutex::new(None));
 
     let listener = TcpListener::bind(BRIDGE_ADDR).await
         .map_err(|e| anyhow::anyhow!("Nie udalo sie otworzyc {}: {}", BRIDGE_ADDR, e))?;
@@ -70,10 +144,18 @@ pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback)> {
                 Ok((stream, addr)) => {
                     tracing::info!(peer = %addr, "JS bridge polaczony");
                     let capture_tx_conn = capture_tx.clone();
+                    let roster_tx_conn = roster_tx.clone();
+                    let speaker_tx_conn = speaker_tx.clone();
                     let playback_slot_conn = Arc::clone(&playback_slot_accept);
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_bridge_connection(stream, capture_tx_conn, playback_slot_conn).await {
+                        if let Err(e) = handle_bridge_connection(
+                            stream,
+                            capture_tx_conn,
+                            roster_tx_conn,
+                            speaker_tx_conn,
+                            playback_slot_conn,
+                        ).await {
                             tracing::warn!("Bridge polaczenie zakonczone: {}", e);
                         }
                     });
@@ -89,6 +171,8 @@ pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback)> {
     Ok((
         AudioCapture { rx: capture_rx },
         AudioPlayback { tx: playback_tx_slot },
+        RosterReceiver { rx: roster_rx },
+        ActiveSpeakerReceiver { rx: speaker_rx },
     ))
 }
 
@@ -97,7 +181,9 @@ pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback)> {
 async fn handle_bridge_connection(
     tcp: tokio::net::TcpStream,
     capture_tx: mpsc::Sender<Vec<i16>>,
-    playback_slot: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    roster_tx: mpsc::Sender<Vec<RosterEntry>>,
+    speaker_tx: mpsc::Sender<Option<String>>,
+    playback_slot: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
 ) -> Result<()> {
     let ws_stream = tokio_tungstenite::accept_async(tcp).await
         .map_err(|e| anyhow::anyhow!("Handshake WS blad: {}", e))?;
@@ -105,8 +191,7 @@ async fn handle_bridge_connection(
 
     // Nowy kanal dla playback — wstaw do slotu
     let (pb_tx, mut pb_rx) = mpsc::channel::<Vec<u8>>(32);
-    {
-        let mut slot = playback_slot.lock().await;
+    if let Ok(mut slot) = playback_slot.lock() {
         *slot = Some(pb_tx);
     }
 
@@ -159,6 +244,36 @@ async fn handle_bridge_connection(
                             break;
                         }
                     }
+                    // 0x03 = roster snapshot (JSON UTF-8)
+                    0x03 => {
+                        let payload = &data[1..];
+                        match serde_json::from_slice::<Vec<RosterEntry>>(payload) {
+                            Ok(list) => {
+                                tracing::debug!(count = list.len(), "Roster update");
+                                // try_send: gdy konsument nie nadaza, dropujemy stary
+                                // snapshot — za chwile przyjdzie nowszy (polling 3s).
+                                if let Err(mpsc::error::TrySendError::Closed(_)) = roster_tx.try_send(list) {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Blad parsowania roster JSON: {}", e);
+                            }
+                        }
+                    }
+                    // 0x04 = active speaker change (nazwa UTF-8 albo pusty = brak)
+                    0x04 => {
+                        let payload = &data[1..];
+                        let name = if payload.is_empty() {
+                            None
+                        } else {
+                            Some(String::from_utf8_lossy(payload).to_string())
+                        };
+                        tracing::debug!(?name, "Active speaker change");
+                        if let Err(mpsc::error::TrySendError::Closed(_)) = speaker_tx.try_send(name) {
+                            break;
+                        }
+                    }
                     _ => {
                         tracing::debug!(msg_type, "Nieznany typ ramki od JS");
                     }
@@ -173,8 +288,7 @@ async fn handle_bridge_connection(
     }
 
     // Wyczysc slot playback
-    {
-        let mut slot = playback_slot.lock().await;
+    if let Ok(mut slot) = playback_slot.lock() {
         *slot = None;
     }
     send_task.abort();
@@ -212,5 +326,51 @@ mod tests {
         let bytes = [0x00, 0x01, 0xFF];
         let samples = bytes_to_i16_samples(&bytes);
         assert_eq!(samples, vec![256]);
+    }
+
+    fn build_wav(sample_rate: u32, channels: u16, bits: u16, data: &[u8]) -> Vec<u8> {
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + data.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVE");
+        w.extend_from_slice(b"fmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&channels.to_le_bytes());
+        w.extend_from_slice(&sample_rate.to_le_bytes());
+        let byte_rate = sample_rate * channels as u32 * (bits as u32 / 8);
+        w.extend_from_slice(&byte_rate.to_le_bytes());
+        let block_align = channels * (bits / 8);
+        w.extend_from_slice(&block_align.to_le_bytes());
+        w.extend_from_slice(&bits.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        w.extend_from_slice(data);
+        w
+    }
+
+    #[test]
+    fn parse_audio_payload_raw_passthrough() {
+        let raw = vec![1, 2, 3, 4];
+        assert_eq!(parse_audio_payload(raw.clone()).unwrap(), raw);
+    }
+
+    #[test]
+    fn parse_audio_payload_valid_wav() {
+        let pcm = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let wav = build_wav(16000, 1, 16, &pcm);
+        assert_eq!(parse_audio_payload(wav).unwrap(), pcm);
+    }
+
+    #[test]
+    fn parse_audio_payload_rejects_bad_sample_rate() {
+        let wav = build_wav(44100, 1, 16, &[0; 4]);
+        assert!(parse_audio_payload(wav).is_err());
+    }
+
+    #[test]
+    fn parse_audio_payload_rejects_stereo() {
+        let wav = build_wav(16000, 2, 16, &[0; 4]);
+        assert!(parse_audio_payload(wav).is_err());
     }
 }
