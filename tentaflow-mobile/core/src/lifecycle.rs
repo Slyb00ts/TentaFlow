@@ -99,6 +99,7 @@ pub extern "C" fn tentaflow_on_pause() {
     if let Some(lifecycle) = get_lifecycle() {
         lifecycle.on_pause();
     }
+    tentaflow_core::lifecycle_signal::broadcast_pause();
 }
 
 #[no_mangle]
@@ -106,6 +107,9 @@ pub extern "C" fn tentaflow_on_resume() {
     if let Some(lifecycle) = get_lifecycle() {
         lifecycle.on_resume();
     }
+    // Nadaje Resume globalnym subskrybentom — unified_server rebinduje TCP
+    // listener, mesh pipeline robi natychmiastowy redial peerow.
+    tentaflow_core::lifecycle_signal::broadcast_resume();
 }
 
 #[no_mangle]

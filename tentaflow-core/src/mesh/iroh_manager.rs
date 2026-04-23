@@ -55,6 +55,14 @@ pub struct IrohMeshConfig {
     pub relay_url: Option<RelayUrl>,
     /// Interwal wysylania heartbeatow.
     pub heartbeat_interval: Duration,
+    /// Czy wlaczyc wbudowane LAN mDNS (swarm-discovery). Na iOS false —
+    /// iOS blokuje raw multicast bez Apple entitlementa; LAN discovery
+    /// idzie przez natywny Bonjour (NWBrowser) w warstwie Swift.
+    pub enable_lan_discovery: bool,
+    /// Czy wlaczyc DHT (pkarr-mainline) discovery. Mobile defaultowo false —
+    /// DHT listening + bootstrap dodaje ~0.5-1s do starta i na mobile nie
+    /// jest potrzebne (LAN Bonjour + iroh relay wystarcza).
+    pub enable_dht_discovery: bool,
 }
 
 impl Default for IrohMeshConfig {
@@ -64,6 +72,8 @@ impl Default for IrohMeshConfig {
             bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             relay_url: None,
             heartbeat_interval: Duration::from_millis(500),
+            enable_lan_discovery: true,
+            enable_dht_discovery: true,
         }
     }
 }
@@ -229,8 +239,8 @@ impl IrohMeshManager {
             secret_key,
             bind_addr: config.bind_addr,
             relay_url: config.relay_url.clone(),
-            enable_lan_discovery: true,
-            enable_dht_discovery: true,
+            enable_lan_discovery: config.enable_lan_discovery,
+            enable_dht_discovery: config.enable_dht_discovery,
         };
 
         let endpoint = IrohEndpoint::bind(iroh_config)
@@ -507,6 +517,38 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect: {e:?}"))?;
+        self.register_connection(node_id_hex.to_string(), connection.clone())
+            .await;
+        let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
+            node_id: node_id_hex.to_string(),
+        });
+        let me = self.clone_for_spawn();
+        let id = node_id_hex.to_string();
+        tokio::spawn(async move {
+            me.handle_mesh_connection(id, connection).await;
+        });
+        Ok(())
+    }
+
+    /// Laczy sie z peerem podajac explicit direct address (IP+port). Uzywane
+    /// na iOS gdzie swarm-discovery mDNS nie dziala — Swift NWBrowser znajduje
+    /// peera przez systemowy Bonjour i przekazuje adres do Rust. iroh probuje
+    /// hole-punch na direct addr; jak padnie → fallback na relay.
+    pub async fn connect_to_peer_direct(
+        &self,
+        node_id_hex: &str,
+        direct_addr: std::net::SocketAddr,
+    ) -> Result<()> {
+        if self.is_connected(node_id_hex).await {
+            return Ok(());
+        }
+        let endpoint_id = parse_endpoint_id(node_id_hex)?;
+        let addr = EndpointAddr::new(endpoint_id).with_ip_addr(direct_addr);
+        let connection = self
+            .endpoint
+            .connect(addr, ALPN_MESH)
+            .await
+            .map_err(|e| anyhow::anyhow!("iroh connect direct: {e:?}"))?;
         self.register_connection(node_id_hex.to_string(), connection.clone())
             .await;
         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
