@@ -251,6 +251,10 @@ async fn handle_chat_completions(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let user_ctx = req
+        .extensions()
+        .get::<crate::routing::acl::UserContext>()
+        .cloned();
 
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
@@ -276,7 +280,7 @@ async fn handle_chat_completions(
 
     if is_streaming {
         // === STREAMING MODE: SSE ===
-        match router.route_chat_completion_stream(request).await {
+        match router.route_chat_completion_stream_for_user(request, user_ctx.clone()).await {
             Ok(route_result) => {
                 let metadata = route_result.metadata;
                 let chunk_stream = route_result.response;
@@ -350,7 +354,7 @@ async fn handle_chat_completions(
         }
     } else {
         // === NON-STREAMING MODE: JSON ===
-        match router.route_chat_completion(request).await {
+        match router.route_chat_completion_for_user(request, user_ctx).await {
             Ok(route_result) => {
                 let body = serde_json::to_vec(&route_result.response).unwrap();
                 let mut resp = json_response(StatusCode::OK, body);
@@ -413,6 +417,10 @@ async fn handle_audio_tts(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let user_ctx = req
+        .extensions()
+        .get::<crate::routing::acl::UserContext>()
+        .cloned();
 
     // Parsuj body jako JSON
     let body_bytes = match req.into_body().collect().await {
@@ -445,7 +453,7 @@ async fn handle_audio_tts(
     );
 
     // Wywolaj Router.synthesize_speech()
-    match router.synthesize_speech(&tts_request).await {
+    match router.synthesize_speech_for_user(&tts_request, user_ctx).await {
         Ok(route_result) => {
             let audio_bytes = route_result.response;
             // Okresl content type na podstawie formatu
@@ -523,6 +531,10 @@ async fn handle_audio_transcriptions(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let user_ctx = req
+        .extensions()
+        .get::<crate::routing::acl::UserContext>()
+        .cloned();
 
     // Wyciagnij Content-Type header aby sprawdzic boundary
     let content_type = match req.headers().get("content-type") {
@@ -689,7 +701,7 @@ async fn handle_audio_transcriptions(
 
     // Routuj do odpowiedniego backendu
     match router
-        .route_audio_transcription(transcription_request)
+        .route_audio_transcription_for_user(transcription_request, user_ctx)
         .await
     {
         Ok(route_result) => {
@@ -749,6 +761,10 @@ async fn handle_embeddings(
     hyper::Error,
 > {
     let debug_route = is_debug_route_openai(req.headers(), req.uri());
+    let user_ctx = req
+        .extensions()
+        .get::<crate::routing::acl::UserContext>()
+        .cloned();
 
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
@@ -769,7 +785,7 @@ async fn handle_embeddings(
     debug!("Embeddings request: model={}", request.model);
 
     // Routuj do odpowiedniego backendu
-    match router.route_embeddings(request).await {
+    match router.route_embeddings_for_user(request, user_ctx).await {
         Ok(route_result) => {
             let body = serde_json::to_vec(&route_result.response).unwrap();
             let mut resp = json_response(StatusCode::OK, body);

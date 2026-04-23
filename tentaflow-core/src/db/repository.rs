@@ -415,7 +415,7 @@ pub fn update_backend(
 // --- API Keys ---
 
 const API_KEY_COLS: &str =
-    "id, key_hash, key_prefix, name, rate_limit_rps, is_active, created_at, last_used_at";
+    "id, key_hash, key_prefix, name, rate_limit_rps, is_active, created_at, last_used_at, owner_user_id";
 
 fn row_to_api_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbApiKey> {
     Ok(DbApiKey {
@@ -427,13 +427,14 @@ fn row_to_api_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbApiKey> {
         is_active: row.get(5)?,
         created_at: row.get(6)?,
         last_used_at: row.get(7)?,
+        owner_user_id: row.get::<_, Option<i64>>(8).ok().flatten(),
     })
 }
 
 pub fn list_api_keys(pool: &DbPool) -> Result<Vec<DbApiKey>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(
-        "SELECT id, key_prefix, name, rate_limit_rps, is_active, created_at, last_used_at FROM api_keys ORDER BY name",
+        "SELECT id, key_prefix, name, rate_limit_rps, is_active, created_at, last_used_at, owner_user_id FROM api_keys ORDER BY name",
     )?;
     let keys = stmt
         .query_map([], |row| {
@@ -446,6 +447,7 @@ pub fn list_api_keys(pool: &DbPool) -> Result<Vec<DbApiKey>> {
                 is_active: row.get(4)?,
                 created_at: row.get(5)?,
                 last_used_at: row.get(6)?,
+                owner_user_id: row.get::<_, Option<i64>>(7).ok().flatten(),
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

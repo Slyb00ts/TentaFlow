@@ -60,6 +60,9 @@ pub struct DbApiKey {
     pub is_active: bool,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    /// Migracja 51 — nullable. None = legacy admin-equivalent.
+    #[serde(default)]
+    pub owner_user_id: Option<i64>,
 }
 
 /// Alias serwisu
