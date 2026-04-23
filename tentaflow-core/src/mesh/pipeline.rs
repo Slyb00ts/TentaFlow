@@ -69,7 +69,8 @@ pub async fn start_mesh_pipeline(
     config: MeshPipelineConfig,
     mesh_peer_store: &MeshPeerStore,
     db_pool: Option<crate::db::DbPool>,
-    settings_cipher: std::sync::Arc<crate::crypto::SettingsCipher>,
+    _settings_cipher: std::sync::Arc<crate::crypto::SettingsCipher>,
+    mesh_security: Arc<MeshSecurity>,
 ) -> Result<MeshPipelineHandles> {
     let app_node_id = &config.node_id;
     let mesh_config = &config.mesh_config;
@@ -78,28 +79,8 @@ pub async fn start_mesh_pipeline(
     info!(
         "Inicjalizacja mesh networking (port {}, node_id: {})",
         mesh_port,
-        &app_node_id[..8.min(app_node_id.len())]
+        &app_node_id[..16.min(app_node_id.len())]
     );
-
-    // Inicjalizacja MeshSecurity (jesli dostepna baza danych)
-    let mesh_security: Option<Arc<MeshSecurity>> = if let Some(ref pool) = db_pool {
-        match MeshSecurity::new(pool.clone(), settings_cipher.clone()) {
-            Ok(sec) => {
-                info!(
-                    "MeshSecurity zainicjalizowany (klucz publiczny: {}...)",
-                    &sec.public_key_hex()[..16]
-                );
-                Some(Arc::new(sec))
-            }
-            Err(e) => {
-                // VULN-015: Brak MeshSecurity = mesh dziala w trybie zero trust (odrzuca polaczenia)
-                error!("Nie udalo sie zainicjalizowac MeshSecurity: {} — mesh bedzie odrzucac polaczenia!", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     // iroh endpoint: LAN mDNS + pkarr-DHT discovery + relay — wszystko wbudowane.
     // mdns_enabled=false na iOS bo Apple blokuje raw multicast bez entitlementa;
@@ -116,12 +97,7 @@ pub async fn start_mesh_pipeline(
         enable_dht_discovery: enable_dht,
     };
 
-    let security_for_mesh = match mesh_security.clone() {
-        Some(s) => s,
-        None => {
-            anyhow::bail!("MeshSecurity niedostepne dla iroh mesh manager");
-        }
-    };
+    let security_for_mesh = mesh_security.clone();
 
     match IrohMeshManager::new(iroh_cfg, security_for_mesh).await {
         Ok(quic_mesh) => {
@@ -143,8 +119,9 @@ pub async fn start_mesh_pipeline(
             }
 
             // Reconnect do trusted peerow po EndpointId — iroh sam rozwiazuje adres.
-            if let Some(ref sec) = mesh_security {
-                if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
+            {
+                if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&mesh_security.db)
+                {
                     for node in &trusted {
                         let qm = quic_mesh.clone();
                         let nid = node.node_id.clone();
@@ -262,7 +239,7 @@ pub async fn start_mesh_pipeline(
                 quic_mesh.clone(),
                 mesh_peer_store.clone(),
                 local_node_info.clone(),
-                mesh_security.clone(),
+                Some(mesh_security.clone()),
                 local_node_id.clone(),
                 db_pool.clone(),
             );
@@ -279,19 +256,17 @@ pub async fn start_mesh_pipeline(
                 mesh_peer_store.clone(),
                 quic_mesh.clone(),
                 local_node_id.clone(),
-                mesh_security.clone(),
+                Some(mesh_security.clone()),
             );
 
-            if let Some(ref sec) = mesh_security {
-                spawn_pairing_cleanup(sec.clone());
-            }
+            spawn_pairing_cleanup(mesh_security.clone());
 
             info!("Mesh networking uruchomiony (iroh transport)");
 
             Ok(MeshPipelineHandles {
                 mdns: None,
                 quic_mesh: Some(quic_mesh),
-                security: mesh_security,
+                security: Some(mesh_security),
             })
         }
         Err(e) => {
@@ -307,7 +282,7 @@ pub async fn start_mesh_pipeline(
             Ok(MeshPipelineHandles {
                 mdns: None,
                 quic_mesh: None,
-                security: mesh_security,
+                security: Some(mesh_security),
             })
         }
     }

@@ -131,6 +131,10 @@ async fn run_server(args: Args) -> Result<()> {
         e
     })?;
 
+    // Czyszczenie osieroconego settings.node_id (legacy UUID) — zastapiony
+    // iroh EndpointId z MeshSecurity.public_key_hex().
+    let _ = db::repository::delete_setting(&db, "node_id");
+
     log_config_summary(&config, &args.db_path);
 
     // Ladowanie master key z pliku i inicjalizacja SettingsCipher
@@ -147,20 +151,24 @@ async fn run_server(args: Args) -> Result<()> {
         _ => {}
     }
 
+    // MeshSecurity — single source of truth dla tozsamosci. Ed25519 keypair
+    // zapisany zaszyfrowany w settings; iroh uzywa tego klucza jako EndpointId.
+    // public_key_hex() to nasz node_id wszedzie — w DB, w UI, w protokole mesh.
+    let mesh_security = Arc::new(
+        tentaflow_core::mesh::security::MeshSecurity::new(db.clone(), settings_cipher.clone())
+            .map_err(|e| {
+                error!("MeshSecurity init: {}", e);
+                e
+            })?,
+    );
+    let local_node_id_str = mesh_security.public_key_hex();
+    info!(
+        "Mesh identity: {}",
+        &local_node_id_str[..16.min(local_node_id_str.len())]
+    );
+
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
-
-    // Node id — persistent w DB, zawsze wygenerowany niezaleznie od mesh.enabled,
-    // zeby /api/mesh/nodes od razu zwracal local entry.
-    let local_node_id_str = db::repository::get_setting(&db, "node_id")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| {
-            let id = uuid::Uuid::new_v4().to_string();
-            let _ = db::repository::set_setting(&db, "node_id", &id);
-            info!("Wygenerowano nowy node_id: {}", id);
-            id
-        });
 
     // Seed lokalnego noda w peer_store — synchronicznie, przed startupem mesh.
     // Dzieki temu catalog/services/mesh GUI zawsze ma target "local" do dyspozycji.
@@ -227,7 +235,7 @@ async fn run_server(args: Args) -> Result<()> {
         None;
     let mut mesh_security_for_server: Option<Arc<tentaflow_core::mesh::security::MeshSecurity>> =
         None;
-    let mut local_node_id_for_server: Arc<str> = Arc::from(local_node_id_str.as_str());
+    let local_node_id_for_server: Arc<str> = Arc::from(local_node_id_str.as_str());
     let _mesh_handles;
 
     if let Some(ref mesh_config) = config.mesh {
@@ -245,6 +253,7 @@ async fn run_server(args: Args) -> Result<()> {
                 &mesh_peer_store,
                 Some(db.clone()),
                 settings_cipher.clone(),
+                mesh_security.clone(),
             )
             .await
             {
@@ -252,13 +261,10 @@ async fn run_server(args: Args) -> Result<()> {
                     quic_mesh_for_server = handles.quic_mesh.clone();
                     mesh_security_for_server = handles.security.clone();
 
-                    // Podepnij mesh do routera — umozliwia forwarding requestow do zdalnych nodow
+                    // Podepnij mesh do routera — umozliwia forwarding requestow do zdalnych nodow.
+                    // node_id = mesh_security.public_key_hex() juz na starcie, wiec quic_mesh
+                    // zwraca ten sam hex — nie ma potrzeby podmieniac peer_store entry.
                     if let Some(ref mesh_mgr) = handles.quic_mesh {
-                        let mesh_node_id = mesh_mgr.node_id();
-                        local_node_id_for_server = Arc::from(mesh_node_id.as_str());
-                        if mesh_node_id != local_node_id_str {
-                            mesh_peer_store.remove(&local_node_id_str);
-                        }
                         router.set_mesh_manager(mesh_mgr.clone());
                         router
                             .service_manager()
