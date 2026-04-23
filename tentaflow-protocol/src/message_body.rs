@@ -5,7 +5,7 @@
 //       Envelope.body. Dzieki temu policy check dziala na envelope bez tykania
 //       body, a dispatcher decoduje dopiero po przejsciu auth.
 // Przyklad:
-//   let body = MessageBody::NodeListRequest;
+//   let body = MessageBody::ModelListRequest;
 //   let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)?.to_vec();
 //   let env = Envelope::new_direct(1, 1, message_kind::META_HEARTBEAT, body_bytes);
 // =============================================================================
@@ -15,21 +15,6 @@ use rkyv::{Archive, Deserialize, Serialize};
 // =============================================================================
 // Pomocnicze typy (bootstrap — docelowo rozpisane per-archetype)
 // =============================================================================
-
-/// Lekki widok noda mesh dla list/overview. Pelne dane idą przez osobny NodeInfo.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct NodeSummary {
-    /// Ed25519 public key (32 bajty).
-    pub node_id: [u8; 32],
-    /// Hostname / display label.
-    pub display_name: String,
-    /// `online` / `offline` / `degraded`. String dla elastycznosci.
-    pub status: String,
-    /// Tier: `leader`, `worker`, itp.
-    pub role: String,
-    /// Czy to lokalny node (self-view).
-    pub is_self: bool,
-}
 
 /// Lekki widok modelu w katalogu.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -68,7 +53,7 @@ pub enum ProtocolErrorCode {
     NotImplemented = 7,
     /// Wewnetrzny blad serwera (szczegoly w `message`).
     Internal = 8,
-    /// Zasoba nie znaleziono (np. NodeInfoRequest z nieznanym id).
+    /// Zasob nie znaleziony.
     NotFound = 9,
     /// Niepoprawne argumenty requestu (walidacja pol).
     BadRequest = 10,
@@ -2533,7 +2518,7 @@ pub enum IamPayload {
 
 /// policy table (`#[policy]` proc-macro z #26).
 ///
-/// Kazda nowa pozycja = additive change i bump `SCHEMA_VERSION`.
+/// Kazda zmiana layoutu wymaga bump `SCHEMA_VERSION`.
 ///
 /// UWAGA: `Eq` NIE implementowane bo ChatStreamRequest ma `Option<f32>` (floaty
 /// nie sa Eq przez NaN). Uzywamy `PartialEq` wszedzie.
@@ -2550,18 +2535,10 @@ pub enum MessageBody {
     MetaCancelStream,
 
     // ---- Read-list (R-LIST archetyp) ----
-    /// Klient -> serwer: lista nodow mesh. Anonymous / UserSession / MeshTrust.
-    NodeListRequest,
-    /// Serwer -> klient: odpowiedz (summary, pelne info przez NodeInfoRequest).
-    NodeListResponse { nodes: Vec<NodeSummary> },
     /// Klient -> serwer: lista modeli (publiczne, Anonymous OK).
     ModelListRequest,
     /// Serwer -> klient: odpowiedz.
     ModelListResponse { models: Vec<ModelSummary> },
-
-    // ---- Read-one (R-ONE archetyp) ----
-    /// Klient -> serwer: szczegoly konkretnego noda.
-    NodeInfoRequest { node_id: [u8; 32] },
 
     // ---- API Keys (R-LIST + W-CREATE + W-DELETE) ----
     ApiKeyListRequest,
@@ -2907,16 +2884,6 @@ pub enum MessageBody {
 mod tests {
     use super::*;
 
-    fn sample_node() -> NodeSummary {
-        NodeSummary {
-            node_id: [5u8; 32],
-            display_name: "alpha".to_string(),
-            status: "online".to_string(),
-            role: "leader".to_string(),
-            is_self: true,
-        }
-    }
-
     fn sample_model() -> ModelSummary {
         ModelSummary {
             id: "llama-3.2-1b-instruct".to_string(),
@@ -2957,37 +2924,6 @@ mod tests {
     #[test]
     fn meta_cancel_stream_round_trip() {
         let body = MessageBody::MetaCancelStream;
-        assert_eq!(round_trip(body.clone()), body);
-    }
-
-    #[test]
-    fn node_list_request_unit_variant() {
-        let body = MessageBody::NodeListRequest;
-        assert_eq!(round_trip(body.clone()), body);
-    }
-
-    #[test]
-    fn node_list_response_with_multiple_nodes() {
-        let body = MessageBody::NodeListResponse {
-            nodes: vec![
-                sample_node(),
-                NodeSummary {
-                    node_id: [6u8; 32],
-                    display_name: "beta".to_string(),
-                    status: "degraded".to_string(),
-                    role: "worker".to_string(),
-                    is_self: false,
-                },
-            ],
-        };
-        assert_eq!(round_trip(body.clone()), body);
-    }
-
-    #[test]
-    fn node_info_request_round_trip() {
-        let body = MessageBody::NodeInfoRequest {
-            node_id: [0xAAu8; 32],
-        };
         assert_eq!(round_trip(body.clone()), body);
     }
 
@@ -3050,8 +2986,8 @@ mod tests {
 
     #[test]
     fn truncated_body_bytes_rejected() {
-        let body = MessageBody::NodeListResponse {
-            nodes: vec![sample_node(), sample_node()],
+        let body = MessageBody::ModelListResponse {
+            models: vec![sample_model(), sample_model()],
         };
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body).expect("encode");
         let half = &bytes[..bytes.len() / 2];
@@ -3274,7 +3210,7 @@ mod tests {
     #[test]
     fn body_nests_inside_envelope() {
         use crate::envelope::{message_kind, Envelope};
-        let body = MessageBody::NodeListRequest;
+        let body = MessageBody::ModelListRequest;
         let body_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&body)
             .expect("encode body")
             .to_vec();

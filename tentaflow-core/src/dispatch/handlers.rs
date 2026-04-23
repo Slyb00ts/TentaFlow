@@ -10,8 +10,8 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginResponse, AuthMeResponse,
     DashboardSnapshot, FlowDetail, FlowExecutionSummary, FlowSummary, HubEngineSummary,
-    MeshPairInitResponse, MeshPeerSummary, MessageBody, ModelDetail, ModelSummary, NodeSummary,
-    PromptDetail, PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
+    MeshPairInitResponse, MeshPeerSummary, MessageBody, ModelDetail, ModelSummary, PromptDetail,
+    PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
     ServiceQuicStatus, ServiceSummary, SessionAuth, SettingEntry, TtsRule,
 };
 
@@ -353,121 +353,6 @@ pub fn api_key_revoke(
 }
 
 // =============================================================================
-// Nodes (mesh peers + this node)
-// =============================================================================
-
-#[handler(variant = "NodeListRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub fn node_list_request(
-    _req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let mut nodes = Vec::new();
-
-    // Self node first.
-    let local_id_str: &str = &ctx.state.local_node_id;
-    let mut self_id = [0u8; 32];
-    let bytes = local_id_str.as_bytes();
-    let copy = bytes.len().min(32);
-    self_id[..copy].copy_from_slice(&bytes[..copy]);
-    nodes.push(NodeSummary {
-        node_id: self_id,
-        display_name: hostname::get()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| local_id_str.to_string()),
-        status: "online".to_string(),
-        role: "leader".to_string(),
-        is_self: true,
-    });
-
-    // Mesh peers.
-    for peer in ctx.state.mesh_peer_store.list() {
-        let mut node_id = [0u8; 32];
-        let bytes = peer.node_id.as_bytes();
-        let copy = bytes.len().min(32);
-        node_id[..copy].copy_from_slice(&bytes[..copy]);
-        nodes.push(NodeSummary {
-            node_id,
-            display_name: if peer.hostname.is_empty() {
-                peer.node_id.clone()
-            } else {
-                peer.hostname.clone()
-            },
-            status: peer.status.clone(),
-            role: peer.role.clone(),
-            is_self: false,
-        });
-    }
-
-    Ok(MessageBody::NodeListResponse { nodes })
-}
-
-#[handler(variant = "NodeInfoRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub fn node_info_request(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let node_id = match req {
-        MessageBody::NodeInfoRequest { node_id } => node_id,
-        _ => {
-            return Err(ProtocolError::bad_request(
-                "node_info_request expected NodeInfoRequest variant",
-            ))
-        }
-    };
-
-    let id_str = String::from_utf8_lossy(&node_id[..])
-        .trim_end_matches('\0')
-        .to_string();
-
-    if id_str == *ctx.state.local_node_id {
-        let mut self_id = [0u8; 32];
-        let bytes = id_str.as_bytes();
-        let copy = bytes.len().min(32);
-        self_id[..copy].copy_from_slice(&bytes[..copy]);
-        return Ok(MessageBody::NodeListResponse {
-            nodes: vec![NodeSummary {
-                node_id: self_id,
-                display_name: hostname::get()
-                    .map(|h| h.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| id_str.clone()),
-                status: "online".to_string(),
-                role: "leader".to_string(),
-                is_self: true,
-            }],
-        });
-    }
-
-    let peer = ctx
-        .state
-        .mesh_peer_store
-        .get(&id_str)
-        .ok_or_else(|| ProtocolError::not_found("node not in mesh"))?;
-
-    let mut id_bytes = [0u8; 32];
-    let bytes = peer.node_id.as_bytes();
-    let copy = bytes.len().min(32);
-    id_bytes[..copy].copy_from_slice(&bytes[..copy]);
-
-    Ok(MessageBody::NodeListResponse {
-        nodes: vec![NodeSummary {
-            node_id: id_bytes,
-            display_name: if peer.hostname.is_empty() {
-                peer.node_id.clone()
-            } else {
-                peer.hostname.clone()
-            },
-            status: peer.status,
-            role: peer.role,
-            is_self: false,
-        }],
-    })
-}
-
-// =============================================================================
 // Models
 // =============================================================================
 
@@ -500,9 +385,9 @@ pub fn model_list_request(
     let models: Vec<ModelSummary> = services
         .into_iter()
         .filter(|s| match &user_acl {
-            Some((uid, role)) => crate::routing::acl::check_access_safe(
-                &ctx.state.db, "model", &s.name, *uid, role,
-            ),
+            Some((uid, role)) => {
+                crate::routing::acl::check_access_safe(&ctx.state.db, "model", &s.name, *uid, role)
+            }
             None => true,
         })
         .map(|s| ModelSummary {
@@ -2907,10 +2792,28 @@ pub fn mesh_identity(
         .mesh_security
         .as_ref()
         .ok_or_else(|| ProtocolError::internal("MeshSecurity niedostepny"))?;
+    let local_node_id = ctx
+        .state
+        .quic_mesh
+        .as_ref()
+        .map(|qm| qm.node_id())
+        .unwrap_or_else(|| {
+            if ctx.state.local_node_id.len() == 64
+                && ctx
+                    .state
+                    .local_node_id
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                ctx.state.local_node_id.to_string()
+            } else {
+                sec.ed25519_public_key_hex()
+            }
+        });
     let addresses: Vec<String> = ctx
         .state
         .mesh_peer_store
-        .get(ctx.state.local_node_id.as_ref())
+        .get(local_node_id.as_str())
         .map(|p| {
             p.addresses
                 .iter()
@@ -2921,7 +2824,7 @@ pub fn mesh_identity(
     let hostname = ctx
         .state
         .mesh_peer_store
-        .get(ctx.state.local_node_id.as_ref())
+        .get(local_node_id.as_str())
         .map(|p| p.hostname)
         .unwrap_or_default();
     // Generuj fresh invite PIN dla QR code (60s TTL). Frontend co 50s re-fetchuje
@@ -2929,7 +2832,7 @@ pub fn mesh_identity(
     let (invite_pin, invite_pin_expires_sec) = sec.generate_invite_pin();
     Ok(MessageBody::MeshIdentityResponseBody(
         tentaflow_protocol::MeshIdentityResponse {
-            node_id: ctx.state.local_node_id.to_string(),
+            node_id: local_node_id,
             hostname,
             public_key: sec.public_key_hex(),
             addresses,
@@ -3929,7 +3832,10 @@ pub fn audit_log_cleanup(
 // Wszystkie operacje mutujace wymagaja policy(Admin).
 // =============================================================================
 
-fn user_to_info(u: crate::db::models::UserAccount, group_ids: Vec<i64>) -> tentaflow_protocol::UserInfo {
+fn user_to_info(
+    u: crate::db::models::UserAccount,
+    group_ids: Vec<i64>,
+) -> tentaflow_protocol::UserInfo {
     tentaflow_protocol::UserInfo {
         id: u.id,
         username: u.username,
@@ -3987,9 +3893,18 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 .into_iter()
                 .map(|g| g.id)
                 .collect();
-            P::ResGetUser { user: user_to_info(u, gs) }
+            P::ResGetUser {
+                user: user_to_info(u, gs),
+            }
         }
-        P::ReqCreateUser { username, password, display_name, email, role, group_ids } => {
+        P::ReqCreateUser {
+            username,
+            password,
+            display_name,
+            email,
+            role,
+            group_ids,
+        } => {
             let hash = crate::crypto::hash_password(password)
                 .map_err(|e| iam_err(anyhow::anyhow!("hash: {}", e)))?;
             let user_id = repository::create_user_account(db, username, &hash, display_name, email)
@@ -4000,8 +3915,15 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             }
             P::ResCreateUser { user_id }
         }
-        P::ReqUpdateUser { user_id, display_name, email, is_active, role } => {
-            repository::update_user_account(db, *user_id, display_name, email, *is_active).map_err(db_err)?;
+        P::ReqUpdateUser {
+            user_id,
+            display_name,
+            email,
+            is_active,
+            role,
+        } => {
+            repository::update_user_account(db, *user_id, display_name, email, *is_active)
+                .map_err(db_err)?;
             repository::set_user_role(db, *user_id, role).map_err(iam_err)?;
             P::ResOk
         }
@@ -4025,7 +3947,10 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             }
             P::ResOk
         }
-        P::ReqResetUserPassword { user_id, new_password } => {
+        P::ReqResetUserPassword {
+            user_id,
+            new_password,
+        } => {
             let hash = crate::crypto::hash_password(new_password)
                 .map_err(|e| iam_err(anyhow::anyhow!("hash: {}", e)))?;
             repository::update_user_account_password(db, *user_id, &hash).map_err(db_err)?;
@@ -4056,7 +3981,11 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             let group_id = repository::create_group(db, name, description).map_err(db_err)?;
             P::ResCreateGroup { group_id }
         }
-        P::ReqUpdateGroup { group_id, name, description } => {
+        P::ReqUpdateGroup {
+            group_id,
+            name,
+            description,
+        } => {
             repository::update_group(db, *group_id, name, description).map_err(db_err)?;
             P::ResOk
         }
@@ -4082,47 +4011,88 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         }
 
         // ---- Resource permissions ----
-        P::ReqSetPermission { resource_type, resource_id, subject_type, subject_id, access_level } => {
+        P::ReqSetPermission {
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+            access_level,
+        } => {
             repository::resource_permissions::set(
-                db, resource_type, resource_id, subject_type, *subject_id, access_level,
-            ).map_err(iam_err)?;
+                db,
+                resource_type,
+                resource_id,
+                subject_type,
+                *subject_id,
+                access_level,
+            )
+            .map_err(iam_err)?;
             P::ResOk
         }
-        P::ReqClearPermission { resource_type, resource_id, subject_type, subject_id } => {
+        P::ReqClearPermission {
+            resource_type,
+            resource_id,
+            subject_type,
+            subject_id,
+        } => {
             repository::resource_permissions::clear(
-                db, resource_type, resource_id, subject_type, *subject_id,
-            ).map_err(db_err)?;
+                db,
+                resource_type,
+                resource_id,
+                subject_type,
+                *subject_id,
+            )
+            .map_err(db_err)?;
             P::ResOk
         }
-        P::ReqListPermsForResource { resource_type, resource_id } => {
-            let rows = repository::resource_permissions::list_for_resource(db, resource_type, resource_id)
-                .map_err(db_err)?;
-            let entries = rows.into_iter().map(|r| tentaflow_protocol::PermissionEntry {
-                resource_type: r.resource_type,
-                resource_id: r.resource_id,
-                subject_type: r.subject_type,
-                subject_id: r.subject_id,
-                access_level: r.access_level,
-            }).collect();
+        P::ReqListPermsForResource {
+            resource_type,
+            resource_id,
+        } => {
+            let rows =
+                repository::resource_permissions::list_for_resource(db, resource_type, resource_id)
+                    .map_err(db_err)?;
+            let entries = rows
+                .into_iter()
+                .map(|r| tentaflow_protocol::PermissionEntry {
+                    resource_type: r.resource_type,
+                    resource_id: r.resource_id,
+                    subject_type: r.subject_type,
+                    subject_id: r.subject_id,
+                    access_level: r.access_level,
+                })
+                .collect();
             P::ResListPermissions { entries }
         }
-        P::ReqListPermsForSubject { subject_type, subject_id } => {
-            let rows = repository::resource_permissions::list_for_subject(db, subject_type, *subject_id)
-                .map_err(db_err)?;
-            let entries = rows.into_iter().map(|r| tentaflow_protocol::PermissionEntry {
-                resource_type: r.resource_type,
-                resource_id: r.resource_id,
-                subject_type: r.subject_type,
-                subject_id: r.subject_id,
-                access_level: r.access_level,
-            }).collect();
+        P::ReqListPermsForSubject {
+            subject_type,
+            subject_id,
+        } => {
+            let rows =
+                repository::resource_permissions::list_for_subject(db, subject_type, *subject_id)
+                    .map_err(db_err)?;
+            let entries = rows
+                .into_iter()
+                .map(|r| tentaflow_protocol::PermissionEntry {
+                    resource_type: r.resource_type,
+                    resource_id: r.resource_id,
+                    subject_type: r.subject_type,
+                    subject_id: r.subject_id,
+                    access_level: r.access_level,
+                })
+                .collect();
             P::ResListPermissions { entries }
         }
 
         // Response-only variants nie powinny byc requestowane przez klienta.
-        P::ResListUsers { .. } | P::ResGetUser { .. } | P::ResCreateUser { .. }
-        | P::ResListGroups { .. } | P::ResCreateGroup { .. }
-        | P::ResGroupMembers { .. } | P::ResListPermissions { .. } | P::ResOk => {
+        P::ResListUsers { .. }
+        | P::ResGetUser { .. }
+        | P::ResCreateUser { .. }
+        | P::ResListGroups { .. }
+        | P::ResCreateGroup { .. }
+        | P::ResGroupMembers { .. }
+        | P::ResListPermissions { .. }
+        | P::ResOk => {
             return Err(ProtocolError::bad_request("response variant in request"));
         }
     };
@@ -4152,17 +4122,59 @@ macro_rules! register_iam_variant {
 
 register_iam_variant!("IamListUsersRequest", "tentaflow_ws_handler_iam_list_users");
 register_iam_variant!("IamGetUserRequest", "tentaflow_ws_handler_iam_get_user");
-register_iam_variant!("IamCreateUserRequest", "tentaflow_ws_handler_iam_create_user");
-register_iam_variant!("IamUpdateUserRequest", "tentaflow_ws_handler_iam_update_user");
-register_iam_variant!("IamDeleteUserRequest", "tentaflow_ws_handler_iam_delete_user");
-register_iam_variant!("IamSetUserGroupsRequest", "tentaflow_ws_handler_iam_set_user_groups");
-register_iam_variant!("IamResetUserPasswordRequest", "tentaflow_ws_handler_iam_reset_user_password");
-register_iam_variant!("IamListGroupsRequest", "tentaflow_ws_handler_iam_list_groups");
-register_iam_variant!("IamCreateGroupRequest", "tentaflow_ws_handler_iam_create_group");
-register_iam_variant!("IamUpdateGroupRequest", "tentaflow_ws_handler_iam_update_group");
-register_iam_variant!("IamDeleteGroupRequest", "tentaflow_ws_handler_iam_delete_group");
-register_iam_variant!("IamGroupMembersRequest", "tentaflow_ws_handler_iam_group_members");
-register_iam_variant!("IamSetPermissionRequest", "tentaflow_ws_handler_iam_set_permission");
-register_iam_variant!("IamClearPermissionRequest", "tentaflow_ws_handler_iam_clear_permission");
-register_iam_variant!("IamListPermsForResourceRequest", "tentaflow_ws_handler_iam_list_perms_resource");
-register_iam_variant!("IamListPermsForSubjectRequest", "tentaflow_ws_handler_iam_list_perms_subject");
+register_iam_variant!(
+    "IamCreateUserRequest",
+    "tentaflow_ws_handler_iam_create_user"
+);
+register_iam_variant!(
+    "IamUpdateUserRequest",
+    "tentaflow_ws_handler_iam_update_user"
+);
+register_iam_variant!(
+    "IamDeleteUserRequest",
+    "tentaflow_ws_handler_iam_delete_user"
+);
+register_iam_variant!(
+    "IamSetUserGroupsRequest",
+    "tentaflow_ws_handler_iam_set_user_groups"
+);
+register_iam_variant!(
+    "IamResetUserPasswordRequest",
+    "tentaflow_ws_handler_iam_reset_user_password"
+);
+register_iam_variant!(
+    "IamListGroupsRequest",
+    "tentaflow_ws_handler_iam_list_groups"
+);
+register_iam_variant!(
+    "IamCreateGroupRequest",
+    "tentaflow_ws_handler_iam_create_group"
+);
+register_iam_variant!(
+    "IamUpdateGroupRequest",
+    "tentaflow_ws_handler_iam_update_group"
+);
+register_iam_variant!(
+    "IamDeleteGroupRequest",
+    "tentaflow_ws_handler_iam_delete_group"
+);
+register_iam_variant!(
+    "IamGroupMembersRequest",
+    "tentaflow_ws_handler_iam_group_members"
+);
+register_iam_variant!(
+    "IamSetPermissionRequest",
+    "tentaflow_ws_handler_iam_set_permission"
+);
+register_iam_variant!(
+    "IamClearPermissionRequest",
+    "tentaflow_ws_handler_iam_clear_permission"
+);
+register_iam_variant!(
+    "IamListPermsForResourceRequest",
+    "tentaflow_ws_handler_iam_list_perms_resource"
+);
+register_iam_variant!(
+    "IamListPermsForSubjectRequest",
+    "tentaflow_ws_handler_iam_list_perms_subject"
+);

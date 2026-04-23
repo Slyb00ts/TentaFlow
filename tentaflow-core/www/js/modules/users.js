@@ -1,11 +1,14 @@
 // =============================================================================
 // Plik: modules/users.js
-// Opis: Admin screen: lista userow + grupy. Wymaga role=admin zalogowanego.
-//       Tabs Users / Groups. Row click → edycja w modal.
+// Opis: Admin screen: lista userow + grupy. Uzywa <tf-screen> jako shell.
+//       Naglowek = slot="breadcrumb" + slot="header" (.tf-page-header albo
+//       .tf-detail-header) + slot="tabs" (<tf-tabs>). Body na widokach detail
+//       to stack .tf-section-card (brak split/aside — wzorzec wg mockupu
+//       addons-permissions). Nawigacja wstecz idzie przez breadcrumb.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, patchInner } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 
 let me = null;
@@ -15,48 +18,25 @@ let activeTab = 'users'; // 'users' | 'groups'
 let filter = 'all';
 let searchQuery = '';
 // View state: 'list' | 'user-detail' | 'group-detail'.
-// Create nowego usera/grupy dalej jest w modalu (per wymaganie).
 let view = 'list';
 let detailEntityId = null;
-let detailTab = 'profile'; // profile | groups | perms | activity (dla usera) / info | members | perms (dla grupy)
+let detailTab = 'profile';
 
 const UsersScreen = {
   title: 'Użytkownicy',
   render() {
-    return `
-      <div class="page users-screen">
-        <div class="page-header">
-          <div>
-            <h1>${escapeHtml(I18n.t('users.title'))}</h1>
-            <div class="sub" id="users-sub"></div>
-          </div>
-          <div class="actions" id="users-actions"></div>
-        </div>
-        <div class="mesh-tabs">
-          <tf-tabs variant="soft" value="users" id="users-tabs-nav">
-            <tf-tab id="users">${escapeHtml(I18n.t('users.tab_users'))}</tf-tab>
-            <tf-tab id="groups">${escapeHtml(I18n.t('users.tab_groups'))}</tf-tab>
-          </tf-tabs>
-        </div>
-        <div id="users-content"><div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div></div>
-      </div>
-    `;
+    return `<div id="users-root"></div>`;
   },
   async mount() {
     try {
       me = await ApiBinary.one('authMeRequest');
     } catch { me = null; }
+    const root = byId('users-root');
+    if (!root) return;
     if (!me || (me.role !== 'admin' && !me.isAdmin)) {
-      byId('users-content').innerHTML = `<div class="card"><p>${escapeHtml(I18n.t('users.admin_only'))}</p></div>`;
+      root.innerHTML = `<div class="card"><p>${escapeHtml(I18n.t('users.admin_only'))}</p></div>`;
       return;
     }
-    const tabsEl = byId('users-tabs-nav');
-    if (tabsEl) tabsEl.addEventListener('change', (e) => {
-      activeTab = e.detail?.value || 'users';
-      renderActive();
-    });
-    const contentEl = byId('users-content');
-    if (contentEl) contentEl.addEventListener('click', handleClick);
     await loadData();
     renderActive();
   },
@@ -79,56 +59,87 @@ async function loadData() {
 }
 
 function renderActive() {
-  const sub = byId('users-sub');
-  const actions = byId('users-actions');
-  const host = byId('users-content');
-  const tabsEl = byId('users-tabs-nav');
-  const pageHeader = host?.closest('.users-screen')?.querySelector('.page-header');
-  if (!host) return;
-  // Detail view — pokazuje screen-head z back-btn, ukrywamy header strony + tabs users/groups.
+  const root = byId('users-root');
+  if (!root) return;
   if (view === 'user-detail') {
     const u = users.find((x) => x.id === detailEntityId);
     if (!u) { view = 'list'; return renderActive(); }
-    if (pageHeader) pageHeader.style.display = 'none';
-    if (tabsEl) tabsEl.parentElement.style.display = 'none';
-    host.innerHTML = renderUserDetail(u);
-    wireUserDetail(host, u);
+    renderUserDetailScreen(root, u);
     return;
   }
   if (view === 'group-detail') {
     const g = groups.find((x) => x.id === detailEntityId);
     if (!g) { view = 'list'; return renderActive(); }
-    if (pageHeader) pageHeader.style.display = 'none';
-    if (tabsEl) tabsEl.parentElement.style.display = 'none';
-    host.innerHTML = renderGroupDetail(g);
-    wireGroupDetail(host, g);
+    renderGroupDetailScreen(root, g);
     return;
   }
-  if (pageHeader) pageHeader.style.display = '';
-  if (tabsEl) tabsEl.parentElement.style.display = '';
-  if (activeTab === 'users') {
-    if (sub) {
-      const active = users.filter((u) => u.isActive).length;
-      const inactive = users.length - active;
-      const admin = users.filter((u) => u.role === 'admin').length;
-      sub.textContent = `${I18n.t('users.count_users', { n: users.length })} · ${I18n.t('users.sub_active', { n: active })} · ${I18n.t('users.sub_inactive', { n: inactive })} · ${I18n.t('users.sub_admin', { n: admin })}`;
-    }
-    if (actions) actions.innerHTML = `<tf-button variant="primary" icon="plus" id="btn-add-user">${escapeHtml(I18n.t('users.new_user'))}</tf-button>`;
-    actions?.querySelector('#btn-add-user')?.addEventListener('click', openCreateUserModal);
-    patchInner(host, renderUsersList());
-    // Search input rewire (tf-searchbox emits "input" event with detail.value)
-    const sb = host.querySelector('#users-search');
-    if (sb) {
-      sb.addEventListener('input', (e) => {
-        searchQuery = e.detail?.value ?? e.target?.value ?? '';
-        rerenderUsersPart();
-      });
-    }
-  } else {
-    if (sub) sub.textContent = I18n.t('users.count_groups', { n: groups.length });
-    if (actions) actions.innerHTML = `<tf-button variant="primary" icon="plus" id="btn-add-group">${escapeHtml(I18n.t('users.new_group'))}</tf-button>`;
-    actions?.querySelector('#btn-add-group')?.addEventListener('click', openCreateGroupModal);
-    patchInner(host, renderGroupsList());
+  renderListScreen(root);
+}
+
+// ---- LIST SCREEN ----
+
+function renderListScreen(root) {
+  const isUsers = activeTab === 'users';
+  const active = users.filter((u) => u.isActive).length;
+  const inactive = users.length - active;
+  const admin = users.filter((u) => u.role === 'admin').length;
+  const subtitle = isUsers
+    ? `${I18n.t('users.count_users', { n: users.length })} · ${I18n.t('users.sub_active', { n: active })} · ${I18n.t('users.sub_inactive', { n: inactive })} · ${I18n.t('users.sub_admin', { n: admin })}`
+    : I18n.t('users.count_groups', { n: groups.length });
+  const title = isUsers ? I18n.t('users.title') : I18n.t('users.tab_groups');
+  const count = isUsers ? users.length : groups.length;
+  const addLabel = isUsers ? I18n.t('users.new_user') : I18n.t('users.new_group');
+  const addId = isUsers ? 'btn-add-user' : 'btn-add-group';
+
+  const searchToolbar = isUsers ? `
+    <div class="users-toolbar">
+      <tf-searchbox id="users-search" placeholder="${escapeAttr(I18n.t('users.search_ph'))}" debounce="120" value="${escapeAttr(searchQuery)}"></tf-searchbox>
+      <div class="tf-filter-group" id="users-filter-group">
+        <tf-chip class="filter-chip" clickable ${filter === 'all' ? 'active' : ''} data-filter="all">${escapeHtml(I18n.t('users.filter_all'))}</tf-chip>
+        <tf-chip class="filter-chip" clickable ${filter === 'active' ? 'active' : ''} data-filter="active">${escapeHtml(I18n.t('users.filter_active'))}</tf-chip>
+        <tf-chip class="filter-chip" clickable ${filter === 'admin' ? 'active' : ''} data-filter="admin">${escapeHtml(I18n.t('users.filter_admin'))}</tf-chip>
+        <tf-chip class="filter-chip" clickable ${filter === 'inactive' ? 'active' : ''} data-filter="inactive">${escapeHtml(I18n.t('users.filter_inactive'))}</tf-chip>
+        <tf-chip class="filter-chip" clickable ${filter === 'sso' ? 'active' : ''} data-filter="sso">${escapeHtml(I18n.t('users.filter_sso'))}</tf-chip>
+      </div>
+    </div>
+  ` : '';
+
+  root.innerHTML = `
+    <tf-screen>
+      <div slot="breadcrumb" class="tf-breadcrumb">
+        <span class="crumb current">${escapeHtml(title)}</span>
+      </div>
+      <div slot="header" class="tf-page-header">
+        <div class="titles">
+          <h1>${escapeHtml(title)} <span style="color:var(--text-3);font-weight:600">· ${count}</span></h1>
+          <div class="sub">${escapeHtml(subtitle)}</div>
+        </div>
+        <div class="actions">
+          <tf-button variant="primary" icon="plus" id="${addId}">${escapeHtml(addLabel)}</tf-button>
+        </div>
+      </div>
+      <tf-tabs slot="tabs" variant="underline" value="${activeTab}" id="users-tabs-nav">
+        <tf-tab id="users" icon="user" count="${users.length}">${escapeHtml(I18n.t('users.tab_users'))}</tf-tab>
+        <tf-tab id="groups" icon="users" count="${groups.length}">${escapeHtml(I18n.t('users.tab_groups'))}</tf-tab>
+      </tf-tabs>
+      ${searchToolbar}
+      <div class="tf-section-card" style="padding:0;" id="users-list-body">${isUsers ? renderUsersTable() : renderGroupsTable()}</div>
+    </tf-screen>
+  `;
+
+  const screen = root.querySelector('tf-screen');
+  byId('users-tabs-nav')?.addEventListener('change', (e) => {
+    activeTab = e.detail?.value || 'users';
+    renderActive();
+  });
+  byId(addId)?.addEventListener('click', isUsers ? openCreateUserModal : openCreateGroupModal);
+  screen?.addEventListener('click', handleListClick);
+  const sb = byId('users-search');
+  if (sb) {
+    sb.addEventListener('input', (e) => {
+      searchQuery = e.detail?.value ?? e.target?.value ?? '';
+      rerenderUsersTable();
+    });
   }
 }
 
@@ -145,28 +156,15 @@ function filteredUsers() {
   });
 }
 
-function renderUsersList() {
-  const toolbar = `
-    <div class="users-toolbar">
-      <tf-searchbox id="users-search" placeholder="${escapeAttr(I18n.t('users.search_ph'))}" debounce="120" value="${escapeAttr(searchQuery)}"></tf-searchbox>
-      <div class="tf-filter-group" id="users-filter-group">
-        <tf-chip class="filter-chip" clickable ${filter === 'all' ? 'active' : ''} data-filter="all">${escapeHtml(I18n.t('users.filter_all'))}</tf-chip>
-        <tf-chip class="filter-chip" clickable ${filter === 'active' ? 'active' : ''} data-filter="active">${escapeHtml(I18n.t('users.filter_active'))}</tf-chip>
-        <tf-chip class="filter-chip" clickable ${filter === 'admin' ? 'active' : ''} data-filter="admin">${escapeHtml(I18n.t('users.filter_admin'))}</tf-chip>
-        <tf-chip class="filter-chip" clickable ${filter === 'inactive' ? 'active' : ''} data-filter="inactive">${escapeHtml(I18n.t('users.filter_inactive'))}</tf-chip>
-        <tf-chip class="filter-chip" clickable ${filter === 'sso' ? 'active' : ''} data-filter="sso">${escapeHtml(I18n.t('users.filter_sso'))}</tf-chip>
-      </div>
-    </div>
-  `;
+function renderUsersTable() {
   const list = filteredUsers();
   if (list.length === 0) {
     const empty = users.length === 0 ? I18n.t('users.no_users') : I18n.t('users.no_match');
-    return `${toolbar}<div class="users-empty">${escapeHtml(empty)}</div>`;
+    return `<div class="users-empty">${escapeHtml(empty)}</div>`;
   }
   const body = list.map(renderUserRow).join('');
   return `
-    ${toolbar}
-    <table class="user-table">
+    <table class="tf-accounts-table">
       <thead>
         <tr>
           <th>${escapeHtml(I18n.t('users.col_user'))}</th>
@@ -180,6 +178,20 @@ function renderUsersList() {
       <tbody>${body}</tbody>
     </table>
   `;
+}
+
+function rerenderUsersTable() {
+  const host = byId('users-list-body');
+  if (!host) return;
+  host.innerHTML = renderUsersTable();
+  // Reset active state chip jesli nie ma selektora .filter-chip[active]
+  const fg = byId('users-filter-group');
+  if (fg) {
+    fg.querySelectorAll('.filter-chip').forEach((c) => {
+      if (c.dataset.filter === filter) c.setAttribute('active', '');
+      else c.removeAttribute('active');
+    });
+  }
 }
 
 function initials(u) {
@@ -215,18 +227,18 @@ function renderUserRow(u) {
   return `
     <tr data-user-id="${u.id}">
       <td>
-        <div class="user-cell">
-          <div class="user-avatar-badge">${escapeHtml(initials(u))}</div>
+        <div class="tf-account-cell">
+          <div class="tf-account-avatar">${escapeHtml(initials(u))}</div>
           <div>
-            <div class="user-name-line">${escapeHtml(u.displayName || u.username)} ${statusPill}</div>
-            <div class="user-email-line">${escapeHtml(u.email || u.username)}</div>
+            <div class="tf-account-name">${escapeHtml(u.displayName || u.username)} ${statusPill}</div>
+            <div class="tf-account-sub">${escapeHtml(u.email || u.username)}</div>
           </div>
         </div>
       </td>
       <td><span class="role-pill ${roleClass}">${escapeHtml(roleLabel)}</span></td>
       <td><div class="group-tag-list">${groupTagsHtml || `<span style="color:var(--text-3); font-size:11px;">—</span>`}</div></td>
       <td>${sourcePill}</td>
-      <td style="color:var(--text-3); font-size:12px;">${escapeHtml(formatRelative(u.lastLoginAt))}</td>
+      <td style="color:var(--text-3); font-size:11px;">${escapeHtml(formatRelative(u.lastLoginAt))}</td>
       <td class="actions-col">
         <div class="row-actions">
           <tf-button variant="ghost" size="sm" icon="edit" data-action="edit-user" title="${escapeAttr(I18n.t('users.edit'))}"></tf-button>
@@ -237,13 +249,13 @@ function renderUserRow(u) {
   `;
 }
 
-function renderGroupsList() {
+function renderGroupsTable() {
   if (groups.length === 0) {
     return `<div class="users-empty">${escapeHtml(I18n.t('users.no_groups_yet'))}</div>`;
   }
   const body = groups.map(renderGroupRow).join('');
   return `
-    <table class="user-table">
+    <table class="tf-accounts-table">
       <thead>
         <tr>
           <th>${escapeHtml(I18n.t('users.col_group'))}</th>
@@ -258,15 +270,15 @@ function renderGroupsList() {
 }
 
 function renderGroupRow(g) {
-  const gIcon = `<svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:white;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/></svg>`;
+  const gIcon = `<svg viewBox="0 0 24 24"><use href="#i-users"/></svg>`;
   return `
     <tr data-group-id="${g.id}">
       <td>
-        <div class="user-cell">
-          <div class="user-avatar-badge" style="background:linear-gradient(135deg,#a78bfa,#6366f1);">${gIcon}</div>
+        <div class="tf-account-cell">
+          <div class="tf-account-avatar">${gIcon}</div>
           <div>
-            <div class="user-name-line">${escapeHtml(g.name)}</div>
-            <div class="user-email-line">group_${escapeHtml(String(g.id))}</div>
+            <div class="tf-account-name">${escapeHtml(g.name)}</div>
+            <div class="tf-account-sub">group_${escapeHtml(String(g.id))}</div>
           </div>
         </div>
       </td>
@@ -282,45 +294,7 @@ function renderGroupRow(g) {
   `;
 }
 
-function rerenderUsersPart() {
-  // Rebuilds just the table without touching the toolbar (to keep input focus).
-  const host = byId('users-content');
-  if (!host) return;
-  const oldTable = host.querySelector('.user-table');
-  const oldEmpty = host.querySelector('.users-empty');
-  (oldTable || oldEmpty)?.remove();
-  const list = filteredUsers();
-  if (list.length === 0) {
-    const empty = users.length === 0 ? I18n.t('users.no_users') : I18n.t('users.no_match');
-    host.insertAdjacentHTML('beforeend', `<div class="users-empty">${escapeHtml(empty)}</div>`);
-    return;
-  }
-  const body = list.map(renderUserRow).join('');
-  host.insertAdjacentHTML('beforeend', `
-    <table class="user-table">
-      <thead>
-        <tr>
-          <th>${escapeHtml(I18n.t('users.col_user'))}</th>
-          <th>${escapeHtml(I18n.t('users.col_role'))}</th>
-          <th>${escapeHtml(I18n.t('users.col_groups'))}</th>
-          <th>${escapeHtml(I18n.t('users.col_source'))}</th>
-          <th>${escapeHtml(I18n.t('users.col_last_login'))}</th>
-          <th class="actions-col">${escapeHtml(I18n.t('users.col_actions'))}</th>
-        </tr>
-      </thead>
-      <tbody>${body}</tbody>
-    </table>
-  `);
-  const fg = host.querySelector('#users-filter-group');
-  if (fg) {
-    fg.querySelectorAll('.filter-chip').forEach((c) => {
-      if (c.dataset.filter === filter) c.setAttribute('active', '');
-      else c.removeAttribute('active');
-    });
-  }
-}
-
-function handleClick(e) {
+function handleListClick(e) {
   const row = e.target.closest('[data-user-id]');
   const groupRow = e.target.closest('[data-group-id]');
   const actionBtn = e.target.closest('[data-action]');
@@ -343,7 +317,7 @@ function handleClick(e) {
   const chipFilter = e.target.closest('[data-filter]');
   if (chipFilter) {
     filter = chipFilter.dataset.filter;
-    rerenderUsersPart();
+    rerenderUsersTable();
     return;
   }
   if (row) {
@@ -373,7 +347,309 @@ function backToList() {
   renderActive();
 }
 
-// ---- Modals ----
+// ---- USER DETAIL SCREEN ----
+
+function renderUserDetailScreen(root, u) {
+  const userGroups = (u.groupIds || [])
+    .map((gid) => groups.find((g) => g.id === gid))
+    .filter(Boolean);
+  const displayName = u.displayName || u.username;
+  const subLine = `${u.email || u.username} · user_${u.id}`;
+  const chev = '<svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>';
+
+  // Badges w naglowku: status + zrodlo (Local/SSO) + liczba grup.
+  const statusChip = u.isActive
+    ? `<tf-chip variant="success">${escapeHtml(I18n.t('users.status_active'))}</tf-chip>`
+    : `<tf-chip variant="muted">${escapeHtml(I18n.t('users.status_inactive'))}</tf-chip>`;
+  const sourceChip = u.ssoProvider
+    ? `<tf-chip variant="info">SSO · ${escapeHtml(u.ssoProvider)}</tf-chip>`
+    : `<tf-chip variant="neutral">Local</tf-chip>`;
+  const groupsChip = `<tf-chip variant="accent">${escapeHtml(I18n.t('users.count_groups', { n: userGroups.length }))}</tf-chip>`;
+
+  root.innerHTML = `
+    <tf-screen>
+      <div slot="breadcrumb" class="tf-breadcrumb">
+        <span class="crumb" data-action="back">${escapeHtml(I18n.t('users.title'))}</span>
+        <span class="sep">${chev}</span>
+        <span class="crumb current">${escapeHtml(displayName)}</span>
+      </div>
+      <div slot="header" class="tf-detail-header">
+        <div class="big-ico">${escapeHtml(initials(u))}</div>
+        <div class="d-meta">
+          <div class="d-name">${escapeHtml(displayName)}</div>
+          <div class="d-sub">${escapeHtml(subLine)}</div>
+          <div class="d-badges">${statusChip}${sourceChip}${groupsChip}</div>
+        </div>
+        <div class="d-actions">
+          <tf-button variant="ghost" icon="key" data-action="reset-pw">${escapeHtml(I18n.t('users.reset_password'))}</tf-button>
+          <tf-button variant="danger" data-action="delete-user">${escapeHtml(I18n.t('users.delete_account'))}</tf-button>
+        </div>
+      </div>
+      <tf-tabs slot="tabs" variant="underline" value="${detailTab}" id="ud-tabs">
+        <tf-tab id="profile" icon="user">${escapeHtml(I18n.t('users.tab_profile'))}</tf-tab>
+        <tf-tab id="groups" icon="users" count="${userGroups.length}">${escapeHtml(I18n.t('users.tab_memberships'))}</tf-tab>
+        <tf-tab id="perms" icon="shield">${escapeHtml(I18n.t('users.tab_perms'))}</tf-tab>
+      </tf-tabs>
+      <div id="ud-main">${renderUserDetailPanel(u)}</div>
+    </tf-screen>
+  `;
+  wireUserDetail(root, u);
+}
+
+function renderUserDetailPanel(u) {
+  const selectedGroupIds = new Set(u.groupIds || []);
+  if (detailTab === 'profile') {
+    return `
+      <div class="tf-section-card">
+        <h3>${escapeHtml(I18n.t('users.tab_profile'))}</h3>
+        <div class="users-form-row">
+          <div class="field"><tf-input id="u-username" label="${escapeAttr(I18n.t('users.field_username'))}" value="${escapeAttr(u.username || '')}" disabled></tf-input></div>
+          <div class="field"><tf-input id="u-display" label="${escapeAttr(I18n.t('users.field_display'))}" value="${escapeAttr(u.displayName || '')}"></tf-input></div>
+        </div>
+        <div class="users-form-row full">
+          <div class="field"><tf-input id="u-email" type="email" label="${escapeAttr(I18n.t('users.field_email'))}" value="${escapeAttr(u.email || '')}"></tf-input></div>
+        </div>
+      </div>
+      <div class="tf-section-card">
+        <h3>${escapeHtml(I18n.t('users.field_role'))} &middot; ${escapeHtml(I18n.t('users.field_status'))}</h3>
+        <div class="users-form-row">
+          <div class="field">
+            <tf-select id="u-role" label="${escapeAttr(I18n.t('users.field_role'))}" value="${escapeAttr(u.role || 'user')}">
+              <option value="user">${escapeHtml(I18n.t('users.role_user_desc'))}</option>
+              <option value="power_user">${escapeHtml(I18n.t('users.role_power_desc'))}</option>
+              <option value="admin">${escapeHtml(I18n.t('users.role_admin_desc'))}</option>
+            </tf-select>
+          </div>
+          <div class="field">
+            <tf-select id="u-status" label="${escapeAttr(I18n.t('users.field_status'))}" value="${u.isActive ? 'active' : 'disabled'}">
+              <option value="active">${escapeHtml(I18n.t('users.status_active_desc'))}</option>
+              <option value="disabled">${escapeHtml(I18n.t('users.status_disabled_desc'))}</option>
+            </tf-select>
+          </div>
+        </div>
+        <div class="section-footer">
+          <tf-button variant="ghost" data-action="back">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+          <tf-button variant="primary" data-action="save-profile">${escapeHtml(I18n.t('users.save_changes'))}</tf-button>
+        </div>
+        <div class="form-error" hidden></div>
+      </div>
+    `;
+  }
+  if (detailTab === 'groups') {
+    return `
+      <div class="tf-section-card">
+        <h3>${escapeHtml(I18n.t('users.field_groups'))}</h3>
+        <div id="u-groups-picker">${renderGroupPicker(selectedGroupIds)}</div>
+        <div class="section-footer">
+          <tf-button variant="primary" data-action="save-groups">${escapeHtml(I18n.t('users.save_changes'))}</tf-button>
+        </div>
+      </div>
+    `;
+  }
+  return `
+    <div class="tf-section-card">
+      <h3>${escapeHtml(I18n.t('users.tab_perms'))}</h3>
+      <div class="users-empty">${escapeHtml(I18n.t('users.perms_user_todo'))}</div>
+    </div>
+  `;
+}
+
+function wireUserDetail(host, u) {
+  const selectedGroupIds = new Set(u.groupIds || []);
+
+  const tabsEl = host.querySelector('#ud-tabs');
+  tabsEl?.addEventListener('change', (e) => {
+    detailTab = e.detail?.value || 'profile';
+    const main = host.querySelector('#ud-main');
+    if (main) main.innerHTML = renderUserDetailPanel(u);
+    const pickerHost = host.querySelector('#u-groups-picker');
+    if (pickerHost) wireGroupPicker(pickerHost, selectedGroupIds);
+  });
+
+  host.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'back') return backToList();
+    if (action === 'delete-user') {
+      if (!confirm(I18n.t('users.confirm_delete_user', { name: u.username }))) return;
+      try {
+        await ApiBinary.action('iamDeleteUserRequest', { userId: u.id });
+        toast(I18n.t('users.deleted'), 'success');
+        await loadData();
+        backToList();
+      } catch (err) { toast(err.message, 'error'); }
+      return;
+    }
+    if (action === 'reset-pw') {
+      const newPw = prompt(I18n.t('users.reset_prompt'));
+      if (!newPw) return;
+      try {
+        await ApiBinary.action('iamResetUserPasswordRequest', { userId: u.id, newPassword: newPw });
+        toast(I18n.t('users.password_reset'), 'success');
+      } catch (err) { toast(err.message, 'error'); }
+      return;
+    }
+    if (action === 'save-profile') {
+      try {
+        await ApiBinary.action('iamUpdateUserRequest', {
+          userId: u.id,
+          displayName: host.querySelector('#u-display').value.trim(),
+          email: host.querySelector('#u-email').value.trim(),
+          isActive: host.querySelector('#u-status').value === 'active',
+          role: host.querySelector('#u-role').value,
+        });
+        toast(I18n.t('users.saved'), 'success');
+        await loadData();
+        renderActive();
+      } catch (err) {
+        const fe = host.querySelector('.form-error');
+        if (fe) { fe.hidden = false; fe.textContent = err.message; }
+      }
+      return;
+    }
+    if (action === 'save-groups') {
+      try {
+        await ApiBinary.action('iamSetUserGroupsRequest', { userId: u.id, groupIds: Array.from(selectedGroupIds) });
+        toast(I18n.t('users.saved'), 'success');
+        await loadData();
+        renderActive();
+      } catch (err) { toast(err.message, 'error'); }
+    }
+  });
+
+  const pickerHost = host.querySelector('#u-groups-picker');
+  if (pickerHost) wireGroupPicker(pickerHost, selectedGroupIds);
+}
+
+// ---- GROUP DETAIL SCREEN ----
+
+function renderGroupDetailScreen(root, g) {
+  const membersCount = g.memberCount || 0;
+  const subLine = `group_${g.id}${g.description ? ' · ' + g.description : ''}`;
+  const chev = '<svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>';
+  const groupIco = '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/></svg>';
+  const membersChip = `<tf-chip variant="accent">${escapeHtml(I18n.t('users.members_count', { n: membersCount }))}</tf-chip>`;
+
+  root.innerHTML = `
+    <tf-screen>
+      <div slot="breadcrumb" class="tf-breadcrumb">
+        <span class="crumb" data-action="back">${escapeHtml(I18n.t('users.tab_groups'))}</span>
+        <span class="sep">${chev}</span>
+        <span class="crumb current">${escapeHtml(g.name)}</span>
+      </div>
+      <div slot="header" class="tf-detail-header">
+        <div class="big-ico" style="background:linear-gradient(135deg,#a78bfa,#6366f1);">${groupIco}</div>
+        <div class="d-meta">
+          <div class="d-name">${escapeHtml(g.name)}</div>
+          <div class="d-sub">${escapeHtml(subLine)}</div>
+          <div class="d-badges">${membersChip}</div>
+        </div>
+        <div class="d-actions">
+          <tf-button variant="danger" data-action="delete-group">${escapeHtml(I18n.t('users.delete_group'))}</tf-button>
+        </div>
+      </div>
+      <tf-tabs slot="tabs" variant="underline" value="${detailTab}" id="gd-tabs">
+        <tf-tab id="info" icon="info">${escapeHtml(I18n.t('users.tab_info'))}</tf-tab>
+        <tf-tab id="members" icon="users" count="${membersCount}">${escapeHtml(I18n.t('users.tab_members'))}</tf-tab>
+        <tf-tab id="perms" icon="shield">${escapeHtml(I18n.t('users.tab_perms'))}</tf-tab>
+      </tf-tabs>
+      <div id="gd-main">${renderGroupDetailPanel(g)}</div>
+    </tf-screen>
+  `;
+  wireGroupDetail(root, g);
+}
+
+function renderGroupDetailPanel(g) {
+  if (detailTab === 'info') {
+    return `
+      <div class="tf-section-card">
+        <h3>${escapeHtml(I18n.t('users.tab_info'))}</h3>
+        <div class="users-form-row">
+          <div class="field"><tf-input id="g-name" label="${escapeAttr(I18n.t('users.field_group_name'))}" value="${escapeAttr(g.name || '')}"></tf-input></div>
+          <div class="field"><tf-input id="g-id" label="ID" value="${escapeAttr(String(g.id))}" disabled></tf-input></div>
+        </div>
+        <div class="users-form-row full">
+          <div class="field"><tf-input id="g-descr" label="${escapeAttr(I18n.t('users.field_group_desc'))}" value="${escapeAttr(g.description || '')}"></tf-input></div>
+        </div>
+        <div class="section-footer">
+          <tf-button variant="ghost" data-action="back">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+          <tf-button variant="primary" data-action="save-info">${escapeHtml(I18n.t('users.save_changes'))}</tf-button>
+        </div>
+        <div class="form-error" hidden></div>
+      </div>
+    `;
+  }
+  if (detailTab === 'members') {
+    return `
+      <div class="tf-section-card">
+        <h3>${escapeHtml(I18n.t('users.tab_members'))}</h3>
+        <div id="gd-members-list"><div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div></div>
+      </div>
+    `;
+  }
+  return `
+    <div class="tf-section-card">
+      <h3>${escapeHtml(I18n.t('users.tab_perms'))}</h3>
+      <div id="gd-perms-body"><div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div></div>
+    </div>
+  `;
+}
+
+function wireGroupDetail(host, g) {
+  const tabsEl = host.querySelector('#gd-tabs');
+  const mount = async () => {
+    const main = host.querySelector('#gd-main');
+    if (!main) return;
+    main.innerHTML = renderGroupDetailPanel(g);
+    if (detailTab === 'members') {
+      await loadGroupMembers(g.id, main.querySelector('#gd-members-list'));
+    } else if (detailTab === 'perms') {
+      await loadGroupPermissions(g.id, main.querySelector('#gd-perms-body'));
+    }
+  };
+  tabsEl?.addEventListener('change', async (e) => {
+    detailTab = e.detail?.value || 'info';
+    await mount();
+  });
+
+  host.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === 'back') return backToList();
+    if (action === 'delete-group') {
+      if (!confirm(I18n.t('users.confirm_delete_group', { name: g.name }))) return;
+      try {
+        await ApiBinary.action('iamDeleteGroupRequest', { groupId: g.id });
+        toast(I18n.t('users.group_deleted'), 'success');
+        await loadData();
+        backToList();
+      } catch (err) { toast(err.message, 'error'); }
+      return;
+    }
+    if (action === 'save-info') {
+      try {
+        await ApiBinary.action('iamUpdateGroupRequest', {
+          groupId: g.id,
+          name: host.querySelector('#g-name').value.trim(),
+          description: host.querySelector('#g-descr').value.trim(),
+        });
+        toast(I18n.t('users.group_saved'), 'success');
+        await loadData();
+        renderActive();
+      } catch (err) {
+        const fe = host.querySelector('.form-error');
+        if (fe) { fe.hidden = false; fe.textContent = err.message; }
+      }
+    }
+  });
+
+  // Pre-fetch jesli wchodzimy od razu na taby members/perms.
+  if (detailTab === 'members' || detailTab === 'perms') mount();
+}
+
+// ---- Modals (create user / create group) ----
 
 function openCreateUserModal() {
   const win = document.createElement('tf-window');
@@ -453,6 +729,52 @@ function openCreateUserModal() {
   });
 }
 
+function openCreateGroupModal() {
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', I18n.t('users.modal_create_group'));
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', '440');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.innerHTML = `
+    <div class="users-form-row full"><div class="field"><tf-input id="g-name" label="${escapeAttr(I18n.t('users.field_group_name'))}" required></tf-input></div></div>
+    <div class="users-form-row full"><div class="field"><tf-input id="g-descr" label="${escapeAttr(I18n.t('users.field_group_desc'))}"></tf-input></div></div>
+    <div class="form-error" hidden></div>
+  `;
+  win.appendChild(body);
+  const foot = document.createElement('div');
+  foot.slot = 'footer';
+  foot.innerHTML = `<tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(I18n.t('common.create'))}</tf-button>`;
+  win.appendChild(foot);
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.append(backdrop, win);
+  const cleanup = () => { win.remove(); backdrop.remove(); };
+  win.addEventListener('action', async (e) => {
+    const a = e.detail?.action;
+    if (a === 'cancel') return cleanup();
+    if (a === 'save') {
+      e.preventDefault();
+      try {
+        await ApiBinary.action('iamCreateGroupRequest', {
+          name: body.querySelector('#g-name').value.trim(),
+          description: body.querySelector('#g-descr').value.trim(),
+        });
+        toast(I18n.t('users.group_created'), 'success');
+        cleanup();
+        await loadData(); renderActive();
+      } catch (err) {
+        body.querySelector('.form-error').hidden = false;
+        body.querySelector('.form-error').textContent = err.message;
+      }
+    }
+  });
+}
+
+// ---- Group picker (reusable w create modal + detail tab) ----
+
 function renderGroupPicker(selected) {
   const tags = Array.from(selected)
     .map((gid) => groups.find((g) => g.id === gid))
@@ -514,170 +836,7 @@ function wireGroupPicker(host, selectedSet) {
   });
 }
 
-function renderUserDetail(u) {
-  const src = u.ssoProvider ? `SSO · ${escapeHtml(u.ssoProvider)}` : 'Local';
-  const userGroups = (u.groupIds || [])
-    .map((gid) => groups.find((g) => g.id === gid))
-    .filter(Boolean);
-  const statusColor = u.isActive ? 'var(--success)' : 'var(--text-3)';
-  return `
-    <div class="detail-head">
-      <button class="back-btn" data-action="back" aria-label="${escapeAttr(I18n.t('users.back'))}">
-        <svg><use href="#i-chevron-left"/></svg>
-      </button>
-      <div>
-        <div class="title">${escapeHtml(u.displayName || u.username)}</div>
-        <div class="sub">${escapeHtml(u.email || u.username)} · ${src}</div>
-      </div>
-      <div class="actions">
-        <tf-button variant="ghost" data-action="delete-user">${escapeHtml(I18n.t('users.delete_account'))}</tf-button>
-      </div>
-    </div>
-    <div class="detail-tabs">
-      <tf-tabs variant="underline" value="${detailTab}" id="ud-tabs">
-        <tf-tab id="profile">${escapeHtml(I18n.t('users.tab_profile'))}</tf-tab>
-        <tf-tab id="groups">${escapeHtml(I18n.t('users.tab_memberships'))} <span class="count">${userGroups.length}</span></tf-tab>
-        <tf-tab id="perms">${escapeHtml(I18n.t('users.tab_perms'))}</tf-tab>
-      </tf-tabs>
-    </div>
-    <div class="detail-grid">
-      <aside class="detail-side">
-        <div class="big-avatar">${escapeHtml(initials(u))}</div>
-        <div>
-          <div class="name">${escapeHtml(u.displayName || u.username)}</div>
-          <div class="hex">user_${escapeHtml(String(u.id))}</div>
-        </div>
-        <div class="stat-lines">
-          <div class="stat-line"><span class="k">${escapeHtml(I18n.t('users.stat_status'))}</span><span class="v" style="color:${statusColor};">${escapeHtml(u.isActive ? I18n.t('users.status_active') : I18n.t('users.status_inactive'))}</span></div>
-          <div class="stat-line"><span class="k">${escapeHtml(I18n.t('users.stat_source'))}</span><span class="v">${src}</span></div>
-          <div class="stat-line"><span class="k">${escapeHtml(I18n.t('users.stat_groups'))}</span><span class="v">${userGroups.length}</span></div>
-          <div class="stat-line"><span class="k">${escapeHtml(I18n.t('users.stat_last_login'))}</span><span class="v">${escapeHtml(formatRelative(u.lastLoginAt))}</span></div>
-        </div>
-        <div class="actions-stack">
-          <tf-button variant="secondary" icon="key" data-action="reset-pw">${escapeHtml(I18n.t('users.reset_password'))}</tf-button>
-        </div>
-      </aside>
-      <div class="detail-main" id="ud-main">${renderUserDetailPanel(u)}</div>
-    </div>
-  `;
-}
-
-function renderUserDetailPanel(u) {
-  const selectedGroupIds = new Set(u.groupIds || []);
-  if (detailTab === 'profile') {
-    return `
-      <div class="users-form-row">
-        <div class="field"><tf-input id="u-username" label="${escapeAttr(I18n.t('users.field_username'))}" value="${escapeAttr(u.username || '')}" disabled></tf-input></div>
-        <div class="field"><tf-input id="u-display" label="${escapeAttr(I18n.t('users.field_display'))}" value="${escapeAttr(u.displayName || '')}"></tf-input></div>
-      </div>
-      <div class="users-form-row">
-        <div class="field"><tf-input id="u-email" type="email" label="${escapeAttr(I18n.t('users.field_email'))}" value="${escapeAttr(u.email || '')}"></tf-input></div>
-        <div class="field">
-          <tf-select id="u-role" label="${escapeAttr(I18n.t('users.field_role'))}" value="${escapeAttr(u.role || 'user')}">
-            <option value="user">${escapeHtml(I18n.t('users.role_user_desc'))}</option>
-            <option value="power_user">${escapeHtml(I18n.t('users.role_power_desc'))}</option>
-            <option value="admin">${escapeHtml(I18n.t('users.role_admin_desc'))}</option>
-          </tf-select>
-        </div>
-      </div>
-      <div class="users-form-row full">
-        <div class="field">
-          <tf-select id="u-status" label="${escapeAttr(I18n.t('users.field_status'))}" value="${u.isActive ? 'active' : 'disabled'}">
-            <option value="active">${escapeHtml(I18n.t('users.status_active_desc'))}</option>
-            <option value="disabled">${escapeHtml(I18n.t('users.status_disabled_desc'))}</option>
-          </tf-select>
-        </div>
-      </div>
-      <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
-        <tf-button variant="ghost" data-action="back">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-        <tf-button variant="primary" data-action="save-profile">${escapeHtml(I18n.t('users.save_changes'))}</tf-button>
-      </div>
-      <div class="form-error" hidden></div>
-    `;
-  }
-  if (detailTab === 'groups') {
-    return `
-      <div class="users-form-row full">
-        <div class="field">
-          <label class="field-label">${escapeHtml(I18n.t('users.field_groups'))}</label>
-          <div id="u-groups-picker">${renderGroupPicker(selectedGroupIds)}</div>
-        </div>
-      </div>
-      <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
-        <tf-button variant="primary" data-action="save-groups">${escapeHtml(I18n.t('users.save_changes'))}</tf-button>
-      </div>
-    `;
-  }
-  // perms — placeholder: UI z perspektywy usera (override nad grupami)
-  return `<div class="users-empty">${escapeHtml(I18n.t('users.perms_user_todo'))}</div>`;
-}
-
-function wireUserDetail(host, u) {
-  const selectedGroupIds = new Set(u.groupIds || []);
-  const tabsEl = host.querySelector('#ud-tabs');
-  tabsEl?.addEventListener('change', (e) => {
-    detailTab = e.detail?.value || 'profile';
-    const main = host.querySelector('#ud-main');
-    if (main) main.innerHTML = renderUserDetailPanel(u);
-    const pickerHost = host.querySelector('#u-groups-picker');
-    if (pickerHost) wireGroupPicker(pickerHost, selectedGroupIds);
-  });
-
-  host.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-action]');
-    if (!btn) return;
-    const action = btn.dataset.action;
-    if (action === 'back') return backToList();
-    if (action === 'delete-user') {
-      if (!confirm(I18n.t('users.confirm_delete_user', { name: u.username }))) return;
-      try {
-        await ApiBinary.action('iamDeleteUserRequest', { userId: u.id });
-        toast(I18n.t('users.deleted'), 'success');
-        await loadData();
-        backToList();
-      } catch (err) { toast(err.message, 'error'); }
-      return;
-    }
-    if (action === 'reset-pw') {
-      const newPw = prompt(I18n.t('users.reset_prompt'));
-      if (!newPw) return;
-      try {
-        await ApiBinary.action('iamResetUserPasswordRequest', { userId: u.id, newPassword: newPw });
-        toast(I18n.t('users.password_reset'), 'success');
-      } catch (err) { toast(err.message, 'error'); }
-      return;
-    }
-    if (action === 'save-profile') {
-      try {
-        await ApiBinary.action('iamUpdateUserRequest', {
-          userId: u.id,
-          displayName: host.querySelector('#u-display').value.trim(),
-          email: host.querySelector('#u-email').value.trim(),
-          isActive: host.querySelector('#u-status').value === 'active',
-          role: host.querySelector('#u-role').value,
-        });
-        toast(I18n.t('users.saved'), 'success');
-        await loadData();
-        renderActive();
-      } catch (err) {
-        const fe = host.querySelector('.form-error');
-        if (fe) { fe.hidden = false; fe.textContent = err.message; }
-      }
-      return;
-    }
-    if (action === 'save-groups') {
-      try {
-        await ApiBinary.action('iamSetUserGroupsRequest', { userId: u.id, groupIds: Array.from(selectedGroupIds) });
-        toast(I18n.t('users.saved'), 'success');
-        await loadData();
-        renderActive();
-      } catch (err) { toast(err.message, 'error'); }
-    }
-  });
-
-  const pickerHost = host.querySelector('#u-groups-picker');
-  if (pickerHost) wireGroupPicker(pickerHost, selectedGroupIds);
-}
+// ---- Delete helpers ----
 
 function confirmDeleteUser(u) {
   if (!confirm(I18n.t('users.confirm_delete_user', { name: u.username }))) return;
@@ -686,148 +845,14 @@ function confirmDeleteUser(u) {
     .catch((err) => toast(err.message, 'error'));
 }
 
-function openCreateGroupModal() {
-  const win = document.createElement('tf-window');
-  win.setAttribute('title', I18n.t('users.modal_create_group'));
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('width', '440');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  const body = document.createElement('div');
-  body.slot = 'body';
-  body.innerHTML = `
-    <div class="users-form-row full"><div class="field"><tf-input id="g-name" label="${escapeAttr(I18n.t('users.field_group_name'))}" required></tf-input></div></div>
-    <div class="users-form-row full"><div class="field"><tf-input id="g-descr" label="${escapeAttr(I18n.t('users.field_group_desc'))}"></tf-input></div></div>
-    <div class="form-error" hidden></div>
-  `;
-  win.appendChild(body);
-  const foot = document.createElement('div');
-  foot.slot = 'footer';
-  foot.innerHTML = `<tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(I18n.t('common.create'))}</tf-button>`;
-  win.appendChild(foot);
-  const backdrop = document.createElement('div');
-  backdrop.className = 'tf-window-backdrop';
-  document.body.append(backdrop, win);
-  const cleanup = () => { win.remove(); backdrop.remove(); };
-  win.addEventListener('action', async (e) => {
-    const a = e.detail?.action;
-    if (a === 'cancel') return cleanup();
-    if (a === 'save') {
-      e.preventDefault();
-      try {
-        await ApiBinary.action('iamCreateGroupRequest', {
-          name: body.querySelector('#g-name').value.trim(),
-          description: body.querySelector('#g-descr').value.trim(),
-        });
-        toast(I18n.t('users.group_created'), 'success');
-        cleanup();
-        await loadData(); renderActive();
-      } catch (err) {
-        body.querySelector('.form-error').hidden = false;
-        body.querySelector('.form-error').textContent = err.message;
-      }
-    }
-  });
+function confirmDeleteGroup(g) {
+  if (!confirm(I18n.t('users.confirm_delete_group', { name: g.name }))) return;
+  ApiBinary.action('iamDeleteGroupRequest', { groupId: g.id })
+    .then(() => { toast(I18n.t('users.group_deleted'), 'success'); return loadData().then(renderActive); })
+    .catch((err) => toast(err.message, 'error'));
 }
 
-function renderGroupDetail(g) {
-  const membersCount = g.memberCount || 0;
-  return `
-    <div class="detail-head">
-      <button class="back-btn" data-action="back" aria-label="${escapeAttr(I18n.t('users.back'))}">
-        <svg><use href="#i-chevron-left"/></svg>
-      </button>
-      <div>
-        <div class="title">${escapeHtml(I18n.t('users.group_label'))}: <span style="color:var(--accent-2);">${escapeHtml(g.name)}</span></div>
-        <div class="sub">${escapeHtml(I18n.t('users.members_count', { n: membersCount }))}${g.description ? ' · ' + escapeHtml(g.description) : ''}</div>
-      </div>
-      <div class="actions">
-        <tf-button variant="danger" data-action="delete-group">${escapeHtml(I18n.t('users.delete_group'))}</tf-button>
-      </div>
-    </div>
-    <div class="detail-tabs">
-      <tf-tabs variant="underline" value="${detailTab}" id="gd-tabs">
-        <tf-tab id="info">${escapeHtml(I18n.t('users.tab_info'))}</tf-tab>
-        <tf-tab id="members">${escapeHtml(I18n.t('users.tab_members'))} <span class="count">${membersCount}</span></tf-tab>
-        <tf-tab id="perms">${escapeHtml(I18n.t('users.tab_perms'))}</tf-tab>
-      </tf-tabs>
-    </div>
-    <div id="gd-main" style="padding:24px;">${renderGroupDetailPanel(g)}</div>
-  `;
-}
-
-function renderGroupDetailPanel(g) {
-  if (detailTab === 'info') {
-    return `
-      <div class="users-form-row">
-        <div class="field"><tf-input id="g-name" label="${escapeAttr(I18n.t('users.field_group_name'))}" value="${escapeAttr(g.name || '')}"></tf-input></div>
-        <div class="field"><tf-input id="g-id" label="ID" value="${escapeAttr(String(g.id))}" disabled></tf-input></div>
-      </div>
-      <div class="users-form-row full">
-        <div class="field"><tf-input id="g-descr" label="${escapeAttr(I18n.t('users.field_group_desc'))}" value="${escapeAttr(g.description || '')}"></tf-input></div>
-      </div>
-      <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
-        <tf-button variant="ghost" data-action="back">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-        <tf-button variant="primary" data-action="save-info">${escapeHtml(I18n.t('users.save_changes'))}</tf-button>
-      </div>
-      <div class="form-error" hidden></div>
-    `;
-  }
-  if (detailTab === 'members') {
-    return `<div id="gd-members-list"><div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div></div>`;
-  }
-  return `<div id="gd-perms-body"><div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div></div>`;
-}
-
-function wireGroupDetail(host, g) {
-  const tabsEl = host.querySelector('#gd-tabs');
-  const mount = async () => {
-    const main = host.querySelector('#gd-main');
-    if (!main) return;
-    main.innerHTML = renderGroupDetailPanel(g);
-    if (detailTab === 'members') {
-      await loadGroupMembers(g.id, main.querySelector('#gd-members-list'));
-    } else if (detailTab === 'perms') {
-      await loadGroupPermissions(g.id, main.querySelector('#gd-perms-body'));
-    }
-  };
-  tabsEl?.addEventListener('change', async (e) => {
-    detailTab = e.detail?.value || 'info';
-    await mount();
-  });
-
-  host.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-action]');
-    if (!btn) return;
-    const action = btn.dataset.action;
-    if (action === 'back') return backToList();
-    if (action === 'delete-group') {
-      if (!confirm(I18n.t('users.confirm_delete_group', { name: g.name }))) return;
-      try {
-        await ApiBinary.action('iamDeleteGroupRequest', { groupId: g.id });
-        toast(I18n.t('users.group_deleted'), 'success');
-        await loadData();
-        backToList();
-      } catch (err) { toast(err.message, 'error'); }
-      return;
-    }
-    if (action === 'save-info') {
-      try {
-        await ApiBinary.action('iamUpdateGroupRequest', {
-          groupId: g.id,
-          name: host.querySelector('#g-name').value.trim(),
-          description: host.querySelector('#g-descr').value.trim(),
-        });
-        toast(I18n.t('users.group_saved'), 'success');
-        await loadData();
-        renderActive();
-      } catch (err) {
-        const fe = host.querySelector('.form-error');
-        if (fe) { fe.hidden = false; fe.textContent = err.message; }
-      }
-    }
-  });
-}
+// ---- Group members + permissions matrix (tab content) ----
 
 async function loadGroupMembers(groupId, host) {
   try {
@@ -839,7 +864,7 @@ async function loadGroupMembers(groupId, host) {
     }
     const rows = members.map(renderMemberRow).join('');
     host.innerHTML = `
-      <table class="user-table">
+      <table class="tf-accounts-table">
         <thead>
           <tr>
             <th>${escapeHtml(I18n.t('users.col_user'))}</th>
@@ -864,11 +889,11 @@ function renderMemberRow(u) {
   return `
     <tr>
       <td>
-        <div class="user-cell">
-          <div class="user-avatar-badge">${escapeHtml(initials(u))}</div>
+        <div class="tf-account-cell">
+          <div class="tf-account-avatar">${escapeHtml(initials(u))}</div>
           <div>
-            <div class="user-name-line">${escapeHtml(u.displayName || u.username)}</div>
-            <div class="user-email-line">${escapeHtml(u.email || u.username)}</div>
+            <div class="tf-account-name">${escapeHtml(u.displayName || u.username)}</div>
+            <div class="tf-account-sub">${escapeHtml(u.email || u.username)}</div>
           </div>
         </div>
       </td>
@@ -878,9 +903,6 @@ function renderMemberRow(u) {
   `;
 }
 
-// ---- Permissions matrix per grupa ----
-// Dla kazdego typu zasobu (model/flow/addon) pokazujemy wszystkie dostepne
-// zasoby + segmented toggle Auto/Zezwól/Odmów. Auto = brak wpisu (default allow).
 async function loadGroupPermissions(groupId, host) {
   try {
     const [permsResp, modelsResp, flowsResp, addonsResp] = await Promise.all([
@@ -890,7 +912,6 @@ async function loadGroupPermissions(groupId, host) {
       ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => []),
     ]);
     const entries = permsResp?.entries || [];
-    // Zmapuj per resource_type → resource_id → access_level.
     const byResource = {};
     for (const e of entries) {
       byResource[e.resourceType] = byResource[e.resourceType] || {};
@@ -977,13 +998,6 @@ function renderPermRow(resourceType, item, current, _groupId) {
       </tf-segmented>
     </div>
   `;
-}
-
-function confirmDeleteGroup(g) {
-  if (!confirm(I18n.t('users.confirm_delete_group', { name: g.name }))) return;
-  ApiBinary.action('iamDeleteGroupRequest', { groupId: g.id })
-    .then(() => { toast(I18n.t('users.group_deleted'), 'success'); return loadData().then(renderActive); })
-    .catch((err) => toast(err.message, 'error'));
 }
 
 export default UsersScreen;

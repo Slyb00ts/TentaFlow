@@ -19,6 +19,7 @@ import './tf-table.js';
 import './tf-menu.js';
 import './tf-window.js';
 import './tf-segmented.js';
+import './tf-screen.js';
 
 export { TfButton } from './tf-button.js';
 export { TfInput } from './tf-input.js';
@@ -33,3 +34,4 @@ export { TfTable, TfColumn } from './tf-table.js';
 export { TfMenu, TfMenuItem, TfMenuDivider } from './tf-menu.js';
 export { TfWindow, openTfWindow, tfConfirm } from './tf-window.js';
 export { TfSegmented } from './tf-segmented.js';
+export { TfScreen } from './tf-screen.js';

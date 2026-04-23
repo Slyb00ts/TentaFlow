@@ -71,14 +71,14 @@ pub async fn start_mesh_pipeline(
     db_pool: Option<crate::db::DbPool>,
     settings_cipher: std::sync::Arc<crate::crypto::SettingsCipher>,
 ) -> Result<MeshPipelineHandles> {
-    let node_id = &config.node_id;
+    let app_node_id = &config.node_id;
     let mesh_config = &config.mesh_config;
     let mesh_port = mesh_config.port;
 
     info!(
         "Inicjalizacja mesh networking (port {}, node_id: {})",
         mesh_port,
-        &node_id[..8.min(node_id.len())]
+        &app_node_id[..8.min(app_node_id.len())]
     );
 
     // Inicjalizacja MeshSecurity (jesli dostepna baza danych)
@@ -101,55 +101,9 @@ pub async fn start_mesh_pipeline(
         None
     };
 
-    // Zbierz NodeInfo lokalnego noda
-    let local_node_info = node_info_collector::collect_node_info(node_id);
-
-    // Dodaj lokalny node do store — widoczny na liscie hostow jako "(local)"
-    let local_hostname = if local_node_info.hostname.is_empty() {
-        "(local)".to_string()
-    } else {
-        format!("{} (local)", local_node_info.hostname)
-    };
-    // Zbierz dane lokalne na starcie — adresy, Docker, OS
-    let local_addresses = node_info_collector::collect_local_addresses();
-    let local_os_distro = node_info_collector::collect_os_distro();
-    let (docker_available, docker_version) = node_info_collector::collect_docker_info();
-
-    mesh_peer_store.add_or_update(MeshPeerInfo {
-        node_id: node_id.clone(),
-        addresses: local_addresses,
-        port: mesh_port,
-        role: config.role.clone(),
-        status: "connected".to_string(),
-        quic_connected: true,
-        discovered_at: chrono::Utc::now().to_rfc3339(),
-        hostname: local_hostname,
-        os_info: if local_os_distro.is_empty() {
-            local_node_info.os_info.clone()
-        } else {
-            local_os_distro
-        },
-        cpu_count: local_node_info.cpu_count,
-        ram_total_mb: local_node_info.ram_total_mb,
-        cpu_usage_percent: 0.0,
-        ram_used_mb: 0,
-        gpu_info: local_node_info.gpu_info.clone(),
-        containers: vec![],
-        networks: vec![],
-        platform: node_info_collector::detect_platform(),
-        cpu_temperature_c: None,
-        swap_total_mb: 0,
-        swap_used_mb: 0,
-        docker_available,
-        docker_version,
-        models: vec![],
-        active_requests: 0,
-        tokens_per_sec: 0.0,
-    });
-
     // iroh endpoint: LAN mDNS + pkarr-DHT discovery + relay — wszystko wbudowane.
     let iroh_cfg = IrohMeshConfig {
-        node_id: node_id.clone(),
+        node_id: app_node_id.clone(),
         bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], mesh_port)),
         relay_url: None,
         heartbeat_interval: Duration::from_millis(mesh_config.heartbeat_interval_ms),
@@ -164,6 +118,16 @@ pub async fn start_mesh_pipeline(
 
     match IrohMeshManager::new(iroh_cfg, security_for_mesh).await {
         Ok(quic_mesh) => {
+            let local_node_id = quic_mesh.node_id();
+            let local_node_info = node_info_collector::collect_node_info(&local_node_id);
+            upsert_local_peer(
+                mesh_peer_store,
+                &local_node_id,
+                &config.role,
+                mesh_port,
+                &local_node_info,
+            );
+
             {
                 let qm = quic_mesh.clone();
                 tokio::spawn(async move {
@@ -195,7 +159,7 @@ pub async fn start_mesh_pipeline(
             {
                 let qm = quic_mesh.clone();
                 let store = mesh_peer_store.clone();
-                let self_id = node_id.clone();
+                let self_id = local_node_id.clone();
                 tokio::spawn(async move {
                     let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
                     let mut ticker = tokio::time::interval(Duration::from_secs(15));
@@ -229,7 +193,7 @@ pub async fn start_mesh_pipeline(
                 let _ = crate::db::repository::mesh_topology::cleanup_stale(pool, now_ms);
                 if let Ok(snaps) = crate::db::repository::mesh_topology::list_all(pool) {
                     for s in &snaps {
-                        if s.node_id == *node_id {
+                        if s.node_id == local_node_id {
                             continue;
                         }
                         let addrs: Vec<std::net::IpAddr> = s
@@ -249,7 +213,7 @@ pub async fn start_mesh_pipeline(
                         mesh_peer_store.update_topology(&s.node_id, s.connected_to.clone());
                     }
                     if !snaps.is_empty() {
-                        mesh_peer_store.recalculate_routes(node_id);
+                        mesh_peer_store.recalculate_routes(&local_node_id);
                         info!(
                             "Bootstrap: zaladowano {} snapshot(ow) mesh_topology z DB",
                             snaps.len()
@@ -263,7 +227,7 @@ pub async fn start_mesh_pipeline(
                 mesh_peer_store.clone(),
                 local_node_info.clone(),
                 mesh_security.clone(),
-                node_id.clone(),
+                local_node_id.clone(),
                 db_pool.clone(),
             );
 
@@ -271,14 +235,14 @@ pub async fn start_mesh_pipeline(
             spawn_heartbeat_sender(
                 quic_mesh.clone(),
                 mesh_peer_store.clone(),
-                node_id.clone(),
+                local_node_id.clone(),
                 docker_cache,
             );
-            spawn_slow_refresh(mesh_peer_store.clone(), node_id.clone());
+            spawn_slow_refresh(mesh_peer_store.clone(), local_node_id.clone());
             spawn_liveness_timer(
                 mesh_peer_store.clone(),
                 quic_mesh.clone(),
-                node_id.clone(),
+                local_node_id.clone(),
                 mesh_security.clone(),
             );
 
@@ -296,6 +260,14 @@ pub async fn start_mesh_pipeline(
         }
         Err(e) => {
             error!("Nie udalo sie utworzyc IrohMeshManager: {}", e);
+            let local_node_info = node_info_collector::collect_node_info(app_node_id);
+            upsert_local_peer(
+                mesh_peer_store,
+                app_node_id,
+                &config.role,
+                mesh_port,
+                &local_node_info,
+            );
             Ok(MeshPipelineHandles {
                 mdns: None,
                 quic_mesh: None,
@@ -303,6 +275,55 @@ pub async fn start_mesh_pipeline(
             })
         }
     }
+}
+
+fn upsert_local_peer(
+    mesh_peer_store: &MeshPeerStore,
+    local_node_id: &str,
+    role: &str,
+    mesh_port: u16,
+    local_node_info: &NodeInfo,
+) {
+    let local_hostname = if local_node_info.hostname.is_empty() {
+        "(local)".to_string()
+    } else {
+        format!("{} (local)", local_node_info.hostname)
+    };
+    let local_addresses = node_info_collector::collect_local_addresses();
+    let local_os_distro = node_info_collector::collect_os_distro();
+    let (docker_available, docker_version) = node_info_collector::collect_docker_info();
+
+    mesh_peer_store.add_or_update(MeshPeerInfo {
+        node_id: local_node_id.to_string(),
+        addresses: local_addresses,
+        port: mesh_port,
+        role: role.to_string(),
+        status: "connected".to_string(),
+        quic_connected: true,
+        discovered_at: chrono::Utc::now().to_rfc3339(),
+        hostname: local_hostname,
+        os_info: if local_os_distro.is_empty() {
+            local_node_info.os_info.clone()
+        } else {
+            local_os_distro
+        },
+        cpu_count: local_node_info.cpu_count,
+        ram_total_mb: local_node_info.ram_total_mb,
+        cpu_usage_percent: 0.0,
+        ram_used_mb: 0,
+        gpu_info: local_node_info.gpu_info.clone(),
+        containers: vec![],
+        networks: vec![],
+        platform: node_info_collector::detect_platform(),
+        cpu_temperature_c: None,
+        swap_total_mb: 0,
+        swap_used_mb: 0,
+        docker_available,
+        docker_version,
+        models: vec![],
+        active_requests: 0,
+        tokens_per_sec: 0.0,
+    });
 }
 
 // =============================================================================
@@ -394,7 +415,9 @@ fn spawn_quic_event_handler(
                         // sam peer zostanie anonsowany znowu.
                         let recent = last_dial_at
                             .get(&entry.node_id)
-                            .map(|t| t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS))
+                            .map(|t| {
+                                t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
+                            })
                             .unwrap_or(false);
                         if recent {
                             continue;

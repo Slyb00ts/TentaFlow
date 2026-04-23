@@ -6,7 +6,7 @@
 // Przyklad:
 //   Router.register('meeting', makeWipScreen({
 //     title: 'Meeting Bot',
-//     sourcePaths: ['wwwroot/js/modules/meeting/MeetingBot.js'],
+//     sourcePaths: ['legacy/meeting/MeetingBot.js'],
 //     features: ['transcript live', 'speaker diarization'],
 //   }));
 // =============================================================================
@@ -37,12 +37,12 @@ export function makeWipScreen({ title, sourcePaths = [], description = '', featu
             Status
           </h3>
           <p style="color: var(--text-2); font-size: 13px; line-height: 1.6; margin-bottom: 12px;">
-            ${escapeHtml(description || 'Ten ekran jest jeszcze nie zportowany ze starego wwwroot/. Implementacja — kolejna iteracja.')}
+            ${escapeHtml(description || 'Ten ekran nie ma jeszcze nowego modułu. Implementacja — kolejna iteracja.')}
           </p>
 
           ${sourcePaths.length > 0 ? `
             <h4 style="font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 16px; margin-bottom: 8px; font-weight: 700;">
-              Source w starym wwwroot/ do portowania:
+              Historyczne source paths:
             </h4>
             <ul style="list-style: none; padding: 0;">
               ${sourcePaths.map((p) => `

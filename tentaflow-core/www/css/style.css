@@ -1004,61 +1004,6 @@ input, textarea, select {
 .pair-pin-timer { font-size: 13px; color: var(--warning, #f59e0b); font-weight: 600; }
 .pair-pin-steps { font-size: 11px; color: var(--text-3); text-align: center; line-height: 1.6; white-space: pre-line; }
 
-/* Users & groups admin screen */
-.users-screen .user-list {
-  display: flex; flex-direction: column; gap: 10px;
-  margin-top: 16px;
-}
-.user-row {
-  display: grid;
-  grid-template-columns: 44px 1fr auto auto;
-  gap: 14px;
-  align-items: center;
-  padding: 12px 14px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.user-row:hover {
-  background: var(--bg-card-hover);
-  border-color: var(--border-hover);
-  transform: translateY(-1px);
-}
-.user-row .user-avatar {
-  width: 44px; height: 44px; border-radius: 12px;
-  background: linear-gradient(135deg, var(--accent-1, #6366f1), var(--accent-2, #a78bfa));
-  color: white; font-weight: 800; font-size: 15px;
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-}
-.user-row .user-main { min-width: 0; }
-.user-row .user-title {
-  font-weight: 700; font-size: 14px; color: var(--text);
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-}
-.user-row .user-sub {
-  font-size: 12px; color: var(--text-3); margin-top: 2px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.user-row .user-groups {
-  display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;
-}
-.user-row .user-groups .group-tag {
-  padding: 2px 8px;
-  background: rgba(99, 102, 241, 0.12);
-  border: 1px solid rgba(99, 102, 241, 0.28);
-  color: var(--accent-2);
-  border-radius: 999px;
-  font-size: 11px; font-weight: 600;
-}
-.user-row .user-row-actions {
-  display: flex; gap: 4px;
-  opacity: 0; transition: opacity 0.15s;
-}
-.user-row:hover .user-row-actions { opacity: 1; }
-
 /* Permission matrix — per grupa macierz dostepow do zasobow */
 .perm-header-hint {
   padding: 10px 12px;
@@ -3935,61 +3880,57 @@ textarea {
   color: var(--danger, #ef4444); font-size: 12px; line-height: 1.6;
 }
 
-/* ============ Users screen — table + toolbar, per designs/users-groups-20260422 ============ */
+/* ============ Users screen — lista na wzor .accounts-table z mockup
+   users-groups-20260422 (okragly maly awatar 28px, tlo bg-3, tekst accent-2). ============ */
 
-.users-toolbar {
-  padding: 14px 0 14px;
-  display: flex; align-items: center; gap: 10px;
-  flex-wrap: wrap;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 0;
-}
-.users-toolbar tf-searchbox { flex: 1; max-width: 360px; }
-
-.user-table {
+.tf-accounts-table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
 }
-.user-table th,
-.user-table td {
-  padding: 12px 16px;
+.tf-accounts-table th,
+.tf-accounts-table td {
+  padding: 10px 12px;
+  font-size: 12px;
   text-align: left;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
-.user-table th {
-  font-size: 11px; font-weight: 700;
-  text-transform: uppercase; letter-spacing: 0.06em;
-  color: var(--text-3);
-  background: var(--bg-2);
-  padding-top: 10px; padding-bottom: 10px;
+.tf-accounts-table th {
+  background: var(--bg-3);
+  color: var(--text-2);
+  font-weight: 700;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
-.user-table th.actions-col,
-.user-table td.actions-col { text-align: right; white-space: nowrap; }
-.user-table tbody tr { transition: background 0.12s; }
-.user-table tbody tr:hover { background: rgba(99, 102, 241, 0.04); cursor: pointer; }
+.tf-accounts-table th.actions-col,
+.tf-accounts-table td.actions-col { text-align: right; white-space: nowrap; }
+.tf-accounts-table tbody tr { cursor: pointer; transition: background 0.12s; }
+.tf-accounts-table tbody tr:hover td { background: var(--bg-3); }
+.tf-accounts-table tbody tr:last-child td { border-bottom: 0; }
 
-.user-cell { display: flex; align-items: center; gap: 12px; }
-.user-avatar-badge {
-  width: 36px; height: 36px; border-radius: 10px;
-  background: linear-gradient(135deg, var(--accent-1) 0%, var(--accent-2) 100%);
-  color: white; font-size: 13px; font-weight: 700;
+.tf-account-cell { display: flex; align-items: center; gap: 10px; }
+.tf-account-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-3);
   display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+  color: var(--accent-2);
   flex-shrink: 0;
-  letter-spacing: 0.03em;
 }
-.user-cell .user-name-line {
-  font-weight: 700; color: var(--text);
+.tf-account-avatar svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-account-name {
+  font-weight: 600; color: var(--text);
   display: flex; align-items: center; gap: 8px;
-  font-size: 13px;
+  font-size: 12.5px;
 }
-.user-cell .user-email-line {
-  font-size: 11px; color: var(--text-3);
-  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
-  margin-top: 2px;
+.tf-account-sub {
+  font-size: 10.5px; color: var(--text-3);
+  margin-top: 1px;
 }
 
-.user-table .group-tag-list {
+.tf-accounts-table .group-tag-list {
   display: flex; flex-wrap: wrap; gap: 4px;
 }
 .group-tag {
@@ -4026,7 +3967,7 @@ textarea {
 .status-pill.local { background: rgba(167, 139, 250, 0.14); color: var(--accent-2); }
 
 .row-actions { display: inline-flex; gap: 4px; opacity: 0; transition: opacity 0.15s; }
-.user-table tbody tr:hover .row-actions { opacity: 1; }
+.tf-accounts-table tbody tr:hover .row-actions { opacity: 1; }
 
 .users-empty {
   padding: 48px 24px;
@@ -4098,77 +4039,165 @@ textarea {
 
 @media (max-width: 820px) {
   .users-form-row { grid-template-columns: 1fr; }
-  .user-table th:nth-child(4),
-  .user-table td:nth-child(4),
-  .user-table th:nth-child(5),
-  .user-table td:nth-child(5) { display: none; }
+  .tf-accounts-table th:nth-child(4),
+  .tf-accounts-table td:nth-child(4),
+  .tf-accounts-table th:nth-child(5),
+  .tf-accounts-table td:nth-child(5) { display: none; }
 }
 
-/* ---- Detail view (per mockup sekcja 2/3) ---- */
-.detail-head {
-  display: flex; align-items: center; gap: 16px;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-2);
-  flex-wrap: wrap;
+/* ============ tf-screen — shell ekranu (wzor: mockup addons-permissions) ============
+   Sticky head (breadcrumb + header + tabs) jako flex-shrink:0; body scrolluje
+   sie wewnatrz komponentu. Brak tla/ramki/pasow — wszystko na --bg, zeby
+   zlewalo sie z reszta aplikacji.
+
+   Kiedy .main zawiera <tf-screen>, wyzerowujemy jego padding i overflow: to
+   tf-screen ma byc scroll-containerem, a header pozostaje w miejscu.
+*/
+.main:has(tf-screen) {
+  padding: 0;
+  overflow: hidden;
 }
-.detail-head .back-btn {
-  width: 34px; height: 34px; border-radius: 8px;
-  background: transparent; border: 1px solid var(--border);
-  color: var(--text-2); cursor: pointer;
+.main:has(tf-screen) > * { height: 100%; display: flex; flex-direction: column; }
+
+tf-screen {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+}
+.tf-screen-head {
+  flex-shrink: 0;
+  padding: 22px 26px 0;
+}
+.tf-screen-head__crumbs { margin-bottom: 12px; }
+.tf-screen-head__crumbs:empty,
+.tf-screen-head__crumbs[hidden] { display: none; }
+.tf-screen-head__header { margin-bottom: 16px; }
+.tf-screen-head__header:empty,
+.tf-screen-head__header[hidden] { display: none; }
+.tf-screen-head__tabs:empty,
+.tf-screen-head__tabs[hidden] { display: none; }
+
+.tf-screen-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 20px 26px 26px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-hover) transparent;
+}
+.tf-screen-body::-webkit-scrollbar { width: 8px; height: 8px; }
+.tf-screen-body::-webkit-scrollbar-track { background: transparent; }
+.tf-screen-body::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.tf-screen-body::-webkit-scrollbar-thumb:hover { background: var(--border-hover); background-clip: padding-box; }
+
+/* ---- Helpery uzywane w slotach tf-screen ---- */
+
+/* Breadcrumb (slot="breadcrumb") — wzor: .breadcrumb w addons-permissions. */
+.tf-breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-3);
+}
+.tf-breadcrumb .crumb {
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color 0.12s;
+}
+.tf-breadcrumb .crumb:hover { color: var(--accent-2); }
+.tf-breadcrumb .crumb.current {
+  color: var(--text); font-weight: 600; cursor: default;
+}
+.tf-breadcrumb .sep {
+  opacity: 0.5; display: inline-flex; align-items: center;
+}
+.tf-breadcrumb .sep svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2; }
+
+/* Page header (slot="header") dla widokow listy — wzor: .page-header w mockupie. */
+.tf-page-header {
+  display: flex; align-items: center; gap: 12px;
+}
+.tf-page-header .titles { display: flex; flex-direction: column; min-width: 0; }
+.tf-page-header h1 {
+  font-size: 20px; font-weight: 800;
+  display: flex; align-items: center; gap: 10px;
+  color: var(--text);
+  margin: 0;
+}
+.tf-page-header .sub { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+.tf-page-header .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+/* Detail header jako karta — wzor .detail-header z addons-permissions mockupa.
+   Duza ikona po lewej, meta (name/sub/badges) w srodku, akcje po prawej. */
+.tf-detail-header {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  display: flex; align-items: center; gap: 18px;
+}
+.tf-detail-header .big-ico {
+  width: 60px; height: 60px;
+  border-radius: var(--radius);
+  background: var(--gradient-accent);
+  color: white;
   display: inline-flex; align-items: center; justify-content: center;
   flex-shrink: 0;
+  font-weight: 800; font-size: 22px;
 }
-.detail-head .back-btn:hover { background: var(--bg-card-hover); color: var(--text); }
-.detail-head .back-btn svg { width: 16px; height: 16px; }
-.detail-head .title { font-size: 20px; font-weight: 800; color: var(--text); }
-.detail-head .sub { font-size: 13px; color: var(--text-3); margin-top: 2px; }
-.detail-head .actions { margin-left: auto; display: flex; gap: 8px; flex-shrink: 0; }
+.tf-detail-header .big-ico svg { width: 26px; height: 26px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-detail-header .d-meta { flex: 1; min-width: 0; }
+.tf-detail-header .d-name {
+  font-size: 20px; font-weight: 800; color: var(--text);
+  display: flex; align-items: center; gap: 8px;
+}
+.tf-detail-header .d-sub {
+  font-size: 12px; color: var(--text-3); margin-top: 3px;
+}
+.tf-detail-header .d-badges {
+  display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;
+}
+.tf-detail-header .d-actions {
+  display: flex; gap: 8px; align-items: center; flex-shrink: 0;
+}
 
-.detail-grid {
-  display: grid;
-  grid-template-columns: 300px 1fr;
-  gap: 0;
-  min-height: 360px;
-}
-@media (max-width: 820px) {
-  .detail-grid { grid-template-columns: 1fr; }
-}
-.detail-side {
-  padding: 24px;
-  border-right: 1px solid var(--border);
+/* Karta sekcyjna dla tresci widokow detail — stack pod .tf-detail-header,
+   kazdy segment tresci (form, tabela, lista) w osobnej karcie. */
+.tf-section-card {
   background: var(--bg-2);
-  display: flex; flex-direction: column; gap: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  margin-bottom: 14px;
 }
-.detail-side .big-avatar {
-  width: 72px; height: 72px; border-radius: 18px;
-  background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
-  color: white; font-size: 26px; font-weight: 800;
-  display: flex; align-items: center; justify-content: center;
+.tf-section-card h3 {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--accent-2);
+  margin: 0 0 12px;
 }
-.detail-side .name { font-size: 18px; font-weight: 800; color: var(--text); }
-.detail-side .hex {
-  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
-  font-size: 11px; color: var(--text-3);
-  margin-top: 2px;
+.tf-section-card h3 svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+.tf-section-card .section-sub {
+  font-size: 12px; color: var(--text-3);
+  margin: -4px 0 14px; line-height: 1.5;
 }
-.detail-side .stat-lines { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
-.detail-side .stat-line {
-  display: flex; align-items: baseline; justify-content: space-between;
-  padding: 6px 0;
-  border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
-  font-size: 12px;
+.tf-section-card .section-footer {
+  display: flex; justify-content: flex-end; gap: 10px;
+  margin-top: 16px;
 }
-.detail-side .stat-line:last-child { border-bottom: 0; }
-.detail-side .stat-line .k {
-  color: var(--text-3); text-transform: uppercase;
-  font-size: 10px; letter-spacing: 0.06em; font-weight: 700;
-}
-.detail-side .stat-line .v { color: var(--text); font-weight: 600; }
-.detail-side .actions-stack {
-  display: flex; flex-direction: column; gap: 6px;
-  margin-top: auto;
-}
-.detail-main { padding: 24px; min-width: 0; }
 
-.detail-tabs { padding: 0 20px; background: var(--bg-2); border-bottom: 1px solid var(--border); }
+/* Toolbar (search + filtry) nad tabela users/groups — ten sam padding co reszta body. */
+.users-toolbar {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.users-toolbar tf-searchbox { flex: 1; max-width: 360px; }

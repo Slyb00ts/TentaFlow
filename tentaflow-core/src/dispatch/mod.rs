@@ -117,7 +117,7 @@ impl SessionAuthKind {
 /// Metadata pojedynczego handlera, rejestrowane przez `#[handler]` macro przez
 /// `inventory::submit!`. Linker laczy wszystkie rejestracje w jedna kolekcje.
 pub struct HandlerMeta {
-    /// Nazwa variantu MessageBody, np. "NodeListRequest".
+    /// Nazwa variantu MessageBody, np. "ModelListRequest".
     pub variant_name: &'static str,
     /// Wersja od ktorej handler jest dostepny (major.minor SemVer).
     pub since_major: u8,
@@ -148,7 +148,7 @@ fn registry() -> &'static HashMap<&'static str, &'static HandlerMeta> {
     })
 }
 
-/// Wyszukuje handler po nazwie variantu (np. "NodeListRequest").
+/// Wyszukuje handler po nazwie variantu (np. "ModelListRequest").
 pub fn find(variant_name: &str) -> Option<&'static HandlerMeta> {
     registry().get(variant_name).copied()
 }
@@ -292,11 +292,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::MetaSchemaVersionAck { .. } => "MetaSchemaVersionAck",
         MessageBody::MetaHeartbeat { .. } => "MetaHeartbeat",
         MessageBody::MetaCancelStream => "MetaCancelStream",
-        MessageBody::NodeListRequest => "NodeListRequest",
-        MessageBody::NodeListResponse { .. } => "NodeListResponse",
         MessageBody::ModelListRequest => "ModelListRequest",
         MessageBody::ModelListResponse { .. } => "ModelListResponse",
-        MessageBody::NodeInfoRequest { .. } => "NodeInfoRequest",
         MessageBody::ApiKeyListRequest => "ApiKeyListRequest",
         MessageBody::ApiKeyListResponse { .. } => "ApiKeyListResponse",
         MessageBody::ApiKeyCreateRequestBody(_) => "ApiKeyCreateRequest",
@@ -797,7 +794,6 @@ mod tests {
             "expected at least 10 handlers registered (bootstrap #26 + expanded #36), got {}",
             count
         );
-        assert!(find("NodeListRequest").is_some());
         assert!(find("ModelListRequest").is_some());
         assert!(find("ApiKeyListRequest").is_some());
         assert!(find("AuthLoginRequest").is_some());
@@ -885,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_node_list_request_via_registry() {
+    async fn dispatch_api_key_list_request_via_registry() {
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: [0u8; 16],
@@ -895,20 +891,20 @@ mod tests {
             resume_secret: None,
             state: state::AppState::for_test(),
         };
-        let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx).await;
+        let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
         assert!(!is_err);
-        assert!(matches!(resp, MessageBody::NodeListResponse { .. }));
+        assert!(matches!(resp, MessageBody::ApiKeyListResponse { .. }));
     }
 
     #[tokio::test]
-    async fn dispatch_policy_denies_anonymous_for_node_list() {
+    async fn dispatch_policy_denies_anonymous_for_api_key_list() {
         let ctx = HandlerContext {
             session: SessionAuth::Anonymous,
             correlation_id: 8,
             resume_secret: None,
             state: state::AppState::for_test(),
         };
-        let (resp, is_err) = dispatch(&MessageBody::NodeListRequest, &ctx).await;
+        let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
         assert!(is_err);
         match resp {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::PolicyDenied),

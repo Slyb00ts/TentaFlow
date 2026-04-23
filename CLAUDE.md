@@ -102,13 +102,12 @@ mlx-models (Apple MLX inference bindings)
 
 **Protocol serialization**: All QUIC messages use rkyv (zero-copy binary), not JSON. Protocol types live in `tentaflow-protocol/src/`. Two ALPN protocols: `tentaflow` (client→node) and `tentaflow-mesh` (node↔node).
 
-**build.rs does two things**: (1) compiles WASM addons from `addons/` and `addons-pro/` to `wasm32-wasip1` and embeds them via `include_bytes!`, (2) embeds `wwwroot/` static files into the binary with MIME detection. Changes to `wwwroot/` require recompilation.
+**build.rs does two things**: (1) compiles WASM addons from `addons/` and `addons-pro/` to `wasm32-wasip1` and embeds them via `include_bytes!`, (2) embeds `www/` static files into the binary with MIME detection. Changes to `www/` require recompilation.
 Bundled addon updates at startup are driven by `bundle_hash` (computed from embedded addon payload), not only by manifest `version`, so manifest-only changes propagate to the installed DB state without a forced version bump.
 
 **Mesh security layers**: TLS 1.3 (transport) → Ed25519 identity → X25519 DH key exchange → ChaCha20-Poly1305 AEAD with epoch-based key rotation (24h interval, 7-day grace period) and replay protection (sequential nonce + sliding window).
 
 **Dashboard**:
-- Stara warstwa statyczna nadal istnieje w `tentaflow-core/wwwroot/`, ale aktywnie rozwijana SPA dashboardu jest w `tentaflow-core/www/`.
 - Frontend `www/` używa vanilla JS + custom elements `tf-*` z `tentaflow-core/www/js/components/`.
 - Widok Addons (WASM) korzysta z komponentów `tf-chip`, `tf-searchbox`, `tf-toggle`, `tf-button`; układ i style modułu są trzymane w `tentaflow-core/www/css/addons.css`.
 
@@ -129,7 +128,11 @@ Bundled addon updates at startup are driven by `bundle_hash` (computed from embe
 Single source of truth dla wszystkich silników AI (LLM, TTS, STT, embeddings, vision, image-gen itd.). Każdy silnik = jeden plik TOML w `tentaflow-containers/<category>/_services/<engine_id>.toml`. Build.rs `tentaflow-core` waliduje manifesty przy `cargo build` i generuje:
 
 - Rust const w `$OUT_DIR/services_generated.rs` — statyczny rejestr używany przez `tentaflow-core/src/services/manifest/registry.rs`
-- JS module `tentaflow-core/wwwroot/js/generated/services-manifest.js` — importowany dynamicznie przez `wwwroot/js/modules/catalog/ManifestStore.js` w GUI
+- JS module `tentaflow-core/www/js/generated/services-manifest.js` — importowany dynamicznie przez `www/js/modules/catalog/manifest-store.js` w GUI
+
+## Legacy Cleanup
+- `tentaflow-core/wwwroot/` zostało usunięte; jedynym aktywnym dashboardem jest `tentaflow-core/www/`.
+- Binary protocol nie wspiera już legacy `NodeListRequest` ani `NodeInfoRequest`; GUI i backend używają ścieżki `MeshNode*`.
 
 Pełna specyfikacja: `tentaflow-containers/_schema/SCHEMA.md`. Schema JSON: `tentaflow-containers/_schema/schema.json`.
 

@@ -282,14 +282,14 @@ mod tests {
         let (sub2, mut rx2) = reg.create(200, Some(BucketTier::TenSeconds));
         assert_eq!(reg.count(), 2);
 
-        push_chunk(&sub1, MessageBody::NodeListRequest).unwrap();
+        push_chunk(&sub1, MessageBody::ModelListRequest).unwrap();
         push_chunk(&sub2, MessageBody::ModelListRequest).unwrap();
 
         let e1 = rx1.recv().await.unwrap();
         let e2 = rx2.recv().await.unwrap();
         assert!(matches!(
             e1,
-            SubscriptionEvent::Chunk(MessageBody::NodeListRequest)
+            SubscriptionEvent::Chunk(MessageBody::ModelListRequest)
         ));
         assert!(matches!(
             e2,

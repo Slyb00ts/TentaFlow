@@ -1,7 +1,7 @@
 // =============================================================================
 // File: modules/addons/tools.js
 // Description: Tools tab for addon detail. Simple 3-column table (name,
-//              description, parameters) mirroring the old wwwroot layout.
+//              description, parameters) matching the current dashboard layout.
 //              Parameters render as compact chips (name:type) colored by
 //              required/optional. Backend: AddonToolsRequest.
 // =============================================================================
