@@ -8,6 +8,7 @@ pub mod embeddings;
 pub mod manifest;
 pub mod portainer;
 pub mod rag;
+pub mod teams_bot_bootstrap;
 pub mod tts;
 
 pub use embeddings::{EmbeddingsClient, EmbeddingsEngineConfigCompat};

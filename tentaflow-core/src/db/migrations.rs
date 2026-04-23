@@ -1554,5 +1554,36 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX IF NOT EXISTS idx_apikeys_owner ON api_keys(owner_user_id);
         ",
     ),
+    (
+        52,
+        "prompts_language_and_is_system",
+        "
+            -- UNIQUE(prompt_id) -> UNIQUE(prompt_id, language) aby ten sam
+            -- prompt_id mogl wystapic w wielu jezykach. SQLite nie wspiera
+            -- DROP CONSTRAINT wiec rekreujemy tabele; wszystkie dotychczasowe
+            -- wiersze sa kasowane (task T1.2 czysci stare prompty systemowe).
+            DROP TABLE IF EXISTS prompts;
+            CREATE TABLE prompts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prompt_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                content TEXT NOT NULL,
+                prompt_type TEXT NOT NULL CHECK(prompt_type IN ('system','suffix','template','user')),
+                default_model TEXT,
+                variables TEXT,
+                cache_priority INTEGER DEFAULT 50,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                version INTEGER DEFAULT 1,
+                language TEXT NOT NULL DEFAULT 'pl',
+                is_system INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(prompt_id, language)
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompts_prompt_id ON prompts(prompt_id);
+            CREATE INDEX IF NOT EXISTS idx_prompts_language ON prompts(language);
+        ",
+    ),
 ]
 }

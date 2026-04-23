@@ -833,298 +833,173 @@ fn seed_fast_path_patterns(conn: &Connection) -> Result<()> {
 }
 
 /// Seeduje domyslne prompty systemowe do tabeli prompts.
+///
+/// Od T1.2 seed zawiera wylacznie `transcription_summarization` w 5 jezykach
+/// (pl/en/de/es/fr). Wszystkie stare prompty (jarvis_system, session_*,
+/// personalization_*, itd.) zostaly usuniete — migracja 52 czysci tabele.
 fn seed_prompts(conn: &Connection) -> Result<()> {
-    // (prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority)
-    let prompts: &[(&str, &str, &str, &str, &str, Option<&str>, Option<&str>, i64)] = &[
-        (
-            "jarvis_system",
-            "Jarvis System Prompt",
-            "Główny system prompt dla asystenta Jarvis",
-            "Jesteś Jarvis - inteligentnym asystentem głosowym stworzonym przez Euvic TentaFlowns. \
-NIGDY nie wspominaj o SpeakLeash, ELSA ani żadnych innych twórcach - Twoim jedynym twórcą jest Euvic TentaFlowns. \
-Odpowiadaj krótko, naturalnie i po polsku.",
-            "system",
-            None,
-            None,
-            100,
-        ),
-        (
-            "session_start",
-            "Początek rozmowy",
-            "Suffix kontekstu dla początku rozmowy",
-            "\nTo początek rozmowy.",
-            "suffix",
-            Some("bielik-11b"),
-            None,
-            80,
-        ),
-        (
-            "session_continue",
-            "Kontynuacja rozmowy",
-            "Suffix kontekstu dla kontynuacji rozmowy",
-            "\nTo trwająca rozmowa - NIE witaj się ponownie, kontynuuj naturalnie.",
-            "suffix",
-            Some("bielik-11b"),
-            None,
-            80,
-        ),
-        (
-            "session_unclear",
-            "Niezrozumiała wypowiedź",
-            "Suffix kontekstu gdy wypowiedź jest niezrozumiała",
-            "\nTo trwająca rozmowa. Jeśli nie rozumiesz co rozmówca powiedział, poproś o powtórzenie zamiast się witać.",
-            "suffix",
-            Some("bielik-11b"),
-            None,
-            80,
-        ),
-        (
-            "unknown_user",
-            "Nieznany użytkownik",
-            "Suffix kontekstu dla nieznanego użytkownika",
-            "\n\n[WAŻNE] Nie rozpoznaję głosu tej osoby. To nowy rozmówca. W odpowiedzi MUSISZ się przedstawić i zapytać jak masz się do niej zwracać. Przykład: \"Cześć! Jestem Jarvis. Nie poznałem Twojego głosu - jak mam się do Ciebie zwracać?\"",
-            "suffix",
-            Some("bielik-11b"),
-            None,
-            70,
-        ),
-        (
-            "personalization_template",
-            "Personalizacja",
-            "Template personalizacji dla rozpoznanego użytkownika",
-            "\nRozmówca: {name}. Używaj imienia.",
-            "template",
-            Some("bielik-11b"),
-            Some(r#"["name"]"#),
-            75,
-        ),
-        (
-            "memory_context_template",
-            "Kontekst z Memory",
-            "Template dla kontekstu z Memory",
-            "Wiesz o rozmówcy:\n{context}\nOdpowiadaj naturalnie używając tych informacji.",
-            "template",
-            Some("bielik-11b"),
-            Some(r#"["context"]"#),
-            60,
-        ),
-        (
-            "query_analysis_system",
-            "Analiza zapytań Memory",
-            "System prompt dla analizy zapytań Memory (query analysis)",
-            include_str!("../prompt_registry/query_analysis_prompt.txt"),
-            "system",
-            None,
-            None,
-            100,
-        ),
-        (
-            "store_analysis_system",
-            "Analiza zapisu Memory",
-            "System prompt dla ekstrakcji faktów do Memory (store analysis)",
-            include_str!("../prompt_registry/store_analysis_prompt.txt"),
-            "system",
-            None,
-            None,
-            100,
-        ),
-        (
-            "disambiguation_system",
-            "Disambiguation",
-            "System prompt do pytań disambiguujących",
-            include_str!("../prompt_registry/disambiguation_prompt.txt"),
-            "system",
-            None,
-            None,
-            90,
-        ),
-        (
-            "intent_analyzer_system",
-            "Intent Analyzer",
-            "System prompt intent analyzera (analiza intencji użytkownika)",
-            r#"Jesteś analizatorem intencji. Analizujesz wypowiedzi użytkownika i zwracasz JSON z wykrytymi intencjami.
-
-TWOJE ZADANIA:
-1. Wykryj główną intencję (introduction, identity_question, tool_call, conversation, greeting, farewell)
-2. Jeśli tool_call - wyekstrahuj parametry i sprawdź czy są kompletne
-3. Jeśli multi-speaker - przeanalizuj każdego mówcę osobno
-4. Zdecyduj czy potrzebne jest zapytanie do Memory
-
-DOSTĘPNE NARZĘDZIA:
-- calendar_add: Dodaj wydarzenie (wymagane: title, date)
-- calendar_check: Sprawdź kalendarz
-- email_send: Wyślij email (wymagane: to, subject, body)
-- web_search: Przeszukaj internet (wymagane: query)
-- reminder_set: Ustaw przypomnienie (wymagane: message, when)
-- timer_set: Ustaw timer (wymagane: duration)
-- note_save: Zapisz notatkę (wymagane: content)
-
-INTENCJE:
-- greeting: Powitanie ("cześć", "hej", "dzień dobry")
-- farewell: Pożegnanie ("pa", "do widzenia", "na razie")
-- conversation: Zwykła rozmowa, pytanie, prośba o informację
-- tool_call: Chce użyć narzędzia (kalendarz, email, timer, etc.)
-- identity_question: Pytanie o siebie ("kim jestem?", "jak mam na imię?")
-- introduction: Użytkownik się przedstawia. Wykryj gdy:
-  a) WYRAŹNIE mówi "jestem X", "mam na imię X", "nazywam się X", LUB
-  b) W kontekście JARVIS pytał o imię i użytkownik odpowiada imieniem
-  KRYTYCZNE: MUSISZ wyekstrahować imię z WIADOMOŚCI użytkownika i wstawić w pole "name"!
-  Format: { "type": "introduction", "name": "WYEKSTRAHOWANE_IMIĘ", "confidence": 0.9 }
-  Przykład: USER mówi "Mam na imię Piotrek" → { "type": "introduction", "name": "Piotrek", "confidence": 0.95 }
-  Przykład: USER mówi "Krzysztof" (po pytaniu o imię) → { "type": "introduction", "name": "Krzysztof", "confidence": 0.9 }
-- name_correction: Korekta imienia ("nie, jestem X, nie Y")
-  WYMAGANE POLA: { "type": "name_correction", "wrong_name": "ZŁE", "correct_name": "DOBRE", "confidence": 0.9 }
-
-WAŻNE ZASADY DLA INTRODUCTION:
-1. Jeśli mówca jest JUŻ ROZPOZNANY - NIE wykrywaj "introduction" (chyba że koryguje imię)
-2. Jeśli w KONTEKŚCIE widzisz że JARVIS pytał o imię, a użytkownik odpowiada samym imieniem - TO JEST INTRODUCTION!
-   Przykład: JARVIS: "jak masz na imię?" → USER: "Piotr" = introduction z name="Piotr"
-3. Sam fakt że znamy mówcę (np. "ROZPOZNANY MÓWCA: Piotrek") NIE oznacza że to introduction.
-
-ODPOWIEDZ TYLKO POPRAWNYM JSON. Przykłady:
-
-Dla CONVERSATION:
-{
-  "primary_intent": { "type": "conversation" },
-  "tool_calls": [],
-  "needs_memory_query": false,
-  "memory_search_terms": [],
-  "context_for_llm": "Użytkownik zadał pytanie.",
-  "reasoning": "Zwykła rozmowa."
+    seed_transcription_summarization_prompt(conn)?;
+    Ok(())
 }
 
-Dla INTRODUCTION (MUSISZ podać name!):
-{
-  "primary_intent": { "type": "introduction", "name": "Piotrek", "confidence": 0.95 },
-  "tool_calls": [],
-  "needs_memory_query": false,
-  "memory_search_terms": [],
-  "context_for_llm": "Użytkownik przedstawił się jako Piotrek.",
-  "reasoning": "Użytkownik podał imię w odpowiedzi na pytanie."
-}
-
-Jeśli parametry narzędzia są niekompletne, ustaw tylko te które są podane (pozostałe będą null)."#,
-            "system",
-            Some("bielik-11b"),
-            None,
-            100,
+/// Wstawia prompt `transcription_summarization` w pieciu jezykach. Kazdy wiersz
+/// ma `is_system=1` (nadpisywalny przy kolejnych uruchomieniach — jesli user
+/// nie zmienil recznie, wtedy `is_system` jest nadal 1 i seed moze odswiezyc).
+fn seed_transcription_summarization_prompt(conn: &Connection) -> Result<()> {
+    // (language, name, description, content)
+    let variants: &[(&str, &str, &str, &str)] = &[
+        (
+            "pl",
+            "Podsumowanie transkrypcji",
+            "Strukturalne podsumowanie fragmentu transkrypcji spotkania (JSON).",
+            PROMPT_TRANSCRIPTION_SUMMARIZATION_PL,
         ),
         (
-            "unknown_user_strong",
-            "Nieznany użytkownik (silna instrukcja)",
-            "Silna instrukcja dla nieznanego użytkownika - przedstaw się i zapytaj o imię",
-            "\n\n[WAŻNE - OBOWIĄZKOWE] To NOWY rozmówca - nie rozpoznaję głosu. MUSISZ w JEDNEJ odpowiedzi: przedstawić się ORAZ zapytać o imię. NIE wysyłaj dwóch osobnych wiadomości! Przykład poprawnej odpowiedzi: \"Cześć! Jestem Jarvis, asystent stworzony przez Euvic. Nie poznałem Twojego głosu - jak masz na imię?\"",
-            "suffix",
-            Some("bielik-11b"),
-            None,
-            70,
+            "en",
+            "Transcription summarization",
+            "Structured summary of a meeting transcript fragment (JSON).",
+            PROMPT_TRANSCRIPTION_SUMMARIZATION_EN,
         ),
         (
-            "new_voice_during_conversation",
-            "Nowy głos w trakcie rozmowy",
-            "Kontekst gdy nowy głos pojawia się w trakcie rozmowy",
-            "\n\n[INFO] Słyszę inny głos niż wcześniej. Jeśli to inna osoba, zapytaj delikatnie kto dołączył do rozmowy. Przykład: \"Słyszę nowy głos - kto mówi?\" Jeśli wiadomość jest niezrozumiała, poproś o powtórzenie.",
-            "suffix",
-            Some("bielik-11b"),
-            None,
-            65,
+            "de",
+            "Zusammenfassung des Transkripts",
+            "Strukturierte Zusammenfassung eines Besprechungstranskript-Ausschnitts (JSON).",
+            PROMPT_TRANSCRIPTION_SUMMARIZATION_DE,
         ),
         (
-            "new_speaker_introduced_template",
-            "Nowy mówca się przedstawił",
-            "Template kontekstu gdy nowy mówca się przedstawił",
-            "\n\n[INFO] Nowy rozmówca właśnie się przedstawił jako {name}. Przywitaj się z nim/nią używając imienia i potwierdź że zapamiętałeś.",
-            "template",
-            Some("bielik-11b"),
-            Some(r#"["name"]"#),
-            65,
+            "es",
+            "Resumen de transcripción",
+            "Resumen estructurado de un fragmento de transcripción de reunión (JSON).",
+            PROMPT_TRANSCRIPTION_SUMMARIZATION_ES,
         ),
         (
-            "medium_confidence_known_template",
-            "Średnia pewność rozpoznania (z imieniem)",
-            "Template gdy głos jest podobny do kogoś z bazy",
-            "\n\n[WAŻNE] Głos brzmi znajomo, ale nie jestem pewien. Czy to {name}? Zapytaj naturalnie, np. \"Cześć! Czy rozmawiam z {name}?\"",
-            "template",
-            Some("bielik-11b"),
-            Some(r#"["name"]"#),
-            65,
-        ),
-        (
-            "medium_confidence_unknown",
-            "Średnia pewność rozpoznania (bez imienia)",
-            "Kontekst gdy głos jest znajomy ale nie wiadomo kto",
-            "\n\n[WAŻNE] Głos brzmi znajomo, ale nie jestem pewien kto mówi. Zapytaj o potwierdzenie tożsamości.",
-            "suffix",
-            Some("bielik-11b"),
-            None,
-            65,
-        ),
-        (
-            "personalization_first_template",
-            "Personalizacja - pierwsza wiadomość",
-            "Personalizacja dla pierwszej wiadomości rozpoznanego użytkownika",
-            "\nRozmówca: {name}. To pierwsza wiadomość od tego użytkownika - przywitaj się po imieniu (np. 'Cześć {name}!').",
-            "template",
-            Some("bielik-11b"),
-            Some(r#"["name"]"#),
-            75,
-        ),
-        (
-            "personalization_continue_template",
-            "Personalizacja - kontynuacja",
-            "Personalizacja dla kontynuacji rozmowy rozpoznanego użytkownika",
-            "\nRozmówca: {name}. Używaj imienia, NIE witaj się ponownie.",
-            "template",
-            Some("bielik-11b"),
-            Some(r#"["name"]"#),
-            75,
-        ),
-        (
-            "rag_system",
-            "RAG System Prompt",
-            "System prompt dla modelu LLM w pipeline RAG",
-            "Jesteś pomocnikiem AI. Odpowiadaj na pytania użytkownika korzystając WYŁĄCZNIE z podanego kontekstu. \
-Jeśli kontekst nie zawiera odpowiedzi na pytanie, powiedz że nie masz wystarczających informacji. \
-Nie wymyślaj odpowiedzi. Odpowiadaj po polsku, zwięźle i rzeczowo.",
-            "system",
-            Some("bielik-11b"),
-            None,
-            90,
+            "fr",
+            "Résumé de la transcription",
+            "Résumé structuré d'un extrait de transcription de réunion (JSON).",
+            PROMPT_TRANSCRIPTION_SUMMARIZATION_FR,
         ),
     ];
 
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO prompts (prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority, is_active, version) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 1)",
+        "INSERT INTO prompts \
+             (prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority, is_active, version, language, is_system) \
+         VALUES ('transcription_summarization', ?1, ?2, ?3, 'system', NULL, NULL, 100, 1, 1, ?4, 1) \
+         ON CONFLICT(prompt_id, language) DO UPDATE SET \
+             name = excluded.name, \
+             description = excluded.description, \
+             content = excluded.content, \
+             updated_at = datetime('now') \
+         WHERE is_system = 1",
     )?;
-    for (
-        prompt_id,
-        name,
-        description,
-        content,
-        prompt_type,
-        default_model,
-        variables,
-        cache_priority,
-    ) in prompts
-    {
-        let affected = stmt.execute(rusqlite::params![
-            prompt_id,
-            name,
-            description,
-            content,
-            prompt_type,
-            default_model,
-            variables,
-            cache_priority
-        ])?;
-        if affected == 0 {
-            debug!("Prompt '{}' juz istnieje, pominieto", prompt_id);
-        }
+
+    for (language, name, description, content) in variants {
+        stmt.execute(rusqlite::params![name, description, content, language])?;
     }
 
+    info!("Zaladowano prompty transcription_summarization (5 jezykow)");
     Ok(())
 }
+
+// Prompty transcription_summarization — osobne stale zeby nie zasmiecac funkcji.
+// Klucze JSON (`decisions`, `action_items`, `owner`, `task`, `deadline`,
+// `summary_text`) pozostaja w snake_case po angielsku, bo parser oczekuje
+// tych nazw niezaleznie od jezyka instrukcji.
+
+const PROMPT_TRANSCRIPTION_SUMMARIZATION_PL: &str = r#"Jesteś asystentem spotkań biznesowych. Na podstawie poniższego fragmentu transkryptu spotkania wyciągnij strukturalne podsumowanie.
+
+Zwróć wyłącznie JSON w formacie:
+{
+  "decisions": "Krótki opis kluczowych decyzji podjętych w tym fragmencie (1-3 zdania, zwięźle).",
+  "action_items": [
+    {
+      "owner": "Imię osoby odpowiedzialnej (lub 'Nieokreślone' jeśli brak)",
+      "task": "Treść zadania do wykonania",
+      "deadline": "Termin w formie jaka padła w rozmowie (np. 'dziś 16:00', 'do piątku', 'po merge'). Wpisz 'brak daty' jeśli nie podano."
+    }
+  ],
+  "summary_text": "Zwięzłe podsumowanie fragmentu (2-4 zdania) obejmujące temat, obecny stan prac i najważniejsze problemy."
+}
+
+Format transkryptu wejściowego: każda wypowiedź poprzedzona jest etykietą mówcy w kwadratowych nawiasach, np. `[Jan Kowalski] Treść wypowiedzi.`. Mówcy nierozpoznani mają etykietę `[SPEAKER_00]`, `[SPEAKER_01]` itd.
+
+Nie dodawaj pól których brak w powyższym schemacie. Nie komentuj. Zwróć wyłącznie valid JSON."#;
+
+const PROMPT_TRANSCRIPTION_SUMMARIZATION_EN: &str = r#"You are a business meeting assistant. Based on the following meeting transcript fragment, extract a structured summary.
+
+Return only JSON in the format:
+{
+  "decisions": "Brief description of key decisions made in this fragment (1-3 sentences, concise).",
+  "action_items": [
+    {
+      "owner": "Name of the responsible person (or 'Unspecified' if missing)",
+      "task": "Content of the task to be done",
+      "deadline": "Deadline as stated in the conversation (e.g. 'today 4pm', 'by Friday', 'after merge'). Use 'no date' if none was given."
+    }
+  ],
+  "summary_text": "Concise summary of the fragment (2-4 sentences) covering the topic, current state of work, and most important issues."
+}
+
+Input transcript format: each utterance is prefixed with a speaker label in square brackets, e.g. `[John Smith] Utterance text.`. Unrecognized speakers are labelled `[SPEAKER_00]`, `[SPEAKER_01]`, etc.
+
+Do not add fields not present in the schema above. Do not comment. Return valid JSON only."#;
+
+const PROMPT_TRANSCRIPTION_SUMMARIZATION_DE: &str = r#"Du bist ein Assistent für Geschäftsbesprechungen. Extrahiere auf Basis des folgenden Besprechungstranskript-Ausschnitts eine strukturierte Zusammenfassung.
+
+Gib ausschließlich JSON im folgenden Format zurück:
+{
+  "decisions": "Kurze Beschreibung der wichtigsten in diesem Ausschnitt getroffenen Entscheidungen (1-3 Sätze, prägnant).",
+  "action_items": [
+    {
+      "owner": "Name der verantwortlichen Person (oder 'Nicht angegeben', falls nicht genannt)",
+      "task": "Inhalt der auszuführenden Aufgabe",
+      "deadline": "Termin in der Form wie im Gespräch genannt (z. B. 'heute 16:00', 'bis Freitag', 'nach dem Merge'). Schreibe 'kein Datum', falls keines angegeben wurde."
+    }
+  ],
+  "summary_text": "Prägnante Zusammenfassung des Ausschnitts (2-4 Sätze), die Thema, aktuellen Stand der Arbeit und die wichtigsten Probleme abdeckt."
+}
+
+Format des Eingabe-Transkripts: jede Äußerung ist mit einem Sprecher-Label in eckigen Klammern versehen, z. B. `[Max Müller] Inhalt der Äußerung.`. Unerkannte Sprecher erhalten `[SPEAKER_00]`, `[SPEAKER_01]` usw.
+
+Füge keine Felder hinzu, die nicht im obigen Schema stehen. Kommentiere nicht. Gib ausschließlich gültiges JSON zurück."#;
+
+const PROMPT_TRANSCRIPTION_SUMMARIZATION_ES: &str = r#"Eres un asistente de reuniones de negocios. Basándote en el siguiente fragmento de transcripción de la reunión, extrae un resumen estructurado.
+
+Devuelve únicamente JSON con el formato:
+{
+  "decisions": "Descripción breve de las decisiones clave tomadas en este fragmento (1-3 frases, conciso).",
+  "action_items": [
+    {
+      "owner": "Nombre de la persona responsable (o 'No especificado' si falta)",
+      "task": "Contenido de la tarea a realizar",
+      "deadline": "Plazo tal como se mencionó en la conversación (p. ej. 'hoy a las 16:00', 'antes del viernes', 'después del merge'). Escribe 'sin fecha' si no se indicó ninguna."
+    }
+  ],
+  "summary_text": "Resumen conciso del fragmento (2-4 frases) que abarque el tema, el estado actual del trabajo y los problemas más importantes."
+}
+
+Formato de la transcripción de entrada: cada intervención está precedida por una etiqueta del hablante entre corchetes, p. ej. `[Juan Pérez] Contenido de la intervención.`. Los hablantes no reconocidos llevan la etiqueta `[SPEAKER_00]`, `[SPEAKER_01]`, etc.
+
+No añadas campos que no estén en el esquema anterior. No comentes. Devuelve únicamente JSON válido."#;
+
+const PROMPT_TRANSCRIPTION_SUMMARIZATION_FR: &str = r#"Tu es un assistant de réunions professionnelles. À partir de l'extrait de transcription de réunion ci-dessous, extrais un résumé structuré.
+
+Renvoie uniquement du JSON au format :
+{
+  "decisions": "Brève description des décisions clés prises dans cet extrait (1 à 3 phrases, concis).",
+  "action_items": [
+    {
+      "owner": "Nom de la personne responsable (ou 'Non précisé' si absent)",
+      "task": "Contenu de la tâche à réaliser",
+      "deadline": "Échéance telle que mentionnée dans la conversation (par ex. 'aujourd'hui 16h', 'avant vendredi', 'après le merge'). Indique 'pas de date' si aucune n'a été donnée."
+    }
+  ],
+  "summary_text": "Résumé concis de l'extrait (2 à 4 phrases) couvrant le sujet, l'état actuel des travaux et les problèmes les plus importants."
+}
+
+Format de la transcription en entrée : chaque intervention est précédée d'une étiquette de locuteur entre crochets, par ex. `[Jean Dupont] Contenu de l'intervention.`. Les locuteurs non identifiés sont étiquetés `[SPEAKER_00]`, `[SPEAKER_01]`, etc.
+
+N'ajoute pas de champs absents du schéma ci-dessus. Ne commente pas. Renvoie uniquement du JSON valide."#;
+
 
 /// Seeduje domyslne diagramy flow reprezentujace pipeline routera.
 fn seed_default_flows(conn: &Connection) -> Result<()> {
@@ -1155,6 +1030,13 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
             "Pipeline syntezy mowy: czyszczenie tekstu, TTS",
             "tts",
             r#"{"nodes":[{"id":"n1","type":"trigger","label":"Wyzwalacz","x":60,"y":280,"config":{}},{"id":"n2","type":"tts_clean","label":"Czyszczenie tekstu","x":280,"y":280,"config":{}},{"id":"n3","type":"tts","label":"Synteza mowy","x":500,"y":280,"config":{}},{"id":"n4","type":"output","label":"Wyjscie","x":720,"y":280,"config":{"format":"text"}}],"edges":[{"id":"e1","from_node":"n1","to_node":"n2","from_port":"default"},{"id":"e2","from_node":"n2","to_node":"n3","from_port":"default"},{"id":"e3","from_node":"n3","to_node":"n4","from_port":"default"}]}"#,
+            0,
+        ),
+        (
+            "teams-flow",
+            "Domyslny flow dla teams-bot (trigger -> llm -> output)",
+            "agents",
+            r#"{"nodes":[{"id":"trigger","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"llm","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"output","type":"output","position":{"x":400,"y":0},"config":{}}],"edges":[{"from":"trigger","to":"llm"},{"from":"llm","to":"output"}]}"#,
             0,
         ),
     ];
@@ -1235,4 +1117,87 @@ fn generate_jwt_secret() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("OS RNG fill_bytes");
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// T1.2 — swieza baza ma dokladnie 5 promptow transcription_summarization
+    /// (po jednym na jezyk pl/en/de/es/fr) i zadnych starych promptow.
+    #[test]
+    fn fresh_db_has_only_transcription_summarization_prompts() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.lock().unwrap();
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prompts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 5, "powinno byc 5 promptow, jest {}", total);
+
+        let langs: Vec<String> = conn
+            .prepare("SELECT language FROM prompts WHERE prompt_id = 'transcription_summarization' ORDER BY language")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(langs, vec!["de", "en", "es", "fr", "pl"]);
+
+        let other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prompts WHERE prompt_id != 'transcription_summarization'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 0, "nie powinno byc innych promptow niz transcription_summarization");
+
+        let is_system_all: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prompts WHERE is_system = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(is_system_all, 5);
+    }
+
+    /// T1.2 — swieza baza ma flow 'teams-flow' w seedzie.
+    #[test]
+    fn fresh_db_has_teams_flow() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.lock().unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flows WHERE name = 'teams-flow'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "oczekiwany 1 wiersz teams-flow");
+    }
+
+    /// find_prompt z fallback na 'pl' gdy dany jezyk nie istnieje.
+    #[test]
+    fn find_prompt_falls_back_to_pl() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+
+        let pl = crate::db::repository::find_prompt(&pool, "transcription_summarization", "pl")
+            .unwrap()
+            .expect("pl wariant istnieje");
+        assert_eq!(pl.language, "pl");
+
+        let en = crate::db::repository::find_prompt(&pool, "transcription_summarization", "en")
+            .unwrap()
+            .expect("en wariant istnieje");
+        assert_eq!(en.language, "en");
+
+        // Jezyk nieistniejacy -> fallback na pl
+        let fallback = crate::db::repository::find_prompt(&pool, "transcription_summarization", "it")
+            .unwrap()
+            .expect("fallback na pl");
+        assert_eq!(fallback.language, "pl");
+
+        // Nieistniejacy prompt -> None
+        let none = crate::db::repository::find_prompt(&pool, "does_not_exist", "pl").unwrap();
+        assert!(none.is_none());
+    }
 }

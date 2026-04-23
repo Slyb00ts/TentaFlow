@@ -18,6 +18,7 @@ pub struct CreatePromptRequest {
     pub default_model: Option<String>,
     pub variables: Option<String>,
     pub cache_priority: Option<i64>,
+    pub language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -30,6 +31,7 @@ pub struct UpdatePromptRequest {
     pub variables: Option<String>,
     pub cache_priority: Option<i64>,
     pub is_active: Option<bool>,
+    pub language: Option<String>,
 }
 
 const ALLOWED_PROMPT_TYPES: &[&str] = &["system", "suffix", "template", "user"];
@@ -73,6 +75,7 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
         ));
     }
 
+    let language = req.language.as_deref().unwrap_or("pl");
     let params = NewPrompt {
         prompt_id: &req.prompt_id,
         name: &req.name,
@@ -82,6 +85,7 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
         default_model: req.default_model.as_deref(),
         variables: req.variables.as_deref(),
         cache_priority: req.cache_priority.unwrap_or(0),
+        language,
     };
 
     let id = db::repository::create_prompt(pool, &params)?;
@@ -119,6 +123,10 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
         ));
     }
 
+    let language = req
+        .language
+        .as_deref()
+        .unwrap_or(existing.as_ref().map(|p| p.language.as_str()).unwrap_or("pl"));
     let params = UpdatePrompt {
         id,
         name: &req.name,
@@ -129,6 +137,7 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
         variables: req.variables.as_deref(),
         cache_priority: req.cache_priority.unwrap_or(0),
         is_active: req.is_active.unwrap_or(true),
+        language,
     };
 
     db::repository::update_prompt(pool, &params)?;

@@ -155,11 +155,16 @@ pub async fn meeting_session_start(
         } else {
             Some(r.tts_alias.clone())
         },
-        llm_alias: if r.llm_alias.is_empty() {
+        // Wire protocol ma jedno pole llm_alias — teams-bot (T1.5) rozdziela
+        // LLM na summarization (końcowe podsumowanie) i flow (orchestrator).
+        // Póki frontend/protocol nie dodadzą flow_alias osobno, pojedynczy wire
+        // alias trafia do summarization; flow_alias używa domyślnego teams-flow.
+        summarization_alias: if r.llm_alias.is_empty() {
             None
         } else {
             Some(r.llm_alias.clone())
         },
+        flow_alias: None,
     };
     let desc = ctx
         .state
