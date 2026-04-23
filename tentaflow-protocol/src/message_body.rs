@@ -2861,6 +2861,12 @@ pub enum MessageBody {
     // ---- Meeting Bot (single-variant, req+res w inner enum) ----
     MeetingBody(MeetingPayload),
 
+    // ---- Meeting live broadcast (unsolicited push, correlation_id=0) ----
+    // Pushowany z writer task w ws_binary po każdym sukcesie
+    // `persist_meeting_event`. Filtr ownership (owner_user_id) stosowany
+    // server-side — frame wychodzi tylko do właściciela sesji.
+    MeetingLiveEventBody(crate::types::MeetingLiveEvent),
+
     // ---- Deployments (single-variant, req+res+stream w inner enum) ----
     DeploymentBody(DeploymentPayload),
 

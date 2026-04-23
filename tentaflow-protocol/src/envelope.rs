@@ -42,7 +42,11 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// v8 changes (2026-04-23):
 ///   - MeshNodeInfo rozszerzony o `connection` z aktywna sciezka i listą pathow
 ///     (p2p/relay + adresy), zeby GUI moglo pokazac realny transport mesh.
-pub const SCHEMA_VERSION: u16 = 8;
+/// v9 changes (2026-04-23):
+///   - `MessageBody::MeetingLiveEventBody(MeetingLiveEvent)` — unsolicited
+///     broadcast dashboard GUI po każdym sukcesie `persist_meeting_event`.
+///     Filtrowany server-side po owner_user_id sesji.
+pub const SCHEMA_VERSION: u16 = 9;
 
 // =============================================================================
 // Message kind discriminants

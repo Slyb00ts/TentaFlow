@@ -25,6 +25,7 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
+pub mod meeting_live_broadcast;
 pub mod system_event_broadcast;
 pub mod handlers;
 pub mod mesh_write_handlers;
@@ -408,6 +409,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "MeshPeerStatusChanged"
             }
         },
+        MessageBody::MeetingLiveEventBody(_) => "MeetingLiveEvent",
         MessageBody::MeetingBody(p) => match p {
             tentaflow_protocol::MeetingPayload::ReqSessionStart(_) => "MeetingSessionStartRequest",
             tentaflow_protocol::MeetingPayload::ResSessionStart(_) => "MeetingSessionStartResponse",

@@ -4149,6 +4149,29 @@ pub mod transcripts {
         Ok(())
     }
 
+    /// Zwraca owner_user_id sesji po meeting_key. Wynik to:
+    /// - `Ok(Some(Some(uid)))` — sesja istnieje i ma przypisanego ownera,
+    /// - `Ok(Some(None))` — sesja istnieje ale bez ownera (starsze wpisy),
+    /// - `Ok(None)` — sesja nie istnieje.
+    /// Uzywane przez live-broadcast writer task do filtrowania eventow
+    /// po ownership — bez dostepu uzytkownik nie dostaje frame'u.
+    pub fn owner_of_meeting_key(
+        pool: &DbPool,
+        meeting_key: &str,
+    ) -> Result<Option<Option<i64>>> {
+        let conn = pool.lock().unwrap();
+        let row: rusqlite::Result<Option<i64>> = conn.query_row(
+            "SELECT owner_user_id FROM meeting_sessions WHERE meeting_key = ?1",
+            rusqlite::params![meeting_key],
+            |r| r.get::<_, Option<i64>>(0),
+        );
+        match row {
+            Ok(opt) => Ok(Some(opt)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Lista sesji posortowana po last_activity_at malejaco. Opcjonalny filtr po owner_user_id.
     pub fn list_sessions(pool: &DbPool, owner_user_id: Option<i64>) -> Result<Vec<SessionRow>> {
         let conn = pool.lock().unwrap();
@@ -8593,6 +8616,38 @@ mod meeting_summary_action_items_tests {
         }
         let rows = list_summaries_for_meeting(&db, sid, 2).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn owner_of_meeting_key_returns_none_for_unknown() {
+        let db = setup_db();
+        let got = owner_of_meeting_key(&db, "missing").unwrap();
+        assert!(got.is_none(), "nieistniejaca sesja -> None");
+    }
+
+    #[test]
+    fn owner_of_meeting_key_returns_some_none_when_no_owner() {
+        let db = setup_db();
+        mk_session(&db, "ownerless");
+        let got = owner_of_meeting_key(&db, "ownerless").unwrap();
+        assert_eq!(got, Some(None), "sesja bez ownera -> Some(None)");
+    }
+
+    #[test]
+    fn owner_of_meeting_key_returns_owner_when_set() {
+        let db = setup_db();
+        let sid = mk_session(&db, "owned");
+        // Ustawiamy owner_user_id bezposrednio — testujemy tylko reader.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE meeting_sessions SET owner_user_id = 42 WHERE id = ?1",
+                rusqlite::params![sid],
+            )
+            .unwrap();
+        }
+        let got = owner_of_meeting_key(&db, "owned").unwrap();
+        assert_eq!(got, Some(Some(42)));
     }
 
     #[test]
