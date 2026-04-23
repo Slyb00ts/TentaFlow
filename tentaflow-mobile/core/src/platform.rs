@@ -84,7 +84,7 @@ pub fn init_logging() {
         use tracing_subscriber::EnvFilter;
 
         let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
+            .unwrap_or_else(|_| EnvFilter::new("info,iroh::net_report=error,iroh_relay=error,noq_proto=error,mdns_sd=off"));
 
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -98,7 +98,7 @@ pub fn init_logging() {
         use tracing_subscriber::EnvFilter;
 
         let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,tentaflow_core=debug,tentaflow_mobile=debug"));
+            .unwrap_or_else(|_| EnvFilter::new("info,tentaflow_core=debug,tentaflow_mobile=debug,iroh::net_report=error,iroh_relay=error,noq_proto=error,mdns_sd=off"));
 
         tracing_subscriber::fmt()
             .with_env_filter(filter)

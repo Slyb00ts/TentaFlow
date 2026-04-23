@@ -427,12 +427,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MeetingPayload::ResTranscriptsList(_) => {
                 "MeetingTranscriptsListResponse"
             }
-            tentaflow_protocol::MeetingPayload::ReqSummaryGenerate(_) => {
-                "MeetingSummaryGenerateRequest"
-            }
-            tentaflow_protocol::MeetingPayload::ResSummaryGenerate(_) => {
-                "MeetingSummaryGenerateResponse"
-            }
             tentaflow_protocol::MeetingPayload::ReqActiveSession(_) => {
                 "MeetingActiveSessionRequest"
             }

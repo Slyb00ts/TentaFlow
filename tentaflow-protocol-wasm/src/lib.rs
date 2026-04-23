@@ -1512,7 +1512,7 @@ use tentaflow_protocol::{
     MeetingActiveSessionRequest, MeetingPayload, MeetingSessionDetailRequest,
     MeetingSessionLeaveRequest, MeetingSessionListRequest, MeetingSessionStartRequest,
     MeetingSettingKv, MeetingSettingsGetRequest, MeetingSettingsUpdateRequest,
-    MeetingSummaryGenerateRequest, MeetingTranscriptsListRequest,
+    MeetingTranscriptsListRequest,
 };
 
 #[wasm_bindgen(js_name = encodeMeetingSessionStartRequest)]
@@ -1580,20 +1580,6 @@ pub fn encode_meeting_transcripts_list(
         MeetingTranscriptsListRequest {
             session_id: session_id as i64,
             since_ms: since_ms as i64,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-#[wasm_bindgen(js_name = encodeMeetingSummaryGenerateRequest)]
-pub fn encode_meeting_summary_generate(
-    session_id: f64,
-    force_refresh: bool,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSummaryGenerate(
-        MeetingSummaryGenerateRequest {
-            session_id: session_id as i64,
-            force_refresh,
         },
     )))
     .map_err(|e| JsError::new(&e))
@@ -4098,12 +4084,6 @@ fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPay
                 arr.push(&meeting_entry_to_js(e).into());
             }
             set(obj, "transcripts", arr.into());
-            set(obj, "summaryTldr", r.summary_tldr.into());
-            set(obj, "summaryDecisions", r.summary_decisions.into());
-            set(obj, "summaryActionItemsJson", r.summary_action_items_json.into());
-            set(obj, "summaryOpenQuestions", r.summary_open_questions.into());
-            set(obj, "summaryModel", r.summary_model.into());
-            set(obj, "summaryGeneratedAt", r.summary_generated_at.into());
         }
         MP::ReqTranscriptsList(_) => set(obj, "variant", "MeetingTranscriptsListRequest".into()),
         MP::ResTranscriptsList(r) => {
@@ -4113,17 +4093,6 @@ fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPay
                 arr.push(&meeting_entry_to_js(e).into());
             }
             set(obj, "entries", arr.into());
-        }
-        MP::ReqSummaryGenerate(_) => set(obj, "variant", "MeetingSummaryGenerateRequest".into()),
-        MP::ResSummaryGenerate(r) => {
-            set(obj, "variant", "MeetingSummaryGenerateResponse".into());
-            let s = r.summary;
-            set(obj, "tldr", s.tldr.into());
-            set(obj, "decisions", s.decisions.into());
-            set(obj, "actionItemsJson", s.action_items_json.into());
-            set(obj, "openQuestions", s.open_questions.into());
-            set(obj, "model", s.model.into());
-            set(obj, "generatedAt", s.generated_at.into());
         }
         MP::ReqActiveSession(_) => set(obj, "variant", "MeetingActiveSessionRequest".into()),
         MP::ResActiveSession(r) => {
