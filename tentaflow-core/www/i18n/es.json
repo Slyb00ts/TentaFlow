@@ -1537,7 +1537,22 @@
     "col_description": "Descripción",
     "sub_active": "{n} activos",
     "sub_inactive": "{n} inactivos",
-    "sub_admin": "{n} admin"
+    "sub_admin": "{n} admin",
+    "back": "Volver",
+    "tab_profile": "Perfil",
+    "tab_memberships": "Miembro de",
+    "stat_status": "Estado",
+    "stat_source": "Origen",
+    "stat_groups": "Grupos",
+    "stat_last_login": "Último acceso",
+    "field_status": "Estado de la cuenta",
+    "status_active_desc": "Activo — puede iniciar sesión y usar la app",
+    "status_disabled_desc": "Bloqueado — existe pero no puede iniciar sesión",
+    "save_changes": "Guardar cambios",
+    "delete_account": "Eliminar cuenta",
+    "delete_group": "Eliminar grupo",
+    "group_label": "Grupo",
+    "perms_user_todo": "Permisos de usuario (override sobre grupos) — próxima versión."
   },
   "groups": {
     "title": "Grupos",
