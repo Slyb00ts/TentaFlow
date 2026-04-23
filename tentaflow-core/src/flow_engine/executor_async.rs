@@ -13,14 +13,12 @@ use crate::db::repository;
 use crate::db::DbPool;
 use anyhow::{bail, Result};
 use chrono::Utc;
-use regex::RegexBuilder;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 const MAX_FLOW_NODES: usize = 256;
 const MAX_FLOW_EDGES: usize = 1024;
-const REGEX_SIZE_LIMIT: usize = 1_000_000;
 
 /// Asynchroniczny executor flow DAG z prawdziwymi adapterami serwisow
 pub struct FlowExecutorAsync {
@@ -532,11 +530,7 @@ impl FlowExecutorAsync {
     /// Wezel trigger - punkt wejscia flow
     fn execute_trigger(&self, node: &FlowNode, context: &FlowContext) -> Result<serde_json::Value> {
         debug!(node_id = %node.id, "Trigger: rozpoczecie flow");
-        Ok(serde_json::json!({
-            "input": context.input,
-            "model": context.model,
-            "request_id": context.request_id,
-        }))
+        Ok(super::adapters::trigger::build_trigger_output(context))
     }
 
     /// Wezel przekazujacy dane (output, router) - roznia sie tylko typem wyniku
@@ -546,12 +540,10 @@ impl FlowExecutorAsync {
         context: &FlowContext,
         type_name: &str,
     ) -> Result<serde_json::Value> {
-        let text = self.resolve_input_text(node, context);
         debug!(node_id = %node.id, type_name = type_name, "Passthrough: przekazanie danych");
-        Ok(serde_json::json!({
-            "type": type_name,
-            "text": text,
-        }))
+        Ok(super::adapters::output::build_passthrough_output(
+            node, context, type_name,
+        ))
     }
 
     /// Condition/Switch - ewaluuje warunek i zwraca wynik
@@ -560,39 +552,10 @@ impl FlowExecutorAsync {
         node: &FlowNode,
         context: &FlowContext,
     ) -> Result<serde_json::Value> {
-        let field = node
-            .config
-            .get("field")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let operator = node
-            .config
-            .get("operator")
-            .and_then(|v| v.as_str())
-            .unwrap_or("equals");
-        let expected = node
-            .config
-            .get("value")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-
-        let actual = self.resolve_field_value(field, context);
-        let result = evaluate_condition(&actual, operator, &expected);
-
-        debug!(
-            node_id = %node.id,
-            field = field,
-            operator = operator,
-            result = result,
-            "Condition: ewaluacja warunku"
-        );
-
-        Ok(serde_json::json!({
-            "type": "condition_result",
-            "field": field,
-            "operator": operator,
-            "result": result,
-        }))
+        debug!(node_id = %node.id, "Condition: ewaluacja warunku");
+        Ok(super::adapters::condition::build_condition_output(
+            node, context,
+        ))
     }
 
     /// Template - formatowanie tekstu z podstawianiem zmiennych
@@ -630,138 +593,22 @@ impl FlowExecutorAsync {
         }))
     }
 
-    /// PII Filter - pobiera aktywne reguly z DB i aplikuje regex na tekscie
+    /// PII Filter - deleguje do adapters::pii_filter::apply_pii_filter.
     async fn execute_pii_filter(
         &self,
         node: &FlowNode,
         context: &mut FlowContext,
     ) -> Result<serde_json::Value> {
-        let db_clone = self.db.clone();
-        let rules =
-            tokio::task::spawn_blocking(move || repository::list_pii_rules_active(&db_clone))
-                .await??;
-        let mut text = self.resolve_input_text(node, context);
-
-        for rule in &rules {
-            match RegexBuilder::new(&rule.pattern)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .build()
-            {
-                Ok(re) => {
-                    let replaced = re.replace_all(&text, rule.replacement.as_str());
-                    // Cow::Borrowed = brak dopasowania, Cow::Owned = tekst zmieniony
-                    if let std::borrow::Cow::Owned(new_text) = replaced {
-                        text = new_text;
-                        debug!(
-                            rule_name = %rule.name,
-                            category = %rule.category,
-                            "PII filter: zastosowano regule"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        rule_id = rule.id,
-                        rule_name = %rule.name,
-                        pattern = %rule.pattern,
-                        error = %e,
-                        "PII filter: niepoprawny regex w regule"
-                    );
-                }
-            }
-        }
-
-        // Przefiltruj ostatnia wiadomosc user w ctx.messages (przed move do context.input)
-        if !context.messages.is_empty() {
-            if let Some(last_user_idx) = context
-                .messages
-                .iter()
-                .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            {
-                context.messages[last_user_idx] = serde_json::json!({
-                    "role": "user",
-                    "content": &text,
-                });
-            }
-        }
-
-        // Zaktualizuj kontekst na przefiltrowany tekst
-        context.input = text.clone();
-
-        debug!(
-            node_id = %node.id,
-            rules_count = rules.len(),
-            "PII filter: przefiltrowano tekst"
-        );
-
-        Ok(serde_json::json!({
-            "type": "pii_filtered",
-            "text": text,
-            "rules_applied": rules.len(),
-        }))
+        super::adapters::pii_filter::apply_pii_filter(&self.db, node, context).await
     }
 
-    /// TTS Clean - pobiera aktywne reguly czyszczenia z DB i aplikuje na tekscie
+    /// TTS Clean - deleguje do adapters::tts_clean::apply_tts_clean.
     async fn execute_tts_clean(
         &self,
         node: &FlowNode,
         context: &FlowContext,
     ) -> Result<serde_json::Value> {
-        let db_clone = self.db.clone();
-        let rules = tokio::task::spawn_blocking(move || {
-            repository::list_tts_cleaning_rules_active(&db_clone)
-        })
-        .await??;
-        let mut text = self.resolve_input_text(node, context);
-
-        for rule in &rules {
-            match rule.rule_type.as_str() {
-                "abbreviation" => {
-                    if let Some(ref replacement) = rule.replacement {
-                        text = text.replace(&rule.pattern, replacement);
-                    }
-                }
-                "regex_remove" | "emoji_range" => {
-                    match RegexBuilder::new(&rule.pattern)
-                        .size_limit(REGEX_SIZE_LIMIT)
-                        .build()
-                    {
-                        Ok(re) => {
-                            let replacement = rule.replacement.as_deref().unwrap_or("");
-                            text = re.replace_all(&text, replacement).to_string();
-                        }
-                        Err(e) => {
-                            warn!(
-                                rule_id = rule.id,
-                                pattern = %rule.pattern,
-                                error = %e,
-                                "TTS clean: niepoprawny regex"
-                            );
-                        }
-                    }
-                }
-                "phonetic" => {
-                    if let Some(ref replacement) = rule.replacement {
-                        text = text.replace(&rule.pattern, replacement);
-                    }
-                }
-                other => {
-                    debug!(rule_type = other, "TTS clean: nieznany typ reguly");
-                }
-            }
-        }
-
-        debug!(
-            node_id = %node.id,
-            rules_count = rules.len(),
-            "TTS clean: wyczyszczono tekst"
-        );
-
-        Ok(serde_json::json!({
-            "type": "tts_cleaned",
-            "text": text,
-            "rules_applied": rules.len(),
-        }))
+        super::adapters::tts_clean::apply_tts_clean(&self.db, node, context).await
     }
 
     /// Ewaluuje warunki na krawedziach wychodzacych z wezla condition/switch.
@@ -812,62 +659,6 @@ impl FlowExecutorAsync {
         }
     }
 
-    /// Pobiera tekst wejsciowy dla wezla - szuka wstecz w execution_log
-    /// az znajdzie node z polem "text" (pomija condition, side-effect nody)
-    fn resolve_input_text(&self, node: &FlowNode, context: &FlowContext) -> String {
-        if let Some(input_from) = node.config.get("input_from").and_then(|v| v.as_str()) {
-            if let Some(prev_result) = context.node_results.get(input_from) {
-                if let Some(text) = prev_result.get("text").and_then(|v| v.as_str()) {
-                    return text.to_string();
-                }
-                return prev_result.to_string();
-            }
-        }
-
-        for step in context.execution_log.iter().rev() {
-            if let Some(prev_result) = context.node_results.get(&step.node_id) {
-                if let Some(text) = prev_result.get("text").and_then(|v| v.as_str()) {
-                    return text.to_string();
-                }
-            }
-        }
-
-        context.input.clone()
-    }
-
-    /// Pobiera wartosc pola z kontekstu - wspiera auto-resolve z predecessora
-    /// i zagniezdzona notacje kropkowa (np. "tokens.prompt")
-    fn resolve_field_value(&self, field: &str, context: &FlowContext) -> serde_json::Value {
-        if field == "input" {
-            return serde_json::Value::String(context.input.clone());
-        }
-        if field == "model" {
-            return serde_json::Value::String(context.model.clone());
-        }
-
-        if let Some(val) = context.variables.get(field) {
-            return val.clone();
-        }
-
-        // Backward compat: jawne node_id.pole (np. "n6.should_query")
-        if let Some((prefix, rest)) = field.split_once('.') {
-            if context.node_results.contains_key(prefix) {
-                return resolve_json_path(context.node_results.get(prefix).unwrap(), rest);
-            }
-        }
-
-        // Auto-resolve: szukaj pola w outputach wezlow wstecz
-        for step in context.execution_log.iter().rev() {
-            if let Some(result) = context.node_results.get(&step.node_id) {
-                let resolved = resolve_json_path(result, field);
-                if !resolved.is_null() {
-                    return resolved;
-                }
-            }
-        }
-
-        serde_json::Value::Null
-    }
 }
 
 /// Czy dany typ node'a jest pass-through na stream path — executor w S4b
@@ -880,18 +671,6 @@ fn is_stream_passthrough(node_type: &str) -> bool {
     )
 }
 
-/// Rozwiazuje sciezke JSON z notacja kropkowa (np. "tokens.prompt")
-fn resolve_json_path(value: &serde_json::Value, path: &str) -> serde_json::Value {
-    let mut current = value;
-    for key in path.split('.') {
-        match current.get(key) {
-            Some(v) => current = v,
-            None => return serde_json::Value::Null,
-        }
-    }
-    current.clone()
-}
-
 /// Bezpiecznie obcina string do zadanej liczby znakow (nie bajtow).
 /// Unika panicu na wielobajtowych znakach UTF-8.
 fn truncate_utf8(s: &str, max_chars: usize) -> String {
@@ -901,70 +680,10 @@ fn truncate_utf8(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Ewaluuje prosty warunek porownania
-fn evaluate_condition(
-    actual: &serde_json::Value,
-    operator: &str,
-    expected: &serde_json::Value,
-) -> bool {
-    match operator {
-        "equals" | "eq" | "==" => actual == expected,
-        "not_equals" | "neq" | "!=" => actual != expected,
-        "contains" => {
-            if let (Some(haystack), Some(needle)) = (actual.as_str(), expected.as_str()) {
-                haystack.contains(needle)
-            } else {
-                false
-            }
-        }
-        "not_contains" => {
-            if let (Some(haystack), Some(needle)) = (actual.as_str(), expected.as_str()) {
-                !haystack.contains(needle)
-            } else {
-                true
-            }
-        }
-        "gt" | ">" => compare_numbers(actual, expected, |a, b| a > b),
-        "gte" | ">=" => compare_numbers(actual, expected, |a, b| a >= b),
-        "lt" | "<" => compare_numbers(actual, expected, |a, b| a < b),
-        "lte" | "<=" => compare_numbers(actual, expected, |a, b| a <= b),
-        "exists" => !actual.is_null(),
-        "not_exists" => actual.is_null(),
-        "is_empty" => {
-            actual.is_null()
-                || actual.as_str().map_or(false, |s| s.is_empty())
-                || actual.as_array().map_or(false, |a| a.is_empty())
-        }
-        "is_not_empty" => {
-            !actual.is_null()
-                && !actual.as_str().map_or(false, |s| s.is_empty())
-                && !actual.as_array().map_or(false, |a| a.is_empty())
-        }
-        _ => {
-            warn!(operator = operator, "Nieznany operator warunku");
-            false
-        }
-    }
-}
-
-/// Porownuje dwie wartosci JSON jako liczby
-fn compare_numbers(
-    a: &serde_json::Value,
-    b: &serde_json::Value,
-    cmp: fn(f64, f64) -> bool,
-) -> bool {
-    let a_num = a.as_f64().or_else(|| a.as_i64().map(|i| i as f64));
-    let b_num = b.as_f64().or_else(|| b.as_i64().map(|i| i as f64));
-
-    match (a_num, b_num) {
-        (Some(av), Some(bv)) => cmp(av, bv),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_engine::adapters::condition::{compare_numbers, evaluate_condition};
     use crate::flow_engine::adapters::{AdapterRegistry, NodeAdapter};
     use crate::flow_engine::types::{FlowContext, FlowDefinition, FlowEdge, FlowNode};
     use std::sync::Arc;
