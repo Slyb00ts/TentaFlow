@@ -489,19 +489,19 @@ impl IrohMeshManager {
         self.connections.write().await.clear();
     }
 
-    /// Laczy sie z peerem po hex-enkodowanym EndpointId. Drugi argument (stary
-    /// `SocketAddr`) jest zachowany dla compat z QuicMeshManager ale ignorowany
-    /// — iroh discovery sam rozwiazuje adres.
+    /// Laczy sie z peerem po hex-enkodowanym EndpointId. Gdy caller poda
+    /// konkretny `SocketAddr`, dolaczamy go do EndpointAddr jako fallback dla
+    /// recznego diala po adresie z peer_store. To pozwala na pairing po samym
+    /// hash ID nawet wtedy, gdy iroh discovery jeszcze nie zna adresu peera.
     pub async fn connect_to_peer(
         &self,
         node_id_hex: &str,
-        _addr: std::net::SocketAddr,
+        addr: std::net::SocketAddr,
     ) -> Result<()> {
         if self.is_connected(node_id_hex).await {
             return Ok(());
         }
-        let endpoint_id = parse_endpoint_id(node_id_hex)?;
-        let addr = EndpointAddr::new(endpoint_id);
+        let addr = endpoint_addr_from_target(node_id_hex, Some(addr))?;
         let connection = self
             .endpoint
             .connect(addr, ALPN_MESH)
@@ -1161,9 +1161,54 @@ fn parse_endpoint_id(hex_str: &str) -> Result<EndpointId> {
     EndpointId::from_bytes(&arr).map_err(|e| anyhow::anyhow!("EndpointId: {e}"))
 }
 
+fn endpoint_addr_from_target(
+    node_id_hex: &str,
+    addr: Option<std::net::SocketAddr>,
+) -> Result<EndpointAddr> {
+    let endpoint_id = parse_endpoint_id(node_id_hex)?;
+    let endpoint_addr = EndpointAddr::new(endpoint_id);
+    Ok(match addr {
+        Some(addr) if addr.port() != 0 && !addr.ip().is_unspecified() => {
+            endpoint_addr.with_ip_addr(addr)
+        }
+        _ => endpoint_addr,
+    })
+}
+
 fn hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|s| s.into_string().ok())
         .unwrap_or_else(|| "unknown-host".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_addr_from_target;
+
+    #[test]
+    fn endpoint_addr_uses_manual_ip_when_provided() {
+        let addr = endpoint_addr_from_target(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            Some("192.168.1.10:7777".parse().unwrap()),
+        )
+        .unwrap();
+        let ips: Vec<_> = addr.ip_addrs().copied().collect();
+        assert_eq!(
+            ips,
+            vec!["192.168.1.10:7777"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()]
+        );
+    }
+
+    #[test]
+    fn endpoint_addr_ignores_unspecified_manual_addr() {
+        let addr = endpoint_addr_from_target(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            Some("0.0.0.0:0".parse().unwrap()),
+        )
+        .unwrap();
+        assert!(addr.ip_addrs().next().is_none());
+    }
 }

@@ -20,7 +20,7 @@ fn main() {
     generate_services_manifest(&out_dir_env);
 
     // Zbuduj tentaflow-protocol-wasm (Envelope + MessageBody codec dla browsera)
-    // i wygeneruj wasm-bindgen JS glue do wwwroot/js/protocol/.
+    // i wygeneruj wasm-bindgen JS glue do www/js/protocol/.
     // MUSI byc przed generate_wwwroot_embed zeby wynikowe pliki trafily do embed.
     build_protocol_wasm_bindings();
 
@@ -422,13 +422,10 @@ fn escape_path(path: &Path) -> String {
 /// Skanuje www/ rekurencyjnie i generuje wwwroot_embed.rs z include_bytes!
 /// dla kazdego pliku. Rejestruje rerun-if-changed na kazdym pliku zeby cargo
 /// automatycznie rekompilowalo po zmianie jakiegokolwiek zasobu www.
-///
-/// UWAGA: zmieniono z wwwroot/ na www/ (2026-04-18) — wwwroot/ zostawiony
-/// na dysku jako referencja starego GUI ale NIE jest embedowany w binarce.
 fn generate_wwwroot_embed(out_dir: &Path) {
     let wwwroot = Path::new("www");
     if !wwwroot.exists() {
-        // Brak wwwroot — generuj pusta funkcje lookup
+        // Brak www — generuj pusta funkcje lookup
         let code =
             "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8])> { None }\n";
         std::fs::write(out_dir.join("wwwroot_embed.rs"), code).unwrap();
@@ -479,7 +476,7 @@ fn generate_wwwroot_embed(out_dir: &Path) {
     std::fs::write(out_dir.join("wwwroot_embed.rs"), code).unwrap();
 }
 
-/// Rekurencyjnie zbiera pliki z katalogu wwwroot
+/// Rekurencyjnie zbiera pliki z katalogu www.
 fn collect_wwwroot_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -992,7 +989,7 @@ fn generate_services_manifest(out_dir: &Path) {
 
     write_generated(out_dir, &json_compact);
 
-    // GUI module — zapisujemy do wwwroot, ale podajemy sciezke wzgledem build.rs CWD.
+    // GUI module — zapisujemy do www, ale podajemy sciezke wzgledem build.rs CWD.
     let js_path = Path::new("www/js/generated/services-manifest.js");
     if let Some(parent) = js_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -1081,7 +1078,7 @@ fn chrono_now_iso() -> String {
 
 /// Buduje crate tentaflow-protocol-wasm do targetu wasm32-unknown-unknown,
 /// pozniej wola wasm-bindgen CLI zeby wygenerowac JS glue (target=web) do
-/// wwwroot/js/protocol/. Generowane pliki (wasm_glue.js + wasm_glue_bg.wasm)
+/// www/js/protocol/. Generowane pliki (wasm_glue.js + wasm_glue_bg.wasm)
 /// sa pozniej embedowane do binarki przez generate_wwwroot_embed.
 ///
 /// Non-blocking: brak wasm32-unknown-unknown targetu lub brak wasm-bindgen
@@ -1178,7 +1175,7 @@ fn build_protocol_wasm_bindings() {
         return;
     }
 
-    // 2) wasm-bindgen --target web --out-dir wwwroot/js/protocol --out-name wasm_glue
+    // 2) wasm-bindgen --target web --out-dir www/js/protocol --out-name wasm_glue
     std::fs::create_dir_all(out_js_dir).ok();
     let status = Command::new("wasm-bindgen")
         .args(["--target", "web", "--out-dir"])

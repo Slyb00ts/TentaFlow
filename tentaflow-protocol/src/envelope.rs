@@ -25,7 +25,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Resume tokens now bind to originating_user_id (P0 fix)
 /// v4 changes (2026-04-18):
 ///   - ServiceSummary rozszerzony o name/service_type/strategy/config_json/
-///     node_id/node_hostname/created_at (migracja funkcjonalnosci wwwroot)
+///     node_id/node_hostname/created_at (migracja funkcjonalnosci starego dashboardu)
 ///   - Nowe wiadomosci ServiceCreateRequest/Response, ServiceUpdateRequest/Response
 ///   - Nowe wiadomosci ServiceQuicStatusRequest/Response do monitorowania QUIC
 /// v5 changes (2026-04-18): BREAKING — brak backward compat z nodami na v4
@@ -39,7 +39,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Custom AEAD/replay/rotation usunieta z `mesh/security.rs` — bezpieczenstwo
 ///     transportu zapewnia iroh TLS. Zostaje Ed25519 identity, trusted_keys,
 ///     PIN pairing + X25519 pin-proof derywacja, TrustRevoked broadcast.
-pub const SCHEMA_VERSION: u16 = 6;
+pub const SCHEMA_VERSION: u16 = 7;
 
 // =============================================================================
 // Message kind discriminants

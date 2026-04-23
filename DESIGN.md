@@ -2,7 +2,7 @@
 
 Single source of truth dla wszystkich design decisions. Każdy nowy UI touchpoint **MUSI** używać tych tokens — zero hardcoded hex colors, zero magic numbers.
 
-**Source:** extracted z `tentaflow-core/wwwroot/css/variables.css` + `components.css` + patterns z v3 mockups (`~/.gstack/projects/Slyb00ts-TentaFlow/designs/wireframes-20260417/`).
+**Source:** extracted z `tentaflow-core/www/css/variables.css` + `components.css` + patterns z v3 mockups (`~/.gstack/projects/Slyb00ts-TentaFlow/designs/wireframes-20260417/`).
 
 **Last updated:** 2026-04-17 · Week 0 Lane C deliverable (Task #23)
 
@@ -302,7 +302,7 @@ Color: default accent, `.hot` class triggers warning color gdy >85%.
 
 ### 9.8 Sparkline (inline mini-chart)
 
-Reuse istniejący `wwwroot/js/modules/mesh/SparklineChart.js`. SVG inline, 60×20px typical. Używaj dla time-series w stat cards (tokens/s over last 60s, requests per minute).
+Reuse istniejący `www/js/modules/mesh/sparkline-chart.js`. SVG inline, 60×20px typical. Używaj dla time-series w stat cards (tokens/s over last 60s, requests per minute).
 
 ### 9.9 Empty states
 
@@ -362,7 +362,7 @@ Usage:
 
 ### 10.4 Rule: NEVER emoji w UI
 
-Commit 18ccfce explicite replaced emoji z SVG. User-stated HARD RULE w learnings. Grep CI gate: reject emoji characters w wwwroot/**/*.{html,js} poza i18n string values.
+Commit 18ccfce explicite replaced emoji z SVG. User-stated HARD RULE w learnings. Grep CI gate: reject emoji characters w www/**/*.{html,js} poza i18n string values.
 
 ---
 
@@ -490,13 +490,13 @@ Feature-preservation details: `FEATURES-TO-PRESERVE.md` w tym samym folderze.
 ## 15. Maintenance
 
 **Source of truth hierarchy:**
-1. `wwwroot/css/variables.css` — authoritative token values
+1. `www/css/variables.css` — authoritative token values
 2. Ten dokument — documentation + patterns + rules
 3. Mockupy — visual reference
 
 **Gdy dodajesz nowy token:** edytuj `variables.css` FIRST, potem update tego dokumentu. Nigdy duplikuj wartości w ten dokument bez referencji.
 
-**Gdy dodajesz nowy komponent:** pisz w `wwwroot/css/components.css` używając istniejących tokens. Sekcję patterns w tym docu update if pattern is reusable.
+**Gdy dodajesz nowy komponent:** pisz w `www/css/components.css` używając istniejących tokens. Sekcję patterns w tym docu update if pattern is reusable.
 
 **CI gates associated:**
 - Grep reject: hardcoded hex colors poza `variables.css`

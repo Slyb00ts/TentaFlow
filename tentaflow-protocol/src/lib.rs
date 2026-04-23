@@ -58,7 +58,7 @@ pub use message_body::{
     MeshServicesEntry, MeshServicesListResponse, MeshTrustRetrustRequest,
     MeshTrustRetrustResponse, MeshTrustRevokeRequest, MeshTrustRevokeResponse,
     MeshTrustRevokedEvent, MeshTrustedKeysSyncEvent, MeshTrustedListResponse, MeshTrustedNode,
-    MessageBody, ModelDetail, ModelInstallRequest, ModelSummary, NodeSummary, PiiRule,
+    MessageBody, ModelDetail, ModelInstallRequest, ModelSummary, PiiRule,
     PromptDetail, PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
     ServiceCreateRequest, ServiceDeployProgress, ServiceDeployRequest, ServiceQuicStatus,
     ServiceSummary, ServiceUpdateRequest, SettingEntry, SettingsUpdateRequest,
