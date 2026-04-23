@@ -1104,6 +1104,36 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MeetingSummariesListRequest { meeting_key, limit? } — lista najnowszych podsumowan. */
+  meetingSummariesListRequest(correlationId, { meetingKey, limit } = {}, sequence = 1) {
+    assertReady();
+    const lim = limit == null ? undefined : Number(limit);
+    const body = _wasm.encodeMeetingSummariesListRequest(String(meetingKey ?? ''), lim);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MeetingActionItemsListRequest { meeting_key, status_filter? } */
+  meetingActionItemsListRequest(correlationId, { meetingKey, statusFilter } = {}, sequence = 1) {
+    assertReady();
+    const sf = statusFilter == null || statusFilter === '' ? undefined : String(statusFilter);
+    const body = _wasm.encodeMeetingActionItemsListRequest(String(meetingKey ?? ''), sf);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MeetingActionItemStatusUpdateRequest { item_id, status } */
+  meetingActionItemStatusUpdateRequest(correlationId, { itemId, status } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingActionItemStatusUpdateRequest(Number(itemId), String(status ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MeetingTranscriptExportRequest { meeting_key } — zwraca plain text w polu content. */
+  meetingTranscriptExportRequest(correlationId, { meetingKey } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeetingTranscriptExportRequest(String(meetingKey ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   // -------------------------------------------------------------------------
   // Registries
   // -------------------------------------------------------------------------

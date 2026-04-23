@@ -1509,9 +1509,11 @@ pub fn encode_note_delete_request(note_id: f64) -> Result<Vec<u8>, JsError> {
 // --- Meeting Bot ----------------------------------------------------------
 
 use tentaflow_protocol::{
+    MeetingActionItemStatusUpdateRequest, MeetingActionItemsListRequest,
     MeetingActiveSessionRequest, MeetingPayload, MeetingSessionDetailRequest,
     MeetingSessionLeaveRequest, MeetingSessionListRequest, MeetingSessionStartRequest,
     MeetingSettingKv, MeetingSettingsGetRequest, MeetingSettingsUpdateRequest,
+    MeetingSummariesListRequest, MeetingTranscriptExportRequest,
     MeetingTranscriptsListRequest,
 };
 
@@ -1625,6 +1627,53 @@ pub fn encode_meeting_settings_update(settings: JsValue) -> Result<Vec<u8>, JsEr
     }
     encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSettingsUpdate(
         MeetingSettingsUpdateRequest { settings: kvs },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingSummariesListRequest)]
+pub fn encode_meeting_summaries_list(
+    meeting_key: String,
+    limit: Option<u32>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqSummariesList(
+        MeetingSummariesListRequest { meeting_key, limit },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingActionItemsListRequest)]
+pub fn encode_meeting_action_items_list(
+    meeting_key: String,
+    status_filter: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqActionItemsList(
+        MeetingActionItemsListRequest {
+            meeting_key,
+            status_filter,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingActionItemStatusUpdateRequest)]
+pub fn encode_meeting_action_item_status_update(
+    item_id: f64,
+    status: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(
+        MeetingPayload::ReqActionItemStatusUpdate(MeetingActionItemStatusUpdateRequest {
+            item_id: item_id as i64,
+            status,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMeetingTranscriptExportRequest)]
+pub fn encode_meeting_transcript_export(meeting_key: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeetingBody(MeetingPayload::ReqTranscriptExport(
+        MeetingTranscriptExportRequest { meeting_key },
     )))
     .map_err(|e| JsError::new(&e))
 }
@@ -3899,6 +3948,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MeetingBody(p) => {
             meeting_payload_to_js(&obj, p);
         }
+        MessageBody::MeetingLiveEventBody(event) => {
+            set(&obj, "variant", "MeetingLiveEventBody".into());
+            set(&obj, "meetingKey", event.meeting_key.clone().into());
+            set(&obj, "timestampMs", (event.timestamp_ms as f64).into());
+            let payload = js_sys::Object::new();
+            meeting_event_payload_to_js(&payload, event.payload);
+            set(&obj, "payload", payload.into());
+        }
     }
     Ok(obj.into())
 }
@@ -4117,7 +4174,166 @@ fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPay
             set(obj, "variant", "MeetingSettingsUpdateResponse".into());
             set(obj, "ok", r.ok.into());
         }
+        MP::ReqSummariesList(_) => set(obj, "variant", "MeetingSummariesListRequest".into()),
+        MP::ResSummariesList(r) => {
+            set(obj, "variant", "MeetingSummariesListResponse".into());
+            let arr = js_sys::Array::new();
+            for s in r.items {
+                arr.push(&meeting_summary_to_js(s).into());
+            }
+            set(obj, "items", arr.into());
+        }
+        MP::ReqActionItemsList(_) => set(obj, "variant", "MeetingActionItemsListRequest".into()),
+        MP::ResActionItemsList(r) => {
+            set(obj, "variant", "MeetingActionItemsListResponse".into());
+            let arr = js_sys::Array::new();
+            for a in r.items {
+                arr.push(&meeting_action_item_to_js(a).into());
+            }
+            set(obj, "items", arr.into());
+        }
+        MP::ReqActionItemStatusUpdate(_) => {
+            set(obj, "variant", "MeetingActionItemStatusUpdateRequest".into())
+        }
+        MP::ResActionItemStatusUpdate(r) => {
+            set(obj, "variant", "MeetingActionItemStatusUpdateResponse".into());
+            set(obj, "success", r.success.into());
+        }
+        MP::ReqTranscriptExport(_) => {
+            set(obj, "variant", "MeetingTranscriptExportRequest".into())
+        }
+        MP::ResTranscriptExport(r) => {
+            set(obj, "variant", "MeetingTranscriptExportResponse".into());
+            set(obj, "content", r.content.into());
+        }
     }
+}
+
+fn meeting_summary_to_js(s: tentaflow_protocol::MeetingSummaryItem) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "id", (s.id as f64).into());
+    set(&o, "createdAt", s.created_at.into());
+    set(&o, "decisionsText", s.decisions_text.into());
+    set(&o, "summaryText", s.summary_text.into());
+    set(&o, "model", s.model.into());
+    o
+}
+
+fn meeting_action_item_to_js(a: tentaflow_protocol::MeetingActionItemItem) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "id", (a.id as f64).into());
+    set(&o, "owner", a.owner.into());
+    set(&o, "task", a.task.into());
+    if let Some(d) = a.deadline {
+        set(&o, "deadline", d.into());
+    }
+    set(&o, "status", a.status.into());
+    set(&o, "createdAt", a.created_at.into());
+    set(&o, "updatedAt", a.updated_at.into());
+    o
+}
+
+/// Tlumaczy `MeetingEventPayload` na JS object. Pole `type` zawiera nazwe
+/// wariantu ("SummaryUpdate" itd.), `data` zawiera splaszczone pola danych.
+fn meeting_event_payload_to_js(
+    obj: &js_sys::Object,
+    p: tentaflow_protocol::MeetingEventPayload,
+) {
+    use tentaflow_protocol::MeetingEventPayload as EP;
+    let data = js_sys::Object::new();
+    match p {
+        EP::SummaryUpdate {
+            decisions_text,
+            summary_text,
+            model,
+        } => {
+            set(obj, "type", "SummaryUpdate".into());
+            set(&data, "decisionsText", decisions_text.into());
+            set(&data, "summaryText", summary_text.into());
+            set(&data, "model", model.into());
+        }
+        EP::ActionItemsUpdate { items } => {
+            set(obj, "type", "ActionItemsUpdate".into());
+            let arr = js_sys::Array::new();
+            for it in items {
+                let io = js_sys::Object::new();
+                set(&io, "owner", it.owner.into());
+                set(&io, "task", it.task.into());
+                if let Some(d) = it.deadline {
+                    set(&io, "deadline", d.into());
+                }
+                arr.push(&io.into());
+            }
+            set(&data, "items", arr.into());
+        }
+        EP::TranscriptEntry {
+            speaker_id,
+            speaker_name,
+            is_enrolled,
+            speaker_confidence,
+            text,
+            language,
+            resolved_stt_model,
+            latency_ms,
+        } => {
+            set(obj, "type", "TranscriptEntry".into());
+            set(&data, "speakerId", speaker_id.into());
+            if let Some(n) = speaker_name {
+                set(&data, "speakerName", n.into());
+            }
+            set(&data, "isEnrolled", is_enrolled.into());
+            if let Some(c) = speaker_confidence {
+                set(&data, "speakerConfidence", (c as f64).into());
+            }
+            set(&data, "text", text.into());
+            if let Some(l) = language {
+                set(&data, "language", l.into());
+            }
+            set(&data, "resolvedSttModel", resolved_stt_model.into());
+            set(&data, "latencyMs", (latency_ms as f64).into());
+        }
+        EP::ParticipantUpdate {
+            speaker_id,
+            speaker_name,
+            status,
+            last_spoken_ago_sec,
+        } => {
+            set(obj, "type", "ParticipantUpdate".into());
+            set(&data, "speakerId", speaker_id.into());
+            if let Some(n) = speaker_name {
+                set(&data, "speakerName", n.into());
+            }
+            set(&data, "status", status.into());
+            if let Some(s) = last_spoken_ago_sec {
+                set(&data, "lastSpokenAgoSec", (s as f64).into());
+            }
+        }
+        EP::BackendUpdate {
+            stt_model,
+            tts_model,
+            summarization_model,
+            diarization_model,
+            streaming_latency_ms,
+            enrolled_speakers,
+            total_participants,
+        } => {
+            set(obj, "type", "BackendUpdate".into());
+            set(&data, "sttModel", stt_model.into());
+            set(&data, "ttsModel", tts_model.into());
+            set(&data, "summarizationModel", summarization_model.into());
+            set(&data, "diarizationModel", diarization_model.into());
+            if let Some(v) = streaming_latency_ms {
+                set(&data, "streamingLatencyMs", (v as f64).into());
+            }
+            if let Some(v) = enrolled_speakers {
+                set(&data, "enrolledSpeakers", (v as f64).into());
+            }
+            if let Some(v) = total_participants {
+                set(&data, "totalParticipants", (v as f64).into());
+            }
+        }
+    }
+    set(obj, "data", data.into());
 }
 
 fn flow_node_template_to_js(t: tentaflow_protocol::message_body::FlowNodeTemplate) -> js_sys::Object {
