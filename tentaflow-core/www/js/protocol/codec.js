@@ -265,11 +265,26 @@ export const encode = {
 
   // ---- Mesh write ops (FAZA 1b) ----
 
-  /** MeshPairingStartRequest { remoteAddress } */
-  meshPairingStartRequest(correlationId, { remoteAddress, pin, pinHint }, sequence = 1) {
+  /** MeshPairingStartRequest { remoteAddress, remoteAddresses, remoteRelayUrl } */
+  meshPairingStartRequest(correlationId, {
+    remoteAddress,
+    pin,
+    pinHint,
+    remotePublicKey,
+    remoteAddresses,
+    remoteRelayUrl,
+    remoteHostname,
+  }, sequence = 1) {
     assertReady();
     const hint = pinHint || pin || '';
-    const body = _wasm.encodeMeshPairingStartRequest(remoteAddress, hint);
+    const body = _wasm.encodeMeshPairingStartRequest(
+      remoteAddress,
+      hint,
+      remotePublicKey || '',
+      Array.isArray(remoteAddresses) ? remoteAddresses : [],
+      remoteRelayUrl || '',
+      remoteHostname || '',
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
