@@ -356,23 +356,35 @@ pub async fn dispatch_reverse_request(
                 );
             };
 
+            // Zachowujemy kopie do live broadcastu przed move do persist.
+            // Persist moze nie zapisywac danego wariantu do DB (TranscriptEntry,
+            // ParticipantUpdate, BackendUpdate tylko logują), ale broadcastujemy
+            // WSZYSTKIE — GUI potrzebuje pełnego stream'u do live view.
+            let live_event = tentaflow_protocol::MeetingLiveEvent {
+                meeting_key: event.meeting_key.clone(),
+                timestamp_ms: event.timestamp_ms,
+                payload: event.payload.clone(),
+            };
             match persist_meeting_event(pool, event) {
-                Ok(()) => ModelResponse {
-                    request_id,
-                    result: ModelResult::Completion(CompletionResult {
-                        text: String::new(),
-                        reasoning_content: None,
-                        model: String::new(),
-                        finish_reason: Some("stop".to_string()),
-                        tool_calls: None,
-                        detected_intent: None,
-                        detected_tools: None,
-                        transcribed_text: None,
-                        speaker_id: None,
-                        speaker_name: None,
-                    }),
-                    metrics: None,
-                },
+                Ok(()) => {
+                    crate::dispatch::meeting_live_broadcast::publish(live_event);
+                    ModelResponse {
+                        request_id,
+                        result: ModelResult::Completion(CompletionResult {
+                            text: String::new(),
+                            reasoning_content: None,
+                            model: String::new(),
+                            finish_reason: Some("stop".to_string()),
+                            tool_calls: None,
+                            detected_intent: None,
+                            detected_tools: None,
+                            transcribed_text: None,
+                            speaker_id: None,
+                            speaker_name: None,
+                        }),
+                        metrics: None,
+                    }
+                }
                 Err(e) => make_error_response(request_id, &e),
             }
         }

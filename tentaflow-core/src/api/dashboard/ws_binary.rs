@@ -21,7 +21,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, warn};
 
 use crate::dispatch::{
-    self, addon_perm_broadcast, audit_broadcast, resume_token,
+    self, addon_perm_broadcast, audit_broadcast, meeting_live_broadcast, resume_token,
     subscription::{self, SubscriptionEvent},
     AppState, HandlerContext,
 };
@@ -161,6 +161,55 @@ pub async fn handle_ws_connection<S>(
                     next_seq(&seq_perm),
                     tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
                     &Mb::AddonPermissionChangedEventBody(event),
+                    EnvelopeFlags::empty(),
+                )
+                .await;
+            }
+        });
+    }
+
+    // Spawnuj task pushujacy MeetingLiveEvent jako unsolicited frames. Filtr
+    // ownership: tylko wlasciciel sesji (meeting_sessions.owner_user_id == uid)
+    // dostaje frame. Sesje bez owner_user_id (legacy) widoczne dla wszystkich
+    // zalogowanych — zgodne z list_sessions(owner_user_id=Some(uid)) ktory tez
+    // pokazuje OR IS NULL. Anonimowe polaczenia i connecty bez user_id nie
+    // dostaja niczego.
+    if let Some(uid) = user_id {
+        let sink_meet = Arc::clone(&sink);
+        let seq_meet = Arc::clone(&next_server_sequence);
+        let db = app_state.db.clone();
+        let mut meet_rx = meeting_live_broadcast::subscribe();
+        tokio::spawn(async move {
+            loop {
+                let event = match meet_rx.recv().await {
+                    Ok(e) => e,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                // Ownership lookup blocking (rusqlite) — zwijamy w spawn_blocking
+                // zeby nie blokowac writer task dla innych broadcastow.
+                let key = event.meeting_key.clone();
+                let db2 = db.clone();
+                let ownership = tokio::task::spawn_blocking(move || {
+                    crate::db::repository::transcripts::owner_of_meeting_key(&db2, &key)
+                })
+                .await;
+                let should_deliver = match ownership {
+                    Ok(Ok(Some(Some(owner)))) => owner == uid,
+                    // Sesja bez ownera — legacy, doreczamy kazdemu zalogowanemu.
+                    Ok(Ok(Some(None))) => true,
+                    // Sesja nie istnieje lub blad DB — pomijamy frame (bezpieczny default).
+                    _ => false,
+                };
+                if !should_deliver {
+                    continue;
+                }
+                let _ = send_body(
+                    &sink_meet,
+                    0,
+                    next_seq(&seq_meet),
+                    tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
+                    &Mb::MeetingLiveEventBody(event),
                     EnvelopeFlags::empty(),
                 )
                 .await;
