@@ -1,8 +1,8 @@
 // =============================================================================
 // Plik: routing/streaming.rs
 // Opis: Streaming SSE — route_chat_completion_stream, route_to_rag_stream,
-//       route_to_quic_llm_stream. Obsluga PII filtering w strumieniu,
-//       TTS buffering, memory store po zakonczeniu streamu.
+//       route_to_quic_llm_stream. Audio input (STT + speaker ID), PII
+//       filtering w strumieniu, TTS buffering dla RAG audio output.
 // =============================================================================
 
 use crate::api::openai::types::{
@@ -10,7 +10,6 @@ use crate::api::openai::types::{
     TTSRequest,
 };
 use crate::error::{CoreError, Result};
-use crate::intent_analyzer::{Intent, ToolExecutor};
 use crate::routing::chat::flow_result_to_chat_response;
 use crate::routing::router::{RequestMetrics, Router};
 use crate::services::tts::{SynthesizeCallback, TTSBufferingProcessor};
@@ -121,7 +120,9 @@ impl Router {
 
         debug!("Routing streaming request dla modelu: {}", model_name);
 
-        // === VOICE CONVERSATION: Przetworz audio przez STT przed LLM ===
+        // Audio input -> STT + speaker ID. Fizyczna transkrypcja audio na tekst;
+        // bez tego klient wysylajacy audio dostaje blad. Bez pre-processingu
+        // request-a (intent/memory/context injection) — to robia user-defined flows.
         if let Some(ref audio_data) = request.audio_input {
             if !audio_data.is_empty() {
                 let t_stt = std::time::Instant::now();
@@ -136,13 +137,10 @@ impl Router {
 
                 metrics.stt_ms = Some(t_stt.elapsed().as_millis() as u64);
 
-                let (transcribed_text, diarized_speakers) = match stt_result {
+                let transcribed_text = match stt_result {
                     Ok(stt_data) => {
                         debug!("STT transkrypcja: '{}'", stt_data.text);
-                        if stt_data.speakers.len() > 1 {
-                            info!("Wykryto {} mowcow w audio", stt_data.speakers.len());
-                        }
-                        (stt_data.text, stt_data.speakers)
+                        stt_data.text
                     }
                     Err(e) => {
                         error!("STT error: {}", e);
@@ -150,416 +148,17 @@ impl Router {
                     }
                 };
 
-                let speaker_id = speaker_result.speaker_id.clone();
                 let speaker_name = speaker_result.speaker_name.clone();
-                let speaker_confidence = speaker_result.similarity;
 
                 info!(
                     "Speaker Identification: confidence={}, similarity={:.3}, speaker_id={:?}, speaker_name={:?}",
                     speaker_result.confidence_level,
-                    speaker_confidence.unwrap_or(0.0),
-                    speaker_id,
+                    speaker_result.similarity.unwrap_or(0.0),
+                    speaker_result.speaker_id,
                     speaker_name
                 );
 
-                match speaker_result.confidence_level.as_str() {
-                    "HIGH" => {
-                        info!(
-                            "Speaker HIGH confidence: {} (id: {:?}, similarity: {:?})",
-                            speaker_name.as_deref().unwrap_or("?"),
-                            speaker_id,
-                            speaker_confidence
-                        );
-                    }
-                    "MEDIUM" => {
-                        info!("Speaker MEDIUM confidence: {} (id: {:?}, similarity: {:?}) - needs_confirmation={}",
-                              speaker_name.as_deref().unwrap_or("?"), speaker_id, speaker_confidence,
-                              speaker_result.needs_confirmation);
-                    }
-                    _ => {
-                        debug!(
-                            "Speaker LOW/UNKNOWN confidence (similarity: {:?}) - new speaker?",
-                            speaker_confidence
-                        );
-                    }
-                }
-
-                // Ustaw speaker info w memory_options
-                {
-                    let memory_opts = request.memory_options.get_or_insert_with(Default::default);
-                    if memory_opts.session_id.is_none() {
-                        memory_opts.session_id = Some(uuid::Uuid::new_v4().to_string());
-                    }
-
-                    if speaker_result.is_high_confidence() {
-                        if let Some(ref sid) = speaker_id {
-                            memory_opts.person_id = Some(sid.clone());
-                            memory_opts.speaker_confidence = speaker_confidence;
-                            memory_opts.speaker_name = speaker_name.clone();
-                        }
-                    } else if speaker_result.is_medium_confidence() {
-                        memory_opts.speaker_confidence = speaker_confidence;
-                        if let Some(ref name) = speaker_name {
-                            let confirmation_hint = speaker_result
-                                .confirmation_message
-                                .clone()
-                                .unwrap_or_else(|| format!("Czy to ty, {}?", name));
-                            memory_opts.session_context = Some(format!(
-                                "SPEAKER_CANDIDATE: id={}, name={}, confidence={:.2}, ask: {}",
-                                speaker_id.as_deref().unwrap_or("?"),
-                                name,
-                                speaker_confidence.unwrap_or(0.0),
-                                confirmation_hint
-                            ));
-                        }
-                    }
-                }
-
-                // === INTENT ANALYZER ===
-                let session_id = request
-                    .memory_options
-                    .as_ref()
-                    .and_then(|m| m.session_id.clone())
-                    .unwrap_or_else(|| "default".to_string());
-
-                let cache = self.memory_integration.conversation_cache();
-                let history = cache.get_history(&session_id).await;
-
-                let conversation_context = self.build_context_from_conversation_cache(&history, 4);
-
-                let session_context = conversation_context.or_else(|| {
-                    request
-                        .memory_options
-                        .as_ref()
-                        .and_then(|m| m.session_context.as_deref())
-                        .map(|s| s.to_string())
-                });
-
-                let t_intent = std::time::Instant::now();
-                let intent_result = self
-                    .intent_analyzer
-                    .analyze(
-                        &transcribed_text,
-                        speaker_id.as_deref(),
-                        speaker_name.as_deref(),
-                        speaker_confidence,
-                        Some(&diarized_speakers),
-                        session_context.as_deref(),
-                    )
-                    .await;
-
-                match intent_result {
-                    Ok(analysis) => {
-                        info!(
-                            "Intent Analyzer: intent={:?}, took={:?}ms, tools={}, memory_query={}, reasoning='{}'",
-                            analysis.primary_intent,
-                            t_intent.elapsed().as_millis(),
-                            analysis.tool_calls.len(),
-                            analysis.needs_memory_query,
-                            analysis.reasoning.chars().take(100).collect::<String>()
-                        );
-
-                        // === HANDLE INTRODUCTION ===
-                        if let Some(Intent::Introduction {
-                            ref name,
-                            confidence,
-                        }) = analysis.primary_intent
-                        {
-                            info!(
-                                "Wykryto przedstawienie: name='{}', confidence={:.2}, speaker_is_unknown={}",
-                                name, confidence, speaker_result.is_unknown()
-                            );
-                            if confidence >= 0.7 && speaker_result.is_unknown() {
-                                info!(
-                                    "Intent: ENROLLING new speaker as '{}' (confidence: {:.2})",
-                                    name, confidence
-                                );
-
-                                let new_speaker_id = format!(
-                                    "voice_{}",
-                                    uuid::Uuid::new_v4()
-                                        .to_string()
-                                        .split('-')
-                                        .next()
-                                        .unwrap_or("unknown")
-                                );
-
-                                let stt_service_name = self
-                                    .service_manager
-                                    .get_first_stt_service_name()
-                                    .map(|s| s.to_string());
-                                if let Some(service_name) = stt_service_name {
-                                    if let Some(stt_client) = self
-                                        .service_manager
-                                        .get_quic_stt_client(&service_name)
-                                        .await
-                                    {
-                                        let memory_client = {
-                                            let mut client = None;
-                                            let memory_handles: Vec<_> = self
-                                                .service_manager
-                                                .quic_memory_services
-                                                .read()
-                                                .values()
-                                                .cloned()
-                                                .collect();
-                                            for handle in memory_handles {
-                                                let client_guard = handle.client.read().await;
-                                                if let Some(c) = client_guard.as_ref() {
-                                                    client = Some(c.clone());
-                                                    break;
-                                                }
-                                            }
-                                            client
-                                        };
-
-                                        let audio_for_enroll = audio_for_speaker.clone();
-                                        let name_for_enroll = name.clone();
-                                        let speaker_id_for_enroll = new_speaker_id.clone();
-                                        let pending_samples = self.pending_voice_samples.clone();
-
-                                        tokio::spawn(async move {
-                                            debug!(
-                                                "Enrolling new speaker: id={}, name={}",
-                                                speaker_id_for_enroll, name_for_enroll
-                                            );
-
-                                            let model_request = tentaflow_protocol::ModelRequest {
-                                                request_id: uuid::Uuid::new_v4().to_string(),
-                                                payload: tentaflow_protocol::ModelPayload::Audio(tentaflow_protocol::AudioPayload {
-                                                    operation: tentaflow_protocol::AudioOperation::SpeakerEnroll {
-                                                        speaker_id: speaker_id_for_enroll.clone(),
-                                                        speaker_name: name_for_enroll.clone(),
-                                                        audio_samples: vec![audio_for_enroll],
-                                                        metadata: vec![
-                                                            ("source".to_string(), "intent_analyzer_introduction".to_string()),
-                                                        ],
-                                                    },
-                                                }),
-                                                stream: false,
-                                                metadata: None,
-                                                session_id: None,
-                                            };
-
-                                            match stt_client.send_request(model_request).await {
-                                                Ok(response) => {
-                                                    info!(
-                                                        "SUCCESS: Registered new voice: {} ({}) - response: {:?}",
-                                                        name_for_enroll, speaker_id_for_enroll, response.result
-                                                    );
-
-                                                    {
-                                                        let mut pending =
-                                                            pending_samples.write().await;
-                                                        pending.insert(
-                                                            speaker_id_for_enroll.clone(),
-                                                            3,
-                                                        );
-                                                    }
-
-                                                    if let Some(mem_client) = memory_client {
-                                                        let memory_request = tentaflow_protocol::ModelRequest {
-                                                            request_id: uuid::Uuid::new_v4().to_string(),
-                                                            payload: tentaflow_protocol::ModelPayload::Memory(tentaflow_protocol::MemoryPayload {
-                                                                operation: tentaflow_protocol::MemoryOperation::UpdatePersonName {
-                                                                    session_id: "enrollment".to_string(),
-                                                                    voice_id: Some(speaker_id_for_enroll.clone()),
-                                                                    node_id: None,
-                                                                    new_name: name_for_enroll.clone(),
-                                                                    preserve_history: false,
-                                                                },
-                                                            }),
-                                                            stream: false,
-                                                            metadata: None,
-                                                            session_id: None,
-                                                        };
-
-                                                        match mem_client
-                                                            .send_request(memory_request)
-                                                            .await
-                                                        {
-                                                            Ok(_) => {
-                                                                info!("SUCCESS: Registered person in Memory: {} ({})",
-                                                                    name_for_enroll, speaker_id_for_enroll);
-                                                            }
-                                                            Err(e) => {
-                                                                error!("FAILED to register person in Memory for {}: {}", name_for_enroll, e);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "FAILED to register voice for {}: {}",
-                                                        name_for_enroll, e
-                                                    );
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        }
-
-                        // === HANDLE TOOL CALLS ===
-                        if !analysis.tool_calls.is_empty() {
-                            info!("Executing {} tool call(s)", analysis.tool_calls.len());
-                            let execution_results =
-                                ToolExecutor::execute_all(&analysis.tool_calls).await;
-
-                            let mut tool_context_parts = Vec::new();
-                            for exec_result in &execution_results {
-                                if exec_result.success {
-                                    tool_context_parts
-                                        .push(format!("[TOOL RESULT] {}", exec_result.message));
-                                } else {
-                                    tool_context_parts
-                                        .push(format!("[TOOL INCOMPLETE] {}", exec_result.message));
-                                }
-                            }
-
-                            if !tool_context_parts.is_empty() {
-                                let memory_opts =
-                                    request.memory_options.get_or_insert_with(Default::default);
-                                let tool_context = tool_context_parts.join("\n");
-                                if let Some(ref existing) = memory_opts.session_context {
-                                    memory_opts.session_context =
-                                        Some(format!("{}\n\n{}", existing, tool_context));
-                                } else {
-                                    memory_opts.session_context = Some(tool_context);
-                                }
-                            }
-                        }
-
-                        // === INJECT CONTEXT FOR LLM ===
-                        if let Some(ref ctx) = analysis.context_for_llm {
-                            let memory_opts =
-                                request.memory_options.get_or_insert_with(Default::default);
-                            if let Some(ref existing) = memory_opts.session_context {
-                                memory_opts.session_context =
-                                    Some(format!("{}\n\n{}", existing, ctx));
-                            } else {
-                                memory_opts.session_context = Some(ctx.clone());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Intent Analyzer error: {} - continuing without intent analysis",
-                            e
-                        );
-                    }
-                }
-
-                // Dodaj transkrypcje jako user message
-                if !transcribed_text.trim().is_empty() {
-                    // === MULTI-SPEAKER HANDLING ===
-                    let multi_speaker_context = if diarized_speakers.len() > 1 {
-                        let known_speakers: Vec<_> =
-                            diarized_speakers.iter().filter(|s| s.is_known).collect();
-                        let unknown_speakers: Vec<_> =
-                            diarized_speakers.iter().filter(|s| !s.is_known).collect();
-
-                        let mut context_parts = Vec::new();
-                        for speaker in &known_speakers {
-                            context_parts.push(format!(
-                                "[{}] mowi: \"{}\"",
-                                speaker.label,
-                                speaker.text.trim()
-                            ));
-                        }
-                        for (i, speaker) in unknown_speakers.iter().enumerate() {
-                            context_parts.push(format!(
-                                "[Nieznany mowca {}] mowi: \"{}\"",
-                                i + 1,
-                                speaker.text.trim()
-                            ));
-                        }
-
-                        let instruction = if known_speakers.len() > 0 && unknown_speakers.len() > 0
-                        {
-                            let known_names: Vec<_> =
-                                known_speakers.iter().map(|s| s.label.as_str()).collect();
-                            if unknown_speakers.len() == 1 {
-                                format!(
-                                    "[INFO MULTI-SPEAKER] W nagraniu slyszę {} osob. Rozpoznaję: {}. Jest tez jedna osoba, ktorej nie znam - zapytaj o imie.",
-                                    diarized_speakers.len(), known_names.join(", ")
-                                )
-                            } else {
-                                format!(
-                                    "[INFO MULTI-SPEAKER] W nagraniu slyszę {} osob. Rozpoznaję: {}. Jest tez {} osob, ktorych nie znam - popros o przedstawienie sie.",
-                                    diarized_speakers.len(), known_names.join(", "), unknown_speakers.len()
-                                )
-                            }
-                        } else if unknown_speakers.len() > 1 {
-                            format!(
-                                "[INFO MULTI-SPEAKER] W nagraniu slyszę {} nieznanych osob. Popros wszystkich o przedstawienie sie.",
-                                unknown_speakers.len()
-                            )
-                        } else {
-                            String::new()
-                        };
-
-                        if !instruction.is_empty() {
-                            Some(format!(
-                                "{}\n\nTranskrypcja per mowca:\n{}",
-                                instruction,
-                                context_parts.join("\n")
-                            ))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(ref ms_context) = multi_speaker_context {
-                        let memory_opts =
-                            request.memory_options.get_or_insert_with(Default::default);
-                        if let Some(ref existing) = memory_opts.session_context {
-                            memory_opts.session_context =
-                                Some(format!("{}\n\n{}", existing, ms_context));
-                        } else {
-                            memory_opts.session_context = Some(ms_context.clone());
-                        }
-                    }
-
-                    let should_replace = request
-                        .messages
-                        .last()
-                        .map(|m| {
-                            m.role == "user"
-                                && m.content
-                                    .as_ref()
-                                    .map(|c| match c {
-                                        crate::api::openai::types::MessageContent::Text(t) => {
-                                            t.trim().is_empty()
-                                        }
-                                        _ => false,
-                                    })
-                                    .unwrap_or(true)
-                        })
-                        .unwrap_or(false);
-
-                    if should_replace && !request.messages.is_empty() {
-                        let last_idx = request.messages.len() - 1;
-                        request.messages[last_idx].content =
-                            Some(crate::api::openai::types::MessageContent::Text(
-                                transcribed_text.clone(),
-                            ));
-                    } else {
-                        request.messages.push(crate::api::openai::types::Message {
-                            role: "user".to_string(),
-                            content: Some(crate::api::openai::types::MessageContent::Text(
-                                transcribed_text.clone(),
-                            )),
-                            reasoning_content: None,
-                            name: speaker_name,
-                            tool_call_id: None,
-                            tool_calls: None,
-                        });
-                    }
-                } else {
+                if transcribed_text.trim().is_empty() {
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: stream_node_name.clone(),
                         backend_type: "local_stt".to_string(),
@@ -574,28 +173,39 @@ impl Router {
                     });
                 }
 
+                let should_replace = request
+                    .messages
+                    .last()
+                    .map(|m| {
+                        m.role == "user"
+                            && m.content
+                                .as_ref()
+                                .map(|c| match c {
+                                    MessageContent::Text(t) => t.trim().is_empty(),
+                                    _ => false,
+                                })
+                                .unwrap_or(true)
+                    })
+                    .unwrap_or(false);
+
+                if should_replace && !request.messages.is_empty() {
+                    let last_idx = request.messages.len() - 1;
+                    request.messages[last_idx].content =
+                        Some(MessageContent::Text(transcribed_text.clone()));
+                } else {
+                    request.messages.push(Message {
+                        role: "user".to_string(),
+                        content: Some(MessageContent::Text(transcribed_text.clone())),
+                        reasoning_content: None,
+                        name: speaker_name,
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                }
+
                 request.audio_input = None;
             }
         }
-
-        // === MEMORY INTEGRATION: Query przed LLM ===
-        let (request, _query_decision, mem_timings) = match self
-            .memory_integration
-            .process_request(request.clone())
-            .await
-        {
-            Ok((req, decision, timings)) => (req, decision, timings),
-            Err(e) => {
-                warn!("Memory integration error: {} - kontynuuje bez pamieci", e);
-                (
-                    request,
-                    None,
-                    crate::routing::memory_integration::MemoryTimings::default(),
-                )
-            }
-        };
-        metrics.query_analysis_ms = mem_timings.query_analysis_ms;
-        metrics.memory_query_ms = mem_timings.memory_query_ms;
 
         // === DISPATCH: iteruj backendy wg strategii, zwroc stream ===
         {
@@ -716,8 +326,6 @@ impl Router {
         use std::sync::{Arc as StdArc, Mutex};
         let collected_response: StdArc<Mutex<String>> = StdArc::new(Mutex::new(String::new()));
         let collected_response_clone = collected_response.clone();
-        let request_for_memory = request.clone();
-        let memory_integration = self.memory_integration.clone();
 
         let t_llm = std::time::Instant::now();
         let backend_stream = backend.chat_completion_stream(request).await?;
@@ -806,29 +414,18 @@ impl Router {
 
         let stream = stream.chain(
             futures::stream::once(async move {
-                let response_text = collected_response
-                    .lock()
-                    .map(|r| r.clone())
-                    .unwrap_or_default();
+                let _ = collected_response.lock().map(|r| r.clone()).unwrap_or_default();
 
                 let mut final_metrics = metrics;
                 final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);
                 info!("\n{}", final_metrics.format_table());
 
-                if !response_text.is_empty() {
-                    memory_integration.process_response_async(
-                        &request_for_memory,
-                        &response_text,
-                        None,
-                    );
-                }
-
-                Err::<ChatCompletionChunk, anyhow::Error>(anyhow::anyhow!("__memory_marker__"))
+                Err::<ChatCompletionChunk, anyhow::Error>(anyhow::anyhow!("__metrics_marker__"))
             })
             .filter_map(|r| async move {
                 match r {
                     Ok(chunk) => Some(Ok(chunk)),
-                    Err(e) if e.to_string() == "__memory_marker__" => None,
+                    Err(e) if e.to_string() == "__metrics_marker__" => None,
                     Err(e) => Some(Err(e)),
                 }
             }),
@@ -1249,9 +846,6 @@ impl Router {
 
         let t_llm = std::time::Instant::now();
 
-        let request_for_memory = request.clone();
-        let memory_integration = self.memory_integration.clone();
-
         let collected_response: std::sync::Arc<std::sync::Mutex<String>> =
             std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let collected_response_clone = collected_response.clone();
@@ -1419,32 +1013,21 @@ impl Router {
 
         let stream = stream.chain(
             futures::stream::once(async move {
-                let response_text = collected_response
-                    .lock()
-                    .map(|r| r.clone())
-                    .unwrap_or_default();
+                let _ = collected_response.lock().map(|r| r.clone()).unwrap_or_default();
 
                 let mut final_metrics = metrics;
                 final_metrics.llm_inference_ms = Some(t_llm.elapsed().as_millis() as u64);
                 info!("\n{}", final_metrics.format_table());
 
-                if !response_text.is_empty() {
-                    memory_integration.process_response_async(
-                        &request_for_memory,
-                        &response_text,
-                        None,
-                    );
-                }
-
                 Err::<ChatCompletionChunk, CoreError>(CoreError::InternalError {
-                    message: "__memory_marker__".to_string(),
+                    message: "__metrics_marker__".to_string(),
                     source: None,
                 })
             })
             .filter_map(|r| async move {
                 match r {
                     Ok(chunk) => Some(Ok(chunk)),
-                    Err(ref e) if e.to_string().contains("__memory_marker__") => None,
+                    Err(ref e) if e.to_string().contains("__metrics_marker__") => None,
                     Err(e) => Some(Err(anyhow::Error::from(e))),
                 }
             }),

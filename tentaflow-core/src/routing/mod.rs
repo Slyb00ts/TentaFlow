@@ -14,7 +14,6 @@ pub mod loadbalancer;
 pub mod local_inference;
 pub mod local_stt;
 pub mod meeting_transcript;
-pub mod memory_integration;
 pub mod middleware;
 pub mod reverse_request;
 pub mod router;
@@ -25,7 +24,6 @@ pub mod transcript_store;
 pub mod tts;
 
 // Re-eksporty publicznych typow
-pub use memory_integration::MemoryIntegration;
 pub use middleware::{BackendHandle, ResolvedRoute, RouteMetadata, RouteResult};
 pub use router::{
     BackendMetric, DiarizedSpeaker, RequestMetrics, Router, RouterMetrics, SpeakerIdentifyResult,
