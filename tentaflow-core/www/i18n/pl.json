@@ -1443,7 +1443,22 @@
     "col_description": "Opis",
     "sub_active": "{n} aktywnych",
     "sub_inactive": "{n} nieaktywnych",
-    "sub_admin": "{n} admin"
+    "sub_admin": "{n} admin",
+    "back": "Wróć",
+    "tab_profile": "Profil",
+    "tab_memberships": "Członkostwa",
+    "stat_status": "Status",
+    "stat_source": "Źródło",
+    "stat_groups": "Grupy",
+    "stat_last_login": "Zalogowany",
+    "field_status": "Status konta",
+    "status_active_desc": "Aktywny — może logować się i używać aplikacji",
+    "status_disabled_desc": "Zablokowany — istnieje ale nie może się logować",
+    "save_changes": "Zapisz zmiany",
+    "delete_account": "Usuń konto",
+    "delete_group": "Usuń grupę",
+    "group_label": "Grupa",
+    "perms_user_todo": "Uprawnienia użytkownika (override nad grupami) — w kolejnej wersji."
   },
   "groups": {
     "title": "Grupy",

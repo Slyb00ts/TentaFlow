@@ -1537,7 +1537,22 @@
     "col_description": "Beschreibung",
     "sub_active": "{n} aktiv",
     "sub_inactive": "{n} inaktiv",
-    "sub_admin": "{n} Admin"
+    "sub_admin": "{n} Admin",
+    "back": "Zurück",
+    "tab_profile": "Profil",
+    "tab_memberships": "Mitgliedschaften",
+    "stat_status": "Status",
+    "stat_source": "Quelle",
+    "stat_groups": "Gruppen",
+    "stat_last_login": "Letzte Anmeldung",
+    "field_status": "Kontostatus",
+    "status_active_desc": "Aktiv — kann sich anmelden und die App nutzen",
+    "status_disabled_desc": "Gesperrt — existiert, kann sich aber nicht anmelden",
+    "save_changes": "Änderungen speichern",
+    "delete_account": "Konto löschen",
+    "delete_group": "Gruppe löschen",
+    "group_label": "Gruppe",
+    "perms_user_todo": "Benutzerberechtigungen (Override über Gruppen) — nächste Version."
   },
   "groups": {
     "title": "Gruppen",
