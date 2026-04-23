@@ -111,6 +111,8 @@ Bundled addon updates at startup are driven by `bundle_hash` (computed from embe
 - Pierwszy kontakt nie idzie już przez istniejący `mesh` stream, tylko przez osobny ALPN `tentaflow-pairing/v1`.
 - `MeshPairingStartRequest` może nieść hinty transportowe (`remote_addresses`, `remote_relay_url`, `remote_hostname`) z QR albo z autodiscovery.
 - QR payload `tentaflow-pair://...` powinien zawierać co najmniej `node_id`, `pin`, oraz gdy są znane także `addr=` i `relay=`.
+- Po potwierdzonym parowaniu utrwalamy `trusted_contact:*` w `settings`, żeby reconnect po zmianie sieci mógł iść od razu przez relay/direct hints zamiast czekać na świeże discovery.
+- `MeshNodeInfo.connection` raportuje do GUI aktywną ścieżkę iroh (`p2p`/`relay`, `lan`/`wan`, adres, lista pathów), więc ekran Mesh pokazuje realny transport zamiast zgadywać po statusie.
 - Receiver zapisuje `pending_contact:*` w settings, żeby późniejsze `confirm/reject` mogły dociągnąć połączenie do inicjatora nawet bez świeżego autodiscovery.
 - `mesh` stream jest dalej używany po zestawieniu łączności do `PairingConfirm/Reject`, `NodeInfo` i `TrustedKeysSync`.
 

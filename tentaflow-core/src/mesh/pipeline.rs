@@ -18,6 +18,9 @@ use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
+use crate::net::iroh::pairing::{
+    load_trusted_contact_hints, store_trusted_contact_hints, PairingContactHints,
+};
 use crate::routing::live_metrics;
 
 /// Snapshot live-metrics routera — zwracany do heartbeat.
@@ -125,15 +128,22 @@ pub async fn start_mesh_pipeline(
 
             // Reconnect do trusted peerow po EndpointId — iroh sam rozwiazuje adres.
             {
-                if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&mesh_security.db)
-                {
+                let sec = mesh_security.clone();
+                if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&mesh_security.db) {
                     for node in &trusted {
                         let qm = quic_mesh.clone();
                         let nid = node.node_id.clone();
+                        let sec = sec.clone();
                         tokio::spawn(async move {
-                            let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-                            if let Err(e) = qm.connect_to_peer(&nid, dummy_addr).await {
-                                debug!(peer_id = %nid, "Reconnect via iroh: {}", e);
+                            if let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &nid) {
+                                if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
+                                    debug!(peer_id = %nid, "Reconnect via trusted hints: {}", e);
+                                }
+                            } else {
+                                let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+                                if let Err(e) = qm.connect_to_peer(&nid, dummy_addr).await {
+                                    debug!(peer_id = %nid, "Reconnect via iroh: {}", e);
+                                }
                             }
                         });
                     }
@@ -153,6 +163,7 @@ pub async fn start_mesh_pipeline(
                 let qm = quic_mesh.clone();
                 let store = mesh_peer_store.clone();
                 let self_id = local_node_id.clone();
+                let sec = mesh_security.clone();
                 let mut lifecycle_rx = crate::lifecycle_signal::subscribe();
                 tokio::spawn(async move {
                     let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
@@ -168,12 +179,38 @@ pub async fn start_mesh_pipeline(
                             }
                             let qm2 = qm.clone();
                             let nid = p.node_id.clone();
+                            let hints = trusted_contact_hints_for_peer(sec.as_ref(), &nid);
                             tokio::spawn(async move {
-                                if let Err(e) = qm2.connect_to_peer(&nid, dummy).await {
+                                if let Some(hints) = hints {
+                                    if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
+                                        debug!(peer_id = %nid, "Reconnect loop via trusted hints: {}", e);
+                                    }
+                                } else if let Err(e) = qm2.connect_to_peer(&nid, dummy).await {
                                     debug!(peer_id = %nid, "Reconnect loop: {}", e);
                                 }
                             });
                             redialed += 1;
+                        }
+                        if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
+                            for node in trusted {
+                                if node.node_id == self_id || store.is_quic_connected(&node.node_id) {
+                                    continue;
+                                }
+                                if peers.iter().any(|p| p.node_id == node.node_id) {
+                                    continue;
+                                }
+                                let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &node.node_id) else {
+                                    continue;
+                                };
+                                let qm2 = qm.clone();
+                                let nid = node.node_id.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
+                                        debug!(peer_id = %nid, "Reconnect loop via trusted-only hints: {}", e);
+                                    }
+                                });
+                                redialed += 1;
+                            }
                         }
                         if redialed > 0 {
                             debug!("reconnect-loop({}): {} peer(ow) redial", trigger, redialed);
@@ -335,6 +372,38 @@ fn upsert_local_peer(
         active_requests: 0,
         tokens_per_sec: 0.0,
     });
+}
+
+fn merge_contact_hints(
+    current: Option<PairingContactHints>,
+    fresh: PairingContactHints,
+) -> PairingContactHints {
+    let mut merged = current.unwrap_or_default();
+    if merged.node_id.is_empty() {
+        merged.node_id = fresh.node_id.clone();
+    }
+    if merged.public_key_hex.is_empty() && !fresh.public_key_hex.is_empty() {
+        merged.public_key_hex = fresh.public_key_hex.clone();
+    }
+    if merged.hostname.is_empty() && !fresh.hostname.is_empty() {
+        merged.hostname = fresh.hostname.clone();
+    }
+    if merged.relay_url.is_empty() && !fresh.relay_url.is_empty() {
+        merged.relay_url = fresh.relay_url.clone();
+    }
+    for addr in fresh.addresses {
+        if !addr.is_empty() && !merged.addresses.contains(&addr) {
+            merged.addresses.push(addr);
+        }
+    }
+    merged
+}
+
+fn trusted_contact_hints_for_peer(
+    security: &MeshSecurity,
+    node_id: &str,
+) -> Option<PairingContactHints> {
+    load_trusted_contact_hints(&security.db, node_id).ok().flatten()
 }
 
 // =============================================================================
@@ -878,17 +947,38 @@ fn spawn_quic_event_handler(
                     if let Some(ref sec) = mesh_security {
                         if sec.is_trusted(&node_id) {
                             if let Some(peer_info) = peer_store.get(&node_id) {
-                                if !peer_info.addresses.is_empty() && peer_info.port > 0 {
-                                    let addr_str = peer_info
+                                let direct_addresses = if !peer_info.addresses.is_empty() && peer_info.port > 0 {
+                                    peer_info
                                         .addresses
                                         .iter()
                                         .map(|ip| format!("{}:{}", ip, peer_info.port))
                                         .collect::<Vec<_>>()
-                                        .join(",");
+                                } else {
+                                    Vec::new()
+                                };
+                                if !peer_info.addresses.is_empty() && peer_info.port > 0 {
+                                    let addr_str = direct_addresses.join(",");
                                     let _ = crate::db::repository::update_trusted_node_addresses(
                                         &sec.db, &node_id, &addr_str,
                                     );
                                 }
+                                let relay_url = qm_events
+                                    .relay_url()
+                                    .map(|url| url.to_string())
+                                    .unwrap_or_default();
+                                let current =
+                                    load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
+                                let hints = merge_contact_hints(
+                                    current,
+                                    PairingContactHints {
+                                        node_id: node_id.clone(),
+                                        public_key_hex: String::new(),
+                                        hostname: peer_info.hostname.clone(),
+                                        addresses: direct_addresses,
+                                        relay_url,
+                                    },
+                                );
+                                let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
                             }
                         }
                     }
@@ -930,35 +1020,27 @@ fn spawn_quic_event_handler(
                         None => false,
                     };
                     if should_reconnect {
-                        let mut addrs: Vec<std::net::SocketAddr> = Vec::new();
-                        // Adresy z peer_store
-                        if let Some(peer_info) = peer_store.get(&node_id) {
-                            for ip in &peer_info.addresses {
-                                addrs.push(std::net::SocketAddr::new(*ip, peer_info.port));
-                            }
-                        }
-                        // Fallback: adresy z DB
-                        if addrs.is_empty() {
-                            if let Some(ref sec) = mesh_security {
-                                if let Ok(trusted) =
-                                    crate::db::repository::list_trusted_nodes(&sec.db)
-                                {
-                                    if let Some(tn) = trusted.iter().find(|t| t.node_id == node_id)
-                                    {
-                                        for part in tn.last_addresses.split(',') {
-                                            if let Ok(addr) =
-                                                part.trim().parse::<std::net::SocketAddr>()
-                                            {
-                                                addrs.push(addr);
-                                            }
-                                        }
+                        if let Some(ref sec) = mesh_security {
+                            let qm2 = qm_events.clone();
+                            let node_id2 = node_id.clone();
+                            let hints = trusted_contact_hints_for_peer(sec.as_ref(), &node_id);
+                            tokio::spawn(async move {
+                                if let Some(hints) = hints {
+                                    if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
+                                        debug!(
+                                            peer_id = %node_id2,
+                                            "Reconnect after disconnect via trusted hints: {}",
+                                            e
+                                        );
+                                    }
+                                } else {
+                                    let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+                                    if let Err(e) = qm2.connect_to_peer(&node_id2, dummy).await {
+                                        debug!(peer_id = %node_id2, "Reconnect after disconnect: {}", e);
                                     }
                                 }
-                            }
+                            });
                         }
-                        // iroh sam wykonuje reconnect przez discovery + relay
-                        // gdy peer wroci online — nie potrzebujemy wlasnej petli.
-                        let _ = addrs;
                     }
                 }
                 Ok(IrohMeshEvent::HeartbeatReceived { node_id, heartbeat }) => {
