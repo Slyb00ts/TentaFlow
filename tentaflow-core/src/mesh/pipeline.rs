@@ -148,11 +148,18 @@ pub async fn start_mesh_pipeline(
     });
 
     // iroh endpoint: LAN mDNS + pkarr-DHT discovery + relay — wszystko wbudowane.
+    // mdns_enabled=false na iOS bo Apple blokuje raw multicast bez entitlementa;
+    // zamiast tego Swift NWBrowser karmi iroh przez FFI tentaflow_mobile_add_discovered_peer.
+    // DHT wylaczony na mobile — mainline bootstrap spowalnia start, a LAN Bonjour
+    // + iroh relay wystarczaja do discovery peerow.
+    let enable_dht = cfg!(not(any(target_os = "ios", target_os = "android")));
     let iroh_cfg = IrohMeshConfig {
         node_id: node_id.clone(),
         bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], mesh_port)),
         relay_url: None,
         heartbeat_interval: Duration::from_millis(mesh_config.heartbeat_interval_ms),
+        enable_lan_discovery: mesh_config.mdns_enabled,
+        enable_dht_discovery: enable_dht,
     };
 
     let security_for_mesh = match mesh_security.clone() {
@@ -192,17 +199,23 @@ pub async fn start_mesh_pipeline(
             // `connect_to_peer`. Iroh rozwiazuje adres przez mDNS/DHT. Dzieki
             // temu peer ktory padl (PeerDisconnected) zostanie automatycznie
             // redialowany bez czekania na kolejny DiscoveryEvent.
+            //
+            // Dodatkowo na Resume (iOS wake z suspendu) robimy natychmiastowy
+            // przebieg bez czekania do 15s — peerzy po naszej stronie mogli
+            // nas uznac za martwych i trzeba od nowa zestawic QUIC.
             {
                 let qm = quic_mesh.clone();
                 let store = mesh_peer_store.clone();
                 let self_id = node_id.clone();
+                let mut lifecycle_rx = crate::lifecycle_signal::subscribe();
                 tokio::spawn(async move {
                     let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
                     let mut ticker = tokio::time::interval(Duration::from_secs(15));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
-                        ticker.tick().await;
+
+                    let run_iteration = |trigger: &str| {
                         let peers = store.list();
+                        let mut redialed = 0usize;
                         for p in peers.iter() {
                             if p.node_id == self_id || p.quic_connected {
                                 continue;
@@ -214,6 +227,29 @@ pub async fn start_mesh_pipeline(
                                     debug!(peer_id = %nid, "Reconnect loop: {}", e);
                                 }
                             });
+                            redialed += 1;
+                        }
+                        if redialed > 0 {
+                            debug!("reconnect-loop({}): {} peer(ow) redial", trigger, redialed);
+                        }
+                    };
+
+                    loop {
+                        tokio::select! {
+                            _ = ticker.tick() => {
+                                run_iteration("timer");
+                            }
+                            lc = lifecycle_rx.recv() => {
+                                match lc {
+                                    Ok(crate::lifecycle_signal::LifecycleEvent::Resume) => {
+                                        info!("mesh reconnect: Resume — force redial wszystkich peerow");
+                                        run_iteration("resume");
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                                }
+                            }
                         }
                     }
                 });

@@ -17,7 +17,7 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::NodeConfig;
 use crate::crypto::{generate_master_key, SecretsCipher, SettingsCipher};
@@ -160,39 +160,86 @@ pub fn start_unified_server_with_permissions(
     // (bez TIME_WAIT zombie).
     let mut shutdown_rx = service_manager.shutdown_rx.clone();
 
+    // Subskrypcja eventow cyklu zycia (iOS resume po suspend). Na wake
+     // wymuszamy rebind listenera, bo iOS przy suspendzie moze uniewaznic
+     // socket loopback (errno 9 EBADF / errno 57 ENOTCONN przy accept).
+    let mut lifecycle_rx = crate::lifecycle_signal::subscribe();
+
     tokio::spawn(async move {
-        let listener = match TcpListener::bind(&bind_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Nie mozna zbindowac na {}: {}", bind_addr, e);
-                return;
-            }
-        };
-
-        info!(
-            "Unified HTTPS server nasluchuje na {} (OpenAI API + Dashboard)",
-            bind_addr
-        );
-
-        loop {
-            let accept = tokio::select! {
-                biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!("Unified server: shutdown — zamykam listener");
-                        return;
-                    }
-                    continue;
-                }
-                res = listener.accept() => res,
-            };
-            let (stream, remote_addr) = match accept {
-                Ok(conn) => conn,
+        // Outer rebind loop — listener jest tworzony od nowa gdy wymusi to
+        // lifecycle signal LUB nastapi seria bledow accept (iOS po suspendzie).
+        'rebind: loop {
+            let listener = match TcpListener::bind(&bind_addr).await {
+                Ok(l) => l,
                 Err(e) => {
-                    error!("Blad akceptowania polaczenia: {}", e);
-                    continue;
+                    error!("Nie mozna zbindowac na {}: {} — retry za 1s", bind_addr, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue 'rebind;
                 }
             };
+
+            info!(
+                "Unified HTTPS server nasluchuje na {} (OpenAI API + Dashboard)",
+                bind_addr
+            );
+
+            // Licznik kolejnych bledow accept — po 5 w ciagu 10s uznajemy
+            // listener za zdychlego i robimy rebind (kernel mogl zresetowac socket).
+            let mut consecutive_errors: u32 = 0;
+            let mut first_error_at: Option<std::time::Instant> = None;
+
+            loop {
+                let accept = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            info!("Unified server: shutdown — zamykam listener");
+                            return;
+                        }
+                        continue;
+                    }
+                    lc = lifecycle_rx.recv() => {
+                        match lc {
+                            Ok(crate::lifecycle_signal::LifecycleEvent::Resume) => {
+                                warn!("Unified server: Resume — forsuje rebind listenera na {}", bind_addr);
+                                continue 'rebind;
+                            }
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Kanal zamkniety — nie powinno sie zdarzyc dla static OnceLock.
+                                continue;
+                            }
+                        }
+                    }
+                    res = listener.accept() => res,
+                };
+                let (stream, remote_addr) = match accept {
+                    Ok(conn) => {
+                        consecutive_errors = 0;
+                        first_error_at = None;
+                        conn
+                    }
+                    Err(e) => {
+                        error!("Blad akceptowania polaczenia: {}", e);
+                        consecutive_errors += 1;
+                        let now = std::time::Instant::now();
+                        let first = first_error_at.get_or_insert(now);
+                        if consecutive_errors >= 5
+                            && now.duration_since(*first) < std::time::Duration::from_secs(10)
+                        {
+                            warn!(
+                                "Unified server: {} bledow accept w {}ms — rebind listenera",
+                                consecutive_errors,
+                                now.duration_since(*first).as_millis()
+                            );
+                            continue 'rebind;
+                        }
+                        // Krotkim sleep unikamy busy-loopa na persystentnym EBADF.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
 
             let tls_acceptor = tls_acceptor.clone();
             let router = router.clone();
@@ -339,7 +386,8 @@ pub fn start_unified_server_with_permissions(
                     }
                 }
             });
-        }
+            } // koniec wewnetrznej petli accept
+        } // koniec 'rebind loop
     });
 
     Ok(())

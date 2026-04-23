@@ -39,6 +39,10 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     let data_dir = crate::platform::data_dir();
     std::fs::create_dir_all(&data_dir)?;
 
+    // Diagnostyka: czy to wake po suspend, czy cold start po terminate?
+    // Czytamy last_alive.txt pisane przez heartbeat_task w poprzedniej instancji.
+    crate::diagnostics::diagnose_startup(&data_dir);
+
     let db_path = data_dir.join("mobile.db");
     info!(path = %db_path.display(), "Baza danych SQLite");
 
@@ -69,6 +73,10 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
     collector.start(shutdown_tx.subscribe()).await;
+
+    // Heartbeat diagnostyki — co 5s zapisuje timestamp do last_alive.txt,
+    // zeby nastepny startup mogl rozroznic suspend od terminate.
+    crate::diagnostics::spawn_heartbeat_task(data_dir.clone(), shutdown_tx.subscribe());
 
     // Identyfikator wezla
     // Persystentny node_id — generowany raz i zapisywany w bazie
@@ -111,6 +119,14 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
         match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone()), settings_cipher.clone()).await {
             Ok(handles) => {
                 info!("Mesh pipeline uruchomiony");
+
+                // Eksponuj IrohMeshManager + tokio runtime handle do FFI — Swift
+                // NWBrowser bedzie karmic iroh peerami znalezionymi przez Bonjour.
+                if let Some(ref quic_mesh) = handles.quic_mesh {
+                    crate::ffi_discovery::set_mesh_handle(quic_mesh.clone());
+                    crate::ffi_discovery::set_mesh_runtime(tokio::runtime::Handle::current());
+                }
+
                 mesh_handles = Some(handles);
             }
             Err(e) => {

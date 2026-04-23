@@ -15,6 +15,21 @@ void tentaflow_on_resume(void);
 void tentaflow_on_memory_warning(void);
 
 // =============================================================================
+// LAN discovery — Swift NWBrowser -> Rust iroh mesh
+// =============================================================================
+
+// Przekazuje peera znalezionego przez systemowy Bonjour (NWBrowser) do iroh.
+// endpoint_id: z-base32 lowercase (52 znaki, format iroh mDNS instance name)
+//              albo hex (64 znaki) Ed25519 public key
+// ip: string IPv4/IPv6 (bez portu)
+// port: port QUIC peera (iroh defaultowo przypisuje dynamicznie)
+// Zwraca true jesli zlecono laczenie; false gdy mesh jeszcze nie gotowy
+// albo argumenty niepoprawne.
+_Bool tentaflow_mobile_add_discovered_peer(const char* endpoint_id,
+                                           const char* ip,
+                                           unsigned short port);
+
+// =============================================================================
 // Swift MLX bridge — typy callbackow i rejestracja
 // =============================================================================
 
