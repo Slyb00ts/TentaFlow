@@ -6,16 +6,17 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, toast, formatDate, formatRelative } from '/js/utils.js';
 import { TfWindow } from '/js/components/tf-window.js';
+import { I18n } from '/js/i18n.js';
 
 let keys = [];
 
 const ApiKeysScreen = {
-  title: 'Klucze API',
+  get title() { return I18n.t('apikeys.title'); },
   render() {
     return `
       <div class="content-header">
-        <h1>Klucze API</h1>
-        <tf-button variant="primary" id="btn-create-key" label="Utwórz klucz"></tf-button>
+        <h1>${escapeHtml(I18n.t('apikeys.title'))}</h1>
+        <tf-button variant="primary" id="btn-create-key" label="${escapeHtml(I18n.t('apikeys.create_key'))}"></tf-button>
       </div>
       <div class="card" style="padding: 0;"><div id="keys-host"></div></div>`;
   },
@@ -30,24 +31,30 @@ async function load() {
   try {
     keys = await ApiBinary.list('apiKeyListRequest');
     renderTable();
-  } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
+  } catch (err) { toast(`${I18n.t('apikeys.error_prefix')}: ${err.message}`, 'error'); }
 }
 
 function renderTable() {
   const host = byId('keys-host');
   if (keys.length === 0) {
-    host.innerHTML = `<div class="empty-state"><div class="empty-state-text">Brak kluczy API</div></div>`;
+    host.innerHTML = `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('apikeys.empty'))}</div></div>`;
     return;
   }
   host.innerHTML = `
     <table class="data-table">
-      <thead><tr><th>ID</th><th>Nazwa</th><th>Utworzono</th><th>Ostatnio użyty</th><th></th></tr></thead>
+      <thead><tr>
+        <th>${escapeHtml(I18n.t('apikeys.col_id'))}</th>
+        <th>${escapeHtml(I18n.t('apikeys.col_name'))}</th>
+        <th>${escapeHtml(I18n.t('apikeys.col_created'))}</th>
+        <th>${escapeHtml(I18n.t('apikeys.col_last_used'))}</th>
+        <th></th>
+      </tr></thead>
       <tbody>${keys.map((k) => `<tr>
         <td><code>${escapeHtml(k.keyId)}</code></td>
         <td>${escapeHtml(k.name)}</td>
         <td>${formatDate(k.createdAtEpoch)}</td>
         <td>${k.lastUsedAtEpoch ? formatRelative(k.lastUsedAtEpoch) : '—'}</td>
-        <td><tf-button variant="danger" size="sm" icon="trash" data-revoke="${escapeHtml(k.keyId)}" title="Usuń"></tf-button></td>
+        <td><tf-button variant="danger" size="sm" icon="trash" data-revoke="${escapeHtml(k.keyId)}" title="${escapeHtml(I18n.t('apikeys.delete_title'))}"></tf-button></td>
       </tr>`).join('')}</tbody>
     </table>`;
   host.querySelectorAll('[data-revoke]').forEach((b) => {
@@ -57,18 +64,18 @@ function renderTable() {
 
 async function revoke(keyId) {
   const ok = await TfWindow.confirm({
-    title: 'Usuń klucz API',
-    message: `Usunąć klucz ${keyId}?`,
-    confirmLabel: 'Usuń',
-    cancelLabel: 'Anuluj',
+    title: I18n.t('apikeys.delete_confirm_title'),
+    message: I18n.t('apikeys.delete_confirm_msg', { keyId }),
+    confirmLabel: I18n.t('apikeys.delete_title'),
+    cancelLabel: I18n.t('common.cancel'),
     danger: true,
   });
   if (!ok) return;
   try {
     const r = await ApiBinary.action('apiKeyRevokeRequest', { keyId });
-    if (r.deleted) { toast('Usunięto', 'success'); await load(); }
-    else { toast('Nie znaleziono', 'warning'); }
-  } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
+    if (r.deleted) { toast(I18n.t('apikeys.deleted_ok'), 'success'); await load(); }
+    else { toast(I18n.t('apikeys.not_found'), 'warning'); }
+  } catch (err) { toast(`${I18n.t('apikeys.error_prefix')}: ${err.message}`, 'error'); }
 }
 
 function openCreateModal() {
@@ -76,24 +83,24 @@ function openCreateModal() {
   const bodyEl = document.createElement('div');
   bodyEl.innerHTML = `
     <div class="form-row">
-      <tf-input id="k-name" label="Nazwa" placeholder="np. CI Pipeline" autofocus></tf-input>
+      <tf-input id="k-name" label="${escapeHtml(I18n.t('apikeys.name_label'))}" placeholder="${escapeHtml(I18n.t('apikeys.name_placeholder_ci'))}" autofocus></tf-input>
     </div>
     <div id="k-result" style="display: none; margin-top: var(--space-4);">
-      <div class="tf-label">Skopiuj klucz — będzie widoczny tylko teraz!</div>
+      <div class="tf-label">${escapeHtml(I18n.t('apikeys.copy_hint'))}</div>
       <pre id="k-result-token" style="background: var(--color-bg); padding: var(--space-3); border-radius: var(--radius-md); border: 1px solid var(--color-border); word-break: break-all; user-select: all;"></pre>
     </div>
   `;
 
   const footerEl = document.createElement('div');
   footerEl.innerHTML = `
-    <tf-button variant="ghost" data-action="close" label="Zamknij"></tf-button>
-    <tf-button variant="primary" data-action="create" label="Utwórz" id="k-create-btn"></tf-button>
+    <tf-button variant="ghost" data-action="close" label="${escapeHtml(I18n.t('apikeys.close'))}"></tf-button>
+    <tf-button variant="primary" data-action="create" label="${escapeHtml(I18n.t('apikeys.create_btn'))}" id="k-create-btn"></tf-button>
   `;
 
   // Recznie tworzymy okno (nie uzywamy TfWindow.open bo potrzebujemy nie zamykac
   // okna po akcji "create" — serwer zwraca token ktory musi zobaczyc uzytkownik).
   const win = document.createElement('tf-window');
-  win.setAttribute('title', 'Nowy klucz API');
+  win.setAttribute('title', I18n.t('apikeys.new_key'));
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
   win.setAttribute('min-width', '420');
@@ -132,7 +139,7 @@ function openCreateModal() {
     if (action === 'create') {
       const nameInput = win.querySelector('#k-name');
       const name = (nameInput?.value || '').trim();
-      if (!name) { toast('Nazwa wymagana', 'warning'); return; }
+      if (!name) { toast(I18n.t('apikeys.name_required_short'), 'warning'); return; }
       try {
         const r = await ApiBinary.action('apiKeyCreateRequest', { name, scopes: [] });
         const resultBox = win.querySelector('#k-result');
@@ -141,7 +148,7 @@ function openCreateModal() {
         resultToken.textContent = r.token;
         const createBtn = win.querySelector('#k-create-btn');
         if (createBtn) createBtn.setAttribute('disabled', '');
-      } catch (err) { toast(`Błąd: ${err.message}`, 'error'); }
+      } catch (err) { toast(`${I18n.t('apikeys.error_prefix')}: ${err.message}`, 'error'); }
     }
   });
 }

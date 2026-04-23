@@ -2486,6 +2486,16 @@ fn store_peer_to_proto(
     route: Option<tentaflow_protocol::MeshNodeRoute>,
 ) -> tentaflow_protocol::MeshNodeInfo {
     let is_local = p.node_id == local_node_id;
+    let effective_status = if is_local {
+        p.status.clone()
+    } else if p.quic_connected {
+        p.status.clone()
+    } else {
+        match p.status.as_str() {
+            "connected" | "online" | "active" | "ready" | "degraded" => "offline".to_string(),
+            other => other.to_string(),
+        }
+    };
     let source = if is_local {
         "local"
     } else if is_trusted {
@@ -2575,7 +2585,7 @@ fn store_peer_to_proto(
         node_id: p.node_id.clone(),
         hostname: p.hostname.clone(),
         ip: first_non_loopback_ip_str(&p.addresses),
-        status: p.status.clone(),
+        status: effective_status,
         source: source.to_string(),
         is_local,
         uptime_secs: None,
