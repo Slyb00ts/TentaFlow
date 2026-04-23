@@ -4155,6 +4155,26 @@ pub mod transcripts {
     /// - `Ok(None)` — sesja nie istnieje.
     /// Uzywane przez live-broadcast writer task do filtrowania eventow
     /// po ownership — bez dostepu uzytkownik nie dostaje frame'u.
+    /// Read-only lookup session_id po meeting_key. `Ok(None)` gdy brak sesji.
+    /// Uzywane przez handlery (summaries/action-items/export), ktore nie moga
+    /// tworzyc sesji — w odroznieniu od `get_or_create_session`.
+    pub fn session_id_by_meeting_key(
+        pool: &DbPool,
+        meeting_key: &str,
+    ) -> Result<Option<i64>> {
+        let conn = pool.lock().unwrap();
+        let id: rusqlite::Result<i64> = conn.query_row(
+            "SELECT id FROM meeting_sessions WHERE meeting_key = ?1",
+            rusqlite::params![meeting_key],
+            |r| r.get(0),
+        );
+        match id {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn owner_of_meeting_key(
         pool: &DbPool,
         meeting_key: &str,
