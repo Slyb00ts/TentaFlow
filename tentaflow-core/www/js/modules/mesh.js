@@ -626,7 +626,11 @@ function openPairModal() {
       </div>
     </div>
     <div class="pair-tab-panel" data-tab="id" hidden>
-      <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="64"></tf-input>
+      <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="512"></tf-input>
+      <tf-input id="pair-node-pin" label="${escapeAttr(I18n.t('mesh.pair_node_pin_label'))}" placeholder="123456" maxlength="6" inputmode="numeric"></tf-input>
+      <tf-input id="pair-node-host" label="${escapeAttr(I18n.t('mesh.pair_node_host_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_host_hint'))}"></tf-input>
+      <tf-input id="pair-node-port" label="${escapeAttr(I18n.t('mesh.pair_node_port_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_port_hint'))}" inputmode="numeric"></tf-input>
+      <tf-input id="pair-node-relay" label="${escapeAttr(I18n.t('mesh.pair_node_relay_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_relay_hint'))}"></tf-input>
       <button type="button" class="pair-scan-btn" id="pair-scan-btn" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
         <span>${escapeHtml(I18n.t('mesh.pair_scan_camera'))}</span>
@@ -649,18 +653,52 @@ function openPairModal() {
         // zeskanowaniu kodu. User moze skopiowac dane i robic recznie.
         return true;
       }
-      const idHex = (winEl.querySelector('#pair-node-id')?.value || '').trim().toLowerCase();
+      const pairInputRaw = (winEl.querySelector('#pair-node-id')?.value || '').trim();
+      const pinInput = winEl.querySelector('#pair-node-pin');
+      const manualPin = String(pinInput?.value || '').replace(/\D/g, '');
+      const manualHost = (winEl.querySelector('#pair-node-host')?.value || '').trim();
+      const manualPort = (winEl.querySelector('#pair-node-port')?.value || '').trim();
+      const manualRelayUrl = (winEl.querySelector('#pair-node-relay')?.value || '').trim();
       const errBox = winEl.querySelector('[data-tab="id"] .form-error');
-      if (!/^[0-9a-f]{64}$/.test(idHex)) {
+      const parsed = await parseManualPairTarget(pairInputRaw);
+      const idHex = parsed?.hex || '';
+      const effectivePin = manualPin || parsed?.pin || '';
+      if (!idHex) {
         if (errBox) {
           errBox.textContent = I18n.t('mesh.pair_invalid_node_id');
           errBox.hidden = false;
         }
         return false;
       }
+      if (effectivePin && !/^\d{6}$/.test(effectivePin)) {
+        if (errBox) {
+          errBox.textContent = I18n.t('mesh.pair_invalid_pin');
+          errBox.hidden = false;
+        }
+        return false;
+      }
+      const manualAddress = buildManualPairAddress(manualHost, manualPort);
+      if (manualHost && !manualAddress) {
+        if (errBox) {
+          errBox.textContent = I18n.t('mesh.pair_invalid_socket');
+          errBox.hidden = false;
+        }
+        return false;
+      }
       try {
-        const resp = await ApiBinary.action('meshPairingStartRequest', { remoteAddress: idHex });
-        if (resp?.pin) {
+        if (errBox) errBox.hidden = true;
+        const remoteAddresses = uniqueStrings((manualAddress ? [manualAddress] : []).concat(parsed?.addresses || []));
+        const resp = await ApiBinary.action('meshPairingStartRequest', {
+          remoteAddress: idHex,
+          ...(effectivePin ? { pin: effectivePin } : {}),
+          ...(parsed?.publicKey ? { remotePublicKey: parsed.publicKey } : {}),
+          ...(remoteAddresses.length ? { remoteAddresses } : {}),
+          ...(manualRelayUrl || parsed?.relayUrl ? { remoteRelayUrl: manualRelayUrl || parsed?.relayUrl } : {}),
+          ...(parsed?.host ? { remoteHostname: parsed.host } : {}),
+        });
+        if (resp?.completed) {
+          toast(I18n.t('mesh.pair_success'), 'success');
+        } else if (!effectivePin && resp?.pin) {
           openPinDisplayModal(idHex, resp.pin);
         } else {
           toast(I18n.t('mesh.pair_success'), 'success');
@@ -734,8 +772,14 @@ async function wireUpPairTabs(winEl) {
               const resp = await ApiBinary.action('meshPairingStartRequest', {
                 remoteAddress: parsed.hex,
                 ...(parsed.pin ? { pin: parsed.pin } : {}),
+                ...(parsed.publicKey ? { remotePublicKey: parsed.publicKey } : {}),
+                ...(parsed.addresses?.length ? { remoteAddresses: parsed.addresses } : {}),
+                ...(parsed.relayUrl ? { remoteRelayUrl: parsed.relayUrl } : {}),
+                ...(parsed.host ? { remoteHostname: parsed.host } : {}),
               });
-              if (resp?.pin) {
+              if (resp?.completed) {
+                toast(I18n.t('mesh.pair_success'), 'success');
+              } else if (!parsed.pin && resp?.pin) {
                 openPinDisplayModal(parsed.hex, resp.pin);
               } else {
                 toast(I18n.t('mesh.pair_success'), 'success');
@@ -768,12 +812,22 @@ async function wireUpPairTabs(winEl) {
       const hex = resp?.nodeId || resp?.node_id || '';
       const pin = resp?.invitePin || resp?.invite_pin || '';
       const host = resp?.hostname || '';
+      const relayUrl = resp?.relayUrl || resp?.relay_url || '';
+      const publicKey = resp?.publicKey || resp?.public_key || '';
+      const addresses = Array.isArray(resp?.addresses) ? resp.addresses.filter(Boolean) : [];
       const hexEl = winEl.querySelector('#pair-invite-hex');
       const pinEl = winEl.querySelector('#pair-invite-pin');
       if (hexEl) hexEl.textContent = hex;
       if (pinEl) pinEl.textContent = pin ? pin.replace(/(\d{3})(\d{3})/, '$1 $2') : '—';
       if (QR && hex) {
-        const payload = `tentaflow-pair://${hex}?pin=${encodeURIComponent(pin || '')}&host=${encodeURIComponent(host || '')}&ver=1`;
+        const qs = new URLSearchParams();
+        qs.set('pin', pin || '');
+        qs.set('host', host || '');
+        qs.set('ver', '2');
+        if (publicKey) qs.set('pk', publicKey);
+        if (relayUrl) qs.set('relay', relayUrl);
+        for (const addr of addresses) qs.append('addr', addr);
+        const payload = `tentaflow-pair://${hex}?${qs.toString()}`;
         const svg = await QR.renderQrSvg(payload, { size: 220, errorCorrectionLevel: 'M' });
         const box = winEl.querySelector('#pair-qr-box');
         if (box) box.innerHTML = svg;
@@ -813,6 +867,51 @@ function openPinModal(nodeId) {
       toast(`${I18n.t('mesh.pair_failed')}: ${e.message || ''}`, 'error');
     }
   })();
+}
+
+async function parseManualPairTarget(raw) {
+  if (!raw) return null;
+  try {
+    const qrScanner = await import('/js/modules/qr-scanner.js');
+    const parsed = qrScanner.parsePairUri(raw);
+    if (parsed) return parsed;
+  } catch (_e) {
+    // Ignorujemy — ponizej idzie fallback do czystego hex.
+  }
+  const idHex = raw.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(idHex)) return null;
+  return {
+    hex: idHex,
+    pin: '',
+    host: '',
+    relayUrl: '',
+    publicKey: '',
+    addresses: [],
+  };
+}
+
+function buildManualPairAddress(host, port) {
+  const hostValue = String(host || '').trim();
+  const portValue = String(port || '').trim();
+  if (!hostValue) return '';
+  if (/^\[[^\]]+\]:\d+$/.test(hostValue) || /^[^:\s]+:\d+$/.test(hostValue)) {
+    return hostValue;
+  }
+  if (!/^\d{1,5}$/.test(portValue)) {
+    return '';
+  }
+  const numericPort = Number(portValue);
+  if (numericPort < 1 || numericPort > 65535) {
+    return '';
+  }
+  if (hostValue.includes(':') && !hostValue.startsWith('[')) {
+    return `[${hostValue}]:${numericPort}`;
+  }
+  return `${hostValue}:${numericPort}`;
+}
+
+function uniqueStrings(values) {
+  return Array.from(new Set((values || []).filter(Boolean)));
 }
 
 /// Modal pokazujacy wygenerowany PIN do przekazania na drugi node. Zawiera

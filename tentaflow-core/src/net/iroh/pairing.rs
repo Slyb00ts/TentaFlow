@@ -1,24 +1,43 @@
 // =============================================================================
 // Plik: net/iroh/pairing.rs
-// Opis: Handler iroh protokolu parowania (ALPN `tentaflow-pairing/v1`). Przyj-
-//       muje polaczenia inicjatora na pairing, odczytuje `PairingRequest`
-//       z bidirectional streamu, weryfikuje `pin_proof` przy uzyciu
-//       `MeshSecurity::derive_pin_proof`, zapisuje zaufanego peera, wysyla
-//       `PairingConfirm` z wlasnym public_key_hex lub `PairingReject` gdy
-//       PIN albo HKDF proof nie zgadza sie. Strumien binarny: len-prefixed
-//       JSON dla requestu/responsu; rkyv zarezerwowane dla mesh core.
+// Opis: Handler iroh protokolu parowania (ALPN `tentaflow-pairing/v1`).
+//       Przyjmuje polaczenia inicjatora, zapisuje oczekujace parowanie wraz
+//       z hintami transportowymi i potrafi auto-potwierdzic flow QR invite.
+//       Request/response sa len-prefixed JSON; mesh stream sluzy dalej do
+//       heartbeatow i synchronizacji juz po zestawieniu zaufania.
 // =============================================================================
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use iroh::endpoint::Connection;
+use iroh::{EndpointAddr, RelayUrl};
 use iroh::protocol::ProtocolHandler;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::db;
 use crate::mesh::security::MeshSecurity;
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const PENDING_CONTACT_PREFIX: &str = "pending_contact:";
+
+/// Hinty transportowe potrzebne do first-contact pairingu oraz do pozniejszego
+/// `confirm/reject`, gdy drugi nod nie jest jeszcze obecny w peer_store.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PairingContactHints {
+    pub node_id: String,
+    pub public_key_hex: String,
+    pub hostname: String,
+    pub addresses: Vec<String>,
+    pub relay_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingAttemptOutcome {
+    Pending,
+    Confirmed,
+}
 
 /// Zadanie parowania wyslane przez inicjatora — node B → node A.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,9 +48,12 @@ pub struct PairingRequest {
     pub sender_public_key_hex: String,
     /// Hostname noda B — do wyswietlenia w logu zaufanych.
     pub sender_hostname: String,
-    /// Hex-enkodowany 32-bajtowy pin_proof wyprowadzony przez
-    /// `MeshSecurity::derive_pin_proof(pin, sender_node_id, receiver_node_id)`.
-    pub pin_proof_hex: String,
+    /// PIN przekazany recznie albo z invite QR.
+    pub pin: String,
+    /// Znane adresy `ip:port` inicjatora — potrzebne do pozniejszego confirm.
+    pub sender_addresses: Vec<String>,
+    /// Relay URL inicjatora — pozwala dogadac confirm nawet bez autodiscovery.
+    pub sender_relay_url: String,
 }
 
 /// Odpowiedz noda A potwierdzajaca lub odrzucajaca parowanie.
@@ -45,6 +67,9 @@ pub enum PairingResponse {
         receiver_hostname: String,
         /// Lista (node_id, public_key_hex) juz zaufanych przez A.
         trusted_keys: Vec<(String, String)>,
+    },
+    Pending {
+        receiver_hostname: String,
     },
     Reject {
         reason: String,
@@ -74,8 +99,8 @@ impl PairingHandler {
         }
     }
 
-    /// Weryfikacja requestu i zbudowanie odpowiedzi. Wydzielone zeby test
-    /// mogl sprawdzic logike bez iroh endpoint.
+    /// Weryfikacja requestu i zbudowanie odpowiedzi. Request zawsze zapisuje
+    /// pending pairing lokalnie; auto-confirm odpala tylko dla aktywnego QR invite.
     pub fn verify_request(&self, req: &PairingRequest) -> PairingResponse {
         if !self.security.check_pin_rate_limit(&req.sender_node_id) {
             return PairingResponse::Reject {
@@ -83,84 +108,70 @@ impl PairingHandler {
             };
         }
 
-        let pending_pin = match self.security.get_pending_pin(&req.sender_node_id) {
-            Ok(Some(pin)) => pin,
-            Ok(None) => {
-                return PairingResponse::Reject {
-                    reason: "brak oczekujacego parowania dla tego noda".into(),
-                };
-            }
-            Err(e) => {
-                return PairingResponse::Reject {
-                    reason: format!("blad bazy: {e}"),
-                };
-            }
-        };
-
         if req.sender_public_key_hex.len() != 128 {
             return PairingResponse::Reject {
                 reason: "klucz publiczny musi miec 128 hex znakow".into(),
             };
         }
 
-        // X25519 pub noda B to druga polowa klucza publicznego.
-        let remote_x25519_pub_hex = &req.sender_public_key_hex[64..128];
-        let local_node_id = self.security.ed25519_public_key_hex();
-
-        let expected_proof = match self.security.derive_pin_proof(
-            remote_x25519_pub_hex,
-            &pending_pin,
-            &local_node_id,
-            &req.sender_node_id,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return PairingResponse::Reject {
-                    reason: format!("nie udalo sie wyprowadzic pin_proof: {e}"),
-                };
-            }
-        };
-
-        let actual_proof = match hex::decode(&req.pin_proof_hex) {
-            Ok(b) if b.len() == 32 => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&b);
-                arr
-            }
-            _ => {
-                return PairingResponse::Reject {
-                    reason: "pin_proof_hex musi byc 32-bajtowym hex".into(),
-                };
-            }
-        };
-
-        if !constant_time_eq(&expected_proof, &actual_proof) {
+        if req.pin.len() != 6 || !req.pin.chars().all(|c| c.is_ascii_digit()) {
             return PairingResponse::Reject {
-                reason: "pin_proof nie zgadza sie — niewlasciwy PIN lub klucz".into(),
+                reason: "PIN musi miec 6 cyfr".into(),
             };
         }
 
-        if let Err(e) = self.security.confirm_pairing(
+        if let Err(e) = self.security.receive_pairing_request(
             &req.sender_node_id,
+            &req.pin,
             &req.sender_public_key_hex,
-            &req.sender_hostname,
-            "iroh-pairing",
         ) {
             return PairingResponse::Reject {
-                reason: format!("zapis trusted_node nieudany: {e}"),
+                reason: format!("zapis pending pairing nieudany: {e}"),
             };
         }
 
-        info!(
-            peer = %req.sender_node_id,
-            hostname = %req.sender_hostname,
-            "Parowanie zaakceptowane nad iroh transportem"
-        );
+        let hints = PairingContactHints {
+            node_id: req.sender_node_id.clone(),
+            public_key_hex: req.sender_public_key_hex.clone(),
+            hostname: req.sender_hostname.clone(),
+            addresses: req.sender_addresses.clone(),
+            relay_url: req.sender_relay_url.clone(),
+        };
+        if let Err(e) = store_pending_contact_hints(&self.security.db, &req.sender_node_id, &hints) {
+            warn!(peer = %req.sender_node_id, "pairing: zapis pending contact hints nieudany: {}", e);
+        }
 
-        PairingResponse::Confirm {
-            receiver_public_key_hex: self.security.public_key_hex(),
-            receiver_hostname: self.local_hostname.clone(),
-            trusted_keys: self.security.get_all_trusted_keys(),
+        if self.security.consume_invite_pin(&req.pin) {
+            if let Err(e) = self.security.confirm_pairing(
+                &req.sender_node_id,
+                &req.sender_public_key_hex,
+                &req.sender_hostname,
+                "iroh-pairing",
+            ) {
+                return PairingResponse::Reject {
+                    reason: format!("zapis trusted_node nieudany: {e}"),
+                };
+            }
+            let _ = delete_pending_contact_hints(&self.security.db, &req.sender_node_id);
+            info!(
+                peer = %req.sender_node_id,
+                hostname = %req.sender_hostname,
+                "Parowanie zaakceptowane nad iroh transportem"
+            );
+            PairingResponse::Confirm {
+                receiver_public_key_hex: self.security.public_key_hex(),
+                receiver_hostname: self.local_hostname.clone(),
+                trusted_keys: self.security.get_all_trusted_keys(),
+            }
+        } else {
+            info!(
+                peer = %req.sender_node_id,
+                hostname = %req.sender_hostname,
+                "Parowanie zapisane jako pending nad iroh transportem"
+            );
+            PairingResponse::Pending {
+                receiver_hostname: self.local_hostname.clone(),
+            }
         }
     }
 
@@ -227,45 +238,29 @@ impl ProtocolHandler for PairingHandler {
 /// trusted_keys z odpowiedzi.
 pub async fn initiate_pairing_over_iroh(
     endpoint: &iroh::Endpoint,
-    receiver_id: iroh::EndpointId,
-    receiver_node_id_hex: &str,
+    receiver: &PairingContactHints,
     security: &MeshSecurity,
     pin: &str,
     local_hostname: &str,
-) -> anyhow::Result<()> {
+    local_addresses: Vec<String>,
+    local_relay_url: String,
+) -> anyhow::Result<PairingAttemptOutcome> {
     let sender_node_id = security.ed25519_public_key_hex();
-
-    let pin_proof_bytes = security.derive_pin_proof(
-        // Remote X25519 pub to polowa ich public_key_hex — ale tu jeszcze jej
-        // nie mamy. Musimy derywowac PIN proof od PO odebraniu klucza A, czyli
-        // faktyczny flow to dwuetapowy: najpierw wymiana kluczy, potem PIN
-        // proof. W tej implementacji PairingRequest niesie dane od razu —
-        // wiec zakladamy ze receiver_node_id + receiver_x25519_pub sa znane
-        // wczesniej (np. z QR code razem z PIN-em).
-        &receiver_node_id_hex[64..128],
-        pin,
-        &sender_node_id,
-        // Uwaga: receiver_node_id_hex zawiera 128 hex (Ed25519+X25519), ale
-        // derive_pin_proof przyjmuje tylko ed25519 czesc jako `remote_node_id`
-        // w info_buf. Bezpieczniej jest uzywac pelnego hex — protokol musi
-        // byc spojny po obu stronach. Implementacja handlera (verify_request)
-        // uzywa `req.sender_node_id` (pelnego Ed25519 hex) — skoro my jestesmy
-        // receiver dla handlera, a sender dla requestu, uzywamy ich Ed25519.
-        &receiver_node_id_hex[..64],
-    )?;
-    let pin_proof_hex = hex::encode(pin_proof_bytes);
+    let endpoint_addr = endpoint_addr_from_hints(receiver)?;
 
     let request = PairingRequest {
         sender_node_id: sender_node_id.clone(),
         sender_public_key_hex: security.public_key_hex(),
         sender_hostname: local_hostname.to_string(),
-        pin_proof_hex,
+        pin: pin.to_string(),
+        sender_addresses: local_addresses,
+        sender_relay_url: local_relay_url,
     };
     let body = serde_json::to_vec(&request)
         .map_err(|e| anyhow::anyhow!("pairing: encode request: {e}"))?;
 
     let connection = endpoint
-        .connect(receiver_id, super::ALPN_PAIRING)
+        .connect(endpoint_addr, super::ALPN_PAIRING)
         .await
         .map_err(|e| anyhow::anyhow!("pairing: connect: {e}"))?;
     let (mut send, mut recv) = connection
@@ -304,19 +299,22 @@ pub async fn initiate_pairing_over_iroh(
             receiver_hostname,
             trusted_keys,
         } => {
-            // Zapisujemy receiver jako trusted.
             security
-                .add_trusted_key(
-                    &receiver_node_id_hex[..64],
+                .confirm_pairing(
+                    &receiver.node_id,
                     &receiver_public_key_hex,
                     &receiver_hostname,
+                    "iroh-pairing",
                 )
-                .map_err(|e| anyhow::anyhow!("add_trusted_key receiver: {e}"))?;
-            // Sync trusted_keys otrzymane od receiver.
+                .map_err(|e| anyhow::anyhow!("confirm_pairing receiver: {e}"))?;
             for (nid, pk) in trusted_keys {
                 let _ = security.add_trusted_key(&nid, &pk, "mesh-sync");
             }
-            Ok(())
+            Ok(PairingAttemptOutcome::Confirmed)
+        }
+        PairingResponse::Pending { .. } => {
+            info!(peer = %receiver.node_id, "PairingRequest dostarczony — oczekuje na potwierdzenie");
+            Ok(PairingAttemptOutcome::Pending)
         }
         PairingResponse::Reject { reason } => {
             anyhow::bail!("pairing rejected: {reason}")
@@ -324,29 +322,108 @@ pub async fn initiate_pairing_over_iroh(
     }
 }
 
-/// Porownanie dwoch 32-bajtowych tablic w czasie stalym (odporne na timing attack).
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
+pub fn load_pending_contact_hints(
+    db: &crate::db::DbPool,
+    remote_node_id: &str,
+) -> anyhow::Result<Option<PairingContactHints>> {
+    let Some(raw) = db::repository::get_setting(db, &pending_contact_setting_key(remote_node_id))?
+    else {
+        return Ok(None);
+    };
+    let hints = serde_json::from_str::<PairingContactHints>(&raw)
+        .map_err(|e| anyhow::anyhow!("pending contact decode: {e}"))?;
+    Ok(Some(hints))
+}
+
+pub fn store_pending_contact_hints(
+    db: &crate::db::DbPool,
+    remote_node_id: &str,
+    hints: &PairingContactHints,
+) -> anyhow::Result<()> {
+    let raw = serde_json::to_string(hints)
+        .map_err(|e| anyhow::anyhow!("pending contact encode: {e}"))?;
+    db::repository::set_setting(db, &pending_contact_setting_key(remote_node_id), &raw)?;
+    Ok(())
+}
+
+pub fn delete_pending_contact_hints(
+    db: &crate::db::DbPool,
+    remote_node_id: &str,
+) -> anyhow::Result<()> {
+    db::repository::delete_setting(db, &pending_contact_setting_key(remote_node_id))?;
+    Ok(())
+}
+
+pub fn endpoint_addr_from_hints(hints: &PairingContactHints) -> anyhow::Result<EndpointAddr> {
+    let receiver_id = parse_endpoint_id(&hints.node_id)?;
+    let mut addr = EndpointAddr::new(receiver_id);
+    for socket_addr in parse_socket_addrs(&hints.addresses) {
+        addr = addr.with_ip_addr(socket_addr);
     }
-    diff == 0
+    if !hints.relay_url.trim().is_empty() {
+        let relay_url: RelayUrl = hints
+            .relay_url
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("pairing relay url: {e}"))?;
+        addr = addr.with_relay_url(relay_url);
+    }
+    Ok(addr)
+}
+
+fn parse_socket_addrs(addrs: &[String]) -> Vec<SocketAddr> {
+    addrs.iter().filter_map(|addr| addr.parse().ok()).collect()
+}
+
+fn pending_contact_setting_key(remote_node_id: &str) -> String {
+    format!("{PENDING_CONTACT_PREFIX}{remote_node_id}")
+}
+
+fn parse_endpoint_id(hex_str: &str) -> anyhow::Result<iroh::EndpointId> {
+    let bytes = hex::decode(hex_str).map_err(|e| anyhow::anyhow!("hex decode node_id: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("node_id musi byc 32 bajtami"))?;
+    iroh::EndpointId::from_bytes(&arr).map_err(|e| anyhow::anyhow!("EndpointId: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn constant_time_eq_sanity() {
-        let a = [0u8; 32];
-        let mut b = [0u8; 32];
-        assert!(constant_time_eq(&a, &b));
-        b[5] = 1;
-        assert!(!constant_time_eq(&a, &b));
+    #[test]
+    fn endpoint_addr_zawiera_direct_i_relay() {
+        let node_id = hex::encode(iroh::SecretKey::generate().public().as_bytes());
+        let hints = PairingContactHints {
+            node_id,
+            public_key_hex: String::new(),
+            hostname: "peer".to_string(),
+            addresses: vec!["10.0.0.7:8090".to_string(), "192.168.1.7:8090".to_string()],
+            relay_url: "https://relay.example./".to_string(),
+        };
+
+        let addr = endpoint_addr_from_hints(&hints).expect("endpoint addr");
+        let direct: Vec<_> = addr.ip_addrs().copied().collect();
+        let relays: Vec<_> = addr.relay_urls().cloned().collect();
+
+        assert_eq!(direct.len(), 2);
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].to_string(), "https://relay.example./");
     }
 
     #[test]
-    fn constant_time_eq_smoke() {
-        constant_time_eq_sanity();
+    fn endpoint_addr_pomija_niepoprawne_adresy() {
+        let node_id = hex::encode(iroh::SecretKey::generate().public().as_bytes());
+        let hints = PairingContactHints {
+            node_id,
+            public_key_hex: String::new(),
+            hostname: String::new(),
+            addresses: vec!["nie-adres".to_string(), "127.0.0.1:8090".to_string()],
+            relay_url: String::new(),
+        };
+
+        let addr = endpoint_addr_from_hints(&hints).expect("endpoint addr");
+        let direct: Vec<_> = addr.ip_addrs().copied().collect();
+        assert_eq!(direct, vec!["127.0.0.1:8090".parse::<SocketAddr>().unwrap()]);
     }
 }

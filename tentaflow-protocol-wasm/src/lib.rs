@@ -508,11 +508,19 @@ pub fn encode_mesh_trusted_list_request() -> Result<Vec<u8>, JsError> {
 pub fn encode_mesh_pairing_start_request(
     remote_address: String,
     pin_hint: Option<String>,
+    remote_public_key: Option<String>,
+    remote_addresses: Option<Vec<String>>,
+    remote_relay_url: Option<String>,
+    remote_hostname: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MeshPairingStartRequestBody(
         MeshPairingStartRequest {
             remote_address,
             pin_hint: pin_hint.unwrap_or_default(),
+            remote_public_key: remote_public_key.unwrap_or_default(),
+            remote_addresses: remote_addresses.unwrap_or_default(),
+            remote_relay_url: remote_relay_url.unwrap_or_default(),
+            remote_hostname: remote_hostname.unwrap_or_default(),
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -3023,6 +3031,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 addrs.push(&a.into());
             }
             set(&obj, "addresses", addrs.into());
+            set(&obj, "relayUrl", resp.relay_url.clone().into());
+            set(&obj, "relay_url", resp.relay_url.into());
             set(&obj, "version", resp.version.into());
             set(&obj, "invitePin", resp.invite_pin.clone().into());
             set(&obj, "invite_pin", resp.invite_pin.into());
@@ -3067,11 +3077,21 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MeshPairingStartRequestBody(r) => {
             set(&obj, "variant", "MeshPairingStartRequest".into());
             set(&obj, "remoteAddress", r.remote_address.into());
+            set(&obj, "pinHint", r.pin_hint.into());
+            set(&obj, "remotePublicKey", r.remote_public_key.into());
+            let addrs = js_sys::Array::new();
+            for a in r.remote_addresses {
+                addrs.push(&a.into());
+            }
+            set(&obj, "remoteAddresses", addrs.into());
+            set(&obj, "remoteRelayUrl", r.remote_relay_url.into());
+            set(&obj, "remoteHostname", r.remote_hostname.into());
         }
         MessageBody::MeshPairingStartResponseBody(r) => {
             set(&obj, "variant", "MeshPairingStartResponse".into());
             set(&obj, "pairId", r.pair_id.into());
             set(&obj, "pin", r.pin.into());
+            set(&obj, "completed", r.completed.into());
         }
         MessageBody::MeshPairingConfirmRequestBody(r) => {
             set(&obj, "variant", "MeshPairingConfirmRequest".into());

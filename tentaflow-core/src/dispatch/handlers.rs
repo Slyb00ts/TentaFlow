@@ -2827,6 +2827,13 @@ pub fn mesh_identity(
         .get(local_node_id.as_str())
         .map(|p| p.hostname)
         .unwrap_or_default();
+    let relay_url = ctx
+        .state
+        .quic_mesh
+        .as_ref()
+        .and_then(|qm| qm.relay_url())
+        .map(|url| url.to_string())
+        .unwrap_or_default();
     // Generuj fresh invite PIN dla QR code (60s TTL). Frontend co 50s re-fetchuje
     // identity zeby odswiezyc PIN, wiec zawsze w QR jest wazny kod.
     let (invite_pin, invite_pin_expires_sec) = sec.generate_invite_pin();
@@ -2836,6 +2843,7 @@ pub fn mesh_identity(
             hostname,
             public_key: sec.public_key_hex(),
             addresses,
+            relay_url,
             version: env!("CARGO_PKG_VERSION").to_string(),
             invite_pin,
             invite_pin_expires_sec,

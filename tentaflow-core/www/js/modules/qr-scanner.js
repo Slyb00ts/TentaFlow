@@ -204,17 +204,24 @@ export async function scanQr() {
 }
 
 /**
- * Parsuje `tentaflow-pair://<hex>?pin=<pin>&host=<name>&ver=1` URI albo
- * plain hex. Zwraca { hex, pin, host } albo null gdy nie pasuje.
+ * Parsuje `tentaflow-pair://<hex>?pin=<pin>&host=<name>&relay=<url>&addr=ip:port`
+ * albo plain hex. Zwraca obiekt z hintami transportowymi albo null.
  */
 export function parsePairUri(raw) {
   if (!raw) return null;
   const str = String(raw).trim();
   // Plain hex (64 chars)?
   if (/^[0-9a-f]{64}$/i.test(str)) {
-    return { hex: str.toLowerCase(), pin: '', host: '' };
+    return {
+      hex: str.toLowerCase(),
+      pin: '',
+      host: '',
+      relayUrl: '',
+      publicKey: '',
+      addresses: [],
+    };
   }
-  // tentaflow-pair://HEX?pin=XXX&host=YYY&ver=1
+  // tentaflow-pair://HEX?pin=XXX&host=YYY&ver=2
   const m = str.match(/^tentaflow-pair:\/\/([0-9a-fA-F]{64})(?:\?(.*))?$/);
   if (!m) return null;
   const hex = m[1].toLowerCase();
@@ -223,6 +230,9 @@ export function parsePairUri(raw) {
     hex,
     pin: qs.get('pin') || '',
     host: qs.get('host') || '',
+    relayUrl: qs.get('relay') || '',
+    publicKey: qs.get('pk') || '',
+    addresses: qs.getAll('addr').filter(Boolean),
   };
 }
 

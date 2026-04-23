@@ -227,6 +227,47 @@ impl MeshPeerStore {
         self.dirty.store(true, Ordering::Release);
     }
 
+    fn normalize_hostname(hostname: &str) -> String {
+        hostname
+            .trim()
+            .trim_end_matches(" (local)")
+            .trim()
+            .to_string()
+    }
+
+    fn remove_stale_by_hostname_port(
+        peers: &mut HashMap<String, MeshPeerInfo>,
+        node_id: &str,
+        hostname: &str,
+        port: u16,
+    ) {
+        let normalized = Self::normalize_hostname(hostname);
+        if normalized.is_empty() || port == 0 {
+            return;
+        }
+        let stale_ids: Vec<String> = peers
+            .iter()
+            .filter(|(id, _)| id.as_str() != node_id)
+            .filter(|(_, existing)| {
+                !existing.quic_connected
+                    && existing.port == port
+                    && Self::normalize_hostname(&existing.hostname) == normalized
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in stale_ids {
+            tracing::info!(
+                old_node_id = %id,
+                new_node_id = %node_id,
+                hostname = %normalized,
+                port,
+                "Usuwanie stalego wpisu peera (hostname+port match)"
+            );
+            peers.remove(&id);
+        }
+    }
+
     /// Dodaje nowego peera lub aktualizuje istniejacego.
     /// Deduplikacja: jesli istnieje disconnected peer z tym samym adresem+portem,
     /// stary wpis jest usuwany i nowy go zastepuje (host sie zrestartowal z nowym node_id).
@@ -308,14 +349,19 @@ impl MeshPeerStore {
     /// Hostname — ustawiany na podstawie Hello payload od peera lub seed_local.
     /// Nigdy nie nadpisuje niepustej wartosci pustym stringiem.
     pub fn set_hostname(&self, node_id: &str, hostname: &str) {
+        let hostname = Self::normalize_hostname(hostname);
         if hostname.is_empty() {
             return;
         }
         let mut peers = self.peers.write();
-        let p = peers
-            .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.hostname = hostname.to_string();
+        let port = {
+            let p = peers
+                .entry(node_id.to_string())
+                .or_insert_with(|| Self::empty_peer(node_id));
+            p.hostname = hostname.clone();
+            p.port
+        };
+        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
         drop(peers);
         self.mark_dirty();
     }
@@ -392,50 +438,37 @@ impl MeshPeerStore {
     /// o tej samej nazwie hosta i porcie, stary wpis jest usuwany.
     /// Zaktualizuj hostname peera (np. z mDNS TXT records)
     pub fn update_hostname(&self, node_id: &str, hostname: &str) {
-        let mut peers = self.peers.write();
-        if let Some(p) = peers.get_mut(node_id) {
-            p.hostname = hostname.to_string();
+        let hostname = Self::normalize_hostname(hostname);
+        if hostname.is_empty() {
+            return;
         }
+        let mut peers = self.peers.write();
+        let port = if let Some(p) = peers.get_mut(node_id) {
+            p.hostname = hostname.clone();
+            p.port
+        } else {
+            0
+        };
+        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
         drop(peers);
         self.mark_dirty();
     }
 
     pub fn update_node_info(&self, node_id: &str, info: &NodeInfo) {
         let mut peers = self.peers.write();
-        let p = peers
-            .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.hostname = info.hostname.clone();
-        p.os_info = info.os_info.clone();
-        p.cpu_count = info.cpu_count;
-        p.ram_total_mb = info.ram_total_mb;
-        p.gpu_info = info.gpu_info.clone();
+        let (hostname, port) = {
+            let p = peers
+                .entry(node_id.to_string())
+                .or_insert_with(|| Self::empty_peer(node_id));
+            p.hostname = Self::normalize_hostname(&info.hostname);
+            p.os_info = info.os_info.clone();
+            p.cpu_count = info.cpu_count;
+            p.ram_total_mb = info.ram_total_mb;
+            p.gpu_info = info.gpu_info.clone();
+            (p.hostname.clone(), p.port)
+        };
 
-        // Deduplikacja po hostname+port — usun stare disconnected wpisy tego samego hosta
-        if !info.hostname.is_empty() && p.port > 0 {
-            let port = p.port;
-            let hostname = info.hostname.clone();
-            let stale_ids: Vec<String> = peers
-                .iter()
-                .filter(|(id, _)| id.as_str() != node_id)
-                .filter(|(_, existing)| {
-                    !existing.quic_connected
-                        && existing.port == port
-                        && existing.hostname == hostname
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-
-            for id in stale_ids {
-                tracing::info!(
-                    old_node_id = %id,
-                    new_node_id = %node_id,
-                    hostname = %hostname,
-                    "Usuwanie starego wpisu disconnected peera (hostname+port match)"
-                );
-                peers.remove(&id);
-            }
-        }
+        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
 
         drop(peers);
         self.mark_dirty();
@@ -495,25 +528,29 @@ impl MeshPeerStore {
         docker_version: String,
     ) {
         let mut peers = self.peers.write();
-        let entry = peers
-            .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        entry.hostname = hostname;
-        entry.os_info = os_info;
-        entry.platform = platform;
-        entry.cpu_count = cpu_count;
-        entry.ram_total_mb = ram_total_mb;
-        entry.gpu_info = gpu_info;
-        entry.addresses = addresses;
-        entry.docker_available = docker_available;
-        entry.docker_version = docker_version;
-        entry.role = if entry.role.is_empty() {
-            "router".to_string()
-        } else {
-            entry.role.clone()
+        let (hostname, port) = {
+            let entry = peers
+                .entry(node_id.to_string())
+                .or_insert_with(|| Self::empty_peer(node_id));
+            entry.hostname = Self::normalize_hostname(&hostname);
+            entry.os_info = os_info;
+            entry.platform = platform;
+            entry.cpu_count = cpu_count;
+            entry.ram_total_mb = ram_total_mb;
+            entry.gpu_info = gpu_info;
+            entry.addresses = addresses;
+            entry.docker_available = docker_available;
+            entry.docker_version = docker_version;
+            entry.role = if entry.role.is_empty() {
+                "router".to_string()
+            } else {
+                entry.role.clone()
+            };
+            entry.status = "connected".to_string();
+            entry.quic_connected = true;
+            (entry.hostname.clone(), entry.port)
         };
-        entry.status = "connected".to_string();
-        entry.quic_connected = true;
+        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
         drop(peers);
         self.mark_dirty();
     }
@@ -644,27 +681,32 @@ impl MeshPeerStore {
         port: u16,
     ) {
         let mut peers = self.peers.write();
-        let entry = peers
-            .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        if !hostname.is_empty() && entry.hostname.is_empty() {
-            entry.hostname = hostname.to_string();
-        }
-        if !platform.is_empty() && entry.platform.is_empty() {
-            entry.platform = platform.to_string();
-        }
-        if !os_info.is_empty() && entry.os_info.is_empty() {
-            entry.os_info = os_info.to_string();
-        }
-        if entry.addresses.is_empty() && !addresses.is_empty() {
-            entry.addresses = addresses;
-        }
-        if entry.port == 0 && port != 0 {
-            entry.port = port;
-        }
-        if entry.status == "disconnected" || entry.status.is_empty() {
-            entry.status = "reachable".to_string();
-        }
+        let hostname = Self::normalize_hostname(hostname);
+        let (dedupe_hostname, dedupe_port) = {
+            let entry = peers
+                .entry(node_id.to_string())
+                .or_insert_with(|| Self::empty_peer(node_id));
+            if !hostname.is_empty() && entry.hostname.is_empty() {
+                entry.hostname = hostname.clone();
+            }
+            if !platform.is_empty() && entry.platform.is_empty() {
+                entry.platform = platform.to_string();
+            }
+            if !os_info.is_empty() && entry.os_info.is_empty() {
+                entry.os_info = os_info.to_string();
+            }
+            if entry.addresses.is_empty() && !addresses.is_empty() {
+                entry.addresses = addresses;
+            }
+            if entry.port == 0 && port != 0 {
+                entry.port = port;
+            }
+            if entry.status == "disconnected" || entry.status.is_empty() {
+                entry.status = "reachable".to_string();
+            }
+            (entry.hostname.clone(), entry.port)
+        };
+        Self::remove_stale_by_hostname_port(&mut peers, node_id, &dedupe_hostname, dedupe_port);
         drop(peers);
         self.mark_dirty();
     }

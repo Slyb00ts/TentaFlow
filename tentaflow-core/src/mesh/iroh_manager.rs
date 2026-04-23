@@ -23,8 +23,9 @@ use tracing::{debug, info, warn};
 use crate::mesh::security::MeshSecurity;
 use crate::mesh::service_registry::MeshServiceRegistry;
 use crate::net::iroh::{
-    handler::IrohStreamError, pairing::PairingHandler, IrohConfig, IrohEndpoint, IrohEndpointError,
-    ALPN_API, ALPN_MESH, ALPN_PAIRING,
+    handler::IrohStreamError,
+    pairing::{endpoint_addr_from_hints, PairingContactHints, PairingHandler},
+    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_MESH, ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -486,6 +487,14 @@ impl IrohMeshManager {
         self.endpoint.id()
     }
 
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        self.endpoint.inner()
+    }
+
+    pub fn relay_url(&self) -> Option<RelayUrl> {
+        self.config.relay_url.clone()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<IrohMeshEvent> {
         self.event_tx.subscribe()
     }
@@ -556,6 +565,29 @@ impl IrohMeshManager {
         });
         let me = self.clone_for_spawn();
         let id = node_id_hex.to_string();
+        tokio::spawn(async move {
+            me.handle_mesh_connection(id, connection).await;
+        });
+        Ok(())
+    }
+
+    pub async fn connect_to_peer_with_hints(&self, hints: &PairingContactHints) -> Result<()> {
+        if self.is_connected(&hints.node_id).await {
+            return Ok(());
+        }
+        let addr = endpoint_addr_from_hints(hints)?;
+        let connection = self
+            .endpoint
+            .connect(addr, ALPN_MESH)
+            .await
+            .map_err(|e| anyhow::anyhow!("iroh connect hinted: {e:?}"))?;
+        self.register_connection(hints.node_id.clone(), connection.clone())
+            .await;
+        let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
+            node_id: hints.node_id.clone(),
+        });
+        let me = self.clone_for_spawn();
+        let id = hints.node_id.clone();
         tokio::spawn(async move {
             me.handle_mesh_connection(id, connection).await;
         });

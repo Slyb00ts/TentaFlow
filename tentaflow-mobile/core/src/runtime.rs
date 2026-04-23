@@ -101,7 +101,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
 
     // MeshSecurity — single source of truth dla tozsamosci. Ed25519 keypair
     // jest zapisany zaszyfrowany w settings; iroh uzywa tego klucza jako
-    // EndpointId. public_key_hex() to nasz node_id wszedzie.
+    // EndpointId. Dashboard mesh porownuje node_id po Ed25519 hex.
     let mesh_security = Arc::new(
         MeshSecurity::new(db.clone(), settings_cipher.clone())
             .map_err(|e| {
@@ -109,7 +109,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
                 e
             })?,
     );
-    let node_id = mesh_security.public_key_hex();
+    let node_id = mesh_security.ed25519_public_key_hex();
     info!("Mesh identity: {}", &node_id[..16.min(node_id.len())]);
 
     // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard

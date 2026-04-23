@@ -16,7 +16,7 @@ use iroh::{
     },
     endpoint::presets,
     protocol::Router,
-    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
 
 use super::{ALPN_API, ALPN_MESH, ALPN_PAIRING};
@@ -70,7 +70,7 @@ pub enum IrohEndpointError {
 impl IrohEndpoint {
     /// Tworzy i bind'uje endpoint z podana konfiguracja.
     pub async fn bind(config: IrohConfig) -> Result<Self, IrohEndpointError> {
-        let builder = Endpoint::builder(presets::N0::default())
+        let mut builder = Endpoint::builder(presets::N0::default())
             .secret_key(config.secret_key.clone())
             .alpns(vec![
                 ALPN_MESH.to_vec(),
@@ -79,6 +79,10 @@ impl IrohEndpoint {
             ])
             .bind_addr(config.bind_addr)
             .map_err(|e| IrohEndpointError::InvalidBind(format!("{e:?}")))?;
+
+        if let Some(relay_url) = config.relay_url.clone() {
+            builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay_url)));
+        }
 
         // DNS i Pkarr publisher uzywaja domyslnej n0 konfiguracji przez preset N0.
         let _ = PkarrPublisher::n0_dns;
@@ -113,11 +117,6 @@ impl IrohEndpoint {
                 .address_lookup()
                 .map_err(|e| IrohEndpointError::Bind(format!("address_lookup: {e:?}")))?
                 .add(dht);
-        }
-
-        if let Some(_relay) = config.relay_url {
-            // TODO(task-58): override relay per-config. Aktualny iroh 0.98
-            // ustawia relay przez presets. Override wymaga `relay_mode` w builderze.
         }
 
         Ok(Self {

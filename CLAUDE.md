@@ -107,6 +107,13 @@ Bundled addon updates at startup are driven by `bundle_hash` (computed from embe
 
 **Mesh security layers**: TLS 1.3 (transport) → Ed25519 identity → X25519 DH key exchange → ChaCha20-Poly1305 AEAD with epoch-based key rotation (24h interval, 7-day grace period) and replay protection (sequential nonce + sliding window).
 
+**Pairing / First Contact**:
+- Pierwszy kontakt nie idzie już przez istniejący `mesh` stream, tylko przez osobny ALPN `tentaflow-pairing/v1`.
+- `MeshPairingStartRequest` może nieść hinty transportowe (`remote_addresses`, `remote_relay_url`, `remote_hostname`) z QR albo z autodiscovery.
+- QR payload `tentaflow-pair://...` powinien zawierać co najmniej `node_id`, `pin`, oraz gdy są znane także `addr=` i `relay=`.
+- Receiver zapisuje `pending_contact:*` w settings, żeby późniejsze `confirm/reject` mogły dociągnąć połączenie do inicjatora nawet bez świeżego autodiscovery.
+- `mesh` stream jest dalej używany po zestawieniu łączności do `PairingConfirm/Reject`, `NodeInfo` i `TrustedKeysSync`.
+
 **Dashboard**:
 - Frontend `www/` używa vanilla JS + custom elements `tf-*` z `tentaflow-core/www/js/components/`.
 - Widok Addons (WASM) korzysta z komponentów `tf-chip`, `tf-searchbox`, `tf-toggle`, `tf-button`; układ i style modułu są trzymane w `tentaflow-core/www/css/addons.css`.

@@ -742,6 +742,7 @@ pub struct MeshIdentityResponse {
     pub hostname: String,
     pub public_key: String,
     pub addresses: Vec<String>,
+    pub relay_url: String,
     pub version: String,
     /// Aktywny invite PIN dla QR. Empty string gdy disabled.
     /// Frontend odswieza co 50s (co kazdy re-fetch identity).
@@ -782,12 +783,22 @@ pub struct MeshPairingStartRequest {
     /// losowy. Pozwala nodowi B (skanujacemu) uzyc invite PIN-u nodu A, co
     /// triggeruje auto-confirm po stronie A bez user-interakcji.
     pub pin_hint: String,
+    /// Publiczny klucz zdalnego noda (Ed25519 + X25519), jesli byl dostepny
+    /// np. z QR. Nie jest wymagany do zestawienia polaczenia.
+    pub remote_public_key: String,
+    /// Lista adresow `ip:port` zdalnego noda z QR albo discovery.
+    pub remote_addresses: Vec<String>,
+    /// Relay URL zdalnego noda, jesli byl znany przy inicjacji.
+    pub remote_relay_url: String,
+    /// Hostname zdalnego noda — tylko hint diagnostyczny/UI.
+    pub remote_hostname: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeshPairingStartResponse {
     pub pair_id: String,
     pub pin: String,
+    pub completed: bool,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
