@@ -225,6 +225,14 @@ async function onLeaveClick() {
   render();
 }
 
+async function onOpenLive() {
+  if (!activeSession?.meetingKey) return;
+  const { openMeetingLive } = await import('/js/modules/meeting-live.js');
+  const { Router } = await import('/js/router.js');
+  openMeetingLive(activeSession.meetingKey);
+  Router.navigate('meeting-live');
+}
+
 async function onDownloadTranscript() {
   if (!activeSession) return;
   const lines = transcripts.map(
@@ -441,6 +449,7 @@ function renderActiveScreen() {
   const title = s?.title || s?.meetingKey || I18n.t('meeting.title');
   const subtitle = `${s?.entryCount || transcripts.length} ${escapeHtml(I18n.t('meeting.entries'))} · ${durationLabel} · ${escapeHtml(s?.platform || 'teams')}`;
   const actions = `
+    <tf-button variant="primary" size="sm" icon="star" id="meeting-live-btn">${escapeHtml(I18n.t('meeting.live.open_button'))}</tf-button>
     <tf-button variant="ghost" size="sm" icon="maximize" id="meeting-vnc-btn">${escapeHtml(I18n.t('meeting.vnc_button'))}</tf-button>
     <tf-button variant="ghost" size="sm" icon="download" id="meeting-download-btn">${escapeHtml(I18n.t('meeting.download'))}</tf-button>
     <tf-button variant="danger" size="sm" icon="log-out" id="meeting-leave-btn">${escapeHtml(I18n.t('meeting.leave_button'))}</tf-button>`;
@@ -888,6 +897,7 @@ function mountHistoryVlist(entries) {
 
 function bindEvents() {
   byId('meeting-join-btn')?.addEventListener('click', onJoinClick);
+  byId('meeting-live-btn')?.addEventListener('click', onOpenLive);
   byId('meeting-leave-btn')?.addEventListener('click', onLeaveClick);
   byId('meeting-cancel-btn')?.addEventListener('click', onLeaveClick);
   byId('meeting-download-btn')?.addEventListener('click', onDownloadTranscript);
