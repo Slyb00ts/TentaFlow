@@ -17,7 +17,6 @@ use tentaflow_core::db;
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::routing::Router;
 
-
 // =============================================================================
 // Argumenty CLI
 // =============================================================================
@@ -70,7 +69,7 @@ enum Subcommand {
     SystemCheck,
 }
 
-use tentaflow_core::mesh::pipeline::{MeshPipelineConfig, start_mesh_pipeline};
+use tentaflow_core::mesh::pipeline::{start_mesh_pipeline, MeshPipelineConfig};
 
 // =============================================================================
 // Punkt wejscia
@@ -107,9 +106,14 @@ async fn run_server(args: Args) -> Result<()> {
             anyhow::anyhow!("{}", e)
         })?
     } else {
-        info!("Plik konfiguracji {:?} nie istnieje — tworzenie domyslnej konfiguracji", args.config);
+        info!(
+            "Plik konfiguracji {:?} nie istnieje — tworzenie domyslnej konfiguracji",
+            args.config
+        );
         let config = NodeConfig::default();
-        let toml_str = config.to_toml_string().map_err(|e| anyhow::anyhow!("{}", e))?;
+        let toml_str = config
+            .to_toml_string()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         std::fs::write(&args.config, &toml_str)?;
         info!("Zapisano domyslna konfiguracje do: {:?}", args.config);
         config
@@ -132,7 +136,9 @@ async fn run_server(args: Args) -> Result<()> {
     // Ladowanie master key z pliku i inicjalizacja SettingsCipher
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key()
         .expect("Nie udalo sie zaladowac master key z pliku");
-    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(&file_master_key));
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+        &file_master_key,
+    ));
 
     // Migracja istniejacych plaintextowych sekretow
     match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {
@@ -173,7 +179,11 @@ async fn run_server(args: Args) -> Result<()> {
         mesh_peer_store.seed_local(
             &local_node_id_str,
             hostname,
-            if os_info.is_empty() { info.os_info.clone() } else { os_info },
+            if os_info.is_empty() {
+                info.os_info.clone()
+            } else {
+                os_info
+            },
             platform,
             info.cpu_count,
             info.ram_total_mb,
@@ -208,15 +218,17 @@ async fn run_server(args: Args) -> Result<()> {
             .expect("Blad inicjalizacji AddonManager"),
     );
     addon_manager.set_router(router.clone());
-    router.service_manager().set_event_bus(addon_manager.event_bus().clone());
+    router
+        .service_manager()
+        .set_event_bus(addon_manager.event_bus().clone());
 
     // Mesh networking — iroh (LAN mDNS + DHT + relay), wspoldzielony pipeline z Core
-    let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>> = None;
-    let mut mesh_security_for_server: Option<Arc<tentaflow_core::mesh::security::MeshSecurity>> = None;
-    let mut local_node_id_for_server: Arc<str> = Arc::from("");
+    let mut quic_mesh_for_server: Option<Arc<tentaflow_core::mesh::iroh_manager::IrohMeshManager>> =
+        None;
+    let mut mesh_security_for_server: Option<Arc<tentaflow_core::mesh::security::MeshSecurity>> =
+        None;
+    let mut local_node_id_for_server: Arc<str> = Arc::from(local_node_id_str.as_str());
     let _mesh_handles;
-
-    local_node_id_for_server = Arc::from(local_node_id_str.as_str());
 
     if let Some(ref mesh_config) = config.mesh {
         if mesh_config.enabled {
@@ -228,15 +240,29 @@ async fn run_server(args: Args) -> Result<()> {
                 mesh_config: mesh_config.clone(),
             };
 
-            match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone()), settings_cipher.clone()).await {
+            match start_mesh_pipeline(
+                pipeline_config,
+                &mesh_peer_store,
+                Some(db.clone()),
+                settings_cipher.clone(),
+            )
+            .await
+            {
                 Ok(handles) => {
                     quic_mesh_for_server = handles.quic_mesh.clone();
                     mesh_security_for_server = handles.security.clone();
 
                     // Podepnij mesh do routera — umozliwia forwarding requestow do zdalnych nodow
                     if let Some(ref mesh_mgr) = handles.quic_mesh {
+                        let mesh_node_id = mesh_mgr.node_id();
+                        local_node_id_for_server = Arc::from(mesh_node_id.as_str());
+                        if mesh_node_id != local_node_id_str {
+                            mesh_peer_store.remove(&local_node_id_str);
+                        }
                         router.set_mesh_manager(mesh_mgr.clone());
-                        router.service_manager().set_mesh_registry(mesh_mgr.service_registry().clone());
+                        router
+                            .service_manager()
+                            .set_mesh_registry(mesh_mgr.service_registry().clone());
 
                         // Ustaw forward handler — zdalny node uzywa routera do obslugi forwardowanych requestow
                         let router_for_forward = router.clone();
@@ -329,7 +355,9 @@ async fn run_server(args: Args) -> Result<()> {
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
-    collector.start(router.service_manager().shutdown_rx.clone()).await;
+    collector
+        .start(router.service_manager().shutdown_rx.clone())
+        .await;
 
     // Sprzątanie ephemeral kontenerów Meeting Bot po unclean shutdown — stare wiersze
     // meeting_sessions ze status=active/joining dostają ended_at, porty sa zwalniane,
@@ -352,7 +380,16 @@ async fn run_server(args: Args) -> Result<()> {
     }
 
     // Uruchom serwer HTTPS (OpenAI API + Dashboard na jednym porcie) — z Core
-    tentaflow_core::api::unified_server::start_unified_server(&config, &db, &metrics, &router, &mesh_peer_store, quic_mesh_for_server, local_node_id_for_server, mesh_security_for_server)?;
+    tentaflow_core::api::unified_server::start_unified_server(
+        &config,
+        &db,
+        &metrics,
+        &router,
+        &mesh_peer_store,
+        quic_mesh_for_server,
+        local_node_id_for_server,
+        mesh_security_for_server,
+    )?;
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");
 
@@ -421,9 +458,11 @@ fn setup_logging(verbose: bool) -> Result<()> {
         wgpu_hal=error,\
         wgpu_core=error";
     let filter = if verbose {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("debug,{}", BASE_FILTER)))
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(format!("debug,{}", BASE_FILTER)))
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("info,{}", BASE_FILTER)))
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(format!("info,{}", BASE_FILTER)))
     };
 
     fmt()
@@ -465,7 +504,6 @@ fn apply_cli_overrides(config: &mut NodeConfig, args: &Args) {
             mesh.enabled = false;
         }
     }
-
 }
 
 // =============================================================================
@@ -476,20 +514,32 @@ fn log_config_summary(config: &NodeConfig, db_path: &PathBuf) {
     info!("   - Serwisy: {}", config.services.len());
     info!(
         "   - OpenAI API: {} ({})",
-        if config.protocols.openai_api.enabled { "wlaczony" } else { "wylaczony" },
+        if config.protocols.openai_api.enabled {
+            "wlaczony"
+        } else {
+            "wylaczony"
+        },
         config.protocols.openai_api.bind
     );
     if let Some(ref quic) = config.protocols.quic {
         info!(
             "   - QUIC: {} ({})",
-            if quic.enabled { "wlaczony" } else { "wylaczony" },
+            if quic.enabled {
+                "wlaczony"
+            } else {
+                "wylaczony"
+            },
             quic.bind
         );
     }
     if let Some(ref mesh) = config.mesh {
         info!(
             "   - Mesh QUIC: {} (port {})",
-            if mesh.enabled { "wlaczony" } else { "wylaczony" },
+            if mesh.enabled {
+                "wlaczony"
+            } else {
+                "wylaczony"
+            },
             mesh.port
         );
     }
@@ -542,9 +592,15 @@ fn run_update(check_only: bool, force: bool) -> Result<()> {
         }
         match updater.run_sync()? {
             Some(result) => {
-                let old = result.old_version.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+                let old = result
+                    .old_version
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".into());
                 println!("Zaktualizowano: {} -> {}", old, result.new_version);
-                println!("Restartuj usluge: systemctl restart tentaflow  (lub launchctl unload/load).");
+                println!(
+                    "Restartuj usluge: systemctl restart tentaflow  (lub launchctl unload/load)."
+                );
                 Ok(())
             }
             None => {
@@ -555,4 +611,3 @@ fn run_update(check_only: bool, force: bool) -> Result<()> {
     };
     outcome.map_err(|e| anyhow::anyhow!("Update nieudany: {}", e))
 }
-

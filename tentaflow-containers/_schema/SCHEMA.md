@@ -24,7 +24,7 @@ tentaflow-containers/
 
 | Konsument | Co czyta | Co robi |
 |-----------|----------|---------|
-| `tentaflow-core/build.rs` | wszystkie `*.toml` z `_services/` | waliduje semantycznie, generuje `services_generated.rs` (Rust const z embedded JSON) oraz `wwwroot/js/generated/services-manifest.js` (ESM module) |
+| `tentaflow-core/build.rs` | wszystkie `*.toml` z `_services/` | waliduje semantycznie, generuje `services_generated.rs` (Rust const z embedded JSON) oraz `www/js/generated/services-manifest.js` (ESM module) |
 | `tentaflow-core/src/services/manifest/registry.rs` | embedded JSON | leniwie tworzy `ManifestRegistry` (singleton) |
 | Dashboard GUI | `services-manifest.js` | renderuje katalog silników, kafelki w wizardzie deploymentu |
 | `build-containers.sh` | manifesty z sekcją `[deploy.docker]` | buduje obrazy lokalnie wg `context_path` |
@@ -108,7 +108,7 @@ recommended = true                         # OPTIONAL, default false
 | `description_en` | string (max 200) | tak | Opis po angielsku. |
 | `homepage` | URL | tak | Strona projektu. |
 | `license` | string SPDX | tak | Identyfikator SPDX licencji. |
-| `icon` | string | nie | Klucz ikony w `wwwroot/js/modules/catalog/CatalogIcons.js`. Brak = ikona kategorii. |
+| `icon` | string | nie | Klucz ikony w `www/js/modules/catalog/icons.js`. Brak = ikona kategorii. |
 | `default_port` | u16 (1–65535) | tak | Domyślny port silnika. |
 | `api` | enum | tak | Protokół API. Patrz lista poniżej. |
 | `version` | string | tak | Wersja referencyjna silnika. |

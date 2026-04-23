@@ -8,10 +8,10 @@
 //   import init, {
 //     SCHEMA_VERSION, messageKind,
 //     encodeEnvelopeDirect, decodeEnvelope,
-//     encodeNodeListRequest, encodeMetaHeartbeat, decodeMessageBody,
+//     encodeModelListRequest, encodeMetaHeartbeat, decodeMessageBody,
 //   } from './codec.js';
 //   await init();
-//   const body = encodeNodeListRequest();
+//   const body = encodeModelListRequest();
 //   const frame = encodeEnvelopeDirect(1n, 1, messageKind.META_HEARTBEAT, body);
 //   ws.send(frame);
 // =============================================================================
@@ -232,21 +232,6 @@ fn encode_body_inner(body: &MessageBody) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("body encode failed: {e}"))
 }
 
-fn encode_node_info_request_inner(node_id: &[u8]) -> Result<Vec<u8>, String> {
-    if node_id.len() != 32 {
-        return Err("node_id must be exactly 32 bytes".to_string());
-    }
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(node_id);
-    encode_body_inner(&MessageBody::NodeInfoRequest { node_id: buf })
-}
-
-/// MessageBody::NodeListRequest (unit variant).
-#[wasm_bindgen(js_name = encodeNodeListRequest)]
-pub fn encode_node_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NodeListRequest).map_err(|e| JsError::new(&e))
-}
-
 /// MessageBody::ModelListRequest (unit variant).
 #[wasm_bindgen(js_name = encodeModelListRequest)]
 pub fn encode_model_list_request() -> Result<Vec<u8>, JsError> {
@@ -271,12 +256,6 @@ pub fn encode_meta_cancel_stream() -> Result<Vec<u8>, JsError> {
 pub fn encode_meta_schema_version_check(client_version: u16) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MetaSchemaVersionCheck { client_version })
         .map_err(|e| JsError::new(&e))
-}
-
-/// MessageBody::NodeInfoRequest { node_id }. node_id MUSI byc 32 bajtami.
-#[wasm_bindgen(js_name = encodeNodeInfoRequest)]
-pub fn encode_node_info_request(node_id: &[u8]) -> Result<Vec<u8>, JsError> {
-    encode_node_info_request_inner(node_id).map_err(|e| JsError::new(&e))
 }
 
 /// MessageBody::ApiKeyListRequest (unit variant).
@@ -1752,9 +1731,9 @@ fn set(obj: &js_sys::Object, key: &str, value: JsValue) {
     let _ = js_sys::Reflect::set(obj, &key.into(), &value);
 }
 
-/// Dekoduje rkyv-zakodowany MessageBody na JS object w formacie
-/// `{ variant: "NodeListResponse", nodes: [...] }`. Dla bootstrap variantow
-/// pokrywa 10 kejsow; nieznany variant zwraca `{ variant: "Unknown" }`.
+/// Dekoduje rkyv-zakodowany MessageBody na JS object.
+/// Dla znanych variantow zwraca obiekt z polem `variant`, a dla nieznanego
+/// variantu `{ variant: "Unknown" }`.
 #[wasm_bindgen(js_name = decodeMessageBody)]
 pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
     let body = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(bytes)
@@ -1781,23 +1760,6 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MetaCancelStream => {
             set(&obj, "variant", "MetaCancelStream".into());
         }
-        MessageBody::NodeListRequest => {
-            set(&obj, "variant", "NodeListRequest".into());
-        }
-        MessageBody::NodeListResponse { nodes } => {
-            set(&obj, "variant", "NodeListResponse".into());
-            let arr = js_sys::Array::new();
-            for n in nodes {
-                let item = js_sys::Object::new();
-                set(&item, "nodeId", js_sys::Uint8Array::from(&n.node_id[..]).into());
-                set(&item, "displayName", n.display_name.into());
-                set(&item, "status", n.status.into());
-                set(&item, "role", n.role.into());
-                set(&item, "isSelf", n.is_self.into());
-                arr.push(&item.into());
-            }
-            set(&obj, "nodes", arr.into());
-        }
         MessageBody::ModelListRequest => {
             set(&obj, "variant", "ModelListRequest".into());
         }
@@ -1813,10 +1775,6 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 arr.push(&item.into());
             }
             set(&obj, "models", arr.into());
-        }
-        MessageBody::NodeInfoRequest { node_id } => {
-            set(&obj, "variant", "NodeInfoRequest".into());
-            set(&obj, "nodeId", js_sys::Uint8Array::from(&node_id[..]).into());
         }
         MessageBody::ApiKeyListRequest => {
             set(&obj, "variant", "ApiKeyListRequest".into());
@@ -4865,12 +4823,12 @@ mod tests {
 
     #[test]
     fn protocol_schema_version_matches() {
-        assert_eq!(PROTOCOL_SCHEMA_VERSION, 6);
+        assert_eq!(PROTOCOL_SCHEMA_VERSION, 7);
     }
 
     #[test]
-    fn roundtrip_envelope_with_node_list_request() {
-        let body = encode_body_inner(&MessageBody::NodeListRequest).unwrap();
+    fn roundtrip_envelope_with_model_list_request() {
+        let body = encode_body_inner(&MessageBody::ModelListRequest).unwrap();
         let frame =
             encode_envelope_direct_inner(42, 1, message_kind::META_HEARTBEAT, body.clone())
                 .unwrap();
@@ -4883,7 +4841,7 @@ mod tests {
 
     #[test]
     fn validate_frame_accepts_good_and_rejects_bad() {
-        let body = encode_body_inner(&MessageBody::NodeListRequest).unwrap();
+        let body = encode_body_inner(&MessageBody::ModelListRequest).unwrap();
         let frame = encode_envelope_direct_inner(1, 1, 0xF001, body).unwrap();
         assert!(rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&frame).is_ok());
         assert!(rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&[]).is_err());
@@ -4891,13 +4849,6 @@ mod tests {
         assert!(
             rkyv::from_bytes::<Envelope, rkyv::rancor::Error>(&frame[..frame.len() / 2]).is_err()
         );
-    }
-
-    #[test]
-    fn node_info_request_requires_32_bytes() {
-        assert!(encode_node_info_request_inner(&[0u8; 32]).is_ok());
-        assert!(encode_node_info_request_inner(&[0u8; 10]).is_err());
-        assert!(encode_node_info_request_inner(&[0u8; 64]).is_err());
     }
 
     #[test]

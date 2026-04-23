@@ -12,7 +12,9 @@ use anyhow::Result;
 use tentaflow_core::config::NodeConfig;
 use tentaflow_core::db;
 use tentaflow_core::mesh::peer_store::MeshPeerStore;
-use tentaflow_core::mesh::pipeline::{MeshPipelineConfig, MeshPipelineHandles, start_mesh_pipeline};
+use tentaflow_core::mesh::pipeline::{
+    start_mesh_pipeline, MeshPipelineConfig, MeshPipelineHandles,
+};
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::routing::Router;
 use tentaflow_ui::state::SharedAppState;
@@ -93,7 +95,9 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     // Ladowanie master key z pliku i inicjalizacja SettingsCipher
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
         .expect("Nie udalo sie zaladowac master key z pliku");
-    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(&file_master_key));
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+        &file_master_key,
+    ));
 
     // Migracja istniejacych plaintextowych sekretow
     match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {
@@ -104,6 +108,7 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
 
     // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard
     let mesh_peer_store = MeshPeerStore::new();
+    let mut local_mesh_node_id = node_id.clone();
 
     // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
     let mesh_handles: Option<MeshPipelineHandles>;
@@ -116,8 +121,18 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
             mesh_config: config.mesh.as_ref().unwrap().clone(),
         };
 
-        match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone()), settings_cipher.clone()).await {
+        match start_mesh_pipeline(
+            pipeline_config,
+            &mesh_peer_store,
+            Some(db.clone()),
+            settings_cipher.clone(),
+        )
+        .await
+        {
             Ok(handles) => {
+                if let Some(ref qm) = handles.quic_mesh {
+                    local_mesh_node_id = qm.node_id();
+                }
                 info!("Mesh pipeline uruchomiony");
 
                 // Eksponuj IrohMeshManager + tokio runtime handle do FFI — Swift
@@ -142,11 +157,17 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     // Unified HTTPS server (OpenAI API + Dashboard na jednym porcie) — z Core
     let quic_mesh_for_server = mesh_handles.as_ref().and_then(|h| h.quic_mesh.clone());
     let mesh_security_for_server = mesh_handles.as_ref().and_then(|h| h.security.clone());
-    let local_node_id: Arc<str> = Arc::from(node_id.as_str());
+    let local_node_id: Arc<str> = Arc::from(local_mesh_node_id.as_str());
 
     tentaflow_core::api::unified_server::start_unified_server(
-        &config, &db, &metrics, &router,
-        &mesh_peer_store, quic_mesh_for_server, local_node_id, mesh_security_for_server,
+        &config,
+        &db,
+        &metrics,
+        &router,
+        &mesh_peer_store,
+        quic_mesh_for_server,
+        local_node_id,
+        mesh_security_for_server,
     )?;
 
     info!("Wszystkie serwisy uruchomione (tryb mobilny)");

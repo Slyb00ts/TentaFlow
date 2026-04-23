@@ -72,8 +72,8 @@ fn decode_response(bytes: &[u8]) -> (Envelope, MessageBody) {
 // =============================================================================
 
 #[test]
-fn node_list_request_full_pipeline() {
-    let req = encode_request(42, MessageBody::NodeListRequest);
+fn model_list_request_full_pipeline() {
+    let req = encode_request(42, MessageBody::ModelListRequest);
     let resp = server_handle(
         &req,
         SessionAuth::UserSession {
@@ -85,8 +85,8 @@ fn node_list_request_full_pipeline() {
     assert_eq!(env.correlation_id, 42);
     assert!(!env.flags.contains(EnvelopeFlags::IS_ERROR));
     match body {
-        MessageBody::NodeListResponse { nodes } => assert!(!nodes.is_empty()),
-        other => panic!("expected NodeListResponse, got {:?}", other),
+        MessageBody::ModelListResponse { models } => assert!(models.is_empty()),
+        other => panic!("expected ModelListResponse, got {:?}", other),
     }
 }
 
@@ -104,7 +104,7 @@ fn model_list_request_allows_anonymous() {
 
 #[test]
 fn anonymous_session_denied_for_admin_handler() {
-    let req = encode_request(7, MessageBody::NodeListRequest);
+    let req = encode_request(7, MessageBody::ApiKeyListRequest);
     let resp = server_handle(&req, SessionAuth::Anonymous);
     let (env, body) = decode_response(&resp);
     assert!(env.flags.contains(EnvelopeFlags::IS_ERROR));
@@ -253,7 +253,7 @@ fn settings_update_with_admin_succeeds() {
 #[test]
 fn correlation_id_preserved_across_pipeline() {
     for correlation_id in [1u64, 42, 1_000_000, u64::MAX] {
-        let req = encode_request(correlation_id, MessageBody::NodeListRequest);
+        let req = encode_request(correlation_id, MessageBody::ModelListRequest);
         let resp = server_handle(
             &req,
             SessionAuth::UserSession {

@@ -285,7 +285,7 @@ mod tests {
             Direction::Incoming,
             1,
             0xF001,
-            "NodeListRequest",
+            "ModelListRequest",
             0,
             &[1, 2, 3],
         );
@@ -293,7 +293,7 @@ mod tests {
             Direction::Outgoing,
             1,
             0xF001,
-            "NodeListResponse",
+            "ModelListResponse",
             0,
             &[4, 5, 6],
         );

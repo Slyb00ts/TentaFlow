@@ -114,8 +114,8 @@ wszystkie manifesty przy `cargo build`, waliduje 9 regul semantycznych i generuj
 
 - Rust const w `$OUT_DIR/services_generated.rs` — uzywany przez
   `tentaflow-core/src/services/manifest/registry.rs`
-- JS module `tentaflow-core/wwwroot/js/generated/services-manifest.js` —
-  konsumowany przez `wwwroot/js/modules/catalog/ManifestStore.js` w GUI
+- JS module `tentaflow-core/www/js/generated/services-manifest.js` —
+  konsumowany przez `www/js/modules/catalog/manifest-store.js` w GUI
 
 Pelna specyfikacja: [`_schema/SCHEMA.md`](./_schema/SCHEMA.md) (sekcje, pola,
 podsekcje, enum-y, reguly walidacji, przyklady). JSON Schema do walidacji w

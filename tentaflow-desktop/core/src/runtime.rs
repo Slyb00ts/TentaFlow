@@ -11,10 +11,12 @@ use std::time::Duration;
 use anyhow::Result;
 use tentaflow_core::config::NodeConfig;
 use tentaflow_core::db;
-use tentaflow_core::mesh::peer_store::MeshPeerStore;
-use tentaflow_core::mesh::pipeline::{MeshPipelineConfig, MeshPipelineHandles, start_mesh_pipeline};
-use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::db::DbPool;
+use tentaflow_core::mesh::peer_store::MeshPeerStore;
+use tentaflow_core::mesh::pipeline::{
+    start_mesh_pipeline, MeshPipelineConfig, MeshPipelineHandles,
+};
+use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::routing::Router;
 use tentaflow_ui::state::{self as ui_state, SharedAppState, UiCommand};
 use tokio::sync::{mpsc, watch};
@@ -36,10 +38,7 @@ pub struct ServiceHandles {
 }
 
 /// Uruchamia wszystkie serwisy Core w tle
-pub async fn start_services(
-    config: NodeConfig,
-    state: SharedAppState,
-) -> Result<ServiceHandles> {
+pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result<ServiceHandles> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     info!("Uruchamianie serwisow Core...");
@@ -106,7 +105,9 @@ pub async fn start_services(
     // Ladowanie master key z pliku i inicjalizacja SettingsCipher
     let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
         .expect("Nie udalo sie zaladowac master key z pliku");
-    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(&file_master_key));
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+        &file_master_key,
+    ));
 
     // Migracja istniejacych plaintextowych sekretow
     match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {
@@ -117,6 +118,7 @@ pub async fn start_services(
 
     // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard i UI sync
     let mesh_peer_store = MeshPeerStore::new();
+    let mut local_mesh_node_id = node_id.clone();
 
     // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
     // PRZED Dashboard server, zeby Dashboard mial dostep do quic_mesh
@@ -130,10 +132,21 @@ pub async fn start_services(
             mesh_config: config.mesh.as_ref().unwrap().clone(),
         };
 
-        match start_mesh_pipeline(pipeline_config, &mesh_peer_store, Some(db.clone()), settings_cipher.clone()).await {
+        match start_mesh_pipeline(
+            pipeline_config,
+            &mesh_peer_store,
+            Some(db.clone()),
+            settings_cipher.clone(),
+        )
+        .await
+        {
             Ok(handles) => {
+                if let Some(ref qm) = handles.quic_mesh {
+                    local_mesh_node_id = qm.node_id();
+                }
                 {
                     let mut s = state.write().unwrap_or_else(|e| e.into_inner());
+                    s.node_id = local_mesh_node_id.clone();
                     s.mesh_connected = handles.quic_mesh.is_some();
                 }
                 mesh_handles = Some(handles);
@@ -155,11 +168,17 @@ pub async fn start_services(
     // Unified HTTPS server (OpenAI API + Dashboard na jednym porcie) — z Core
     let quic_mesh_for_server = mesh_handles.as_ref().and_then(|h| h.quic_mesh.clone());
     let mesh_security_for_server = mesh_handles.as_ref().and_then(|h| h.security.clone());
-    let local_node_id: Arc<str> = Arc::from(node_id.as_str());
+    let local_node_id: Arc<str> = Arc::from(local_mesh_node_id.as_str());
 
     tentaflow_core::api::unified_server::start_unified_server(
-        &config, &db, &metrics, &router,
-        &mesh_peer_store, quic_mesh_for_server, local_node_id, mesh_security_for_server,
+        &config,
+        &db,
+        &metrics,
+        &router,
+        &mesh_peer_store,
+        quic_mesh_for_server,
+        local_node_id,
+        mesh_security_for_server,
     )?;
 
     // Inference manager — juz obslugiwany przez restore_native_services() wyzej
@@ -198,7 +217,15 @@ pub async fn start_services(
         let shutdown_rx_cmd = shutdown_rx.clone();
 
         Some(tokio::spawn(async move {
-            process_ui_commands(cmd_rx, db_cmd, state_cmd, metrics_cmd, mps_cmd, shutdown_rx_cmd).await;
+            process_ui_commands(
+                cmd_rx,
+                db_cmd,
+                state_cmd,
+                metrics_cmd,
+                mps_cmd,
+                shutdown_rx_cmd,
+            )
+            .await;
         }))
     };
 
@@ -249,43 +276,62 @@ pub async fn shutdown(handles: ServiceHandles) {
 // Synchronizacja danych z bazy do SharedAppState
 // =============================================================================
 
-fn sync_all_to_state(db: &DbPool, state: &SharedAppState, metrics: &Arc<RouterMetrics>, mesh_peer_store: &MeshPeerStore) {
+fn sync_all_to_state(
+    db: &DbPool,
+    state: &SharedAppState,
+    metrics: &Arc<RouterMetrics>,
+    mesh_peer_store: &MeshPeerStore,
+) {
     let mut s = state.write().unwrap_or_else(|e| e.into_inner());
 
     // Metryki
-    let total = metrics.total_requests.load(std::sync::atomic::Ordering::Relaxed);
+    let total = metrics
+        .total_requests
+        .load(std::sync::atomic::Ordering::Relaxed);
     s.total_requests = total;
     s.metrics.total_requests = total;
 
     // Services
     if let Ok(services) = db::repository::list_services_with_backends(db) {
-        s.services = services.iter().map(|(svc, backends)| {
-            let backend_names: Vec<String> = backends.iter().map(|b| {
-                b.model_name_override.clone().unwrap_or_else(|| b.connection_type.clone())
-            }).collect();
-            ui_state::ServiceInfo {
-                id: svc.id,
-                name: svc.name.clone(),
-                service_type: parse_service_type(&svc.service_type),
-                status: parse_service_status(&svc.status),
-                quic_status: ui_state::QuicStatus::Disconnected,
-                quic_address: String::new(),
-                backends: backend_names,
-                strategy: svc.strategy.clone(),
-                avg_latency_ms: 0.0,
-                created_at: Some(svc.created_at.clone()),
-            }
-        }).collect();
+        s.services = services
+            .iter()
+            .map(|(svc, backends)| {
+                let backend_names: Vec<String> = backends
+                    .iter()
+                    .map(|b| {
+                        b.model_name_override
+                            .clone()
+                            .unwrap_or_else(|| b.connection_type.clone())
+                    })
+                    .collect();
+                ui_state::ServiceInfo {
+                    id: svc.id,
+                    name: svc.name.clone(),
+                    service_type: parse_service_type(&svc.service_type),
+                    status: parse_service_status(&svc.status),
+                    quic_status: ui_state::QuicStatus::Disconnected,
+                    quic_address: String::new(),
+                    backends: backend_names,
+                    strategy: svc.strategy.clone(),
+                    avg_latency_ms: 0.0,
+                    created_at: Some(svc.created_at.clone()),
+                }
+            })
+            .collect();
         s.metrics.active_services = s.services.len() as u64;
     }
 
     // Models
     if let Ok(models) = db::repository::list_model_entries(db, 0, 1000) {
-        s.models = models.iter().map(|m| {
-            ui_state::ModelInfo {
+        s.models = models
+            .iter()
+            .map(|m| ui_state::ModelInfo {
                 id: m.id,
                 name: m.model_name.clone(),
-                display_name: m.display_name.clone().unwrap_or_else(|| m.model_name.clone()),
+                display_name: m
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| m.model_name.clone()),
                 service_type: parse_service_type(&m.service_type),
                 strategy: m.connection_type.clone(),
                 service_count: if m.service_id.is_some() { 1 } else { 0 },
@@ -295,26 +341,28 @@ fn sync_all_to_state(db: &DbPool, state: &SharedAppState, metrics: &Arc<RouterMe
                 loaded: false,
                 backend: m.connection_type.clone(),
                 tokens_per_second: 0.0,
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // Model Aliases
     if let Ok(aliases) = db::repository::list_model_aliases(db) {
-        s.model_aliases = aliases.iter().map(|a| {
-            ui_state::ModelAlias {
+        s.model_aliases = aliases
+            .iter()
+            .map(|a| ui_state::ModelAlias {
                 id: a.id,
                 alias: a.alias.clone(),
                 target_model: a.target_model.clone(),
                 is_active: a.is_active,
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // API Keys
     if let Ok(keys) = db::repository::list_api_keys(db) {
-        s.api_keys = keys.iter().map(|k| {
-            ui_state::ApiKeyInfo {
+        s.api_keys = keys
+            .iter()
+            .map(|k| ui_state::ApiKeyInfo {
                 id: k.id,
                 key_prefix: k.key_prefix.clone(),
                 name: k.name.clone(),
@@ -322,14 +370,15 @@ fn sync_all_to_state(db: &DbPool, state: &SharedAppState, metrics: &Arc<RouterMe
                 is_active: k.is_active,
                 created_at: k.created_at.clone(),
                 last_used_at: k.last_used_at.clone(),
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // Prompts
     if let Ok(prompts) = db::repository::list_prompts(db, 0, 1000) {
-        s.prompts = prompts.iter().map(|p| {
-            ui_state::PromptInfo {
+        s.prompts = prompts
+            .iter()
+            .map(|p| ui_state::PromptInfo {
                 id: p.id,
                 name: p.name.clone(),
                 prompt_id: p.prompt_id.clone(),
@@ -338,14 +387,15 @@ fn sync_all_to_state(db: &DbPool, state: &SharedAppState, metrics: &Arc<RouterMe
                 default_model: p.default_model.clone().unwrap_or_default(),
                 version: p.version as u32,
                 is_active: p.is_active,
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // Flows
     if let Ok(flows) = db::repository::list_flows(db, 0, 1000) {
-        s.flows = flows.iter().map(|f| {
-            ui_state::FlowInfo {
+        s.flows = flows
+            .iter()
+            .map(|f| ui_state::FlowInfo {
                 id: f.id,
                 name: f.name.clone(),
                 description: f.description.clone().unwrap_or_default(),
@@ -353,14 +403,15 @@ fn sync_all_to_state(db: &DbPool, state: &SharedAppState, metrics: &Arc<RouterMe
                 status: parse_flow_status(&f.status),
                 last_run: None,
                 flow_json: f.flow_json.clone(),
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // PII Rules
     if let Ok(rules) = db::repository::list_pii_rules(db, 0, 1000) {
-        s.pii_rules = rules.iter().map(|r| {
-            ui_state::PiiRule {
+        s.pii_rules = rules
+            .iter()
+            .map(|r| ui_state::PiiRule {
                 id: r.id,
                 name: r.name.clone(),
                 category: r.category.clone(),
@@ -368,111 +419,142 @@ fn sync_all_to_state(db: &DbPool, state: &SharedAppState, metrics: &Arc<RouterMe
                 replacement: r.replacement.clone(),
                 priority: r.priority as i32,
                 is_active: r.is_active,
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // TTS Cleaning Rules
     if let Ok(rules) = db::repository::list_tts_cleaning_rules(db, 0, 1000) {
-        s.tts_cleaning_rules = rules.iter().map(|r| {
-            ui_state::TtsCleaningRule {
+        s.tts_cleaning_rules = rules
+            .iter()
+            .map(|r| ui_state::TtsCleaningRule {
                 id: r.id,
                 name: r.rule_type.clone(),
                 pattern: r.pattern.clone(),
                 replacement: r.replacement.clone().unwrap_or_default(),
                 priority: r.priority as i32,
                 is_active: r.is_active,
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // Fast Path Patterns
     if let Ok(patterns) = db::repository::list_fast_path_patterns(db, 0, 1000) {
-        s.fast_path_patterns = patterns.iter().map(|p| {
-            ui_state::FastPathPattern {
+        s.fast_path_patterns = patterns
+            .iter()
+            .map(|p| ui_state::FastPathPattern {
                 id: p.id,
                 name: format!("{}/{}", p.module, p.pattern_type),
                 pattern: p.pattern.clone(),
                 response: p.result_json.clone(),
                 priority: p.priority as i32,
                 is_active: p.is_active,
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // Settings
     if let Ok(settings) = db::repository::list_settings(db) {
-        s.settings = settings.iter().map(|st| {
-            ui_state::SettingEntry {
+        s.settings = settings
+            .iter()
+            .map(|st| ui_state::SettingEntry {
                 key: st.key.clone(),
                 value: st.value.clone(),
                 updated_at: Some(st.updated_at.clone()),
-            }
-        }).collect();
+            })
+            .collect();
     }
 
     // Portainer Instances
     if let Ok(instances) = db::repository::list_portainer_instances(db) {
-        s.portainer_instances = instances.iter().map(|inst| {
-            ui_state::PortainerInstance {
+        s.portainer_instances = instances
+            .iter()
+            .map(|inst| ui_state::PortainerInstance {
                 id: inst.id,
                 name: inst.name.clone(),
                 url: inst.url.clone(),
-                auth_type: if !inst.api_key.is_empty() { "API Key".to_string() } else { "Credentials".to_string() },
-            }
-        }).collect();
+                auth_type: if !inst.api_key.is_empty() {
+                    "API Key".to_string()
+                } else {
+                    "Credentials".to_string()
+                },
+            })
+            .collect();
     }
 
     // Peers z MeshPeerStore
     let mesh_peers = mesh_peer_store.list();
-    s.peers = mesh_peers.iter().map(|p| {
-        let ram_pct = if p.ram_total_mb > 0 {
-            p.ram_used_mb as f64 / p.ram_total_mb as f64 * 100.0
-        } else {
-            0.0
-        };
-        let (net_rx, net_tx) = if !p.networks.is_empty() {
-            let rx: u64 = p.networks.iter().map(|n| n.rx_bytes_per_sec).sum();
-            let tx: u64 = p.networks.iter().map(|n| n.tx_bytes_per_sec).sum();
-            (rx as f64, tx as f64)
-        } else {
-            (0.0, 0.0)
-        };
-        ui_state::PeerInfo {
-            node_id: p.node_id.clone(),
-            hostname: p.hostname.clone(),
-            address: p.addresses.first().map(|a| a.to_string()).unwrap_or_default(),
-            ip_addresses: p.addresses.iter().map(|a| a.to_string()).collect(),
-            role: p.role.clone(),
-            status: p.status.clone(),
-            quic_connected: p.quic_connected,
-            services: vec![],
-            cpu_usage: p.cpu_usage_percent as f64,
-            ram_usage: ram_pct,
-            ram_used_mb: p.ram_used_mb,
-            ram_total_mb: p.ram_total_mb,
-            gpu_info: if p.gpu_info.is_empty() { None } else {
-                Some(p.gpu_info.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(", "))
-            },
-            gpus: p.gpu_info.iter().map(|g| ui_state::GpuInfo {
-                name: g.name.clone(),
-                usage_percent: g.usage_percent as f64,
-                vram_used_mb: g.vram_used_mb,
-                vram_total_mb: g.vram_total_mb,
-            }).collect(),
-            models: vec![],
-            containers: p.containers.iter().map(|c| ui_state::PeerContainerInfo {
-                name: c.name.clone(),
-                image: c.image.clone(),
-                status: c.status.clone(),
-                cpu_percent: c.cpu_percent,
-                memory_mb: c.memory_mb,
-            }).collect(),
-            labels: vec![],
-            network_rx_bytes_sec: net_rx,
-            network_tx_bytes_sec: net_tx,
-        }
-    }).collect();
+    s.peers = mesh_peers
+        .iter()
+        .map(|p| {
+            let ram_pct = if p.ram_total_mb > 0 {
+                p.ram_used_mb as f64 / p.ram_total_mb as f64 * 100.0
+            } else {
+                0.0
+            };
+            let (net_rx, net_tx) = if !p.networks.is_empty() {
+                let rx: u64 = p.networks.iter().map(|n| n.rx_bytes_per_sec).sum();
+                let tx: u64 = p.networks.iter().map(|n| n.tx_bytes_per_sec).sum();
+                (rx as f64, tx as f64)
+            } else {
+                (0.0, 0.0)
+            };
+            ui_state::PeerInfo {
+                node_id: p.node_id.clone(),
+                hostname: p.hostname.clone(),
+                address: p
+                    .addresses
+                    .first()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default(),
+                ip_addresses: p.addresses.iter().map(|a| a.to_string()).collect(),
+                role: p.role.clone(),
+                status: p.status.clone(),
+                quic_connected: p.quic_connected,
+                services: vec![],
+                cpu_usage: p.cpu_usage_percent as f64,
+                ram_usage: ram_pct,
+                ram_used_mb: p.ram_used_mb,
+                ram_total_mb: p.ram_total_mb,
+                gpu_info: if p.gpu_info.is_empty() {
+                    None
+                } else {
+                    Some(
+                        p.gpu_info
+                            .iter()
+                            .map(|g| g.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                },
+                gpus: p
+                    .gpu_info
+                    .iter()
+                    .map(|g| ui_state::GpuInfo {
+                        name: g.name.clone(),
+                        usage_percent: g.usage_percent as f64,
+                        vram_used_mb: g.vram_used_mb,
+                        vram_total_mb: g.vram_total_mb,
+                    })
+                    .collect(),
+                models: vec![],
+                containers: p
+                    .containers
+                    .iter()
+                    .map(|c| ui_state::PeerContainerInfo {
+                        name: c.name.clone(),
+                        image: c.image.clone(),
+                        status: c.status.clone(),
+                        cpu_percent: c.cpu_percent,
+                        memory_mb: c.memory_mb,
+                    })
+                    .collect(),
+                labels: vec![],
+                network_rx_bytes_sec: net_rx,
+                network_tx_bytes_sec: net_tx,
+            }
+        })
+        .collect();
     // Aktualizuj historie metryk
     s.push_metrics_point();
 }
@@ -564,37 +646,69 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
 
     match cmd {
         // --- Prompts ---
-        UiCommand::CreatePrompt { prompt_id, name, content, prompt_type, default_model } => {
-            db::repository::create_prompt(db, &NewPrompt {
-                prompt_id,
-                name,
-                description: None,
-                content,
-                prompt_type,
-                default_model: if default_model.is_empty() { None } else { Some(default_model) },
-                variables: None,
-                cache_priority: 0,
-            })?;
+        UiCommand::CreatePrompt {
+            prompt_id,
+            name,
+            content,
+            prompt_type,
+            default_model,
+        } => {
+            db::repository::create_prompt(
+                db,
+                &NewPrompt {
+                    prompt_id,
+                    name,
+                    description: None,
+                    content,
+                    prompt_type,
+                    default_model: if default_model.is_empty() {
+                        None
+                    } else {
+                        Some(default_model)
+                    },
+                    variables: None,
+                    cache_priority: 0,
+                },
+            )?;
         }
-        UiCommand::UpdatePrompt { id, name, content, prompt_type, default_model, is_active } => {
-            db::repository::update_prompt(db, &UpdatePrompt {
-                id: *id,
-                name,
-                description: None,
-                content,
-                prompt_type,
-                default_model: if default_model.is_empty() { None } else { Some(default_model) },
-                variables: None,
-                cache_priority: 0,
-                is_active: *is_active,
-            })?;
+        UiCommand::UpdatePrompt {
+            id,
+            name,
+            content,
+            prompt_type,
+            default_model,
+            is_active,
+        } => {
+            db::repository::update_prompt(
+                db,
+                &UpdatePrompt {
+                    id: *id,
+                    name,
+                    description: None,
+                    content,
+                    prompt_type,
+                    default_model: if default_model.is_empty() {
+                        None
+                    } else {
+                        Some(default_model)
+                    },
+                    variables: None,
+                    cache_priority: 0,
+                    is_active: *is_active,
+                },
+            )?;
         }
         UiCommand::DeletePrompt(id) => {
             db::repository::delete_prompt(db, *id)?;
         }
 
         // --- Services ---
-        UiCommand::CreateService { name, service_type, strategy, config_json } => {
+        UiCommand::CreateService {
+            name,
+            service_type,
+            strategy,
+            config_json,
+        } => {
             db::repository::create_service(db, name, service_type, strategy, None, config_json)?;
         }
         UiCommand::DeleteService(id) => {
@@ -602,24 +716,41 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
         }
 
         // --- Models ---
-        UiCommand::CreateModelEntry { model_name, display_name, service_type, connection_type, is_public, config_json } => {
-            db::repository::create_model_entry(db, &NewModelEntry {
-                model_name,
-                display_name: if display_name.is_empty() { None } else { Some(display_name) },
-                service_type,
-                connection_type,
-                service_id: None,
-                flow_id: None,
-                is_public: *is_public,
-                config_json,
-            })?;
+        UiCommand::CreateModelEntry {
+            model_name,
+            display_name,
+            service_type,
+            connection_type,
+            is_public,
+            config_json,
+        } => {
+            db::repository::create_model_entry(
+                db,
+                &NewModelEntry {
+                    model_name,
+                    display_name: if display_name.is_empty() {
+                        None
+                    } else {
+                        Some(display_name)
+                    },
+                    service_type,
+                    connection_type,
+                    service_id: None,
+                    flow_id: None,
+                    is_public: *is_public,
+                    config_json,
+                },
+            )?;
         }
         UiCommand::DeleteModelEntry(id) => {
             db::repository::delete_model_entry(db, *id)?;
         }
 
         // --- Model Aliases ---
-        UiCommand::CreateModelAlias { alias, target_model } => {
+        UiCommand::CreateModelAlias {
+            alias,
+            target_model,
+        } => {
             db::repository::create_model_alias(db, alias, target_model)?;
         }
         UiCommand::DeleteModelAlias(id) => {
@@ -627,7 +758,10 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
         }
 
         // --- API Keys ---
-        UiCommand::CreateApiKey { name, rate_limit_rps } => {
+        UiCommand::CreateApiKey {
+            name,
+            rate_limit_rps,
+        } => {
             use std::hash::{Hash, Hasher};
             let key_raw = format!("sk-{}", uuid::Uuid::new_v4());
             let key_prefix = key_raw[..12].to_string();
@@ -641,55 +775,104 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
         }
 
         // --- Flows ---
-        UiCommand::CreateFlow { name, description, service_type, flow_json } => {
-            db::repository::create_flow(db, &FlowParams {
-                name,
-                description: if description.is_empty() { None } else { Some(description) },
-                is_default: false,
-                service_type: if service_type.is_empty() { None } else { Some(service_type) },
-                flow_json,
-                status: "draft",
-            })?;
+        UiCommand::CreateFlow {
+            name,
+            description,
+            service_type,
+            flow_json,
+        } => {
+            db::repository::create_flow(
+                db,
+                &FlowParams {
+                    name,
+                    description: if description.is_empty() {
+                        None
+                    } else {
+                        Some(description)
+                    },
+                    is_default: false,
+                    service_type: if service_type.is_empty() {
+                        None
+                    } else {
+                        Some(service_type)
+                    },
+                    flow_json,
+                    status: "draft",
+                },
+            )?;
         }
         UiCommand::DeleteFlow(id) => {
             db::repository::delete_flow(db, *id)?;
         }
 
         // --- PII Rules ---
-        UiCommand::CreatePiiRule { name, category, pattern, replacement, priority } => {
-            db::repository::create_pii_rule(db, &NewPiiRule {
-                name,
-                category,
-                pattern,
-                replacement,
-                priority: *priority,
-                description: None,
-                test_examples: None,
-            })?;
+        UiCommand::CreatePiiRule {
+            name,
+            category,
+            pattern,
+            replacement,
+            priority,
+        } => {
+            db::repository::create_pii_rule(
+                db,
+                &NewPiiRule {
+                    name,
+                    category,
+                    pattern,
+                    replacement,
+                    priority: *priority,
+                    description: None,
+                    test_examples: None,
+                },
+            )?;
         }
-        UiCommand::UpdatePiiRule { id, name, category, pattern, replacement, is_active, priority } => {
-            db::repository::update_pii_rule(db, &UpdatePiiRule {
-                id: *id,
-                name,
-                category,
-                pattern,
-                replacement,
-                is_active: *is_active,
-                priority: *priority as i64,
-                description: None,
-                test_examples: None,
-            })?;
+        UiCommand::UpdatePiiRule {
+            id,
+            name,
+            category,
+            pattern,
+            replacement,
+            is_active,
+            priority,
+        } => {
+            db::repository::update_pii_rule(
+                db,
+                &UpdatePiiRule {
+                    id: *id,
+                    name,
+                    category,
+                    pattern,
+                    replacement,
+                    is_active: *is_active,
+                    priority: *priority as i64,
+                    description: None,
+                    test_examples: None,
+                },
+            )?;
         }
         UiCommand::DeletePiiRule(id) => {
             db::repository::delete_pii_rule(db, *id)?;
         }
 
         // --- TTS Cleaning Rules ---
-        UiCommand::CreateTtsRule { rule_type, pattern, replacement, language, priority } => {
+        UiCommand::CreateTtsRule {
+            rule_type,
+            pattern,
+            replacement,
+            language,
+            priority,
+        } => {
             db::repository::create_tts_cleaning_rule(
-                db, rule_type, pattern,
-                if replacement.is_empty() { None } else { Some(replacement.as_str()) },
-                language, *priority,
+                db,
+                rule_type,
+                pattern,
+                if replacement.is_empty() {
+                    None
+                } else {
+                    Some(replacement.as_str())
+                },
+                language,
+                *priority,
             )?;
         }
         UiCommand::DeleteTtsRule(id) => {
@@ -697,9 +880,22 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
         }
 
         // --- Fast Path Patterns ---
-        UiCommand::CreateFastPath { module, pattern_type, pattern, match_type, result_json, priority } => {
+        UiCommand::CreateFastPath {
+            module,
+            pattern_type,
+            pattern,
+            match_type,
+            result_json,
+            priority,
+        } => {
             db::repository::create_fast_path_pattern(
-                db, module, pattern_type, pattern, match_type, result_json, *priority,
+                db,
+                module,
+                pattern_type,
+                pattern,
+                match_type,
+                result_json,
+                *priority,
             )?;
         }
         UiCommand::DeleteFastPath(id) => {
@@ -712,7 +908,13 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
         }
 
         // --- Portainer ---
-        UiCommand::CreatePortainerInstance { name, url, api_key, username, password } => {
+        UiCommand::CreatePortainerInstance {
+            name,
+            url,
+            api_key,
+            username,
+            password,
+        } => {
             db::repository::create_portainer_instance(db, name, url, api_key, username, password)?;
         }
         UiCommand::DeletePortainerInstance(id) => {

@@ -1,11 +1,12 @@
 // =============================================================================
 // Plik: api/dashboard/static_files.rs
-// Opis: Serwowanie plikow statycznych wbudowanych w binarie z katalogu wwwroot/.
-//       Pliki sa generowane przez build.rs (rerun-if-changed=wwwroot) co gwarantuje
-//       automatyczna rekompilacje po zmianie jakiegokolwiek pliku www.
+// Opis: Serwowanie plikow statycznych wbudowanych w binarie z katalogu www/.
+//       Pliki sa generowane przez build.rs (rerun-if-changed=www) co gwarantuje
+//       automatyczna rekompilacje po zmianie jakiegokolwiek pliku dashboardu.
 // =============================================================================
 
-// Wygenerowany przez build.rs — mapa sciezka -> (content_type, bytes)
+// Wygenerowany przez build.rs — mapa sciezka -> (content_type, bytes).
+// Nazwa pliku pozostala historyczna po usunieciu wwwroot/.
 include!(concat!(env!("OUT_DIR"), "/wwwroot_embed.rs"));
 
 /// Zwraca (status, content_type, body_bytes) dla podanej sciezki HTTP.
