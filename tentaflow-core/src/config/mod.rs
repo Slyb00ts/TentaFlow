@@ -139,7 +139,7 @@ pub struct MeshConfig {
 
 /// Publiczny relay n0 — dla produkcji offline-first zalecany self-hosted.
 fn default_iroh_relay_url() -> String {
-    "https://use.iroh.network./".to_string()
+    "https://use.iroh.network/".to_string()
 }
 
 // =============================================================================
