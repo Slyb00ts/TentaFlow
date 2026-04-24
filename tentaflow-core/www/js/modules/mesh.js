@@ -789,6 +789,34 @@ async function wireUpPairTabs(winEl) {
       });
     });
   }
+
+  // Auto-rozpakowanie `tentaflow-pair://...` URL-a wklejonego do pola
+  // Node ID: wyciagamy hex do pola id, a PIN / relay / hostname do wlasciwych
+  // pol. Dzieki temu user ktory zeskanowal QR systemowa kamera iOS i wkleil
+  // calego linka widzi od razu ze PIN sie wypelnil sam — nie musi rozdzielac
+  // recznie URL-a na kawalki.
+  const idInput = winEl.querySelector('#pair-node-id');
+  const pinInput = winEl.querySelector('#pair-node-pin');
+  const hostInput = winEl.querySelector('#pair-node-host');
+  const relayInput = winEl.querySelector('#pair-node-relay');
+  if (idInput) {
+    const unpack = async () => {
+      const raw = String(idInput.value || '').trim();
+      if (!raw.startsWith('tentaflow-pair://')) return;
+      try {
+        const { parsePairUri } = await import('/js/modules/qr-scanner.js');
+        const parsed = parsePairUri(raw);
+        if (!parsed) return;
+        idInput.value = parsed.hex;
+        if (pinInput && parsed.pin && !pinInput.value) pinInput.value = parsed.pin;
+        if (relayInput && parsed.relayUrl && !relayInput.value) relayInput.value = parsed.relayUrl;
+        if (hostInput && parsed.host && !hostInput.value) hostInput.value = parsed.host;
+      } catch (_) { /* ignore */ }
+    };
+    idInput.addEventListener('paste', () => setTimeout(unpack, 0));
+    idInput.addEventListener('input', unpack);
+    idInput.addEventListener('change', unpack);
+  }
   // Copy buttons
   winEl.querySelectorAll('.pair-copy-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
