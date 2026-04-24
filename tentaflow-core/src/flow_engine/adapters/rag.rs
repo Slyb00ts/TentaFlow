@@ -128,14 +128,12 @@ impl NodeAdapter for RagNodeAdapter {
         );
 
         // Pobierz handle serwisu RAG
-        let rag_handle = {
-            self.service_manager
-                .rag_services
-                .read()
-                .get(&engine_name)
-                .cloned()
-        }
-        .ok_or_else(|| {
+        let rag_handle = self
+            .service_manager
+            .rag_services
+            .get(&engine_name)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| {
             anyhow::anyhow!(
                 "RAG adapter: serwis '{}' nie jest skonfigurowany",
                 engine_name

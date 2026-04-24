@@ -28,6 +28,8 @@ pub struct Engine {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
+    pub resource_kind: Option<ResourceKind>,
+    #[serde(default)]
     pub requires_model: Option<bool>,
     #[serde(default)]
     pub gpu_supported: Option<bool>,
@@ -64,6 +66,15 @@ pub enum ApiKind {
     SherpaStt,
     Comfyui,
     Custom,
+}
+
+/// High-level resource class used by the GUI to distinguish AI runtimes from
+/// supporting infrastructure and utility stacks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceKind {
+    Ai,
+    Infra,
 }
 
 /// `[deploy]` section aggregating optional docker/native/external variants.

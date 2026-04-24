@@ -487,13 +487,7 @@ impl Router {
             .cloned()
             .unwrap_or_else(|| request.model.clone());
 
-        let rag_handle = {
-            self.service_manager
-                .rag_services
-                .read()
-                .get(&model_name)
-                .cloned()
-        }
+        let rag_handle = self.service_manager.rag_services.get(&model_name).map(|r| r.value().clone())
         .ok_or_else(|| CoreError::ModelNotFound {
             model_name: model_name.clone(),
         })?;

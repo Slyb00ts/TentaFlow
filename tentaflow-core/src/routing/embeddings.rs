@@ -58,16 +58,17 @@ impl Router {
                 async move {
                     match &handle {
                         BackendHandle::QuicEmbedding(name) => {
-                            let quic_handle = {
-                                this.service_manager
-                                    .quic_embedding_services
-                                    .read()
-                                    .get(name)
-                                    .cloned()
-                            }
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("QUIC embedding serwis '{}' nie znaleziony", name)
-                            })?;
+                            let quic_handle = this
+                                .service_manager
+                                .quic_embedding_services
+                                .get(name)
+                                .map(|r| r.value().clone())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "QUIC embedding serwis '{}' nie znaleziony",
+                                        name
+                                    )
+                                })?;
                             let quic_client = quic_handle.get_client().await.ok_or_else(|| {
                                 anyhow::anyhow!("QUIC embedding serwis '{}' nie polaczony", name)
                             })?;
@@ -96,19 +97,17 @@ impl Router {
                                 service = %svc,
                                 "MeshForward embeddings do zdalnej uslugi"
                             );
-                            let quic_handle = {
-                                this.service_manager
-                                    .quic_embedding_services
-                                    .read()
-                                    .get(svc)
-                                    .cloned()
-                            }
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "Mesh embedding serwis '{}' na nodzie {} nie zarejestrowany lokalnie",
-                                    svc, node_id
-                                )
-                            })?;
+                            let quic_handle = this
+                                .service_manager
+                                .quic_embedding_services
+                                .get(svc)
+                                .map(|r| r.value().clone())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "Mesh embedding serwis '{}' na nodzie {} nie zarejestrowany lokalnie",
+                                        svc, node_id
+                                    )
+                                })?;
                             let quic_client = quic_handle.get_client().await.ok_or_else(|| {
                                 anyhow::anyhow!("Mesh embedding serwis '{}' nie polaczony", svc)
                             })?;
@@ -235,13 +234,7 @@ impl Router {
             texts.len()
         );
 
-        let quic_handle = {
-            self.service_manager
-                .quic_embedding_services
-                .read()
-                .get(&model_name)
-                .cloned()
-        }
+        let quic_handle = self.service_manager.quic_embedding_services.get(&model_name).map(|r| r.value().clone())
         .ok_or_else(|| CoreError::ModelNotFound {
             model_name: model_name.clone(),
         })?;
@@ -290,13 +283,7 @@ impl Router {
 
         let model_name = self.resolve_model_alias(&payload.model);
 
-        let rerank_quic_handle = {
-            self.service_manager
-                .quic_embedding_services
-                .read()
-                .get(&model_name)
-                .cloned()
-        };
+        let rerank_quic_handle = self.service_manager.quic_embedding_services.get(&model_name).map(|r| r.value().clone());
         let quic_client = if let Some(quic_handle) = rerank_quic_handle {
             quic_handle
                 .get_client()

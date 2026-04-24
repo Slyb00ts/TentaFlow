@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
+use arc_swap::ArcSwap;
 use tracing::{debug, warn};
 
 use crate::db::DbPool;
@@ -75,12 +75,13 @@ const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 /// 5. Fallback: Denied (deny-by-default)
 pub struct PermissionChecker {
     db: DbPool,
-    /// Cache uprawnien: CacheKey → PermissionResult
-    cache: Arc<RwLock<HashMap<CacheKey, PermissionResult>>>,
+    /// Cache uprawnien: CacheKey → PermissionResult. ArcSwap = lock-free readers,
+    /// refresh kopiuje mape i atomowo podmienia (COW).
+    cache: ArcSwap<HashMap<CacheKey, PermissionResult>>,
     /// Cache default uprawnien per (addon_id, permission_id) → grant_mode
-    defaults_cache: Arc<RwLock<HashMap<DefaultKey, PermissionResult>>>,
+    defaults_cache: ArcSwap<HashMap<DefaultKey, PermissionResult>>,
     /// Cache listy adminow (user_id)
-    admin_cache: Arc<RwLock<Vec<i64>>>,
+    admin_cache: ArcSwap<Vec<i64>>,
     /// Licznik trafien cache — monitoring
     cache_hits: AtomicU64,
     /// Licznik odpytan — monitoring
@@ -99,9 +100,9 @@ impl PermissionChecker {
     pub fn new(db: DbPool) -> Self {
         Self {
             db,
-            cache: Arc::new(RwLock::new(HashMap::with_capacity(256))),
-            defaults_cache: Arc::new(RwLock::new(HashMap::new())),
-            admin_cache: Arc::new(RwLock::new(Vec::new())),
+            cache: ArcSwap::from_pointee(HashMap::with_capacity(256)),
+            defaults_cache: ArcSwap::from_pointee(HashMap::new()),
+            admin_cache: ArcSwap::from_pointee(Vec::new()),
             cache_hits: AtomicU64::new(0),
             cache_lookups: AtomicU64::new(0),
         }
@@ -120,7 +121,7 @@ impl PermissionChecker {
 
         // 1. Admin bypass — sprawdz z cache listy adminow
         {
-            let admins = self.admin_cache.read();
+            let admins = self.admin_cache.load();
             if admins.contains(&user_id) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return PermissionResult::Granted;
@@ -137,7 +138,7 @@ impl PermissionChecker {
         };
 
         {
-            let cache = self.cache.read();
+            let cache = self.cache.load();
             if let Some(result) = cache.get(&cache_key) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return *result;
@@ -149,7 +150,7 @@ impl PermissionChecker {
             addon_id: addon_id.to_string(),
             permission_id: permission_type.to_string(),
         };
-        let defaults = self.defaults_cache.read();
+        let defaults = self.defaults_cache.load();
         if let Some(result) = defaults.get(&default_key) {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return *result;
@@ -180,18 +181,9 @@ impl PermissionChecker {
         let new_defaults = Self::load_all_defaults(&conn);
 
         // Zamien cache atomowo (swap)
-        {
-            let mut admin_cache = self.admin_cache.write();
-            *admin_cache = admins;
-        }
-        {
-            let mut cache = self.cache.write();
-            *cache = new_cache;
-        }
-        {
-            let mut defaults = self.defaults_cache.write();
-            *defaults = new_defaults;
-        }
+        self.admin_cache.store(Arc::new(admins));
+        self.cache.store(Arc::new(new_cache));
+        self.defaults_cache.store(Arc::new(new_defaults));
 
         debug!("Cache uprawnien odswiezony (refresh_all)");
     }
@@ -210,17 +202,16 @@ impl PermissionChecker {
         let addon_entries = Self::load_addon_permissions(&conn, addon_id);
         let addon_defaults = Self::load_addon_defaults(&conn, addon_id);
 
-        // Zaktualizuj wpisy w cache dla tego addonu
-        {
-            let mut cache = self.cache.write();
-            cache.retain(|key, _| key.addon_id != addon_id);
-            cache.extend(addon_entries);
-        }
-        {
-            let mut defaults = self.defaults_cache.write();
-            defaults.retain(|key, _| key.addon_id != addon_id);
-            defaults.extend(addon_defaults);
-        }
+        // Zaktualizuj wpisy w cache dla tego addonu — COW: kopiuj, zmien, zamien
+        let mut new_cache = (**self.cache.load()).clone();
+        new_cache.retain(|key, _| key.addon_id != addon_id);
+        new_cache.extend(addon_entries);
+        self.cache.store(Arc::new(new_cache));
+
+        let mut new_defaults = (**self.defaults_cache.load()).clone();
+        new_defaults.retain(|key, _| key.addon_id != addon_id);
+        new_defaults.extend(addon_defaults);
+        self.defaults_cache.store(Arc::new(new_defaults));
 
         debug!("Cache uprawnien odswiezony dla addonu '{}'", addon_id);
     }
@@ -237,8 +228,7 @@ impl PermissionChecker {
         };
 
         let admins = Self::load_admins(&conn);
-        let mut admin_cache = self.admin_cache.write();
-        *admin_cache = admins;
+        self.admin_cache.store(Arc::new(admins));
 
         debug!("Cache listy adminow odswiezony");
     }

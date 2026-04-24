@@ -6,6 +6,7 @@ description_pl = "Self-hosted iroh relay and pkarr DNS stack for TentaFlow mesh.
 description_en = "Self-hosted iroh relay and pkarr DNS stack for TentaFlow mesh."
 homepage = "https://www.iroh.computer/"
 license = "MIT"
+resource_kind = "infra"
 default_port = 443
 api = "custom"
 version = "0.98.0"

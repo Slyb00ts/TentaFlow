@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -55,8 +57,9 @@ const EVENT_RING_BUFFER_SIZE: usize = 4096;
 
 /// EventBus — publish/subscribe in-process z ring buffer
 pub struct EventBus {
-    /// Mapa: event_type -> lista subskrybentow
-    subscribers: RwLock<HashMap<String, Vec<EventSubscriber>>>,
+    /// Mapa: event_type -> lista subskrybentow. ArcSwap — readers lock-free,
+    /// subscribe/unsubscribe kopiuja mape (COW) i atomowo podmieniaja.
+    subscribers: ArcSwap<HashMap<String, Vec<EventSubscriber>>>,
     /// Ring buffer ostatnich eventow (do debugowania i replay)
     event_history: RwLock<RingBuffer<Event>>,
     /// Globalny licznik subskrypcji (do generowania ID)
@@ -71,7 +74,7 @@ impl EventBus {
     /// Tworzy nowy EventBus
     pub fn new() -> Self {
         Self {
-            subscribers: RwLock::new(HashMap::with_capacity(64)),
+            subscribers: ArcSwap::from_pointee(HashMap::with_capacity(64)),
             event_history: RwLock::new(RingBuffer::new(EVENT_RING_BUFFER_SIZE)),
             subscription_counter: AtomicU64::new(1),
             published_count: AtomicU64::new(0),
@@ -83,10 +86,12 @@ impl EventBus {
     pub fn subscribe(&self, event_type: &str, subscriber: EventSubscriber) -> u64 {
         let subscription_id = self.subscription_counter.fetch_add(1, Ordering::Relaxed);
 
-        let mut subs = self.subscribers.write();
-        subs.entry(event_type.to_string())
+        let mut new_subs = (**self.subscribers.load()).clone();
+        new_subs
+            .entry(event_type.to_string())
             .or_insert_with(|| Vec::with_capacity(4))
             .push(subscriber.clone());
+        self.subscribers.store(Arc::new(new_subs));
 
         debug!(
             "EventBus: addon '{}' subskrybuje '{}' (subscription_id={})",
@@ -112,7 +117,7 @@ impl EventBus {
 
     /// Pobiera liste subskrybentow dla danego typu eventu
     pub fn get_subscribers(&self, event_type: &str) -> Vec<EventSubscriber> {
-        let subs = self.subscribers.read();
+        let subs = self.subscribers.load();
 
         let mut result = Vec::new();
 
@@ -141,22 +146,24 @@ impl EventBus {
 
     /// Odsubskrybowuje addon z danego typu eventu
     pub fn unsubscribe(&self, addon_id: &str, event_type: &str) {
-        let mut subs = self.subscribers.write();
-        if let Some(subscribers) = subs.get_mut(event_type) {
+        let mut new_subs = (**self.subscribers.load()).clone();
+        if let Some(subscribers) = new_subs.get_mut(event_type) {
             subscribers.retain(|s| s.addon_id != addon_id);
             if subscribers.is_empty() {
-                subs.remove(event_type);
+                new_subs.remove(event_type);
             }
         }
+        self.subscribers.store(Arc::new(new_subs));
     }
 
     /// Odsubskrybowuje addon ze wszystkich typow eventow
     pub fn unsubscribe_all(&self, addon_id: &str) {
-        let mut subs = self.subscribers.write();
-        subs.values_mut().for_each(|subscribers| {
+        let mut new_subs = (**self.subscribers.load()).clone();
+        new_subs.values_mut().for_each(|subscribers| {
             subscribers.retain(|s| s.addon_id != addon_id);
         });
-        subs.retain(|_, v| !v.is_empty());
+        new_subs.retain(|_, v| !v.is_empty());
+        self.subscribers.store(Arc::new(new_subs));
 
         debug!(
             "EventBus: addon '{}' odsubskrybowany ze wszystkich eventow",
@@ -166,11 +173,12 @@ impl EventBus {
 
     /// Odsubskrybowuje konkretna instancje
     pub fn unsubscribe_instance(&self, instance_id: &str) {
-        let mut subs = self.subscribers.write();
-        subs.values_mut().for_each(|subscribers| {
+        let mut new_subs = (**self.subscribers.load()).clone();
+        new_subs.values_mut().for_each(|subscribers| {
             subscribers.retain(|s| s.instance_id != instance_id);
         });
-        subs.retain(|_, v| !v.is_empty());
+        new_subs.retain(|_, v| !v.is_empty());
+        self.subscribers.store(Arc::new(new_subs));
     }
 
     /// Pobiera ostatnie N eventow z ring buffer
@@ -180,7 +188,7 @@ impl EventBus {
 
     /// Zwraca statystyki
     pub fn stats(&self) -> EventBusStats {
-        let subs = self.subscribers.read();
+        let subs = self.subscribers.load();
         let total_subscribers: usize = subs.values().map(|v| v.len()).sum();
         let event_types = subs.len();
 

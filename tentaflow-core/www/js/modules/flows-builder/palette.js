@@ -7,6 +7,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
+import { getNodeName, getNodeDescription } from '/js/modules/flows-builder/node-i18n.js';
 
 const CATEGORY_ORDER = ['trigger', 'service', 'rag', 'transform', 'logic', 'filter', 'output', 'other'];
 
@@ -115,8 +116,8 @@ export class FlowPalette {
     let shown = 0;
     for (const tpl of this.templates) {
       const c = catFor(tpl);
-      const label = (tpl.label || tpl.node_type || '').toLowerCase();
-      const desc = (tpl.description || '').toLowerCase();
+      const label = getNodeName(tpl.node_type, tpl.label).toLowerCase();
+      const desc = getNodeDescription(tpl.node_type, tpl.description).toLowerCase();
       const type = (tpl.node_type || '').toLowerCase();
       const matches = !this.filter || label.includes(this.filter) || desc.includes(this.filter) || type.includes(this.filter);
       if (!matches) continue;
@@ -171,8 +172,8 @@ export class FlowPalette {
   _renderItem(tpl) {
     const iconId = TYPE_ICON[tpl.node_type] || 'chip';
     const varName = TYPE_VAR[tpl.node_type] || '--node-llm';
-    const name = tpl.label || tpl.node_type;
-    const desc = tpl.description || '';
+    const name = getNodeName(tpl.node_type, tpl.label);
+    const desc = getNodeDescription(tpl.node_type, tpl.description);
     return `
       <div class="fb-node-item" data-node-type="${escapeAttr(tpl.node_type)}" style="--node-color: var(${varName})">
         <div class="fb-node-icon"><svg><use href="#i-${iconId}"/></svg></div>
@@ -209,7 +210,7 @@ export class FlowPalette {
       this._ghost = document.createElement('div');
       this._ghost.className = 'fb-drag-ghost';
       this._ghost.style.setProperty('--node-color', `var(${TYPE_VAR[d.tpl.node_type] || '--node-llm'})`);
-      this._ghost.textContent = d.tpl.label || d.tpl.node_type;
+      this._ghost.textContent = getNodeName(d.tpl.node_type, d.tpl.label);
       document.body.appendChild(this._ghost);
     }
     if (this._ghost) {

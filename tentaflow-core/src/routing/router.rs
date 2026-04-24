@@ -749,8 +749,8 @@ impl Router {
             }
         }
         // Dynamiczny rejestr
-        let dyn_map = self.service_manager.dynamic_backends.read();
-        if let Some((backends, strategy)) = dyn_map.get(service_name) {
+        if let Some(entry) = self.service_manager.dynamic_backends.get(service_name) {
+            let (backends, strategy) = entry.value();
             if !backends.is_empty() {
                 if let Ok(idx) = strategy.select_backend(backends) {
                     return Some(backends[idx].clone());

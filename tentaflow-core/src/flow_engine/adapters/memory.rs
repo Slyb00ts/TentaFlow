@@ -35,9 +35,8 @@ impl MemoryNodeAdapter {
         let handles: Vec<_> = self
             .service_manager
             .quic_memory_services
-            .read()
-            .values()
-            .cloned()
+            .iter()
+            .map(|r| r.value().clone())
             .collect();
         for handle in handles {
             if let Some(client) = handle.get_client().await {

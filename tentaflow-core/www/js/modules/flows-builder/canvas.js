@@ -7,6 +7,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 
 const NODE_WIDTH = 280;
 const NODE_H_APPROX = 110;
@@ -186,6 +187,7 @@ export class FlowCanvas {
     for (const t of list || []) {
       this.templates.set(t.node_type, t);
     }
+    this._normalizeNodeLabels();
     this._normalizeEdgePorts();
   }
 
@@ -242,6 +244,7 @@ export class FlowCanvas {
   setData(nodes, edges, { reset = true } = {}) {
     this.nodes = (nodes || []).map((n) => ({ ...n, config: n.config || {} }));
     this.edges = (edges || []).map((e) => ({ ...e }));
+    this._normalizeNodeLabels();
     this._normalizeEdgePorts();
     this.selectedIds.clear();
     this.selectedEdgeId = null;
@@ -400,7 +403,7 @@ export class FlowCanvas {
     const node = {
       id: 'n_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
       type: tpl.node_type,
-      label: tpl.label || tpl.node_type,
+      label: '',
       x: Math.round((pt.x - NODE_WIDTH / 2) / GRID) * GRID,
       y: Math.round((pt.y - NODE_H_APPROX / 2) / GRID) * GRID,
       config: defaultConfig,
@@ -429,6 +432,16 @@ export class FlowCanvas {
     this._pushHistory();
     this._renderSingleNode(n);
     this.onChange();
+  }
+
+  _normalizeNodeLabels() {
+    if (!Array.isArray(this.nodes) || this.nodes.length === 0) return;
+    for (const node of this.nodes) {
+      const template = this.templates.get(node.type);
+      if (isAutoNodeLabel(node.label, node.type, template?.label)) {
+        node.label = '';
+      }
+    }
   }
 
   removeNodes(ids) {
@@ -554,7 +567,7 @@ export class FlowCanvas {
     const iconId = TYPE_ICON[n.type] || 'chip';
     const cat = TYPE_CATEGORY[n.type] || n.type;
     const tmpl = this.templates.get(n.type);
-    const title = n.label || (tmpl?.label) || n.type;
+    const title = getNodeDisplayTitle(n, tmpl);
 
     const { inputs, outputs } = portsForNode(n, tmpl);
 

@@ -8522,56 +8522,73 @@ pub mod mesh_topology {
         pub last_seen_ms: i64,
     }
 
-    /// Upsert snapshot topologii. epoch monotoniczny per origin — pomija update
-    /// jesli aktualny wpis ma nowszy epoch (antypamieciowe anti-replay).
-    pub fn upsert(
-        pool: &DbPool,
-        node_id: &str,
-        hostname: &str,
-        platform: &str,
-        os_info: &str,
-        connected_to: &[String],
-        direct_addrs: &[String],
-        port: u16,
-        services_json: &str,
-        models_json: &str,
-        epoch: u64,
-        now_ms: i64,
-    ) -> Result<()> {
-        let conn = pool.lock().unwrap();
-        let ct = serde_json::to_string(connected_to).unwrap_or_else(|_| "[]".to_string());
-        let addrs = serde_json::to_string(direct_addrs).unwrap_or_else(|_| "[]".to_string());
-        conn.execute(
-            "INSERT INTO mesh_topology
-               (node_id, hostname, platform, os_info, connected_to, direct_addrs,
-                port, services_json, models_json, last_epoch, last_seen_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(node_id) DO UPDATE SET
-                hostname = excluded.hostname,
-                platform = excluded.platform,
-                os_info = excluded.os_info,
-                connected_to = excluded.connected_to,
-                direct_addrs = excluded.direct_addrs,
-                port = excluded.port,
-                services_json = excluded.services_json,
-                models_json = excluded.models_json,
-                last_epoch = excluded.last_epoch,
-                last_seen_ms = excluded.last_seen_ms
-             WHERE excluded.last_epoch >= mesh_topology.last_epoch",
-            rusqlite::params![
-                node_id,
-                hostname,
-                platform,
-                os_info,
-                ct,
-                addrs,
-                port as i64,
-                services_json,
-                models_json,
-                epoch as i64,
-                now_ms,
-            ],
-        )?;
+    /// Jeden wpis w batch upserta — wszystko, co trzeba zapisac dla jednego noda.
+    pub struct UpsertEntry<'a> {
+        pub node_id: &'a str,
+        pub hostname: &'a str,
+        pub platform: &'a str,
+        pub os_info: &'a str,
+        pub connected_to: &'a [String],
+        pub direct_addrs: &'a [String],
+        pub port: u16,
+        pub services_json: &'a str,
+        pub models_json: &'a str,
+        pub epoch: u64,
+        pub now_ms: i64,
+    }
+
+    /// Batch upsert — jedna transakcja dla calej listy. Pod gossip burstem z 1000
+    /// peerow oszczedza N-1 commitow (kazdy commit = fsync w WAL). Prepared stmt
+    /// jest reuzywany dla wszystkich wierszy.
+    pub fn upsert_batch(pool: &DbPool, entries: &[UpsertEntry<'_>]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut conn = pool.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO mesh_topology
+                   (node_id, hostname, platform, os_info, connected_to, direct_addrs,
+                    port, services_json, models_json, last_epoch, last_seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    hostname = excluded.hostname,
+                    platform = excluded.platform,
+                    os_info = excluded.os_info,
+                    connected_to = excluded.connected_to,
+                    direct_addrs = excluded.direct_addrs,
+                    port = excluded.port,
+                    services_json = excluded.services_json,
+                    models_json = excluded.models_json,
+                    last_epoch = excluded.last_epoch,
+                    last_seen_ms = excluded.last_seen_ms
+                 WHERE excluded.last_epoch >= mesh_topology.last_epoch",
+            )?;
+            for e in entries {
+                let ct = serde_json::to_string(e.connected_to).unwrap_or_else(|_| "[]".to_string());
+                let addrs =
+                    serde_json::to_string(e.direct_addrs).unwrap_or_else(|_| "[]".to_string());
+                // Per-row error log zamiast propagacji — jeden zly wiersz nie wali
+                // calej gossip-batch transakcji. Poprawne wiersze commituja sie.
+                if let Err(err) = stmt.execute(rusqlite::params![
+                    e.node_id,
+                    e.hostname,
+                    e.platform,
+                    e.os_info,
+                    ct,
+                    addrs,
+                    e.port as i64,
+                    e.services_json,
+                    e.models_json,
+                    e.epoch as i64,
+                    e.now_ms,
+                ]) {
+                    tracing::debug!(node = %e.node_id, "mesh_topology row upsert: {}", err);
+                }
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 

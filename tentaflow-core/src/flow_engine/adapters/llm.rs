@@ -248,13 +248,11 @@ impl NodeAdapter for LlmNodeAdapter {
 
         // Sprawdz czy to QUIC LLM
         if self.service_manager.has_quic_llm_service(&model_name) {
-            let quic_handle = {
-                self.service_manager
-                    .quic_llm_services
-                    .read()
-                    .get(&model_name)
-                    .cloned()
-            };
+            let quic_handle = self
+                .service_manager
+                .quic_llm_services
+                .get(&model_name)
+                .map(|r| r.value().clone());
             if let Some(quic_handle) = quic_handle {
                 if let Some(quic_client) = quic_handle.get_client().await {
                     debug!("LLM adapter: uzywam QUIC backend: {}", model_name);
@@ -427,13 +425,11 @@ impl NodeAdapter for LlmNodeAdapter {
         );
 
         if self.service_manager.has_quic_llm_service(&model_name) {
-            let quic_handle = {
-                self.service_manager
-                    .quic_llm_services
-                    .read()
-                    .get(&model_name)
-                    .cloned()
-            };
+            let quic_handle = self
+                .service_manager
+                .quic_llm_services
+                .get(&model_name)
+                .map(|r| r.value().clone());
             if let Some(quic_handle) = quic_handle {
                 if let Some(quic_client) = quic_handle.get_client().await {
                     let protocol_messages: Vec<tentaflow_protocol::Message> = request

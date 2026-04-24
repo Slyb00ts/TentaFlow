@@ -647,13 +647,7 @@ impl Router {
     ) -> Result<ChatCompletionResponse> {
         debug!("Routing to RAG engine: {}", rag_engine_name);
 
-        let rag_handle = {
-            self.service_manager
-                .rag_services
-                .read()
-                .get(&rag_engine_name)
-                .cloned()
-        }
+        let rag_handle = self.service_manager.rag_services.get(&rag_engine_name).map(|r| r.value().clone())
         .ok_or_else(|| CoreError::ModelNotFound {
             model_name: rag_engine_name.clone(),
         })?;
@@ -1010,13 +1004,7 @@ impl Router {
                     input.len()
                 );
 
-                let emb_handle = {
-                    service_manager
-                        .quic_embedding_services
-                        .read()
-                        .get(&model)
-                        .cloned()
-                };
+                let emb_handle = service_manager.quic_embedding_services.get(&model).map(|r| r.value().clone());
                 if let Some(quic_handle) = emb_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla embeddingow: {}", model);
@@ -1168,13 +1156,7 @@ impl Router {
                     prompt.as_ref().map(|p| p.len())
                 );
 
-                let llm_handle = {
-                    service_manager
-                        .quic_llm_services
-                        .read()
-                        .get(&model)
-                        .cloned()
-                };
+                let llm_handle = service_manager.quic_llm_services.get(&model).map(|r| r.value().clone());
                 if let Some(quic_handle) = llm_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla LLM: {}", model);
@@ -1732,13 +1714,7 @@ impl Router {
                     rerank_payload.documents.len()
                 );
 
-                let rerank_handle = {
-                    service_manager
-                        .quic_embedding_services
-                        .read()
-                        .get(&model)
-                        .cloned()
-                };
+                let rerank_handle = service_manager.quic_embedding_services.get(&model).map(|r| r.value().clone());
                 if let Some(quic_handle) = rerank_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla rerankingu: {}", model);
@@ -1860,17 +1836,15 @@ impl Router {
         &self,
         request: tentaflow_protocol::IngestRequest,
     ) -> Result<tentaflow_protocol::IngestResponse> {
-        let rag_handle = {
-            self.service_manager
-                .rag_services
-                .read()
-                .values()
-                .next()
-                .cloned()
-        }
-        .ok_or_else(|| CoreError::ModelNotFound {
-            model_name: "rag".to_string(),
-        })?;
+        let rag_handle = self
+            .service_manager
+            .rag_services
+            .iter()
+            .next()
+            .map(|r| r.value().clone())
+            .ok_or_else(|| CoreError::ModelNotFound {
+                model_name: "rag".to_string(),
+            })?;
 
         let rag_client =
             rag_handle
@@ -1912,18 +1886,16 @@ impl Router {
             rag_payload.search_modes
         );
 
-        let (rag_name, rag_handle) = {
-            self.service_manager
-                .rag_services
-                .read()
-                .iter()
-                .next()
-                .map(|(n, h)| (n.clone(), h.clone()))
-        }
-        .ok_or_else(|| CoreError::InternalError {
-            message: "Brak skonfigurowanego RAG engine".to_string(),
-            source: None,
-        })?;
+        let (rag_name, rag_handle) = self
+            .service_manager
+            .rag_services
+            .iter()
+            .next()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .ok_or_else(|| CoreError::InternalError {
+                message: "Brak skonfigurowanego RAG engine".to_string(),
+                source: None,
+            })?;
 
         let rag_client =
             rag_handle
@@ -2171,11 +2143,7 @@ impl Router {
             let mut client = None;
             let memory_handles: Vec<_> = self
                 .service_manager
-                .quic_memory_services
-                .read()
-                .values()
-                .cloned()
-                .collect();
+                .quic_memory_services.iter().map(|r| r.value().clone()).collect();
             for handle in memory_handles {
                 if let Some(c) = handle.get_client().await {
                     client = Some(c);

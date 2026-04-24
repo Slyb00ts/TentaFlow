@@ -2074,10 +2074,12 @@ pub fn handle_invoke_addon_tool(
         };
 
         // Znajdz QUIC handle i wyslij
-        let quic_services = router.service_manager.quic_llm_services.read();
-        if let Some(handle) = quic_services.get(service_name) {
-            let handle = handle.clone();
-            drop(quic_services);
+        let handle = router
+            .service_manager
+            .quic_llm_services
+            .get(service_name)
+            .map(|r| r.value().clone());
+        if let Some(handle) = handle {
 
             // Async → sync bridge (ten handler jest wolany z sync kontekstu)
             let result = tokio::task::block_in_place(|| {

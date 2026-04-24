@@ -7,6 +7,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 
 const TYPE_ICON = {
   trigger: 'bolt', start: 'bolt',
@@ -84,7 +85,7 @@ export class FlowConfig {
     const n = this.node;
     const iconId = TYPE_ICON[n.type] || 'chip';
     const varName = TYPE_VAR[n.type] || '--node-llm';
-    const title = n.label || this.template?.label || n.type;
+    const title = getNodeDisplayTitle(n, this.template);
     const subtitle = I18n.t('flows_config.subtitle', { type: n.type, id: n.id });
 
     this.root.innerHTML = `
@@ -183,7 +184,7 @@ export class FlowConfig {
     let html = `
       <div class="fb-field">
         <label class="fb-label">${escapeHtml(I18n.t('flows_config.name'))}</label>
-        <input class="fb-input" data-bind="label" value="${escapeAttr(n.label || '')}">
+        <input class="fb-input" data-bind="label" value="${escapeAttr(isAutoNodeLabel(n.label, n.type, this.template?.label) ? '' : (n.label || ''))}" placeholder="${escapeAttr(getNodeName(n.type, this.template?.label))}">
       </div>
     `;
 

@@ -143,7 +143,6 @@ impl Router {
             let strategy = self
                 .service_manager
                 .model_pool
-                .read()
                 .get(model)
                 .map(|e| e.strategy)
                 .unwrap_or(PoolStrategy::FirstAvailable);

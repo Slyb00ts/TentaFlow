@@ -176,11 +176,8 @@ pub async fn auto_register_deployed_service(
         .register_model_mapping(&model_name, &info.service_name);
 
     // Ustaw service_type w model_pool
-    {
-        let mut pool_guard = router.service_manager.model_pool.write();
-        if let Some(entry) = pool_guard.get_mut(&model_name) {
-            entry.service_type = info.service_type.clone();
-        }
+    if let Some(mut entry) = router.service_manager.model_pool.get_mut(&model_name) {
+        entry.service_type = info.service_type.clone();
     }
 
     // 8. Zarejestruj w mesh
@@ -321,11 +318,8 @@ async fn auto_register_quic_service(
     router
         .service_manager
         .register_model_mapping(&model_name, &info.service_name);
-    {
-        let mut pool_guard = router.service_manager.model_pool.write();
-        if let Some(entry) = pool_guard.get_mut(&model_name) {
-            entry.service_type = info.service_type.clone();
-        }
+    if let Some(mut entry) = router.service_manager.model_pool.get_mut(&model_name) {
+        entry.service_type = info.service_type.clone();
     }
 
     // 7. Zarejestruj w mesh

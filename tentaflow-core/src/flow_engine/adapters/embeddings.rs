@@ -94,13 +94,11 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
         }
 
         // Sprawdz QUIC embedding client
-        let quic_handle = {
-            self.service_manager
-                .quic_embedding_services
-                .read()
-                .get(&model_name)
-                .cloned()
-        };
+        let quic_handle = self
+            .service_manager
+            .quic_embedding_services
+            .get(&model_name)
+            .map(|r| r.value().clone());
         if let Some(quic_handle) = quic_handle {
             if let Some(quic_client) = quic_handle.get_client().await {
                 debug!("Embeddings adapter: uzywam QUIC backend: {}", model_name);
