@@ -680,6 +680,35 @@ pub struct NewVoiceProfileSample<'a> {
     pub source: &'a str,
 }
 
+/// Podsumowanie sesji wygenerowane przez LLM po zakończonym meetingu. Jedna
+/// sesja moze miec wiele rekordów (regeneracje, roznice modeli) — kolejność
+/// po `created_at DESC`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbMeetingSummary {
+    pub id: i64,
+    pub session_id: i64,
+    pub created_at: String,
+    pub decisions_text: String,
+    pub summary_text: String,
+    pub model: String,
+}
+
+/// Pojedynczy action item wyekstrahowany z transkryptu. `content_hash` sluzy
+/// deduplikacji w obrębie sesji (ta sama para owner+task generowana wielokrotnie
+/// przez LLM nie tworzy duplikatów — zamiast tego aktualizujemy deadline).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbMeetingActionItem {
+    pub id: i64,
+    pub session_id: i64,
+    pub owner: String,
+    pub task: String,
+    pub deadline: Option<String>,
+    pub status: String,
+    pub content_hash: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Tymczasowy mowca w trakcie meetingu (przed przypisaniem do profilu przez LLM)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbVoiceTempSpeaker {

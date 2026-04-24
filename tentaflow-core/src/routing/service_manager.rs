@@ -30,15 +30,108 @@ use crate::services::rag::client::{RAGClient, RAGEngineConfigCompat};
 use crate::services::tts::client::{TTSClient, TTSConfigCompat};
 // TODO: Przeniesc SharedPromptRegistry i create_shared_registry do crate::prompt_registry
 use crate::prompt_registry::{create_shared_registry, SharedPromptRegistry};
-// TODO: Przeniesc ConversationCache do crate::routing::memory_integration
-use crate::routing::memory_integration::ConversationCache;
 
 use crate::mesh::service_registry::MeshServiceRegistry;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+const MAX_HISTORY_MESSAGES: usize = 50;
+const SESSION_TTL_SECS: u64 = 3600;
+
+/// Pojedyncza wiadomosc w historii konwersacji per sesja.
+#[derive(Debug, Clone)]
+pub struct ConversationMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: Instant,
+}
+
+struct SessionHistory {
+    messages: VecDeque<ConversationMessage>,
+    last_activity: Instant,
+}
+
+impl SessionHistory {
+    fn new() -> Self {
+        Self {
+            messages: VecDeque::new(),
+            last_activity: Instant::now(),
+        }
+    }
+
+    fn add_message(&mut self, role: &str, content: &str) {
+        self.messages.push_back(ConversationMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: Instant::now(),
+        });
+        self.last_activity = Instant::now();
+        if self.messages.len() > MAX_HISTORY_MESSAGES {
+            self.messages.pop_front();
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.last_activity.elapsed() > Duration::from_secs(SESSION_TTL_SECS)
+    }
+}
+
+/// Cache historii konwersacji per session_id — uzywany wylacznie przez
+/// flow_engine adapter `conversation_history`. Nie wstrzykuje historii
+/// automatycznie w request; to robi user-defined flow.
+pub struct ConversationCache {
+    sessions: RwLock<HashMap<String, SessionHistory>>,
+}
+
+impl ConversationCache {
+    pub fn new() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub async fn add_message(&self, session_id: &str, role: &str, content: &str) {
+        let mut sessions = self.sessions.write().await;
+        let history = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(SessionHistory::new);
+        history.add_message(role, content);
+        debug!(
+            "ConversationCache: added {} message to session {}, total: {}",
+            role,
+            session_id,
+            history.messages.len()
+        );
+    }
+
+    pub async fn get_history(&self, session_id: &str) -> Vec<ConversationMessage> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|h| h.messages.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub async fn cleanup_expired(&self) {
+        let mut sessions = self.sessions.write().await;
+        let before = sessions.len();
+        sessions.retain(|_, h| !h.is_expired());
+        let removed = before - sessions.len();
+        if removed > 0 {
+            debug!("ConversationCache: cleaned up {} expired sessions", removed);
+        }
+    }
+}
+
+impl Default for ConversationCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ============================================================================
 // LOKALIZACJA SERWISU

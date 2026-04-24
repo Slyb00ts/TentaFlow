@@ -172,4 +172,35 @@ impl NodeAdapter for TtsNodeAdapter {
     fn node_type(&self) -> &'static str {
         "tts"
     }
+
+    fn supported_output_ports(&self) -> &'static [&'static str] {
+        // Streaming output niewspierany — backend QUIC i silniki TTS
+        // (sherpa-onnx, xtts, voxcpm, parakeet) oferują tylko blocking
+        // synthesis. Port "stream" zostanie dodany razem z realną
+        // implementacją streaming TTS.
+        &["full"]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RouterConfig;
+    use crate::routing::service_manager::ServiceManager;
+
+    fn make_adapter() -> TtsNodeAdapter {
+        let config = Arc::new(RouterConfig::default());
+        let service_manager = Arc::new(
+            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
+        );
+        TtsNodeAdapter::new(service_manager, config)
+    }
+
+    #[tokio::test]
+    async fn tts_adapter_does_not_expose_stream_port_until_backend_supports_it() {
+        let adapter = make_adapter();
+        let ports = adapter.supported_output_ports();
+        assert_eq!(ports, &["full"]);
+        assert!(!ports.contains(&"stream"));
+    }
 }

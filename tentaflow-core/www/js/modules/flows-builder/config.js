@@ -340,9 +340,16 @@ export class FlowConfig {
   _computePorts(n) {
     const isTrigger = n.type === 'trigger' || n.type === 'start';
     const isOutput = n.type === 'output' || n.type === 'end';
-    let inputs = isTrigger ? [] : [{ name: 'in' }];
+    // Adapter metadata z backendu ma priorytet (input_ports/output_ports);
+    // inaczej zostajemy przy heurystyce per node-type.
+    const tpl = this.template;
+    const tplIn = (tpl && Array.isArray(tpl.input_ports) && tpl.input_ports.length > 0) ? tpl.input_ports : null;
+    const tplOut = (tpl && Array.isArray(tpl.output_ports) && tpl.output_ports.length > 0) ? tpl.output_ports : null;
+    const inputs = tplIn ? tplIn.map((name) => ({ name })) : (isTrigger ? [] : [{ name: 'in' }]);
     let outputs;
-    if (n.type === 'condition') outputs = [{ name: 'true' }, { name: 'false' }];
+    if (tplOut) {
+      outputs = tplOut.map((name) => ({ name }));
+    } else if (n.type === 'condition') outputs = [{ name: 'true' }, { name: 'false' }];
     else if (n.type === 'switch' || n.type === 'router') {
       const cases = Array.isArray(n.config?.cases) ? n.config.cases : [];
       if (cases.length > 0) {
@@ -352,7 +359,7 @@ export class FlowConfig {
         outputs = [{ name: 'case_1' }, { name: 'case_2' }, { name: 'default' }];
       }
     } else if (isOutput) outputs = [];
-    else outputs = [{ name: 'out' }];
+    else outputs = [{ name: 'full' }];
     return { inputs, outputs };
   }
 

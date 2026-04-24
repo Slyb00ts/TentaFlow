@@ -9,11 +9,9 @@ use crate::config::RouterConfig;
 use crate::db::DbPool;
 use crate::error::Result;
 use crate::flow_engine::dispatcher::FlowDispatcher;
-use crate::intent_analyzer::IntentAnalyzer;
 use crate::middleware::ResponseMiddleware;
 use crate::routing::backend::BackendClient;
 use crate::routing::loadbalancer::LoadBalancingStrategy;
-use crate::routing::memory_integration::MemoryIntegration;
 use crate::routing::service_manager::ServiceManager;
 use crate::services::rag::RAGClient;
 use crate::services::tts::TTSClient;
@@ -44,12 +42,6 @@ pub struct Router {
 
     /// Response middleware dla filtrowania PII
     pub(crate) response_middleware: Arc<ResponseMiddleware>,
-
-    /// Memory Integration - integracja z TentaFlow.Memory
-    pub(crate) memory_integration: Arc<MemoryIntegration>,
-
-    /// Intent Analyzer - wykrywanie intencji uzywajac Bielika 11B
-    pub(crate) intent_analyzer: Arc<IntentAnalyzer>,
 
     /// Mowcy potrzebujacy dodatkowych sampli glosu (speaker_id -> remaining_samples)
     /// Po enrollment zbieramy 3 dodatkowe probki zeby wzmocnic model glosu
@@ -182,10 +174,6 @@ pub struct RequestMetrics {
     pub stt_ms: Option<u64>,
     /// Speaker identification
     pub speaker_id_ms: Option<u64>,
-    /// Memory Analyzer - query decision (bielik-1.5b)
-    pub query_analysis_ms: Option<u64>,
-    /// Memory query (QUIC do Memory Engine)
-    pub memory_query_ms: Option<u64>,
     /// Person context lookup
     pub person_context_ms: Option<u64>,
     /// Main LLM inference (bielik-11b)
@@ -226,12 +214,6 @@ impl RequestMetrics {
         }
         if let Some(ms) = self.speaker_id_ms {
             lines.push(format!("│ Speaker ID       {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.query_analysis_ms {
-            lines.push(format!("│ Query Analysis   {:>10} ms     │", ms));
-        }
-        if let Some(ms) = self.memory_query_ms {
-            lines.push(format!("│ Memory Query     {:>10} ms     │", ms));
         }
         if let Some(ms) = self.person_context_ms {
             lines.push(format!("│ Person Context   {:>10} ms     │", ms));
@@ -300,13 +282,7 @@ impl Router {
             config.middleware.response_filtering_enabled,
         ));
 
-        // === KROK 4: INICJALIZUJ MEMORY INTEGRATION ===
-        let memory_integration = Arc::new(MemoryIntegration::new(service_manager.clone(), None));
-
-        // === KROK 5: INICJALIZUJ INTENT ANALYZER ===
-        let intent_analyzer = Arc::new(IntentAnalyzer::new(service_manager.clone(), None));
-
-        // === KROK 6: INICJALIZUJ FLOW DISPATCHER ===
+        // === KROK 4: INICJALIZUJ FLOW DISPATCHER ===
         let db_clone = db.clone();
         let flow_dispatcher = db.map(|pool| {
             Arc::new(FlowDispatcher::new(
@@ -334,8 +310,6 @@ impl Router {
             config,
             service_manager,
             response_middleware,
-            memory_integration,
-            intent_analyzer,
             pending_voice_samples: Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -360,6 +334,13 @@ impl Router {
     /// Zwraca referencje do ServiceManager.
     pub fn service_manager(&self) -> &Arc<ServiceManager> {
         &self.service_manager
+    }
+
+    /// Zwraca referencje do FlowDispatcher jesli Router zostal skonstruowany
+    /// z DB (produkcja ma zawsze, niektore testy nie). Handlery zapisu flow
+    /// uzywaja go do pobrania AdapterRegistry dla walidacji.
+    pub fn flow_dispatcher(&self) -> Option<&Arc<FlowDispatcher>> {
+        self.flow_dispatcher.as_ref()
     }
 
     pub fn start(&self) {
@@ -970,114 +951,6 @@ impl Router {
             }
         }
         model.to_string()
-    }
-
-    // ========================================================================
-    // CONVERSATION CONTEXT BUILDERS
-    // ========================================================================
-
-    /// Buduje kontekst rozmowy z ostatnich wiadomosci dla Intent Analyzera.
-    #[allow(dead_code)]
-    pub(crate) fn build_conversation_context_for_intent(
-        &self,
-        messages: &[crate::api::openai::types::Message],
-        max_turns: usize,
-    ) -> Option<String> {
-        if messages.is_empty() {
-            return None;
-        }
-
-        let skip_last = if messages.len() > 1 { 1 } else { 0 };
-        let start = messages.len().saturating_sub(max_turns + skip_last);
-        let end = messages.len().saturating_sub(skip_last);
-
-        if start >= end {
-            return None;
-        }
-
-        let mut context_parts = Vec::new();
-        for msg in &messages[start..end] {
-            let role = match msg.role.as_str() {
-                "assistant" => "ASSISTANT",
-                "user" => "USER",
-                "system" => continue,
-                _ => &msg.role,
-            };
-
-            let text = match &msg.content {
-                Some(crate::api::openai::types::MessageContent::Text(s)) => Some(s.clone()),
-                Some(crate::api::openai::types::MessageContent::Parts(parts)) => {
-                    let texts: Vec<String> = parts
-                        .iter()
-                        .filter_map(|p| {
-                            if let crate::api::openai::types::ContentPart::Text { text } = p {
-                                Some(text.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if texts.is_empty() {
-                        None
-                    } else {
-                        Some(texts.join(" "))
-                    }
-                }
-                None => None,
-            };
-
-            if let Some(content) = text {
-                let truncated = if content.chars().count() > 200 {
-                    format!("{}...", content.chars().take(200).collect::<String>())
-                } else {
-                    content
-                };
-                context_parts.push(format!("{}: {}", role, truncated));
-            }
-        }
-
-        if context_parts.is_empty() {
-            None
-        } else {
-            Some(context_parts.join("\n"))
-        }
-    }
-
-    /// Buduje kontekst konwersacji z historii w ConversationCache.
-    pub(crate) fn build_context_from_conversation_cache(
-        &self,
-        history: &[crate::routing::memory_integration::ConversationMessage],
-        max_turns: usize,
-    ) -> Option<String> {
-        if history.is_empty() {
-            return None;
-        }
-
-        let start = history.len().saturating_sub(max_turns);
-        let messages_to_use = &history[start..];
-
-        let mut context_parts = Vec::new();
-        for msg in messages_to_use {
-            let role = match msg.role.as_str() {
-                "assistant" => "ASSISTANT",
-                "user" => "USER",
-                "system" => continue,
-                _ => &msg.role,
-            };
-
-            let content = if msg.content.chars().count() > 200 {
-                format!("{}...", msg.content.chars().take(200).collect::<String>())
-            } else {
-                msg.content.clone()
-            };
-            context_parts.push(format!("{}: {}", role, content));
-        }
-
-        if context_parts.is_empty() {
-            None
-        } else {
-            Some(context_parts.join("\n"))
-        }
     }
 
     // ========================================================================

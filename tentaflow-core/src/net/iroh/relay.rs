@@ -17,7 +17,7 @@ pub const RELAY_URL_SETTING_KEY: &str = "mesh.iroh_relay_url";
 
 /// Publiczny serwer relay hostowany przez n0 — stosowany gdy nic innego
 /// nie jest skonfigurowane.
-pub const DEFAULT_RELAY_URL: &str = "https://use.iroh.network./";
+pub const DEFAULT_RELAY_URL: &str = "https://use.iroh.network/";
 
 /// Zwraca `RelayUrl` na podstawie priorytetu DB → config → default.
 /// Niepoprawny URL w DB lub configu jest zastepowany domyslnym z warn logiem.

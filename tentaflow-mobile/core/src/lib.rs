@@ -275,7 +275,7 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             heartbeat_interval_ms: 500,
             peer_timeout_ms: 3000,
             cluster_name: "tentaflow".to_string(),
-            iroh_relay_url: "https://use.iroh.network./".to_string(),
+            iroh_relay_url: "https://use.iroh.network/".to_string(),
         }),
         inference: Some(InferenceConfig {
             enabled: true,

@@ -15,10 +15,45 @@ pub struct FlowNode {
     pub node_type: String,
     #[serde(default)]
     pub config: serde_json::Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_position")]
     pub position: Option<(f64, f64)>,
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// Parsuje pole `position` — akceptuje zarowno format GUI (`{"x":0,"y":0}`)
+/// jak i tuple (`[0, 0]`) uzywane wewnetrznie w testach.
+fn deserialize_position<'de, D>(deserializer: D) -> Result<Option<(f64, f64)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(arr)) if arr.len() == 2 => {
+            let x = arr[0].as_f64().ok_or_else(|| {
+                serde::de::Error::custom("position[0] nie jest liczba")
+            })?;
+            let y = arr[1].as_f64().ok_or_else(|| {
+                serde::de::Error::custom("position[1] nie jest liczba")
+            })?;
+            Ok(Some((x, y)))
+        }
+        Some(serde_json::Value::Object(map)) => {
+            let x = map
+                .get("x")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| serde::de::Error::custom("position.x brak lub nie-liczba"))?;
+            let y = map
+                .get("y")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| serde::de::Error::custom("position.y brak lub nie-liczba"))?;
+            Ok(Some((x, y)))
+        }
+        _ => Err(serde::de::Error::custom(
+            "position musi byc {x,y} albo [x,y]",
+        )),
+    }
 }
 
 /// Krawedz (polaczenie) miedzy dwoma wezlami w DAG
@@ -32,8 +67,35 @@ pub struct FlowEdge {
     pub to: String,
     #[serde(default)]
     pub label: Option<String>,
-    #[serde(default, alias = "from_port")]
+    #[serde(default)]
     pub condition: Option<String>,
+
+    /// Port wyjsciowy zrodlowego node'a. Default "full" dla backward compat —
+    /// stream-aware adaptery (LLM, TTS) eksponuja tez port "stream".
+    /// skip_serializing_if chroni stare flow_json — edges bez jawnych portow
+    /// round-trippuja byte-identycznie.
+    #[serde(default = "default_port_full", skip_serializing_if = "is_default_port_full")]
+    pub from_port: String,
+
+    /// Port wejsciowy docelowego node'a. Default "in".
+    #[serde(default = "default_port_in", skip_serializing_if = "is_default_port_in")]
+    pub to_port: String,
+}
+
+fn default_port_full() -> String {
+    "full".to_string()
+}
+
+fn default_port_in() -> String {
+    "in".to_string()
+}
+
+fn is_default_port_full(s: &str) -> bool {
+    s == "full"
+}
+
+fn is_default_port_in(s: &str) -> bool {
+    s == "in"
 }
 
 /// Pelna definicja flow (parsowana z flow_json w DB)
@@ -110,4 +172,68 @@ pub struct FlowExecutionResult {
     pub total_tokens: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_without_ports_gets_defaults() {
+        let json = r#"{"from":"a","to":"b"}"#;
+        let edge: FlowEdge = serde_json::from_str(json).unwrap();
+        assert_eq!(edge.from_port, "full");
+        assert_eq!(edge.to_port, "in");
+        assert!(edge.condition.is_none());
+    }
+
+    #[test]
+    fn edge_with_explicit_ports_deserializes() {
+        let json = r#"{"from":"a","to":"b","from_port":"stream","to_port":"audio"}"#;
+        let edge: FlowEdge = serde_json::from_str(json).unwrap();
+        assert_eq!(edge.from_port, "stream");
+        assert_eq!(edge.to_port, "audio");
+    }
+
+    #[test]
+    fn edge_default_ports_skip_serialize() {
+        let edge = FlowEdge {
+            id: None,
+            from: "a".into(),
+            to: "b".into(),
+            label: None,
+            condition: None,
+            from_port: "full".into(),
+            to_port: "in".into(),
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        assert!(!s.contains("from_port"), "got: {s}");
+        assert!(!s.contains("to_port"), "got: {s}");
+    }
+
+    #[test]
+    fn edge_non_default_ports_serialize() {
+        let edge = FlowEdge {
+            id: None,
+            from: "a".into(),
+            to: "b".into(),
+            label: None,
+            condition: None,
+            from_port: "stream".into(),
+            to_port: "in".into(),
+        };
+        let s = serde_json::to_string(&edge).unwrap();
+        assert!(s.contains("\"from_port\":\"stream\""));
+        assert!(!s.contains("to_port"));
+    }
+
+    #[test]
+    fn from_port_no_longer_aliased_to_condition() {
+        // Chroni przed regresja buga: alias "from_port" -> condition mapowal
+        // z powrotem stream ports na condition. Teraz from_port to real port.
+        let json = r#"{"from":"a","to":"b","from_port":"stream"}"#;
+        let edge: FlowEdge = serde_json::from_str(json).unwrap();
+        assert!(edge.condition.is_none());
+        assert_eq!(edge.from_port, "stream");
+    }
 }

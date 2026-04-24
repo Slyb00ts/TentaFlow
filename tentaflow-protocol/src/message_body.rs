@@ -680,6 +680,23 @@ pub struct MeshNodeRoute {
     pub next_hop: Option<String>,
 }
 
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshConnectionPathInfo {
+    pub transport: String,
+    pub address: String,
+    pub selected: bool,
+    pub closed: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeshConnectionInfo {
+    pub transport: String,
+    pub scope: Option<String>,
+    pub address: Option<String>,
+    pub relay_url: Option<String>,
+    pub paths: Vec<MeshConnectionPathInfo>,
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct MeshNodeInfo {
     pub node_id: String,
@@ -703,6 +720,7 @@ pub struct MeshNodeInfo {
     pub last_seen_epoch: Option<i64>,
     pub route: Option<MeshNodeRoute>,
     pub platform: String,
+    pub connection: Option<MeshConnectionInfo>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -1096,6 +1114,12 @@ pub struct FlowNodeTemplate {
     /// Default config JSON shoved into a new node when dropped on the canvas.
     pub default_config: String,
     pub icon: Option<String>,
+    /// Dostepne porty wejsciowe adaptera dla tego typu node'a. Pusta lista
+    /// oznacza "nieznany adapter" — GUI powinno odradzac wiazania takich nodow.
+    pub input_ports: Vec<String>,
+    /// Dostepne porty wyjsciowe adaptera. LLM: ["stream","full"], wiekszosc
+    /// innych: ["full"]. Pusta lista = nieznany adapter.
+    pub output_ports: Vec<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2297,26 +2321,10 @@ pub struct MeetingSessionDetailRequest {
     pub include_transcripts: bool,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct MeetingSessionSummaryEntry {
-    pub tldr: String,
-    pub decisions: String,
-    pub action_items_json: String,
-    pub open_questions: String,
-    pub model: String,
-    pub generated_at: String,
-}
-
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct MeetingSessionDetailResponse {
     pub session: MeetingSessionDescriptor,
     pub transcripts: Vec<MeetingTranscriptEntry>,
-    pub summary_tldr: String,
-    pub summary_decisions: String,
-    pub summary_action_items_json: String,
-    pub summary_open_questions: String,
-    pub summary_model: String,
-    pub summary_generated_at: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2329,17 +2337,6 @@ pub struct MeetingTranscriptsListRequest {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct MeetingTranscriptsListResponse {
     pub entries: Vec<MeetingTranscriptEntry>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct MeetingSummaryGenerateRequest {
-    pub session_id: i64,
-    pub force_refresh: bool,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct MeetingSummaryGenerateResponse {
-    pub summary: MeetingSessionSummaryEntry,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2376,6 +2373,79 @@ pub struct MeetingSettingsUpdateResponse {
     pub ok: bool,
 }
 
+// -----------------------------------------------------------------------------
+// Summaries / action items / transcript export (post-Etap 2.1).
+// -----------------------------------------------------------------------------
+
+/// Jedno podsumowanie sesji z `meeting_summaries`. Protokolowa forma bez
+/// content_hash — dedup jest szczegolem DB i nie jedzie po wire.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummaryItem {
+    pub id: i64,
+    pub created_at: String,
+    pub decisions_text: String,
+    pub summary_text: String,
+    pub model: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummariesListRequest {
+    pub meeting_key: String,
+    /// Limit najnowszych rekordow. `None` = domyslnie 20.
+    pub limit: Option<u32>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingSummariesListResponse {
+    pub items: Vec<MeetingSummaryItem>,
+}
+
+/// Action item wyekstrahowany przez LLM z transkryptu.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemItem {
+    pub id: i64,
+    pub owner: String,
+    pub task: String,
+    pub deadline: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemsListRequest {
+    pub meeting_key: String,
+    /// `None` = wszystkie; `Some("pending"|"done"|"cancelled")` = filtr po statusie.
+    pub status_filter: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemsListResponse {
+    pub items: Vec<MeetingActionItemItem>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemStatusUpdateRequest {
+    pub item_id: i64,
+    pub status: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingActionItemStatusUpdateResponse {
+    pub success: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingTranscriptExportRequest {
+    pub meeting_key: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingTranscriptExportResponse {
+    /// Sformatowany plain text gotowy do zapisu jako .txt (naglowek + linie).
+    pub content: String,
+}
+
 /// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
 /// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -2390,14 +2460,20 @@ pub enum MeetingPayload {
     ResSessionDetail(MeetingSessionDetailResponse),
     ReqTranscriptsList(MeetingTranscriptsListRequest),
     ResTranscriptsList(MeetingTranscriptsListResponse),
-    ReqSummaryGenerate(MeetingSummaryGenerateRequest),
-    ResSummaryGenerate(MeetingSummaryGenerateResponse),
     ReqActiveSession(MeetingActiveSessionRequest),
     ResActiveSession(MeetingActiveSessionResponse),
     ReqSettingsGet(MeetingSettingsGetRequest),
     ResSettingsGet(MeetingSettingsGetResponse),
     ReqSettingsUpdate(MeetingSettingsUpdateRequest),
     ResSettingsUpdate(MeetingSettingsUpdateResponse),
+    ReqSummariesList(MeetingSummariesListRequest),
+    ResSummariesList(MeetingSummariesListResponse),
+    ReqActionItemsList(MeetingActionItemsListRequest),
+    ResActionItemsList(MeetingActionItemsListResponse),
+    ReqActionItemStatusUpdate(MeetingActionItemStatusUpdateRequest),
+    ResActionItemStatusUpdate(MeetingActionItemStatusUpdateResponse),
+    ReqTranscriptExport(MeetingTranscriptExportRequest),
+    ResTranscriptExport(MeetingTranscriptExportResponse),
 }
 
 // =============================================================================
@@ -2865,6 +2941,12 @@ pub enum MessageBody {
 
     // ---- Meeting Bot (single-variant, req+res w inner enum) ----
     MeetingBody(MeetingPayload),
+
+    // ---- Meeting live broadcast (unsolicited push, correlation_id=0) ----
+    // Pushowany z writer task w ws_binary po każdym sukcesie
+    // `persist_meeting_event`. Filtr ownership (owner_user_id) stosowany
+    // server-side — frame wychodzi tylko do właściciela sesji.
+    MeetingLiveEventBody(crate::types::MeetingLiveEvent),
 
     // ---- Deployments (single-variant, req+res+stream w inner enum) ----
     DeploymentBody(DeploymentPayload),

@@ -1585,5 +1585,45 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE INDEX IF NOT EXISTS idx_prompts_language ON prompts(language);
         ",
     ),
+    (
+        53,
+        "meeting_summaries_and_action_items_rewrite",
+        "
+            -- Stara tabela meeting_session_summaries (migracja 47) byla dead stubem:
+            -- handler zwracal NotImplemented, zaden produkcyjny path nic nie zapisywal.
+            -- Caly schemat redesignowany pod Etap 2.2 (MeetingEvent z decisions_text,
+            -- summary_text, lista action_items z deduplikacja przez content_hash).
+            DROP TABLE IF EXISTS meeting_session_summaries;
+
+            CREATE TABLE meeting_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                decisions_text TEXT NOT NULL DEFAULT '',
+                summary_text TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (session_id) REFERENCES meeting_sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_meeting_summaries_session
+                ON meeting_summaries(session_id, created_at DESC);
+
+            CREATE TABLE meeting_action_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                owner TEXT NOT NULL,
+                task TEXT NOT NULL,
+                deadline TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','done','cancelled')),
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES meeting_sessions(id) ON DELETE CASCADE,
+                UNIQUE(session_id, content_hash)
+            );
+            CREATE INDEX idx_meeting_action_items_session
+                ON meeting_action_items(session_id, status, created_at DESC);
+        ",
+    ),
 ]
 }

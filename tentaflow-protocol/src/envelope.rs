@@ -39,7 +39,14 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Custom AEAD/replay/rotation usunieta z `mesh/security.rs` — bezpieczenstwo
 ///     transportu zapewnia iroh TLS. Zostaje Ed25519 identity, trusted_keys,
 ///     PIN pairing + X25519 pin-proof derywacja, TrustRevoked broadcast.
-pub const SCHEMA_VERSION: u16 = 7;
+/// v8 changes (2026-04-23):
+///   - MeshNodeInfo rozszerzony o `connection` z aktywna sciezka i listą pathow
+///     (p2p/relay + adresy), zeby GUI moglo pokazac realny transport mesh.
+/// v9 changes (2026-04-23):
+///   - `MessageBody::MeetingLiveEventBody(MeetingLiveEvent)` — unsolicited
+///     broadcast dashboard GUI po każdym sukcesie `persist_meeting_event`.
+///     Filtrowany server-side po owner_user_id sesji.
+pub const SCHEMA_VERSION: u16 = 9;
 
 // =============================================================================
 // Message kind discriminants

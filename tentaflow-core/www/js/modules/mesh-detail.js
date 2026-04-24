@@ -213,8 +213,28 @@ function buildSystemInfo(n) {
     ? n.gpus.map(g => g.name).filter(Boolean).join(', ')
     : null;
   if (gpuSummary) parts.push(escapeHtml(gpuSummary));
+  if (n.connection && n.connection.transport) {
+    const transport = connectionTransportLabel(n.connection.transport);
+    const scope = n.connection.scope ? connectionScopeLabel(n.connection.scope) : '';
+    const addr = n.connection.address ? escapeHtml(n.connection.address) : '—';
+    const value = [transport, scope].filter(Boolean).join(' · ');
+    parts.push(`${escapeHtml(I18n.t('mesh.connection'))}: ${escapeHtml(value)} · ${addr}`);
+  }
   if (parts.length === 0) return '<span class="muted">—</span>';
   return parts.map(p => `<span>${p}</span>`).join(' · ');
+}
+
+function connectionTransportLabel(value) {
+  if (value === 'p2p') return I18n.t('mesh.connection_p2p');
+  if (value === 'relay') return I18n.t('mesh.connection_relay');
+  if (value === 'custom') return I18n.t('mesh.connection_custom');
+  return I18n.t('mesh.connection_unknown');
+}
+
+function connectionScopeLabel(value) {
+  if (value === 'lan') return I18n.t('mesh.connection_lan');
+  if (value === 'wan') return I18n.t('mesh.connection_wan');
+  return value || '';
 }
 
 function buildVramSummary(n) {

@@ -45,6 +45,7 @@ import PromptsUserScreen from '/js/modules/prompts-user.js';
 import TranslateScreen from '/js/modules/translate.js';
 import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
+import MeetingLiveScreen from '/js/modules/meeting-live.js';
 import { makeComingSoonScreen } from '/js/modules/coming-soon.js';
 
 // Helper: SVG <use> reference do inline sprite.
@@ -398,6 +399,7 @@ async function renderApp() {
   // Apps whose binary handlers are not yet wired — honest placeholder, not a stub feature.
   Router.register('images',         makeComingSoonScreen('images',    'image'));
   Router.register('meeting', MeetingScreen);
+  Router.register('meeting-live', MeetingLiveScreen);
   Router.register('tts',            makeComingSoonScreen('tts',       'speaker'));
   Router.register('translate',      TranslateScreen);
   Router.register('search-app',     makeComingSoonScreen('search',    'search'));

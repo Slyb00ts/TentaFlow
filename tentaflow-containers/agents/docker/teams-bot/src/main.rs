@@ -8,6 +8,7 @@ mod audio;
 mod browser;
 mod config;
 mod quic_server;
+mod summarizer;
 mod vad;
 
 use anyhow::{Context, Result};
@@ -20,7 +21,71 @@ use tracing_subscriber::EnvFilter;
 
 use crate::audio::RosterEntry;
 use crate::config::MeetingConfig;
+use crate::summarizer::{TranscriptBuffer, TranscriptEntry};
 use crate::vad::VadResult;
+use tentaflow_protocol::MeetingEventPayload;
+
+/// Model diarization jest skonfigurowany hardcoded po stronie routera (mesh
+/// config — jeden pipeline pyannote w tej wersji). Bot nie wie który konkretnie
+/// jest używany, więc raportuje ustaloną nazwę — router przed broadcastem może
+/// ją podmienić jeśli kiedyś pojawi się wybór.
+const DIARIZATION_MODEL_NAME: &str = "pyannote-3.1";
+
+/// Wysyła jednorazowy MeetingEventPayload::BackendUpdate na start sesji tak,
+/// żeby dashboard pokazał jakie aliasy modeli są w grze. Pola opcjonalne
+/// (liczby) zostają `None` — router może je wypełnić przed broadcastem
+/// (enrolled_speakers z voice_profiles, total_participants z rostera).
+async fn send_backend_update(
+    router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+    meeting_id: &str,
+    config: &MeetingConfig,
+) {
+    let client = {
+        let guard = router.lock().await;
+        guard.as_ref().cloned()
+    };
+    let Some(client) = client else {
+        tracing::warn!("send_backend_update: router client niedostepny");
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = client
+        .send_meeting_event(
+            meeting_id,
+            ts,
+            MeetingEventPayload::BackendUpdate {
+                stt_model: config.stt_alias.clone(),
+                tts_model: config.tts_alias.clone(),
+                summarization_model: config.summarization_alias.clone(),
+                diarization_model: DIARIZATION_MODEL_NAME.to_string(),
+                streaming_latency_ms: None,
+                enrolled_speakers: None,
+                total_participants: None,
+            },
+        )
+        .await
+    {
+        tracing::warn!("send_meeting_event BackendUpdate failed: {}", e);
+    }
+}
+
+/// Uchwyt aktualnie uruchomionej petli summarizera dla sesji spotkania.
+/// Przy LeaveMeeting / nowym JoinMeeting stary handle jest zamykany, a w jego
+/// miejsce spawnujemy nowy — meeting_key musi pasowac do biezacej sesji.
+struct SummarizerHandle {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+impl SummarizerHandle {
+    async fn stop(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.join.await;
+    }
+}
 
 /// Sidecar meeting bot — automatyzacja spotkan Teams z pipeline audio
 #[derive(Parser, Debug)]
@@ -81,6 +146,74 @@ async fn main() -> Result<()> {
     }
     tracing::info!("Router polaczony — STT/TTS dostepne");
 
+    // Rolling buffer transkrypcji — summarizer czyta go co N sekund.
+    // Trzymany tu, a nie w summarizerze, zeby main loop mogl pushowac wpisy
+    // niezaleznie od lifecycle summarizera (summarizer spawnuje sie per-session,
+    // buffer zyje caly czas).
+    let transcript_buffer: Arc<tokio::sync::Mutex<TranscriptBuffer>> = Arc::new(
+        tokio::sync::Mutex::new(TranscriptBuffer::new(
+            (config.transcript_buffer_minutes as i64).saturating_mul(60),
+        )),
+    );
+
+    // Handle summarizera dla aktywnej sesji — None gdy bot nie jest w spotkaniu.
+    let mut summarizer_handle: Option<SummarizerHandle> = None;
+
+    // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
+    // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
+    // Prompt pobierany jest z DB routera przez reverse QUIC (handler `PromptFetch`).
+    // Gdy fetch nie powiedzie sie — zwracamy `None`, caller kontynuuje sesje
+    // bez summarizera (transcript nadal dziala). Zadnego hardcoded fallbacku.
+    async fn spawn_summarizer(
+        buffer: Arc<tokio::sync::Mutex<TranscriptBuffer>>,
+        router: Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+        meeting_key: String,
+        config: &MeetingConfig,
+    ) -> Option<SummarizerHandle> {
+        // Pobierz aktualny RouterClient do fetchu promptu.
+        let client = {
+            let guard = router.lock().await;
+            guard.as_ref().cloned()
+        };
+        let Some(client) = client else {
+            tracing::warn!(
+                "spawn_summarizer: router client niedostepny — skip summarizer"
+            );
+            return None;
+        };
+
+        let prompt_content = match client
+            .fetch_prompt("transcription_summarization", &config.meeting_language)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    lang = %config.meeting_language,
+                    "fetch_prompt nie powiodl sie — summarizer nie wystartuje w tej sesji"
+                );
+                return None;
+            }
+        };
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let alias = config.summarization_alias.clone();
+        let interval = config.summarization_interval_sec;
+        let min_entries = config.summarization_min_entries;
+        let join = tokio::spawn(summarizer::run_summarizer_loop(
+            buffer,
+            router,
+            interval,
+            min_entries,
+            meeting_key,
+            alias,
+            prompt_content,
+            rx,
+        ));
+        Some(SummarizerHandle { shutdown_tx: tx, join })
+    }
+
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
     let mut _chromium: Option<chromiumoxide::browser::Browser> = None;
     let mut page = if !config.meeting_url.is_empty() {
@@ -88,6 +221,26 @@ async fn main() -> Result<()> {
         let p = browser::join_meeting(&browser, &config.meeting_url, &config).await?;
         _chromium = Some(browser);
         tracing::info!("Dolaczono do spotkania");
+        // Auto-join — ustaw meeting_id w RouterClient i spawn summarizer. Bez
+        // meeting_id router nie przypisze transkryptu/summary do sesji.
+        let meeting_id = config
+            .meeting_id_override
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        {
+            let guard = router_client_handle.lock().await;
+            if let Some(ref c) = *guard {
+                c.set_meeting_id(meeting_id.clone());
+            }
+        }
+        summarizer_handle = spawn_summarizer(
+            transcript_buffer.clone(),
+            router_client_handle.clone(),
+            meeting_id.clone(),
+            &config,
+        )
+        .await;
+        send_backend_update(&router_client_handle, &meeting_id, &config).await;
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
@@ -136,6 +289,7 @@ async fn main() -> Result<()> {
     }
     {
         let speaker_state = Arc::clone(&current_active_speaker);
+        let router_for_speaker = Arc::clone(&router_client_handle);
         tokio::spawn(async move {
             let mut none_count: u32 = 0;
             while let Some(name) = speaker_rx.rx.recv().await {
@@ -151,7 +305,47 @@ async fn main() -> Result<()> {
                 } else {
                     none_count = 0;
                 }
-                *speaker_state.write().await = name;
+                // Porównaj ze stanem poprzednim — emit ParticipantUpdate tylko
+                // przy realnej zmianie Some(X)->Some(Y) albo None->Some(Y).
+                // Przejście Some->None (opuszczenie mównicy) zostawiamy ciche —
+                // nie znamy speaker_id bez nowej wartości, a dashboard liczy
+                // "active_now" jako ostatni znany.
+                let prev = speaker_state.read().await.clone();
+                *speaker_state.write().await = name.clone();
+                if let Some(new_name) = name {
+                    if prev.as_deref() != Some(new_name.as_str()) {
+                        let client = {
+                            let guard = router_for_speaker.lock().await;
+                            guard.as_ref().cloned()
+                        };
+                        if let Some(client) = client {
+                            if let Some(meeting_id) = client.current_meeting_id() {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                if let Err(e) = client
+                                    .send_meeting_event(
+                                        &meeting_id,
+                                        ts,
+                                        MeetingEventPayload::ParticipantUpdate {
+                                            speaker_id: new_name.clone(),
+                                            speaker_name: Some(new_name.clone()),
+                                            status: "active_now".to_string(),
+                                            last_spoken_ago_sec: None,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "send_meeting_event ParticipantUpdate failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -405,6 +599,7 @@ async fn main() -> Result<()> {
                         silence_tail_samples = 0;
                         continue;
                     };
+                    let stt_started = std::time::Instant::now();
                     let stt_result = match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
                         client.transcribe(&speech_buffer, stt_alias, None, extra_meta),
@@ -415,10 +610,63 @@ async fn main() -> Result<()> {
                             Err(anyhow::anyhow!("STT timeout"))
                         }
                     };
+                    let stt_latency_ms = stt_started.elapsed().as_millis() as u64;
                     match stt_result {
                         Ok(text) if !text.is_empty() => {
-                            tracing::info!(text = %text, "STT zwrocilo transkrypt");
+                            tracing::info!(text = %text, latency_ms = stt_latency_ms, "STT zwrocilo transkrypt");
                             let _ = transcript_tx.send(("Nieznany".to_string(), text.clone(), timestamp_ms));
+
+                            // Wpis do rolling bufferu summarizera. Speaker name
+                            // pochodzi z active_speaker DOM (gdy dostepny) — bez
+                            // diarization po stronie bota uzywamy fallback "Nieznany",
+                            // ktory i tak pojdzie do prompta jako `[Nieznany]`.
+                            let speaker_label = current_active_speaker
+                                .read()
+                                .await
+                                .clone()
+                                .unwrap_or_else(|| "Nieznany".to_string());
+                            {
+                                let mut buf = transcript_buffer.lock().await;
+                                buf.push(TranscriptEntry {
+                                    timestamp_ms: timestamp_ms as i64,
+                                    speaker_name: speaker_label.clone(),
+                                    text: text.clone(),
+                                });
+                            }
+
+                            // Live broadcast chunku transkryptu — router rozsyła
+                            // do dashboardu i może wzbogacić speaker_id (diarization
+                            // lookup z voice_profiles). Persist chunka do DB leci
+                            // osobno przez STT metadata `meeting_id` → transcript_store,
+                            // więc ten event nie duplikuje zapisu.
+                            if let Some(meeting_id) = client.current_meeting_id() {
+                                if let Err(e) = client
+                                    .send_meeting_event(
+                                        &meeting_id,
+                                        timestamp_ms as i64,
+                                        MeetingEventPayload::TranscriptEntry {
+                                            speaker_id: speaker_label.clone(),
+                                            speaker_name: if speaker_label == "Nieznany" {
+                                                None
+                                            } else {
+                                                Some(speaker_label.clone())
+                                            },
+                                            is_enrolled: false,
+                                            speaker_confidence: None,
+                                            text: text.clone(),
+                                            language: None,
+                                            resolved_stt_model: stt_alias.to_string(),
+                                            latency_ms: stt_latency_ms,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "send_meeting_event TranscriptEntry failed: {}",
+                                        e
+                                    );
+                                }
+                            }
 
                             // TTS uruchamiamy TYLKO w echo_mode (tryb testowy). Bez tego
                             // bot powtarza co uslyszal = nieskonczony feedback loop, nawet
@@ -482,6 +730,13 @@ async fn main() -> Result<()> {
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
                         }
+                        // Zatrzymaj summarizer poprzedniej sesji — nowe spotkanie
+                        // dostanie swojego z nowym meeting_key. Buffer czyscimy zeby
+                        // transkrypty z poprzedniego spotkania nie trafily do promptu.
+                        if let Some(h) = summarizer_handle.take() {
+                            h.stop().await;
+                        }
+                        transcript_buffer.lock().await.clear();
                         speech_buffer.clear();
                         vad_detector.reset();
 
@@ -512,6 +767,21 @@ async fn main() -> Result<()> {
                                     Ok(p) => {
                                         _chromium = Some(browser);
                                         page = Some(p);
+                                        // Odpal summarizera dla nowej sesji —
+                                        // meeting_key == meeting_id po stronie routera.
+                                        summarizer_handle = spawn_summarizer(
+                                            transcript_buffer.clone(),
+                                            router_client_handle.clone(),
+                                            meeting_id.clone(),
+                                            &config,
+                                        )
+                                        .await;
+                                        send_backend_update(
+                                            &router_client_handle,
+                                            &meeting_id,
+                                            &config,
+                                        )
+                                        .await;
                                         let _ = response_tx.send(format!(
                                             "OK: dolaczono do spotkania (meeting_id={})",
                                             meeting_id
@@ -543,6 +813,10 @@ async fn main() -> Result<()> {
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
                         }
+                        if let Some(h) = summarizer_handle.take() {
+                            h.stop().await;
+                        }
+                        transcript_buffer.lock().await.clear();
                         speech_buffer.clear();
                         vad_detector.reset();
 
@@ -577,6 +851,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(h) = summarizer_handle.take() {
+        h.stop().await;
+    }
     let _ = shutdown_tx.send(true);
     tracing::info!("Sidecar meeting bot zakonczony");
     Ok(())

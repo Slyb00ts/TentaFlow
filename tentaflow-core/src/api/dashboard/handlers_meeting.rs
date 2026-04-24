@@ -7,12 +7,14 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
+    MeetingActionItemItem, MeetingActionItemStatusUpdateResponse, MeetingActionItemsListResponse,
     MeetingActiveSessionResponse, MeetingPayload, MeetingSessionDescriptor,
     MeetingSessionDetailResponse, MeetingSessionLeaveResponse, MeetingSessionListResponse,
-    MeetingSessionStartResponse, MeetingSessionSummaryEntry, MeetingSettingKv,
-    MeetingSettingsGetResponse, MeetingSettingsUpdateResponse, MeetingSummaryGenerateResponse,
-    MeetingTranscriptEntry, MeetingTranscriptsListResponse, MessageBody, ProtocolError,
-    ProtocolErrorCode, SessionAuth,
+    MeetingSessionStartResponse, MeetingSettingKv,
+    MeetingSettingsGetResponse, MeetingSettingsUpdateResponse,
+    MeetingSummariesListResponse, MeetingSummaryItem,
+    MeetingTranscriptEntry, MeetingTranscriptExportResponse, MeetingTranscriptsListResponse,
+    MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
 };
 
 use crate::db::repository;
@@ -288,35 +290,9 @@ pub fn meeting_session_detail(
     } else {
         Vec::new()
     };
-    let summary = ctx
-        .state
-        .meeting_manager
-        .summary(r.session_id)
-        .map_err(internal)?;
     let resp = MeetingSessionDetailResponse {
         session: desc_to_proto(desc),
         transcripts,
-        summary_tldr: summary.as_ref().map(|s| s.tldr.clone()).unwrap_or_default(),
-        summary_decisions: summary
-            .as_ref()
-            .map(|s| s.decisions.clone())
-            .unwrap_or_default(),
-        summary_action_items_json: summary
-            .as_ref()
-            .map(|s| s.action_items_json.clone())
-            .unwrap_or_else(|| "[]".into()),
-        summary_open_questions: summary
-            .as_ref()
-            .map(|s| s.open_questions.clone())
-            .unwrap_or_default(),
-        summary_model: summary
-            .as_ref()
-            .map(|s| s.model.clone())
-            .unwrap_or_default(),
-        summary_generated_at: summary
-            .as_ref()
-            .map(|s| s.generated_at.clone())
-            .unwrap_or_default(),
     };
     Ok(MessageBody::MeetingBody(MeetingPayload::ResSessionDetail(
         resp,
@@ -351,83 +327,7 @@ pub fn meeting_transcripts_list(
 }
 
 // =============================================================================
-// 6. Summary generate (LLM)
-// =============================================================================
-
-#[handler(variant = "MeetingSummaryGenerateRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub async fn meeting_summary_generate(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = meeting_payload(req)?;
-    let MeetingPayload::ReqSummaryGenerate(r) = payload else {
-        return Err(bad_request("expected ReqSummaryGenerate"));
-    };
-    // Cache: jesli mamy summary i nie force — zwroc istniejace.
-    if !r.force_refresh {
-        if let Some(s) = ctx
-            .state
-            .meeting_manager
-            .summary(r.session_id)
-            .map_err(internal)?
-        {
-            return Ok(to_summary_response(s));
-        }
-    }
-    // Weryfikuj ze sesja ma transkrypty do podsumowania.
-    let rows =
-        repository::transcripts::list_transcripts(&ctx.state.db, r.session_id).map_err(internal)?;
-    if rows.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotFound,
-            "brak transkryptow — nie ma co podsumowywac",
-        ));
-    }
-    // Resolve alias `teams-summary` — pusty target = admin nie skonfigurowal modelu.
-    // Handler zwraca jawny error, frontend pokazuje info "summary wylaczone".
-    let alias =
-        repository::resolve_model_alias(&ctx.state.db, "teams-summary").map_err(internal)?;
-    let target = alias
-        .as_ref()
-        .map(|a| a.target_model.trim().to_string())
-        .unwrap_or_default();
-    if target.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotImplemented,
-            "Summary wylaczone — wpisz target dla aliasu 'teams-summary' w Models > Aliases",
-        ));
-    }
-    // TODO(meeting-bot LLM): integracja z router.chat_completion. Na razie
-    // zwracamy jawny NotImplemented z nazwa modelu — admin wie ze alias jest OK
-    // ale kod LLM calla jeszcze nie wpiety. Zadne fake TLDR sie nie zapisuje.
-    Err(ProtocolError::new(
-        ProtocolErrorCode::NotImplemented,
-        format!(
-            "Alias teams-summary ustawiony na '{}' — integracja LLM w toku, na razie summary niedostepne",
-            target
-        ),
-    ))
-}
-
-fn to_summary_response(s: crate::meeting::SessionSummary) -> MessageBody {
-    MessageBody::MeetingBody(MeetingPayload::ResSummaryGenerate(
-        MeetingSummaryGenerateResponse {
-            summary: MeetingSessionSummaryEntry {
-                tldr: s.tldr,
-                decisions: s.decisions,
-                action_items_json: s.action_items_json,
-                open_questions: s.open_questions,
-                model: s.model,
-                generated_at: s.generated_at,
-            },
-        },
-    ))
-}
-
-// =============================================================================
-// 7. Active session — UI refresh helper
+// 6. Active session — UI refresh helper
 // =============================================================================
 
 #[handler(variant = "MeetingActiveSessionRequest", since = (1, 0))]
@@ -515,4 +415,552 @@ pub fn meeting_settings_update(
     Ok(MessageBody::MeetingBody(MeetingPayload::ResSettingsUpdate(
         MeetingSettingsUpdateResponse { ok: true },
     )))
+}
+
+// =============================================================================
+// 10. Summaries list (po-sesyjne, historyczne)
+// =============================================================================
+
+/// Weryfikuje ownership sesji i zwraca session_id. Admin widzi wszystko.
+/// Sesje bez ownera (legacy) — tylko admin.
+fn resolve_owned_session_id(
+    ctx: &HandlerContext,
+    meeting_key: &str,
+) -> Result<i64, ProtocolError> {
+    let session_id = repository::transcripts::session_id_by_meeting_key(&ctx.state.db, meeting_key)
+        .map_err(internal)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "meeting session not found"))?;
+    if is_admin(ctx) {
+        return Ok(session_id);
+    }
+    let me = current_user_id(ctx).ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::AuthRequired, "session missing user_id")
+    })?;
+    let owner = repository::transcripts::owner_of_meeting_key(&ctx.state.db, meeting_key)
+        .map_err(internal)?
+        .flatten();
+    if owner != Some(me) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "nie masz dostepu do tej sesji",
+        ));
+    }
+    Ok(session_id)
+}
+
+#[handler(variant = "MeetingSummariesListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn meeting_summaries_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = meeting_payload(req)?;
+    let MeetingPayload::ReqSummariesList(r) = payload else {
+        return Err(bad_request("expected ReqSummariesList"));
+    };
+    let session_id = resolve_owned_session_id(ctx, &r.meeting_key)?;
+    let limit = r.limit.unwrap_or(20).max(1);
+    let rows = repository::transcripts::list_summaries_for_meeting(&ctx.state.db, session_id, limit)
+        .map_err(internal)?;
+    let items = rows
+        .into_iter()
+        .map(|s| MeetingSummaryItem {
+            id: s.id,
+            created_at: s.created_at,
+            decisions_text: s.decisions_text,
+            summary_text: s.summary_text,
+            model: s.model,
+        })
+        .collect();
+    Ok(MessageBody::MeetingBody(MeetingPayload::ResSummariesList(
+        MeetingSummariesListResponse { items },
+    )))
+}
+
+// =============================================================================
+// 11. Action items list
+// =============================================================================
+
+#[handler(variant = "MeetingActionItemsListRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn meeting_action_items_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = meeting_payload(req)?;
+    let MeetingPayload::ReqActionItemsList(r) = payload else {
+        return Err(bad_request("expected ReqActionItemsList"));
+    };
+    let session_id = resolve_owned_session_id(ctx, &r.meeting_key)?;
+    // Wczesna walidacja statusu: CHECK constraint w DB ogranicza sie do trzech
+    // wartosci, ale filtr wchodzi w WHERE — niepoprawna wartosc zwrocilaby
+    // pusta liste zamiast bledu. Zwracamy 400 dla czytelnego feedbacku GUI.
+    if let Some(s) = r.status_filter.as_deref() {
+        if !matches!(s, "pending" | "done" | "cancelled") {
+            return Err(bad_request("status_filter musi byc pending/done/cancelled"));
+        }
+    }
+    let rows = repository::transcripts::list_action_items_for_meeting(
+        &ctx.state.db,
+        session_id,
+        r.status_filter.as_deref(),
+    )
+    .map_err(internal)?;
+    let items = rows
+        .into_iter()
+        .map(|a| MeetingActionItemItem {
+            id: a.id,
+            owner: a.owner,
+            task: a.task,
+            deadline: a.deadline,
+            status: a.status,
+            created_at: a.created_at,
+            updated_at: a.updated_at,
+        })
+        .collect();
+    Ok(MessageBody::MeetingBody(MeetingPayload::ResActionItemsList(
+        MeetingActionItemsListResponse { items },
+    )))
+}
+
+// =============================================================================
+// 12. Action item status update
+// =============================================================================
+
+#[handler(variant = "MeetingActionItemStatusUpdateRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn meeting_action_item_status_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = meeting_payload(req)?;
+    let MeetingPayload::ReqActionItemStatusUpdate(r) = payload else {
+        return Err(bad_request("expected ReqActionItemStatusUpdate"));
+    };
+    if !matches!(r.status.as_str(), "pending" | "done" | "cancelled") {
+        return Err(bad_request("status musi byc pending/done/cancelled"));
+    }
+    // Ownership: sprawdzamy przez join item -> session -> owner. Bezposredniego
+    // helpera nie ma, wiec czytamy session_id z wiersza i delegujemy do
+    // resolve_owned_session_id po meeting_key. Jesli item nie istnieje -> 404
+    // (zgodne z update zwracajacym 0 rows).
+    let session_id = {
+        let conn = ctx.state.db.lock().unwrap();
+        conn.query_row::<i64, _, _>(
+            "SELECT session_id FROM meeting_action_items WHERE id = ?1",
+            rusqlite::params![r.item_id],
+            |row| row.get(0),
+        )
+        .ok()
+    };
+    let session_id = session_id
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "action item not found"))?;
+    let meeting_key: String = {
+        let conn = ctx.state.db.lock().unwrap();
+        conn.query_row(
+            "SELECT meeting_key FROM meeting_sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(internal)?
+    };
+    // Ta sama sciezka ACL co przy list/export — admin albo owner sesji.
+    resolve_owned_session_id(ctx, &meeting_key)?;
+
+    let ok = repository::transcripts::update_action_item_status(&ctx.state.db, r.item_id, &r.status)
+        .map_err(internal)?;
+    Ok(MessageBody::MeetingBody(
+        MeetingPayload::ResActionItemStatusUpdate(MeetingActionItemStatusUpdateResponse {
+            success: ok,
+        }),
+    ))
+}
+
+// =============================================================================
+// 13. Transcript export (plain text z naglowkiem)
+// =============================================================================
+
+fn format_ts_ms(ms: i64) -> String {
+    // Zamiana epoch-ms na "YYYY-MM-DD HH:MM:SS" w UTC. Celowo bez strefy —
+    // transkrypt jest artefaktem sesji, nie wiadomoscia wyslana o tej godzinie
+    // do usera; dodawanie TZ mylaco.
+    let secs = ms / 1000;
+    let naive = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .unwrap_or_else(chrono::Utc::now);
+    naive.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+#[handler(variant = "MeetingTranscriptExportRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn meeting_transcript_export(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = meeting_payload(req)?;
+    let MeetingPayload::ReqTranscriptExport(r) = payload else {
+        return Err(bad_request("expected ReqTranscriptExport"));
+    };
+    let session_id = resolve_owned_session_id(ctx, &r.meeting_key)?;
+
+    let session = repository::transcripts::get_session(&ctx.state.db, session_id)
+        .map_err(internal)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "session not found"))?;
+    let entries = repository::transcripts::list_transcripts(&ctx.state.db, session_id)
+        .map_err(internal)?;
+
+    // Naglowek: tytul (fallback na meeting_key), start, unikalni uczestnicy.
+    let title = session
+        .title
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| session.meeting_key.clone());
+    let mut participants: Vec<String> = {
+        let mut seen = std::collections::BTreeSet::new();
+        for e in &entries {
+            seen.insert(e.speaker.clone());
+        }
+        seen.into_iter().collect()
+    };
+    // Deterministyczna kolejnosc juz z BTreeSet; na pustke zostaw "-".
+    if participants.is_empty() {
+        participants.push("-".into());
+    }
+
+    let mut out = String::with_capacity(256 + entries.len() * 80);
+    out.push_str(&format!("Transkrypt spotkania: {}\n", title));
+    out.push_str(&format!("Rozpoczęcie: {}\n", session.started_at));
+    out.push_str(&format!("Uczestnicy: {}\n", participants.join(", ")));
+    out.push_str("================================\n\n");
+    for e in &entries {
+        out.push_str(&format!(
+            "[{}] {}: {}\n",
+            format_ts_ms(e.timestamp_ms),
+            e.speaker,
+            e.text
+        ));
+    }
+
+    Ok(MessageBody::MeetingBody(MeetingPayload::ResTranscriptExport(
+        MeetingTranscriptExportResponse { content: out },
+    )))
+}
+
+// =============================================================================
+// Testy
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::repository::transcripts as repo_tx;
+    use crate::dispatch::state::AppState;
+    use tentaflow_protocol::{
+        MeetingActionItemStatusUpdateRequest, MeetingActionItemsListRequest,
+        MeetingSummariesListRequest, MeetingTranscriptExportRequest,
+    };
+
+    fn user_ctx(state: std::sync::Arc<AppState>, uid: i64, admin: bool) -> HandlerContext {
+        let mut bytes = [0u8; 16];
+        bytes[0] = 0xFF;
+        bytes[8..].copy_from_slice(&(uid as u64).to_le_bytes());
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: bytes,
+                role: if admin { Some("admin".into()) } else { None },
+            },
+            correlation_id: 1,
+            resume_secret: None,
+            state,
+        }
+    }
+
+    /// Tworzy sesje + ustawia owner_user_id. Zwraca (session_id, meeting_key).
+    fn make_owned_session(state: &AppState, key: &str, owner: i64) -> i64 {
+        let sid = repo_tx::get_or_create_session(&state.db, key, Some("u"), Some("Stand-up 22.04"))
+            .expect("create session");
+        {
+            let conn = state.db.lock().unwrap();
+            conn.execute(
+                "UPDATE meeting_sessions SET owner_user_id = ?1, started_at = '2024-04-23 14:22:00' WHERE id = ?2",
+                rusqlite::params![owner, sid],
+            )
+            .unwrap();
+        }
+        sid
+    }
+
+    // ----- summaries_list ------------------------------------------------
+
+    #[test]
+    fn summaries_list_returns_owner_records_desc() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-sum", 7);
+        repository::transcripts::insert_meeting_summary(&state.db, sid, "D1", "S1", "qwen").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        repository::transcripts::insert_meeting_summary(&state.db, sid, "D2", "S2", "qwen").unwrap();
+
+        let ctx = user_ctx(state.clone(), 7, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqSummariesList(
+            MeetingSummariesListRequest {
+                meeting_key: "m-sum".into(),
+                limit: None,
+            },
+        ));
+        let res = meeting_summaries_list(&req, &ctx).expect("ok");
+        let MessageBody::MeetingBody(MeetingPayload::ResSummariesList(r)) = res else {
+            panic!("wrong variant");
+        };
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.items[0].summary_text, "S2");
+    }
+
+    #[test]
+    fn summaries_list_forbidden_for_non_owner() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-sum-priv", 7);
+        repository::transcripts::insert_meeting_summary(&state.db, sid, "d", "s", "m").unwrap();
+
+        let ctx = user_ctx(state.clone(), 8, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqSummariesList(
+            MeetingSummariesListRequest {
+                meeting_key: "m-sum-priv".into(),
+                limit: None,
+            },
+        ));
+        let err = meeting_summaries_list(&req, &ctx).expect_err("must be forbidden");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[test]
+    fn summaries_list_not_found_for_unknown_key() {
+        let state = AppState::for_test();
+        let ctx = user_ctx(state.clone(), 1, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqSummariesList(
+            MeetingSummariesListRequest {
+                meeting_key: "nope".into(),
+                limit: Some(5),
+            },
+        ));
+        let err = meeting_summaries_list(&req, &ctx).expect_err("nf");
+        assert_eq!(err.code, ProtocolErrorCode::NotFound);
+    }
+
+    #[test]
+    fn summaries_list_empty_ok() {
+        let state = AppState::for_test();
+        let _ = make_owned_session(&state, "m-empty", 2);
+        let ctx = user_ctx(state.clone(), 2, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqSummariesList(
+            MeetingSummariesListRequest {
+                meeting_key: "m-empty".into(),
+                limit: None,
+            },
+        ));
+        let res = meeting_summaries_list(&req, &ctx).expect("ok");
+        let MessageBody::MeetingBody(MeetingPayload::ResSummariesList(r)) = res else {
+            panic!()
+        };
+        assert!(r.items.is_empty());
+    }
+
+    // ----- action_items_list ---------------------------------------------
+
+    #[test]
+    fn action_items_list_filters_by_status() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-ai", 3);
+        let a = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "Alice", "task A", None)
+            .unwrap();
+        repository::transcripts::upsert_meeting_action_item(&state.db, sid, "Bob", "task B", None).unwrap();
+        repository::transcripts::update_action_item_status(&state.db, a, "done").unwrap();
+
+        let ctx = user_ctx(state.clone(), 3, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemsList(
+            MeetingActionItemsListRequest {
+                meeting_key: "m-ai".into(),
+                status_filter: Some("pending".into()),
+            },
+        ));
+        let res = meeting_action_items_list(&req, &ctx).unwrap();
+        let MessageBody::MeetingBody(MeetingPayload::ResActionItemsList(r)) = res else {
+            panic!()
+        };
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].task, "task B");
+    }
+
+    #[test]
+    fn action_items_list_invalid_status_filter_rejected() {
+        let state = AppState::for_test();
+        make_owned_session(&state, "m-ai-bad", 1);
+        let ctx = user_ctx(state.clone(), 1, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemsList(
+            MeetingActionItemsListRequest {
+                meeting_key: "m-ai-bad".into(),
+                status_filter: Some("bogus".into()),
+            },
+        ));
+        let err = meeting_action_items_list(&req, &ctx).expect_err("bad status");
+        assert_eq!(err.code, ProtocolErrorCode::InvalidFrame);
+    }
+
+    #[test]
+    fn action_items_list_admin_can_see_other_user_session() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-ai-adm", 99);
+        repository::transcripts::upsert_meeting_action_item(&state.db, sid, "X", "t", None).unwrap();
+        let ctx = user_ctx(state.clone(), 1, true);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemsList(
+            MeetingActionItemsListRequest {
+                meeting_key: "m-ai-adm".into(),
+                status_filter: None,
+            },
+        ));
+        let res = meeting_action_items_list(&req, &ctx).unwrap();
+        let MessageBody::MeetingBody(MeetingPayload::ResActionItemsList(r)) = res else {
+            panic!()
+        };
+        assert_eq!(r.items.len(), 1);
+    }
+
+    // ----- action_item_status_update -------------------------------------
+
+    #[test]
+    fn action_item_status_update_transitions_pending_to_done() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-upd", 5);
+        let id = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None).unwrap();
+
+        let ctx = user_ctx(state.clone(), 5, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
+            MeetingActionItemStatusUpdateRequest {
+                item_id: id,
+                status: "done".into(),
+            },
+        ));
+        let res = meeting_action_item_status_update(&req, &ctx).unwrap();
+        let MessageBody::MeetingBody(MeetingPayload::ResActionItemStatusUpdate(r)) = res else {
+            panic!()
+        };
+        assert!(r.success);
+
+        let rows =
+            repository::transcripts::list_action_items_for_meeting(&state.db, sid, Some("done")).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn action_item_status_update_invalid_status_rejected() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-upd-bad", 5);
+        let id = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None).unwrap();
+
+        let ctx = user_ctx(state.clone(), 5, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
+            MeetingActionItemStatusUpdateRequest {
+                item_id: id,
+                status: "archived".into(),
+            },
+        ));
+        let err = meeting_action_item_status_update(&req, &ctx).expect_err("bad");
+        assert_eq!(err.code, ProtocolErrorCode::InvalidFrame);
+    }
+
+    #[test]
+    fn action_item_status_update_forbidden_for_non_owner() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-upd-priv", 5);
+        let id = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None).unwrap();
+
+        let ctx = user_ctx(state.clone(), 999, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
+            MeetingActionItemStatusUpdateRequest {
+                item_id: id,
+                status: "done".into(),
+            },
+        ));
+        let err = meeting_action_item_status_update(&req, &ctx).expect_err("forbidden");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[test]
+    fn action_item_status_update_not_found() {
+        let state = AppState::for_test();
+        let ctx = user_ctx(state.clone(), 1, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
+            MeetingActionItemStatusUpdateRequest {
+                item_id: 4242,
+                status: "done".into(),
+            },
+        ));
+        let err = meeting_action_item_status_update(&req, &ctx).expect_err("nf");
+        assert_eq!(err.code, ProtocolErrorCode::NotFound);
+    }
+
+    // ----- transcript_export ---------------------------------------------
+
+    #[test]
+    fn transcript_export_formats_with_header_and_timestamps() {
+        let state = AppState::for_test();
+        let sid = make_owned_session(&state, "m-exp", 10);
+        // Wstawiamy dwa wpisy przez insert_transcript (uzywa TranscriptEntry z routing::transcript_store).
+        use crate::routing::transcript_store::TranscriptEntry;
+        let e1 = TranscriptEntry {
+            timestamp_ms: 1_713_881_323_000u64, // 2024-04-23 14:08:43 UTC (przyklad)
+            speaker: "Maja K.".into(),
+            profile_id: None,
+            confidence: None,
+            is_enrolled: false,
+            meeting_id: None,
+            text: "Cześć wszystkim.".into(),
+            model: "whisper".into(),
+        };
+        let e2 = TranscriptEntry {
+            timestamp_ms: 1_713_881_334_000u64,
+            speaker: "Tomek P.".into(),
+            profile_id: None,
+            confidence: None,
+            is_enrolled: false,
+            meeting_id: None,
+            text: "Skończyłem migrację.".into(),
+            model: "whisper".into(),
+        };
+        repo_tx::insert_transcript(&state.db, sid, &e1).unwrap();
+        repo_tx::insert_transcript(&state.db, sid, &e2).unwrap();
+
+        let ctx = user_ctx(state.clone(), 10, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqTranscriptExport(
+            MeetingTranscriptExportRequest {
+                meeting_key: "m-exp".into(),
+            },
+        ));
+        let res = meeting_transcript_export(&req, &ctx).unwrap();
+        let MessageBody::MeetingBody(MeetingPayload::ResTranscriptExport(r)) = res else {
+            panic!()
+        };
+        assert!(r.content.starts_with("Transkrypt spotkania: Stand-up 22.04\n"));
+        assert!(r.content.contains("Rozpoczęcie: 2024-04-23 14:22:00"));
+        assert!(r.content.contains("Uczestnicy: Maja K., Tomek P."));
+        assert!(r.content.contains("================================"));
+        assert!(r.content.contains("] Maja K.: Cześć wszystkim."));
+        assert!(r.content.contains("] Tomek P.: Skończyłem migrację."));
+    }
+
+    #[test]
+    fn transcript_export_forbidden_for_non_owner() {
+        let state = AppState::for_test();
+        make_owned_session(&state, "m-exp-priv", 10);
+        let ctx = user_ctx(state.clone(), 11, false);
+        let req = MessageBody::MeetingBody(MeetingPayload::ReqTranscriptExport(
+            MeetingTranscriptExportRequest {
+                meeting_key: "m-exp-priv".into(),
+            },
+        ));
+        let err = meeting_transcript_export(&req, &ctx).expect_err("forbidden");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
 }

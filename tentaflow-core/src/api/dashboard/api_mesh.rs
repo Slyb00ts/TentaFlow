@@ -15,8 +15,9 @@ use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::MeshPeerStore;
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::pairing::{
-    delete_pending_contact_hints, initiate_pairing_over_iroh, load_pending_contact_hints,
-    store_pending_contact_hints, PairingAttemptOutcome, PairingContactHints,
+    delete_pending_contact_hints, delete_trusted_contact_hints, initiate_pairing_over_iroh,
+    load_pending_contact_hints, store_pending_contact_hints, store_trusted_contact_hints,
+    PairingAttemptOutcome, PairingContactHints,
 };
 use anyhow::Result;
 use serde::Deserialize;
@@ -78,6 +79,7 @@ pub async fn handle_initiate_pairing(
             remote_relay_url,
             remote_hostname,
             peer_store,
+            &local_hints.relay_url,
         );
         let can_use_existing_mesh = remote_addresses.is_empty()
             && remote_relay_url.is_empty()
@@ -114,6 +116,7 @@ pub async fn handle_initiate_pairing(
             .await
             {
                 Ok(PairingAttemptOutcome::Confirmed) => {
+                    store_trusted_contact_hints(&security.db, remote_node_id, &remote_hints)?;
                     if let Err(e) = qm.connect_to_peer_with_hints(&remote_hints).await {
                         warn!(
                             target_node = %remote_hints.node_id,
@@ -276,6 +279,9 @@ pub fn handle_confirm_pairing(
             let pending_hints = load_pending_contact_hints(&security.db, remote_node_id)
                 .ok()
                 .flatten();
+            if let Some(ref hints) = pending_hints {
+                let _ = store_trusted_contact_hints(&security.db, remote_node_id, hints);
+            }
             // Wyslij PairingConfirm + NodeInfo przez QUIC w tle
             if let Some(ref qm) = quic_mesh {
                 let pin_for_confirm = req.pin.clone().unwrap_or_default();
@@ -355,6 +361,7 @@ pub fn handle_confirm_pairing(
                 &security.db,
                 &format!("pending_pubkey:{}", remote_node_id),
             );
+            let _ = delete_pending_contact_hints(&security.db, remote_node_id);
 
             let json = serde_json::json!({"ok": true, "node_id": remote_node_id}).to_string();
             Ok((200, json))
@@ -402,6 +409,7 @@ pub fn handle_reject_pairing(
             }
         });
     }
+    let _ = delete_pending_contact_hints(&security.db, remote_node_id);
 
     let json = serde_json::json!({"ok": true}).to_string();
     Ok((200, json))
@@ -439,6 +447,7 @@ fn remote_contact_hints(
     remote_relay_url: &str,
     remote_hostname: &str,
     peer_store: &MeshPeerStore,
+    local_relay_url: &str,
 ) -> PairingContactHints {
     if !remote_addresses.is_empty() || !remote_relay_url.is_empty() || !remote_hostname.is_empty() {
         return PairingContactHints {
@@ -446,7 +455,11 @@ fn remote_contact_hints(
             public_key_hex: remote_public_key.to_string(),
             hostname: remote_hostname.to_string(),
             addresses: remote_addresses.to_vec(),
-            relay_url: remote_relay_url.to_string(),
+            relay_url: if remote_relay_url.is_empty() {
+                local_relay_url.to_string()
+            } else {
+                remote_relay_url.to_string()
+            },
         };
     }
 
@@ -463,7 +476,11 @@ fn remote_contact_hints(
             } else {
                 Vec::new()
             },
-            relay_url: remote_relay_url.to_string(),
+            relay_url: if remote_relay_url.is_empty() {
+                local_relay_url.to_string()
+            } else {
+                remote_relay_url.to_string()
+            },
         };
     }
 
@@ -472,7 +489,11 @@ fn remote_contact_hints(
         public_key_hex: remote_public_key.to_string(),
         hostname: remote_hostname.to_string(),
         addresses: remote_addresses.to_vec(),
-        relay_url: remote_relay_url.to_string(),
+        relay_url: if remote_relay_url.is_empty() {
+            local_relay_url.to_string()
+        } else {
+            remote_relay_url.to_string()
+        },
     }
 }
 
@@ -549,6 +570,7 @@ pub fn handle_revoke_trust(
         security.unpair(node_id)?;
         security.clear_revoking(node_id);
     }
+    let _ = delete_trusted_contact_hints(&security.db, node_id);
 
     let json = serde_json::json!({"ok": true}).to_string();
     Ok((200, json))

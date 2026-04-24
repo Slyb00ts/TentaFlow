@@ -4053,17 +4053,6 @@ pub mod transcripts {
     }
 
     #[derive(Debug, Clone, Serialize)]
-    pub struct SessionSummaryRow {
-        pub session_id: i64,
-        pub tldr: String,
-        pub decisions: String,
-        pub action_items_json: String,
-        pub open_questions: String,
-        pub model: String,
-        pub generated_at: String,
-    }
-
-    #[derive(Debug, Clone, Serialize)]
     pub struct TranscriptRow {
         pub id: i64,
         pub session_id: i64,
@@ -4158,6 +4147,49 @@ pub mod transcripts {
             rusqlite::params![session_id],
         )?;
         Ok(())
+    }
+
+    /// Zwraca owner_user_id sesji po meeting_key. Wynik to:
+    /// - `Ok(Some(Some(uid)))` — sesja istnieje i ma przypisanego ownera,
+    /// - `Ok(Some(None))` — sesja istnieje ale bez ownera (starsze wpisy),
+    /// - `Ok(None)` — sesja nie istnieje.
+    /// Uzywane przez live-broadcast writer task do filtrowania eventow
+    /// po ownership — bez dostepu uzytkownik nie dostaje frame'u.
+    /// Read-only lookup session_id po meeting_key. `Ok(None)` gdy brak sesji.
+    /// Uzywane przez handlery (summaries/action-items/export), ktore nie moga
+    /// tworzyc sesji — w odroznieniu od `get_or_create_session`.
+    pub fn session_id_by_meeting_key(
+        pool: &DbPool,
+        meeting_key: &str,
+    ) -> Result<Option<i64>> {
+        let conn = pool.lock().unwrap();
+        let id: rusqlite::Result<i64> = conn.query_row(
+            "SELECT id FROM meeting_sessions WHERE meeting_key = ?1",
+            rusqlite::params![meeting_key],
+            |r| r.get(0),
+        );
+        match id {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn owner_of_meeting_key(
+        pool: &DbPool,
+        meeting_key: &str,
+    ) -> Result<Option<Option<i64>>> {
+        let conn = pool.lock().unwrap();
+        let row: rusqlite::Result<Option<i64>> = conn.query_row(
+            "SELECT owner_user_id FROM meeting_sessions WHERE meeting_key = ?1",
+            rusqlite::params![meeting_key],
+            |r| r.get::<_, Option<i64>>(0),
+        );
+        match row {
+            Ok(opt) => Ok(Some(opt)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Lista sesji posortowana po last_activity_at malejaco. Opcjonalny filtr po owner_user_id.
@@ -4363,70 +4395,6 @@ pub mod transcripts {
     }
 
     // =========================================================================
-    // Summaries
-    // =========================================================================
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn upsert_session_summary(
-        pool: &DbPool,
-        session_id: i64,
-        tldr: &str,
-        decisions: &str,
-        action_items_json: &str,
-        open_questions: &str,
-        model: &str,
-    ) -> Result<()> {
-        let conn = pool.lock().unwrap();
-        conn.execute(
-            "INSERT INTO meeting_session_summaries
-                (session_id, tldr, decisions, action_items_json, open_questions, model, generated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
-             ON CONFLICT(session_id) DO UPDATE SET
-                tldr = excluded.tldr,
-                decisions = excluded.decisions,
-                action_items_json = excluded.action_items_json,
-                open_questions = excluded.open_questions,
-                model = excluded.model,
-                generated_at = excluded.generated_at",
-            rusqlite::params![
-                session_id,
-                tldr,
-                decisions,
-                action_items_json,
-                open_questions,
-                model
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_session_summary(
-        pool: &DbPool,
-        session_id: i64,
-    ) -> Result<Option<SessionSummaryRow>> {
-        let conn = pool.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT session_id, tldr, decisions, action_items_json, open_questions, model, generated_at
-                 FROM meeting_session_summaries WHERE session_id = ?1",
-                rusqlite::params![session_id],
-                |row| {
-                    Ok(SessionSummaryRow {
-                        session_id: row.get(0)?,
-                        tldr: row.get(1)?,
-                        decisions: row.get(2)?,
-                        action_items_json: row.get(3)?,
-                        open_questions: row.get(4)?,
-                        model: row.get(5)?,
-                        generated_at: row.get(6)?,
-                    })
-                },
-            )
-            .ok();
-        Ok(row)
-    }
-
-    // =========================================================================
     // Per-user settings
     // =========================================================================
 
@@ -4462,6 +4430,157 @@ pub mod transcripts {
             rusqlite::params![user_id, key, value],
         )?;
         Ok(())
+    }
+
+    // =========================================================================
+    // Summaries & action items (migracja 53 — nowy schemat pod Etap 2.2)
+    // =========================================================================
+
+    use crate::db::models::{DbMeetingActionItem, DbMeetingSummary};
+    use sha2::{Digest, Sha256};
+
+    /// Zwraca hex SHA256 z pary (owner, task) po normalizacji (lowercase + trim).
+    /// Uzywane jako deduplikator action itemow w obrębie jednej sesji.
+    pub fn action_item_content_hash(owner: &str, task: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(owner.trim().to_lowercase().as_bytes());
+        hasher.update(b"|");
+        hasher.update(task.trim().to_lowercase().as_bytes());
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(digest.len() * 2);
+        for b in digest {
+            out.push_str(&format!("{:02x}", b));
+        }
+        out
+    }
+
+    pub fn insert_meeting_summary(
+        pool: &DbPool,
+        session_id: i64,
+        decisions_text: &str,
+        summary_text: &str,
+        model: &str,
+    ) -> Result<i64> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meeting_summaries (session_id, decisions_text, summary_text, model)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![session_id, decisions_text, summary_text, model],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_summaries_for_meeting(
+        pool: &DbPool,
+        session_id: i64,
+        limit: u32,
+    ) -> Result<Vec<DbMeetingSummary>> {
+        let conn = pool.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, created_at, decisions_text, summary_text, model
+             FROM meeting_summaries
+             WHERE session_id = ?1
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
+            Ok(DbMeetingSummary {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                created_at: row.get(2)?,
+                decisions_text: row.get(3)?,
+                summary_text: row.get(4)?,
+                model: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Wstawia action item lub aktualizuje istniejacy (po content_hash). Przy
+    /// konflikcie nadpisuje `deadline` i odswieza `updated_at`. Zwraca id wiersza.
+    pub fn upsert_meeting_action_item(
+        pool: &DbPool,
+        session_id: i64,
+        owner: &str,
+        task: &str,
+        deadline: Option<&str>,
+    ) -> Result<i64> {
+        let hash = action_item_content_hash(owner, task);
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meeting_action_items
+                (session_id, owner, task, deadline, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, content_hash) DO UPDATE SET
+                deadline = excluded.deadline,
+                updated_at = datetime('now')",
+            rusqlite::params![session_id, owner, task, deadline, hash],
+        )?;
+        let id: i64 = conn.query_row(
+            "SELECT id FROM meeting_action_items
+             WHERE session_id = ?1 AND content_hash = ?2",
+            rusqlite::params![session_id, hash],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_action_items_for_meeting(
+        pool: &DbPool,
+        session_id: i64,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<DbMeetingActionItem>> {
+        let conn = pool.lock().unwrap();
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<DbMeetingActionItem> {
+            Ok(DbMeetingActionItem {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                owner: row.get(2)?,
+                task: row.get(3)?,
+                deadline: row.get(4)?,
+                status: row.get(5)?,
+                content_hash: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        };
+        let rows: Vec<DbMeetingActionItem> = match status_filter {
+            Some(s) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, session_id, owner, task, deadline, status,
+                            content_hash, created_at, updated_at
+                     FROM meeting_action_items
+                     WHERE session_id = ?1 AND status = ?2
+                     ORDER BY created_at DESC, id DESC",
+                )?;
+                let iter = stmt.query_map(rusqlite::params![session_id, s], map_row)?;
+                iter.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, session_id, owner, task, deadline, status,
+                            content_hash, created_at, updated_at
+                     FROM meeting_action_items
+                     WHERE session_id = ?1
+                     ORDER BY created_at DESC, id DESC",
+                )?;
+                let iter = stmt.query_map(rusqlite::params![session_id], map_row)?;
+                iter.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Zmienia status action itemu. Zwraca true jesli wiersz istnial.
+    pub fn update_action_item_status(pool: &DbPool, id: i64, status: &str) -> Result<bool> {
+        let conn = pool.lock().unwrap();
+        let affected = conn.execute(
+            "UPDATE meeting_action_items
+             SET status = ?1, updated_at = datetime('now')
+             WHERE id = ?2",
+            rusqlite::params![status, id],
+        )?;
+        Ok(affected > 0)
     }
 }
 
@@ -8444,5 +8563,199 @@ pub mod mesh_topology {
             rusqlite::params![cutoff],
         )?;
         Ok(n as u32)
+    }
+}
+
+// =============================================================================
+// Tests: meeting_summaries + meeting_action_items (migracja 53)
+// =============================================================================
+
+#[cfg(test)]
+mod meeting_summary_action_items_tests {
+    use super::transcripts::*;
+    use super::*;
+    use std::path::Path;
+
+    fn setup_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test DB")
+    }
+
+    fn mk_session(db: &DbPool, key: &str) -> i64 {
+        get_or_create_session(db, key, Some("https://x"), Some("title")).expect("create session")
+    }
+
+    #[test]
+    fn migration_53_drops_old_summaries_creates_new_tables() {
+        let db = setup_db();
+        let conn = db.lock().unwrap();
+        // Stara tabela musi byc skasowana migracja 53.
+        let old: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meeting_session_summaries'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0, "stara tabela nadal istnieje");
+
+        // Nowe tabele musza istniec.
+        for tbl in ["meeting_summaries", "meeting_action_items"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![tbl],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "brak tabeli {}", tbl);
+        }
+    }
+
+    #[test]
+    fn insert_summary_returns_id_and_list_in_desc_order() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m1");
+        let id1 = insert_meeting_summary(&db, sid, "D1", "S1", "qwen").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let id2 = insert_meeting_summary(&db, sid, "D2", "S2", "qwen").unwrap();
+        assert!(id2 > id1);
+
+        let rows = list_summaries_for_meeting(&db, sid, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, id2);
+        assert_eq!(rows[0].summary_text, "S2");
+        assert_eq!(rows[1].id, id1);
+    }
+
+    #[test]
+    fn list_summaries_respects_limit() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m-lim");
+        for i in 0..5 {
+            insert_meeting_summary(&db, sid, &format!("D{i}"), &format!("S{i}"), "qwen").unwrap();
+        }
+        let rows = list_summaries_for_meeting(&db, sid, 2).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn owner_of_meeting_key_returns_none_for_unknown() {
+        let db = setup_db();
+        let got = owner_of_meeting_key(&db, "missing").unwrap();
+        assert!(got.is_none(), "nieistniejaca sesja -> None");
+    }
+
+    #[test]
+    fn owner_of_meeting_key_returns_some_none_when_no_owner() {
+        let db = setup_db();
+        mk_session(&db, "ownerless");
+        let got = owner_of_meeting_key(&db, "ownerless").unwrap();
+        assert_eq!(got, Some(None), "sesja bez ownera -> Some(None)");
+    }
+
+    #[test]
+    fn owner_of_meeting_key_returns_owner_when_set() {
+        let db = setup_db();
+        let sid = mk_session(&db, "owned");
+        // Ustawiamy owner_user_id bezposrednio — testujemy tylko reader.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE meeting_sessions SET owner_user_id = 42 WHERE id = ?1",
+                rusqlite::params![sid],
+            )
+            .unwrap();
+        }
+        let got = owner_of_meeting_key(&db, "owned").unwrap();
+        assert_eq!(got, Some(Some(42)));
+    }
+
+    #[test]
+    fn upsert_action_item_deduplicates_same_content() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m-dedup");
+        let id1 =
+            upsert_meeting_action_item(&db, sid, "Alice", "prepare report", Some("2026-05-01"))
+                .unwrap();
+        // Ten sam owner+task — dedup przez content_hash, to samo id.
+        let id2 = upsert_meeting_action_item(
+            &db,
+            sid,
+            "  alice ",
+            "Prepare Report",
+            Some("2026-05-02"),
+        )
+        .unwrap();
+        assert_eq!(id1, id2);
+        let rows = list_action_items_for_meeting(&db, sid, None).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn upsert_action_item_updates_deadline_on_conflict() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m-deadline");
+        upsert_meeting_action_item(&db, sid, "Bob", "ship PR", Some("2026-05-01")).unwrap();
+        upsert_meeting_action_item(&db, sid, "Bob", "ship PR", Some("2026-05-10")).unwrap();
+        let rows = list_action_items_for_meeting(&db, sid, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].deadline.as_deref(), Some("2026-05-10"));
+    }
+
+    #[test]
+    fn upsert_action_item_touches_updated_at_on_conflict() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m-touch");
+        upsert_meeting_action_item(&db, sid, "Carol", "refactor X", None).unwrap();
+        let before = list_action_items_for_meeting(&db, sid, None).unwrap();
+        let u0 = before[0].updated_at.clone();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        upsert_meeting_action_item(&db, sid, "Carol", "refactor X", Some("later")).unwrap();
+        let after = list_action_items_for_meeting(&db, sid, None).unwrap();
+        assert_ne!(u0, after[0].updated_at, "updated_at musi sie odswiezyc");
+    }
+
+    #[test]
+    fn list_action_items_filters_by_status() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m-filter");
+        let a = upsert_meeting_action_item(&db, sid, "D", "t1", None).unwrap();
+        upsert_meeting_action_item(&db, sid, "E", "t2", None).unwrap();
+        update_action_item_status(&db, a, "done").unwrap();
+        let pending = list_action_items_for_meeting(&db, sid, Some("pending")).unwrap();
+        let done = list_action_items_for_meeting(&db, sid, Some("done")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task, "t2");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].id, a);
+    }
+
+    #[test]
+    fn update_action_item_status_returns_affected() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m-aff");
+        let id = upsert_meeting_action_item(&db, sid, "F", "t", None).unwrap();
+        assert!(update_action_item_status(&db, id, "done").unwrap());
+        assert!(!update_action_item_status(&db, 999_999, "done").unwrap());
+    }
+
+    #[test]
+    fn cascade_delete_removes_summaries_and_action_items() {
+        let db = setup_db();
+        let sid = mk_session(&db, "m-cascade");
+        insert_meeting_summary(&db, sid, "d", "s", "m").unwrap();
+        upsert_meeting_action_item(&db, sid, "G", "t", None).unwrap();
+        {
+            let conn = db.lock().unwrap();
+            // SQLite wymaga wlaczonego PRAGMA foreign_keys per-connection — init
+            // to robi globalnie przez set_pragmas, ale sprawdzamy tu eksplicytnie.
+            conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+            conn.execute("DELETE FROM meeting_sessions WHERE id = ?1", rusqlite::params![sid])
+                .unwrap();
+        }
+        let summaries = list_summaries_for_meeting(&db, sid, 10).unwrap();
+        let items = list_action_items_for_meeting(&db, sid, None).unwrap();
+        assert!(summaries.is_empty(), "summaries niezcascadowane");
+        assert!(items.is_empty(), "action items niezcascadowane");
     }
 }
