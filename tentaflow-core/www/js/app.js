@@ -29,9 +29,7 @@ import FlowsScreen from '/js/modules/flows.js';
 import FlowBuilderScreen from '/js/modules/flows-builder.js';
 import ChatScreen from '/js/modules/chat.js';
 import PromptsScreen from '/js/modules/prompts.js';
-import RegistriesScreen from '/js/modules/registries.js';
 import RulesScreen from '/js/modules/rules.js';
-import ApiKeysScreen from '/js/modules/apikeys.js';
 import UsersScreen from '/js/modules/users.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
@@ -40,8 +38,6 @@ import MyAccountsScreen from '/js/modules/my-accounts.js';
 import AppsHomeScreen from '/js/modules/apps-home.js';
 import ProfileScreen from '/js/modules/profile.js';
 import SettingsUserScreen from '/js/modules/settings-user.js';
-import FlowsUserScreen from '/js/modules/flows-user.js';
-import PromptsUserScreen from '/js/modules/prompts-user.js';
 import TranslateScreen from '/js/modules/translate.js';
 import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
@@ -61,7 +57,6 @@ const ADMIN_NAV = [
     items: [
       { id: 'dashboard', labelKey: 'nav.dashboard', icon: 'dashboard' },
       { id: 'services', labelKey: 'nav.services', icon: 'services' },
-      { id: 'apikeys', labelKey: 'nav.apikeys', icon: 'key' },
       { id: 'settings', labelKey: 'nav.settings', icon: 'settings' },
     ],
   },
@@ -79,9 +74,7 @@ const ADMIN_NAV = [
     icon: 'flow',
     items: [
       { id: 'flows', labelKey: 'nav.flows', icon: 'flow' },
-      { id: 'playground', labelKey: 'nav.playground', icon: 'play' },
       { id: 'rules', labelKey: 'nav.rules', icon: 'rules' },
-      { id: 'registries', labelKey: 'nav.registries', icon: 'registry' },
     ],
   },
   {
@@ -113,11 +106,7 @@ const USER_NAV = [
       { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
       { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
       { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
-      { id: 'flows-user', labelKey: 'nav.flows_user', icon: 'workflow-app' },
-      { id: 'prompts-user', labelKey: 'nav.prompts_user', icon: 'star' },
-      { id: 'tts', labelKey: 'nav.tts', icon: 'speaker', badge: 'soon' },
       { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
-      { id: 'search-app', labelKey: 'nav.search_app', icon: 'search', badge: 'soon' },
     ],
   },
   {
@@ -125,7 +114,6 @@ const USER_NAV = [
     icon: 'network',
     items: [
       { id: 'mesh-user', labelKey: 'nav.mesh_user', icon: 'network', badge: 'soon' },
-      { id: 'tailscale-user', labelKey: 'nav.tailscale_user', icon: 'zap', badge: 'soon' },
     ],
   },
   {
@@ -382,10 +370,8 @@ async function renderApp() {
   Router.register('flow-builder', FlowBuilderScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
-  Router.register('apikeys', ApiKeysScreen);
   Router.register('users', UsersScreen);
   Router.register('rules', RulesScreen);
-  Router.register('registries', RegistriesScreen);
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);
   Router.register('addons', AddonsScreen);
@@ -393,18 +379,13 @@ async function renderApp() {
   Router.register('apps-home', AppsHomeScreen);
   Router.register('profile', ProfileScreen);
   Router.register('settings-user', SettingsUserScreen);
-  Router.register('flows-user', FlowsUserScreen);
-  Router.register('prompts-user', PromptsUserScreen);
   Router.register('notes', NotesScreen);
   // Apps whose binary handlers are not yet wired — honest placeholder, not a stub feature.
   Router.register('images',         makeComingSoonScreen('images',    'image'));
   Router.register('meeting', MeetingScreen);
   Router.register('meeting-live', MeetingLiveScreen);
-  Router.register('tts',            makeComingSoonScreen('tts',       'speaker'));
   Router.register('translate',      TranslateScreen);
-  Router.register('search-app',     makeComingSoonScreen('search',    'search'));
   Router.register('mesh-user',      makeComingSoonScreen('mesh_user', 'network'));
-  Router.register('tailscale-user', makeComingSoonScreen('tailscale', 'zap'));
 
   paint();
 
