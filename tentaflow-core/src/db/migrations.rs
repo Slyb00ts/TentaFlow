@@ -1659,5 +1659,20 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE services_new RENAME TO services;
         ",
     ),
+    (
+        55,
+        "meeting_sessions_lifecycle_stage",
+        "
+            -- Real lifecycle stage of the meeting bot, updated both by the host
+            -- (initial 'container_spawned' after docker spawn) and by the bot
+            -- itself (LifecycleUpdate events from browser.rs at browser_launched,
+            -- navigating, prejoin_ready, joining, joined, failed). Independent
+            -- from the existing coarse `status` column (idle/joining/active/ended)
+            -- which tracks container availability.
+            ALTER TABLE meeting_sessions ADD COLUMN lifecycle_stage TEXT DEFAULT 'idle';
+            ALTER TABLE meeting_sessions ADD COLUMN lifecycle_details TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN lifecycle_updated_at TEXT;
+        ",
+    ),
 ]
 }

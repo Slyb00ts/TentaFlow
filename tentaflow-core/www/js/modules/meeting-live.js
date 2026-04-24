@@ -33,6 +33,10 @@ const state = {
   aiInsightsEnabled: true,
   activeTab: 'transcript',
   groupsCollapsed: { pending: false, done: true, cancelled: true },
+  // Bot lifecycle — 'joined' means the LIVE chip is real; other values mean
+  // the bot is still setting up and we show a pending chip instead.
+  lifecycleStage: 'idle',
+  lifecycleDetails: '',
 };
 
 let unsubscribeLive = null;
@@ -107,6 +111,8 @@ function resetState(meetingKey) {
   state.aiInsightsEnabled = true;
   state.activeTab = 'transcript';
   state.groupsCollapsed = { pending: false, done: true, cancelled: true };
+  state.lifecycleStage = 'idle';
+  state.lifecycleDetails = '';
 }
 
 // --- Data loading -----------------------------------------------------------
@@ -122,6 +128,8 @@ async function loadInitialData() {
     if (match) {
       sessionId = match.sessionId;
       state.sessionDetail = match;
+      if (match.lifecycleStage) state.lifecycleStage = match.lifecycleStage;
+      if (match.lifecycleDetails) state.lifecycleDetails = match.lifecycleDetails;
     }
   } catch (e) {
     toast(e?.message || I18n.t('meeting.live.load_failed'), 'error');
@@ -134,7 +142,11 @@ async function loadInitialData() {
         sessionId,
         includeTranscripts: true,
       });
-      if (det?.session) state.sessionDetail = det.session;
+      if (det?.session) {
+        state.sessionDetail = det.session;
+        if (det.session.lifecycleStage) state.lifecycleStage = det.session.lifecycleStage;
+        if (det.session.lifecycleDetails) state.lifecycleDetails = det.session.lifecycleDetails;
+      }
       const entries = Array.isArray(det?.transcripts) ? det.transcripts : [];
       // Mapujemy stary format transcript entry na live event shape.
       state.transcript = entries.map((t) => ({
@@ -319,6 +331,11 @@ function applyLiveEvent(timestampMs, type, data) {
       };
       break;
     }
+    case 'LifecycleUpdate': {
+      state.lifecycleStage = String(data.stage || state.lifecycleStage);
+      state.lifecycleDetails = data.details ? String(data.details) : '';
+      break;
+    }
     default:
       // Nieznane warianty ignorujemy (forward-compat).
       break;
@@ -390,13 +407,14 @@ function renderHeader() {
   const sub = `${I18n.t('meeting.live.subtitle_participants', { n: participantsCount })} · ${durationLabel} · ${escapeHtml(platform)}`;
   // Ikona video (lucide).
   const ico = '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>';
+  const chip = renderLifecycleChip();
   host.className = 'tf-detail-header';
   host.innerHTML = `
     <div class="big-ico">${ico}</div>
     <div class="d-meta">
       <div class="d-name">
         ${escapeHtml(title)}
-        <tf-chip status="ok" dot>${escapeHtml(I18n.t('meeting.live.chip_live'))}</tf-chip>
+        ${chip}
       </div>
       <div class="d-sub">${sub}</div>
     </div>
@@ -409,6 +427,22 @@ function renderHeader() {
   byId('meet-live-vnc-btn')?.addEventListener('click', onOpenVnc);
   byId('meet-live-dl-btn')?.addEventListener('click', onDownloadTranscript);
   byId('meet-live-leave-btn')?.addEventListener('click', onLeave);
+}
+
+function renderLifecycleChip() {
+  const stage = state.lifecycleStage || 'idle';
+  if (stage === 'joined') {
+    return `<tf-chip status="ok" dot>${escapeHtml(I18n.t('meeting.live.chip_live'))}</tf-chip>`;
+  }
+  if (stage === 'failed') {
+    return `<tf-chip status="err" dot>${escapeHtml(I18n.t('meeting.status_error'))}</tf-chip>`;
+  }
+  // Any pre-'joined' stage — show the stage label so the user knows why LIVE
+  // has not turned on yet (the backend may take ~20s to reach joined).
+  const labelKey = `meeting.lifecycle_${stage}`;
+  const label = I18n.t(labelKey);
+  const resolved = label === labelKey ? I18n.t('meeting.status_joining') : label;
+  return `<tf-chip status="warn" dot>${escapeHtml(resolved)}</tf-chip>`;
 }
 
 function renderBody() {

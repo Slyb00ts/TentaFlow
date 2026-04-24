@@ -2263,6 +2263,12 @@ pub struct MeetingSessionDescriptor {
     pub bot_endpoint_id: String,
     pub container_name: String,
     pub owner_user_id: i64,
+    /// Aktualny etap lifecycle bota (patrz `LIFECYCLE_*` w `types.rs`).
+    /// Pusty string gdy sesja jeszcze nie dotknęła żadnego etapu.
+    pub lifecycle_stage: String,
+    /// Opcjonalne szczegóły ostatniego etapu (np. treść błędu przy `failed`).
+    /// Pusty string = brak dodatkowych informacji.
+    pub lifecycle_details: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]

@@ -42,6 +42,31 @@ let settings = {
 let sessionListTimer = null;
 let errorMessage = '';
 
+// Lifecycle state tracked during 'joining' screen. Stage strings mirror
+// LIFECYCLE_* constants in tentaflow-protocol; 'idle' means no event received
+// yet (bot just spawned, first broadcast in flight).
+let currentLifecycleStage = 'idle';
+let currentLifecycleDetails = '';
+let unsubscribeLifecycle = null;
+let lifecycleTimeoutId = null;
+let elapsedTimer = null;
+let joinStartedAt = 0;
+
+// Ordered pipeline the user sees. 'failed' is a terminal side-branch, not part
+// of this list — handled separately in renderJoiningScreen.
+const LIFECYCLE_STEPS = [
+  { key: 'container_spawned', labelKey: 'meeting.lifecycle_container_spawned' },
+  { key: 'browser_launched',  labelKey: 'meeting.lifecycle_browser_launched' },
+  { key: 'navigating',        labelKey: 'meeting.lifecycle_navigating' },
+  { key: 'prejoin_ready',     labelKey: 'meeting.lifecycle_prejoin_ready' },
+  { key: 'joining',           labelKey: 'meeting.lifecycle_joining' },
+  { key: 'joined',             labelKey: 'meeting.lifecycle_joined' },
+];
+
+// Safety net: bot container sometimes hangs on OAuth / lobby. Bail after 90s
+// so the user sees an actionable error instead of a frozen spinner.
+const LIFECYCLE_TIMEOUT_MS = 90_000;
+
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
 }
@@ -147,6 +172,10 @@ async function onJoinClick() {
     return;
   }
   activeScreen = 'joining';
+  currentLifecycleStage = 'idle';
+  currentLifecycleDetails = '';
+  joinStartedAt = Date.now();
+  startElapsedTimer();
   render();
   try {
     const resp = await ApiBinary.one('meetingSessionStartRequest', {
@@ -158,20 +187,114 @@ async function onJoinClick() {
       ttsAlias: settings.tts_alias,
       llmAlias: settings.llm_alias,
     });
-    if (resp?.session) {
-      activeSession = resp.session;
-      await navigateToLive(activeSession.meetingKey);
-    } else {
-      throw new Error('brak session w odpowiedzi');
+    if (!resp?.session) {
+      throw new Error(I18n.t('meeting.err_no_session'));
     }
-  } catch (e) {
-    errorMessage = e?.message || I18n.t('meeting.err_generic');
-    activeScreen = 'error';
+    activeSession = resp.session;
+    // Descriptor may already carry a stage (bot broadcasted before response
+    // landed, or user reloaded mid-join). If bot is already 'joined', skip the
+    // lifecycle screen; otherwise subscribe and wait for events.
+    if (activeSession.lifecycleStage) currentLifecycleStage = activeSession.lifecycleStage;
+    if (activeSession.lifecycleDetails) currentLifecycleDetails = activeSession.lifecycleDetails;
+    if (currentLifecycleStage === 'joined') {
+      cleanupJoiningWatchers();
+      await navigateToLive(activeSession.meetingKey);
+      return;
+    }
+    if (currentLifecycleStage === 'failed') {
+      failJoining(currentLifecycleDetails || I18n.t('meeting.err_generic'));
+      return;
+    }
+    await subscribeToLifecycle();
+    armLifecycleTimeout();
     render();
+  } catch (e) {
+    failJoining(e?.message || I18n.t('meeting.err_generic'));
+  }
+}
+
+function failJoining(message) {
+  cleanupJoiningWatchers();
+  errorMessage = message;
+  activeScreen = 'error';
+  render();
+}
+
+function cleanupJoiningWatchers() {
+  if (unsubscribeLifecycle) {
+    try { unsubscribeLifecycle(); } catch (_) { /* no-op */ }
+    unsubscribeLifecycle = null;
+  }
+  if (lifecycleTimeoutId) {
+    clearTimeout(lifecycleTimeoutId);
+    lifecycleTimeoutId = null;
+  }
+  stopElapsedTimer();
+}
+
+function armLifecycleTimeout() {
+  if (lifecycleTimeoutId) clearTimeout(lifecycleTimeoutId);
+  lifecycleTimeoutId = setTimeout(() => {
+    failJoining(I18n.t('meeting.err_lifecycle_timeout'));
+  }, LIFECYCLE_TIMEOUT_MS);
+}
+
+// Refreshes only the elapsed counter in place so we do not re-render the whole
+// joining screen every second (and thus do not disturb keyboard focus).
+function startElapsedTimer() {
+  stopElapsedTimer();
+  elapsedTimer = setInterval(() => {
+    const el = byId('meeting-joining-elapsed');
+    if (el) el.textContent = formatElapsed(Date.now() - joinStartedAt);
+  }, 1000);
+}
+
+function stopElapsedTimer() {
+  if (elapsedTimer) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+}
+
+function formatElapsed(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+async function subscribeToLifecycle() {
+  try {
+    const client = await ApiBinary.client();
+    unsubscribeLifecycle = client.addUnsolicitedListener(({ body }) => {
+      if (!body || body.variant !== 'MeetingLiveEventBody') return;
+      if (!activeSession || body.meetingKey !== activeSession.meetingKey) return;
+      const payload = body.payload;
+      if (!payload || payload.type !== 'LifecycleUpdate') return;
+      const data = payload.data || {};
+      currentLifecycleStage = String(data.stage || currentLifecycleStage);
+      currentLifecycleDetails = data.details ? String(data.details) : '';
+      if (currentLifecycleStage === 'joined') {
+        const key = activeSession.meetingKey;
+        cleanupJoiningWatchers();
+        navigateToLive(key);
+        return;
+      }
+      if (currentLifecycleStage === 'failed') {
+        failJoining(currentLifecycleDetails || I18n.t('meeting.err_generic'));
+        return;
+      }
+      // Each forward-progress event extends the timeout; the bot is alive.
+      armLifecycleTimeout();
+      if (activeScreen === 'joining') render();
+    });
+  } catch (e) {
+    console.warn('[meeting] subscribeToLifecycle failed:', e?.message);
   }
 }
 
 async function onCancelJoining() {
+  cleanupJoiningWatchers();
   if (!activeSession) {
     activeScreen = 'join';
     render();
@@ -315,25 +438,67 @@ function renderJoinScreen() {
 }
 
 function renderJoiningScreen() {
+  const failed = currentLifecycleStage === 'failed';
+  const chipStatus = failed ? 'err' : 'warn';
+  const chipLabel = failed
+    ? I18n.t('meeting.status_error')
+    : I18n.t('meeting.status_joining');
   const header = renderHeader(
     I18n.t('meeting.title'),
     I18n.t('meeting.joining_sub'),
-    `<tf-chip status="warn" dot>${escapeHtml(I18n.t('meeting.status_joining'))}</tf-chip>`,
+    `<tf-chip status="${chipStatus}" dot>${escapeHtml(chipLabel)}</tf-chip>`,
     `<tf-button variant="danger" size="sm" icon="x" id="meeting-cancel-btn">${escapeHtml(I18n.t('meeting.cancel'))}</tf-button>`
   );
+
+  // Resolve active step index. 'idle' → -1 (everything pending). 'failed' keeps
+  // previous step as the failure point; we cannot tell which transition blew
+  // up without more info, so we highlight the last known successful stage.
+  const stageIndex = LIFECYCLE_STEPS.findIndex((s) => s.key === currentLifecycleStage);
+  const stepsHtml = LIFECYCLE_STEPS.map((step, i) => {
+    let cls = 'pending';
+    let ico;
+    if (failed) {
+      if (i < stageIndex) { cls = 'done'; ico = sprite('check'); }
+      else if (i === stageIndex) { cls = 'error'; ico = sprite('alert'); }
+      else { cls = 'pending'; ico = String(i + 1); }
+    } else if (stageIndex < 0) {
+      ico = String(i + 1);
+    } else if (i < stageIndex) {
+      cls = 'done'; ico = sprite('check');
+    } else if (i === stageIndex) {
+      cls = 'active'; ico = String(i + 1);
+    } else {
+      ico = String(i + 1);
+    }
+    return `
+      <div class="joining-step ${cls}">
+        <div class="step-ico">${ico}</div>
+        <div class="step-body">
+          <div class="step-title">${escapeHtml(I18n.t(step.labelKey))}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  const failureNote = failed && currentLifecycleDetails
+    ? `<div class="joining-failure">${escapeHtml(currentLifecycleDetails)}</div>`
+    : '';
+  const elapsed = formatElapsed(Date.now() - (joinStartedAt || Date.now()));
+
   return `
     ${header}
     <div class="meeting-joining-hero">
       <div class="meeting-joining-card">
-        <div class="meeting-spinner"></div>
+        ${failed ? '' : '<div class="meeting-spinner"></div>'}
         <h2>${escapeHtml(I18n.t('meeting.joining_title'))}</h2>
         <p class="sub">${escapeHtml(activeSession?.meetingUrl || '')}</p>
-        <div class="joining-steps">
-          <div class="joining-step done"><div class="step-ico">${sprite('check')}</div><div class="step-body"><div class="step-title">${escapeHtml(I18n.t('meeting.step1_title'))}</div><div class="step-desc">${escapeHtml(I18n.t('meeting.step1_desc'))}</div></div></div>
-          <div class="joining-step active"><div class="step-ico">2</div><div class="step-body"><div class="step-title">${escapeHtml(I18n.t('meeting.step2_title'))}</div><div class="step-desc">${escapeHtml(I18n.t('meeting.step2_desc'))}</div></div></div>
-          <div class="joining-step pending"><div class="step-ico">3</div><div class="step-body"><div class="step-title">${escapeHtml(I18n.t('meeting.step3_title'))}</div><div class="step-desc">${escapeHtml(I18n.t('meeting.step3_desc'))}</div></div></div>
-          <div class="joining-step pending"><div class="step-ico">4</div><div class="step-body"><div class="step-title">${escapeHtml(I18n.t('meeting.step4_title'))}</div><div class="step-desc">${escapeHtml(I18n.t('meeting.step4_desc'))}</div></div></div>
+        <div class="joining-elapsed">
+          ${sprite('clock')}
+          <span id="meeting-joining-elapsed">${escapeHtml(elapsed)}</span>
         </div>
+        <div class="joining-steps">
+          ${stepsHtml}
+        </div>
+        ${failureNote}
       </div>
     </div>`;
 }
@@ -654,10 +819,12 @@ function bindEvents() {
     render();
   });
   byId('mt-nav-join')?.addEventListener('click', () => {
+    cleanupJoiningWatchers();
     activeScreen = activeSession ? 'active' : 'join';
     render();
   });
   byId('mt-retry')?.addEventListener('click', () => {
+    cleanupJoiningWatchers();
     activeScreen = 'join';
     errorMessage = '';
     render();
@@ -728,6 +895,7 @@ const MeetingScreen = {
   },
   unmount() {
     destroyHistoryVlist();
+    cleanupJoiningWatchers();
     if (sessionListTimer) {
       clearInterval(sessionListTimer);
       sessionListTimer = null;

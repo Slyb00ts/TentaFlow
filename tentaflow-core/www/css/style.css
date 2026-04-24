@@ -3673,6 +3673,22 @@ textarea {
 .joining-step .step-title { font-size: 13px; font-weight: 600; color: var(--text); }
 .joining-step .step-desc { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 .joining-step.pending .step-title { color: var(--text-3); }
+.joining-step.error .step-ico { background: rgba(239,68,68,0.15); color: var(--danger, #ef4444); border: 1.5px solid rgba(239,68,68,0.5); }
+.joining-step.error .step-title { color: var(--danger, #ef4444); }
+.joining-elapsed {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--text-3); font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 20px;
+}
+.joining-elapsed .icon { width: 14px; height: 14px; }
+.joining-failure {
+  margin-top: 20px; padding: 12px 14px; text-align: left;
+  background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.3);
+  border-radius: var(--radius, 10px);
+  color: var(--danger, #ef4444); font-size: 12.5px; line-height: 1.5;
+  word-break: break-word;
+}
 
 /* transcript-list pelni role hosta dla VirtualList — pretext/virtual-list
    wymaga block-level kontenera z overflow-y + jawną wysokością. Padding dajemy

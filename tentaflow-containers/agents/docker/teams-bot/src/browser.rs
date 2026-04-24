@@ -4,14 +4,57 @@
 //       wykrywanie aktywnego mowcy, injekcja mostu audio (browser_inject.js).
 // =============================================================================
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
+use tentaflow_protocol::{
+    MeetingEventPayload, LIFECYCLE_BROWSER_LAUNCHED, LIFECYCLE_JOINED, LIFECYCLE_JOINING,
+    LIFECYCLE_NAVIGATING, LIFECYCLE_PREJOIN_READY,
+};
+use tokio::sync::Mutex;
 
 use crate::config::MeetingConfig;
+use crate::quic_server::RouterClient;
+
+/// Uchwyt do opcjonalnego RouterClient współdzielonego z main.rs — gdy None,
+/// `join_meeting` po prostu pomija wysyłanie lifecycle events (np. w trybie
+/// stand-alone bez hosta). Meeting_key identyfikuje sesję po stronie routera.
+pub type RouterHandle = Arc<Mutex<Option<Arc<RouterClient>>>>;
+
+/// Wysyła pojedynczy `LifecycleUpdate` bez twardej zależności od aktualnego
+/// stanu routera — błąd/brak klienta jest logowany i połykany, żeby diagnostyka
+/// nie zabiła flow dołączania.
+async fn emit_lifecycle(router: &RouterHandle, meeting_key: &str, stage: &str, details: Option<String>) {
+    let client = {
+        let guard = router.lock().await;
+        guard.as_ref().cloned()
+    };
+    let Some(client) = client else {
+        tracing::debug!(stage, "emit_lifecycle: router client niedostepny — pomijam");
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = client
+        .send_meeting_event(
+            meeting_key,
+            ts,
+            MeetingEventPayload::LifecycleUpdate {
+                stage: stage.to_string(),
+                details,
+            },
+        )
+        .await
+    {
+        tracing::warn!("emit_lifecycle({}) failed: {}", stage, e);
+    }
+}
 
 /// Maksymalny czas oczekiwania na dolaczenie do spotkania (5 minut)
 const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -85,9 +128,20 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     Ok(browser)
 }
 
-/// Nawiguje do URL spotkania Teams i dolacza jako gosc lub czeka na logowanie VNC
-pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) -> Result<Page> {
+/// Nawiguje do URL spotkania Teams i dolacza jako gosc lub czeka na logowanie VNC.
+/// Emituje `LifecycleUpdate` events do routera na każdym kluczowym przejściu:
+/// `browser_launched` (caller już po `launch_chromium`) → `navigating` → `prejoin_ready`
+/// → `joining` → `joined`.
+pub async fn join_meeting(
+    browser: &Browser,
+    url: &str,
+    config: &MeetingConfig,
+    router: &RouterHandle,
+    meeting_key: &str,
+) -> Result<Page> {
     use chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams;
+
+    emit_lifecycle(router, meeting_key, LIFECYCLE_BROWSER_LAUNCHED, None).await;
 
     // Otworz pusta strone, zainstaluj init script PRZED nawigacja do Teams.
     // Dzieki temu monkey-patch getUserMedia jest aktywny zanim Teams go wywola.
@@ -111,11 +165,16 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
     // NIE wywolujemy wait_for_navigation — Teams robi chain redirectow
     // (launcher.html → v2 → light-meetings) i event 'navigation done' nigdy
     // nie przychodzi. Nasz polling click_when_present sam poczeka na DOM.
+    emit_lifecycle(router, meeting_key, LIFECYCLE_NAVIGATING, None).await;
     page.goto(url).await?;
     tracing::info!(url = url, "Nawigacja do spotkania Teams rozpoczeta");
 
     // Czekamy na zaladowanie strony light-meetings
     tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Prejoin DOM powinien być dostępny po 3s — emitujemy stage zanim
+    // klikniemy "Continue without audio or video" / kamerę.
+    emit_lifecycle(router, meeting_key, LIFECYCLE_PREJOIN_READY, None).await;
 
     // KROK 1: Dialog "Are you sure you don't want audio or video?"
     // Gdy bot_video_enabled=true NIE klikamy "Continue without" — zamiast tego
@@ -200,6 +259,7 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
 
     // KROK 3: Klikniecie "Join now"
     tracing::info!("Klikanie przycisku 'Join now'");
+    emit_lifecycle(router, meeting_key, LIFECYCLE_JOINING, None).await;
     let joined = click_when_present(
         &page,
         r#"
@@ -235,6 +295,7 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
     while tokio::time::Instant::now() < deadline {
         if is_in_meeting(&page).await? {
             tracing::info!("Pomyslnie dolaczono do spotkania");
+            emit_lifecycle(router, meeting_key, LIFECYCLE_JOINED, None).await;
             return Ok(page);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
