@@ -338,6 +338,7 @@ pub async fn start_mesh_pipeline(
                 quic_mesh.clone(),
                 local_node_id.clone(),
                 Some(mesh_security.clone()),
+                db_pool.clone(),
             );
 
             spawn_pairing_cleanup(mesh_security.clone());
@@ -1880,6 +1881,7 @@ fn spawn_liveness_timer(
     quic_mesh: Arc<IrohMeshManager>,
     local_node_id: String,
     mesh_security: Option<Arc<MeshSecurity>>,
+    db_pool: Option<crate::db::DbPool>,
 ) {
     tokio::spawn(async move {
         // Progi dobrane z zapasem — iroh multi-path czasem opuszcza heartbeat
@@ -1916,7 +1918,7 @@ fn spawn_liveness_timer(
                     warn!(
                         peer = %node_id,
                         age_ms,
-                        "Liveness timer: trusted peer nieaktywny > 30s — force disconnect"
+                        "Liveness timer: trusted peer nieaktywny > 30s — force disconnect + reconnect"
                     );
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "offline");
@@ -1929,8 +1931,44 @@ fn spawn_liveness_timer(
                     );
                     let qm = quic_mesh.clone();
                     let nid = node_id.clone();
+                    let db_for_reconnect = db_pool.clone();
                     tokio::spawn(async move {
                         qm.disconnect_peer(&nid).await;
+                        // Po kill-u od razu probujemy ponownie nawiazac polaczenie
+                        // dla zaufanego peera — uzywamy zapisanych hints (addrs +
+                        // relay) z trusted_contact:*, zeby nie czekac na kolejny
+                        // mDNS tick albo DHT lookup. Dla cross-network pairingu
+                        // jedyna sciezka to relay i hints ja niosa.
+                        if let Some(pool) = db_for_reconnect {
+                            match crate::net::iroh::pairing::load_trusted_contact_hints(
+                                &pool, &nid,
+                            ) {
+                                Ok(Some(hints)) => {
+                                    if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
+                                        warn!(
+                                            peer = %nid,
+                                            "Liveness reconnect nieudany: {}",
+                                            e
+                                        );
+                                    } else {
+                                        info!(peer = %nid, "Liveness reconnect ok");
+                                    }
+                                }
+                                Ok(None) => {
+                                    debug!(
+                                        peer = %nid,
+                                        "Liveness: brak zapisanych hints — reconnect pominiety"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        peer = %nid,
+                                        "Liveness: load_trusted_contact_hints blad: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                     });
                 } else if age_ms > DEGRADED_MS && peer.status != "degraded" {
                     peer_store.set_status(&node_id, "degraded");
