@@ -461,15 +461,27 @@ pub fn merge_contact_hints(
 /// musi go wyczyscic zanim `connect_to_peer_with_hints` wejdzie w dial fail.
 const DEAD_RELAY_PATTERNS: &[&str] = &["use.iroh.network"];
 
-/// Czysci pole `relay_url` w `trusted_contact:*` gdy matchuje wzorzec martwego
-/// hosta (patrz `DEAD_RELAY_PATTERNS`). Pojedyncze bledy dekodowania/zapisu
-/// sa tylko logowane — iteracja idzie dalej zeby nie zablokowac startu mesh
-/// jednym skorumpowanym wpisem.
+/// Upgrade-path cleanup dla `trusted_contact:*`:
+///  1. Czysci `relay_url` gdy matchuje wzorzec martwego hosta (`DEAD_RELAY_PATTERNS`).
+///     Stare instalacje mialy zapisane `https://use.iroh.network/`, ktore nie
+///     resolwuje DNS — bez czyszczenia `connect_to_peer_with_hints` wchodzi w
+///     dial fail.
+///  2. Przepuszcza liste `addresses` przez biezace `AdvertiseFilters` z settings.
+///     Gdy user wlaczy np. `hide_docker=true` w trakcie zycia aplikacji, stare
+///     adresy `172.17.x.y` juz zapisane w `trusted_contact:*` musza zniknac —
+///     inaczej relaunch uzyje ich z cache i znow wyciekna do peera.
+///  3. IPv6 jest usuwany bezwarunkowo (mesh IPv4-only).
+///
+/// Pojedyncze bledy dekodowania/zapisu sa tylko logowane — iteracja idzie dalej
+/// zeby jeden skorumpowany wpis nie blokowal startu mesh.
 ///
 /// Zwraca liczbe faktycznie zaktualizowanych wpisow.
 pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize> {
     let rows = db::repository::list_settings_with_prefix(db, TRUSTED_CONTACT_PREFIX)?;
     let mut cleaned = 0usize;
+
+    let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
+    let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
 
     for (key, raw_value) in rows {
         let mut hints = match serde_json::from_str::<PairingContactHints>(&raw_value) {
@@ -484,14 +496,45 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
             }
         };
 
-        let has_dead = DEAD_RELAY_PATTERNS
+        let original_addresses = hints.addresses.clone();
+        let original_relay = hints.relay_url.clone();
+
+        let has_dead_relay = DEAD_RELAY_PATTERNS
             .iter()
             .any(|p| hints.relay_url.contains(p));
-        if !has_dead {
+        if has_dead_relay {
+            hints.relay_url.clear();
+        }
+
+        // Filter addresses. Format "ip:port" — wyluskujemy IPv4, odrzucamy IPv6
+        // oraz adresy ktorych filtr advertise nie przepuszcza.
+        hints.addresses = hints
+            .addresses
+            .iter()
+            .filter(|raw| {
+                let Some(ip_part) = raw.split(':').next() else {
+                    return false;
+                };
+                match ip_part.parse::<std::net::Ipv4Addr>() {
+                    Ok(v4) => {
+                        let kind =
+                            kind_map.get(&v4).map(String::as_str).unwrap_or("unknown");
+                        crate::mesh::network_interfaces::should_advertise_interface_ipv4(
+                            v4, kind, &filters,
+                        )
+                    }
+                    Err(_) => false,
+                }
+            })
+            .cloned()
+            .collect();
+
+        let changed =
+            hints.addresses != original_addresses || hints.relay_url != original_relay;
+        if !changed {
             continue;
         }
 
-        let original = std::mem::take(&mut hints.relay_url);
         let serialized = match serde_json::to_string(&hints) {
             Ok(s) => s,
             Err(e) => {
@@ -508,8 +551,9 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
                 cleaned += 1;
                 info!(
                     key = %key,
-                    old_url = %original,
-                    "sanitize_trusted_contacts: wyczyszczono martwy relay URL"
+                    dropped_addrs = original_addresses.len() - hints.addresses.len(),
+                    relay_cleared = (has_dead_relay),
+                    "sanitize_trusted_contacts: zaktualizowano wpis"
                 );
             }
             Err(e) => warn!(

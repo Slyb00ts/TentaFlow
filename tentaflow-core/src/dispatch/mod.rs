@@ -509,6 +509,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::SettingsListResponse { .. } => "SettingsListResponse",
         MessageBody::SettingsUpdateRequestBody(_) => "SettingsUpdateRequest",
         MessageBody::SettingsUpdateResponse { .. } => "SettingsUpdateResponse",
+        MessageBody::NetworkBody(p) => match p {
+            tentaflow_protocol::NetworkPayload::ReqInterfacesList => "NetworkInterfacesListRequest",
+            tentaflow_protocol::NetworkPayload::ResInterfacesList { .. } => {
+                "NetworkInterfacesListResponse"
+            }
+            tentaflow_protocol::NetworkPayload::ReqConfigGet => "NetworkConfigGetRequest",
+            tentaflow_protocol::NetworkPayload::ResConfigGet(_) => "NetworkConfigGetResponse",
+            tentaflow_protocol::NetworkPayload::ReqConfigUpdate(_) => "NetworkConfigUpdateRequest",
+            tentaflow_protocol::NetworkPayload::ResConfigUpdate { .. } => {
+                "NetworkConfigUpdateResponse"
+            }
+        },
         MessageBody::DashboardMetricsRequest => "DashboardMetricsRequest",
         MessageBody::DashboardMetricsResponse(_) => "DashboardMetricsResponse",
         MessageBody::MeshNodeListRequest => "MeshNodeListRequest",
