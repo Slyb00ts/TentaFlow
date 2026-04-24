@@ -4,7 +4,8 @@
 //   (1) method: docker | native | external (tiles from availableDeployMethods)
 //   (2) model:  preset from manifest or HuggingFace Hub search
 //   (3) gpu:    pick GPUs on the selected node (all | specific | none)
-//   (4) runtime: port, container name (docker) and extras
+//   (4) runtime: port and deploy target name for docker, with compose-stack
+//       manifests using a stack/project name instead of a single container name
 //   Submit → POST /api/services/deploy.
 // =============================================================================
 
@@ -169,6 +170,15 @@ function randomSuffix(len = 5) {
   let r = '';
   for (let i = 0; i < len; i++) r += chars[Math.floor(Math.random() * chars.length)];
   return r;
+}
+
+function dockerSection() {
+  return engineEntry?.deploy?.docker || null;
+}
+
+function usesDockerCompose() {
+  const docker = dockerSection();
+  return !!(docker && docker.compose_path);
 }
 
 // ---- Shell ----------------------------------------------------------------
@@ -423,6 +433,7 @@ function renderStepRuntime() {
   const eng = engineEntry?.engine || {};
   const port = selection.port || eng.default_port || 8080;
   const cname = selection.containerName || '';
+  const composeMode = selection.deployMethod === 'docker' && usesDockerCompose();
 
   let summary = '';
   if (selection.modelRepo) {
@@ -449,20 +460,24 @@ function renderStepRuntime() {
     extra = `
       <div class="form-group">
         <tf-input type="text" id="edw-cname"
-          label="${escapeAttr(I18n.t('wizard.containerName'))}"
+          label="${escapeAttr(I18n.t(composeMode ? 'wizard.stackName' : 'wizard.containerName'))}"
           value="${escapeAttr(cname)}"></tf-input>
       </div>
     `;
   }
 
-  return `
-    <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.configureRuntime'))}</h4>
-    ${summary}
+  const portField = composeMode ? '' : `
     <div class="form-group">
       <tf-input type="number" id="edw-port"
         label="${escapeAttr(I18n.t('wizard.port'))}"
         value="${escapeAttr(String(port))}"></tf-input>
     </div>
+  `;
+
+  return `
+    <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.configureRuntime'))}</h4>
+    ${summary}
+    ${portField}
     ${extra}
   `;
 }
@@ -492,6 +507,7 @@ function shouldSkipModelStep() {
 function shouldSkipGpuStep() {
   const gpus = nodeGpus(selection.nodeId);
   if (gpus.length === 0) return true;
+  if (usesDockerCompose()) return true;
   const gpuSupported = engineEntry?.engine?.gpu_supported;
   if (gpuSupported === false) return true;
   return false;
@@ -846,7 +862,7 @@ async function startDeploy() {
   const configJson = JSON.stringify({
     model_preset_id: selection.modelPresetId || null,
     model_repo: selection.modelRepo || null,
-    port: selection.port || eng.default_port,
+    port: usesDockerCompose() ? null : (selection.port || eng.default_port),
     container_name: selection.containerName || null,
     gpu_select_mode: selection.gpuSelectMode,
     gpu_ids: selection.gpuSelectMode === 'specific' ? selection.gpuIds : null,

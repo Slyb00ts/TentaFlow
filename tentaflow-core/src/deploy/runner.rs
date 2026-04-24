@@ -48,6 +48,7 @@ struct EngineMeta {
     category: String,
     default_port: u16,
     context_path: Option<String>,
+    compose_path: Option<String>,
     native_runtime: Option<String>,
     model_presets: Vec<ModelPreset>,
 }
@@ -151,6 +152,7 @@ fn load_engine_meta(engine_id: &str) -> Result<EngineMeta> {
         .ok_or_else(|| anyhow!("engine '{}' nie istnieje w manifeście", engine_id))?;
 
     let context_path = entry.deploy.docker.as_ref().map(|d| d.context_path.clone());
+    let compose_path = entry.deploy.docker.as_ref().map(|d| d.compose_path.clone()).flatten();
     let native_runtime = entry
         .deploy
         .native
@@ -161,7 +163,8 @@ fn load_engine_meta(engine_id: &str) -> Result<EngineMeta> {
         engine_id: entry.engine.id.clone(),
         category: format!("{:?}", entry.engine.category).to_lowercase(),
         default_port: entry.engine.default_port,
-        context_path,
+        context_path: context_path.flatten(),
+        compose_path,
         native_runtime,
         model_presets: entry.model_presets.clone(),
     })
@@ -179,6 +182,18 @@ async fn do_docker_deploy(
     config: &DeployConfig,
     start_ms: i64,
 ) -> Result<()> {
+    if engine.compose_path.is_some() {
+        return do_docker_compose_deploy(
+            db,
+            deploy_id,
+            tx,
+            engine,
+            config,
+            start_ms,
+        )
+        .await;
+    }
+
     let context_path = engine.context_path.as_ref().ok_or_else(|| {
         anyhow!(
             "engine '{}' nie ma deploy.docker.context_path",
@@ -406,6 +421,167 @@ async fn do_docker_deploy(
         start_ms,
         image_tag.to_string(),
         created_name,
+    )
+    .await;
+    Ok(())
+}
+
+#[cfg(feature = "docker")]
+async fn do_docker_compose_deploy(
+    db: &DbPool,
+    deploy_id: &str,
+    tx: &broadcast::Sender<BusMessage>,
+    engine: &EngineMeta,
+    config: &DeployConfig,
+    start_ms: i64,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let compose_path = engine.compose_path.as_ref().ok_or_else(|| {
+        anyhow!(
+            "engine '{}' does not define deploy.docker.compose_path",
+            engine.engine_id
+        )
+    })?;
+
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        &format!("extracting container bundle → {}", compose_path),
+    );
+
+    let workdir = tempfile::tempdir().context("tmpdir for compose deploy")?;
+    crate::deploy::extract_to(workdir.path()).context("extract container bundle")?;
+
+    let compose_rel = format!("tentaflow-containers/{}", compose_path);
+    let compose_abs = workdir.path().join(&compose_rel);
+    if !compose_abs.exists() {
+        return Err(anyhow!(
+            "Compose file not found in bundle: {} (cwd={})",
+            compose_rel,
+            workdir.path().display()
+        ));
+    }
+
+    let project_name = config
+        .container_name
+        .as_deref()
+        .map(slugify_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("tentaflow-{}", slugify_name(&engine.engine_id)));
+
+    let _ = deployments_repo::set_container_name(db, deploy_id, &project_name);
+
+    phase(db, deploy_id, tx, "building", 10, "docker compose build/up");
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        &format!("running `docker compose` project '{}'", project_name),
+    );
+
+    let mut cmd = Command::new("docker");
+    cmd.arg("compose")
+        .arg("-p")
+        .arg(&project_name)
+        .arg("-f")
+        .arg(&compose_abs)
+        .arg("up")
+        .arg("-d")
+        .arg("--build")
+        .current_dir(
+            compose_abs
+                .parent()
+                .ok_or_else(|| anyhow!("compose file has no parent directory"))?,
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to start `docker compose` - check whether docker is in PATH")?;
+    let stdout = child.stdout.take().expect("stdout captured");
+    let stderr = child.stderr.take().expect("stderr captured");
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+
+    let mut last_progress = 10u32;
+    let mut max_step_seen = 0u32;
+    let mut total_steps: Option<u32> = None;
+
+    loop {
+        tokio::select! {
+            line = stdout_lines.next_line() => {
+                match line {
+                    Ok(Some(l)) => {
+                        log_line(db, deploy_id, tx, "log", l.trim_end());
+                        if let Some(pct) = parse_progress_line(&l, &mut max_step_seen, &mut total_steps) {
+                            if pct > last_progress {
+                                last_progress = pct;
+                                progress(db, deploy_id, tx, pct);
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("stdout read: {}", e);
+                        break;
+                    }
+                }
+            }
+            line = stderr_lines.next_line() => {
+                match line {
+                    Ok(Some(l)) => {
+                        log_line(db, deploy_id, tx, "log", l.trim_end());
+                        if let Some(pct) = parse_progress_line(&l, &mut max_step_seen, &mut total_steps) {
+                            if pct > last_progress {
+                                last_progress = pct;
+                                progress(db, deploy_id, tx, pct);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("stderr read: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    while let Ok(Some(l)) = stderr_lines.next_line().await {
+        log_line(db, deploy_id, tx, "log", l.trim_end());
+    }
+
+    let status = child.wait().await.context("docker compose wait")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "docker compose returned exit code {:?}",
+            status.code()
+        ));
+    }
+
+    phase(db, deploy_id, tx, "running", 96, "compose stack deployed");
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        &format!("compose stack deployed: {}", project_name),
+    );
+
+    finish_success(
+        db,
+        deploy_id,
+        tx,
+        start_ms,
+        String::new(),
+        project_name,
     )
     .await;
     Ok(())

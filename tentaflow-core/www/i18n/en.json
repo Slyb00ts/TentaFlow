@@ -1876,6 +1876,7 @@
     "noMethodsAvailable": "No deployment methods available for platform {os}.",
     "noNodesAvailable": "No real deployment target is available. Wait for mesh node discovery or reopen the catalog.",
     "containerName": "Container name",
+    "stackName": "Stack name",
     "port": "Port",
     "modelLabel": "Model",
     "method": {

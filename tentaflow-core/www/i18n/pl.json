@@ -1876,6 +1876,7 @@
     "noMethodsAvailable": "Brak dostępnych trybów wdrożenia dla platformy {os}.",
     "noNodesAvailable": "Brak prawdziwego celu deployu. Poczekaj na wykrycie noda mesh albo otwórz katalog ponownie.",
     "containerName": "Nazwa kontenera",
+    "stackName": "Nazwa stacka",
     "port": "Port",
     "modelLabel": "Model",
     "method": {
