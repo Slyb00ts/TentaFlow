@@ -1,11 +1,8 @@
 // =============================================================================
-// Plik: protocol/transport.js
-// Opis: Abstrakcja transportu browser↔daemon. WebTransport gdy przegladarka
-//       wspiera, WebSocket jako kolejna dostepna droga. Ten sam kontrakt
-//       wyjsciowy (send bajtow, onmessage callback) dla wyzszych warstw
-//       (binary-ws-client.js wpiete bez zmian). Identity browser-a to
-//       Ed25519 NodeId generowany w module WASM (identity.rs), persistowany
-//       w localStorage. JWT zostaje jako warstwa session-level auth.
+// File: protocol/transport.js
+// Description: Browser-to-daemon transport abstraction. It uses WebTransport
+// when the browser supports it and falls back to WebSocket otherwise, while
+// exposing the same send/onmessage contract to the upper layers.
 // =============================================================================
 
 import { codecReady } from './codec.js';
@@ -14,9 +11,9 @@ export const TRANSPORT_WEBTRANSPORT = 'webtransport';
 export const TRANSPORT_WEBSOCKET = 'websocket';
 
 /**
- * Tworzy instancje transportu najlepszego dostepnego typu. Probuje
- * WebTransport pod `/wt/api`, w razie bledu przelacza na WebSocket `/ws/api`.
- * Oba endpoints daemon serwuje pod tym samym portem HTTPS.
+ * Creates the best available transport instance. It tries WebTransport on
+ * `/wt/api` first and falls back to WebSocket on `/ws/api` if that fails.
+ * Both endpoints are served by the daemon on the same HTTPS port.
  */
 export async function openTransport(options = {}) {
   await codecReady;
@@ -28,9 +25,9 @@ export async function openTransport(options = {}) {
 
   const baseUrl = window.location.origin;
 
-  // WebTransport wymaga serwera H3 pod `/wt/api` — aktualnie unified_server
-  // obsluguje tylko HTTPS/1.1+H2 z upgrade do WebSocket. Dopoki iroh-relay
-  // nie jest wpiety jako H3 endpoint na tym samym porcie, zostajemy przy WS.
+  // WebTransport needs an HTTP/3 endpoint on `/wt/api`. The current unified
+  // server only exposes HTTPS/1.1 and HTTP/2 with WebSocket upgrade, so
+  // WebSocket stays the default until iroh-relay is wired in as an H3 endpoint.
   if (preferred === TRANSPORT_WEBTRANSPORT && typeof window.WebTransport === 'function') {
     try {
       const wt = await Promise.race([
@@ -41,7 +38,7 @@ export async function openTransport(options = {}) {
       ]);
       return wt;
     } catch (err) {
-      console.debug('[transport] WebTransport niedostepne, uzywam WebSocket:', err.message);
+      console.debug('[transport] WebTransport unavailable, falling back to WebSocket:', err.message);
     }
   }
 
@@ -49,9 +46,9 @@ export async function openTransport(options = {}) {
 }
 
 /**
- * Transport WebTransport — otwiera polaczenie HTTP/3 do /wt/api.
- * Daemon hostuje endpoint WebTransport razem z iroh-relay (przez http_server
- * iroh-relay). Kazda wiadomosc = jeden bidi stream do prostoty.
+ * WebTransport implementation that opens an HTTP/3 connection to `/wt/api`.
+ * Each message uses a separate bidirectional stream to keep the transport
+ * simple.
  */
 async function openWebTransport(baseUrl, jwtToken) {
   const httpsBase = baseUrl.replace(/^http:/, 'https:');
@@ -71,7 +68,7 @@ async function openWebTransport(baseUrl, jwtToken) {
     }
   };
 
-  // Incoming unidirectional streams — tutaj serwer wysyla event/response frames.
+  // Incoming unidirectional streams carry event and response frames.
   (async () => {
     const reader = wt.incomingUnidirectionalStreams.getReader();
     while (!closed) {
@@ -147,8 +144,9 @@ async function readAllFromStream(stream) {
 }
 
 /**
- * Transport WebSocket — sciezka kompatybilna z istniejacym serwerem.
- * ALPN `bearer.<token>` w Sec-WebSocket-Protocol pozwala na JWT przy upgrade.
+ * WebSocket implementation for compatibility with the existing server.
+ * ALPN `bearer.<token>` in `Sec-WebSocket-Protocol` carries the JWT during the
+ * upgrade request.
  */
 async function openWebSocket(baseUrl, jwtToken) {
   const wsScheme = baseUrl.startsWith('https') ? 'wss' : 'ws';
@@ -179,7 +177,7 @@ async function openWebSocket(baseUrl, jwtToken) {
     }
   };
 
-  // Propaguj close do warstwy wyzszej — binary-ws-client uzywa tego do reconnectu.
+  // Propagate close events to the upper layer so reconnect logic can react.
   ws.onclose = (evt) => {
     const info = {
       code: evt?.code ?? 1006,
@@ -192,9 +190,9 @@ async function openWebSocket(baseUrl, jwtToken) {
     }
   };
 
-  // `onerror` przed `onopen` wywola reject promisa, ale moze tez zdarzyc sie pozniej —
-  // wtedy ws i tak wywola onclose, wiec nie duplikujemy listener.
-  ws.onerror = (_e) => { /* nastepnie onclose wyemituje szczegoly */ };
+  // `onerror` before `onopen` rejects the promise. Later errors still lead to
+  // `onclose`, so there is no need to duplicate reporting here.
+  ws.onerror = (_e) => { /* onclose will emit the details */ };
 
   return {
     kind: TRANSPORT_WEBSOCKET,

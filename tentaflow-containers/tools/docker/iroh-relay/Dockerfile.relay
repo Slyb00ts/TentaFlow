@@ -1,7 +1,8 @@
 # =============================================================================
-# Plik: Dockerfile.relay
-# Opis: Buduje obraz iroh-relay:0.98.0 z crates.io (oficjalne zrodlo n0).
-# Przyklad buildu:
+# File: Dockerfile.relay
+# Description: Builds the iroh-relay:0.98.0 image from crates.io using the
+# official n0 source package.
+# Example:
 #   docker build -t ghcr.io/slyb00ts/iroh-relay:0.98.0 -f Dockerfile.relay .
 #   docker push   ghcr.io/slyb00ts/iroh-relay:0.98.0
 # =============================================================================
