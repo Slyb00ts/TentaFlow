@@ -691,10 +691,16 @@ impl IrohMeshManager {
         if self.is_connected(&peer_id_str).await {
             return Ok(());
         }
-        let addr = endpoint_addr_from_target(node_id_hex, Some(addr))?;
+        // Relay-first nawet przy dialu z samej dyskowerki: direct IP idzie w
+        // parze z naszym home relay, co otwiera sciezke jesli peer siedzi za
+        // NATem albo w innej sieci.
+        let mut endpoint_addr = endpoint_addr_from_target(node_id_hex, Some(addr))?;
+        if let Some(relay) = self.endpoint.inner().addr().relay_urls().next().cloned() {
+            endpoint_addr = endpoint_addr.with_relay_url(relay);
+        }
         let connection = self
             .endpoint
-            .connect(addr, ALPN_MESH)
+            .connect(endpoint_addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect: {e:?}"))?;
         match self
@@ -746,7 +752,10 @@ impl IrohMeshManager {
             return Ok(());
         }
         let endpoint_id = parse_endpoint_id(node_id_hex)?;
-        let addr = EndpointAddr::new(endpoint_id).with_ip_addr(direct_addr);
+        let mut addr = EndpointAddr::new(endpoint_id).with_ip_addr(direct_addr);
+        if let Some(relay) = self.endpoint.inner().addr().relay_urls().next().cloned() {
+            addr = addr.with_relay_url(relay);
+        }
         let connection = self
             .endpoint
             .connect(addr, ALPN_MESH)
