@@ -2581,6 +2581,43 @@ pub enum VncTunnelPayload {
     StreamEnd(VncTunnelStreamEnd),
 }
 
+// =============================================================================
+// Meeting Browser Capture — jednorazowe zapytania do teams-bot po screenshot
+// albo snapshot DOM aktywnej strony Chromium. Dashboard pyta przez WSS,
+// handler otwiera bistream do bota i dostaje `BrowserResult` w `ModelResponse`.
+// =============================================================================
+
+pub const BROWSER_CAPTURE_OK: &str = "ok";
+pub const BROWSER_CAPTURE_NOT_FOUND: &str = "not_found";
+pub const BROWSER_CAPTURE_FORBIDDEN: &str = "forbidden";
+pub const BROWSER_CAPTURE_REMOTE_NODE: &str = "remote_node";
+pub const BROWSER_CAPTURE_FAILED: &str = "failed";
+
+pub const BROWSER_CAPTURE_KIND_SCREENSHOT: &str = "screenshot";
+pub const BROWSER_CAPTURE_KIND_DOM: &str = "dom";
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCaptureRequest {
+    pub session_id: i64,
+    /// `"screenshot"` albo `"dom"`. Inna wartość => `status="failed"`.
+    pub kind: String,
+    /// Ignorowane gdy `kind="dom"`. Dla screenshota: true => cała strona ze
+    /// scrollowaniem, false => tylko viewport.
+    pub full_page: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCaptureResponse {
+    pub status: String,
+    pub kind: String,
+    /// Populated gdy `kind="screenshot"` i `status="ok"`.
+    pub png: Vec<u8>,
+    /// Populated gdy `kind="dom"` i `status="ok"`.
+    pub html: String,
+    /// Opis błędu gdy `status != "ok"`.
+    pub error: String,
+}
+
 /// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
 /// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -3079,6 +3116,10 @@ pub enum MessageBody {
 
     // ---- Meeting VNC tunnel (one slot for entire R-STREAM + two one-shot RPCs) ----
     VncTunnelBody(VncTunnelPayload),
+
+    // ---- Meeting browser capture (one-shot RPC: screenshot / DOM snapshot) ----
+    BrowserCaptureRequestBody(BrowserCaptureRequest),
+    BrowserCaptureResponseBody(BrowserCaptureResponse),
 
     // ---- Meeting live broadcast (unsolicited push, correlation_id=0) ----
     // Pushowany z writer task w ws_binary po każdym sukcesie

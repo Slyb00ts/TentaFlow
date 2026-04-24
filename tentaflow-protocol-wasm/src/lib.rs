@@ -874,6 +874,26 @@ pub fn encode_vnc_tunnel_close_request(tunnel_id: String) -> Result<Vec<u8>, JsE
     .map_err(|e| JsError::new(&e))
 }
 
+// ---- Meeting browser capture (screenshot / DOM snapshot) ----
+
+/// MessageBody::BrowserCaptureRequest — one-shot capture of the bot's page.
+#[wasm_bindgen(js_name = encodeBrowserCaptureRequest)]
+pub fn encode_browser_capture_request(
+    session_id: f64,
+    kind: String,
+    full_page: bool,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::BrowserCaptureRequest;
+    encode_body_inner(&MessageBody::BrowserCaptureRequestBody(
+        BrowserCaptureRequest {
+            session_id: session_id as i64,
+            kind,
+            full_page,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 // ---- Addons + Users (FAZA 6) ----
 
 /// MessageBody::AddonsListRequest (unit variant).
@@ -4008,6 +4028,24 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::VncTunnelBody(p) => {
             vnc_tunnel_payload_to_js(&obj, p);
+        }
+        MessageBody::BrowserCaptureRequestBody(r) => {
+            set(&obj, "variant", "BrowserCaptureRequest".into());
+            set(&obj, "sessionId", (r.session_id as f64).into());
+            set(&obj, "session_id", (r.session_id as f64).into());
+            set(&obj, "kind", r.kind.into());
+            set(&obj, "fullPage", r.full_page.into());
+            set(&obj, "full_page", r.full_page.into());
+        }
+        MessageBody::BrowserCaptureResponseBody(r) => {
+            set(&obj, "variant", "BrowserCaptureResponse".into());
+            set(&obj, "status", r.status.into());
+            set(&obj, "kind", r.kind.into());
+            // Browser → JS: surowy PNG jako Uint8Array, DOM jako string.
+            let png = js_sys::Uint8Array::from(r.png.as_slice());
+            set(&obj, "png", png.into());
+            set(&obj, "html", r.html.into());
+            set(&obj, "error", r.error.into());
         }
         MessageBody::MeetingLiveEventBody(event) => {
             set(&obj, "variant", "MeetingLiveEventBody".into());
