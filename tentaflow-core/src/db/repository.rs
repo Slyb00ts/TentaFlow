@@ -265,6 +265,35 @@ pub fn create_service(
     Ok(conn.last_insert_rowid())
 }
 
+/// Wstawia serwis on_demand (agents/tools). Gdy wiersz o tej nazwie juz istnieje,
+/// aktualizuje config_json + updated_at bez zmiany statusu (zeby nie resetowac
+/// stanu wlacz/wylacz ustawionego przez admina). Zwraca id wiersza.
+pub fn upsert_service_on_demand(
+    pool: &DbPool,
+    name: &str,
+    service_type: &str,
+    model_category: Option<&str>,
+    config_json: &str,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO services (name, service_type, strategy, model_category, status, config_json)
+             VALUES (?1, ?2, 'single', ?3, 'on_demand', ?4)
+         ON CONFLICT(name) DO UPDATE SET
+             service_type = excluded.service_type,
+             model_category = excluded.model_category,
+             config_json = excluded.config_json,
+             updated_at = datetime('now')",
+        rusqlite::params![name, service_type, model_category, config_json],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM services WHERE name = ?1",
+        rusqlite::params![name],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
 pub fn update_service(
     pool: &DbPool,
     id: i64,
