@@ -17,23 +17,7 @@
 //   if (!ok) return;
 // =============================================================================
 
-import { escapeHtml } from '/js/utils.js';
-
-const VARIANT_ICON = {
-  danger: { // warning triangle
-    svg: '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
-    colorVar: '--danger',
-  },
-  primary: { // info circle
-    svg: '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
-    colorVar: '--accent-1',
-  },
-};
-
-const CONFIRM_ICON_SVG = {
-  trash: '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>',
-  check: '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
-};
+import { escapeHtml, escapeAttr } from '/js/utils.js';
 
 const PEER_ICON_SVG = '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="2" x2="9" y2="4"/><line x1="15" y1="2" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="22"/><line x1="15" y1="20" x2="15" y2="22"/><line x1="20" y1="9" x2="22" y2="9"/><line x1="20" y1="14" x2="22" y2="14"/><line x1="2" y1="9" x2="4" y2="9"/><line x1="2" y1="14" x2="4" y2="14"/></svg>';
 
@@ -64,7 +48,6 @@ export function confirmDialog({
   variant = 'danger',
 } = {}) {
   return new Promise((resolve) => {
-    const variantCfg = VARIANT_ICON[variant] || VARIANT_ICON.danger;
     const cancel = cancelLabel || 'Anuluj';
 
     const peerHtml = peer ? `
@@ -85,40 +68,36 @@ export function confirmDialog({
           </div>`).join('')}
       </div>` : '';
 
-    const confirmIconHtml = confirmIcon && CONFIRM_ICON_SVG[confirmIcon]
-      ? CONFIRM_ICON_SVG[confirmIcon]
-      : '';
-
     const win = document.createElement('tf-window');
     win.setAttribute('title', title || '');
+    // Ikona w headerze tf-window — sprite id z #i-*. Dla danger uzywamy alert,
+    // dla primary info. Unikamy drugiej ikony w body (wczesniej byla
+    // dublowana — tf-window renderowal czerwona kropke obok tytulu, a my
+    // wrzucalismy trojkat ostrzegawczy w srodek).
+    win.setAttribute('icon', variant === 'primary' ? 'info' : 'alert');
     win.setAttribute('buttons', 'close');
     win.setAttribute('width', '460');
     win.setAttribute('initial-x', 'center');
     win.setAttribute('initial-y', 'center');
+    win.classList.add('tf-window--confirm', `tf-window--confirm-${variant}`);
 
     const body = document.createElement('div');
     body.slot = 'body';
     body.className = 'confirm-dlg__body';
     body.innerHTML = `
-      <div class="confirm-dlg__head-ico confirm-dlg__head-ico--${variant}" style="color: var(${variantCfg.colorVar});">
-        ${variantCfg.svg}
-      </div>
-      <div class="confirm-dlg__body-inner">
-        ${lead ? `<p class="confirm-dlg__lead">${escapeHtml(lead)}</p>` : ''}
-        ${peerHtml}
-        ${consequencesHtml}
-      </div>
+      ${lead ? `<p class="confirm-dlg__lead">${escapeHtml(lead)}</p>` : ''}
+      ${peerHtml}
+      ${consequencesHtml}
     `;
     win.appendChild(body);
 
+    const btnVariant = variant === 'primary' ? 'primary' : 'danger-solid';
     const foot = document.createElement('div');
     foot.slot = 'footer';
     foot.className = 'confirm-dlg__foot';
     foot.innerHTML = `
       <tf-button variant="ghost" data-action="cancel">${escapeHtml(cancel)}</tf-button>
-      <tf-button variant="${variant === 'primary' ? 'primary' : 'danger'}" data-action="confirm">
-        ${confirmIconHtml}<span>${escapeHtml(confirmLabel || 'OK')}</span>
-      </tf-button>
+      <tf-button variant="${btnVariant}"${confirmIcon ? ` icon="${escapeAttr(confirmIcon)}"` : ''} data-action="confirm">${escapeHtml(confirmLabel || 'OK')}</tf-button>
     `;
     win.appendChild(foot);
 
