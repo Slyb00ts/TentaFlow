@@ -55,8 +55,6 @@ pub struct IrohMeshConfig {
     pub bind_addr: std::net::SocketAddr,
     /// URL publicznego lub self-hosted relay.
     pub relay_url: Option<RelayUrl>,
-    /// Interwal wysylania heartbeatow.
-    pub heartbeat_interval: Duration,
     /// Czy wlaczyc wbudowane LAN mDNS (swarm-discovery). Na iOS false —
     /// iOS blokuje raw multicast bez Apple entitlementa; LAN discovery
     /// idzie przez natywny Bonjour (NWBrowser) w warstwie Swift.
@@ -73,7 +71,6 @@ impl Default for IrohMeshConfig {
             node_id: String::new(),
             bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             relay_url: None,
-            heartbeat_interval: Duration::from_millis(500),
             enable_lan_discovery: true,
             enable_dht_discovery: true,
         }
@@ -212,11 +209,22 @@ pub enum IrohMeshEvent {
     },
 }
 
+/// Kierunek polaczenia QUIC z perspektywy lokalnego noda. Uzywany przez
+/// deterministyczny tie-break, gdy A i B dialuja sie jednoczesnie i iroh
+/// tworzy dwa oddzielne fizyczne connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionDirection {
+    /// My wywolalismy `endpoint.connect()` do peera.
+    Outgoing,
+    /// Peer zrobil `accept` na naszym endpoincie.
+    Incoming,
+}
+
 /// Aktywne polaczenie zalogowane przez manager.
 struct ActiveConnection {
     id: u64,
     connection: Connection,
-    remote_id_hex: String,
+    direction: ConnectionDirection,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +258,9 @@ pub struct IrohMeshManager {
     command_waiters:
         AsyncRwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>>,
     service_reg: Arc<MeshServiceRegistry>,
+    /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
+    /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
+    dial_locks: AsyncRwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl IrohMeshManager {
@@ -284,6 +295,7 @@ impl IrohMeshManager {
             forward_handler: AsyncRwLock::new(None),
             command_waiters: AsyncRwLock::new(HashMap::new()),
             service_reg,
+            dial_locks: AsyncRwLock::new(HashMap::new()),
         }))
     }
 
@@ -295,11 +307,6 @@ impl IrohMeshManager {
         let me = Arc::clone(self);
         handles.push(tokio::spawn(async move {
             Self::run_accept_loop(me).await;
-        }));
-
-        let me = Arc::clone(self);
-        handles.push(tokio::spawn(async move {
-            me.run_heartbeat_loop().await;
         }));
 
         let me = Arc::clone(self);
@@ -396,8 +403,6 @@ impl IrohMeshManager {
 
     fn clone_for_spawn(&self) -> IrohMeshManagerRef {
         IrohMeshManagerRef {
-            endpoint: Arc::clone(&self.endpoint),
-            security: Arc::clone(&self.security),
             connections: Arc::clone(&self.connections),
             event_tx: self.event_tx.clone(),
         }
@@ -414,16 +419,31 @@ impl IrohMeshManager {
 
         match alpn {
             a if a == ALPN_MESH => {
-                let connection_id =
-                    self.register_connection(remote_hex.clone(), connection.clone()).await;
-                let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
-                    node_id: remote_hex.clone(),
-                });
-                let me = self.clone_for_spawn();
-                tokio::spawn(async move {
-                    me.handle_mesh_connection(remote_hex, connection, connection_id)
-                        .await;
-                });
+                match self
+                    .register_connection(
+                        remote_hex.clone(),
+                        connection.clone(),
+                        ConnectionDirection::Incoming,
+                    )
+                    .await
+                {
+                    Some(connection_id) => {
+                        let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
+                            node_id: remote_hex.clone(),
+                        });
+                        let me = self.clone_for_spawn();
+                        tokio::spawn(async move {
+                            me.handle_mesh_connection(remote_hex, connection, connection_id)
+                                .await;
+                        });
+                    }
+                    None => {
+                        debug!(
+                            peer = %remote_hex,
+                            "iroh_mesh: incoming connection odrzucone przez tie-break"
+                        );
+                    }
+                }
             }
             a if a == ALPN_PAIRING => {
                 // PairingHandler::accept uzywany przez iroh Router jest tutaj
@@ -449,72 +469,93 @@ impl IrohMeshManager {
         Ok(())
     }
 
-    async fn register_connection(&self, remote_hex: String, conn: Connection) -> u64 {
-        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
-        let mut map = self.connections.write().await;
-        let previous = map.insert(
-            remote_hex.clone(),
-            ActiveConnection {
-                id: connection_id,
-                connection: conn,
-                remote_id_hex: remote_hex,
-            },
-        );
-        drop(map);
-        if let Some(active) = previous {
-            active.connection.close(0u32.into(), b"superseded");
-        }
-        connection_id
-    }
-
-    async fn handle_mesh_connection(
+    /// Rejestruje fizyczna QUIC connection w mapie z deterministycznym tie-break'em.
+    ///
+    /// Gdy A i B dialuja sie jednoczesnie, iroh tworzy dwa oddzielne connections
+    /// (A→B outgoing u A / incoming u B, i odwrotnie). Bez tie-break'u kazda strona
+    /// zatrzymywala swoje ostatnie (outgoing) i zamykala przeciwne (incoming) —
+    /// koncowo obie strony trzymaly _rozne_ fizyczne connections i nie mogly nic
+    /// wymienic.
+    ///
+    /// Reguła: wygrywa connection, ktorej dialer ma leksykograficznie mniejszy
+    /// hex endpoint_id. Obie strony patrza na te same ID → zbiegaja sie na tym
+    /// samym fizycznym connectionie.
+    ///
+    /// Zwraca `Some(id)` gdy ta connection wygrala i zostala w mapie.
+    /// Zwraca `None` gdy przegrala — connection jest zamknieta, caller NIE powinien
+    /// emitowac `PeerConnected` ani uruchamiac `handle_mesh_connection`.
+    async fn register_connection(
         &self,
         remote_hex: String,
-        connection: Connection,
-        connection_id: u64,
-    ) {
-        // Petla odbierania uni streamow. Format: [1B disc][payload].
-        loop {
-            let recv = match connection.accept_uni().await {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!(peer = %remote_hex, "mesh uni stream closed: {}", e);
-                    break;
-                }
-            };
-            let me = self.clone_for_spawn();
-            let rhex = remote_hex.clone();
-            tokio::spawn(async move {
-                if let Err(e) = me.handle_mesh_uni(rhex, recv).await {
-                    debug!("mesh uni handler blad: {}", e);
-                }
-            });
-        }
+        conn: Connection,
+        direction: ConnectionDirection,
+    ) -> Option<u64> {
+        let self_hex = self.local_node_id.read().clone();
+        // Preferowany dialer to ten z leksykograficznie mniejszym endpoint_id.
+        let prefer_outgoing = self_hex.as_str() < remote_hex.as_str();
+        let new_is_winner = matches!(
+            (direction, prefer_outgoing),
+            (ConnectionDirection::Outgoing, true) | (ConnectionDirection::Incoming, false)
+        );
+
+        let new_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let mut map = self.connections.write().await;
-        let is_current = map
-            .get(&remote_hex)
-            .map(|active| active.id == connection_id)
-            .unwrap_or(false);
-        if is_current {
-            map.remove(&remote_hex);
-            drop(map);
-            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
-                node_id: remote_hex,
-            });
+
+        match map.get(&remote_hex) {
+            Some(existing) if existing.direction == direction => {
+                // Duplikat tego samego kierunku — prawdopodobnie iroh retry/migration.
+                // Idempotent no-op: trzymamy istniejace, nowa zamykamy.
+                drop(map);
+                conn.close(0u32.into(), b"duplicate");
+                None
+            }
+            Some(_) if !new_is_winner => {
+                // W mapie jest zwyciezca przeciwnego kierunku, nowa przegrywa.
+                drop(map);
+                conn.close(0u32.into(), b"tie-break-loser");
+                None
+            }
+            Some(_) => {
+                // Nowa wygrywa nad istniejaca przegrana — podmien.
+                let prev = map.insert(
+                    remote_hex.clone(),
+                    ActiveConnection {
+                        id: new_id,
+                        connection: conn,
+                        direction,
+                    },
+                );
+                drop(map);
+                if let Some(active) = prev {
+                    active.connection.close(0u32.into(), b"tie-break-loser");
+                }
+                Some(new_id)
+            }
+            None => {
+                // Pusta mapa — wpisz niezaleznie od tie-break'a. Gdy druga strona dojdzie
+                // ze zwycieska direction, jej register_connection wejdzie w galaz
+                // "podmien przegrana" i obie strony zbiegna sie na tym samym fizycznym
+                // connectionie.
+                map.insert(
+                    remote_hex.clone(),
+                    ActiveConnection {
+                        id: new_id,
+                        connection: conn,
+                        direction,
+                    },
+                );
+                Some(new_id)
+            }
         }
     }
 
-    async fn run_heartbeat_loop(&self) {
-        let mut ticker = tokio::time::interval(self.config.heartbeat_interval);
-        loop {
-            tokio::select! {
-                _ = self.shutdown.cancelled() => return,
-                _ = ticker.tick() => {
-                    // Heartbeat payload: placeholder. Callerzy mesh uzywaja
-                    // send_heartbeat_data() z wlasnym payloadem.
-                }
-            }
-        }
+    /// Zwraca (lub tworzy) per-peer mutex zabezpieczajacy przed rownoleglymi
+    /// dialami do tego samego peera z roznych tasków.
+    async fn dial_lock_for(&self, peer_hex: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.dial_locks.write().await;
+        map.entry(peer_hex.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     // =========================================================================
@@ -579,7 +620,15 @@ impl IrohMeshManager {
         node_id_hex: &str,
         addr: std::net::SocketAddr,
     ) -> Result<()> {
-        if self.is_connected(node_id_hex).await {
+        // iroh rzucilby blad przy dialu do siebie, ale taniej odrzucic tutaj.
+        if node_id_hex == self.local_node_id.read().as_str() {
+            return Ok(());
+        }
+        let peer_id_str = node_id_hex.to_string();
+        let lock = self.dial_lock_for(&peer_id_str).await;
+        let _guard = lock.lock().await;
+        // Po wzieciu locka re-sprawdz is_connected — inny task mogl juz zadialowac.
+        if self.is_connected(&peer_id_str).await {
             return Ok(());
         }
         let addr = endpoint_addr_from_target(node_id_hex, Some(addr))?;
@@ -588,18 +637,33 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect: {e:?}"))?;
-        let connection_id = self
-            .register_connection(node_id_hex.to_string(), connection.clone())
-            .await;
-        let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
-            node_id: node_id_hex.to_string(),
-        });
-        let me = self.clone_for_spawn();
-        let id = node_id_hex.to_string();
-        tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection, connection_id).await;
-        });
-        Ok(())
+        match self
+            .register_connection(
+                peer_id_str.clone(),
+                connection.clone(),
+                ConnectionDirection::Outgoing,
+            )
+            .await
+        {
+            Some(connection_id) => {
+                let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
+                    node_id: peer_id_str.clone(),
+                });
+                let me = self.clone_for_spawn();
+                tokio::spawn(async move {
+                    me.handle_mesh_connection(peer_id_str, connection, connection_id)
+                        .await;
+                });
+                Ok(())
+            }
+            None => {
+                debug!(
+                    peer = %peer_id_str,
+                    "iroh_mesh: outgoing odrzucone przez tie-break, peer polaczony przez incoming"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Laczy sie z peerem podajac explicit direct address (IP+port). Uzywane
@@ -611,7 +675,13 @@ impl IrohMeshManager {
         node_id_hex: &str,
         direct_addr: std::net::SocketAddr,
     ) -> Result<()> {
-        if self.is_connected(node_id_hex).await {
+        if node_id_hex == self.local_node_id.read().as_str() {
+            return Ok(());
+        }
+        let peer_id_str = node_id_hex.to_string();
+        let lock = self.dial_lock_for(&peer_id_str).await;
+        let _guard = lock.lock().await;
+        if self.is_connected(&peer_id_str).await {
             return Ok(());
         }
         let endpoint_id = parse_endpoint_id(node_id_hex)?;
@@ -621,22 +691,43 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect direct: {e:?}"))?;
-        let connection_id = self
-            .register_connection(node_id_hex.to_string(), connection.clone())
-            .await;
-        let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
-            node_id: node_id_hex.to_string(),
-        });
-        let me = self.clone_for_spawn();
-        let id = node_id_hex.to_string();
-        tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection, connection_id).await;
-        });
-        Ok(())
+        match self
+            .register_connection(
+                peer_id_str.clone(),
+                connection.clone(),
+                ConnectionDirection::Outgoing,
+            )
+            .await
+        {
+            Some(connection_id) => {
+                let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
+                    node_id: peer_id_str.clone(),
+                });
+                let me = self.clone_for_spawn();
+                tokio::spawn(async move {
+                    me.handle_mesh_connection(peer_id_str, connection, connection_id)
+                        .await;
+                });
+                Ok(())
+            }
+            None => {
+                debug!(
+                    peer = %peer_id_str,
+                    "iroh_mesh: outgoing direct odrzucone przez tie-break, peer polaczony przez incoming"
+                );
+                Ok(())
+            }
+        }
     }
 
     pub async fn connect_to_peer_with_hints(&self, hints: &PairingContactHints) -> Result<()> {
-        if self.is_connected(&hints.node_id).await {
+        if hints.node_id == *self.local_node_id.read() {
+            return Ok(());
+        }
+        let peer_id_str = hints.node_id.clone();
+        let lock = self.dial_lock_for(&peer_id_str).await;
+        let _guard = lock.lock().await;
+        if self.is_connected(&peer_id_str).await {
             return Ok(());
         }
         let addr = endpoint_addr_from_hints(hints)?;
@@ -645,18 +736,33 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect hinted: {e:?}"))?;
-        let connection_id = self
-            .register_connection(hints.node_id.clone(), connection.clone())
-            .await;
-        let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
-            node_id: hints.node_id.clone(),
-        });
-        let me = self.clone_for_spawn();
-        let id = hints.node_id.clone();
-        tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection, connection_id).await;
-        });
-        Ok(())
+        match self
+            .register_connection(
+                peer_id_str.clone(),
+                connection.clone(),
+                ConnectionDirection::Outgoing,
+            )
+            .await
+        {
+            Some(connection_id) => {
+                let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
+                    node_id: peer_id_str.clone(),
+                });
+                let me = self.clone_for_spawn();
+                tokio::spawn(async move {
+                    me.handle_mesh_connection(peer_id_str, connection, connection_id)
+                        .await;
+                });
+                Ok(())
+            }
+            None => {
+                debug!(
+                    peer = %peer_id_str,
+                    "iroh_mesh: outgoing hinted odrzucone przez tie-break, peer polaczony przez incoming"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Wysyla ramke `[disc][data]` na uni streamie do peera.
@@ -728,6 +834,9 @@ impl IrohMeshManager {
                 node_id: node_id.to_string(),
             });
         }
+        // Sprzataj per-peer dial lock — odpada gdy rozlaczany peer
+        // nie bedzie juz dialowany w tym cyklu zycia managera.
+        self.dial_locks.write().await.remove(node_id);
     }
 
     // =========================================================================
@@ -1105,8 +1214,6 @@ impl IrohMeshManager {
 /// Kopia referencji uzywana w spawned tasks — bez `Arc<Self>` aby unikac cyklu.
 #[derive(Clone)]
 struct IrohMeshManagerRef {
-    endpoint: Arc<IrohEndpoint>,
-    security: Arc<MeshSecurity>,
     connections: Arc<AsyncRwLock<HashMap<String, ActiveConnection>>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
 }
@@ -1233,10 +1340,6 @@ impl IrohMeshManagerRef {
             }
             x if x == MESH_MSG_NODE_LEAVING => IrohMeshEvent::NodeLeavingReceived {
                 node_id: remote_hex,
-            },
-            x if x == MESH_MSG_MODEL_LIST => IrohMeshEvent::ModelListUpdate {
-                node_id: remote_hex,
-                data: payload,
             },
             x if x == MESH_MSG_CONTAINER_LIST => IrohMeshEvent::ContainerListUpdate {
                 node_id: remote_hex,
@@ -1469,5 +1572,335 @@ mod tests {
         assert!(is_private_socket_addr(&"10.0.0.7:9000".parse().unwrap()));
         assert!(is_private_socket_addr(&"[fd00::1]:9000".parse().unwrap()));
         assert!(!is_private_socket_addr(&"1.1.1.1:9000".parse().unwrap()));
+    }
+}
+
+// =============================================================================
+// Testy tie-break dla `register_connection`.
+//
+// Testuja bezposrednio logike tie-break'u. Wymagaja prawdziwych obiektow
+// `iroh::endpoint::Connection` — zero mockow. Setup:
+//   1. Dwa prawdziwe `IrohEndpoint` bind'ed na loopback.
+//   2. Dwa rownoczesne connect/accept daja cztery fizyczne `Connection`
+//      (outgoing + incoming z perspektywy kazdej strony, ale na dwoch
+//      oddzielnych fizycznych linkach QUIC).
+//   3. `IrohMeshManager` z podmienionym `local_node_id` wymusza pozadana
+//      relacje leksykograficzna i pozwala testowac kazdy branch tie-break'a.
+// =============================================================================
+#[cfg(test)]
+mod tie_break_tests {
+    use super::*;
+    use crate::crypto::SettingsCipher;
+    use crate::mesh::security::MeshSecurity;
+    use iroh::{endpoint::Connection, SecretKey};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// In-memory DbPool z minimalnymi tabelami ktorych wymaga `MeshSecurity::new`.
+    fn setup_test_db() -> crate::db::DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS trusted_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL UNIQUE,
+                public_key TEXT NOT NULL,
+                hostname TEXT DEFAULT '',
+                approved_by TEXT DEFAULT '',
+                approved_at TEXT NOT NULL DEFAULT (datetime('now')),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_addresses TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS pending_pairings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_node_id TEXT NOT NULL,
+                pin_code TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK(direction IN ('outgoing','incoming')),
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS revoked_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL UNIQUE,
+                revoked_by TEXT,
+                revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .expect("create tables");
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn test_cipher() -> Arc<SettingsCipher> {
+        Arc::new(SettingsCipher::new(&[0u8; 32]))
+    }
+
+    /// Buduje `IrohMeshManager` na loopback z wylaczonym discovery (mDNS/DHT),
+    /// zeby test nie zalezal od srodowiska sieciowego.
+    async fn make_manager() -> Arc<IrohMeshManager> {
+        let db = setup_test_db();
+        let security = Arc::new(MeshSecurity::new(db, test_cipher()).expect("security new"));
+        let cfg = IrohMeshConfig {
+            node_id: String::new(),
+            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            relay_url: None,
+            enable_lan_discovery: false,
+            enable_dht_discovery: false,
+        };
+        IrohMeshManager::new(cfg, security)
+            .await
+            .expect("manager new")
+    }
+
+    /// Nawiazuje JEDNO fizyczne polaczenie QUIC: A dial do B (znany EndpointId).
+    /// Zwraca `(conn_outgoing_na_A, conn_incoming_na_B)`. Obie wartosci to uchwyty
+    /// do tego samego fizycznego linka z dwoch perspektyw.
+    ///
+    /// Z braku DNS/DHT w teście podajemy konkretny `SocketAddr` (loopback z
+    /// `bound_sockets()`) zeby dial nie szedl przez discovery.
+    async fn single_link(
+        dialer: &IrohMeshManager,
+        target: &IrohMeshManager,
+    ) -> (Connection, Connection) {
+        let target_id = target.endpoint.id();
+        let sockets = target.endpoint.inner().bound_sockets();
+        let direct_addr = sockets
+            .into_iter()
+            .find(|a| a.ip().is_loopback() || a.is_ipv4())
+            .expect("target bound socket");
+        let target_addr = EndpointAddr::new(target_id).with_ip_addr(direct_addr);
+        let accept_ep = target.endpoint.inner().clone();
+
+        // Accept task musi wystartowac przed connect, zeby handshake mial kto
+        // zapiac po stronie target'a.
+        let accept = tokio::spawn(async move {
+            let incoming = accept_ep.accept().await.expect("incoming");
+            let connecting = incoming.accept().expect("accept incoming");
+            connecting.await.expect("finalize incoming")
+        });
+
+        let out = dialer
+            .endpoint
+            .connect(target_addr, ALPN_MESH)
+            .await
+            .expect("dial");
+        let inc = accept.await.expect("accept task");
+        (out, inc)
+    }
+
+    /// Ustawia `local_node_id` w managerze na wartosc ktora porownuje sie w
+    /// zadany sposob z `peer_hex`. `self_smaller = true` → self < peer.
+    fn force_relation(manager: &IrohMeshManager, peer_hex: &str, self_smaller: bool) {
+        let forced = if self_smaller {
+            // Klucz "0000..." jest zawsze mniejszy od peer_hex (peer_hex pochodzi
+            // z losowego Ed25519 public key, statystycznie != same zera).
+            assert!(peer_hex > "0", "peer_hex musi byc != pusty");
+            "0".repeat(peer_hex.len())
+        } else {
+            // Klucz "ffff..." jest zawsze >= peer_hex.
+            "f".repeat(peer_hex.len())
+        };
+        *manager.local_node_id.write() = forced;
+    }
+
+    /// Outgoing connection wygrywa gdy `self_id < peer_id`. W mapie
+    /// powinien zostac wpis z direction=Outgoing, funkcja zwraca Some(id).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_outgoing_wins_when_self_id_smaller() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, true);
+
+        let (out, _inc) = single_link(&manager, &peer).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.register_connection(peer_hex.clone(), out, ConnectionDirection::Outgoing),
+        )
+        .await
+        .expect("register timeout")
+        ;
+        assert!(result.is_some(), "outgoing powinno wygrac");
+        assert!(manager.is_connected(&peer_hex).await);
+    }
+
+    /// Outgoing connection przegrywa gdy `self_id > peer_id` (czyli to peer
+    /// powinien byc dialerem) — mapa jest pusta, `None` zwracane.
+    /// Uwaga: test sprawdza branch "pusta mapa + nowa jest losing direction" —
+    /// w tej galezi kod i tak wpisuje connection (bo to pierwszy element),
+    /// zwraca `Some(id)`. Walidacje przeprowadza nastepny test (podmien).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_first_outgoing_accepted_even_when_losing() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, false);
+
+        let (out, _inc) = single_link(&manager, &peer).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.register_connection(peer_hex.clone(), out, ConnectionDirection::Outgoing),
+        )
+        .await
+        .expect("register timeout");
+        assert!(result.is_some(), "pierwszy wpis zawsze wchodzi do mapy");
+    }
+
+    /// Klucz sedna: gdy w mapie jest ZWYCIEZCA i przychodzi nowy connection
+    /// przeciwnego kierunku ktory tez by wygral (bo `self` zmienil sie
+    /// albo to powtorzony dial) — nowa i tak PRZEGRYWA zgodnie z reguala
+    /// tie-break i dostaje `None`.
+    ///
+    /// Scenariusz: `self_id < peer_id` → outgoing to zwyciezca. Najpierw
+    /// rejestrujemy incoming (pusta mapa — wchodzi), potem outgoing (powinno
+    /// podmienic przegranego incoming; poprzednie connection zostaje
+    /// zamkniete). Sprawdzamy ze mapa trzyma outgoing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn winning_direction_replaces_losing_in_map() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, true); // self < peer → Outgoing wygrywa
+
+        // Link 1: A → B (outgoing dla A)
+        let (out_a, _inc_b) = single_link(&manager, &peer).await;
+        // Link 2: B → A (incoming dla A)
+        let (_out_b, inc_a) = single_link(&peer, &manager).await;
+
+        // Najpierw probujemy zarejestrowac przegrywajacy incoming — wchodzi do
+        // pustej mapy.
+        let first = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.register_connection(peer_hex.clone(), inc_a.clone(), ConnectionDirection::Incoming),
+        )
+        .await
+        .expect("register incoming timeout");
+        assert!(first.is_some(), "pierwszy wpis wchodzi do mapy");
+
+        // Potem rejestrujemy zwycieski outgoing — powinien podmienic.
+        let second = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.register_connection(peer_hex.clone(), out_a, ConnectionDirection::Outgoing),
+        )
+        .await
+        .expect("register outgoing timeout");
+        assert!(second.is_some(), "zwycieski outgoing musi wejsc do mapy");
+
+        // Poprzedni incoming powinien byc zamkniety z kodem tie-break.
+        // `close_reason` nie jest natychmiastowe — iroh propaguje async. Damy
+        // krotki bufor czasowy.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            inc_a.close_reason().is_some(),
+            "przegrane incoming powinno byc zamkniete po podmianie"
+        );
+    }
+
+    /// Gdy w mapie jest zwyciezca (outgoing) i przychodzi przegrywajacy
+    /// incoming (bo `self_id < peer_id`) — nowy musi zostac zamkniety a mapa
+    /// niezmieniona. Funkcja zwraca `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loser_is_closed_and_map_unchanged() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, true); // self < peer → Outgoing wygrywa
+
+        let (out_a, _inc_b) = single_link(&manager, &peer).await;
+        let (_out_b, inc_a) = single_link(&peer, &manager).await;
+
+        // Najpierw zwyciezca.
+        let first = manager
+            .register_connection(peer_hex.clone(), out_a.clone(), ConnectionDirection::Outgoing)
+            .await;
+        let winner_id = first.expect("outgoing wygrywa");
+
+        // Potem przychodzi przegrany.
+        let second = manager
+            .register_connection(peer_hex.clone(), inc_a.clone(), ConnectionDirection::Incoming)
+            .await;
+        assert!(second.is_none(), "przegrany incoming nie dostaje id");
+
+        // Mapa dalej trzyma ten sam connection_id.
+        let map = manager.connections.read().await;
+        let active = map.get(&peer_hex).expect("entry still present");
+        assert_eq!(active.id, winner_id, "zwyciezca w mapie niezmienny");
+        assert_eq!(active.direction, ConnectionDirection::Outgoing);
+        drop(map);
+
+        // Przegrany incoming dostal close().
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            inc_a.close_reason().is_some(),
+            "przegrany incoming powinien byc zamkniety"
+        );
+        // Zwyciezca dalej otwarty.
+        assert!(
+            out_a.close_reason().is_none(),
+            "zwyciezca nie moze byc zamkniety"
+        );
+    }
+
+    /// Duplikat tego samego kierunku to idempotent no-op — drugi register
+    /// zwraca `None`, mapa dalej trzyma pierwszy connection_id, drugi
+    /// connection zostaje zamkniety z reason "duplicate".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_direction_is_idempotent() {
+        let manager = make_manager().await;
+        let peer = make_manager().await;
+        let peer_hex = hex::encode(peer.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, true);
+
+        let (out_first, _inc1) = single_link(&manager, &peer).await;
+        let (out_second, _inc2) = single_link(&manager, &peer).await;
+
+        let first = manager
+            .register_connection(peer_hex.clone(), out_first.clone(), ConnectionDirection::Outgoing)
+            .await
+            .expect("pierwszy outgoing");
+
+        let second = manager
+            .register_connection(peer_hex.clone(), out_second.clone(), ConnectionDirection::Outgoing)
+            .await;
+        assert!(second.is_none(), "duplikat kierunku → no-op");
+
+        let map = manager.connections.read().await;
+        assert_eq!(map.get(&peer_hex).unwrap().id, first);
+        drop(map);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            out_second.close_reason().is_some(),
+            "duplikat musi byc zamkniety"
+        );
+        assert!(
+            out_first.close_reason().is_none(),
+            "pierwszy dalej otwarty"
+        );
+    }
+
+    /// `dial_locks` musi zwracac ten sam `Arc<Mutex>` dla tego samego peera.
+    /// To chroni przed rownoleglymi outgoing dial do tego samego peera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_lock_is_shared_per_peer() {
+        let manager = make_manager().await;
+        let peer_hex = "a".repeat(64);
+        let other_hex = "b".repeat(64);
+
+        let lock1 = manager.dial_lock_for(&peer_hex).await;
+        let lock2 = manager.dial_lock_for(&peer_hex).await;
+        let lock_other = manager.dial_lock_for(&other_hex).await;
+
+        assert!(
+            Arc::ptr_eq(&lock1, &lock2),
+            "ten sam peer = ten sam Arc<Mutex>"
+        );
+        assert!(
+            !Arc::ptr_eq(&lock1, &lock_other),
+            "rozni peerzy = rozne Arc<Mutex>"
+        );
     }
 }

@@ -121,15 +121,25 @@ pub async fn start_mesh_pipeline(
     // DHT wylaczony na mobile — mainline bootstrap spowalnia start, a LAN Bonjour
     // + iroh relay wystarczaja do discovery peerow.
     let enable_dht = cfg!(not(any(target_os = "ios", target_os = "android")));
-    let relay_url = db_pool
-        .as_ref()
-        .map(|db| load_relay_url(db, Some(mesh_config)))
-        .or_else(|| mesh_config.iroh_relay_url.parse().ok());
+    let relay_url = load_relay_url(db_pool.as_ref(), Some(mesh_config));
+
+    // Wyczysc stare wpisy `trusted_contact:*` z martwym relay URL zanim
+    // IrohMeshManager zacznie reconnect — inaczej dial idzie na DNS NXDOMAIN.
+    if let Some(ref db) = db_pool {
+        match crate::net::iroh::pairing::sanitize_trusted_contacts(db) {
+            Ok(n) if n > 0 => info!(
+                cleaned = n,
+                "sanitize_trusted_contacts: wyczyszczono stare wpisy"
+            ),
+            Ok(_) => debug!("sanitize_trusted_contacts: nic do czyszczenia"),
+            Err(e) => warn!(error = %e, "sanitize_trusted_contacts: nieudany"),
+        }
+    }
+
     let iroh_cfg = IrohMeshConfig {
         node_id: app_node_id.clone(),
         bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], mesh_port)),
         relay_url,
-        heartbeat_interval: Duration::from_millis(mesh_config.heartbeat_interval_ms),
         enable_lan_discovery: mesh_config.mdns_enabled,
         enable_dht_discovery: enable_dht,
     };
