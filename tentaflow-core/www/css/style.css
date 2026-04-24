@@ -3641,12 +3641,24 @@ textarea {
 .meeting-empty-hint { color: var(--text-3); font-size: 13px; font-style: italic; }
 
 /* Joining */
-.meeting-joining-hero { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px; min-height: calc(100vh - 160px); }
+.meeting-joining-hero {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: rgba(8, 9, 14, 0.82);
+  backdrop-filter: blur(6px);
+  z-index: 40;
+}
 .meeting-joining-card {
+  position: relative;
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: var(--radius-xl, 20px); padding: 40px 48px;
   width: 560px; max-width: 100%; text-align: center;
 }
+.meeting-joining-cancel { position: absolute; top: 14px; right: 14px; }
 .meeting-spinner {
   width: 72px; height: 72px; border-radius: 50%;
   border: 3px solid rgba(99,102,241,0.15); border-top-color: var(--accent-2);
