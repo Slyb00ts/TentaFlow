@@ -618,45 +618,108 @@
       window.__tentaflowVideoAvailable = false;
       return;
     }
-    const canvas = new OffscreenCanvas(640, 480);
+    const W = 640, H = 480;
+    const canvas = new OffscreenCanvas(W, H);
     const ctx = canvas.getContext('2d');
     let baseTs = 0;
-    // Statyczny avatar — 1 FPS wystarczy, oszczedza RAM w kontenerze. Teams
-    // i tak nie pokaze ruchu na tym kafelku, bo tresc jest identyczna ramka po ramce.
-    const FPS = 1;
+    // 30 FPS so the rotating ring looks smooth as Teams compresses the tile.
+    // VideoFrame objects are cheap to produce with OffscreenCanvas and Chromium
+    // reuses the underlying GPU buffer, so 30 fps costs little over the 1 fps
+    // static avatar we had before.
+    const FPS = 30;
     const frameIntervalUs = Math.round(1_000_000 / FPS);
+    const TAU = Math.PI * 2;
+    const cx = W / 2, cy = H / 2;
+    const ringOuter = 140, ringInner = 116;
+    const accent = '#7c5cff';
+    const accentSoft = 'rgba(99,102,241,0.20)';
+    const dotColor = '#9b87ff';
+    const label = 'TENTAFLOW';
+    let t0 = performance.now();
     const drawAndWrite = async () => {
       let bitmap = null;
       let frame = null;
       try {
-        ctx.fillStyle = '#1f6feb';
-        ctx.fillRect(0, 0, 640, 480);
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold 72px sans-serif';
+        const t = (performance.now() - t0) / 1000;
+        // Deep navy gradient backdrop — same palette as the login screen.
+        const grad = ctx.createRadialGradient(cx, cy, 40, cx, cy, 380);
+        grad.addColorStop(0, '#171a2e');
+        grad.addColorStop(1, '#0a0b18');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+
+        // Soft pulsing halo behind the ring.
+        const pulse = 0.5 + 0.5 * Math.sin(t * 1.4);
+        ctx.beginPath();
+        ctx.fillStyle = `rgba(124,92,255,${0.06 + 0.05 * pulse})`;
+        ctx.arc(cx, cy - 10, 190 + pulse * 8, 0, TAU);
+        ctx.fill();
+
+        // Base track of the ring (dim).
+        ctx.beginPath();
+        ctx.lineWidth = ringOuter - ringInner;
+        ctx.strokeStyle = accentSoft;
+        ctx.arc(cx, cy - 10, (ringOuter + ringInner) / 2, 0, TAU);
+        ctx.stroke();
+
+        // Rotating highlighted arc — same feel as the login spinner.
+        const angle = (t * 2.6) % TAU;
+        ctx.beginPath();
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = accent;
+        ctx.arc(cx, cy - 10, (ringOuter + ringInner) / 2, angle - 1.2, angle);
+        ctx.stroke();
+
+        // Orbiting dot to add life at slower tempo.
+        const dotAngle = angle * 1.3;
+        const dx = cx + Math.cos(dotAngle) * (ringOuter + 14);
+        const dy = (cy - 10) + Math.sin(dotAngle) * (ringOuter + 14);
+        ctx.beginPath();
+        ctx.fillStyle = dotColor;
+        ctx.arc(dx, dy, 6, 0, TAU);
+        ctx.fill();
+
+        // Center mark — letter T for brand recognition. A wireframe face would
+        // be a nicer port of faceBackground.js, but would require shipping the
+        // face-data / face-edges datasets into the bot container.
+        ctx.fillStyle = '#f5f5ff';
+        ctx.font = 'bold 96px "Segoe UI", system-ui, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText('Bot', 320, 200);
-        ctx.font = '24px monospace';
-        ctx.fillText(new Date().toISOString().slice(11, 19), 320, 300);
+        ctx.fillText('T', cx, cy - 14);
+
+        // Label row underneath.
+        ctx.fillStyle = 'rgba(220, 220, 255, 0.72)';
+        ctx.font = '600 22px "Segoe UI", system-ui, sans-serif';
+        ctx.letterSpacing = '4px';
+        ctx.fillText(label, cx, cy + 120);
+
+        // Animated three-dot activity row.
+        const dotsY = cy + 150;
+        for (let i = 0; i < 3; i++) {
+          const phase = (t * 2 - i * 0.35) % 1.2;
+          const alpha = phase < 1 ? Math.sin(phase * Math.PI) : 0;
+          ctx.beginPath();
+          ctx.fillStyle = `rgba(155, 135, 255, ${0.25 + 0.6 * alpha})`;
+          ctx.arc(cx - 20 + i * 20, dotsY, 3.5, 0, TAU);
+          ctx.fill();
+        }
+
         bitmap = canvas.transferToImageBitmap();
         frame = new VideoFrame(bitmap, { timestamp: baseTs });
         baseTs += frameIntervalUs;
         await videoWriter.write(frame);
       } catch (e) {
-        // Writer zamkniety — przerwij caly pipeline i posprzataj interwaly
         cleanupTentaflow();
       } finally {
-        // VideoFrame i ImageBitmap trzymaja GPU/native pamiec — bez close()
-        // Chrome niszczy kontener po kilku minutach przy OOM.
         if (frame) { try { frame.close(); } catch (_) {} }
         if (bitmap && bitmap.close) { try { bitmap.close(); } catch (_) {} }
       }
     };
-    // Interval zamiast requestAnimationFrame — rAF jest throttled na tabach w tle.
-    registerInterval(setInterval(drawAndWrite, 1000 / FPS));
+    registerInterval(setInterval(drawAndWrite, Math.round(1000 / FPS)));
     window.__tentaflowVideoAvailable = true;
     if (window.__tentaflowBridge) window.__tentaflowBridge.videoSetupDone = true;
-    console.log('[tentaflow] Video injection zainicjalizowane (640x480 @ ' + FPS + 'fps)');
+    console.log('[tentaflow] Video injection zainicjalizowane (' + W + 'x' + H + ' @ ' + FPS + 'fps)');
   }
 
   function handleMicPcm(i16) {
