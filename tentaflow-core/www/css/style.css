@@ -4539,3 +4539,122 @@ tf-screen {
   word-break: break-word;
   overflow-x: auto;
 }
+
+/* =============================================================================
+   Ustawienia → Mesh i Siec (modules/settings-network.js)
+   Klasy: .net-banner, .bind-mode-grid/.bind-mode-card/.bind-radio,
+   .adv-list/.adv-row, .net-filter-row, .ip-mono/.ip-mono-sub oraz rozszerzone
+   warianty .role-pill (role-lan/role-wifi/role-vpn/role-virt/role-loop).
+   ============================================================================= */
+
+.settings-mesh-tab { display: flex; flex-direction: column; }
+
+.net-banner {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 12px 14px; border-radius: var(--radius); margin-bottom: 14px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.22);
+  font-size: 12.5px; color: var(--text-2);
+}
+.net-banner svg {
+  width: 16px; height: 16px; stroke: var(--warning, #f59e0b);
+  fill: none; stroke-width: 2; flex-shrink: 0; margin-top: 2px;
+}
+.net-banner strong { color: var(--text); }
+
+.bind-mode-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+}
+@media (max-width: 720px) {
+  .bind-mode-grid { grid-template-columns: 1fr; }
+}
+.bind-mode-card {
+  background: var(--bg-3); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px 16px;
+  cursor: pointer; display: flex; gap: 12px; align-items: flex-start;
+  transition: border-color 0.12s, background 0.12s;
+}
+.bind-mode-card:hover { border-color: var(--border-hover); }
+.bind-mode-card.active {
+  border-color: var(--accent-1);
+  background: rgba(99, 102, 241, 0.06);
+}
+.bind-mode-card .bind-radio { margin-top: 2px; }
+.bind-mode-card .t {
+  font-weight: 700; font-size: 13px;
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.bind-mode-card .d {
+  font-size: 12px; color: var(--text-3); line-height: 1.55;
+}
+
+/* Radio "kropka" uzywane w kartach bind-mode i w wierszach tabeli. */
+.bind-radio {
+  width: 16px; height: 16px;
+  border: 2px solid var(--border-hover);
+  border-radius: 50%; position: relative; cursor: pointer;
+  flex-shrink: 0; transition: border-color 0.12s;
+}
+.bind-radio:hover { border-color: var(--accent-2); }
+.bind-radio.on { border-color: var(--accent-1); }
+.bind-radio.on::after {
+  content: ""; position: absolute; inset: 2px;
+  background: var(--gradient-accent); border-radius: 50%;
+}
+.bind-radio.disabled {
+  opacity: 0.35; cursor: not-allowed;
+}
+
+/* Role-pill warianty dla sieci (inne niz admin/power/user). */
+.role-pill.role-lan { background: rgba(34, 197, 94, 0.14); color: var(--success, #22c55e); }
+.role-pill.role-wifi { background: rgba(96, 165, 250, 0.14); color: var(--info, #60a5fa); }
+.role-pill.role-vpn { background: rgba(167, 139, 250, 0.14); color: var(--accent-2); }
+.role-pill.role-virt { background: rgba(245, 158, 11, 0.14); color: var(--warning, #f59e0b); }
+.role-pill.role-loop { color: var(--text-3); background: transparent; padding-left: 0; padding-right: 0; }
+
+/* Adresy IP w tabeli — monospace, wielolinijkowo (primary + fallbacks). */
+.ip-mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px; color: var(--text);
+}
+.ip-mono-sub {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 10.5px; color: var(--text-3); margin-top: 2px;
+}
+
+/* Podglad listy direct_addrs propagowanej przez relay. */
+.adv-list { display: flex; flex-direction: column; }
+.adv-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 0; border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px;
+}
+.adv-row:last-child { border-bottom: 0; }
+.adv-row.filtered { color: var(--text-3); }
+.adv-row.filtered .addr { text-decoration: line-through; }
+.adv-row.included { color: var(--success, #22c55e); }
+.adv-row .label {
+  font-family: inherit; /* fallback Manrope z body */
+  font-family: var(--font-body, 'Manrope'), system-ui, sans-serif;
+  font-size: 10px; color: var(--text-3);
+  min-width: 160px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700;
+}
+.adv-row .addr { word-break: break-all; }
+
+/* Wiersz filtra (tytul + opis + tf-toggle po prawej). */
+.net-filter-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 0; gap: 16px;
+  border-bottom: 1px dashed rgba(99, 102, 241, 0.12);
+}
+.net-filter-row:last-child { border-bottom: 0; }
+.net-filter-row .t { font-size: 13px; font-weight: 600; color: var(--text); }
+.net-filter-row .d {
+  font-size: 11px; color: var(--text-3);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  margin-top: 2px;
+}
+
+/* Drobny fix: grupa filtr-chipow w toolbarze wspoldzieli gap z tf-filter-group. */
+.tf-filter-group { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }

@@ -1685,5 +1685,21 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE services ADD COLUMN deployed_source_hash TEXT;
         ",
     ),
+    (
+        57,
+        "mesh_network_settings_defaults",
+        "
+            -- Seed domyslnych ustawien mesh & network (bind mode + advertise filters).
+            -- Kolumna `is_secret` w settings nie istnieje — tabela ma (key, value, updated_at).
+            INSERT OR IGNORE INTO settings(key, value) VALUES
+              ('mesh.bind_mode', 'auto'),
+              ('mesh.bind_ipv4', ''),
+              ('mesh.advertise_hide_docker', '1'),
+              ('mesh.advertise_hide_link_local', '1'),
+              ('mesh.advertise_hide_loopback', '1'),
+              ('mesh.advertise_hide_cgnat', '0'),
+              ('mesh.advertise_prefer_same_subnet', '1');
+        ",
+    ),
 ]
 }

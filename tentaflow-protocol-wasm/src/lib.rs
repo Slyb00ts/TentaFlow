@@ -4055,6 +4055,38 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             meeting_event_payload_to_js(&payload, event.payload);
             set(&obj, "payload", payload.into());
         }
+        MessageBody::NetworkBody(p) => {
+            use tentaflow_protocol::NetworkPayload as NP;
+            match p {
+                NP::ReqInterfacesList => {
+                    set(&obj, "variant", "NetworkInterfacesListRequest".into());
+                }
+                NP::ResInterfacesList { interfaces } => {
+                    set(&obj, "variant", "NetworkInterfacesListResponse".into());
+                    let arr = js_sys::Array::new();
+                    for iface in interfaces.iter() {
+                        arr.push(&network_interface_info_to_js(iface).into());
+                    }
+                    set(&obj, "interfaces", arr.into());
+                }
+                NP::ReqConfigGet => {
+                    set(&obj, "variant", "NetworkConfigGetRequest".into());
+                }
+                NP::ResConfigGet(cfg) => {
+                    set(&obj, "variant", "NetworkConfigGetResponse".into());
+                    set(&obj, "config", network_config_to_js(&cfg).into());
+                }
+                NP::ReqConfigUpdate(cfg) => {
+                    set(&obj, "variant", "NetworkConfigUpdateRequest".into());
+                    set(&obj, "config", network_config_to_js(&cfg).into());
+                }
+                NP::ResConfigUpdate { restart_required } => {
+                    set(&obj, "variant", "NetworkConfigUpdateResponse".into());
+                    set(&obj, "restartRequired", restart_required.into());
+                    set(&obj, "restart_required", restart_required.into());
+                }
+            }
+        }
     }
     Ok(obj.into())
 }
@@ -5410,4 +5442,95 @@ pub fn encode_iam_list_perms_resource(resource_type: String, resource_id: String
 #[wasm_bindgen(js_name = encodeIamListPermsForSubjectRequest)]
 pub fn encode_iam_list_perms_subject(subject_type: String, subject_id: f64) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqListPermsForSubject { subject_type, subject_id: subject_id as i64 })
+}
+
+// =============================================================================
+// Network settings encoders (interfejsy hosta + konfiguracja bind/filter).
+// Wrapuja NetworkPayload w MessageBody::NetworkBody i serializuja rkyv.
+// =============================================================================
+
+use tentaflow_protocol::{NetworkConfig, NetworkInterfaceInfo, NetworkPayload};
+
+fn encode_network(payload: NetworkPayload) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::NetworkBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// Konwertuje pojedynczy `NetworkInterfaceInfo` na JS object dla GUI.
+fn network_interface_info_to_js(iface: &NetworkInterfaceInfo) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "name", iface.name.clone().into());
+    set(&obj, "mac", iface.mac.clone().into());
+    let ipv4 = js_sys::Array::new();
+    for addr in iface.ipv4_addrs.iter() {
+        ipv4.push(&JsValue::from_str(addr));
+    }
+    set(&obj, "ipv4Addrs", ipv4.clone().into());
+    set(&obj, "ipv4_addrs", ipv4.into());
+    set(&obj, "mtu", (iface.mtu as f64).into());
+    set(&obj, "kind", iface.kind.clone().into());
+    set(&obj, "isUp", iface.is_up.into());
+    set(&obj, "is_up", iface.is_up.into());
+    set(&obj, "description", iface.description.clone().into());
+    obj
+}
+
+/// Konwertuje `NetworkConfig` na JS object z polami w camelCase i snake_case
+/// (parzysta dostepnosc dla istniejacych konsumentow w GUI).
+fn network_config_to_js(cfg: &NetworkConfig) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "bindMode", cfg.bind_mode.clone().into());
+    set(&obj, "bind_mode", cfg.bind_mode.clone().into());
+    set(&obj, "bindIpv4", cfg.bind_ipv4.clone().into());
+    set(&obj, "bind_ipv4", cfg.bind_ipv4.clone().into());
+    set(&obj, "hideDocker", cfg.hide_docker.into());
+    set(&obj, "hide_docker", cfg.hide_docker.into());
+    set(&obj, "hideLinkLocal", cfg.hide_link_local.into());
+    set(&obj, "hide_link_local", cfg.hide_link_local.into());
+    set(&obj, "hideLoopback", cfg.hide_loopback.into());
+    set(&obj, "hide_loopback", cfg.hide_loopback.into());
+    set(&obj, "hideCgnat", cfg.hide_cgnat.into());
+    set(&obj, "hide_cgnat", cfg.hide_cgnat.into());
+    set(&obj, "preferSameSubnet", cfg.prefer_same_subnet.into());
+    set(&obj, "prefer_same_subnet", cfg.prefer_same_subnet.into());
+    set(&obj, "irohRelayUrl", cfg.iroh_relay_url.clone().into());
+    set(&obj, "iroh_relay_url", cfg.iroh_relay_url.clone().into());
+    obj
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqInterfacesList).
+#[wasm_bindgen(js_name = encodeNetworkInterfacesListRequest)]
+pub fn encode_network_interfaces_list_request() -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqInterfacesList)
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqConfigGet).
+#[wasm_bindgen(js_name = encodeNetworkConfigGetRequest)]
+pub fn encode_network_config_get_request() -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqConfigGet)
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqConfigUpdate(NetworkConfig { .. })).
+/// Pola przekazywane jako typed args (no serde-wasm-bindgen); strony JS i WASM
+/// zgodne z definicja `NetworkConfig` w `tentaflow-protocol`.
+#[wasm_bindgen(js_name = encodeNetworkConfigUpdateRequest)]
+pub fn encode_network_config_update_request(
+    bind_mode: String,
+    bind_ipv4: String,
+    hide_docker: bool,
+    hide_link_local: bool,
+    hide_loopback: bool,
+    hide_cgnat: bool,
+    prefer_same_subnet: bool,
+    iroh_relay_url: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqConfigUpdate(NetworkConfig {
+        bind_mode,
+        bind_ipv4,
+        hide_docker,
+        hide_link_local,
+        hide_loopback,
+        hide_cgnat,
+        prefer_same_subnet,
+        iroh_relay_url,
+    }))
 }

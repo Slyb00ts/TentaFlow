@@ -163,6 +163,9 @@ urlencoding = "2"
 url = "2"
 dirs = "6.0.0"
 
+# Enumeracja interfejsow sieciowych (IPv4-only advertise/bind dla iroh mesh)
+netdev = "0.31"
+
 # Metrics (optional)
 prometheus = { version = "0.14.0", optional = true }
 

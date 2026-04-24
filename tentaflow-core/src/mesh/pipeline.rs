@@ -137,9 +137,18 @@ pub async fn start_mesh_pipeline(
         }
     }
 
+    // Bind address: domyslnie `0.0.0.0:port` (mode=auto). Gdy user wybral
+    // `custom` i wpisal istniejace IPv4 hosta — iroh bindne sie tylko na ten
+    // jeden interfejs. Fallback do 0.0.0.0 z warnem gdy custom IP znikloby z
+    // systemu (np. VPN wylaczony po restartcie).
+    let bind_addr = match &db_pool {
+        Some(db) => crate::mesh::network_interfaces::resolve_bind_addr(db, mesh_port),
+        None => std::net::SocketAddr::from(([0u8, 0, 0, 0], mesh_port)),
+    };
+
     let iroh_cfg = IrohMeshConfig {
         node_id: app_node_id.clone(),
-        bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], mesh_port)),
+        bind_addr,
         relay_url,
         enable_lan_discovery: mesh_config.mdns_enabled,
         enable_dht_discovery: enable_dht,
@@ -157,6 +166,7 @@ pub async fn start_mesh_pipeline(
                 &config.role,
                 mesh_port,
                 &local_node_info,
+                db_pool.as_ref(),
             );
 
             {
@@ -333,7 +343,11 @@ pub async fn start_mesh_pipeline(
                 local_node_id.clone(),
                 docker_cache,
             );
-            spawn_slow_refresh(mesh_peer_store.clone(), local_node_id.clone());
+            spawn_slow_refresh(
+                mesh_peer_store.clone(),
+                local_node_id.clone(),
+                db_pool.clone(),
+            );
             spawn_liveness_timer(
                 mesh_peer_store.clone(),
                 quic_mesh.clone(),
@@ -361,6 +375,7 @@ pub async fn start_mesh_pipeline(
                 &config.role,
                 mesh_port,
                 &local_node_info,
+                db_pool.as_ref(),
             );
             Ok(MeshPipelineHandles {
                 mdns: None,
@@ -377,8 +392,22 @@ fn upsert_local_peer(
     role: &str,
     mesh_port: u16,
     local_node_info: &NodeInfo,
+    db_pool: Option<&crate::db::DbPool>,
 ) {
-    let local_addresses = node_info_collector::collect_local_addresses();
+    let raw_addresses = node_info_collector::collect_local_addresses();
+    // IPv4 only + user-defined hide_* filtry. Bez DB (test/embed) przepuszczamy
+    // IPv4 wszystkie, IPv6 ucinamy zawsze — mesh nie obsluguje v6.
+    let local_addresses = match db_pool {
+        Some(db) => {
+            let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
+            let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+            crate::mesh::network_interfaces::filter_advertise_ips(&raw_addresses, &filters, &kind_map)
+        }
+        None => raw_addresses
+            .into_iter()
+            .filter(|ip| ip.is_ipv4())
+            .collect(),
+    };
     let local_os_distro = node_info_collector::collect_os_distro();
     let (docker_available, docker_version) = node_info_collector::collect_docker_info();
 
@@ -570,7 +599,22 @@ async fn handle_peer_connected(
         if let Some(ref sec) = mesh_security {
             if let Some((hostname, addresses, port)) = peer_store.contact_snapshot(&node_id) {
                 if !addresses.is_empty() && port > 0 {
-                    let mut direct_addresses: Vec<String> = addresses
+                    // Filtr IPv4 + advertise rules: do trusted_contact:* wrzucamy
+                    // tylko to co user pozwolil widziec zdalnie (hide_docker/
+                    // hide_cgnat itp.). Bez filtra peerzy dostawali np. adresy
+                    // docker bridge, ktore sa nieosiagalne z zewnatrz hosta.
+                    let filters = crate::mesh::network_interfaces::load_advertise_filters(&sec.db);
+                    let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+                    let filtered_ips = crate::mesh::network_interfaces::filter_advertise_ips(
+                        &addresses, &filters, &kind_map,
+                    );
+                    if filtered_ips.is_empty() {
+                        debug!(
+                            peer_id = %node_id,
+                            "contact_snapshot: wszystkie adresy odrzucone przez advertise filters — pomijam persist"
+                        );
+                    } else {
+                    let mut direct_addresses: Vec<String> = filtered_ips
                         .iter()
                         .map(|ip| format!("{}:{}", ip, port))
                         .collect();
@@ -582,6 +626,14 @@ async fn handle_peer_connected(
                         .unwrap_or(false);
                     if selected_is_direct {
                         prefer_address_first(&mut direct_addresses, selected_address);
+                    }
+                    // Gdy user wlaczyl prefer_same_subnet, po filtrze przestawiamy
+                    // adres z tej samej /24 co peer na poczatek listy.
+                    if crate::mesh::network_interfaces::load_prefer_same_subnet(&sec.db) {
+                        crate::mesh::network_interfaces::sort_prefer_same_subnet(
+                            &mut direct_addresses,
+                            selected_address,
+                        );
                     }
                     let addr_str = direct_addresses.join(",");
                     let _ = crate::db::repository::update_trusted_node_addresses(
@@ -604,6 +656,7 @@ async fn handle_peer_connected(
                         },
                     );
                     let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
+                    }
                 }
             }
         }
@@ -1967,13 +2020,32 @@ fn collect_local_models(
 
 /// Slow refresh — co 60s odswiezaj wolno-zmienne dane lokalnego noda:
 /// adresy IP, Docker availability/version, OS distro.
-fn spawn_slow_refresh(peer_store: MeshPeerStore, local_node_id: String) {
+fn spawn_slow_refresh(
+    peer_store: MeshPeerStore,
+    local_node_id: String,
+    db_pool: Option<crate::db::DbPool>,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
+            let db_for_task = db_pool.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let addresses = node_info_collector::collect_local_addresses();
+                let raw = node_info_collector::collect_local_addresses();
+                // Ta sama logika co w `upsert_local_peer`: IPv4 only + advertise
+                // filtry z settings. User moze przez 60s zmienic flagi i nie
+                // chcemy zeby stary set adresow wrocil do peer_store.
+                let addresses = match db_for_task.as_ref() {
+                    Some(db) => {
+                        let filters =
+                            crate::mesh::network_interfaces::load_advertise_filters(db);
+                        let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+                        crate::mesh::network_interfaces::filter_advertise_ips(
+                            &raw, &filters, &kind_map,
+                        )
+                    }
+                    None => raw.into_iter().filter(|ip| ip.is_ipv4()).collect(),
+                };
                 let (docker_available, docker_version) = node_info_collector::collect_docker_info();
                 let os_info = node_info_collector::collect_os_distro();
                 (addresses, docker_available, docker_version, os_info)

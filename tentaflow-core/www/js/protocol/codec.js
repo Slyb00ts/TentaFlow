@@ -1297,6 +1297,67 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Network (interfejsy hosta + konfiguracja bind/filter mesh)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::NetworkBody(NetworkPayload::ReqInterfacesList) — unit. */
+  networkInterfacesListRequest(correlationId, _payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNetworkInterfacesListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NetworkBody(NetworkPayload::ReqConfigGet) — unit. */
+  networkConfigGetRequest(correlationId, _payload, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNetworkConfigGetRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::NetworkBody(NetworkPayload::ReqConfigUpdate(NetworkConfig)).
+   * `payload` akceptuje pola w camelCase lub snake_case (alias), co upraszcza
+   * integracje z istniejacym kodem GUI.
+   */
+  networkConfigUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const bindMode = String(payload.bindMode ?? payload.bind_mode ?? 'auto');
+    const bindIpv4 = String(payload.bindIpv4 ?? payload.bind_ipv4 ?? '');
+    const hideDocker = !!(payload.hideDocker ?? payload.hide_docker);
+    const hideLinkLocal = !!(payload.hideLinkLocal ?? payload.hide_link_local);
+    const hideLoopback = !!(payload.hideLoopback ?? payload.hide_loopback);
+    const hideCgnat = !!(payload.hideCgnat ?? payload.hide_cgnat);
+    const preferSameSubnet = !!(payload.preferSameSubnet ?? payload.prefer_same_subnet);
+    const irohRelayUrl = String(payload.irohRelayUrl ?? payload.iroh_relay_url ?? '');
+    const body = _wasm.encodeNetworkConfigUpdateRequest(
+      bindMode,
+      bindIpv4,
+      hideDocker,
+      hideLinkLocal,
+      hideLoopback,
+      hideCgnat,
+      preferSameSubnet,
+      irohRelayUrl,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // SSO / TLS / NGC (FAZA 4)
   // -------------------------------------------------------------------------
 
