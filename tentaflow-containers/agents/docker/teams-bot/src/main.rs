@@ -7,6 +7,7 @@
 mod audio;
 mod browser;
 mod config;
+mod participant_scanner;
 mod quic_server;
 mod summarizer;
 mod vad;
@@ -124,6 +125,37 @@ impl SummarizerHandle {
     }
 }
 
+/// Uchwyt skanera uczestnikow — periodycznie czyta DOM Teams i emituje
+/// `ParticipantUpdate { joined|left }`. Osobny handle od summarizera zeby
+/// LeaveMeeting / kolejny JoinMeeting moglo go czysto zamknac.
+struct ScannerHandle {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl ScannerHandle {
+    async fn stop(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.join.await;
+    }
+}
+
+/// Spawnuje task participant_scanner dla aktywnej sesji. Scanner zyje tak dlugo
+/// jak strona (Page) — po LeaveMeeting / Join nowej sesji caller musi wywolac
+/// `stop()` na zwroconym handle.
+fn spawn_participant_scanner(
+    page: chromiumoxide::Page,
+    router: Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+    meeting_key: String,
+    bot_name: String,
+) -> ScannerHandle {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let join = tokio::spawn(async move {
+        participant_scanner::run(page, router, meeting_key, bot_name, rx).await;
+    });
+    ScannerHandle { shutdown_tx: tx, join }
+}
+
 /// Sidecar meeting bot — automatyzacja spotkan Teams z pipeline audio
 #[derive(Parser, Debug)]
 #[command(name = "tentaflow-meeting")]
@@ -196,6 +228,8 @@ async fn main() -> Result<()> {
 
     // Handle summarizera dla aktywnej sesji — None gdy bot nie jest w spotkaniu.
     let mut summarizer_handle: Option<SummarizerHandle> = None;
+    // Handle skanera uczestnikow — analogicznie per-session.
+    let mut scanner_handle: Option<ScannerHandle> = None;
 
     // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
     // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
@@ -317,6 +351,12 @@ async fn main() -> Result<()> {
             &config,
         )
         .await;
+        scanner_handle = Some(spawn_participant_scanner(
+            p.clone(),
+            router_client_handle.clone(),
+            meeting_id.clone(),
+            config.bot_name.clone(),
+        ));
         send_backend_update(&router_client_handle, &meeting_id, &config).await;
         Some(p)
     } else {
@@ -817,6 +857,9 @@ async fn main() -> Result<()> {
                         if let Some(h) = summarizer_handle.take() {
                             h.stop().await;
                         }
+                        if let Some(h) = scanner_handle.take() {
+                            h.stop().await;
+                        }
                         transcript_buffer.lock().await.clear();
                         speech_buffer.clear();
                         vad_detector.reset();
@@ -868,7 +911,7 @@ async fn main() -> Result<()> {
                                             let mut slot = page_slot.lock().await;
                                             *slot = Some(p.clone());
                                         }
-                                        page = Some(p);
+                                        page = Some(p.clone());
                                         // Odpal summarizera dla nowej sesji —
                                         // meeting_key == meeting_id po stronie routera.
                                         summarizer_handle = spawn_summarizer(
@@ -878,6 +921,12 @@ async fn main() -> Result<()> {
                                             &config,
                                         )
                                         .await;
+                                        scanner_handle = Some(spawn_participant_scanner(
+                                            p.clone(),
+                                            router_client_handle.clone(),
+                                            meeting_id.clone(),
+                                            config.bot_name.clone(),
+                                        ));
                                         send_backend_update(
                                             &router_client_handle,
                                             &meeting_id,
@@ -938,6 +987,9 @@ async fn main() -> Result<()> {
                         if let Some(h) = summarizer_handle.take() {
                             h.stop().await;
                         }
+                        if let Some(h) = scanner_handle.take() {
+                            h.stop().await;
+                        }
                         transcript_buffer.lock().await.clear();
                         speech_buffer.clear();
                         vad_detector.reset();
@@ -974,6 +1026,9 @@ async fn main() -> Result<()> {
     }
 
     if let Some(h) = summarizer_handle.take() {
+        h.stop().await;
+    }
+    if let Some(h) = scanner_handle.take() {
         h.stop().await;
     }
     let _ = shutdown_tx.send(true);
