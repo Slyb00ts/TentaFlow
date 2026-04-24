@@ -6,7 +6,6 @@
 pub mod api_addon_system;
 pub mod api_apikeys;
 pub mod api_auth;
-pub mod api_chat;
 pub mod api_clusters;
 pub mod api_dashboard;
 pub mod api_fast_path;

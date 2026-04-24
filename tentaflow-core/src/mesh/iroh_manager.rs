@@ -415,8 +415,6 @@ impl IrohMeshManager {
 
         let remote_id = connection.remote_id();
         let remote_hex = hex::encode(remote_id.as_bytes());
-        info!(peer = %remote_hex, alpn = ?alpn, "iroh_mesh: polaczenie zaakceptowane");
-
         match alpn {
             a if a == ALPN_MESH => {
                 match self

@@ -457,6 +457,7 @@ fn setup_logging(verbose: bool) -> Result<()> {
         iroh::net_report=error,\
         iroh::socket::remote_map::remote_state=error,\
         iroh_relay=error,\
+        iroh::socket::transports::relay=error,\
         noq_proto=error,\
         mdns_sd=off,\
         wgpu_hal=error,\

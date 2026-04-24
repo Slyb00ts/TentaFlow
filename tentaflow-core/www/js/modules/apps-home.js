@@ -15,11 +15,7 @@ const TILES = [
   { id: 'images',       route: 'images',       icon: 'image',        soon: true },
   { id: 'notes',        route: 'notes',        icon: 'mic',          soon: true },
   { id: 'meeting',      route: 'meeting',      icon: 'meeting',      soon: true },
-  { id: 'flows',        route: 'flows-user',   icon: 'workflow-app' },
-  { id: 'prompts',      route: 'prompts-user', icon: 'star' },
-  { id: 'tts',          route: 'tts',          icon: 'speaker',      soon: true },
   { id: 'translate',    route: 'translate',    icon: 'globe',        soon: true },
-  { id: 'search',       route: 'search-app',   icon: 'search',       soon: true },
 ];
 
 function sprite(id) {

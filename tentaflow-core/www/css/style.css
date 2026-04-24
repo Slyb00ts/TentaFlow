@@ -3529,7 +3529,7 @@ textarea {
    Meeting Bot — per-meeting container app
    ============================================================================= */
 
-.meeting-app-root { display: flex; flex-direction: column; height: 100%; background: var(--bg-2); }
+.meeting-app-root { display: flex; flex-direction: column; height: 100%; background: var(--bg); }
 .meeting-header { padding: 18px 28px; }
 .meeting-header .title-ico {
   width: 36px; height: 36px; border-radius: 10px;
@@ -3540,18 +3540,21 @@ textarea {
 }
 
 .meeting-empty-hero {
-  flex: 1; overflow-y: auto; padding: 32px 40px 40px;
-  display: grid; grid-template-columns: 1fr 360px; gap: 28px; align-content: start;
+  display: grid; grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 14px; align-content: start;
 }
 .meeting-join-card {
-  background: var(--bg-card); border: 1px solid var(--border);
-  border-radius: var(--radius-xl, 20px); padding: 36px 40px; position: relative; overflow: hidden;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 32px 34px 36px;
+  position: relative; overflow: hidden;
+  min-height: 520px;
 }
 .meeting-join-card::before {
   content: ''; position: absolute; inset: 0;
-  background: radial-gradient(circle at top left, rgba(167,139,250,0.12), transparent 55%);
+  background: radial-gradient(circle at top left, rgba(167,139,250,0.08), transparent 55%);
   pointer-events: none;
 }
+.meeting-join-card > * { position: relative; }
 .meeting-join-card .hero-ico {
   width: 64px; height: 64px; border-radius: 16px;
   background: linear-gradient(135deg, rgba(167,139,250,0.25), rgba(99,102,241,0.15));
@@ -3652,26 +3655,6 @@ textarea {
 .joining-step .step-desc { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 .joining-step.pending .step-title { color: var(--text-3); }
 
-/* Active meeting layout */
-.meeting-body { flex: 1; display: grid; grid-template-columns: 1fr 340px; overflow: hidden; min-height: 0; }
-.transcript-col { display: flex; flex-direction: column; overflow: hidden; background: var(--bg-2); }
-.transcript-toolbar {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 28px; border-bottom: 1px solid var(--border); gap: 10px;
-}
-.transcript-toolbar .tabs {
-  display: flex; gap: 2px; background: var(--bg-input);
-  border-radius: var(--radius, 10px); padding: 3px;
-}
-.transcript-toolbar .tab {
-  padding: 6px 14px; font-size: 12px; font-weight: 600;
-  color: var(--text-3); border-radius: 7px; cursor: pointer;
-}
-.transcript-toolbar .tab.active { background: var(--bg-card); color: var(--text); box-shadow: var(--shadow, 0 8px 24px rgba(0,0,0,0.5)); }
-.transcript-toolbar .count-chip {
-  font-size: 11px; color: var(--text-3);
-  padding: 3px 8px; border-radius: 6px; background: var(--bg-input);
-}
 /* transcript-list pelni role hosta dla VirtualList — pretext/virtual-list
    wymaga block-level kontenera z overflow-y + jawną wysokością. Padding dajemy
    na vlist-item aby spacer odzwierciedlał pełną przestrzeń wpisów. */
@@ -3706,58 +3689,6 @@ textarea {
   background: rgba(167,139,250,0.06); border: 1px dashed rgba(167,139,250,0.3);
   border-radius: var(--radius, 10px); padding: 12px 14px; color: var(--text);
 }
-
-.live-bar {
-  padding: 10px 28px 14px;
-  background: linear-gradient(to top, var(--bg-2) 0%, var(--bg-2) 60%, transparent 100%);
-  display: flex; align-items: center; gap: 10px; color: var(--text-3); font-size: 12px;
-  border-top: 1px solid var(--border);
-}
-.live-bar .pulse-dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--success); animation: meeting-pulse 1.4s ease-in-out infinite;
-}
-
-/* Side column (active meeting) */
-.side-col {
-  border-left: 1px solid var(--border); background: var(--bg);
-  overflow-y: auto; padding: 20px;
-  display: flex; flex-direction: column; gap: 18px; min-height: 0;
-}
-.side-col .panel {
-  background: var(--bg-card); border: 1px solid var(--border);
-  border-radius: var(--radius-lg); overflow: hidden;
-}
-.side-col .panel-head {
-  padding: 12px 16px; font-size: 11px; font-weight: 700;
-  color: var(--text-2); text-transform: uppercase; letter-spacing: 0.08em;
-  border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; justify-content: space-between;
-}
-.side-col .panel-head .count { color: var(--text-3); }
-.side-col .panel-body { padding: 12px 14px; }
-.side-col .participant { display: flex; align-items: center; gap: 10px; padding: 8px 4px; }
-.side-col .participant + .participant { border-top: 1px dashed var(--border); }
-.side-col .p-avatar {
-  width: 30px; height: 30px; border-radius: 8px;
-  display: inline-flex; align-items: center; justify-content: center;
-  font-weight: 700; font-size: 11px; color: white; flex-shrink: 0;
-}
-.side-col .p-body { flex: 1; min-width: 0; }
-.side-col .p-name { font-size: 12px; font-weight: 600; color: var(--text); }
-.side-col .p-sub { font-size: 10px; color: var(--text-3); }
-.side-col .cfg-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; font-size: 12px; }
-.side-col .cfg-row .k { color: var(--text-3); }
-.side-col .cfg-row .v { color: var(--text); font-weight: 600; }
-.side-col .cfg-row code { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--accent-2); }
-
-/* VNC */
-.meeting-vnc-window { flex: 1; overflow: hidden; padding: 20px 40px; display: flex; flex-direction: column; gap: 14px; }
-.meeting-vnc-iframe {
-  flex: 1; border: 1px solid var(--border); border-radius: var(--radius-lg);
-  background: #000; min-height: 400px;
-}
-.meeting-vnc-hint { font-size: 11px; color: var(--text-3); text-align: center; }
 
 /* History */
 .meeting-history-layout { flex: 1; display: grid; grid-template-columns: 320px 1fr; overflow: hidden; min-height: 0; }
@@ -3843,8 +3774,6 @@ textarea {
 
 @media (max-width: 1200px) {
   .meeting-empty-hero { grid-template-columns: 1fr; }
-  .meeting-body { grid-template-columns: 1fr; }
-  .side-col { border-left: none; border-top: 1px solid var(--border); }
   .meeting-history-layout { grid-template-columns: 1fr; }
 }
 
