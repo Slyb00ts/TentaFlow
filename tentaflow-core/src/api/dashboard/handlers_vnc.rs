@@ -125,9 +125,12 @@ fn vnc_tunnel_open_handler(
         // The constant is preserved so the wire contract stays stable.
         let _remote_sentinel = VNC_TUNNEL_OPEN_REMOTE_NODE;
 
-        // 4. Port lookup.
-        let Some(port) = desc.novnc_port else {
-            emit_open_status(&sub, VNC_TUNNEL_OPEN_NO_PORT, "container has no novnc port");
+        // 4. Port lookup. Use the raw RFB port (x11vnc on container 5900) rather
+        // than the websockify port (6080). noVNC's RFB client speaks raw RFB and
+        // runs its own framing; websockify would expect a WebSocket handshake
+        // we don't perform on the tunnel, leading to a silent stall.
+        let Some(port) = desc.vnc_port else {
+            emit_open_status(&sub, VNC_TUNNEL_OPEN_NO_PORT, "container has no vnc port");
             return;
         };
 
