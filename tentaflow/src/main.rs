@@ -463,13 +463,21 @@ fn setup_logging(verbose: bool) -> Result<()> {
         noq_udp=error,\
         wgpu_hal=error,\
         wgpu_core=error";
-    let filter = if verbose {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(format!("debug,{}", BASE_FILTER)))
-    } else {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(format!("info,{}", BASE_FILTER)))
-    };
+    // RUST_LOG MOZE byc ustawione w srodowisku — wtedy uzytkownik dostaje
+    // kontrole nad poziomem, ale BASE_FILTER dokladamy ZAWSZE zeby iroh/noq
+    // spam nie wrocil tylnymi drzwiami. Directives sa wstawiane PRZED
+    // zawartoscia RUST_LOG: pozniejsze dyrektywy dla tych samych celow
+    // nadpisaly by nasze, wiec nasze wyciszenia sa append'owane na koncu i
+    // wygrywaja przy kolizji z ogolnym RUST_LOG=info.
+    let user_level = std::env::var("RUST_LOG").ok().unwrap_or_else(|| {
+        if verbose {
+            "debug".to_string()
+        } else {
+            "info".to_string()
+        }
+    });
+    let filter_str = format!("{},{}", user_level, BASE_FILTER);
+    let filter = EnvFilter::new(filter_str);
 
     fmt()
         .with_env_filter(filter)
