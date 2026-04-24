@@ -4130,3 +4130,103 @@ tf-screen {
   margin-bottom: 16px;
 }
 .users-toolbar tf-searchbox { flex: 1; max-width: 360px; }
+
+/* =============================================================================
+   Confirm dialog (lib/confirm-dialog.js) — modal potwierdzenia na tf-window.
+   Zastepuje window.confirm() (flaky w iOS WKWebView). Uzywany m.in. przy
+   usuwaniu sparowanego noda, usuwaniu uzytkownika/grupy, rewokacji OAuth.
+   ============================================================================= */
+
+.confirm-dlg__body {
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 2px 2px 6px;
+}
+.confirm-dlg__head-ico {
+  width: 36px; height: 36px; border-radius: var(--radius-sm);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.confirm-dlg__head-ico--danger {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+.confirm-dlg__head-ico--primary {
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+.confirm-dlg__head-ico svg {
+  width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2;
+}
+
+.confirm-dlg__body-inner { flex: 1; min-width: 0; }
+.confirm-dlg__lead {
+  margin: 0 0 14px; font-size: 13.5px; line-height: 1.6;
+  color: var(--text-2);
+}
+.confirm-dlg__lead strong { color: var(--text); font-weight: 700; }
+
+/* Peer summary card */
+.confirm-dlg__peer {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 14px;
+}
+.confirm-dlg__peer-ico {
+  width: 38px; height: 38px; border-radius: var(--radius-sm);
+  background: rgba(99,102,241,0.14);
+  border: 1px solid rgba(99,102,241,0.3);
+  color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.confirm-dlg__peer-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+.confirm-dlg__peer-meta { flex: 1; min-width: 0; }
+.confirm-dlg__peer-name {
+  font-size: 13px; font-weight: 700; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.confirm-dlg__peer-id {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 10.5px; color: var(--text-3);
+  margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Consequence bullet list */
+.confirm-dlg__consequences {
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+}
+.confirm-dlg__consequences--danger {
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+.confirm-dlg__consequences--primary {
+  background: rgba(99, 102, 241, 0.06);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+}
+.confirm-dlg__item {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: 12px; color: var(--text-2);
+  line-height: 1.5;
+}
+.confirm-dlg__item svg {
+  width: 12px; height: 12px; margin-top: 3px;
+  fill: none; stroke-width: 2.2;
+  flex-shrink: 0;
+}
+.confirm-dlg__consequences--danger .confirm-dlg__item svg { stroke: var(--danger); }
+.confirm-dlg__consequences--primary .confirm-dlg__item svg { stroke: var(--accent-2); }
+
+/* Footer — prawostronne przyciski, na mobile stack column-reverse */
+.confirm-dlg__foot {
+  display: flex; justify-content: flex-end; gap: 8px;
+}
+@media (max-width: 520px) {
+  .confirm-dlg__foot { flex-direction: column-reverse; gap: 8px; }
+  .confirm-dlg__foot tf-button { width: 100%; }
+}
