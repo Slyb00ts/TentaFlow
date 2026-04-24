@@ -427,6 +427,33 @@ pub fn delete_trusted_contact_hints(
     Ok(())
 }
 
+pub fn merge_contact_hints(
+    current: Option<PairingContactHints>,
+    fresh: PairingContactHints,
+) -> PairingContactHints {
+    let mut merged = fresh.clone();
+    if let Some(current) = current {
+        if merged.node_id.is_empty() {
+            merged.node_id = current.node_id;
+        }
+        if merged.public_key_hex.is_empty() {
+            merged.public_key_hex = current.public_key_hex;
+        }
+        if merged.hostname.is_empty() {
+            merged.hostname = current.hostname;
+        }
+        if merged.relay_url.is_empty() {
+            merged.relay_url = current.relay_url;
+        }
+        for addr in current.addresses {
+            if !addr.is_empty() && !merged.addresses.contains(&addr) {
+                merged.addresses.push(addr);
+            }
+        }
+    }
+    merged
+}
+
 /// Wzorce hostow uznanych za martwe relay URL — usuwane przy starcie mesh.
 /// Do commitu e9552dc zapisywalismy domyslne `https://use.iroh.network/`, ktore
 /// od dawna nie resolwuje DNS. Po naprawie Fazy 1 nowe eventy zapisuja pusty
@@ -634,6 +661,44 @@ mod tests {
         assert_eq!(direct.len(), 2);
         assert_eq!(relays.len(), 1);
         assert_eq!(relays[0].to_string(), "https://relay.example./");
+    }
+
+    #[test]
+    fn merge_contact_hints_keeps_fresh_order_and_appends_missing_current() {
+        let current = PairingContactHints {
+            node_id: "peer".to_string(),
+            public_key_hex: "abcd".to_string(),
+            hostname: "old-host".to_string(),
+            addresses: vec![
+                "10.0.0.8:8090".to_string(),
+                "192.168.0.8:8090".to_string(),
+            ],
+            relay_url: "https://relay.old/".to_string(),
+        };
+        let fresh = PairingContactHints {
+            node_id: "peer".to_string(),
+            public_key_hex: String::new(),
+            hostname: "new-host".to_string(),
+            addresses: vec![
+                "192.168.0.8:8090".to_string(),
+                "10.10.10.8:8090".to_string(),
+            ],
+            relay_url: String::new(),
+        };
+
+        let merged = merge_contact_hints(Some(current), fresh);
+
+        assert_eq!(merged.public_key_hex, "abcd");
+        assert_eq!(merged.hostname, "new-host");
+        assert_eq!(merged.relay_url, "https://relay.old/");
+        assert_eq!(
+            merged.addresses,
+            vec![
+                "192.168.0.8:8090".to_string(),
+                "10.10.10.8:8090".to_string(),
+                "10.0.0.8:8090".to_string(),
+            ]
+        );
     }
 
     #[test]

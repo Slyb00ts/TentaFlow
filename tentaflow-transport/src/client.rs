@@ -74,6 +74,7 @@ pub struct ServiceClient {
     endpoint: Endpoint,
     config: Arc<ServiceClientConfig>,
     connection: Arc<Mutex<Option<Connection>>>,
+    shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -84,9 +85,23 @@ impl ServiceClient {
     pub async fn connect(
         endpoint: Endpoint,
         config: ServiceClientConfig,
-        shutdown_rx: watch::Receiver<bool>,
+        mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<Self, TransportError> {
         let config = Arc::new(config);
+        let (shutdown_tx, local_shutdown_rx) = watch::channel(false);
+        let forward_shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *shutdown_rx.borrow() {
+                    let _ = forward_shutdown_tx.send(true);
+                    break;
+                }
+                if shutdown_rx.changed().await.is_err() {
+                    let _ = forward_shutdown_tx.send(true);
+                    break;
+                }
+            }
+        });
         let addr = build_endpoint_addr(config.endpoint_id, &config.direct_addrs);
         let connection = endpoint
             .connect(addr, &config.alpn)
@@ -99,7 +114,8 @@ impl ServiceClient {
             endpoint,
             config,
             connection: Arc::new(Mutex::new(Some(connection))),
-            shutdown_rx,
+            shutdown_tx,
+            shutdown_rx: local_shutdown_rx,
         };
 
         if client.config.auto_reconnect {
@@ -189,6 +205,16 @@ impl ServiceClient {
     /// Zamyka polaczenie i endpoint. Po `close()` klient nie moze byc uzyty
     /// ponownie.
     pub async fn close(self) {
+        if let Some(conn) = self.connection.lock().take() {
+            conn.close(0u32.into(), b"client_shutdown");
+        }
+        self.endpoint.close().await;
+    }
+
+    /// Zatrzymuje klienta bez przejmowania ownership — uzywane przy dynamicznym
+    /// wyrejestrowaniu serwisu, zeby ubijac wewnetrzny keepalive/reconnect task.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
         if let Some(conn) = self.connection.lock().take() {
             conn.close(0u32.into(), b"client_shutdown");
         }
