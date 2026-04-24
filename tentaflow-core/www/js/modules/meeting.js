@@ -485,9 +485,9 @@ function renderJoiningScreen() {
   const elapsed = formatElapsed(Date.now() - (joinStartedAt || Date.now()));
 
   return `
-    ${header}
     <div class="meeting-joining-hero">
       <div class="meeting-joining-card">
+        <tf-button class="meeting-joining-cancel" variant="ghost" size="sm" icon="x" id="meeting-cancel-btn" aria-label="${escapeAttr(I18n.t('meeting.cancel'))}"></tf-button>
         ${failed ? '' : '<div class="meeting-spinner"></div>'}
         <h2>${escapeHtml(I18n.t('meeting.joining_title'))}</h2>
         <p class="sub">${escapeHtml(activeSession?.meetingUrl || '')}</p>
