@@ -65,6 +65,11 @@ export function byCategory(category) {
   return services.filter((s) => s?.engine?.category === category);
 }
 
+export function resourceKind(service) {
+  const raw = String(service?.engine?.resource_kind || 'ai').toLowerCase();
+  return raw === 'infra' ? 'infra' : 'ai';
+}
+
 function normalizeSection(section) {
   if (!section || typeof section !== 'object') return null;
   const platforms = Array.isArray(section.platforms)

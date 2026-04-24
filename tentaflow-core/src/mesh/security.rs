@@ -7,14 +7,16 @@
 //       jest obowiazkiem iroh TLS — ten modul nie wrapuje payloadow AEAD.
 // =============================================================================
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use rand::RngExt;
 use sha2::Sha256;
 use tracing::{info, warn};
@@ -40,22 +42,21 @@ pub struct MeshSecurity {
     /// Klucz publiczny X25519 (do wymiany w pairingu).
     x25519_public: X25519PublicKey,
     /// Zaufane nody: node_id -> klucz publiczny Ed25519.
-    trusted_keys: RwLock<HashMap<String, VerifyingKey>>,
+    /// DashMap — per-shard lock, is_trusted() i verify() nie konkuruja.
+    trusted_keys: DashMap<String, VerifyingKey>,
     /// Snapshot zaufanych `node_id` jako `Arc<HashSet>` — odbudowywany przy
-    /// kazdej zmianie trusted_keys. Pozwala na batch trust check bez lockow.
-    trusted_node_ids: RwLock<Arc<HashSet<String>>>,
+    /// kazdej zmianie trusted_keys. ArcSwap = zero-lock reads.
+    trusted_node_ids: ArcSwap<HashSet<String>>,
     /// Aktywnie cofniete zaufanie — wypelniane przez `revoke_trust`.
-    revoked_nodes: RwLock<HashSet<String>>,
+    revoked_nodes: DashMap<String, ()>,
     /// Nody w trakcie revoke/unpair — synchronicznie ustawiane przed async
     /// broadcastem TrustRevoked.
-    revoking_nodes: RwLock<HashSet<String>>,
+    revoking_nodes: DashMap<String, ()>,
     /// Rate limit prob PIN per node_id: (count, last_attempt).
-    pin_attempts: RwLock<HashMap<String, (u32, Instant)>>,
+    pin_attempts: DashMap<String, (u32, Instant)>,
     /// Aktywne zaproszenie QR — (pin, expiry). Jeden naraz, rotowany co 60s.
-    /// Uzywany w flow: nod A pokazuje QR z (hex, pin), nod B skanuje i inicjuje
-    /// parowanie uzywajac tego pinu. Nod A gdy dostanie PairingRequest z tym
-    /// pinem → auto-confirm bez user-confirmu.
-    invite: RwLock<Option<(String, Instant)>>,
+    /// Mutex bo to jeden globalny slot; contention znikoma (co 50s refresh).
+    invite: Mutex<Option<(String, Instant)>>,
     /// Pool bazy danych.
     pub db: DbPool,
     /// Szyfr do szyfrowania kluczy prywatnych w `settings`.
@@ -76,12 +77,12 @@ impl MeshSecurity {
             verifying_key,
             x25519_secret,
             x25519_public,
-            trusted_keys: RwLock::new(HashMap::new()),
-            trusted_node_ids: RwLock::new(Arc::new(HashSet::new())),
-            revoked_nodes: RwLock::new(HashSet::new()),
-            revoking_nodes: RwLock::new(HashSet::new()),
-            pin_attempts: RwLock::new(HashMap::new()),
-            invite: RwLock::new(None),
+            trusted_keys: DashMap::with_capacity(256),
+            trusted_node_ids: ArcSwap::from_pointee(HashSet::new()),
+            revoked_nodes: DashMap::with_capacity(64),
+            revoking_nodes: DashMap::with_capacity(16),
+            pin_attempts: DashMap::with_capacity(64),
+            invite: Mutex::new(None),
             db,
             settings_cipher,
         };
@@ -89,15 +90,14 @@ impl MeshSecurity {
         security.load_trusted_from_db()?;
 
         if let Ok(revoked) = db::repository::list_revoked_nodes(&security.db) {
-            let mut set = security.revoked_nodes.write();
             for node_id in revoked {
-                set.insert(node_id);
+                security.revoked_nodes.insert(node_id, ());
             }
         }
 
         info!(
             public_key = %security.public_key_hex(),
-            trusted_count = security.trusted_keys.read().len(),
+            trusted_count = security.trusted_keys.len(),
             "MeshSecurity zainicjalizowany"
         );
 
@@ -156,12 +156,11 @@ impl MeshSecurity {
 
     fn load_trusted_from_db(&self) -> Result<()> {
         let trusted = db::repository::list_trusted_nodes(&self.db)?;
-        let mut keys = self.trusted_keys.write();
 
         for node in &trusted {
             match Self::parse_verifying_key(&node.public_key) {
                 Ok(vk) => {
-                    keys.insert(node.node_id.clone(), vk);
+                    self.trusted_keys.insert(node.node_id.clone(), vk);
                 }
                 Err(e) => {
                     warn!(
@@ -172,10 +171,7 @@ impl MeshSecurity {
             }
         }
 
-        let trusted_set: HashSet<String> = keys.keys().cloned().collect();
-        drop(keys);
-        *self.trusted_node_ids.write() = Arc::new(trusted_set);
-
+        self.rebuild_trusted_snapshot();
         Ok(())
     }
 
@@ -195,9 +191,11 @@ impl MeshSecurity {
     }
 
     /// Odbudowuje snapshot `trusted_node_ids` po modyfikacji `trusted_keys`.
+    /// ArcSwap::store jest atomowy — readers widza spojny snapshot.
     fn rebuild_trusted_snapshot(&self) {
-        let trusted_set: HashSet<String> = self.trusted_keys.read().keys().cloned().collect();
-        *self.trusted_node_ids.write() = Arc::new(trusted_set);
+        let trusted_set: HashSet<String> =
+            self.trusted_keys.iter().map(|e| e.key().clone()).collect();
+        self.trusted_node_ids.store(Arc::new(trusted_set));
     }
 
     /// Polaczony hex Ed25519 (64) + X25519 (64) = 128 znakow.
@@ -218,17 +216,18 @@ impl MeshSecurity {
     }
 
     /// Czy node jest zaufany? Sprawdza rowniez flage revoking.
+    /// Dwa DashMap contains_key — kazdy na swoim shardzie, zero read-lock
+    /// contention z zapisami innych node_id.
     pub fn is_trusted(&self, node_id: &str) -> bool {
-        if self.revoking_nodes.read().contains(node_id) {
+        if self.revoking_nodes.contains_key(node_id) {
             return false;
         }
-        self.trusted_keys.read().contains_key(node_id)
+        self.trusted_keys.contains_key(node_id)
     }
 
-    /// Snapshot zaufanych node_id — jedno `Arc::clone` na heartbeat loop zamiast
-    /// N lockow RwLock.
+    /// Snapshot zaufanych node_id — ArcSwap::load_full, zero lockow.
     pub fn trusted_node_ids_snapshot(&self) -> Arc<HashSet<String>> {
-        Arc::clone(&self.trusted_node_ids.read())
+        self.trusted_node_ids.load_full()
     }
 
     // =========================================================================
@@ -246,14 +245,14 @@ impl MeshSecurity {
     pub fn generate_invite_pin(&self) -> (String, u32) {
         let pin = Self::generate_pin();
         let expiry = Instant::now() + Duration::from_secs(60);
-        *self.invite.write() = Some((pin.clone(), expiry));
+        *self.invite.lock() = Some((pin.clone(), expiry));
         (pin, 60)
     }
 
     /// Zwraca aktualny invite PIN (jesli wciaz wazny). Do sprawdzenia przez
     /// `handle_pairing_request` — jesli przychodzacy PIN matchuje, auto-confirm.
     pub fn peek_invite_pin(&self) -> Option<String> {
-        let guard = self.invite.read();
+        let guard = self.invite.lock();
         let (pin, expiry) = guard.as_ref()?;
         if Instant::now() < *expiry {
             Some(pin.clone())
@@ -264,7 +263,7 @@ impl MeshSecurity {
 
     /// Skonsumuj invite PIN jesli matchuje — zapobiega reuse.
     pub fn consume_invite_pin(&self, candidate: &str) -> bool {
-        let mut guard = self.invite.write();
+        let mut guard = self.invite.lock();
         let matches = guard
             .as_ref()
             .map(|(p, exp)| p == candidate && Instant::now() < *exp)
@@ -297,7 +296,7 @@ impl MeshSecurity {
             let _ = self.admin_retrust(remote_node_id);
         }
 
-        self.pin_attempts.write().remove(remote_node_id);
+        self.pin_attempts.remove(remote_node_id);
 
         let pin = if !pin_hint.is_empty() && pin_hint.len() == 6 && pin_hint.chars().all(|c| c.is_ascii_digit()) {
             pin_hint.to_string()
@@ -338,7 +337,7 @@ impl MeshSecurity {
             let _ = self.admin_retrust(remote_node_id);
         }
 
-        self.pin_attempts.write().remove(remote_node_id);
+        self.pin_attempts.remove(remote_node_id);
 
         db::repository::create_pending_pairing(
             &self.db,
@@ -402,9 +401,7 @@ impl MeshSecurity {
             approved_by,
         )?;
 
-        self.trusted_keys
-            .write()
-            .insert(remote_node_id.to_string(), vk);
+        self.trusted_keys.insert(remote_node_id.to_string(), vk);
 
         db::repository::delete_pending_pairing(&self.db, remote_node_id)?;
         self.rebuild_trusted_snapshot();
@@ -469,8 +466,8 @@ impl MeshSecurity {
     /// Cofniecie zaufania — usuniecie z `trusted_nodes` i zapis do `revoked_nodes`.
     pub fn revoke_trust(&self, node_id: &str) -> Result<()> {
         db::repository::remove_trusted_node(&self.db, node_id)?;
-        self.trusted_keys.write().remove(node_id);
-        self.revoked_nodes.write().insert(node_id.to_string());
+        self.trusted_keys.remove(node_id);
+        self.revoked_nodes.insert(node_id.to_string(), ());
         let _ = db::repository::add_revoked_node(&self.db, node_id, None);
         self.rebuild_trusted_snapshot();
         info!(node_id = %node_id, "Cofnieto zaufanie dla noda");
@@ -480,7 +477,7 @@ impl MeshSecurity {
     /// Unpair bez revoke — usun z trusted_nodes, nie dodawaj do revoked.
     pub fn unpair(&self, node_id: &str) -> Result<()> {
         db::repository::remove_trusted_node(&self.db, node_id)?;
-        self.trusted_keys.write().remove(node_id);
+        self.trusted_keys.remove(node_id);
         self.rebuild_trusted_snapshot();
         info!(node_id = %node_id, "Odparowano node (friendly unpair)");
         Ok(())
@@ -488,27 +485,27 @@ impl MeshSecurity {
 
     /// Czy node jest aktywnie revoked?
     pub fn is_revoked(&self, node_id: &str) -> bool {
-        self.revoked_nodes.read().contains(node_id)
+        self.revoked_nodes.contains_key(node_id)
     }
 
     /// Oznacza node jako w trakcie odparowywania (synchronicznie, przed async broadcast).
     pub fn mark_revoking(&self, node_id: &str) {
-        self.revoking_nodes.write().insert(node_id.to_string());
+        self.revoking_nodes.insert(node_id.to_string(), ());
     }
 
     /// Zdejmuje oznaczenie revoking po zakonczeniu operacji.
     pub fn clear_revoking(&self, node_id: &str) {
-        self.revoking_nodes.write().remove(node_id);
+        self.revoking_nodes.remove(node_id);
     }
 
     /// Lista revokowanych node IDs — do synchronizacji przy reconnect.
     pub fn get_revoked_node_ids(&self) -> Vec<String> {
-        self.revoked_nodes.read().iter().cloned().collect()
+        self.revoked_nodes.iter().map(|e| e.key().clone()).collect()
     }
 
     /// Usuwa node z listy revoked (admin re-trust).
     pub fn admin_retrust(&self, node_id: &str) -> Result<()> {
-        self.revoked_nodes.write().remove(node_id);
+        self.revoked_nodes.remove(node_id);
         db::repository::remove_revoked_node(&self.db, node_id)?;
         info!(node_id = %node_id, "Admin re-trust — usunieto z revoked");
         Ok(())
@@ -525,8 +522,8 @@ impl MeshSecurity {
 
     /// Weryfikuje podpis od zaufanego noda.
     pub fn verify(&self, node_id: &str, data: &[u8], signature_bytes: &[u8]) -> Result<bool> {
-        let keys = self.trusted_keys.read();
-        let key = keys
+        let key = self
+            .trusted_keys
             .get(node_id)
             .ok_or_else(|| anyhow::anyhow!("Node {} nie jest zaufany", node_id))?;
 
@@ -579,7 +576,7 @@ impl MeshSecurity {
 
         db::repository::add_trusted_node(&self.db, node_id, public_key_hex, hostname, "mesh-sync")?;
 
-        self.trusted_keys.write().insert(node_id.to_string(), vk);
+        self.trusted_keys.insert(node_id.to_string(), vk);
         self.rebuild_trusted_snapshot();
 
         info!(
@@ -598,8 +595,8 @@ impl MeshSecurity {
 
     /// Sprawdza limit prob PIN (3 proby w oknie 60 s).
     pub fn check_pin_rate_limit(&self, node_id: &str) -> bool {
-        let mut attempts = self.pin_attempts.write();
-        let entry = attempts
+        let mut entry = self
+            .pin_attempts
             .entry(node_id.to_string())
             .or_insert((0, Instant::now()));
 

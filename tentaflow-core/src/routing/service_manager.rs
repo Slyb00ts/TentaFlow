@@ -368,18 +368,21 @@ pub struct ServiceManager {
     /// Konfiguracja
     pub config: Arc<RouterConfig>,
 
-    /// RAG serwisy (QUIC) - nazwa -> handle
-    pub rag_services: parking_lot::RwLock<HashMap<String, Arc<RAGServiceHandle>>>,
+    /// RAG serwisy (QUIC) - nazwa -> handle. DashMap: lock-free per-shard.
+    pub rag_services: dashmap::DashMap<String, Arc<RAGServiceHandle>>,
 
     /// QUIC Embedding serwisy - nazwa -> handle
-    pub quic_embedding_services: parking_lot::RwLock<HashMap<String, Arc<QuicServiceHandle>>>,
+    pub quic_embedding_services: dashmap::DashMap<String, Arc<QuicServiceHandle>>,
 
     /// OpenAI API backends (LLM, Vision, STT, Embedding) - synchroniczne, nie wymagaja polaczenia
     pub service_backends: HashMap<String, Vec<Arc<BackendClient>>>,
 
-    /// Dynamicznie rejestrowane HTTP backends (po deploy kontenera)
-    pub dynamic_backends: parking_lot::RwLock<
-        HashMap<String, (Vec<Arc<BackendClient>>, Box<dyn LoadBalancingStrategy>)>,
+    /// Dynamicznie rejestrowane HTTP backends (po deploy kontenera). Zawiera
+    /// tuple z Box<dyn LoadBalancingStrategy> — LoadBalancingStrategy musi byc
+    /// Send+Sync dla DashMap.
+    pub dynamic_backends: dashmap::DashMap<
+        String,
+        (Vec<Arc<BackendClient>>, Box<dyn LoadBalancingStrategy>),
     >,
 
     /// Load balancing strategies
@@ -389,25 +392,26 @@ pub struct ServiceManager {
     pub tts_clients: HashMap<String, Arc<TTSClient>>,
 
     /// QUIC TTS serwisy - nazwa -> handle
-    pub quic_tts_services: parking_lot::RwLock<HashMap<String, Arc<QuicServiceHandle>>>,
+    pub quic_tts_services: dashmap::DashMap<String, Arc<QuicServiceHandle>>,
 
     /// QUIC LLM serwisy - nazwa -> handle
-    pub quic_llm_services: parking_lot::RwLock<HashMap<String, Arc<QuicServiceHandle>>>,
+    pub quic_llm_services: dashmap::DashMap<String, Arc<QuicServiceHandle>>,
 
     /// Kategorie modeli LLM (dla KV Cache) - nazwa -> kategoria
-    pub llm_model_categories: parking_lot::RwLock<HashMap<String, crate::config::LlmModelCategory>>,
+    pub llm_model_categories: dashmap::DashMap<String, crate::config::LlmModelCategory>,
 
     /// QUIC STT serwisy - nazwa -> handle
-    pub quic_stt_services: parking_lot::RwLock<HashMap<String, Arc<QuicServiceHandle>>>,
+    pub quic_stt_services: dashmap::DashMap<String, Arc<QuicServiceHandle>>,
 
     /// QUIC Memory serwisy - nazwa -> handle
-    pub quic_memory_services: parking_lot::RwLock<HashMap<String, Arc<QuicServiceHandle>>>,
+    pub quic_memory_services: dashmap::DashMap<String, Arc<QuicServiceHandle>>,
 
     /// Pula serwisow per model: model_name -> ModelPoolEntry
-    pub model_pool: parking_lot::RwLock<HashMap<String, ModelPoolEntry>>,
+    pub model_pool: dashmap::DashMap<String, ModelPoolEntry>,
 
-    /// Modele obslugiwane przez lokalna inferencje in-process (MLX, llama.cpp)
-    pub local_inference_models: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Modele obslugiwane przez lokalna inferencje in-process (MLX, llama.cpp).
+    /// DashMap<K, ()> zamiast HashSet — lock-free contains_key.
+    pub local_inference_models: dashmap::DashMap<String, ()>,
 
     /// Callback channel dla RAG
     callback_tx: mpsc::UnboundedSender<(
@@ -922,19 +926,19 @@ impl ServiceManager {
 
         Ok(Self {
             config,
-            rag_services: parking_lot::RwLock::new(rag_services),
-            quic_embedding_services: parking_lot::RwLock::new(quic_embedding_services),
+            rag_services: rag_services.into_iter().collect(),
+            quic_embedding_services: quic_embedding_services.into_iter().collect(),
             service_backends,
-            dynamic_backends: parking_lot::RwLock::new(HashMap::new()),
+            dynamic_backends: dashmap::DashMap::new(),
             load_balancing_strategies,
             tts_clients,
-            quic_tts_services: parking_lot::RwLock::new(quic_tts_services),
-            quic_llm_services: parking_lot::RwLock::new(quic_llm_services),
-            llm_model_categories: parking_lot::RwLock::new(llm_model_categories),
-            quic_stt_services: parking_lot::RwLock::new(quic_stt_services),
-            quic_memory_services: parking_lot::RwLock::new(quic_memory_services),
-            model_pool: parking_lot::RwLock::new(model_pool),
-            local_inference_models: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            quic_tts_services: quic_tts_services.into_iter().collect(),
+            quic_llm_services: quic_llm_services.into_iter().collect(),
+            llm_model_categories: llm_model_categories.into_iter().collect(),
+            quic_stt_services: quic_stt_services.into_iter().collect(),
+            quic_memory_services: quic_memory_services.into_iter().collect(),
+            model_pool: model_pool.into_iter().collect(),
+            local_inference_models: dashmap::DashMap::new(),
             callback_tx,
             callback_rx: Arc::new(tokio::sync::Mutex::new(callback_rx)),
             shutdown_tx,
@@ -981,7 +985,7 @@ impl ServiceManager {
                 };
 
                 // Sprawdz czy juz zarejestrowany (z config.toml)
-                if self.quic_llm_services.read().contains_key(&service.name) {
+                if self.quic_llm_services.contains_key(&service.name) {
                     continue;
                 }
 
@@ -1006,10 +1010,7 @@ impl ServiceManager {
 
         // Spawn RAG connection tasks
         let rag_entries: Vec<_> = self
-            .rag_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .rag_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in rag_entries {
             let callback_tx = self.callback_tx.clone();
@@ -1022,10 +1023,7 @@ impl ServiceManager {
 
         // Spawn QUIC Embedding connection tasks
         let embedding_entries: Vec<_> = self
-            .quic_embedding_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_embedding_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in embedding_entries {
             let shutdown_rx = self.shutdown_rx.clone();
@@ -1045,10 +1043,7 @@ impl ServiceManager {
 
         // Spawn QUIC TTS connection tasks
         let tts_entries: Vec<_> = self
-            .quic_tts_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_tts_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in tts_entries {
             let shutdown_rx = self.shutdown_rx.clone();
@@ -1068,10 +1063,7 @@ impl ServiceManager {
 
         // Spawn QUIC LLM + Meeting Bot connection tasks
         let llm_entries: Vec<_> = self
-            .quic_llm_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_llm_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in llm_entries {
             let shutdown_rx = self.shutdown_rx.clone();
@@ -1094,9 +1086,8 @@ impl ServiceManager {
                 let prompt_registry = self.prompt_registry.clone();
                 let model_category = self
                     .llm_model_categories
-                    .read()
                     .get(&name)
-                    .copied()
+                    .map(|r| *r.value())
                     .unwrap_or_default();
                 tokio::spawn(async move {
                     Self::quic_llm_connection_loop(
@@ -1113,10 +1104,7 @@ impl ServiceManager {
 
         // Spawn QUIC STT connection tasks
         let stt_entries: Vec<_> = self
-            .quic_stt_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_stt_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in stt_entries {
             let shutdown_rx = self.shutdown_rx.clone();
@@ -1136,10 +1124,7 @@ impl ServiceManager {
 
         // Spawn QUIC Memory connection tasks (z obsluga callbacks)
         let memory_entries: Vec<_> = self
-            .quic_memory_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_memory_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in memory_entries {
             let callback_tx = self.callback_tx.clone();
@@ -1161,17 +1146,17 @@ impl ServiceManager {
 
         let all_services: Vec<(String, Arc<QuicServiceHandle>)> = {
             let mut entries = Vec::new();
-            for (n, h) in self.quic_tts_services.read().iter() {
-                entries.push((n.clone(), h.clone()));
+            for r in self.quic_tts_services.iter() {
+                entries.push((r.key().clone(), r.value().clone()));
             }
-            for (n, h) in self.quic_stt_services.read().iter() {
-                entries.push((n.clone(), h.clone()));
+            for r in self.quic_stt_services.iter() {
+                entries.push((r.key().clone(), r.value().clone()));
             }
-            for (n, h) in self.quic_llm_services.read().iter() {
-                entries.push((n.clone(), h.clone()));
+            for r in self.quic_llm_services.iter() {
+                entries.push((r.key().clone(), r.value().clone()));
             }
-            for (n, h) in self.quic_embedding_services.read().iter() {
-                entries.push((n.clone(), h.clone()));
+            for r in self.quic_embedding_services.iter() {
+                entries.push((r.key().clone(), r.value().clone()));
             }
             entries
         };
@@ -1860,7 +1845,7 @@ impl ServiceManager {
 
     /// Pobierz RAG client jesli dostepny (non-blocking)
     pub async fn get_rag_client(&self, service_name: &str) -> Option<Arc<RAGClient>> {
-        let handle = self.rag_services.read().get(service_name).cloned()?;
+        let handle = self.rag_services.get(service_name).map(|r| r.value().clone())?;
         handle.get_client().await
     }
 
@@ -1871,9 +1856,8 @@ impl ServiceManager {
     ) -> Option<Arc<crate::net::quic::QuicClient>> {
         let handle = self
             .quic_embedding_services
-            .read()
             .get(service_name)
-            .cloned()?;
+            .map(|r| r.value().clone())?;
         handle.get_client().await
     }
 
@@ -1882,7 +1866,7 @@ impl ServiceManager {
         &self,
         service_name: &str,
     ) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handle = self.quic_tts_services.read().get(service_name).cloned()?;
+        let handle = self.quic_tts_services.get(service_name).map(|r| r.value().clone())?;
         handle.get_client().await
     }
 
@@ -1891,7 +1875,7 @@ impl ServiceManager {
         &self,
         service_name: &str,
     ) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handle = self.quic_llm_services.read().get(service_name).cloned()?;
+        let handle = self.quic_llm_services.get(service_name).map(|r| r.value().clone())?;
         handle.get_client().await
     }
 
@@ -1900,7 +1884,7 @@ impl ServiceManager {
         &self,
         service_name: &str,
     ) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handle = self.quic_stt_services.read().get(service_name).cloned()?;
+        let handle = self.quic_stt_services.get(service_name).map(|r| r.value().clone())?;
         handle.get_client().await
     }
 
@@ -1915,7 +1899,7 @@ impl ServiceManager {
     /// Sprawdza czy serwis ma HTTP backends (statyczne lub dynamiczne)
     pub fn has_http_backends(&self, service_name: &str) -> bool {
         self.service_backends.contains_key(service_name)
-            || self.dynamic_backends.read().contains_key(service_name)
+            || self.dynamic_backends.contains_key(service_name)
     }
 
     /// Pobierz backend clients (statyczne lub dynamiczne) — klonuje Arc referencje
@@ -1926,10 +1910,9 @@ impl ServiceManager {
         if let Some(v) = self.service_backends.get(service_name) {
             return Some(v.clone());
         }
-        let dyn_map = self.dynamic_backends.read();
-        dyn_map
+        self.dynamic_backends
             .get(service_name)
-            .map(|(backends, _)| backends.clone())
+            .map(|r| r.value().0.clone())
     }
 
     /// Pobierz load balancing strategy
@@ -1944,8 +1927,8 @@ impl ServiceManager {
                 create_strategy("round_robin", &[backend.clone()], vec![1]).unwrap()
             });
 
-        let mut dyn_map = self.dynamic_backends.write();
-        let entry = dyn_map
+        let mut entry = self
+            .dynamic_backends
             .entry(service_name.to_string())
             .or_insert_with(|| (Vec::new(), strategy));
         if !entry
@@ -1982,7 +1965,7 @@ impl ServiceManager {
 
     /// Sprawdz czy RAG jest dostepny
     pub async fn is_rag_available(&self, service_name: &str) -> bool {
-        let handle = self.rag_services.read().get(service_name).cloned();
+        let handle = self.rag_services.get(service_name).map(|r| r.value().clone());
         match handle {
             Some(h) => h.is_available().await,
             None => false,
@@ -2000,42 +1983,38 @@ impl ServiceManager {
 
     /// Sprawdz czy serwis RAG istnieje (niezaleznie od stanu polaczenia)
     pub fn has_rag_service(&self, service_name: &str) -> bool {
-        self.rag_services.read().contains_key(service_name)
+        self.rag_services.contains_key(service_name)
     }
 
     /// Sprawdz czy serwis QUIC embedding istnieje
     pub fn has_quic_embedding_service(&self, service_name: &str) -> bool {
-        self.quic_embedding_services
-            .read()
-            .contains_key(service_name)
+        self.quic_embedding_services.contains_key(service_name)
     }
 
     /// Sprawdz czy serwis TTS istnieje (HTTP lub QUIC)
     pub fn has_tts_service(&self, service_name: &str) -> bool {
         self.tts_clients.contains_key(service_name)
-            || self.quic_tts_services.read().contains_key(service_name)
+            || self.quic_tts_services.contains_key(service_name)
     }
 
     /// Sprawdz czy serwis QUIC TTS istnieje
     pub fn has_quic_tts_service(&self, service_name: &str) -> bool {
-        self.quic_tts_services.read().contains_key(service_name)
+        self.quic_tts_services.contains_key(service_name)
     }
 
     /// Sprawdz czy serwis QUIC LLM istnieje
     pub fn has_quic_llm_service(&self, service_name: &str) -> bool {
-        self.quic_llm_services.read().contains_key(service_name)
+        self.quic_llm_services.contains_key(service_name)
     }
 
     /// Sprawdz czy model jest obslugiwany przez lokalna inferencje in-process
     pub fn has_local_inference_service(&self, model_name: &str) -> bool {
-        self.local_inference_models.read().contains(model_name)
+        self.local_inference_models.contains_key(model_name)
     }
 
     /// Rejestruje model jako obslugiwany lokalnie (in-process MLX/llama.cpp)
     pub fn register_local_inference_model(&self, model_name: &str) {
-        self.local_inference_models
-            .write()
-            .insert(model_name.to_string());
+        self.local_inference_models.insert(model_name.to_string(), ());
         info!(
             "LocalInference: zarejestrowano model '{}' do obslugi in-process",
             model_name
@@ -2044,28 +2023,27 @@ impl ServiceManager {
 
     /// Sprawdz czy serwis QUIC STT istnieje
     pub fn has_quic_stt_service(&self, service_name: &str) -> bool {
-        self.quic_stt_services.read().contains_key(service_name)
+        self.quic_stt_services.contains_key(service_name)
     }
 
     /// Sprawdz czy serwis LLM istnieje (HTTP lub QUIC)
     pub fn has_llm_service(&self, service_name: &str) -> bool {
         self.service_backends.contains_key(service_name)
-            || self.quic_llm_services.read().contains_key(service_name)
+            || self.quic_llm_services.contains_key(service_name)
     }
 
     /// Sprawdz czy serwis STT istnieje (HTTP lub QUIC)
     pub fn has_stt_service(&self, service_name: &str) -> bool {
         self.service_backends.contains_key(service_name)
-            || self.quic_stt_services.read().contains_key(service_name)
+            || self.quic_stt_services.contains_key(service_name)
     }
 
     /// Pobierz nazwe pierwszego serwisu TTS (dla fallback) - preferuje QUIC
     pub fn get_first_tts_service_name(&self) -> Option<String> {
         self.quic_tts_services
-            .read()
-            .keys()
+            .iter()
             .next()
-            .cloned()
+            .map(|r| r.key().clone())
             .or_else(|| self.tts_clients.keys().next().cloned())
     }
 
@@ -2076,8 +2054,11 @@ impl ServiceManager {
 
     /// Pobierz pierwszy dostepny QUIC TTS client (async, dla fallback)
     pub async fn get_first_quic_tts_client(&self) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handles: Vec<Arc<QuicServiceHandle>> =
-            self.quic_tts_services.read().values().cloned().collect();
+        let handles: Vec<Arc<QuicServiceHandle>> = self
+            .quic_tts_services
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
         for handle in handles {
             if let Some(client) = handle.get_client().await {
                 return Some(client);
@@ -2088,13 +2069,16 @@ impl ServiceManager {
 
     /// Pobierz nazwe pierwszego serwisu STT (dla fallback) - preferuje QUIC
     pub fn get_first_stt_service_name(&self) -> Option<String> {
-        self.quic_stt_services.read().keys().next().cloned()
+        self.quic_stt_services.iter().next().map(|r| r.key().clone())
     }
 
     /// Pobierz pierwszy dostepny QUIC STT client (async, dla fallback)
     pub async fn get_first_quic_stt_client(&self) -> Option<Arc<crate::net::quic::QuicClient>> {
-        let handles: Vec<Arc<QuicServiceHandle>> =
-            self.quic_stt_services.read().values().cloned().collect();
+        let handles: Vec<Arc<QuicServiceHandle>> = self
+            .quic_stt_services
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
         for handle in handles {
             if let Some(client) = handle.get_client().await {
                 return Some(client);
@@ -2110,7 +2094,7 @@ impl ServiceManager {
 
     /// Sprawdz czy sa jakiekolwiek RAG serwisy
     pub fn has_rag_services(&self) -> bool {
-        !self.rag_services.read().is_empty()
+        !self.rag_services.is_empty()
     }
 
     /// Pobierz nazwy wszystkich service backends
@@ -2120,7 +2104,7 @@ impl ServiceManager {
 
     /// Pobierz nazwy wszystkich RAG serwisow
     pub fn rag_service_names(&self) -> Vec<String> {
-        self.rag_services.read().keys().cloned().collect()
+        self.rag_services.iter().map(|r| r.key().clone()).collect()
     }
 
     /// Clone service backends (dla callback handler)
@@ -2131,9 +2115,8 @@ impl ServiceManager {
     /// Clone QUIC embedding services handles (dla callback handler - zwraca nazwy)
     pub fn quic_embedding_service_names(&self) -> Vec<String> {
         self.quic_embedding_services
-            .read()
-            .keys()
-            .cloned()
+            .iter()
+            .map(|r| r.key().clone())
             .collect()
     }
 
@@ -2149,7 +2132,7 @@ impl ServiceManager {
 
     /// Pobierz RAG handle (dla bezposredniego dostepu)
     pub fn get_rag_handle(&self, service_name: &str) -> Option<Arc<RAGServiceHandle>> {
-        self.rag_services.read().get(service_name).cloned()
+        self.rag_services.get(service_name).map(|r| r.value().clone())
     }
 
     /// Pobierz status wszystkich serwisow (do diagnostyki)
@@ -2161,10 +2144,7 @@ impl ServiceManager {
         }
 
         let rag_entries: Vec<_> = self
-            .rag_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .rag_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in rag_entries {
             let state = handle.state.read().await;
@@ -2178,10 +2158,7 @@ impl ServiceManager {
         }
 
         let embedding_entries: Vec<_> = self
-            .quic_embedding_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_embedding_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in embedding_entries {
             let state = handle.state.read().await;
@@ -2199,10 +2176,7 @@ impl ServiceManager {
         }
 
         let tts_entries: Vec<_> = self
-            .quic_tts_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_tts_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in tts_entries {
             let state = handle.state.read().await;
@@ -2220,10 +2194,7 @@ impl ServiceManager {
         }
 
         let llm_entries: Vec<_> = self
-            .quic_llm_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_llm_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in llm_entries {
             let state = handle.state.read().await;
@@ -2241,10 +2212,7 @@ impl ServiceManager {
         }
 
         let stt_entries: Vec<_> = self
-            .quic_stt_services
-            .read()
-            .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .quic_stt_services.iter().map(|r| (r.key().clone(), r.value().clone()))
             .collect();
         for (name, handle) in stt_entries {
             let state = handle.state.read().await;
@@ -2289,7 +2257,7 @@ impl ServiceManager {
             }
             "stt" => self.has_quic_stt_service(model_name),
             "rag" => self.has_rag_service(model_name),
-            "memory" => self.quic_memory_services.read().contains_key(model_name),
+            "memory" => self.quic_memory_services.contains_key(model_name),
             _ => false,
         };
 
@@ -2377,12 +2345,8 @@ impl ServiceManager {
 
         match service_type {
             "llm" => {
-                self.quic_llm_services
-                    .write()
-                    .insert(name.clone(), handle.clone());
-                self.llm_model_categories
-                    .write()
-                    .insert(name.clone(), crate::config::LlmModelCategory::Main);
+                self.quic_llm_services.insert(name.clone(), handle.clone());
+                self.llm_model_categories.insert(name.clone(), crate::config::LlmModelCategory::Main);
                 let prompt_registry = self.prompt_registry.clone();
                 tokio::spawn(async move {
                     Self::quic_llm_connection_loop(
@@ -2396,9 +2360,7 @@ impl ServiceManager {
                 });
             }
             "tts" => {
-                self.quic_tts_services
-                    .write()
-                    .insert(name.clone(), handle.clone());
+                self.quic_tts_services.insert(name.clone(), handle.clone());
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
                     Self::quic_service_connection_loop(
@@ -2412,9 +2374,7 @@ impl ServiceManager {
                 });
             }
             "stt" => {
-                self.quic_stt_services
-                    .write()
-                    .insert(name.clone(), handle.clone());
+                self.quic_stt_services.insert(name.clone(), handle.clone());
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
                     Self::quic_service_connection_loop(
@@ -2428,9 +2388,7 @@ impl ServiceManager {
                 });
             }
             "embedding" => {
-                self.quic_embedding_services
-                    .write()
-                    .insert(name.clone(), handle.clone());
+                self.quic_embedding_services.insert(name.clone(), handle.clone());
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
                     Self::quic_service_connection_loop(
@@ -2444,18 +2402,14 @@ impl ServiceManager {
                 });
             }
             "memory" => {
-                self.quic_memory_services
-                    .write()
-                    .insert(name.clone(), handle.clone());
+                self.quic_memory_services.insert(name.clone(), handle.clone());
                 let callback_tx = self.callback_tx.clone();
                 tokio::spawn(async move {
                     Self::memory_connection_loop(name, handle, callback_tx, shutdown_rx).await;
                 });
             }
             "meeting-bot" => {
-                self.quic_llm_services
-                    .write()
-                    .insert(name.clone(), handle.clone());
+                self.quic_llm_services.insert(name.clone(), handle.clone());
                 let event_bus = self.event_bus.read().clone();
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
@@ -2479,38 +2433,38 @@ impl ServiceManager {
     pub fn remove_quic_service(&self, name: &str, service_type: &str) {
         match service_type {
             "llm" => {
-                self.llm_model_categories.write().remove(name);
-                if let Some(h) = self.quic_llm_services.write().remove(name) {
+                self.llm_model_categories.remove(name);
+                if let Some((_, h)) = self.quic_llm_services.remove(name) {
                     h.shutdown();
                 }
             }
             "tts" => {
-                if let Some(h) = self.quic_tts_services.write().remove(name) {
+                if let Some((_, h)) = self.quic_tts_services.remove(name) {
                     h.shutdown();
                 }
             }
             "stt" => {
-                if let Some(h) = self.quic_stt_services.write().remove(name) {
+                if let Some((_, h)) = self.quic_stt_services.remove(name) {
                     h.shutdown();
                 }
             }
             "embedding" => {
-                if let Some(h) = self.quic_embedding_services.write().remove(name) {
+                if let Some((_, h)) = self.quic_embedding_services.remove(name) {
                     h.shutdown();
                 }
             }
             "rag" => {
-                if let Some(h) = self.rag_services.write().remove(name) {
+                if let Some((_, h)) = self.rag_services.remove(name) {
                     h.shutdown();
                 }
             }
             "memory" => {
-                if let Some(h) = self.quic_memory_services.write().remove(name) {
+                if let Some((_, h)) = self.quic_memory_services.remove(name) {
                     h.shutdown();
                 }
             }
             "meeting-bot" => {
-                if let Some(h) = self.quic_llm_services.write().remove(name) {
+                if let Some((_, h)) = self.quic_llm_services.remove(name) {
                     h.shutdown();
                 }
             }
@@ -2528,11 +2482,11 @@ impl ServiceManager {
 
     /// Rejestruje mapowanie model -> serwis. Jesli model juz istnieje, dodaje serwis do puli.
     pub fn register_model_mapping(&self, model_name: &str, service_name: &str) {
-        let mut pool = self.model_pool.write();
-        let entry = pool
+        let mut entry = self
+            .model_pool
             .entry(model_name.to_string())
             .or_insert_with(ModelPoolEntry::new);
-        if !entry.service_names.contains(&service_name.to_string()) {
+        if !entry.service_names.iter().any(|s| s == service_name) {
             entry.service_names.push(service_name.to_string());
             info!(
                 "ModelPool: '{}' -> dodano serwis '{}' (lacznie: {})",
@@ -2545,46 +2499,45 @@ impl ServiceManager {
 
     /// Zwraca liste serwisow obslugujacych dany model
     pub fn resolve_model_services(&self, model_name: &str) -> Option<Vec<String>> {
-        let pool = self.model_pool.read();
-        pool.get(model_name).map(|e| e.service_names.clone())
+        self.model_pool
+            .get(model_name)
+            .map(|e| e.service_names.clone())
     }
 
     /// Wybiera najlepszy serwis dla modelu (round-robin)
     pub fn select_service_for_model(&self, model_name: &str) -> Option<String> {
-        let pool = self.model_pool.read();
-        pool.get(model_name)
-            .and_then(|e| e.next_service())
-            .map(|s| s.to_string())
+        self.model_pool
+            .get(model_name)
+            .and_then(|e| e.next_service().map(|s| s.to_string()))
     }
 
     /// Sprawdza czy model istnieje w puli
     pub fn has_model(&self, model_name: &str) -> bool {
-        self.model_pool.read().contains_key(model_name)
+        self.model_pool.contains_key(model_name)
     }
 
     /// Usuwa mapowanie serwisu z puli modelu
     pub fn remove_model_mapping(&self, model_name: &str, service_name: &str) {
-        let mut pool = self.model_pool.write();
-        if let Some(entry) = pool.get_mut(model_name) {
+        let remaining = if let Some(mut entry) = self.model_pool.get_mut(model_name) {
             entry.service_names.retain(|s| s != service_name);
-            if entry.service_names.is_empty() {
-                pool.remove(model_name);
-                info!("ModelPool: '{}' -> usunieto (brak serwisow)", model_name);
-            } else {
-                info!(
-                    "ModelPool: '{}' -> usunieto serwis '{}' (pozostalo: {})",
-                    model_name,
-                    service_name,
-                    entry.service_names.len()
-                );
-            }
+            entry.service_names.len()
+        } else {
+            return;
+        };
+        if remaining == 0 {
+            self.model_pool.remove(model_name);
+            info!("ModelPool: '{}' -> usunieto (brak serwisow)", model_name);
+        } else {
+            info!(
+                "ModelPool: '{}' -> usunieto serwis '{}' (pozostalo: {})",
+                model_name, service_name, remaining
+            );
         }
     }
 
     /// Zmienia strategie load-balancing dla modelu w puli
     pub fn set_model_strategy(&self, model_name: &str, strategy: PoolStrategy) -> bool {
-        let mut pool = self.model_pool.write();
-        if let Some(entry) = pool.get_mut(model_name) {
+        if let Some(mut entry) = self.model_pool.get_mut(model_name) {
             entry.strategy = strategy;
             info!(
                 "ModelPool: '{}' -> strategia zmieniona na {:?}",
@@ -2598,8 +2551,8 @@ impl ServiceManager {
 
     /// Ustawia liste serwisow dla modelu w puli (zastepuje istniejace)
     pub fn set_model_services(&self, model_name: &str, service_names: Vec<String>) {
-        let mut pool = self.model_pool.write();
-        let entry = pool
+        let mut entry = self
+            .model_pool
             .entry(model_name.to_string())
             .or_insert_with(ModelPoolEntry::new);
         entry.service_names = service_names;
@@ -2612,14 +2565,15 @@ impl ServiceManager {
 
     /// Zwraca informacje o model_pool (do diagnostyki/API)
     pub fn get_model_pool_info(&self) -> Vec<(String, Vec<String>, String, String)> {
-        let pool = self.model_pool.read();
-        pool.iter()
-            .map(|(name, entry)| {
-                let strategy = entry.strategy.to_string();
+        self.model_pool
+            .iter()
+            .map(|kv| {
+                let name = kv.key().clone();
+                let entry = kv.value();
                 (
-                    name.clone(),
+                    name,
                     entry.service_names.clone(),
-                    strategy,
+                    entry.strategy.to_string(),
                     entry.service_type.clone(),
                 )
             })
@@ -2635,8 +2589,7 @@ impl ServiceManager {
                     {
                         if !model_name.is_empty() {
                             self.register_model_mapping(model_name, &svc.name);
-                            let mut pool = self.model_pool.write();
-                            if let Some(entry) = pool.get_mut(model_name) {
+                            if let Some(mut entry) = self.model_pool.get_mut(model_name) {
                                 entry.service_type = svc.service_type.clone();
                             }
                         }
@@ -2644,8 +2597,7 @@ impl ServiceManager {
                 }
             }
         }
-        let pool = self.model_pool.read();
-        info!("ModelPool: Zaladowano {} modeli z DB", pool.len());
+        info!("ModelPool: Zaladowano {} modeli z DB", self.model_pool.len());
     }
 }
 

@@ -629,6 +629,8 @@ mod services_manifest_build {
         #[serde(default)]
         pub icon: Option<String>,
         #[serde(default)]
+        pub resource_kind: Option<ResourceKind>,
+        #[serde(default)]
         pub requires_model: Option<bool>,
         #[serde(default)]
         pub gpu_supported: Option<bool>,
@@ -663,6 +665,13 @@ mod services_manifest_build {
         SherpaStt,
         Comfyui,
         Custom,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum ResourceKind {
+        Ai,
+        Infra,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

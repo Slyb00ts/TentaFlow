@@ -13,6 +13,7 @@ import { FlowPalette } from '/js/modules/flows-builder/palette.js';
 import { FlowConfig } from '/js/modules/flows-builder/config.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
+import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 
 // Stan aktualnie otwartego buildera (przechowywany poza klasa dla param route'a).
 let pendingFlowId = null;
@@ -164,7 +165,7 @@ const FlowBuilderScreen = {
         const tpl = node ? state.templatesMap.get(node.type) : null;
         state.config.show(node, tpl);
         const crumb = root.querySelector('[data-role="crumb-name"]');
-        if (crumb) crumb.textContent = node ? (node.label || node.type) : (state.flow?.name || I18n.t('flows_builder.crumb_empty'));
+        if (crumb) crumb.textContent = node ? getNodeDisplayTitle(node, tpl) : (state.flow?.name || I18n.t('flows_builder.crumb_empty'));
       },
       onViewChange: (v) => {
         const zl = root.querySelector('[data-role="zoom-level"]');

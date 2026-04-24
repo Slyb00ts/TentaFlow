@@ -10,7 +10,11 @@ use std::sync::OnceLock;
 use tentaflow_protocol::SystemEventPayload;
 use tokio::sync::broadcast;
 
-const CHANNEL_CAPACITY: usize = 256;
+// Buffer event-ow systemowych. Kazdy WS client subskrybuje — przy burst
+// eventow (mass pair/unpair, flap mesh, service announce z wielu nodow)
+// bufor 256 sie wypelnial i klienci dostawali Lagged(n) → tracimy eventy.
+// 8192 = ~2MB pamieci per-process (SystemEventPayload ~200B), zaniedbywalne.
+const CHANNEL_CAPACITY: usize = 8192;
 
 static SENDER: OnceLock<broadcast::Sender<SystemEventPayload>> = OnceLock::new();
 

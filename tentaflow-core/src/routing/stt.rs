@@ -768,11 +768,7 @@ impl Router {
             let mut client = None;
             let memory_handles: Vec<_> = self
                 .service_manager
-                .quic_memory_services
-                .read()
-                .values()
-                .cloned()
-                .collect();
+                .quic_memory_services.iter().map(|r| r.value().clone()).collect();
             for handle in memory_handles {
                 let client_guard = handle.client.read().await;
                 if let Some(c) = client_guard.as_ref() {
