@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, RelayUrl};
@@ -220,6 +221,13 @@ impl PairingHandler {
             .map_err(|e| anyhow::anyhow!("pairing: write body: {e}"))?;
         send.finish()
             .map_err(|e| anyhow::anyhow!("pairing: finish send stream: {e}"))?;
+
+        // KRYTYCZNE: accept() zaraz po returnie upuszcza Connection i strumien
+        // moze nie zdazyc dostarczyc ostatnich bajtow — inicjator dostaje
+        // "read response len: connection lost". Czekamy az peer potwierdzi
+        // odbior (stopped() resolvuje kiedy pelen ACK doszedl albo peer wyslal
+        // STOP_SENDING). Krotki 5s timeout na wypadek gdyby peer zwisl.
+        let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
 
         Ok(())
     }
