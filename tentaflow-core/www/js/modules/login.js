@@ -69,7 +69,7 @@ const LoginScreen = {
       try {
         const result = await ApiBinary.action('authLoginRequest', { username, password });
         if (result.variant === 'AuthLoginResponse' && result.jwt) {
-          ApiBinary.setJwt(result.jwt);
+          await ApiBinary.setJwt(result.jwt);
           // Kinematograficzne przejście: zoom do oka → reveal UI.
           // Karta logowania fade-outuje przez klasę CSS, UI montujemy
           // w onMidpoint (ok. 1.1 s), face-bg chowa się w onComplete.
