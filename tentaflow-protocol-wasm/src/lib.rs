@@ -837,6 +837,43 @@ pub fn encode_service_redeploy_request(
     .map_err(|e| JsError::new(&e))
 }
 
+// ---- Meeting VNC tunnel (same-node websockify bridge) ----
+
+/// MessageBody::VncTunnelBody(ReqOpen) — start streaming tunnel for session.
+#[wasm_bindgen(js_name = encodeVncTunnelOpenRequest)]
+pub fn encode_vnc_tunnel_open_request(session_id: f64) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{VncTunnelOpenRequest, VncTunnelPayload};
+    encode_body_inner(&MessageBody::VncTunnelBody(VncTunnelPayload::ReqOpen(
+        VncTunnelOpenRequest {
+            session_id: session_id as i64,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::VncTunnelBody(ReqSend) — browser → container RFB bytes.
+#[wasm_bindgen(js_name = encodeVncTunnelSendRequest)]
+pub fn encode_vnc_tunnel_send_request(
+    tunnel_id: String,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{VncTunnelPayload, VncTunnelSendRequest};
+    encode_body_inner(&MessageBody::VncTunnelBody(VncTunnelPayload::ReqSend(
+        VncTunnelSendRequest { tunnel_id, bytes },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::VncTunnelBody(ReqClose) — tear down tunnel explicitly.
+#[wasm_bindgen(js_name = encodeVncTunnelCloseRequest)]
+pub fn encode_vnc_tunnel_close_request(tunnel_id: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{VncTunnelCloseRequest, VncTunnelPayload};
+    encode_body_inner(&MessageBody::VncTunnelBody(VncTunnelPayload::ReqClose(
+        VncTunnelCloseRequest { tunnel_id },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
 // ---- Addons + Users (FAZA 6) ----
 
 /// MessageBody::AddonsListRequest (unit variant).
@@ -3969,6 +4006,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MeetingBody(p) => {
             meeting_payload_to_js(&obj, p);
         }
+        MessageBody::VncTunnelBody(p) => {
+            vnc_tunnel_payload_to_js(&obj, p);
+        }
         MessageBody::MeetingLiveEventBody(event) => {
             set(&obj, "variant", "MeetingLiveEventBody".into());
             set(&obj, "meetingKey", event.meeting_key.clone().into());
@@ -4142,6 +4182,50 @@ fn meeting_entry_to_js(e: tentaflow_protocol::MeetingTranscriptEntry) -> js_sys:
     set(&o, "text", e.text.into());
     set(&o, "model", e.model.into());
     o
+}
+
+fn vnc_tunnel_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::VncTunnelPayload) {
+    use tentaflow_protocol::VncTunnelPayload as VP;
+    match p {
+        VP::ReqOpen(r) => {
+            set(obj, "variant", "VncTunnelOpenRequest".into());
+            set(obj, "sessionId", (r.session_id as f64).into());
+        }
+        VP::ResOpen(r) => {
+            set(obj, "variant", "VncTunnelOpenResponse".into());
+            set(obj, "status", r.status.into());
+            set(obj, "tunnelId", r.tunnel_id.into());
+            set(obj, "error", r.error.into());
+        }
+        VP::Chunk(c) => {
+            set(obj, "variant", "VncTunnelChunk".into());
+            set(obj, "tunnelId", c.tunnel_id.into());
+            set(obj, "bytes", js_sys::Uint8Array::from(c.bytes.as_slice()).into());
+        }
+        VP::ReqSend(r) => {
+            set(obj, "variant", "VncTunnelSendRequest".into());
+            set(obj, "tunnelId", r.tunnel_id.into());
+            set(obj, "bytes", js_sys::Uint8Array::from(r.bytes.as_slice()).into());
+        }
+        VP::ResSend(r) => {
+            set(obj, "variant", "VncTunnelSendResponse".into());
+            set(obj, "ok", r.ok.into());
+            set(obj, "error", r.error.into());
+        }
+        VP::ReqClose(r) => {
+            set(obj, "variant", "VncTunnelCloseRequest".into());
+            set(obj, "tunnelId", r.tunnel_id.into());
+        }
+        VP::ResClose(r) => {
+            set(obj, "variant", "VncTunnelCloseResponse".into());
+            set(obj, "ok", r.ok.into());
+        }
+        VP::StreamEnd(e) => {
+            set(obj, "variant", "VncTunnelStreamEnd".into());
+            set(obj, "tunnelId", e.tunnel_id.into());
+            set(obj, "reason", e.reason.into());
+        }
+    }
 }
 
 fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPayload) {

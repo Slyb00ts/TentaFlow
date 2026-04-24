@@ -470,6 +470,16 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "MeetingTranscriptExportResponse"
             }
         },
+        MessageBody::VncTunnelBody(p) => match p {
+            tentaflow_protocol::VncTunnelPayload::ReqOpen(_) => "VncTunnelOpenRequest",
+            tentaflow_protocol::VncTunnelPayload::ResOpen(_) => "VncTunnelOpenResponse",
+            tentaflow_protocol::VncTunnelPayload::Chunk(_) => "VncTunnelChunk",
+            tentaflow_protocol::VncTunnelPayload::ReqSend(_) => "VncTunnelSendRequest",
+            tentaflow_protocol::VncTunnelPayload::ResSend(_) => "VncTunnelSendResponse",
+            tentaflow_protocol::VncTunnelPayload::ReqClose(_) => "VncTunnelCloseRequest",
+            tentaflow_protocol::VncTunnelPayload::ResClose(_) => "VncTunnelCloseResponse",
+            tentaflow_protocol::VncTunnelPayload::StreamEnd(_) => "VncTunnelStreamEnd",
+        },
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",
         MessageBody::AuditEventBody(_) => "AuditEvent",
