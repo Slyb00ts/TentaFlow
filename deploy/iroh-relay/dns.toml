@@ -1,0 +1,29 @@
+# =============================================================================
+# Plik: dns.toml
+# Opis: Konfiguracja iroh-dns-server. Zamontowany read-only do /data/dns.toml.
+#       iroh-dns-server serwuje zarowno klasyczne DNS TXT records (port 53/udp)
+#       jak i HTTPS /pkarr endpoint (port 8080 domyslnie).
+#       Dla TentaFlow uzywamy WYLACZNIE HTTPS /pkarr — DNS na 53 zostawiamy
+#       wylaczony, bo wymaga przywilei rootowania portu i wlasnej delegacji.
+# =============================================================================
+
+# ---- HTTPS /pkarr endpoint (to jest to co uzywa iroh client po przepiciu
+# ---- na nasz custom pkarr_dns_url) --------------------------------------------
+bind_port = 8080
+bind_addr = "0.0.0.0"
+
+# ---- Disable klasycznego DNS na 53 --------------------------------------------
+# iroh-dns-server domyslnie probuje bindowac 53/udp+tcp. Wylaczamy bo nie
+# jestesmy delegowanym serwerem DNS i i tak przekierowujemy klientow iroh
+# na HTTPS.
+[dns]
+disabled = true
+
+# ---- Storage (pkarr records persist) ------------------------------------------
+# Wolume iroh-dns-data przetrwa restart kontenera.
+db_path = "/data/pkarr.db"
+
+# ---- Opcjonalne — zezwolenia ----------------------------------------------------
+# Domyslnie serwer akceptuje publikacje od dowolnego klucza publicznego.
+# W srodowisku produkcyjnym mozna ograniczyc:
+# allowed_origins = ["relay.example.com"]
