@@ -1888,8 +1888,12 @@ fn spawn_liveness_timer(
         // podczas reroutingu. Liveness timer dziala TYLKO na zaufanych peerach
         // (dla nich gwarantujemy stabilny heartbeat co 500ms). Dla discovered/
         // unpaired iroh sam zarzadza zyciem polaczenia — nie wtracamy sie.
-        const DEGRADED_MS: i64 = 10_000;
-        const OFFLINE_MS: i64 = 30_000;
+        // QUIC keep-alive idzie co 10s a idle_timeout=25s (patrz net/iroh/
+        // endpoint.rs). Wiec jesli Quinn nie zdazyl zamknac sesji w 25s, a
+        // my nie widzimy heartbeatu wiekszego z nadmiarem, cos realnie padlo.
+        // OFFLINE_MS trzymamy lekko wyzej zeby nie wyscigac z Quinn close.
+        const DEGRADED_MS: i64 = 15_000;
+        const OFFLINE_MS: i64 = 45_000;
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
@@ -1918,7 +1922,7 @@ fn spawn_liveness_timer(
                     warn!(
                         peer = %node_id,
                         age_ms,
-                        "Liveness timer: trusted peer nieaktywny > 30s — force disconnect + reconnect"
+                        "Liveness timer: trusted peer nieaktywny > 45s — force disconnect + reconnect"
                     );
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "offline");
