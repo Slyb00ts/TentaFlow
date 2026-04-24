@@ -1,16 +1,15 @@
 // =============================================================================
-// Plik: validate.rs
-// Opis: Walidacja semantyczna service manifestow — implementuje 4 reguly ze
-//       SCHEMA.md (sekcja "Reguly walidacji semantycznej") oraz walidacje
-//       engine.id chroniaca przed path-traversal/RCE w sciezkach runtime.
+// File: validate.rs
+// Description: Semantic validation for service manifests. It implements the
+// schema rules from SCHEMA.md and validates engine ids used in runtime paths.
 // =============================================================================
 
 use super::types::*;
 use std::path::Path;
 
-/// Waliduje `engine.id` (oraz inne identyfikatory uzywane w sciezkach FS i URL).
-/// Regex: `^[a-z0-9][a-z0-9_-]{0,63}$` — kebab/snake_case, 1-64 znakow.
-/// Wspoldzielona z warstwa API (`is_valid_engine_id` w server.rs MUSI byc identyczna).
+/// Validates `engine.id` and other identifiers used in filesystem paths and URLs.
+/// Regex: `^[a-z0-9][a-z0-9_-]{0,63}$`.
+/// Shared with the API layer and must stay identical there.
 pub fn validate_engine_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     if bytes.is_empty() || bytes.len() > 64 {
@@ -28,36 +27,40 @@ pub fn validate_engine_id(id: &str) -> bool {
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error(
-        "Engine id = '{id}' nie spelnia wymaganego formatu \
-         '^[a-z0-9][a-z0-9_-]{{0,63}}$' (1-64 znakow, kebab/snake_case)"
+        "Engine id = '{id}' must match '^[a-z0-9][a-z0-9_-]{{0,63}}$'"
     )]
     InvalidEngineId { id: String },
 
     #[error(
-        "Engine '{engine_id}': brak sekcji deploymentu — wymagana przynajmniej jedna z \
-         [deploy.docker], [deploy.native], [deploy.external]"
+        "Engine '{engine_id}': missing deployment section; define at least one of \
+         [deploy.docker], [deploy.native], or [deploy.external]"
     )]
     NoDeploySection { engine_id: String },
 
     #[error(
-        "Engine '{engine_id}': deploy.native.runtime = embedded wymaga pola feature_flag \
-         (i nie moze miec binary_path/bundle_path)"
+        "Engine '{engine_id}': deploy.docker must define exactly one of context_path or compose_path"
+    )]
+    DockerRequiresSingleSource { engine_id: String },
+
+    #[error(
+        "Engine '{engine_id}': deploy.native.runtime = embedded requires feature_flag \
+         and must not define binary_path or bundle_path"
     )]
     EmbeddedRequiresFeatureFlag { engine_id: String },
 
     #[error(
-        "Engine '{engine_id}': deploy.native.runtime = binary wymaga pola binary_path \
-         (i nie moze miec feature_flag/bundle_path)"
+        "Engine '{engine_id}': deploy.native.runtime = binary requires binary_path \
+         and must not define feature_flag or bundle_path"
     )]
     BinaryRequiresBinaryPath { engine_id: String },
 
     #[error(
-        "Engine '{engine_id}': deploy.native.runtime = python-bundle wymaga pola bundle_path \
-         (i nie moze miec feature_flag/binary_path)"
+        "Engine '{engine_id}': deploy.native.runtime = python-bundle requires bundle_path \
+         and must not define feature_flag or binary_path"
     )]
     PythonBundleRequiresBundlePath { engine_id: String },
 
-    #[error("Engine '{engine_id}': sciezka {field} = '{path}' nie istnieje na dysku")]
+    #[error("Engine '{engine_id}': path {field} = '{path}' does not exist on disk")]
     PathMissing {
         engine_id: String,
         field: &'static str,
@@ -65,10 +68,9 @@ pub enum ValidationError {
     },
 }
 
-/// Waliduje pojedynczy manifest. 4 reguly ze SCHEMA.md.
+/// Validates a single manifest.
 ///
-/// Reguła 4 (sciezki istnieja na dysku) jest sprawdzana tylko gdy `containers_root`
-/// jest podany — runtime moze nie miec dostepu do FS containers/.
+/// The path-existence rule is only checked when `containers_root` is provided.
 pub fn validate_engine(
     manifest: &ServiceManifest,
     containers_root: Option<&Path>,
@@ -76,12 +78,12 @@ pub fn validate_engine(
     let mut errors = Vec::new();
     let eid = &manifest.engine.id;
 
-    // Reguła 1: engine.id musi spelniac whitelist regex.
+    // Rule 1: validate engine id against the whitelist regex.
     if !validate_engine_id(eid) {
         errors.push(ValidationError::InvalidEngineId { id: eid.clone() });
     }
 
-    // Reguła 2: minimum jedna sekcja deploy.
+    // Rule 2: at least one deploy section must be present.
     let deploy = &manifest.deploy;
     if deploy.docker.is_none() && deploy.native.is_none() && deploy.external.is_none() {
         errors.push(ValidationError::NoDeploySection {
@@ -89,7 +91,25 @@ pub fn validate_engine(
         });
     }
 
-    // Reguła 3: deploy.native.runtime spojny z polami.
+    if let Some(docker) = &deploy.docker {
+        let has_context = docker
+            .context_path
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_compose = docker
+            .compose_path
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if has_context == has_compose {
+            errors.push(ValidationError::DockerRequiresSingleSource {
+                engine_id: eid.clone(),
+            });
+        }
+    }
+
+    // Rule 3: native runtime must be consistent with its fields.
     if let Some(native) = &deploy.native {
         match native.runtime {
             NativeRuntime::Embedded => {
@@ -125,16 +145,15 @@ pub fn validate_engine(
         }
     }
 
-    // Reguła 4: sciezki na dysku (sprawdzana tylko build-time).
+    // Rule 4: referenced paths must exist on disk.
     if let Some(root) = containers_root {
         if let Some(d) = &deploy.docker {
-            check_path(
-                root,
-                &d.context_path,
-                "deploy.docker.context_path",
-                eid,
-                &mut errors,
-            );
+            if let Some(path) = &d.context_path {
+                check_path(root, path, "deploy.docker.context_path", eid, &mut errors);
+            }
+            if let Some(path) = &d.compose_path {
+                check_file(root, path, "deploy.docker.compose_path", eid, &mut errors);
+            }
         }
         if let Some(n) = &deploy.native {
             if let Some(p) = &n.binary_path {
@@ -162,6 +181,23 @@ fn check_path(
 ) {
     let full = root.join(rel);
     if !full.is_dir() {
+        errors.push(ValidationError::PathMissing {
+            engine_id: engine_id.to_string(),
+            field,
+            path: rel.to_string(),
+        });
+    }
+}
+
+fn check_file(
+    root: &Path,
+    rel: &str,
+    field: &'static str,
+    engine_id: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let full = root.join(rel);
+    if !full.is_file() {
         errors.push(ValidationError::PathMissing {
             engine_id: engine_id.to_string(),
             field,

@@ -42,7 +42,18 @@ fn empty_deploy() -> DeploySection {
 
 fn docker_deploy(context_path: &str, platforms: Vec<TargetOs>) -> DockerDeploy {
     DockerDeploy {
-        context_path: context_path.to_string(),
+        context_path: Some(context_path.to_string()),
+        compose_path: None,
+        platforms,
+        download_image: None,
+        download_size_mb: None,
+    }
+}
+
+fn docker_compose_deploy(compose_path: &str, platforms: Vec<TargetOs>) -> DockerDeploy {
+    DockerDeploy {
+        context_path: None,
+        compose_path: Some(compose_path.to_string()),
         platforms,
         download_image: None,
         download_size_mb: None,
@@ -177,6 +188,8 @@ recommended = true
     assert_eq!(parsed.engine.icon.as_deref(), Some("full-icon"));
 
     let d = parsed.deploy.docker.as_ref().unwrap();
+    assert_eq!(d.context_path.as_deref(), Some("llm/docker/full"));
+    assert_eq!(d.compose_path, None);
     assert_eq!(d.platforms, vec![TargetOs::Linux, TargetOs::Windows]);
     assert_eq!(d.download_size_mb, Some(1024));
 
@@ -278,6 +291,66 @@ fn validate_with_at_least_one_deploy_passes() {
         },
     );
     assert!(validate_engine(&manifest, None).is_ok());
+}
+
+#[test]
+fn validate_docker_with_compose_path_passes() {
+    let manifest = make_manifest(
+        make_engine("relay", Category::Tools),
+        DeploySection {
+            docker: Some(docker_compose_deploy(
+                "tools/docker/iroh-relay/stack.yml",
+                vec![TargetOs::Linux],
+            )),
+            native: None,
+            external: None,
+        },
+    );
+    assert!(validate_engine(&manifest, None).is_ok());
+}
+
+#[test]
+fn validate_docker_without_context_or_compose_fails() {
+    let manifest = make_manifest(
+        make_engine("relay", Category::Tools),
+        DeploySection {
+            docker: Some(DockerDeploy {
+                context_path: None,
+                compose_path: None,
+                platforms: vec![TargetOs::Linux],
+                download_image: None,
+                download_size_mb: None,
+            }),
+            native: None,
+            external: None,
+        },
+    );
+    let errs = validate_engine(&manifest, None).expect_err("blad oczekiwany");
+    assert!(errs
+        .iter()
+        .any(|e| matches!(e, ValidationError::DockerRequiresSingleSource { .. })));
+}
+
+#[test]
+fn validate_docker_with_context_and_compose_fails() {
+    let manifest = make_manifest(
+        make_engine("relay", Category::Tools),
+        DeploySection {
+            docker: Some(DockerDeploy {
+                context_path: Some("tools/docker/iroh-relay".to_string()),
+                compose_path: Some("tools/docker/iroh-relay/stack.yml".to_string()),
+                platforms: vec![TargetOs::Linux],
+                download_image: None,
+                download_size_mb: None,
+            }),
+            native: None,
+            external: None,
+        },
+    );
+    let errs = validate_engine(&manifest, None).expect_err("blad oczekiwany");
+    assert!(errs
+        .iter()
+        .any(|e| matches!(e, ValidationError::DockerRequiresSingleSource { .. })));
 }
 
 /// B2.-: Reguła 2 — brak wszystkich sekcji deploy daje NoDeploySection.
@@ -424,6 +497,31 @@ fn validate_path_exists_passes() {
         make_engine("e", Category::Llm),
         DeploySection {
             docker: Some(docker_deploy("llm/docker/test", vec![TargetOs::Linux])),
+            native: None,
+            external: None,
+        },
+    );
+    assert!(validate_engine(&manifest, Some(tmp.path())).is_ok());
+}
+
+#[test]
+fn validate_compose_file_exists_passes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let compose = tmp
+        .path()
+        .join("tools")
+        .join("docker")
+        .join("iroh-relay")
+        .join("stack.yml");
+    std::fs::create_dir_all(compose.parent().unwrap()).expect("create_dir_all");
+    std::fs::write(&compose, "services: {}\n").expect("write compose");
+    let manifest = make_manifest(
+        make_engine("relay", Category::Tools),
+        DeploySection {
+            docker: Some(docker_compose_deploy(
+                "tools/docker/iroh-relay/stack.yml",
+                vec![TargetOs::Linux],
+            )),
             native: None,
             external: None,
         },
