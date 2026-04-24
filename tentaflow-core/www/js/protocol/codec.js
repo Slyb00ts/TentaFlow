@@ -847,6 +847,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::DeploymentBody(ReqRedeploy { serviceId, forceIfActiveSessions }) */
+  serviceRedeployRequest(correlationId, { serviceId, forceIfActiveSessions = false }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceRedeployRequest(Number(serviceId), !!forceIfActiveSessions);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ServiceDeployRequest { engineId, modelId, deployMethod, nodeId: Uint8Array(32) } */
   serviceDeployRequest(correlationId, { engineId, modelId, deployMethod, nodeId }, sequence = 1) {
     assertReady();

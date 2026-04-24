@@ -819,6 +819,24 @@ pub fn encode_deployment_log_stream_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::DeploymentBody(DeploymentPayload::ReqRedeploy). Force flag asks
+/// backend to terminate active sessions (agents) rather than returning
+/// `active_sessions`.
+#[wasm_bindgen(js_name = encodeServiceRedeployRequest)]
+pub fn encode_service_redeploy_request(
+    service_id: f64,
+    force_if_active_sessions: bool,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{DeploymentPayload, ServiceRedeployRequest};
+    encode_body_inner(&MessageBody::DeploymentBody(DeploymentPayload::ReqRedeploy(
+        ServiceRedeployRequest {
+            service_id: service_id as i64,
+            force_if_active_sessions,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
 // ---- Addons + Users (FAZA 6) ----
 
 /// MessageBody::AddonsListRequest (unit variant).
@@ -2502,6 +2520,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(mid) = s.model_id {
                     set(&item, "modelId", mid.into());
                 }
+                if let Some(h) = s.deployed_source_hash {
+                    set(&item, "deployedSourceHash", h.into());
+                }
                 arr.push(&item.into());
             }
             set(&obj, "services", arr.into());
@@ -4072,6 +4093,19 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
             set(obj, "errorMessage", e.error_message.into());
             set(obj, "durationMs", (e.duration_ms as f64).into());
         }
+        DP::ReqRedeploy(req) => {
+            set(obj, "variant", "ServiceRedeployRequest".into());
+            set(obj, "serviceId", (req.service_id as f64).into());
+            set(obj, "forceIfActiveSessions", req.force_if_active_sessions.into());
+        }
+        DP::ResRedeploy(resp) => {
+            set(obj, "variant", "ServiceRedeployResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "deployId", resp.deploy_id.into());
+            set(obj, "newHash", resp.new_hash.into());
+            set(obj, "error", resp.error.into());
+            set(obj, "activeSessionCount", (resp.active_session_count as f64).into());
+        }
     }
 }
 
@@ -4330,6 +4364,13 @@ fn meeting_event_payload_to_js(
             }
             if let Some(v) = total_participants {
                 set(&data, "totalParticipants", (v as f64).into());
+            }
+        }
+        EP::LifecycleUpdate { stage, details } => {
+            set(obj, "type", "LifecycleUpdate".into());
+            set(&data, "stage", stage.into());
+            if let Some(d) = details {
+                set(&data, "details", d.into());
             }
         }
     }
