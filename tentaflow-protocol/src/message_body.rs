@@ -2665,6 +2665,14 @@ pub struct BrowserCaptureResponse {
     pub error: String,
 }
 
+/// Single inner enum carrying both browser capture messages so the top-level
+/// `MessageBody` spends only one variant slot on the feature.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum BrowserCapturePayload {
+    Request(BrowserCaptureRequest),
+    Response(BrowserCaptureResponse),
+}
+
 /// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
 /// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -3169,8 +3177,7 @@ pub enum MessageBody {
     VncTunnelBody(VncTunnelPayload),
 
     // ---- Meeting browser capture (one-shot RPC: screenshot / DOM snapshot) ----
-    BrowserCaptureRequestBody(BrowserCaptureRequest),
-    BrowserCaptureResponseBody(BrowserCaptureResponse),
+    BrowserCaptureBody(BrowserCapturePayload),
 
     // ---- Meeting live broadcast (unsolicited push, correlation_id=0) ----
     // Pushowany z writer task w ws_binary po każdym sukcesie
