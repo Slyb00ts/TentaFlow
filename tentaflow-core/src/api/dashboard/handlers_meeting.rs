@@ -69,6 +69,8 @@ fn desc_to_proto(d: crate::meeting::SessionDescriptor) -> MeetingSessionDescript
         bot_endpoint_id: d.bot_endpoint_id.unwrap_or_default(),
         container_name: d.container_name.unwrap_or_default(),
         owner_user_id: d.owner_user_id.unwrap_or(0),
+        lifecycle_stage: d.lifecycle_stage.unwrap_or_default(),
+        lifecycle_details: d.lifecycle_details.unwrap_or_default(),
     }
 }
 
@@ -90,6 +92,8 @@ fn empty_desc() -> MeetingSessionDescriptor {
         bot_endpoint_id: String::new(),
         container_name: String::new(),
         owner_user_id: 0,
+        lifecycle_stage: String::new(),
+        lifecycle_details: String::new(),
     }
 }
 

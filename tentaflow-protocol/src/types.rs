@@ -836,7 +836,30 @@ pub enum MeetingEventPayload {
         enrolled_speakers: Option<u32>,
         total_participants: Option<u32>,
     },
+    /// Etap cyklu życia sesji meeting bota. Emitowany przez bota przy przejściach
+    /// kluczowych fazami (spawn kontenera → chromium → prejoin → joined). Router
+    /// persistuje aktualny stage w `meeting_sessions.lifecycle_stage`, broadcast
+    /// do GUI idzie przez ten sam kanał co pozostałe MeetingEventPayload.
+    LifecycleUpdate {
+        /// Jeden ze stage stringów — patrz `LIFECYCLE_*` constants.
+        stage: String,
+        /// Opcjonalny komunikat błędu lub informacja diagnostyczna (np. przy
+        /// `LIFECYCLE_FAILED` pełny tekst błędu z `join_meeting`).
+        details: Option<String>,
+    },
 }
+
+/// Etapy cyklu życia sesji meeting bota. Używane w
+/// `MeetingEventPayload::LifecycleUpdate::stage` oraz w kolumnie
+/// `meeting_sessions.lifecycle_stage`. Zachować tę listę jako single source
+/// of truth — bot i router trzymają się tych samych stringów.
+pub const LIFECYCLE_CONTAINER_SPAWNED: &str = "container_spawned";
+pub const LIFECYCLE_BROWSER_LAUNCHED: &str = "browser_launched";
+pub const LIFECYCLE_NAVIGATING: &str = "navigating";
+pub const LIFECYCLE_PREJOIN_READY: &str = "prejoin_ready";
+pub const LIFECYCLE_JOINING: &str = "joining";
+pub const LIFECYCLE_JOINED: &str = "joined";
+pub const LIFECYCLE_FAILED: &str = "failed";
 
 /// Pojedynczy action item przesyłany w `ActionItemsUpdate`.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
