@@ -273,6 +273,14 @@ function renderRow(s) {
   const deployMode = extractDeployMode(cfg);
   const nodeLabel = s.nodeHostname
     || (s.nodeId ? `${s.nodeId.slice(0, 12)}…` : I18n.t('services.deploy_local'));
+  const isOnDemand = String(s.status || '').toLowerCase() === 'on_demand' || !!cfg?.on_demand;
+  const onDemandLabel = I18n.t('services.status.on_demand');
+  const quicAddrCell = isOnDemand
+    ? `<span style="color:var(--text-3); font-style:italic;">${escapeHtml(onDemandLabel)}</span>`
+    : (quicAddr ? `<code style="font-size:11px;">${escapeHtml(quicAddr)}</code>` : '<span style="color:var(--text-3);">—</span>');
+  const quicStatusCell = isOnDemand
+    ? `<span class="tag-status pending">${escapeHtml(onDemandLabel)}</span>`
+    : `<span data-quic-status="${escapeAttr(s.name)}"><span class="tag-status offline">${escapeHtml(I18n.t('services.status.none'))}</span></span>`;
   return `
     <tr data-key="svc-${escapeAttr(s.id)}">
       <td data-label="${escapeAttr(I18n.t('services.col_name'))}">
@@ -283,8 +291,8 @@ function renderRow(s) {
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_type'))}"><span class="scope-chip ${typeChipClass(s.serviceType)}">${escapeHtml((s.serviceType || '').toUpperCase())}</span></td>
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}" style="font-size: 12px;">${escapeHtml(nodeLabel)}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddr ? `<code style="font-size:11px;">${escapeHtml(quicAddr)}</code>` : '<span style="color:var(--text-3);">—</span>'}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}"><span data-quic-status="${escapeAttr(s.name)}"><span class="tag-status offline">${escapeHtml(I18n.t('services.status.none'))}</span></span></td>
+      <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddrCell}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}">${quicStatusCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
         <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
@@ -790,6 +798,8 @@ function typeChipClass(t) {
     case 'stt':
     case 'tts': return 'deploy';
     case 'rag': return 'mesh-admin';
+    case 'agent':
+    case 'tool': return 'mesh-admin';
     default: return 'license';
   }
 }

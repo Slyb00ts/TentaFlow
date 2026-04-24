@@ -316,10 +316,10 @@ async fn do_docker_deploy(
     phase(db, deploy_id, tx, "building", 90, "build done");
 
     // Dla agents/tools — build wystarczy. Kontener uruchamia MeetingManager /
-    // tools-executor ad-hoc, nie zostawiamy persistent service.
+    // tools-executor ad-hoc, nie zostawiamy persistent service. Mimo to rejestru­
+    // jemy wpis w services (status=on_demand) zeby zakladka Services pokazywala
+    // ze silnik jest zainstalowany i gotowy na spawn per-zadanie.
     if matches!(engine.category.as_str(), "agents" | "tools") {
-        // Teams-bot wymaga domyślnych aliasów modeli (stt/summarization/tts) i flow
-        // żeby zadziałał out-of-the-box po deployu — best-effort, nie blokujemy deploy.
         if engine.engine_id == "teams-bot" {
             if let Err(e) = crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults(db).await {
                 warn!("ensure_teams_bot_defaults nie powiodło się: {}", e);
@@ -327,6 +327,8 @@ async fn do_docker_deploy(
                 info!("domyślne aliasy i flow dla teams-bota zainicjalizowane");
             }
         }
+        register_on_demand_service(db, &engine.engine_id, &engine.category, &image_tag);
+        log_line(db, deploy_id, tx, "log", "serwis zarejestrowany (on_demand)");
         finish_success(
             db,
             deploy_id,
@@ -876,6 +878,28 @@ fn register_service(
     };
     let url = format!("http://127.0.0.1:{}", host_port);
     service_manager.register_quic_service(engine_id.to_string(), service_type, url, None, None);
+}
+
+/// Rejestruje wpis `services` dla silnika ktory nie utrzymuje persistent
+/// kontenera (agents/tools). Status=on_demand informuje GUI ze instancje sa
+/// spawnowane per-zadanie (teams-bot: per spotkanie przez MeetingManager).
+/// Idempotentne: jesli wpis z ta sama nazwa juz istnieje, nie nadpisujemy go.
+fn register_on_demand_service(db: &DbPool, engine_id: &str, category: &str, image_tag: &str) {
+    let config_json = serde_json::json!({
+        "deploy_mode": "docker",
+        "image": image_tag,
+        "on_demand": true,
+    })
+    .to_string();
+    if let Err(e) = crate::db::repository::upsert_service_on_demand(
+        db,
+        engine_id,
+        service_type_from_category(category),
+        Some(category),
+        &config_json,
+    ) {
+        warn!("register_on_demand_service '{}': {}", engine_id, e);
+    }
 }
 
 fn service_type_from_category(category: &str) -> &str {
