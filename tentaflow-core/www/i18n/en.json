@@ -1881,6 +1881,12 @@
       "export_empty": "Nothing to export",
       "export_failed": "Export failed",
       "vnc_unavailable": "VNC preview unavailable for this session",
+      "vnc_error_not_found": "VNC session not found",
+      "vnc_error_forbidden": "Access denied for VNC preview",
+      "vnc_error_no_port": "VNC port not allocated for this session",
+      "vnc_error_remote_node": "Session is hosted on another mesh node — VNC preview will be available in phase B",
+      "vnc_error_failed": "VNC tunnel error: {message}",
+      "vnc_disconnected": "VNC connection lost",
       "missing_key": "Missing meeting key",
       "load_failed": "Failed to load session",
       "open_button": "Live view"

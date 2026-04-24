@@ -1881,6 +1881,12 @@
       "export_empty": "Brak treści do eksportu",
       "export_failed": "Eksport nie powiódł się",
       "vnc_unavailable": "Podgląd VNC niedostępny dla tej sesji",
+      "vnc_error_not_found": "Nie znaleziono sesji VNC",
+      "vnc_error_forbidden": "Brak uprawnień do podglądu VNC",
+      "vnc_error_no_port": "Port VNC nie został przydzielony dla tej sesji",
+      "vnc_error_remote_node": "Sesja działa na innym węźle mesh — podgląd VNC będzie dostępny w fazie B",
+      "vnc_error_failed": "Błąd tunelu VNC: {message}",
+      "vnc_disconnected": "Połączenie VNC przerwane",
       "missing_key": "Brak klucza spotkania",
       "load_failed": "Nie udało się załadować sesji",
       "open_button": "Live view"
