@@ -330,20 +330,25 @@ async fn click_when_present(
 /// Sprawdza czy jestesmy w aktywnym spotkaniu (wykrywanie elementow UI).
 /// Dziala zarowno dla klasycznego Teams jak i light-meetings experience.
 async fn is_in_meeting(page: &Page) -> Result<bool> {
+    // Teams 2026 uses button id="hangup-button" (title="Leave") plus a handful of
+    // stable data-tid hooks on the stage wrappers. Older Teams builds still ship
+    // the data-tid="hangup-button" / "call-end" variants, so keep both families.
     let in_meeting = page
         .evaluate(
             r#"
             (function() {
-                // Light-meetings experience — po dolaczeniu sa przyciski mic/camera/hangup
+                if (document.querySelector('#hangup-button')) return true;
+                if (document.querySelector('#mic-button')) return true;
+                if (document.querySelector('[data-tid="modern-stage-wrapper"]')) return true;
+                if (document.querySelector('[data-tid="calling-right-side-panel"]')) return true;
+                if (document.querySelector('[data-tid="MixedStage-wrapper"]')) return true;
                 if (document.querySelector('[data-tid="call-end"]')) return true;
                 if (document.querySelector('[data-tid="toggle-mute"]')) return true;
                 if (document.querySelector('[data-tid="toggle-video"]')) return true;
-                // Klasyczny Teams
                 if (document.querySelector('[data-tid="calling-bar"]')) return true;
                 if (document.querySelector('[data-tid="hangup-button"]')) return true;
-                // Fallback po aria-label
                 if (document.querySelector('[aria-label="Leave"], [aria-label="Hang up"], [aria-label="Leave call"]')) return true;
-                // Obecnosc elementu audio z active stream (WebRTC peer connection ustanowiony)
+                if (document.querySelector('button[title="Leave"]')) return true;
                 const audios = document.querySelectorAll('audio');
                 for (const a of audios) {
                     if (a.srcObject && a.srcObject.getAudioTracks && a.srcObject.getAudioTracks().length > 0) return true;
