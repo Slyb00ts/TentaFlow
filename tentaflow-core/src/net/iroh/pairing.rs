@@ -264,6 +264,20 @@ pub async fn initiate_pairing_over_iroh(
     local_relay_url: String,
 ) -> anyhow::Result<PairingAttemptOutcome> {
     let sender_node_id = security.ed25519_public_key_hex();
+    // Czekamy az nasz endpoint dopnie do home relay i zdazy opublikowac sie
+    // w pkarr DNS. Bez tego pierwsze pairing-y po starcie czesto leca na
+    // stare/brakujace rekordy i padaja z 'connect: timed out' 25s.
+    // Timeout 8s — relay connect zwykle <1s, publikacja <5s; gdy sie nie
+    // uda w 8s i tak probujemy dalej (moze byc tryb offline-LAN).
+    if let Err(_) = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        endpoint.online(),
+    )
+    .await
+    {
+        tracing::debug!("pairing: online() timeout 8s — proba bez pelnej rejestracji relay");
+    }
+
     // Zawsze pairing relay-first: jesli hints nie niosa relay_url, uzupelniamy
     // go naszym home relay. Direct adresy (gdy sa) zostaja — iroh probuje ich
     // rownolegle i hole-punchuje LAN-side po otwartej sesji relay.
@@ -281,10 +295,15 @@ pub async fn initiate_pairing_over_iroh(
     let body = serde_json::to_vec(&request)
         .map_err(|e| anyhow::anyhow!("pairing: encode request: {e}"))?;
 
-    let connection = endpoint
-        .connect(endpoint_addr, super::ALPN_PAIRING)
-        .await
-        .map_err(|e| anyhow::anyhow!("pairing: connect: {e}"))?;
+    // Retry na timeout — pierwszy strzal moze trafic na stary pkarr rekord
+    // (race po restarcie peera). Drugi strzal po 2s pauzie zwykle uderza w
+    // juz wypublikowane swieze adresy.
+    let connection = connect_pairing_with_retry(
+        endpoint,
+        endpoint_addr.clone(),
+        &receiver_hints.node_id,
+    )
+    .await?;
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -503,6 +522,57 @@ pub fn hints_with_relay_fallback(
     let mut filled = hints.clone();
     filled.relay_url = our_relay;
     filled
+}
+
+/// Dial pairing ALPN z jedna ponowna proba przy timeout. Miedzy probami robimy
+/// krotkie tchniecie zeby iroh mial szanse odswiezyc address-lookup (gdy peer
+/// dopiero sie publikuje w pkarr DNS po restarcie). Zwraca Connection albo
+/// ostateczny blad.
+async fn connect_pairing_with_retry(
+    endpoint: &iroh::Endpoint,
+    addr: EndpointAddr,
+    peer_id_hex: &str,
+) -> anyhow::Result<iroh::endpoint::Connection> {
+    match endpoint.connect(addr.clone(), super::ALPN_PAIRING).await {
+        Ok(c) => return Ok(c),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            let is_timeout = msg.contains("timed out") || msg.contains("TimedOut");
+            if !is_timeout {
+                return Err(anyhow::anyhow!("pairing: connect: {e:?}"));
+            }
+            tracing::info!(
+                peer = %peer_id_hex,
+                "pairing: pierwszy dial timeout — retry za 2s (pkarr moze publikowac swieze adresy)"
+            );
+        }
+    }
+
+    // Pauza — daje iroh chwile na rezolucje swiezszych rekordow pkarr.
+    // Drugi retry z dluzszym czasem (15s) — gdy pierwszy 2s zabraklo na
+    // propagacje DHT po restarcie peera (pkarr TTL default 5-10s).
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    match endpoint.connect(addr.clone(), super::ALPN_PAIRING).await {
+        Ok(c) => return Ok(c),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            let is_timeout = msg.contains("timed out") || msg.contains("TimedOut");
+            if !is_timeout {
+                return Err(anyhow::anyhow!("pairing: connect (retry): {e:?}"));
+            }
+            tracing::info!(
+                peer = %peer_id_hex,
+                "pairing: drugi dial timeout — ostatnia proba za 15s"
+            );
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    endpoint
+        .connect(addr, super::ALPN_PAIRING)
+        .await
+        .map_err(|e| anyhow::anyhow!("pairing: connect (retry-2): {e:?}"))
 }
 
 pub fn endpoint_addr_from_hints(hints: &PairingContactHints) -> anyhow::Result<EndpointAddr> {
