@@ -420,11 +420,13 @@ function renderHeader() {
     </div>
     <div class="d-actions">
       <tf-button variant="ghost" icon="desktop" id="meet-live-vnc-btn">${escapeHtml(I18n.t('meeting.live.action_btn_screen'))}</tf-button>
+      <tf-button variant="ghost" icon="code" id="meet-live-diag-btn">${escapeHtml(I18n.t('meeting.live.action_btn_diag'))}</tf-button>
       <tf-button variant="ghost" icon="share" id="meet-live-dl-btn">${escapeHtml(I18n.t('meeting.live.action_btn_download'))}</tf-button>
       <tf-button variant="danger" icon="logout" id="meet-live-leave-btn">${escapeHtml(I18n.t('meeting.live.action_btn_leave'))}</tf-button>
     </div>
   `;
   byId('meet-live-vnc-btn')?.addEventListener('click', onOpenVnc);
+  byId('meet-live-diag-btn')?.addEventListener('click', onOpenDiag);
   byId('meet-live-dl-btn')?.addEventListener('click', onDownloadTranscript);
   byId('meet-live-leave-btn')?.addEventListener('click', onLeave);
 }
@@ -895,6 +897,205 @@ async function onOpenVnc() {
     toast(I18n.t('meeting.live.vnc_error_failed', { message: err?.message || '' }), 'error');
     cleanup();
   }
+}
+
+async function onOpenDiag() {
+  const s = state.sessionDetail;
+  if (!s || !Number.isFinite(s.sessionId)) {
+    toast(I18n.t('meeting.live.vnc_unavailable'), 'warn');
+    return;
+  }
+  const sessionId = Number(s.sessionId);
+
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', I18n.t('meeting.live.diag_title'));
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', '860');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.className = 'diag-window-body';
+
+  const actions = document.createElement('div');
+  actions.className = 'diag-actions';
+  const btnShot = document.createElement('tf-button');
+  btnShot.setAttribute('variant', 'primary');
+  btnShot.setAttribute('icon', 'camera');
+  btnShot.textContent = I18n.t('meeting.live.diag_screenshot_viewport');
+  const btnShotFull = document.createElement('tf-button');
+  btnShotFull.setAttribute('variant', 'ghost');
+  btnShotFull.setAttribute('icon', 'camera');
+  btnShotFull.textContent = I18n.t('meeting.live.diag_screenshot_full');
+  const btnDom = document.createElement('tf-button');
+  btnDom.setAttribute('variant', 'ghost');
+  btnDom.setAttribute('icon', 'code');
+  btnDom.textContent = I18n.t('meeting.live.diag_dump_dom');
+  actions.append(btnShot, btnShotFull, btnDom);
+
+  const result = document.createElement('div');
+  result.className = 'diag-result';
+  const empty = document.createElement('div');
+  empty.className = 'diag-empty';
+  empty.textContent = I18n.t('meeting.live.diag_empty');
+  result.appendChild(empty);
+
+  body.append(actions, result);
+  win.appendChild(body);
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.append(backdrop, win);
+
+  // Track blob URLs created inside this window so we can revoke them on close.
+  const objectUrls = [];
+  const trackUrl = (url) => { objectUrls.push(url); return url; };
+
+  let disposed = false;
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    for (const u of objectUrls) { try { URL.revokeObjectURL(u); } catch (_) {} }
+    objectUrls.length = 0;
+    if (win.parentNode) win.remove();
+    if (backdrop.parentNode) backdrop.remove();
+  };
+  win.addEventListener('action', (e) => {
+    if (e.detail?.action === 'close') cleanup();
+  });
+
+  const setBusy = (busy) => {
+    for (const b of [btnShot, btnShotFull, btnDom]) {
+      if (busy) b.setAttribute('disabled', '');
+      else b.removeAttribute('disabled');
+    }
+  };
+
+  const showLoading = () => {
+    result.innerHTML = '';
+    const load = document.createElement('div');
+    load.className = 'diag-empty';
+    load.textContent = I18n.t('meeting.live.diag_loading');
+    result.appendChild(load);
+  };
+
+  const handleError = ({ status, error }) => {
+    const keyByStatus = {
+      not_found: 'meeting.live.diag_error_not_found',
+      forbidden: 'meeting.live.diag_error_forbidden',
+      remote_node: 'meeting.live.diag_error_remote_node',
+    };
+    const key = keyByStatus[status] || 'meeting.live.diag_error_failed';
+    const msg = key === 'meeting.live.diag_error_failed'
+      ? I18n.t(key, { message: error || status || '' })
+      : I18n.t(key);
+    toast(msg, 'error');
+    result.innerHTML = '';
+    const fail = document.createElement('div');
+    fail.className = 'diag-empty';
+    fail.textContent = msg;
+    result.appendChild(fail);
+  };
+
+  const renderScreenshot = (pngBytes) => {
+    // Reset panel (shared for screenshot + DOM) and revoke previous URLs.
+    for (const u of objectUrls) { try { URL.revokeObjectURL(u); } catch (_) {} }
+    objectUrls.length = 0;
+    result.innerHTML = '';
+    const blob = new Blob([pngBytes], { type: 'image/png' });
+    const url = trackUrl(URL.createObjectURL(blob));
+    const toolbar = document.createElement('div');
+    toolbar.className = 'diag-actions';
+    const dl = document.createElement('tf-button');
+    dl.setAttribute('variant', 'ghost');
+    dl.setAttribute('icon', 'share');
+    dl.textContent = I18n.t('meeting.live.diag_download');
+    dl.addEventListener('click', () => {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `meeting-${sessionId}-screenshot-${Date.now()}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    });
+    toolbar.appendChild(dl);
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = 'screenshot';
+    result.append(toolbar, img);
+  };
+
+  const renderDom = (html) => {
+    for (const u of objectUrls) { try { URL.revokeObjectURL(u); } catch (_) {} }
+    objectUrls.length = 0;
+    result.innerHTML = '';
+    const toolbar = document.createElement('div');
+    toolbar.className = 'diag-actions';
+    const copyBtn = document.createElement('tf-button');
+    copyBtn.setAttribute('variant', 'ghost');
+    copyBtn.setAttribute('icon', 'copy');
+    copyBtn.textContent = I18n.t('meeting.live.diag_copy');
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(html);
+        toast(I18n.t('meeting.live.diag_copy_ok'), 'success');
+      } catch (err) {
+        toast(err?.message || 'Clipboard error', 'error');
+      }
+    });
+    const dlBtn = document.createElement('tf-button');
+    dlBtn.setAttribute('variant', 'ghost');
+    dlBtn.setAttribute('icon', 'share');
+    dlBtn.textContent = I18n.t('meeting.live.diag_download');
+    dlBtn.addEventListener('click', () => {
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = trackUrl(URL.createObjectURL(blob));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `meeting-${sessionId}-dom-${Date.now()}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    });
+    toolbar.append(copyBtn, dlBtn);
+    const pre = document.createElement('pre');
+    // Large dumps: show as text only; parsing HTML into DOM would be slow and unsafe.
+    pre.textContent = html;
+    result.append(toolbar, pre);
+  };
+
+  const runCapture = async (kind, fullPage) => {
+    if (disposed) return;
+    setBusy(true);
+    showLoading();
+    try {
+      const resp = await ApiBinary.one('browserCaptureRequest', {
+        sessionId,
+        kind,
+        fullPage: !!fullPage,
+      });
+      if (disposed) return;
+      if (resp?.status !== 'ok') {
+        handleError({ status: resp?.status, error: resp?.error });
+        return;
+      }
+      if (kind === 'screenshot') {
+        const png = resp.png instanceof Uint8Array ? resp.png : new Uint8Array(resp.png || []);
+        renderScreenshot(png);
+      } else {
+        renderDom(String(resp.html ?? ''));
+      }
+    } catch (err) {
+      if (disposed) return;
+      handleError({ status: 'failed', error: err?.message || '' });
+    } finally {
+      if (!disposed) setBusy(false);
+    }
+  };
+
+  btnShot.addEventListener('click', () => runCapture('screenshot', false));
+  btnShotFull.addEventListener('click', () => runCapture('screenshot', true));
+  btnDom.addEventListener('click', () => runCapture('dom', false));
 }
 
 async function onDownloadTranscript() {

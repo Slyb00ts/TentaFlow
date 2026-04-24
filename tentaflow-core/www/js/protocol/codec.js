@@ -1079,6 +1079,13 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** One-shot — capture screenshot (PNG) or DOM (HTML) from the bot's Chromium page. */
+  browserCaptureRequest(correlationId, { sessionId, kind, fullPage = false }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBrowserCaptureRequest(Number(sessionId), String(kind), !!fullPage);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   meetingSessionStartRequest(correlationId, { meetingUrl, title, platform, botName, sttAlias, ttsAlias, llmAlias }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeMeetingSessionStartRequest(
