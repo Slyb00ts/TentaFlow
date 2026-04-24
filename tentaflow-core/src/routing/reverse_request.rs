@@ -148,28 +148,23 @@ async fn handle_reverse_stream(
     // Routuj request w zaleznosci od typu payload
     let response = dispatch_reverse_request(&router, request).await;
 
-    // Serializacja i wyslanie odpowiedzi
-    match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
-        Ok(resp_data) => {
-            if let Err(e) = send.write_all(&resp_data).await {
-                error!(
-                    "Reverse '{}': blad wysylania odpowiedzi: {}",
-                    service_name, e
-                );
-                return;
-            }
-            let _ = send.finish();
-            debug!(
-                "Reverse '{}': odpowiedz wyslana (request_id={})",
-                service_name, response.request_id
-            );
-        }
-        Err(e) => {
-            error!(
-                "Reverse '{}': blad serializacji odpowiedzi: {}",
-                service_name, e
-            );
-        }
+    // Bot side reads the response with tentaflow_transport::framing::read_frame,
+    // which expects a 4-byte big-endian length prefix before the rkyv payload.
+    // We were writing raw rkyv bytes here, so the bot interpreted the first
+    // four bytes of the payload as the length and rejected every response as
+    // `frame exceeds 16777216 bytes`. Emit the same [len][rkyv] framing the
+    // bot produces on the request side.
+    if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &response).await {
+        error!(
+            "Reverse '{}': blad wysylania odpowiedzi: {:?}",
+            service_name, e
+        );
+    } else {
+        let _ = send.finish();
+        debug!(
+            "Reverse '{}': odpowiedz wyslana (request_id={})",
+            service_name, response.request_id
+        );
     }
 }
 
