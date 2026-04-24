@@ -19,6 +19,7 @@ import { I18n } from '/js/i18n.js';
 import MeshDetailScreen from '/js/modules/mesh-detail.js';
 import { renderDiagram, bindDiagramEvents, destroyDiagram } from '/js/modules/mesh-diagram.js';
 import { confirmDialog } from '/js/lib/confirm-dialog.js';
+import { runPairProgress } from '/js/lib/pair-progress.js';
 import { patchInner } from '/js/lib/patch.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -728,32 +729,47 @@ function openPairModal() {
         }
         return false;
       }
-      try {
-        if (errBox) errBox.hidden = true;
-        const remoteAddresses = uniqueStrings((manualAddress ? [manualAddress] : []).concat(parsed?.addresses || []));
-        const resp = await ApiBinary.action('meshPairingStartRequest', {
-          remoteAddress: idHex,
-          ...(effectivePin ? { pin: effectivePin } : {}),
-          ...(parsed?.publicKey ? { remotePublicKey: parsed.publicKey } : {}),
-          ...(remoteAddresses.length ? { remoteAddresses } : {}),
-          ...(manualRelayUrl || parsed?.relayUrl ? { remoteRelayUrl: manualRelayUrl || parsed?.relayUrl } : {}),
-          ...(parsed?.host ? { remoteHostname: parsed.host } : {}),
-        });
-        if (resp?.completed) {
-          toast(I18n.t('mesh.pair_success'), 'success');
-        } else if (!effectivePin && resp?.pin) {
-          openPinDisplayModal(idHex, resp.pin);
-        } else {
-          toast(I18n.t('mesh.pair_success'), 'success');
+      if (errBox) errBox.hidden = true;
+      const remoteAddresses = uniqueStrings((manualAddress ? [manualAddress] : []).concat(parsed?.addresses || []));
+      const remoteRelayUrl = manualRelayUrl || parsed?.relayUrl || '';
+      const remoteHostname = parsed?.host || '';
+      const remotePublicKey = parsed?.publicKey || '';
+      // Otwieramy progress-dialog od razu zamiast zostawiac user-a ze starym
+      // modalem i awaita — submit wykonuje sie w tle a kroki przewijaja sie
+      // wizualnie. Dla flow z PIN-em (invite aktywny u odbiorcy) konczy sie
+      // auto-confirm; bez PIN lub z nieaktywnym — status 'pending' i banner
+      // informujacy ze wyslane czeka na akceptacje.
+      const result = await runPairProgress({
+        target: { hostname: remoteHostname || I18n.t('mesh.unknown_host'), nodeId: idHex },
+        submit: async () => {
+          const resp = await ApiBinary.action('meshPairingStartRequest', {
+            remoteAddress: idHex,
+            ...(effectivePin ? { pin: effectivePin } : {}),
+            ...(remotePublicKey ? { remotePublicKey } : {}),
+            ...(remoteAddresses.length ? { remoteAddresses } : {}),
+            ...(remoteRelayUrl ? { remoteRelayUrl } : {}),
+            ...(remoteHostname ? { remoteHostname } : {}),
+          });
+          if (resp?.completed) return { outcome: 'confirmed', resp };
+          if (resp?.pin) return { outcome: 'pending', resp };
+          return { outcome: 'pending', resp };
+        },
+      });
+      if (result.outcome === 'confirmed') {
+        toast(I18n.t('mesh.pair_success'), 'success');
+        return true;
+      }
+      if (result.outcome === 'pending') {
+        // Dla backward-compat pokaz stary PIN-display modal, zeby user mogl
+        // pokazac kod drugiej stronie gdy odbiorca zwrocil pending + pin.
+        if (result.resp?.pin && !effectivePin) {
+          openPinDisplayModal(idHex, result.resp.pin);
         }
         return true;
-      } catch (e) {
-        if (errBox) {
-          errBox.textContent = e.message || I18n.t('mesh.pair_failed');
-          errBox.hidden = false;
-        }
-        return false;
       }
+      // cancelled / error — nie zamykamy outer dialogu wpisz-ID-PIN,
+      // wiadomosc blędu jest juz na progress window.
+      return false;
     },
   });
   // Tab switch + QR populate

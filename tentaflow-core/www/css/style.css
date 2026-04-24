@@ -4230,3 +4230,185 @@ tf-screen {
   .confirm-dlg__foot { flex-direction: column-reverse; gap: 8px; }
   .confirm-dlg__foot tf-button { width: 100%; }
 }
+
+/* =============================================================================
+   Pair progress dialog (lib/pair-progress.js) — animowana timeline krokow
+   handshake parowania. Zastepuje stary modal "Wpisz ID + PIN" — submit
+   otwiera ten dialog, kroki przewijaja sie podczas RPC, final success/error
+   pokazany na head-icon + bannerze. Sukces = auto-close po 1.5s.
+   ============================================================================= */
+
+.pair-progress__head-ico {
+  width: 32px; height: 32px; border-radius: var(--radius-sm);
+  background: rgba(99,102,241,0.14);
+  border: 1px solid rgba(99,102,241,0.3);
+  color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.pair-progress__head-ico svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; }
+.pair-progress__head-ico--success {
+  background: rgba(34,197,94,0.14); border-color: rgba(34,197,94,0.35); color: var(--success);
+}
+.pair-progress__head-ico--error {
+  background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.35); color: var(--danger);
+}
+.pair-progress__head-ico--info {
+  background: rgba(96,165,250,0.14); border-color: rgba(96,165,250,0.35); color: var(--info);
+}
+
+.pair-progress__body { padding: 2px 0 4px; }
+
+.pair-progress__target {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 16px;
+}
+.pair-progress__target-ico {
+  width: 38px; height: 38px; border-radius: var(--radius-sm);
+  background: rgba(99,102,241,0.14);
+  border: 1px solid rgba(99,102,241,0.3);
+  color: var(--accent-2);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.pair-progress__target-ico svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+.pair-progress__target-meta { flex: 1; min-width: 0; }
+.pair-progress__target-name { font-size: 13px; font-weight: 700; color: var(--text); }
+.pair-progress__target-id {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 10.5px; color: var(--text-3);
+  margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.pair-progress__steps { position: relative; padding: 6px 2px 4px 2px; }
+.pair-progress__steps .pair-step {
+  position: relative;
+  display: flex; align-items: flex-start; gap: 14px;
+  padding: 8px 0 14px 0;
+}
+.pair-progress__steps .pair-step:last-child { padding-bottom: 2px; }
+.pair-progress__steps .pair-step::before {
+  content: ""; position: absolute;
+  left: 15px; top: 40px; width: 2px; bottom: -4px;
+  background: var(--border);
+  border-radius: 1px;
+  transition: background 0.3s;
+}
+.pair-progress__steps .pair-step:last-child::before { display: none; }
+.pair-progress__steps .pair-step.done::before,
+.pair-progress__steps .pair-step.active::before {
+  background: linear-gradient(to bottom, var(--accent-1), var(--border));
+}
+.pair-progress__steps .pair-step.done + .pair-step.done::before { background: var(--accent-1); }
+
+.pair-progress__steps .step-dot {
+  width: 32px; height: 32px; border-radius: 50%;
+  background: var(--bg-3);
+  border: 1.5px solid var(--border);
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-3);
+  transition: all 0.25s;
+  position: relative;
+  z-index: 1;
+}
+.pair-progress__steps .step-dot svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2.4; }
+
+.pair-progress__steps .pair-step.pending .step-dot::after {
+  content: "";
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-3); opacity: 0.5;
+}
+.pair-progress__steps .pair-step.active .step-dot {
+  background: var(--gradient-accent, linear-gradient(135deg, #6366f1, #a78bfa));
+  color: white;
+  border-color: var(--accent-1);
+  animation: pair-step-pulse 1.6s ease-in-out infinite;
+}
+@keyframes pair-step-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(99,102,241,0.4); }
+  50%      { box-shadow: 0 0 0 10px rgba(99,102,241,0); }
+}
+.pair-progress__steps .pair-step.active .step-dot svg { animation: pair-step-spin 1s linear infinite; }
+@keyframes pair-step-spin { to { transform: rotate(360deg); } }
+
+.pair-progress__steps .pair-step.done .step-dot {
+  background: rgba(34,197,94,0.18);
+  border-color: rgba(34,197,94,0.55);
+  color: var(--success);
+}
+.pair-progress__steps .pair-step.error .step-dot {
+  background: rgba(239,68,68,0.18);
+  border-color: rgba(239,68,68,0.55);
+  color: var(--danger);
+  animation: pair-step-shake 0.4s ease-in-out;
+}
+@keyframes pair-step-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+
+.pair-progress__steps .step-body { flex: 1; min-width: 0; padding-top: 5px; }
+.pair-progress__steps .step-label {
+  font-size: 13px; font-weight: 600; color: var(--text-2);
+  transition: color 0.25s;
+}
+.pair-progress__steps .pair-step.active .step-label,
+.pair-progress__steps .pair-step.done .step-label,
+.pair-progress__steps .pair-step.error .step-label { color: var(--text); font-weight: 700; }
+.pair-progress__steps .step-detail {
+  font-size: 11.5px; color: var(--text-3);
+  margin-top: 3px; line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.pair-progress__steps .pair-step.error .step-detail { color: var(--danger); }
+
+.pair-progress__banner {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  display: flex; align-items: center; gap: 10px;
+}
+.pair-progress__banner svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; flex-shrink: 0; }
+.pair-progress__banner--success {
+  background: rgba(34,197,94,0.08);
+  border: 1px solid rgba(34,197,94,0.3);
+  color: var(--success);
+}
+.pair-progress__banner--error {
+  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239,68,68,0.3);
+  color: var(--danger);
+}
+.pair-progress__banner--info {
+  background: rgba(96,165,250,0.08);
+  border: 1px solid rgba(96,165,250,0.3);
+  color: var(--info);
+}
+.pair-progress__banner .bar-inner { flex: 1; }
+.pair-progress__banner .bar-inner b {
+  display: block; color: currentColor; margin-bottom: 2px;
+  font-weight: 700; font-size: 12.5px;
+}
+.pair-progress__banner .bar-inner span { color: var(--text-2); font-weight: 500; }
+.pair-progress__banner .countdown {
+  margin-left: auto;
+  font-size: 11px; color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+.pair-progress__foot {
+  display: flex; justify-content: flex-end; gap: 8px;
+}
+@media (max-width: 520px) {
+  .pair-progress__foot { flex-direction: column-reverse; gap: 8px; }
+  .pair-progress__foot tf-button { width: 100%; }
+}
