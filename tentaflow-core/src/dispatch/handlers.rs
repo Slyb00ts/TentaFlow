@@ -1865,6 +1865,7 @@ pub fn service_list(
                 started_at_epoch: parse_ts_opt(&Some(s.created_at)),
                 engine_id,
                 model_id,
+                deployed_source_hash: s.deployed_source_hash,
             }
         })
         .collect();

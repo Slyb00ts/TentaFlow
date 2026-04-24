@@ -4429,3 +4429,43 @@ tf-screen {
   .pair-progress__foot { flex-direction: column-reverse; gap: 8px; }
   .pair-progress__foot tf-button { width: 100%; }
 }
+
+/* =============================================================================
+ * Services — update modal (ServiceRedeployRequest live stream)
+ * ============================================================================= */
+.svc-update-body { min-height: 280px; }
+.svc-update-warning {
+  background: rgba(234, 179, 8, 0.12);
+  border: 1px solid rgba(234, 179, 8, 0.45);
+  color: #f5d663;
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 12px;
+}
+.svc-update-message {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.svc-update-message-error {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: var(--danger, #ef4444);
+}
+.svc-update-log {
+  max-height: 240px;
+  font-variant-numeric: tabular-nums;
+  padding: 6px 10px;
+}
+.svc-update-log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+.svc-update-log-info { color: var(--text-2); }
+.svc-update-log-warn { color: #f5d663; }
+.svc-update-log-error { color: var(--danger, #ef4444); }
+.svc-update-log-success { color: #4ade80; }
