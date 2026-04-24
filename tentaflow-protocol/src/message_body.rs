@@ -2497,6 +2497,90 @@ pub struct MeetingTranscriptExportResponse {
     pub content: String,
 }
 
+// =============================================================================
+// Meeting VNC tunnel — same-node websockify bridge through dashboard WSS.
+// =============================================================================
+//
+// Phase A: frontend opens `VncTunnelOpenRequest{session_id}` as a subscription.
+// Handler bridges a TCP connection to the container's novnc port (websockify)
+// and streams RFB bytes back as `VncTunnelChunk`. Reverse direction (keyboard/
+// mouse events) uses one-shot `VncTunnelSendRequest{tunnel_id, bytes}`. On TCP
+// end a `VncTunnelStreamEnd` is emitted and the tunnel entry is cleaned up.
+// Cross-node forwarding over iroh is reserved for phase B (remote_node status).
+
+pub const VNC_TUNNEL_OPEN_OK: &str = "ok";
+pub const VNC_TUNNEL_OPEN_NOT_FOUND: &str = "not_found";
+pub const VNC_TUNNEL_OPEN_FORBIDDEN: &str = "forbidden";
+pub const VNC_TUNNEL_OPEN_NO_PORT: &str = "no_port";
+pub const VNC_TUNNEL_OPEN_REMOTE_NODE: &str = "remote_node";
+pub const VNC_TUNNEL_OPEN_FAILED: &str = "failed";
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelOpenRequest {
+    pub session_id: i64,
+}
+
+/// First frame on the subscription stream. When `status != "ok"`, the stream
+/// also ends immediately and `tunnel_id` is empty.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelOpenResponse {
+    pub status: String,
+    pub tunnel_id: String,
+    pub error: String,
+}
+
+/// RFB bytes read from the container TCP socket, pushed to the browser.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelChunk {
+    pub tunnel_id: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Browser → container RFB bytes (keyboard/mouse, client init). One-shot.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelSendRequest {
+    pub tunnel_id: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelSendResponse {
+    pub ok: bool,
+    pub error: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelCloseRequest {
+    pub tunnel_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelCloseResponse {
+    pub ok: bool,
+}
+
+/// Emitted as the terminal stream chunk when the container-side TCP socket
+/// closes (either EOF, I/O error, or handler-initiated shutdown).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelStreamEnd {
+    pub tunnel_id: String,
+    pub reason: String,
+}
+
+/// Single inner enum carrying every VNC tunnel message so the top-level
+/// `MessageBody` spends only one variant slot on the feature.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum VncTunnelPayload {
+    ReqOpen(VncTunnelOpenRequest),
+    ResOpen(VncTunnelOpenResponse),
+    Chunk(VncTunnelChunk),
+    ReqSend(VncTunnelSendRequest),
+    ResSend(VncTunnelSendResponse),
+    ReqClose(VncTunnelCloseRequest),
+    ResClose(VncTunnelCloseResponse),
+    StreamEnd(VncTunnelStreamEnd),
+}
+
 /// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
 /// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -2992,6 +3076,9 @@ pub enum MessageBody {
 
     // ---- Meeting Bot (single-variant, req+res w inner enum) ----
     MeetingBody(MeetingPayload),
+
+    // ---- Meeting VNC tunnel (one slot for entire R-STREAM + two one-shot RPCs) ----
+    VncTunnelBody(VncTunnelPayload),
 
     // ---- Meeting live broadcast (unsolicited push, correlation_id=0) ----
     // Pushowany z writer task w ws_binary po każdym sukcesie
