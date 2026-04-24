@@ -920,6 +920,53 @@ pub struct SettingsUpdateRequest {
 }
 
 // =============================================================================
+// Mesh & Network settings (IPv4-only enumeracja NIC + reguly bind/advertise)
+// =============================================================================
+
+/// Pojedynczy interfejs sieciowy hosta z adresami IPv4 (v6 odrzucane).
+/// `kind` jest znormalizowaną kategorią dla GUI (nie surowy `InterfaceType`).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceInfo {
+    pub name: String,
+    pub mac: String,
+    pub ipv4_addrs: Vec<String>,
+    pub mtu: u32,
+    /// "ethernet" | "wifi" | "loopback" | "docker" | "tunnel" | "virtual" | "unknown"
+    pub kind: String,
+    pub is_up: bool,
+    pub description: String,
+}
+
+/// Perzistowana konfiguracja mesh networking. `bind_mode="auto"` pozwala iroh
+/// bindowac 0.0.0.0, `"custom"` wymusza `bind_ipv4`. Flagi `hide_*` filtruja
+/// adresy wysylane peerom. `iroh_relay_url` pusty = default N0 preset.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkConfig {
+    /// "auto" | "custom"
+    pub bind_mode: String,
+    pub bind_ipv4: String,
+    pub hide_docker: bool,
+    pub hide_link_local: bool,
+    pub hide_loopback: bool,
+    pub hide_cgnat: bool,
+    pub prefer_same_subnet: bool,
+    pub iroh_relay_url: String,
+}
+
+/// Skonsolidowany payload dla Mesh & Network settings — 6 logicznych variantow
+/// (interfaces list req/res, config get req/res, config update req/res) zajmuje
+/// 1 slot w `MessageBody` zeby zmiescic sie w 256-variant limicie rkyv.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum NetworkPayload {
+    ReqInterfacesList,
+    ResInterfacesList { interfaces: Vec<NetworkInterfaceInfo> },
+    ReqConfigGet,
+    ResConfigGet(NetworkConfig),
+    ReqConfigUpdate(NetworkConfig),
+    ResConfigUpdate { restart_required: bool },
+}
+
+// =============================================================================
 // Dashboard metrics (R-LIST z subscription candidate, migration-map #60)
 // =============================================================================
 
@@ -3011,6 +3058,10 @@ pub enum MessageBody {
     SettingsListResponse { entries: Vec<SettingEntry> },
     SettingsUpdateRequestBody(SettingsUpdateRequest),
     SettingsUpdateResponse { applied: u32 },
+
+    // ---- Mesh & Network settings (enumeracja NIC + bind/advertise rules) ----
+    // Skonsolidowane w `NetworkPayload` — 1 slot w enum (256-variant limit rkyv).
+    NetworkBody(NetworkPayload),
 
     // ---- Dashboard (R-LIST + subscription candidate) ----
     DashboardMetricsRequest,
