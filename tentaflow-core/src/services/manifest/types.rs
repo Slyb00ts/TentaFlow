@@ -13,6 +13,14 @@ pub struct ServiceManifest {
     pub deploy: DeploySection,
     #[serde(default, rename = "model_preset")]
     pub model_presets: Vec<ModelPreset>,
+    /// Sha256 of the docker build context tree at compile time. Empty when
+    /// the manifest has no buildable docker context. Populated by build.rs.
+    #[serde(default)]
+    pub docker_source_hash: String,
+    /// Sha256 of the native build tree (binary/python-bundle) at compile
+    /// time. Empty for embedded/external runtimes. Populated by build.rs.
+    #[serde(default)]
+    pub native_source_hash: String,
 }
 
 /// `[engine]` section with catalog metadata.

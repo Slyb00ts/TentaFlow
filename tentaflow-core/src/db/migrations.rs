@@ -1674,5 +1674,16 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE meeting_sessions ADD COLUMN lifecycle_updated_at TEXT;
         ",
     ),
+    (
+        56,
+        "services_source_hash",
+        "
+            -- Sha256 of the container source tree captured when the service
+            -- was deployed. Compared against the compile-time hash in the
+            -- manifest registry to flag 'update available' in the dashboard.
+            -- NULL for rows created before this migration (treated as unknown).
+            ALTER TABLE services ADD COLUMN deployed_source_hash TEXT;
+        ",
+    ),
 ]
 }

@@ -104,6 +104,8 @@ fn make_manifest(engine: Engine, deploy: DeploySection) -> ServiceManifest {
         engine,
         deploy,
         model_presets: Vec::new(),
+        docker_source_hash: String::new(),
+        native_source_hash: String::new(),
     }
 }
 
