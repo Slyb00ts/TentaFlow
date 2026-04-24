@@ -34,12 +34,15 @@ pub struct MeetingConfig {
     /// transkrypty pod tym kluczem. None = bot wygeneruje uuid przy kazdym join.
     pub meeting_id_override: Option<String>,
 
-    /// Wlacza LAN mDNS discovery.
-    #[serde(default = "default_true")]
+    /// Wlacza LAN mDNS discovery. Domyslnie false bo teams-bot jest serwerem
+    /// QUIC do ktorego host laczy sie po znanym endpoint_id + porcie — nie
+    /// potrzebuje byc discoverable, a mDNS broadcast na docker bridge powodowal
+    /// ze host widzial go jako kandydata do parowania w mesh.
+    #[serde(default)]
     pub enable_lan_discovery: bool,
 
-    /// Wlacza DHT pkarr-mainline.
-    #[serde(default = "default_true")]
+    /// Wlacza DHT pkarr-mainline. Domyslnie false z tego samego powodu co wyzej.
+    #[serde(default)]
     pub enable_dht_discovery: bool,
 
     /// Nazwa urzadzenia audio PulseAudio (None = domyslne)
@@ -116,10 +119,6 @@ pub struct MeetingConfig {
 
 fn default_transport_port() -> u16 {
     5000
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_chunk_duration() -> u32 {
@@ -199,9 +198,9 @@ impl MeetingConfig {
             secret_key_hex: std::env::var("BOT_SECRET_KEY_HEX").ok(),
             meeting_id_override: std::env::var("MEETING_ID").ok(),
             enable_lan_discovery: std::env::var("ENABLE_LAN_DISCOVERY")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(true),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
             enable_dht_discovery: std::env::var("ENABLE_DHT_DISCOVERY")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(true),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
             audio_device: std::env::var("AUDIO_DEVICE").ok(),
             vad_model_path: std::env::var("VAD_MODEL_PATH")
                 .ok()
@@ -308,8 +307,8 @@ mod tests {
         assert_eq!(config.summarization_alias, "teams-summarization");
         assert_eq!(config.flow_alias, "teams-flow");
         assert!(config.secret_key_path.is_none());
-        assert!(config.enable_lan_discovery);
-        assert!(config.enable_dht_discovery);
+        assert!(!config.enable_lan_discovery);
+        assert!(!config.enable_dht_discovery);
         assert!(!config.bot_video_enabled, "bot_video_enabled domyslnie false");
         assert!(!config.echo_mode, "echo_mode domyslnie false");
     }

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
@@ -261,6 +261,15 @@ pub struct IrohMeshManager {
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
     dial_locks: AsyncRwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Stan logowania per-peer: kiedy ostatnio zalogowalismy discovery oraz
+    /// ile bylo kolejnych nieudanych dialow. Sluzy do tlumienia spamu.
+    peer_log_state: parking_lot::Mutex<HashMap<String, PeerLogState>>,
+}
+
+#[derive(Default)]
+struct PeerLogState {
+    last_discovery_log: Option<Instant>,
+    consecutive_dial_failures: u32,
 }
 
 impl IrohMeshManager {
@@ -296,7 +305,43 @@ impl IrohMeshManager {
             command_waiters: AsyncRwLock::new(HashMap::new()),
             service_reg,
             dial_locks: AsyncRwLock::new(HashMap::new()),
+            peer_log_state: parking_lot::Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Discovery spamuje na kazdy mDNS tick — logujemy pierwsze odkrycie peera
+    /// i potem co najmniej co `DISCOVERY_LOG_COOLDOWN`. Zwraca true gdy log
+    /// ma sie wyemitowac, false — stlumic.
+    fn should_log_discovery(&self, peer_hex: &str) -> bool {
+        const COOLDOWN: Duration = Duration::from_secs(60);
+        let mut map = self.peer_log_state.lock();
+        let entry = map.entry(peer_hex.to_string()).or_default();
+        let now = Instant::now();
+        let emit = match entry.last_discovery_log {
+            Some(prev) => now.duration_since(prev) >= COOLDOWN,
+            None => true,
+        };
+        if emit {
+            entry.last_discovery_log = Some(now);
+        }
+        emit
+    }
+
+    /// Liczy kolejne nieudane dial-y. Zwraca nowa wartosc licznika; 1 = pierwszy
+    /// fail w serii, >1 = kolejny z rzedu bez sukcesu.
+    fn note_dial_failure(&self, peer_hex: &str) -> u32 {
+        let mut map = self.peer_log_state.lock();
+        let entry = map.entry(peer_hex.to_string()).or_default();
+        entry.consecutive_dial_failures = entry.consecutive_dial_failures.saturating_add(1);
+        entry.consecutive_dial_failures
+    }
+
+    /// Reset licznika po udanym polaczeniu.
+    fn note_dial_success(&self, peer_hex: &str) {
+        let mut map = self.peer_log_state.lock();
+        if let Some(entry) = map.get_mut(peer_hex) {
+            entry.consecutive_dial_failures = 0;
+        }
     }
 
     /// Startuje accept loop + heartbeat loop + discovery loop (LAN mDNS).
@@ -363,12 +408,27 @@ impl IrohMeshManager {
                         if self_arc.is_connected(&peer_hex).await {
                             continue;
                         }
-                        info!(peer = %peer_hex, addrs = ?addresses, "iroh_mesh: odkryty nowy peer — dial");
+                        let log_it = self_arc.should_log_discovery(&peer_hex);
+                        if log_it {
+                            info!(peer = %peer_hex, addrs = ?addresses, "iroh_mesh: peer odkryty — dial");
+                        } else {
+                            debug!(peer = %peer_hex, "iroh_mesh: peer re-odkryty (log stlumiony)");
+                        }
                         let me = Arc::clone(&self_arc);
                         tokio::spawn(async move {
                             let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-                            if let Err(e) = me.connect_to_peer(&peer_hex, dummy).await {
-                                warn!(peer = %peer_hex, "iroh_mesh: dial po discovery nieudany: {}", e);
+                            match me.connect_to_peer(&peer_hex, dummy).await {
+                                Ok(_) => {
+                                    me.note_dial_success(&peer_hex);
+                                }
+                                Err(e) => {
+                                    let fails = me.note_dial_failure(&peer_hex);
+                                    if fails == 1 {
+                                        warn!(peer = %peer_hex, "iroh_mesh: dial nieudany: {}", e);
+                                    } else {
+                                        debug!(peer = %peer_hex, fails, "iroh_mesh: dial nieudany (powtorka): {}", e);
+                                    }
+                                }
                             }
                         });
                     }
@@ -429,6 +489,8 @@ impl IrohMeshManager {
                         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
                             node_id: remote_hex.clone(),
                         });
+                        info!(peer = %remote_hex, "iroh_mesh: polaczenie nawiazane (incoming)");
+                        self.note_dial_success(&remote_hex);
                         let me = self.clone_for_spawn();
                         tokio::spawn(async move {
                             me.handle_mesh_connection(remote_hex, connection, connection_id)
@@ -647,6 +709,7 @@ impl IrohMeshManager {
                 let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
                     node_id: peer_id_str.clone(),
                 });
+                info!(peer = %peer_id_str, "iroh_mesh: polaczenie nawiazane (outgoing)");
                 let me = self.clone_for_spawn();
                 tokio::spawn(async move {
                     me.handle_mesh_connection(peer_id_str, connection, connection_id)
@@ -1223,11 +1286,12 @@ impl IrohMeshManagerRef {
         connection: Connection,
         connection_id: u64,
     ) {
+        let mut close_reason: Option<String> = None;
         loop {
             let recv = match connection.accept_uni().await {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(peer = %remote_hex, "mesh uni stream closed: {}", e);
+                    close_reason = Some(format!("{e}"));
                     break;
                 }
             };
@@ -1247,6 +1311,8 @@ impl IrohMeshManagerRef {
         if is_current {
             map.remove(&remote_hex);
             drop(map);
+            let reason = close_reason.as_deref().unwrap_or("stream closed");
+            info!(peer = %remote_hex, reason, "iroh_mesh: polaczenie zamkniete");
             let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
                 node_id: remote_hex,
             });
