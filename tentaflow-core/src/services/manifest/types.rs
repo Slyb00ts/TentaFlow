@@ -1,12 +1,12 @@
 // =============================================================================
-// Plik: types.rs
-// Opis: Typy serde dla deserializacji service manifestow (TOML).
-//       Modeluja schemat opisany w tentaflow-containers/_schema/SCHEMA.md.
+// File: types.rs
+// Description: Serde types used to deserialize service manifests from TOML.
+// They model the schema described in tentaflow-containers/_schema/SCHEMA.md.
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
 
-/// Pelny manifest pojedynczego silnika wraz z trybami deploymentu i presetami modeli.
+/// Full manifest for a single engine, including its deploy modes and model presets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceManifest {
     pub engine: Engine,
@@ -15,7 +15,7 @@ pub struct ServiceManifest {
     pub model_presets: Vec<ModelPreset>,
 }
 
-/// Sekcja `[engine]` — metadane silnika.
+/// `[engine]` section with catalog metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Engine {
     pub id: String,
@@ -27,12 +27,16 @@ pub struct Engine {
     pub license: String,
     #[serde(default)]
     pub icon: Option<String>,
+    #[serde(default)]
+    pub requires_model: Option<bool>,
+    #[serde(default)]
+    pub gpu_supported: Option<bool>,
     pub default_port: u16,
     pub api: ApiKind,
     pub version: String,
 }
 
-/// Kategoria silnika (zgodna z layoutem katalogow `tentaflow-containers/`).
+/// Engine category aligned with the `tentaflow-containers/` directory layout.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum Category {
@@ -50,7 +54,7 @@ pub enum Category {
     Tools,
 }
 
-/// Rodzaj API udostepnianego przez silnik.
+/// API family exposed by the engine.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApiKind {
@@ -62,8 +66,8 @@ pub enum ApiKind {
     Custom,
 }
 
-/// Sekcja `[deploy]` — agreguje opcjonalne sub-sekcje docker/native/external.
-/// Manifest MUSI miec przynajmniej jedna z trzech zdefiniowana.
+/// `[deploy]` section aggregating optional docker/native/external variants.
+/// A manifest must define at least one of them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploySection {
     #[serde(default)]
@@ -74,10 +78,13 @@ pub struct DeploySection {
     pub external: Option<ExternalDeploy>,
 }
 
-/// Sekcja `[deploy.docker]` — build kontenera + opcjonalny prebuilt image.
+/// `[deploy.docker]` section for Docker deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerDeploy {
-    pub context_path: String,
+    #[serde(default)]
+    pub context_path: Option<String>,
+    #[serde(default)]
+    pub compose_path: Option<String>,
     pub platforms: Vec<TargetOs>,
     #[serde(default)]
     pub download_image: Option<String>,
@@ -85,7 +92,7 @@ pub struct DockerDeploy {
     pub download_size_mb: Option<u64>,
 }
 
-/// Sekcja `[deploy.native]` — natywne uruchomienie (embedded/binary/python-bundle).
+/// `[deploy.native]` section for native execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeDeploy {
     pub platforms: Vec<TargetOs>,
@@ -98,19 +105,19 @@ pub struct NativeDeploy {
     pub bundle_path: Option<String>,
 }
 
-/// Wariant uruchomienia natywnego silnika.
+/// Native runtime variant.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NativeRuntime {
-    /// Wkompilowane w `tentaflow` przez Cargo feature.
+    /// Compiled into `tentaflow` behind a Cargo feature.
     Embedded,
-    /// Natywna binarka kompilowana skryptem `<binary_path>/build.sh`.
+    /// Native binary built by `<binary_path>/build.sh`.
     Binary,
-    /// Bundle Pythona (venv + server.py) zarzadzany przez TentaFlow.
+    /// Python bundle managed by TentaFlow.
     PythonBundle,
 }
 
-/// Sekcja `[deploy.external]` — wykrycie zewnetrznego serwisu w PATH.
+/// `[deploy.external]` section for discovering an already running external service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalDeploy {
     pub platforms: Vec<TargetOs>,
@@ -124,7 +131,7 @@ fn default_health_path() -> String {
     "/".to_string()
 }
 
-/// System operacyjny obslugiwany przez wariant deploymentu.
+/// Operating system supported by a deploy variant.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetOs {
@@ -135,7 +142,7 @@ pub enum TargetOs {
     Android,
 }
 
-/// Sekcja `[[model_preset]]` — rekomendowany model dla silnika.
+/// `[[model_preset]]` section with a recommended model entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPreset {
     pub id: String,

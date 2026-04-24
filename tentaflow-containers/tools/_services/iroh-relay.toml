@@ -1,0 +1,17 @@
+[engine]
+id = "iroh-relay"
+category = "tools"
+name = "iroh Relay"
+description_pl = "Self-hosted iroh relay and pkarr DNS stack for TentaFlow mesh."
+description_en = "Self-hosted iroh relay and pkarr DNS stack for TentaFlow mesh."
+homepage = "https://www.iroh.computer/"
+license = "MIT"
+default_port = 443
+api = "custom"
+version = "0.98.0"
+requires_model = false
+gpu_supported = false
+
+[deploy.docker]
+compose_path = "tools/docker/iroh-relay/stack.yml"
+platforms = ["linux"]

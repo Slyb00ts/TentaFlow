@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::RwLock;
@@ -245,25 +246,31 @@ pub struct ConnectionSnapshot {
 }
 
 /// Glowny menedzer mesh uzywajacy iroh.
+///
+/// SCALABILITY: glowne mapy (connections, dial_locks, peer_log_state) uzywaja
+/// `DashMap` zamiast `RwLock<HashMap>` zeby read/write byl lock-free per-shard.
+/// Przy 1000+ peerach rozne operacje (dial, heartbeat broadcast, is_connected)
+/// nie konkuruja o ten sam lock. Event bus ma rozszerzony buffer (16K)
+/// — inaczej przy burst discovery subskrybenci dostaja Lagged i gubia eventy.
 pub struct IrohMeshManager {
     endpoint: Arc<IrohEndpoint>,
     security: Arc<MeshSecurity>,
     config: IrohMeshConfig,
-    connections: Arc<AsyncRwLock<HashMap<String, ActiveConnection>>>,
+    connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
     shutdown: CancellationToken,
     local_node_id: RwLock<String>,
     next_connection_id: AtomicU64,
     forward_handler: AsyncRwLock<Option<ForwardHandler>>,
-    command_waiters:
-        AsyncRwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>>,
+    command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
     service_reg: Arc<MeshServiceRegistry>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
-    dial_locks: AsyncRwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// DashMap — upsert/read lock-free per-shard.
+    dial_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Stan logowania per-peer: kiedy ostatnio zalogowalismy discovery oraz
     /// ile bylo kolejnych nieudanych dialow. Sluzy do tlumienia spamu.
-    peer_log_state: parking_lot::Mutex<HashMap<String, PeerLogState>>,
+    peer_log_state: DashMap<String, PeerLogState>,
 }
 
 #[derive(Default)]
@@ -290,23 +297,26 @@ impl IrohMeshManager {
             .map_err(|e: IrohEndpointError| anyhow::anyhow!("iroh endpoint bind: {e:?}"))?;
 
         let local_id_hex = hex::encode(endpoint.id().as_bytes());
-        let (event_tx, _rx) = broadcast::channel(1024);
+        // Duzy buffer — przy discovery burst (nowa siec, wiele peerow na raz)
+        // subscriber pipeline moze chwilowo byc wolniejszy niz producent
+        // eventow. 1024 bylo za malo, przy 100+ peerach Lagged sie zdarzal.
+        let (event_tx, _rx) = broadcast::channel(16_384);
         let service_reg = Arc::new(MeshServiceRegistry::new(local_id_hex.clone()));
 
         Ok(Arc::new(Self {
             endpoint: Arc::new(endpoint),
             security,
             config,
-            connections: Arc::new(AsyncRwLock::new(HashMap::new())),
+            connections: Arc::new(DashMap::with_capacity(256)),
             event_tx,
             shutdown: CancellationToken::new(),
             local_node_id: RwLock::new(local_id_hex),
             next_connection_id: AtomicU64::new(1),
             forward_handler: AsyncRwLock::new(None),
-            command_waiters: AsyncRwLock::new(HashMap::new()),
+            command_waiters: DashMap::new(),
             service_reg,
-            dial_locks: AsyncRwLock::new(HashMap::new()),
-            peer_log_state: parking_lot::Mutex::new(HashMap::new()),
+            dial_locks: DashMap::with_capacity(256),
+            peer_log_state: DashMap::with_capacity(256),
         }))
     }
 
@@ -315,8 +325,10 @@ impl IrohMeshManager {
     /// ma sie wyemitowac, false — stlumic.
     fn should_log_discovery(&self, peer_hex: &str) -> bool {
         const COOLDOWN: Duration = Duration::from_secs(60);
-        let mut map = self.peer_log_state.lock();
-        let entry = map.entry(peer_hex.to_string()).or_default();
+        let mut entry = self
+            .peer_log_state
+            .entry(peer_hex.to_string())
+            .or_default();
         let now = Instant::now();
         let emit = match entry.last_discovery_log {
             Some(prev) => now.duration_since(prev) >= COOLDOWN,
@@ -331,16 +343,17 @@ impl IrohMeshManager {
     /// Liczy kolejne nieudane dial-y. Zwraca nowa wartosc licznika; 1 = pierwszy
     /// fail w serii, >1 = kolejny z rzedu bez sukcesu.
     fn note_dial_failure(&self, peer_hex: &str) -> u32 {
-        let mut map = self.peer_log_state.lock();
-        let entry = map.entry(peer_hex.to_string()).or_default();
+        let mut entry = self
+            .peer_log_state
+            .entry(peer_hex.to_string())
+            .or_default();
         entry.consecutive_dial_failures = entry.consecutive_dial_failures.saturating_add(1);
         entry.consecutive_dial_failures
     }
 
     /// Reset licznika po udanym polaczeniu.
     fn note_dial_success(&self, peer_hex: &str) {
-        let mut map = self.peer_log_state.lock();
-        if let Some(entry) = map.get_mut(peer_hex) {
+        if let Some(mut entry) = self.peer_log_state.get_mut(peer_hex) {
             entry.consecutive_dial_failures = 0;
         }
     }
@@ -357,8 +370,10 @@ impl IrohMeshManager {
         } else {
             Duration::from_secs(30)
         };
-        let mut map = self.peer_log_state.lock();
-        let entry = map.entry(peer_hex.to_string()).or_default();
+        let mut entry = self
+            .peer_log_state
+            .entry(peer_hex.to_string())
+            .or_default();
         let now = Instant::now();
         if let Some(prev) = entry.last_dial_attempt {
             if now.duration_since(prev) < cooldown {
@@ -593,51 +608,37 @@ impl IrohMeshManager {
         );
 
         let new_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
-        let mut map = self.connections.write().await;
 
-        match map.get(&remote_hex) {
-            Some(existing) if existing.direction == direction => {
-                // Duplikat tego samego kierunku — prawdopodobnie iroh retry/migration.
-                // Idempotent no-op: trzymamy istniejace, nowa zamykamy.
-                drop(map);
-                conn.close(0u32.into(), b"duplicate");
-                None
-            }
-            Some(_) if !new_is_winner => {
-                // W mapie jest zwyciezca przeciwnego kierunku, nowa przegrywa.
-                drop(map);
-                conn.close(0u32.into(), b"tie-break-loser");
-                None
-            }
-            Some(_) => {
-                // Nowa wygrywa nad istniejaca przegrana — podmien.
-                let prev = map.insert(
-                    remote_hex.clone(),
-                    ActiveConnection {
+        use dashmap::mapref::entry::Entry;
+        match self.connections.entry(remote_hex.clone()) {
+            Entry::Occupied(mut occ) => {
+                let existing_dir = occ.get().direction;
+                if existing_dir == direction {
+                    // Duplikat tego samego kierunku — iroh retry/migration.
+                    drop(occ);
+                    conn.close(0u32.into(), b"duplicate");
+                    None
+                } else if !new_is_winner {
+                    drop(occ);
+                    conn.close(0u32.into(), b"tie-break-loser");
+                    None
+                } else {
+                    let prev = occ.insert(ActiveConnection {
                         id: new_id,
                         connection: conn,
                         direction,
-                    },
-                );
-                drop(map);
-                if let Some(active) = prev {
-                    active.connection.close(0u32.into(), b"tie-break-loser");
+                    });
+                    drop(occ);
+                    prev.connection.close(0u32.into(), b"tie-break-loser");
+                    Some(new_id)
                 }
-                Some(new_id)
             }
-            None => {
-                // Pusta mapa — wpisz niezaleznie od tie-break'a. Gdy druga strona dojdzie
-                // ze zwycieska direction, jej register_connection wejdzie w galaz
-                // "podmien przegrana" i obie strony zbiegna sie na tym samym fizycznym
-                // connectionie.
-                map.insert(
-                    remote_hex.clone(),
-                    ActiveConnection {
-                        id: new_id,
-                        connection: conn,
-                        direction,
-                    },
-                );
+            Entry::Vacant(vac) => {
+                vac.insert(ActiveConnection {
+                    id: new_id,
+                    connection: conn,
+                    direction,
+                });
                 Some(new_id)
             }
         }
@@ -645,9 +646,9 @@ impl IrohMeshManager {
 
     /// Zwraca (lub tworzy) per-peer mutex zabezpieczajacy przed rownoleglymi
     /// dialami do tego samego peera z roznych tasków.
-    async fn dial_lock_for(&self, peer_hex: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.dial_locks.write().await;
-        map.entry(peer_hex.to_string())
+    fn dial_lock_for(&self, peer_hex: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.dial_locks
+            .entry(peer_hex.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -673,20 +674,17 @@ impl IrohMeshManager {
     }
 
     pub fn connection_snapshot(&self, node_id: &str) -> Option<ConnectionSnapshot> {
-        let map = self.connections.try_read().ok()?;
-        let active = map.get(node_id)?;
+        let active = self.connections.get(node_id)?;
         Some(connection_snapshot_from_connection(&active.connection))
     }
 
     pub fn connection_snapshots(&self) -> HashMap<String, ConnectionSnapshot> {
-        let Ok(map) = self.connections.try_read() else {
-            return HashMap::new();
-        };
-        map.iter()
-            .map(|(node_id, active)| {
+        self.connections
+            .iter()
+            .map(|entry| {
                 (
-                    node_id.clone(),
-                    connection_snapshot_from_connection(&active.connection),
+                    entry.key().clone(),
+                    connection_snapshot_from_connection(&entry.value().connection),
                 )
             })
             .collect()
@@ -702,7 +700,7 @@ impl IrohMeshManager {
 
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
-        self.connections.write().await.clear();
+        self.connections.clear();
     }
 
     /// Laczy sie z peerem po hex-enkodowanym EndpointId. Gdy caller poda
@@ -719,7 +717,7 @@ impl IrohMeshManager {
             return Ok(());
         }
         let peer_id_str = node_id_hex.to_string();
-        let lock = self.dial_lock_for(&peer_id_str).await;
+        let lock = self.dial_lock_for(&peer_id_str);
         let _guard = lock.lock().await;
         // Po wzieciu locka re-sprawdz is_connected — inny task mogl juz zadialowac.
         if self.is_connected(&peer_id_str).await {
@@ -780,7 +778,7 @@ impl IrohMeshManager {
             return Ok(());
         }
         let peer_id_str = node_id_hex.to_string();
-        let lock = self.dial_lock_for(&peer_id_str).await;
+        let lock = self.dial_lock_for(&peer_id_str);
         let _guard = lock.lock().await;
         if self.is_connected(&peer_id_str).await {
             return Ok(());
@@ -829,7 +827,7 @@ impl IrohMeshManager {
             return Ok(());
         }
         let peer_id_str = hints.node_id.clone();
-        let lock = self.dial_lock_for(&peer_id_str).await;
+        let lock = self.dial_lock_for(&peer_id_str);
         let _guard = lock.lock().await;
         if self.is_connected(&peer_id_str).await {
             return Ok(());
@@ -879,12 +877,12 @@ impl IrohMeshManager {
         discriminant: u8,
         data: &[u8],
     ) -> Result<()> {
-        let map = self.connections.read().await;
-        let active = map
+        let connection = self
+            .connections
             .get(target_node_id)
-            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?;
-        let connection = active.connection.clone();
-        drop(map);
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
+            .connection
+            .clone();
 
         let mut send = connection
             .open_uni()
@@ -909,33 +907,35 @@ impl IrohMeshManager {
         data: &[u8],
         exclude: Option<&str>,
     ) -> Vec<(String, Result<()>)> {
+        use futures::future::join_all;
         let trusted = self.security.trusted_node_ids_snapshot();
-        let map = self.connections.read().await;
-        let targets: Vec<String> = map
-            .keys()
-            .filter(|id| trusted.contains(*id))
+        let targets: Vec<String> = self
+            .connections
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|id| trusted.contains(id))
             .filter(|id| exclude.map(|e| id.as_str() != e).unwrap_or(true))
-            .cloned()
             .collect();
-        drop(map);
-        let mut results = Vec::with_capacity(targets.len());
-        for node_id in targets {
+        // PARALLEL: send_to_peer na kazdy cel rownolegle. Dla 1000 peerow
+        // sekwencyjne wysylanie trwalo 2-5s (open_uni + write + finish);
+        // rownolegle spada do max(rtt) + overhead, zwykle <50ms.
+        let futs = targets.into_iter().map(|node_id| async move {
             let res = self.send_to_peer(&node_id, discriminant, data).await;
-            results.push((node_id, res));
-        }
-        results
+            (node_id, res)
+        });
+        join_all(futs).await
     }
 
     pub async fn connected_peers(&self) -> Vec<String> {
-        self.connections.read().await.keys().cloned().collect()
+        self.connections.iter().map(|e| e.key().clone()).collect()
     }
 
     pub async fn is_connected(&self, node_id: &str) -> bool {
-        self.connections.read().await.contains_key(node_id)
+        self.connections.contains_key(node_id)
     }
 
     pub async fn disconnect_peer(&self, node_id: &str) {
-        if let Some(active) = self.connections.write().await.remove(node_id) {
+        if let Some((_, active)) = self.connections.remove(node_id) {
             active.connection.close(0u32.into(), b"disconnect");
             let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
                 node_id: node_id.to_string(),
@@ -943,7 +943,7 @@ impl IrohMeshManager {
         }
         // Sprzataj per-peer dial lock — odpada gdy rozlaczany peer
         // nie bedzie juz dialowany w tym cyklu zycia managera.
-        self.dial_locks.write().await.remove(node_id);
+        self.dial_locks.remove(node_id);
     }
 
     // =========================================================================
@@ -952,23 +952,27 @@ impl IrohMeshManager {
     // =========================================================================
 
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
+        use futures::future::join_all;
         let ids: Vec<String> = self.connected_peers().await;
-        for id in ids {
+        let futs = ids.into_iter().map(|id| async move {
             let _ = self
                 .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
                 .await;
-        }
+        });
+        join_all(futs).await;
     }
 
     /// Broadcast listy modeli do wszystkich polaczonych peerow. Wywolywane
     /// co `models_sync_interval` z pipeline.
     pub async fn send_models_sync_data(&self, data: &[u8]) {
+        use futures::future::join_all;
         let ids: Vec<String> = self.connected_peers().await;
-        for id in ids {
+        let futs = ids.into_iter().map(|id| async move {
             let _ = self
                 .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
                 .await;
-        }
+        });
+        join_all(futs).await;
     }
 
     pub async fn send_node_info(&self, node_id: &str, data: &[u8]) -> Result<()> {
@@ -1083,12 +1087,12 @@ impl IrohMeshManager {
         request_id: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        let map = self.connections.read().await;
-        let active = map
+        let connection = self
+            .connections
             .get(target_node_id)
-            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?;
-        let connection = active.connection.clone();
-        drop(map);
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
+            .connection
+            .clone();
 
         let request_id = request_id.to_string();
         let task = async move {
@@ -1209,10 +1213,7 @@ impl IrohMeshManager {
         timeout: Duration,
     ) -> Result<CommandWaitResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.command_waiters
-            .write()
-            .await
-            .insert(command_id.clone(), tx);
+        self.command_waiters.insert(command_id.clone(), tx);
 
         self.send_to_peer(
             target_node_id,
@@ -1224,11 +1225,11 @@ impl IrohMeshManager {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => {
-                self.command_waiters.write().await.remove(&command_id);
+                self.command_waiters.remove(&command_id);
                 anyhow::bail!("command waiter dropped before response")
             }
             Err(_) => {
-                self.command_waiters.write().await.remove(&command_id);
+                self.command_waiters.remove(&command_id);
                 anyhow::bail!("command {} timed out", command_id)
             }
         }
@@ -1242,7 +1243,7 @@ impl IrohMeshManager {
         output: &str,
         error: Option<&str>,
     ) -> bool {
-        if let Some(tx) = self.command_waiters.write().await.remove(command_id) {
+        if let Some((_, tx)) = self.command_waiters.remove(command_id) {
             let _ = tx.send(CommandWaitResponse {
                 command_id: command_id.to_string(),
                 success,
@@ -1321,7 +1322,7 @@ impl IrohMeshManager {
 /// Kopia referencji uzywana w spawned tasks — bez `Arc<Self>` aby unikac cyklu.
 #[derive(Clone)]
 struct IrohMeshManagerRef {
-    connections: Arc<AsyncRwLock<HashMap<String, ActiveConnection>>>,
+    connections: Arc<DashMap<String, ActiveConnection>>,
     event_tx: broadcast::Sender<IrohMeshEvent>,
 }
 
@@ -1349,14 +1350,13 @@ impl IrohMeshManagerRef {
                 }
             });
         }
-        let mut map = self.connections.write().await;
-        let is_current = map
+        let is_current = self
+            .connections
             .get(&remote_hex)
             .map(|active| active.id == connection_id)
             .unwrap_or(false);
         if is_current {
-            map.remove(&remote_hex);
-            drop(map);
+            self.connections.remove(&remote_hex);
             let reason = close_reason.as_deref().unwrap_or("stream closed");
             info!(peer = %remote_hex, reason, "iroh_mesh: polaczenie zamkniete");
             let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
@@ -1955,11 +1955,11 @@ mod tie_break_tests {
         assert!(second.is_none(), "przegrany incoming nie dostaje id");
 
         // Mapa dalej trzyma ten sam connection_id.
-        let map = manager.connections.read().await;
-        let active = map.get(&peer_hex).expect("entry still present");
-        assert_eq!(active.id, winner_id, "zwyciezca w mapie niezmienny");
-        assert_eq!(active.direction, ConnectionDirection::Outgoing);
-        drop(map);
+        {
+            let active = manager.connections.get(&peer_hex).expect("entry still present");
+            assert_eq!(active.id, winner_id, "zwyciezca w mapie niezmienny");
+            assert_eq!(active.direction, ConnectionDirection::Outgoing);
+        }
 
         // Przegrany incoming dostal close().
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1997,9 +1997,10 @@ mod tie_break_tests {
             .await;
         assert!(second.is_none(), "duplikat kierunku → no-op");
 
-        let map = manager.connections.read().await;
-        assert_eq!(map.get(&peer_hex).unwrap().id, first);
-        drop(map);
+        {
+            let active = manager.connections.get(&peer_hex).expect("entry still present");
+            assert_eq!(active.id, first);
+        }
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
@@ -2020,9 +2021,9 @@ mod tie_break_tests {
         let peer_hex = "a".repeat(64);
         let other_hex = "b".repeat(64);
 
-        let lock1 = manager.dial_lock_for(&peer_hex).await;
-        let lock2 = manager.dial_lock_for(&peer_hex).await;
-        let lock_other = manager.dial_lock_for(&other_hex).await;
+        let lock1 = manager.dial_lock_for(&peer_hex);
+        let lock2 = manager.dial_lock_for(&peer_hex);
+        let lock_other = manager.dial_lock_for(&other_hex);
 
         assert!(
             Arc::ptr_eq(&lock1, &lock2),

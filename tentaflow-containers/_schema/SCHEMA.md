@@ -109,6 +109,8 @@ recommended = true                         # OPTIONAL, default false
 | `homepage` | URL | tak | Strona projektu. |
 | `license` | string SPDX | tak | Identyfikator SPDX licencji. |
 | `icon` | string | nie | Klucz ikony w `www/js/modules/catalog/icons.js`. Brak = ikona kategorii. |
+| `requires_model` | bool | nie | Wymusza pokazanie lub ukrycie kroku wyboru modelu w wizardzie. |
+| `gpu_supported` | bool | nie | Pozwala ukryć krok wyboru GPU dla silników, które nigdy nie używają GPU. |
 | `default_port` | u16 (1–65535) | tak | Domyślny port silnika. |
 | `api` | enum | tak | Protokół API. Patrz lista poniżej. |
 | `version` | string | tak | Wersja referencyjna silnika. |
@@ -131,10 +133,13 @@ Manifest **musi mieć przynajmniej jedną** sekcję deploy: `[deploy.docker]`, `
 
 | Pole | Typ | Wymagane | Opis |
 |------|-----|----------|------|
-| `context_path` | string | tak | Ścieżka kontekstu Dockerfile, względem `tentaflow-containers/`. Katalog MUSI istnieć (sprawdzane przez build.rs). |
+| `context_path` | string | warunkowo | Ścieżka kontekstu Dockerfile, względem `tentaflow-containers/`. Wymagane gdy deploy uruchamia pojedynczy kontener budowany z `Dockerfile`. |
+| `compose_path` | string | warunkowo | Ścieżka do pliku Compose/stack, względem `tentaflow-containers/`. Wymagane gdy jeden kafelek ma uruchamiać wiele kontenerów. |
 | `platforms` | array enum OS | tak | Systemy, na których ten obraz może być zbudowany / uruchomiony. |
 | `download_image` | string | nie | Referencja OCI prebuilt image (Pro feature). |
 | `download_size_mb` | u64 | nie | Rozmiar do pobrania (informacyjnie). |
+
+Dokładnie jedno z pól `context_path` albo `compose_path` musi być ustawione.
 
 ### 4.2. `[deploy.native]`
 

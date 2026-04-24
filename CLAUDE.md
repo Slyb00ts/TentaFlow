@@ -150,6 +150,7 @@ Single source of truth dla wszystkich silników AI (LLM, TTS, STT, embeddings, v
 - `tentaflow-core/wwwroot/` zostało usunięte; jedynym aktywnym dashboardem jest `tentaflow-core/www/`.
 - Binary protocol nie wspiera już legacy `NodeListRequest` ani `NodeInfoRequest`; GUI i backend używają ścieżki `MeshNode*`.
 - Self-hosted iroh relay deployment assets live in `tentaflow-containers/tools/docker/iroh-relay/`; the old top-level `deploy/iroh-relay/` location is no longer used.
+- `deploy.docker` supports both single-container deployments via `context_path` and multi-container stack deployments via `compose_path`.
 
 Pełna specyfikacja: `tentaflow-containers/_schema/SCHEMA.md`. Schema JSON: `tentaflow-containers/_schema/schema.json`.
 

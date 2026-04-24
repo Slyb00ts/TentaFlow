@@ -628,6 +628,10 @@ mod services_manifest_build {
         pub license: String,
         #[serde(default)]
         pub icon: Option<String>,
+        #[serde(default)]
+        pub requires_model: Option<bool>,
+        #[serde(default)]
+        pub gpu_supported: Option<bool>,
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,
@@ -673,7 +677,10 @@ mod services_manifest_build {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DockerDeploy {
-        pub context_path: String,
+        #[serde(default)]
+        pub context_path: Option<String>,
+        #[serde(default)]
+        pub compose_path: Option<String>,
         pub platforms: Vec<TargetOs>,
         #[serde(default)]
         pub download_image: Option<String>,
@@ -819,15 +826,45 @@ mod services_manifest_build {
             }
         }
 
+        if let Some(docker) = &d.docker {
+            let has_context = docker
+                .context_path
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let has_compose = docker
+                .compose_path
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            if has_context == has_compose {
+                errors.push(format!(
+                    "engine '{}': deploy.docker must define exactly one of context_path or compose_path",
+                    eid
+                ));
+            }
+        }
+
         // Reguła 4: sciezki na dysku.
         if let Some(docker) = &d.docker {
-            check_path(
-                containers_root,
-                &docker.context_path,
-                "deploy.docker.context_path",
-                eid,
-                &mut errors,
-            );
+            if let Some(path) = &docker.context_path {
+                check_path(
+                    containers_root,
+                    path,
+                    "deploy.docker.context_path",
+                    eid,
+                    &mut errors,
+                );
+            }
+            if let Some(path) = &docker.compose_path {
+                check_file(
+                    containers_root,
+                    path,
+                    "deploy.docker.compose_path",
+                    eid,
+                    &mut errors,
+                );
+            }
         }
         if let Some(n) = &d.native {
             if let Some(p) = &n.binary_path {
@@ -872,6 +909,22 @@ mod services_manifest_build {
                 field,
                 rel,
                 full.display()
+            ));
+        }
+    }
+
+    fn check_file(
+        root: &std::path::Path,
+        rel: &str,
+        field: &'static str,
+        engine_id: &str,
+        errors: &mut Vec<String>,
+    ) {
+        let full = root.join(rel);
+        if !full.is_file() {
+            errors.push(format!(
+                "engine '{}': sciezka {} = '{}' nie istnieje na dysku",
+                engine_id, field, rel
             ));
         }
     }
