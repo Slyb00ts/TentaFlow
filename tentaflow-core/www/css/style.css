@@ -4049,19 +4049,6 @@ tf-screen {
   overflow: hidden;
   background: var(--bg);
 }
-#meet-live-body {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-}
-.meet-footer {
-  flex-shrink: 0;
-  padding: 10px 26px;
-  border-top: 1px solid var(--border);
-  background: var(--bg-2);
-  font-size: 12px;
-  color: var(--text-3);
-}
 .tf-screen-head {
   flex-shrink: 0;
   padding: 22px 26px 0;
