@@ -1387,6 +1387,26 @@ impl IrohMeshManagerRef {
                 node_id: remote_hex,
                 data: payload,
             },
+            x if x == MESH_MSG_TRUSTED_KEYS_SYNC => {
+                let parsed = rkyv::from_bytes::<
+                    tentaflow_protocol::mesh::TrustedKeysSyncPayload,
+                    rkyv::rancor::Error,
+                >(&payload);
+                match parsed {
+                    Ok(p) => IrohMeshEvent::TrustedKeysSyncReceived {
+                        node_id: remote_hex,
+                        keys: p
+                            .keys
+                            .into_iter()
+                            .map(|e| (e.node_id, e.public_key_hex))
+                            .collect(),
+                    },
+                    Err(e) => {
+                        warn!(peer = %remote_hex, "iroh_mesh: nie udalo sie zdekodowac TrustedKeysSync: {}", e);
+                        return Ok(());
+                    }
+                }
+            }
             x if x == MESH_MSG_TRUST_REVOKED => {
                 // payload: JSON { revoked_node_id }
                 let revoked: String = serde_json::from_slice::<serde_json::Value>(&payload)

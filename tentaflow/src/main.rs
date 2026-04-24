@@ -460,6 +460,7 @@ fn setup_logging(verbose: bool) -> Result<()> {
         portmapper=error,\
         mdns_sd=off,\
         noq_proto=error,\
+        noq_udp=error,\
         wgpu_hal=error,\
         wgpu_core=error";
     let filter = if verbose {
