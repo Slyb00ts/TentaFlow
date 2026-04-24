@@ -16,10 +16,11 @@ use iroh::{
     address_lookup::{
         DhtAddressLookup, DiscoveryEvent, DnsAddressLookup, MdnsAddressLookup, PkarrPublisher,
     },
-    endpoint::presets,
+    endpoint::{presets, QuicTransportConfig},
     protocol::Router,
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
 };
+use std::time::Duration;
 
 use super::{ALPN_API, ALPN_MESH, ALPN_PAIRING};
 
@@ -73,6 +74,21 @@ pub enum IrohEndpointError {
 impl IrohEndpoint {
     /// Tworzy i bind'uje endpoint z podana konfiguracja.
     pub async fn bind(config: IrohConfig) -> Result<Self, IrohEndpointError> {
+        // QUIC keep-alive + idle timeout. Bez tego iroh zostawia polaczenie
+        // kompletnie na lasce ruchu aplikacyjnego — gdy peer na chwile zamilczy
+        // (NAT rebind, wifi roam, krotki packet-loss), Quinn nie wysyla PINGow,
+        // idle timer po swojemu zabija sesje a my dopiero po 30s liveness
+        // wykrywamy zgon. Keep-alive co 10s + idle 25s daje stabilna sesje i
+        // szybkie wykrycie realnej awarii bez spamu rekonektow.
+        let transport_config = QuicTransportConfig::builder()
+            .keep_alive_interval(Duration::from_secs(10))
+            .max_idle_timeout(Some(
+                Duration::from_secs(25)
+                    .try_into()
+                    .expect("25s fits in VarInt"),
+            ))
+            .build();
+
         let mut builder = Endpoint::builder(presets::N0::default())
             .secret_key(config.secret_key.clone())
             .alpns(vec![
@@ -80,6 +96,7 @@ impl IrohEndpoint {
                 ALPN_PAIRING.to_vec(),
                 ALPN_API.to_vec(),
             ])
+            .transport_config(transport_config)
             .bind_addr(config.bind_addr)
             .map_err(|e| IrohEndpointError::InvalidBind(format!("{e:?}")))?;
 
