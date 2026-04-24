@@ -883,13 +883,13 @@ pub fn encode_browser_capture_request(
     kind: String,
     full_page: bool,
 ) -> Result<Vec<u8>, JsError> {
-    use tentaflow_protocol::BrowserCaptureRequest;
-    encode_body_inner(&MessageBody::BrowserCaptureRequestBody(
-        BrowserCaptureRequest {
+    use tentaflow_protocol::{BrowserCapturePayload, BrowserCaptureRequest};
+    encode_body_inner(&MessageBody::BrowserCaptureBody(
+        BrowserCapturePayload::Request(BrowserCaptureRequest {
             session_id: session_id as i64,
             kind,
             full_page,
-        },
+        }),
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -4029,24 +4029,26 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::VncTunnelBody(p) => {
             vnc_tunnel_payload_to_js(&obj, p);
         }
-        MessageBody::BrowserCaptureRequestBody(r) => {
-            set(&obj, "variant", "BrowserCaptureRequest".into());
-            set(&obj, "sessionId", (r.session_id as f64).into());
-            set(&obj, "session_id", (r.session_id as f64).into());
-            set(&obj, "kind", r.kind.into());
-            set(&obj, "fullPage", r.full_page.into());
-            set(&obj, "full_page", r.full_page.into());
-        }
-        MessageBody::BrowserCaptureResponseBody(r) => {
-            set(&obj, "variant", "BrowserCaptureResponse".into());
-            set(&obj, "status", r.status.into());
-            set(&obj, "kind", r.kind.into());
-            // Browser → JS: surowy PNG jako Uint8Array, DOM jako string.
-            let png = js_sys::Uint8Array::from(r.png.as_slice());
-            set(&obj, "png", png.into());
-            set(&obj, "html", r.html.into());
-            set(&obj, "error", r.error.into());
-        }
+        MessageBody::BrowserCaptureBody(payload) => match payload {
+            tentaflow_protocol::BrowserCapturePayload::Request(r) => {
+                set(&obj, "variant", "BrowserCaptureRequest".into());
+                set(&obj, "sessionId", (r.session_id as f64).into());
+                set(&obj, "session_id", (r.session_id as f64).into());
+                set(&obj, "kind", r.kind.into());
+                set(&obj, "fullPage", r.full_page.into());
+                set(&obj, "full_page", r.full_page.into());
+            }
+            tentaflow_protocol::BrowserCapturePayload::Response(r) => {
+                set(&obj, "variant", "BrowserCaptureResponse".into());
+                set(&obj, "status", r.status.into());
+                set(&obj, "kind", r.kind.into());
+                // Browser → JS: surowy PNG jako Uint8Array, DOM jako string.
+                let png = js_sys::Uint8Array::from(r.png.as_slice());
+                set(&obj, "png", png.into());
+                set(&obj, "html", r.html.into());
+                set(&obj, "error", r.error.into());
+            }
+        },
         MessageBody::MeetingLiveEventBody(event) => {
             set(&obj, "variant", "MeetingLiveEventBody".into());
             set(&obj, "meetingKey", event.meeting_key.clone().into());
