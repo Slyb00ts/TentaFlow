@@ -25,7 +25,7 @@ use crate::mesh::security::MeshSecurity;
 use crate::mesh::service_registry::MeshServiceRegistry;
 use crate::net::iroh::{
     handler::IrohStreamError,
-    pairing::{endpoint_addr_from_hints, PairingContactHints, PairingHandler},
+    pairing::{endpoint_addr_from_hints, hints_with_relay_fallback, PairingContactHints, PairingHandler},
     IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_MESH, ALPN_PAIRING,
 };
 
@@ -791,7 +791,10 @@ impl IrohMeshManager {
         if self.is_connected(&peer_id_str).await {
             return Ok(());
         }
-        let addr = endpoint_addr_from_hints(hints)?;
+        // Relay-first: dokladamy nasz home relay jako fallback zawsze gdy
+        // hints go nie maja (direct addrs leca rownolegle).
+        let hints_resolved = hints_with_relay_fallback(self.endpoint.inner(), hints);
+        let addr = endpoint_addr_from_hints(&hints_resolved)?;
         let connection = self
             .endpoint
             .connect(addr, ALPN_MESH)
