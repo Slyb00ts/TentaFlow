@@ -216,10 +216,24 @@
 .meet-kv-row .v.warn { color: var(--warning); }
 .meet-kv-row .v.err { color: var(--danger); }
 
-/* Sticky footer. */
+/* Live view turns its tf-screen body into a flex column so the status
+   footer always glues to the bottom of the visible area, even when the
+   transcript is empty. meet-live-body grows; meet-footer holds fixed
+   height and sticks via flex layout, not position:sticky (sticky only
+   reaches content bottom, which was leaving the pill hovering in the
+   middle of a short screen). */
+.tf-screen-body:has(> .meet-footer) {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+#meet-live-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 0 14px;
+}
 .meet-footer {
-  position: sticky;
-  bottom: 0;
   display: flex; align-items: center; justify-content: space-between;
   gap: 14px; flex-wrap: wrap;
   padding: 10px 26px;
@@ -228,6 +242,27 @@
   font-size: 11.5px;
   color: var(--text-3);
   margin: 0 -26px;
+  flex-shrink: 0;
+}
+
+/* VNC preview window layout. noVNC canvas fills the body; scaleViewport in
+   RFB options handles aspect-ratio letterboxing. The body itself has no
+   padding so the picture reaches every edge and the user can drag the window
+   corner to resize. */
+.meet-vnc-body {
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+}
+.meet-vnc-screen {
+  width: 100%;
+  height: 100%;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .meet-footer .live-dot {
   display: inline-flex; align-items: center; gap: 8px;

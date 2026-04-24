@@ -824,18 +824,23 @@ async function onOpenVnc() {
 
   const win = document.createElement('tf-window');
   win.setAttribute('title', I18n.t('meeting.live.action_btn_screen'));
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('width', '960');
+  // Use the full default button set so users can minimize / maximize; mark the
+  // window draggable and resizable so noVNC scales to whatever size the user
+  // settles on (scaleViewport=true preserves the captured aspect ratio by
+  // letterboxing inside the bounds).
+  win.setAttribute('draggable', '');
+  win.setAttribute('resizable', '');
+  win.setAttribute('width', '1024');
+  win.setAttribute('height', '640');
+  win.setAttribute('min-width', '480');
+  win.setAttribute('min-height', '320');
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
   const body = document.createElement('div');
   body.slot = 'body';
-  body.style.padding = '0';
+  body.className = 'meet-vnc-body';
   const screen = document.createElement('div');
   screen.className = 'meet-vnc-screen';
-  screen.style.width = '960px';
-  screen.style.height = '560px';
-  screen.style.background = '#000';
   body.appendChild(screen);
   win.appendChild(body);
   const backdrop = document.createElement('div');
