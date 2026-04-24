@@ -109,7 +109,10 @@ export const ApiBinary = {
     return dispatch(kind, ...args);
   },
 
-  async action(kind, payload) {
+  async action(kind, payload, options) {
+    if (options && typeof options.timeoutMs === 'number') {
+      return dispatch(kind, payload, { _isRequestOptions: true, timeoutMs: options.timeoutMs });
+    }
     return dispatch(kind, payload);
   },
 

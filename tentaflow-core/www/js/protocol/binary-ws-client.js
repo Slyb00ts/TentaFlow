@@ -209,14 +209,27 @@ export class BinaryWsClient {
    * @returns {Promise<{envelope, body}>}
    */
   request(kind, ...args) {
+    // Ostatni argument moze byc obiektem opcji {timeoutMs}. Wyciagamy go
+    // zanim encode[kind] dostanie reszte, inaczej bylby przekazany jako
+    // payload.
+    let timeoutMs = this.requestTimeoutMs;
+    if (
+      args.length > 0 &&
+      typeof args[args.length - 1] === 'object' &&
+      args[args.length - 1] !== null &&
+      typeof args[args.length - 1].timeoutMs === 'number' &&
+      args[args.length - 1]._isRequestOptions === true
+    ) {
+      timeoutMs = args.pop().timeoutMs;
+    }
     const correlationId = this.nextCorrelationId();
     const sequence = this.takeSequence();
     const frame = encode[kind](correlationId, ...args, sequence);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(correlationId.toString());
-        reject(new Error(`request ${kind} timed out after ${this.requestTimeoutMs}ms`));
-      }, this.requestTimeoutMs);
+        reject(new Error(`request ${kind} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
 
       this.pending.set(correlationId.toString(), {
         resolve: (result) => {

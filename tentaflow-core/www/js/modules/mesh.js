@@ -742,6 +742,9 @@ function openPairModal() {
       const result = await runPairProgress({
         target: { hostname: remoteHostname || I18n.t('mesh.unknown_host'), nodeId: idHex },
         submit: async () => {
+          // Pairing robi w backendzie do 3 retry x 25s = ~67s + bufor pauz.
+          // Default RPC timeout = 30s — za malo, RPC pada przed ostatnim
+          // retry. Podbijamy do 90s zeby 3. proba zdazyla sie zakonczyc.
           const resp = await ApiBinary.action('meshPairingStartRequest', {
             remoteAddress: idHex,
             ...(effectivePin ? { pin: effectivePin } : {}),
@@ -749,7 +752,7 @@ function openPairModal() {
             ...(remoteAddresses.length ? { remoteAddresses } : {}),
             ...(remoteRelayUrl ? { remoteRelayUrl } : {}),
             ...(remoteHostname ? { remoteHostname } : {}),
-          });
+          }, { timeoutMs: 90_000 });
           if (resp?.completed) return { outcome: 'confirmed', resp };
           if (resp?.pin) return { outcome: 'pending', resp };
           return { outcome: 'pending', resp };
