@@ -1058,6 +1058,27 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** Subscribe — otwiera tunel RFB dla sesji meeting, chunki to RFB bytes z kontenera. */
+  vncTunnelOpenRequest(correlationId, { sessionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVncTunnelOpenRequest(Number(sessionId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** One-shot — wysyła RFB input (keyboard/mouse) z przeglądarki do kontenera. */
+  vncTunnelSendRequest(correlationId, { tunnelId, bytes }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVncTunnelSendRequest(String(tunnelId), bytes);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** One-shot — zamyka tunel RFB i zwalnia zasoby po stronie backendu. */
+  vncTunnelCloseRequest(correlationId, { tunnelId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVncTunnelCloseRequest(String(tunnelId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   meetingSessionStartRequest(correlationId, { meetingUrl, title, platform, botName, sttAlias, ttsAlias, llmAlias }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeMeetingSessionStartRequest(

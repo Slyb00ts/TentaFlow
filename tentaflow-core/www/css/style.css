@@ -1054,6 +1054,11 @@ input, textarea, select {
 /* Pairing modal z tabami QR + ID */
 .pair-tabs { margin-bottom: 16px; }
 .pair-tab-panel { padding: 4px 0; }
+.pair-tab-panel[data-tab="id"] {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 .pair-qr-grid {
   display: grid;
   grid-template-columns: 232px 1fr;

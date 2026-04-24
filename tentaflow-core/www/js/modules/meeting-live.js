@@ -815,12 +815,11 @@ function footerHtml() {
 
 async function onOpenVnc() {
   const s = state.sessionDetail;
-  if (!s || !s.novncPort) {
+  if (!s || !Number.isFinite(s.sessionId)) {
     toast(I18n.t('meeting.live.vnc_unavailable'), 'warn');
     return;
   }
-  const scheme = location.protocol;
-  const url = `${scheme}//${location.hostname}:${s.novncPort}/vnc.html?autoconnect=1&resize=scale&host=${location.hostname}&port=${s.novncPort}`;
+
   const win = document.createElement('tf-window');
   win.setAttribute('title', I18n.t('meeting.live.action_btn_screen'));
   win.setAttribute('buttons', 'close');
@@ -830,17 +829,72 @@ async function onOpenVnc() {
   const body = document.createElement('div');
   body.slot = 'body';
   body.style.padding = '0';
-  body.innerHTML = `<iframe src="${escapeAttr(url)}" style="width:100%;height:560px;border:0;background:#000;" allowfullscreen></iframe>`;
+  const screen = document.createElement('div');
+  screen.className = 'meet-vnc-screen';
+  screen.style.width = '960px';
+  screen.style.height = '560px';
+  screen.style.background = '#000';
+  body.appendChild(screen);
   win.appendChild(body);
   const backdrop = document.createElement('div');
   backdrop.className = 'tf-window-backdrop';
   document.body.append(backdrop, win);
+
+  let rfb = null;
+  let transport = null;
+  let disposed = false;
+
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    try { rfb?.disconnect(); } catch (_) {}
+    try { transport?.close(); } catch (_) {}
+    if (win.parentNode) win.remove();
+    if (backdrop.parentNode) backdrop.remove();
+  };
   win.addEventListener('action', (e) => {
-    if (e.detail?.action === 'close') {
-      win.remove();
-      backdrop.remove();
-    }
+    if (e.detail?.action === 'close') cleanup();
   });
+
+  const showStatusToast = ({ status, error }) => {
+    if (disposed) return;
+    if (status === 'ok') return;
+    const keyByStatus = {
+      not_found: 'meeting.live.vnc_error_not_found',
+      forbidden: 'meeting.live.vnc_error_forbidden',
+      no_port: 'meeting.live.vnc_error_no_port',
+      remote_node: 'meeting.live.vnc_error_remote_node',
+    };
+    const key = keyByStatus[status] || 'meeting.live.vnc_error_failed';
+    const msg = key === 'meeting.live.vnc_error_failed'
+      ? I18n.t(key, { message: error || '' })
+      : I18n.t(key);
+    toast(msg, 'error');
+    cleanup();
+  };
+
+  try {
+    const [{ default: RFB }, { VncApiBinaryTransport }] = await Promise.all([
+      import('/js/vendor/novnc/core/rfb.js'),
+      import('/js/modules/meeting/vnc-transport.js'),
+    ]);
+    transport = new VncApiBinaryTransport(Number(s.sessionId));
+    rfb = new RFB(screen, transport, { shared: true });
+    rfb.scaleViewport = true;
+    rfb.resizeSession = false;
+    rfb.addEventListener('disconnect', (ev) => {
+      if (disposed) return;
+      if (!ev?.detail?.clean) {
+        toast(I18n.t('meeting.live.vnc_disconnected'), 'warn');
+      }
+      cleanup();
+    });
+    await transport.start(showStatusToast);
+  } catch (err) {
+    console.error('[meeting-live] vnc open failed:', err);
+    toast(I18n.t('meeting.live.vnc_error_failed', { message: err?.message || '' }), 'error');
+    cleanup();
+  }
 }
 
 async function onDownloadTranscript() {

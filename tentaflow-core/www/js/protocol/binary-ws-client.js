@@ -16,6 +16,7 @@ import { openTransport, TRANSPORT_WEBTRANSPORT, TRANSPORT_WEBSOCKET } from './tr
 const DEFAULT_TIMEOUT_MS = 30_000;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+let GLOBAL_NEXT_SEQUENCE = 1n;
 
 export class BinaryWsClient {
   /**
@@ -39,8 +40,10 @@ export class BinaryWsClient {
     this.reconnectAttempt = 0;
     this.closed = false;
     this.outbox = [];
-    // Sequence per connection — server odrzuca <= last_seen, wiec MUSI rosnac.
-    this.nextSequence = 1n;
+    // Sequence jest globalnie monotoniczny per-page. Przy reconnect/auth-switch
+    // stary socket moze jeszcze chwile dozywac po stronie serwera, wiec reset do
+    // `1` bywa traktowany jako replay. Globalny licznik eliminuje ten wyścig.
+    this.nextSequence = GLOBAL_NEXT_SEQUENCE;
 
     this.jwtToken = opts.jwtToken ?? null;
     this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 15_000;
@@ -190,7 +193,6 @@ export class BinaryWsClient {
       this.onDisconnected({ reason: info?.reason ?? 'unknown', code: info?.code });
     }
     this.onClose(info);
-    this.nextSequence = 1n;
     this._scheduleReconnect(info?.reason ?? 'closed');
   }
 
@@ -239,6 +241,9 @@ export class BinaryWsClient {
   takeSequence() {
     const seq = this.nextSequence;
     this.nextSequence = this.nextSequence + 1n;
+    if (this.nextSequence > GLOBAL_NEXT_SEQUENCE) {
+      GLOBAL_NEXT_SEQUENCE = this.nextSequence;
+    }
     return seq;
   }
 
