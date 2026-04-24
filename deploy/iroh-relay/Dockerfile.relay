@@ -1,0 +1,28 @@
+# =============================================================================
+# Plik: Dockerfile.relay
+# Opis: Buduje obraz iroh-relay:0.98.0 z crates.io (oficjalne zrodlo n0).
+# Przyklad buildu:
+#   docker build -t ghcr.io/slyb00ts/iroh-relay:0.98.0 -f Dockerfile.relay .
+#   docker push   ghcr.io/slyb00ts/iroh-relay:0.98.0
+# =============================================================================
+
+FROM rust:1.82-bookworm AS builder
+RUN cargo install --root /opt --version 0.98.0 iroh-relay
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/bin/iroh-relay /usr/local/bin/iroh-relay
+
+# Non-root user
+RUN useradd -r -u 1001 -d /data iroh \
+ && mkdir -p /data/certs \
+ && chown -R iroh:iroh /data
+USER iroh
+WORKDIR /data
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/local/bin/iroh-relay"]
+CMD ["--config-path", "/data/relay.toml"]

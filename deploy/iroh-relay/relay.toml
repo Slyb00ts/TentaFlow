@@ -1,0 +1,47 @@
+# =============================================================================
+# Plik: relay.toml
+# Opis: Konfiguracja iroh-relay. Zamontowany read-only do /data/relay.toml w
+#       kontenerze. Zmiana wymaga restartu kontenera.
+# =============================================================================
+
+# HTTP na :80 — Let's Encrypt HTTP-01 challenge + redirect na HTTPS.
+http_bind_addr = "0.0.0.0:80"
+
+# Publiczny endpoint, tu trafiaja klienci iroh (obaj TentaFlow nody).
+https_bind_addr = "0.0.0.0:443"
+
+# STUN do wykrywania publicznego adresu klienta dla hole-punchingu.
+stun_bind_addr = "0.0.0.0:3478"
+
+# QUIC relay — iroh tuneluje strumieniami mesh po UDP 7842.
+enable_quic_addr_discovery = true
+
+# Proxyjemy /pkarr/* na lokalny iroh-dns-server (patrz stack.yml). Dzieki temu
+# z zewnatrz wystarczy jeden hostname ('relay.example.com') dla obu funkcji.
+# UWAGA: iroh-relay 0.98 nie ma wbudowanego reverse proxy — zaimplementujemy
+# to na poziomie reverse-proxy przed relay (nginx/Caddy) albo postawimy
+# iroh-dns pod osobna subdomena (dns.example.com).
+# Patrz README.md w tym katalogu — polecany pattern: osobna subdomena.
+
+[tls]
+# Podmien na swoja domene (musi wskazywac A na hosta Portainera):
+hostname = "RELAY_HOSTNAME_PLACEHOLDER"
+
+# Let's Encrypt (prod). Przed pierwszym startem upewnij sie ze port 80 jest
+# otwarty w firewallu — potrzebny do ACME HTTP-01 challenge.
+cert_mode = "LetsEncrypt"
+
+# Cert storage (w wolume Dockerowym).
+cert_dir = "/data/certs"
+
+# Mail do Let's Encrypt — dostaniesz tam ostrzezenia o wygasajacym cercie.
+contact = "CONTACT_EMAIL_PLACEHOLDER"
+
+# Prod LE (false = staging, tylko do testow).
+prod_tls = true
+
+[limits]
+# Opcjonalne limity per-klient. Domyslnie wylaczone; ustaw gdy relay obsluguje
+# publicznie wiele nieznanych peerow.
+# client_rx_ratelimit.bytes_per_second = 4_000_000
+# client_rx_ratelimit.max_burst_bytes = 16_000_000
