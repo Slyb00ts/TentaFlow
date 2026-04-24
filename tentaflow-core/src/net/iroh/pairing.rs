@@ -256,26 +256,10 @@ pub async fn initiate_pairing_over_iroh(
     local_relay_url: String,
 ) -> anyhow::Result<PairingAttemptOutcome> {
     let sender_node_id = security.ed25519_public_key_hex();
-    // Gdy hinty od peera nie niosa ani bezposrednich adresow ani relay URL
-    // (np. recznie wpisany node_id, bez QR), podpowiadamy iroh nasze wlasne
-    // relaye — w domyslnej konfiguracji obie strony uzywaja tej samej n0 mesh
-    // relay pool, wiec peer jest osiagalny przez te same URL co my. To daje
-    // iroh adresowalnosc startowa zanim DHT discovery dostarczy wiecej.
-    let receiver_hints = if receiver.addresses.is_empty() && receiver.relay_url.trim().is_empty() {
-        let mut filled = receiver.clone();
-        let our_relay = endpoint
-            .addr()
-            .relay_urls()
-            .next()
-            .map(|u| u.to_string())
-            .unwrap_or_default();
-        if !our_relay.is_empty() {
-            filled.relay_url = our_relay;
-        }
-        filled
-    } else {
-        receiver.clone()
-    };
+    // Zawsze pairing relay-first: jesli hints nie niosa relay_url, uzupelniamy
+    // go naszym home relay. Direct adresy (gdy sa) zostaja — iroh probuje ich
+    // rownolegle i hole-punchuje LAN-side po otwartej sesji relay.
+    let receiver_hints = hints_with_relay_fallback(endpoint, receiver);
     let endpoint_addr = endpoint_addr_from_hints(&receiver_hints)?;
 
     let request = PairingRequest {
@@ -483,6 +467,34 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
     }
 
     Ok(cleaned)
+}
+
+/// Gwarantuje ze `hints.relay_url` jest ustawiony — gdy peer go nie dostarczyl
+/// (bare node_id, stary QR bez relay, autodiscovery LAN bez relay pola),
+/// wpisujemy nasz wlasny home relay. Przy domyslnym secie obie strony sa w n0
+/// relay mesh i peer jest osiagalny przez ten sam URL. Relay-first: adresy
+/// bezposrednie zostaja (iroh tries them in parallel), ale relay zawsze jest
+/// gotowy fallback, a po jego zestawieniu iroh sam hole-punchuje do direct
+/// path gdy sasiedzi sa w LANie.
+pub fn hints_with_relay_fallback(
+    endpoint: &iroh::Endpoint,
+    hints: &PairingContactHints,
+) -> PairingContactHints {
+    if !hints.relay_url.trim().is_empty() {
+        return hints.clone();
+    }
+    let our_relay = endpoint
+        .addr()
+        .relay_urls()
+        .next()
+        .map(|u| u.to_string())
+        .unwrap_or_default();
+    if our_relay.is_empty() {
+        return hints.clone();
+    }
+    let mut filled = hints.clone();
+    filled.relay_url = our_relay;
+    filled
 }
 
 pub fn endpoint_addr_from_hints(hints: &PairingContactHints) -> anyhow::Result<EndpointAddr> {
