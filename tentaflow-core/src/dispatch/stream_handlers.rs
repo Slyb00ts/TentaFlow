@@ -5,48 +5,148 @@
 //       SubscriptionEvent::Chunk + final SubscriptionEvent::End. ws_binary
 //       writer task drainuje mpsc i pakuje w IS_STREAM_CHUNK/IS_STREAM_END
 //       envelope flags.
-//
-// Bootstrap: ChatStreamRequest emituje 3 chunki "Hello", " world", "!"
-// na potrzeby testow — prawdziwa integracja z LLM przyjdzie w #36 phase 2
-// gdy router/inference bedzie wystawial async stream.
 // =============================================================================
 
 use std::sync::Arc;
 
+use futures::StreamExt;
 use tentaflow_protocol::{ChatStreamChunk, ChatStreamEnd, MessageBody, SessionAuth};
 
 use super::recorder;
 use super::resume_token::{self, ResumeError};
-use super::subscription::{push_chunk, push_end, StreamHandlerMeta, Subscription};
+use super::subscription::{
+    push_chunk, push_chunk_async, push_end, push_end_async, StreamHandlerMeta, Subscription,
+};
 use super::{HandlerContext, SessionAuthKind};
 
 // =============================================================================
-// ChatStreamRequest — emituje 3 demo chunki + end.
+// ChatStreamRequest — real SSE streaming z Router. Bierze ChatStreamRequest
+// (model_id + messages[] + temperature + max_tokens), konstruuje OpenAI-shape
+// ChatCompletionRequest z stream=true, woła Router::route_chat_completion_stream
+// i forwarduje kazdy Delta.content jako ChatStreamChunk. Router sam wybiera
+// backend: flow engine → QUIC mesh → HTTP backend (dynamic, np. vllm-metal na
+// 127.0.0.1:8000) → local inference fallback.
 // =============================================================================
 
-fn chat_stream_handler(_req: MessageBody, _ctx: HandlerContext, sub: Arc<Subscription>) {
-    tokio::spawn(async move {
-        let demo_chunks = ["Hello", ", world", "!"];
-        for delta in demo_chunks {
-            if push_chunk(
+fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent};
+
+    let stream_req = match req {
+        MessageBody::ChatStreamRequestBody(r) => r,
+        _ => {
+            let _ = push_end(
                 &sub,
-                MessageBody::ChatStreamChunkBody(ChatStreamChunk {
-                    delta: delta.to_string(),
-                }),
-            )
-            .is_err()
-            {
-                // Subscriber odpadl (writer task zamknal mpsc).
+                Some(MessageBody::ChatStreamEndBody(ChatStreamEnd {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                })),
+            );
+            return;
+        }
+    };
+
+    let router = ctx.state.router.clone();
+    tokio::spawn(async move {
+        let messages: Vec<Message> = stream_req
+            .messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: Some(MessageContent::Text(m.content.clone())),
+                ..Default::default()
+            })
+            .collect();
+
+        let request = ChatCompletionRequest {
+            model: stream_req.model_id.clone(),
+            messages,
+            temperature: stream_req.temperature,
+            max_tokens: stream_req.max_tokens,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: true,
+            user: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            rag_options: None,
+            memory_options: None,
+            audio_input: None,
+        };
+
+        let route_result = match router.route_chat_completion_stream(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("chat_stream: route_chat_completion_stream failed: {:#}", e);
+                let _ = push_chunk(
+                    &sub,
+                    MessageBody::ChatStreamChunkBody(ChatStreamChunk {
+                        delta: format!("[routing error] {}", e),
+                    }),
+                );
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::ChatStreamEndBody(ChatStreamEnd {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                    })),
+                );
                 return;
             }
+        };
+
+        let mut stream = route_result.response;
+        let mut completion_tokens: u32 = 0;
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = push_chunk_async(
+                        &sub,
+                        MessageBody::ChatStreamChunkBody(ChatStreamChunk {
+                            delta: format!("\n[stream error] {}", e),
+                        }),
+                    )
+                    .await;
+                    break;
+                }
+            };
+            if let Some(choice) = chunk.choices.first() {
+                if let Some(content) = choice.delta.content.as_ref() {
+                    if !content.is_empty() {
+                        // Async send — czeka na slot gdy channel pelny zeby nie
+                        // gubic tokenow (maly model 0.8B emituje ~200 tok/s,
+                        // WS writer moze nie nadazac — bez backpressure gubimy
+                        // wszystko po pierwszych 64 chunkach).
+                        if push_chunk_async(
+                            &sub,
+                            MessageBody::ChatStreamChunkBody(ChatStreamChunk {
+                                delta: content.clone(),
+                            }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            // Receiver naprawde odpadl — kanczymy task.
+                            return;
+                        }
+                        completion_tokens = completion_tokens.saturating_add(1);
+                    }
+                }
+            }
         }
-        let _ = push_end(
+
+        let _ = push_end_async(
             &sub,
             Some(MessageBody::ChatStreamEndBody(ChatStreamEnd {
-                prompt_tokens: 5,
-                completion_tokens: 3,
+                prompt_tokens: 0,
+                completion_tokens,
             })),
-        );
+        )
+        .await;
     });
 }
 
@@ -717,7 +817,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_handler_emits_three_chunks_and_end() {
+    async fn chat_stream_handler_routes_to_router_and_emits_end() {
+        // AppState::for_test() nie ma skonfigurowanych backendow LLM, wiec
+        // router.route_chat_completion_stream zwroci Err → handler emituje
+        // jeden chunk [routing error] i End. Test weryfikuje ze (a) request
+        // w ogole jest parsowany, (b) End jest emitowany, (c) nie wystepuje
+        // panika. Pelny test produkcji z backendem jest w api/openai/server.rs.
         use super::super::subscription::SubscriptionRegistry;
         use super::super::HandlerContext;
         use tentaflow_protocol::{ChatMessage, ChatStreamRequest, MessageBody, SessionAuth};
@@ -746,11 +851,12 @@ mod tests {
         };
         (h.handler_fn)(req, ctx, sub);
 
-        let mut chunks = 0;
         let mut got_end = false;
         while let Some(evt) = rx.recv().await {
             match evt {
-                SubscriptionEvent::Chunk(MessageBody::ChatStreamChunkBody(_)) => chunks += 1,
+                SubscriptionEvent::Chunk(MessageBody::ChatStreamChunkBody(_)) => {
+                    // chunk z [routing error] albo realny delta — ignorujemy
+                }
                 SubscriptionEvent::End(_) => {
                     got_end = true;
                     break;
@@ -758,7 +864,6 @@ mod tests {
                 other => panic!("unexpected event: {:?}", other),
             }
         }
-        assert_eq!(chunks, 3);
-        assert!(got_end);
+        assert!(got_end, "chat_stream_handler powinien emitowac End");
     }
 }

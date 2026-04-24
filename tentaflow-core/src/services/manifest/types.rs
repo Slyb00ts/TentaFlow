@@ -128,6 +128,16 @@ pub enum NativeRuntime {
     PythonBundle,
 }
 
+impl NativeRuntime {
+    pub fn as_kebab_str(&self) -> &'static str {
+        match self {
+            NativeRuntime::Embedded => "embedded",
+            NativeRuntime::Binary => "binary",
+            NativeRuntime::PythonBundle => "python-bundle",
+        }
+    }
+}
+
 /// `[deploy.external]` section for discovering an already running external service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalDeploy {

@@ -19,8 +19,20 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+
+/// Log callback: wywolywany dla kazdej linii stdout/stderr subprocesu oraz
+/// wysokopoziomowych faz deployu. `Arc` zeby wolno bylo clone'owac do watkow
+/// czytajacych piped stdio.
+pub type LogSink = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+
+/// Noop sink dla wywolan gdzie caller nie chce logow (np. legacy bootstrap).
+pub fn noop_log_sink() -> LogSink {
+    Arc::new(|_: &str| {})
+}
 
 /// Sparsowane bundle.toml.
 #[derive(Debug, Clone, Deserialize)]
@@ -55,7 +67,7 @@ pub struct BundleMeta {
     pub engine: String,
     pub description: String,
     pub python_version: String,
-    pub source: String, // "pypi" | "git"
+    pub source: String, // "pypi" | "git" | "vllm-metal"
     #[serde(default)]
     pub pypi_package: Option<String>,
     #[serde(default)]
@@ -71,6 +83,14 @@ pub struct BundleMeta {
     /// package, uruchamia sie przez python main.py).
     #[serde(default)]
     pub install_mode: Option<String>,
+    /// source="vllm-metal": wersja upstream vllm tarballa z GitHub Releases
+    /// (np. "0.19.1"). Wymagana dla tego source.
+    #[serde(default)]
+    pub vllm_version: Option<String>,
+    /// source="vllm-metal": repo pluginu w formacie "<owner>/<name>"
+    /// (default "vllm-project/vllm-metal").
+    #[serde(default)]
+    pub vllm_metal_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,6 +199,10 @@ pub struct BootstrappedEngine {
 /// `cargo run --example bootstrap_python_bundle` do sprawdzenia czy
 /// pobieranie Pythona/uv + instalacja wheels dzialaja na danej maszynie.
 pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
+    bootstrap_with_logs(engine, &noop_log_sink())
+}
+
+pub fn bootstrap_with_logs(engine: &str, log: &LogSink) -> Result<BootstrappedEngine> {
     let extracted = tempfile::tempdir()?;
     super::bundle::extract_to(extracted.path())?;
     let spec = read_bundle_spec(extracted.path(), engine)?;
@@ -187,11 +211,14 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
     let detected = crate::system_check::collect();
     let backend_name = backend_to_str(&detected.gpu.preferred_backend);
     let variant = pick_install_variant(&spec.install_variants, backend_name)?;
-    tracing::info!(engine=%engine, backend=%backend_name, "Bootstrap python bundle");
+    log(&format!(
+        "bootstrap: engine={} backend={}",
+        engine, backend_name
+    ));
 
     let cache = cache_root()?;
-    let python_bin = ensure_python(&cache, &spec.bundle.python_version)?;
-    let uv_bin = ensure_uv(&cache).ok();
+    let python_bin = ensure_python(&cache, &spec.bundle.python_version, log)?;
+    let uv_bin = ensure_uv(&cache, log).ok();
 
     let bundle_src = find_bundle_dir(extracted.path(), engine)
         .ok_or_else(|| anyhow::anyhow!(
@@ -199,7 +226,17 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
             engine
         ))?;
 
-    let venv_dir = prepare_template_env(&cache, &python_bin, &uv_bin, &spec, variant, &bundle_src)?;
+    let empty_env: HashMap<String, String> = HashMap::new();
+    let venv_dir = prepare_template_env(
+        &cache,
+        &python_bin,
+        &uv_bin,
+        &spec,
+        variant,
+        &bundle_src,
+        &empty_env,
+        log,
+    )?;
 
     Ok(BootstrappedEngine {
         engine: engine.to_string(),
@@ -210,8 +247,14 @@ pub fn bootstrap(engine: &str) -> Result<BootstrappedEngine> {
 }
 
 /// Glowna funkcja. Odpowiada tentaflow-core::deploy::docker::deploy() ale
-/// dla Pythona bez kontenera.
+/// dla Pythona bez kontenera. Wersja `deploy_with_logs` streamuje kazda linie
+/// stdout/stderr subprocesu przez `log_cb` — preferowana sciezka dla runnera
+/// GUI. `deploy()` to backward-compat wrapper dla wywolan bez streamu logow.
 pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
+    deploy_with_logs(req, &noop_log_sink())
+}
+
+pub fn deploy_with_logs(req: &NativeDeployRequest, log: &LogSink) -> Result<RunningEngine> {
     let extracted = tempfile::tempdir()?;
     super::bundle::extract_to(extracted.path())?;
     let spec = read_bundle_spec(extracted.path(), &req.engine)?;
@@ -222,11 +265,15 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
     let detected = crate::system_check::collect();
     let backend_name = backend_to_str(&detected.gpu.preferred_backend);
     let variant = pick_install_variant(&spec.install_variants, backend_name)?;
-    tracing::info!(engine=%req.engine, backend=%backend_name, "Wybrany wariant instalacji");
+    log(&format!(
+        "wariant instalacji: engine={} backend={}",
+        req.engine, backend_name
+    ));
 
     let cache = cache_root()?;
-    let python_bin = ensure_python(&cache, &spec.bundle.python_version)?;
-    let uv_bin = ensure_uv(&cache).ok();
+    log("przygotowanie Pythona i uv");
+    let python_bin = ensure_python(&cache, &spec.bundle.python_version, log)?;
+    let uv_bin = ensure_uv(&cache, log).ok();
 
     let bundle_src = find_bundle_dir(extracted.path(), &req.engine)
         .ok_or_else(|| anyhow::anyhow!(
@@ -238,17 +285,35 @@ pub fn deploy(req: &NativeDeployRequest) -> Result<RunningEngine> {
         .instance_name
         .clone()
         .unwrap_or_else(|| format!("tentaflow-{}-native", req.engine));
-    let template_venv =
-        prepare_template_env(&cache, &python_bin, &uv_bin, &spec, variant, &bundle_src)?;
+    log(&format!(
+        "template venv + instalacja zaleznosci dla {}",
+        req.engine
+    ));
+    let template_venv = prepare_template_env(
+        &cache,
+        &python_bin,
+        &uv_bin,
+        &spec,
+        variant,
+        &bundle_src,
+        &req.env,
+        log,
+    )?;
     let template_id = template_identity(&spec, variant, &bundle_src)?;
+    log(&format!("instance venv: {}", instance_name));
     let venv_dir = prepare_instance_env(
         &cache,
         &req.engine,
         &instance_name,
         &template_venv,
         &template_id,
+        log,
     )?;
 
+    log(&format!(
+        "uruchamiam silnik: {} (port wewn. {})",
+        req.engine, spec.launch.internal_port
+    ));
     let child = spawn_engine(&venv_dir, &spec, req)?;
 
     Ok(RunningEngine {
@@ -289,10 +354,11 @@ const UV_VERSION: &str = "0.5.14";
 /// Zapewnia relokowalnego Pythona w `<cache>/python/<py_ver>/`. Jesli
 /// katalog istnieje -> reuse. W przeciwnym razie pobiera odpowiednie archiwum
 /// z github.com/astral-sh/python-build-standalone/releases.
-fn ensure_python(cache: &Path, py_ver: &str) -> Result<PathBuf> {
+fn ensure_python(cache: &Path, py_ver: &str, log: &LogSink) -> Result<PathBuf> {
     let target_dir = cache.join("python").join(py_ver);
     let python_bin = python_bin_path(&target_dir);
     if python_bin.exists() {
+        log(&format!("python {}: reuse z cache", py_ver));
         return Ok(python_bin);
     }
 
@@ -310,9 +376,9 @@ fn ensure_python(cache: &Path, py_ver: &str) -> Result<PathBuf> {
         date = date, ver = full_ver, triple = triple
     );
 
-    tracing::info!(url = %url, "Pobieram python-build-standalone");
+    log(&format!("pobieram Python {} ({})", full_ver, triple));
     std::fs::create_dir_all(&target_dir)?;
-    download_and_extract(&url, &target_dir)?;
+    download_and_extract(&url, &target_dir, log)?;
 
     if !python_bin.exists() {
         anyhow::bail!(
@@ -324,11 +390,12 @@ fn ensure_python(cache: &Path, py_ver: &str) -> Result<PathBuf> {
 }
 
 /// Zapewnia binarke `uv` w `<cache>/bin/uv`. Reuse jesli juz jest.
-fn ensure_uv(cache: &Path) -> Result<PathBuf> {
+fn ensure_uv(cache: &Path, log: &LogSink) -> Result<PathBuf> {
     let bin_dir = cache.join("bin");
     let uv_name = if cfg!(windows) { "uv.exe" } else { "uv" };
     let uv_path = bin_dir.join(uv_name);
     if uv_path.exists() {
+        log(&format!("uv: reuse z cache ({})", uv_path.display()));
         return Ok(uv_path);
     }
     std::fs::create_dir_all(&bin_dir)?;
@@ -342,8 +409,8 @@ fn ensure_uv(cache: &Path) -> Result<PathBuf> {
         ext = ext
     );
 
-    tracing::info!(url = %url, "Pobieram uv");
-    download_and_extract(&url, &bin_dir)?;
+    log(&format!("pobieram uv {} ({})", UV_VERSION, triple));
+    download_and_extract(&url, &bin_dir, log)?;
 
     // Po extract uv konczy jako `<bin_dir>/uv-<triple>/uv` — przenosimy wprost
     let nested = bin_dir.join(format!("uv-{}", triple)).join(uv_name);
@@ -446,7 +513,8 @@ fn uv_triple() -> Option<&'static str> {
 
 /// Pobiera i rozpakowuje archiwum tar.gz / zip do docelowego katalogu.
 /// Blocking; wolamy synchronicznie z thread pool (deploy to rzadka operacja).
-fn download_and_extract(url: &str, dst: &Path) -> Result<()> {
+fn download_and_extract(url: &str, dst: &Path, log: &LogSink) -> Result<()> {
+    log(&format!("pobieranie: {}", url));
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(1800))
         .build()?
@@ -458,6 +526,11 @@ fn download_and_extract(url: &str, dst: &Path) -> Result<()> {
         anyhow::bail!("HTTP {} przy {}", response.status(), url);
     }
     let bytes = response.bytes()?;
+    log(&format!(
+        "pobrane: {} bajtow, rozpakowuje do {}",
+        bytes.len(),
+        dst.display()
+    ));
 
     if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
         let decoder = flate2::read::GzDecoder::new(&bytes[..]);
@@ -478,12 +551,17 @@ fn download_and_extract(url: &str, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_venv(python: &Path, venv: &Path) -> Result<()> {
+fn create_venv(python: &Path, venv: &Path, log: &LogSink) -> Result<()> {
     if venv.join("pyvenv.cfg").exists() {
         return Ok(());
     }
     std::fs::create_dir_all(venv.parent().unwrap()).ok();
-    run(Command::new(python).args(["-m", "venv", venv.to_str().unwrap()])).context("tworzenie venv")
+    log(&format!("python -m venv {}", venv.display()));
+    run_with_logs(
+        Command::new(python).args(["-m", "venv", venv.to_str().unwrap()]),
+        log,
+    )
+    .context("tworzenie venv")
 }
 
 fn prepare_template_env(
@@ -493,6 +571,8 @@ fn prepare_template_env(
     spec: &BundleSpec,
     variant: Option<&InstallVariant>,
     bundle_src: &Path,
+    extra_env: &HashMap<String, String>,
+    log: &LogSink,
 ) -> Result<PathBuf> {
     let template_id = template_identity(spec, variant, bundle_src)?;
     let template_dir = templates_root(cache)
@@ -501,17 +581,17 @@ fn prepare_template_env(
         .join("venv");
 
     if template_dir.join("pyvenv.cfg").exists() {
+        log("template venv: reuse (pyvenv.cfg istnieje)");
         return Ok(template_dir);
     }
 
     std::fs::create_dir_all(template_dir.parent().unwrap()).ok();
     if let Some(legacy) = legacy_env_dir(cache, &spec.bundle.engine) {
-        tracing::info!(
-            engine = %spec.bundle.engine,
-            source = %legacy.display(),
-            target = %template_dir.display(),
-            "Kopiuje legacy env do wersjonowanego template bundla"
-        );
+        log(&format!(
+            "migracja legacy env {} → {}",
+            legacy.display(),
+            template_dir.display()
+        ));
         copy_dir_recursive(&legacy, &template_dir)?;
         let stale_clone = template_dir.join("src").join(&spec.bundle.engine);
         if stale_clone.exists() {
@@ -523,9 +603,9 @@ fn prepare_template_env(
             })?;
         }
     } else {
-        create_venv(python, &template_dir)?;
+        create_venv(python, &template_dir, log)?;
     }
-    install_deps(&template_dir, uv, spec, variant, bundle_src)?;
+    install_deps(&template_dir, uv, spec, variant, bundle_src, extra_env, log)?;
     copy_bundle_files(bundle_src, &template_dir)?;
     Ok(template_dir)
 }
@@ -536,6 +616,7 @@ fn prepare_instance_env(
     instance_name: &str,
     template_venv: &Path,
     template_id: &str,
+    log: &LogSink,
 ) -> Result<PathBuf> {
     let instance_dir = instances_root(cache)
         .join(engine)
@@ -545,15 +626,27 @@ fn prepare_instance_env(
     if instance_dir.join("pyvenv.cfg").exists()
         && std::fs::read_to_string(&marker).ok().as_deref() == Some(template_id)
     {
+        log(&format!(
+            "instance venv: reuse (template id zgodny) {}",
+            instance_dir.display()
+        ));
         return Ok(instance_dir);
     }
 
     if instance_dir.exists() {
+        log(&format!(
+            "usuwam stary instance venv {} (inny template id)",
+            instance_dir.display()
+        ));
         std::fs::remove_dir_all(&instance_dir).with_context(|| {
             format!("usuwanie starego env instancji {}", instance_dir.display())
         })?;
     }
 
+    log(&format!(
+        "klonuje template venv do instance {}",
+        instance_dir.display()
+    ));
     copy_dir_recursive(template_venv, &instance_dir)?;
     std::fs::write(&marker, template_id)?;
     Ok(instance_dir)
@@ -711,9 +804,17 @@ fn install_deps(
     spec: &BundleSpec,
     variant: Option<&InstallVariant>,
     bundle_src: &Path,
+    extra_env: &HashMap<String, String>,
+    log: &LogSink,
 ) -> Result<()> {
     let extra_index = variant.and_then(|v| v.extra_index.clone());
-    let installer = Installer::new(venv, uv.as_deref(), extra_index);
+    let installer = Installer::new(
+        venv,
+        uv.as_deref(),
+        extra_index,
+        Arc::clone(log),
+        extra_env.clone(),
+    );
     // setuptools>=77 wymagane zeby VoxCPM / niektore nowe pyproject.toml
     // z `license = "MIT"` (string form, PEP 639) sie instalowaly.
     installer.upgrade_pip()?;
@@ -757,14 +858,18 @@ fn install_deps(
             let clone_dir = venv.join("src").join(&spec.bundle.engine);
             if !clone_dir.exists() {
                 std::fs::create_dir_all(clone_dir.parent().unwrap()).ok();
-                run(Command::new("git")
-                    .arg("clone")
-                    .arg("--depth")
-                    .arg("1")
-                    .arg("--branch")
-                    .arg(refname)
-                    .arg(repo)
-                    .arg(&clone_dir))
+                log(&format!("git clone --depth 1 --branch {} {}", refname, repo));
+                run_with_logs(
+                    Command::new("git")
+                        .arg("clone")
+                        .arg("--depth")
+                        .arg("1")
+                        .arg("--branch")
+                        .arg(refname)
+                        .arg(repo)
+                        .arg(&clone_dir),
+                    log,
+                )
                 .context("git clone")?;
             }
             // Podkatalog z pyproject/setup.py (np. SGLang -> python/)
@@ -794,6 +899,10 @@ fn install_deps(
                 other => anyhow::bail!("nieznany install_mode: {}", other),
             }
         }
+        "vllm-metal" => {
+            install_vllm_metal(&installer, &spec.bundle, log)
+                .context("install vllm-metal (MLX plugin)")?;
+        }
         other => anyhow::bail!("nieznane source: {}", other),
     }
 
@@ -808,6 +917,163 @@ fn install_deps(
     }
 
     Ok(())
+}
+
+/// Restartuje proces silnika z istniejacego venv instancji — bez reinstall.
+/// Uzywana przy autostartcie tentaflow dla serwisow `deploy_mode=native`
+/// ktorych proces padl (crash OS, reboot) albo ktorych stare PID-y sa juz
+/// nieaktywne. Zaklada ze venv w `<cache>/bundle-instances/<engine>/<name>/`
+/// istnieje z poprzedniego deploy — jesli nie, zwraca blad i caller powinien
+/// zdecydowac czy oznaczyc serwis jako `stopped` w DB.
+pub fn relaunch(req: &NativeDeployRequest) -> Result<RunningEngine> {
+    let extracted = tempfile::tempdir()?;
+    super::bundle::extract_to(extracted.path())?;
+    let spec = read_bundle_spec(extracted.path(), &req.engine)?;
+    check_platform_compat(&spec.requires)?;
+
+    let cache = cache_root()?;
+    let instance_name = req
+        .instance_name
+        .clone()
+        .unwrap_or_else(|| format!("tentaflow-{}-native", req.engine));
+    let venv_dir = instances_root(&cache)
+        .join(&req.engine)
+        .join(sanitize_fs_name(&instance_name));
+    if !venv_dir.join("pyvenv.cfg").exists() {
+        anyhow::bail!(
+            "brak instance venv w {} — nie mozna restartowac bez ponownej instalacji",
+            venv_dir.display()
+        );
+    }
+
+    let child = spawn_engine(&venv_dir, &spec, req)?;
+    Ok(RunningEngine {
+        engine: req.engine.clone(),
+        instance_name,
+        child,
+        venv_dir,
+        internal_port: spec.launch.internal_port,
+    })
+}
+
+/// Install flow dla `source = "vllm-metal"` — odwzorowuje
+/// https://github.com/vllm-project/vllm-metal/blob/main/install.sh:
+///   1) pobierz tarball vllm v<vllm_version> z GitHub Releases i rozpakuj
+///   2) `uv pip install -r vllm-<ver>/requirements/cpu.txt --index-strategy unsafe-best-match`
+///   3) `CXXFLAGS="-Wno-parentheses" uv pip install <vllm-<ver>/>`
+///   4) pobierz `.whl` z vllm-project/vllm-metal releases/latest → `uv pip install <wheel>`
+fn install_vllm_metal(installer: &Installer<'_>, meta: &BundleMeta, log: &LogSink) -> Result<()> {
+    let vllm_ver = meta
+        .vllm_version
+        .as_deref()
+        .context("source=vllm-metal wymaga pola vllm_version w [bundle]")?;
+    let metal_repo = meta
+        .vllm_metal_repo
+        .as_deref()
+        .unwrap_or("vllm-project/vllm-metal");
+
+    installer.upgrade_pip()?;
+
+    let work = tempfile::tempdir().context("tmpdir dla vllm-metal")?;
+    let tarball_url = format!(
+        "https://github.com/vllm-project/vllm/releases/download/v{ver}/vllm-{ver}.tar.gz",
+        ver = vllm_ver
+    );
+    log(&format!("pobieram upstream vLLM {} tarball", vllm_ver));
+    download_and_extract(&tarball_url, work.path(), log)?;
+
+    let vllm_src = work.path().join(format!("vllm-{}", vllm_ver));
+    if !vllm_src.exists() {
+        anyhow::bail!(
+            "tarball vllm rozpakowal sie bez oczekiwanego podkatalogu {}",
+            vllm_src.display()
+        );
+    }
+
+    let cpu_req = vllm_src.join("requirements").join("cpu.txt");
+    if !cpu_req.exists() {
+        anyhow::bail!(
+            "vllm tarball nie zawiera {} (zmiana upstream layoutu?)",
+            cpu_req.display()
+        );
+    }
+    log("instaluje vLLM requirements/cpu.txt (torch CPU)");
+    installer.install_requirements(&cpu_req)?;
+
+    log("kompiluje vLLM z CXXFLAGS=-Wno-parentheses");
+    let mut cmd = installer.cmd();
+    cmd.env("CXXFLAGS", "-Wno-parentheses");
+    cmd.arg("install");
+    installer.add_install_flags(&mut cmd);
+    cmd.arg(
+        vllm_src
+            .to_str()
+            .context("nie-UTF8 sciezka do vllm src")?,
+    );
+    run_with_logs(&mut cmd, log).context("kompilacja vllm ze zrodla")?;
+
+    let wheel_dir = tempfile::tempdir().context("tmpdir dla wheel vllm-metal")?;
+    let wheel_path = download_vllm_metal_wheel(metal_repo, wheel_dir.path(), log)?;
+    log(&format!(
+        "instaluje vllm-metal wheel: {}",
+        wheel_path.display()
+    ));
+    installer.install_package(
+        wheel_path
+            .to_str()
+            .context("nie-UTF8 sciezka do wheel vllm-metal")?,
+    )?;
+
+    Ok(())
+}
+
+/// Pobiera najnowszy asset `.whl` z GitHub Releases/latest danego repo i
+/// zapisuje do `dst_dir`. Zwraca sciezke do zapisanego pliku.
+fn download_vllm_metal_wheel(repo: &str, dst_dir: &Path, log: &LogSink) -> Result<PathBuf> {
+    let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+    log(&format!("GET {}", api_url));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent("tentaflow")
+        .build()?;
+    let resp = client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .with_context(|| format!("GET {}", api_url))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub API {} zwrocil HTTP {}", api_url, resp.status());
+    }
+    let json: serde_json::Value = resp.json().context("parse JSON z releases/latest")?;
+    let assets = json
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .context("brak `assets` w odpowiedzi releases/latest")?;
+    let (wheel_name, wheel_url) = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name").and_then(|n| n.as_str())?;
+            let url = a.get("browser_download_url").and_then(|u| u.as_str())?;
+            if name.ends_with(".whl") {
+                Some((name.to_string(), url.to_string()))
+            } else {
+                None
+            }
+        })
+        .next()
+        .context("zadne z assets w releases/latest nie konczy sie na .whl")?;
+    log(&format!("pobieram wheel {}", wheel_name));
+    let dst = dst_dir.join(&wheel_name);
+    let resp = client
+        .get(&wheel_url)
+        .send()
+        .with_context(|| format!("GET {}", wheel_url))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("download wheel HTTP {}", resp.status());
+    }
+    let bytes = resp.bytes()?;
+    std::fs::write(&dst, &bytes).with_context(|| format!("zapis {}", dst.display()))?;
+    Ok(dst)
 }
 
 /// Naprawia znane upstream problemy w pyproject.toml sklonowanych repo.
@@ -908,18 +1174,28 @@ struct Installer<'a> {
     venv: PathBuf,
     uv: Option<&'a Path>,
     extra_index_url: Option<String>,
+    log: LogSink,
+    extra_env: HashMap<String, String>,
 }
 
 impl<'a> Installer<'a> {
-    fn new(venv: &Path, uv: Option<&'a Path>, extra_index_url: Option<String>) -> Self {
+    fn new(
+        venv: &Path,
+        uv: Option<&'a Path>,
+        extra_index_url: Option<String>,
+        log: LogSink,
+        extra_env: HashMap<String, String>,
+    ) -> Self {
         Self {
             venv: venv.to_path_buf(),
             uv,
             extra_index_url,
+            log,
+            extra_env,
         }
     }
     fn cmd(&self) -> Command {
-        if let Some(uv) = self.uv {
+        let mut c = if let Some(uv) = self.uv {
             let mut c = Command::new(uv);
             c.env("VIRTUAL_ENV", &self.venv);
             c.arg("pip");
@@ -927,7 +1203,14 @@ impl<'a> Installer<'a> {
         } else {
             let pip = venv_bin(&self.venv, "pip");
             Command::new(pip)
+        };
+        // Propaguj HF_TOKEN/HF_HOME/HUGGINGFACE_HUB_CACHE/TRANSFORMERS_CACHE/
+        // TORCH_HOME z runner.rs zeby pip install gated repo i kompilacja
+        // torchow widzialy token + wspolny katalog modeli.
+        for (k, v) in &self.extra_env {
+            c.env(k, v);
         }
+        c
     }
     /// Dopisuje flagi do `pip install` (po subkomendzie). Osobno bo uv
     /// uzywa --index-strategy a pip nie zna tego flaga.
@@ -945,48 +1228,53 @@ impl<'a> Installer<'a> {
         }
     }
     fn upgrade_pip(&self) -> Result<()> {
+        (self.log)("pip: upgrade pip/wheel/setuptools");
         let mut c = self.cmd();
         c.arg("install")
             .arg("--upgrade")
             .arg("pip")
             .arg("wheel")
             .arg("setuptools>=77");
-        run(&mut c)
+        run_with_logs(&mut c, &self.log)
     }
     fn install_requirements(&self, path: &Path) -> Result<()> {
+        (self.log)(&format!("pip: install -r {}", path.display()));
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("-r").arg(path);
-        run(&mut c)
+        run_with_logs(&mut c, &self.log)
     }
     fn install_package(&self, pkg: &str) -> Result<()> {
+        (self.log)(&format!("pip: install {}", pkg));
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg(pkg);
-        run(&mut c)
+        run_with_logs(&mut c, &self.log)
     }
     fn install_editable(&self, path: &Path) -> Result<()> {
+        (self.log)(&format!("pip: install -e {}", path.display()));
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("-e").arg(path);
-        run(&mut c)
+        run_with_logs(&mut c, &self.log)
     }
     /// Instalacja z wylaczona izolacja buildu (`--no-build-isolation`) —
     /// pakiet ma dostep do zainstalowanego torcha podczas budowy natywnych
     /// kerneli. Wymagane dla flash-attn, niektorych wariantow xformers itp.
     fn install_package_no_build_isolation(&self, pkg: &str) -> Result<()> {
+        (self.log)(&format!("pip: install --no-build-isolation {}", pkg));
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("--no-build-isolation").arg(pkg);
-        run(&mut c)
+        run_with_logs(&mut c, &self.log)
     }
 }
 
@@ -1036,7 +1324,11 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         }
     }
 
-    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    // Piped stdout/stderr zeby runner mogl forwardowac logi silnika (m.in.
+    // HuggingFace model download po starcie vLLM) do deploy_log w GUI
+    // zamiast do stdout tentaflow. Runner odczytuje przez child.stdout.take()
+    // i spawnuje watki czytajace linia po linii.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = cmd.spawn().with_context(|| format!("spawn {:?}", exe))?;
     Ok(child)
@@ -1086,12 +1378,43 @@ fn venv_bin(venv: &Path, bin: &str) -> PathBuf {
     venv.join(dir).join(format!("{}{}", bin, suffix))
 }
 
-fn run(cmd: &mut Command) -> Result<()> {
-    let status = cmd
-        .status()
-        .with_context(|| format!("uruchomienie {:?}", cmd.get_program()))?;
+/// Odpala subprocess z piped stdout/stderr i forwarduje kazda linie przez
+/// `log_cb`. Bloku az subprocess sie zakonczy — wewnatrz `spawn_blocking`
+/// caller nie blokuje tokio runtime. Errory subprocesu (kod != 0) zwracane
+/// jako anyhow::Error, logi stderr juz wyszly do sink po drodze.
+fn run_with_logs(cmd: &mut Command, log_cb: &LogSink) -> Result<()> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let program = format!("{:?}", cmd.get_program());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", program))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let cb_out = Arc::clone(log_cb);
+    let stdout_handle = std::thread::spawn(move || {
+        if let Some(o) = stdout {
+            for line in BufReader::new(o).lines().map_while(Result::ok) {
+                cb_out(&line);
+            }
+        }
+    });
+    let cb_err = Arc::clone(log_cb);
+    let stderr_handle = std::thread::spawn(move || {
+        if let Some(e) = stderr {
+            for line in BufReader::new(e).lines().map_while(Result::ok) {
+                cb_err(&line);
+            }
+        }
+    });
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait {}", program))?;
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
     if !status.success() {
-        anyhow::bail!("{:?} zwrocilo kod {}", cmd.get_program(), status);
+        anyhow::bail!("{} zwrocilo kod {}", program, status);
     }
     Ok(())
 }
