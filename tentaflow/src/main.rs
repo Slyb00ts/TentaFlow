@@ -454,8 +454,10 @@ fn setup_logging(verbose: bool) -> Result<()> {
     //   wgpu — compile warnings
     const BASE_FILTER: &str = "iroh::socket::remote_map=error,\
         iroh::address_lookup=warn,\
+        iroh::net_report=error,\
         iroh::socket::remote_map::remote_state=error,\
         iroh_relay=error,\
+        noq_proto=error,\
         mdns_sd=off,\
         wgpu_hal=error,\
         wgpu_core=error";

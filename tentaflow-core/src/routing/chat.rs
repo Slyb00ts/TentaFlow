@@ -1,9 +1,8 @@
 // =============================================================================
 // Plik: routing/chat.rs
 // Opis: Obsluga zapytan chat completion — non-streaming route, flow engine,
-//       audio input processing, speaker identification, intent analysis,
-//       RAG routing (non-streaming), QUIC LLM routing, callback handler,
-//       protocol-native completion, memory store.
+//       audio input processing (STT + speaker identification), RAG routing,
+//       QUIC LLM routing, callback handler, protocol-native completion.
 // =============================================================================
 
 use crate::api::openai::types::{
@@ -65,13 +64,12 @@ impl Router {
         request: ChatCompletionRequest,
         user: Option<crate::routing::acl::UserContext>,
     ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
-        // Najpierw spróbuj flow engine z user context (dispatcher sam sprawdzi
+        // Najpierw sprobuj flow engine z user context (dispatcher sam sprawdzi
         // ACL dla flow_id i albo wykona flow albo zwroci None — fallback na
         // route_chat_completion ktorego potem wywolujemy z model-level ACL).
         if let Some(ref u) = user {
             if let Some(ref dispatcher) = self.flow_dispatcher {
-                let mut ctx = crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
-                let _ = ctx.user_id; // silenced
+                let ctx = crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
                 if let Ok(Some(result)) = dispatcher.try_dispatch(&request.model, "chat", ctx).await {
                     use crate::routing::chat::flow_result_to_chat_response;
                     let response = flow_result_to_chat_response(result, &request.model);
@@ -126,7 +124,6 @@ impl Router {
             match dispatcher.try_dispatch(&request.model, "chat", ctx).await {
                 Ok(Some(result)) => {
                     let response = flow_result_to_chat_response(result, &request.model);
-                    self.process_memory_store_async(&request, &response, None);
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: hostname::get()
                             .map(|h| h.to_string_lossy().to_string())
@@ -141,25 +138,20 @@ impl Router {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("Flow Engine error, fallback na stary pipeline: {}", e);
+                    warn!("Flow Engine error, fallback na direct dispatch: {}", e);
                 }
             }
         }
 
-        // === AUDIO INPUT PROCESSING ===
+        // Audio input -> STT + speaker ID przeksztalca audio na tekst + speaker metadata.
+        // To jest fizyczna transkrypcja, nie pre-processing request-a.
         let t0 = std::time::Instant::now();
         let (request, voice_info) = self.process_audio_input(request).await?;
         if voice_info.is_some() {
             metrics.stt_ms = Some(t0.elapsed().as_millis() as u64);
         }
 
-        // === MEMORY INTEGRATION (QUERY) ===
-        let (request, query_decision, mem_timings) =
-            self.memory_integration.process_request(request).await?;
-        metrics.query_analysis_ms = mem_timings.query_analysis_ms;
-        metrics.memory_query_ms = mem_timings.memory_query_ms;
-
-        // === ROUTE TO APPROPRIATE BACKEND ===
+        // Direct dispatch do backendu — bez pre/post processingu request-a.
         let t2 = std::time::Instant::now();
         let route_result = {
             use crate::routing::middleware::BackendHandle;
@@ -186,14 +178,13 @@ impl Router {
                             Ok(backend.chat_completion(req).await?)
                         }
                         BackendHandle::MeshForward(node_id, svc) => {
-                            // Uslugi z mesh sa rejestrowane w service_manager jako zdalne
-                            // QUIC LLM (adres iroh endpoint peera). Iroh obsluguje multi-hop
-                            // routing przez relay automatycznie — wywolanie `route_to_quic_llm`
-                            // z nazwa uslugi dziala tak samo jak dla direct peera.
+                            // Iroh obsluguje multi-hop routing przez relay automatycznie —
+                            // wywolanie `route_to_quic_llm` z nazwa uslugi dziala tak samo
+                            // jak dla direct peera.
                             debug!(
                                 target_node = %node_id,
                                 service = %svc,
-                                "MeshForward — wysyłam chat request do zdalnej uslugi mesh"
+                                "MeshForward — wysylam chat request do zdalnej uslugi mesh"
                             );
                             this.route_to_quic_llm(svc.clone(), req, None, None).await
                         }
@@ -208,10 +199,6 @@ impl Router {
         metrics.model_name = Some(route_metadata.backend_type.clone());
         metrics.llm_inference_ms = Some(t2.elapsed().as_millis() as u64);
 
-        // === MEMORY STORE (async) ===
-        self.process_memory_store_async(&request, &response, query_decision);
-
-        // === ADD VOICE INFO TO RESPONSE ===
         if let Some(info) = voice_info {
             response.transcribed_text = Some(info.transcribed_text);
             response.speaker_id = info.speaker_id;
@@ -219,30 +206,12 @@ impl Router {
             response.speaker_confidence = info.speaker_confidence;
         }
 
-        // === LOG TIMING TABLE ===
         info!("\n{}", metrics.format_table());
 
         Ok(crate::routing::RouteResult {
             response,
             metadata: route_metadata,
         })
-    }
-
-    /// Helper do asynchronicznego zapisu do Memory po odpowiedzi modelu
-    pub(crate) fn process_memory_store_async(
-        &self,
-        request: &ChatCompletionRequest,
-        response: &ChatCompletionResponse,
-        query_decision: Option<crate::memory_analyzer::QueryDecision>,
-    ) {
-        let response_text = crate::routing::extract_response_text(response);
-
-        if response_text.is_empty() {
-            return;
-        }
-
-        self.memory_integration
-            .process_response_async(request, &response_text, query_decision);
     }
 
     /// Przetwarza audio_input: STT + speaker identification z confidence levels.
@@ -1841,6 +1810,42 @@ impl Router {
                         message: "PrefixCacheInit is not valid in callbacks".to_string(),
                         details: Some(
                             "PrefixCacheInit is sent from Router to LLM, not in callbacks"
+                                .to_string(),
+                        ),
+                    }),
+                    metrics: None,
+                }
+            }
+
+            // MeetingEvent nie jest callbackiem embedding pipeline — bot wysyla
+            // je przez dispatch_reverse_request, nie przez chat routing.
+            ModelPayload::MeetingEvent(_) => {
+                warn!("Unexpected MeetingEvent payload in chat embedding callback");
+                ModelResponse {
+                    request_id,
+                    result: ModelResult::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: "MeetingEvent is not valid in chat callbacks".to_string(),
+                        details: Some(
+                            "MeetingEvent is handled by dispatch_reverse_request only"
+                                .to_string(),
+                        ),
+                    }),
+                    metrics: None,
+                }
+            }
+
+            // PromptFetch to payload odwrotnego żądania od kontenera — nie ma
+            // sensu w embedding callbacku. Obsługiwany wyłącznie w dispatch_reverse_request.
+            ModelPayload::PromptFetch(_) => {
+                warn!("Unexpected PromptFetch payload in chat embedding callback");
+                ModelResponse {
+                    request_id,
+                    result: ModelResult::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: "PromptFetch is not valid in chat callbacks".to_string(),
+                        details: Some(
+                            "PromptFetch is handled by dispatch_reverse_request only"
                                 .to_string(),
                         ),
                     }),

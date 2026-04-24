@@ -6,21 +6,25 @@
 
 use crate::config::RouterConfig;
 use crate::db::{repository, DbPool};
+use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
 use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
 use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
 use crate::flow_engine::adapters::llm::LlmNodeAdapter;
 use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
-use crate::flow_engine::adapters::memory_analyzer::MemoryAnalyzerAdapter;
+use crate::flow_engine::adapters::output::OutputNodeAdapter;
+use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
 use crate::flow_engine::adapters::rag::RagNodeAdapter;
 use crate::flow_engine::adapters::session_context::SessionContextAdapter;
 use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
 use crate::flow_engine::adapters::stt::SttNodeAdapter;
+use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
 use crate::flow_engine::adapters::tts::TtsNodeAdapter;
-use crate::flow_engine::adapters::AdapterRegistry;
+use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
+use crate::flow_engine::adapters::{AdapterChunkStream, AdapterRegistry};
 use crate::flow_engine::cache::FlowCache;
 use crate::flow_engine::executor_async::FlowExecutorAsync;
 use crate::flow_engine::resolver;
-use crate::flow_engine::types::{FlowContext, FlowExecutionResult};
+use crate::flow_engine::types::{FlowContext, FlowDefinition, FlowExecutionResult};
 use crate::routing::service_manager::ServiceManager;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,11 +71,12 @@ impl FlowDispatcher {
             service_manager.clone(),
             config.clone(),
         ));
-        registry.register(SpeakerContextAdapter::new(
-            service_manager.clone(),
-            config.clone(),
-        ));
-        registry.register(MemoryAnalyzerAdapter::new(service_manager, config));
+        registry.register(SpeakerContextAdapter::new(service_manager, config));
+        registry.register(TriggerNodeAdapter::new());
+        registry.register(OutputNodeAdapter::new());
+        registry.register(ConditionNodeAdapter::new());
+        registry.register(PiiFilterNodeAdapter::new(db.clone()));
+        registry.register(TtsCleanNodeAdapter::new(db.clone()));
 
         Self {
             db,
@@ -83,6 +88,12 @@ impl FlowDispatcher {
                     - std::time::Duration::from_secs(ENABLED_CACHE_TTL_SECS + 1),
             ),
         }
+    }
+
+    /// Udostepnia AdapterRegistry — uzywane przez handlery do walidacji
+    /// flow_json przed zapisem (porty krawedzi vs metadata adaptera).
+    pub fn registry(&self) -> &Arc<AdapterRegistry> {
+        &self.registry
     }
 
     /// Sprawdza czy flow engine jest wlaczony (setting w DB, cache na 5s)
@@ -202,6 +213,92 @@ impl FlowDispatcher {
                 warn!(
                     "Timeout flow {} po {}s. Fallback na stary pipeline.",
                     flow_id, FLOW_TIMEOUT_SECS
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Streaming wariant dispatch. Zwraca `Some(stream)` tylko gdy flow istnieje
+    /// i definiuje edge `from_port="stream"` (czyli autor flow'u zdeklarowal
+    /// streamowa sciezke). Inaczej `None` — caller uzywa blocking try_dispatch
+    /// lub omija flow engine calkowicie.
+    pub async fn try_dispatch_streaming(
+        &self,
+        model_name: &str,
+        service_type: &str,
+        mut ctx: FlowContext,
+    ) -> Result<Option<AdapterChunkStream>> {
+        if !self.is_enabled().await {
+            return Ok(None);
+        }
+
+        let cache_key = format!("{}:{}", model_name, service_type);
+
+        let flow = match self.cache.get(&cache_key) {
+            Some(Some(cached_flow)) => cached_flow,
+            Some(None) => return Ok(None),
+            None => {
+                let db_clone = self.db.clone();
+                let model_owned = model_name.to_string();
+                let svc_owned = service_type.to_string();
+                let resolved = tokio::task::spawn_blocking(move || {
+                    resolver::resolve_flow(&db_clone, &model_owned, &svc_owned)
+                })
+                .await??;
+                match resolved {
+                    Some(f) => {
+                        self.cache.set(&cache_key, Some(f.clone()));
+                        f
+                    }
+                    None => {
+                        self.cache.set(&cache_key, None);
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+
+        // Szybka inspekcja: czy flow zawiera edge from_port="stream"? Jesli nie —
+        // blocking path zrobi robote i nie ma po co budowac streaming executor'a.
+        let has_stream_edge = match serde_json::from_str::<FlowDefinition>(&flow.flow_json) {
+            Ok(def) => def.edges.iter().any(|e| e.from_port == "stream"),
+            Err(e) => {
+                warn!("Niepoprawny flow_json przy sprawdzaniu portow: {}", e);
+                return Ok(None);
+            }
+        };
+        if !has_stream_edge {
+            return Ok(None);
+        }
+
+        let flow_id = flow.id;
+
+        if let Some(uid) = ctx.user_id {
+            let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
+            if !crate::routing::acl::check_access_safe(
+                &self.db,
+                "flow",
+                &flow_id.to_string(),
+                uid,
+                &role,
+            ) {
+                tracing::warn!(
+                    user_id = uid,
+                    flow_id,
+                    "ACL denied streaming flow execution"
+                );
+                return Ok(None);
+            }
+        }
+
+        let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
+        match executor.execute_streaming_flow(&flow, &mut ctx).await {
+            Ok(stream) => Ok(Some(stream)),
+            Err(e) => {
+                warn!(
+                    "Blad streaming flow {}: {}. Fallback na blocking/stary pipeline.",
+                    flow_id, e
                 );
                 Ok(None)
             }

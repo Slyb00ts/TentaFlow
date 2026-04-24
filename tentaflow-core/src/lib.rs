@@ -15,8 +15,6 @@ pub mod error;
 pub mod flow_engine;
 pub mod hub;
 pub mod inference;
-pub mod intent_analyzer;
-pub mod memory_analyzer;
 pub mod mesh;
 pub mod metrics;
 pub mod middleware;

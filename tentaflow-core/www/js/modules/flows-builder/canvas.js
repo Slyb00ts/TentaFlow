@@ -85,15 +85,14 @@ const TYPE_CATEGORY = {
   output: 'output', end: 'output',
 };
 
-// Zwraca listę portów wejściowych/wyjściowych dla nody. Bierze je najpierw z
-// templatki (pole `inputs`/`outputs` albo `params_schema.ports`), potem
-// stosuje heurystyki po typie.
+// Zwraca listę portów wejściowych/wyjściowych dla nody. Priorytet: adapter
+// metadata z backendu (`template.input_ports`/`template.output_ports`), potem
+// legacy pola `inputs`/`outputs`, a na koncu heurystyki.
+// Adapter metadata jest autorytatywnym zrodlem — backend odrzuci krawedz z
+// nazwa portu spoza listy, wiec UI musi pokazywac dokladnie te porty.
 function portsForNode(node, template) {
   const isTrigger = node.type === 'trigger' || node.type === 'start';
   const isOutput = node.type === 'output' || node.type === 'end';
-
-  let inputs = [];
-  let outputs = [];
 
   const readList = (raw) => {
     if (!raw) return null;
@@ -104,8 +103,16 @@ function portsForNode(node, template) {
   let tplIn = null;
   let tplOut = null;
   if (template) {
-    tplIn = readList(template.inputs);
-    tplOut = readList(template.outputs);
+    // Adapter metadata (Rust registry → protocol); puste listy traktujemy jako
+    // "brak zarejestrowanego adaptera" — wtedy spadamy do heurystyki.
+    if (Array.isArray(template.input_ports) && template.input_ports.length > 0) {
+      tplIn = readList(template.input_ports);
+    }
+    if (Array.isArray(template.output_ports) && template.output_ports.length > 0) {
+      tplOut = readList(template.output_ports);
+    }
+    if (!tplIn) tplIn = readList(template.inputs);
+    if (!tplOut) tplOut = readList(template.outputs);
     if (!tplIn || !tplOut) {
       try {
         const schema = typeof template.params_schema === 'string'
@@ -119,8 +126,9 @@ function portsForNode(node, template) {
     }
   }
 
-  inputs = tplIn || (isTrigger ? [] : [{ name: 'in' }]);
+  const inputs = tplIn || (isTrigger ? [] : [{ name: 'in' }]);
 
+  let outputs;
   if (tplOut) {
     outputs = tplOut;
   } else if (node.type === 'condition') {
@@ -136,7 +144,9 @@ function portsForNode(node, template) {
   } else if (isOutput) {
     outputs = [];
   } else {
-    outputs = [{ name: 'out' }];
+    // Domyslny port backendu to "full" — stary "out" byl odrzucany przez
+    // validate_flow_json_str (S4b).
+    outputs = [{ name: 'full' }];
   }
 
   return { inputs, outputs };
@@ -242,10 +252,75 @@ export class FlowCanvas {
   }
 
   getData() {
+    // Przy serializacji pomijamy porty rowne domyslnym ("full"/"in"), zeby
+    // nie zasmiecac flow_json pusta metadata — backend rozumie brak pol
+    // dzieki serde(default). Dzieki temu edge tak jak przed S4a round-trippuje
+    // do bajtowo identycznego JSONu.
     return {
       nodes: this.nodes.map((n) => ({ ...n, config: { ...n.config } })),
-      edges: this.edges.map((e) => ({ ...e })),
+      edges: this.edges.map((e) => {
+        const out = { ...e };
+        if (out.from_port === 'full') delete out.from_port;
+        if (out.to_port === 'in') delete out.to_port;
+        return out;
+      }),
     };
+  }
+
+  // Waliduje klient-side przed zapisem: kazdy edge musi wskazywac istniejace
+  // node'y i porty obecne w adapter metadata. Zwraca liste bledow jako
+  // stringi (juz zlokalizowane) — pusta lista oznacza flow gotowy do zapisu.
+  validate() {
+    const errors = [];
+    const nodeById = new Map(this.nodes.map((n) => [n.id, n]));
+    for (const edge of this.edges) {
+      const from = nodeById.get(edge.from_node);
+      const to = nodeById.get(edge.to_node);
+      if (!from || !to) {
+        errors.push(I18n.t('flows_builder.edge_dangling'));
+        continue;
+      }
+      const fromTpl = this.templates.get(from.type);
+      const toTpl = to ? this.templates.get(to.type) : null;
+      const fromPort = edge.from_port || 'full';
+      const toPort = edge.to_port || 'in';
+      if (fromTpl && Array.isArray(fromTpl.output_ports) && fromTpl.output_ports.length > 0) {
+        if (!fromTpl.output_ports.includes(fromPort)) {
+          errors.push(I18n.t('flows_builder.invalid_port', { node_type: from.type, port: fromPort }));
+        }
+      }
+      if (toTpl && Array.isArray(toTpl.input_ports) && toTpl.input_ports.length > 0) {
+        if (!toTpl.input_ports.includes(toPort)) {
+          errors.push(I18n.t('flows_builder.invalid_port', { node_type: to.type, port: toPort }));
+        }
+      }
+    }
+    // Wykrywanie cykli — DFS z kolorowaniem; zwracamy pojedynczy blad jesli
+    // jakikolwiek cykl istnieje, bo lista cykli nie wnosi wiecej dla usera.
+    const adj = new Map();
+    for (const e of this.edges) {
+      if (!adj.has(e.from_node)) adj.set(e.from_node, []);
+      adj.get(e.from_node).push(e.to_node);
+    }
+    const WHITE = 0, GRAY = 1, BLACK = 2;
+    const color = new Map(this.nodes.map((n) => [n.id, WHITE]));
+    const dfs = (id) => {
+      color.set(id, GRAY);
+      for (const next of adj.get(id) || []) {
+        const c = color.get(next);
+        if (c === GRAY) return true;
+        if (c === WHITE && dfs(next)) return true;
+      }
+      color.set(id, BLACK);
+      return false;
+    };
+    for (const n of this.nodes) {
+      if (color.get(n.id) === WHITE && dfs(n.id)) {
+        errors.push(I18n.t('flows_builder.cycle_detected'));
+        break;
+      }
+    }
+    return errors;
   }
 
   _pushHistory() {
@@ -467,11 +542,18 @@ export class FlowCanvas {
   _renderPortEl(nodeId, port, idx, side, total) {
     const top = PORT_HEADER_OFFSET + idx * PORT_STEP;
     const showLabel = total >= 2;
+    // Tooltip z opisem portu — stream/full/in maja tlumaczenia, reszta idzie
+    // surowa nazwa (np. "true"/"false" dla condition, "case_N" dla switch).
+    const tooltipKey = port.name === 'stream' ? 'flows_builder.port_stream'
+      : port.name === 'full' ? 'flows_builder.port_full'
+      : port.name === 'in' ? 'flows_builder.port_in'
+      : null;
+    const tooltip = tooltipKey ? I18n.t(tooltipKey) : port.name;
     const labelHtml = showLabel
       ? `<span class="fb-port-label">${escapeHtml(port.name)}</span>`
       : '';
     const cls = side === 'in' ? 'fb-port fb-port-in' : 'fb-port fb-port-out';
-    return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(port.name)}">${labelHtml}</div>`;
+    return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-kind="${escapeAttr(port.name)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(tooltip)}">${labelHtml}</div>`;
   }
 
   _renderNodeSummary(n) {
@@ -500,7 +582,11 @@ export class FlowCanvas {
     return false;
   }
 
-  // Zwraca pozycję portu w WORLD coords (bez pan/zoom).
+  // Zwraca pozycję portu w WORLD coords (bez pan/zoom). Portu szukamy po
+  // nazwie; jesli nie ma — bierzemy pierwszy z listy (fallback dla krawedzi
+  // zapisanych pod inna nazwa portu, np. legacy "out"). Lokalizacja
+  // geometryczna jest tylko sprawa rysowania — walidacja nazw odbywa sie
+  // osobno w _validate().
   _getPortWorldPos(nodeId, portName, side) {
     const node = this.nodes.find((n) => n.id === nodeId);
     if (!node) return { x: 0, y: 0 };
@@ -523,7 +609,7 @@ export class FlowCanvas {
       const from = this.nodes.find((n) => n.id === e.from_node);
       const to = this.nodes.find((n) => n.id === e.to_node);
       if (!from || !to) continue;
-      const fp = this._getPortWorldPos(e.from_node, e.from_port || 'out', 'out');
+      const fp = this._getPortWorldPos(e.from_node, e.from_port || 'full', 'out');
       const tp = this._getPortWorldPos(e.to_node, e.to_port || 'in', 'in');
       const d = this._bezierPath(fp.x, fp.y, tp.x, tp.y);
       // Hit area
@@ -656,7 +742,7 @@ export class FlowCanvas {
         const pt = this._clientToWorld(ev.clientX, ev.clientY);
         this._connecting = {
           fromNode: node,
-          fromPort: portOut.dataset.port || 'out',
+          fromPort: portOut.dataset.port || 'full',
           currentX: pt.x,
           currentY: pt.y,
           pointerId: ev.pointerId,
@@ -801,22 +887,39 @@ export class FlowCanvas {
       if (portIn) {
         const toNodeId = portIn.dataset.nodeId;
         const toPort = portIn.dataset.port || 'in';
-        if (toNodeId && toNodeId !== this._connecting.fromNode.id) {
-          const exists = this.edges.some((e) =>
-            e.from_node === this._connecting.fromNode.id
-            && e.to_node === toNodeId
-            && e.from_port === this._connecting.fromPort
-            && e.to_port === toPort);
-          if (!exists) {
-            this.edges.push({
-              id: 'e_' + Date.now().toString(36),
-              from_node: this._connecting.fromNode.id,
-              to_node: toNodeId,
-              from_port: this._connecting.fromPort,
-              to_port: toPort,
-            });
-            this._pushHistory();
-            this.onChange();
+        const fromNode = this._connecting.fromNode;
+        const fromPort = this._connecting.fromPort;
+        if (toNodeId && toNodeId !== fromNode.id) {
+          const toNode = this.nodes.find((n) => n.id === toNodeId);
+          const fromTpl = this.templates.get(fromNode.type);
+          const toTpl = toNode ? this.templates.get(toNode.type) : null;
+          const fromOutputs = (fromTpl && Array.isArray(fromTpl.output_ports) && fromTpl.output_ports.length > 0) ? fromTpl.output_ports : null;
+          const toInputs = (toTpl && Array.isArray(toTpl.input_ports) && toTpl.input_ports.length > 0) ? toTpl.input_ports : null;
+          let rejectMsg = null;
+          if (fromOutputs && !fromOutputs.includes(fromPort)) {
+            rejectMsg = I18n.t('flows_builder.invalid_port', { node_type: fromNode.type, port: fromPort });
+          } else if (toInputs && !toInputs.includes(toPort)) {
+            rejectMsg = I18n.t('flows_builder.invalid_port', { node_type: toNode.type, port: toPort });
+          }
+          if (rejectMsg) {
+            this.opts.onInvalidConnection?.(rejectMsg);
+          } else {
+            const exists = this.edges.some((e) =>
+              e.from_node === fromNode.id
+              && e.to_node === toNodeId
+              && e.from_port === fromPort
+              && e.to_port === toPort);
+            if (!exists) {
+              this.edges.push({
+                id: 'e_' + Date.now().toString(36),
+                from_node: fromNode.id,
+                to_node: toNodeId,
+                from_port: fromPort,
+                to_port: toPort,
+              });
+              this._pushHistory();
+              this.onChange();
+            }
           }
         }
       }

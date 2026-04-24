@@ -332,6 +332,63 @@ pub async fn dispatch_reverse_request(
             }
         }
 
+        ModelPayload::PromptFetch(req) => {
+            // Kontener (np. meeting-bot) pobiera treść promptu z DB routera —
+            // jedno źródło prawdy zamiast kopiowania seed-a po stronie obrazu.
+            let Some(ref pool) = router.db else {
+                return make_error_response(
+                    request_id,
+                    "PromptFetch: router bez DB",
+                );
+            };
+            handle_prompt_fetch(pool, request_id, req)
+        }
+
+
+        ModelPayload::MeetingEvent(event) => {
+            // Bot meetingowy otwiera reverse stream i pcha eventy summary/action
+            // items. Router resolvuje meeting_key -> session_id przez get_or_create
+            // (bot moze miec inny widok sesji niz DB, np. przy restarcie routera).
+            let Some(ref pool) = router.db else {
+                return make_error_response(
+                    request_id,
+                    "MeetingEvent persist: router bez DB",
+                );
+            };
+
+            // Zachowujemy kopie do live broadcastu przed move do persist.
+            // Persist moze nie zapisywac danego wariantu do DB (TranscriptEntry,
+            // ParticipantUpdate, BackendUpdate tylko logują), ale broadcastujemy
+            // WSZYSTKIE — GUI potrzebuje pełnego stream'u do live view.
+            let live_event = tentaflow_protocol::MeetingLiveEvent {
+                meeting_key: event.meeting_key.clone(),
+                timestamp_ms: event.timestamp_ms,
+                payload: event.payload.clone(),
+            };
+            match persist_meeting_event(pool, event) {
+                Ok(()) => {
+                    crate::dispatch::meeting_live_broadcast::publish(live_event);
+                    ModelResponse {
+                        request_id,
+                        result: ModelResult::Completion(CompletionResult {
+                            text: String::new(),
+                            reasoning_content: None,
+                            model: String::new(),
+                            finish_reason: Some("stop".to_string()),
+                            tool_calls: None,
+                            detected_intent: None,
+                            detected_tools: None,
+                            transcribed_text: None,
+                            speaker_id: None,
+                            speaker_name: None,
+                        }),
+                        metrics: None,
+                    }
+                }
+                Err(e) => make_error_response(request_id, &e),
+            }
+        }
+
         _ => make_error_response(
             request_id,
             &format!(
@@ -396,6 +453,148 @@ fn make_error_response(request_id: String, message: &str) -> tentaflow_protocol:
         }),
         metrics: None,
     }
+}
+
+/// Buduje `ModelResponse` dla `PromptFetch`. Wydzielone żeby test mógł uderzyć
+/// bezpośrednio w DB bez budowania pełnego Routera (mesh + QUIC to ciężki setup).
+fn handle_prompt_fetch(
+    pool: &crate::db::DbPool,
+    request_id: String,
+    req: tentaflow_protocol::PromptFetchRequest,
+) -> tentaflow_protocol::ModelResponse {
+    use tentaflow_protocol::*;
+    match crate::db::repository::find_prompt(pool, &req.prompt_id, &req.language) {
+        Ok(Some(prompt)) => ModelResponse {
+            request_id,
+            result: ModelResult::PromptFetched(PromptFetchResponse {
+                content: prompt.content,
+                name: prompt.name,
+                resolved_language: prompt.language,
+            }),
+            metrics: None,
+        },
+        Ok(None) => make_error_response(
+            request_id,
+            &format!(
+                "PromptFetch: prompt '{}' nie istnieje (language={})",
+                req.prompt_id, req.language
+            ),
+        ),
+        Err(e) => make_error_response(
+            request_id,
+            &format!("PromptFetch: blad DB: {}", e),
+        ),
+    }
+}
+
+/// Persistuje pojedynczy MeetingEvent do DB. Wydzielone zeby mozna testowac
+/// logike bez budowania calego Routera (Router + QUIC + mesh to ciezkie setup).
+fn persist_meeting_event(
+    pool: &crate::db::DbPool,
+    event: tentaflow_protocol::MeetingEventData,
+) -> std::result::Result<(), String> {
+    use tentaflow_protocol::MeetingEventPayload;
+
+    let session_id = crate::db::repository::transcripts::get_or_create_session(
+        pool,
+        &event.meeting_key,
+        None,
+        None,
+    )
+    .map_err(|e| format!("MeetingEvent: resolve session '{}' failed: {}", event.meeting_key, e))?;
+
+    match event.payload {
+        MeetingEventPayload::SummaryUpdate {
+            decisions_text,
+            summary_text,
+            model,
+        } => {
+            crate::db::repository::transcripts::insert_meeting_summary(
+                pool,
+                session_id,
+                &decisions_text,
+                &summary_text,
+                &model,
+            )
+            .map_err(|e| format!("MeetingEvent: insert_meeting_summary failed: {}", e))?;
+            info!(
+                "MeetingEvent SummaryUpdate: session_id={} model={} dec_len={} sum_len={}",
+                session_id,
+                model,
+                decisions_text.len(),
+                summary_text.len()
+            );
+        }
+        MeetingEventPayload::ActionItemsUpdate { items } => {
+            let count = items.len();
+            for item in items {
+                crate::db::repository::transcripts::upsert_meeting_action_item(
+                    pool,
+                    session_id,
+                    &item.owner,
+                    &item.task,
+                    item.deadline.as_deref(),
+                )
+                .map_err(|e| format!("MeetingEvent: upsert_meeting_action_item failed: {}", e))?;
+            }
+            info!(
+                "MeetingEvent ActionItemsUpdate: session_id={} items={}",
+                session_id, count
+            );
+        }
+        // TranscriptEntry nie jest persistowany tym handlerem: chunki transkryptu
+        // trafiają do DB osobną ścieżką (STT ModelRequest z metadata meeting_id →
+        // transcript_store). Ten wariant istnieje wyłącznie po to, żeby dashboard
+        // dostał live broadcast (layer dopinany przez subskrybentów eventów;
+        // persist DB pozostaje pojedynczy punkt prawdy — transcript_store).
+        MeetingEventPayload::TranscriptEntry {
+            speaker_id,
+            text,
+            latency_ms,
+            resolved_stt_model,
+            ..
+        } => {
+            info!(
+                "MeetingEvent TranscriptEntry: session_id={} speaker={} model={} latency_ms={} text_len={}",
+                session_id,
+                speaker_id,
+                resolved_stt_model,
+                latency_ms,
+                text.len()
+            );
+        }
+        // ParticipantUpdate: brak tabeli participants per-session. Roster + active
+        // speaker to stan runtime'owy trzymany w pamięci bota i broadcastowany
+        // live. Zapis do DB nie jest potrzebny — rekonstrukcja możliwa z
+        // transcript_entries (DISTINCT speaker_name).
+        MeetingEventPayload::ParticipantUpdate {
+            speaker_id,
+            status,
+            ..
+        } => {
+            info!(
+                "MeetingEvent ParticipantUpdate: session_id={} speaker={} status={}",
+                session_id, speaker_id, status
+            );
+        }
+        // BackendUpdate: info o modelach sesji jest stanem runtime'owym (zmienia
+        // się tylko przy zmianie aliasów w configu bota między sesjami). DB ma już
+        // `model` w `meeting_summaries` dla historii, osobna tabela byłaby
+        // duplikacją. Ten event służy tylko live broadcastowi do UI.
+        MeetingEventPayload::BackendUpdate {
+            stt_model,
+            tts_model,
+            summarization_model,
+            diarization_model,
+            ..
+        } => {
+            info!(
+                "MeetingEvent BackendUpdate: session_id={} stt={} tts={} sum={} diar={}",
+                session_id, stt_model, tts_model, summarization_model, diarization_model
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -551,5 +750,285 @@ mod tests {
             }
             _ => panic!("Oczekiwano MessageContent::Text"),
         }
+    }
+
+    // =========================================================================
+    // Persist MeetingEvent: testy logiki wydzielonej z dispatch_reverse_request.
+    // Uzywamy in-memory SQLite, nie potrzeba Routera.
+    // =========================================================================
+
+    fn setup_test_db() -> crate::db::DbPool {
+        crate::db::init(std::path::Path::new(":memory:")).expect("init test DB")
+    }
+
+    #[test]
+    fn persist_handler_summary_insert_row() {
+        let db = setup_test_db();
+        // Sesja musi istniec zanim wstawimy summary — get_or_create utworzy.
+        let event = MeetingEventData {
+            meeting_key: "m-summary-1".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "D1".to_string(),
+                summary_text: "S1".to_string(),
+                model: "qwen".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist summary");
+
+        // Odczyt: session_id z klucza + lista summaries.
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db,
+            "m-summary-1",
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].decisions_text, "D1");
+        assert_eq!(rows[0].summary_text, "S1");
+        assert_eq!(rows[0].model, "qwen");
+    }
+
+    #[test]
+    fn persist_handler_action_items_upsert_dedup() {
+        let db = setup_test_db();
+        // Dwa razy ten sam owner+task — powinno byc dedup po content_hash.
+        let event1 = MeetingEventData {
+            meeting_key: "m-actions-1".to_string(),
+            timestamp_ms: 1,
+            payload: MeetingEventPayload::ActionItemsUpdate {
+                items: vec![
+                    MeetingActionItemData {
+                        owner: "Alice".to_string(),
+                        task: "prepare report".to_string(),
+                        deadline: Some("2026-05-01".to_string()),
+                    },
+                    MeetingActionItemData {
+                        owner: "Bob".to_string(),
+                        task: "ship PR".to_string(),
+                        deadline: None,
+                    },
+                ],
+            },
+        };
+        persist_meeting_event(&db, event1).expect("persist 1");
+
+        // Ponowny push tych samych owner+task — nie tworzy duplikatow.
+        let event2 = MeetingEventData {
+            meeting_key: "m-actions-1".to_string(),
+            timestamp_ms: 2,
+            payload: MeetingEventPayload::ActionItemsUpdate {
+                items: vec![MeetingActionItemData {
+                    owner: "Alice".to_string(),
+                    task: "prepare report".to_string(),
+                    deadline: Some("2026-05-10".to_string()),
+                }],
+            },
+        };
+        persist_meeting_event(&db, event2).expect("persist 2");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db,
+            "m-actions-1",
+            None,
+            None,
+        )
+        .unwrap();
+        let rows = crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
+            .unwrap();
+        assert_eq!(rows.len(), 2, "dwa unikalne action items (dedup drugiego Alice)");
+        let alice = rows.iter().find(|r| r.owner == "Alice").unwrap();
+        assert_eq!(alice.deadline.as_deref(), Some("2026-05-10"), "deadline odswiezony");
+    }
+
+    // =========================================================================
+    // PromptFetch: testy handlera odczytu promptu z seedowanej DB.
+    // Świeża DB po `db::init` ma już 5 wariantów `transcription_summarization`.
+    // =========================================================================
+
+    #[test]
+    fn prompt_fetch_handler_returns_content_for_language() {
+        let db = setup_test_db();
+        let resp = handle_prompt_fetch(
+            &db,
+            "rid-1".to_string(),
+            PromptFetchRequest {
+                prompt_id: "transcription_summarization".to_string(),
+                language: "en".to_string(),
+            },
+        );
+        assert_eq!(resp.request_id, "rid-1");
+        match resp.result {
+            ModelResult::PromptFetched(p) => {
+                assert_eq!(p.resolved_language, "en");
+                assert!(!p.content.is_empty());
+                assert!(!p.name.is_empty());
+            }
+            _ => panic!("expected PromptFetched"),
+        }
+    }
+
+    #[test]
+    fn prompt_fetch_handler_falls_back_to_pl_when_language_missing() {
+        let db = setup_test_db();
+        // `it` nie jest seedowany — `find_prompt` ma zwrocic wariant `pl`.
+        let resp = handle_prompt_fetch(
+            &db,
+            "rid-2".to_string(),
+            PromptFetchRequest {
+                prompt_id: "transcription_summarization".to_string(),
+                language: "it".to_string(),
+            },
+        );
+        match resp.result {
+            ModelResult::PromptFetched(p) => {
+                assert_eq!(p.resolved_language, "pl", "fallback na pl gdy brak wariantu");
+                assert!(!p.content.is_empty());
+            }
+            _ => panic!("expected PromptFetched"),
+        }
+    }
+
+    #[test]
+    fn prompt_fetch_handler_returns_error_for_unknown_prompt() {
+        let db = setup_test_db();
+        let resp = handle_prompt_fetch(
+            &db,
+            "rid-3".to_string(),
+            PromptFetchRequest {
+                prompt_id: "does_not_exist".to_string(),
+                language: "pl".to_string(),
+            },
+        );
+        match resp.result {
+            ModelResult::Error(info) => {
+                assert!(info.message.contains("does_not_exist"));
+                assert!(matches!(info.error_type, ErrorType::InternalError));
+            }
+            _ => panic!("expected Error response for unknown prompt"),
+        }
+    }
+
+    #[test]
+    fn persist_handler_unknown_meeting_key_creates_session() {
+        let db = setup_test_db();
+        // Klucz ktorego nie ma w DB — handler ma utworzyc nowa sesje idle.
+        let event = MeetingEventData {
+            meeting_key: "m-new-key".to_string(),
+            timestamp_ms: 42,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d".to_string(),
+                summary_text: "s".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist should create session");
+
+        // Sesja powinna istniec w meeting_sessions po call.
+        let conn = db.lock().unwrap();
+        let cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meeting_sessions WHERE meeting_key = ?1",
+                rusqlite::params!["m-new-key"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 1);
+    }
+
+    // Handler musi akceptować TranscriptEntry bez błędu i bez wpisów do
+    // meeting_summaries / meeting_action_items — persist chunków leci przez
+    // transcript_store, nie przez ten handler.
+    #[test]
+    fn persist_handler_transcript_entry_is_noop_but_creates_session() {
+        let db = setup_test_db();
+        let event = MeetingEventData {
+            meeting_key: "m-te-1".to_string(),
+            timestamp_ms: 100,
+            payload: MeetingEventPayload::TranscriptEntry {
+                speaker_id: "SPEAKER_00".to_string(),
+                speaker_name: Some("Alice".to_string()),
+                is_enrolled: false,
+                speaker_confidence: Some(0.5),
+                text: "test".to_string(),
+                language: Some("pl".to_string()),
+                resolved_stt_model: "whisper".to_string(),
+                latency_ms: 250,
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist transcript entry");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db, "m-te-1", None, None,
+        )
+        .unwrap();
+        let summaries =
+            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
+        let actions =
+            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
+                .unwrap();
+        assert!(summaries.is_empty(), "TranscriptEntry nie wpisuje summary");
+        assert!(actions.is_empty(), "TranscriptEntry nie wpisuje action items");
+    }
+
+    // ParticipantUpdate: handler nie persistuje nigdzie — sprawdzamy że nie
+    // zwraca błędu i nie tworzy rekordów w tabelach zapisywanych.
+    #[test]
+    fn persist_handler_participant_update_is_noop() {
+        let db = setup_test_db();
+        let event = MeetingEventData {
+            meeting_key: "m-pu-1".to_string(),
+            timestamp_ms: 100,
+            payload: MeetingEventPayload::ParticipantUpdate {
+                speaker_id: "SPEAKER_02".to_string(),
+                speaker_name: Some("Bob".to_string()),
+                status: "active_now".to_string(),
+                last_spoken_ago_sec: None,
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist participant update");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db, "m-pu-1", None, None,
+        )
+        .unwrap();
+        let summaries =
+            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
+        let actions =
+            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
+                .unwrap();
+        assert!(summaries.is_empty());
+        assert!(actions.is_empty());
+    }
+
+    // BackendUpdate: to samo — stan runtime'owy, nic nie wpada do DB.
+    #[test]
+    fn persist_handler_backend_update_is_noop() {
+        let db = setup_test_db();
+        let event = MeetingEventData {
+            meeting_key: "m-bu-1".to_string(),
+            timestamp_ms: 100,
+            payload: MeetingEventPayload::BackendUpdate {
+                stt_model: "teams-stt".to_string(),
+                tts_model: "teams-tts".to_string(),
+                summarization_model: "teams-summarization".to_string(),
+                diarization_model: "pyannote-3.1".to_string(),
+                streaming_latency_ms: None,
+                enrolled_speakers: None,
+                total_participants: None,
+            },
+        };
+        persist_meeting_event(&db, event).expect("persist backend update");
+
+        let sid = crate::db::repository::transcripts::get_or_create_session(
+            &db, "m-bu-1", None, None,
+        )
+        .unwrap();
+        let summaries =
+            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
+        assert!(summaries.is_empty());
     }
 }

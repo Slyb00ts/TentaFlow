@@ -25,6 +25,7 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
+pub mod meeting_live_broadcast;
 pub mod system_event_broadcast;
 pub mod handlers;
 pub mod mesh_write_handlers;
@@ -408,6 +409,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "MeshPeerStatusChanged"
             }
         },
+        MessageBody::MeetingLiveEventBody(_) => "MeetingLiveEvent",
         MessageBody::MeetingBody(p) => match p {
             tentaflow_protocol::MeetingPayload::ReqSessionStart(_) => "MeetingSessionStartRequest",
             tentaflow_protocol::MeetingPayload::ResSessionStart(_) => "MeetingSessionStartResponse",
@@ -427,12 +429,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MeetingPayload::ResTranscriptsList(_) => {
                 "MeetingTranscriptsListResponse"
             }
-            tentaflow_protocol::MeetingPayload::ReqSummaryGenerate(_) => {
-                "MeetingSummaryGenerateRequest"
-            }
-            tentaflow_protocol::MeetingPayload::ResSummaryGenerate(_) => {
-                "MeetingSummaryGenerateResponse"
-            }
             tentaflow_protocol::MeetingPayload::ReqActiveSession(_) => {
                 "MeetingActiveSessionRequest"
             }
@@ -446,6 +442,30 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::MeetingPayload::ResSettingsUpdate(_) => {
                 "MeetingSettingsUpdateResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqSummariesList(_) => {
+                "MeetingSummariesListRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResSummariesList(_) => {
+                "MeetingSummariesListResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqActionItemsList(_) => {
+                "MeetingActionItemsListRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResActionItemsList(_) => {
+                "MeetingActionItemsListResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqActionItemStatusUpdate(_) => {
+                "MeetingActionItemStatusUpdateRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResActionItemStatusUpdate(_) => {
+                "MeetingActionItemStatusUpdateResponse"
+            }
+            tentaflow_protocol::MeetingPayload::ReqTranscriptExport(_) => {
+                "MeetingTranscriptExportRequest"
+            }
+            tentaflow_protocol::MeetingPayload::ResTranscriptExport(_) => {
+                "MeetingTranscriptExportResponse"
             }
         },
         MessageBody::RegistryListRequest => "RegistryListRequest",
@@ -783,6 +803,34 @@ mod tests {
             "AddonReloadRequest",
         ] {
             assert!(find(name).is_some(), "handler {} nie zarejestrowany", name);
+        }
+    }
+
+    // Bug guard: wszystkie 8 meeting handlers (api/dashboard/handlers_meeting.rs)
+    // musi byc widocznych w dispatch registry — inaczej GUI dostaje HandlerNotFound
+    // na WSS i ekran meetingow nie dziala. Ten test lapie regresje gdyby ktos
+    // przypadkiem wylaczyl feature/module.
+    #[test]
+    fn registry_contains_meeting_handlers() {
+        for name in [
+            "MeetingSessionStartRequest",
+            "MeetingSessionLeaveRequest",
+            "MeetingSessionListRequest",
+            "MeetingSessionDetailRequest",
+            "MeetingTranscriptsListRequest",
+            "MeetingActiveSessionRequest",
+            "MeetingSettingsGetRequest",
+            "MeetingSettingsUpdateRequest",
+            "MeetingSummariesListRequest",
+            "MeetingActionItemsListRequest",
+            "MeetingActionItemStatusUpdateRequest",
+            "MeetingTranscriptExportRequest",
+        ] {
+            assert!(
+                find(name).is_some(),
+                "meeting handler {} nie zarejestrowany",
+                name
+            );
         }
     }
 

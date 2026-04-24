@@ -12,4 +12,4 @@ pub mod container;
 pub mod manager;
 pub mod port_pool;
 
-pub use manager::{MeetingManager, SessionDescriptor, SessionSummary, StartSessionRequest};
+pub use manager::{MeetingManager, SessionDescriptor, StartSessionRequest};

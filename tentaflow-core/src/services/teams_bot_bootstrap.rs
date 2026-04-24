@@ -44,25 +44,34 @@ fn ensure_teams_flow(pool: &DbPool) -> Result<()> {
     let flow_json = json!({
         "nodes": [
             {
-                "id": "trigger",
+                "id": "t1",
                 "type": "trigger",
-                "position": [0.0, 0.0]
+                "position": { "x": 0, "y": 0 },
+                "config": {}
             },
             {
-                "id": "llm",
+                "id": "l1",
                 "type": "llm",
-                "config": { "model_alias": "teams-summarization" },
-                "position": [200.0, 0.0]
+                "position": { "x": 200, "y": 0 },
+                "config": { "model_alias": "teams-summarization" }
             },
             {
-                "id": "output",
+                "id": "p1",
+                "type": "pii_filter",
+                "position": { "x": 400, "y": 0 },
+                "config": {}
+            },
+            {
+                "id": "o1",
                 "type": "output",
-                "position": [400.0, 0.0]
+                "position": { "x": 600, "y": 0 },
+                "config": {}
             }
         ],
         "edges": [
-            { "from": "trigger", "to": "llm" },
-            { "from": "llm", "to": "output" }
+            { "from": "t1", "to": "l1" },
+            { "from": "l1", "to": "p1" },
+            { "from": "p1", "to": "o1" }
         ]
     })
     .to_string();
@@ -70,7 +79,7 @@ fn ensure_teams_flow(pool: &DbPool) -> Result<()> {
     let params = FlowParams {
         name: TEAMS_FLOW_NAME,
         description: Some(
-            "Domyślny flow dla teams-bot — prosty pipeline trigger → llm → output",
+            "Domyslny flow dla teams-bot: trigger -> llm -> pii_filter -> output.",
         ),
         is_default: false,
         service_type: Some("agents"),
@@ -136,8 +145,21 @@ mod tests {
 
         // Parsowanie flow_json potwierdza że DAG jest poprawny strukturalnie.
         let parsed: serde_json::Value = serde_json::from_str(&flow.flow_json).unwrap();
-        assert_eq!(parsed["nodes"].as_array().unwrap().len(), 3);
-        assert_eq!(parsed["edges"].as_array().unwrap().len(), 2);
+        let nodes = parsed["nodes"].as_array().unwrap();
+        let edges = parsed["edges"].as_array().unwrap();
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(edges.len(), 3);
+
+        // Kolejność węzłów i krawędzi: trigger -> llm -> pii_filter -> output.
+        let node_types: Vec<&str> = nodes
+            .iter()
+            .map(|n| n["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(node_types, vec!["trigger", "llm", "pii_filter", "output"]);
+
+        // LLM musi mieć alias do routingu summaryzacji.
+        let llm_node = nodes.iter().find(|n| n["type"] == "llm").unwrap();
+        assert_eq!(llm_node["config"]["model_alias"], "teams-summarization");
     }
 
     #[tokio::test]

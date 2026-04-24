@@ -60,7 +60,6 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_pii_rules(&tx)?;
     seed_flow_node_templates(&tx)?;
     seed_tts_cleaning_rules(&tx)?;
-    seed_fast_path_patterns(&tx)?;
     seed_prompts(&tx)?;
     seed_default_flows(&tx)?;
     seed_model_aliases(&tx)?;
@@ -237,16 +236,8 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "service",
             "Pamięć",
             "Odczyt/zapis pamięci konwersacji",
-            r#"{"mode":"query","memory_type":"conversation","max_entries":10,"inject_to_messages":false,"context_prompt_id":"memory_context_template"}"#,
+            r#"{"mode":"query","memory_type":"conversation","max_entries":10,"inject_to_messages":false,"context_prompt_id":""}"#,
             "database",
-        ),
-        (
-            "template",
-            "transform",
-            "Szablon",
-            "Formatowanie tekstu z podstawianiem zmiennych",
-            r#"{"template":""}"#,
-            "file-text",
         ),
         (
             "pii_filter",
@@ -273,22 +264,6 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "git-branch",
         ),
         (
-            "switch",
-            "logic",
-            "Przełącznik",
-            "Wielokrotny wybór (switch/case)",
-            r#"{"field":"","cases":[]}"#,
-            "list",
-        ),
-        (
-            "router",
-            "logic",
-            "Router",
-            "Przekazanie danych dalej",
-            "{}",
-            "send",
-        ),
-        (
             "output",
             "output",
             "Wyjście",
@@ -309,7 +284,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "transform",
             "Kontekst sesji",
             "Świadomość sesji - informuje LLM czy to początek/kontynuacja/niezrozumiała wiadomość",
-            r#"{"first_prompt_id":"session_start","continue_prompt_id":"session_continue","unclear_prompt_id":"session_unclear"}"#,
+            r#"{"first_prompt_id":"","continue_prompt_id":"","unclear_prompt_id":""}"#,
             "clock",
         ),
         (
@@ -317,16 +292,8 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "transform",
             "Rozpoznawanie mówcy",
             "Identyfikacja głosu, personalizacja, obsługa nieznanego użytkownika",
-            r#"{"high_threshold":0.85,"medium_threshold":0.60,"personalization_first_prompt":"personalization_first_template","personalization_continue_prompt":"personalization_continue_template","unknown_user_prompt":"unknown_user_strong","medium_confidence_known_prompt":"medium_confidence_known_template","medium_confidence_unknown_prompt":"medium_confidence_unknown","new_voice_prompt":"new_voice_during_conversation","new_speaker_prompt":"new_speaker_introduced_template"}"#,
+            r#"{"high_threshold":0.85,"medium_threshold":0.60,"personalization_first_prompt":"","personalization_continue_prompt":"","unknown_user_prompt":"","medium_confidence_known_prompt":"","medium_confidence_unknown_prompt":"","new_voice_prompt":"","new_speaker_prompt":""}"#,
             "user",
-        ),
-        (
-            "memory_analyzer",
-            "transform",
-            "Analizator pamięci",
-            "Decyzja czy odpytać bazę wiedzy (bielik-1.5b)",
-            r#"{"mode":"query_analysis","prompt_id":"query_analysis_system"}"#,
-            "cpu",
         ),
     ];
 
@@ -390,442 +357,6 @@ fn seed_tts_cleaning_rules(conn: &Connection) -> Result<()> {
         let affected = stmt.execute(rusqlite::params![pattern, replacement, priority])?;
         if affected == 0 {
             debug!("Regula TTS '{}' juz istnieje, pominieto", pattern);
-        }
-    }
-
-    Ok(())
-}
-
-/// Seeduje domyslne wzorce fast path (powitania, pozegnania, krotkie wiadomosci).
-fn seed_fast_path_patterns(conn: &Connection) -> Result<()> {
-    // (module, pattern_type, pattern, match_type, result_json, priority)
-    let patterns: &[(&str, &str, &str, &str, &str, i64)] = &[
-        // Intent Analyzer - powitania
-        (
-            "intent_analyzer",
-            "greeting",
-            "cześć",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "hej",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "hejka",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "siema",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "siemka",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "dzień dobry",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "dobry wieczór",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "witaj",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "witam",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "hello",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "hi",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "greeting",
-            "yo",
-            "exact",
-            r#"{"intent":"greeting","confidence":1.0}"#,
-            100,
-        ),
-        // Intent Analyzer - pozegnania
-        (
-            "intent_analyzer",
-            "farewell",
-            "pa",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "farewell",
-            "papa",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "farewell",
-            "do widzenia",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "farewell",
-            "do zobaczenia",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "farewell",
-            "na razie",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "farewell",
-            "bye",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "farewell",
-            "goodbye",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        (
-            "intent_analyzer",
-            "farewell",
-            "dobranoc",
-            "exact",
-            r#"{"intent":"farewell","confidence":1.0}"#,
-            100,
-        ),
-        // Intent Analyzer - krotkie wiadomosci
-        (
-            "intent_analyzer",
-            "short_message",
-            "3",
-            "length",
-            r#"{"intent":"too_short","confidence":1.0}"#,
-            90,
-        ),
-        // Memory Analyzer - powitania
-        (
-            "memory_analyzer",
-            "greeting",
-            "cześć",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "hej",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "hejka",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "siema",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "siemka",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "dzień dobry",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "dobry wieczór",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "witaj",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "witam",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "hello",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "hi",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "yo",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "hej jarvis",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "cześć jarvis",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        (
-            "memory_analyzer",
-            "greeting",
-            "witaj jarvis",
-            "exact",
-            r#"{"skip_memory":true,"reason":"greeting"}"#,
-            100,
-        ),
-        // Memory Analyzer - pytania do AI
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "jak się masz",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "co słychać",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "co robisz",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "co porabiasz",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "jak tam",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "co u ciebie",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "pomóż mi",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "pomocy",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        (
-            "memory_analyzer",
-            "question_to_ai",
-            "help",
-            "exact",
-            r#"{"skip_memory":true,"reason":"question_to_ai"}"#,
-            90,
-        ),
-        // Memory Analyzer - przedstawienia
-        (
-            "memory_analyzer",
-            "introduction",
-            "jestem",
-            "starts_with",
-            r#"{"skip_memory":false,"reason":"introduction","extract_name":true}"#,
-            80,
-        ),
-        (
-            "memory_analyzer",
-            "introduction",
-            "mam na imię",
-            "starts_with",
-            r#"{"skip_memory":false,"reason":"introduction","extract_name":true}"#,
-            80,
-        ),
-        (
-            "memory_analyzer",
-            "introduction",
-            "nazywam się",
-            "starts_with",
-            r#"{"skip_memory":false,"reason":"introduction","extract_name":true}"#,
-            80,
-        ),
-        (
-            "memory_analyzer",
-            "introduction",
-            "moje imię to",
-            "starts_with",
-            r#"{"skip_memory":false,"reason":"introduction","extract_name":true}"#,
-            80,
-        ),
-        // Memory Analyzer - krotkie wiadomosci
-        (
-            "memory_analyzer",
-            "short_message",
-            "5",
-            "length",
-            r#"{"skip_memory":true,"reason":"too_short"}"#,
-            90,
-        ),
-    ];
-
-    let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO fast_path_patterns (module, pattern_type, pattern, match_type, result_json, priority) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
-    for (module, pattern_type, pattern, match_type, result_json, priority) in patterns {
-        let affected = stmt.execute(rusqlite::params![
-            module,
-            pattern_type,
-            pattern,
-            match_type,
-            result_json,
-            priority
-        ])?;
-        if affected == 0 {
-            debug!(
-                "Wzorzec fast path '{}/{}' juz istnieje, pominieto",
-                module, pattern
-            );
         }
     }
 
@@ -1006,37 +537,23 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
     let flows: &[(&str, &str, &str, &str, i64)] = &[
         (
             "Standardowy pipeline LLM",
-            "Pipeline rozmowy z historią, kontekstem sesji, rozpoznawaniem mówcy, analizą pamięci i warunkowym odczytem",
+            "Prosty pipeline LLM z filtrem PII na odpowiedzi.",
             "llm",
-            r#"{"nodes":[{"id":"n1","type":"trigger","label":"Wyzwalacz","x":60,"y":280,"config":{}},{"id":"n2","type":"pii_filter","label":"Filtr PII (request)","x":260,"y":280,"config":{}},{"id":"n3","type":"conversation_history","label":"Historia rozmowy","x":460,"y":280,"config":{"max_messages":20}},{"id":"n4","type":"session_context","label":"Kontekst sesji","x":660,"y":280,"config":{"first_prompt_id":"session_start","continue_prompt_id":"session_continue","unclear_prompt_id":"session_unclear"}},{"id":"n5","type":"speaker_context","label":"Rozpoznawanie mowcy","x":860,"y":280,"config":{"high_threshold":0.85,"medium_threshold":0.60,"personalization_first_prompt":"personalization_first_template","personalization_continue_prompt":"personalization_continue_template","unknown_user_prompt":"unknown_user_strong","medium_confidence_known_prompt":"medium_confidence_known_template","medium_confidence_unknown_prompt":"medium_confidence_unknown","new_voice_prompt":"new_voice_during_conversation","new_speaker_prompt":"new_speaker_introduced_template"}},{"id":"n6","type":"memory_analyzer","label":"Analizator pamieci","x":1060,"y":280,"config":{"mode":"query_analysis","prompt_id":"query_analysis_system"}},{"id":"n7","type":"condition","label":"Czy odpytac pamiec?","x":1260,"y":280,"config":{"field":"should_query","operator":"equals","value":true}},{"id":"n8","type":"memory","label":"Pamiec - odczyt","x":1460,"y":200,"config":{"mode":"query","inject_to_messages":true,"context_prompt_id":"memory_context_template"}},{"id":"n9","type":"llm","label":"Model LLM","x":1660,"y":280,"config":{"prompt_id":"jarvis_system","temperature":0.7,"max_tokens":4096,"stream":true,"use_messages_context":true}},{"id":"n10","type":"pii_filter","label":"Filtr PII (response)","x":1860,"y":280,"config":{}},{"id":"n11","type":"tts_clean","label":"Czyszczenie tekstu","x":2060,"y":280,"config":{}},{"id":"n12","type":"output","label":"Wyjscie","x":2260,"y":280,"config":{"format":"text"}}],"edges":[{"id":"e1","from_node":"n1","to_node":"n2","from_port":"default"},{"id":"e2","from_node":"n2","to_node":"n3","from_port":"default"},{"id":"e3","from_node":"n3","to_node":"n4","from_port":"default"},{"id":"e4","from_node":"n4","to_node":"n5","from_port":"default"},{"id":"e5","from_node":"n5","to_node":"n6","from_port":"default"},{"id":"e6","from_node":"n6","to_node":"n7","from_port":"default"},{"id":"e7","from_node":"n7","to_node":"n8","from_port":"true","condition":"true"},{"id":"e8","from_node":"n7","to_node":"n9","from_port":"false","condition":"false"},{"id":"e9","from_node":"n8","to_node":"n9","from_port":"default"},{"id":"e10","from_node":"n9","to_node":"n10","from_port":"default"},{"id":"e11","from_node":"n10","to_node":"n11","from_port":"default"},{"id":"e12","from_node":"n11","to_node":"n12","from_port":"default"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from":"t1","to":"l1"},{"from":"l1","to":"p1"},{"from":"p1","to":"o1"}]}"#,
             1,
         ),
         (
-            "Standardowy pipeline RAG",
-            "Pipeline wyszukiwania w bazie wiedzy: RAG, LLM z kontekstem, filtr PII na odpowiedzi",
-            "rag",
-            r#"{"nodes":[{"id":"n1","type":"trigger","label":"Wyzwalacz","x":60,"y":280,"config":{}},{"id":"n2","type":"rag","label":"RAG","x":280,"y":280,"config":{"top_k":5,"min_similarity":0.7,"search_modes":["VectorSearch","FullTextSearch"]}},{"id":"n3","type":"llm","label":"Model LLM","x":500,"y":280,"config":{"prompt_id":"rag_system","temperature":0.7,"max_tokens":4096}},{"id":"n4","type":"pii_filter","label":"Filtr PII","x":720,"y":280,"config":{}},{"id":"n5","type":"output","label":"Wyjscie","x":940,"y":280,"config":{"format":"text"}}],"edges":[{"id":"e1","from_node":"n1","to_node":"n2","from_port":"default"},{"id":"e2","from_node":"n2","to_node":"n3","from_port":"default"},{"id":"e3","from_node":"n3","to_node":"n4","from_port":"default"},{"id":"e4","from_node":"n4","to_node":"n5","from_port":"default"}]}"#,
-            0,
-        ),
-        (
-            "Standardowy pipeline STT",
-            "Pipeline rozpoznawania mowy: STT, czyszczenie tekstu",
-            "stt",
-            r#"{"nodes":[{"id":"n1","type":"trigger","label":"Wyzwalacz","x":60,"y":280,"config":{}},{"id":"n2","type":"stt","label":"Rozpoznawanie mowy","x":280,"y":280,"config":{}},{"id":"n3","type":"tts_clean","label":"Czyszczenie tekstu","x":500,"y":280,"config":{}},{"id":"n4","type":"output","label":"Wyjscie","x":720,"y":280,"config":{"format":"text"}}],"edges":[{"id":"e1","from_node":"n1","to_node":"n2","from_port":"default"},{"id":"e2","from_node":"n2","to_node":"n3","from_port":"default"},{"id":"e3","from_node":"n3","to_node":"n4","from_port":"default"}]}"#,
-            0,
-        ),
-        (
             "Standardowy pipeline TTS",
-            "Pipeline syntezy mowy: czyszczenie tekstu, TTS",
+            "Prosty pipeline syntezy mowy: czyszczenie tekstu i TTS.",
             "tts",
-            r#"{"nodes":[{"id":"n1","type":"trigger","label":"Wyzwalacz","x":60,"y":280,"config":{}},{"id":"n2","type":"tts_clean","label":"Czyszczenie tekstu","x":280,"y":280,"config":{}},{"id":"n3","type":"tts","label":"Synteza mowy","x":500,"y":280,"config":{}},{"id":"n4","type":"output","label":"Wyjscie","x":720,"y":280,"config":{"format":"text"}}],"edges":[{"id":"e1","from_node":"n1","to_node":"n2","from_port":"default"},{"id":"e2","from_node":"n2","to_node":"n3","from_port":"default"},{"id":"e3","from_node":"n3","to_node":"n4","from_port":"default"}]}"#,
-            0,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"c1","type":"tts_clean","position":{"x":200,"y":0},"config":{}},{"id":"s1","type":"tts","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from":"t1","to":"c1"},{"from":"c1","to":"s1"},{"from":"s1","to":"o1"}]}"#,
+            1,
         ),
         (
             "teams-flow",
-            "Domyslny flow dla teams-bot (trigger -> llm -> output)",
+            "Domyslny flow dla teams-bot: trigger -> llm -> pii_filter -> output.",
             "agents",
-            r#"{"nodes":[{"id":"trigger","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"llm","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"output","type":"output","position":{"x":400,"y":0},"config":{}}],"edges":[{"from":"trigger","to":"llm"},{"from":"llm","to":"output"}]}"#,
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{"model_alias":"teams-summarization"}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{}}],"edges":[{"from":"t1","to":"l1"},{"from":"l1","to":"p1"},{"from":"p1","to":"o1"}]}"#,
             0,
         ),
     ];
@@ -1159,20 +676,97 @@ mod tests {
         assert_eq!(is_system_all, 5);
     }
 
-    /// T1.2 — swieza baza ma flow 'teams-flow' w seedzie.
+    /// Swieza baza ma dokladnie 3 domyslne flows: LLM, TTS, teams-flow.
+    /// Kazdy ma zdefiniowany DAG trigger -> ... -> output z odpowiednimi nodami.
     #[test]
-    fn fresh_db_has_teams_flow() {
+    fn fresh_db_has_expected_default_flows() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
         let conn = pool.lock().unwrap();
 
-        let count: i64 = conn
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3, "oczekiwane 3 domyslne flows, jest {}", total);
+
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM flows ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Standardowy pipeline LLM".to_string(),
+                "Standardowy pipeline TTS".to_string(),
+                "teams-flow".to_string(),
+            ]
+        );
+
+        // Sprawdz kazdy flow strukturalnie.
+        let assert_dag = |name: &str, expected_types: &[&str], expected_edges: usize| {
+            let (flow_json, service_type, is_default): (String, String, i64) = conn
+                .query_row(
+                    "SELECT flow_json, service_type, is_default FROM flows WHERE name = ?1",
+                    rusqlite::params![name],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&flow_json).unwrap();
+            let nodes = parsed["nodes"].as_array().unwrap();
+            let edges = parsed["edges"].as_array().unwrap();
+            assert_eq!(
+                nodes.len(),
+                expected_types.len(),
+                "{}: node count",
+                name
+            );
+            assert_eq!(edges.len(), expected_edges, "{}: edge count", name);
+            let types: Vec<&str> = nodes.iter().map(|n| n["type"].as_str().unwrap()).collect();
+            assert_eq!(types, expected_types, "{}: node types", name);
+            (service_type, is_default)
+        };
+
+        let (st, def) = assert_dag(
+            "Standardowy pipeline LLM",
+            &["trigger", "llm", "pii_filter", "output"],
+            3,
+        );
+        assert_eq!(st, "llm");
+        assert_eq!(def, 1);
+
+        let (st, def) = assert_dag(
+            "Standardowy pipeline TTS",
+            &["trigger", "tts_clean", "tts", "output"],
+            3,
+        );
+        assert_eq!(st, "tts");
+        assert_eq!(def, 1);
+
+        let (st, _) = assert_dag(
+            "teams-flow",
+            &["trigger", "llm", "pii_filter", "output"],
+            3,
+        );
+        assert_eq!(st, "agents");
+
+        // teams-flow: llm node musi miec model_alias = teams-summarization.
+        let teams_json: String = conn
             .query_row(
-                "SELECT COUNT(*) FROM flows WHERE name = 'teams-flow'",
+                "SELECT flow_json FROM flows WHERE name = 'teams-flow'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "oczekiwany 1 wiersz teams-flow");
+        let teams_parsed: serde_json::Value = serde_json::from_str(&teams_json).unwrap();
+        let llm_node = teams_parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "llm")
+            .unwrap();
+        assert_eq!(llm_node["config"]["model_alias"], "teams-summarization");
     }
 
     /// find_prompt z fallback na 'pl' gdy dany jezyk nie istnieje.
@@ -1199,5 +793,74 @@ mod tests {
         // Nieistniejacy prompt -> None
         let none = crate::db::repository::find_prompt(&pool, "does_not_exist", "pl").unwrap();
         assert!(none.is_none());
+    }
+
+    /// Kazdy seedowany flow musi przechodzic walidacje AdapterRegistry
+    /// (zbudowanej z tym samym zestawem adapterow co FlowDispatcher). Chroni
+    /// przed regresja: dodanie node_type do seed'a bez adaptera w dispatcherze
+    /// blokowaloby zapis flow przez walidacje dispatch/handlers.rs.
+    #[test]
+    fn seeded_flows_pass_adapter_validation() {
+        use crate::config::RouterConfig;
+        use crate::flow_engine::adapters::condition::ConditionNodeAdapter;
+        use crate::flow_engine::adapters::conversation_history::ConversationHistoryAdapter;
+        use crate::flow_engine::adapters::embeddings::EmbeddingsNodeAdapter;
+        use crate::flow_engine::adapters::llm::LlmNodeAdapter;
+        use crate::flow_engine::adapters::memory::MemoryNodeAdapter;
+        use crate::flow_engine::adapters::output::OutputNodeAdapter;
+        use crate::flow_engine::adapters::pii_filter::PiiFilterNodeAdapter;
+        use crate::flow_engine::adapters::rag::RagNodeAdapter;
+        use crate::flow_engine::adapters::session_context::SessionContextAdapter;
+        use crate::flow_engine::adapters::speaker_context::SpeakerContextAdapter;
+        use crate::flow_engine::adapters::stt::SttNodeAdapter;
+        use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
+        use crate::flow_engine::adapters::tts::TtsNodeAdapter;
+        use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
+        use crate::flow_engine::adapters::AdapterRegistry;
+        use crate::flow_engine::types::FlowDefinition;
+        use crate::flow_engine::validation::validate_flow;
+        use crate::routing::service_manager::ServiceManager;
+        use std::sync::Arc;
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let config = Arc::new(RouterConfig::default());
+        let sm = Arc::new(
+            ServiceManager::new(config.clone(), None).expect("ServiceManager with empty config"),
+        );
+
+        let mut registry = AdapterRegistry::new();
+        registry.register(LlmNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(RagNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(SttNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(TtsNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(EmbeddingsNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(MemoryNodeAdapter::new(sm.clone(), config.clone()));
+        registry.register(ConversationHistoryAdapter::new(sm.clone(), config.clone()));
+        registry.register(SessionContextAdapter::new(sm.clone(), config.clone()));
+        registry.register(SpeakerContextAdapter::new(sm, config));
+        registry.register(TriggerNodeAdapter::new());
+        registry.register(OutputNodeAdapter::new());
+        registry.register(ConditionNodeAdapter::new());
+        registry.register(PiiFilterNodeAdapter::new(pool.clone()));
+        registry.register(TtsCleanNodeAdapter::new(pool.clone()));
+
+        let flow_jsons: Vec<(String, String)> = {
+            let conn = pool.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT name, flow_json FROM flows").unwrap();
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            rows
+        };
+
+        assert!(!flow_jsons.is_empty(), "seed nie wyprodukowal flows");
+        for (name, json) in &flow_jsons {
+            let parsed: FlowDefinition = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("flow '{}': nie parsuje: {}", name, e));
+            validate_flow(&parsed, &registry)
+                .unwrap_or_else(|e| panic!("flow '{}': walidacja nie przechodzi: {}", name, e));
+        }
     }
 }

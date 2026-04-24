@@ -76,7 +76,8 @@ impl MemoryNodeAdapter {
         ctx.input.clone()
     }
 
-    /// Rozwiazuje zapytanie do pamieci - preferuje search_terms z memory_analyzer
+    /// Rozwiazuje zapytanie do pamieci — preferuje search_terms wstrzyknięte przez
+    /// poprzedzający węzeł flow; w ich braku używa surowego inputu.
     fn resolve_query_text(&self, node_config: &Value, ctx: &FlowContext) -> String {
         for result in ctx.node_results.values() {
             if result.get("should_query").and_then(|v| v.as_bool()) == Some(true) {
@@ -85,7 +86,7 @@ impl MemoryNodeAdapter {
                     if !terms_str.is_empty() {
                         debug!(
                             terms_count = terms_str.len(),
-                            "Memory adapter: uzywam search_terms z memory_analyzer"
+                            "Memory adapter: uzywam search_terms z node_results"
                         );
                         return terms_str.join(" ");
                     }
@@ -378,16 +379,17 @@ impl NodeAdapter for MemoryNodeAdapter {
                 if inject {
                     if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
                         if !text.is_empty() {
-                            let prompt_id = node_config
+                            // Brak prompt_id => wstrzykujemy surowy tekst kontekstu, bez
+                            // hardkodowanego szablonu — flow_json kontroluje formatowanie.
+                            let template = node_config
                                 .get("context_prompt_id")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("memory_context_template");
-                            let template = self
-                                .service_manager
-                                .prompt_registry
-                                .get_content(prompt_id)
+                                .filter(|s| !s.is_empty())
+                                .and_then(|pid| {
+                                    self.service_manager.prompt_registry.get_content(pid)
+                                })
                                 .map(|s| s.replace("{context}", text))
-                                .unwrap_or_else(|| format!("Kontekst z pamieci:\n{}", text));
+                                .unwrap_or_else(|| text.to_string());
                             Self::inject_memory_context(&mut ctx.messages, &template);
                         }
                     }
