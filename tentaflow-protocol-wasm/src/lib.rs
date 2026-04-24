@@ -4205,6 +4205,11 @@ fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_
     set(&o, "botEndpointId", s.bot_endpoint_id.into());
     set(&o, "containerName", s.container_name.into());
     set(&o, "ownerUserId", (s.owner_user_id as f64).into());
+    // Lifecycle pola są kluczowe dla live view (chip LIVE/JOINING) i dla
+    // onJoinClick który decyduje czy wracać do joining screen czy nawigować
+    // wprost do live view po reload. Bez nich chip zawsze zostaje JOINING.
+    set(&o, "lifecycleStage", s.lifecycle_stage.into());
+    set(&o, "lifecycleDetails", s.lifecycle_details.into());
     o
 }
 
