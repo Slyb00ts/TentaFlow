@@ -256,6 +256,7 @@
     "model_unloaded": "Niezaładowany",
     "update_available": "Aktualizacja dostępna",
     "update_button": "Aktualizuj",
+    "rebuild_button": "Przebuduj",
     "update_title": "Aktualizacja {name}",
     "update_active_sessions_warning": "{count} aktywnych sesji spotkania zostanie przerwanych.",
     "update_confirm": "Aktualizuj",

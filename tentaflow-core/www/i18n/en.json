@@ -256,6 +256,7 @@
     "model_unloaded": "Unloaded",
     "update_available": "Update available",
     "update_button": "Update",
+    "rebuild_button": "Rebuild",
     "update_title": "Update {name}",
     "update_active_sessions_warning": "{count} active meeting sessions will be terminated.",
     "update_confirm": "Update",

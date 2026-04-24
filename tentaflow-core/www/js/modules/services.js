@@ -317,7 +317,11 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}">${quicStatusCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
-        ${updateInfo.showButton ? `<tf-button variant="ghost" size="sm" icon="refresh" data-svc-update="${escapeAttr(s.id)}" title="${escapeAttr(I18n.t('services.update_button'))}">${escapeHtml(I18n.t('services.update_button'))}</tf-button>` : ''}
+        ${updateInfo.canRebuild ? (() => {
+          const labelKey = updateInfo.updateAvailable ? 'services.update_button' : 'services.rebuild_button';
+          const variant = updateInfo.updateAvailable ? 'primary' : 'ghost';
+          return `<tf-button variant="${variant}" size="sm" icon="refresh" data-svc-update="${escapeAttr(s.id)}" title="${escapeAttr(I18n.t(labelKey))}">${escapeHtml(I18n.t(labelKey))}</tf-button>`;
+        })() : ''}
         <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
       </td>
     </tr>
@@ -812,20 +816,32 @@ function extractQuicAddr(cfg) {
 /// External / embedded / unknown-method deployments never show the button
 /// because we have no source tree to rebuild from.
 function evaluateUpdate(service, cfg) {
-  const engineId = service.engineId || cfg?.engine_id || cfg?.engineId || '';
-  const rawMethod = (service.deployMethod || cfg?.deploy_method || cfg?.deployMethod || '').toLowerCase();
+  // On-demand services like teams-bot register without engine_id in config_json,
+  // so fall back to service.name which equals the manifest engine.id for them.
+  const engineId = service.engineId || cfg?.engine_id || cfg?.engineId || service.name || '';
+  // Registrations in the wild use deploy_mode, deploy_method, camelCase, or
+  // snake_case interchangeably — accept any of them rather than forcing a
+  // migration of existing rows.
+  const rawMethod = (
+    service.deployMethod
+    || cfg?.deploy_method
+    || cfg?.deployMethod
+    || cfg?.deploy_mode
+    || cfg?.deployMode
+    || ''
+  ).toLowerCase();
   if (!engineId || !ManifestStore.isLoaded()) {
-    return { showButton: false, badge: null };
+    return { canRebuild: false, badge: null };
   }
   if (rawMethod === 'external') {
-    return { showButton: false, badge: { variant: 'info', labelKey: 'services.update_managed_externally' } };
+    return { canRebuild: false, badge: { variant: 'info', labelKey: 'services.update_managed_externally' } };
   }
   if (rawMethod !== 'docker' && rawMethod !== 'native') {
-    return { showButton: false, badge: null };
+    return { canRebuild: false, badge: null };
   }
   const manifest = ManifestStore.byId(engineId);
   if (!manifest) {
-    return { showButton: false, badge: null };
+    return { canRebuild: false, badge: null };
   }
   const manifestHash = rawMethod === 'docker'
     ? (manifest.docker_source_hash || '')
@@ -833,12 +849,13 @@ function evaluateUpdate(service, cfg) {
   if (!manifestHash) {
     // Source-less deploy kind (embedded feature-flag, or manifest predates the
     // hash feature) — nothing to compare, nothing to update.
-    return { showButton: false, badge: null };
+    return { canRebuild: false, badge: null };
   }
   const deployedHash = service.deployedSourceHash || '';
   const updateAvailable = deployedHash !== manifestHash;
   return {
-    showButton: updateAvailable,
+    canRebuild: true,
+    updateAvailable,
     badge: updateAvailable
       ? { variant: 'warn', labelKey: 'services.update_available' }
       : null,
