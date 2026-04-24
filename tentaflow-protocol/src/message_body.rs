@@ -2239,6 +2239,46 @@ pub enum DeploymentPayload {
     ReqLogStream(DeploymentLogStreamRequest),
     StreamChunk(DeploymentStreamChunk),
     StreamEnd(DeploymentStreamEnd),
+    /// Redeploy an already-deployed service from a refreshed source tree.
+    /// Caller obtains the streaming deploy_id in `ResRedeploy` and then
+    /// subscribes through the existing `ReqLogStream` flow.
+    ReqRedeploy(ServiceRedeployRequest),
+    ResRedeploy(ServiceRedeployResponse),
+}
+
+/// Possible `status` values returned in `ServiceRedeployResponse`. Kept as
+/// constants so dispatch handler and GUI share one source of truth.
+pub const REDEPLOY_STATUS_STARTED: &str = "started";
+pub const REDEPLOY_STATUS_ACTIVE_SESSIONS: &str = "active_sessions";
+pub const REDEPLOY_STATUS_NO_SOURCE: &str = "no_source";
+pub const REDEPLOY_STATUS_UNSUPPORTED: &str = "unsupported";
+pub const REDEPLOY_STATUS_NOT_FOUND: &str = "not_found";
+pub const REDEPLOY_STATUS_FAILED: &str = "failed";
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRedeployRequest {
+    pub service_id: i64,
+    /// For agents (teams-bot): when `false` and the engine has live meeting
+    /// sessions, handler returns `active_sessions` without stopping anything.
+    /// GUI is expected to ask the user first; backend does not re-prompt.
+    pub force_if_active_sessions: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRedeployResponse {
+    /// One of the `REDEPLOY_STATUS_*` constants.
+    pub status: String,
+    /// Streaming id — subscribe via `DeploymentLogStreamRequest{deploy_id}`.
+    /// Empty unless `status == "started"`.
+    pub deploy_id: String,
+    /// New manifest source hash once rebuild succeeds. Empty while the job
+    /// runs — the GUI reads the final value from the `services` row after
+    /// the stream ends.
+    pub new_hash: String,
+    /// Human-readable detail for non-success statuses.
+    pub error: String,
+    /// Populated when `status == "active_sessions"`; zero otherwise.
+    pub active_session_count: u32,
 }
 
 // =============================================================================
