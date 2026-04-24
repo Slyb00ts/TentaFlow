@@ -119,10 +119,20 @@ export function runPairProgress({ target, submit }) {
       if (a === 'cancel' || a === 'close') cleanup({ outcome: 'cancelled' });
     });
 
-    // Animowane przewijanie krokow w trakcie RPC. Kazdy przejsciowy krok =
-    // aktywny, poprzednie = done. Robimy to w sposob ciagly az do finalnego
-    // sygnalu z submit().
-    let currentIdx = 0;
+    // Etapy mapuja sie na FAZY backendu:
+    //   prepare    — synchronicznie przed RPC (PIN + podpis)
+    //   reach      — iroh.connect(ALPN_PAIRING), moze trwac do ~25s timeoutu
+    //   handshake  — bi-stream + PairingRequest/Response
+    //   keys       — TrustedKeysSync + NodeInfo (po confirm)
+    //   connected  — mesh session zestawiona
+    //
+    // Backend zwraca JEDEN wynik submit() na koniec. Zeby nie wyprzedzac
+    // zdarzen: prepare oznaczamy done szybko (nie ma asynchronicznosci),
+    // potem ZATRZYMUJEMY sie na 'handshake' jako active (bo to tam scenariusz
+    // failu laduje — connect: timed out / read response: connection lost).
+    // Sukces advance'uje dalej do done w callbacku. Failure attachuje error
+    // do HANDSHAKE, nie losowo.
+    let activeIdx = 0; // ktory krok jest 'active'
     const setStep = (id, state, detail) => {
       const el = body.querySelector(`[data-step="${id}"]`);
       if (!el) return;
@@ -141,19 +151,25 @@ export function runPairProgress({ target, submit }) {
       }
     };
 
-    const advance = () => {
-      if (settled) return;
-      if (currentIdx >= STEP_IDS.length - 1) return; // ostatni krok rezerwujemy dla final state
-      if (currentIdx > 0) setStep(STEP_IDS[currentIdx - 1], 'done');
-      setStep(STEP_IDS[currentIdx], 'active');
-      currentIdx += 1;
-      tickerTimer = setTimeout(advance, 550);
-    };
-
-    // Start: prepare jako active.
+    // Start: prepare active.
     setStep(STEP_IDS[0], 'active');
-    currentIdx = 1;
-    tickerTimer = setTimeout(advance, 450);
+    activeIdx = 0;
+    // Po 300ms: prepare done, reach active. Po 800ms: reach done, handshake
+    // active — i tutaj czekamy na RPC result. Ze strony UX to odzwierciedla
+    // realne fazy: prepare = instant, reach = opening iroh connection (moze
+    // trwac ale zwykle <1s przez relay), handshake = czekanie na peer.
+    tickerTimer = setTimeout(() => {
+      if (settled) return;
+      setStep(STEP_IDS[0], 'done');
+      setStep(STEP_IDS[1], 'active');
+      activeIdx = 1;
+      tickerTimer = setTimeout(() => {
+        if (settled) return;
+        setStep(STEP_IDS[1], 'done');
+        setStep(STEP_IDS[2], 'active');
+        activeIdx = 2;
+      }, 500);
+    }, 300);
 
     // Uruchamiamy submit rownolegle. Czekamy na result albo error.
     Promise.resolve()
@@ -193,11 +209,15 @@ export function runPairProgress({ target, submit }) {
       .catch((err) => {
         if (settled) return;
         clearTimeout(tickerTimer);
-        // Oznacz aktywny krok jako error, reszta pending.
-        const errIdx = Math.max(0, Math.min(currentIdx - 1, STEP_IDS.length - 1));
+        // Attach error do faktycznie aktywnego kroku (handshake po tickerze,
+        // albo wczesniejszy krok jesli timing RPC go wyprzedzil). Reszta
+        // pending.
+        const errIdx = Math.max(0, Math.min(activeIdx, STEP_IDS.length - 1));
+        const rawMsg = err?.message || String(err || '');
+        const detail = friendlyErrorMessage(rawMsg);
         for (let i = 0; i < STEP_IDS.length; i++) {
           if (i < errIdx) setStep(STEP_IDS[i], 'done');
-          else if (i === errIdx) setStep(STEP_IDS[i], 'error', err?.message || String(err || ''));
+          else if (i === errIdx) setStep(STEP_IDS[i], 'error', detail);
           else setStep(STEP_IDS[i], 'pending');
         }
         headIcoEl.className = 'pair-progress__head-ico pair-progress__head-ico--error';
@@ -214,6 +234,25 @@ export function runPairProgress({ target, submit }) {
         `;
       });
   });
+}
+
+// Tlumaczy surowy komunikat backendu na czytelna etykiete w dialogu. Nie
+// ukrywamy oryginalu — dodajemy tylko sugestie co zrobic.
+function friendlyErrorMessage(raw) {
+  const s = String(raw || '').toLowerCase();
+  if (s.includes('connect: timed out') || s.includes('timed out')) {
+    return I18n.t('mesh.pair_err_connect_timeout');
+  }
+  if (s.includes('no addressing information')) {
+    return I18n.t('mesh.pair_err_no_addressing');
+  }
+  if (s.includes('connection lost') || s.includes('read response')) {
+    return I18n.t('mesh.pair_err_stream_closed');
+  }
+  if (s.includes('pin')) {
+    return I18n.t('mesh.pair_err_pin');
+  }
+  return raw;
 }
 
 function renderStep(id) {
