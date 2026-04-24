@@ -3641,7 +3641,7 @@ textarea {
 .meeting-empty-hint { color: var(--text-3); font-size: 13px; font-style: italic; }
 
 /* Joining */
-.meeting-joining-hero { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px; }
+.meeting-joining-hero { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px; min-height: calc(100vh - 160px); }
 .meeting-joining-card {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: var(--radius-xl, 20px); padding: 40px 48px;
