@@ -18,6 +18,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import MeshDetailScreen from '/js/modules/mesh-detail.js';
 import { renderDiagram, bindDiagramEvents, destroyDiagram } from '/js/modules/mesh-diagram.js';
+import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import { patchInner } from '/js/lib/patch.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -1079,7 +1080,23 @@ async function rejectPairing(nodeId) {
 }
 
 async function revokeTrust(nodeId) {
-  if (!confirm(I18n.t('mesh.revoke_confirm'))) return;
+  const peer = nodes.find((n) => (n.nodeId || n.node_id) === nodeId);
+  const peerName = peer?.hostname || peer?.displayName || I18n.t('mesh.unknown_host');
+  const ok = await confirmDialog({
+    title: I18n.t('mesh.revoke_dialog_title'),
+    lead: I18n.t('mesh.revoke_dialog_lead'),
+    peer: { name: peerName, id: nodeId },
+    consequences: [
+      I18n.t('mesh.revoke_dialog_cons_disconnect'),
+      I18n.t('mesh.revoke_dialog_cons_key'),
+      I18n.t('mesh.revoke_dialog_cons_pair_again'),
+    ],
+    confirmLabel: I18n.t('mesh.revoke_dialog_confirm'),
+    confirmIcon: 'trash',
+    cancelLabel: I18n.t('common.cancel'),
+    variant: 'danger',
+  });
+  if (!ok) return;
   try {
     await ApiBinary.action('meshTrustRevokeRequest', { nodeId });
     toast(I18n.t('mesh.revoke_success'), 'success');
