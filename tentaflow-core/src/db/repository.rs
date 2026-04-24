@@ -28,6 +28,7 @@ fn row_to_service(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbService> {
         updated_at: row.get(8)?,
         service_uuid: row.get(9)?,
         node_id: row.get(10)?,
+        deployed_source_hash: row.get(11)?,
     })
 }
 
@@ -162,7 +163,7 @@ fn row_to_flow_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowExec
 
 // --- Services ---
 
-const SERVICE_COLS: &str = "id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id";
+const SERVICE_COLS: &str = "id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id, deployed_source_hash";
 const BACKEND_COLS: &str = "id, service_id, connection_type, config_json, max_concurrent, timeout_ms, weight, model_name_override, health_check_path, is_active";
 
 pub fn list_services(pool: &DbPool) -> Result<Vec<DbService>> {
@@ -184,7 +185,7 @@ pub fn list_services_with_backends(
     let conn = acquire(pool)?;
 
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.name, s.service_type, s.strategy, s.model_category, s.status, s.config_json, s.created_at, s.updated_at, s.service_uuid, s.node_id, \
+        "SELECT s.id, s.name, s.service_type, s.strategy, s.model_category, s.status, s.config_json, s.created_at, s.updated_at, s.service_uuid, s.node_id, s.deployed_source_hash, \
          b.id, b.service_id, b.connection_type, b.config_json, b.max_concurrent, b.timeout_ms, b.weight, b.model_name_override, b.health_check_path, b.is_active \
          FROM services s LEFT JOIN service_backends b ON s.id = b.service_id ORDER BY s.name, b.id",
     )?;
@@ -209,24 +210,25 @@ pub fn list_services_with_backends(
                 updated_at: row.get(8)?,
                 service_uuid: row.get(9)?,
                 node_id: row.get(10)?,
+                deployed_source_hash: row.get(11)?,
             };
             services.push((service, Vec::new()));
             last_service_id = Some(svc_id);
         }
 
-        let backend_id: Option<i64> = row.get(11)?;
+        let backend_id: Option<i64> = row.get(12)?;
         if backend_id.is_some() {
             let backend = DbServiceBackend {
-                id: row.get(11)?,
-                service_id: row.get(12)?,
-                connection_type: row.get(13)?,
-                config_json: row.get(14)?,
-                max_concurrent: row.get(15)?,
-                timeout_ms: row.get(16)?,
-                weight: row.get(17)?,
-                model_name_override: row.get(18)?,
-                health_check_path: row.get(19)?,
-                is_active: row.get(20)?,
+                id: row.get(12)?,
+                service_id: row.get(13)?,
+                connection_type: row.get(14)?,
+                config_json: row.get(15)?,
+                max_concurrent: row.get(16)?,
+                timeout_ms: row.get(17)?,
+                weight: row.get(18)?,
+                model_name_override: row.get(19)?,
+                health_check_path: row.get(20)?,
+                is_active: row.get(21)?,
             };
             if let Some(last) = services.last_mut() {
                 last.1.push(backend);
@@ -325,6 +327,18 @@ pub fn set_service_node_id(pool: &DbPool, id: i64, node_id: Option<&str>) -> Res
     conn.execute(
         "UPDATE services SET node_id = ?2, updated_at = datetime('now') WHERE id = ?1",
         rusqlite::params![id, node_id],
+    )?;
+    Ok(())
+}
+
+/// Records the sha256 of the container source tree captured at deploy time.
+/// Used by the dashboard to detect whether a running service is out of date
+/// relative to the compile-time manifest hash.
+pub fn set_deployed_source_hash(pool: &DbPool, service_id: i64, hash: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE services SET deployed_source_hash = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![service_id, hash],
     )?;
     Ok(())
 }

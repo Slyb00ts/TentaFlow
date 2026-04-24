@@ -343,6 +343,7 @@ async fn do_docker_deploy(
             }
         }
         register_on_demand_service(db, &engine.engine_id, &engine.category, &image_tag);
+        persist_source_hash(db, &engine.engine_id, "docker", &engine.engine_id);
         log_line(db, deploy_id, tx, "log", "serwis zarejestrowany (on_demand)");
         finish_success(
             db,
@@ -412,6 +413,7 @@ async fn do_docker_deploy(
         host_port,
         node_id,
     );
+    persist_source_hash(db, &engine.engine_id, "docker", &engine.engine_id);
     log_line(db, deploy_id, tx, "log", "serwis zarejestrowany w routerze");
 
     finish_success(
@@ -727,6 +729,8 @@ async fn do_embedded_native_deploy(
             service_manager.register_local_inference_model(&model_repo);
             service_manager.register_local_inference_model(&service_name);
 
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+
             log_line(
                 db,
                 deploy_id,
@@ -772,6 +776,8 @@ async fn do_embedded_native_deploy(
                 &config_json,
                 "single",
             )?;
+
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
             log_line(
                 db,
@@ -1013,6 +1019,41 @@ fn find_gguf_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Stores the source-tree hash of the just-deployed engine against the row
+/// in `services` identified by `service_name`. Failures are warned and
+/// swallowed — the deployment itself already succeeded and this bookkeeping
+/// must not fail the caller.
+fn persist_source_hash(db: &DbPool, engine_id: &str, deploy_method: &str, service_name: &str) {
+    let registry = crate::services::manifest::registry();
+    let Some(manifest) = registry.by_id(engine_id) else {
+        return;
+    };
+    let hash = match deploy_method {
+        "docker" => manifest.docker_source_hash.as_str(),
+        "native" => manifest.native_source_hash.as_str(),
+        _ => return,
+    };
+    if hash.is_empty() {
+        return;
+    }
+    let services = match crate::db::repository::list_services(db) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("persist_source_hash: list_services: {}", e);
+            return;
+        }
+    };
+    let Some(row) = services.into_iter().find(|s| s.name == service_name) else {
+        return;
+    };
+    if let Err(e) = crate::db::repository::set_deployed_source_hash(db, row.id, hash) {
+        warn!(
+            "persist_source_hash({}): set_deployed_source_hash: {}",
+            engine_id, e
+        );
+    }
 }
 
 fn register_service(
