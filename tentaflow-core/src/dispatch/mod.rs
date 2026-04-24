@@ -480,6 +480,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::VncTunnelPayload::ResClose(_) => "VncTunnelCloseResponse",
             tentaflow_protocol::VncTunnelPayload::StreamEnd(_) => "VncTunnelStreamEnd",
         },
+        MessageBody::BrowserCaptureRequestBody(_) => "BrowserCaptureRequest",
+        MessageBody::BrowserCaptureResponseBody(_) => "BrowserCaptureResponse",
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",
         MessageBody::AuditEventBody(_) => "AuditEvent",
