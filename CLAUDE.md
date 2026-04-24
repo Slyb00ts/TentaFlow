@@ -116,6 +116,13 @@ Bundled addon updates at startup are driven by `bundle_hash` (computed from embe
 - Receiver zapisuje `pending_contact:*` w settings, żeby późniejsze `confirm/reject` mogły dociągnąć połączenie do inicjatora nawet bez świeżego autodiscovery.
 - `mesh` stream jest dalej używany po zestawieniu łączności do `PairingConfirm/Reject`, `NodeInfo` i `TrustedKeysSync`.
 
+**Mesh connection lifecycle (iroh)**:
+- Transport is iroh QUIC via `IrohMeshManager` (`tentaflow-core/src/mesh/iroh_manager.rs`). Relay URL: `load_relay_url` returns `Option<RelayUrl>`. `None` = iroh's built-in N0 preset (4 production relays `*.relay.n0.iroh-canary.iroh.link`). `Some(url)` = custom override from DB `settings.mesh.iroh_relay_url` or `config.toml`.
+- On simultaneous dial (A→B and B→A concurrently) iroh produces two distinct QUIC connections. `register_connection` applies a deterministic tie-break: **outgoing wins only if `self_hex < peer_hex`** (lexicographic on endpoint-id hex). Both sides converge on the same physical connection; the loser is closed with reason `"tie-break-loser"`.
+- `dial_locks: HashMap<peer_hex, Arc<Mutex<()>>>` — per-peer async mutex. All three `connect_to_peer*` variants acquire the lock before `endpoint.connect`, so at most one dial per peer is in flight. Lock is dropped on `disconnect_peer`.
+- Heartbeat: sole producer is the loop in `pipeline.rs` (broadcasts rkyv `HeartbeatMetrics` every `heartbeat_interval_ms`, default 500). The empty `run_heartbeat_loop` stub in `iroh_manager.rs` has been removed.
+- Upgrade path: `sanitize_trusted_contacts` runs at startup and strips `settings.trusted_contact:*` entries still pointing at the dead `use.iroh.network` default.
+
 **Dashboard**:
 - Frontend `www/` używa vanilla JS + custom elements `tf-*` z `tentaflow-core/www/js/components/`.
 - Widok Addons (WASM) korzysta z komponentów `tf-chip`, `tf-searchbox`, `tf-toggle`, `tf-button`; układ i style modułu są trzymane w `tentaflow-core/www/css/addons.css`.

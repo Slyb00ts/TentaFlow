@@ -895,7 +895,7 @@ mod tests {
             heartbeat_interval_ms: 500,
             peer_timeout_ms: 3000,
             cluster_name: "test".to_string(),
-            iroh_relay_url: "https://use.iroh.network/".to_string(),
+            iroh_relay_url: String::new(),
         };
         PeerManager::new("test-node".to_string(), gossip, mesh_config)
     }

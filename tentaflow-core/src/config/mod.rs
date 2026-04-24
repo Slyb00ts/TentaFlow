@@ -131,15 +131,18 @@ pub struct MeshConfig {
     pub cluster_name: String,
 
     /// URL serwera relay iroh uzywanego gdy bezposrednie QUIC hole punching
-    /// nie jest mozliwe (NAT, firewall). Domyslnie publiczny `use.iroh.network`
-    /// hostowany przez n0. Override wpisem w DB `settings.mesh.iroh_relay_url`.
+    /// nie jest mozliwe (NAT, firewall). Pusty string (domyslnie) oznacza
+    /// uzycie wbudowanego presetu N0 iroh (4 produkcyjne regiony
+    /// `*.relay.n0.iroh-canary.iroh.link`). Niepusta wartosc zastepuje preset
+    /// podanym URL; override mozna tez zrobic wpisem
+    /// `settings.mesh.iroh_relay_url` w DB.
     #[serde(default = "default_iroh_relay_url")]
     pub iroh_relay_url: String,
 }
 
-/// Publiczny relay n0 — dla produkcji offline-first zalecany self-hosted.
+/// Domyslnie pusty string — iroh uzyje wbudowanego presetu N0.
 fn default_iroh_relay_url() -> String {
-    "https://use.iroh.network/".to_string()
+    String::new()
 }
 
 // =============================================================================

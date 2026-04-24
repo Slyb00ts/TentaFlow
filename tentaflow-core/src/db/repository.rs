@@ -605,6 +605,25 @@ pub fn list_settings(pool: &DbPool) -> Result<Vec<DbSetting>> {
     Ok(settings)
 }
 
+/// Zwraca pary `(key, value)` ze `settings` ktorych klucz zaczyna sie od `prefix`.
+/// Uzywane m.in. przez `net::iroh::pairing::sanitize_trusted_contacts` do iteracji
+/// po wpisach `trusted_contact:*` bez wczytywania calej tabeli.
+pub fn list_settings_with_prefix(pool: &DbPool, prefix: &str) -> Result<Vec<(String, String)>> {
+    let conn = acquire(pool)?;
+    let pattern = format!("{}%", prefix);
+    let mut stmt = conn.prepare(
+        "SELECT key, value FROM settings WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![pattern], |row| {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            Ok((key, value))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // --- Users ---
 
 pub fn get_user_by_username(pool: &DbPool, username: &str) -> Result<Option<DbUser>> {
