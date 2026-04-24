@@ -186,6 +186,7 @@ export class FlowCanvas {
     for (const t of list || []) {
       this.templates.set(t.node_type, t);
     }
+    this._normalizeEdgePorts();
   }
 
   _buildDom() {
@@ -241,6 +242,7 @@ export class FlowCanvas {
   setData(nodes, edges, { reset = true } = {}) {
     this.nodes = (nodes || []).map((n) => ({ ...n, config: n.config || {} }));
     this.edges = (edges || []).map((e) => ({ ...e }));
+    this._normalizeEdgePorts();
     this.selectedIds.clear();
     this.selectedEdgeId = null;
     if (reset) {
@@ -252,6 +254,7 @@ export class FlowCanvas {
   }
 
   getData() {
+    this._normalizeEdgePorts();
     // Przy serializacji pomijamy porty rowne domyslnym ("full"/"in"), zeby
     // nie zasmiecac flow_json pusta metadata — backend rozumie brak pol
     // dzieki serde(default). Dzieki temu edge tak jak przed S4a round-trippuje
@@ -271,6 +274,7 @@ export class FlowCanvas {
   // node'y i porty obecne w adapter metadata. Zwraca liste bledow jako
   // stringi (juz zlokalizowane) — pusta lista oznacza flow gotowy do zapisu.
   validate() {
+    this._normalizeEdgePorts();
     const errors = [];
     const nodeById = new Map(this.nodes.map((n) => [n.id, n]));
     for (const edge of this.edges) {
@@ -321,6 +325,39 @@ export class FlowCanvas {
       }
     }
     return errors;
+  }
+
+  _normalizeEdgePorts() {
+    if (!Array.isArray(this.edges) || this.edges.length === 0) return;
+    const nodeById = new Map(this.nodes.map((n) => [n.id, n]));
+    for (const edge of this.edges) {
+      const from = nodeById.get(edge.from_node);
+      const to = nodeById.get(edge.to_node);
+      if (from) {
+        const fromTpl = this.templates.get(from.type);
+        const { outputs } = portsForNode(from, fromTpl);
+        const outputNames = outputs.map((p) => p.name);
+        const currentFrom = edge.from_port || 'full';
+        if (!outputNames.includes(currentFrom)) {
+          if (outputNames.length === 1) edge.from_port = outputNames[0];
+          else if (outputNames.includes('full')) edge.from_port = 'full';
+        } else {
+          edge.from_port = currentFrom;
+        }
+      }
+      if (to) {
+        const toTpl = this.templates.get(to.type);
+        const { inputs } = portsForNode(to, toTpl);
+        const inputNames = inputs.map((p) => p.name);
+        const currentTo = edge.to_port || 'in';
+        if (!inputNames.includes(currentTo)) {
+          if (inputNames.length === 1) edge.to_port = inputNames[0];
+          else if (inputNames.includes('in')) edge.to_port = 'in';
+        } else {
+          edge.to_port = currentTo;
+        }
+      }
+    }
   }
 
   _pushHistory() {
