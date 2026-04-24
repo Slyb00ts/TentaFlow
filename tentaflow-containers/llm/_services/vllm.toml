@@ -1,12 +1,14 @@
-# Manifest serwisu vLLM — serwer LLM z PagedAttention. Tylko native bundle
-# (python), wieloplatformowo: CUDA (Linux/Windows), ROCm (Linux), MLX (macOS).
+# Manifest serwisu vLLM — serwer LLM z PagedAttention. Native bundle (python),
+# CUDA (Linux/Windows) i ROCm (Linux). Dla macOS Apple Silicon uzywamy
+# osobnego silnika `vllm-metal` (plugin MLX) w vllm-metal.toml, bo upstream
+# vLLM nie obsluguje Metal/MLX out-of-the-box.
 
 [engine]
 id = "vllm"
 category = "llm"
 name = "vLLM"
-description_pl = "Serwer LLM z PagedAttention i continuous batching. Wykrywa backend: CUDA / ROCm / MLX (Apple Silicon)."
-description_en = "LLM server with PagedAttention and continuous batching. Auto-detects backend: CUDA / ROCm / MLX (Apple Silicon)."
+description_pl = "Serwer LLM z PagedAttention i continuous batching. CUDA (Linux/Windows) albo ROCm (Linux)."
+description_en = "LLM server with PagedAttention and continuous batching. CUDA (Linux/Windows) or ROCm (Linux)."
 homepage = "https://github.com/vllm-project/vllm"
 license = "Apache-2.0"
 icon = "vllm"
@@ -15,7 +17,7 @@ api = "openai-compatible"
 version = "0.6.3"
 
 [deploy.native]
-platforms = ["linux", "windows", "macos"]
+platforms = ["linux", "windows"]
 runtime = "python-bundle"
 bundle_path = "llm/python/vllm"
 

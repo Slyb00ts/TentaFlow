@@ -12,6 +12,7 @@
 //       frontendu live. Dla agents/tools pomijamy run + register — build-only.
 // =============================================================================
 
+use std::io::BufRead;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -19,6 +20,8 @@ use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
+use crate::crypto::SettingsCipher;
+use crate::db::repository as repository;
 use crate::db::repository::deployments as deployments_repo;
 use crate::db::DbPool;
 use crate::deploy::log_bus::{self, BusMessage, LogLine};
@@ -56,6 +59,7 @@ struct EngineMeta {
 pub async fn run_deployment(
     db: DbPool,
     service_manager: Arc<ServiceManager>,
+    settings_cipher: Arc<SettingsCipher>,
     deploy_id: String,
     engine_id: String,
     deploy_method: String,
@@ -112,6 +116,7 @@ pub async fn run_deployment(
             if let Err(e) = do_native_deploy(
                 &db,
                 &service_manager,
+                &settings_cipher,
                 &deploy_id,
                 &tx,
                 &engine,
@@ -157,7 +162,7 @@ fn load_engine_meta(engine_id: &str) -> Result<EngineMeta> {
         .deploy
         .native
         .as_ref()
-        .map(|n| format!("{:?}", n.runtime).to_lowercase().replace('_', "-"));
+        .map(|n| n.runtime.as_kebab_str().to_string());
 
     Ok(EngineMeta {
         engine_id: entry.engine.id.clone(),
@@ -606,6 +611,7 @@ async fn do_docker_deploy(
 async fn do_native_deploy(
     db: &DbPool,
     service_manager: &Arc<ServiceManager>,
+    settings_cipher: &Arc<SettingsCipher>,
     deploy_id: &str,
     tx: &broadcast::Sender<BusMessage>,
     engine: &EngineMeta,
@@ -652,16 +658,18 @@ async fn do_native_deploy(
             ))
         }
         "python-bundle" => {
-            log_line(
+            do_python_bundle_native_deploy(
                 db,
+                service_manager,
+                settings_cipher,
                 deploy_id,
                 tx,
-                "log",
-                "runtime=python-bundle — bundle.toml setup",
-            );
-            Err(anyhow!(
-                "runtime=python-bundle jeszcze nie podpięty pod runner — użyj deploy.docker dla tego silnika"
-            ))
+                engine,
+                node_id,
+                config,
+                start_ms,
+            )
+            .await
         }
         other => Err(anyhow!("Nieznany runtime: {}", other)),
     }
@@ -788,6 +796,338 @@ async fn do_embedded_native_deploy(
             engine.engine_id
         )),
     }
+}
+
+/// Deploy native runtime=python-bundle: wywoluje `deploy::python_venv::deploy_with_logs`
+/// w blocking thread pool, streamuje kazda linie stdout/stderr z subprocesu (uv
+/// pip install, python -m venv, git clone, wlasciwy silnik) do broadcast_bus zeby
+/// GUI widzial progress. Po sukcesie rejestruje serwis w DB `services` z PID +
+/// venv_dir w config_json zeby backend mogl zrestorowac state po restarcie.
+/// Zablokowane na iOS/Android — tam Python-bundle nie dziala (sandboxing, brak
+/// Pythona w systemie), silniki mobilne uzywaja wylacznie embedded FFI.
+async fn do_python_bundle_native_deploy(
+    db: &DbPool,
+    _service_manager: &Arc<ServiceManager>,
+    settings_cipher: &Arc<SettingsCipher>,
+    deploy_id: &str,
+    tx: &broadcast::Sender<BusMessage>,
+    engine: &EngineMeta,
+    node_id: &str,
+    config: &DeployConfig,
+    start_ms: i64,
+) -> Result<()> {
+    match std::env::consts::OS {
+        "linux" | "macos" | "windows" => {}
+        other => {
+            anyhow::bail!(
+                "runtime=python-bundle nieobslugiwany na platformie {} — tylko linux/macos/windows",
+                other
+            );
+        }
+    }
+
+    let model_repo = resolve_model_repo(engine, config).unwrap_or_default();
+    let service_name = if model_repo.is_empty() {
+        config
+            .container_name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{}-native", slugify_name(&engine.engine_id)))
+    } else {
+        native_service_name(engine, config, &model_repo)
+    };
+    let host_port = config.port.unwrap_or(engine.default_port);
+
+    phase(db, deploy_id, tx, "building", 10, "przygotowywanie bundla");
+
+    let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    env.insert("PORT".to_string(), host_port.to_string());
+    if !model_repo.is_empty() {
+        env.insert("MODEL".to_string(), model_repo.clone());
+    }
+    if let Some(ids) = config.gpu_ids.as_ref().filter(|v| !v.is_empty()) {
+        env.insert("GPU_IDS".to_string(), ids.join(","));
+    }
+
+    // Hugging Face token z zaszyfrowanego ustawienia `hf_token` w DB —
+    // uzywany i przy install (uv pip sciaga wheels z HF), i przy runtime
+    // (pobieranie modeli przez transformers/HF Hub dla gated repo).
+    let hf_token = repository::get_setting_secure(db, "hf_token", settings_cipher)
+        .unwrap_or_default()
+        .unwrap_or_default();
+    if !hf_token.is_empty() {
+        env.insert("HF_TOKEN".to_string(), hf_token.clone());
+        env.insert("HUGGING_FACE_HUB_TOKEN".to_string(), hf_token);
+    }
+
+    // Wspolny katalog modeli dla Docker + native — model pobrany raz, widziany
+    // wszedzie. crate::paths::ensure_models_dirs tworzy <tentaflow_home>/models/
+    // i podkatalogi hf/torch.
+    let _ = crate::paths::ensure_models_dirs();
+    let hf_home = crate::paths::hf_home();
+    let torch_home = crate::paths::torch_home();
+    env.insert("HF_HOME".to_string(), hf_home.to_string_lossy().into_owned());
+    env.insert(
+        "HUGGINGFACE_HUB_CACHE".to_string(),
+        hf_home.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "TRANSFORMERS_CACHE".to_string(),
+        hf_home.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "TORCH_HOME".to_string(),
+        torch_home.to_string_lossy().into_owned(),
+    );
+
+    let native_req = crate::deploy::python_venv::NativeDeployRequest {
+        engine: engine.engine_id.clone(),
+        instance_name: Some(service_name.clone()),
+        env,
+    };
+
+    // Streaming stdout/stderr z subprocesow (pobieranie Pythona, uv pip install,
+    // git clone, spawn silnika). `python_venv::deploy_with_logs` pracuje w
+    // blocking threadpool — kanal mpsc przekazuje linie do async forwardera.
+    let (log_tx_sync, mut log_rx_async) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: crate::deploy::python_venv::LogSink = Arc::new(move |line: &str| {
+        let _ = log_tx_sync.send(line.to_string());
+    });
+
+    let db_forward = db.clone();
+    let deploy_forward = deploy_id.to_string();
+    let tx_forward = tx.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(line) = log_rx_async.recv().await {
+            log_line(&db_forward, &deploy_forward, &tx_forward, "log", &line);
+        }
+    });
+
+    phase(
+        db,
+        deploy_id,
+        tx,
+        "building",
+        30,
+        "pobieranie Pythona + instalacja zaleznosci",
+    );
+
+    let sink_blocking = Arc::clone(&sink);
+    let mut running = tokio::task::spawn_blocking(move || {
+        crate::deploy::python_venv::deploy_with_logs(&native_req, &sink_blocking)
+    })
+    .await
+    .context("spawn_blocking python_venv::deploy_with_logs")?
+    .context("python_venv::deploy_with_logs")?;
+
+    let pid = running.child.id();
+
+    phase(
+        db,
+        deploy_id,
+        tx,
+        "starting",
+        85,
+        "silnik wystartowany — czekam na gotowosc",
+    );
+
+    // Pipeline stdout/stderr silnika do deploy_log — m.in. HuggingFace model
+    // download ktory vLLM robi po `python -m vllm...` startuje. Watki odczytuja
+    // do zamkniecia pipe'ow (gdy engine padnie albo zostanie zabity).
+    let stdout_handle = running.child.stdout.take();
+    let stderr_handle = running.child.stderr.take();
+    let db_c = db.clone();
+    let dep_c = deploy_id.to_string();
+    let tx_c = tx.clone();
+    std::thread::spawn(move || {
+        if let Some(o) = stdout_handle {
+            for line in std::io::BufReader::new(o)
+                .lines()
+                .map_while(Result::ok)
+            {
+                log_line(&db_c, &dep_c, &tx_c, "log", &line);
+            }
+        }
+    });
+    let db_c = db.clone();
+    let dep_c = deploy_id.to_string();
+    let tx_c = tx.clone();
+    std::thread::spawn(move || {
+        if let Some(e) = stderr_handle {
+            for line in std::io::BufReader::new(e)
+                .lines()
+                .map_while(Result::ok)
+            {
+                log_line(&db_c, &dep_c, &tx_c, "log", &line);
+            }
+        }
+    });
+
+    // Child przekazujemy do `std::mem::forget` zeby Rust drop nie zrobil wait
+    // (w Unixie drop nie zabija, ale bez wait zombie przy exit tentaflow —
+    // proces kernela zyje niezaleznie). Zarzadzanie cyklem zycia: PID zapisany
+    // w config_json services + `kill <pid>` przez osobny endpoint.
+    std::mem::forget(running.child);
+
+    // Zamknij log-sink instalacyjny — forwarder z mpsc zakonczy po drop.
+    drop(sink);
+    let _ = forwarder.await;
+
+    // Health poll: czekamy az silnik odpowie na `/v1/models` (OpenAI-compatible
+    // engines — vllm, vllm-metal, xtts w trybie OAI itd.) albo `/health` na
+    // standardowym porcie. Podczas czekania live stream stdout/stderr leci juz
+    // do deploy_log — user widzi m.in. "Downloading model..." z HF Hub.
+    let health_timeout_secs: u64 = std::env::var("TENTAFLOW_DEPLOY_HEALTH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(900);
+    let poll_interval_secs: u64 = 3;
+    let max_attempts = health_timeout_secs / poll_interval_secs;
+    let health_url = format!("http://127.0.0.1:{}/v1/models", host_port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok();
+    let mut ready = false;
+    for attempt in 0..max_attempts {
+        tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+        if let Some(c) = client.as_ref() {
+            if let Ok(resp) = c.get(&health_url).send().await {
+                if resp.status().is_success() {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        // Progress bar 85..92 w trakcie czekania, co 30s aktualizuj wiadomosc
+        if attempt > 0 && attempt % 10 == 0 {
+            let pct = 85 + ((attempt * 7) / max_attempts.max(1)).min(7) as u32;
+            phase(
+                db,
+                deploy_id,
+                tx,
+                "starting",
+                pct,
+                &format!(
+                    "czekam na /v1/models na porcie {} ({}s)",
+                    host_port,
+                    attempt * poll_interval_secs
+                ),
+            );
+        }
+    }
+    if ready {
+        log_line(
+            db,
+            deploy_id,
+            tx,
+            "log",
+            &format!("silnik odpowiedzial na {} — gotowy", health_url),
+        );
+    } else {
+        log_line(
+            db,
+            deploy_id,
+            tx,
+            "log",
+            &format!(
+                "timeout {}s czekania na /v1/models — silnik startuje dalej w tle, sprawdz Services",
+                health_timeout_secs
+            ),
+        );
+    }
+
+    phase(
+        db,
+        deploy_id,
+        tx,
+        "registering",
+        95,
+        "rejestracja serwisu python-bundle",
+    );
+
+    let config_json = serde_json::json!({
+        "deploy_mode": "native",
+        "runtime": "python-bundle",
+        "engine": engine.engine_id,
+        "manifest_engine_id": engine.engine_id,
+        "deployed_model": model_repo,
+        "service_type": engine.category,
+        "port": host_port,
+        "internal_port": running.internal_port,
+        "venv_dir": running.venv_dir.to_string_lossy(),
+        "pid": pid,
+        "instance_name": running.instance_name,
+    })
+    .to_string();
+
+    let model_category = if engine.category == "llm" {
+        Some("llm")
+    } else {
+        None
+    };
+    let service_id = upsert_native_service(
+        db,
+        node_id,
+        &service_name,
+        &engine.category,
+        model_category,
+        &config_json,
+        "first_available",
+    )?;
+
+    // Natychmiastowa rejestracja w ServiceManager — router zacznie routowac
+    // /v1/chat/completions (i inne OpenAI endpointy) do naszego vLLM-Metal
+    // od razu, bez potrzeby restartu tentaflow. Idempotentne — jesli ten sam
+    // (service_id, URL) juz istnieje w DB, create_backend jest pominiety.
+    let model_override = if model_repo.is_empty() {
+        None
+    } else {
+        Some(model_repo.as_str())
+    };
+    if let Err(e) = register_native_http_backend(
+        db,
+        _service_manager,
+        service_id,
+        &service_name,
+        host_port,
+        model_override,
+    ) {
+        log_line(
+            db,
+            deploy_id,
+            tx,
+            "log",
+            &format!(
+                "WARN: rejestracja HTTP backendu nie powiodla sie ({}): {:#}",
+                service_name, e
+            ),
+        );
+    } else {
+        log_line(
+            db,
+            deploy_id,
+            tx,
+            "log",
+            &format!(
+                "HTTP backend zarejestrowany: http://127.0.0.1:{}/v1 → {}",
+                host_port, service_name
+            ),
+        );
+    }
+
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        &format!(
+            "python-bundle serwis uruchomiony: {} (pid={}, port={})",
+            service_name, pid, host_port
+        ),
+    );
+    finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+    Ok(())
 }
 
 async fn ensure_llm_model(
@@ -958,11 +1298,14 @@ fn upsert_native_service(
     model_category: Option<&str>,
     config_json: &str,
     strategy: &str,
-) -> Result<()> {
+) -> Result<i64> {
     let existing = crate::db::repository::list_services(db)?
         .into_iter()
         .find(|svc| svc.name == service_name);
 
+    // Schema `services.status` CHECK: 'active','disabled','maintenance','on_demand'.
+    // Nowy/restartowany deployment → 'active'. Runtime health (czy proces zyje,
+    // czy port odpowiada) jest osobnym sygnalem w service_manager, nie status w DB.
     let row_id = if let Some(existing) = existing {
         crate::db::repository::update_service(
             db,
@@ -971,7 +1314,7 @@ fn upsert_native_service(
             service_type,
             strategy,
             model_category,
-            "running",
+            "active",
             config_json,
         )?;
         existing.id
@@ -991,7 +1334,7 @@ fn upsert_native_service(
             service_type,
             strategy,
             model_category,
-            "running",
+            "active",
             config_json,
         )?;
         id
@@ -1001,6 +1344,74 @@ fn upsert_native_service(
         crate::db::repository::set_service_node_id(db, row_id, Some(node_id))?;
     }
 
+    Ok(row_id)
+}
+
+/// Rejestruje HTTP backend (OpenAI-compatible) dla natywnie uruchomionego
+/// silnika python-bundle (vllm, vllm-metal, sglang, xtts itd.). Zapisuje
+/// rekord w `service_backends` + live rejestracja w ServiceManager zeby router
+/// potrafil dispatche'owac /v1/chat/completions, /v1/embeddings itd. do
+/// procesu na 127.0.0.1:<port>. Analog do auto_register::... dla docker.
+fn register_native_http_backend(
+    db: &DbPool,
+    service_manager: &Arc<ServiceManager>,
+    service_id: i64,
+    service_name: &str,
+    port: u16,
+    model_override: Option<&str>,
+) -> Result<()> {
+    use crate::config::{ConnectionType, ServiceBackend};
+    use crate::db::models::NewBackend;
+    use crate::routing::backend::BackendClient;
+
+    let base_url = format!("http://127.0.0.1:{}/v1", port);
+    let backend_config = serde_json::json!({ "url": base_url.clone() }).to_string();
+
+    // Idempotencja: jesli ten sam service_id juz ma backend z tym samym URL,
+    // pomin insert (zdarza sie po ponownym deploy tej samej instancji).
+    let existing = crate::db::repository::list_backends_for_service(db, service_id)
+        .unwrap_or_default();
+    let already = existing.iter().any(|b| b.config_json.contains(&base_url));
+
+    if !already {
+        let new_backend = NewBackend {
+            service_id,
+            connection_type: "openai_api",
+            config_json: &backend_config,
+            max_concurrent: 50,
+            timeout_ms: 600_000,
+            weight: 1,
+            model_name_override: model_override,
+            health_check_path: Some("/v1/models"),
+        };
+        crate::db::repository::create_backend(db, &new_backend)?;
+    }
+
+    let sb = ServiceBackend {
+        connection: ConnectionType::OpenAIApi {
+            url: base_url,
+            // Lokalne silniki OSS (vllm, vllm-metal, sglang) nie wymagaja auth,
+            // ale BackendClient::new wymaga *jakiegos* api_key do zbudowania
+            // `Bearer ...` headera. Dummy token — backend go ignoruje.
+            api_key: Some("sk-tentaflow-local".to_string()),
+            api_key_env: None,
+            extra_headers: vec![],
+            custom_endpoint: None,
+            request_format: None,
+            tts_config: None,
+        },
+        max_concurrent: 50,
+        timeout_ms: 600_000,
+        weight: 1,
+        // vLLM zna model pod HF repo name (np. "Qwen/Qwen3.5-0.8B"), GUI
+        // dispatchuje pod service name (np. "tentaflow-vllm-metal-2izlb").
+        // Override podmienia nazwe tuz przed wyslaniem requestu do silnika.
+        model_name_override: model_override.map(String::from),
+        health_check_path: Some("/v1/models".to_string()),
+    };
+
+    let client = BackendClient::new(sb, None).context("BackendClient::new for native python-bundle")?;
+    service_manager.register_dynamic_http_backend(service_name, Arc::new(client));
     Ok(())
 }
 

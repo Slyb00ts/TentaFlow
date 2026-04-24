@@ -283,25 +283,41 @@ function sendMessage() {
 }
 
 function pushMessage(conv, msg) {
-  conv.messages.push(msg);
+  // vlist.append pushuje element do items — a items to ta sama referencja co
+  // conv.messages (przekazywana przez `items: messages` w mountVList).
+  // Osobny `conv.messages.push(msg)` zdublowalby wpis. Fallback push tylko
+  // gdy vlist nie jest jeszcze zainicjalizowany.
+  if (vlist) {
+    vlist.append(msg);
+  } else {
+    conv.messages.push(msg);
+  }
   conv.updatedAt = Date.now();
-  vlist?.append(msg);
   saveConversations();
 }
 
-// Called on every stream chunk. We only update the tail message: O(1) height
-// recompute + re-render of visible window. Full refresh is avoided.
+// Wywolywane po kazdym chunk ze streama. Przy maly modelach LLM (vllm-metal
+// Qwen 0.8B) tokeny lecą ~150-250/s — render viewport co chunk zacinal UI.
+// Throttlujemy przez requestAnimationFrame do ~60fps: kazdy chunk modyfikuje
+// assistantMsg.text, ale flush do DOM robimy raz na klatke. Delta tekstu
+// juz jest w modelu wiec nic nie tracimy.
+let streamRafPending = false;
 function onStreamTick() {
-  if (!vlist) return;
-  const wasPinned = vlist.pinned;
-  vlist.updateTail();
-  const pill = byId('chat-new-pill');
-  if (!pill) return;
-  if (!wasPinned) {
-    pill.classList.add('visible');
-  } else {
-    pill.classList.remove('visible');
-  }
+  if (streamRafPending) return;
+  streamRafPending = true;
+  requestAnimationFrame(() => {
+    streamRafPending = false;
+    if (!vlist) return;
+    const wasPinned = vlist.pinned;
+    vlist.updateTail();
+    const pill = byId('chat-new-pill');
+    if (!pill) return;
+    if (!wasPinned) {
+      pill.classList.add('visible');
+    } else {
+      pill.classList.remove('visible');
+    }
+  });
 }
 
 // ---- Screen --------------------------------------------------------------

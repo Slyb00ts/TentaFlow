@@ -26,27 +26,49 @@ class NativeDiscovery {
     private var irohBrowser: NWBrowser?
     private var nodeId: String = ""
     private var port: UInt16 = 8090
+    private var started = false
 
     // Cache rezolwowanych peerow — zeby nie spamowac FFI przy kazdym
     // browseResultsChangedHandler (moze byc wolany wielokrotnie).
-    private var resolvedEndpoints = Set<String>()
+    // Mapa: endpointIdBase32 -> liczba proub FFI (dla backoff).
+    private var resolvedEndpoints = [String: Int]()
+    // Kolejka peerow ktore czekaja na gotowosc Rust mesh (FFI zwrocil false).
+    private var pendingPeers = [String: (endpoint: NWEndpoint, attempts: Int)]()
     private let resolveQueue = DispatchQueue(label: "ai.tentaflow.discovery.resolve")
+
+    // Watchdog — co 10s loguje stan browsera i ile peerow zostalo znalezionych.
+    private var watchdogTimer: DispatchSourceTimer?
+    private var lastResultsCount = 0
+    private var peersDeliveredToRust = 0
 
     private init() {}
 
     /// Uruchom LAN discovery — browsuje iroh Bonjour service.
+    ///
     /// Advertising robi Rust iroh na desktopie. Na iOS nie robimy advertisingu
     /// z Swift, bo iroh w Rust na iOS nie moze nadawac mDNS (raw multicast
-    /// blocked by kernel). iOS bedzie dostepne dla innych iOS-ow przez relay
-    /// iroh po tym jak choc raz peer nas zna z druga strone.
+    /// blocked by kernel).
+    ///
+    /// UWAGA: wywoluj DOPIERO po tentaflow_mobile_start() i dodaniu 1-2s
+    /// opoznienia, zeby Rust MESH_HANDLE zdazyl sie zainicjalizowac. Inaczej
+    /// pierwsze FFI add_discovered_peer zwroci false (mesh niegotowy).
     func start(nodeId: String, port: UInt16) {
+        if started {
+            NSLog("[NativeDiscovery] start() ponowne — ignoruje")
+            return
+        }
+        started = true
         self.nodeId = nodeId
         self.port = port
 
+        NSLog("[NativeDiscovery] Startuje na typie \(IROH_SERVICE_TYPE)")
         startBrowsing()
+        startWatchdog()
+        startRetryLoop()
     }
 
-    /// Szukaj iroh peerow przez systemowy Bonjour.
+    /// Szukaj iroh peerow przez systemowy Bonjour. Browser startuje na main
+    /// queue — to wymusza wyswietlenie promptu "Local Network" od iOS.
     private func startBrowsing() {
         let descriptor = NWBrowser.Descriptor.bonjour(type: IROH_SERVICE_TYPE, domain: nil)
         let params = NWParameters()
@@ -55,18 +77,36 @@ class NativeDiscovery {
         let browser = NWBrowser(for: descriptor, using: params)
         self.irohBrowser = browser
 
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
+        browser.browseResultsChangedHandler = { [weak self] results, changes in
             guard let self = self else { return }
+            NSLog("[NativeDiscovery] browseResultsChangedHandler: %d wynik(ow), %d zmian(a)",
+                  results.count, changes.count)
+            self.lastResultsCount = results.count
+
+            for change in changes {
+                switch change {
+                case .added(let result):
+                    NSLog("[NativeDiscovery] ADD: \(self.describeEndpoint(result.endpoint))")
+                case .removed(let result):
+                    NSLog("[NativeDiscovery] REM: \(self.describeEndpoint(result.endpoint))")
+                case .changed(_, let result, _):
+                    NSLog("[NativeDiscovery] CHG: \(self.describeEndpoint(result.endpoint))")
+                case .identical:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+
             for result in results {
                 guard case .service(let name, _, _, _) = result.endpoint else { continue }
 
-                // Nazwa instancji = base32-nopad lowercase EndpointId (52 znaki).
-                // Unikaj wielokrotnego rozwiazywania tego samego peera.
                 self.resolveQueue.async {
-                    if self.resolvedEndpoints.contains(name) {
+                    // Cache po nazwie instancji = EndpointId w base32.
+                    if self.resolvedEndpoints[name] != nil {
                         return
                     }
-                    self.resolvedEndpoints.insert(name)
+                    self.resolvedEndpoints[name] = 0
                     DispatchQueue.global(qos: .utility).async {
                         self.resolvePeer(endpointIdBase32: name, serviceEndpoint: result.endpoint)
                     }
@@ -74,50 +114,116 @@ class NativeDiscovery {
             }
         }
 
-        browser.stateUpdateHandler = { state in
+        browser.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
             switch state {
+            case .setup:
+                NSLog("[NativeDiscovery] state=setup")
             case .ready:
-                print("[NativeDiscovery] Browsuje \(IROH_SERVICE_TYPE) — LAN discovery aktywne")
+                NSLog("[NativeDiscovery] state=READY — browsing \(IROH_SERVICE_TYPE) aktywny")
             case .failed(let error):
-                print("[NativeDiscovery] Browser BLAD: \(error)")
+                NSLog("[NativeDiscovery] state=FAILED: \(error.localizedDescription)")
+                // Po porazce sprobuj restartowac za 3s (permission/network issue).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    NSLog("[NativeDiscovery] Restart po failure...")
+                    self.irohBrowser?.cancel()
+                    self.startBrowsing()
+                }
             case .cancelled:
-                print("[NativeDiscovery] Browser zamkniety")
-            default:
-                break
+                NSLog("[NativeDiscovery] state=cancelled")
+            case .waiting(let error):
+                NSLog("[NativeDiscovery] state=WAITING: \(error.localizedDescription)")
+            @unknown default:
+                NSLog("[NativeDiscovery] state=unknown")
             }
         }
 
-        browser.start(queue: .global(qos: .utility))
+        // Main queue - wymusza wyswietlenie promptu "Local Network" od iOS
+        // przy pierwszej probie multicastu. Inne kolejki moga nie wyzwolic UI.
+        browser.start(queue: .main)
+        NSLog("[NativeDiscovery] browser.start(queue: .main) wywolany")
+    }
+
+    /// Watchdog co 10s — loguje stan systemu (aby user widzial w konsoli Xcode
+    /// czy cokolwiek sie dzieje). Pomaga zdiagnozowac: prompt nie pokazany,
+    /// permission denied, czy po prostu brak peerow w sieci.
+    private func startWatchdog() {
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 10.0, repeating: 10.0)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let state = self.irohBrowser?.state.debugDescription ?? "nil"
+            self.resolveQueue.sync {
+                NSLog(
+                    "[NativeDiscovery] WATCHDOG: browser=\(state) results=\(self.lastResultsCount) resolved=\(self.resolvedEndpoints.count) delivered=\(self.peersDeliveredToRust) pending=\(self.pendingPeers.count)"
+                )
+            }
+        }
+        timer.resume()
+        watchdogTimer = timer
+    }
+
+    /// Retry loop — co 2s sprobuj dostarczyc pending peerow do Rust.
+    /// Peer trafia do pending gdy FFI zwraca false (mesh nie gotowy).
+    private func startRetryLoop() {
+        resolveQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.retryPendingPeers()
+        }
+    }
+
+    private func retryPendingPeers() {
+        let snapshot: [(String, NWEndpoint, Int)] = pendingPeers.map { ($0.key, $0.value.endpoint, $0.value.attempts) }
+        if !snapshot.isEmpty {
+            NSLog("[NativeDiscovery] Retry \(snapshot.count) pending peer(s)")
+        }
+        for (name, endpoint, attempts) in snapshot {
+            if attempts > 20 {
+                NSLog("[NativeDiscovery] Poddaje sie dla \(name.prefix(12))… po 20 probach")
+                pendingPeers.removeValue(forKey: name)
+                resolvedEndpoints.removeValue(forKey: name)
+                continue
+            }
+            pendingPeers[name] = (endpoint: endpoint, attempts: attempts + 1)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.resolvePeer(endpointIdBase32: name, serviceEndpoint: endpoint)
+            }
+        }
+        // Reschedule.
+        resolveQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.retryPendingPeers()
+        }
     }
 
     /// Rozwiazuje endpoint Bonjour do SocketAddr (IPv4 + port) i przekazuje
     /// do Rust przez FFI. Wlasna nazwa iroh instance jest pomijana.
     private func resolvePeer(endpointIdBase32: String, serviceEndpoint: NWEndpoint) {
+        NSLog("[NativeDiscovery] Rozwiazuje \(endpointIdBase32.prefix(12))…")
         let connection = NWConnection(to: serviceEndpoint, using: .udp)
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             switch state {
             case .ready:
                 if let path = connection.currentPath,
-                   let remote = path.remoteEndpoint,
-                   case .hostPort(let host, let port) = remote {
-                    let ipString = NativeDiscovery.hostToIPString(host)
-                    if let ip = ipString {
-                        self.deliverToRust(endpointIdBase32: endpointIdBase32,
-                                           ipString: ip,
-                                           port: port.rawValue)
-                    } else {
-                        print("[NativeDiscovery] Nie udalo sie wyciagnac IP dla \(endpointIdBase32)")
-                    }
+                   let remote = path.remoteEndpoint {
+                    NSLog("[NativeDiscovery] Resolve OK dla \(endpointIdBase32.prefix(12))… remote=\(remote.debugDescription)")
+                    self.handleResolvedEndpoint(endpointIdBase32: endpointIdBase32,
+                                                 remote: remote,
+                                                 serviceEndpoint: serviceEndpoint)
+                } else {
+                    NSLog("[NativeDiscovery] Resolve READY bez remoteEndpoint dla \(endpointIdBase32.prefix(12))…")
                 }
                 connection.cancel()
             case .failed(let error):
-                print("[NativeDiscovery] Resolve failed dla \(endpointIdBase32): \(error)")
-                // Odblokuj retry jesli sie nie udalo — moze peer wrocil na inny adres.
+                NSLog("[NativeDiscovery] Resolve FAIL \(endpointIdBase32.prefix(12))…: \(error)")
+                // Daj retry na kolejnym tickzie watchdoga — pozwol NWBrowser wykryc ponownie.
                 self.resolveQueue.async {
-                    self.resolvedEndpoints.remove(endpointIdBase32)
+                    self.resolvedEndpoints.removeValue(forKey: endpointIdBase32)
                 }
                 connection.cancel()
+            case .waiting(let error):
+                NSLog("[NativeDiscovery] Resolve WAITING \(endpointIdBase32.prefix(12))…: \(error)")
+            case .preparing:
+                break
             default:
                 break
             }
@@ -125,36 +231,101 @@ class NativeDiscovery {
         connection.start(queue: .global(qos: .utility))
     }
 
-    /// Zamienia NWEndpoint.Host na string IP. IPv4 prefereowane nad IPv6,
-    /// bo iroh na LAN-ie uzywa UDP v4 domyslnie.
-    private static func hostToIPString(_ host: NWEndpoint.Host) -> String? {
-        switch host {
-        case .ipv4(let addr):
-            return "\(addr)"
-        case .ipv6(let addr):
-            // Pomin link-local fe80::
-            let s = "\(addr)"
-            if s.hasPrefix("fe80:") {
-                return nil
-            }
-            return s
-        case .name(let hostname, _):
-            return hostname
-        @unknown default:
-            return nil
-        }
-    }
-
-    /// Woluje Rust FFI przez C-stringi.
-    private func deliverToRust(endpointIdBase32: String, ipString: String, port: UInt16) {
-        // Pomin wlasny node — advertising local service wraca do nas samych.
-        // Rust FFI i tak by odrzucil (is_connected check albo connect do siebie),
-        // ale lepiej nie palic cykli.
-        if endpointIdBase32.lowercased() == nodeIdToBase32(nodeId) {
+    /// Z rozwiazanego endpointu wyciagnij IP+port, zrob FFI do Rust. Jesli
+    /// remote to hostname (typu "host.local"), rozwiaz go przez getaddrinfo.
+    private func handleResolvedEndpoint(endpointIdBase32: String,
+                                        remote: NWEndpoint,
+                                        serviceEndpoint: NWEndpoint) {
+        guard case .hostPort(let host, let port) = remote else {
+            NSLog("[NativeDiscovery] Remote endpoint nie hostPort: \(remote.debugDescription)")
             return
         }
 
-        print("[NativeDiscovery] Peer: \(endpointIdBase32.prefix(12))… @ \(ipString):\(port)")
+        switch host {
+        case .ipv4(let addr):
+            deliverToRust(endpointIdBase32: endpointIdBase32,
+                          ipString: "\(addr)",
+                          port: port.rawValue,
+                          serviceEndpoint: serviceEndpoint)
+        case .ipv6(let addr):
+            let s = "\(addr)"
+            if s.hasPrefix("fe80:") {
+                NSLog("[NativeDiscovery] IPv6 link-local pominiety dla \(endpointIdBase32.prefix(12))…")
+                return
+            }
+            deliverToRust(endpointIdBase32: endpointIdBase32,
+                          ipString: s,
+                          port: port.rawValue,
+                          serviceEndpoint: serviceEndpoint)
+        case .name(let hostname, _):
+            NSLog("[NativeDiscovery] Remote to hostname (\(hostname)) — rozwiazuje przez getaddrinfo")
+            if let ip = NativeDiscovery.resolveHostname(hostname) {
+                NSLog("[NativeDiscovery] \(hostname) -> \(ip)")
+                deliverToRust(endpointIdBase32: endpointIdBase32,
+                              ipString: ip,
+                              port: port.rawValue,
+                              serviceEndpoint: serviceEndpoint)
+            } else {
+                NSLog("[NativeDiscovery] getaddrinfo FAIL dla \(hostname)")
+            }
+        @unknown default:
+            NSLog("[NativeDiscovery] Nieznany typ host dla \(endpointIdBase32.prefix(12))…")
+        }
+    }
+
+    /// Blokujacy getaddrinfo — rozwiaze hostname .local przez systemowe DNS
+    /// (mDNS responder). Zwraca pierwszy IPv4 adres.
+    private static func resolveHostname(_ hostname: String) -> String? {
+        var hints = addrinfo(
+            ai_flags: 0,
+            ai_family: AF_INET,
+            ai_socktype: SOCK_DGRAM,
+            ai_protocol: IPPROTO_UDP,
+            ai_addrlen: 0,
+            ai_canonname: nil,
+            ai_addr: nil,
+            ai_next: nil
+        )
+        var result: UnsafeMutablePointer<addrinfo>?
+        let err = getaddrinfo(hostname, nil, &hints, &result)
+        if err != 0 || result == nil {
+            return nil
+        }
+        defer { freeaddrinfo(result) }
+
+        var node = result
+        while let current = node {
+            if let sa = current.pointee.ai_addr {
+                var addrBuf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if sa.pointee.sa_family == sa_family_t(AF_INET) {
+                    sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                        var inaddr = sin.pointee.sin_addr
+                        inet_ntop(AF_INET, &inaddr, &addrBuf, socklen_t(INET_ADDRSTRLEN))
+                    }
+                    return String(cString: addrBuf)
+                }
+            }
+            node = current.pointee.ai_next
+        }
+        return nil
+    }
+
+    /// Woluje Rust FFI przez C-stringi. Jesli mesh niegotowy (false) —
+    /// dodaje do pendingPeers zeby retry loop sprobowal ponownie co 2s.
+    private func deliverToRust(endpointIdBase32: String,
+                               ipString: String,
+                               port: UInt16,
+                               serviceEndpoint: NWEndpoint) {
+        // Pomin wlasny node — advertising local service wraca do nas samych.
+        if endpointIdBase32.lowercased() == nodeIdToBase32(nodeId) {
+            NSLog("[NativeDiscovery] Pomijam siebie: \(endpointIdBase32.prefix(12))…")
+            resolveQueue.async {
+                self.pendingPeers.removeValue(forKey: endpointIdBase32)
+            }
+            return
+        }
+
+        NSLog("[NativeDiscovery] FFI: \(endpointIdBase32.prefix(12))… @ \(ipString):\(port)")
 
         var delivered = false
         endpointIdBase32.withCString { epPtr in
@@ -163,18 +334,24 @@ class NativeDiscovery {
             }
         }
 
-        if !delivered {
-            // Mesh jeszcze nie gotowy albo connect odrzucony. Zdejmij z cache
-            // zeby nastepny browseResultsChangedHandler sprobowal ponownie.
-            resolveQueue.async { [endpointIdBase32] in
-                self.resolvedEndpoints.remove(endpointIdBase32)
+        resolveQueue.async {
+            if delivered {
+                NSLog("[NativeDiscovery] FFI OK — peer dodany")
+                self.peersDeliveredToRust += 1
+                self.pendingPeers.removeValue(forKey: endpointIdBase32)
+            } else {
+                NSLog("[NativeDiscovery] FFI false — mesh niegotowy, dodaje do pending")
+                // Zostaw w pending — retry loop sprobuje ponownie za 2s.
+                let prev = self.pendingPeers[endpointIdBase32]?.attempts ?? 0
+                self.pendingPeers[endpointIdBase32] = (endpoint: serviceEndpoint, attempts: prev)
             }
-            print("[NativeDiscovery] FFI zwrocil false — retry przy nastepnym update")
         }
     }
 
     /// Konwersja hex node_id → base32 lowercase (iroh instance format).
-    /// Uzywane tylko do porownania self vs peer.
+    /// Uzywane tylko do porownania self vs peer. Jesli nodeId nie jest hex
+    /// (np. UUID), zwroci pusty string — porownanie da false, OK (i tak nie
+    /// chcemy siebie dodawac do mesh, a Rust FFI odrzuci self-connect).
     private func nodeIdToBase32(_ hex: String) -> String {
         guard hex.count == 64 else { return "" }
         var bytes = [UInt8]()
@@ -212,11 +389,48 @@ class NativeDiscovery {
         return result
     }
 
+    /// Diagnostyczny opis endpointu dla logow.
+    private func describeEndpoint(_ ep: NWEndpoint) -> String {
+        switch ep {
+        case .service(let name, let type, let domain, let iface):
+            let ifaceStr = iface?.name ?? "?"
+            return "service(name=\(name) type=\(type) domain=\(domain) iface=\(ifaceStr))"
+        case .hostPort(let host, let port):
+            return "hostPort(\(host):\(port))"
+        case .url(let url):
+            return "url(\(url))"
+        case .unix(let path):
+            return "unix(\(path))"
+        case .opaque:
+            return "opaque"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
     func stop() {
+        watchdogTimer?.cancel()
+        watchdogTimer = nil
         irohBrowser?.cancel()
         irohBrowser = nil
         resolveQueue.async {
             self.resolvedEndpoints.removeAll()
+            self.pendingPeers.removeAll()
+        }
+        started = false
+    }
+}
+
+// Pomocniczy describe dla NWBrowser.State.
+extension NWBrowser.State {
+    var debugDescription: String {
+        switch self {
+        case .setup: return "setup"
+        case .ready: return "ready"
+        case .failed(let e): return "failed(\(e))"
+        case .cancelled: return "cancelled"
+        case .waiting(let e): return "waiting(\(e))"
+        @unknown default: return "unknown"
         }
     }
 }

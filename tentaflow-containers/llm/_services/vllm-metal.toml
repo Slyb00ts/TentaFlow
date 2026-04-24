@@ -1,0 +1,33 @@
+# Manifest serwisu vLLM-Metal — vLLM na Apple Silicon przez plugin
+# vllm-project/vllm-metal (backend MLX). Osobny silnik od vllm.toml bo upstream
+# vLLM nie ma Metal target; vllm-metal dostarcza wlasny install flow z
+# konkretna wersja vllm 0.19.1 + wheel plugin z GitHub Releases.
+
+[engine]
+id = "vllm-metal"
+category = "llm"
+name = "vLLM-Metal"
+description_pl = "vLLM na Apple Silicon przez plugin vllm-metal (MLX). Serwer OpenAI-compatible."
+description_en = "vLLM on Apple Silicon via vllm-metal plugin (MLX). OpenAI-compatible server."
+homepage = "https://github.com/vllm-project/vllm-metal"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "0.19.1"
+
+[deploy.native]
+platforms = ["macos"]
+runtime = "python-bundle"
+bundle_path = "llm/python/vllm-metal"
+
+[[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen 3.5 0.8B"
+repo = "Qwen/Qwen3.5-0.8B"
+recommended = true
+
+[[model_preset]]
+id = "llama-3-1-8b-instruct"
+display_name = "Llama 3.1 8B Instruct"
+repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
