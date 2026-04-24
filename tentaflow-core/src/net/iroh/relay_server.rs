@@ -1,10 +1,9 @@
 // =============================================================================
-// Plik: net/iroh/relay_server.rs
-// Opis: Embedded serwer iroh-relay dla browser klientow. Przyjmuje polaczenia
-//       WebSocket i WebTransport, bridguje je do iroh mesh. Umozliwia daemonowi
-//       bycie self-hosted relayem kiedy klienty przegladarki nie moga dotrzec
-//       do publicznego `use.iroh.network`. Self-signed cert generowany przy
-//       starcie; w produkcji podmieniany przez certyfikat z `[relay].tls_cert`.
+// File: net/iroh/relay_server.rs
+// Description: Embedded iroh-relay server for browser clients. It accepts
+// WebSocket and WebTransport connections and bridges them into the iroh mesh.
+// This lets the daemon act as a self-hosted relay when browsers cannot reach
+// the public `use.iroh.network` endpoint.
 // =============================================================================
 
 use std::net::SocketAddr;
@@ -13,13 +12,13 @@ use anyhow::{Context, Result};
 use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 use rcgen::generate_simple_self_signed;
 
-/// Konfiguracja startowa embedded relay.
+/// Startup configuration for the embedded relay.
 pub struct RelayServerConfig {
-    /// Adres bind HTTPS (WebSocket + WebTransport).
+    /// HTTPS bind address for WebSocket and WebTransport.
     pub bind_addr: SocketAddr,
-    /// Port QUIC (0 = automatyczny).
+    /// QUIC bind address. Port 0 means automatic allocation.
     pub quic_bind_addr: Option<SocketAddr>,
-    /// Hostname dla self-signed cert.
+    /// Hostname used for the self-signed certificate.
     pub hostname: String,
 }
 
@@ -33,18 +32,18 @@ impl Default for RelayServerConfig {
     }
 }
 
-/// Startuje embedded iroh-relay Server. Zwraca uchwyt — `Drop` powoduje
-/// abort task-a, wiec uchwyt musi zyc w miejscu ktore kontroluje shutdown.
+/// Starts the embedded iroh-relay server and returns its handle. Dropping the
+/// handle aborts the background task, so the owner must control shutdown.
 ///
-/// Aktualnie konfiguruje HTTP bind dla WebSocket/WebTransport. QUIC bridge
-/// wymaga dodatkowego `rustls::ServerConfig` z cert+key i bedzie dodany
-/// gdy pelna integracja browser↔daemon przez iroh bedzie produkcyjna.
+/// The current implementation only configures the HTTP bind used by
+/// WebSocket/WebTransport. A full QUIC bridge still needs an explicit
+/// `rustls::ServerConfig` with certificate and key material.
 pub async fn spawn_relay_server(config: RelayServerConfig) -> Result<Server> {
     let _cert = generate_simple_self_signed(vec![config.hostname.clone()])
-        .context("generacja self-signed cert dla relay")?;
+        .context("failed to generate self-signed relay certificate")?;
 
-    // QUIC bridge nie jest tu konfigurowany — WebSocket przez HTTP bind
-    // wystarcza dla browsera, dopoki nie dodamy TLS config dla WebTransport/QUIC.
+    // The QUIC bridge is not configured here yet. The HTTP bind is enough for
+    // browser traffic until WebTransport/QUIC gets explicit TLS wiring.
     let _ = config.quic_bind_addr;
 
     let server_config: ServerConfig<(), ()> = ServerConfig {

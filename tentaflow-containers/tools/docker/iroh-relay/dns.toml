@@ -1,0 +1,23 @@
+# =============================================================================
+# File: dns.toml
+# Description: iroh-dns-server configuration mounted read-only as /data/dns.toml.
+# It can serve both classic DNS TXT records on port 53 and an HTTPS /pkarr
+# endpoint on port 8080. TentaFlow uses only the HTTPS /pkarr endpoint.
+# =============================================================================
+
+# HTTPS /pkarr endpoint used by iroh clients when a custom pkarr_dns_url is set.
+bind_port = 8080
+bind_addr = "0.0.0.0"
+
+# Disable classic DNS on port 53. iroh-dns-server enables it by default, but
+# this deployment uses HTTPS only and does not act as an authoritative DNS
+# server.
+[dns]
+disabled = true
+
+# Persistent storage for pkarr records.
+db_path = "/data/pkarr.db"
+
+# Optional publish restrictions. By default the server accepts records from any
+# public key. In production you may want to restrict it, for example:
+# allowed_origins = ["relay.example.com"]
