@@ -396,6 +396,75 @@ pub fn delete_trusted_contact_hints(
     Ok(())
 }
 
+/// Wzorce hostow uznanych za martwe relay URL — usuwane przy starcie mesh.
+/// Do commitu e9552dc zapisywalismy domyslne `https://use.iroh.network/`, ktore
+/// od dawna nie resolwuje DNS. Po naprawie Fazy 1 nowe eventy zapisuja pusty
+/// string, ale w bazie starych instalacji moze lezec martwy URL — sanitizer
+/// musi go wyczyscic zanim `connect_to_peer_with_hints` wejdzie w dial fail.
+const DEAD_RELAY_PATTERNS: &[&str] = &["use.iroh.network"];
+
+/// Czysci pole `relay_url` w `trusted_contact:*` gdy matchuje wzorzec martwego
+/// hosta (patrz `DEAD_RELAY_PATTERNS`). Pojedyncze bledy dekodowania/zapisu
+/// sa tylko logowane — iteracja idzie dalej zeby nie zablokowac startu mesh
+/// jednym skorumpowanym wpisem.
+///
+/// Zwraca liczbe faktycznie zaktualizowanych wpisow.
+pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize> {
+    let rows = db::repository::list_settings_with_prefix(db, TRUSTED_CONTACT_PREFIX)?;
+    let mut cleaned = 0usize;
+
+    for (key, raw_value) in rows {
+        let mut hints = match serde_json::from_str::<PairingContactHints>(&raw_value) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    "sanitize_trusted_contacts: pominieto wpis — decode nieudany: {}",
+                    e
+                );
+                continue;
+            }
+        };
+
+        let has_dead = DEAD_RELAY_PATTERNS
+            .iter()
+            .any(|p| hints.relay_url.contains(p));
+        if !has_dead {
+            continue;
+        }
+
+        let original = std::mem::take(&mut hints.relay_url);
+        let serialized = match serde_json::to_string(&hints) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    "sanitize_trusted_contacts: pominieto wpis — encode nieudany: {}",
+                    e
+                );
+                continue;
+            }
+        };
+        match db::repository::set_setting(db, &key, &serialized) {
+            Ok(()) => {
+                cleaned += 1;
+                info!(
+                    key = %key,
+                    old_url = %original,
+                    "sanitize_trusted_contacts: wyczyszczono martwy relay URL"
+                );
+            }
+            Err(e) => warn!(
+                key = %key,
+                "sanitize_trusted_contacts: zapis nieudany: {}",
+                e
+            ),
+        }
+    }
+
+    Ok(cleaned)
+}
+
 pub fn endpoint_addr_from_hints(hints: &PairingContactHints) -> anyhow::Result<EndpointAddr> {
     let receiver_id = parse_endpoint_id(&hints.node_id)?;
     let mut addr = EndpointAddr::new(receiver_id);
@@ -455,6 +524,68 @@ mod tests {
         assert_eq!(direct.len(), 2);
         assert_eq!(relays.len(), 1);
         assert_eq!(relays[0].to_string(), "https://relay.example./");
+    }
+
+    #[test]
+    fn sanitize_trusted_contacts_clears_dead_relay() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("init test DB");
+
+        let dead = PairingContactHints {
+            node_id: "peer-dead".to_string(),
+            public_key_hex: "aa".to_string(),
+            hostname: "host-dead".to_string(),
+            addresses: vec!["10.0.0.1:8090".to_string()],
+            relay_url: "https://use.iroh.network/".to_string(),
+        };
+        let good = PairingContactHints {
+            node_id: "peer-good".to_string(),
+            public_key_hex: "bb".to_string(),
+            hostname: "host-good".to_string(),
+            addresses: vec![],
+            relay_url: "https://my-relay.example.com/".to_string(),
+        };
+        let empty = PairingContactHints {
+            node_id: "peer-empty".to_string(),
+            public_key_hex: "cc".to_string(),
+            hostname: "host-empty".to_string(),
+            addresses: vec![],
+            relay_url: String::new(),
+        };
+
+        store_trusted_contact_hints(&db, "peer-dead", &dead).unwrap();
+        store_trusted_contact_hints(&db, "peer-good", &good).unwrap();
+        store_trusted_contact_hints(&db, "peer-empty", &empty).unwrap();
+
+        let cleaned = sanitize_trusted_contacts(&db).expect("sanitize");
+        assert_eq!(cleaned, 1, "tylko jeden wpis powinien byc czyszczony");
+
+        let loaded_dead = load_trusted_contact_hints(&db, "peer-dead")
+            .expect("load dead")
+            .expect("dead present");
+        assert!(
+            loaded_dead.relay_url.is_empty(),
+            "dead URL powinien byc wyczyszczony"
+        );
+        // Pozostale pola nietkniete.
+        assert_eq!(loaded_dead.hostname, "host-dead");
+        assert_eq!(loaded_dead.addresses, vec!["10.0.0.1:8090".to_string()]);
+
+        let loaded_good = load_trusted_contact_hints(&db, "peer-good")
+            .expect("load good")
+            .expect("good present");
+        assert_eq!(
+            loaded_good.relay_url, "https://my-relay.example.com/",
+            "dobry URL nietkniety"
+        );
+
+        let loaded_empty = load_trusted_contact_hints(&db, "peer-empty")
+            .expect("load empty")
+            .expect("empty present");
+        assert!(loaded_empty.relay_url.is_empty(), "pusty dalej pusty");
+
+        // Idempotentnosc — drugi przebieg nie powinien nic zmieniac.
+        let cleaned2 = sanitize_trusted_contacts(&db).expect("sanitize idempotent");
+        assert_eq!(cleaned2, 0, "drugi przebieg nie powinien nic czyscic");
     }
 
     #[test]

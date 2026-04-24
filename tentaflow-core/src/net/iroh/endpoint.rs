@@ -2,9 +2,11 @@
 // Plik: net/iroh/endpoint.rs
 // Opis: Tworzenie i konfiguracja `iroh::Endpoint`. `IrohEndpoint::bind` zwraca
 //       obiekt nasluchujacy na skonfigurowanych ALPN-ach, z LAN mDNS, DHT
-//       pkarr i relayem (default `use.iroh.network`, override z configu lub
-//       z DB settings). `IrohEndpoint::connect` otwiera polaczenie do peera
-//       po `EndpointId` albo `EndpointAddr`.
+//       pkarr oraz relayami z wbudowanego presetu N0 (4 regiony
+//       `*.relay.n0.iroh-canary.iroh.link`). Custom relay mozna wstrzyknac
+//       przez `IrohConfig::relay_url` (z configu albo z DB settings).
+//       `IrohEndpoint::connect` otwiera polaczenie do peera po `EndpointId`
+//       albo `EndpointAddr`.
 // =============================================================================
 
 use std::net::SocketAddr;
@@ -28,7 +30,8 @@ pub struct IrohConfig {
     pub secret_key: SecretKey,
     /// Adres bind dla QUIC UDP. `0.0.0.0:0` → dowolny wolny port.
     pub bind_addr: SocketAddr,
-    /// URL relay (None = default `presets::N0`, ktory uzywa `use.iroh.network`).
+    /// URL custom relay; `None` oznacza zostawienie presetu N0 iroh
+    /// (4 regiony `*.relay.n0.iroh-canary.iroh.link`).
     pub relay_url: Option<RelayUrl>,
     /// Wlacz LAN discovery przez swarm-discovery mDNS.
     pub enable_lan_discovery: bool,

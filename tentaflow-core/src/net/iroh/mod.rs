@@ -3,8 +3,9 @@
 // Opis: Transport iroh. Eksportuje `IrohEndpoint` oraz stale ALPN dla trzech
 //       kanalow: mesh (node-to-node), pairing (handshake nowego peera), api
 //       (browser i zewnetrzne klienty). Rdzen oparty o `iroh::Endpoint`
-//       z discovery LAN (mDNS), DHT (pkarr-mainline) oraz relayem publicznym
-//       `use.iroh.network` z mozliwoscia podmiany na self-hosted.
+//       z discovery LAN (mDNS), DHT (pkarr-mainline) oraz relayami z presetu
+//       N0 (`*.relay.n0.iroh-canary.iroh.link`) — custom relay mozna wstrzyknac
+//       przez config.toml lub DB settings.
 // =============================================================================
 
 pub mod endpoint;
@@ -16,7 +17,7 @@ pub mod relay_server;
 pub use endpoint::{IrohConfig, IrohEndpoint, IrohEndpointError};
 pub use handler::{IrohConnection, IrohStreamError};
 pub use pairing::{initiate_pairing_over_iroh, PairingHandler, PairingRequest, PairingResponse};
-pub use relay::{load_relay_url, DEFAULT_RELAY_URL, RELAY_URL_SETTING_KEY};
+pub use relay::{load_relay_url, RELAY_URL_SETTING_KEY};
 pub use relay_server::{spawn_relay_server, RelayServerConfig};
 
 /// ALPN dla komunikacji mesh node-to-node. Rkyv `MessageBody` z kind discrim
