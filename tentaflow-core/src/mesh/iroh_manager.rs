@@ -9,11 +9,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
-use iroh::{EndpointAddr, EndpointId, RelayUrl};
+use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, RwLock as AsyncRwLock};
 use tokio::task::JoinHandle;
@@ -213,8 +214,26 @@ pub enum IrohMeshEvent {
 
 /// Aktywne polaczenie zalogowane przez manager.
 struct ActiveConnection {
+    id: u64,
     connection: Connection,
     remote_id_hex: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionPathSnapshot {
+    pub transport: String,
+    pub address: String,
+    pub selected: bool,
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionSnapshot {
+    pub transport: String,
+    pub scope: Option<String>,
+    pub address: Option<String>,
+    pub relay_url: Option<String>,
+    pub paths: Vec<ConnectionPathSnapshot>,
 }
 
 /// Glowny menedzer mesh uzywajacy iroh.
@@ -226,6 +245,7 @@ pub struct IrohMeshManager {
     event_tx: broadcast::Sender<IrohMeshEvent>,
     shutdown: CancellationToken,
     local_node_id: RwLock<String>,
+    next_connection_id: AtomicU64,
     forward_handler: AsyncRwLock<Option<ForwardHandler>>,
     command_waiters:
         AsyncRwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>>,
@@ -260,6 +280,7 @@ impl IrohMeshManager {
             event_tx,
             shutdown: CancellationToken::new(),
             local_node_id: RwLock::new(local_id_hex),
+            next_connection_id: AtomicU64::new(1),
             forward_handler: AsyncRwLock::new(None),
             command_waiters: AsyncRwLock::new(HashMap::new()),
             service_reg,
@@ -393,14 +414,15 @@ impl IrohMeshManager {
 
         match alpn {
             a if a == ALPN_MESH => {
-                self.register_connection(remote_hex.clone(), connection.clone())
-                    .await;
+                let connection_id =
+                    self.register_connection(remote_hex.clone(), connection.clone()).await;
                 let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
                     node_id: remote_hex.clone(),
                 });
                 let me = self.clone_for_spawn();
                 tokio::spawn(async move {
-                    me.handle_mesh_connection(remote_hex, connection).await;
+                    me.handle_mesh_connection(remote_hex, connection, connection_id)
+                        .await;
                 });
             }
             a if a == ALPN_PAIRING => {
@@ -427,18 +449,30 @@ impl IrohMeshManager {
         Ok(())
     }
 
-    async fn register_connection(&self, remote_hex: String, conn: Connection) {
+    async fn register_connection(&self, remote_hex: String, conn: Connection) -> u64 {
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let mut map = self.connections.write().await;
-        map.insert(
+        let previous = map.insert(
             remote_hex.clone(),
             ActiveConnection {
+                id: connection_id,
                 connection: conn,
                 remote_id_hex: remote_hex,
             },
         );
+        drop(map);
+        if let Some(active) = previous {
+            active.connection.close(0u32.into(), b"superseded");
+        }
+        connection_id
     }
 
-    async fn handle_mesh_connection(&self, remote_hex: String, connection: Connection) {
+    async fn handle_mesh_connection(
+        &self,
+        remote_hex: String,
+        connection: Connection,
+        connection_id: u64,
+    ) {
         // Petla odbierania uni streamow. Format: [1B disc][payload].
         loop {
             let recv = match connection.accept_uni().await {
@@ -456,10 +490,18 @@ impl IrohMeshManager {
                 }
             });
         }
-        self.connections.write().await.remove(&remote_hex);
-        let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
-            node_id: remote_hex,
-        });
+        let mut map = self.connections.write().await;
+        let is_current = map
+            .get(&remote_hex)
+            .map(|active| active.id == connection_id)
+            .unwrap_or(false);
+        if is_current {
+            map.remove(&remote_hex);
+            drop(map);
+            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
+                node_id: remote_hex,
+            });
+        }
     }
 
     async fn run_heartbeat_loop(&self) {
@@ -495,6 +537,26 @@ impl IrohMeshManager {
         self.config.relay_url.clone()
     }
 
+    pub fn connection_snapshot(&self, node_id: &str) -> Option<ConnectionSnapshot> {
+        let map = self.connections.try_read().ok()?;
+        let active = map.get(node_id)?;
+        Some(connection_snapshot_from_connection(&active.connection))
+    }
+
+    pub fn connection_snapshots(&self) -> HashMap<String, ConnectionSnapshot> {
+        let Ok(map) = self.connections.try_read() else {
+            return HashMap::new();
+        };
+        map.iter()
+            .map(|(node_id, active)| {
+                (
+                    node_id.clone(),
+                    connection_snapshot_from_connection(&active.connection),
+                )
+            })
+            .collect()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<IrohMeshEvent> {
         self.event_tx.subscribe()
     }
@@ -526,7 +588,8 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect: {e:?}"))?;
-        self.register_connection(node_id_hex.to_string(), connection.clone())
+        let connection_id = self
+            .register_connection(node_id_hex.to_string(), connection.clone())
             .await;
         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
             node_id: node_id_hex.to_string(),
@@ -534,7 +597,7 @@ impl IrohMeshManager {
         let me = self.clone_for_spawn();
         let id = node_id_hex.to_string();
         tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection).await;
+            me.handle_mesh_connection(id, connection, connection_id).await;
         });
         Ok(())
     }
@@ -558,7 +621,8 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect direct: {e:?}"))?;
-        self.register_connection(node_id_hex.to_string(), connection.clone())
+        let connection_id = self
+            .register_connection(node_id_hex.to_string(), connection.clone())
             .await;
         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
             node_id: node_id_hex.to_string(),
@@ -566,7 +630,7 @@ impl IrohMeshManager {
         let me = self.clone_for_spawn();
         let id = node_id_hex.to_string();
         tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection).await;
+            me.handle_mesh_connection(id, connection, connection_id).await;
         });
         Ok(())
     }
@@ -581,7 +645,8 @@ impl IrohMeshManager {
             .connect(addr, ALPN_MESH)
             .await
             .map_err(|e| anyhow::anyhow!("iroh connect hinted: {e:?}"))?;
-        self.register_connection(hints.node_id.clone(), connection.clone())
+        let connection_id = self
+            .register_connection(hints.node_id.clone(), connection.clone())
             .await;
         let _ = self.event_tx.send(IrohMeshEvent::PeerConnected {
             node_id: hints.node_id.clone(),
@@ -589,7 +654,7 @@ impl IrohMeshManager {
         let me = self.clone_for_spawn();
         let id = hints.node_id.clone();
         tokio::spawn(async move {
-            me.handle_mesh_connection(id, connection).await;
+            me.handle_mesh_connection(id, connection, connection_id).await;
         });
         Ok(())
     }
@@ -1047,7 +1112,12 @@ struct IrohMeshManagerRef {
 }
 
 impl IrohMeshManagerRef {
-    async fn handle_mesh_connection(&self, remote_hex: String, connection: Connection) {
+    async fn handle_mesh_connection(
+        &self,
+        remote_hex: String,
+        connection: Connection,
+        connection_id: u64,
+    ) {
         loop {
             let recv = match connection.accept_uni().await {
                 Ok(r) => r,
@@ -1064,10 +1134,18 @@ impl IrohMeshManagerRef {
                 }
             });
         }
-        self.connections.write().await.remove(&remote_hex);
-        let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
-            node_id: remote_hex,
-        });
+        let mut map = self.connections.write().await;
+        let is_current = map
+            .get(&remote_hex)
+            .map(|active| active.id == connection_id)
+            .unwrap_or(false);
+        if is_current {
+            map.remove(&remote_hex);
+            drop(map);
+            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
+                node_id: remote_hex,
+            });
+        }
     }
 
     async fn handle_mesh_uni(
@@ -1249,6 +1327,92 @@ fn endpoint_addr_from_target(
     })
 }
 
+fn connection_snapshot_from_connection(connection: &Connection) -> ConnectionSnapshot {
+    let mut relay_url = None;
+    let mut selected_transport = String::from("unknown");
+    let mut selected_scope = None;
+    let mut selected_address = None;
+    let paths: Vec<ConnectionPathSnapshot> = connection
+        .paths()
+        .into_iter()
+        .map(|path| {
+            let transport = transport_kind(path.remote_addr());
+            let address = transport_addr_label(path.remote_addr());
+            if path.is_selected() {
+                selected_transport = transport.clone();
+                selected_scope = transport_scope(path.remote_addr());
+                selected_address = Some(address.clone());
+                if let TransportAddr::Relay(url) = path.remote_addr() {
+                    relay_url = Some(url.to_string());
+                }
+            } else if relay_url.is_none() {
+                if let TransportAddr::Relay(url) = path.remote_addr() {
+                    relay_url = Some(url.to_string());
+                }
+            }
+            ConnectionPathSnapshot {
+                transport,
+                address,
+                selected: path.is_selected(),
+                closed: path.is_closed(),
+            }
+        })
+        .collect();
+
+    ConnectionSnapshot {
+        transport: selected_transport,
+        scope: selected_scope,
+        address: selected_address,
+        relay_url,
+        paths,
+    }
+}
+
+fn transport_kind(addr: &TransportAddr) -> String {
+    if addr.is_relay() {
+        String::from("relay")
+    } else if addr.is_ip() {
+        String::from("p2p")
+    } else if addr.is_custom() {
+        String::from("custom")
+    } else {
+        String::from("unknown")
+    }
+}
+
+fn transport_scope(addr: &TransportAddr) -> Option<String> {
+    match addr {
+        TransportAddr::Ip(addr) => Some(if is_private_socket_addr(addr) {
+            String::from("lan")
+        } else {
+            String::from("wan")
+        }),
+        TransportAddr::Relay(_) => Some(String::from("wan")),
+        TransportAddr::Custom(_) => None,
+        _ => None,
+    }
+}
+
+fn transport_addr_label(addr: &TransportAddr) -> String {
+    match addr {
+        TransportAddr::Ip(addr) => addr.to_string(),
+        TransportAddr::Relay(url) => url.to_string(),
+        TransportAddr::Custom(addr) => addr.to_string(),
+        _ => addr.to_string(),
+    }
+}
+
+fn is_private_socket_addr(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast()
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+    }
+}
+
 fn hostname() -> String {
     hostname::get()
         .ok()
@@ -1258,7 +1422,8 @@ fn hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_addr_from_target;
+    use super::{endpoint_addr_from_target, is_private_socket_addr, transport_kind, transport_scope};
+    use iroh::TransportAddr;
 
     #[test]
     fn endpoint_addr_uses_manual_ip_when_provided() {
@@ -1284,5 +1449,25 @@ mod tests {
         )
         .unwrap();
         assert!(addr.ip_addrs().next().is_none());
+    }
+
+    #[test]
+    fn transport_snapshot_helpers_classify_ip_scope() {
+        let lan = TransportAddr::Ip("192.168.1.10:7777".parse().unwrap());
+        let wan = TransportAddr::Ip("8.8.8.8:7777".parse().unwrap());
+        let relay = TransportAddr::Relay("https://relay.example./".parse().unwrap());
+
+        assert_eq!(transport_kind(&lan), "p2p");
+        assert_eq!(transport_scope(&lan).as_deref(), Some("lan"));
+        assert_eq!(transport_scope(&wan).as_deref(), Some("wan"));
+        assert_eq!(transport_kind(&relay), "relay");
+        assert_eq!(transport_scope(&relay).as_deref(), Some("wan"));
+    }
+
+    #[test]
+    fn private_socket_addr_detects_ipv4_and_ipv6() {
+        assert!(is_private_socket_addr(&"10.0.0.7:9000".parse().unwrap()));
+        assert!(is_private_socket_addr(&"[fd00::1]:9000".parse().unwrap()));
+        assert!(!is_private_socket_addr(&"1.1.1.1:9000".parse().unwrap()));
     }
 }

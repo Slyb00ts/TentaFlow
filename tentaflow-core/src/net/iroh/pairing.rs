@@ -21,6 +21,7 @@ use crate::mesh::security::MeshSecurity;
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const PENDING_CONTACT_PREFIX: &str = "pending_contact:";
+const TRUSTED_CONTACT_PREFIX: &str = "trusted_contact:";
 
 /// Hinty transportowe potrzebne do first-contact pairingu oraz do pozniejszego
 /// `confirm/reject`, gdy drugi nod nie jest jeszcze obecny w peer_store.
@@ -151,6 +152,15 @@ impl PairingHandler {
                 return PairingResponse::Reject {
                     reason: format!("zapis trusted_node nieudany: {e}"),
                 };
+            }
+            if let Err(e) =
+                store_trusted_contact_hints(&self.security.db, &req.sender_node_id, &hints)
+            {
+                warn!(
+                    peer = %req.sender_node_id,
+                    "pairing: zapis trusted contact hints nieudany: {}",
+                    e
+                );
             }
             let _ = delete_pending_contact_hints(&self.security.db, &req.sender_node_id);
             info!(
@@ -354,6 +364,38 @@ pub fn delete_pending_contact_hints(
     Ok(())
 }
 
+pub fn load_trusted_contact_hints(
+    db: &crate::db::DbPool,
+    remote_node_id: &str,
+) -> anyhow::Result<Option<PairingContactHints>> {
+    let Some(raw) = db::repository::get_setting(db, &trusted_contact_setting_key(remote_node_id))?
+    else {
+        return Ok(None);
+    };
+    let hints = serde_json::from_str::<PairingContactHints>(&raw)
+        .map_err(|e| anyhow::anyhow!("trusted contact decode: {e}"))?;
+    Ok(Some(hints))
+}
+
+pub fn store_trusted_contact_hints(
+    db: &crate::db::DbPool,
+    remote_node_id: &str,
+    hints: &PairingContactHints,
+) -> anyhow::Result<()> {
+    let raw = serde_json::to_string(hints)
+        .map_err(|e| anyhow::anyhow!("trusted contact encode: {e}"))?;
+    db::repository::set_setting(db, &trusted_contact_setting_key(remote_node_id), &raw)?;
+    Ok(())
+}
+
+pub fn delete_trusted_contact_hints(
+    db: &crate::db::DbPool,
+    remote_node_id: &str,
+) -> anyhow::Result<()> {
+    db::repository::delete_setting(db, &trusted_contact_setting_key(remote_node_id))?;
+    Ok(())
+}
+
 pub fn endpoint_addr_from_hints(hints: &PairingContactHints) -> anyhow::Result<EndpointAddr> {
     let receiver_id = parse_endpoint_id(&hints.node_id)?;
     let mut addr = EndpointAddr::new(receiver_id);
@@ -377,6 +419,10 @@ fn parse_socket_addrs(addrs: &[String]) -> Vec<SocketAddr> {
 
 fn pending_contact_setting_key(remote_node_id: &str) -> String {
     format!("{PENDING_CONTACT_PREFIX}{remote_node_id}")
+}
+
+fn trusted_contact_setting_key(remote_node_id: &str) -> String {
+    format!("{TRUSTED_CONTACT_PREFIX}{remote_node_id}")
 }
 
 fn parse_endpoint_id(hex_str: &str) -> anyhow::Result<iroh::EndpointId> {

@@ -1,0 +1,244 @@
+/* =============================================================================
+   Plik: meeting-live.css
+   Opis: Layout live view spotkania — 2-kolumny (main + sidebar), sticky footer,
+         style transkryptu, action items, AI summary, backendu. Odwzorowanie
+         zatwierdzonego mockupu designs/meeting-live-final/index.html.
+   ============================================================================= */
+
+.meet-live-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+  gap: 14px;
+  align-items: start;
+  padding-bottom: 14px;
+}
+@media (max-width: 1100px) {
+  .meet-live-grid { grid-template-columns: 1fr; }
+}
+
+/* Glowna kolumna — tf-section-card przy zerowym paddingu zeby taby dotykaly krawedzi. */
+.meet-main .tf-section-card { padding: 0; }
+.meet-main tf-tabs { margin: 0; padding: 0 8px; }
+.meet-main .meet-tab-body {
+  padding: 16px 20px 20px;
+  min-height: 420px;
+}
+
+/* Transkrypt — scrollowana lista wpisow. */
+.meet-transcript-scroll {
+  max-height: 60vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.meet-entry {
+  display: flex; gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.meet-entry:last-child { border-bottom: 0; }
+.meet-entry-avatar {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--bg-3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+.meet-entry-avatar.unknown {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning);
+  border: 1px dashed rgba(245, 158, 11, 0.4);
+}
+.meet-entry-avatar svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+.meet-entry-body { flex: 1; min-width: 0; }
+.meet-entry-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.meet-entry-name { font-weight: 700; color: var(--text); font-size: 13px; }
+.meet-entry-time { color: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.meet-entry-conf { color: var(--text-3); font-size: 11px; margin-left: auto; }
+.meet-entry-text {
+  font-size: 13.5px; color: var(--text-2);
+  line-height: 1.55;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Dzialania — grupy collapsible. */
+.meet-action-group { margin-bottom: 16px; }
+.meet-action-group-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 0;
+  font-size: 11px; font-weight: 700;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+  user-select: none;
+}
+.meet-action-group-head .chevron { width: 12px; height: 12px; transition: transform 0.15s; }
+.meet-action-group.collapsed .chevron { transform: rotate(-90deg); }
+.meet-action-group.collapsed .meet-action-items { display: none; }
+.meet-action-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 6px;
+}
+.meet-action-item .ai-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+.meet-action-item .ai-meta { flex: 1; min-width: 0; }
+.meet-action-item .ai-owner { font-size: 12px; font-weight: 700; color: var(--text); }
+.meet-action-item .ai-task { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+.meet-action-status-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Podsumowanie. */
+.meet-summary-text {
+  font-size: 13.5px; line-height: 1.65;
+  color: var(--text-2);
+}
+.meet-summary-sep {
+  border: 0; border-top: 1px solid var(--border);
+  margin: 18px 0;
+}
+.meet-summary-list { list-style: none; padding: 0; margin: 0; }
+.meet-summary-list li {
+  position: relative;
+  padding: 6px 0 6px 20px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.meet-summary-list li::before {
+  content: ""; position: absolute;
+  left: 4px; top: 14px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent-2);
+}
+.meet-summary-update {
+  font-size: 11px; color: var(--text-3);
+  margin-top: 14px;
+}
+
+/* Sidebar. */
+.meet-side .tf-section-card { padding: 14px 16px; }
+
+.meet-participant {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border-left: 2px solid transparent;
+  margin: 0 -10px;
+}
+.meet-participant.speaking {
+  background: rgba(167, 139, 250, 0.06);
+  border-left-color: var(--accent-2);
+}
+.meet-participant .p-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--bg-3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+  color: var(--accent-2);
+  flex-shrink: 0;
+}
+.meet-participant .p-avatar.unknown {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warning);
+  border: 1px dashed rgba(245, 158, 11, 0.4);
+}
+.meet-participant .p-meta { flex: 1; min-width: 0; }
+.meet-participant .p-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.meet-participant .p-sub { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+.meet-participant.speaking .p-sub { color: var(--success); font-weight: 600; }
+.meet-participant .p-mic {
+  width: 14px; height: 14px;
+  stroke: var(--text-3); fill: none; stroke-width: 2;
+  opacity: 0;
+}
+.meet-participant.speaking .p-mic { opacity: 1; stroke: var(--success); }
+
+/* AI summary sub-sekcje. */
+.meet-ai-sub { margin-top: 10px; }
+.meet-ai-sub:first-child { margin-top: 0; }
+.meet-ai-sub-label {
+  font-size: 10px; font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-2);
+  margin-bottom: 6px;
+}
+.meet-ai-sub-text {
+  font-size: 12.5px; color: var(--text-2);
+  line-height: 1.55;
+}
+.meet-ai-action {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border);
+  font-size: 12px;
+}
+.meet-ai-action:last-child { border-bottom: 0; }
+.meet-ai-action .owner { color: var(--text); font-weight: 600; }
+.meet-ai-action .arrow { color: var(--text-3); }
+.meet-ai-action .task { color: var(--text-2); flex: 1; min-width: 0; }
+
+/* Backend — key/value lista. */
+.meet-kv { display: flex; flex-direction: column; gap: 6px; }
+.meet-kv-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+}
+.meet-kv-row .k { color: var(--text-3); }
+.meet-kv-row .v {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+}
+.meet-kv-row .v.ok { color: var(--success); }
+.meet-kv-row .v.warn { color: var(--warning); }
+.meet-kv-row .v.err { color: var(--danger); }
+
+/* Sticky footer. */
+.meet-footer {
+  position: sticky;
+  bottom: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap;
+  padding: 10px 26px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-2);
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin: 0 -26px;
+}
+.meet-footer .live-dot {
+  display: inline-flex; align-items: center; gap: 8px;
+  color: var(--text-2);
+}
+.meet-footer .live-dot::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-1);
+  animation: meet-footer-pulse 1.4s ease-in-out infinite;
+}
+.meet-footer .mono {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+@keyframes meet-footer-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }

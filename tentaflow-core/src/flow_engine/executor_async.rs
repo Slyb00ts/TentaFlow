@@ -5,7 +5,7 @@
 //       synchroniczny FlowEngine dla wezlow serwisowych (LLM, RAG, STT itd.).
 // =============================================================================
 
-use super::adapters::AdapterRegistry;
+use super::adapters::{AdapterChunkStream, AdapterRegistry};
 use super::types::{
     FlowContext, FlowDefinition, FlowEdge, FlowExecutionResult, FlowNode, FlowStepLog,
 };
@@ -13,14 +13,12 @@ use crate::db::repository;
 use crate::db::DbPool;
 use anyhow::{bail, Result};
 use chrono::Utc;
-use regex::RegexBuilder;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 const MAX_FLOW_NODES: usize = 256;
 const MAX_FLOW_EDGES: usize = 1024;
-const REGEX_SIZE_LIMIT: usize = 1_000_000;
 
 /// Asynchroniczny executor flow DAG z prawdziwymi adapterami serwisow
 pub struct FlowExecutorAsync {
@@ -360,6 +358,141 @@ impl FlowExecutorAsync {
         Ok(execution_result)
     }
 
+    /// Wykonuje flow w trybie streaming. Wymaga ze dokladnie jeden node w flow
+    /// jest producentem streamu (ma wychodzaca edge z `from_port="stream"`),
+    /// a jego adapter zaimplementuje `execute_streaming`. Nody przed producentem
+    /// (topologicznie) wykonuja sie blocking; nody za producentem na stream-path
+    /// musza byc pass-through (`output`/`end`/`stream_chunk`) — bo aktualnie
+    /// executor nie transformuje chunków per-node na stream.
+    ///
+    /// Zwraca strumien ChatCompletionChunk gotowy do wyslania do klienta SSE.
+    pub async fn execute_streaming_flow(
+        &self,
+        flow: &crate::db::models::DbFlow,
+        context: &mut FlowContext,
+    ) -> Result<AdapterChunkStream> {
+        let definition = Self::parse_flow(&flow.flow_json)?;
+        let execution_order = Self::topological_sort(&definition)?;
+
+        let node_map: HashMap<&str, &FlowNode> = definition
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n))
+            .collect();
+
+        let outgoing_edges: HashMap<&str, Vec<&FlowEdge>> = {
+            let mut map: HashMap<&str, Vec<&FlowEdge>> = HashMap::new();
+            for edge in &definition.edges {
+                map.entry(edge.from.as_str()).or_default().push(edge);
+            }
+            map
+        };
+
+        // Znajdz unikalnego producenta streamu — node ktory ma choc jedna wychodzaca
+        // edge from_port="stream". W tym S4b-cut wspieramy dokladnie jeden.
+        let mut stream_producers: Vec<&str> = Vec::new();
+        for node in &definition.nodes {
+            if let Some(edges) = outgoing_edges.get(node.id.as_str()) {
+                if edges.iter().any(|e| e.from_port == "stream") {
+                    stream_producers.push(node.id.as_str());
+                }
+            }
+        }
+        if stream_producers.is_empty() {
+            bail!("Flow nie zawiera edge z portem 'stream' — uzyj execute()");
+        }
+        if stream_producers.len() > 1 {
+            bail!(
+                "Flow ma wiecej niz jednego producenta streamu ({}) — multi-stream nie wspierany",
+                stream_producers.len()
+            );
+        }
+        let producer_id = stream_producers[0].to_string();
+
+        // Nody za producentem na stream path musza byc pass-through
+        let producer_outgoing = outgoing_edges
+            .get(producer_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        for edge in &producer_outgoing {
+            if edge.from_port != "stream" {
+                continue;
+            }
+            let target = node_map
+                .get(edge.to.as_str())
+                .ok_or_else(|| anyhow::anyhow!("stream edge wskazuje brakujacy node"))?;
+            if !is_stream_passthrough(&target.node_type) {
+                bail!(
+                    "Node '{}' typu '{}' na stream path nie jest pass-through — \
+                    streaming transformations nie sa wspierane w tym cut (S4b)",
+                    target.id,
+                    target.node_type
+                );
+            }
+        }
+
+        info!(
+            flow_id = flow.id,
+            flow_name = %flow.name,
+            producer = %producer_id,
+            "Streaming flow start"
+        );
+
+        // Pre-fix: wykonuj nody w kolejnosci topologicznej az dojdziemy do producenta.
+        // Producent sam sie NIE wykonuje blocking — wywolamy execute_streaming.
+        for node_id in &execution_order {
+            if node_id == &producer_id {
+                break;
+            }
+            let node = match node_map.get(node_id.as_str()) {
+                Some(n) => *n,
+                None => continue,
+            };
+            let step_start = Utc::now().to_rfc3339();
+            let result = self.execute_node(node, context).await;
+            match result {
+                Ok(output) => {
+                    context.node_results.insert(node_id.clone(), output);
+                    context.execution_log.push(FlowStepLog {
+                        node_id: node_id.clone(),
+                        node_type: node.node_type.clone(),
+                        started_at: step_start,
+                        finished_at: Some(Utc::now().to_rfc3339()),
+                        status: "completed".to_string(),
+                        output_preview: None,
+                    });
+                }
+                Err(e) => {
+                    bail!("pre-stream node '{}' failed: {}", node_id, e);
+                }
+            }
+        }
+
+        // Wywolaj producenta w trybie streaming
+        let producer_node = node_map
+            .get(producer_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("producer node zniknal z mapy"))?;
+        let adapter = self.registry.get(&producer_node.node_type).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Brak adaptera dla typu '{}' (producent streamu)",
+                producer_node.node_type
+            )
+        })?;
+
+        let stream_opt = adapter
+            .execute_streaming_dyn(&producer_node.config, context)
+            .await;
+
+        match stream_opt {
+            Some(Ok(stream)) => Ok(stream),
+            Some(Err(e)) => Err(e),
+            None => bail!(
+                "Adapter '{}' nie wspiera streamingu — walidacja flow powinna to zlapac",
+                producer_node.node_type
+            ),
+        }
+    }
+
     /// Wykonuje pojedynczy wezel - typy wewnetrzne (trigger, condition, template,
     /// output, router, pii_filter, tts_clean) obsluguje bezposrednio,
     /// typy serwisowe (llm, rag, stt, tts, embeddings, memory) deleguje do adapterow.
@@ -397,11 +530,7 @@ impl FlowExecutorAsync {
     /// Wezel trigger - punkt wejscia flow
     fn execute_trigger(&self, node: &FlowNode, context: &FlowContext) -> Result<serde_json::Value> {
         debug!(node_id = %node.id, "Trigger: rozpoczecie flow");
-        Ok(serde_json::json!({
-            "input": context.input,
-            "model": context.model,
-            "request_id": context.request_id,
-        }))
+        Ok(super::adapters::trigger::build_trigger_output(context))
     }
 
     /// Wezel przekazujacy dane (output, router) - roznia sie tylko typem wyniku
@@ -411,12 +540,10 @@ impl FlowExecutorAsync {
         context: &FlowContext,
         type_name: &str,
     ) -> Result<serde_json::Value> {
-        let text = self.resolve_input_text(node, context);
         debug!(node_id = %node.id, type_name = type_name, "Passthrough: przekazanie danych");
-        Ok(serde_json::json!({
-            "type": type_name,
-            "text": text,
-        }))
+        Ok(super::adapters::output::build_passthrough_output(
+            node, context, type_name,
+        ))
     }
 
     /// Condition/Switch - ewaluuje warunek i zwraca wynik
@@ -425,39 +552,10 @@ impl FlowExecutorAsync {
         node: &FlowNode,
         context: &FlowContext,
     ) -> Result<serde_json::Value> {
-        let field = node
-            .config
-            .get("field")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let operator = node
-            .config
-            .get("operator")
-            .and_then(|v| v.as_str())
-            .unwrap_or("equals");
-        let expected = node
-            .config
-            .get("value")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-
-        let actual = self.resolve_field_value(field, context);
-        let result = evaluate_condition(&actual, operator, &expected);
-
-        debug!(
-            node_id = %node.id,
-            field = field,
-            operator = operator,
-            result = result,
-            "Condition: ewaluacja warunku"
-        );
-
-        Ok(serde_json::json!({
-            "type": "condition_result",
-            "field": field,
-            "operator": operator,
-            "result": result,
-        }))
+        debug!(node_id = %node.id, "Condition: ewaluacja warunku");
+        Ok(super::adapters::condition::build_condition_output(
+            node, context,
+        ))
     }
 
     /// Template - formatowanie tekstu z podstawianiem zmiennych
@@ -495,138 +593,22 @@ impl FlowExecutorAsync {
         }))
     }
 
-    /// PII Filter - pobiera aktywne reguly z DB i aplikuje regex na tekscie
+    /// PII Filter - deleguje do adapters::pii_filter::apply_pii_filter.
     async fn execute_pii_filter(
         &self,
         node: &FlowNode,
         context: &mut FlowContext,
     ) -> Result<serde_json::Value> {
-        let db_clone = self.db.clone();
-        let rules =
-            tokio::task::spawn_blocking(move || repository::list_pii_rules_active(&db_clone))
-                .await??;
-        let mut text = self.resolve_input_text(node, context);
-
-        for rule in &rules {
-            match RegexBuilder::new(&rule.pattern)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .build()
-            {
-                Ok(re) => {
-                    let replaced = re.replace_all(&text, rule.replacement.as_str());
-                    // Cow::Borrowed = brak dopasowania, Cow::Owned = tekst zmieniony
-                    if let std::borrow::Cow::Owned(new_text) = replaced {
-                        text = new_text;
-                        debug!(
-                            rule_name = %rule.name,
-                            category = %rule.category,
-                            "PII filter: zastosowano regule"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        rule_id = rule.id,
-                        rule_name = %rule.name,
-                        pattern = %rule.pattern,
-                        error = %e,
-                        "PII filter: niepoprawny regex w regule"
-                    );
-                }
-            }
-        }
-
-        // Przefiltruj ostatnia wiadomosc user w ctx.messages (przed move do context.input)
-        if !context.messages.is_empty() {
-            if let Some(last_user_idx) = context
-                .messages
-                .iter()
-                .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            {
-                context.messages[last_user_idx] = serde_json::json!({
-                    "role": "user",
-                    "content": &text,
-                });
-            }
-        }
-
-        // Zaktualizuj kontekst na przefiltrowany tekst
-        context.input = text.clone();
-
-        debug!(
-            node_id = %node.id,
-            rules_count = rules.len(),
-            "PII filter: przefiltrowano tekst"
-        );
-
-        Ok(serde_json::json!({
-            "type": "pii_filtered",
-            "text": text,
-            "rules_applied": rules.len(),
-        }))
+        super::adapters::pii_filter::apply_pii_filter(&self.db, node, context).await
     }
 
-    /// TTS Clean - pobiera aktywne reguly czyszczenia z DB i aplikuje na tekscie
+    /// TTS Clean - deleguje do adapters::tts_clean::apply_tts_clean.
     async fn execute_tts_clean(
         &self,
         node: &FlowNode,
         context: &FlowContext,
     ) -> Result<serde_json::Value> {
-        let db_clone = self.db.clone();
-        let rules = tokio::task::spawn_blocking(move || {
-            repository::list_tts_cleaning_rules_active(&db_clone)
-        })
-        .await??;
-        let mut text = self.resolve_input_text(node, context);
-
-        for rule in &rules {
-            match rule.rule_type.as_str() {
-                "abbreviation" => {
-                    if let Some(ref replacement) = rule.replacement {
-                        text = text.replace(&rule.pattern, replacement);
-                    }
-                }
-                "regex_remove" | "emoji_range" => {
-                    match RegexBuilder::new(&rule.pattern)
-                        .size_limit(REGEX_SIZE_LIMIT)
-                        .build()
-                    {
-                        Ok(re) => {
-                            let replacement = rule.replacement.as_deref().unwrap_or("");
-                            text = re.replace_all(&text, replacement).to_string();
-                        }
-                        Err(e) => {
-                            warn!(
-                                rule_id = rule.id,
-                                pattern = %rule.pattern,
-                                error = %e,
-                                "TTS clean: niepoprawny regex"
-                            );
-                        }
-                    }
-                }
-                "phonetic" => {
-                    if let Some(ref replacement) = rule.replacement {
-                        text = text.replace(&rule.pattern, replacement);
-                    }
-                }
-                other => {
-                    debug!(rule_type = other, "TTS clean: nieznany typ reguly");
-                }
-            }
-        }
-
-        debug!(
-            node_id = %node.id,
-            rules_count = rules.len(),
-            "TTS clean: wyczyszczono tekst"
-        );
-
-        Ok(serde_json::json!({
-            "type": "tts_cleaned",
-            "text": text,
-            "rules_applied": rules.len(),
-        }))
+        super::adapters::tts_clean::apply_tts_clean(&self.db, node, context).await
     }
 
     /// Ewaluuje warunki na krawedziach wychodzacych z wezla condition/switch.
@@ -677,74 +659,16 @@ impl FlowExecutorAsync {
         }
     }
 
-    /// Pobiera tekst wejsciowy dla wezla - szuka wstecz w execution_log
-    /// az znajdzie node z polem "text" (pomija condition, side-effect nody)
-    fn resolve_input_text(&self, node: &FlowNode, context: &FlowContext) -> String {
-        if let Some(input_from) = node.config.get("input_from").and_then(|v| v.as_str()) {
-            if let Some(prev_result) = context.node_results.get(input_from) {
-                if let Some(text) = prev_result.get("text").and_then(|v| v.as_str()) {
-                    return text.to_string();
-                }
-                return prev_result.to_string();
-            }
-        }
-
-        for step in context.execution_log.iter().rev() {
-            if let Some(prev_result) = context.node_results.get(&step.node_id) {
-                if let Some(text) = prev_result.get("text").and_then(|v| v.as_str()) {
-                    return text.to_string();
-                }
-            }
-        }
-
-        context.input.clone()
-    }
-
-    /// Pobiera wartosc pola z kontekstu - wspiera auto-resolve z predecessora
-    /// i zagniezdzona notacje kropkowa (np. "tokens.prompt")
-    fn resolve_field_value(&self, field: &str, context: &FlowContext) -> serde_json::Value {
-        if field == "input" {
-            return serde_json::Value::String(context.input.clone());
-        }
-        if field == "model" {
-            return serde_json::Value::String(context.model.clone());
-        }
-
-        if let Some(val) = context.variables.get(field) {
-            return val.clone();
-        }
-
-        // Backward compat: jawne node_id.pole (np. "n6.should_query")
-        if let Some((prefix, rest)) = field.split_once('.') {
-            if context.node_results.contains_key(prefix) {
-                return resolve_json_path(context.node_results.get(prefix).unwrap(), rest);
-            }
-        }
-
-        // Auto-resolve: szukaj pola w outputach wezlow wstecz
-        for step in context.execution_log.iter().rev() {
-            if let Some(result) = context.node_results.get(&step.node_id) {
-                let resolved = resolve_json_path(result, field);
-                if !resolved.is_null() {
-                    return resolved;
-                }
-            }
-        }
-
-        serde_json::Value::Null
-    }
 }
 
-/// Rozwiazuje sciezke JSON z notacja kropkowa (np. "tokens.prompt")
-fn resolve_json_path(value: &serde_json::Value, path: &str) -> serde_json::Value {
-    let mut current = value;
-    for key in path.split('.') {
-        match current.get(key) {
-            Some(v) => current = v,
-            None => return serde_json::Value::Null,
-        }
-    }
-    current.clone()
+/// Czy dany typ node'a jest pass-through na stream path — executor w S4b
+/// zwraca stream bezposrednio do klienta bez transformacji per-node, wiec
+/// tylko sink-typy sa dozwolone za producentem streamu.
+fn is_stream_passthrough(node_type: &str) -> bool {
+    matches!(
+        node_type,
+        "output" | "end" | "http_response" | "quic_response" | "stream_chunk"
+    )
 }
 
 /// Bezpiecznie obcina string do zadanej liczby znakow (nie bajtow).
@@ -756,70 +680,10 @@ fn truncate_utf8(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Ewaluuje prosty warunek porownania
-fn evaluate_condition(
-    actual: &serde_json::Value,
-    operator: &str,
-    expected: &serde_json::Value,
-) -> bool {
-    match operator {
-        "equals" | "eq" | "==" => actual == expected,
-        "not_equals" | "neq" | "!=" => actual != expected,
-        "contains" => {
-            if let (Some(haystack), Some(needle)) = (actual.as_str(), expected.as_str()) {
-                haystack.contains(needle)
-            } else {
-                false
-            }
-        }
-        "not_contains" => {
-            if let (Some(haystack), Some(needle)) = (actual.as_str(), expected.as_str()) {
-                !haystack.contains(needle)
-            } else {
-                true
-            }
-        }
-        "gt" | ">" => compare_numbers(actual, expected, |a, b| a > b),
-        "gte" | ">=" => compare_numbers(actual, expected, |a, b| a >= b),
-        "lt" | "<" => compare_numbers(actual, expected, |a, b| a < b),
-        "lte" | "<=" => compare_numbers(actual, expected, |a, b| a <= b),
-        "exists" => !actual.is_null(),
-        "not_exists" => actual.is_null(),
-        "is_empty" => {
-            actual.is_null()
-                || actual.as_str().map_or(false, |s| s.is_empty())
-                || actual.as_array().map_or(false, |a| a.is_empty())
-        }
-        "is_not_empty" => {
-            !actual.is_null()
-                && !actual.as_str().map_or(false, |s| s.is_empty())
-                && !actual.as_array().map_or(false, |a| a.is_empty())
-        }
-        _ => {
-            warn!(operator = operator, "Nieznany operator warunku");
-            false
-        }
-    }
-}
-
-/// Porownuje dwie wartosci JSON jako liczby
-fn compare_numbers(
-    a: &serde_json::Value,
-    b: &serde_json::Value,
-    cmp: fn(f64, f64) -> bool,
-) -> bool {
-    let a_num = a.as_f64().or_else(|| a.as_i64().map(|i| i as f64));
-    let b_num = b.as_f64().or_else(|| b.as_i64().map(|i| i as f64));
-
-    match (a_num, b_num) {
-        (Some(av), Some(bv)) => cmp(av, bv),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_engine::adapters::condition::{compare_numbers, evaluate_condition};
     use crate::flow_engine::adapters::{AdapterRegistry, NodeAdapter};
     use crate::flow_engine::types::{FlowContext, FlowDefinition, FlowEdge, FlowNode};
     use std::sync::Arc;
@@ -911,6 +775,8 @@ mod tests {
             to: to.to_string(),
             label: None,
             condition: None,
+            from_port: "full".to_string(),
+            to_port: "in".to_string(),
         }
     }
 
@@ -1609,5 +1475,234 @@ mod tests {
             &serde_json::json!(5),
             |a, b| a > b
         ));
+    }
+
+    // === Streaming flow tests (S4b) ===
+
+    use crate::api::openai::types::{ChatCompletionChunk, ChunkChoice, Delta};
+    use crate::flow_engine::adapters::AdapterChunkStream;
+    use futures::stream::StreamExt;
+
+    /// Adapter ktory produkuje zdefiniowana liste chunkow na wywolanie streaming.
+    struct StreamingMockAdapter {
+        node_type_name: &'static str,
+        chunks: Vec<String>,
+    }
+
+    impl NodeAdapter for StreamingMockAdapter {
+        fn execute(
+            &self,
+            _c: &serde_json::Value,
+            _ctx: &mut FlowContext,
+        ) -> impl std::future::Future<Output = Result<serde_json::Value>> + Send {
+            async { Ok(serde_json::json!({"text": "blocking-fallback"})) }
+        }
+
+        fn node_type(&self) -> &'static str {
+            self.node_type_name
+        }
+
+        fn supported_output_ports(&self) -> &'static [&'static str] {
+            &["stream", "full"]
+        }
+
+        fn execute_streaming(
+            &self,
+            _node_config: &serde_json::Value,
+            _ctx: &mut FlowContext,
+        ) -> impl std::future::Future<Output = Option<Result<AdapterChunkStream>>> + Send {
+            let chunks = self.chunks.clone();
+            async move {
+                let items: Vec<Result<ChatCompletionChunk>> = chunks
+                    .into_iter()
+                    .map(|text| {
+                        Ok(ChatCompletionChunk {
+                            id: "test".to_string(),
+                            object: "chat.completion.chunk".to_string(),
+                            created: 0,
+                            model: "m".to_string(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: Delta {
+                                    role: None,
+                                    content: Some(text),
+                                    reasoning_content: None,
+                                    tool_calls: None,
+                                },
+                                finish_reason: None,
+                                logprobs: None,
+                            }],
+                            system_fingerprint: None,
+                            audio: None,
+                            detected_intent: None,
+                            detected_tools: None,
+                            transcribed_text: None,
+                            speaker_id: None,
+                            speaker_name: None,
+                        })
+                    })
+                    .collect();
+                let s = futures::stream::iter(items);
+                let boxed: AdapterChunkStream = Box::pin(s);
+                Some(Ok(boxed))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_forwarduje_chunki() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        registry.register(StreamingMockAdapter {
+            node_type_name: "llm",
+            chunks: vec!["Hel".to_string(), "lo".to_string(), "!".to_string()],
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "t1", "type": "trigger", "config": {}},
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "t1", "to": "llm1"},
+                {"from": "llm1", "to": "out", "from_port": "stream", "to_port": "in"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new(
+            "req-stream-1".to_string(),
+            "any".to_string(),
+            "Hej".to_string(),
+        );
+
+        let stream = executor
+            .execute_streaming_flow(&flow, &mut ctx)
+            .await
+            .expect("streaming flow should start");
+
+        let collected: Vec<_> = stream.collect().await;
+        assert_eq!(collected.len(), 3);
+        assert_eq!(
+            collected[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("Hel")
+        );
+        assert_eq!(
+            collected[2].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            Some("!")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_odrzuca_flow_bez_stream_edge() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        registry.register(StreamingMockAdapter {
+            node_type_name: "llm",
+            chunks: vec![],
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "t1", "type": "trigger", "config": {}},
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "t1", "to": "llm1"},
+                {"from": "llm1", "to": "out"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
+
+        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("flow bez stream edge powinien dac blad"),
+        };
+        assert!(msg.contains("stream"), "error zawiera 'stream': {}", msg);
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_odrzuca_transforming_node_po_producencie() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        registry.register(StreamingMockAdapter {
+            node_type_name: "llm",
+            chunks: vec![],
+        });
+        // 'rag' to node nie-passthrough — nie moze lezec za producentem na stream
+        registry.register(MockAdapter {
+            node_type_name: "rag",
+            response: serde_json::json!({"text": "x"}),
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "rag1", "type": "rag", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "llm1", "to": "rag1", "from_port": "stream", "to_port": "in"},
+                {"from": "rag1", "to": "out"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
+
+        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("powinno zwrocic blad"),
+        };
+        assert!(
+            msg.contains("pass-through") || msg.contains("passthrough"),
+            "error dot. pass-through: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_streaming_flow_odrzuca_adapter_bez_streamingu() {
+        let db = create_test_db();
+        let mut registry = AdapterRegistry::new();
+        // Mock adapter NIE implementuje execute_streaming — default None
+        registry.register(MockAdapter {
+            node_type_name: "llm",
+            response: serde_json::json!({"text": "x"}),
+        });
+        let executor = FlowExecutorAsync::new(db.clone(), Arc::new(registry));
+
+        let flow_json = r#"{
+            "nodes": [
+                {"id": "llm1", "type": "llm", "config": {}},
+                {"id": "out", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "llm1", "to": "out", "from_port": "stream", "to_port": "in"}
+            ]
+        }"#;
+
+        let flow = create_test_flow(flow_json);
+        let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
+
+        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("powinno zwrocic blad"),
+        };
+        assert!(
+            msg.contains("nie wspiera streamingu"),
+            "error dot. braku streamingu: {}",
+            msg
+        );
     }
 }
