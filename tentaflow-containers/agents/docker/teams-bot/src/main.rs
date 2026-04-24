@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
     let quic = quic_server::MeetingQuicServer::new(transport_config);
     let transcript_tx = quic.transcript_sender();
     let router_client_handle = quic.router_client_handle();
+    let page_slot = quic.page_slot();
     let mut command_rx = quic.command_receiver().await
         .expect("command_receiver powinien byc dostepny przy pierwszym wywolaniu");
 
@@ -304,6 +305,10 @@ async fn main() -> Result<()> {
             }
         };
         _chromium = Some(browser);
+        {
+            let mut slot = page_slot.lock().await;
+            *slot = Some(p.clone());
+        }
         tracing::info!("Dolaczono do spotkania");
         summarizer_handle = spawn_summarizer(
             transcript_buffer.clone(),
@@ -799,6 +804,10 @@ async fn main() -> Result<()> {
                         if let Some(mut old_browser) = _chromium.take() {
                             tracing::info!("Zamykam poprzednia instancje Chromium");
                             page = None;
+                            {
+                                let mut slot = page_slot.lock().await;
+                                *slot = None;
+                            }
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
                         }
@@ -855,6 +864,10 @@ async fn main() -> Result<()> {
                                 {
                                     Ok(p) => {
                                         _chromium = Some(browser);
+                                        {
+                                            let mut slot = page_slot.lock().await;
+                                            *slot = Some(p.clone());
+                                        }
                                         page = Some(p);
                                         // Odpal summarizera dla nowej sesji —
                                         // meeting_key == meeting_id po stronie routera.
@@ -914,6 +927,10 @@ async fn main() -> Result<()> {
                     Some(quic_server::MeetingCommand::LeaveMeeting { response_tx }) => {
                         tracing::info!("Komenda QUIC: opuszczanie spotkania");
                         page = None;
+                        {
+                            let mut slot = page_slot.lock().await;
+                            *slot = None;
+                        }
                         if let Some(mut old_browser) = _chromium.take() {
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
