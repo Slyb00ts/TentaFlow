@@ -19,7 +19,8 @@ use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, Nod
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
 use crate::net::iroh::pairing::{
-    load_trusted_contact_hints, store_trusted_contact_hints, PairingContactHints,
+    load_trusted_contact_hints, merge_contact_hints, store_trusted_contact_hints,
+    PairingContactHints,
 };
 use crate::routing::live_metrics;
 
@@ -414,36 +415,24 @@ fn upsert_local_peer(
     });
 }
 
-fn merge_contact_hints(
-    current: Option<PairingContactHints>,
-    fresh: PairingContactHints,
-) -> PairingContactHints {
-    let mut merged = current.unwrap_or_default();
-    if merged.node_id.is_empty() {
-        merged.node_id = fresh.node_id.clone();
-    }
-    if merged.public_key_hex.is_empty() && !fresh.public_key_hex.is_empty() {
-        merged.public_key_hex = fresh.public_key_hex.clone();
-    }
-    if merged.hostname.is_empty() && !fresh.hostname.is_empty() {
-        merged.hostname = fresh.hostname.clone();
-    }
-    if merged.relay_url.is_empty() && !fresh.relay_url.is_empty() {
-        merged.relay_url = fresh.relay_url.clone();
-    }
-    for addr in fresh.addresses {
-        if !addr.is_empty() && !merged.addresses.contains(&addr) {
-            merged.addresses.push(addr);
-        }
-    }
-    merged
-}
-
 fn trusted_contact_hints_for_peer(
     security: &MeshSecurity,
     node_id: &str,
 ) -> Option<PairingContactHints> {
     load_trusted_contact_hints(&security.db, node_id).ok().flatten()
+}
+
+fn prefer_address_first(addresses: &mut Vec<String>, preferred: Option<&str>) {
+    let Some(preferred) = preferred else {
+        return;
+    };
+    let Some(index) = addresses.iter().position(|addr| addr == preferred) else {
+        return;
+    };
+    if index > 0 {
+        let preferred = addresses.remove(index);
+        addresses.insert(0, preferred);
+    }
 }
 
 /// [SCALE] Handler PeerConnected wywolywany w tokio::spawn z per-peer lockiem
@@ -581,17 +570,27 @@ async fn handle_peer_connected(
         if let Some(ref sec) = mesh_security {
             if let Some((hostname, addresses, port)) = peer_store.contact_snapshot(&node_id) {
                 if !addresses.is_empty() && port > 0 {
-                    let direct_addresses: Vec<String> = addresses
+                    let mut direct_addresses: Vec<String> = addresses
                         .iter()
                         .map(|ip| format!("{}:{}", ip, port))
                         .collect();
+                    let snapshot = qm_events.connection_snapshot(&node_id);
+                    let selected_address = snapshot.as_ref().and_then(|c| c.address.as_deref());
+                    let selected_is_direct = snapshot
+                        .as_ref()
+                        .map(|c| c.transport.as_str() == "p2p")
+                        .unwrap_or(false);
+                    if selected_is_direct {
+                        prefer_address_first(&mut direct_addresses, selected_address);
+                    }
                     let addr_str = direct_addresses.join(",");
                     let _ = crate::db::repository::update_trusted_node_addresses(
                         &sec.db, &node_id, &addr_str,
                     );
-                    let relay_url = qm_events
-                        .relay_url()
-                        .map(|url| url.to_string())
+                    let relay_url = snapshot
+                        .as_ref()
+                        .and_then(|c| c.relay_url.clone())
+                        .or_else(|| qm_events.relay_url().map(|url| url.to_string()))
                         .unwrap_or_default();
                     let current = load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
                     let hints = merge_contact_hints(
@@ -795,18 +794,10 @@ fn spawn_quic_event_handler(
                         if peer_store.is_quic_connected(&entry.node_id) {
                             continue;
                         }
-                        // Cooldown — nie probuj ponownie przez 30s nawet jesli ten
-                        // sam peer zostanie anonsowany znowu.
-                        let recent = last_dial_at
-                            .get(&entry.node_id)
-                            .map(|t| {
-                                t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
-                            })
-                            .unwrap_or(false);
-                        if recent {
-                            continue;
-                        }
-                        last_dial_at.insert(entry.node_id.clone(), std::time::Instant::now());
+                        let target_trusted = match &mesh_security {
+                            Some(sec) => sec.is_trusted(&entry.node_id),
+                            None => false,
+                        };
 
                         let addrs: Vec<std::net::IpAddr> = entry
                             .direct_addrs
@@ -830,19 +821,39 @@ fn spawn_quic_event_handler(
                             peer_store.set_hostname(&entry.node_id, &entry.hostname);
                         }
                         peer_store.set_status(&entry.node_id, "discovered");
+                        if !target_trusted {
+                            continue;
+                        }
+                        let recent = last_dial_at
+                            .get(&entry.node_id)
+                            .map(|t| {
+                                t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
+                            })
+                            .unwrap_or(false);
+                        if recent {
+                            continue;
+                        }
+                        last_dial_at.insert(entry.node_id.clone(), std::time::Instant::now());
+                        let hints = match &mesh_security {
+                            Some(sec) => merge_contact_hints(
+                                load_trusted_contact_hints(&sec.db, &entry.node_id)
+                                    .ok()
+                                    .flatten(),
+                                PairingContactHints {
+                                    node_id: entry.node_id.clone(),
+                                    public_key_hex: String::new(),
+                                    hostname: entry.hostname.clone(),
+                                    addresses: entry.direct_addrs.clone(),
+                                    relay_url: String::new(),
+                                },
+                            ),
+                            None => continue,
+                        };
 
-                        // Auto-dial — iroh sam zajmuje sie NAT traversal + relay gdy
-                        // direct addr nie dziala.
                         let target = entry.node_id.clone();
                         let qm = qm_events.clone();
-                        let dial_addr = entry
-                            .direct_addrs
-                            .iter()
-                            .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
-                            .next()
-                            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                         tokio::spawn(async move {
-                            match qm.connect_to_peer(&target, dial_addr).await {
+                            match qm.connect_to_peer_with_hints(&hints).await {
                                 Ok(_) => debug!(peer = %target, "Auto-dial (KnownPeers): OK"),
                                 Err(e) => debug!(peer = %target, "Auto-dial (KnownPeers): {}", e),
                             }
@@ -1026,18 +1037,34 @@ fn spawn_quic_event_handler(
                             if peer_store.is_quic_connected(&entry.node_id) {
                                 continue;
                             }
+                            let recent = last_dial_at
+                                .get(&entry.node_id)
+                                .map(|t| {
+                                    t.elapsed()
+                                        < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
+                                })
+                                .unwrap_or(false);
+                            if recent {
+                                continue;
+                            }
+                            last_dial_at
+                                .insert(entry.node_id.clone(), std::time::Instant::now());
                             let target = entry.node_id.clone();
                             let qm = qm_events.clone();
-                            let addrs: Vec<std::net::SocketAddr> = entry
-                                .direct_addrs
-                                .iter()
-                                .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
-                                .collect();
+                            let hints = merge_contact_hints(
+                                load_trusted_contact_hints(&sec.db, &entry.node_id)
+                                    .ok()
+                                    .flatten(),
+                                PairingContactHints {
+                                    node_id: entry.node_id.clone(),
+                                    public_key_hex: String::new(),
+                                    hostname: entry.hostname.clone(),
+                                    addresses: entry.direct_addrs.clone(),
+                                    relay_url: String::new(),
+                                },
+                            );
                             tokio::spawn(async move {
-                                let dial_addr = addrs.into_iter().next().unwrap_or_else(|| {
-                                    std::net::SocketAddr::from(([0, 0, 0, 0], 0))
-                                });
-                                match qm.connect_to_peer(&target, dial_addr).await {
+                                match qm.connect_to_peer_with_hints(&hints).await {
                                     Ok(_) => debug!(
                                         peer = %target,
                                         "Auto-dial z TopologyAnnounce udany — iroh polaczony"

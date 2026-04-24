@@ -285,6 +285,14 @@ impl QuicServiceHandle {
             );
         }
     }
+
+    pub async fn shutdown_client_and_mark_disconnected(&self, reason: &str) {
+        let client = self.client.write().await.take();
+        if let Some(client) = client {
+            client.shutdown().await;
+        }
+        self.set_disconnected(reason.to_string()).await;
+    }
 }
 
 /// Z ALPN typu "tentaflow-llm" / "tentaflow-tts" wyjmij czysta kategorie.
@@ -1329,14 +1337,14 @@ impl ServiceManager {
                             _ = shutdown_rx.changed() => {
                                 if *shutdown_rx.borrow() {
                                     info!("{} QUIC '{}': Shutdown signal", service_type, name);
-                                    handle.set_disconnected("shutdown".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("shutdown").await;
                                     break true;
                                 }
                             }
                             _ = per_service_rx.changed() => {
                                 if *per_service_rx.borrow() {
                                     info!("{} QUIC '{}': Per-service shutdown signal", service_type, name);
-                                    handle.set_disconnected("removed".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("removed").await;
                                     break true;
                                 }
                             }
@@ -1436,14 +1444,14 @@ impl ServiceManager {
                             _ = shutdown_rx.changed() => {
                                 if *shutdown_rx.borrow() {
                                     info!("MeetingBot QUIC '{}': Shutdown signal", name);
-                                    handle.set_disconnected("shutdown".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("shutdown").await;
                                     break true;
                                 }
                             }
                             _ = per_service_rx.changed() => {
                                 if *per_service_rx.borrow() {
                                     info!("MeetingBot QUIC '{}': Per-service shutdown signal", name);
-                                    handle.set_disconnected("removed".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("removed").await;
                                     break true;
                                 }
                             }
@@ -1589,14 +1597,14 @@ impl ServiceManager {
                             _ = shutdown_rx.changed() => {
                                 if *shutdown_rx.borrow() {
                                     info!("LLM QUIC '{}': Shutdown signal", name);
-                                    handle.set_disconnected("shutdown".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("shutdown").await;
                                     return;
                                 }
                             }
                             _ = per_service_rx.changed() => {
                                 if *per_service_rx.borrow() {
                                     info!("LLM QUIC '{}': Per-service shutdown signal", name);
-                                    handle.set_disconnected("removed".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("removed").await;
                                     return;
                                 }
                             }
@@ -1792,7 +1800,7 @@ impl ServiceManager {
                                 if *shutdown_rx.borrow() {
                                     info!("Memory QUIC '{}': Shutdown signal", name);
                                     callback_task.abort();
-                                    handle.set_disconnected("shutdown".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("shutdown").await;
                                     return;
                                 }
                             }
@@ -1800,7 +1808,7 @@ impl ServiceManager {
                                 if *per_service_rx.borrow() {
                                     info!("Memory QUIC '{}': Per-service shutdown signal", name);
                                     callback_task.abort();
-                                    handle.set_disconnected("removed".to_string()).await;
+                                    handle.shutdown_client_and_mark_disconnected("removed").await;
                                     return;
                                 }
                             }
@@ -2345,7 +2353,9 @@ impl ServiceManager {
 
         match service_type {
             "llm" => {
-                self.quic_llm_services.insert(name.clone(), handle.clone());
+                if let Some(old) = self.quic_llm_services.insert(name.clone(), handle.clone()) {
+                    old.shutdown();
+                }
                 self.llm_model_categories.insert(name.clone(), crate::config::LlmModelCategory::Main);
                 let prompt_registry = self.prompt_registry.clone();
                 tokio::spawn(async move {
@@ -2360,7 +2370,9 @@ impl ServiceManager {
                 });
             }
             "tts" => {
-                self.quic_tts_services.insert(name.clone(), handle.clone());
+                if let Some(old) = self.quic_tts_services.insert(name.clone(), handle.clone()) {
+                    old.shutdown();
+                }
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
                     Self::quic_service_connection_loop(
@@ -2374,7 +2386,9 @@ impl ServiceManager {
                 });
             }
             "stt" => {
-                self.quic_stt_services.insert(name.clone(), handle.clone());
+                if let Some(old) = self.quic_stt_services.insert(name.clone(), handle.clone()) {
+                    old.shutdown();
+                }
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
                     Self::quic_service_connection_loop(
@@ -2388,7 +2402,10 @@ impl ServiceManager {
                 });
             }
             "embedding" => {
-                self.quic_embedding_services.insert(name.clone(), handle.clone());
+                if let Some(old) = self.quic_embedding_services.insert(name.clone(), handle.clone())
+                {
+                    old.shutdown();
+                }
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
                     Self::quic_service_connection_loop(
@@ -2402,14 +2419,18 @@ impl ServiceManager {
                 });
             }
             "memory" => {
-                self.quic_memory_services.insert(name.clone(), handle.clone());
+                if let Some(old) = self.quic_memory_services.insert(name.clone(), handle.clone()) {
+                    old.shutdown();
+                }
                 let callback_tx = self.callback_tx.clone();
                 tokio::spawn(async move {
                     Self::memory_connection_loop(name, handle, callback_tx, shutdown_rx).await;
                 });
             }
             "meeting-bot" => {
-                self.quic_llm_services.insert(name.clone(), handle.clone());
+                if let Some(old) = self.quic_llm_services.insert(name.clone(), handle.clone()) {
+                    old.shutdown();
+                }
                 let event_bus = self.event_bus.read().clone();
                 let reverse_router = self.reverse_router.read().clone();
                 tokio::spawn(async move {
