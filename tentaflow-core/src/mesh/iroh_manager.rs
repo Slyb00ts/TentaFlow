@@ -270,6 +270,7 @@ pub struct IrohMeshManager {
 struct PeerLogState {
     last_discovery_log: Option<Instant>,
     consecutive_dial_failures: u32,
+    last_dial_attempt: Option<Instant>,
 }
 
 impl IrohMeshManager {
@@ -344,6 +345,30 @@ impl IrohMeshManager {
         }
     }
 
+    /// Cooldown miedzy sekwencyjnymi probami dialu tego samego peera. Bez
+    /// tego mDNS wyzwala dial co sekunde — obaj peerowie probuja jednoczesnie,
+    /// tie-break pierwsza zamyka, zostaje druga, mDNS znowu wyzwala, loop.
+    /// Trusted peery (sparowane) uzywaja krotszego cooldownu zeby szybko
+    /// wrocic po realnym padzie, niesparowane dluzszego zeby nie spamowac
+    /// dopoki user nie kliknie pairing.
+    fn try_consume_dial_attempt(&self, peer_hex: &str, is_trusted: bool) -> bool {
+        let cooldown = if is_trusted {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(30)
+        };
+        let mut map = self.peer_log_state.lock();
+        let entry = map.entry(peer_hex.to_string()).or_default();
+        let now = Instant::now();
+        if let Some(prev) = entry.last_dial_attempt {
+            if now.duration_since(prev) < cooldown {
+                return false;
+            }
+        }
+        entry.last_dial_attempt = Some(now);
+        true
+    }
+
     /// Startuje accept loop + heartbeat loop + discovery loop (LAN mDNS).
     /// Zwraca JoinHandles do monitorowania.
     pub fn start(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
@@ -408,9 +433,18 @@ impl IrohMeshManager {
                         if self_arc.is_connected(&peer_hex).await {
                             continue;
                         }
+                        // Tlumimy rapid re-dial tego samego peera — cooldown
+                        // jest dluzszy dla niesparowanych (30s) niz zaufanych
+                        // (5s). Dzieki temu dwa nody w tej samej LANie nie
+                        // wchodza w petle tie-break / re-discovery.
+                        let is_trusted = self_arc.security.is_trusted(&peer_hex);
+                        if !self_arc.try_consume_dial_attempt(&peer_hex, is_trusted) {
+                            debug!(peer = %peer_hex, trusted = is_trusted, "iroh_mesh: dial pominiety (cooldown)");
+                            continue;
+                        }
                         let log_it = self_arc.should_log_discovery(&peer_hex);
                         if log_it {
-                            info!(peer = %peer_hex, addrs = ?addresses, "iroh_mesh: peer odkryty — dial");
+                            info!(peer = %peer_hex, addrs = ?addresses, trusted = is_trusted, "iroh_mesh: peer odkryty — dial");
                         } else {
                             debug!(peer = %peer_hex, "iroh_mesh: peer re-odkryty (log stlumiony)");
                         }
