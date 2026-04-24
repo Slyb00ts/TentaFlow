@@ -331,6 +331,11 @@ pub struct ServiceSummary {
     pub engine_id: Option<String>,
     /// Identyfikator modelu (jesli serwis obsluguje konkretny model).
     pub model_id: Option<String>,
+    /// Source-tree hash captured at last deploy. `None` for instances created
+    /// before the update-detection feature. GUI compares this with the
+    /// manifest's current `docker_source_hash`/`native_source_hash` to decide
+    /// whether an update is available.
+    pub deployed_source_hash: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
