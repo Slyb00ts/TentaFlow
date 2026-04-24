@@ -4486,3 +4486,56 @@ tf-screen {
 .svc-update-log-warn { color: #f5d663; }
 .svc-update-log-error { color: var(--danger, #ef4444); }
 .svc-update-log-success { color: #4ade80; }
+
+/* Meeting live — bot diagnostics window */
+.diag-window-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+}
+.diag-actions {
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.diag-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 300px;
+  max-height: 65vh;
+  overflow: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+}
+.diag-result .diag-empty {
+  color: var(--text-2);
+  font-size: 13px;
+  padding: 12px;
+}
+.diag-result img {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: block;
+}
+.diag-result pre {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  background: var(--bg-input);
+  color: var(--text-1);
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  tab-size: 2;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
