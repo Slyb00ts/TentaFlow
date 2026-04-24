@@ -3653,6 +3653,104 @@ pub fn deployment_list(
 }
 
 // =============================================================================
+// Service redeploy - rebuild already-deployed service from refreshed sources.
+// =============================================================================
+
+#[handler(variant = "ServiceRedeployRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_redeploy(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqRedeploy(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected ReqRedeploy")),
+    };
+    if payload.service_id <= 0 {
+        return Err(ProtocolError::bad_request("service_id must be positive"));
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.redeploy",
+        Some(&payload.service_id.to_string()),
+        Some(&format!("force={}", payload.force_if_active_sessions)),
+    );
+
+    let outcome = crate::deploy::redeploy::start_redeploy(
+        ctx.state.db.clone(),
+        ctx.state.service_manager.clone(),
+        payload.service_id,
+        payload.force_if_active_sessions,
+    )
+    .await;
+
+    let response = match outcome {
+        crate::deploy::redeploy::RedeployOutcome::Started { deploy_id } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_STARTED.to_string(),
+                deploy_id,
+                new_hash: String::new(),
+                error: String::new(),
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::ActiveSessions { count } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_ACTIVE_SESSIONS.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: String::new(),
+                active_session_count: count,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::NoSource => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_NO_SOURCE.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: "manifest exposes no source_hash for this engine/deploy_mode"
+                    .to_string(),
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::Unsupported { reason } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_UNSUPPORTED.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: reason,
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::NotFound => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_NOT_FOUND.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: format!("service id {} does not exist", payload.service_id),
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::Failed { error } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_FAILED.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error,
+                active_session_count: 0,
+            }
+        }
+    };
+    Ok(MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ResRedeploy(response),
+    ))
+}
+
+// =============================================================================
 // Addons + Users listy (FAZA 6 — REST → binary dla badge counts w nav)
 // =============================================================================
 

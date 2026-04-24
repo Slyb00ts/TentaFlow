@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use crate::db::repository::deployments as deployments_repo;
 use crate::db::DbPool;
-use crate::deploy::log_bus::{self, BusMessage, LogLine};
+use crate::deploy::log_bus::{self, BusMessage};
 use crate::routing::service_manager::ServiceManager;
 use crate::services::manifest::ModelPreset;
 
@@ -1209,36 +1209,9 @@ fn parse_progress_line(
     None
 }
 
-fn log_line(
-    db: &DbPool,
-    deploy_id: &str,
-    tx: &broadcast::Sender<BusMessage>,
-    kind: &str,
-    line: &str,
-) {
-    let _ = deployments_repo::append_log_line(db, deploy_id, line);
-    let _ = tx.send(BusMessage::Line(LogLine {
-        deploy_id: deploy_id.to_string(),
-        kind: kind.to_string(),
-        line: line.to_string(),
-        phase: String::new(),
-        progress_pct: 0,
-        ts_ms: log_bus::now_ms(),
-    }));
-}
-
-fn progress(db: &DbPool, deploy_id: &str, tx: &broadcast::Sender<BusMessage>, pct: u32) {
-    let _ = deployments_repo::set_status(db, deploy_id, "building", "building", pct);
-    let _ = tx.send(BusMessage::Line(LogLine {
-        deploy_id: deploy_id.to_string(),
-        kind: "progress".to_string(),
-        line: String::new(),
-        phase: "building".to_string(),
-        progress_pct: pct,
-        ts_ms: log_bus::now_ms(),
-    }));
-}
-
+use log_bus::{finish_success, log_line, progress};
+// Wraps `log_bus::phase` so the runner also emits an `info!` span — helpful
+// when tailing tentaflow logs. Other callers can use `log_bus::phase` directly.
 fn phase(
     db: &DbPool,
     deploy_id: &str,
@@ -1247,38 +1220,8 @@ fn phase(
     pct: u32,
     phase_name: &str,
 ) {
-    let _ = deployments_repo::set_status(db, deploy_id, status, phase_name, pct);
-    let _ = tx.send(BusMessage::Line(LogLine {
-        deploy_id: deploy_id.to_string(),
-        kind: "phase".to_string(),
-        line: phase_name.to_string(),
-        phase: phase_name.to_string(),
-        progress_pct: pct,
-        ts_ms: log_bus::now_ms(),
-    }));
+    log_bus::phase(db, deploy_id, tx, status, pct, phase_name);
     info!(deploy_id = %deploy_id, status = %status, phase = %phase_name, pct, "deployment phase");
-}
-
-async fn finish_success(
-    db: &DbPool,
-    deploy_id: &str,
-    tx: &broadcast::Sender<BusMessage>,
-    start_ms: i64,
-    image_tag: String,
-    container_name: String,
-) {
-    let _ = deployments_repo::mark_finished(db, deploy_id, "success", None);
-    let _ = tx.send(BusMessage::End {
-        deploy_id: deploy_id.to_string(),
-        final_status: "success".to_string(),
-        image_tag,
-        container_name,
-        error_message: String::new(),
-        duration_ms: log_bus::now_ms() - start_ms,
-    });
-    // Daj szansę subscriberom otrzymać End zanim zamkniemy kanał.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    log_bus::close(deploy_id);
 }
 
 /// Pakuje `root` do `tar_builder`, pomijając symlinki i foldery target/,
