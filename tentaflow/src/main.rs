@@ -445,21 +445,21 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 fn setup_logging(verbose: bool) -> Result<()> {
     use tracing_subscriber::{fmt, EnvFilter};
 
-    // Wyciszamy glosne biblioteki ktore spamuja WARN/INFO na disconnect/rediscovery
-    // peerow:
-    //   iroh::socket::remote_map — 'Address Lookup failed' dla niedostepnych peerow
-    //   iroh::address_lookup::pkarr::dht — 'resolving X from DHT' dla kazdej proby
-    //   iroh-relay — MaxPathIdReached gdy zbyt wiele polaczen przez relay
-    //   mdns_sd — internal chatter
-    //   wgpu — compile warnings
-    const BASE_FILTER: &str = "iroh::socket::remote_map=error,\
-        iroh::address_lookup=warn,\
-        iroh::net_report=error,\
-        iroh::socket::remote_map::remote_state=error,\
+    // Chcemy widziec tylko NASZE logi (iroh_mesh:, mesh:, meeting:, ...), a nic
+    // z samego stacka iroh/netwatch/mdns/wgpu. Wszystko z tych modulow spada do
+    // `error` albo `off` — w razie realnego bledu dalej zobaczymy, ale nie ma
+    // spamu INFO/WARN na kazdy rediscover/dial/relay-retry.
+    const BASE_FILTER: &str = "iroh=error,\
+        iroh_base=error,\
+        iroh_quinn=error,\
+        iroh_quinn_proto=error,\
         iroh_relay=error,\
-        iroh::socket::transports::relay=error,\
-        noq_proto=error,\
+        iroh_metrics=error,\
+        swarm_discovery=error,\
+        netwatch=error,\
+        portmapper=error,\
         mdns_sd=off,\
+        noq_proto=error,\
         wgpu_hal=error,\
         wgpu_core=error";
     let filter = if verbose {
