@@ -862,14 +862,22 @@ async function wireUpPairTabs(winEl) {
       if (hexEl) hexEl.textContent = hex;
       if (pinEl) pinEl.textContent = pin ? pin.replace(/(\d{3})(\d{3})/, '$1 $2') : '—';
       if (QR && hex) {
+        // QR trzyma TYLKO identity + relay (relay-first). Adresy bezposrednie
+        // sa pomijane: przy kilkunastu kartach sieciowych/dockerach payload
+        // puchnie do kilkuset znakow i QR traci czytelnosc. Peer i tak
+        // dostaje nas po relay, a gdy obaj jestesmy w tej samej sieci iroh
+        // po otwarciu sesji sam hole-punchuje direct path przez mDNS/DHT.
+        // Manual ip:port wpisujemy recznie tylko w trybie offline-LAN.
         const qs = new URLSearchParams();
         qs.set('pin', pin || '');
         qs.set('host', host || '');
         qs.set('ver', '2');
         if (publicKey) qs.set('pk', publicKey);
         if (relayUrl) qs.set('relay', relayUrl);
-        for (const addr of addresses) qs.append('addr', addr);
         const payload = `tentaflow-pair://${hex}?${qs.toString()}`;
+        // Zmienna addresses zostaje nieuzywana — poza QR moze byc wyswietlona
+        // w UI (lista "adresy tego noda") dla troubleshootingu LAN-only.
+        void addresses;
         const svg = await QR.renderQrSvg(payload, { size: 220, errorCorrectionLevel: 'M' });
         const box = winEl.querySelector('#pair-qr-box');
         if (box) box.innerHTML = svg;
