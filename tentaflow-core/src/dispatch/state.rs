@@ -33,6 +33,10 @@ pub struct AppState {
     pub permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     pub license: Arc<dyn LicenseChecker>,
     pub meeting_manager: Arc<crate::meeting::MeetingManager>,
+    /// Active VNC tunnels for same-node websockify bridging. Keyed by server-
+    /// generated tunnel_id (UUID). Instantiated per WS connection so tunnels
+    /// die with the socket that spawned them.
+    pub vnc_tunnels: Arc<dashmap::DashMap<String, crate::api::dashboard::vnc_tunnel::VncTunnelEntry>>,
 }
 
 impl AppState {
@@ -75,6 +79,7 @@ impl AppState {
             permission_checker: None,
             license: Arc::new(StaticLicenseChecker::free()),
             meeting_manager,
+            vnc_tunnels: Arc::new(dashmap::DashMap::new()),
         })
     }
 }

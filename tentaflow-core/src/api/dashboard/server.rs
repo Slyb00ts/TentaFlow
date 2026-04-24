@@ -506,6 +506,7 @@ pub async fn handle_request(
             permission_checker: permission_checker.clone(),
             license: license.clone(),
             meeting_manager,
+            vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);
