@@ -5,7 +5,8 @@
 //       aktualizacje metryk bez klonowania calej kolekcji.
 // =============================================================================
 
-use parking_lot::RwLock;
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -157,37 +158,44 @@ pub struct RoutingEntry {
 
 /// Wspoldzielony store peerow — bezpieczny miedzy watkami.
 ///
-/// [OPT] Optymalizacje pod 1000 peerow:
-/// - `list_cache`: Arc<Vec<MeshPeerInfo>> — klonowany snapshot odswiezany
-///   tylko gdy dane sie zmienia (flaga dirty). Eliminuje klonowanie 1000
-///   peerow przy kazdym wywolaniu /api/mesh/nodes.
-/// - `dirty`: atomowa flaga — ustawiana przy write, czyszczona przy rebuild cache.
-///   Przy 2000 heartbeatow/s list() nie musi klonowac jesli nikt nie pisze.
+/// [SCALE] Optymalizacje pod tysiace peerow:
+/// - `peers: DashMap` — lock-free per-shard, 2000 heartbeatow/s nie
+///   szereguje sie na globalnym locku.
+/// - `list_cache: ArcSwap<Vec>` — atomowa publikacja snapshotu, readers
+///   nie biora zadnego locka (`load_full` = atomic ptr copy).
+/// - `topology: DashMap` — insert per-peer bez globalnej synchronizacji.
+/// - `routing_table: ArcSwap<HashMap>` — BFS buduje nowa mape i publikuje
+///   atomowo. Readers (`get_route`) zero-lock.
+/// - `last_heartbeat_ms: DashMap` — mark/clear per-peer lock-free.
 #[derive(Debug, Clone)]
 pub struct MeshPeerStore {
-    peers: Arc<RwLock<HashMap<String, MeshPeerInfo>>>,
-    /// [OPT] Cache listy peerow — Arc pozwala na tanie klonowanie referencji
-    list_cache: Arc<RwLock<Arc<Vec<MeshPeerInfo>>>>,
-    /// [OPT] Flaga dirty — czy cache trzeba odswiezyc
+    peers: Arc<DashMap<String, MeshPeerInfo>>,
+    /// Snapshot listy peerow — publikowany atomowo, czytany bez locka.
+    list_cache: Arc<ArcSwap<Vec<MeshPeerInfo>>>,
+    /// Flaga dirty — ustawiana przy write, czyszczona przy rebuild cache.
     dirty: Arc<AtomicBool>,
     /// Topologia mesh — node_id -> lista bezposrednio polaczonych peerow
-    topology: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    /// Tabela routingu — obliczana z topologii BFS
-    routing_table: Arc<RwLock<HashMap<String, RoutingEntry>>>,
+    topology: Arc<DashMap<String, Vec<String>>>,
+    /// Tabela routingu — obliczana z topologii BFS, publikowana atomowo.
+    routing_table: Arc<ArcSwap<HashMap<String, RoutingEntry>>>,
     /// Ostatni odebrany heartbeat per peer (unix millis). Liveness timer sprawdza
     /// aktualnosc — >2s = degraded, >5s = offline + force disconnect.
-    last_heartbeat_ms: Arc<RwLock<HashMap<String, i64>>>,
+    last_heartbeat_ms: Arc<DashMap<String, i64>>,
+    /// Flaga dirty dla routing_table — handlery tylko zaznaczaja, periodyczny
+    /// task wola `maybe_recalculate_routes` i coalesce'uje burst reconnectow.
+    routes_dirty: Arc<AtomicBool>,
 }
 
 impl MeshPeerStore {
     pub fn new() -> Self {
         Self {
-            peers: Arc::new(RwLock::new(HashMap::new())),
-            list_cache: Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            peers: Arc::new(DashMap::with_capacity(256)),
+            list_cache: Arc::new(ArcSwap::from_pointee(Vec::new())),
             dirty: Arc::new(AtomicBool::new(false)),
-            topology: Arc::new(RwLock::new(HashMap::new())),
-            routing_table: Arc::new(RwLock::new(HashMap::new())),
-            last_heartbeat_ms: Arc::new(RwLock::new(HashMap::new())),
+            topology: Arc::new(DashMap::with_capacity(256)),
+            routing_table: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            last_heartbeat_ms: Arc::new(DashMap::with_capacity(256)),
+            routes_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -197,9 +205,7 @@ impl MeshPeerStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        self.last_heartbeat_ms
-            .write()
-            .insert(node_id.to_string(), now_ms);
+        self.last_heartbeat_ms.insert(node_id.to_string(), now_ms);
     }
 
     /// Snapshot ostatnich heartbeatow — (node_id, age_ms).
@@ -209,15 +215,14 @@ impl MeshPeerStore {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.last_heartbeat_ms
-            .read()
             .iter()
-            .map(|(k, v)| (k.clone(), now_ms - v))
+            .map(|e| (e.key().clone(), now_ms - *e.value()))
             .collect()
     }
 
     /// Usun wpis heartbeat (po PeerDisconnected).
     pub fn clear_heartbeat(&self, node_id: &str) {
-        self.last_heartbeat_ms.write().remove(node_id);
+        self.last_heartbeat_ms.remove(node_id);
     }
 
     /// [OPT] Oznacza cache jako nieaktualny — nastepne list() odbuduje.
@@ -235,28 +240,40 @@ impl MeshPeerStore {
             .to_string()
     }
 
+    /// Zbiera id-ki disconnected peerow z pasujacym hostname+port (rozne od
+    /// `node_id`). Nie zmienia mapy — caller musi wywolac `peers.remove` dla
+    /// kazdego zwroconego id (kazde remove lock-free per-shard).
+    fn stale_ids_by_hostname_port(
+        peers: &DashMap<String, MeshPeerInfo>,
+        node_id: &str,
+        hostname: &str,
+        port: u16,
+    ) -> Vec<String> {
+        let normalized = Self::normalize_hostname(hostname);
+        if normalized.is_empty() || port == 0 {
+            return Vec::new();
+        }
+        peers
+            .iter()
+            .filter(|e| e.key().as_str() != node_id)
+            .filter(|e| {
+                let v = e.value();
+                !v.quic_connected
+                    && v.port == port
+                    && Self::normalize_hostname(&v.hostname) == normalized
+            })
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     fn remove_stale_by_hostname_port(
-        peers: &mut HashMap<String, MeshPeerInfo>,
+        peers: &DashMap<String, MeshPeerInfo>,
         node_id: &str,
         hostname: &str,
         port: u16,
     ) {
         let normalized = Self::normalize_hostname(hostname);
-        if normalized.is_empty() || port == 0 {
-            return;
-        }
-        let stale_ids: Vec<String> = peers
-            .iter()
-            .filter(|(id, _)| id.as_str() != node_id)
-            .filter(|(_, existing)| {
-                !existing.quic_connected
-                    && existing.port == port
-                    && Self::normalize_hostname(&existing.hostname) == normalized
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for id in stale_ids {
+        for id in Self::stale_ids_by_hostname_port(peers, node_id, hostname, port) {
             tracing::info!(
                 old_node_id = %id,
                 new_node_id = %node_id,
@@ -272,22 +289,19 @@ impl MeshPeerStore {
     /// Deduplikacja: jesli istnieje disconnected peer z tym samym adresem+portem,
     /// stary wpis jest usuwany i nowy go zastepuje (host sie zrestartowal z nowym node_id).
     pub fn add_or_update(&self, peer: MeshPeerInfo) {
-        let mut peers = self.peers.write();
-
         // Szukaj disconnected peera z pasujacym adresem+portem (ten sam host, nowy UUID)
         if !peer.addresses.is_empty() && peer.port > 0 {
-            let stale_ids: Vec<String> = peers
+            let stale_ids: Vec<String> = self
+                .peers
                 .iter()
-                .filter(|(id, _)| *id != &peer.node_id)
-                .filter(|(_, existing)| {
-                    !existing.quic_connected
-                        && existing.port == peer.port
-                        && existing
-                            .addresses
-                            .iter()
-                            .any(|a| peer.addresses.contains(a))
+                .filter(|e| *e.key() != peer.node_id)
+                .filter(|e| {
+                    let v = e.value();
+                    !v.quic_connected
+                        && v.port == peer.port
+                        && v.addresses.iter().any(|a| peer.addresses.contains(a))
                 })
-                .map(|(id, _)| id.clone())
+                .map(|e| e.key().clone())
                 .collect();
 
             for id in stale_ids {
@@ -297,52 +311,45 @@ impl MeshPeerStore {
                     port = peer.port,
                     "Usuwanie starego wpisu disconnected peera (ten sam host sie ponownie polaczyl)"
                 );
-                peers.remove(&id);
+                self.peers.remove(&id);
             }
         }
 
-        peers.insert(peer.node_id.clone(), peer);
-        drop(peers);
+        self.peers.insert(peer.node_id.clone(), peer);
         self.mark_dirty();
     }
 
     pub fn set_status(&self, node_id: &str, status: &str) {
-        let mut peers = self.peers.write();
-        let p = peers
+        self.peers
             .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.status = status.to_string();
-        drop(peers);
+            .or_insert_with(|| Self::empty_peer(node_id))
+            .status = status.to_string();
         self.mark_dirty();
     }
 
     pub fn set_quic_connected(&self, node_id: &str, connected: bool) {
-        let mut peers = self.peers.write();
-        let p = peers
+        self.peers
             .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.quic_connected = connected;
-        drop(peers);
+            .or_insert_with(|| Self::empty_peer(node_id))
+            .quic_connected = connected;
         self.mark_dirty();
     }
 
     pub fn is_quic_connected(&self, node_id: &str) -> bool {
         self.peers
-            .read()
             .get(node_id)
             .map(|p| p.quic_connected)
             .unwrap_or(false)
     }
 
     pub fn set_addresses(&self, node_id: &str, addrs: Vec<IpAddr>) {
-        let mut peers = self.peers.write();
-        let p = peers
-            .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        if !addrs.is_empty() {
-            p.addresses = addrs;
+        if addrs.is_empty() {
+            return;
         }
-        drop(peers);
+        self.peers
+            .entry(node_id.to_string())
+            .or_insert_with(|| Self::empty_peer(node_id))
+            .addresses = addrs;
         self.mark_dirty();
     }
 
@@ -353,16 +360,15 @@ impl MeshPeerStore {
         if hostname.is_empty() {
             return;
         }
-        let mut peers = self.peers.write();
         let port = {
-            let p = peers
+            let mut entry = self
+                .peers
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
-            p.hostname = hostname.clone();
-            p.port
+            entry.hostname = hostname.clone();
+            entry.port
         };
-        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
-        drop(peers);
+        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
     }
 
@@ -370,12 +376,10 @@ impl MeshPeerStore {
         if platform.is_empty() {
             return;
         }
-        let mut peers = self.peers.write();
-        let p = peers
+        self.peers
             .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.platform = platform.to_string();
-        drop(peers);
+            .or_insert_with(|| Self::empty_peer(node_id))
+            .platform = platform.to_string();
         self.mark_dirty();
     }
 
@@ -383,54 +387,95 @@ impl MeshPeerStore {
         if os_info.is_empty() {
             return;
         }
-        let mut peers = self.peers.write();
-        let p = peers
+        self.peers
             .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.os_info = os_info.to_string();
-        drop(peers);
+            .or_insert_with(|| Self::empty_peer(node_id))
+            .os_info = os_info.to_string();
         self.mark_dirty();
     }
 
     pub fn remove(&self, node_id: &str) {
-        self.peers.write().remove(node_id);
+        self.peers.remove(node_id);
         self.mark_dirty();
     }
 
-    /// [OPT] Zwraca liste peerow z cache — Arc<Vec> zamiast klonowania calego Vec.
-    /// Cache odbudowywany tylko gdy dane sie zmienily (flaga dirty).
-    /// Przy 1000 peerach i /api/mesh/nodes co 1s: 0 alokacji jesli brak zmian.
+    /// Zwraca liste peerow (klon Vec — API wymaga owned).
+    /// Cache przebudowywany tylko gdy dane sie zmienily (flaga dirty).
     pub fn list(&self) -> Vec<MeshPeerInfo> {
-        // Sprawdz czy cache jest aktualny (atomic load — brak locka)
         if self.dirty.load(Ordering::Acquire) {
             self.rebuild_cache();
         }
-        // Zwroc sklonowany Vec z cache — konieczne bo API wymaga Vec<MeshPeerInfo>
-        // Ale jesli wielu callerow czyta jednoczesnie, lockujemy cache na krotko
-        let cache = self.list_cache.read();
-        (**cache).clone()
+        // ArcSwap::load_full daje Arc<Vec> bez locka; (*).clone() robi jeden
+        // klon vektora. Czytelnicy rownolegli sie nie blokuja.
+        (**self.list_cache.load()).clone()
     }
 
-    /// [OPT] Zwraca Arc<Vec> bez klonowania — dla callerow ktorzy moga uzyc Arc.
-    /// Zero alokacji jesli cache jest aktualny.
+    /// Arc na cache — zero alokacji na ten klon (tanie shared-ownership).
     pub fn list_arc(&self) -> Arc<Vec<MeshPeerInfo>> {
         if self.dirty.load(Ordering::Acquire) {
             self.rebuild_cache();
         }
-        Arc::clone(&self.list_cache.read())
+        self.list_cache.load_full()
     }
 
-    /// [OPT] Odbudowuje cache listy peerow
     fn rebuild_cache(&self) {
-        let peers = self.peers.read();
-        let list: Vec<MeshPeerInfo> = peers.values().cloned().collect();
-        drop(peers);
-        *self.list_cache.write() = Arc::new(list);
+        let list: Vec<MeshPeerInfo> =
+            self.peers.iter().map(|e| e.value().clone()).collect();
+        self.list_cache.store(Arc::new(list));
         self.dirty.store(false, Ordering::Release);
     }
 
     pub fn get(&self, node_id: &str) -> Option<MeshPeerInfo> {
-        self.peers.read().get(node_id).cloned()
+        self.peers.get(node_id).map(|p| p.clone())
+    }
+
+    /// Zwraca tylko hostname — bez klonowania reszty MeshPeerInfo (mnóstwo String/Vec).
+    /// Hot path: publish_mesh_peer_status, diagnostyka.
+    pub fn get_hostname(&self, node_id: &str) -> Option<String> {
+        self.peers.get(node_id).map(|p| p.hostname.clone())
+    }
+
+    /// Buduje KnownPeersPayload entries bezposrednio z mapy — omija klonowanie
+    /// calego Vec<MeshPeerInfo>. Filtruje w locie. Jeden pass, write! zamiast format!
+    /// Wywolywane przy kazdym PeerConnected w handle_peer_connected.
+    pub fn known_peers_snapshot(
+        &self,
+        exclude_a: &str,
+        exclude_b: &str,
+    ) -> Vec<tentaflow_protocol::mesh::KnownPeerEntry> {
+        let mut out = Vec::with_capacity(self.peers.len().saturating_sub(2));
+        for entry in self.peers.iter() {
+            let p = entry.value();
+            if p.node_id == exclude_a || p.node_id == exclude_b {
+                continue;
+            }
+            if !p.quic_connected || p.addresses.is_empty() {
+                continue;
+            }
+            let direct_addrs: Vec<String> = p
+                .addresses
+                .iter()
+                .map(|ip| format!("{}:{}", ip, p.port))
+                .collect();
+            out.push(tentaflow_protocol::mesh::KnownPeerEntry {
+                node_id: p.node_id.clone(),
+                hostname: p.hostname.clone(),
+                direct_addrs,
+                port: p.port,
+            });
+        }
+        out
+    }
+
+    /// Snapshot hostname + addresses + port — dla persystencji trusted contact
+    /// hints. Omija klonowanie pozostalych ~20 pol MeshPeerInfo.
+    pub fn contact_snapshot(
+        &self,
+        node_id: &str,
+    ) -> Option<(String, Vec<std::net::IpAddr>, u16)> {
+        self.peers
+            .get(node_id)
+            .map(|p| (p.hostname.clone(), p.addresses.clone(), p.port))
     }
 
     /// Aktualizuje dane systemowe peera po otrzymaniu NodeInfo przez QUIC.
@@ -442,35 +487,30 @@ impl MeshPeerStore {
         if hostname.is_empty() {
             return;
         }
-        let mut peers = self.peers.write();
-        let port = if let Some(p) = peers.get_mut(node_id) {
+        let port = if let Some(mut p) = self.peers.get_mut(node_id) {
             p.hostname = hostname.clone();
             p.port
         } else {
-            0
+            return;
         };
-        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
-        drop(peers);
+        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
     }
 
     pub fn update_node_info(&self, node_id: &str, info: &NodeInfo) {
-        let mut peers = self.peers.write();
         let (hostname, port) = {
-            let p = peers
+            let mut entry = self
+                .peers
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
-            p.hostname = Self::normalize_hostname(&info.hostname);
-            p.os_info = info.os_info.clone();
-            p.cpu_count = info.cpu_count;
-            p.ram_total_mb = info.ram_total_mb;
-            p.gpu_info = info.gpu_info.clone();
-            (p.hostname.clone(), p.port)
+            entry.hostname = Self::normalize_hostname(&info.hostname);
+            entry.os_info = info.os_info.clone();
+            entry.cpu_count = info.cpu_count;
+            entry.ram_total_mb = info.ram_total_mb;
+            entry.gpu_info = info.gpu_info.clone();
+            (entry.hostname.clone(), entry.port)
         };
-
-        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
-
-        drop(peers);
+        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
     }
 
@@ -490,24 +530,24 @@ impl MeshPeerStore {
         active_requests: u32,
         tokens_per_sec: f32,
     ) {
-        let mut peers = self.peers.write();
-        let p = peers
+        let mut entry = self
+            .peers
             .entry(node_id.to_string())
             .or_insert_with(|| Self::empty_peer(node_id));
-        p.cpu_usage_percent = cpu_usage;
-        p.ram_used_mb = ram_used;
-        p.gpu_info = gpus;
-        p.containers = containers;
-        p.networks = networks;
-        p.cpu_temperature_c = cpu_temperature_c;
-        p.swap_total_mb = swap_total_mb;
-        p.swap_used_mb = swap_used_mb;
-        p.active_requests = active_requests;
-        p.tokens_per_sec = tokens_per_sec;
+        entry.cpu_usage_percent = cpu_usage;
+        entry.ram_used_mb = ram_used;
+        entry.gpu_info = gpus;
+        entry.containers = containers;
+        entry.networks = networks;
+        entry.cpu_temperature_c = cpu_temperature_c;
+        entry.swap_total_mb = swap_total_mb;
+        entry.swap_used_mb = swap_used_mb;
+        entry.active_requests = active_requests;
+        entry.tokens_per_sec = tokens_per_sec;
         if !platform.is_empty() {
-            p.platform = platform;
+            entry.platform = platform;
         }
-        drop(peers);
+        drop(entry);
         self.mark_dirty();
     }
 
@@ -527,9 +567,9 @@ impl MeshPeerStore {
         docker_available: bool,
         docker_version: String,
     ) {
-        let mut peers = self.peers.write();
         let (hostname, port) = {
-            let entry = peers
+            let mut entry = self
+                .peers
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
             entry.hostname = Self::normalize_hostname(&hostname);
@@ -541,29 +581,24 @@ impl MeshPeerStore {
             entry.addresses = addresses;
             entry.docker_available = docker_available;
             entry.docker_version = docker_version;
-            entry.role = if entry.role.is_empty() {
-                "router".to_string()
-            } else {
-                entry.role.clone()
-            };
+            if entry.role.is_empty() {
+                entry.role = "router".to_string();
+            }
             entry.status = "connected".to_string();
             entry.quic_connected = true;
             (entry.hostname.clone(), entry.port)
         };
-        Self::remove_stale_by_hostname_port(&mut peers, node_id, &hostname, port);
-        drop(peers);
+        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
         self.mark_dirty();
     }
 
     /// Aktualizuje liste modeli propagowanych przez ModelsSync. Nadpisuje
     /// calkowicie — peer jest zrodlem prawdy dla swoich modeli.
     pub fn update_models(&self, node_id: &str, models: Vec<PeerModelInfo>) {
-        let mut peers = self.peers.write();
-        let p = peers
+        self.peers
             .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.models = models;
-        drop(peers);
+            .or_insert_with(|| Self::empty_peer(node_id))
+            .models = models;
         self.mark_dirty();
     }
 
@@ -577,40 +612,63 @@ impl MeshPeerStore {
         docker_version: String,
         os_info: String,
     ) {
-        let mut peers = self.peers.write();
-        let p = peers
-            .entry(node_id.to_string())
-            .or_insert_with(|| Self::empty_peer(node_id));
-        p.addresses = addresses;
-        p.docker_available = docker_available;
-        p.docker_version = docker_version;
-        if !os_info.is_empty() {
-            p.os_info = os_info;
+        {
+            let mut entry = self
+                .peers
+                .entry(node_id.to_string())
+                .or_insert_with(|| Self::empty_peer(node_id));
+            entry.addresses = addresses;
+            entry.docker_available = docker_available;
+            entry.docker_version = docker_version;
+            if !os_info.is_empty() {
+                entry.os_info = os_info;
+            }
         }
-        drop(peers);
         self.mark_dirty();
     }
 
     /// Aktualizuje topologie mesh — zapisuje liste bezposrednich peerow danego noda
     pub fn update_topology(&self, node_id: &str, connected_peers: Vec<String>) {
-        self.topology
-            .write()
-            .insert(node_id.to_string(), connected_peers);
+        self.topology.insert(node_id.to_string(), connected_peers);
     }
 
     /// Zwraca kopie calej topologii mesh
     pub fn get_topology(&self) -> HashMap<String, Vec<String>> {
-        self.topology.read().clone()
+        self.topology
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
     }
 
-    /// Pobierz routing entry dla noda — None jesli nieosiagalny
+    /// Pobierz routing entry dla noda — None jesli nieosiagalny.
+    /// Zero-lock: ArcSwap::load daje Guard bez mutex'a.
     pub fn get_route(&self, node_id: &str) -> Option<RoutingEntry> {
-        self.routing_table.read().get(node_id).cloned()
+        self.routing_table.load().get(node_id).cloned()
     }
 
-    /// Przelicz tabele routingu z topologii (BFS od local_node_id, max 4 hopy)
+    /// Oznacza routing_table jako wymagajacy przeliczenia. Handlery tylko wolaja
+    /// ten no-op zamiast pelnego BFS — periodyczny task robi faktyczna robote.
+    pub fn mark_routes_dirty(&self) {
+        self.routes_dirty.store(true, Ordering::Release);
+    }
+
+    /// Periodyczny tick: jesli flag dirty ustawiony, wykonaj BFS. Idempotentne —
+    /// zwraca od razu gdy nic sie nie zmienilo. Zaprojektowane do wolania z
+    /// jednego taska w tle (nie trzeba synchronizacji miedzy wieloma).
+    pub fn maybe_recalculate_routes(&self, local_node_id: &str) {
+        if self.routes_dirty.swap(false, Ordering::AcqRel) {
+            self.recalculate_routes(local_node_id);
+        }
+    }
+
+    /// Przelicz tabele routingu z topologii (BFS od local_node_id, max 4 hopy).
+    /// Buduje nowa HashMap poza locka, publikuje atomowo przez ArcSwap.
     pub fn recalculate_routes(&self, local_node_id: &str) {
-        let topology = self.topology.read().clone();
+        let topology: HashMap<String, Vec<String>> = self
+            .topology
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
         let mut routes: HashMap<String, RoutingEntry> = HashMap::new();
 
         // BFS od lokalnego noda
@@ -660,12 +718,12 @@ impl MeshPeerStore {
             }
         }
 
-        *self.routing_table.write() = routes;
+        self.routing_table.store(Arc::new(routes));
     }
 
-    /// Pelna tabela routingu (do debugowania/API)
+    /// Pelna tabela routingu (do debugowania/API). Zero-lock read.
     pub fn get_routing_table(&self) -> HashMap<String, RoutingEntry> {
-        self.routing_table.read().clone()
+        (**self.routing_table.load()).clone()
     }
 
     /// Upsert minimalnego wpisu peera z TopologyAnnounce — tworzy `MeshPeerInfo`
@@ -680,10 +738,10 @@ impl MeshPeerStore {
         addresses: Vec<std::net::IpAddr>,
         port: u16,
     ) {
-        let mut peers = self.peers.write();
         let hostname = Self::normalize_hostname(hostname);
         let (dedupe_hostname, dedupe_port) = {
-            let entry = peers
+            let mut entry = self
+                .peers
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
             if !hostname.is_empty() && entry.hostname.is_empty() {
@@ -706,8 +764,7 @@ impl MeshPeerStore {
             }
             (entry.hostname.clone(), entry.port)
         };
-        Self::remove_stale_by_hostname_port(&mut peers, node_id, &dedupe_hostname, dedupe_port);
-        drop(peers);
+        Self::remove_stale_by_hostname_port(&self.peers, node_id, &dedupe_hostname, dedupe_port);
         self.mark_dirty();
     }
 

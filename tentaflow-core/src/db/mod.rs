@@ -52,14 +52,20 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
 
     let conn = Connection::open(db_path)?;
 
-    // Pragmy wydajnosciowe SQLite
+    // Pragmy wydajnosciowe SQLite. cache_size=-65536 (64MB) dla high-throughput
+    // mesh_topology upsertow i per-request metryk. busy_timeout=5000 — pod mesh
+    // gossip burstem writery z roznych taskow moga kolidowac; bez timeoutu SQLITE_BUSY
+    // wraca natychmiast. wal_autocheckpoint=2000 (8MB) — checkpoint rzadziej,
+    // mniej fsync na tick.
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;\
          PRAGMA foreign_keys=ON;\
          PRAGMA synchronous=NORMAL;\
-         PRAGMA cache_size=-8000;\
+         PRAGMA cache_size=-65536;\
          PRAGMA mmap_size=268435456;\
-         PRAGMA temp_store=MEMORY;",
+         PRAGMA temp_store=MEMORY;\
+         PRAGMA busy_timeout=5000;\
+         PRAGMA wal_autocheckpoint=2000;",
     )?;
 
     // Uruchom migracje

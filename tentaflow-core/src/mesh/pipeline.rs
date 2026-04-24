@@ -446,6 +446,239 @@ fn trusted_contact_hints_for_peer(
     load_trusted_contact_hints(&security.db, node_id).ok().flatten()
 }
 
+/// [SCALE] Handler PeerConnected wywolywany w tokio::spawn z per-peer lockiem
+/// w event loopie mesh. Debounce 150ms + send Hello/KnownPeers/NodeInfo +
+/// TrustedKeysSync. 100 peerow na raz daje ~150ms total zamiast 100*150ms
+/// sekwencyjnie.
+async fn handle_peer_connected(
+    node_id: String,
+    peer_store: MeshPeerStore,
+    qm_events: Arc<IrohMeshManager>,
+    local_node_info: NodeInfo,
+    local_node_id: String,
+    mesh_security: Option<Arc<MeshSecurity>>,
+    last_sync_sent: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    sync_cooldown_secs: u64,
+) {
+    // Tie-break potrzebuje czasu zeby sie ustabilizowac. 150ms debounce.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    if !qm_events.is_connected(&node_id).await {
+        debug!(
+            peer_id = %node_id,
+            "QUIC peer — PeerConnected zniwelowane przez tie-break w ciagu 150ms"
+        );
+        peer_store.set_quic_connected(&node_id, false);
+        peer_store.set_status(&node_id, "disconnected");
+        return;
+    }
+    info!(peer_id = %node_id, "QUIC peer polaczony");
+
+    // Cache is_trusted raz — unikamy 3x DashMap lookup w dalszej czesci handlera.
+    let is_trusted = match &mesh_security {
+        Some(sec) => sec.is_trusted(&node_id),
+        None => false,
+    };
+
+    // Emit event do GUI — toast "peer connected" + refresh mesh view.
+    let hostname_ev = peer_store.get_hostname(&node_id).unwrap_or_default();
+    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
+        &node_id,
+        &hostname_ev,
+        "online",
+        "",
+    );
+
+    // Wyslij minimalne Hello (hostname + platform) niezaleznie od trust.
+    let hello = tentaflow_protocol::mesh::MeshHelloPayload {
+        hostname: local_node_info.hostname.clone(),
+        platform: node_info_collector::detect_platform(),
+        os_info: local_node_info.os_info.clone(),
+    };
+    if let Ok(hello_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&hello) {
+        if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
+            warn!("Blad wysylania Hello do {}: {}", node_id, e);
+        }
+    }
+
+    // KnownPeers — pozwala peerowi polaczyc sie z sasiadami bez mDNS.
+    // known_peers_snapshot omija klonowanie Vec<MeshPeerInfo> — single-pass po DashMap,
+    // wyciagamy 4 pola zamiast ~20. Przy 1000 peerow ~95% mniej alokacji.
+    let known = peer_store.known_peers_snapshot(&node_id, &local_node_id);
+    if !known.is_empty() {
+        let payload = tentaflow_protocol::mesh::KnownPeersPayload { peers: known };
+        if let Ok(kp_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
+            if let Err(e) = qm_events.send_known_peers(&node_id, &kp_bytes).await {
+                debug!("Blad wysylania KnownPeers do {}: {}", node_id, e);
+            }
+        }
+    }
+
+    // NodeInfo + TrustedKeysSync — TYLKO do zaufanych (is_trusted scache'owany powyzej).
+    if is_trusted {
+        if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_node_info) {
+            if let Err(e) = qm_events.send_node_info(&node_id, &info_bytes).await {
+                warn!("Blad wysylania NodeInfo do {}: {}", node_id, e);
+            }
+        }
+
+        if let Some(ref sec) = mesh_security {
+            let should_sync = last_sync_sent.get(&node_id).map_or(true, |t| {
+                t.elapsed() >= std::time::Duration::from_secs(sync_cooldown_secs)
+            });
+
+            if should_sync {
+                let all_keys = sec.get_all_trusted_keys();
+                if !all_keys.is_empty() {
+                    let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
+                        .iter()
+                        .map(|(nid, pk)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                            node_id: nid.clone(),
+                            public_key_hex: pk.clone(),
+                        })
+                        .collect();
+                    let payload =
+                        tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
+                    if let Ok(sync_data) =
+                        rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
+                    {
+                        if let Err(e) =
+                            qm_events.send_trusted_keys_sync(&node_id, &sync_data).await
+                        {
+                            warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
+                        }
+                    }
+                }
+
+                // Revoked node sync.
+                let revoked = sec.get_revoked_node_ids();
+                for revoked_id in &revoked {
+                    let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
+                        revoked_node_id: revoked_id.clone(),
+                        from_node_id: local_node_id.clone(),
+                    };
+                    if let Ok(data) =
+                        rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
+                    {
+                        let _ = qm_events
+                            .send_to_peer(
+                                &node_id,
+                                tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
+                                &data,
+                            )
+                            .await;
+                    }
+                }
+
+                last_sync_sent.insert(node_id.clone(), std::time::Instant::now());
+            }
+        }
+    } else {
+        debug!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
+    }
+
+    // Persist adresy trusted peera do DB (is_trusted scache'owany na poczatku handlera).
+    if is_trusted {
+        if let Some(ref sec) = mesh_security {
+            if let Some((hostname, addresses, port)) = peer_store.contact_snapshot(&node_id) {
+                if !addresses.is_empty() && port > 0 {
+                    let direct_addresses: Vec<String> = addresses
+                        .iter()
+                        .map(|ip| format!("{}:{}", ip, port))
+                        .collect();
+                    let addr_str = direct_addresses.join(",");
+                    let _ = crate::db::repository::update_trusted_node_addresses(
+                        &sec.db, &node_id, &addr_str,
+                    );
+                    let relay_url = qm_events
+                        .relay_url()
+                        .map(|url| url.to_string())
+                        .unwrap_or_default();
+                    let current = load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
+                    let hints = merge_contact_hints(
+                        current,
+                        PairingContactHints {
+                            node_id: node_id.clone(),
+                            public_key_hex: String::new(),
+                            hostname,
+                            addresses: direct_addresses,
+                            relay_url,
+                        },
+                    );
+                    let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
+                }
+            }
+        }
+    }
+
+    // Znacz routing do przeliczenia — heartbeat tick (co ~5s) zrobi BFS.
+    peer_store.mark_routes_dirty();
+}
+
+/// [SCALE] Handler PeerDisconnected wywolywany w tokio::spawn z per-peer
+/// lockiem. Debounce 150ms + emit event + auto-reconnect dla trusted.
+async fn handle_peer_disconnected(
+    node_id: String,
+    peer_store: MeshPeerStore,
+    qm_events: Arc<IrohMeshManager>,
+    mesh_security: Option<Arc<MeshSecurity>>,
+    last_sync_sent: Arc<dashmap::DashMap<String, std::time::Instant>>,
+) {
+    // Po disconnect czyscimy cooldown — przy reconnecie od razu zsynchronizujemy klucze.
+    last_sync_sent.remove(&node_id);
+    // Debounce: tie-break swap moze podstawic inna sciezke w <150ms.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    if qm_events.is_connected(&node_id).await {
+        debug!(
+            peer_id = %node_id,
+            "QUIC peer — PeerDisconnected zniwelowane przez natychmiastowy reconnect (tie-break swap)"
+        );
+        return;
+    }
+    peer_store.set_quic_connected(&node_id, false);
+    peer_store.set_status(&node_id, "disconnected");
+    peer_store.clear_heartbeat(&node_id);
+    info!(peer_id = %node_id, "QUIC peer rozlaczony");
+
+    let hostname = peer_store.get_hostname(&node_id).unwrap_or_default();
+    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
+        &node_id,
+        &hostname,
+        "offline",
+        "QUIC disconnect",
+    );
+
+    peer_store.mark_routes_dirty();
+
+    // Auto-reconnect dla trusted peerow.
+    let should_reconnect = match &mesh_security {
+        Some(sec) => sec.is_trusted(&node_id),
+        None => false,
+    };
+    if should_reconnect {
+        if let Some(ref sec) = mesh_security {
+            let qm2 = qm_events.clone();
+            let node_id2 = node_id.clone();
+            let hints = trusted_contact_hints_for_peer(sec.as_ref(), &node_id);
+            tokio::spawn(async move {
+                if let Some(hints) = hints {
+                    if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
+                        debug!(
+                            peer_id = %node_id2,
+                            "Reconnect after disconnect via trusted hints: {}",
+                            e
+                        );
+                    }
+                } else {
+                    let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+                    if let Err(e) = qm2.connect_to_peer(&node_id2, dummy).await {
+                        debug!(peer_id = %node_id2, "Reconnect after disconnect: {}", e);
+                    }
+                }
+            });
+        }
+    }
+}
+
 // =============================================================================
 // Wewnetrzne taski mesh pipeline
 // =============================================================================
@@ -461,9 +694,40 @@ fn spawn_quic_event_handler(
     let qm_events = quic_mesh.clone();
     let mut event_rx = quic_mesh.subscribe();
 
+    // [SCALE] last_sync_sent wspoldzielony Arc<DashMap> — debouncowany
+    // handler PeerConnected wyrzucony do tokio::spawn potrzebuje dostepu
+    // z roznych taskow.
+    let last_sync_sent: Arc<dashmap::DashMap<String, std::time::Instant>> =
+        Arc::new(dashmap::DashMap::new());
+    // Per-peer lock dla serializacji PeerConnected/Disconnected eventow
+    // dla TEGO SAMEGO peera. Miedzy roznymi peerami zero kontencji.
+    let peer_event_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+        Arc::new(dashmap::DashMap::new());
+
+    // [SCALE] GC task: co 60s sprzata mapy od entries dla peerow ktorzy znikli.
+    // Bez tego mapa rosnie monotonicznie przez caly czas uptime (1 entry per
+    // unikalny node_id jaki kiedykolwiek widzielismy).
+    {
+        let locks_gc = peer_event_locks.clone();
+        let sync_gc = last_sync_sent.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // pierwszy tick natychmiast — pomin
+            loop {
+                tick.tick().await;
+                // Lock entry usuwamy gdy tylko mapa go trzyma (zaden handler
+                // nie ma clone'a Arc) — strong_count == 1. Jesli wciaz ktos
+                // pracuje, zostaje.
+                locks_gc.retain(|_, arc| Arc::strong_count(arc) > 1);
+                // last_sync_sent: wyrzuc wpisy starsze niz 10min — po takiej
+                // ciszy peer i tak potrzebuje ponownego full-sync.
+                let cutoff = std::time::Duration::from_secs(600);
+                sync_gc.retain(|_, t| t.elapsed() < cutoff);
+            }
+        });
+    }
+
     tokio::spawn(async move {
-        let mut last_sync_sent: std::collections::HashMap<String, std::time::Instant> =
-            std::collections::HashMap::new();
         const SYNC_COOLDOWN_SECS: u64 = 30;
 
         // Dedup cache dla TopologyAnnounce — klucz (origin_node_id, epoch).
@@ -620,8 +884,21 @@ fn spawn_quic_event_handler(
                         topo_seen.pop_front();
                     }
 
+                    // Batch DB upsertow: cala TopologyAnnounce w jednej transakcji
+                    // zamiast N osobnych COMMITow (N*fsync pod gossip burstem).
+                    // Trzymamy tylko owned Stringi dla pol ktore sa SERIALIZOWANE
+                    // (services_json, models_json); pozostale pola UpsertEntry
+                    // borrow'uja bezposrednio z payload.entries — brak klonowania
+                    // node_id/hostname/platform/os_info/connected_to/direct_addrs.
+                    type TopoRow = (usize, String, String); // (entry_idx, services_json, models_json)
+                    let mut topo_batch: Vec<TopoRow> = Vec::new();
+                    let batch_now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+
                     // Aktualizuj peer_store + topologie dla kazdego wpisu
-                    for entry in &payload.entries {
+                    for (entry_idx, entry) in payload.entries.iter().enumerate() {
                         if entry.node_id == local_node_id {
                             continue;
                         }
@@ -693,58 +970,46 @@ fn spawn_quic_event_handler(
                                 .update_remote(&entry.node_id, services);
                         }
                         // Persystuj snapshot do DB — bootstrap po restarcie.
-                        if let Some(ref pool) = db_pool {
-                            let services_json = serde_json::to_string(
-                                &entry
-                                    .services
+                        // Serializujemy bezposrednio Vec<ServiceSummary>/<ModelSummary>
+                        // (derive SerdeSerialize) — omija intermediate serde_json::Value tree.
+                        if db_pool.is_some() {
+                            let services_json = serde_json::to_string(&entry.services)
+                                .unwrap_or_else(|_| "[]".to_string());
+                            let models_json = serde_json::to_string(&entry.models)
+                                .unwrap_or_else(|_| "[]".to_string());
+                            topo_batch.push((entry_idx, services_json, models_json));
+                        }
+                    }
+                    if let Some(ref pool) = db_pool {
+                        if !topo_batch.is_empty() {
+                            let entries: Vec<crate::db::repository::mesh_topology::UpsertEntry> =
+                                topo_batch
                                     .iter()
-                                    .map(|s| {
-                                        serde_json::json!({
-                                            "name": s.name,
-                                            "service_type": s.service_type,
-                                            "ready": s.ready,
-                                        })
+                                    .map(|(idx, sj, mj)| {
+                                        let e = &payload.entries[*idx];
+                                        crate::db::repository::mesh_topology::UpsertEntry {
+                                            node_id: &e.node_id,
+                                            hostname: &e.hostname,
+                                            platform: &e.platform,
+                                            os_info: &e.os_info,
+                                            connected_to: &e.connected_to,
+                                            direct_addrs: &e.direct_addrs,
+                                            port: e.port,
+                                            services_json: sj,
+                                            models_json: mj,
+                                            epoch: payload.epoch,
+                                            now_ms: batch_now_ms,
+                                        }
                                     })
-                                    .collect::<Vec<_>>(),
-                            )
-                            .unwrap_or_else(|_| "[]".to_string());
-                            let models_json = serde_json::to_string(
-                                &entry
-                                    .models
-                                    .iter()
-                                    .map(|m| {
-                                        serde_json::json!({
-                                            "alias": m.alias,
-                                            "backend": m.backend,
-                                            "loaded": m.loaded,
-                                        })
-                                    })
-                                    .collect::<Vec<_>>(),
-                            )
-                            .unwrap_or_else(|_| "[]".to_string());
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0);
-                            if let Err(e) = crate::db::repository::mesh_topology::upsert(
-                                pool,
-                                &entry.node_id,
-                                &entry.hostname,
-                                &entry.platform,
-                                &entry.os_info,
-                                &entry.connected_to,
-                                &entry.direct_addrs,
-                                entry.port,
-                                &services_json,
-                                &models_json,
-                                payload.epoch,
-                                now_ms,
-                            ) {
-                                debug!(node = %entry.node_id, "mesh_topology upsert: {}", e);
+                                    .collect();
+                            if let Err(e) =
+                                crate::db::repository::mesh_topology::upsert_batch(pool, &entries)
+                            {
+                                debug!("mesh_topology batch upsert: {}", e);
                             }
                         }
                     }
-                    peer_store.recalculate_routes(&local_node_id);
+                    peer_store.mark_routes_dirty();
 
                     // Auto-dial fallback: jesli gossip anonsuje trusted peera ktorego
                     // mDNS/DHT nie zlapal (2 nody na LAN nie widza sie przez multicast),
@@ -865,207 +1130,38 @@ fn spawn_quic_event_handler(
                         continue;
                     }
 
-                    // Tie-break pomiedzy inicjatorem i akceptatorem potrzebuje czasu
-                    // zeby sie ustabilizowac — iroh na obu stronach przy
-                    // rownoleglym dialingu tworzy multiple Connection objektow
-                    // (direct + relay + multi-relay). Jesli natychmiast wyslemy
-                    // Hello, trafia na 'closed by peer: tie-break-loser' bo peer
-                    // juz wybral innego zwyciezce. Dajemy 150ms na zbiegniecie
-                    // stanu, potem re-check czy ta sciezka przezyla — jesli nie,
-                    // cicho wychodzimy, poczekamy na nastepny PeerConnected
-                    // (ten zwycieski).
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                    if !qm_events.is_connected(&node_id).await {
-                        debug!(
-                            peer_id = %node_id,
-                            "QUIC peer — PeerConnected zniwelowane przez tie-break w ciagu 150ms"
-                        );
-                        // Reset peer_store do stanu przed debounce: jeszcze nie
-                        // bylismy polaczeni (peer_store.set_quic_connected(true)
-                        // wczesniej byl optymistyczny).
-                        peer_store.set_quic_connected(&node_id, false);
-                        peer_store.set_status(&node_id, "disconnected");
-                        continue;
-                    }
-                    info!(peer_id = %node_id, "QUIC peer polaczony");
-
-                    // Emit event do GUI — toast "peer connected" + refresh mesh view.
-                    let hostname_ev = peer_store
-                        .get(&node_id)
-                        .map(|p| p.hostname)
-                        .unwrap_or_default();
-                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
-                        &node_id,
-                        &hostname_ev,
-                        "online",
-                        "",
-                    );
-
-                    // Wyslij minimalne Hello (hostname + platform) niezaleznie od trust —
-                    // GUI potrzebuje rozpoznawalnej nazwy na karcie discovered przed
-                    // zakonczeniem pairingu. To tylko info identyfikujace, bez metryk.
-                    let hello = tentaflow_protocol::mesh::MeshHelloPayload {
-                        hostname: local_node_info.hostname.clone(),
-                        platform: node_info_collector::detect_platform(),
-                        os_info: local_node_info.os_info.clone(),
-                    };
-                    if let Ok(hello_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&hello) {
-                        if let Err(e) = qm_events.send_hello(&node_id, &hello_bytes).await {
-                            warn!("Blad wysylania Hello do {}: {}", node_id, e);
-                        }
-                    }
-
-                    // Wyslij KnownPeers — liste wszystkich aktualnie polaczonych peerow,
-                    // zeby nowy peer mogl sie z nimi polaczyc bez mDNS (ratuje scenariusz
-                    // enterprise VLAN z zablokowanym inter-client multicast).
-                    let known: Vec<tentaflow_protocol::mesh::KnownPeerEntry> = peer_store
-                        .list()
-                        .into_iter()
-                        .filter(|p| p.node_id != node_id && p.node_id != local_node_id)
-                        .filter(|p| p.quic_connected && !p.addresses.is_empty())
-                        .map(|p| tentaflow_protocol::mesh::KnownPeerEntry {
-                            node_id: p.node_id.clone(),
-                            hostname: p.hostname.clone(),
-                            direct_addrs: p
-                                .addresses
-                                .iter()
-                                .map(|ip| format!("{}:{}", ip, p.port))
-                                .collect(),
-                            port: p.port,
-                        })
-                        .collect();
-                    if !known.is_empty() {
-                        let payload = tentaflow_protocol::mesh::KnownPeersPayload { peers: known };
-                        if let Ok(kp_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
-                            if let Err(e) = qm_events.send_known_peers(&node_id, &kp_bytes).await {
-                                debug!("Blad wysylania KnownPeers do {}: {}", node_id, e);
-                            }
-                        }
-                    }
-
-                    // Wyslij swoje NodeInfo do nowego peera — TYLKO jesli zaufany
-                    let should_send = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&node_id),
-                        None => false, // Zero trust — bez MeshSecurity nie wysylaj danych
-                    };
-                    if should_send {
-                        if let Ok(info_bytes) =
-                            rkyv::to_bytes::<rkyv::rancor::Error>(&local_node_info)
-                        {
-                            if let Err(e) = qm_events.send_node_info(&node_id, &info_bytes).await {
-                                warn!("Blad wysylania NodeInfo do {}: {}", node_id, e);
-                            }
-                        }
-
-                        // Synchronizacja zaufanych kluczy przy reconnect (z cooldownem)
-                        if let Some(ref sec) = mesh_security {
-                            let should_sync = last_sync_sent.get(&node_id).map_or(true, |t| {
-                                t.elapsed() >= std::time::Duration::from_secs(SYNC_COOLDOWN_SECS)
-                            });
-
-                            if should_sync {
-                                let all_keys = sec.get_all_trusted_keys();
-                                if !all_keys.is_empty() {
-                                    let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> =
-                                        all_keys
-                                            .iter()
-                                            .map(|(nid, pk)| {
-                                                tentaflow_protocol::mesh::TrustedKeyEntry {
-                                                    node_id: nid.clone(),
-                                                    public_key_hex: pk.clone(),
-                                                }
-                                            })
-                                            .collect();
-                                    let payload =
-                                        tentaflow_protocol::mesh::TrustedKeysSyncPayload {
-                                            keys: entries,
-                                        };
-                                    if let Ok(sync_data) =
-                                        rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                                            .map(|v| v.to_vec())
-                                    {
-                                        if let Err(e) = qm_events
-                                            .send_trusted_keys_sync(&node_id, &sync_data)
-                                            .await
-                                        {
-                                            warn!(
-                                                "Blad wysylania TrustedKeysSync do {}: {}",
-                                                node_id, e
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Wyslij revokowane nody — peer moze nie wiedziec o revoke jesli byl offline
-                                let revoked = sec.get_revoked_node_ids();
-                                for revoked_id in &revoked {
-                                    let payload = tentaflow_protocol::mesh::TrustRevokedPayload {
-                                        revoked_node_id: revoked_id.clone(),
-                                        from_node_id: local_node_id.clone(),
-                                    };
-                                    if let Ok(data) =
-                                        rkyv::to_bytes::<rkyv::rancor::Error>(&payload)
-                                            .map(|v| v.to_vec())
-                                    {
-                                        let _ = qm_events
-                                            .send_to_peer(
-                                                &node_id,
-                                                tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
-                                                &data,
-                                            )
-                                            .await;
-                                    }
-                                }
-
-                                last_sync_sent.insert(node_id.clone(), std::time::Instant::now());
-                            }
-                        }
-                    } else {
-                        debug!(peer_id = %node_id, "Peer niezaufany — pomijam wysylanie NodeInfo");
-                    }
-
-                    // Persist adresy trusted peera do DB (do reconnectu po restarcie)
-                    if let Some(ref sec) = mesh_security {
-                        if sec.is_trusted(&node_id) {
-                            if let Some(peer_info) = peer_store.get(&node_id) {
-                                let direct_addresses = if !peer_info.addresses.is_empty() && peer_info.port > 0 {
-                                    peer_info
-                                        .addresses
-                                        .iter()
-                                        .map(|ip| format!("{}:{}", ip, peer_info.port))
-                                        .collect::<Vec<_>>()
-                                } else {
-                                    Vec::new()
-                                };
-                                if !peer_info.addresses.is_empty() && peer_info.port > 0 {
-                                    let addr_str = direct_addresses.join(",");
-                                    let _ = crate::db::repository::update_trusted_node_addresses(
-                                        &sec.db, &node_id, &addr_str,
-                                    );
-                                }
-                                let relay_url = qm_events
-                                    .relay_url()
-                                    .map(|url| url.to_string())
-                                    .unwrap_or_default();
-                                let current =
-                                    load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
-                                let hints = merge_contact_hints(
-                                    current,
-                                    PairingContactHints {
-                                        node_id: node_id.clone(),
-                                        public_key_hex: String::new(),
-                                        hostname: peer_info.hostname.clone(),
-                                        addresses: direct_addresses,
-                                        relay_url,
-                                    },
-                                );
-                                let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
-                            }
-                        }
-                    }
-
-                    // Przelicz routing po polaczeniu nowego peera
-                    peer_store.recalculate_routes(&local_node_id);
+                    // [SCALE] Debounce + full handler body przeniesione do
+                    // spawnowanego taska. Glowny event loop nie blokuje na
+                    // 150ms sleep'ie. Per-peer lock (peer_event_locks) zapewnia
+                    // ze Connected/Disconnected dla TEGO SAMEGO peera sa
+                    // serializowane, ale miedzy roznymi peerami pelna
+                    // rownoleglosc — 100 peerow wchodzacych rownoczesnie daje
+                    // ~150ms total, nie 100*150ms sekwencyjnie.
+                    let peer_lock = peer_event_locks
+                        .entry(node_id.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                        .clone();
+                    let peer_store_c = peer_store.clone();
+                    let qm_events_c = qm_events.clone();
+                    let local_node_info_c = local_node_info.clone();
+                    let local_node_id_c = local_node_id.clone();
+                    let mesh_security_c = mesh_security.clone();
+                    let last_sync_sent_c = last_sync_sent.clone();
+                    tokio::spawn(async move {
+                        let _guard = peer_lock.lock().await;
+                        handle_peer_connected(
+                            node_id,
+                            peer_store_c,
+                            qm_events_c,
+                            local_node_info_c,
+                            local_node_id_c,
+                            mesh_security_c,
+                            last_sync_sent_c,
+                            SYNC_COOLDOWN_SECS,
+                        )
+                        .await;
+                    });
+                    continue;
                 }
                 Ok(IrohMeshEvent::PeerDisconnected { node_id }) => {
                     // Dedup — iroh multi-path moze emitowac kilka disconnect dla tego
@@ -1076,67 +1172,28 @@ fn spawn_quic_event_handler(
                         continue;
                     }
 
-                    // Debounce: iroh moze zamknac pojedyncza sciezke (tie-break
-                    // loser) ale rownoczesnie inna sciezka do tego samego peera
-                    // moze byc aktywna albo zaraz sie otworzyc. Dajemy 150ms
-                    // okno — jesli po nim wciaz jest rozlaczone, uznajemy
-                    // offline. Inaczej byl to flap i peer dalej zyje.
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                    if qm_events.is_connected(&node_id).await {
-                        debug!(
-                            peer_id = %node_id,
-                            "QUIC peer — PeerDisconnected zniwelowane przez natychmiastowy reconnect (tie-break swap)"
-                        );
-                        continue;
-                    }
-                    peer_store.set_quic_connected(&node_id, false);
-                    peer_store.set_status(&node_id, "disconnected");
-                    peer_store.clear_heartbeat(&node_id);
-                    info!(peer_id = %node_id, "QUIC peer rozlaczony");
-
-                    // Emituj event do GUI — pokazuje toast + odswieza karty mesh.
-                    let hostname = peer_store
-                        .get(&node_id)
-                        .map(|p| p.hostname)
-                        .unwrap_or_default();
-                    crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
-                        &node_id,
-                        &hostname,
-                        "offline",
-                        "QUIC disconnect",
-                    );
-
-                    // Przelicz routing po rozlaczeniu peera
-                    peer_store.recalculate_routes(&local_node_id);
-
-                    // Auto-reconnect dla trusted peerow
-                    let should_reconnect = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&node_id),
-                        None => false,
-                    };
-                    if should_reconnect {
-                        if let Some(ref sec) = mesh_security {
-                            let qm2 = qm_events.clone();
-                            let node_id2 = node_id.clone();
-                            let hints = trusted_contact_hints_for_peer(sec.as_ref(), &node_id);
-                            tokio::spawn(async move {
-                                if let Some(hints) = hints {
-                                    if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
-                                        debug!(
-                                            peer_id = %node_id2,
-                                            "Reconnect after disconnect via trusted hints: {}",
-                                            e
-                                        );
-                                    }
-                                } else {
-                                    let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-                                    if let Err(e) = qm2.connect_to_peer(&node_id2, dummy).await {
-                                        debug!(peer_id = %node_id2, "Reconnect after disconnect: {}", e);
-                                    }
-                                }
-                            });
-                        }
-                    }
+                    // [SCALE] Debounce + reszta przeniesione do spawnowanego
+                    // taska z per-peer lockiem (wspolny z PeerConnected).
+                    // 150ms inline sleep nie blokuje juz main event loop.
+                    let peer_lock = peer_event_locks
+                        .entry(node_id.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                        .clone();
+                    let peer_store_c = peer_store.clone();
+                    let qm_events_c = qm_events.clone();
+                    let mesh_security_c = mesh_security.clone();
+                    let last_sync_sent_c = last_sync_sent.clone();
+                    tokio::spawn(async move {
+                        let _guard = peer_lock.lock().await;
+                        handle_peer_disconnected(
+                            node_id,
+                            peer_store_c,
+                            qm_events_c,
+                            mesh_security_c,
+                            last_sync_sent_c,
+                        )
+                        .await;
+                    });
                 }
                 Ok(IrohMeshEvent::HeartbeatReceived { node_id, heartbeat }) => {
                     // Odnotuj heartbeat dla liveness timera ZAWSZE — sama ramka =
@@ -1756,10 +1813,12 @@ fn spawn_heartbeat_sender(
                     quic_mesh.send_heartbeat_data(&data).await;
                 }
 
-                // Przelicz routing co 10 heartbeatow (~5s)
+                // Tick routing co 10 heartbeatow (~5s) — faktyczny BFS odbywa sie
+                // tylko jesli handlery zaznaczyly dirty. Coalescing: 100 PeerConnected
+                // w burst daje 1x BFS zamiast 100.
                 heartbeat_count += 1;
                 if heartbeat_count % 10 == 0 {
-                    peer_store.recalculate_routes(&local_node_id);
+                    peer_store.maybe_recalculate_routes(&local_node_id);
                 }
 
                 // ModelsSync broadcast co 60 heartbeatow (~30s). Serwer-side

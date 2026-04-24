@@ -304,24 +304,43 @@ function updateCount() {
 function renderTentaflowTab() {
   const targetOs = target?.os || 'linux';
   const categories = Manifest.nonEmptyCategories();
+  const groups = [
+    { id: 'ai', label: I18n.t('catalog.group_ai') },
+    { id: 'infra', label: I18n.t('catalog.group_infra') },
+  ];
 
   let html = '';
   let rendered = 0;
-  for (const cat of categories) {
-    const engines = Manifest.byCategory(cat).filter((e) => Manifest.isEngineCompatible(e, targetOs));
-    if (engines.length === 0) continue;
-    rendered += engines.length;
+  for (const group of groups) {
+    let groupHtml = '';
+    let groupCount = 0;
+    for (const cat of categories) {
+      const engines = Manifest.byCategory(cat).filter((e) =>
+        Manifest.isEngineCompatible(e, targetOs) && Manifest.resourceKind(e) === group.id
+      );
+      if (engines.length === 0) continue;
+      rendered += engines.length;
+      groupCount += engines.length;
 
-    const categoryLabel = I18n.t(`category.${cat}`) !== `category.${cat}`
-      ? I18n.t(`category.${cat}`)
-      : cat.toUpperCase();
+      const categoryLabel = I18n.t(`category.${cat}`) !== `category.${cat}`
+        ? I18n.t(`category.${cat}`)
+        : cat.toUpperCase();
 
-    html += `
-      <h3 class="catalog-section-title">${escapeHtml(categoryLabel)} <span class="section-count">${engines.length}</span></h3>
-      <div class="catalog-grid">
-        ${engines.map((e) => renderEngineCard(e, targetOs)).join('')}
-      </div>
-    `;
+      groupHtml += `
+        <h3 class="catalog-section-title">${escapeHtml(categoryLabel)} <span class="section-count">${engines.length}</span></h3>
+        <div class="catalog-grid">
+          ${engines.map((e) => renderEngineCard(e, targetOs)).join('')}
+        </div>
+      `;
+    }
+    if (groupCount > 0) {
+      html += `
+        <div class="catalog-group">
+          <h2 class="catalog-group-title">${escapeHtml(group.label)} <span class="section-count">${groupCount}</span></h2>
+          ${groupHtml}
+        </div>
+      `;
+    }
   }
 
   if (rendered === 0) {
@@ -343,6 +362,10 @@ function renderEngineCard(service, targetOs) {
   const desc = I18n.getLanguage() === 'pl' ? (e.description_pl || e.description_en) : (e.description_en || e.description_pl);
   const deployMethods = Manifest.availableDeployMethods(service, targetOs);
   const methodsLabel = deployMethods.map((m) => escapeHtml(I18n.t(`catalog.method_${m}`))).join(' · ') || '—';
+  const resourceKind = Manifest.resourceKind(service);
+  const resourceBadge = resourceKind === 'infra'
+    ? `<span class="platform-badge infra">${escapeHtml(I18n.t('catalog.badge_infra'))}</span>`
+    : `<span class="platform-badge ai">${escapeHtml(I18n.t('catalog.badge_ai'))}</span>`;
 
   return `
     <div class="catalog-card" data-engine-id="${escapeAttr(e.id || '')}">
@@ -354,6 +377,7 @@ function renderEngineCard(service, targetOs) {
         </div>
       </div>
       <div class="catalog-card-meta">
+        <div class="meta-row">${resourceBadge}</div>
         <div class="meta-row methods">${escapeHtml(I18n.t('catalog.deploy_as'))}: ${methodsLabel}</div>
       </div>
       <div class="catalog-card-foot">

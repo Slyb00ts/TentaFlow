@@ -6,8 +6,10 @@
 // =============================================================================
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
-use parking_lot::RwLock;
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -40,21 +42,30 @@ pub struct ModelInstance {
 // MeshServiceRegistry
 // =============================================================================
 
-/// Rejestr serwisow ze wszystkich nodow mesh
+/// Rejestr serwisow ze wszystkich nodow mesh.
+///
+/// [SCALE]:
+/// - `local_services: ArcSwap<Vec>` — lokalne serwisy zmieniaja sie rzadko
+///   (register/unregister), a `visible_services()` czyta je na kazdym requeszcie
+///   API. ArcSwap daje zero-lock read via `load()`.
+/// - `remote_services: DashMap` — per-peer entries, update_remote idzie tylko
+///   na swoj shard.
+/// - `direct_connections: DashMap` — topology update per-peer, find_route
+///   iteruje (best-effort snapshot, dla BFS akceptowalne).
 pub struct MeshServiceRegistry {
     local_node_id: String,
-    local_services: RwLock<Vec<MeshServiceInfo>>,
-    remote_services: RwLock<HashMap<String, Vec<MeshServiceInfo>>>,
-    direct_connections: RwLock<HashMap<String, HashSet<String>>>,
+    local_services: ArcSwap<Vec<MeshServiceInfo>>,
+    remote_services: DashMap<String, Vec<MeshServiceInfo>>,
+    direct_connections: DashMap<String, HashSet<String>>,
 }
 
 impl MeshServiceRegistry {
     pub fn new(local_node_id: String) -> Self {
         Self {
             local_node_id,
-            local_services: RwLock::new(Vec::new()),
-            remote_services: RwLock::new(HashMap::new()),
-            direct_connections: RwLock::new(HashMap::new()),
+            local_services: ArcSwap::from_pointee(Vec::new()),
+            remote_services: DashMap::with_capacity(256),
+            direct_connections: DashMap::with_capacity(256),
         }
     }
 
@@ -65,16 +76,24 @@ impl MeshServiceRegistry {
             service_name = %service.service_name,
             "Rejestracja lokalnego serwisu"
         );
-        self.local_services.write().push(service);
+        // Copy-on-write: klon obecnego snapshotu + push + atomic swap.
+        let mut new_vec = (**self.local_services.load()).clone();
+        new_vec.push(service);
+        self.local_services.store(Arc::new(new_vec));
     }
 
     /// Wyrejestruj lokalny serwis po ID
     pub fn unregister_local(&self, service_id: &str) {
-        let mut services = self.local_services.write();
-        let before = services.len();
-        services.retain(|s| s.service_id != service_id);
-        if services.len() < before {
+        let current = self.local_services.load();
+        let before = current.len();
+        let new_vec: Vec<MeshServiceInfo> = current
+            .iter()
+            .filter(|s| s.service_id != service_id)
+            .cloned()
+            .collect();
+        if new_vec.len() < before {
             info!(service_id = %service_id, "Wyrejestrowano lokalny serwis");
+            self.local_services.store(Arc::new(new_vec));
         }
     }
 
@@ -85,15 +104,13 @@ impl MeshServiceRegistry {
             count = services.len(),
             "Aktualizacja zdalnych serwisow"
         );
-        self.remote_services
-            .write()
-            .insert(node_id.to_string(), services);
+        self.remote_services.insert(node_id.to_string(), services);
     }
 
     /// Usun serwisy noda (po disconnect)
     pub fn remove_node(&self, node_id: &str) {
-        self.remote_services.write().remove(node_id);
-        self.direct_connections.write().remove(node_id);
+        self.remote_services.remove(node_id);
+        self.direct_connections.remove(node_id);
         info!(node_id = %node_id, "Usunieto serwisy i topologie noda");
     }
 
@@ -105,7 +122,6 @@ impl MeshServiceRegistry {
             "Aktualizacja topologii"
         );
         self.direct_connections
-            .write()
             .insert(node_id.to_string(), connected_to);
     }
 
@@ -113,39 +129,44 @@ impl MeshServiceRegistry {
     /// Dedup: jesli lokalny node widzi node C bezposrednio,
     /// nie pokazuj serwisow C przez node B.
     pub fn visible_services(&self) -> Vec<MeshServiceInfo> {
-        let local = self.local_services.read();
-        let remote = self.remote_services.read();
+        let local = self.local_services.load();
 
         // Zbierz node_id do ktorych mamy bezposrednie polaczenie
-        let directly_connected: HashSet<&String> = remote.keys().collect();
+        let directly_connected: HashSet<String> = self
+            .remote_services
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
 
-        let mut result: Vec<MeshServiceInfo> = local.clone();
+        let mut result: Vec<MeshServiceInfo> = (**local).clone();
 
         // Dodaj serwisy ze zdalnych nodow — dedup po owner_node_id
         let mut seen_owners: HashSet<String> = HashSet::new();
         seen_owners.insert(self.local_node_id.clone());
 
         // Bezposrednie polaczenia — priorytet
-        for (node_id, services) in remote.iter() {
-            for svc in services {
+        for entry in self.remote_services.iter() {
+            let node_id = entry.key();
+            let services = entry.value();
+            for svc in services.iter() {
                 let owner = if svc.node_id.is_empty() {
-                    node_id
+                    node_id.clone()
                 } else {
-                    &svc.node_id
+                    svc.node_id.clone()
                 };
 
-                if seen_owners.contains(owner) {
+                if seen_owners.contains(&owner) {
                     continue;
                 }
 
                 // Jesli widzimy owner bezposrednio, dodaj serwis tylko
                 // gdy pochodzi z tego bezposredniego polaczenia
-                if directly_connected.contains(owner) && owner != node_id {
+                if directly_connected.contains(&owner) && &owner != node_id {
                     continue;
                 }
 
                 result.push(svc.clone());
-                seen_owners.insert(owner.clone());
+                seen_owners.insert(owner);
             }
         }
 
@@ -211,17 +232,20 @@ impl MeshServiceRegistry {
             .map(|svc| svc.node_id.clone())
     }
 
-    /// Znajdz sciezke multi-hop do noda (BFS po topologii)
+    /// Znajdz sciezke multi-hop do noda (BFS po topologii).
+    /// Best-effort snapshot topologii — podczas BFS dane moga sie zmienic,
+    /// ale BFS chroni przed tym przez visited set.
     pub fn find_route(&self, target_node_id: &str) -> Option<Vec<String>> {
         if target_node_id == self.local_node_id {
             return Some(vec![self.local_node_id.clone()]);
         }
 
-        let topology = self.direct_connections.read();
-        let remote = self.remote_services.read();
-
         // Bezposrednie polaczenie z lokalnego noda
-        let local_neighbors: HashSet<String> = remote.keys().cloned().collect();
+        let local_neighbors: HashSet<String> = self
+            .remote_services
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
 
         if local_neighbors.contains(target_node_id) {
             return Some(vec![self.local_node_id.clone(), target_node_id.to_string()]);
@@ -243,12 +267,12 @@ impl MeshServiceRegistry {
         }
 
         while let Some(path) = queue.pop_front() {
-            let current = path.last().unwrap();
-            let neighbors = topology.get(current);
-
-            if let Some(neighbors) = neighbors {
+            let current = path.last().unwrap().clone();
+            if let Some(neighbors_entry) = self.direct_connections.get(&current) {
+                let neighbors = neighbors_entry.value().clone();
+                drop(neighbors_entry);
                 for next in neighbors {
-                    if visited.contains(next) {
+                    if visited.contains(&next) {
                         continue;
                     }
                     visited.insert(next.clone());
@@ -268,9 +292,9 @@ impl MeshServiceRegistry {
         None
     }
 
-    /// Pobierz lokalne serwisy (do ServiceAnnounce)
+    /// Pobierz lokalne serwisy (do ServiceAnnounce). Zero-lock read.
     pub fn local_services(&self) -> Vec<MeshServiceInfo> {
-        self.local_services.read().clone()
+        (**self.local_services.load()).clone()
     }
 }
 

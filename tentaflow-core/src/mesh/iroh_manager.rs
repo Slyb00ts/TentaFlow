@@ -909,20 +909,27 @@ impl IrohMeshManager {
     ) -> Vec<(String, Result<()>)> {
         use futures::future::join_all;
         let trusted = self.security.trusted_node_ids_snapshot();
-        let targets: Vec<String> = self
-            .connections
-            .iter()
-            .map(|e| e.key().clone())
-            .filter(|id| trusted.contains(id))
-            .filter(|id| exclude.map(|e| id.as_str() != e).unwrap_or(true))
-            .collect();
-        // PARALLEL: send_to_peer na kazdy cel rownolegle. Dla 1000 peerow
-        // sekwencyjne wysylanie trwalo 2-5s (open_uni + write + finish);
-        // rownolegle spada do max(rtt) + overhead, zwykle <50ms.
-        let futs = targets.into_iter().map(|node_id| async move {
-            let res = self.send_to_peer(&node_id, discriminant, data).await;
-            (node_id, res)
-        });
+        // Jeden pass po DashMap: filtracja + build future. Brak posredniej Vec<String>.
+        // Klon String tylko dla peerow ktorzy przechodza filtr (trusted ∩ !exclude).
+        let mut futs = Vec::with_capacity(self.connections.len());
+        for entry in self.connections.iter() {
+            let id = entry.key();
+            if !trusted.contains(id) {
+                continue;
+            }
+            if let Some(e) = exclude {
+                if id.as_str() == e {
+                    continue;
+                }
+            }
+            let node_id = id.clone();
+            futs.push(async move {
+                let res = self.send_to_peer(&node_id, discriminant, data).await;
+                (node_id, res)
+            });
+        }
+        // PARALLEL: send_to_peer na kazdy cel rownolegle. 1000 peerow sekwencyjnie
+        // 2-5s (open_uni + write + finish); rownolegle max(rtt) + overhead, <50ms.
         join_all(futs).await
     }
 
@@ -953,12 +960,17 @@ impl IrohMeshManager {
 
     pub async fn send_heartbeat_data(&self, data: &[u8]) {
         use futures::future::join_all;
-        let ids: Vec<String> = self.connected_peers().await;
-        let futs = ids.into_iter().map(|id| async move {
-            let _ = self
-                .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
-                .await;
-        });
+        // Single pass po DashMap — brak intermediate Vec<String> (2000 heartbeatow/s
+        // × 1000 peerow = potencjalnie 2M alokacji/s w wersji z Vec posrednim).
+        let mut futs = Vec::with_capacity(self.connections.len());
+        for entry in self.connections.iter() {
+            let id = entry.key().clone();
+            futs.push(async move {
+                let _ = self
+                    .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, data)
+                    .await;
+            });
+        }
         join_all(futs).await;
     }
 
@@ -966,12 +978,15 @@ impl IrohMeshManager {
     /// co `models_sync_interval` z pipeline.
     pub async fn send_models_sync_data(&self, data: &[u8]) {
         use futures::future::join_all;
-        let ids: Vec<String> = self.connected_peers().await;
-        let futs = ids.into_iter().map(|id| async move {
-            let _ = self
-                .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
-                .await;
-        });
+        let mut futs = Vec::with_capacity(self.connections.len());
+        for entry in self.connections.iter() {
+            let id = entry.key().clone();
+            futs.push(async move {
+                let _ = self
+                    .send_to_peer(&id, tentaflow_protocol::mesh::MESH_MSG_MODEL_LIST, data)
+                    .await;
+            });
+        }
         join_all(futs).await;
     }
 

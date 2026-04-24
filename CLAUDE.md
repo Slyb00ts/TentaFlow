@@ -151,6 +151,7 @@ Single source of truth dla wszystkich silników AI (LLM, TTS, STT, embeddings, v
 - Binary protocol nie wspiera już legacy `NodeListRequest` ani `NodeInfoRequest`; GUI i backend używają ścieżki `MeshNode*`.
 - Self-hosted iroh relay deployment assets live in `tentaflow-containers/tools/docker/iroh-relay/`; the old top-level `deploy/iroh-relay/` location is no longer used.
 - `deploy.docker` supports both single-container deployments via `context_path` and multi-container stack deployments via `compose_path`.
+- Manifests may set `engine.resource_kind` to `ai` or `infra`; the catalog renders infrastructure separately so supporting stacks do not appear as AI runtimes.
 
 Pełna specyfikacja: `tentaflow-containers/_schema/SCHEMA.md`. Schema JSON: `tentaflow-containers/_schema/schema.json`.
 
