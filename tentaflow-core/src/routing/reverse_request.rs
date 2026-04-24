@@ -593,6 +593,24 @@ fn persist_meeting_event(
                 session_id, stt_model, tts_model, summarization_model, diarization_model
             );
         }
+        // Lifecycle stage z bota — persistuje do meeting_sessions.lifecycle_stage
+        // żeby reload GUI w trakcie joiningu zobaczył aktualny etap bez zależności
+        // od tego, czy WSS broadcast już trafił. Broadcast i tak idzie równolegle
+        // przez publish() w callerze.
+        MeetingEventPayload::LifecycleUpdate { stage, details } => {
+            if let Err(e) = crate::db::repository::transcripts::update_session_lifecycle(
+                pool,
+                &event.meeting_key,
+                &stage,
+                details.as_deref(),
+            ) {
+                warn!("update_session_lifecycle failed: {}", e);
+            }
+            info!(
+                "MeetingEvent LifecycleUpdate: meeting_key={} session_id={} stage={}",
+                event.meeting_key, session_id, stage
+            );
+        }
     }
     Ok(())
 }

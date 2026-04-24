@@ -62,6 +62,12 @@ pub struct SessionDescriptor {
     pub summarization_alias: String,
     pub tts_alias: String,
     pub flow_alias: String,
+    /// Aktualny etap lifecycle bota. `None` gdy sesja jeszcze nie dotknęła
+    /// żadnego stage (np. świeża sesja idle w DB). Patrz `LIFECYCLE_*` w
+    /// `tentaflow_protocol`.
+    pub lifecycle_stage: Option<String>,
+    /// Opcjonalne szczegóły ostatniego stage (np. treść błędu przy `failed`).
+    pub lifecycle_details: Option<String>,
 }
 
 #[derive(Clone)]
@@ -182,6 +188,17 @@ impl MeetingManager {
                     rusqlite::params![session_id, outcome.container_id],
                 );
                 drop(conn);
+                // Docker zwrócił success — kontener istnieje. Bot potwierdzi własne
+                // `container_spawned` gdy QUIC server w środku wystartuje, ale już
+                // tu stage jest prawdziwy z perspektywy hosta.
+                if let Err(e) = repository::transcripts::update_session_lifecycle(
+                    &self.db,
+                    &meeting_key,
+                    tentaflow_protocol::LIFECYCLE_CONTAINER_SPAWNED,
+                    None,
+                ) {
+                    warn!("update_session_lifecycle (container_spawned): {}", e);
+                }
                 info!(
                     session = session_id,
                     bot_endpoint_id = %bot_endpoint_id,
@@ -311,6 +328,8 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
         summarization_alias: DEFAULT_SUMMARIZATION_ALIAS.to_string(),
         tts_alias: DEFAULT_TTS_ALIAS.to_string(),
         flow_alias: DEFAULT_FLOW_ALIAS.to_string(),
+        lifecycle_stage: row.lifecycle_stage.clone(),
+        lifecycle_details: row.lifecycle_details.clone(),
     }
 }
 

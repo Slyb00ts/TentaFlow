@@ -4098,6 +4098,9 @@ pub mod transcripts {
         pub bot_endpoint_id: Option<String>,
         pub platform: Option<String>,
         pub owner_user_id: Option<i64>,
+        pub lifecycle_stage: Option<String>,
+        pub lifecycle_details: Option<String>,
+        pub lifecycle_updated_at: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -4144,7 +4147,8 @@ pub mod transcripts {
         "s.id, s.meeting_key, s.meeting_url, s.title, s.started_at, s.last_activity_at, \
          (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id), \
          s.status, s.ended_at, s.container_id, s.container_name, \
-         s.quic_port, s.vnc_port, s.novnc_port, s.bot_endpoint_id, s.platform, s.owner_user_id";
+         s.quic_port, s.vnc_port, s.novnc_port, s.bot_endpoint_id, s.platform, s.owner_user_id, \
+         s.lifecycle_stage, s.lifecycle_details, s.lifecycle_updated_at";
 
     fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         Ok(SessionRow {
@@ -4165,6 +4169,9 @@ pub mod transcripts {
             bot_endpoint_id: row.get(14)?,
             platform: row.get(15)?,
             owner_user_id: row.get(16)?,
+            lifecycle_stage: row.get(17)?,
+            lifecycle_details: row.get(18)?,
+            lifecycle_updated_at: row.get(19)?,
         })
     }
 
@@ -4376,6 +4383,33 @@ pub mod transcripts {
             "UPDATE meeting_sessions SET status = ?2, last_activity_at = datetime('now')
              WHERE id = ?1",
             rusqlite::params![id, status],
+        )?;
+        Ok(())
+    }
+
+    /// Zapisuje aktualny etap lifecycle bota — wolany zarówno z host managera
+    /// (po udanym docker spawn), jak i z routera po otrzymaniu
+    /// `MeetingEventPayload::LifecycleUpdate` od bota. `meeting_key` zamiast
+    /// `session_id` bo bot nie zna wewnętrznego id, operuje na swoim kluczu.
+    /// No-op gdy sesji o tym meeting_key nie ma — bot nie powinien emitować
+    /// lifecycle events dla nieznanej sesji, ale nie chcemy twardego błędu
+    /// który zabija cały reverse request flow.
+    pub fn update_session_lifecycle(
+        pool: &DbPool,
+        meeting_key: &str,
+        stage: &str,
+        details: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET lifecycle_stage = ?2,
+                 lifecycle_details = ?3,
+                 lifecycle_updated_at = ?4,
+                 last_activity_at = datetime('now')
+             WHERE meeting_key = ?1",
+            rusqlite::params![meeting_key, stage, details, now],
         )?;
         Ok(())
     }
