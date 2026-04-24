@@ -843,38 +843,6 @@ pub async fn handle_request(
         }
     };
 
-    // Chat API - obsluga przed walidacja Content-Type (SSE streaming)
-    if path.starts_with("/api/chat/") {
-        let debug_route = is_debug_route(req.headers(), &query_string);
-        let body_bytes = if method == Method::POST {
-            req.collect().await?.to_bytes()
-        } else {
-            let _ = req.collect().await?;
-            Bytes::new()
-        };
-        // ACL context — pobierz aktualna role z DB (Zero Trust, JWT nie ma role).
-        let user_ctx = {
-            let role = db::repository::get_user_account_by_id(&db, claims.user_id)
-                .ok()
-                .flatten()
-                .map(|u| u.role)
-                .unwrap_or_else(|| "user".to_string());
-            Some(crate::routing::acl::UserContext::new(claims.user_id, role))
-        };
-        return Ok(super::api_chat::route_chat_api(
-            &method,
-            &path,
-            &router,
-            body_bytes,
-            &db,
-            &metrics,
-            cors_origin.as_deref(),
-            debug_route,
-            user_ctx,
-        )
-        .await);
-    }
-
     // Walidacja Content-Type dla POST/PUT
     if method == Method::POST || method == Method::PUT {
         let content_type = req
@@ -2174,13 +2142,4 @@ async fn route_clusters_api(
         404,
         serde_json::json!({"error": "Nieznany endpoint clusters"}).to_string(),
     )
-}
-
-/// Sprawdza czy request ma wlaczony debug routing (header lub query param)
-pub(super) fn is_debug_route(headers: &hyper::header::HeaderMap, query: &str) -> bool {
-    headers
-        .get("x-tentaflow-debug")
-        .and_then(|v| v.to_str().ok())
-        .map_or(false, |v| v == "true")
-        || query.contains("debug=route")
 }

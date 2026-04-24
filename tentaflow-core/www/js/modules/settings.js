@@ -14,9 +14,10 @@
 //      testu NGC (/api/nim/catalog).
 // =============================================================================
 
-import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, formatDate, formatRelative } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { TfWindow } from '/js/components/tf-window.js';
 
 // --- Klucze obslugiwane w dedykowanych zakladkach (ukryte w "Ogólne") ---
 const DEDICATED_KEYS = new Set([
@@ -47,6 +48,8 @@ function isDeadKey(key) {
 let currentTab = 'general';
 let settings = {};            // { key: { value, isSecret } }
 let ssoProviders = [];
+let apiKeys = [];
+let registries = [];
 
 const SSO_TYPES = [
   { value: 'azure_ad', label: 'Azure AD' },
@@ -77,6 +80,8 @@ const SettingsScreen = {
         <tf-tab id="oauth" icon="share">${escapeHtml(I18n.t('settings.tab_oauth'))}</tf-tab>
         <tf-tab id="tls" icon="mesh-admin">${escapeHtml(I18n.t('settings.tab_tls'))}</tf-tab>
         <tf-tab id="ngc" icon="model">${escapeHtml(I18n.t('settings.tab_ngc'))}</tf-tab>
+        <tf-tab id="apikeys" icon="key">${escapeHtml(I18n.t('nav.apikeys'))}</tf-tab>
+        <tf-tab id="registries" icon="registry">${escapeHtml(I18n.t('nav.registries'))}</tf-tab>
       </tf-tabs>
 
       <div id="settings-tab-body"></div>
@@ -92,6 +97,8 @@ const SettingsScreen = {
   unmount() {
     settings = {};
     ssoProviders = [];
+    apiKeys = [];
+    registries = [];
   },
 };
 
@@ -99,15 +106,19 @@ const SettingsScreen = {
 
 async function loadAll() {
   try {
-    const [settingsResp, ssoResp] = await Promise.all([
+    const [settingsResp, ssoResp, apiKeysResp, registriesResp] = await Promise.all([
       ApiBinary.one('settingsListRequest').catch(() => ({ entries: [] })),
       ApiBinary.one('ssoProvidersListRequest').catch(() => ({ providers: [] })),
+      ApiBinary.list('apiKeyListRequest').catch(() => []),
+      ApiBinary.list('registryListRequest').catch(() => []),
     ]);
     settings = {};
     for (const row of settingsResp.entries || []) {
       settings[row.key] = { value: row.value, isSecret: !!row.isSecret };
     }
     ssoProviders = ssoResp.providers || [];
+    apiKeys = Array.isArray(apiKeysResp) ? apiKeysResp : [];
+    registries = Array.isArray(registriesResp) ? registriesResp : [];
   } catch (err) {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
   }
@@ -144,6 +155,8 @@ function renderTab() {
     case 'oauth': host.innerHTML = renderOauthTab(); bindOauthTab(); break;
     case 'tls': host.innerHTML = renderTlsTab(); bindTlsTab(); break;
     case 'ngc': host.innerHTML = renderNgcTab(); bindNgcTab(); break;
+    case 'apikeys': host.innerHTML = renderApiKeysTab(); bindApiKeysTab(); break;
+    case 'registries': host.innerHTML = renderRegistriesTab(); bindRegistriesTab(); break;
   }
 }
 
@@ -591,6 +604,211 @@ function bindNgcTab() {
     } finally {
       if (btn) btn.removeAttribute('disabled');
     }
+  });
+}
+
+// ==========================================================================
+// Zakladka: API Keys
+// ==========================================================================
+
+function renderApiKeysTab() {
+  const rows = apiKeys.length === 0
+    ? `<tr><td colspan="5"><div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('apikeys.empty'))}</div></td></tr>`
+    : apiKeys.map((k) => `
+      <tr>
+        <td><code>${escapeHtml(k.keyId)}</code></td>
+        <td>${escapeHtml(k.name)}</td>
+        <td>${formatDate(k.createdAtEpoch)}</td>
+        <td>${k.lastUsedAtEpoch ? formatRelative(k.lastUsedAtEpoch) : '—'}</td>
+        <td style="text-align:right;">
+          <tf-button variant="danger" size="sm" icon="trash" data-key-revoke="${escapeAttr(k.keyId)}" title="${escapeAttr(I18n.t('apikeys.delete_title'))}"></tf-button>
+        </td>
+      </tr>
+    `).join('');
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h3>${escapeHtml(I18n.t('apikeys.title'))}</h3>
+        <div style="display:flex;gap:8px;">
+          <tf-button variant="ghost" size="sm" icon="refresh" id="apikeys-refresh">${escapeHtml(I18n.t('settings.refresh'))}</tf-button>
+          <tf-button variant="primary" size="sm" icon="plus" id="apikeys-create">${escapeHtml(I18n.t('apikeys.create_key'))}</tf-button>
+        </div>
+      </div>
+      <div class="card-body">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>${escapeHtml(I18n.t('apikeys.col_id'))}</th>
+              <th>${escapeHtml(I18n.t('apikeys.col_name'))}</th>
+              <th>${escapeHtml(I18n.t('apikeys.col_created'))}</th>
+              <th>${escapeHtml(I18n.t('apikeys.col_last_used'))}</th>
+              <th style="text-align:right;">${escapeHtml(I18n.t('common.actions'))}</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function bindApiKeysTab() {
+  byId('apikeys-refresh')?.addEventListener('click', async () => {
+    apiKeys = await ApiBinary.list('apiKeyListRequest').catch(() => []);
+    renderTab();
+  });
+
+  byId('apikeys-create')?.addEventListener('click', openCreateApiKeyModal);
+
+  document.querySelectorAll('[data-key-revoke]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const keyId = btn.dataset.keyRevoke;
+      if (!keyId) return;
+      const ok = await TfWindow.confirm({
+        title: I18n.t('apikeys.delete_confirm_title'),
+        message: I18n.t('apikeys.delete_confirm_msg', { keyId }),
+        confirmLabel: I18n.t('apikeys.delete_title'),
+        cancelLabel: I18n.t('common.cancel'),
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        const resp = await ApiBinary.action('apiKeyRevokeRequest', { keyId });
+        if (resp.deleted) {
+          toast(I18n.t('apikeys.deleted_ok'), 'success');
+        } else {
+          toast(I18n.t('apikeys.not_found'), 'warning');
+        }
+        apiKeys = await ApiBinary.list('apiKeyListRequest').catch(() => []);
+        renderTab();
+      } catch (err) {
+        toast(`${I18n.t('apikeys.error_prefix')}: ${err.message}`, 'error');
+      }
+    });
+  });
+}
+
+function openCreateApiKeyModal() {
+  const bodyEl = document.createElement('div');
+  bodyEl.innerHTML = `
+    <div class="form-row">
+      <tf-input id="k-name" label="${escapeAttr(I18n.t('apikeys.name_label'))}" placeholder="${escapeAttr(I18n.t('apikeys.name_placeholder_ci'))}" autofocus></tf-input>
+    </div>
+    <div id="k-result" style="display:none;margin-top:var(--space-4);">
+      <div class="tf-label">${escapeHtml(I18n.t('apikeys.copy_hint'))}</div>
+      <pre id="k-result-token" style="background:var(--color-bg);padding:var(--space-3);border-radius:var(--radius-md);border:1px solid var(--color-border);word-break:break-all;user-select:all;"></pre>
+    </div>
+  `;
+
+  const footerEl = document.createElement('div');
+  footerEl.innerHTML = `
+    <tf-button variant="ghost" data-action="close" label="${escapeHtml(I18n.t('apikeys.close'))}"></tf-button>
+    <tf-button variant="primary" data-action="create" label="${escapeHtml(I18n.t('apikeys.create_btn'))}" id="k-create-btn"></tf-button>
+  `;
+
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', I18n.t('apikeys.new_key'));
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('min-width', '420');
+  win.setAttribute('min-height', '220');
+  win.setAttribute('width', '460');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+
+  const bodyWrap = document.createElement('div');
+  bodyWrap.slot = 'body';
+  bodyWrap.appendChild(bodyEl);
+  win.appendChild(bodyWrap);
+
+  const footWrap = document.createElement('div');
+  footWrap.slot = 'footer';
+  footWrap.appendChild(footerEl);
+  win.appendChild(footWrap);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.appendChild(backdrop);
+  document.body.appendChild(win);
+
+  const cleanup = async () => {
+    if (win.isConnected) win.remove();
+    if (backdrop.isConnected) backdrop.remove();
+    apiKeys = await ApiBinary.list('apiKeyListRequest').catch(() => []);
+    if (currentTab === 'apikeys') renderTab();
+  };
+
+  win.addEventListener('action', async (e) => {
+    const action = e.detail?.action;
+    if (action === 'close') {
+      await cleanup();
+      return;
+    }
+    if (action !== 'create') return;
+    const nameInput = win.querySelector('#k-name');
+    const name = (nameInput?.value || '').trim();
+    if (!name) {
+      toast(I18n.t('apikeys.name_required_short'), 'warning');
+      return;
+    }
+    try {
+      const resp = await ApiBinary.action('apiKeyCreateRequest', { name, scopes: [] });
+      const resultBox = win.querySelector('#k-result');
+      const resultToken = win.querySelector('#k-result-token');
+      resultBox.style.display = 'block';
+      resultToken.textContent = resp.token;
+      const createBtn = win.querySelector('#k-create-btn');
+      if (createBtn) createBtn.setAttribute('disabled', '');
+      apiKeys = await ApiBinary.list('apiKeyListRequest').catch(() => []);
+      if (currentTab === 'apikeys') renderTab();
+    } catch (err) {
+      toast(`${I18n.t('apikeys.error_prefix')}: ${err.message}`, 'error');
+    }
+  });
+}
+
+// ==========================================================================
+// Zakladka: Registries
+// ==========================================================================
+
+function renderRegistriesTab() {
+  const rows = registries.length === 0
+    ? `<tr><td colspan="3"><div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('registries.empty'))}</div></td></tr>`
+    : registries.map((r) => `
+      <tr>
+        <td><code>${escapeHtml(r.url)}</code></td>
+        <td><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
+        <td>${r.authRequired ? `<tf-chip status="warn">${escapeHtml(I18n.t('registries.auth_yes'))}</tf-chip>` : `<tf-chip status="ok">${escapeHtml(I18n.t('registries.auth_no'))}</tf-chip>`}</td>
+      </tr>
+    `).join('');
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h3>${escapeHtml(I18n.t('registries.title'))}</h3>
+        <tf-button variant="ghost" size="sm" icon="refresh" id="registries-refresh">${escapeHtml(I18n.t('settings.refresh'))}</tf-button>
+      </div>
+      <div class="card-body">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>${escapeHtml(I18n.t('registries.col_url'))}</th>
+              <th>${escapeHtml(I18n.t('registries.col_type'))}</th>
+              <th>${escapeHtml(I18n.t('registries.col_auth'))}</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function bindRegistriesTab() {
+  byId('registries-refresh')?.addEventListener('click', async () => {
+    registries = await ApiBinary.list('registryListRequest').catch(() => []);
+    renderTab();
   });
 }
 
