@@ -163,12 +163,25 @@ async function onJoinClick() {
     toast(I18n.t('meeting.url_required'), 'error');
     return;
   }
-  // Zapobiega duplikatom: jesli user ma juz zywa sesje, kierujemy do podgladu
-  // zamiast spawnowac drugi kontener.
+  // Zapobiega duplikatom: jesli user ma juz zywa sesje, kierujemy go albo do
+  // podglądu (bot już w meetingu), albo z powrotem do status screenu (bot
+  // w trakcie joina) — pokazanie pustego live view zanim bot wejdzie było
+  // mylące.
   const existing = await fetchActiveSession();
   if (existing?.meetingKey) {
     activeSession = existing;
-    await navigateToLive(existing.meetingKey);
+    if (existing.lifecycleStage === 'joined') {
+      await navigateToLive(existing.meetingKey);
+      return;
+    }
+    currentLifecycleStage = existing.lifecycleStage || 'idle';
+    currentLifecycleDetails = existing.lifecycleDetails || '';
+    activeScreen = 'joining';
+    joinStartedAt = Date.now();
+    startElapsedTimer();
+    render();
+    await subscribeToLifecycle();
+    armLifecycleTimeout();
     return;
   }
   activeScreen = 'joining';
