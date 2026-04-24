@@ -2173,7 +2173,10 @@ pub fn service_deploy(
 #[handler(variant = "ServiceStopRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn service_stop(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+pub async fn service_stop(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
     let service_id_str = match req {
         MessageBody::ServiceStopRequest { service_id } => service_id,
         _ => return Err(ProtocolError::bad_request("expected ServiceStopRequest")),
@@ -2183,22 +2186,83 @@ pub fn service_stop(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         .map_err(|_| ProtocolError::bad_request("service_id must be integer"))?;
 
     // Existence check via list — delete_service nie raisuje na missing.
-    let exists = repository::list_services(&ctx.state.db)
-        .map_err(db_err)?
-        .iter()
-        .any(|s| s.id == service_id);
-    if !exists {
-        return Ok(MessageBody::ServiceStopResponse { stopped: false });
+    let services = repository::list_services(&ctx.state.db).map_err(db_err)?;
+    let svc = match services.iter().find(|s| s.id == service_id) {
+        Some(s) => s.clone(),
+        None => return Ok(MessageBody::ServiceStopResponse { stopped: false }),
+    };
+
+    // Przed delete z DB: zabij podleglu proces (native) albo kontener (docker)
+    // zeby nie zostawic zombie zajmujacego RAM/VRAM/GPU. Brak zabicia NIE
+    // zatrzymuje delete — wpis serwisu i tak znika, user dostaje warning
+    // w logu audytu.
+    let config: serde_json::Value =
+        serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
+    let deploy_mode = config
+        .get("deploy_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut stop_warnings: Vec<String> = Vec::new();
+
+    if deploy_mode == "native" {
+        if let Some(pid) = config.get("pid").and_then(|v| v.as_u64()) {
+            match crate::deploy::process_ctl::terminate(pid as u32) {
+                Ok(killed) => {
+                    if killed {
+                        tracing::info!(
+                            service = %svc.name, pid, "native service: proces zabity"
+                        );
+                    } else {
+                        tracing::info!(
+                            service = %svc.name, pid,
+                            "native service: PID juz martwy przed stop"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        service = %svc.name, pid, error = %e,
+                        "native service: blad podczas zabijania PID"
+                    );
+                    stop_warnings.push(format!("kill PID {} nieudane: {:#}", pid, e));
+                }
+            }
+        }
+    } else if deploy_mode == "docker" {
+        #[cfg(feature = "docker")]
+        {
+            if let Some(container) = config
+                .get("container_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                if let Err(e) = crate::deploy::docker::stop(container).await {
+                    tracing::warn!(
+                        service = %svc.name, container, error = %e,
+                        "docker service: blad zatrzymywania kontenera"
+                    );
+                    stop_warnings.push(format!("docker stop {} nieudane: {:#}", container, e));
+                } else {
+                    tracing::info!(service = %svc.name, container, "docker kontener zatrzymany");
+                }
+            }
+        }
     }
+
     repository::delete_service(&ctx.state.db, service_id).map_err(db_err)?;
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let audit_detail = if stop_warnings.is_empty() {
+        format!("service:{}", service_id)
+    } else {
+        format!("service:{} warnings=[{}]", service_id, stop_warnings.join("; "))
+    };
     let _ = repository::log_audit(
         &ctx.state.db,
         user_id,
         None,
         "service.stop",
-        Some(&format!("service:{}", service_id)),
+        Some(&audit_detail),
         None,
         None,
         Some(&ctx.state.local_node_id),
@@ -3513,6 +3577,7 @@ pub fn service_manifest_deploy(
 
     let db_clone = ctx.state.db.clone();
     let service_manager = ctx.state.service_manager.clone();
+    let settings_cipher = ctx.state.settings_cipher.clone();
     let deploy_id_task = deploy_id.clone();
     let engine_id_task = payload.engine_id.clone();
     let method_task = payload.deploy_method.clone();
@@ -3522,6 +3587,7 @@ pub fn service_manifest_deploy(
         crate::deploy::runner::run_deployment(
             db_clone,
             service_manager,
+            settings_cipher,
             deploy_id_task,
             engine_id_task,
             method_task,

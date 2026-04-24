@@ -1,0 +1,36 @@
+# =============================================================================
+# Plik: python-bundles/vllm-metal/bundle.toml
+# Opis: vLLM dla Apple Silicon przez plugin vllm-project/vllm-metal (MLX
+#       backend). Source=vllm-metal uruchamia custom install flow w
+#       `tentaflow-core/src/deploy/python_venv.rs::install_vllm_metal()`
+#       ktory odwzorowuje upstream install.sh:
+#         1) curl tarball vllm v<vllm_version> z GitHub Releases
+#         2) uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
+#         3) CXXFLAGS="-Wno-parentheses" uv pip install <vllm_src>
+#         4) uv pip install <wheel vllm-metal z GitHub Releases/latest>
+# =============================================================================
+
+[bundle]
+engine = "vllm-metal"
+description = "vLLM Metal plugin dla Apple Silicon (MLX)"
+python_version = "3.12"
+source = "vllm-metal"
+vllm_version = "0.19.1"
+vllm_metal_repo = "vllm-project/vllm-metal"
+
+[launch]
+command = "python"
+args = [
+    "-m", "vllm.entrypoints.openai.api_server",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8000}",
+    "--model", "${MODEL}",
+    "--dtype", "auto",
+    "--max-model-len", "${MAX_MODEL_LEN:-8192}",
+]
+internal_port = 8000
+
+[requires]
+gpu_memory_gb = 8
+disk_gb = 20
+platforms = ["macos-aarch64"]

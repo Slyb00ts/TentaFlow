@@ -194,24 +194,40 @@ export function createVirtualList(host, opts) {
   }
 
   // Incremental tail update: only the last item changed (streaming case).
-  // Recomputes height of items[len-1], patches offset table in O(1), and
-  // re-renders the visible window. Avoids O(n) full recompute per chunk.
+  // Patchuje `innerHTML` istniejacego `.vlist-item[data-vidx=lastIdx]` zamiast
+  // przepisywac caly viewport.innerHTML — przy streaming LLM (100-250 tok/s)
+  // render calego viewport co klatke powodowal skoki UI. Pelny render robimy
+  // tylko gdy item spadl poza widoczny zakres (musi pojawic sie od nowa).
   function updateTail() {
     const len = items.length;
     if (len === 0) return;
     const lastIdx = len - 1;
     const newH = getItemHeight(lastIdx, items[lastIdx]);
     const prevH = heightCache[lastIdx] || 0;
-    if (newH === prevH) {
-      // Height unchanged — still need to re-render the visible text.
-      render();
+
+    const existing = viewport.querySelector(`[data-vidx="${lastIdx}"]`);
+    if (existing) {
+      // Patchuj tylko ostatni bubble. Reszta viewport DOM nietknieta,
+      // brak scroll jank / focus loss / reflow reszty.
+      existing.innerHTML = renderItem(lastIdx, items[lastIdx]);
+      if (newH !== prevH) {
+        existing.style.minHeight = `${newH}px`;
+        heightCache[lastIdx] = newH;
+        totalHeight = offsetCache[lastIdx] + newH;
+        offsetCache[len] = totalHeight;
+        spacer.style.height = `${totalHeight}px`;
+      }
       if (pinned) host.scrollTop = host.scrollHeight;
       return;
     }
-    heightCache[lastIdx] = newH;
-    totalHeight = offsetCache[lastIdx] + newH;
-    offsetCache[len] = totalHeight;
-    spacer.style.height = `${totalHeight}px`;
+
+    // Item poza widocznym zakresem — pelny render.
+    if (newH !== prevH) {
+      heightCache[lastIdx] = newH;
+      totalHeight = offsetCache[lastIdx] + newH;
+      offsetCache[len] = totalHeight;
+      spacer.style.height = `${totalHeight}px`;
+    }
     lastRenderRange = { start: -1, end: -1 };
     render();
     if (pinned) host.scrollTop = host.scrollHeight;
