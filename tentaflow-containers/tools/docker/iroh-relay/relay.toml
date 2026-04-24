@@ -1,0 +1,45 @@
+# =============================================================================
+# File: relay.toml
+# Description: iroh-relay configuration mounted read-only as /data/relay.toml
+# inside the container. Any change requires a container restart.
+# =============================================================================
+
+# HTTP on :80 for the Let's Encrypt HTTP-01 challenge and HTTPS redirect.
+http_bind_addr = "0.0.0.0:80"
+
+# Public HTTPS endpoint used by iroh clients.
+https_bind_addr = "0.0.0.0:443"
+
+# STUN for public address discovery during hole punching.
+stun_bind_addr = "0.0.0.0:3478"
+
+# QUIC relay. iroh tunnels mesh streams over UDP 7842.
+enable_quic_addr_discovery = true
+
+# If you proxy /pkarr/* to a local iroh-dns-server, one hostname can expose
+# both services. iroh-relay 0.98 does not include a reverse proxy, so this
+# must be handled by a front proxy such as Caddy or nginx, or by using a
+# dedicated DNS subdomain. See the README in this directory.
+
+[tls]
+# Replace with your public hostname. The A record must point at the relay host.
+hostname = "RELAY_HOSTNAME_PLACEHOLDER"
+
+# Production Let's Encrypt. Port 80 must be reachable on first startup for the
+# ACME HTTP-01 challenge.
+cert_mode = "LetsEncrypt"
+
+# Certificate storage inside the Docker volume.
+cert_dir = "/data/certs"
+
+# Contact email used by Let's Encrypt for expiry notices.
+contact = "CONTACT_EMAIL_PLACEHOLDER"
+
+# Production ACME endpoint. Set to false only for staging tests.
+prod_tls = true
+
+[limits]
+# Optional per-client limits. Disabled by default. Enable them if the relay is
+# exposed publicly to many unknown peers.
+# client_rx_ratelimit.bytes_per_second = 4_000_000
+# client_rx_ratelimit.max_burst_bytes = 16_000_000

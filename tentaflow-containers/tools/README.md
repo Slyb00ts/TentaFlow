@@ -1,32 +1,36 @@
 # Tools
 
-Function calling, MCP servers, integracje z zewnetrznymi API.
+Function calling, MCP servers, and external integrations.
 
-## Status: PUSTE
+## Status
 
-Ta kategoria nie ma jeszcze zaimplementowanych silnikow. Pojawi sie w GUI jako
-pusta sekcja z napisem "Wkrotce".
+This category does not expose any user-facing tool manifests yet, but it now
+contains shared deployment assets such as the self-hosted iroh relay stack.
 
-## Struktura
+## Structure
 
-- `_services/*.toml` — manifesty narzedzi (deklaratywny opis: schema funkcji, MCP, deployment)
-- `docker/<engine>/` — kontenery Docker (do dodania)
+- `_services/*.toml` - declarative tool manifests used by the catalog and GUI
+- `docker/<engine>/` - Docker-based tool runtimes
 
-## Jak dodac pierwsze narzedzie
+## How to add a tool
 
-1. Utworz `_services/<engine-id>.toml` zgodnie z `tentaflow-containers/_schema/SCHEMA.md`
-2. Dla wariantu docker: dodaj `docker/<engine-id>/Dockerfile` + `entrypoint.sh` + `config.default.toml` + `build.sh`
-3. `cargo build` w tentaflow-core/ zwaliduje TOML i wygeneruje wpisy w GUI
+1. Create `_services/<engine-id>.toml` according to `tentaflow-containers/_schema/SCHEMA.md`
+2. For a Docker runtime, add `docker/<engine-id>/Dockerfile` and any runtime files it needs
+3. Run `cargo build` in `tentaflow-core/` to validate the manifest and regenerate GUI data
 
-## Kandydaci do dodania (przyszle)
+## Current infrastructure assets
 
-- MCP Filesystem Server — bezpieczny dostep do plikow
-- MCP Git Server — operacje git przez MCP
-- MCP Web Fetch — fetching URL
-- Web Search (SearxNG) — meta-wyszukiwarka
-- Web Search (Brave) — Brave Search API
-- Calculator — obliczenia matematyczne
-- Code Interpreter — sandboxed Python execution
-- Web Scraper — fetching i parsowanie HTML/JSON
-- SQL Query Tool — bezpieczne zapytania do baz
-- Calendar API — Google/Outlook calendar
+- `docker/iroh-relay/` - self-hosted iroh relay + pkarr DNS deployment bundle
+
+## Future candidates
+
+- MCP Filesystem Server
+- MCP Git Server
+- MCP Web Fetch
+- Web Search (SearxNG)
+- Web Search (Brave)
+- Calculator
+- Code Interpreter
+- Web Scraper
+- SQL Query Tool
+- Calendar API

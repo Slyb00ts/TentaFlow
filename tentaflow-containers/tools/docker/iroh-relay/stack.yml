@@ -1,0 +1,75 @@
+# =============================================================================
+# File: stack.yml
+# Description: Portainer stack with a self-hosted iroh-relay and
+# iroh-dns-server for TentaFlow. Use it when the public n0 infrastructure is
+# blocked or unavailable.
+#
+# Host requirements:
+#   - Public IPv4 with these firewall openings:
+#       443/tcp   HTTPS for relay and pkarr over HTTPS
+#       3478/udp  STUN
+#       7842/udp  iroh QUIC relay
+#       80/tcp    HTTP for the Let's Encrypt ACME HTTP-01 challenge
+#   - A public hostname such as "relay.example.com" with an A record pointing
+#     to the host IP.
+#   - Docker + Portainer with outbound internet access for ACME.
+#
+# Deployment:
+#   1. Build the images from this directory and push them to your registry, or
+#      build them directly on the Portainer host.
+#   2. In Portainer > Stacks > Add stack, paste this stack.yml.
+#   3. Adjust the mounted config paths if needed.
+#   4. Deploy the stack. The 'iroh-relay-data' volume stores issued certs.
+#   5. After startup, `docker logs iroh-relay` should show "relay started" and
+#      "obtained certificate". Then from any TentaFlow node:
+#        curl -v https://relay.example.com/
+#      should return HTTP 200.
+#   6. In each TentaFlow node config.toml:
+#        [mesh]
+#        iroh_relay_url     = "https://relay.example.com/"
+#        iroh_pkarr_dns_url = "https://relay.example.com/pkarr"
+# =============================================================================
+
+services:
+
+  # QUIC/STUN relay server for peers behind NAT. TentaFlow nodes keep HTTPS and
+  # QUIC sessions here so mesh traffic can be forwarded when direct paths fail.
+  iroh-relay:
+    image: ghcr.io/slyb00ts/iroh-relay:0.98.0
+    container_name: iroh-relay
+    restart: unless-stopped
+    network_mode: host   # raw UDP STUN and QUIC do not work well behind Docker NAT
+    volumes:
+      - iroh-relay-data:/data
+      - ./relay.toml:/data/relay.toml:ro
+    environment:
+      RUST_LOG: "iroh_relay=info,warn"
+    command:
+      - "--config-path"
+      - "/data/relay.toml"
+
+  # Stores pkarr address records for node IDs that publish through this relay.
+  # Without it, peers on another network cannot resolve a node by ID alone.
+  iroh-dns:
+    image: ghcr.io/slyb00ts/iroh-dns-server:0.98.0
+    container_name: iroh-dns
+    restart: unless-stopped
+    # Host networking is not required here because clients access this server
+    # over HTTPS through the /pkarr endpoint.
+    network_mode: bridge
+    expose:
+      - "8080"
+    volumes:
+      - iroh-dns-data:/data
+      - ./dns.toml:/data/dns.toml:ro
+    environment:
+      RUST_LOG: "iroh_dns_server=info,warn"
+    command:
+      - "--config"
+      - "/data/dns.toml"
+
+volumes:
+  iroh-relay-data:
+    name: iroh-relay-data
+  iroh-dns-data:
+    name: iroh-dns-data

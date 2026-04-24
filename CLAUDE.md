@@ -124,8 +124,8 @@ Bundled addon updates at startup are driven by `bundle_hash` (computed from embe
 - Upgrade path: `sanitize_trusted_contacts` runs at startup and strips `settings.trusted_contact:*` entries still pointing at the dead `use.iroh.network` default.
 
 **Dashboard**:
-- Frontend `www/` używa vanilla JS + custom elements `tf-*` z `tentaflow-core/www/js/components/`.
-- Widok Addons (WASM) korzysta z komponentów `tf-chip`, `tf-searchbox`, `tf-toggle`, `tf-button`; układ i style modułu są trzymane w `tentaflow-core/www/css/addons.css`.
+- Frontend `www/` uses vanilla JS + custom elements `tf-*` from `tentaflow-core/www/js/components/`.
+- The Addons (WASM) view uses `tf-chip`, `tf-searchbox`, `tf-toggle`, and `tf-button`; layout and styling live in `tentaflow-core/www/css/addons.css`.
 
 ### Mesh Protocol Discriminants
 
@@ -149,6 +149,7 @@ Single source of truth dla wszystkich silników AI (LLM, TTS, STT, embeddings, v
 ## Legacy Cleanup
 - `tentaflow-core/wwwroot/` zostało usunięte; jedynym aktywnym dashboardem jest `tentaflow-core/www/`.
 - Binary protocol nie wspiera już legacy `NodeListRequest` ani `NodeInfoRequest`; GUI i backend używają ścieżki `MeshNode*`.
+- Self-hosted iroh relay deployment assets live in `tentaflow-containers/tools/docker/iroh-relay/`; the old top-level `deploy/iroh-relay/` location is no longer used.
 
 Pełna specyfikacja: `tentaflow-containers/_schema/SCHEMA.md`. Schema JSON: `tentaflow-containers/_schema/schema.json`.
 

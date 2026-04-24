@@ -1,8 +1,8 @@
 # =============================================================================
-# Plik: Dockerfile.dns
-# Opis: Buduje iroh-dns-server z github (nie jest publikowany na crates.io
-#       jako samodzielny crate, tylko jako subdir glownego repo iroh).
-# Przyklad:
+# File: Dockerfile.dns
+# Description: Builds iroh-dns-server from GitHub. It is not published as a
+# standalone crate on crates.io and lives in the main iroh repository.
+# Example:
 #   docker build -t ghcr.io/slyb00ts/iroh-dns-server:0.98.0 -f Dockerfile.dns .
 #   docker push   ghcr.io/slyb00ts/iroh-dns-server:0.98.0
 # =============================================================================
@@ -12,8 +12,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
-# Checkoutujemy konkretny tag odpowiadajacy wersji iroh-relay (synchronizacja
-# protokolu pkarr). W razie zmiany wersji iroh bumpuj oba obrazy rownoczesnie.
+# Check out the tag that matches the iroh-relay version so the pkarr protocol
+# stays aligned. When bumping iroh, bump both images together.
 RUN git clone --depth=1 --branch v0.98.0 https://github.com/n0-computer/iroh.git /src
 WORKDIR /src/iroh-dns-server
 RUN cargo build --release --bin iroh-dns-server

@@ -864,6 +864,29 @@ fn spawn_quic_event_handler(
                         debug!(peer_id = %node_id, "QUIC peer — duplicate connected event (iroh multi-path)");
                         continue;
                     }
+
+                    // Tie-break pomiedzy inicjatorem i akceptatorem potrzebuje czasu
+                    // zeby sie ustabilizowac — iroh na obu stronach przy
+                    // rownoleglym dialingu tworzy multiple Connection objektow
+                    // (direct + relay + multi-relay). Jesli natychmiast wyslemy
+                    // Hello, trafia na 'closed by peer: tie-break-loser' bo peer
+                    // juz wybral innego zwyciezce. Dajemy 150ms na zbiegniecie
+                    // stanu, potem re-check czy ta sciezka przezyla — jesli nie,
+                    // cicho wychodzimy, poczekamy na nastepny PeerConnected
+                    // (ten zwycieski).
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if !qm_events.is_connected(&node_id).await {
+                        debug!(
+                            peer_id = %node_id,
+                            "QUIC peer — PeerConnected zniwelowane przez tie-break w ciagu 150ms"
+                        );
+                        // Reset peer_store do stanu przed debounce: jeszcze nie
+                        // bylismy polaczeni (peer_store.set_quic_connected(true)
+                        // wczesniej byl optymistyczny).
+                        peer_store.set_quic_connected(&node_id, false);
+                        peer_store.set_status(&node_id, "disconnected");
+                        continue;
+                    }
                     info!(peer_id = %node_id, "QUIC peer polaczony");
 
                     // Emit event do GUI — toast "peer connected" + refresh mesh view.
@@ -1048,13 +1071,27 @@ fn spawn_quic_event_handler(
                     // Dedup — iroh multi-path moze emitowac kilka disconnect dla tego
                     // samego peera. Emit event tylko na transition connected→offline.
                     let was_connected = peer_store.is_quic_connected(&node_id);
-                    peer_store.set_quic_connected(&node_id, false);
-                    peer_store.set_status(&node_id, "disconnected");
-                    peer_store.clear_heartbeat(&node_id);
                     if !was_connected {
                         debug!(peer_id = %node_id, "QUIC peer — duplicate disconnect event");
                         continue;
                     }
+
+                    // Debounce: iroh moze zamknac pojedyncza sciezke (tie-break
+                    // loser) ale rownoczesnie inna sciezka do tego samego peera
+                    // moze byc aktywna albo zaraz sie otworzyc. Dajemy 150ms
+                    // okno — jesli po nim wciaz jest rozlaczone, uznajemy
+                    // offline. Inaczej byl to flap i peer dalej zyje.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    if qm_events.is_connected(&node_id).await {
+                        debug!(
+                            peer_id = %node_id,
+                            "QUIC peer — PeerDisconnected zniwelowane przez natychmiastowy reconnect (tie-break swap)"
+                        );
+                        continue;
+                    }
+                    peer_store.set_quic_connected(&node_id, false);
+                    peer_store.set_status(&node_id, "disconnected");
+                    peer_store.clear_heartbeat(&node_id);
                     info!(peer_id = %node_id, "QUIC peer rozlaczony");
 
                     // Emituj event do GUI — pokazuje toast + odswieza karty mesh.
