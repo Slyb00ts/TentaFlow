@@ -263,7 +263,8 @@
       "running": "Running",
       "starting": "Starting",
       "stopped": "Stopped",
-      "error": "Error"
+      "error": "Error",
+      "on_demand": "On demand"
     },
     "deploy": {
       "title": "Deploy new service",

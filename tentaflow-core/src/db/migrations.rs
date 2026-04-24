@@ -1625,5 +1625,39 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
                 ON meeting_action_items(session_id, status, created_at DESC);
         ",
     ),
+    (
+        54,
+        "services_allow_agent_and_on_demand",
+        "
+            -- Rozluznia CHECK constraints na services:
+            -- * service_type akceptuje 'agent' i 'tool' (do tej pory tylko LLM/STT/TTS/...).
+            --   Bez tego deploy teams-bota (category=agents) nie tworzyl wpisu
+            --   i serwis nie pojawial sie w zakladce Services.
+            -- * status akceptuje 'on_demand' — oznacza serwis ktory nie ma stale
+            --   dzialajacego kontenera, tylko jest uruchamiany na zadanie
+            --   (np. teams-bot spawnuje instancje per spotkanie przez MeetingManager).
+            -- SQLite nie pozwala na ALTER CHECK w miejscu — robimy recreate.
+            CREATE TABLE services_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                service_type TEXT NOT NULL
+                    CHECK(service_type IN ('llm','embedding','rag','vision','stt','tts','memory','agent','tool')),
+                strategy TEXT NOT NULL DEFAULT 'single'
+                    CHECK(strategy IN ('single','least_loaded','round_robin','weighted','first_available')),
+                model_category TEXT DEFAULT 'main',
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active','disabled','maintenance','on_demand')),
+                config_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                service_uuid TEXT,
+                node_id TEXT
+            );
+            INSERT INTO services_new (id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id)
+                SELECT id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id FROM services;
+            DROP TABLE services;
+            ALTER TABLE services_new RENAME TO services;
+        ",
+    ),
 ]
 }

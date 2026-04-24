@@ -263,7 +263,8 @@
       "running": "Działa",
       "starting": "Uruchamia się",
       "stopped": "Zatrzymany",
-      "error": "Błąd"
+      "error": "Błąd",
+      "on_demand": "Na żądanie"
     },
     "deploy": {
       "title": "Wdróż nowy serwis",
