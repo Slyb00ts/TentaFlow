@@ -458,6 +458,32 @@
     registerInterval(setInterval(healthCheck, 2000));
   }
 
+  // Teams' light-meetings UI carries 'Camera/Mic is not available — Go to
+  // your device settings' for anonymous joiners even though Chromium
+  // publishes the fake devices we asked for. The cause is a stricter
+  // permission gate: Teams calls navigator.permissions.query and treats
+  // anything other than 'granted' as 'no device'. Force-grant camera and
+  // microphone so the toggle button is enabled and getUserMedia can fire.
+  if (navigator && navigator.permissions && navigator.permissions.query) {
+    const origPermQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = function (desc) {
+      try {
+        if (desc && (desc.name === 'camera' || desc.name === 'microphone')) {
+          return Promise.resolve({
+            state: 'granted',
+            status: 'granted',
+            onchange: null,
+            addEventListener() {},
+            removeEventListener() {},
+            dispatchEvent() { return false; },
+          });
+        }
+      } catch (_) {}
+      return origPermQuery(desc);
+    };
+    console.log('[tentaflow] permissions.query patched (camera+microphone always granted)');
+  }
+
   // --------------------------------------------------------------------------
   // Microphone injection — monkey-patch getUserMedia
   // Ostroznie: Teams ma skomplikowany pipeline media, wszystko w try/catch

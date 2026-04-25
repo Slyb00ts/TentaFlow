@@ -335,28 +335,41 @@ pub async fn join_meeting(
                     // screen is up, so the toggle click we did earlier was a
                     // no-op. After the in-call surface renders, re-enable
                     // the camera so getUserMedia fires and our canvas track
-                    // reaches Teams.
-                    let _ = page.evaluate(
+                    // reaches Teams. We log a JSON status object back so the
+                    // bot logs reveal whether we actually clicked, which
+                    // selector matched, or why we gave up.
+                    let res = page.evaluate(
                         r#"
                         (async function() {
+                            const sels = [
+                                '#video-button',
+                                '[data-tid="toggle-video"]',
+                                'button[aria-label*="camera" i]',
+                                'button[aria-label*="kamera" i]',
+                                'button[title*="camera" i]',
+                            ];
                             for (let i = 0; i < 30; i++) {
-                                const btn = document.querySelector('#video-button')
-                                    || document.querySelector('[data-tid="toggle-video"]')
-                                    || document.querySelector('button[aria-label*="camera" i]')
-                                    || document.querySelector('button[aria-label*="kamera" i]');
-                                if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                                for (const sel of sels) {
+                                    const btn = document.querySelector(sel);
+                                    if (!btn) continue;
+                                    const disabled = btn.disabled
+                                        || btn.getAttribute('aria-disabled') === 'true';
+                                    if (disabled) continue;
                                     const pressed = btn.getAttribute('aria-pressed') === 'true'
                                         || btn.getAttribute('aria-checked') === 'true';
                                     if (!pressed) btn.click();
-                                    return true;
+                                    return JSON.stringify({ ok: true, selector: sel, pressed });
                                 }
                                 await new Promise((r) => setTimeout(r, 500));
                             }
-                            return false;
+                            return JSON.stringify({ ok: false, reason: 'no enabled camera button after 15s' });
                         })()
                         "#,
                     ).await;
-                    tracing::info!("Post-join camera toggle attempted");
+                    let report = res
+                        .map(|v| v.into_value::<String>().unwrap_or_default())
+                        .unwrap_or_default();
+                    tracing::info!(report = %report, "Post-join camera toggle result");
                 }
                 return Ok(page);
             }
