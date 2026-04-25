@@ -29,7 +29,11 @@ use crate::routing::chat_template::{detect_chat_template, ChatTemplate};
 const DEFAULT_CTX_SIZE: u32 = 4096;
 
 /// Rozmiar kanalu streamingu tokenow
-const STREAM_CHANNEL_SIZE: usize = 64;
+/// Buffer dla token streaming z MLX worker do async konsumenta.
+/// 256 = ~18s buforu przy 14 tok/s (Bielik 4.5B M-series), albo ~280ms przy
+/// 900 tok/s (M3 Ultra z 0.5B 4-bit). Wystarczajaco zeby konsument WS writer
+/// (z batch send 16ms) nigdy nie blokowal MLX worker thread.
+const STREAM_CHANNEL_SIZE: usize = 256;
 
 /// Konfiguracja modelu wczytana z config.json
 #[allow(dead_code)]
