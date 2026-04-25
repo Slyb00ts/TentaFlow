@@ -1301,7 +1301,7 @@ export const encode = {
   // -------------------------------------------------------------------------
 
   /** MessageBody::NetworkBody(NetworkPayload::ReqInterfacesList) — unit. */
-  networkInterfacesListRequest(correlationId, _payload, sequence = 1) {
+  networkInterfacesListRequest(correlationId, sequence = 1) {
     assertReady();
     const body = _wasm.encodeNetworkInterfacesListRequest();
     return _wasm.encodeEnvelopeDirect(
@@ -1313,7 +1313,7 @@ export const encode = {
   },
 
   /** MessageBody::NetworkBody(NetworkPayload::ReqConfigGet) — unit. */
-  networkConfigGetRequest(correlationId, _payload, sequence = 1) {
+  networkConfigGetRequest(correlationId, sequence = 1) {
     assertReady();
     const body = _wasm.encodeNetworkConfigGetRequest();
     return _wasm.encodeEnvelopeDirect(
