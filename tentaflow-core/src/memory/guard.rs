@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::engine::LoadableEngine;
-use super::state::{LoadState, ServiceMemState};
+use super::state::{GpuAffinity, LoadState, ServiceMemState};
 
 static GLOBAL: OnceLock<Arc<MemoryGuard>> = OnceLock::new();
 
@@ -79,10 +79,12 @@ impl MemoryGuard {
         vram_estimated_mb: u64,
         pinned: bool,
         paused: bool,
+        gpu_affinity: GpuAffinity,
     ) {
         let mut state = ServiceMemState::new(service_name.clone(), vram_estimated_mb);
         state.pinned = pinned;
         state.paused = paused;
+        state.gpu_affinity = gpu_affinity.clone();
         if engine.is_loaded() {
             state.state = LoadState::Warm;
         }
@@ -94,7 +96,8 @@ impl MemoryGuard {
         self.entries.write().insert(service_name.clone(), entry);
         info!(
             service = %service_name, vram_mb = vram_estimated_mb,
-            pinned, paused, "MemoryGuard: zarejestrowano serwis"
+            pinned, paused, affinity = ?gpu_affinity,
+            "MemoryGuard: zarejestrowano serwis"
         );
     }
 
@@ -154,6 +157,23 @@ impl MemoryGuard {
             .sum()
     }
 
+    /// VRAM zajety przez warm services na konkretnym GPU. Sumuje vram_per_gpu
+    /// dla services ktorych affinity covers ten gpu_idx.
+    fn warm_vram_on_gpu(&self, gpu_idx: usize, total_gpus: usize) -> u64 {
+        self.entries
+            .read()
+            .values()
+            .map(|e| {
+                let s = e.state.read();
+                if s.is_loaded() && s.gpu_affinity.covers(gpu_idx, total_gpus) {
+                    s.vram_per_gpu_mb(total_gpus)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
     /// Glowna metoda: wywolywana przed kazdym dispatch. Gdy service zaladowany
     /// — touch last_used + return. Gdy nie — load z eviction jesli trzeba.
     pub async fn ensure_loaded(&self, service_name: &str) -> Result<()> {
@@ -191,44 +211,77 @@ impl MemoryGuard {
             s.state = LoadState::Loading;
         }
 
-        // Eviction wg REAL VRAM z node_info_collector — sumuje aktualnie zajety
-        // VRAM po wszystkich procesach systemu (nasz tentaflow + ext silniki +
-        // inne aplikacje), nie tylko serwisy zarejestrowane w guardzie.
-        // Cache 2s wiec wywolanie tanie. Override przez TENTAFLOW_VRAM_BUDGET_MB
-        // (gdy user chce sztywno ograniczyc — uzyteczne na shared host).
-        let needed = entry.state.read().vram_estimated_mb;
-        let (total_real, used_real, free_real) =
-            crate::mesh::node_info_collector::vram_snapshot_local();
-        let budget_override = self.budget_mb();
-
-        // Wybieramy efektywny limit: override (jesli ustawiony) albo realny
-        // total. Free = limit - max(used_real, sum(warm guard estimates))
-        // — bezpieczniej brac wieksza wartosc, zeby nie przepelnic.
-        let effective_limit = if budget_override > 0 {
-            budget_override
-        } else {
-            total_real
+        // Per-GPU decyzja eviction. Sprawdzamy budzet TYLKO dla kart z
+        // affinity tego serwisu — multi-GPU rig moze miec wolne VRAM na karcie 1
+        // a pelne na karcie 0, a serwis pinowany na karcie 0 nie pomoze
+        // sumarycznemu rachunkowi.
+        let (affinity, needed_total) = {
+            let s = entry.state.read();
+            (s.gpu_affinity.clone(), s.vram_estimated_mb)
         };
-        let warm_guard_estimate = self.total_warm_vram_mb();
-        let conservative_used = used_real.max(warm_guard_estimate);
 
-        if effective_limit > 0 && conservative_used + needed > effective_limit {
-            let _eviction = self.eviction_lock.lock().await;
-            let to_free = (conservative_used + needed).saturating_sub(effective_limit);
-            tracing::info!(
-                service = %service_name, needed_mb = needed,
-                used_mb = conservative_used, total_mb = effective_limit,
-                free_mb = effective_limit.saturating_sub(conservative_used),
-                "MemoryGuard: eviction needed (real VRAM={}, used={}, override={})",
-                total_real, used_real, budget_override
-            );
-            self.evict_at_least(to_free, service_name).await?;
-        } else {
-            tracing::debug!(
-                service = %service_name, needed_mb = needed,
-                free_mb = free_real,
-                "MemoryGuard: budget OK, ladujemy bez eviction"
-            );
+        // Cpu — pomijamy VRAM check w ogole.
+        if !matches!(affinity, GpuAffinity::Cpu) {
+            let snapshots = crate::mesh::node_info_collector::vram_snapshot_per_gpu();
+            let total_gpus = snapshots.len();
+            let target_indices = affinity.resolve_indices(total_gpus);
+
+            // Per karta: sprawdz needed_per_gpu vs free_per_gpu. Jesli ktorakolwiek
+            // karta z affinity nie miesci, eviction tylko z tej karty.
+            let needed_per_gpu =
+                needed_total / target_indices.len().max(1) as u64;
+
+            for &idx in &target_indices {
+                let snapshot = match snapshots.get(idx) {
+                    Some(s) => s,
+                    None => continue, // brak GPU o tym indeksie — skip
+                };
+                let warm_on_gpu = self.warm_vram_on_gpu(idx, total_gpus);
+                let conservative_used = snapshot.used_mb.max(warm_on_gpu);
+                let limit = snapshot.total_mb;
+
+                if limit == 0 {
+                    continue; // brak danych o karcie (ioreg nie zwrocil) — skip
+                }
+
+                if conservative_used + needed_per_gpu > limit {
+                    let _eviction = self.eviction_lock.lock().await;
+                    let to_free =
+                        (conservative_used + needed_per_gpu).saturating_sub(limit);
+                    tracing::info!(
+                        service = %service_name, gpu = idx,
+                        needed_mb = needed_per_gpu, used_mb = conservative_used,
+                        total_mb = limit, gpu_name = %snapshot.name,
+                        "MemoryGuard: eviction needed na GPU {}", idx
+                    );
+                    self.evict_at_least_on_gpu(to_free, idx, total_gpus, service_name)
+                        .await?;
+                } else {
+                    tracing::debug!(
+                        service = %service_name, gpu = idx,
+                        needed_mb = needed_per_gpu, free_mb = snapshot.free_mb,
+                        "MemoryGuard: GPU {} ma miejsce, brak eviction", idx
+                    );
+                }
+            }
+        }
+
+        // Override TENTAFLOW_VRAM_BUDGET_MB — globalny hard cap (nadrzedny nad
+        // per-GPU). Uzyteczny na shared hostach gdzie nie chcemy wziac calego
+        // GPU. Sprawdzane sumarycznie po affinity.
+        let budget_override = self.budget_mb();
+        if budget_override > 0 {
+            let warm_total = self.total_warm_vram_mb();
+            if warm_total + needed_total > budget_override {
+                let _eviction = self.eviction_lock.lock().await;
+                let to_free = (warm_total + needed_total).saturating_sub(budget_override);
+                tracing::info!(
+                    service = %service_name,
+                    "MemoryGuard: override hard cap exceeded ({} + {} > {}), evicting",
+                    warm_total, needed_total, budget_override
+                );
+                self.evict_at_least(to_free, service_name).await?;
+            }
         }
 
         // Properna load.
@@ -268,8 +321,80 @@ impl MemoryGuard {
         Ok(())
     }
 
+    /// Eviction NA KONKRETNEJ KARCIE — kandydaci to warm services ktorych
+    /// affinity covers `gpu_idx`. Zwolniony VRAM liczony jako vram_per_gpu na
+    /// tej karcie (multi-GPU service uwalnia tylko swoja "doze" z tej karty).
+    async fn evict_at_least_on_gpu(
+        &self,
+        needed_mb: u64,
+        gpu_idx: usize,
+        total_gpus: usize,
+        requesting: &str,
+    ) -> Result<u64> {
+        if needed_mb == 0 {
+            return Ok(0);
+        }
+        let mut candidates: Vec<(String, Instant, u64, Arc<Entry>)> = self
+            .entries
+            .read()
+            .iter()
+            .filter_map(|(name, entry)| {
+                let s = entry.state.read();
+                if s.pinned
+                    || s.paused
+                    || !s.is_loaded()
+                    || name == requesting
+                    || !s.gpu_affinity.covers(gpu_idx, total_gpus)
+                {
+                    None
+                } else {
+                    let vram_on_gpu = s.vram_per_gpu_mb(total_gpus);
+                    Some((name.clone(), s.last_used, vram_on_gpu, entry.clone()))
+                }
+            })
+            .collect();
+        candidates.sort_by_key(|(_, t, _, _)| *t);
+
+        let mut freed = 0u64;
+        for (name, _, vram_on_gpu, entry) in candidates {
+            if freed >= needed_mb {
+                break;
+            }
+            debug!(
+                service = %name, vram_mb = vram_on_gpu, gpu = gpu_idx,
+                "MemoryGuard: eviction kandydat na GPU {} — unload", gpu_idx
+            );
+            // Unload zwalnia VRAM ze WSZYSTKICH kart na ktorych ten serwis byl,
+            // nie tylko tej. Akceptujemy — wzywany przez user jako koszt eviction.
+            match entry.engine.unload().await {
+                Ok(()) => {
+                    entry.state.write().state = LoadState::Cold;
+                    freed = freed.saturating_add(vram_on_gpu);
+                    info!(
+                        service = %name, freed_mb = vram_on_gpu, gpu = gpu_idx,
+                        "MemoryGuard: zwolniono na GPU {} przez eviction", gpu_idx
+                    );
+                }
+                Err(e) => warn!(
+                    service = %name, error = %e,
+                    "MemoryGuard: unload nieudany podczas eviction — pomijam"
+                ),
+            }
+        }
+
+        if freed < needed_mb {
+            warn!(
+                requested_mb = needed_mb, freed_mb = freed, gpu = gpu_idx, requesting,
+                "MemoryGuard: nie udalo sie zwolnic wystarczajaco na GPU {}", gpu_idx
+            );
+        }
+        Ok(freed)
+    }
+
     /// Wybiera kandydatow do eviction wg LRU, pomija pinned i requesting.
     /// Unloaduje az suma freed >= needed_mb. Zwraca sume zwolnionego.
+    /// Sumaryczna wersja — uzywana TYLKO dla TENTAFLOW_VRAM_BUDGET_MB hard cap
+    /// (per-GPU eviction obsluguje normalny przypadek).
     async fn evict_at_least(&self, needed_mb: u64, requesting: &str) -> Result<u64> {
         if needed_mb == 0 {
             return Ok(0);

@@ -890,13 +890,15 @@ impl Router {
             pid_after_restore,
         ));
         let auto_pin = is_orchestrator_model_for_guard(&engine_id, &model_repo);
-        let already_paused = svc.status == "stopped";
+        let already_paused = svc.status == "stopped" || svc.paused;
+        let affinity = parse_gpu_affinity_from_config(&config);
         crate::memory::guard_global().register(
             svc.name.clone(),
             guard_engine,
             vram,
             auto_pin,
             already_paused,
+            affinity,
         );
 
         info!(
@@ -1248,6 +1250,32 @@ impl Router {
             total_requests: 0,
             active_connections: 0,
         }
+    }
+}
+
+/// Wyciaga GpuAffinity z config_json restorowanego serwisu. Mirror
+/// `runner::parse_gpu_affinity` ale dla serde_json::Value.
+fn parse_gpu_affinity_from_config(config: &serde_json::Value) -> crate::memory::GpuAffinity {
+    use crate::memory::GpuAffinity;
+    let arr = match config.get("gpu_ids").and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return GpuAffinity::All,
+    };
+    let ids: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if ids.iter().any(|s| s.eq_ignore_ascii_case("all")) {
+        return GpuAffinity::All;
+    }
+    if ids.iter().any(|s| s.eq_ignore_ascii_case("cpu")) {
+        return GpuAffinity::Cpu;
+    }
+    let parsed: Vec<usize> = ids.iter().filter_map(|s| s.parse().ok()).collect();
+    match parsed.len() {
+        0 => GpuAffinity::All,
+        1 => GpuAffinity::Single(parsed[0]),
+        _ => GpuAffinity::Multi(parsed),
     }
 }
 
