@@ -40,14 +40,16 @@ const DashboardScreen = {
       </div>
 
       <div class="hero">
-        <div class="network-bg"></div>
-        <div class="network-lines"></div>
+        <!-- Animowana siatka particles + linie miedzy bliskimi sasiadami.
+             Renderowana w canvasie przez lib/hero-network.js (mountowane w mount()). -->
+        <canvas class="hero-network" id="hero-network" aria-hidden="true"></canvas>
+
         <div class="orbs">
-          <div class="orb red">${sprite('brain')}</div>
-          <div class="orb yellow">${sprite('share')}</div>
-          <div class="orb blue">${sprite('network-svg')}</div>
-          <div class="orb green">${sprite('database')}</div>
-          <div class="orb purple">${sprite('cloud')}</div>
+          <div class="orb-wrap" style="--angle: -70deg;   --float-delay: 0s;"><div class="orb red">${sprite('brain')}</div></div>
+          <div class="orb-wrap" style="--angle: -35deg;   --float-delay: 0.6s;"><div class="orb yellow">${sprite('share')}</div></div>
+          <div class="orb-wrap" style="--angle: 0deg;     --float-delay: 1.2s;"><div class="orb blue">${sprite('network-svg')}</div></div>
+          <div class="orb-wrap" style="--angle: 35deg;    --float-delay: 1.8s;"><div class="orb green">${sprite('database')}</div></div>
+          <div class="orb-wrap" style="--angle: 70deg;    --float-delay: 2.4s;"><div class="orb purple">${sprite('cloud')}</div></div>
         </div>
         <div class="hero-content">
           <img class="hero-mascot" src="/tentaflow.png" alt="">
@@ -148,6 +150,18 @@ const DashboardScreen = {
   async mount() {
     byId('dash-refresh')?.addEventListener('click', () => refresh());
 
+    // Animowana siatka network w hero — lazy import zeby nie opozniac
+    // pierwszego paint'u ekranow ktore go nie maja.
+    try {
+      const heroCanvas = byId('hero-network');
+      if (heroCanvas) {
+        const { mount: mountHeroNetwork } = await import('/js/lib/hero-network.js');
+        mountHeroNetwork(heroCanvas);
+      }
+    } catch (e) {
+      console.warn('[dashboard] hero network mount failed', e);
+    }
+
     await refresh();
     metricsTimer = setInterval(refresh, 5000);
 
@@ -170,6 +184,10 @@ const DashboardScreen = {
     if (auditUnsubscribe) auditUnsubscribe();
     auditUnsubscribe = null;
     recentEvents.length = 0;
+    try {
+      const { unmount: unmountHeroNetwork } = await import('/js/lib/hero-network.js');
+      unmountHeroNetwork();
+    } catch { /* ignore */ }
   },
 };
 

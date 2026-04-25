@@ -7647,6 +7647,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "walkdir",
  "wasmi",
  "wasmtime",
  "wasmtime-wasi",

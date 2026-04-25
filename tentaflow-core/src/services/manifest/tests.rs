@@ -29,6 +29,9 @@ fn make_engine(id: &str, category: Category) -> Engine {
         default_port: 8000,
         api: ApiKind::OpenaiCompatible,
         version: "1.0.0".to_string(),
+        resource_kind: None,
+        requires_model: None,
+        gpu_supported: None,
     }
 }
 
@@ -104,6 +107,8 @@ fn make_manifest(engine: Engine, deploy: DeploySection) -> ServiceManifest {
         engine,
         deploy,
         model_presets: Vec::new(),
+        docker_source_hash: String::new(),
+        native_source_hash: String::new(),
     }
 }
 

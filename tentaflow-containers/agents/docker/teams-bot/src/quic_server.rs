@@ -307,6 +307,12 @@ impl Default for ContainerTransportConfig {
     }
 }
 
+/// Slot na aktywną stronę Chromium — dzielony między main loopem (ustawia po
+/// join, czyści po leave) a handlerami QUIC (czytają przy
+/// `ModelPayload::Browser`). `chromiumoxide::Page` jest tanią Arc-kopią, więc
+/// trzymanie jej tutaj nie rywalizuje z main loopem.
+pub type PageSlot = Arc<tokio::sync::Mutex<Option<chromiumoxide::Page>>>;
+
 /// Serwer iroh meeting bota.
 pub struct MeetingQuicServer {
     config: ContainerTransportConfig,
@@ -315,6 +321,7 @@ pub struct MeetingQuicServer {
     router_client: Arc<tokio::sync::Mutex<Option<Arc<RouterClient>>>>,
     command_tx: mpsc::UnboundedSender<MeetingCommand>,
     command_rx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<MeetingCommand>>>>,
+    page: PageSlot,
 }
 
 impl MeetingQuicServer {
@@ -328,7 +335,14 @@ impl MeetingQuicServer {
             router_client: Arc::new(tokio::sync::Mutex::new(None)),
             command_tx: cmd_tx,
             command_rx: Arc::new(tokio::sync::Mutex::new(Some(cmd_rx))),
+            page: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// Handle do slotu aktywnej strony Chromium. Main loop używa go do
+    /// `set`/`clear` przy join/leave; QUIC handler czyta przy browser capture.
+    pub fn page_slot(&self) -> PageSlot {
+        self.page.clone()
     }
 
     pub fn transcript_sender(&self) -> mpsc::UnboundedSender<(String, String, u64)> {
@@ -386,6 +400,7 @@ impl MeetingQuicServer {
                     let transcript_rx = self.transcript_rx.clone();
                     let router_client_slot = self.router_client.clone();
                     let command_tx = self.command_tx.clone();
+                    let page_slot = self.page.clone();
 
                     tokio::spawn(async move {
                         match incoming.await {
@@ -397,6 +412,7 @@ impl MeetingQuicServer {
                                     transcript_rx,
                                     router_client_slot,
                                     command_tx,
+                                    page_slot,
                                 ).await;
                             }
                             Err(e) => {
@@ -424,6 +440,7 @@ impl MeetingQuicServer {
         transcript_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, String, u64)>>>,
         router_client_slot: Arc<tokio::sync::Mutex<Option<Arc<RouterClient>>>>,
         command_tx: mpsc::UnboundedSender<MeetingCommand>,
+        page_slot: PageSlot,
     ) {
         let remote = connection.remote_id();
 
@@ -441,8 +458,9 @@ impl MeetingQuicServer {
                 Ok((send, recv)) => {
                     let transcript_rx = transcript_rx.clone();
                     let command_tx = command_tx.clone();
+                    let page_slot = page_slot.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_stream(send, recv, transcript_rx, command_tx).await {
+                        if let Err(e) = Self::handle_stream(send, recv, transcript_rx, command_tx, page_slot).await {
                             debug!("handle_stream: {e}");
                         }
                     });
@@ -466,6 +484,7 @@ impl MeetingQuicServer {
         mut recv: iroh::endpoint::RecvStream,
         transcript_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(String, String, u64)>>>,
         command_tx: mpsc::UnboundedSender<MeetingCommand>,
+        page_slot: PageSlot,
     ) -> Result<()> {
         let request: ModelRequest = read_frame(&mut recv)
             .await
@@ -481,7 +500,9 @@ impl MeetingQuicServer {
         if request.stream {
             Self::handle_streaming_request(&request, &mut send, transcript_rx).await?;
         } else {
-            let response = if let Some(cmd_response) =
+            let response = if let ModelPayload::Browser(payload) = &request.payload {
+                Self::process_browser(&request.request_id, payload, &page_slot).await
+            } else if let Some(cmd_response) =
                 Self::try_handle_tool_command(&request, &command_tx).await
             {
                 cmd_response
@@ -495,6 +516,61 @@ impl MeetingQuicServer {
             send.finish().ok();
         }
         Ok(())
+    }
+
+    /// Obsluguje `ModelPayload::Browser` — screenshot albo snapshot DOM aktywnej
+    /// strony Chromium. Brak aktywnej strony, timeout CDP albo blad evaluate
+    /// mapuja sie na `BrowserResult::Error` (tunnel dashboard↔bot zostaje).
+    async fn process_browser(
+        request_id: &str,
+        payload: &BrowserPayload,
+        page_slot: &PageSlot,
+    ) -> ModelResponse {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Krotki timeout na samo pozyczenie strony — main loop robi swap tylko
+        // przy join/leave, wiec zwykle to non-blocking; 1s zabezpiecza przed
+        // deadlockiem gdyby main loop trzymal slot dluzej.
+        let guard = match timeout(Duration::from_secs(1), page_slot.lock()).await {
+            Ok(g) => g,
+            Err(_) => return browser_error(request_id, "page slot lock timeout"),
+        };
+        let Some(page) = guard.as_ref() else {
+            return browser_error(request_id, "no active page");
+        };
+
+        // Klonujemy handle (Page = Arc) i dropujemy guard przed dlugimi await —
+        // nie blokujemy join/leave podczas screenshotu full_page.
+        let page = page.clone();
+        drop(guard);
+
+        // 10s budzet CDP: full_page screenshot na Teams UI potrafi trwac kilka
+        // sekund (scroll + stitch). Dashboard caller (backend) ma wlasny 12s.
+        let deadline = Duration::from_secs(10);
+        let result = match &payload.operation {
+            BrowserOperation::Screenshot { full_page } => {
+                let fp = *full_page;
+                match timeout(deadline, capture_screenshot(&page, fp)).await {
+                    Ok(Ok(png)) => BrowserResult::Screenshot { png },
+                    Ok(Err(e)) => BrowserResult::Error { message: format!("screenshot: {e}") },
+                    Err(_) => BrowserResult::Error { message: "screenshot timeout (10s)".into() },
+                }
+            }
+            BrowserOperation::Dom => {
+                match timeout(deadline, capture_dom(&page)).await {
+                    Ok(Ok(html)) => BrowserResult::Dom { html },
+                    Ok(Err(e)) => BrowserResult::Error { message: format!("dom: {e}") },
+                    Err(_) => BrowserResult::Error { message: "dom snapshot timeout (10s)".into() },
+                }
+            }
+        };
+
+        ModelResponse {
+            request_id: request_id.to_string(),
+            result: ModelResult::Browser(result),
+            metrics: None,
+        }
     }
 
     /// Sprawdza czy request zawiera komende narzedzia w polu prompt.
@@ -732,6 +808,39 @@ fn load_or_generate_secret_key(path: Option<&str>) -> Result<SecretKey> {
         .with_context(|| format!("zapis klucza do {}", path.display()))?;
     info!(path = %path.display(), "wygenerowano i zapisano Ed25519 secret key");
     Ok(key)
+}
+
+async fn capture_screenshot(page: &chromiumoxide::Page, full_page: bool) -> Result<Vec<u8>> {
+    use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+    use chromiumoxide::page::ScreenshotParams;
+    let params = ScreenshotParams::builder()
+        .format(CaptureScreenshotFormat::Png)
+        .full_page(full_page)
+        .build();
+    page.screenshot(params)
+        .await
+        .map_err(|e| anyhow::anyhow!("page.screenshot: {e}"))
+}
+
+async fn capture_dom(page: &chromiumoxide::Page) -> Result<String> {
+    let result = page
+        .evaluate("document.documentElement.outerHTML")
+        .await
+        .map_err(|e| anyhow::anyhow!("page.evaluate: {e}"))?;
+    let html: String = result
+        .into_value()
+        .map_err(|e| anyhow::anyhow!("evaluate into_value: {e}"))?;
+    Ok(html)
+}
+
+fn browser_error(request_id: &str, message: &str) -> ModelResponse {
+    ModelResponse {
+        request_id: request_id.to_string(),
+        result: ModelResult::Browser(BrowserResult::Error {
+            message: message.to_string(),
+        }),
+        metrics: None,
+    }
 }
 
 fn error_resp(request_id: &str, error_type: ErrorType, message: &str) -> ModelResponse {

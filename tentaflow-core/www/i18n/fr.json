@@ -1935,6 +1935,12 @@
       "export_empty": "Rien à exporter",
       "export_failed": "Échec de l'export",
       "vnc_unavailable": "Aperçu VNC indisponible pour cette session",
+      "vnc_error_not_found": "Session VNC introuvable",
+      "vnc_error_forbidden": "Accès refusé à l'aperçu VNC",
+      "vnc_error_no_port": "Port VNC non alloué pour cette session",
+      "vnc_error_remote_node": "La session est hébergée sur un autre nœud — l'aperçu VNC sera disponible en phase B",
+      "vnc_error_failed": "Erreur du tunnel VNC : {message}",
+      "vnc_disconnected": "Connexion VNC perdue",
       "missing_key": "Clé de réunion manquante",
       "load_failed": "Impossible de charger la session",
       "open_button": "Vue en direct"

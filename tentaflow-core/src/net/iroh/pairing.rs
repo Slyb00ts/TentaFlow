@@ -427,6 +427,33 @@ pub fn delete_trusted_contact_hints(
     Ok(())
 }
 
+pub fn merge_contact_hints(
+    current: Option<PairingContactHints>,
+    fresh: PairingContactHints,
+) -> PairingContactHints {
+    let mut merged = fresh.clone();
+    if let Some(current) = current {
+        if merged.node_id.is_empty() {
+            merged.node_id = current.node_id;
+        }
+        if merged.public_key_hex.is_empty() {
+            merged.public_key_hex = current.public_key_hex;
+        }
+        if merged.hostname.is_empty() {
+            merged.hostname = current.hostname;
+        }
+        if merged.relay_url.is_empty() {
+            merged.relay_url = current.relay_url;
+        }
+        for addr in current.addresses {
+            if !addr.is_empty() && !merged.addresses.contains(&addr) {
+                merged.addresses.push(addr);
+            }
+        }
+    }
+    merged
+}
+
 /// Wzorce hostow uznanych za martwe relay URL — usuwane przy starcie mesh.
 /// Do commitu e9552dc zapisywalismy domyslne `https://use.iroh.network/`, ktore
 /// od dawna nie resolwuje DNS. Po naprawie Fazy 1 nowe eventy zapisuja pusty
@@ -434,15 +461,27 @@ pub fn delete_trusted_contact_hints(
 /// musi go wyczyscic zanim `connect_to_peer_with_hints` wejdzie w dial fail.
 const DEAD_RELAY_PATTERNS: &[&str] = &["use.iroh.network"];
 
-/// Czysci pole `relay_url` w `trusted_contact:*` gdy matchuje wzorzec martwego
-/// hosta (patrz `DEAD_RELAY_PATTERNS`). Pojedyncze bledy dekodowania/zapisu
-/// sa tylko logowane — iteracja idzie dalej zeby nie zablokowac startu mesh
-/// jednym skorumpowanym wpisem.
+/// Upgrade-path cleanup dla `trusted_contact:*`:
+///  1. Czysci `relay_url` gdy matchuje wzorzec martwego hosta (`DEAD_RELAY_PATTERNS`).
+///     Stare instalacje mialy zapisane `https://use.iroh.network/`, ktore nie
+///     resolwuje DNS — bez czyszczenia `connect_to_peer_with_hints` wchodzi w
+///     dial fail.
+///  2. Przepuszcza liste `addresses` przez biezace `AdvertiseFilters` z settings.
+///     Gdy user wlaczy np. `hide_docker=true` w trakcie zycia aplikacji, stare
+///     adresy `172.17.x.y` juz zapisane w `trusted_contact:*` musza zniknac —
+///     inaczej relaunch uzyje ich z cache i znow wyciekna do peera.
+///  3. IPv6 jest usuwany bezwarunkowo (mesh IPv4-only).
+///
+/// Pojedyncze bledy dekodowania/zapisu sa tylko logowane — iteracja idzie dalej
+/// zeby jeden skorumpowany wpis nie blokowal startu mesh.
 ///
 /// Zwraca liczbe faktycznie zaktualizowanych wpisow.
 pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize> {
     let rows = db::repository::list_settings_with_prefix(db, TRUSTED_CONTACT_PREFIX)?;
     let mut cleaned = 0usize;
+
+    let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
+    let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
 
     for (key, raw_value) in rows {
         let mut hints = match serde_json::from_str::<PairingContactHints>(&raw_value) {
@@ -457,14 +496,45 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
             }
         };
 
-        let has_dead = DEAD_RELAY_PATTERNS
+        let original_addresses = hints.addresses.clone();
+        let original_relay = hints.relay_url.clone();
+
+        let has_dead_relay = DEAD_RELAY_PATTERNS
             .iter()
             .any(|p| hints.relay_url.contains(p));
-        if !has_dead {
+        if has_dead_relay {
+            hints.relay_url.clear();
+        }
+
+        // Filter addresses. Format "ip:port" — wyluskujemy IPv4, odrzucamy IPv6
+        // oraz adresy ktorych filtr advertise nie przepuszcza.
+        hints.addresses = hints
+            .addresses
+            .iter()
+            .filter(|raw| {
+                let Some(ip_part) = raw.split(':').next() else {
+                    return false;
+                };
+                match ip_part.parse::<std::net::Ipv4Addr>() {
+                    Ok(v4) => {
+                        let kind =
+                            kind_map.get(&v4).map(String::as_str).unwrap_or("unknown");
+                        crate::mesh::network_interfaces::should_advertise_interface_ipv4(
+                            v4, kind, &filters,
+                        )
+                    }
+                    Err(_) => false,
+                }
+            })
+            .cloned()
+            .collect();
+
+        let changed =
+            hints.addresses != original_addresses || hints.relay_url != original_relay;
+        if !changed {
             continue;
         }
 
-        let original = std::mem::take(&mut hints.relay_url);
         let serialized = match serde_json::to_string(&hints) {
             Ok(s) => s,
             Err(e) => {
@@ -481,8 +551,9 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
                 cleaned += 1;
                 info!(
                     key = %key,
-                    old_url = %original,
-                    "sanitize_trusted_contacts: wyczyszczono martwy relay URL"
+                    dropped_addrs = original_addresses.len() - hints.addresses.len(),
+                    relay_cleared = (has_dead_relay),
+                    "sanitize_trusted_contacts: zaktualizowano wpis"
                 );
             }
             Err(e) => warn!(
@@ -634,6 +705,44 @@ mod tests {
         assert_eq!(direct.len(), 2);
         assert_eq!(relays.len(), 1);
         assert_eq!(relays[0].to_string(), "https://relay.example./");
+    }
+
+    #[test]
+    fn merge_contact_hints_keeps_fresh_order_and_appends_missing_current() {
+        let current = PairingContactHints {
+            node_id: "peer".to_string(),
+            public_key_hex: "abcd".to_string(),
+            hostname: "old-host".to_string(),
+            addresses: vec![
+                "10.0.0.8:8090".to_string(),
+                "192.168.0.8:8090".to_string(),
+            ],
+            relay_url: "https://relay.old/".to_string(),
+        };
+        let fresh = PairingContactHints {
+            node_id: "peer".to_string(),
+            public_key_hex: String::new(),
+            hostname: "new-host".to_string(),
+            addresses: vec![
+                "192.168.0.8:8090".to_string(),
+                "10.10.10.8:8090".to_string(),
+            ],
+            relay_url: String::new(),
+        };
+
+        let merged = merge_contact_hints(Some(current), fresh);
+
+        assert_eq!(merged.public_key_hex, "abcd");
+        assert_eq!(merged.hostname, "new-host");
+        assert_eq!(merged.relay_url, "https://relay.old/");
+        assert_eq!(
+            merged.addresses,
+            vec![
+                "192.168.0.8:8090".to_string(),
+                "10.10.10.8:8090".to_string(),
+                "10.0.0.8:8090".to_string(),
+            ]
+        );
     }
 
     #[test]

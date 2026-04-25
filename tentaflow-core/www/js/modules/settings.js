@@ -18,6 +18,7 @@ import { byId, escapeHtml, escapeAttr, toast, formatDate, formatRelative } from 
 import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { TfWindow } from '/js/components/tf-window.js';
+import { renderMeshTab, bindMeshTab } from '/js/modules/settings-network.js';
 
 // --- Klucze obslugiwane w dedykowanych zakladkach (ukryte w "Ogólne") ---
 const DEDICATED_KEYS = new Set([
@@ -79,6 +80,7 @@ const SettingsScreen = {
         <tf-tab id="sso" icon="users">${escapeHtml(I18n.t('settings.tab_sso'))}</tf-tab>
         <tf-tab id="oauth" icon="share">${escapeHtml(I18n.t('settings.tab_oauth'))}</tf-tab>
         <tf-tab id="tls" icon="mesh-admin">${escapeHtml(I18n.t('settings.tab_tls'))}</tf-tab>
+        <tf-tab id="mesh" icon="network">${escapeHtml(I18n.t('settings.tab_mesh'))}</tf-tab>
         <tf-tab id="ngc" icon="model">${escapeHtml(I18n.t('settings.tab_ngc'))}</tf-tab>
         <tf-tab id="apikeys" icon="key">${escapeHtml(I18n.t('nav.apikeys'))}</tf-tab>
         <tf-tab id="registries" icon="registry">${escapeHtml(I18n.t('nav.registries'))}</tf-tab>
@@ -154,6 +156,15 @@ function renderTab() {
     case 'sso': host.innerHTML = renderSsoTab(); bindSsoTab(); break;
     case 'oauth': host.innerHTML = renderOauthTab(); bindOauthTab(); break;
     case 'tls': host.innerHTML = renderTlsTab(); bindTlsTab(); break;
+    case 'mesh':
+      host.innerHTML = `<div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('common.loading'))}</div>`;
+      renderMeshTab().then((html) => {
+        host.innerHTML = html;
+        bindMeshTab(host, () => { renderTab(); });
+      }).catch((err) => {
+        host.innerHTML = `<div class="empty-big" style="padding:24px;color:var(--danger);">${escapeHtml(err.message || String(err))}</div>`;
+      });
+      break;
     case 'ngc': host.innerHTML = renderNgcTab(); bindNgcTab(); break;
     case 'apikeys': host.innerHTML = renderApiKeysTab(); bindApiKeysTab(); break;
     case 'registries': host.innerHTML = renderRegistriesTab(); bindRegistriesTab(); break;

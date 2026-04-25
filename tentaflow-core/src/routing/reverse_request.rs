@@ -148,28 +148,23 @@ async fn handle_reverse_stream(
     // Routuj request w zaleznosci od typu payload
     let response = dispatch_reverse_request(&router, request).await;
 
-    // Serializacja i wyslanie odpowiedzi
-    match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
-        Ok(resp_data) => {
-            if let Err(e) = send.write_all(&resp_data).await {
-                error!(
-                    "Reverse '{}': blad wysylania odpowiedzi: {}",
-                    service_name, e
-                );
-                return;
-            }
-            let _ = send.finish();
-            debug!(
-                "Reverse '{}': odpowiedz wyslana (request_id={})",
-                service_name, response.request_id
-            );
-        }
-        Err(e) => {
-            error!(
-                "Reverse '{}': blad serializacji odpowiedzi: {}",
-                service_name, e
-            );
-        }
+    // Bot side reads the response with tentaflow_transport::framing::read_frame,
+    // which expects a 4-byte big-endian length prefix before the rkyv payload.
+    // We were writing raw rkyv bytes here, so the bot interpreted the first
+    // four bytes of the payload as the length and rejected every response as
+    // `frame exceeds 16777216 bytes`. Emit the same [len][rkyv] framing the
+    // bot produces on the request side.
+    if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &response).await {
+        error!(
+            "Reverse '{}': blad wysylania odpowiedzi: {:?}",
+            service_name, e
+        );
+    } else {
+        let _ = send.finish();
+        debug!(
+            "Reverse '{}': odpowiedz wyslana (request_id={})",
+            service_name, response.request_id
+        );
     }
 }
 
@@ -577,20 +572,52 @@ fn persist_meeting_event(
                 session_id, speaker_id, status
             );
         }
-        // BackendUpdate: info o modelach sesji jest stanem runtime'owym (zmienia
-        // się tylko przy zmianie aliasów w configu bota między sesjami). DB ma już
-        // `model` w `meeting_summaries` dla historii, osobna tabela byłaby
-        // duplikacją. Ten event służy tylko live broadcastowi do UI.
+        // BackendUpdate: persisted on meeting_sessions so a live view mounted
+        // after the broadcast still sees the BACKEND panel populated. The same
+        // event is broadcast to dashboards; this branch only owns DB durability.
         MeetingEventPayload::BackendUpdate {
             stt_model,
             tts_model,
             summarization_model,
             diarization_model,
-            ..
+            streaming_latency_ms,
+            enrolled_speakers,
+            total_participants,
         } => {
+            if let Err(e) = crate::db::repository::transcripts::update_session_backend(
+                pool,
+                &event.meeting_key,
+                &stt_model,
+                &tts_model,
+                &summarization_model,
+                &diarization_model,
+                streaming_latency_ms.map(|v| v as i64),
+                enrolled_speakers.map(|v| v as i64),
+                total_participants.map(|v| v as i64),
+            ) {
+                warn!("update_session_backend failed: {}", e);
+            }
             info!(
                 "MeetingEvent BackendUpdate: session_id={} stt={} tts={} sum={} diar={}",
                 session_id, stt_model, tts_model, summarization_model, diarization_model
+            );
+        }
+        // Lifecycle stage z bota — persistuje do meeting_sessions.lifecycle_stage
+        // żeby reload GUI w trakcie joiningu zobaczył aktualny etap bez zależności
+        // od tego, czy WSS broadcast już trafił. Broadcast i tak idzie równolegle
+        // przez publish() w callerze.
+        MeetingEventPayload::LifecycleUpdate { stage, details } => {
+            if let Err(e) = crate::db::repository::transcripts::update_session_lifecycle(
+                pool,
+                &event.meeting_key,
+                &stage,
+                details.as_deref(),
+            ) {
+                warn!("update_session_lifecycle failed: {}", e);
+            }
+            info!(
+                "MeetingEvent LifecycleUpdate: meeting_key={} session_id={} stage={}",
+                event.meeting_key, session_id, stage
             );
         }
     }
@@ -1004,10 +1031,14 @@ mod tests {
         assert!(actions.is_empty());
     }
 
-    // BackendUpdate: to samo — stan runtime'owy, nic nie wpada do DB.
+    // BackendUpdate: persisted on meeting_sessions so a live view mounted
+    // after the broadcast still sees the BACKEND panel populated.
     #[test]
-    fn persist_handler_backend_update_is_noop() {
+    fn persist_handler_backend_update_writes_models() {
         let db = setup_test_db();
+        // Session must exist before the bot's BackendUpdate, mirroring host flow.
+        crate::db::repository::transcripts::get_or_create_session(&db, "m-bu-1", None, None)
+            .unwrap();
         let event = MeetingEventData {
             meeting_key: "m-bu-1".to_string(),
             timestamp_ms: 100,
@@ -1016,19 +1047,31 @@ mod tests {
                 tts_model: "teams-tts".to_string(),
                 summarization_model: "teams-summarization".to_string(),
                 diarization_model: "pyannote-3.1".to_string(),
-                streaming_latency_ms: None,
-                enrolled_speakers: None,
-                total_participants: None,
+                streaming_latency_ms: Some(180),
+                enrolled_speakers: Some(2),
+                total_participants: Some(5),
             },
         };
         persist_meeting_event(&db, event).expect("persist backend update");
 
-        let sid = crate::db::repository::transcripts::get_or_create_session(
-            &db, "m-bu-1", None, None,
-        )
-        .unwrap();
-        let summaries =
-            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
-        assert!(summaries.is_empty());
+        let sid = crate::db::repository::transcripts::session_id_by_meeting_key(&db, "m-bu-1")
+            .unwrap()
+            .expect("session id");
+        let row = crate::db::repository::transcripts::get_session(&db, sid)
+            .unwrap()
+            .expect("session row");
+        assert_eq!(row.backend_stt_model.as_deref(), Some("teams-stt"));
+        assert_eq!(row.backend_tts_model.as_deref(), Some("teams-tts"));
+        assert_eq!(
+            row.backend_summarization_model.as_deref(),
+            Some("teams-summarization")
+        );
+        assert_eq!(
+            row.backend_diarization_model.as_deref(),
+            Some("pyannote-3.1")
+        );
+        assert_eq!(row.backend_streaming_latency_ms, Some(180));
+        assert_eq!(row.backend_enrolled_speakers, Some(2));
+        assert_eq!(row.backend_total_participants, Some(5));
     }
 }

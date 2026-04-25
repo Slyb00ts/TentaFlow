@@ -46,7 +46,11 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - `MessageBody::MeetingLiveEventBody(MeetingLiveEvent)` — unsolicited
 ///     broadcast dashboard GUI po każdym sukcesie `persist_meeting_event`.
 ///     Filtrowany server-side po owner_user_id sesji.
-pub const SCHEMA_VERSION: u16 = 9;
+/// v10 changes (2026-04-24):
+///   - Mesh & Network settings: `NetworkInterfacesList*`, `NetworkConfigGet*`,
+///     `NetworkConfigUpdate*` — enumeracja IPv4 NIC hosta + perzistowane w DB
+///     reguly bind/advertise dla iroh mesh (IPv4-only, zero v6).
+pub const SCHEMA_VERSION: u16 = 10;
 
 // =============================================================================
 // Message kind discriminants

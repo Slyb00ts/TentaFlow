@@ -204,6 +204,7 @@ impl IrohServiceClient {
     pub async fn shutdown(self: Arc<Self>) {
         debug!(name = %self.config.name, "iroh service client shutdown");
         let _ = &self.shutdown_rx;
+        self.inner.shutdown().await;
     }
 
     /// Zwraca wewnetrzny `ServiceClient` — do zaawansowanych uzyc (np. ensure_connection).

@@ -37,6 +37,13 @@ pub fn is_alive(pid: u32) -> bool {
     is_alive_impl(pid)
 }
 
+// errno cross-platform: macOS uzywa __error(), Linux __errno_location().
+// std::io::Error::last_os_error() opakowuje to przenosnie.
+#[cfg(unix)]
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
 #[cfg(unix)]
 fn is_alive_impl(pid: u32) -> bool {
     // kill(pid, 0) zwraca 0 gdy proces istnieje i mamy do niego dostep,
@@ -47,8 +54,7 @@ fn is_alive_impl(pid: u32) -> bool {
         if rc == 0 {
             return true;
         }
-        let errno = *libc::__error();
-        errno == libc::EPERM
+        last_errno() == libc::EPERM
     }
 }
 
@@ -56,7 +62,7 @@ fn is_alive_impl(pid: u32) -> bool {
 fn terminate_impl(pid: u32) -> Result<()> {
     unsafe {
         if libc::kill(pid as libc::pid_t, libc::SIGTERM) != 0 {
-            let errno = *libc::__error();
+            let errno = last_errno();
             if errno == libc::ESRCH {
                 return Ok(()); // juz martwy
             }
@@ -70,7 +76,7 @@ fn terminate_impl(pid: u32) -> Result<()> {
 fn force_kill(pid: u32) -> Result<()> {
     unsafe {
         if libc::kill(pid as libc::pid_t, libc::SIGKILL) != 0 {
-            let errno = *libc::__error();
+            let errno = last_errno();
             if errno == libc::ESRCH {
                 return Ok(());
             }

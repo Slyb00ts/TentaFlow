@@ -171,6 +171,7 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     // Unified HTTPS server (OpenAI API + Dashboard na jednym porcie) — z Core
     let quic_mesh_for_server = mesh_handles.as_ref().and_then(|h| h.quic_mesh.clone());
     let mesh_security_for_server = mesh_handles.as_ref().and_then(|h| h.security.clone());
+    let mesh_relay_health_for_server = mesh_handles.as_ref().map(|h| h.relay_health.clone());
     let local_node_id: Arc<str> = Arc::from(node_id.as_str());
 
     tentaflow_core::api::unified_server::start_unified_server(
@@ -182,6 +183,7 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
         quic_mesh_for_server,
         local_node_id,
         mesh_security_for_server,
+        mesh_relay_health_for_server,
     )?;
 
     // Inference manager — juz obslugiwany przez restore_native_services() wyzej

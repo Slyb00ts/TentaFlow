@@ -26,7 +26,10 @@ use crate::mesh::security::MeshSecurity;
 use crate::mesh::service_registry::MeshServiceRegistry;
 use crate::net::iroh::{
     handler::IrohStreamError,
-    pairing::{endpoint_addr_from_hints, hints_with_relay_fallback, PairingContactHints, PairingHandler},
+    pairing::{
+        endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
+        merge_contact_hints, PairingContactHints, PairingHandler,
+    },
     IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_MESH, ALPN_PAIRING,
 };
 
@@ -445,14 +448,14 @@ impl IrohMeshManager {
                             node_id: peer_hex.clone(),
                             addresses: addresses.clone(),
                         });
+                        let is_trusted = self_arc.security.is_trusted(&peer_hex);
+                        if !is_trusted {
+                            continue;
+                        }
                         if self_arc.is_connected(&peer_hex).await {
                             continue;
                         }
-                        // Tlumimy rapid re-dial tego samego peera — cooldown
-                        // jest dluzszy dla niesparowanych (30s) niz zaufanych
-                        // (5s). Dzieki temu dwa nody w tej samej LANie nie
-                        // wchodza w petle tie-break / re-discovery.
-                        let is_trusted = self_arc.security.is_trusted(&peer_hex);
+                        // Tlumimy rapid re-dial tego samego trusted peera.
                         if !self_arc.try_consume_dial_attempt(&peer_hex, is_trusted) {
                             debug!(peer = %peer_hex, trusted = is_trusted, "iroh_mesh: dial pominiety (cooldown)");
                             continue;
@@ -463,10 +466,21 @@ impl IrohMeshManager {
                         } else {
                             debug!(peer = %peer_hex, "iroh_mesh: peer re-odkryty (log stlumiony)");
                         }
+                        let merged_hints = merge_contact_hints(
+                            load_trusted_contact_hints(&self_arc.security.db, &peer_hex)
+                                .ok()
+                                .flatten(),
+                            PairingContactHints {
+                                node_id: peer_hex.clone(),
+                                public_key_hex: String::new(),
+                                hostname: String::new(),
+                                addresses: addresses.iter().map(|addr| addr.to_string()).collect(),
+                                relay_url: String::new(),
+                            },
+                        );
                         let me = Arc::clone(&self_arc);
                         tokio::spawn(async move {
-                            let dummy = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-                            match me.connect_to_peer(&peer_hex, dummy).await {
+                            match me.connect_to_peer_with_hints(&merged_hints).await {
                                 Ok(_) => {
                                     me.note_dial_success(&peer_hex);
                                 }
