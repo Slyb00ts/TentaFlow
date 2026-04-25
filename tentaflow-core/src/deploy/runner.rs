@@ -886,6 +886,10 @@ async fn do_python_bundle_native_deploy(
         torch_home.to_string_lossy().into_owned(),
     );
 
+    // Klonujemy env przed konstrukcja native_req — native_req trafia do
+    // spawn_blocking (move), env_for_guard zostaje na pozniejszy register
+    // w MemoryGuard.
+    let env_for_guard = env.clone();
     let native_req = crate::deploy::python_venv::NativeDeployRequest {
         engine: engine.engine_id.clone(),
         instance_name: Some(service_name.clone()),
@@ -1110,6 +1114,30 @@ async fn do_python_bundle_native_deploy(
             ),
         );
     } else {
+        // Rejestracja w MemoryGuard — process juz zyje (PID > 0), wiec
+        // guard od razu zna ten serwis jako warm.
+        let vram_estimate = crate::memory::estimate_vram_for_model(&model_repo);
+        let guard_engine = std::sync::Arc::new(crate::memory::PythonBundleEngine::new(
+            engine.engine_id.clone(),
+            service_name.clone(),
+            service_name.clone(),
+            model_repo.clone(),
+            host_port,
+            vram_estimate,
+            env_for_guard.clone(),
+            pid,
+        ));
+        let auto_pin = is_orchestrator_model(&engine.engine_id, &model_repo);
+        let affinity = parse_gpu_affinity(config.gpu_ids.as_deref());
+        crate::memory::guard_global().register(
+            service_name.clone(),
+            guard_engine,
+            vram_estimate,
+            auto_pin,
+            false,
+            affinity,
+        );
+
         log_line(
             db,
             deploy_id,
@@ -1252,6 +1280,46 @@ fn native_service_name(engine: &EngineMeta, config: &DeployConfig, model_repo: &
     let engine_slug = slugify_name(&engine.engine_id);
     let model_slug = slugify_name(model_repo);
     format!("{}-native-{}", engine_slug, model_slug)
+}
+
+/// Konwersja `config.gpu_ids: Option<Vec<String>>` -> GpuAffinity.
+/// Brak / pusta lista / "all" -> All. Pojedynczy idx -> Single. Wiele -> Multi.
+fn parse_gpu_affinity(gpu_ids: Option<&[String]>) -> crate::memory::GpuAffinity {
+    use crate::memory::GpuAffinity;
+    let ids = match gpu_ids {
+        Some(v) if !v.is_empty() => v,
+        _ => return GpuAffinity::All,
+    };
+    if ids.iter().any(|s| s.eq_ignore_ascii_case("all")) {
+        return GpuAffinity::All;
+    }
+    if ids.iter().any(|s| s.eq_ignore_ascii_case("cpu")) {
+        return GpuAffinity::Cpu;
+    }
+    let parsed: Vec<usize> = ids.iter().filter_map(|s| s.parse().ok()).collect();
+    match parsed.len() {
+        0 => GpuAffinity::All,
+        1 => GpuAffinity::Single(parsed[0]),
+        _ => GpuAffinity::Multi(parsed),
+    }
+}
+
+/// Czy model powinien byc auto-pinned w MemoryGuard (zawsze warm, nie evict).
+/// Domyslnie: maly orchestrator Qwen 0.8B + Whisper STT + sherpa TTS — uzywane
+/// w jarvis voice loop, musza byc dostepne natychmiast. User moze nadpisac
+/// (toggle Pin w Services).
+fn is_orchestrator_model(engine_id: &str, model_repo: &str) -> bool {
+    let m = model_repo.to_ascii_lowercase();
+    let e = engine_id.to_ascii_lowercase();
+    // Maly Qwen 0.8B jako orchestrator (jakikolwiek backend).
+    if m.contains("qwen3.5-0.8b") || m.contains("qwen3-5-0-8b") {
+        return true;
+    }
+    // Whisper STT i sherpa TTS — pinned bo jarvis voice loop.
+    if e == "whisper" || e == "sherpa-onnx" {
+        return true;
+    }
+    false
 }
 
 fn slugify_name(value: &str) -> String {

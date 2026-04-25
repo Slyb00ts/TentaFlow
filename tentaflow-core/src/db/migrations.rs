@@ -1661,6 +1661,22 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
     ),
     (
         55,
+        "services_pinned_paused_for_memory_guard",
+        "
+            -- MemoryGuard persistence — pinned (zawsze warm, nie evict) + paused
+            -- (skip autostart). Domyslnie 0/0 dla istniejacych wpisow; auto-pin
+            -- ustawiany przez deploy dla orchestratora (Qwen 0.8B, Whisper, sherpa).
+            ALTER TABLE services ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE services ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
+            -- Szacowana pamiec VRAM/RAM modelu w MB. NULL = brak oszacowania
+            -- (guard uzyje heurystyki estimate_vram_for_model).
+            ALTER TABLE services ADD COLUMN vram_estimate_mb INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_services_pinned ON services(pinned);
+            CREATE INDEX IF NOT EXISTS idx_services_paused ON services(paused);
+        ",
+    ),
+    (
+        56,
         "meeting_sessions_lifecycle_stage",
         "
             -- Real lifecycle stage of the meeting bot, updated both by the host
@@ -1675,7 +1691,7 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
         ",
     ),
     (
-        56,
+        57,
         "services_source_hash",
         "
             -- Sha256 of the container source tree captured when the service
@@ -1686,7 +1702,7 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
         ",
     ),
     (
-        57,
+        58,
         "mesh_network_settings_defaults",
         "
             -- Seed domyslnych ustawien mesh & network (bind mode + advertise filters).
@@ -1703,7 +1719,7 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
         ",
     ),
     (
-        58,
+        59,
         "meeting_sessions_backend_models",
         "
             -- Backend model identifiers reported by the bot via

@@ -27,7 +27,7 @@ hex = "0.4"
 data-encoding = "2"
 
 [target.'cfg(target_os = "ios")'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "inference-mlx-swift", "dashboard-api"] }
+tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "inference-mlx", "dashboard-api"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.13"

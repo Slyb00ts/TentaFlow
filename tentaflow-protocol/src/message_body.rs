@@ -19,8 +19,11 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// Lekki widok modelu w katalogu.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ModelSummary {
-    /// Np. "llama-3.2-1b-instruct".
+    /// Np. "tentaflow-vllm-metal-2izlb" — service name (do dispatchu).
     pub id: String,
+    /// User-friendly etykieta dla GUI: HF repo modelu (np. "Qwen/Qwen3.5-0.8B")
+    /// gdy znany, inaczej service name jako fallback.
+    pub display_name: String,
     /// Rodzina: "llm", "tts", "stt", "embedding", itd.
     pub category: String,
     /// Silnik ktory uruchamia model: "llama-cpp", "mlx", "vllm"...
@@ -331,6 +334,10 @@ pub struct ServiceSummary {
     pub engine_id: Option<String>,
     /// Identyfikator modelu (jesli serwis obsluguje konkretny model).
     pub model_id: Option<String>,
+    /// MemoryGuard pinning — true = zawsze warm, nie evict.
+    pub pinned: bool,
+    /// MemoryGuard pause — true = nie startuje autostart, request odrzucany.
+    pub paused: bool,
     /// Source-tree hash captured at last deploy. `None` for instances created
     /// before the update-detection feature. GUI compares this with the
     /// manifest's current `docker_source_hash`/`native_source_hash` to decide
@@ -2354,6 +2361,28 @@ pub struct ServiceRedeployResponse {
     pub active_session_count: u32,
 }
 
+/// MemoryGuard flagi (pinned/paused) — wrapper req/res.
+/// Pola w `ServiceFlagsUpdateRequest` opcjonalne: `None` = nie zmieniaj.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum ServiceFlagsPayload {
+    Req(ServiceFlagsUpdateRequest),
+    Res(ServiceFlagsUpdateResponse),
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceFlagsUpdateRequest {
+    pub service_id: String,
+    pub pinned: Option<bool>,
+    pub paused: Option<bool>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceFlagsUpdateResponse {
+    pub ok: bool,
+    pub pinned: bool,
+    pub paused: bool,
+}
+
 // =============================================================================
 // Meeting Bot (per-meeting container, live transcript, AI summary).
 // =============================================================================
@@ -2983,6 +3012,9 @@ pub enum MessageBody {
     ServiceDeployProgressBody(ServiceDeployProgress),
     ServiceStopRequest { service_id: String },
     ServiceStopResponse { stopped: bool },
+    /// MemoryGuard pin/pause toggle. Wrapper na sub-enum, zeby zaoszczedzic
+    /// slot w 256-variant limicie rkyv (Req + Res = 1 wariant zamiast 2).
+    ServiceFlagsBody(ServiceFlagsPayload),
     ServiceQuicStatusRequest,
     ServiceQuicStatusResponse { statuses: Vec<ServiceQuicStatus> },
 
@@ -3255,6 +3287,7 @@ mod tests {
     fn sample_model() -> ModelSummary {
         ModelSummary {
             id: "llama-3.2-1b-instruct".to_string(),
+            display_name: "meta-llama/Llama-3.2-1B-Instruct".to_string(),
             category: "llm".to_string(),
             engine_id: "llama-cpp".to_string(),
             availability: "ready".to_string(),
