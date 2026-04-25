@@ -37,6 +37,11 @@ pub struct AppState {
     /// generated tunnel_id (UUID). Instantiated per WS connection so tunnels
     /// die with the socket that spawned them.
     pub vnc_tunnels: Arc<dashmap::DashMap<String, crate::api::dashboard::vnc_tunnel::VncTunnelEntry>>,
+    /// Snapshot zdrowia relay iroh + faktyczny adres bind. Aktualizowany w tle
+    /// przez `mesh::relay_health::spawn_relay_health_monitor`. Czytany przez
+    /// handler `NetworkRelayStatusRequest`. `None` gdy mesh w ogole nie wystartowal
+    /// (np. przy testach lub `mesh.enabled=false`).
+    pub mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
 }
 
 impl AppState {
@@ -80,6 +85,7 @@ impl AppState {
             license: Arc::new(StaticLicenseChecker::free()),
             meeting_manager,
             vnc_tunnels: Arc::new(dashmap::DashMap::new()),
+            mesh_relay_health: None,
         })
     }
 }

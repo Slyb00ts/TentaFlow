@@ -953,6 +953,25 @@ pub struct NetworkConfig {
     pub iroh_relay_url: String,
 }
 
+/// Snapshot zdrowia relay iroh — co backend wie o aktualnym stanie polaczenia
+/// z konfigurowanym serwerem relay + faktyczny adres bind iroh endpointu.
+/// `rtt_ms == 0` gdy relay unreachable; `last_success_unix_secs == 0` gdy nigdy
+/// nie udalo sie zpingowac. `status` jest jedna z czterech wartosci:
+/// `"connected" | "degraded" | "unreachable" | "disabled"`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelayHealthInfo {
+    pub url: String,
+    pub reachable: bool,
+    pub rtt_ms: u32,
+    pub last_check_unix_secs: i64,
+    pub last_success_unix_secs: i64,
+    pub status: String,
+    /// Realny adres bind iroh endpointu (np. "192.168.0.93:8090" lub
+    /// "0.0.0.0:8090" gdy fallback z custom IP). To jest to co iroh REALNIE
+    /// zbindowal, nie zadanie z DB — dzieki temu GUI moze pokazac fallback.
+    pub bind_addr_actual: String,
+}
+
 /// Skonsolidowany payload dla Mesh & Network settings — 6 logicznych variantow
 /// (interfaces list req/res, config get req/res, config update req/res) zajmuje
 /// 1 slot w `MessageBody` zeby zmiescic sie w 256-variant limicie rkyv.
@@ -964,6 +983,8 @@ pub enum NetworkPayload {
     ResConfigGet(NetworkConfig),
     ReqConfigUpdate(NetworkConfig),
     ResConfigUpdate { restart_required: bool },
+    ReqRelayStatus,
+    ResRelayStatus(RelayHealthInfo),
 }
 
 // =============================================================================

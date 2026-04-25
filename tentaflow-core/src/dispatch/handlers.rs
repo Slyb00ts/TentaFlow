@@ -4627,7 +4627,38 @@ pub fn network_dispatch(
 
             P::ResConfigUpdate { restart_required }
         }
-        P::ResInterfacesList { .. } | P::ResConfigGet(_) | P::ResConfigUpdate { .. } => {
+        P::ReqRelayStatus => {
+            // Snapshot stanu relay z background monitora; gdy mesh nie wystartowal
+            // (np. mesh.enabled=false), zwracamy "disabled" z pustym URL.
+            let info = match &ctx.state.mesh_relay_health {
+                Some(state) => {
+                    let g = state.read();
+                    tentaflow_protocol::RelayHealthInfo {
+                        url: g.url.clone(),
+                        reachable: g.reachable,
+                        rtt_ms: g.rtt_ms.unwrap_or(0),
+                        last_check_unix_secs: g.last_check_unix_secs,
+                        last_success_unix_secs: g.last_success_unix_secs.unwrap_or(0),
+                        status: g.status.clone(),
+                        bind_addr_actual: g.bind_addr_actual.clone(),
+                    }
+                }
+                None => tentaflow_protocol::RelayHealthInfo {
+                    url: String::new(),
+                    reachable: false,
+                    rtt_ms: 0,
+                    last_check_unix_secs: 0,
+                    last_success_unix_secs: 0,
+                    status: "disabled".to_string(),
+                    bind_addr_actual: String::new(),
+                },
+            };
+            P::ResRelayStatus(info)
+        }
+        P::ResInterfacesList { .. }
+        | P::ResConfigGet(_)
+        | P::ResConfigUpdate { .. }
+        | P::ResRelayStatus(_) => {
             return Err(ProtocolError::bad_request(
                 "response variants are not accepted as requests",
             ));
@@ -4641,12 +4672,15 @@ pub fn network_dispatch(
 // `variant_name_of()` -> Registry::find() je znajdowalo.
 macro_rules! register_network_variant {
     ($variant:literal, $metric:literal) => {
+        register_network_variant!($variant, $metric, Admin);
+    };
+    ($variant:literal, $metric:literal, $auth:ident) => {
         ::inventory::submit! {
             crate::dispatch::HandlerMeta {
                 variant_name: $variant,
                 since_major: 1,
                 since_minor: 0,
-                required_auth: crate::dispatch::SessionAuthKind::Admin,
+                required_auth: crate::dispatch::SessionAuthKind::$auth,
                 metric_name: $metric,
                 dispatch_fn: __tentaflow_dispatch_network_dispatch,
             }
@@ -4665,4 +4699,11 @@ register_network_variant!(
 register_network_variant!(
     "NetworkConfigUpdateRequest",
     "tentaflow_ws_handler_network_config_update"
+);
+// Status relay jest informacja read-only dla zwyklych userow na ekranie Mesh —
+// nie wymaga roli admina. Zwykly UserSession wystarcza.
+register_network_variant!(
+    "NetworkRelayStatusRequest",
+    "tentaflow_ws_handler_network_relay_status",
+    UserSession
 );

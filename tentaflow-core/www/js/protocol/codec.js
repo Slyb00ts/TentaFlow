@@ -1324,6 +1324,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::NetworkBody(NetworkPayload::ReqRelayStatus) — unit. */
+  networkRelayStatusRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNetworkRelayStatusRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /**
    * MessageBody::NetworkBody(NetworkPayload::ReqConfigUpdate(NetworkConfig)).
    * `payload` akceptuje pola w camelCase lub snake_case (alias), co upraszcza

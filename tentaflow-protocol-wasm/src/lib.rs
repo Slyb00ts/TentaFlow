@@ -4089,6 +4089,31 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&obj, "restartRequired", restart_required.into());
                     set(&obj, "restart_required", restart_required.into());
                 }
+                NP::ReqRelayStatus => {
+                    set(&obj, "variant", "NetworkRelayStatusRequest".into());
+                }
+                NP::ResRelayStatus(info) => {
+                    set(&obj, "variant", "NetworkRelayStatusResponse".into());
+                    set(&obj, "url", info.url.clone().into());
+                    set(&obj, "reachable", info.reachable.into());
+                    set(&obj, "rttMs", (info.rtt_ms as f64).into());
+                    set(&obj, "rtt_ms", (info.rtt_ms as f64).into());
+                    set(&obj, "lastCheckUnixSecs", (info.last_check_unix_secs as f64).into());
+                    set(&obj, "last_check_unix_secs", (info.last_check_unix_secs as f64).into());
+                    set(
+                        &obj,
+                        "lastSuccessUnixSecs",
+                        (info.last_success_unix_secs as f64).into(),
+                    );
+                    set(
+                        &obj,
+                        "last_success_unix_secs",
+                        (info.last_success_unix_secs as f64).into(),
+                    );
+                    set(&obj, "status", info.status.clone().into());
+                    set(&obj, "bindAddrActual", info.bind_addr_actual.clone().into());
+                    set(&obj, "bind_addr_actual", info.bind_addr_actual.clone().into());
+                }
             }
         }
     }
@@ -5573,6 +5598,12 @@ pub fn encode_network_interfaces_list_request() -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen(js_name = encodeNetworkConfigGetRequest)]
 pub fn encode_network_config_get_request() -> Result<Vec<u8>, JsError> {
     encode_network(NetworkPayload::ReqConfigGet)
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqRelayStatus).
+#[wasm_bindgen(js_name = encodeNetworkRelayStatusRequest)]
+pub fn encode_network_relay_status_request() -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqRelayStatus)
 }
 
 /// MessageBody::NetworkBody(NetworkPayload::ReqConfigUpdate(NetworkConfig { .. })).
