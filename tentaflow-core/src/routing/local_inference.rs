@@ -17,7 +17,7 @@ use crate::routing::chat_template::{ChatMessage, ChatTemplate};
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Adapter routujacy OpenAI-compatible requesty do lokalnego silnika inferencji.
@@ -61,12 +61,14 @@ impl LocalInferenceHandler {
         Ok(response)
     }
 
-    /// Obsluga streaming /v1/chat/completions przez lokalne LLM.
-    /// Zwraca kanal z chunkami SSE w formacie OpenAI.
-    pub async fn handle_chat_completion_stream(
+    /// Streaming bezposrednio jako ChatCompletionChunk — zero serde_json hop.
+    /// Uzywane przez router::streaming dla LocalLlm; OpenAI HTTP API SSE
+    /// endpoint nadal moze uzywac `handle_chat_completion_stream` ktory
+    /// owija to w SSE.
+    pub async fn stream_chat_chunks(
         &self,
         request: &ChatCompletionRequest,
-    ) -> anyhow::Result<mpsc::Receiver<String>> {
+    ) -> anyhow::Result<mpsc::Receiver<ChatCompletionChunk>> {
         let template = self.get_chat_template().await;
         let params = Self::request_to_generate_params(request, &template);
         let model_name = self
@@ -77,7 +79,7 @@ impl LocalInferenceHandler {
         let created = chrono::Utc::now().timestamp() as u64;
 
         debug!(
-            "Lokalna inferencja streaming: model={}, id={}",
+            "Lokalna inferencja streaming (binary): model={}, id={}",
             model_name, completion_id
         );
 
@@ -89,18 +91,19 @@ impl LocalInferenceHandler {
             engine.generate_stream(params).await?
         };
 
-        let (sse_tx, sse_rx) = mpsc::channel::<String>(256);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<ChatCompletionChunk>(256);
 
-        tokio::spawn(Self::stream_tokens_to_sse(
+        tokio::spawn(Self::stream_tokens_to_chunks(
             token_rx,
-            sse_tx,
+            chunk_tx,
             completion_id,
             model_name,
             created,
         ));
 
-        Ok(sse_rx)
+        Ok(chunk_rx)
     }
+
 
     /// Obsluga /v1/embeddings przez lokalne modele.
     pub async fn handle_embeddings(
@@ -301,15 +304,18 @@ impl LocalInferenceHandler {
     }
 
     /// Przetwarza stream tokenow na chunki SSE w formacie OpenAI.
-    async fn stream_tokens_to_sse(
+    /// Hot-path streaming dla ws_binary path. Zero JSON hop — bezposrednio
+    /// emituje `ChatCompletionChunk` strukt do mpsc, ktory streaming.rs
+    /// konsumuje i przekazuje do rkyv encoded WS frames.
+    async fn stream_tokens_to_chunks(
         mut token_rx: mpsc::Receiver<StreamToken>,
-        sse_tx: mpsc::Sender<String>,
+        chunk_tx: mpsc::Sender<ChatCompletionChunk>,
         completion_id: String,
         model_name: String,
         created: u64,
     ) {
-        // Pierwszy chunk z rola
-        let first_chunk = ChatCompletionChunk {
+        // Pierwszy chunk — wysyla role bez contentu.
+        let first = ChatCompletionChunk {
             id: completion_id.clone(),
             object: "chat.completion.chunk".to_string(),
             created,
@@ -333,28 +339,21 @@ impl LocalInferenceHandler {
             speaker_id: None,
             speaker_name: None,
         };
-
-        if let Ok(json) = serde_json::to_string(&first_chunk) {
-            let sse_line = format!("data: {}\n\n", json);
-            if sse_tx.send(sse_line).await.is_err() {
-                return;
-            }
+        if chunk_tx.send(first).await.is_err() {
+            return;
         }
 
-        // Tokeny z contentem
         while let Some(token) = token_rx.recv().await {
             let finish_reason = if token.is_final {
                 Some("stop".to_string())
             } else {
                 None
             };
-
             let content = if token.text.is_empty() && token.is_final {
                 None
             } else {
                 Some(token.text)
             };
-
             let chunk = ChatCompletionChunk {
                 id: completion_id.clone(),
                 object: "chat.completion.chunk".to_string(),
@@ -380,30 +379,14 @@ impl LocalInferenceHandler {
                 speaker_name: None,
             };
 
-            match serde_json::to_string(&chunk) {
-                Ok(json) => {
-                    let sse_line = format!("data: {}\n\n", json);
-                    if sse_tx.send(sse_line).await.is_err() {
-                        warn!("Odbiorca SSE rozlaczony");
-                        return;
-                    }
-                }
-                Err(e) => {
-                    error!("Blad serializacji chunka SSE: {}", e);
-                }
+            if chunk_tx.send(chunk).await.is_err() {
+                warn!("Odbiorca chunk channel rozlaczony");
+                return;
             }
-
-            if chunk
-                .choices
-                .first()
-                .and_then(|c| c.finish_reason.as_ref())
-                .is_some()
-            {
+            if token.is_final {
                 break;
             }
         }
-
-        // Koncowy sygnal [DONE]
-        let _ = sse_tx.send("data: [DONE]\n\n".to_string()).await;
     }
+
 }
