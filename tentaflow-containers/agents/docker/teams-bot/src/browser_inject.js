@@ -643,6 +643,12 @@
       window.__tentaflowVideoAvailable = false;
       return;
     }
+    // Flag the capability the moment we know we will set the track up. The
+    // Rust side polls this flag at the prejoin dialog with a 2s deadline; if
+    // we wait until the end of setupVideoInjection (createElement, append,
+    // captureStream, draw) the polling can finish first on slow machines
+    // and the bot falls back to "Continue without audio or video".
+    window.__tentaflowVideoAvailable = true;
     const W = 640, H = 480;
     // captureStream samples whatever the compositor draws for this canvas.
     // A canvas that is never attached to the document never gets composited,
