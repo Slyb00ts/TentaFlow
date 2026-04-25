@@ -627,53 +627,54 @@
   // Video injection — kamerka bota (avatar 640x480 @ 30fps)
   // --------------------------------------------------------------------------
   let videoGenerator = null;
-  let videoWriter = null;
+  let videoCanvas = null;
   function setupVideoInjection() {
     if (window.__tentaflowBridge && window.__tentaflowBridge.videoSetupDone) return;
-    if (typeof MediaStreamTrackGenerator === 'undefined' ||
-        typeof OffscreenCanvas === 'undefined' ||
-        typeof VideoFrame === 'undefined') {
-      console.warn('[tentaflow] MSTG/OffscreenCanvas/VideoFrame niedostepne — video injection wylaczone');
-      videoGenerator = null;
-      window.__tentaflowVideoAvailable = false;
-      return;
-    }
-    try {
-      videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
-      // Hint to the encoder that the source is animated content rather than
-      // a still slideshow. Without it Teams' WebRTC pipeline picks a long
-      // keyframe interval and rendered our tile as black until the very
-      // first delta frame arrived.
-      try { videoGenerator.contentHint = 'motion'; } catch (_) {}
-      videoWriter = videoGenerator.writable.getWriter();
-    } catch (e) {
-      console.warn('[tentaflow] Blad tworzenia video generator', e);
-      videoGenerator = null;
+    // Switched away from MediaStreamTrackGenerator + VideoFrame: setInterval
+    // racing the async writer.write() pipe-locked the writer (Teams showed
+    // "Your video stopped working" once a single write was still pending
+    // when the next tick fired). HTMLCanvasElement.captureStream() owns the
+    // frame timing internally, paces itself against compositor vsync, and
+    // never throws on backpressure — it just drops the frame. Battle-tested
+    // path that every webcam-replacement plugin uses.
+    if (typeof HTMLCanvasElement === 'undefined' ||
+        !HTMLCanvasElement.prototype.captureStream) {
+      console.warn('[tentaflow] canvas.captureStream niedostepny — video injection wylaczone');
       window.__tentaflowVideoAvailable = false;
       return;
     }
     const W = 640, H = 480;
+    // Use a real (off-screen DOM) canvas — OffscreenCanvas does not have
+    // .captureStream(). The element is never appended so it never paints to
+    // the document; it just holds the framebuffer the stream samples from.
+    const canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = H;
+    videoCanvas = canvas;
     // alpha: false hands the encoder an opaque RGB buffer. Without it the
-    // OffscreenCanvas keeps an alpha channel, transferToImageBitmap produces
-    // RGBA, and Teams' video pipeline has historically rendered such frames
-    // as a black tile when the upstream encoder picks YUV420 with the alpha
+    // canvas keeps an alpha channel, the captured stream produces RGBA, and
+    // Teams' video pipeline has historically rendered such frames as a
+    // black tile when the upstream encoder picks YUV420 with the alpha
     // dropped.
-    const canvas = new OffscreenCanvas(W, H);
     const ctx = canvas.getContext('2d', { alpha: false });
-    // VideoFrame.timestamp must read as monotonic microseconds against the
-    // same clock the WebRTC encoder uses. We were starting at 0 and
-    // incrementing by frameIntervalUs, which made the codec interpret the
-    // first frames as decades old (epoch 1970) and drop them — Teams kept
-    // showing the placeholder black tile because no frame ever made it
-    // through. Anchor on performance.now() so timestamps line up with the
-    // rest of the page's media clock.
-    const tsAnchor = performance.now() * 1000;
-    let baseTs = tsAnchor;
-    // 30 FPS keeps the wireframe motion smooth through Teams' video pipeline.
-    // VideoFrame objects are cheap with OffscreenCanvas and Chromium reuses the
-    // underlying GPU buffer, so the ~800-edge stroke pass per frame is fine.
+    let stream = null;
+    try {
+      stream = canvas.captureStream(30);
+      const tracks = stream.getVideoTracks();
+      if (!tracks.length) throw new Error('captureStream returned no video tracks');
+      videoGenerator = tracks[0];
+      try { videoGenerator.contentHint = 'motion'; } catch (_) {}
+    } catch (e) {
+      console.warn('[tentaflow] Blad tworzenia video stream', e);
+      videoGenerator = null;
+      window.__tentaflowVideoAvailable = false;
+      return;
+    }
+    // captureStream samples this canvas internally at the rate we passed
+    // to captureStream(30), so the drawing loop just has to keep the
+    // backbuffer fresh — no manual VideoFrame timestamping, no writer
+    // backpressure to drain.
     const FPS = 30;
-    const frameIntervalUs = Math.round(1_000_000 / FPS);
     const TAU = Math.PI * 2;
     const cx = W / 2, cy = H / 2;
     const label = 'TENTAFLOW';
@@ -863,9 +864,7 @@
     let nextBlinkAt = 3.0;
     let blinkPhase = 0;
 
-    const drawAndWrite = async () => {
-      let bitmap = null;
-      let frame = null;
+    const drawAndWrite = () => {
       try {
         const t = (performance.now() - t0) / 1000;
         // Deep navy gradient backdrop — same palette as the login screen.
@@ -941,24 +940,11 @@
           ctx.fill();
         }
 
-        bitmap = canvas.transferToImageBitmap();
-        // Use the actual wall-clock since anchor instead of a stepped
-        // counter. If a frame is dropped or the loop is throttled the next
-        // frame still has a sensible timestamp; a stepped counter would
-        // accumulate drift and push frames into the future.
-        const ts = Math.round(performance.now() * 1000);
-        frame = new VideoFrame(bitmap, { timestamp: ts });
-        baseTs = ts;
-        await videoWriter.write(frame);
+        // captureStream picks up whatever is on the canvas at its own pace;
+        // we just need to leave the backbuffer freshly painted. No frame
+        // object, no writer, no manual timestamps.
       } catch (e) {
-        // Tearing down the whole bridge on a single bad frame killed audio
-        // capture too — for instance an ImageBitmap allocation hiccup once
-        // every few minutes used to silence the bot. Log instead, drop this
-        // frame, and let the next interval try again.
-        console.warn('[tentaflow] video frame error:', e && e.message ? e.message : e);
-      } finally {
-        if (frame) { try { frame.close(); } catch (_) {} }
-        if (bitmap && bitmap.close) { try { bitmap.close(); } catch (_) {} }
+        console.warn('[tentaflow] video draw error:', e && e.message ? e.message : e);
       }
     };
     registerInterval(setInterval(drawAndWrite, Math.round(1000 / FPS)));
