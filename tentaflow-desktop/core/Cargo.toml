@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "tentaflow-desktop"
 path = "src/main.rs"
 
+[features]
+# Wlacza inference-mlx (Swift bridge) w tentaflow-core. macOS desktop bin
+# propaguje to przez swoj mlx-swift-bridge feature; iOS / inne platformy nie
+# ruszaja.
+mlx-swift-bridge = ["tentaflow-core/inference-mlx"]
+
 [dependencies]
 tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "dashboard-api"] }
 tentaflow-ui = { path = "../../tentaflow-ui" }

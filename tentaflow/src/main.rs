@@ -17,6 +17,9 @@ use tentaflow_core::db;
 use tentaflow_core::metrics::{collector::MetricsCollector, RouterMetrics};
 use tentaflow_core::routing::Router;
 
+#[cfg(target_os = "macos")]
+mod mlx_swift_init;
+
 // =============================================================================
 // Argumenty CLI
 // =============================================================================
@@ -94,6 +97,20 @@ fn main() -> Result<()> {
 async fn run_server(args: Args) -> Result<()> {
     // Inicjalizacja loggingu
     setup_logging(args.verbose)?;
+
+    // Bootstrap Swift MLX bridge (macOS) — musi sie wykonac PRZED router init,
+    // zeby InferenceManager::new() zauwazyl ze MlxSwiftEngine jest dostepny i
+    // dal mu priorytet nad mlx-models. Bledy nie blokuja startu — fallback na
+    // inne backendy (mlx-models, llama.cpp).
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = mlx_swift_init::init() {
+            tracing::warn!(
+                "[mlx-swift] Bootstrap nieudany — kontynuuje bez Swift MLX: {:#}",
+                e
+            );
+        }
+    }
 
     info!("Uruchamianie TentaFlow.Router...");
     info!("Konfiguracja: {:?}", args.config);

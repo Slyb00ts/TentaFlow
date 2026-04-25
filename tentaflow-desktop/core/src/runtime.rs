@@ -72,8 +72,16 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     // Zaladuj serwisy QUIC z bazy danych (metoda w Core — wspolna dla Router.New, Desktop, Mobile)
     router.load_db_services();
 
+    // Ladowanie master key z pliku i inicjalizacja SettingsCipher (potrzebne
+    // dla restore_native_services, ktore deszyfruje sekrety w configu).
+    let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
+        .expect("Nie udalo sie zaladowac master key z pliku");
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+        &file_master_key,
+    ));
+
     // Przywroc natywne serwisy (in-process MLX/llama.cpp) z bazy
-    router.restore_native_services().await;
+    router.restore_native_services(&settings_cipher).await;
 
     // Zainstaluj wbudowane addony
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
@@ -83,17 +91,12 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();
     let collector = MetricsCollector::new(metrics.clone(), Some(db.clone()));
-    collector.start().await;
+    collector
+        .start(router.service_manager().shutdown_rx.clone())
+        .await;
 
     // Kanal komend UI → Core
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
-
-    // Ladowanie master key z pliku i inicjalizacja SettingsCipher
-    let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
-        .expect("Nie udalo sie zaladowac master key z pliku");
-    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
-        &file_master_key,
-    ));
 
     // Migracja istniejacych plaintextowych sekretow
     match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {
@@ -673,6 +676,7 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
                     },
                     variables: None,
                     cache_priority: 0,
+                    language: "",
                 },
             )?;
         }
@@ -700,6 +704,7 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
                     variables: None,
                     cache_priority: 0,
                     is_active: *is_active,
+                    language: "",
                 },
             )?;
         }
@@ -756,7 +761,7 @@ fn handle_ui_command(db: &DbPool, cmd: &UiCommand) -> Result<()> {
             alias,
             target_model,
         } => {
-            db::repository::create_model_alias(db, alias, target_model)?;
+            db::repository::create_model_alias(db, alias, target_model, None, None)?;
         }
         UiCommand::DeleteModelAlias(id) => {
             db::repository::delete_model_alias(db, *id)?;

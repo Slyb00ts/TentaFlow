@@ -6,10 +6,10 @@
 #[cfg(feature = "inference-llamacpp")]
 pub mod llamacpp;
 
+// MLX inference — implementacja przez Swift bridge (mlx-swift / MLXLLM).
+// Stary modul `mlx` (mlx-rs / mlx-models w Rust) zostal usuniety bo Rust port
+// mial bug w 4-bit forward pass: Bielik / Qwen generowaly losowe tokeny.
 #[cfg(feature = "inference-mlx")]
-pub mod mlx;
-
-#[cfg(feature = "inference-mlx-swift")]
 pub mod mlx_swift_bridge;
 
 pub mod model_manager;
@@ -71,7 +71,12 @@ impl Default for GenerateParams {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
-            repeat_penalty: 1.1,
+            // 1.0 = no-op (zgodnie z mlx-swift z iOS gdzie Bielik dziala czysto).
+            // Dla 4-bit quantized modeli (Bielik 4.5B 4-bit, Qwen 0.8B 4-bit)
+            // dodatkowy repeat_penalty na juz zdegradowanej kwantyzacja
+            // dystrybucji logitow rozwala koherencje — model losuje tokeny z
+            // calego corpusu zamiast trzymac sie watku.
+            repeat_penalty: 1.0,
             stop_sequences: vec![],
             system_prompt: None,
         }
@@ -186,12 +191,10 @@ impl InferenceManager {
             engines.push(Box::new(llamacpp::LlamaCppEngine::new()));
         }
 
+        // MLX przez Swift bridge — wymaga zarejestrowanych callbackow z
+        // libMLXBridge.dylib (bootstrap w tentaflow/src/mlx_swift_init.rs).
+        // Bez bridge'a engine nie pojawia sie na liscie.
         #[cfg(feature = "inference-mlx")]
-        {
-            engines.push(Box::new(mlx::MlxEngine::new()));
-        }
-
-        #[cfg(feature = "inference-mlx-swift")]
         {
             if mlx_swift_bridge::is_available() {
                 engines.push(Box::new(mlx_swift_bridge::MlxSwiftEngine::new()));

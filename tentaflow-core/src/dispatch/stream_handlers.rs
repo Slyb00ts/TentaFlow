@@ -57,6 +57,10 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             })
             .collect();
 
+        // Przekazujemy request 1:1 z GUI — bez forced system prompt i bez
+        // override sampling defaults. Backend (LocalInference / vLLM) zna
+        // swoje sane defaults; wstrzykiwanie ENG system prompt do polskich
+        // 4-bit modeli (Bielik) degradowalo kontekst → bełkot z corpusu.
         let request = ChatCompletionRequest {
             model: stream_req.model_id.clone(),
             messages,
@@ -118,9 +122,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 if let Some(content) = choice.delta.content.as_ref() {
                     if !content.is_empty() {
                         // Async send — czeka na slot gdy channel pelny zeby nie
-                        // gubic tokenow (maly model 0.8B emituje ~200 tok/s,
-                        // WS writer moze nie nadazac — bez backpressure gubimy
-                        // wszystko po pierwszych 64 chunkach).
+                        // gubic tokenow przy szybko generujacym modelu (200+ tok/s).
                         if push_chunk_async(
                             &sub,
                             MessageBody::ChatStreamChunkBody(ChatStreamChunk {
@@ -130,7 +132,6 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         .await
                         .is_err()
                         {
-                            // Receiver naprawde odpadl — kanczymy task.
                             return;
                         }
                         completion_tokens = completion_tokens.saturating_add(1);

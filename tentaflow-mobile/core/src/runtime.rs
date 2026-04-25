@@ -68,8 +68,16 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     // Zaladuj serwisy z bazy danych (wspolna metoda Core)
     router.load_db_services();
 
+    // Ladowanie master key z pliku i inicjalizacja SettingsCipher (potrzebne
+    // dla restore_native_services, ktore deszyfruje sekrety w configu).
+    let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
+        .expect("Nie udalo sie zaladowac master key z pliku");
+    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+        &file_master_key,
+    ));
+
     // Przywroc natywne serwisy (in-process MLX/llama.cpp) z bazy
-    router.restore_native_services().await;
+    router.restore_native_services(&settings_cipher).await;
 
     // Zainstaluj wbudowane addony (WASM — wasmi interpreter na mobile)
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
@@ -84,13 +92,6 @@ pub async fn start_services(config: NodeConfig, _state: SharedAppState) -> Resul
     // Heartbeat diagnostyki — co 5s zapisuje timestamp do last_alive.txt,
     // zeby nastepny startup mogl rozroznic suspend od terminate.
     crate::diagnostics::spawn_heartbeat_task(data_dir.clone(), shutdown_tx.subscribe());
-
-    // Ladowanie master key z pliku i inicjalizacja SettingsCipher
-    let file_master_key = tentaflow_core::crypto::load_or_create_master_key_in(Some(&data_dir))
-        .expect("Nie udalo sie zaladowac master key z pliku");
-    let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
-        &file_master_key,
-    ));
 
     // Migracja istniejacych plaintextowych sekretow
     match tentaflow_core::crypto::migrate_plaintext_secrets(&db, &settings_cipher) {

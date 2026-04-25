@@ -370,6 +370,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ServiceDeployProgressBody(_) => "ServiceDeployProgress",
         MessageBody::ServiceStopRequest { .. } => "ServiceStopRequest",
         MessageBody::ServiceStopResponse { .. } => "ServiceStopResponse",
+        MessageBody::ServiceFlagsBody(p) => match p {
+            tentaflow_protocol::ServiceFlagsPayload::Req(_) => "ServiceFlagsUpdateRequest",
+            tentaflow_protocol::ServiceFlagsPayload::Res(_) => "ServiceFlagsUpdateResponse",
+        },
         MessageBody::ServiceQuicStatusRequest => "ServiceQuicStatusRequest",
         MessageBody::ServiceQuicStatusResponse { .. } => "ServiceQuicStatusResponse",
         MessageBody::PromptListRequest => "PromptListRequest",

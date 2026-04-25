@@ -296,28 +296,22 @@ function pushMessage(conv, msg) {
   saveConversations();
 }
 
-// Wywolywane po kazdym chunk ze streama. Przy maly modelach LLM (vllm-metal
-// Qwen 0.8B) tokeny lecą ~150-250/s — render viewport co chunk zacinal UI.
-// Throttlujemy przez requestAnimationFrame do ~60fps: kazdy chunk modyfikuje
-// assistantMsg.text, ale flush do DOM robimy raz na klatke. Delta tekstu
-// juz jest w modelu wiec nic nie tracimy.
-let streamRafPending = false;
+// Wywolywane po kazdym chunk ze streama. updateTail patchuje TYLKO innerHTML
+// ostatniego .vlist-item (incremental), wiec ~1ms per chunk — taniej niz
+// requestAnimationFrame ktory w background tab moze byc throttlowany do
+// <1Hz przez Chrome (powod "tokeny po 30s" gdy uzytkownik przelaczyl karte).
+// Bezposrednie wywolanie zapewnia stabilny render niezaleznie od visibility.
 function onStreamTick() {
-  if (streamRafPending) return;
-  streamRafPending = true;
-  requestAnimationFrame(() => {
-    streamRafPending = false;
-    if (!vlist) return;
-    const wasPinned = vlist.pinned;
-    vlist.updateTail();
-    const pill = byId('chat-new-pill');
-    if (!pill) return;
-    if (!wasPinned) {
-      pill.classList.add('visible');
-    } else {
-      pill.classList.remove('visible');
-    }
-  });
+  if (!vlist) return;
+  const wasPinned = vlist.pinned;
+  vlist.updateTail();
+  const pill = byId('chat-new-pill');
+  if (!pill) return;
+  if (!wasPinned) {
+    pill.classList.add('visible');
+  } else {
+    pill.classList.remove('visible');
+  }
 }
 
 // ---- Screen --------------------------------------------------------------
@@ -372,9 +366,14 @@ const ChatScreen = {
 
     const sel = byId('chat-model');
     const innerSelect = sel?.querySelector('select');
+    // value = service id (do dispatchu), label = display_name (HF repo, np.
+    // "Qwen/Qwen3.5-0.8B") gdy znany, fallback na id.
     const optionsHtml = modelOptions.length === 0
       ? `<option value="default">default</option>`
-      : modelOptions.map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('');
+      : modelOptions.map((m) => {
+          const label = m.display_name || m.displayName || m.id;
+          return `<option value="${escapeHtml(m.id)}">${escapeHtml(label)}</option>`;
+        }).join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;
       sel.setAttribute('value', innerSelect.value);
