@@ -6,18 +6,28 @@
 //       EndpointAddr z znanego EndpointId + direct IP i wola iroh.
 // =============================================================================
 
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::net::{IpAddr, SocketAddr};
 use std::os::raw::c_char;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tentaflow_core::mesh::iroh_manager::IrohMeshManager;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Globalny uchwyt do IrohMeshManager — ustawiany raz po starcie mesh pipeline,
 /// odczytywany przez FFI z watkow Swift (NWBrowser callback).
 static MESH_HANDLE: OnceLock<Arc<IrohMeshManager>> = OnceLock::new();
+
+/// Peer id (hex) dla ktorych w tej chwili leci async connect_to_peer_direct.
+/// NWBrowser callback moze zawolac FFI wielokrotnie dla tego samego peera
+/// zanim pierwszy handshake sie zakonczy — bez tego zestawu dostajemy
+/// connection storm (8 QUIC connectow w 30ms).
+static INFLIGHT_CONNECTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn inflight() -> &'static Mutex<HashSet<String>> {
+    INFLIGHT_CONNECTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 /// Ustawia globalny uchwyt. Wolane raz z runtime.rs po udanym starcie mesh.
 pub fn set_mesh_handle(handle: Arc<IrohMeshManager>) {
@@ -97,45 +107,60 @@ pub unsafe extern "C" fn tentaflow_mobile_add_discovered_peer(
         }
     };
 
-    debug!(
+    // Dedup — dla tego samego peer_id moze lecieć co najwyzej 1 connect na raz.
+    // Swift wola FFI wielokrotnie (browser update + retry loop) — bez tego
+    // dostajemy 8 QUIC connectow zanim pierwsze handshake sie skonczy.
+    {
+        let mut set = inflight().lock().expect("inflight poisoned");
+        if set.contains(&endpoint_id_hex) {
+            debug!(
+                endpoint_id = %&endpoint_id_hex[..16.min(endpoint_id_hex.len())],
+                "skip — connect w toku"
+            );
+            return true;
+        }
+        set.insert(endpoint_id_hex.clone());
+    }
+
+    info!(
         endpoint_id = %&endpoint_id_hex[..16.min(endpoint_id_hex.len())],
         addr = %socket_addr,
-        "Dodaje peera znalezionego przez Bonjour"
+        "Dial peera z Bonjour"
     );
 
-    // Uruchamiamy laczenie w tle — nie blokujemy watku Swift.
-    // tokio::spawn wymaga aktywnego runtime; uzywamy Handle::try_current
-    // bo funkcja moze byc wolana z dowolnego watku.
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn(async move {
-                if let Err(e) = manager.connect_to_peer_direct(&endpoint_id_hex, socket_addr).await {
-                    debug!(endpoint_id = %&endpoint_id_hex[..16.min(endpoint_id_hex.len())],
-                           "connect_to_peer_direct: {}", e);
-                }
-            });
-            true
+    // Preferuj biezacy tokio runtime (gdy FFI leci z Rust taska), w przeciwnym
+    // razie uzyj globalnego MESH_RUNTIME ustawionego po starcie mesh.
+    let rt = match tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| MESH_RUNTIME.get().cloned())
+    {
+        Some(h) => h,
+        None => {
+            warn!("discovered peer: brak aktywnego tokio runtime");
+            // Zwolnij slot, inaczej kolejne FFI dla tego peera nigdy nie dojda.
+            let _ = inflight().lock().map(|mut s| s.remove(&endpoint_id_hex));
+            return false;
         }
-        Err(_) => {
-            // Brak biezacego runtime — prawdopodobnie wolane z czystego watku Swift.
-            // Szukamy dedykowanego runtime'u w ktorym mesh dziala.
-            match MESH_RUNTIME.get() {
-                Some(rt) => {
-                    rt.spawn(async move {
-                        if let Err(e) = manager.connect_to_peer_direct(&endpoint_id_hex, socket_addr).await {
-                            debug!(endpoint_id = %&endpoint_id_hex[..16.min(endpoint_id_hex.len())],
-                                   "connect_to_peer_direct: {}", e);
-                        }
-                    });
-                    true
-                }
-                None => {
-                    warn!("discovered peer: brak aktywnego tokio runtime");
-                    false
-                }
-            }
+    };
+
+    rt.spawn(async move {
+        let ep_short = endpoint_id_hex
+            .get(..16)
+            .unwrap_or(&endpoint_id_hex)
+            .to_string();
+        let result = manager
+            .connect_to_peer_direct(&endpoint_id_hex, socket_addr)
+            .await;
+        match result {
+            Ok(()) => info!(endpoint_id = %ep_short, "connect_to_peer_direct OK"),
+            Err(e) => debug!(endpoint_id = %ep_short, "connect_to_peer_direct: {}", e),
         }
-    }
+        // Odblokuj slot w inflight — ok albo error, obie sciezki pozwalaja
+        // na kolejne proby (ok → nastepne FFI bede odfiltrowane przez
+        // is_connected; err → retry z NWBrowser cache ma sens).
+        let _ = inflight().lock().map(|mut s| s.remove(&endpoint_id_hex));
+    });
+    true
 }
 
 /// Globalny uchwyt do runtime'u tokio w ktorym dziala mesh. Ustawiany raz

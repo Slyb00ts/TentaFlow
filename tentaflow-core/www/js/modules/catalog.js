@@ -293,7 +293,7 @@ function renderActiveTab() {
 
 function updateCount() {
   if (!target) return;
-  const targetOs = target.os || 'linux';
+  const targetOs = target.os || 'unknown';
   const total = Manifest.all().filter((s) => Manifest.isEngineCompatible(s, targetOs)).length;
   const tab = document.querySelector('#catalog-tabs tf-tab#tentaflow');
   if (tab) tab.setAttribute('count', String(total));
@@ -302,7 +302,7 @@ function updateCount() {
 // ---- TentaFlow tab --------------------------------------------------------
 
 function renderTentaflowTab() {
-  const targetOs = target?.os || 'linux';
+  const targetOs = target?.os || 'unknown';
   const categories = Manifest.nonEmptyCategories();
   const groups = [
     { id: 'ai', label: I18n.t('catalog.group_ai') },

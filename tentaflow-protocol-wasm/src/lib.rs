@@ -4599,6 +4599,18 @@ fn flow_node_template_to_js(t: tentaflow_protocol::message_body::FlowNodeTemplat
     if let Some(i) = t.icon {
         set(&obj, "icon", i.into());
     }
+    let input_ports = js_sys::Array::new();
+    for p in &t.input_ports {
+        input_ports.push(&JsValue::from_str(p));
+    }
+    set(&obj, "inputPorts", input_ports.clone().into());
+    set(&obj, "input_ports", input_ports.into());
+    let output_ports = js_sys::Array::new();
+    for p in &t.output_ports {
+        output_ports.push(&JsValue::from_str(p));
+    }
+    set(&obj, "outputPorts", output_ports.clone().into());
+    set(&obj, "output_ports", output_ports.into());
     obj
 }
 
@@ -4683,7 +4695,10 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "trust", n.source.into());
     set(&obj, "isLocal", n.is_local.into());
     set(&obj, "is_local", n.is_local.into());
-    if let Some(v) = n.uptime_secs { set(&obj, "uptimeSecs", (v as f64).into()); }
+    if let Some(v) = n.uptime_secs {
+        set(&obj, "uptimeSecs", (v as f64).into());
+        set(&obj, "uptime_secs", (v as f64).into());
+    }
     let ifs = js_sys::Array::new();
     let mut total_rx: u64 = 0;
     let mut total_tx: u64 = 0;
@@ -4866,7 +4881,10 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "containers", containers.into());
     set(&obj, "containers_running", containers_running.into());
     set(&obj, "containers_total", containers_total.into());
-    if let Some(v) = n.last_seen_epoch { set(&obj, "lastSeenEpoch", (v as f64).into()); }
+    if let Some(v) = n.last_seen_epoch {
+        set(&obj, "lastSeenEpoch", (v as f64).into());
+        set(&obj, "last_seen_epoch", (v as f64).into());
+    }
     if let Some(r) = n.route {
         let route = js_sys::Object::new();
         set(&route, "hops", r.hops.into());
@@ -4877,6 +4895,7 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         }
         set(&obj, "route", route.into());
     }
+    set(&obj, "platform", n.platform.clone().into());
     obj
 }
 
