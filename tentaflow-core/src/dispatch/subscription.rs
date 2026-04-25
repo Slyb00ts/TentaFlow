@@ -186,10 +186,33 @@ pub fn push_chunk(sub: &Subscription, body: MessageBody) -> Result<(), String> {
         .map_err(|e| format!("backpressure: {}", e))
 }
 
+/// Async wersja `push_chunk` z prawdziwym backpressure. Czeka na slot w kanale
+/// gdy pelno (nie gubi chunkow). Zwraca Err tylko gdy receiver odpadl — wtedy
+/// caller powinien zakonczyc task. Uzywane przez handlery ktore emituja duzo
+/// chunkow (np. chat LLM streaming z maly modelu szybko generujaca tokeny).
+pub async fn push_chunk_async(sub: &Subscription, body: MessageBody) -> Result<(), String> {
+    sub.tx
+        .send(SubscriptionEvent::Chunk(body))
+        .await
+        .map_err(|e| format!("receiver closed: {}", e))
+}
+
 /// Wysyla koncowy frame. Po tym subscription powinno byc cancel'owane przez writer.
 pub fn push_end(sub: &Subscription, final_body: Option<MessageBody>) -> Result<(), String> {
     sub.tx
         .try_send(SubscriptionEvent::End(final_body))
+        .map_err(|e| format!("end send: {}", e))
+}
+
+/// Async wersja `push_end` — czeka na slot gdy kanal pelny. Gwarantuje ze frame
+/// End dotrze do writera nawet przy wysokiej intensywnosci chunkow tuz przed.
+pub async fn push_end_async(
+    sub: &Subscription,
+    final_body: Option<MessageBody>,
+) -> Result<(), String> {
+    sub.tx
+        .send(SubscriptionEvent::End(final_body))
+        .await
         .map_err(|e| format!("end send: {}", e))
 }
 

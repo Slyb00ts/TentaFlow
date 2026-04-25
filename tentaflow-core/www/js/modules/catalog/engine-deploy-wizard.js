@@ -20,7 +20,6 @@ let engineEntry = null;
 let availableMethods = [];
 let hostOs = 'linux';
 let nodes = [];
-let hfToken = '';
 let modelSourceMode = 'preset';
 let hfSearchTimer = null;
 let hfResults = [];
@@ -108,8 +107,6 @@ export async function openDeployWizard(engineId, opts = {}) {
     modelSourceMode = 'hf';
   }
 
-  hfToken = await loadHfToken();
-
   refreshModal();
 }
 
@@ -135,20 +132,6 @@ async function fetchNodes() {
     console.warn('[wizard] fetchNodes:', err);
   }
   return [];
-}
-
-async function loadHfToken() {
-  try {
-    const entries = await ApiBinary.list('settingsListRequest', { arrayKey: 'entries' });
-    if (Array.isArray(entries)) {
-      const t = entries.find((s) => s && s.key === 'hf_token');
-      // Wartosci sekretow sa redaktowane przez protokol — traktujemy jako brak.
-      if (t?.value && t.value !== '<redacted>') return String(t.value);
-    }
-  } catch {
-    // ignore
-  }
-  return '';
 }
 
 function defaultUaOs() {
@@ -379,11 +362,6 @@ function renderHfSearch() {
         placeholder="${escapeAttr(I18n.t('wizard.hfSearchPlaceholder'))}"
         value="${escapeAttr(hfSearchQuery)}" autocomplete="off"
         hint="${escapeAttr(hintText)}"></tf-input>
-    </div>
-    <div class="form-group">
-      <tf-input type="password" id="edw-hf-token"
-        label="${escapeAttr(I18n.t('wizard.huggingfaceToken'))}"
-        value="${escapeAttr(hfToken)}" autocomplete="off"></tf-input>
     </div>
     <div class="model-list" id="edw-hf-results">${renderHfResultsHtml()}</div>
   `;
@@ -732,13 +710,6 @@ function bindStepModelInputs() {
     });
   }
 
-  const tokenInput = document.getElementById('edw-hf-token');
-  if (tokenInput) {
-    tokenInput.addEventListener('input', (e) => {
-      hfToken = e.detail?.value ?? tokenInput.value;
-    });
-  }
-
   bindHfResultClicks();
 }
 
@@ -819,9 +790,7 @@ async function doHfSearch(query) {
   updateHfResults();
   try {
     const url = `https://huggingface.co/api/models?search=${encodeURIComponent(query)}&limit=20`;
-    const headers = {};
-    if (hfToken) headers['Authorization'] = `Bearer ${hfToken}`;
-    const resp = await fetch(url, { headers });
+    const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HF API ${resp.status}`);
     let data = await resp.json();
     if (!Array.isArray(data)) data = [];
