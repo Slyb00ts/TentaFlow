@@ -468,6 +468,12 @@ function renderLifecycleChip() {
   if (stage === 'failed') {
     return `<tf-chip status="err" dot>${escapeHtml(I18n.t('meeting.status_error'))}</tf-chip>`;
   }
+  // Lobby gets its own short chip label and a different colour so the user
+  // sees at a glance that the bot is blocked on the host's admit action,
+  // not on something the dashboard can fix.
+  if (stage === 'lobby_waiting') {
+    return `<tf-chip status="warn" dot>${escapeHtml(I18n.t('meeting.live.chip_lobby'))}</tf-chip>`;
+  }
   // Any pre-'joined' stage — show the stage label so the user knows why LIVE
   // has not turned on yet (the backend may take ~20s to reach joined).
   const labelKey = `meeting.lifecycle_${stage}`;
