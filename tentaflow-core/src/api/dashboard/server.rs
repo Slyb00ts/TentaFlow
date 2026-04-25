@@ -46,6 +46,7 @@ pub struct DashboardServer {
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     license: Arc<dyn LicenseChecker>,
+    mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
 }
 
 impl DashboardServer {
@@ -73,7 +74,17 @@ impl DashboardServer {
             mesh_security: None,
             permission_checker: None,
             license: Arc::new(StaticLicenseChecker::free()),
+            mesh_relay_health: None,
         }
+    }
+
+    /// Ustawia snapshot zdrowia relay aktualizowany w tle przez mesh pipeline.
+    pub fn with_relay_health(
+        mut self,
+        relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    ) -> Self {
+        self.mesh_relay_health = relay_health;
+        self
     }
 
     /// Ustawia LicenseChecker — sprawdzanie tieru licencji (Free/Pro/Enterprise)
@@ -128,6 +139,7 @@ impl DashboardServer {
         let mesh_security = self.mesh_security.clone();
         let permission_checker = self.permission_checker.clone();
         let license = self.license.clone();
+        let mesh_relay_health = self.mesh_relay_health.clone();
 
         loop {
             let (stream, remote_addr) = match listener.accept().await {
@@ -152,6 +164,7 @@ impl DashboardServer {
             let msec_clone = mesh_security.clone();
             let pc_clone = permission_checker.clone();
             let lic_clone = license.clone();
+            let mrh_clone = mesh_relay_health.clone();
             // VULN-035: Przekaz remote_addr do handle_request (dual rate limiting)
             let remote_addr_str = remote_addr.to_string();
 
@@ -171,11 +184,12 @@ impl DashboardServer {
                     let msec = msec_clone.clone();
                     let pc = pc_clone.clone();
                     let lic = lic_clone.clone();
+                    let mrh = mrh_clone.clone();
                     let ra = remote_addr_str.clone();
                     async move {
                         handle_request(
                             req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc, lic,
-                            ra,
+                            mrh, ra,
                         )
                         .await
                     }
@@ -296,6 +310,7 @@ pub async fn handle_request(
     mesh_security: Option<Arc<crate::mesh::security::MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
     license: Arc<dyn LicenseChecker>,
+    mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
     remote_addr: String,
 ) -> std::result::Result<Response<DashboardBody>, hyper::Error> {
     let method = req.method().clone();
@@ -507,6 +522,7 @@ pub async fn handle_request(
             license: license.clone(),
             meeting_manager,
             vnc_tunnels: std::sync::Arc::new(dashmap::DashMap::new()),
+            mesh_relay_health: mesh_relay_health.clone(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);

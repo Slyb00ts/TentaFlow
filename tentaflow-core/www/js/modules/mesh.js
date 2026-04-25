@@ -30,42 +30,45 @@ import '/js/components/tf-window.js';
 let nodes = [];
 let pending = [];
 let unifiedModels = [];
+let relayHealth = null;
 let refreshInterval = null;
+let refreshTickCount = 0;
 let activeTab = 'list';
 
 const MeshScreen = {
   title: 'Mesh',
   render() {
+    // Naglowek + tabs w stylu Users (tf-screen + tf-detail-header). Liczba
+    // nodow renderowana jest dynamicznie w updateSubheader/renderHeaderBadges,
+    // w pierwszym przebiegu render() pokazujemy 0 — zostanie nadpisane po
+    // loadData(). Dla local card uzywamy `i-network` (i-mesh-admin nie istnieje
+    // w sprite). Dla tabow `i-management` (lista) i `i-cluster` (diagram).
     return `
-      <div class="mesh-shell">
-        <div class="page-header" id="mesh-page-header">
-          <div>
-            <h1>${I18n.t('mesh.title')}</h1>
-            <div class="sub" id="mesh-sub"></div>
+      <tf-screen>
+        <div slot="breadcrumb" class="tf-breadcrumb">
+          <span class="crumb current">${escapeHtml(I18n.t('mesh.title'))}</span>
+        </div>
+        <div slot="header" class="tf-detail-header">
+          <div class="big-ico">
+            <svg viewBox="0 0 24 24"><use href="#i-network"/></svg>
           </div>
-          <div class="actions">
+          <div class="d-meta">
+            <div class="d-name">${escapeHtml(I18n.t('mesh.title'))} <span style="color:var(--text-3);font-weight:600;font-size:15px;" id="mesh-count-inline">· 0</span></div>
+            <div class="d-sub" id="mesh-sub"></div>
+            <div class="d-badges" id="mesh-badges"></div>
+          </div>
+          <div class="d-actions">
             <tf-button variant="primary" icon="plus" id="btn-pair-new">${escapeHtml(I18n.t('mesh.pair_new'))}</tf-button>
           </div>
         </div>
-
-        <div class="mesh-tabs" id="mesh-tabs">
-          <tf-tabs variant="soft" value="list" id="mesh-tabs-nav">
-            <tf-tab id="list">${escapeHtml(I18n.t('mesh.tab_list'))}</tf-tab>
-            <tf-tab id="diagram">${escapeHtml(I18n.t('mesh.tab_diagram'))}</tf-tab>
-          </tf-tabs>
-          <div class="mesh-tab-spacer"></div>
-          <div class="mesh-legend-compact">
-            <span><span class="dot" style="background:var(--success,#22c55e);"></span>${escapeHtml(I18n.t('mesh.legend_local'))}</span>
-            <span><span class="dot" style="background:var(--accent-1,#6366f1);"></span>${escapeHtml(I18n.t('mesh.legend_paired'))}</span>
-            <span><span class="dot" style="background:var(--warning,#f59e0b);"></span>${escapeHtml(I18n.t('mesh.legend_pending'))}</span>
-            <span><span class="dot" style="background:var(--text-3,#6a7196);"></span>${escapeHtml(I18n.t('mesh.legend_offline'))}</span>
-          </div>
-        </div>
-
+        <tf-tabs slot="tabs" variant="underline" value="${activeTab}" id="mesh-tabs-nav">
+          <tf-tab id="list" icon="management" count="0">${escapeHtml(I18n.t('mesh.tab_list'))}</tf-tab>
+          <tf-tab id="diagram" icon="cluster">${escapeHtml(I18n.t('mesh.tab_diagram'))}</tf-tab>
+        </tf-tabs>
         <div id="mesh-tab-content">
           <div class="mesh-loading">${escapeHtml(I18n.t('common.loading'))}</div>
         </div>
-      </div>
+      </tf-screen>
     `;
   },
   async mount() {
@@ -78,9 +81,17 @@ const MeshScreen = {
     if (contentEl) contentEl.addEventListener('click', handleCardClick);
 
     await loadData();
+    await loadRelayHealth();
     renderActiveTab();
+    refreshTickCount = 0;
     refreshInterval = setInterval(async () => {
+      refreshTickCount += 1;
       await loadData();
+      // Relay status probujemy co ~30 s (co 6. tick z 5 s loop) — backend i tak
+      // cache'uje wynik probe co 30 s, czesciej nic nie da.
+      if (refreshTickCount % 6 === 0) {
+        await loadRelayHealth();
+      }
       renderActiveTab();
     }, 5000);
   },
@@ -93,6 +104,8 @@ const MeshScreen = {
     nodes = [];
     pending = [];
     unifiedModels = [];
+    relayHealth = null;
+    refreshTickCount = 0;
     activeTab = 'list';
   },
 };
@@ -121,18 +134,94 @@ async function loadData() {
 
 function updateSubheader() {
   const sub = byId('mesh-sub');
-  if (!sub) return;
   const total = nodes.length;
   const online = nodes.filter(n => isOnline(n)).length;
+  const offline = nodes.filter(n => !n.is_local && !isOnline(n)).length;
   const pendingIncoming = pending.filter(p => p.state === 'incoming').length;
-  const parts = [
-    `${total} ${pluralize(total, 'mesh.count_node', 'mesh.count_nodes')}`,
-    `${online} ${escapeHtml(I18n.t('mesh.online'))}`,
-  ];
-  if (pendingIncoming > 0) {
-    parts.push(`${pendingIncoming} ${escapeHtml(I18n.t('mesh.pending_count'))}`);
+  if (sub) {
+    const parts = [
+      `${total} ${pluralize(total, 'mesh.count_node', 'mesh.count_nodes')}`,
+      `${online} ${escapeHtml(I18n.t('mesh.online'))}`,
+    ];
+    if (offline > 0) {
+      parts.push(`${offline} ${escapeHtml(I18n.t('mesh.offline').toLowerCase())}`);
+    }
+    if (pendingIncoming > 0) {
+      parts.push(`${pendingIncoming} ${escapeHtml(I18n.t('mesh.pending_count'))}`);
+    }
+    sub.textContent = parts.join(' · ');
   }
-  sub.textContent = parts.join(' · ');
+  const countInline = byId('mesh-count-inline');
+  if (countInline) countInline.textContent = `· ${total}`;
+  const tabsNav = byId('mesh-tabs-nav');
+  if (tabsNav) {
+    const listTab = tabsNav.querySelector('tf-tab[id="list"]');
+    if (listTab) listTab.setAttribute('count', String(total));
+  }
+}
+
+async function loadRelayHealth() {
+  try {
+    relayHealth = await ApiBinary.one('networkRelayStatusRequest');
+  } catch {
+    relayHealth = { status: 'unknown' };
+  }
+  renderHeaderBadges();
+}
+
+function renderHeaderBadges() {
+  const host = byId('mesh-badges');
+  if (!host) return;
+  if (!relayHealth) {
+    host.innerHTML = '';
+    return;
+  }
+  const parts = [];
+
+  // Chip statusu relay-a — kolor zalezny od `status`. Pokazuje nazwe hosta z
+  // URL-a (zwart) + RTT gdy connected/degraded.
+  const status = String(relayHealth.status || 'unknown').toLowerCase();
+  if (status !== 'unknown') {
+    const url = String(relayHealth.url || '');
+    const host_ = relayHostname(url) || '—';
+    const rttMs = Number(relayHealth.rttMs ?? relayHealth.rtt_ms ?? 0);
+    let chipStatus = 'info';
+    let label = '';
+    let withDot = true;
+    if (status === 'connected') {
+      chipStatus = 'ok';
+      label = `${escapeHtml(I18n.t('mesh.relay_label'))} ${escapeHtml(host_)} · ${rttMs} ms`;
+    } else if (status === 'degraded') {
+      chipStatus = 'warn';
+      label = `${escapeHtml(I18n.t('mesh.relay_label'))} ${escapeHtml(host_)} · ${rttMs} ms (${escapeHtml(I18n.t('mesh.relay_degraded'))})`;
+    } else if (status === 'unreachable') {
+      chipStatus = 'err';
+      label = `${escapeHtml(I18n.t('mesh.relay_label'))} ${escapeHtml(host_)} · ${escapeHtml(I18n.t('mesh.relay_unreachable'))}`;
+    } else if (status === 'disabled') {
+      chipStatus = 'offline';
+      withDot = false;
+      label = `${escapeHtml(I18n.t('mesh.relay_label'))} · ${escapeHtml(I18n.t('mesh.relay_disabled'))}`;
+    }
+    parts.push(`<tf-chip status="${chipStatus}"${withDot ? ' dot' : ''}>${label}</tf-chip>`);
+  }
+
+  // Bind addr (jak naprawde slucha iroh) — info chip, bez kropki.
+  const bind = String(relayHealth.bindAddrActual || relayHealth.bind_addr_actual || '');
+  if (bind) {
+    const addrOnly = bind.replace(/:\d+$/, '');
+    parts.push(`<tf-chip status="info">${escapeHtml(I18n.t('mesh.bind_label'))} ${escapeHtml(addrOnly || bind)}</tf-chip>`);
+  }
+
+  host.innerHTML = parts.join('');
+}
+
+function relayHostname(url) {
+  if (!url) return '';
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  }
 }
 
 function mergeUnifiedModelsIntoNodes() {
@@ -342,6 +431,16 @@ function renderNodeCard(node, kind) {
   // Gauges: CPU / RAM / VRAM-sum / GPU-avg
   const gauges = offlineClass ? '' : buildGauges(node);
 
+  // Sekcja transportu/konektywnosci — local dostaje 2-pane (bind + relay),
+  // peery dostaja `net-conn-row` (transport, adres, RTT). Offline peery dostaja
+  // ten sam row ale w wariancie "no path"/"unreachable".
+  let connectivityHtml = '';
+  if (kind === 'local') {
+    connectivityHtml = renderLocalConnectivity(node);
+  } else if (kind === 'trusted') {
+    connectivityHtml = renderTransportRow(node, online);
+  }
+
   // Meta rows: Modele, Aktywne, (wybrane wg kind)
   const meta = offlineClass ? buildOfflineMeta(node) : buildMeta(node);
 
@@ -368,9 +467,156 @@ function renderNodeCard(node, kind) {
         <div class="mesh-card-actions">${actions}</div>
       </div>
       ${gauges}
+      ${connectivityHtml}
       ${meta}
     </div>
   `;
+}
+
+// ---- Connectivity (local 2-pane + per-peer transport row) -----------------
+
+/// 2-pane panel "Mesh bind | Relay" — pokazywany TYLKO dla karty `local`.
+/// Pobiera dane z relayHealth (bindAddrActual, status relay-a, RTT, last
+/// reachable). Hostname interfejsu nie jest dostepny w protokole — pomijamy
+/// (mockup pokazywal `enp1s0np0` ale to opcjonalne).
+function renderLocalConnectivity(node) {
+  const bind = String(relayHealth?.bindAddrActual || relayHealth?.bind_addr_actual || '');
+  const fallbackBind = (() => {
+    if (bind) return bind;
+    const ip = node.ip || (node.ip_addresses && node.ip_addresses[0]) || '';
+    return ip ? `${ip}` : '—';
+  })();
+
+  const relayStatus = String(relayHealth?.status || 'unknown').toLowerCase();
+  const relayUrl = String(relayHealth?.url || '');
+  const relayHost = relayHostname(relayUrl) || relayUrl || '—';
+  const rttMs = Number(relayHealth?.rttMs ?? relayHealth?.rtt_ms ?? 0);
+  const lastSuccess = Number(relayHealth?.lastSuccessUnixSecs ?? relayHealth?.last_success_unix_secs ?? 0);
+
+  let relayDotCls = 'ok';
+  let relayLabel = I18n.t('mesh.relay_connected');
+  let relayLabelCls = '';
+  if (relayStatus === 'degraded') {
+    relayDotCls = 'warn'; relayLabel = I18n.t('mesh.relay_degraded'); relayLabelCls = 'warn';
+  } else if (relayStatus === 'unreachable') {
+    relayDotCls = 'err'; relayLabel = I18n.t('mesh.relay_unreachable'); relayLabelCls = 'err';
+  } else if (relayStatus === 'disabled') {
+    relayDotCls = 'err'; relayLabel = I18n.t('mesh.relay_disabled'); relayLabelCls = 'err';
+  } else if (relayStatus === 'unknown') {
+    return ''; // bez danych nie ma sensu rysowac panelu
+  }
+
+  const relayMetaParts = [];
+  if (relayStatus === 'connected' || relayStatus === 'degraded') {
+    relayMetaParts.push(`${escapeHtml(I18n.t('mesh.rtt'))} ${rttMs} ms`);
+  }
+  if (lastSuccess > 0) {
+    relayMetaParts.push(`${escapeHtml(I18n.t('mesh.last_reachable'))} ${escapeHtml(formatRelativeSecs(lastSuccess))}`);
+  } else if (relayStatus === 'unreachable' || relayStatus === 'disabled') {
+    relayMetaParts.push(escapeHtml(I18n.t('mesh.never_reachable')));
+  }
+
+  return `
+    <div class="local-connectivity">
+      <div class="local-conn-card">
+        <div class="lc-head">
+          <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4"/></svg>
+          <span class="lc-title">${escapeHtml(I18n.t('mesh.local_bind_section'))}</span>
+          <span class="lc-status"><tf-chip status="ok" dot>${escapeHtml(I18n.t('mesh.bind_listening'))}</tf-chip></span>
+        </div>
+        <div class="lc-body"><code>${escapeHtml(fallbackBind)}</code></div>
+      </div>
+      <div class="local-conn-card">
+        <div class="lc-head">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4M12 2v4M12 18v4"/></svg>
+          <span class="lc-title">${escapeHtml(I18n.t('mesh.local_relay_section'))}</span>
+          <span class="lc-status">
+            <span class="lc-dot ${relayDotCls}"></span>
+            <span class="lc-status-text${relayLabelCls ? ' ' + relayLabelCls : ''}">${escapeHtml(relayLabel)}</span>
+          </span>
+        </div>
+        <div class="lc-body"><code>${escapeHtml(relayUrl || relayHost)}</code></div>
+        ${relayMetaParts.length ? `<div class="lc-meta">${relayMetaParts.join(' · ')}</div>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+/// Pojedynczy row "Transport: <pill> <addr> <RTT>" pokazywany pod gauges peera.
+/// Dla offline pokazuje `unreachable`/`no path` (zalezne od tego czy mamy
+/// jakikolwiek slad poprzedniego connect-a).
+function renderTransportRow(node, online) {
+  const conn = node.connection;
+  const heartbeat = node.heartbeat_ms ?? node.heartbeatMs ?? null;
+
+  let pillCls = '';
+  let pillLabel = '';
+  let pillSvg = '';
+  let addr = '';
+  let rttHtml = '';
+
+  if (online && conn && conn.transport === 'p2p') {
+    pillCls = 'p2p';
+    pillLabel = I18n.t('mesh.transport_p2p');
+    pillSvg = '<svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+    addr = String(conn.address || '');
+  } else if (online && conn && conn.transport === 'relay') {
+    pillCls = 'relay';
+    pillLabel = I18n.t('mesh.transport_relay');
+    pillSvg = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4"/></svg>';
+    addr = relayHostname(conn.relay_url || conn.relayUrl) || String(conn.address || '');
+  } else if (online && conn) {
+    pillCls = 'relay';
+    pillLabel = connectionTransportLabel(conn.transport);
+    pillSvg = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4"/></svg>';
+    addr = String(conn.address || '');
+  } else {
+    // offline: brak `connection` znaczy ze nigdy nie udalo sie polaczyc lub
+    // sesja zostala zerwana. Rozrozniamy "unreachable" (mielismy adres ale
+    // nieosiagalny) od "no path" (brak jakiegokolwiek sladu).
+    const lastSeen = node.discovered_at || node.last_seen || node.lastSeen;
+    const everConnected = lastSeen != null;
+    pillCls = 'relay-bad';
+    pillLabel = everConnected ? I18n.t('mesh.transport_unreachable') : I18n.t('mesh.transport_no_path');
+    pillSvg = '<svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    addr = everConnected
+      ? formatRelativeFromIso(lastSeen, I18n.t('mesh.last_reachable'))
+      : '';
+  }
+
+  if (online && heartbeat != null) {
+    rttHtml = `<span class="rtt">${escapeHtml(I18n.t('mesh.rtt'))} ${Math.round(Number(heartbeat))} ms</span>`;
+  }
+
+  return `
+    <div class="net-conn-row">
+      <span class="label">${escapeHtml(I18n.t('mesh.transport'))}:</span>
+      <span class="net-conn-pill ${pillCls}">${pillSvg}${escapeHtml(pillLabel)}</span>
+      ${addr ? `<span class="addr">${escapeHtml(addr)}</span>` : ''}
+      ${rttHtml}
+    </div>
+  `;
+}
+
+function formatRelativeSecs(epochSecs) {
+  if (!epochSecs) return '—';
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(epochSecs));
+  if (diff < 60) return `${diff} s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)} min ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} h ago`;
+  return `${Math.floor(diff / 86400)} d ago`;
+}
+
+function formatRelativeFromIso(value, label) {
+  if (!value) return '';
+  const t = typeof value === 'number' ? value * 1000 : Date.parse(value);
+  if (!t || isNaN(t)) return '';
+  const secs = Math.floor((Date.now() - t) / 1000);
+  if (secs < 0) return '';
+  if (secs < 60) return `${label} ${secs} s ago`;
+  if (secs < 3600) return `${label} ${Math.floor(secs / 60)} min ago`;
+  if (secs < 86400) return `${label} ${Math.floor(secs / 3600)} h ago`;
+  return `${label} ${Math.floor(secs / 86400)} d ago`;
 }
 
 // ---- Gauges (ring) --------------------------------------------------------
@@ -458,10 +704,8 @@ function buildMeta(node) {
     parts.push(`<div class="meta-item"><span><strong>${escapeHtml(I18n.t('mesh.containers_short'))}:</strong> ${cRun} / ${cTot}</span></div>`);
   }
 
-  const connection = buildConnectionSummary(node);
-  if (connection) {
-    parts.push(connection);
-  }
+  // Transport pokazany jest osobnym .net-conn-row pod gauges, wiec tu juz nie
+  // duplikujemy connection summary.
 
   return `<div class="mesh-card-meta">${parts.join('')}</div>`;
 }
@@ -485,37 +729,11 @@ function isOnline(node) {
   return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
 }
 
-function buildConnectionSummary(node) {
-  const connection = node.connection;
-  if (!connection || !connection.transport) return '';
-  const transport = connectionTransportLabel(connection.transport);
-  const scope = connection.scope ? connectionScopeLabel(connection.scope) : '';
-  const address = connection.address ? escapeHtml(connection.address) : '—';
-  const label = [transport, scope].filter(Boolean).join(' · ');
-  const paths = Array.isArray(connection.paths) ? connection.paths : [];
-  const tooltip = paths
-    .map((path) => {
-      const markers = [];
-      if (path.selected) markers.push(I18n.t('mesh.connection_selected'));
-      if (path.closed) markers.push(I18n.t('mesh.connection_closed'));
-      return `${connectionTransportLabel(path.transport)} · ${path.address}${markers.length ? ` · ${markers.join(' · ')}` : ''}`;
-    })
-    .join('\n');
-  const attrs = tooltip ? ` title="${escapeAttr(tooltip)}"` : '';
-  return `<div class="meta-item"${attrs}><span><strong>${escapeHtml(I18n.t('mesh.connection'))}:</strong> ${escapeHtml(label)} · ${address}</span></div>`;
-}
-
 function connectionTransportLabel(value) {
   if (value === 'p2p') return I18n.t('mesh.connection_p2p');
   if (value === 'relay') return I18n.t('mesh.connection_relay');
   if (value === 'custom') return I18n.t('mesh.connection_custom');
   return I18n.t('mesh.connection_unknown');
-}
-
-function connectionScopeLabel(value) {
-  if (value === 'lan') return I18n.t('mesh.connection_lan');
-  if (value === 'wan') return I18n.t('mesh.connection_wan');
-  return value || '';
 }
 
 function pctOr(value, fallback) {
