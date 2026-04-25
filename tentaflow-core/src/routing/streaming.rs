@@ -244,9 +244,14 @@ impl Router {
             for handle in &ordered {
                 match handle {
                     BackendHandle::LocalLlm => {
-                        let sse_rx = match self
+                        // Hot path: zero JSON hop. Stream<ChatCompletionChunk>
+                        // bezposrednio z LocalInferenceHandler — wczesniej
+                        // robilismy serde_json::to_string per token (w
+                        // local_inference) → unfold serde_json::from_str (tu),
+                        // co dla 14 tok/s jest waste 100-400µs/chunk.
+                        let chunk_rx = match self
                             .local_inference
-                            .handle_chat_completion_stream(&request)
+                            .stream_chat_chunks(&request)
                             .await
                         {
                             Ok(rx) => rx,
@@ -255,20 +260,8 @@ impl Router {
                                 continue;
                             }
                         };
-                        let stream = futures::stream::unfold(sse_rx, |mut rx| async move {
-                            loop {
-                                let sse_line = rx.recv().await?;
-                                let trimmed = sse_line.trim().to_string();
-                                if trimmed == "data: [DONE]" || trimmed.is_empty() {
-                                    continue;
-                                }
-                                if let Some(json_str) = trimmed.strip_prefix("data: ") {
-                                    match serde_json::from_str::<ChatCompletionChunk>(json_str) {
-                                        Ok(chunk) => return Some((Ok(chunk), rx)),
-                                        Err(_) => continue,
-                                    }
-                                }
-                            }
+                        let stream = futures::stream::unfold(chunk_rx, |mut rx| async move {
+                            rx.recv().await.map(|chunk| (Ok(chunk), rx))
                         });
                         let metadata = crate::routing::RouteMetadata {
                             served_by_node: stream_node_name.clone(),
