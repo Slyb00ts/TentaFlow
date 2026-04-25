@@ -879,6 +879,10 @@ pub const LIFECYCLE_BROWSER_LAUNCHED: &str = "browser_launched";
 pub const LIFECYCLE_NAVIGATING: &str = "navigating";
 pub const LIFECYCLE_PREJOIN_READY: &str = "prejoin_ready";
 pub const LIFECYCLE_JOINING: &str = "joining";
+/// Bot kliknal Join, ale host jeszcze go nie wpuscil — ekran "Someone in the
+/// meeting will let you in soon". Wyemitowane po Joining gdy DOM lobby jest
+/// rozpoznany. Pozwala GUI rozroznic "czekamy w lobby" od pelnego JOINED.
+pub const LIFECYCLE_LOBBY_WAITING: &str = "lobby_waiting";
 pub const LIFECYCLE_JOINED: &str = "joined";
 pub const LIFECYCLE_FAILED: &str = "failed";
 
