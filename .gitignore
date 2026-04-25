@@ -12,6 +12,13 @@ bin/
 *.exe
 *.wasm
 
+# Swift Package Manager + xcodebuild (mlx-swift bridge build outputs)
+.build/
+build-xcode/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+
 # Wygenerowany manifest serwisow dla GUI (build.rs produkuje przy kompilacji)
 tentaflow-core/www/js/generated/
 tentaflow-core/wwwroot/js/generated/

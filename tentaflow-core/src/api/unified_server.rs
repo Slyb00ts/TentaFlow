@@ -222,6 +222,17 @@ pub fn start_unified_server_with_permissions(
                     Ok(conn) => {
                         consecutive_errors = 0;
                         first_error_at = None;
+                        // TCP_NODELAY = wylacz Nagle algorithm. Dla streaming
+                        // WS (chat tokens, metrics, deploy logs) każdy chunk
+                        // jest mały (50-300 B) — Nagle czeka aż buffer się
+                        // zapelni albo 200ms timeout, co blokuje LLM streaming
+                        // do widocznych "tokenow co 30s". Loopback też dotyczy.
+                        if let Err(e) = conn.0.set_nodelay(true) {
+                            tracing::warn!(
+                                "set_nodelay failed dla {}: {}",
+                                conn.1, e
+                            );
+                        }
                         conn
                     }
                     Err(e) => {

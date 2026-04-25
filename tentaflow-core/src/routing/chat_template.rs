@@ -58,7 +58,15 @@ impl ChatTemplate {
     /// Zwraca stop tokeny specyficzne dla szablonu
     pub fn stop_tokens(&self) -> Vec<String> {
         match self {
-            ChatTemplate::ChatML => vec!["<|im_end|>".to_string()],
+            // Pelny zestaw stop tokenow dla ChatML (zgodnie z mlx-swift na iOS,
+            // gdzie Bielik 4.5B v3.0 dziala bez bełkotu). Sam <|im_end|> nie wystarczy,
+            // bo niektore quantized modele wpadaja w <|endoftext|>/<s>/</s> i nigdy
+            // nie konczyly.
+            ChatTemplate::ChatML => vec![
+                "<|im_end|>".to_string(),
+                "<|endoftext|>".to_string(),
+                "</s>".to_string(),
+            ],
             ChatTemplate::Llama3 => vec!["<|eot_id|>".to_string()],
             ChatTemplate::Mistral => vec!["[/INST]".to_string()],
             ChatTemplate::Alpaca => vec!["### Instruction:".to_string(), "### Input:".to_string()],

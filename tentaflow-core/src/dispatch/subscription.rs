@@ -23,9 +23,11 @@ use tentaflow_protocol::MessageBody;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-/// Domyslna pojemnosc bounded mpsc per subscription. 64 chunki = ~1s buforu
-/// dla heartbeat-rate eventow. Backpressure dziala przez `try_send` w handlerze.
-pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+/// Domyslna pojemnosc bounded mpsc per subscription. 256 chunki — odpowiada
+/// ~18s przy 14 tok/s (small LLM) i ~280ms przy 900 tok/s (hi-end GPU).
+/// Wystarczajaco aby WS batch writer (recv_many, 16 max) nigdy nie blokowal
+/// upstream stream handler na push_chunk_async. Backpressure przez `send().await`.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
 // =============================================================================
 // Globalny registry

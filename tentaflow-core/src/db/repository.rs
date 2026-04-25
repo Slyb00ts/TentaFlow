@@ -16,6 +16,9 @@ fn acquire(pool: &DbPool) -> Result<std::sync::MutexGuard<'_, rusqlite::Connecti
 
 /// Mapowanie wiersza na DbService
 fn row_to_service(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbService> {
+    let pinned_int: i64 = row.get(11).unwrap_or(0);
+    let paused_int: i64 = row.get(12).unwrap_or(0);
+    let vram_estimate: Option<i64> = row.get(13).ok();
     Ok(DbService {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -28,7 +31,10 @@ fn row_to_service(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbService> {
         updated_at: row.get(8)?,
         service_uuid: row.get(9)?,
         node_id: row.get(10)?,
-        deployed_source_hash: row.get(11)?,
+        pinned: pinned_int != 0,
+        paused: paused_int != 0,
+        vram_estimate_mb: vram_estimate.map(|v| v.max(0) as u64),
+        deployed_source_hash: row.get(14)?,
     })
 }
 
@@ -163,7 +169,7 @@ fn row_to_flow_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowExec
 
 // --- Services ---
 
-const SERVICE_COLS: &str = "id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id, deployed_source_hash";
+const SERVICE_COLS: &str = "id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id, pinned, paused, vram_estimate_mb, deployed_source_hash";
 const BACKEND_COLS: &str = "id, service_id, connection_type, config_json, max_concurrent, timeout_ms, weight, model_name_override, health_check_path, is_active";
 
 pub fn list_services(pool: &DbPool) -> Result<Vec<DbService>> {
@@ -185,7 +191,7 @@ pub fn list_services_with_backends(
     let conn = acquire(pool)?;
 
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.name, s.service_type, s.strategy, s.model_category, s.status, s.config_json, s.created_at, s.updated_at, s.service_uuid, s.node_id, s.deployed_source_hash, \
+        "SELECT s.id, s.name, s.service_type, s.strategy, s.model_category, s.status, s.config_json, s.created_at, s.updated_at, s.service_uuid, s.node_id, s.pinned, s.paused, s.vram_estimate_mb, s.deployed_source_hash, \
          b.id, b.service_id, b.connection_type, b.config_json, b.max_concurrent, b.timeout_ms, b.weight, b.model_name_override, b.health_check_path, b.is_active \
          FROM services s LEFT JOIN service_backends b ON s.id = b.service_id ORDER BY s.name, b.id",
     )?;
@@ -198,6 +204,9 @@ pub fn list_services_with_backends(
         let svc_id: i64 = row.get(0)?;
 
         if last_service_id != Some(svc_id) {
+            let pinned_int: i64 = row.get(11).unwrap_or(0);
+            let paused_int: i64 = row.get(12).unwrap_or(0);
+            let vram_estimate: Option<i64> = row.get(13).ok();
             let service = DbService {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -210,25 +219,28 @@ pub fn list_services_with_backends(
                 updated_at: row.get(8)?,
                 service_uuid: row.get(9)?,
                 node_id: row.get(10)?,
-                deployed_source_hash: row.get(11)?,
+                pinned: pinned_int != 0,
+                paused: paused_int != 0,
+                vram_estimate_mb: vram_estimate.map(|v| v.max(0) as u64),
+                deployed_source_hash: row.get(14)?,
             };
             services.push((service, Vec::new()));
             last_service_id = Some(svc_id);
         }
 
-        let backend_id: Option<i64> = row.get(12)?;
+        let backend_id: Option<i64> = row.get(15)?;
         if backend_id.is_some() {
             let backend = DbServiceBackend {
-                id: row.get(12)?,
-                service_id: row.get(13)?,
-                connection_type: row.get(14)?,
-                config_json: row.get(15)?,
-                max_concurrent: row.get(16)?,
-                timeout_ms: row.get(17)?,
-                weight: row.get(18)?,
-                model_name_override: row.get(19)?,
-                health_check_path: row.get(20)?,
-                is_active: row.get(21)?,
+                id: row.get(15)?,
+                service_id: row.get(16)?,
+                connection_type: row.get(17)?,
+                config_json: row.get(18)?,
+                max_concurrent: row.get(19)?,
+                timeout_ms: row.get(20)?,
+                weight: row.get(21)?,
+                model_name_override: row.get(22)?,
+                health_check_path: row.get(23)?,
+                is_active: row.get(24)?,
             };
             if let Some(last) = services.last_mut() {
                 last.1.push(backend);
@@ -317,6 +329,26 @@ pub fn update_service(
 pub fn delete_service(pool: &DbPool, id: i64) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute("DELETE FROM services WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+/// MemoryGuard: ustawia flag pinned (zawsze warm, nie evict) per service.
+pub fn set_service_pinned(pool: &DbPool, id: i64, pinned: bool) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE services SET pinned = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, if pinned { 1 } else { 0 }],
+    )?;
+    Ok(())
+}
+
+/// MemoryGuard: ustawia flag paused (skip autostart, request odrzucany).
+pub fn set_service_paused(pool: &DbPool, id: i64, paused: bool) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE services SET paused = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, if paused { 1 } else { 0 }],
+    )?;
     Ok(())
 }
 
@@ -888,6 +920,18 @@ pub fn delete_model_entry(pool: &DbPool, id: i64) -> Result<()> {
         rusqlite::params![id],
     )?;
     Ok(())
+}
+
+/// Usuwa wszystkie wpisy model_registry powiazane z danym serwisem.
+/// Wolane przy service_stop — bez tego stare modele MLX/llama.cpp zostaja
+/// w GUI jako "Załadowane" mimo ze ich serwis juz nie istnieje.
+pub fn delete_model_entries_by_service(pool: &DbPool, service_id: i64) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let removed = conn.execute(
+        "DELETE FROM model_registry WHERE service_id = ?1",
+        rusqlite::params![service_id],
+    )?;
+    Ok(removed)
 }
 
 // --- Model Aliases ---

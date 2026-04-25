@@ -118,6 +118,7 @@ fn create_default_config(port: Option<u16>) -> NodeConfig {
             heartbeat_interval_ms: 500,
             peer_timeout_ms: 3000,
             cluster_name: "tentaflow".to_string(),
+            iroh_relay_url: String::new(),
         }),
         inference: Some(InferenceConfig {
             enabled: true,

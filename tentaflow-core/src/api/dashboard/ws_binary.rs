@@ -537,24 +537,41 @@ async fn send_body<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let env_bytes = match encode_envelope_bytes(correlation_id, sequence, message_kind, body, flags)
+    {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let mut guard = sink.lock().await;
+    guard.send(Message::Binary(env_bytes.into())).await
+}
+
+/// Bytes-only encoder — uzywany przez batch writer task ktory feed'uje
+/// wiele frame'ow w jednym sink.lock + flush. Zwraca None tylko gdy rkyv
+/// padlo (loguje sam, caller pomija ten frame).
+fn encode_envelope_bytes(
+    correlation_id: u64,
+    sequence: u64,
+    message_kind: u16,
+    body: &MessageBody,
+    flags: EnvelopeFlags,
+) -> Option<Vec<u8>> {
     let body_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(body) {
         Ok(b) => b.to_vec(),
         Err(e) => {
             warn!("binary-WS: encode body failed: {}", e);
-            return Ok(());
+            return None;
         }
     };
     let mut env = Envelope::new_direct(correlation_id, sequence, message_kind, body_bytes);
     env.flags = flags;
-    let env_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&env) {
-        Ok(b) => b.to_vec(),
+    match rkyv::to_bytes::<rkyv::rancor::Error>(&env) {
+        Ok(b) => Some(b.to_vec()),
         Err(e) => {
             warn!("binary-WS: encode envelope failed: {}", e);
-            return Ok(());
+            None
         }
-    };
-    let mut guard = sink.lock().await;
-    guard.send(Message::Binary(env_bytes.into())).await
+    }
 }
 
 async fn send_protocol_error<S>(

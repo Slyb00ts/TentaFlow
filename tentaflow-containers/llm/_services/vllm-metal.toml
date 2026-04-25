@@ -21,13 +21,57 @@ platforms = ["macos"]
 runtime = "python-bundle"
 bundle_path = "llm/python/vllm-metal"
 
+# Preset domyslny — model w formacie MLX 4-bit. vllm-metal natywnie konsumuje
+# MLX wagi (mniejsze, szybsze inference na Apple Silicon vs vanilla
+# safetensors fp16). mlx-community publikuje pre-konwertowane warianty.
+[[model_preset]]
+id = "qwen3-5-0-8b-mlx-4bit"
+display_name = "Qwen 3.5 0.8B (MLX 4-bit)"
+repo = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
+quantization = "int4"
+recommended = true
+
+# Bielik 4.5B Instruct + RAG (vqstudio) w MLX 4-bit — polski model.
+[[model_preset]]
+id = "bielik-4-5b-instruct-rag-mlx-4bit"
+display_name = "Bielik 4.5B Instruct RAG (MLX 4-bit)"
+repo = "vqstudio/Bielik-4.5B-v3.0-Instruct-RAG-0.8-MLX-4bit"
+quantization = "int4"
+
+# Bielik 4.5B Instruct bez RAG fine-tune.
+[[model_preset]]
+id = "bielik-4-5b-instruct-mlx-4bit"
+display_name = "Bielik 4.5B Instruct (MLX 4-bit)"
+repo = "vqstudio/Bielik-4.5B-v3.0-Instruct-MLX-4bit"
+quantization = "int4"
+
+# Bielik 11B Instruct (speakleash) — wymagajace ~7-8 GB VRAM po 4-bit.
+[[model_preset]]
+id = "bielik-11b-instruct-mlx-4bit"
+display_name = "Bielik 11B Instruct (MLX 4-bit)"
+repo = "speakleash/Bielik-11B-v3.0-Instruct-MLX-4bit"
+quantization = "int4"
+
+# Qwen 3.5 9B (MLX 4-bit) — wieksza alternatywa multijezykowa.
+[[model_preset]]
+id = "qwen3-5-9b-mlx-4bit"
+display_name = "Qwen 3.5 9B (MLX 4-bit)"
+repo = "mlx-community/Qwen3.5-9B-MLX-4bit"
+quantization = "int4"
+
+# Wariant fp16 safetensors — dla porownania jakosci.
 [[model_preset]]
 id = "qwen3-5-0-8b"
-display_name = "Qwen 3.5 0.8B"
+display_name = "Qwen 3.5 0.8B (fp16)"
 repo = "Qwen/Qwen3.5-0.8B"
-recommended = true
+
+[[model_preset]]
+id = "llama-3-1-8b-instruct-mlx-4bit"
+display_name = "Llama 3.1 8B Instruct (MLX 4-bit)"
+repo = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+quantization = "int4"
 
 [[model_preset]]
 id = "llama-3-1-8b-instruct"
-display_name = "Llama 3.1 8B Instruct"
+display_name = "Llama 3.1 8B Instruct (fp16)"
 repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"

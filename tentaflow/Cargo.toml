@@ -3,6 +3,7 @@ name = "tentaflow"
 version = "0.0.2-alpha"
 edition = "2021"
 description = "TentaFlow — API Gateway i mesh node"
+build = "build.rs"
 
 [features]
 rdma-probe = ["tentaflow-core/rdma-probe"]
@@ -37,9 +38,12 @@ parking_lot = "0.12"
 # pliku w trakcie kopiowania).
 axoupdater = { version = "0.9", features = ["blocking"] }
 
-# MLX inference — tylko na macOS (mlx-rs wymaga Metal)
+# MLX inference — tylko na macOS. Implementacja przez Swift bridge
+# (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i
+# src/mlx_swift_init.rs.
 [target.'cfg(target_os = "macos")'.dependencies]
 tentaflow-core = { path = "../tentaflow-core", features = ["inference-mlx"] }
+libloading = "0.8"
 
 [profile.release]
 opt-level = 3

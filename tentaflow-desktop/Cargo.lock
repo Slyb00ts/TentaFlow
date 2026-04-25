@@ -9181,7 +9181,9 @@ name = "tentaflow-desktop-macos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libloading 0.8.9",
  "tentaflow-desktop-core",
+ "tracing",
 ]
 
 [[package]]

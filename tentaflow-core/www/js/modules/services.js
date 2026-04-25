@@ -218,6 +218,20 @@ function bindTabEvents() {
       stopService(b.dataset.svcDelete, b.dataset.svcName);
     };
   });
+  body.querySelectorAll('[data-svc-pin]').forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      const newPin = b.dataset.pinned !== '1';
+      await toggleServiceFlag(b.dataset.svcPin, b.dataset.svcName, { pinned: newPin });
+    };
+  });
+  body.querySelectorAll('[data-svc-pause]').forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      const newPause = b.dataset.paused !== '1';
+      await toggleServiceFlag(b.dataset.svcPause, b.dataset.svcName, { paused: newPause });
+    };
+  });
   body.querySelectorAll('[data-svc-update]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
@@ -316,7 +330,15 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddrCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}">${quicStatusCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
+      <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
+        <tf-button variant="${s.pinned ? 'primary' : 'ghost'}" size="sm" icon="lock"
+          data-svc-pin="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
+          data-pinned="${s.pinned ? '1' : '0'}"
+          title="${escapeAttr(I18n.t(s.pinned ? 'services.tooltip_pin_on' : 'services.tooltip_pin_off'))}"></tf-button>
+        <tf-button variant="${s.paused ? 'warning' : 'ghost'}" size="sm" icon="${s.paused ? 'play' : 'pause'}"
+          data-svc-pause="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
+          data-paused="${s.paused ? '1' : '0'}"
+          title="${escapeAttr(I18n.t(s.paused ? 'services.tooltip_pause_on' : 'services.tooltip_pause_off'))}"></tf-button>
         ${updateInfo.canRebuild ? (() => {
           const labelKey = updateInfo.updateAvailable ? 'services.update_button' : 'services.rebuild_button';
           const variant = updateInfo.updateAvailable ? 'primary' : 'ghost';
@@ -794,6 +816,28 @@ async function stopService(id, name) {
     }
   } catch (err) {
     toast(I18n.t('services.delete_error', { error: err.message }), 'error');
+  }
+}
+
+/// MemoryGuard: ustawia pinned/paused. Jeśli paused=true — backend od razu
+/// zwolni VRAM (force_unload). Po sukcesie odświeżamy listę.
+async function toggleServiceFlag(id, name, { pinned, paused }) {
+  try {
+    const r = await ApiBinary.action('serviceFlagsUpdateRequest', {
+      serviceId: id,
+      pinned,
+      paused,
+    });
+    if (r.ok) {
+      let key;
+      if (pinned !== undefined) key = pinned ? 'services.toast_pinned' : 'services.toast_unpinned';
+      else key = paused ? 'services.toast_paused' : 'services.toast_resumed';
+      toast(I18n.t(key, { name }), 'success');
+      services = await ApiBinary.list('serviceListRequest');
+      patchListTab();
+    }
+  } catch (err) {
+    toast(I18n.t('services.toast_flag_error', { error: err.message }), 'error');
   }
 }
 

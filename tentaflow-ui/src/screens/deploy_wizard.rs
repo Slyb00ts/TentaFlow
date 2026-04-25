@@ -486,7 +486,7 @@ fn generate_preview(wiz: &mut DeployWizardState) {
                 model, wiz.port, wiz.port
             ),
             "mlx" => format!(
-                "# MLX (natywny in-process — Apple Silicon Metal GPU)\n# Model ladowany przez InferenceManager (mlx-rs)\n# Zero overhead — brak osobnego procesu\n#\n# Model: {}\n# Port: {} (OpenAI API endpoint)",
+                "# MLX (natywny in-process — Apple Silicon Metal GPU)\n# Model ladowany przez InferenceManager (Swift bridge: libMLXBridge.dylib + mlx-swift)\n# Zero overhead — brak osobnego procesu\n#\n# Model: {}\n# Port: {} (OpenAI API endpoint)",
                 model, wiz.port
             ),
             "llamacpp" => format!(

@@ -404,11 +404,29 @@ pub fn model_list_request(
             }
             None => true,
         })
-        .map(|s| ModelSummary {
-            id: s.name.clone(),
-            category: s.model_category.clone().unwrap_or_else(|| "llm".into()),
-            engine_id: s.service_type,
-            availability: s.status,
+        .map(|s| {
+            // display_name: parsuj `deployed_model` z config_json (np.
+            // "Qwen/Qwen3.5-0.8B") zeby GUI pokazywalo HF repo a nie nazwe
+            // service'u (typu "tentaflow-vllm-metal-2izlb"). Fallback: nazwa.
+            let display_name = serde_json::from_str::<serde_json::Value>(&s.config_json)
+                .ok()
+                .and_then(|v| v.get("deployed_model").and_then(|m| m.as_str()).map(String::from))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| s.name.clone());
+            // engine_id: takze z config_json (vllm-metal/mlx/llama-cpp), nie
+            // service_type (= zawsze "llm"/"stt"/...).
+            let engine_id = serde_json::from_str::<serde_json::Value>(&s.config_json)
+                .ok()
+                .and_then(|v| v.get("engine").and_then(|m| m.as_str()).map(String::from))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| s.service_type.clone());
+            ModelSummary {
+                id: s.name,
+                display_name,
+                category: s.model_category.unwrap_or_else(|| "llm".into()),
+                engine_id,
+                availability: s.status,
+            }
         })
         .collect();
     Ok(MessageBody::ModelListResponse { models })
@@ -1865,6 +1883,8 @@ pub fn service_list(
                 started_at_epoch: parse_ts_opt(&Some(s.created_at)),
                 engine_id,
                 model_id,
+                pinned: s.pinned,
+                paused: s.paused,
                 deployed_source_hash: s.deployed_source_hash,
             }
         })
@@ -2250,6 +2270,16 @@ pub async fn service_stop(
         }
     }
 
+    // Usun powiazane wpisy model_registry — inaczej GUI Modele pokazuje stale
+    // status (Załadowany / Niezaładowany) mimo ze serwis juz nie istnieje.
+    if let Err(e) = repository::delete_model_entries_by_service(&ctx.state.db, service_id) {
+        tracing::warn!(
+            service = %svc.name, error = %e,
+            "delete_model_entries_by_service nieudane"
+        );
+        stop_warnings.push(format!("cleanup model_registry nieudany: {:#}", e));
+    }
+
     repository::delete_service(&ctx.state.db, service_id).map_err(db_err)?;
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
@@ -2270,6 +2300,78 @@ pub async fn service_stop(
     );
 
     Ok(MessageBody::ServiceStopResponse { stopped: true })
+}
+
+#[handler(variant = "ServiceFlagsBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_flags_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let (service_id_str, pinned_opt, paused_opt) = match req {
+        MessageBody::ServiceFlagsBody(tentaflow_protocol::ServiceFlagsPayload::Req(r)) => {
+            (&r.service_id, r.pinned, r.paused)
+        }
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceFlagsUpdateRequest",
+            ))
+        }
+    };
+    let service_id: i64 = service_id_str
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("service_id must be integer"))?;
+
+    let svc = repository::list_services(&ctx.state.db)
+        .map_err(db_err)?
+        .into_iter()
+        .find(|s| s.id == service_id)
+        .ok_or_else(|| ProtocolError::not_found("service not found"))?;
+
+    if let Some(p) = pinned_opt {
+        repository::set_service_pinned(&ctx.state.db, service_id, p).map_err(db_err)?;
+        let _ = crate::memory::guard_global().set_pinned(&svc.name, p);
+    }
+    if let Some(p) = paused_opt {
+        repository::set_service_paused(&ctx.state.db, service_id, p).map_err(db_err)?;
+        let _ = crate::memory::guard_global().set_paused(&svc.name, p);
+        // Pause = natychmiast zwolnij VRAM (nie czekaj do restartu).
+        if p {
+            if let Err(e) = crate::memory::guard_global().force_unload(&svc.name).await {
+                tracing::warn!(service = %svc.name, error = %e,
+                    "service_flags_update: force_unload przy pause nieudany");
+            }
+        }
+    }
+
+    let final_pinned = pinned_opt.unwrap_or(svc.pinned);
+    let final_paused = paused_opt.unwrap_or(svc.paused);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        user_id,
+        None,
+        "service.flags_update",
+        Some(&format!(
+            "service:{} pinned={} paused={}",
+            service_id, final_pinned, final_paused
+        )),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+
+    Ok(MessageBody::ServiceFlagsBody(
+        tentaflow_protocol::ServiceFlagsPayload::Res(
+            tentaflow_protocol::ServiceFlagsUpdateResponse {
+                ok: true,
+                pinned: final_pinned,
+                paused: final_paused,
+            },
+        ),
+    ))
 }
 
 // =============================================================================

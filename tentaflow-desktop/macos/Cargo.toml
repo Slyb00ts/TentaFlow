@@ -3,11 +3,23 @@ name = "tentaflow-desktop-macos"
 version = "0.1.0"
 edition = "2021"
 description = "TentaFlow Desktop — macOS wrapper"
+build = "build.rs"
 
 [[bin]]
 name = "tentaflow-desktop"
 path = "src/main.rs"
 
+[features]
+# Domyslnie na macOS uzywamy mlx-swift (proven path z iOS gdzie Bielik dziala
+# bezbledne). Disable feature da fallback na mlx-models (Rust crate) ktory ma
+# bug w 4-bit forward pass dla niektorych modeli.
+default = ["mlx-swift-bridge"]
+mlx-swift-bridge = [
+    "tentaflow-desktop-core/mlx-swift-bridge",
+]
+
 [dependencies]
 tentaflow-desktop-core = { path = "../core" }
 anyhow = "1.0"
+libloading = "0.8"
+tracing = "0.1"

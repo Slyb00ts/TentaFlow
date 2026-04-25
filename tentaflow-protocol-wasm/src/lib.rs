@@ -1419,6 +1419,28 @@ pub fn encode_service_stop_request(service_id: String) -> Result<Vec<u8>, JsErro
         .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::ServiceFlagsUpdateRequest { service_id, pinned, paused }.
+/// pinned/paused jako i32 (-1 = nie zmieniaj, 0 = false, 1 = true).
+#[wasm_bindgen(js_name = encodeServiceFlagsUpdateRequest)]
+pub fn encode_service_flags_update_request(
+    service_id: String,
+    pinned: i32,
+    paused: i32,
+) -> Result<Vec<u8>, JsError> {
+    let pinned_opt = if pinned < 0 { None } else { Some(pinned != 0) };
+    let paused_opt = if paused < 0 { None } else { Some(paused != 0) };
+    encode_body_inner(&MessageBody::ServiceFlagsBody(
+        tentaflow_protocol::ServiceFlagsPayload::Req(
+            tentaflow_protocol::ServiceFlagsUpdateRequest {
+                service_id,
+                pinned: pinned_opt,
+                paused: paused_opt,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::ServiceDeployRequest { engine_id, model_id, deploy_method, node_id }.
 /// node_id MUSI byc 32 bajtami.
 #[wasm_bindgen(js_name = encodeServiceDeployRequest)]
@@ -1889,8 +1911,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             for m in models {
                 let item = js_sys::Object::new();
                 set(&item, "id", m.id.into());
+                set(&item, "displayName", m.display_name.clone().into());
+                set(&item, "display_name", m.display_name.into());
                 set(&item, "category", m.category.into());
-                set(&item, "engineId", m.engine_id.into());
+                set(&item, "engineId", m.engine_id.clone().into());
+                set(&item, "engine_id", m.engine_id.into());
                 set(&item, "availability", m.availability.into());
                 arr.push(&item.into());
             }
@@ -2579,6 +2604,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(mid) = s.model_id {
                     set(&item, "modelId", mid.into());
                 }
+                set(&item, "pinned", s.pinned.into());
+                set(&item, "paused", s.paused.into());
                 if let Some(h) = s.deployed_source_hash {
                     set(&item, "deployedSourceHash", h.into());
                 }
@@ -2662,6 +2689,24 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "ServiceStopResponse".into());
             set(&obj, "stopped", stopped.into());
         }
+        MessageBody::ServiceFlagsBody(payload) => match payload {
+            tentaflow_protocol::ServiceFlagsPayload::Req(r) => {
+                set(&obj, "variant", "ServiceFlagsUpdateRequest".into());
+                set(&obj, "serviceId", r.service_id.into());
+                if let Some(p) = r.pinned {
+                    set(&obj, "pinned", p.into());
+                }
+                if let Some(p) = r.paused {
+                    set(&obj, "paused", p.into());
+                }
+            }
+            tentaflow_protocol::ServiceFlagsPayload::Res(r) => {
+                set(&obj, "variant", "ServiceFlagsUpdateResponse".into());
+                set(&obj, "ok", r.ok.into());
+                set(&obj, "pinned", r.pinned.into());
+                set(&obj, "paused", r.paused.into());
+            }
+        },
         MessageBody::PromptListRequest => {
             set(&obj, "variant", "PromptListRequest".into());
         }
