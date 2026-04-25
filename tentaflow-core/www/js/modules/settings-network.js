@@ -85,12 +85,20 @@ export async function renderMeshTab() {
 }
 
 /**
- * Podpina event listenery (input/change/click) do juz zrenderowanego DOM.
- * `host` to element zawierajacy zakladke; `rerender` jest wolane gdy trzeba
- * ponownie wyrysowac (bez refetchu).
+ * Podpina event listenery do juz zrenderowanego DOM.
+ *
+ * Lokalny `rerender` re-renderuje HTML z biezacego `config`/`interfaces` w
+ * pamieci (BEZ refetchu z DB) i ponownie podpina handlery. Drugi argument
+ * `_outerRerender` zostal zachowany dla zgodnosci z settings.js, ale go
+ * ignorujemy — uzycie `renderTab()` z settings.js wywolywaloby `loadAll()`
+ * ktore nadpisywaloby lokalne zmiany konfiguracji wartosciami z DB.
  */
-export function bindMeshTab(host, rerender) {
+export function bindMeshTab(host, _outerRerender) {
   if (!host) return;
+  const rerender = () => {
+    host.innerHTML = renderAll();
+    bindMeshTab(host, _outerRerender);
+  };
 
   // Tryb bind — karty radio.
   host.querySelectorAll('[data-bind-mode]').forEach((card) => {
