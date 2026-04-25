@@ -1812,8 +1812,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             for m in models {
                 let item = js_sys::Object::new();
                 set(&item, "id", m.id.into());
+                set(&item, "displayName", m.display_name.clone().into());
+                set(&item, "display_name", m.display_name.into());
                 set(&item, "category", m.category.into());
-                set(&item, "engineId", m.engine_id.into());
+                set(&item, "engineId", m.engine_id.clone().into());
+                set(&item, "engine_id", m.engine_id.into());
                 set(&item, "availability", m.availability.into());
                 arr.push(&item.into());
             }

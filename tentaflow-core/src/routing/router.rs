@@ -509,6 +509,14 @@ impl Router {
                 continue;
             }
 
+            // MemoryGuard: paused = user wylaczyl autostart w GUI. Wpis serwisu
+            // zostaje w DB i bedzie widoczny w Services jako gotowy do recznego
+            // wlaczenia, ale nie spawnujemy procesu / nie ladujemy modelu.
+            if svc.paused {
+                debug!("Pomijam paused serwis '{}' (MemoryGuard)", svc.name);
+                continue;
+            }
+
             // Natywny python-bundle (vllm, vllm-metal, sglang, xtts, voxcpm, ...)
             // — proces HTTP server OpenAI-compatible uruchamiany z venva w cache.
             // Sprawdz czy poprzedni PID wciaz zyje; jesli tak — tylko rejestrujemy
@@ -833,6 +841,63 @@ impl Router {
             .map_err(|e| anyhow::anyhow!("BackendClient::new: {}", e))?;
         self.service_manager
             .register_dynamic_http_backend(&svc.name, std::sync::Arc::new(client));
+
+        // Rejestracja w MemoryGuard zeby ensure_loaded przed kazdym dispatch
+        // moglo restartowac serwis gdy padnie. Env (HF_TOKEN, HF_HOME itd.)
+        // odbudowywane z DB tak jak w pierwszym deploy.
+        let model_repo = config["deployed_model"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_default();
+        let hf_token = crate::db::repository::get_setting_secure(db, "hf_token", settings_cipher)
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let _ = crate::paths::ensure_models_dirs();
+        let hf_home = crate::paths::hf_home();
+        let torch_home = crate::paths::torch_home();
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        env.insert("PORT".to_string(), host_port.to_string());
+        if !model_repo.is_empty() {
+            env.insert("MODEL".to_string(), model_repo.clone());
+        }
+        if !hf_token.is_empty() {
+            env.insert("HF_TOKEN".to_string(), hf_token.clone());
+            env.insert("HUGGING_FACE_HUB_TOKEN".to_string(), hf_token);
+        }
+        env.insert("HF_HOME".to_string(), hf_home.to_string_lossy().into_owned());
+        env.insert(
+            "HUGGINGFACE_HUB_CACHE".to_string(),
+            hf_home.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "TRANSFORMERS_CACHE".to_string(),
+            hf_home.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "TORCH_HOME".to_string(),
+            torch_home.to_string_lossy().into_owned(),
+        );
+
+        let vram = crate::memory::estimate_vram_for_model(&model_repo);
+        let guard_engine = std::sync::Arc::new(crate::memory::PythonBundleEngine::new(
+            engine_id.clone(),
+            svc.name.clone(),
+            instance_name.clone(),
+            model_repo.clone(),
+            host_port,
+            vram,
+            env,
+            pid_after_restore,
+        ));
+        let auto_pin = is_orchestrator_model_for_guard(&engine_id, &model_repo);
+        let already_paused = svc.status == "stopped";
+        crate::memory::guard_global().register(
+            svc.name.clone(),
+            guard_engine,
+            vram,
+            auto_pin,
+            already_paused,
+        );
 
         info!(
             service = %svc.name, pid = pid_after_restore, url = %base_url,
@@ -1184,4 +1249,19 @@ impl Router {
             active_connections: 0,
         }
     }
+}
+
+/// Lokalna heurystyka — auto-pin orchestrator/STT/TTS w MemoryGuard przy
+/// restore. Duplikat `runner::is_orchestrator_model` zeby uniknac cyklu
+/// zaleznosci (router → deploy → router).
+fn is_orchestrator_model_for_guard(engine_id: &str, model_repo: &str) -> bool {
+    let m = model_repo.to_ascii_lowercase();
+    let e = engine_id.to_ascii_lowercase();
+    if m.contains("qwen3.5-0.8b") || m.contains("qwen3-5-0-8b") {
+        return true;
+    }
+    if e == "whisper" || e == "sherpa-onnx" {
+        return true;
+    }
+    false
 }

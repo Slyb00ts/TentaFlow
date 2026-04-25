@@ -372,9 +372,14 @@ const ChatScreen = {
 
     const sel = byId('chat-model');
     const innerSelect = sel?.querySelector('select');
+    // value = service id (do dispatchu), label = display_name (HF repo, np.
+    // "Qwen/Qwen3.5-0.8B") gdy znany, fallback na id.
     const optionsHtml = modelOptions.length === 0
       ? `<option value="default">default</option>`
-      : modelOptions.map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.id)}</option>`).join('');
+      : modelOptions.map((m) => {
+          const label = m.display_name || m.displayName || m.id;
+          return `<option value="${escapeHtml(m.id)}">${escapeHtml(label)}</option>`;
+        }).join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;
       sel.setAttribute('value', innerSelect.value);
