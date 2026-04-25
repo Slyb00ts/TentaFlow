@@ -2270,6 +2270,16 @@ pub async fn service_stop(
         }
     }
 
+    // Usun powiazane wpisy model_registry — inaczej GUI Modele pokazuje stale
+    // status (Załadowany / Niezaładowany) mimo ze serwis juz nie istnieje.
+    if let Err(e) = repository::delete_model_entries_by_service(&ctx.state.db, service_id) {
+        tracing::warn!(
+            service = %svc.name, error = %e,
+            "delete_model_entries_by_service nieudane"
+        );
+        stop_warnings.push(format!("cleanup model_registry nieudany: {:#}", e));
+    }
+
     repository::delete_service(&ctx.state.db, service_id).map_err(db_err)?;
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
