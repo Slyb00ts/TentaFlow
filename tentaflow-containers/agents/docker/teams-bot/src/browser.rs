@@ -178,18 +178,33 @@ pub async fn join_meeting(
 
     // KROK 1: Dialog "Are you sure you don't want audio or video?"
     // Gdy bot_video_enabled=true NIE klikamy "Continue without" — zamiast tego
-    // wlaczamy kamere w prejoin zeby MSTG video-track byl aktywny. Najpierw
-    // jednak pytamy JS czy MSTG/OffscreenCanvas faktycznie zostaly zainicjalizowane —
-    // w przeciwnym razie wlaczenie kamery w UI stworzy czarny strumien.
+    // wlaczamy kamere w prejoin zeby canvas captureStream video-track byl
+    // aktywny. Init script jest doklejany na document_start ale samo
+    // setupVideoInjection wykonuje sie asynchronicznie — daj mu chwile
+    // przed sprawdzeniem flagi.
     let video_available = if config.bot_video_enabled {
-        page.evaluate("!!window.__tentaflowVideoAvailable").await
-            .map(|v| v.into_value::<bool>().unwrap_or(false))
-            .unwrap_or(false)
+        let mut available = false;
+        for _ in 0..20 {
+            let v = page
+                .evaluate("!!window.__tentaflowVideoAvailable")
+                .await
+                .map(|v| v.into_value::<bool>().unwrap_or(false))
+                .unwrap_or(false);
+            if v {
+                available = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        available
     } else {
         false
     };
     if config.bot_video_enabled && !video_available {
-        tracing::warn!("bot_video_enabled=true ale MSTG/OffscreenCanvas niedostepne — fallback na 'Continue without'");
+        tracing::warn!(
+            "bot_video_enabled=true ale window.__tentaflowVideoAvailable nie ustawione \
+             po 2s — canvas/captureStream niedostepne, fallback na 'Continue without'"
+        );
     }
     if config.bot_video_enabled && video_available {
         tracing::info!("bot_video_enabled=true — wlaczam kamere w prejoin");
