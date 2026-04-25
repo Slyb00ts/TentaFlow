@@ -12,13 +12,13 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 use tentaflow_protocol::{
-    MeetingEventPayload, LIFECYCLE_BROWSER_LAUNCHED, LIFECYCLE_JOINED, LIFECYCLE_JOINING,
-    LIFECYCLE_LOBBY_WAITING,
+    MeetingEventPayload, LIFECYCLE_BROWSER_LAUNCHED, LIFECYCLE_JOINING,
     LIFECYCLE_NAVIGATING, LIFECYCLE_PREJOIN_READY,
 };
 use tokio::sync::Mutex;
 
 use crate::config::MeetingConfig;
+use crate::dom_observer::{self, DomObserver};
 use crate::quic_server::RouterClient;
 
 /// Uchwyt do opcjonalnego RouterClient współdzielonego z main.rs — gdy None,
@@ -57,11 +57,16 @@ async fn emit_lifecycle(router: &RouterHandle, meeting_key: &str, stage: &str, d
     }
 }
 
-/// Maksymalny czas oczekiwania na dolaczenie do spotkania (5 minut)
-const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Max czas na wykrycie JAKIEGOKOLWIEK stanu join (Lobby albo Joined). Jesli
+/// ani jedno ani drugie nie pojawi sie w tym oknie — Teams jest zepsuty,
+/// timeout jest slusznie blad. 5 minut to znaczny zapas na pelny redirect
+/// chain Teams + prejoin click.
+const PRESENCE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Interwal pollingu stanu spotkania
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Max czas na CZEKANIE w lobby na admit hosta. Bot raz wykryty w lobby
+/// czeka cierpliwie — host moze byc poza biurkiem. 60 minut chroni przed
+/// wiszacym kontenerem gdy meeting nigdy sie nie zaczyna.
+const LOBBY_GRACE: Duration = Duration::from_secs(3600);
 
 /// Skrypt wstrzykiwany do strony Teams — przechwytuje audio przez captureStream()
 /// i wysyla PCM do Rust przez WebSocket ws://127.0.0.1:9999/bridge. Obsluguje tez
@@ -179,7 +184,7 @@ pub async fn join_meeting(
     config: &MeetingConfig,
     router: &RouterHandle,
     meeting_key: &str,
-) -> Result<Page> {
+) -> Result<(Page, DomObserver)> {
     use chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams;
 
     emit_lifecycle(router, meeting_key, LIFECYCLE_BROWSER_LAUNCHED, None).await;
@@ -198,6 +203,31 @@ pub async fn join_meeting(
     page.evaluate_on_new_document(AUDIO_BRIDGE_JS).await
         .map_err(|e| anyhow::anyhow!("Blad evaluate_on_new_document: {}", e))?;
     tracing::info!("Zarejestrowano init script (audio bridge) dla wszystkich dokumentow");
+
+    // Bot display name dostepny dla JS (uzywany przez detector active speakera
+    // do filtrowania wlasnego tile'a). Cudzyslowy w nazwie escapowane na wszelki
+    // wypadek — ofertujemy raw string a nie JSON.stringify zeby uniknac
+    // serde_json zaleznosci tutaj.
+    let bot_name_js = format!(
+        "window.__tentaflowBotName = \"{}\";",
+        config.bot_name.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    page.evaluate_on_new_document(bot_name_js).await
+        .map_err(|e| anyhow::anyhow!("Blad evaluate_on_new_document(botName): {}", e))?;
+
+    // Push-based DOM event bridge — registers `__tentaflowEvent` binding and
+    // spawns a tokio task that forwards JS-side MutationObserver events to
+    // the router. Done before `goto` so the binding exists when the injected
+    // observer first fires. Observer also drives lobby/joined lifecycle and
+    // `wait_for_joined` further down.
+    let observer = dom_observer::start(
+        page.clone(),
+        router.clone(),
+        meeting_key.to_string(),
+        config.bot_name.clone(),
+    )
+    .await?;
+    tracing::info!("DOM observer (push-based) uruchomiony");
 
     // Forward JS console messages z Chromium do naszych logow Rust
     // Dzieki temu bledy ze wstrzyknietego browser_inject.js widac w docker logs
@@ -346,112 +376,89 @@ pub async fn join_meeting(
         );
     }
 
-    // Czekamy na potwierdzenie ze jestesmy w spotkaniu (po auto-join lub manualnym VNC).
-    // Lobby state needs its own emit so the dashboard can distinguish "waiting
-    // to be admitted" from "in the meeting"; we also de-bounce the lobby emit
-    // so it only fires once per polling burst.
-    let mut emitted_lobby = false;
-    let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
-    while tokio::time::Instant::now() < deadline {
-        match detect_meeting_progress(&page).await? {
-            MeetingProgress::InMeeting => {
-                tracing::info!("Pomyslnie dolaczono do spotkania");
-                emit_lifecycle(router, meeting_key, LIFECYCLE_JOINED, None).await;
-                if config.bot_video_enabled {
-                    // Camera controls are disabled while the prejoin/lobby
-                    // screen is up, so the toggle click we did earlier was a
-                    // no-op. After the in-call surface renders, re-enable
-                    // the camera so getUserMedia fires and our canvas track
-                    // reaches Teams. We log a JSON status object back so the
-                    // bot logs reveal whether we actually clicked, which
-                    // selector matched, or why we gave up.
-                    let res = page.evaluate(
-                        r#"
-                        (async function() {
-                            const sels = [
-                                '#video-button',
-                                '[data-tid="toggle-video"]',
-                                'button[aria-label*="camera" i]',
-                                'button[aria-label*="kamera" i]',
-                                'button[title*="camera" i]',
-                            ];
-                            const findBtn = () => {
-                                for (const sel of sels) {
-                                    const b = document.querySelector(sel);
-                                    if (b) return { btn: b, sel };
-                                }
-                                return null;
-                            };
-                            const click = (btn) => {
-                                try { btn.removeAttribute('disabled'); } catch (_) {}
-                                try { btn.removeAttribute('aria-disabled'); } catch (_) {}
-                                btn.click();
-                            };
-                            // Ten-second window to find an *enabled* button.
-                            for (let i = 0; i < 20; i++) {
-                                const found = findBtn();
-                                if (found) {
-                                    const disabled = found.btn.disabled
-                                        || found.btn.getAttribute('aria-disabled') === 'true';
-                                    if (!disabled) {
-                                        const pressed = found.btn.getAttribute('aria-pressed') === 'true'
-                                            || found.btn.getAttribute('aria-checked') === 'true';
-                                        if (!pressed) click(found.btn);
-                                        return JSON.stringify({ ok: true, selector: found.sel, mode: 'enabled-click', pressed });
-                                    }
-                                }
-                                await new Promise((r) => setTimeout(r, 500));
-                            }
-                            // Fallback A: try the camera button anyway after stripping disabled.
-                            const found = findBtn();
-                            if (found) {
-                                try { click(found.btn); } catch (_) {}
-                            }
-                            // Fallback B: directly call getUserMedia({video:true}) so our
-                            // override fires and the canvas track lands in the Chromium
-                            // media pipeline. Teams' WebRTC stack often picks up the
-                            // active stream even if its UI never enables the toggle.
-                            let gumOk = false;
-                            try {
-                                const stream = await navigator.mediaDevices.getUserMedia({
-                                    video: true,
-                                    audio: true,
-                                });
-                                gumOk = !!stream && stream.getVideoTracks().length > 0;
-                                window.__tentaflowForcedStream = stream;
-                            } catch (e) {
-                                return JSON.stringify({
-                                    ok: false,
-                                    reason: 'gum forced call rejected: ' + (e && e.message ? e.message : String(e)),
-                                });
-                            }
-                            return JSON.stringify({
-                                ok: gumOk,
-                                mode: 'forced-gum',
-                                fallbackClick: !!found,
-                                reason: 'no enabled camera button — used forced getUserMedia',
-                            });
-                        })()
-                        "#,
-                    ).await;
-                    let report = res
-                        .map(|v| v.into_value::<String>().unwrap_or_default())
-                        .unwrap_or_default();
-                    tracing::info!(report = %report, "Post-join camera toggle result");
+    // Czekamy na realne dolaczenie. Lifecycle (lobby_waiting, joined) emituje
+    // sam DomObserver w momencie gdy JS-side MutationObserver zauwazy stage —
+    // tutaj tylko czekamy az state przejdzie w Joined albo wybuchnie timeout.
+    observer.wait_for_joined(PRESENCE_TIMEOUT, LOBBY_GRACE).await?;
+    tracing::info!("Pomyslnie dolaczono do spotkania");
+
+    if config.bot_video_enabled {
+        // Camera controls are disabled while the prejoin/lobby screen is up,
+        // so the toggle click we did earlier was a no-op. After the in-call
+        // surface renders, re-enable the camera so getUserMedia fires and
+        // our canvas track reaches Teams. We log a JSON status object back so
+        // the bot logs reveal whether we actually clicked, which selector
+        // matched, or why we gave up.
+        let res = page.evaluate(
+            r#"
+            (async function() {
+                const sels = [
+                    '#video-button',
+                    '[data-tid="toggle-video"]',
+                    'button[aria-label*="camera" i]',
+                    'button[aria-label*="kamera" i]',
+                    'button[title*="camera" i]',
+                ];
+                const findBtn = () => {
+                    for (const sel of sels) {
+                        const b = document.querySelector(sel);
+                        if (b) return { btn: b, sel };
+                    }
+                    return null;
+                };
+                const click = (btn) => {
+                    try { btn.removeAttribute('disabled'); } catch (_) {}
+                    try { btn.removeAttribute('aria-disabled'); } catch (_) {}
+                    btn.click();
+                };
+                for (let i = 0; i < 20; i++) {
+                    const found = findBtn();
+                    if (found) {
+                        const disabled = found.btn.disabled
+                            || found.btn.getAttribute('aria-disabled') === 'true';
+                        if (!disabled) {
+                            const pressed = found.btn.getAttribute('aria-pressed') === 'true'
+                                || found.btn.getAttribute('aria-checked') === 'true';
+                            if (!pressed) click(found.btn);
+                            return JSON.stringify({ ok: true, selector: found.sel, mode: 'enabled-click', pressed });
+                        }
+                    }
+                    await new Promise((r) => setTimeout(r, 500));
                 }
-                return Ok(page);
-            }
-            MeetingProgress::Lobby if !emitted_lobby => {
-                tracing::info!("Bot w lobby — czekamy na admit hosta");
-                emit_lifecycle(router, meeting_key, LIFECYCLE_LOBBY_WAITING, None).await;
-                emitted_lobby = true;
-            }
-            _ => {}
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
+                const found = findBtn();
+                if (found) {
+                    try { click(found.btn); } catch (_) {}
+                }
+                let gumOk = false;
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: true,
+                        audio: true,
+                    });
+                    gumOk = !!stream && stream.getVideoTracks().length > 0;
+                    window.__tentaflowForcedStream = stream;
+                } catch (e) {
+                    return JSON.stringify({
+                        ok: false,
+                        reason: 'gum forced call rejected: ' + (e && e.message ? e.message : String(e)),
+                    });
+                }
+                return JSON.stringify({
+                    ok: gumOk,
+                    mode: 'forced-gum',
+                    fallbackClick: !!found,
+                    reason: 'no enabled camera button — used forced getUserMedia',
+                });
+            })()
+            "#,
+        ).await;
+        let report = res
+            .map(|v| v.into_value::<String>().unwrap_or_default())
+            .unwrap_or_default();
+        tracing::info!(report = %report, "Post-join camera toggle result");
     }
 
-    anyhow::bail!("Timeout — nie udalo sie dolaczyc do spotkania w ciagu 5 minut")
+    Ok((page, observer))
 }
 
 /// Polluje wywolanie JS co 500ms az zwroci `true` albo minie timeout.
@@ -477,110 +484,54 @@ async fn click_when_present(
     anyhow::bail!("Timeout czekajac na element: {}", label)
 }
 
-/// Three-state classification of where the bot's Chromium currently sits in
-/// the Teams join flow. We used to flatten this into a single is_in_meeting()
-/// boolean, but the call controls (#hangup-button, #mic-button) are also
-/// rendered inside the lobby waiting screen — flipping LIFECYCLE_JOINED the
-/// moment those appeared made the dashboard report LIVE while the bot was
-/// still waiting to be admitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MeetingProgress {
-    /// No call surface yet — still in prejoin / device picker / loading.
-    NotYet,
-    /// Lobby panel is showing. The "Waiting for someone to let you in"
-    /// screen — the bot has clicked Join, the meeting page acknowledged
-    /// it, but the host has not admitted us. Mic/Hangup buttons exist but
-    /// are wired to lobby controls.
-    Lobby,
-    /// Real call surface — the stage layout is live and the bot is in the
-    /// meeting proper.
-    InMeeting,
-}
-
-async fn detect_meeting_progress(page: &Page) -> Result<MeetingProgress> {
-    let raw = page
+/// Klika "Leave" / "Hang up" w aktywnej page Teams i daje stosowi WebRTC
+/// chwile (1.5s) na wyslanie BYE/RTCP leave do serwerow konferencji. Bez tego
+/// zwykly browser.close()/SIGKILL zostawia bota w ghost-state — Teams nadal
+/// pokazuje go w roster przez kilka-kilkanascie sekund po zniknieciu kontenera.
+///
+/// JS najpierw szuka po `#hangup-button` / `data-tid="hangup-button"`, potem po
+/// aria-label (kilka jezykow + warianty), na koncu po widocznym tekscie. Zwraca
+/// `true` gdy klikniecie zostalo wykonane.
+pub async fn click_leave_in_teams(page: &Page) -> Result<bool> {
+    let clicked = page
         .evaluate(
             r#"
             (function() {
-                // Lobby probes first — Teams light-meetings shows a 'When the
-                // meeting starts' / 'Someone will let you in soon' panel and
-                // tags it with data-tid="prejoin-meet-now" or text on the
-                // page. Classic Teams uses data-tid="lobby-screen" or aria-live
-                // 'You're in the lobby'.
-                const bodyText = (document.body && document.body.innerText) || '';
-                const lobbyPhrases = [
-                    'someone in the meeting will let you in',
-                    "you're in the lobby",
-                    'someone will let you in',
-                    'when you are admitted',
-                    'when you\'re admitted',
-                    'waiting for the host',
-                    'kogos w spotkaniu wpusci',
-                    'oczekiwanie na wpuszczenie',
-                    'gdy zostaniesz wpuszczony',
+                const sels = [
+                    '#hangup-button',
+                    '[data-tid="hangup-button"]',
+                    '[data-tid="call-end"]',
+                    'button[aria-label*="leave" i]',
+                    'button[aria-label*="hang up" i]',
+                    'button[aria-label*="wyjdz" i]',
+                    'button[aria-label*="rozlacz" i]',
+                    'button[title*="leave" i]',
                 ];
-                const lower = bodyText.toLowerCase();
-                const phraseHit = lobbyPhrases.some((p) => lower.indexOf(p) !== -1);
-                const lobbyTids = ['lobby-screen', 'lobby-wait-screen',
-                    'prejoin-meeting-info', 'lobby-waiting-room',
-                    'calling-lobby-screen'];
-                const lobbyTidHit = lobbyTids.some((t) =>
-                    document.querySelector('[data-tid="' + t + '"]'));
-                const inLobby = phraseHit || lobbyTidHit;
-
-                // True call indicators — the stage wrapper plus visible
-                // remote tiles or the participant roster reporting >1.
-                const stage = document.querySelector('[data-tid="MixedStage-wrapper"]')
-                    || document.querySelector('[data-tid="stage-layouts-renderer"]');
-                let stageTiles = 0;
-                if (stage) {
-                    stageTiles = stage.querySelectorAll('[data-tid][data-stream-type]').length;
-                }
-                // Roster button shows participant badge; lobby usually shows '1' (only us).
-                const rosterBadge = document.querySelector('#roster-button [data-tid="toolbar-item-badge"]');
-                const rosterCount = rosterBadge ? parseInt(rosterBadge.textContent.trim(), 10) || 0 : 0;
-                const remoteAudio = (function() {
-                    const audios = document.querySelectorAll('audio');
-                    for (const a of audios) {
-                        if (a.srcObject && a.srcObject.getAudioTracks
-                            && a.srcObject.getAudioTracks().length > 0) return true;
+                for (const sel of sels) {
+                    const btn = document.querySelector(sel);
+                    if (btn && !btn.disabled) {
+                        try { btn.click(); return true; } catch (_) {}
                     }
-                    return false;
-                })();
-
-                // Real meeting if stage exists with multiple tiles, OR roster
-                // shows more than just us, OR remote audio is wired up.
-                const inCall = (!!stage && stageTiles >= 2)
-                    || rosterCount >= 2
-                    || remoteAudio;
-
-                // Any prejoin/call surface at all.
-                const anySurface = !!stage
-                    || !!document.querySelector('#hangup-button')
-                    || !!document.querySelector('#mic-button')
-                    || !!document.querySelector('[data-tid="hangup-button"]')
-                    || !!document.querySelector('[data-tid="calling-right-side-panel"]');
-
-                if (inCall) return 'in_meeting';
-                if (inLobby) return 'lobby';
-                if (anySurface) return 'lobby';
-                return 'not_yet';
+                }
+                const txtBtn = Array.from(document.querySelectorAll('button'))
+                    .find(el => {
+                        if (el.disabled) return false;
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        return t === 'leave' || t === 'hang up'
+                            || t === 'wyjdz' || t === 'rozlacz';
+                    });
+                if (txtBtn) { try { txtBtn.click(); return true; } catch (_) {} }
+                return false;
             })()
             "#,
         )
         .await
-        .map(|v| v.into_value::<String>().unwrap_or_default())
-        .unwrap_or_default();
-    Ok(match raw.as_str() {
-        "in_meeting" => MeetingProgress::InMeeting,
-        "lobby" => MeetingProgress::Lobby,
-        _ => MeetingProgress::NotYet,
-    })
-}
-
-/// Backwards-compatible alias for callers that only need the boolean.
-async fn is_in_meeting(page: &Page) -> Result<bool> {
-    Ok(detect_meeting_progress(page).await? == MeetingProgress::InMeeting)
+        .map(|v| v.into_value::<bool>().unwrap_or(false))
+        .unwrap_or(false);
+    if clicked {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    Ok(clicked)
 }
 
 /// Sprawdza czy Teams przekierowalo na strone logowania (sesja wygasla)
