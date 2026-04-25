@@ -191,16 +191,44 @@ impl MemoryGuard {
             s.state = LoadState::Loading;
         }
 
-        // Eviction jesli przekraczamy budzet (lub by przekroczyc po load).
-        let budget = self.budget_mb();
-        if budget > 0 {
-            let needed = entry.state.read().vram_estimated_mb;
+        // Eviction wg REAL VRAM z node_info_collector — sumuje aktualnie zajety
+        // VRAM po wszystkich procesach systemu (nasz tentaflow + ext silniki +
+        // inne aplikacje), nie tylko serwisy zarejestrowane w guardzie.
+        // Cache 2s wiec wywolanie tanie. Override przez TENTAFLOW_VRAM_BUDGET_MB
+        // (gdy user chce sztywno ograniczyc — uzyteczne na shared host).
+        let needed = entry.state.read().vram_estimated_mb;
+        let (total_real, used_real, free_real) =
+            crate::mesh::node_info_collector::vram_snapshot_local();
+        let budget_override = self.budget_mb();
+
+        // Wybieramy efektywny limit: override (jesli ustawiony) albo realny
+        // total. Free = limit - max(used_real, sum(warm guard estimates))
+        // — bezpieczniej brac wieksza wartosc, zeby nie przepelnic.
+        let effective_limit = if budget_override > 0 {
+            budget_override
+        } else {
+            total_real
+        };
+        let warm_guard_estimate = self.total_warm_vram_mb();
+        let conservative_used = used_real.max(warm_guard_estimate);
+
+        if effective_limit > 0 && conservative_used + needed > effective_limit {
             let _eviction = self.eviction_lock.lock().await;
-            let current = self.total_warm_vram_mb();
-            if current + needed > budget {
-                let to_free = (current + needed).saturating_sub(budget);
-                self.evict_at_least(to_free, service_name).await?;
-            }
+            let to_free = (conservative_used + needed).saturating_sub(effective_limit);
+            tracing::info!(
+                service = %service_name, needed_mb = needed,
+                used_mb = conservative_used, total_mb = effective_limit,
+                free_mb = effective_limit.saturating_sub(conservative_used),
+                "MemoryGuard: eviction needed (real VRAM={}, used={}, override={})",
+                total_real, used_real, budget_override
+            );
+            self.evict_at_least(to_free, service_name).await?;
+        } else {
+            tracing::debug!(
+                service = %service_name, needed_mb = needed,
+                free_mb = free_real,
+                "MemoryGuard: budget OK, ladujemy bez eviction"
+            );
         }
 
         // Properna load.
