@@ -85,8 +85,11 @@ pub struct MeetingConfig {
     pub vad_rms_threshold: f32,
 
     /// Czy bot ma dolaczac z wlaczona kamerka (generowana z canvas przez MSTG).
-    /// Domyslnie false — power user wlacza swiadomie (wymaga MSTG + OffscreenCanvas).
-    #[serde(default)]
+    /// Default true: the canvas avatar is the visible identity of the bot in
+    /// the meeting tile, so we want it on unless the deployment explicitly
+    /// disables it. Falls back to "Continue without audio or video" when MSTG
+    /// or OffscreenCanvas are not available in the Chromium build.
+    #[serde(default = "default_bot_video_enabled")]
     pub bot_video_enabled: bool,
 
     /// Echo mode — gdy true, TTS wypowiada transkrypt ze STT (tryb testowy).
@@ -135,6 +138,10 @@ fn default_vad_rms_threshold() -> f32 {
 
 fn default_bot_name() -> String {
     "TentaFlow Jarvis".to_string()
+}
+
+fn default_bot_video_enabled() -> bool {
+    true
 }
 
 fn default_stt_alias() -> String {

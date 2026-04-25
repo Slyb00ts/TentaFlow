@@ -490,6 +490,35 @@
         return origGum(constraints);
       }
     };
+
+    // Teams calls enumerateDevices() before ever touching getUserMedia.
+    // Without overriding it, the container reports zero audio/video inputs
+    // and the meeting UI shows "No available camera/microphone found",
+    // never giving our getUserMedia override a chance to fire. Inject one
+    // synthetic input per kind that we actually back with a generator so
+    // Teams can build its device dropdown.
+    const origEnum = navigator.mediaDevices.enumerateDevices
+      ? navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices)
+      : async () => [];
+    navigator.mediaDevices.enumerateDevices = async function () {
+      let real = [];
+      try { real = await origEnum(); } catch (_) { real = []; }
+      const fake = [];
+      const hasReal = (kind) => real.some((d) => d.kind === kind);
+      const makeDevice = (kind, label) => ({
+        deviceId: 'tentaflow-' + kind,
+        groupId: 'tentaflow-group',
+        kind,
+        label,
+        toJSON() { return { deviceId: this.deviceId, groupId: this.groupId, kind: this.kind, label: this.label }; },
+      });
+      if (micGenerator && !hasReal('audioinput')) fake.push(makeDevice('audioinput', 'TentaFlow Bot Mic'));
+      if (videoGenerator && !hasReal('videoinput')) fake.push(makeDevice('videoinput', 'TentaFlow Bot Camera'));
+      // audiooutput needs to exist or Teams disables the speaker selector.
+      if (!real.some((d) => d.kind === 'audiooutput')) fake.push(makeDevice('audiooutput', 'TentaFlow Bot Speaker'));
+      return real.concat(fake);
+    };
+
     if (window.__tentaflowBridge) window.__tentaflowBridge.micSetupDone = true;
   }
 
