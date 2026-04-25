@@ -490,10 +490,20 @@
       micGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
       micWriter = micGenerator.writable.getWriter();
       micBaseTimestamp = 0;
+      // Sync deviceId z fake entry z enumerateDevices override.
+      try {
+        const orig = (micGenerator.getSettings && micGenerator.getSettings()) || {};
+        const patched = Object.assign({}, orig, {
+          deviceId: 'tentaflow-mic-default',
+          groupId: 'tentaflow-group',
+        });
+        Object.defineProperty(micGenerator, 'getSettings', {
+          configurable: true,
+          value: () => Object.assign({}, patched),
+        });
+      } catch (_) {}
       // Eksponuj na window zeby post-join replaceTrack mogl wymusic ze
-      // KAZDY audio sender w pc uzywa naszego micGenerator. Bez tego
-      // Teams ma drugi audio sender z Chromium fake-input ktory wysyla
-      // pusty PCM, a nasz track jest disabled.
+      // KAZDY audio sender w pc uzywa naszego micGenerator.
       window.__tentaflowMicGenerator = micGenerator;
     } catch (e) {
       console.warn('[tentaflow] Blad tworzenia MediaStreamTrackGenerator', e);
@@ -575,7 +585,10 @@
   // Video injection — kamerka bota (avatar 640x480 @ 30fps)
   // --------------------------------------------------------------------------
   let videoGenerator = null;
+  let videoWriter = null;
   let videoCanvas = null;
+  let videoFrameTimestamp = 0;
+  let videoWritePending = false;
   function setupVideoInjection() {
     if (window.__tentaflowBridge && window.__tentaflowBridge.videoSetupDone) return;
     // Switched away from MediaStreamTrackGenerator + VideoFrame: setInterval
@@ -607,9 +620,20 @@
     const canvas = document.createElement('canvas');
     canvas.width = W;
     canvas.height = H;
+    // CSS size MUSI miec realny layout footprint (640x480) zeby Chromium
+    // compositor renderowal canvas w pelnym rozmiarze. Wczesniejsze 1x1
+    // off-screen powodowalo ze captureStream sample'owal 1-pikselowy obszar
+    // i Teams renderowal czarny kafelek. Position:fixed daleko za viewport
+    // chowa to przed user'em (i tak headless), ale layout zostaje 640x480.
+    // Canvas w viewport (left:0, top:0, 640x480) zamiast off-screen.
+    // Bot leci w headless Chromium z Xvfb 1920x1080 — nikt nie patrzy na to
+    // okno (poza VNC do diagnostyki). Pelne layout + viewport zmuszaja
+    // Chromium compositor do realnego renderowania frames; off-screen
+    // (left:-99999px) lub 1x1 powodowaly captureStream sample'owal pusty
+    // backbuffer i Teams renderowal czarny kafelek.
     canvas.style.cssText =
-      'position:fixed;left:-99999px;top:-99999px;width:1px;height:1px;' +
-      'pointer-events:none;opacity:0.001;';
+      'position:fixed;left:0;top:0;width:640px;height:480px;' +
+      'pointer-events:none;z-index:99999;background:#000;';
     const attachCanvas = () => {
       if (!canvas.isConnected && document.body) {
         document.body.appendChild(canvas);
@@ -629,18 +653,42 @@
     const ctx = canvas.getContext('2d', { alpha: false });
     let stream = null;
     try {
-      stream = canvas.captureStream(30);
-      const tracks = stream.getVideoTracks();
-      if (!tracks.length) throw new Error('captureStream returned no video tracks');
-      videoGenerator = tracks[0];
+      // PLAN B — MediaStreamTrackGenerator zamiast canvas.captureStream.
+      // captureStream w headless Xvfb byl bug-prone: compositor nie pulled
+      // backbuffer'a regularnie, manual mode (captureStream(0)+requestFrame)
+      // konczyl track jako 'ended' po pierwszym replaceTrack. MediaStreamTrack
+      // Generator omija compositor calkowicie — my serializujemy canvas do
+      // VideoFrame i piszemy do writable. Track zyje tak dlugo jak go
+      // karmimy frame'ami. Backpressure: trzymamy referencje do ostatniego
+      // pending write i skip'ujemy nowe gdy pending nadal nie zakonczony.
+      videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
       try { videoGenerator.contentHint = 'motion'; } catch (_) {}
+      // Sync deviceId z fake entry z enumerateDevices override. Teams sprawdza
+      // czy track.getSettings().deviceId pasuje do enumerated device i potrafi
+      // wycielic track gdy id nie pasuje do zadnego enumerated entry.
+      try {
+        const orig = (videoGenerator.getSettings && videoGenerator.getSettings()) || {};
+        const patched = Object.assign({}, orig, {
+          deviceId: 'tentaflow-camera-default',
+          groupId: 'tentaflow-group',
+        });
+        Object.defineProperty(videoGenerator, 'getSettings', {
+          configurable: true,
+          value: () => Object.assign({}, patched),
+        });
+      } catch (_) {}
       // Eksponuj na window — analogicznie do micGenerator. Post-join
       // replaceTrack wymusza zeby Teams uzywal naszego canvas track
       // (a nie wbudowanego Chromium fake-input).
       window.__tentaflowVideoTrack = videoGenerator;
-      // Diagnostic shapshot the moment the stream is built — reveals whether
-      // captureStream produces a unmuted track at all (ie. whether the
-      // compositor is wired) before the meeting page even sees us.
+      // Writer dla MediaStreamTrackGenerator. Backpressure przez pending
+      // promise — jesli previous write nadal nie skonczyl, drop'ujemy nowe
+      // frames (zamiast queueowac i blokowac draw loop).
+      try {
+        videoWriter = videoGenerator.writable.getWriter();
+      } catch (e) {
+        console.warn('[tentaflow] videoWriter init blad', e);
+      }
       console.log('[tentaflow][video] track ready, muted=' + videoGenerator.muted +
         ' enabled=' + videoGenerator.enabled + ' state=' + videoGenerator.readyState +
         ' settings=' + JSON.stringify(videoGenerator.getSettings()));
@@ -923,9 +971,33 @@
           ctx.fill();
         }
 
-        // captureStream picks up whatever is on the canvas at its own pace;
-        // we just need to leave the backbuffer freshly painted. No frame
-        // object, no writer, no manual timestamps.
+        // Push aktualnego backbuffer'a canvas jako VideoFrame do
+        // MediaStreamTrackGenerator. Backpressure: gdy poprzedni write nadal
+        // nie skonczyl, drop'ujemy nowy frame (lepiej drop niz queue +
+        // pipe-lock writera — ta race byla powodem rollback'u na
+        // captureStream w przeszlosci).
+        if (videoWriter && !videoWritePending) {
+          try {
+            videoWritePending = true;
+            // Timestamp w mikrosekundach. Inkrement = 1/FPS sekund.
+            const ts = videoFrameTimestamp;
+            videoFrameTimestamp += Math.round(1_000_000 / FPS);
+            const frame = new VideoFrame(canvas, { timestamp: ts });
+            videoWriter.write(frame).then(
+              () => { videoWritePending = false; },
+              (err) => {
+                videoWritePending = false;
+                console.warn('[tentaflow] videoWriter.write rejected', err);
+              },
+            );
+            // VideoFrame trzymane przez writer; my zwalniamy nasza
+            // referencje natychmiast.
+            frame.close();
+          } catch (e) {
+            videoWritePending = false;
+            console.warn('[tentaflow] VideoFrame push blad', e && e.message ? e.message : e);
+          }
+        }
       } catch (e) {
         console.warn('[tentaflow] video draw error:', e && e.message ? e.message : e);
       }
@@ -983,6 +1055,32 @@
   // --------------------------------------------------------------------------
   // Bootstrap
   // --------------------------------------------------------------------------
+  // ==========================================================================
+  // EARLY MediaStreamTrack.prototype.stop GUARD
+  // ==========================================================================
+  // Teams po replaceTrack(naszGeneratorTrack) wywoluje .stop() na tym track
+  // jako anti-spoofing — wynik widzielismy w videoWriter "Stream closed"
+  // od pierwszego write'a. Patch blokuje stop() na naszych singletonach
+  // (window.__tentaflowMicGenerator, __tentaflowVideoTrack). Teams moze
+  // wolac, my pomijamy i dalej pchamy frames przez writer.
+  try {
+    const TrackProto = (typeof MediaStreamTrack !== 'undefined') ? MediaStreamTrack.prototype : null;
+    if (TrackProto && TrackProto.stop) {
+      const origStop = TrackProto.stop;
+      TrackProto.stop = function () {
+        if (this === window.__tentaflowMicGenerator
+          || this === window.__tentaflowVideoTrack) {
+          console.log('[tentaflow] track.stop() zablokowany dla generatora '
+            + (this.kind || ''));
+          return;
+        }
+        return origStop.call(this);
+      };
+    }
+  } catch (e) {
+    console.warn('[tentaflow] track.stop guard blad', e);
+  }
+
   // ==========================================================================
   // EARLY navigator.mediaDevices.enumerateDevices OVERRIDE
   // ==========================================================================
