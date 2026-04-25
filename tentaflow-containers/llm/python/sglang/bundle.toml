@@ -1,11 +1,11 @@
 [bundle]
 engine = "sglang"
-description = "SGLang serwer LLM z structured outputs (git HEAD)"
+description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.10)"
 python_version = "3.12"
-source = "git"
-git_repo = "https://github.com/sgl-project/sglang.git"
-git_ref = "main"
-install_subdir = "python"
+# Pinned na najnowsza stabilna wersje sglang (2026-04). Update wymaga
+# regeneracji requirements.lock + bumpa pakietu.
+source = "pypi"
+pypi_package = "sglang[all]==0.5.10.post1"
 
 [launch]
 command = "python"
@@ -16,8 +16,21 @@ args = [
     "--port", "${PORT:-30000}",
     "--tp", "${TP:-1}",
     "--mem-fraction-static", "${MEM_FRACTION:-0.85}",
+    # Domyslny attention-backend (flashinfer) jest stabilny dla wiekszosci
+    # modeli HF. Triton mialismy z dotnet/nextapp dla Bielika, ale na
+    # Qwen3.5 scheduler crashuje przy first prefill (event_loop exception).
 ]
 internal_port = 30000
+
+# Wymus CUDA path w tvm_ffi auto-detect. Bez tego na hostach gdzie
+# /opt/rocm + hipcc sa zainstalowane obok NVIDIA (np. workstations z
+# cross-toolchainami) tvm_ffi wybiera HIP backend i scheduler crashuje
+# przy pierwszym prefill JIT compile. TVM_FFI_GPU_BACKEND=cuda short-
+# circuituje detection na linii 47 tvm_ffi/cpp/extension.py.
+# CUDA_ARCH_LIST pokrywa popularne compute caps (8.0=A100, 8.9=4090, 9.0=H100).
+[launch.env]
+TVM_FFI_GPU_BACKEND = "cuda"
+TVM_FFI_CUDA_ARCH_LIST = "8.0 8.9 9.0"
 
 [requires]
 gpu_memory_gb = 8
@@ -27,10 +40,13 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu124"
-extras = []
+# Torch 2.6.0 ma cudnn 9.5+ ktory sglang akceptuje (>=9.15 wymagane dla
+# konv3d). Pinned tu, zeby uv nie wciagnal torch 2.9.x z cudnn 9.10 ktore
+# sglang odrzuca jako "CRITICAL WARNING: KNOWN BUG".
+extras = ["torch==2.6.0", "torchvision==0.21.0"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = []
+extras = ["torch==2.6.0", "torchvision==0.21.0"]
 install_hint = "SGLANG_BACKEND=rocm"

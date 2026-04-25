@@ -7,7 +7,7 @@
 mod audio;
 mod browser;
 mod config;
-mod participant_scanner;
+mod dom_observer;
 mod quic_server;
 mod summarizer;
 mod vad;
@@ -73,9 +73,48 @@ async fn send_backend_update(
     }
 }
 
-/// Announces the bot itself as a meeting participant. The DOM scanner
-/// (`participant_scanner`) intentionally filters the bot row out, so without
-/// this the GUI roster stays empty until a remote participant is detected.
+/// Generuje 2s 440Hz sine wave (16kHz mono i16 LE) i wysyla przez
+/// audio_playback do JS mic injection. Diagnostyka pipeline'u TX
+/// niezalezna od routera/TTS — uzywamy gdy chcemy zweryfikowac
+/// MediaStreamTrackGenerator -> getUserMedia -> Teams MediaAgent ->
+/// remote bez calego stacku TTS. Aktywuje sie env-em
+/// `BOT_TEST_TONE_ON_JOIN=1`.
+async fn play_test_tone(
+    audio_playback: &Arc<crate::audio::AudioPlayback>,
+    is_bot_speaking: &Arc<AtomicBool>,
+) {
+    const SR: u32 = 16_000;
+    const FREQ: f64 = 440.0;
+    const DUR_MS: u64 = 2_000;
+    const AMP: f64 = 0.3 * (i16::MAX as f64);
+    let n = (SR as u64 * DUR_MS / 1000) as usize;
+    let mut pcm_bytes: Vec<u8> = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64 / SR as f64;
+        let s = (t * FREQ * 2.0 * std::f64::consts::PI).sin();
+        let v = (s * AMP) as i16;
+        pcm_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    is_bot_speaking.store(true, Ordering::Relaxed);
+    match audio_playback.send(pcm_bytes) {
+        Ok(()) => {
+            tracing::info!(duration_ms = DUR_MS, freq = FREQ, "TEST tone wyslany do mic");
+            let flag = Arc::clone(is_bot_speaking);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(DUR_MS + 250)).await;
+                flag.store(false, Ordering::Relaxed);
+            });
+        }
+        Err(e) => {
+            tracing::warn!("play_test_tone: audio_playback.send failed: {}", e);
+            is_bot_speaking.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Announces the bot itself as a meeting participant. The DOM observer
+/// (`dom_observer`) intentionally filters the bot row out, so without this
+/// the GUI roster stays empty until a remote participant is detected.
 /// Emitted once per join, right after `LIFECYCLE_JOINED`.
 async fn send_bot_participant_joined(
     router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
@@ -163,36 +202,6 @@ impl SummarizerHandle {
     }
 }
 
-/// Uchwyt skanera uczestnikow — periodycznie czyta DOM Teams i emituje
-/// `ParticipantUpdate { joined|left }`. Osobny handle od summarizera zeby
-/// LeaveMeeting / kolejny JoinMeeting moglo go czysto zamknac.
-struct ScannerHandle {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    join: tokio::task::JoinHandle<()>,
-}
-
-impl ScannerHandle {
-    async fn stop(self) {
-        let _ = self.shutdown_tx.send(true);
-        let _ = self.join.await;
-    }
-}
-
-/// Spawnuje task participant_scanner dla aktywnej sesji. Scanner zyje tak dlugo
-/// jak strona (Page) — po LeaveMeeting / Join nowej sesji caller musi wywolac
-/// `stop()` na zwroconym handle.
-fn spawn_participant_scanner(
-    page: chromiumoxide::Page,
-    router: Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
-    meeting_key: String,
-    bot_name: String,
-) -> ScannerHandle {
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    let join = tokio::spawn(async move {
-        participant_scanner::run(page, router, meeting_key, bot_name, rx).await;
-    });
-    ScannerHandle { shutdown_tx: tx, join }
-}
 
 /// Sidecar meeting bot — automatyzacja spotkan Teams z pipeline audio
 #[derive(Parser, Debug)]
@@ -268,6 +277,51 @@ async fn main() -> Result<()> {
         tracing::warn!("SKIP_ROUTER_WAIT=1 — uruchamiam bota bez czekania na router (tryb dev)");
     }
 
+    // SIGTERM/SIGINT handler — `docker stop` wysyla SIGTERM z 10s grace
+    // przed SIGKILL. Bez tego goly browser.close() konczy proces zanim Teams
+    // dostanie BYE/RTCP -> bot wisi w roster konferencji przez ~30s. Tutaj
+    // klikamy Leave w Teams na aktywnej page (jesli istnieje), czekamy 1.5s
+    // (tyle robi click_leave_in_teams) i wychodzimy. Browser zostanie
+    // zatrzymany przez docker po naszym exit'cie — to zaplanowane.
+    {
+        let sig_page_slot = page_slot.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGTERM signal setup failed: {}", e);
+                    return;
+                }
+            };
+            let mut intr = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGINT signal setup failed: {}", e);
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = term.recv() => tracing::info!("SIGTERM otrzymany — leave-first shutdown"),
+                _ = intr.recv() => tracing::info!("SIGINT otrzymany — leave-first shutdown"),
+            }
+            let page = {
+                let guard = sig_page_slot.lock().await;
+                guard.clone()
+            };
+            if let Some(p) = page {
+                match browser::click_leave_in_teams(&p).await {
+                    Ok(true) => tracing::info!("Klikniete Leave w Teams (signal handler)"),
+                    Ok(false) => tracing::warn!("Leave button niedostepny przy SIGTERM"),
+                    Err(e) => tracing::warn!("click_leave_in_teams (signal): {}", e),
+                }
+            } else {
+                tracing::info!("SIGTERM bez aktywnej sesji — wychodze bez kliku");
+            }
+            std::process::exit(0);
+        });
+    }
+
     // Rolling buffer transkrypcji — summarizer czyta go co N sekund.
     // Trzymany tu, a nie w summarizerze, zeby main loop mogl pushowac wpisy
     // niezaleznie od lifecycle summarizera (summarizer spawnuje sie per-session,
@@ -281,7 +335,14 @@ async fn main() -> Result<()> {
     // Handle summarizera dla aktywnej sesji — None gdy bot nie jest w spotkaniu.
     let mut summarizer_handle: Option<SummarizerHandle> = None;
     // Handle skanera uczestnikow — analogicznie per-session.
-    let mut scanner_handle: Option<ScannerHandle> = None;
+    let mut dom_observer_handle: Option<dom_observer::DomObserver> = None;
+
+    // Stan rosteru i aktywnego mowcy — zasilane przez dom_observer (push DOM
+    // bridge), odczytywane w STT pipeline jako extra_meta. Trzymane na poziomie
+    // calego sidecara, zeby przezyc LeaveMeeting / ponowny JoinMeeting bez
+    // przedlokowania rzeczy ktore i tak dom_observer zaraz zaktualizuje.
+    let current_roster: Arc<RwLock<Vec<RosterEntry>>> = Arc::new(RwLock::new(Vec::new()));
+    let current_active_speaker: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
     // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
     // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
@@ -338,6 +399,18 @@ async fn main() -> Result<()> {
         Some(SummarizerHandle { shutdown_tx: tx, join })
     }
 
+    // 3b. Most audio WebSocket — server musi byc UP zanim JS w Chromium
+    //     pierwszy raz wykona connectWs(), inaczej widzimy spam "WS blad" /
+    //     "WS zamkniety" do czasu az server zacznie nasluchiwac. Roster i
+    //     active_speaker NIE ida tym kanalem (zasila je dom_observer).
+    let (mut audio_capture, audio_playback) = audio::start_bridge().await?;
+    let audio_playback = Arc::new(audio_playback);
+    // Guard feedback-loop — gdy bot odtwarza TTS przez mic injection, capture
+    // (z HTMLMediaElement i pc.ontrack) moze ponownie zlapac ten sam glos
+    // przez echo konferencji. Bez tego STT zapetla sie na wlasnych odpowiedziach.
+    let is_bot_speaking = Arc::new(AtomicBool::new(false));
+    tracing::info!("Most audio WebSocket uruchomiony na 127.0.0.1:9999");
+
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
     let mut _chromium: Option<chromiumoxide::browser::Browser> = None;
     let mut page = if !config.meeting_url.is_empty() {
@@ -369,16 +442,18 @@ async fn main() -> Result<()> {
         .await;
 
         let browser = browser::launch_chromium(&config).await?;
-        let p = match browser::join_meeting(
+        let (p, observer) = match browser::join_meeting(
             &browser,
             &config.meeting_url,
             &config,
             &router_client_handle,
             &meeting_id,
+            Arc::clone(&current_roster),
+            Arc::clone(&current_active_speaker),
         )
         .await
         {
-            Ok(p) => p,
+            Ok(pair) => pair,
             Err(e) => {
                 emit_lifecycle(
                     &router_client_handle,
@@ -403,122 +478,25 @@ async fn main() -> Result<()> {
             &config,
         )
         .await;
-        scanner_handle = Some(spawn_participant_scanner(
-            p.clone(),
-            router_client_handle.clone(),
-            meeting_id.clone(),
-            config.bot_name.clone(),
-        ));
+        dom_observer_handle = Some(observer);
         send_backend_update(&router_client_handle, &meeting_id, &config).await;
         send_bot_participant_joined(&router_client_handle, &meeting_id, &config.bot_name).await;
+        if std::env::var("BOT_TEST_TONE_ON_JOIN").ok().as_deref() == Some("1") {
+            // 1.5s opoznienie zeby Teams MediaAgent zdazyl podlaczyc track
+            // przed pierwszym AudioData write — bez tego frames trafiaja do
+            // void zanim peer connection zaczyna ich uzywac.
+            let pb = Arc::clone(&audio_playback);
+            let speaking = Arc::clone(&is_bot_speaking);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                play_test_tone(&pb, &speaking).await;
+            });
+        }
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
         None
     };
-
-    // 5. Uruchom most audio WebSocket (wstrzykniety JS w Chromium <-> Rust)
-    // Zastepuje wczesniejsze parec/pacat — audio przechwytywane na poziomie
-    // HTMLMediaElement w Chromium przez captureStream(), bez PulseAudio monitor.
-    let (mut audio_capture, audio_playback, mut roster_rx, mut speaker_rx) =
-        audio::start_bridge().await?;
-    let audio_playback = Arc::new(audio_playback);
-    // Guard feedback-loop — gdy bot odtwarza TTS przez mic injection, capture
-    // (z HTMLMediaElement i pc.ontrack) moze ponownie zlapac ten sam glos
-    // przez echo konferencji. Bez tego STT zapetla sie na wlasnych odpowiedziach.
-    let is_bot_speaking = Arc::new(AtomicBool::new(false));
-    tracing::info!("Most audio WebSocket uruchomiony na 127.0.0.1:9999");
-
-    // Stan rostera i aktywnego mowcy dzielony z taskami receiverow.
-    // Roster wysylany jest w metadata STT, active_speaker tak samo.
-    let current_roster: Arc<RwLock<Vec<RosterEntry>>> = Arc::new(RwLock::new(Vec::new()));
-    let current_active_speaker: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-
-    {
-        let roster_state = Arc::clone(&current_roster);
-        tokio::spawn(async move {
-            // Telemetria selektorow — jesli DOM Teams sie zmieni, roster bedzie
-            // pusty; pod 3 pod rzad ostrzegamy (moze pomoc w diagnostyce bez SSH).
-            let mut empty_count: u32 = 0;
-            while let Some(list) = roster_rx.rx.recv().await {
-                if list.is_empty() {
-                    empty_count = empty_count.saturating_add(1);
-                    if empty_count >= 3 {
-                        tracing::warn!(
-                            empty_count,
-                            "roster empty {} times — Teams DOM may have changed",
-                            empty_count
-                        );
-                    }
-                } else {
-                    empty_count = 0;
-                }
-                *roster_state.write().await = list;
-            }
-        });
-    }
-    {
-        let speaker_state = Arc::clone(&current_active_speaker);
-        let router_for_speaker = Arc::clone(&router_client_handle);
-        tokio::spawn(async move {
-            let mut none_count: u32 = 0;
-            while let Some(name) = speaker_rx.rx.recv().await {
-                if name.is_none() {
-                    none_count = none_count.saturating_add(1);
-                    if none_count == 10 {
-                        tracing::warn!(
-                            none_count,
-                            "active_speaker None {} times — check data-is-presenter selector",
-                            none_count
-                        );
-                    }
-                } else {
-                    none_count = 0;
-                }
-                // Porównaj ze stanem poprzednim — emit ParticipantUpdate tylko
-                // przy realnej zmianie Some(X)->Some(Y) albo None->Some(Y).
-                // Przejście Some->None (opuszczenie mównicy) zostawiamy ciche —
-                // nie znamy speaker_id bez nowej wartości, a dashboard liczy
-                // "active_now" jako ostatni znany.
-                let prev = speaker_state.read().await.clone();
-                *speaker_state.write().await = name.clone();
-                if let Some(new_name) = name {
-                    if prev.as_deref() != Some(new_name.as_str()) {
-                        let client = {
-                            let guard = router_for_speaker.lock().await;
-                            guard.as_ref().cloned()
-                        };
-                        if let Some(client) = client {
-                            if let Some(meeting_id) = client.current_meeting_id() {
-                                let ts = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as i64)
-                                    .unwrap_or(0);
-                                if let Err(e) = client
-                                    .send_meeting_event(
-                                        &meeting_id,
-                                        ts,
-                                        MeetingEventPayload::ParticipantUpdate {
-                                            speaker_id: new_name.clone(),
-                                            speaker_name: Some(new_name.clone()),
-                                            status: "active_now".to_string(),
-                                            last_spoken_ago_sec: None,
-                                        },
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "send_meeting_event ParticipantUpdate failed: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
 
     // 6. Inicjalizacja VAD
     let mut vad_detector = vad::VadDetector::new(
@@ -910,7 +888,7 @@ async fn main() -> Result<()> {
                         if let Some(h) = summarizer_handle.take() {
                             h.stop().await;
                         }
-                        if let Some(h) = scanner_handle.take() {
+                        if let Some(h) = dom_observer_handle.take() {
                             h.stop().await;
                         }
                         transcript_buffer.lock().await.clear();
@@ -955,10 +933,12 @@ async fn main() -> Result<()> {
                                     &config,
                                     &router_client_handle,
                                     &meeting_id,
+                                    Arc::clone(&current_roster),
+                                    Arc::clone(&current_active_speaker),
                                 )
                                 .await
                                 {
-                                    Ok(p) => {
+                                    Ok((p, observer)) => {
                                         _chromium = Some(browser);
                                         {
                                             let mut slot = page_slot.lock().await;
@@ -974,12 +954,7 @@ async fn main() -> Result<()> {
                                             &config,
                                         )
                                         .await;
-                                        scanner_handle = Some(spawn_participant_scanner(
-                                            p.clone(),
-                                            router_client_handle.clone(),
-                                            meeting_id.clone(),
-                                            config.bot_name.clone(),
-                                        ));
+                                        dom_observer_handle = Some(observer);
                                         send_backend_update(
                                             &router_client_handle,
                                             &meeting_id,
@@ -1035,6 +1010,18 @@ async fn main() -> Result<()> {
                     }
                     Some(quic_server::MeetingCommand::LeaveMeeting { response_tx }) => {
                         tracing::info!("Komenda QUIC: opuszczanie spotkania");
+                        // Najpierw klikamy Leave w Teams zeby konferencja
+                        // dostala BYE/RTCP — bez tego Teams trzyma bota w
+                        // roster przez ~30s po samym docker stop.
+                        if let Some(ref p) = page {
+                            match browser::click_leave_in_teams(p).await {
+                                Ok(true) => tracing::info!("Klikniete Leave w Teams"),
+                                Ok(false) => tracing::warn!(
+                                    "Leave button niedostepny — zamykam Chromium bez kliku"),
+                                Err(e) => tracing::warn!(
+                                    "click_leave_in_teams failed: {} — zamykam Chromium", e),
+                            }
+                        }
                         page = None;
                         {
                             let mut slot = page_slot.lock().await;
@@ -1047,7 +1034,7 @@ async fn main() -> Result<()> {
                         if let Some(h) = summarizer_handle.take() {
                             h.stop().await;
                         }
-                        if let Some(h) = scanner_handle.take() {
+                        if let Some(h) = dom_observer_handle.take() {
                             h.stop().await;
                         }
                         transcript_buffer.lock().await.clear();
@@ -1088,7 +1075,7 @@ async fn main() -> Result<()> {
     if let Some(h) = summarizer_handle.take() {
         h.stop().await;
     }
-    if let Some(h) = scanner_handle.take() {
+    if let Some(h) = dom_observer_handle.take() {
         h.stop().await;
     }
     let _ = shutdown_tx.send(true);
