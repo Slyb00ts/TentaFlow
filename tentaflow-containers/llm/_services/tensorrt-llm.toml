@@ -11,7 +11,7 @@ license = "Apache-2.0"
 icon = "nvidia"
 default_port = 8000
 api = "openai-compatible"
-version = "0.13.0"
+version = "1.2.1"
 
 [deploy.docker]
 context_path = "llm/docker/tensorrt-llm"
