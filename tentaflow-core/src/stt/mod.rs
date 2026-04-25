@@ -4,6 +4,7 @@
 // =============================================================================
 
 pub mod audio;
+#[cfg(feature = "inference-whisper")]
 pub mod whisper;
 
 use async_trait::async_trait;
@@ -163,6 +164,7 @@ impl SttManager {
         #[allow(unused_mut)]
         let mut engines: Vec<Box<dyn SttEngine>> = Vec::new();
 
+        #[cfg(feature = "inference-whisper")]
         engines.push(Box::new(whisper::WhisperEngine::new()));
 
         Self {

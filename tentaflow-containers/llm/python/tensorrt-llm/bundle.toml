@@ -1,0 +1,45 @@
+# =============================================================================
+# Plik: python-bundles/tensorrt-llm/bundle.toml
+# Opis: TensorRT-LLM (NVIDIA) jako native bundle. Pinned na 1.2.0 (stable)
+#       — 1.3.0rc12 jest pre-release (kwiecien 2026), nie na produkcje.
+#       Pakiet `tensorrt_llm` z PyPI wystawia `tensorrt_llm.serve.openai_server`
+#       z OpenAI-compatible API. Linux-only, CUDA 12.x + cudnn 9.x.
+# =============================================================================
+
+[bundle]
+engine = "tensorrt-llm"
+description = "NVIDIA TensorRT-LLM OpenAI-compatible server (PyPI, 1.3.0rc12)"
+python_version = "3.12"
+source = "pypi"
+# 1.2.1 stable (release April 20, 2026 — najnowszy non-rc).
+# 1.3.0rc12 ma broken pyproject (conflicting torch constraints), 1.3.x
+# stable nie ukazalo sie jeszcze. Domyslny model preset to
+# Llama-3.2-1B-Instruct (kompatybilny z transformers 4.57.3); Qwen3.5
+# obsluga przyjdzie w 1.3.x stable.
+pypi_package = "tensorrt-llm==1.2.1"
+
+[launch]
+# Wlasciwy entry point to `trtllm-serve serve <MODEL>` (Click CLI).
+# `python -m tensorrt_llm.serve.openai_server` to modul biblioteki bez
+# argparse — uruchamiany bezposrednio nigdy nie wstaje.
+command = "trtllm-serve"
+args = [
+    "serve",
+    "${MODEL}",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8087}",
+    "--tp_size", "${TP:-1}",
+    "--max_batch_size", "${MAX_BATCH_SIZE:-8}",
+    "--free_gpu_memory_fraction", "${KV_FRACTION:-0.85}",
+]
+internal_port = 8087
+
+[requires]
+gpu_memory_gb = 12
+disk_gb = 30
+platforms = ["linux-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://pypi.nvidia.com"
+extras = []

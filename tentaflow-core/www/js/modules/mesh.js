@@ -309,9 +309,13 @@ function renderListSections() {
 
 function renderSection(title, list, kind, count = null) {
   const countBadge = count != null ? `<span class="section-count">${count}</span>` : '';
+  // Sekcja "This node" ma jeden node — full-width tile zamiast jednej z 2
+  // kolumn w 2-column grid (mockup pokazywal mainpc na pelnej szerokosci
+  // i to dawalo "centralna karta z gauges + connectivity panes").
+  const gridMod = kind === 'local' ? ' mesh-grid--single' : '';
   return `
     <h3 class="mesh-section-title">${escapeHtml(title)}${countBadge}</h3>
-    <div class="mesh-grid">
+    <div class="mesh-grid${gridMod}">
       ${list.map(n => renderNodeCard(n, kind)).join('')}
     </div>
   `;
@@ -890,13 +894,6 @@ function openPairModal() {
     <div class="pair-tab-panel" data-tab="id" hidden>
       <tf-input id="pair-node-id" label="${escapeAttr(I18n.t('mesh.pair_node_id_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_id_hint'))}" maxlength="512"></tf-input>
       <tf-input id="pair-node-pin" label="${escapeAttr(I18n.t('mesh.pair_node_pin_label'))}" placeholder="123456" maxlength="6" inputmode="numeric"></tf-input>
-      <tf-input id="pair-node-host" label="${escapeAttr(I18n.t('mesh.pair_node_host_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_host_hint'))}"></tf-input>
-      <tf-input id="pair-node-port" label="${escapeAttr(I18n.t('mesh.pair_node_port_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_port_hint'))}" inputmode="numeric"></tf-input>
-      <tf-input id="pair-node-relay" label="${escapeAttr(I18n.t('mesh.pair_node_relay_label'))}" placeholder="${escapeAttr(I18n.t('mesh.pair_node_relay_hint'))}"></tf-input>
-      <button type="button" class="pair-scan-btn" id="pair-scan-btn" hidden>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-        <span>${escapeHtml(I18n.t('mesh.pair_scan_camera'))}</span>
-      </button>
       <div class="pair-id-hint">${escapeHtml(I18n.t('mesh.pair_id_hint'))}</div>
       <div class="form-error" hidden></div>
     </div>
@@ -911,17 +908,23 @@ function openPairModal() {
     onSubmit: async (winEl) => {
       const activeTab = winEl.querySelector('#pair-tabs-nav')?.value || 'qr';
       if (activeTab === 'qr') {
-        // Na zakladce QR "Paruj" tylko zamyka — pairing inicjuje drugi nod po
-        // zeskanowaniu kodu. User moze skopiowac dane i robic recznie.
-        return true;
+        // Na zakladce QR submit ma label "Odśwież PIN" — regeneruje invite
+        // (backend daje swiezy PIN+countdown). Pairing inicjuje DRUGI nod
+        // po zeskanowaniu kodu, wiec my zostajemy z otwartym oknem (return
+        // false = okno nie zamyka sie).
+        if (typeof winEl._refreshInvite === 'function') {
+          await winEl._refreshInvite();
+        }
+        return false;
       }
       const pairInputRaw = (winEl.querySelector('#pair-node-id')?.value || '').trim();
       const pinInput = winEl.querySelector('#pair-node-pin');
       const manualPin = String(pinInput?.value || '').replace(/\D/g, '');
-      const manualHost = (winEl.querySelector('#pair-node-host')?.value || '').trim();
-      const manualPort = (winEl.querySelector('#pair-node-port')?.value || '').trim();
-      const manualRelayUrl = (winEl.querySelector('#pair-node-relay')?.value || '').trim();
       const errBox = winEl.querySelector('[data-tab="id"] .form-error');
+      // Adres / port / relay sa wyciagane wylacznie z URI 'tentaflow-pair://'
+      // (parseManualPairTarget) albo zostawiane puste. Mesh discovery (mDNS,
+      // DHT, relay) sam dorobi reszte — manualne wpisywanie host/port/relay
+      // zawsze prowadzilo do bledow uzytkownika i zaśmieconej DB.
       const parsed = await parseManualPairTarget(pairInputRaw);
       const idHex = parsed?.hex || '';
       const effectivePin = manualPin || parsed?.pin || '';
@@ -939,17 +942,9 @@ function openPairModal() {
         }
         return false;
       }
-      const manualAddress = buildManualPairAddress(manualHost, manualPort);
-      if (manualHost && !manualAddress) {
-        if (errBox) {
-          errBox.textContent = I18n.t('mesh.pair_invalid_socket');
-          errBox.hidden = false;
-        }
-        return false;
-      }
       if (errBox) errBox.hidden = true;
-      const remoteAddresses = uniqueStrings((manualAddress ? [manualAddress] : []).concat(parsed?.addresses || []));
-      const remoteRelayUrl = manualRelayUrl || parsed?.relayUrl || '';
+      const remoteAddresses = uniqueStrings(parsed?.addresses || []);
+      const remoteRelayUrl = parsed?.relayUrl || '';
       const remoteHostname = parsed?.host || '';
       const remotePublicKey = parsed?.publicKey || '';
       // Otwieramy progress-dialog od razu zamiast zostawiac user-a ze starym
@@ -1002,24 +997,38 @@ async function wireUpPairTabs(winEl) {
   if (!winEl) return;
   const nav = winEl.querySelector('#pair-tabs-nav');
   const panels = winEl.querySelectorAll('.pair-tab-panel');
+  // Submit button label zalezy od aktywnej zakladki: na QR pairing inicjuje
+  // DRUGI nod (tu juz mamy invite gotowe), wiec zamiast "Paruj" pokazujemy
+  // "Odśwież PIN" — uzycie buttona regeneruje invite (poll fetch w
+  // wireUpInviteRefresh poll). Na ID natomiast button rzeczywiscie wysyla
+  // pairing request, wiec label = "Paruj".
+  const submitBtn = winEl.querySelector('tf-button[data-action="pair"]');
+  const updateSubmitLabel = (tab) => {
+    if (!submitBtn) return;
+    const label =
+      tab === 'qr'
+        ? I18n.t('mesh.pair_qr_refresh_pin') || 'Odśwież PIN'
+        : I18n.t('mesh.pair') || 'Paruj';
+    submitBtn.setAttribute('label', label);
+  };
+  updateSubmitLabel(nav?.value || 'qr');
   if (nav) {
     nav.addEventListener('change', () => {
       const val = nav.value;
       panels.forEach((p) => {
         p.hidden = p.dataset.tab !== val;
       });
+      updateSubmitLabel(val);
     });
   }
 
   // Auto-rozpakowanie `tentaflow-pair://...` URL-a wklejonego do pola
-  // Node ID: wyciagamy hex do pola id, a PIN / relay / hostname do wlasciwych
-  // pol. Dzieki temu user ktory zeskanowal QR systemowa kamera iOS i wkleil
-  // calego linka widzi od razu ze PIN sie wypelnil sam — nie musi rozdzielac
-  // recznie URL-a na kawalki.
+  // Node ID: wyciagamy hex do pola id i PIN do PIN-pola. Adresy / relay /
+  // hostname zachowujemy w `parsed` z parseManualPairTarget (przekazane do
+  // submit handlera) — usunelismy widoczne pola Host/Port/Relay z formularza
+  // bo mesh discovery dorobi te pola sam.
   const idInput = winEl.querySelector('#pair-node-id');
   const pinInput = winEl.querySelector('#pair-node-pin');
-  const hostInput = winEl.querySelector('#pair-node-host');
-  const relayInput = winEl.querySelector('#pair-node-relay');
   if (idInput) {
     const unpack = async () => {
       const raw = String(idInput.value || '').trim();
@@ -1030,8 +1039,6 @@ async function wireUpPairTabs(winEl) {
         if (!parsed) return;
         idInput.value = parsed.hex;
         if (pinInput && parsed.pin && !pinInput.value) pinInput.value = parsed.pin;
-        if (relayInput && parsed.relayUrl && !relayInput.value) relayInput.value = parsed.relayUrl;
-        if (hostInput && parsed.host && !hostInput.value) hostInput.value = parsed.host;
       } catch (_) { /* ignore */ }
     };
     idInput.addEventListener('paste', () => setTimeout(unpack, 0));
@@ -1154,8 +1161,15 @@ async function wireUpPairTabs(winEl) {
   };
   await refresh();
 
-  // Countdown — co sekunde. Odswiezamy identity co 50s (server TTL=60s).
+  // Wystaw refresh jako property okna zeby submit button "Odśwież PIN" mogl
+  // wywolac to samo co tick countdown — bez wymyslania osobnego flow.
   let remaining = 50;
+  winEl._refreshInvite = async () => {
+    remaining = 50;
+    await refresh();
+  };
+
+  // Countdown — co sekunde. Odswiezamy identity co 50s (server TTL=60s).
   const countdownEl = winEl.querySelector('#pair-invite-countdown');
   const iv = setInterval(async () => {
     if (!winEl.isConnected) { clearInterval(iv); return; }

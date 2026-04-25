@@ -1,17 +1,18 @@
 # =============================================================================
 # Plik: python-bundles/vllm/bundle.toml
-# Opis: vLLM z git HEAD, CUDA (Linux/Windows) albo ROCm (Linux). Dla macOS
-#       Apple Silicon uzywamy osobnego silnika `vllm-metal` (bundle
+# Opis: vLLM jako PyPI pinned (0.19.1, kwiecien 2026). Dla macOS Apple
+#       Silicon uzywamy osobnego silnika `vllm-metal` (bundle
 #       ../vllm-metal/bundle.toml) — plugin MLX, inny flow instalacji.
 # =============================================================================
 
 [bundle]
 engine = "vllm"
-description = "vLLM OpenAI-compatible LLM server (git HEAD)"
+description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.19.1)"
 python_version = "3.12"
-source = "git"
-git_repo = "https://github.com/vllm-project/vllm.git"
-git_ref = "main"
+# Pinned na 0.19.1 (kwiecien 2026 release, gRPC + Gemma 4). Switch z git HEAD
+# na PyPI dla reproducibility — git main moze rozjechac sie z innymi deps.
+source = "pypi"
+pypi_package = "vllm==0.19.1"
 
 [launch]
 command = "python"
