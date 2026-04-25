@@ -1071,11 +1071,24 @@
     console.log('[tentaflow] Video injection zainicjalizowane (' + W + 'x' + H + ' @ ' + FPS + 'fps)');
     registerVideoInterval(setInterval(() => {
       try {
+        // Pixel readback: prove the draw loop actually paints into the canvas
+        // backbuffer. If the centre pixel (where we render the wireframe) and
+        // a corner pixel (the backdrop gradient) both come back zero, the
+        // problem is upstream in canvas rendering (e.g. software GL stack
+        // never produced any frames). If they come back coloured but Teams
+        // still shows black, the captureStream / encoder side is dropping
+        // frames despite a healthy canvas.
+        const pCenter = ctx.getImageData(W / 2, H / 2, 1, 1).data;
+        const pCorner = ctx.getImageData(8, 8, 1, 1).data;
         console.log('[tentaflow][video] tick muted=' + videoGenerator.muted +
           ' enabled=' + videoGenerator.enabled +
           ' canvasInDom=' + canvas.isConnected +
-          ' canvasParent=' + (canvas.parentNode ? canvas.parentNode.nodeName : 'null'));
-      } catch (_) {}
+          ' canvasParent=' + (canvas.parentNode ? canvas.parentNode.nodeName : 'null') +
+          ' centerRGBA=' + pCenter[0] + ',' + pCenter[1] + ',' + pCenter[2] + ',' + pCenter[3] +
+          ' cornerRGBA=' + pCorner[0] + ',' + pCorner[1] + ',' + pCorner[2] + ',' + pCorner[3]);
+      } catch (e) {
+        console.warn('[tentaflow][video] tick read error:', e && e.message ? e.message : e);
+      }
     }, 5000));
   }
 
