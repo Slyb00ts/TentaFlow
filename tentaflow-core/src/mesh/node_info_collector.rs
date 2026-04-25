@@ -352,6 +352,23 @@ pub fn collect_docker_info() -> (bool, String) {
 // =============================================================================
 
 /// Wykrywanie GPU z cache (co najwyzej raz na 2s) — wgpu base + live enrichment
+/// Snapshot lokalnego GPU/RAM dla MemoryGuard — sumuje wszystkie GPU w
+/// systemie (multi-GPU/laptop iGPU+dGPU) i zwraca w formie:
+///   - total: laczne VRAM w MB (na macOS = unified memory = system RAM)
+///   - used:  laczne uzycie VRAM w MB
+///   - free:  total - used (saturating)
+/// Cache 2s przez `detect_gpus_cached`, wiec wywolanie w hot path
+/// `MemoryGuard::ensure_loaded` jest tanie. Gdy brak wgpu adapters
+/// (CI / headless) zwraca (0, 0, 0) — guard wtedy spadnie do
+/// statycznego budzetu z TENTAFLOW_VRAM_BUDGET_MB.
+pub fn vram_snapshot_local() -> (u64, u64, u64) {
+    let gpus = detect_gpus_cached();
+    let total: u64 = gpus.iter().map(|g| g.vram_total_mb).sum();
+    let used: u64 = gpus.iter().map(|g| g.vram_used_mb).sum();
+    let free = total.saturating_sub(used);
+    (total, used, free)
+}
+
 fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
     {
         let cache = GPU_CACHE.lock();
