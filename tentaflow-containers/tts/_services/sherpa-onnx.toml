@@ -19,13 +19,12 @@ platforms = ["linux", "windows"]
 
 [deploy.native]
 platforms = ["linux", "macos", "windows"]
-# Switch z runtime=binary (wymagal lokalnego cmake build trwajacego 10-30
-# min) na python-bundle z PyPI 'sherpa-onnx==1.12.40'. Sherpa-onnx PyPI
-# dostarcza prebuilt onnxruntime wheels dla Linux x86_64/aarch64,
-# macOS aarch64 i Windows x86_64 — instalacja zero-config we wszystkich
-# systemach. Server.py to FastAPI wrapper z /tts endpointem.
-runtime = "python-bundle"
-bundle_path = "tts/python/sherpa-onnx"
+# Embedded: sherpa-onnx C++ + onnxruntime wkompilowany do binarki tentaflow
+# przez crate `sherpa-rs` (Rust bindings do sherpa-onnx). Cargo feature
+# `inference-sherpa` musi byc wlaczone przy buildzie. Dziala na wszystkich
+# platformach gdzie buduje sie tentaflow (Linux/macOS/Windows + iOS/Android).
+runtime = "embedded"
+feature_flag = "inference-sherpa"
 
 [[model_preset]]
 id = "vits-piper-en-amy-medium"

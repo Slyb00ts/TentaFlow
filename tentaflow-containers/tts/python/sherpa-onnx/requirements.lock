@@ -1,6 +1,0 @@
-# Minimalny lock — nasz wrapper FastAPI/uvicorn. sherpa-onnx sam pociaga
-# swoje ONNX Runtime wheels (CPU lub GPU wedlug wariantu install_variants).
-fastapi
-uvicorn[standard]
-huggingface-hub
-soundfile
