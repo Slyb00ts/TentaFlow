@@ -342,6 +342,25 @@ impl Router {
             }
         }
 
+        // MemoryGuard: zapewnij ze backend jest zaladowany. Dla services z
+        // lazy-loading (vllm-metal cold po restarcie, llama.cpp swap z MLX)
+        // ten call moze trwac od ~1s (proces zyje) do ~30s (fresh spawn +
+        // model load z HF cache). Pinned services sa zawsze warm.
+        let guard = crate::memory::guard_global();
+        if let Some(service_names) = self.service_manager.resolve_model_services(&model_name) {
+            for sn in &service_names {
+                match guard.ensure_loaded(sn).await {
+                    Ok(_) => {
+                        debug!(service = %sn, "MemoryGuard: ensure_loaded OK przed dispatch");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(service = %sn, error = %e, "MemoryGuard: ensure_loaded nieudane, probuje kolejny");
+                    }
+                }
+            }
+        }
+
         // HTTP backend streaming z PII filtering i memory store
         let backend =
             self.select_http_backend(&model_name)

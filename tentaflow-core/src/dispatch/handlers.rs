@@ -404,11 +404,29 @@ pub fn model_list_request(
             }
             None => true,
         })
-        .map(|s| ModelSummary {
-            id: s.name.clone(),
-            category: s.model_category.clone().unwrap_or_else(|| "llm".into()),
-            engine_id: s.service_type,
-            availability: s.status,
+        .map(|s| {
+            // display_name: parsuj `deployed_model` z config_json (np.
+            // "Qwen/Qwen3.5-0.8B") zeby GUI pokazywalo HF repo a nie nazwe
+            // service'u (typu "tentaflow-vllm-metal-2izlb"). Fallback: nazwa.
+            let display_name = serde_json::from_str::<serde_json::Value>(&s.config_json)
+                .ok()
+                .and_then(|v| v.get("deployed_model").and_then(|m| m.as_str()).map(String::from))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| s.name.clone());
+            // engine_id: takze z config_json (vllm-metal/mlx/llama-cpp), nie
+            // service_type (= zawsze "llm"/"stt"/...).
+            let engine_id = serde_json::from_str::<serde_json::Value>(&s.config_json)
+                .ok()
+                .and_then(|v| v.get("engine").and_then(|m| m.as_str()).map(String::from))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| s.service_type.clone());
+            ModelSummary {
+                id: s.name,
+                display_name,
+                category: s.model_category.unwrap_or_else(|| "llm".into()),
+                engine_id,
+                availability: s.status,
+            }
         })
         .collect();
     Ok(MessageBody::ModelListResponse { models })
