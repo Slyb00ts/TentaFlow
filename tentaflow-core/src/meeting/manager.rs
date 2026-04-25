@@ -252,15 +252,30 @@ impl MeetingManager {
     /// Zatrzymuje sesję: wyrejestruj z ServiceManager → stop+rm kontener →
     /// release portów → status=ended. Kolejność: najpierw odłącz router
     /// (żeby nie walił reconnect loopem w umierający kontener), potem stop.
+    ///
+    /// `docker stop` waits up to 10s for SIGTERM grace before killing, and
+    /// that wait used to block the dispatcher slot of the calling WSS
+    /// connection — every other binary request from that user queued behind
+    /// Leave for the full grace period. We now do the synchronous bookkeeping
+    /// that the GUI needs to see immediately (status=leaving, service
+    /// unregistered) and detach the slow container teardown into a background
+    /// task. The session row flips to `ended` once that task finishes.
     pub async fn leave_session(&self, session_id: i64) -> Result<()> {
         repository::transcripts::set_session_status(&self.db, session_id, "leaving")?;
         if let Some(ref sm) = self.service_manager {
             sm.remove_quic_service(&Self::service_name(session_id), "meeting-bot");
         }
-        let _ = container::stop(session_id).await;
-        port_pool::release_for_session(&self.db, session_id)?;
-        repository::transcripts::mark_session_ended(&self.db, session_id)?;
-        info!(session = session_id, "Meeting session zakonczona");
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let _ = container::stop(session_id).await;
+            if let Err(e) = port_pool::release_for_session(&db, session_id) {
+                warn!(session = session_id, "release_for_session: {}", e);
+            }
+            if let Err(e) = repository::transcripts::mark_session_ended(&db, session_id) {
+                warn!(session = session_id, "mark_session_ended: {}", e);
+            }
+            info!(session = session_id, "Meeting session zakonczona");
+        });
         Ok(())
     }
 
