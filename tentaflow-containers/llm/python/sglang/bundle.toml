@@ -22,6 +22,16 @@ args = [
 ]
 internal_port = 30000
 
+# Wymus CUDA path w tvm_ffi auto-detect. Bez tego na hostach gdzie
+# /opt/rocm + hipcc sa zainstalowane obok NVIDIA (np. workstations z
+# cross-toolchainami) tvm_ffi wybiera HIP backend i scheduler crashuje
+# przy pierwszym prefill JIT compile. TVM_FFI_GPU_BACKEND=cuda short-
+# circuituje detection na linii 47 tvm_ffi/cpp/extension.py.
+# CUDA_ARCH_LIST pokrywa popularne compute caps (8.0=A100, 8.9=4090, 9.0=H100).
+[launch.env]
+TVM_FFI_GPU_BACKEND = "cuda"
+TVM_FFI_CUDA_ARCH_LIST = "8.0 8.9 9.0"
+
 [requires]
 gpu_memory_gb = 8
 disk_gb = 20

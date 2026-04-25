@@ -98,6 +98,12 @@ pub struct LaunchSpec {
     pub command: String,
     pub args: Vec<String>,
     pub internal_port: u16,
+    /// Statyczne env vars wymuszane na procesie silnika niezaleznie od tego
+    /// co user/GUI poda. Przyklady: TVM_FFI_GPU_BACKEND=cuda dla sglang na
+    /// hybrid CUDA+ROCm hostach. Klucze tu maja PRIORYTET nad req.env i
+    /// HF_HOME/TORCH_HOME — sa twardym kontraktem bundla.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1302,6 +1308,12 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         cmd.arg(substitute_vars_full(arg, &req.env, &bundle_dir, venv));
     }
     for (k, v) in &req.env {
+        cmd.env(k, v);
+    }
+    // Statyczne env z bundle.toml [launch.env] — wymuszane PO req.env zeby
+    // wartosci z manifestu wygraly nad ad-hoc env z deploy req'a (np.
+    // TVM_FFI_GPU_BACKEND=cuda dla sglang).
+    for (k, v) in &spec.launch.env {
         cmd.env(k, v);
     }
     cmd.env("BUNDLE_DIR", &bundle_dir);

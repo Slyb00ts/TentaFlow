@@ -81,21 +81,8 @@ async fn main() -> Result<()> {
         // MPI socket discovery przy starcie.
         env.insert("OMPI_MCA_btl".to_string(), "self,vader,tcp".to_string());
     }
-    if engine == "sglang" {
-        // sglang 0.5.10 buduje JIT kernels przez tvm_ffi. Auto-detection w
-        // tvm_ffi.cpp.extension._detect_gpu_backend() probuje _find_rocm_home()
-        // PRZED CUDA i jesli znajdzie /opt/rocm (lub hipcc w PATH) wybiera
-        // HIP — system z NVIDIA i ROCm side-by-side dostaje failed HIP build.
-        // TVM_FFI_GPU_BACKEND=cuda wymusza CUDA path.
-        env.insert("TVM_FFI_GPU_BACKEND".to_string(), "cuda".to_string());
-        // Format archlist to spacja (split() na " "), nie srednik. RTX 4090
-        // = 8.9 (Ada). Dorzucamy popularne compute_caps zeby smoke chodzil
-        // tez na A100 (8.0) / H100 (9.0).
-        env.insert(
-            "TVM_FFI_CUDA_ARCH_LIST".to_string(),
-            "8.0 8.9 9.0".to_string(),
-        );
-    }
+    // sglang specific env (TVM_FFI_GPU_BACKEND=cuda) jest teraz w bundle.toml
+    // [launch.env] — domyslny dla wszystkich deployow przez GUI rowniez.
     if let Ok(token) = std::env::var("HF_TOKEN") {
         env.insert("HF_TOKEN".to_string(), token);
     }
