@@ -330,6 +330,34 @@ pub async fn join_meeting(
             MeetingProgress::InMeeting => {
                 tracing::info!("Pomyslnie dolaczono do spotkania");
                 emit_lifecycle(router, meeting_key, LIFECYCLE_JOINED, None).await;
+                if config.bot_video_enabled {
+                    // Camera controls are disabled while the prejoin/lobby
+                    // screen is up, so the toggle click we did earlier was a
+                    // no-op. After the in-call surface renders, re-enable
+                    // the camera so getUserMedia fires and our canvas track
+                    // reaches Teams.
+                    let _ = page.evaluate(
+                        r#"
+                        (async function() {
+                            for (let i = 0; i < 30; i++) {
+                                const btn = document.querySelector('#video-button')
+                                    || document.querySelector('[data-tid="toggle-video"]')
+                                    || document.querySelector('button[aria-label*="camera" i]')
+                                    || document.querySelector('button[aria-label*="kamera" i]');
+                                if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+                                    const pressed = btn.getAttribute('aria-pressed') === 'true'
+                                        || btn.getAttribute('aria-checked') === 'true';
+                                    if (!pressed) btn.click();
+                                    return true;
+                                }
+                                await new Promise((r) => setTimeout(r, 500));
+                            }
+                            return false;
+                        })()
+                        "#,
+                    ).await;
+                    tracing::info!("Post-join camera toggle attempted");
+                }
                 return Ok(page);
             }
             MeetingProgress::Lobby if !emitted_lobby => {
@@ -413,7 +441,8 @@ async fn detect_meeting_progress(page: &Page) -> Result<MeetingProgress> {
                 const lower = bodyText.toLowerCase();
                 const phraseHit = lobbyPhrases.some((p) => lower.indexOf(p) !== -1);
                 const lobbyTids = ['lobby-screen', 'lobby-wait-screen',
-                    'prejoin-meeting-info', 'lobby-waiting-room'];
+                    'prejoin-meeting-info', 'lobby-waiting-room',
+                    'calling-lobby-screen'];
                 const lobbyTidHit = lobbyTids.some((t) =>
                     document.querySelector('[data-tid="' + t + '"]'));
                 const inLobby = phraseHit || lobbyTidHit;
