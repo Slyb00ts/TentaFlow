@@ -247,13 +247,25 @@ impl LocalInferenceHandler {
             stop_sequences.len(),
         );
 
+        // OpenAI `frequency_penalty` (additive, [-2.0, 2.0]) ma INNE semantyki
+        // niz MLX/llama.cpp `repeat_penalty` (multiplicative, > 0). Bezposrednie
+        // mapowanie powodowalo `repeat_penalty=0.0` przy `frequency_penalty=0.0`,
+        // co dzielilo logits przez zero w apply_repeat_penalty_gpu — sampler
+        // wracal pad token (id=0) i model produkowal pusty tekst po 1-szym
+        // tokenie (Bielik 4-bit MLX wisial w nieskonczonosc).
+        // Konwersja: clamp do dodatniej multiplicative skali, gdzie 0 → defaults.
+        let repeat_penalty = match request.frequency_penalty {
+            Some(fp) if fp.abs() > f32::EPSILON => (1.0 + fp.abs() * 0.1).max(1.0),
+            _ => defaults.repeat_penalty,
+        };
+
         GenerateParams {
             prompt,
             max_tokens: request.max_tokens.unwrap_or(defaults.max_tokens),
             temperature: request.temperature.unwrap_or(defaults.temperature),
             top_p: request.top_p.unwrap_or(defaults.top_p),
             top_k: defaults.top_k,
-            repeat_penalty: request.frequency_penalty.unwrap_or(defaults.repeat_penalty),
+            repeat_penalty,
             stop_sequences,
             system_prompt: None, // system prompt jest juz wbudowany w sformatowany prompt
         }
