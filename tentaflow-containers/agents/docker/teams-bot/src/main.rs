@@ -249,17 +249,24 @@ async fn main() -> Result<()> {
     });
     tracing::info!(port = config.transport_port, "Serwer iroh kontenera uruchomiony");
 
-    // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do STT/TTS)
-    tracing::info!("Czekam na polaczenie routera...");
-    loop {
-        let guard = router_client_handle.lock().await;
-        if guard.is_some() {
-            break;
+    // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do STT/TTS).
+    // SKIP_ROUTER_WAIT=1 pozwala uruchomic bota w trybie dev bez routera —
+    // Chromium i pipeline video startuja, audio capture do routera failuje
+    // best-effort.
+    if std::env::var("SKIP_ROUTER_WAIT").ok().as_deref() != Some("1") {
+        tracing::info!("Czekam na polaczenie routera...");
+        loop {
+            let guard = router_client_handle.lock().await;
+            if guard.is_some() {
+                break;
+            }
+            drop(guard);
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
-        drop(guard);
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tracing::info!("Router polaczony — STT/TTS dostepne");
+    } else {
+        tracing::warn!("SKIP_ROUTER_WAIT=1 — uruchamiam bota bez czekania na router (tryb dev)");
     }
-    tracing::info!("Router polaczony — STT/TTS dostepne");
 
     // Rolling buffer transkrypcji — summarizer czyta go co N sekund.
     // Trzymany tu, a nie w summarizerze, zeby main loop mogl pushowac wpisy
