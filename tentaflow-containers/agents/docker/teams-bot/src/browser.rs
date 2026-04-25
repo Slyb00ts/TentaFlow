@@ -580,6 +580,11 @@ pub async fn join_meeting(
                                     result.replacedAudio += 1;
                                     replacedAudioSenders.add(s);
                                 } else if (s.track.kind === 'video' && vid && !replacedVideoSenders.has(s)) {
+                                    // Teams po replaceTrack na video sender
+                                    // robi track.stop() jako anti-spoofing.
+                                    // Mamy stop() guard w injected JS ktory
+                                    // blokuje to dla naszych singletonow,
+                                    // wiec video track przezyje replace.
                                     await s.replaceTrack(vid);
                                     result.replacedVideo += 1;
                                     replacedVideoSenders.add(s);
@@ -589,7 +594,7 @@ pub async fn join_meeting(
                             }
                         }
                     }
-                    if (result.replacedVideo > 0 && result.replacedAudio > 0) break;
+                    if (result.replacedAudio > 0 && result.replacedVideo > 0) break;
                     await new Promise((r) => setTimeout(r, TRY_DELAY_MS));
                 }
                 if (mic && mic.enabled !== true) {
@@ -598,7 +603,51 @@ pub async fn join_meeting(
                 if (vid && vid.enabled !== true) {
                     try { vid.enabled = true; result.enabledOurTrack += 1; } catch (_) {}
                 }
+                // Trigger pierwszy frame na encoder. Niektore wersje Chromium
+                // dla canvas captureStream nie wysylaja frames dopoki ktos
+                // nie wymusi requestFrame() lub dopoki canvas backbuffer nie
+                // jest "dirty". Wywolujemy ZARAZ po replaceTrack, w 200ms
+                // odstepie pare razy.
+                if (vid && typeof vid.requestFrame === 'function') {
+                    for (let i = 0; i < 5; i++) {
+                        try { vid.requestFrame(); } catch (_) {}
+                        await new Promise((r) => setTimeout(r, 200));
+                    }
+                }
                 result.sendersAfter = dumpSenders(pcs);
+                // Dump getStats() per video sender — zobaczymy czy Teams
+                // faktycznie enkoduje frames z naszego canvas. Jesli
+                // framesEncoded > 0 i bytesSent > 0 -> pipeline dziala,
+                // problem renderingu po stronie Teams. Jesli 0 -> Teams
+                // dropuje track przed encoderem.
+                result.videoStats = [];
+                for (const pc of pcs) {
+                    for (const s of pc.getSenders()) {
+                        if (!s.track || s.track.kind !== 'video') continue;
+                        try {
+                            const stats = await s.getStats();
+                            const out = {};
+                            stats.forEach(function (rep) {
+                                if (rep.type === 'outbound-rtp') {
+                                    out.framesEncoded = rep.framesEncoded;
+                                    out.framesSent = rep.framesSent;
+                                    out.bytesSent = rep.bytesSent;
+                                    out.frameWidth = rep.frameWidth;
+                                    out.frameHeight = rep.frameHeight;
+                                    out.framesPerSecond = rep.framesPerSecond;
+                                }
+                                if (rep.type === 'media-source') {
+                                    out.mediaSourceWidth = rep.width;
+                                    out.mediaSourceHeight = rep.height;
+                                    out.mediaSourceFrames = rep.frames;
+                                    out.mediaSourceFps = rep.framesPerSecond;
+                                }
+                            });
+                            out.trackId = s.track.id;
+                            result.videoStats.push(out);
+                        } catch (_) {}
+                    }
+                }
                 return JSON.stringify(result);
             })()
             "#,
