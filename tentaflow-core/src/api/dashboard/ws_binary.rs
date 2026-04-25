@@ -388,62 +388,109 @@ pub async fn handle_ws_connection<S>(
 
                     tokio::spawn(async move {
                         let mut rx = rx;
-                        while let Some(event) = rx.recv().await {
-                            match event {
-                                SubscriptionEvent::Chunk(chunk_body) => {
-                                    let _ = send_body(
-                                        &sink_clone,
-                                        correlation_id,
-                                        next_seq(&seq_clone),
-                                        message_kind,
-                                        &chunk_body,
-                                        EnvelopeFlags::IS_STREAM_CHUNK,
-                                    )
-                                    .await;
+                        // Batch writer: drain do BATCH_MAX events w jednym
+                        // sink.lock, feed po kolei (no flush per frame),
+                        // flush raz na koniec batch'u. Dla szybkich silnikow
+                        // (~900 tok/s na hi-end GPU) zmniejsza liczbe syscall
+                        // write i mutex acquire ~16x. recv_many naturalnie
+                        // grupuje pending events bez explicit timera —
+                        // pierwsza recv blokuje, kolejne sa drained from
+                        // channel buffer (subscription mpsc cap 64).
+                        const BATCH_MAX: usize = 16;
+                        let mut buffer: Vec<SubscriptionEvent> =
+                            Vec::with_capacity(BATCH_MAX);
+                        let mut stream_finished = false;
+
+                        loop {
+                            buffer.clear();
+                            let n = rx.recv_many(&mut buffer, BATCH_MAX).await;
+                            if n == 0 {
+                                break; // channel closed
+                            }
+
+                            // Encode wszystkie frame'y z batch'u przed sink.lock —
+                            // rkyv encode jest CPU bound, lepiej zrobic to bez
+                            // trzymania mutex'a (inne writer task moga rownolegle).
+                            type Frame = (Vec<u8>, bool); // (bytes, is_terminal)
+                            let mut frames: Vec<Frame> = Vec::with_capacity(n * 3);
+
+                            for event in buffer.drain(..) {
+                                match event {
+                                    SubscriptionEvent::Chunk(chunk_body) => {
+                                        if let Some(b) = encode_envelope_bytes(
+                                            correlation_id,
+                                            next_seq(&seq_clone),
+                                            message_kind,
+                                            &chunk_body,
+                                            EnvelopeFlags::IS_STREAM_CHUNK,
+                                        ) {
+                                            frames.push((b, false));
+                                        }
+                                    }
+                                    SubscriptionEvent::End(final_body) => {
+                                        let token = resume_token::issue(
+                                            correlation_id as u128,
+                                            seq_clone.load(Ordering::SeqCst),
+                                            originating_user_id,
+                                            &resume_secret_clone,
+                                        );
+                                        if let Some(b) = encode_envelope_bytes(
+                                            correlation_id,
+                                            next_seq(&seq_clone),
+                                            message_kind,
+                                            &MessageBody::SubscribeResumeOffer {
+                                                resume_token: token,
+                                            },
+                                            EnvelopeFlags::empty(),
+                                        ) {
+                                            frames.push((b, false));
+                                        }
+                                        let body = final_body
+                                            .unwrap_or(MessageBody::MetaCancelStream);
+                                        if let Some(b) = encode_envelope_bytes(
+                                            correlation_id,
+                                            next_seq(&seq_clone),
+                                            message_kind,
+                                            &body,
+                                            EnvelopeFlags::IS_STREAM_END,
+                                        ) {
+                                            frames.push((b, true));
+                                        }
+                                        stream_finished = true;
+                                    }
+                                    SubscriptionEvent::Error(err) => {
+                                        if let Some(b) = encode_envelope_bytes(
+                                            correlation_id,
+                                            next_seq(&seq_clone),
+                                            message_kind,
+                                            &MessageBody::Error(err),
+                                            EnvelopeFlags::IS_ERROR
+                                                | EnvelopeFlags::IS_STREAM_END,
+                                        ) {
+                                            frames.push((b, true));
+                                        }
+                                        stream_finished = true;
+                                    }
                                 }
-                                SubscriptionEvent::End(final_body) => {
-                                    let token = resume_token::issue(
-                                        correlation_id as u128,
-                                        seq_clone.load(Ordering::SeqCst),
-                                        originating_user_id,
-                                        &resume_secret_clone,
-                                    );
-                                    let _ = send_body(
-                                        &sink_clone,
-                                        correlation_id,
-                                        next_seq(&seq_clone),
-                                        message_kind,
-                                        &MessageBody::SubscribeResumeOffer {
-                                            resume_token: token,
-                                        },
-                                        EnvelopeFlags::empty(),
-                                    )
-                                    .await;
-                                    let body =
-                                        final_body.unwrap_or_else(|| MessageBody::MetaCancelStream);
-                                    let _ = send_body(
-                                        &sink_clone,
-                                        correlation_id,
-                                        next_seq(&seq_clone),
-                                        message_kind,
-                                        &body,
-                                        EnvelopeFlags::IS_STREAM_END,
-                                    )
-                                    .await;
-                                    break;
+                            }
+
+                            // Single sink.lock acquire — feed wszystkie frames,
+                            // flush raz. Mniej kontesty z innymi writer tasks
+                            // (broadcasty heartbeat, mesh updates).
+                            if !frames.is_empty() {
+                                let mut guard = sink_clone.lock().await;
+                                for (bytes, _) in &frames {
+                                    if guard.feed(Message::Binary(bytes.clone().into())).await.is_err() {
+                                        // klient odpadl — przerwij batch
+                                        stream_finished = true;
+                                        break;
+                                    }
                                 }
-                                SubscriptionEvent::Error(err) => {
-                                    let _ = send_body(
-                                        &sink_clone,
-                                        correlation_id,
-                                        next_seq(&seq_clone),
-                                        message_kind,
-                                        &MessageBody::Error(err),
-                                        EnvelopeFlags::IS_ERROR | EnvelopeFlags::IS_STREAM_END,
-                                    )
-                                    .await;
-                                    break;
-                                }
+                                let _ = guard.flush().await;
+                            }
+
+                            if stream_finished {
+                                break;
                             }
                         }
                         // Cleanup po naturalnym koncu (writer task wie kiedy stream sie konczy).
@@ -522,24 +569,41 @@ async fn send_body<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let env_bytes = match encode_envelope_bytes(correlation_id, sequence, message_kind, body, flags)
+    {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+    let mut guard = sink.lock().await;
+    guard.send(Message::Binary(env_bytes.into())).await
+}
+
+/// Bytes-only encoder — uzywany przez batch writer task ktory feed'uje
+/// wiele frame'ow w jednym sink.lock + flush. Zwraca None tylko gdy rkyv
+/// padlo (loguje sam, caller pomija ten frame).
+fn encode_envelope_bytes(
+    correlation_id: u64,
+    sequence: u64,
+    message_kind: u16,
+    body: &MessageBody,
+    flags: EnvelopeFlags,
+) -> Option<Vec<u8>> {
     let body_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(body) {
         Ok(b) => b.to_vec(),
         Err(e) => {
             warn!("binary-WS: encode body failed: {}", e);
-            return Ok(());
+            return None;
         }
     };
     let mut env = Envelope::new_direct(correlation_id, sequence, message_kind, body_bytes);
     env.flags = flags;
-    let env_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&env) {
-        Ok(b) => b.to_vec(),
+    match rkyv::to_bytes::<rkyv::rancor::Error>(&env) {
+        Ok(b) => Some(b.to_vec()),
         Err(e) => {
             warn!("binary-WS: encode envelope failed: {}", e);
-            return Ok(());
+            None
         }
-    };
-    let mut guard = sink.lock().await;
-    guard.send(Message::Binary(env_bytes.into())).await
+    }
 }
 
 async fn send_protocol_error<S>(
