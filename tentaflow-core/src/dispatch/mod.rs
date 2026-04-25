@@ -368,6 +368,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ServiceDeployProgressBody(_) => "ServiceDeployProgress",
         MessageBody::ServiceStopRequest { .. } => "ServiceStopRequest",
         MessageBody::ServiceStopResponse { .. } => "ServiceStopResponse",
+        MessageBody::ServiceFlagsUpdateRequest { .. } => "ServiceFlagsUpdateRequest",
+        MessageBody::ServiceFlagsUpdateResponse { .. } => "ServiceFlagsUpdateResponse",
         MessageBody::ServiceQuicStatusRequest => "ServiceQuicStatusRequest",
         MessageBody::ServiceQuicStatusResponse { .. } => "ServiceQuicStatusResponse",
         MessageBody::PromptListRequest => "PromptListRequest",

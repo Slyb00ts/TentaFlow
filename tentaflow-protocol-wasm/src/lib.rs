@@ -1342,6 +1342,24 @@ pub fn encode_service_stop_request(service_id: String) -> Result<Vec<u8>, JsErro
         .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::ServiceFlagsUpdateRequest { service_id, pinned, paused }.
+/// pinned/paused jako i32 (-1 = nie zmieniaj, 0 = false, 1 = true).
+#[wasm_bindgen(js_name = encodeServiceFlagsUpdateRequest)]
+pub fn encode_service_flags_update_request(
+    service_id: String,
+    pinned: i32,
+    paused: i32,
+) -> Result<Vec<u8>, JsError> {
+    let pinned_opt = if pinned < 0 { None } else { Some(pinned != 0) };
+    let paused_opt = if paused < 0 { None } else { Some(paused != 0) };
+    encode_body_inner(&MessageBody::ServiceFlagsUpdateRequest {
+        service_id,
+        pinned: pinned_opt,
+        paused: paused_opt,
+    })
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::ServiceDeployRequest { engine_id, model_id, deploy_method, node_id }.
 /// node_id MUSI byc 32 bajtami.
 #[wasm_bindgen(js_name = encodeServiceDeployRequest)]
@@ -2505,6 +2523,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(mid) = s.model_id {
                     set(&item, "modelId", mid.into());
                 }
+                set(&item, "pinned", s.pinned.into());
+                set(&item, "paused", s.paused.into());
                 arr.push(&item.into());
             }
             set(&obj, "services", arr.into());
@@ -2584,6 +2604,30 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ServiceStopResponse { stopped } => {
             set(&obj, "variant", "ServiceStopResponse".into());
             set(&obj, "stopped", stopped.into());
+        }
+        MessageBody::ServiceFlagsUpdateRequest {
+            service_id,
+            pinned,
+            paused,
+        } => {
+            set(&obj, "variant", "ServiceFlagsUpdateRequest".into());
+            set(&obj, "serviceId", service_id.into());
+            if let Some(p) = pinned {
+                set(&obj, "pinned", p.into());
+            }
+            if let Some(p) = paused {
+                set(&obj, "paused", p.into());
+            }
+        }
+        MessageBody::ServiceFlagsUpdateResponse {
+            ok,
+            pinned,
+            paused,
+        } => {
+            set(&obj, "variant", "ServiceFlagsUpdateResponse".into());
+            set(&obj, "ok", ok.into());
+            set(&obj, "pinned", pinned.into());
+            set(&obj, "paused", paused.into());
         }
         MessageBody::PromptListRequest => {
             set(&obj, "variant", "PromptListRequest".into());

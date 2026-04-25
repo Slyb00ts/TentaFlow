@@ -847,6 +847,21 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ServiceFlagsUpdateRequest { serviceId, pinned?, paused? }
+   *  pinned/paused: undefined/null = nie zmieniaj, true/false = ustaw. */
+  serviceFlagsUpdateRequest(correlationId, { serviceId, pinned, paused }, sequence = 1) {
+    assertReady();
+    const pinnedI32 = pinned === undefined || pinned === null ? -1 : (pinned ? 1 : 0);
+    const pausedI32 = paused === undefined || paused === null ? -1 : (paused ? 1 : 0);
+    const body = _wasm.encodeServiceFlagsUpdateRequest(serviceId, pinnedI32, pausedI32);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ServiceDeployRequest { engineId, modelId, deployMethod, nodeId: Uint8Array(32) } */
   serviceDeployRequest(correlationId, { engineId, modelId, deployMethod, nodeId }, sequence = 1) {
     assertReady();

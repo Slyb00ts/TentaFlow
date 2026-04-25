@@ -334,6 +334,10 @@ pub struct ServiceSummary {
     pub engine_id: Option<String>,
     /// Identyfikator modelu (jesli serwis obsluguje konkretny model).
     pub model_id: Option<String>,
+    /// MemoryGuard pinning — true = zawsze warm, nie evict.
+    pub pinned: bool,
+    /// MemoryGuard pause — true = nie startuje autostart, request odrzucany.
+    pub paused: bool,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2720,6 +2724,17 @@ pub enum MessageBody {
     ServiceDeployProgressBody(ServiceDeployProgress),
     ServiceStopRequest { service_id: String },
     ServiceStopResponse { stopped: bool },
+    /// MemoryGuard pin/pause toggle. Pola opcjonalne — None = nie zmieniaj.
+    ServiceFlagsUpdateRequest {
+        service_id: String,
+        pinned: Option<bool>,
+        paused: Option<bool>,
+    },
+    ServiceFlagsUpdateResponse {
+        ok: bool,
+        pinned: bool,
+        paused: bool,
+    },
     ServiceQuicStatusRequest,
     ServiceQuicStatusResponse { statuses: Vec<ServiceQuicStatus> },
 
