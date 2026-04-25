@@ -113,6 +113,15 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf cmake
 
+      - name: Verify Xcode (macOS — wymagane przez build.rs do zbudowania
+              libMLXBridge.dylib z Metal shaderami przez xcodebuild)
+        if: runner.os == 'macOS'
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          # macos-latest powinien miec Xcode preinstalowane.
+          # Jezeli nie — `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
+
       - name: Install base tools (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -422,6 +431,28 @@ jobs:
           cp scripts/install/tentaflow.service "$STAGE/" 2>/dev/null || true
           cp scripts/install/ai.tentaflow.plist "$STAGE/" 2>/dev/null || true
           cp LICENSE README.md "$STAGE/" 2>/dev/null || true
+
+          # macOS: dorzucamy Swift MLX bridge — libMLXBridge.dylib + Metal
+          # shaders bundle. Bez tego MlxSwiftEngine nie ma do czego wolac
+          # callbackow runtime (`Failed to load default metallib`) i Bielik
+          # / inne MLX modele wpadaja w fallback CPU lub wcale nie startuja.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            DYLIB="tentaflow/target/${{ matrix.target }}/release/libMLXBridge.dylib"
+            BUNDLE="tentaflow/target/${{ matrix.target }}/release/mlx-swift_Cmlx.bundle"
+            if [[ -f "$DYLIB" ]]; then
+              cp "$DYLIB" "$STAGE/"
+              echo "Staged libMLXBridge.dylib"
+            else
+              echo "::warning::brak $DYLIB — Swift MLX bridge nie bedzie dolaczony"
+            fi
+            if [[ -d "$BUNDLE" ]]; then
+              cp -R "$BUNDLE" "$STAGE/"
+              echo "Staged mlx-swift_Cmlx.bundle"
+            else
+              echo "::warning::brak $BUNDLE — MLX modele nie zaladuja Metal shaderow"
+            fi
+          fi
+
           tar -czf "$STAGE.tar.gz" "$STAGE"
           shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
 
