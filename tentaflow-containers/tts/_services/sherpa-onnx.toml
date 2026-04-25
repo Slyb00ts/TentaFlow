@@ -11,7 +11,7 @@ license = "Apache-2.0"
 icon = "sherpa"
 default_port = 5020
 api = "sherpa-tts"
-version = "1.10.0"
+version = "1.12.40"
 
 [deploy.docker]
 context_path = "tts/docker/sherpa-onnx"
@@ -19,8 +19,13 @@ platforms = ["linux", "windows"]
 
 [deploy.native]
 platforms = ["linux", "macos", "windows"]
-runtime = "binary"
-binary_path = "tts/native/sherpa-onnx"
+# Switch z runtime=binary (wymagal lokalnego cmake build trwajacego 10-30
+# min) na python-bundle z PyPI 'sherpa-onnx==1.12.40'. Sherpa-onnx PyPI
+# dostarcza prebuilt onnxruntime wheels dla Linux x86_64/aarch64,
+# macOS aarch64 i Windows x86_64 — instalacja zero-config we wszystkich
+# systemach. Server.py to FastAPI wrapper z /tts endpointem.
+runtime = "python-bundle"
+bundle_path = "tts/python/sherpa-onnx"
 
 [[model_preset]]
 id = "vits-piper-en-amy-medium"
