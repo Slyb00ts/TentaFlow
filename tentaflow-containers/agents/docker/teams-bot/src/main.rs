@@ -7,7 +7,7 @@
 mod audio;
 mod browser;
 mod config;
-mod participant_scanner;
+mod dom_observer;
 mod quic_server;
 mod summarizer;
 mod vad;
@@ -73,9 +73,9 @@ async fn send_backend_update(
     }
 }
 
-/// Announces the bot itself as a meeting participant. The DOM scanner
-/// (`participant_scanner`) intentionally filters the bot row out, so without
-/// this the GUI roster stays empty until a remote participant is detected.
+/// Announces the bot itself as a meeting participant. The DOM observer
+/// (`dom_observer`) intentionally filters the bot row out, so without this
+/// the GUI roster stays empty until a remote participant is detected.
 /// Emitted once per join, right after `LIFECYCLE_JOINED`.
 async fn send_bot_participant_joined(
     router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
@@ -163,36 +163,6 @@ impl SummarizerHandle {
     }
 }
 
-/// Uchwyt skanera uczestnikow — periodycznie czyta DOM Teams i emituje
-/// `ParticipantUpdate { joined|left }`. Osobny handle od summarizera zeby
-/// LeaveMeeting / kolejny JoinMeeting moglo go czysto zamknac.
-struct ScannerHandle {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    join: tokio::task::JoinHandle<()>,
-}
-
-impl ScannerHandle {
-    async fn stop(self) {
-        let _ = self.shutdown_tx.send(true);
-        let _ = self.join.await;
-    }
-}
-
-/// Spawnuje task participant_scanner dla aktywnej sesji. Scanner zyje tak dlugo
-/// jak strona (Page) — po LeaveMeeting / Join nowej sesji caller musi wywolac
-/// `stop()` na zwroconym handle.
-fn spawn_participant_scanner(
-    page: chromiumoxide::Page,
-    router: Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
-    meeting_key: String,
-    bot_name: String,
-) -> ScannerHandle {
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    let join = tokio::spawn(async move {
-        participant_scanner::run(page, router, meeting_key, bot_name, rx).await;
-    });
-    ScannerHandle { shutdown_tx: tx, join }
-}
 
 /// Sidecar meeting bot — automatyzacja spotkan Teams z pipeline audio
 #[derive(Parser, Debug)]
@@ -268,6 +238,51 @@ async fn main() -> Result<()> {
         tracing::warn!("SKIP_ROUTER_WAIT=1 — uruchamiam bota bez czekania na router (tryb dev)");
     }
 
+    // SIGTERM/SIGINT handler — `docker stop` wysyla SIGTERM z 10s grace
+    // przed SIGKILL. Bez tego goly browser.close() konczy proces zanim Teams
+    // dostanie BYE/RTCP -> bot wisi w roster konferencji przez ~30s. Tutaj
+    // klikamy Leave w Teams na aktywnej page (jesli istnieje), czekamy 1.5s
+    // (tyle robi click_leave_in_teams) i wychodzimy. Browser zostanie
+    // zatrzymany przez docker po naszym exit'cie — to zaplanowane.
+    {
+        let sig_page_slot = page_slot.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGTERM signal setup failed: {}", e);
+                    return;
+                }
+            };
+            let mut intr = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGINT signal setup failed: {}", e);
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = term.recv() => tracing::info!("SIGTERM otrzymany — leave-first shutdown"),
+                _ = intr.recv() => tracing::info!("SIGINT otrzymany — leave-first shutdown"),
+            }
+            let page = {
+                let guard = sig_page_slot.lock().await;
+                guard.clone()
+            };
+            if let Some(p) = page {
+                match browser::click_leave_in_teams(&p).await {
+                    Ok(true) => tracing::info!("Klikniete Leave w Teams (signal handler)"),
+                    Ok(false) => tracing::warn!("Leave button niedostepny przy SIGTERM"),
+                    Err(e) => tracing::warn!("click_leave_in_teams (signal): {}", e),
+                }
+            } else {
+                tracing::info!("SIGTERM bez aktywnej sesji — wychodze bez kliku");
+            }
+            std::process::exit(0);
+        });
+    }
+
     // Rolling buffer transkrypcji — summarizer czyta go co N sekund.
     // Trzymany tu, a nie w summarizerze, zeby main loop mogl pushowac wpisy
     // niezaleznie od lifecycle summarizera (summarizer spawnuje sie per-session,
@@ -281,7 +296,7 @@ async fn main() -> Result<()> {
     // Handle summarizera dla aktywnej sesji — None gdy bot nie jest w spotkaniu.
     let mut summarizer_handle: Option<SummarizerHandle> = None;
     // Handle skanera uczestnikow — analogicznie per-session.
-    let mut scanner_handle: Option<ScannerHandle> = None;
+    let mut dom_observer_handle: Option<dom_observer::DomObserver> = None;
 
     // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
     // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
@@ -369,7 +384,7 @@ async fn main() -> Result<()> {
         .await;
 
         let browser = browser::launch_chromium(&config).await?;
-        let p = match browser::join_meeting(
+        let (p, observer) = match browser::join_meeting(
             &browser,
             &config.meeting_url,
             &config,
@@ -378,7 +393,7 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok(p) => p,
+            Ok(pair) => pair,
             Err(e) => {
                 emit_lifecycle(
                     &router_client_handle,
@@ -403,12 +418,7 @@ async fn main() -> Result<()> {
             &config,
         )
         .await;
-        scanner_handle = Some(spawn_participant_scanner(
-            p.clone(),
-            router_client_handle.clone(),
-            meeting_id.clone(),
-            config.bot_name.clone(),
-        ));
+        dom_observer_handle = Some(observer);
         send_backend_update(&router_client_handle, &meeting_id, &config).await;
         send_bot_participant_joined(&router_client_handle, &meeting_id, &config.bot_name).await;
         Some(p)
@@ -910,7 +920,7 @@ async fn main() -> Result<()> {
                         if let Some(h) = summarizer_handle.take() {
                             h.stop().await;
                         }
-                        if let Some(h) = scanner_handle.take() {
+                        if let Some(h) = dom_observer_handle.take() {
                             h.stop().await;
                         }
                         transcript_buffer.lock().await.clear();
@@ -958,7 +968,7 @@ async fn main() -> Result<()> {
                                 )
                                 .await
                                 {
-                                    Ok(p) => {
+                                    Ok((p, observer)) => {
                                         _chromium = Some(browser);
                                         {
                                             let mut slot = page_slot.lock().await;
@@ -974,12 +984,7 @@ async fn main() -> Result<()> {
                                             &config,
                                         )
                                         .await;
-                                        scanner_handle = Some(spawn_participant_scanner(
-                                            p.clone(),
-                                            router_client_handle.clone(),
-                                            meeting_id.clone(),
-                                            config.bot_name.clone(),
-                                        ));
+                                        dom_observer_handle = Some(observer);
                                         send_backend_update(
                                             &router_client_handle,
                                             &meeting_id,
@@ -1035,6 +1040,18 @@ async fn main() -> Result<()> {
                     }
                     Some(quic_server::MeetingCommand::LeaveMeeting { response_tx }) => {
                         tracing::info!("Komenda QUIC: opuszczanie spotkania");
+                        // Najpierw klikamy Leave w Teams zeby konferencja
+                        // dostala BYE/RTCP — bez tego Teams trzyma bota w
+                        // roster przez ~30s po samym docker stop.
+                        if let Some(ref p) = page {
+                            match browser::click_leave_in_teams(p).await {
+                                Ok(true) => tracing::info!("Klikniete Leave w Teams"),
+                                Ok(false) => tracing::warn!(
+                                    "Leave button niedostepny — zamykam Chromium bez kliku"),
+                                Err(e) => tracing::warn!(
+                                    "click_leave_in_teams failed: {} — zamykam Chromium", e),
+                            }
+                        }
                         page = None;
                         {
                             let mut slot = page_slot.lock().await;
@@ -1047,7 +1064,7 @@ async fn main() -> Result<()> {
                         if let Some(h) = summarizer_handle.take() {
                             h.stop().await;
                         }
-                        if let Some(h) = scanner_handle.take() {
+                        if let Some(h) = dom_observer_handle.take() {
                             h.stop().await;
                         }
                         transcript_buffer.lock().await.clear();
@@ -1088,7 +1105,7 @@ async fn main() -> Result<()> {
     if let Some(h) = summarizer_handle.take() {
         h.stop().await;
     }
-    if let Some(h) = scanner_handle.take() {
+    if let Some(h) = dom_observer_handle.take() {
         h.stop().await;
     }
     let _ = shutdown_tx.send(true);
