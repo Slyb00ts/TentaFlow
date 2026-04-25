@@ -1219,10 +1219,16 @@
     //   * START_LEVEL — minimum zeby zaczac uznawac kogos za speakera
     //   * HOLD_LEVEL — minimum zeby przedluzyc trwajacego speakera
     //   * SILENCE_HOLD_MS — czas trzymania speakera mimo levelu < HOLD
+    //
+    // POLL_MS=50 daje 20Hz sampling — Chromium internal audioLevel stats
+    // aktualizuja sie co ~20ms, wiec 50ms jest blisko realnego limitu tej
+    // techniki. getStats() jest lokalny (~100-500us), 20Hz × kilka pc to
+    // pomijalny CPU. SILENCE_HOLD_MS=300 — szybciej kasuje po koncu zdania,
+    // dalej debounce'uje pauzy miedzy sylabami.
     const SPEAKER_START_LEVEL = 0.03;
     const SPEAKER_HOLD_LEVEL = 0.005;
-    const SPEAKER_SILENCE_HOLD_MS = 700;
-    const SPEAKER_POLL_MS = 250;
+    const SPEAKER_SILENCE_HOLD_MS = 300;
+    const SPEAKER_POLL_MS = 50;
     let lastBindingSpeaker = null;
     let silenceSince = 0;
 
