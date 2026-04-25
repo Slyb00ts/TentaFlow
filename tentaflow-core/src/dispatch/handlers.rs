@@ -4458,6 +4458,11 @@ pub fn network_dispatch(
     let res = match payload {
         P::ReqInterfacesList => {
             let interfaces = crate::mesh::network_interfaces::list_interfaces();
+            tracing::info!(
+                count = interfaces.len(),
+                names = ?interfaces.iter().map(|i| &i.name).collect::<Vec<_>>(),
+                "network_dispatch: ReqInterfacesList"
+            );
             P::ResInterfacesList { interfaces }
         }
         P::ReqConfigGet => {
