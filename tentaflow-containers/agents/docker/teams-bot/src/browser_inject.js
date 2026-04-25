@@ -634,6 +634,10 @@
       if (!tracks.length) throw new Error('captureStream returned no video tracks');
       videoGenerator = tracks[0];
       try { videoGenerator.contentHint = 'motion'; } catch (_) {}
+      // Eksponuj na window — analogicznie do micGenerator. Post-join
+      // replaceTrack wymusza zeby Teams uzywal naszego canvas track
+      // (a nie wbudowanego Chromium fake-input).
+      window.__tentaflowVideoTrack = videoGenerator;
       // Diagnostic shapshot the moment the stream is built — reveals whether
       // captureStream produces a unmuted track at all (ie. whether the
       // compositor is wired) before the meeting page even sees us.
@@ -979,21 +983,114 @@
   // --------------------------------------------------------------------------
   // Bootstrap
   // --------------------------------------------------------------------------
+  // ==========================================================================
+  // EARLY navigator.mediaDevices.enumerateDevices OVERRIDE
+  // ==========================================================================
+  // Teams light-meetings dla anonim joinerow w Docker (bez real camera) widzi
+  // pusty kontener "videoinput" / "audioinput" przez enumerateDevices i pokazuje
+  // baner "Teams needs permission to access your camera". Jesli enumerate
+  // zwraca minimum jedna fake camerę + mic, Teams uznaje urządzenie za istniejace
+  // i wpina track do pc.transceiver. Wstawiamy syntetyczne entries DOOKOLA
+  // tego co Chromium zwraca z faktycznego enumerate (jesli cos zwraca).
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      const origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      navigator.mediaDevices.enumerateDevices = async function () {
+        const real = await origEnum();
+        const hasVideoIn = real.some((d) => d.kind === 'videoinput');
+        const hasAudioIn = real.some((d) => d.kind === 'audioinput');
+        const hasAudioOut = real.some((d) => d.kind === 'audiooutput');
+        const fake = [];
+        if (!hasVideoIn) fake.push({
+          deviceId: 'tentaflow-camera-default',
+          groupId: 'tentaflow-group',
+          kind: 'videoinput',
+          label: 'TentaFlow Camera',
+        });
+        if (!hasAudioIn) fake.push({
+          deviceId: 'tentaflow-mic-default',
+          groupId: 'tentaflow-group',
+          kind: 'audioinput',
+          label: 'TentaFlow Microphone',
+        });
+        if (!hasAudioOut) fake.push({
+          deviceId: 'tentaflow-speaker-default',
+          groupId: 'tentaflow-group',
+          kind: 'audiooutput',
+          label: 'TentaFlow Speaker',
+        });
+        return real.concat(fake);
+      };
+    }
+  } catch (e) {
+    console.warn('[tentaflow] enumerateDevices override blad', e);
+  }
+
+  // ==========================================================================
+  // EARLY navigator.permissions.query OVERRIDE
+  // ==========================================================================
+  // Teams light-meetings sprawdza camera/microphone permission state przez
+  // `navigator.permissions.query({name:'camera'})` zanim wpina track do
+  // pc.transceiver. Mimo CDP setPermission Granted, query potrafi zwrocic
+  // 'prompt' albo 'denied' w light-meetings flow (race miedzy permission
+  // store a check). Jesli Teams widzi nie-'granted', pokazuje banner "Teams
+  // needs permission to access your camera" i NIE wysyla video track.
+  // Wymuszamy 'granted' dla camera + microphone na poziomie Permissions API.
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const origQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = function (descriptor) {
+        const name = descriptor && descriptor.name;
+        if (name === 'camera' || name === 'microphone') {
+          return Promise.resolve({
+            state: 'granted',
+            status: 'granted',
+            onchange: null,
+            addEventListener: function () {},
+            removeEventListener: function () {},
+            dispatchEvent: function () { return false; },
+          });
+        }
+        return origQuery(descriptor);
+      };
+    }
+  } catch (e) {
+    console.warn('[tentaflow] permissions.query override blad', e);
+  }
+
+  // ==========================================================================
+  // EARLY HOOKS — SYNCHRONICZNE, jeszcze przed DOMContentLoaded
+  // ==========================================================================
+  // Teams' bundle moze zawolac getUserMedia / new RTCPeerConnection ZANIM
+  // DOMContentLoaded fires. Jesli nasze override'y nie sa wtedy gotowe, Teams
+  // trafia na native gum -> Chrome odmawia (mimo setPermission Granted) -> Teams
+  // pokazuje modal "Are you sure" sugerujacy klikanie camera icon w address
+  // bar. Dlatego hooki ktore nie wymagaja DOM (gum override + RTC patch)
+  // odpalamy natychmiast w IIFE, bez czekania na DOMContentLoaded. Video setup
+  // wymaga DOM (canvas) i zostaje w bootstrap.
+  try {
+    hookRTCPeerConnection();
+  } catch (e) {
+    console.warn('[tentaflow] early hookRTCPeerConnection blad', e);
+  }
+  try {
+    setupMicInjection();
+  } catch (e) {
+    console.warn('[tentaflow] early setupMicInjection blad', e);
+  }
+
   function bootstrap() {
     if (window.__tentaflowBridge && window.__tentaflowBridge.setupDone) {
       console.log('[tentaflow] bootstrap juz wykonany — pomijam');
       return;
     }
-    // WAZNE: hook RTCPeerConnection musi byc ZANIM Teams stworzy pc.
-    // Tutaj jestesmy w evaluate_on_new_document, przed jakimkolwiek JS strony,
-    // wiec jestesmy bezpieczni.
+    // hookRTCPeerConnection + setupMicInjection juz odpalone w EARLY HOOKS
+    // wyzej. Re-call jest no-op (oba sprawdzaja flag setupDone).
     try {
       hookRTCPeerConnection();
     } catch (e) {
       console.warn('[tentaflow] hookRTCPeerConnection blad', e);
     }
-    // Video setup PRZED hookRTCPeerConnection uzyciem, zeby flag
-    // __tentaflowVideoAvailable byl ustawiony zanim Rust odpyta o niego w prejoin.
     try {
       setupVideoInjection();
     } catch (e) {
@@ -1082,22 +1179,35 @@
     }
 
     function detectJoined() {
+      // Najpierw NEGATYW: gdy widoczny prejoin lobby waiting "Hi, X. Someone
+      // will let you in shortly." albo device picker — to jeszcze nie call.
+      // Teams light-meetings odpalalo tu fals positive bo audio.srcObject
+      // zywil ostro przed faktycznym admittem.
+      const prejoinMarkers = [
+        '[data-tid^="prejoin"]',
+        '[data-tid="lobby-screen"]',
+        '[data-tid="lobby-wait-screen"]',
+        '[data-tid="lobby-waiting-room"]',
+        '[data-tid="calling-lobby-screen"]',
+        '[data-tid="prejoin-meeting-info"]',
+      ];
+      for (const sel of prejoinMarkers) {
+        if (document.querySelector(sel)) return false;
+      }
+      // Stage musi byc obecny i miec realne tiles. W call surface to kafelki
+      // uczestnikow ze streamem; w prejoin sam stage moze byc renderowany
+      // bez tile'ow — wymagamy 2+ tiles zeby uniknac false positive.
       const stage = document.querySelector('[data-tid="MixedStage-wrapper"]')
         || document.querySelector('[data-tid="stage-layouts-renderer"]');
       if (stage) {
         const tileCount = stage.querySelectorAll('[data-tid][data-stream-type]').length;
         if (tileCount >= 2) return true;
       }
+      // Roster badge >=2 = realnie kilka uczestnikow w call.
       const rosterBadge = document.querySelector('#roster-button [data-tid="toolbar-item-badge"]');
       if (rosterBadge) {
         const n = parseInt((rosterBadge.textContent || '').trim(), 10) || 0;
         if (n >= 2) return true;
-      }
-      // Active remote audio = realna rozmowa.
-      const audios = document.querySelectorAll('audio');
-      for (const a of audios) {
-        if (a.srcObject && a.srcObject.getAudioTracks
-          && a.srcObject.getAudioTracks().length > 0) return true;
       }
       return false;
     }

@@ -476,10 +476,50 @@ pub async fn join_meeting(
                     unmuteAttempted: false,
                     unmuteClicked: false,
                     replacedAudio: 0,
+                    replacedVideo: 0,
                     enabledOurTrack: 0,
+                    dismissedAreYouSure: false,
                     sendersBefore: [],
                     sendersAfter: [],
                 };
+
+                // Teams light-meetings dla anonim joinerow zaraz po joined
+                // wystrzeliwuje modal "Are you sure you don't want audio or
+                // video?" ktory zaslania caly call UI (w tym kafelek kamery).
+                // ESC nie zamyka go (Teams modal nie sluucha global keydown),
+                // klikniecie "Continue without" zamknie ale Teams oznaczy
+                // sesje jako bez-mediow. Najpewniejsze: ukryj kontener modala
+                // i jego backdrop bez klikania zadnego z buttons. Robimy to
+                // pare razy bo Teams renderuje modal asynchronicznie.
+                function dismissAreYouSure() {
+                    const dialogs = document.querySelectorAll('[role="dialog"], [data-tid="modal"]');
+                    let hidden = 0;
+                    for (const d of dialogs) {
+                        const txt = (d.textContent || '').toLowerCase();
+                        if (txt.includes("are you sure")
+                            || txt.includes("don't want audio")
+                            || txt.includes("audio or video")
+                            || txt.includes("nie chcesz")) {
+                            try {
+                                d.style.display = 'none';
+                                d.setAttribute('aria-hidden', 'true');
+                                // Backdrop tez znika.
+                                let p = d.parentElement;
+                                while (p && p !== document.body) {
+                                    if (p.classList && (p.classList.contains('overlay')
+                                        || p.classList.contains('backdrop')
+                                        || p.classList.contains('ms-Modal'))) {
+                                        p.style.display = 'none';
+                                    }
+                                    p = p.parentElement;
+                                }
+                                hidden += 1;
+                            } catch (_) {}
+                        }
+                    }
+                    return hidden;
+                }
+                result.dismissedAreYouSure = dismissAreYouSure() > 0;
                 const sels = [
                     '#mic-button',
                     '[data-tid="toggle-mute"]',
@@ -520,24 +560,43 @@ pub async fn join_meeting(
                     ? Array.from(window.__tentaflowPeerConnections) : [];
                 result.sendersBefore = dumpSenders(pcs);
                 const mic = window.__tentaflowMicGenerator;
-                if (mic) {
+                const vid = window.__tentaflowVideoTrack;
+                // Audio sender pojawia sie razem z prejoin getUserMedia, video
+                // sender Teams dodaje DOPIERO po SDP renegotiation post-join —
+                // potrafi zajac 1-3s. Stad kilka prob z opoznieniem.
+                const TRIES = 20;
+                const TRY_DELAY_MS = 500;
+                const replacedAudioSenders = new WeakSet();
+                const replacedVideoSenders = new WeakSet();
+                for (let attempt = 0; attempt < TRIES; attempt++) {
+                    // Re-dismiss modal — Teams potrafi go ponownie wyrenderowac.
+                    try { dismissAreYouSure(); } catch (_) {}
                     for (const pc of pcs) {
                         for (const s of pc.getSenders()) {
-                            if (s.track && s.track.kind === 'audio') {
-                                try {
+                            if (!s.track) continue;
+                            try {
+                                if (s.track.kind === 'audio' && mic && !replacedAudioSenders.has(s)) {
                                     await s.replaceTrack(mic);
                                     result.replacedAudio += 1;
-                                } catch (e) {
-                                    console.warn('[tentaflow] replaceTrack failed:', e);
+                                    replacedAudioSenders.add(s);
+                                } else if (s.track.kind === 'video' && vid && !replacedVideoSenders.has(s)) {
+                                    await s.replaceTrack(vid);
+                                    result.replacedVideo += 1;
+                                    replacedVideoSenders.add(s);
                                 }
+                            } catch (e) {
+                                console.warn('[tentaflow] replaceTrack failed:', e);
                             }
                         }
                     }
-                    // micGenerator track muszi byc enabled, inaczej Chromium
-                    // dropuje frames przed enkoderem.
-                    if (mic.enabled !== true) {
-                        try { mic.enabled = true; result.enabledOurTrack = 1; } catch (_) {}
-                    }
+                    if (result.replacedVideo > 0 && result.replacedAudio > 0) break;
+                    await new Promise((r) => setTimeout(r, TRY_DELAY_MS));
+                }
+                if (mic && mic.enabled !== true) {
+                    try { mic.enabled = true; result.enabledOurTrack = 1; } catch (_) {}
+                }
+                if (vid && vid.enabled !== true) {
+                    try { vid.enabled = true; result.enabledOurTrack += 1; } catch (_) {}
                 }
                 result.sendersAfter = dumpSenders(pcs);
                 return JSON.stringify(result);
