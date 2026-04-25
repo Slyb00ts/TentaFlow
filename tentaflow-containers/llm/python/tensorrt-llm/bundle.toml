@@ -11,10 +11,13 @@ engine = "tensorrt-llm"
 description = "NVIDIA TensorRT-LLM OpenAI-compatible server (PyPI, 1.3.0rc12)"
 python_version = "3.12"
 source = "pypi"
-# 1.3.0rc12 (kwiecien 2026) wymaga UV_PRERELEASE=allow (rc tag). Zawiera
-# Qwen3.5 model_type support i fix dla cuda_graph_runner ktorego brakowalo
-# w 1.2.0 stable. Bundle_smoke harness ustawia UV_PRERELEASE globalnie.
-pypi_package = "tensorrt-llm==1.3.0rc12"
+# 1.2.0 stable. Tested April 2026.
+# 1.3.0rc12 ma broken pyproject (conflicting torch constraints), 1.3.x
+# stable nie ukazalo sie jeszcze. Qwen3.5 nie jest wspierany w 1.2.0
+# (transformers 4.57.3 nie ma model_type=qwen3_5) — test domyslny to
+# Llama-3.2-1B-Instruct ktory jest fully supported. Bump do 1.3.x stable
+# gdy ukaze sie release.
+pypi_package = "tensorrt-llm==1.2.0"
 
 [launch]
 # Wlasciwy entry point to `trtllm-serve serve <MODEL>` (Click CLI).
