@@ -145,6 +145,11 @@ pub async fn start_mesh_pipeline(
         Some(db) => crate::mesh::network_interfaces::resolve_bind_addr(db, mesh_port),
         None => std::net::SocketAddr::from(([0u8, 0, 0, 0], mesh_port)),
     };
+    tracing::info!(
+        bind_addr = %bind_addr,
+        relay = ?relay_url.as_ref().map(|r| r.to_string()),
+        "mesh init: resolved bind + relay (z ustawien GUI / config.toml)"
+    );
 
     let iroh_cfg = IrohMeshConfig {
         node_id: app_node_id.clone(),
@@ -636,6 +641,13 @@ async fn handle_peer_connected(
                         );
                     }
                     let addr_str = direct_addresses.join(",");
+                    tracing::info!(
+                        peer = %node_id,
+                        raw_count = addresses.len(),
+                        filtered_count = direct_addresses.len(),
+                        advertised = %addr_str,
+                        "advertise to peer: addresses po filtrach"
+                    );
                     let _ = crate::db::repository::update_trusted_node_addresses(
                         &sec.db, &node_id, &addr_str,
                     );
