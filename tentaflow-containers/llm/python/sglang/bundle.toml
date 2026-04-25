@@ -1,14 +1,11 @@
 [bundle]
 engine = "sglang"
-description = "SGLang serwer LLM z structured outputs (PyPI)"
+description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.10)"
 python_version = "3.12"
-# Editable install z git'owej HEAD (install_subdir=python) nie eksponowal
-# top-level pakietu `sglang` — `python -m sglang.launch_server` rzucal
-# ModuleNotFoundError. PyPI wheel `sglang[all]` instaluje pakiet poprawnie
-# wraz z extras (sgl-kernel, openai, anthropic), ten sam wzorzec dziala w
-# referencyjnym kontenerze lmsysorg/sglang z naszego dotnetowego stacka.
+# Pinned na najnowsza stabilna wersje sglang (2026-04). Update wymaga
+# regeneracji requirements.lock + bumpa pakietu.
 source = "pypi"
-pypi_package = "sglang[all]"
+pypi_package = "sglang[all]==0.5.10.post1"
 
 [launch]
 command = "python"
@@ -32,10 +29,13 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu124"
-extras = []
+# Torch 2.6.0 ma cudnn 9.5+ ktory sglang akceptuje (>=9.15 wymagane dla
+# konv3d). Pinned tu, zeby uv nie wciagnal torch 2.9.x z cudnn 9.10 ktore
+# sglang odrzuca jako "CRITICAL WARNING: KNOWN BUG".
+extras = ["torch==2.6.0", "torchvision==0.21.0"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = []
+extras = ["torch==2.6.0", "torchvision==0.21.0"]
 install_hint = "SGLANG_BACKEND=rocm"

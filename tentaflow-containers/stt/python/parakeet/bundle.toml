@@ -21,10 +21,11 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu124"
-extras = ["nemo_toolkit[asr]"]
+# Pinned na 2.6.2 (Feb 2026) — wspiera Parakeet-TDT-0.6B-v3 multilingual.
+extras = ["nemo_toolkit[asr]==2.6.2"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["nemo_toolkit[asr]"]
+extras = ["nemo_toolkit[asr]==2.6.2"]
 install_hint = "experimental"
