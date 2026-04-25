@@ -47,7 +47,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
     let router = ctx.state.router.clone();
     tokio::spawn(async move {
-        let mut messages: Vec<Message> = stream_req
+        let messages: Vec<Message> = stream_req
             .messages
             .iter()
             .map(|m| Message {
@@ -57,36 +57,18 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             })
             .collect();
 
-        // Brak system promptu = model nie wie ze ma byc asystentem (zwlaszcza
-        // przy malych base modelach). Wstrzyknij domyslny gdy zaden message
-        // nie ma role=system.
-        let has_system = messages.iter().any(|m| m.role == "system");
-        if !has_system {
-            messages.insert(
-                0,
-                Message {
-                    role: "system".to_string(),
-                    content: Some(MessageContent::Text(
-                        "You are a helpful AI assistant. Answer concisely and on-topic. \
-                         Match the user's language."
-                            .to_string(),
-                    )),
-                    ..Default::default()
-                },
-            );
-        }
-
-        // Sane sampling defaults dla chat. Bez nich vllm bierze temperature=1.0
-        // (zbyt randomowe dla 0.8B base/quantized) i max_tokens=None (generuje
-        // do max_model_len = bełkot do EOS). GUI moze nadpisac w request.
+        // Przekazujemy request 1:1 z GUI — bez forced system prompt i bez
+        // override sampling defaults. Backend (LocalInference / vLLM) zna
+        // swoje sane defaults; wstrzykiwanie ENG system prompt do polskich
+        // 4-bit modeli (Bielik) degradowalo kontekst → bełkot z corpusu.
         let request = ChatCompletionRequest {
             model: stream_req.model_id.clone(),
             messages,
-            temperature: Some(stream_req.temperature.unwrap_or(0.7)),
-            max_tokens: Some(stream_req.max_tokens.unwrap_or(1024)),
-            top_p: Some(0.9),
-            frequency_penalty: Some(0.0),
-            presence_penalty: Some(0.0),
+            temperature: stream_req.temperature,
+            max_tokens: stream_req.max_tokens,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             stop: None,
             stream: true,
             user: None,
@@ -140,9 +122,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 if let Some(content) = choice.delta.content.as_ref() {
                     if !content.is_empty() {
                         // Async send — czeka na slot gdy channel pelny zeby nie
-                        // gubic tokenow (maly model 0.8B emituje ~200 tok/s,
-                        // WS writer moze nie nadazac — bez backpressure gubimy
-                        // wszystko po pierwszych 64 chunkach).
+                        // gubic tokenow przy szybko generujacym modelu (200+ tok/s).
                         if push_chunk_async(
                             &sub,
                             MessageBody::ChatStreamChunkBody(ChatStreamChunk {
@@ -152,7 +132,6 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         .await
                         .is_err()
                         {
-                            // Receiver naprawde odpadl — kanczymy task.
                             return;
                         }
                         completion_tokens = completion_tokens.saturating_add(1);
