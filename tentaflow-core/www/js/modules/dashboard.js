@@ -40,14 +40,38 @@ const DashboardScreen = {
       </div>
 
       <div class="hero">
-        <div class="network-bg"></div>
-        <div class="network-lines"></div>
+        <!-- Animowana siatka mesh w tle (SVG inline, dryfuje z lewej-prawej w petli) -->
+        <svg class="hero-mesh" viewBox="0 0 1200 600" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <defs>
+            <radialGradient id="meshDot">
+              <stop offset="0%" stop-color="rgba(167,139,250,0.6)"/>
+              <stop offset="100%" stop-color="rgba(167,139,250,0)"/>
+            </radialGradient>
+          </defs>
+          <g class="hero-mesh-layer hero-mesh-layer-a" stroke="rgba(99,102,241,0.18)" stroke-width="0.6" fill="none">
+            <path d="M40,80 L180,150 L80,260 L220,330 L120,460 L300,500 L400,360 L240,200 L380,90 Z"/>
+            <path d="M900,520 L1080,420 L1140,260 L980,180 L820,80 L700,200 L820,340 Z"/>
+            <path d="M520,40 L640,140 L780,40 L900,160 L780,280 L640,200 Z"/>
+            <circle cx="180" cy="150" r="3" fill="url(#meshDot)"/>
+            <circle cx="220" cy="330" r="3" fill="url(#meshDot)"/>
+            <circle cx="380" cy="90" r="3" fill="url(#meshDot)"/>
+            <circle cx="780" cy="40" r="3" fill="url(#meshDot)"/>
+            <circle cx="980" cy="180" r="3" fill="url(#meshDot)"/>
+            <circle cx="1080" cy="420" r="3" fill="url(#meshDot)"/>
+          </g>
+          <g class="hero-mesh-layer hero-mesh-layer-b" stroke="rgba(96,165,250,0.12)" stroke-width="0.5" fill="none">
+            <path d="M0,300 L120,220 L60,140 L240,60 L380,220 L500,80 L620,260"/>
+            <path d="M700,540 L820,440 L1000,500 L1100,360 L1180,460"/>
+            <path d="M260,560 L420,500 L500,580 L640,520"/>
+          </g>
+        </svg>
+
         <div class="orbs">
-          <div class="orb red">${sprite('brain')}</div>
-          <div class="orb yellow">${sprite('share')}</div>
-          <div class="orb blue">${sprite('network-svg')}</div>
-          <div class="orb green">${sprite('database')}</div>
-          <div class="orb purple">${sprite('cloud')}</div>
+          <div class="orb-wrap" style="--angle: -75deg;   --float-delay: 0s;"><div class="orb red">${sprite('brain')}</div></div>
+          <div class="orb-wrap" style="--angle: -37.5deg; --float-delay: 0.6s;"><div class="orb yellow">${sprite('share')}</div></div>
+          <div class="orb-wrap" style="--angle: 0deg;     --float-delay: 1.2s;"><div class="orb blue">${sprite('network-svg')}</div></div>
+          <div class="orb-wrap" style="--angle: 37.5deg;  --float-delay: 1.8s;"><div class="orb green">${sprite('database')}</div></div>
+          <div class="orb-wrap" style="--angle: 75deg;    --float-delay: 2.4s;"><div class="orb purple">${sprite('cloud')}</div></div>
         </div>
         <div class="hero-content">
           <img class="hero-mascot" src="/tentaflow.png" alt="">
