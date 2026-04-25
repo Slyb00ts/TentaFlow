@@ -8,10 +8,13 @@
 
 [bundle]
 engine = "tensorrt-llm"
-description = "NVIDIA TensorRT-LLM OpenAI-compatible server (PyPI, pinned 1.2.0)"
+description = "NVIDIA TensorRT-LLM OpenAI-compatible server (PyPI, 1.3.0rc12)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "tensorrt-llm==1.2.0"
+# 1.3.0rc12 (kwiecien 2026) wymaga UV_PRERELEASE=allow (rc tag). Zawiera
+# Qwen3.5 model_type support i fix dla cuda_graph_runner ktorego brakowalo
+# w 1.2.0 stable. Bundle_smoke harness ustawia UV_PRERELEASE globalnie.
+pypi_package = "tensorrt-llm==1.3.0rc12"
 
 [launch]
 # Wlasciwy entry point to `trtllm-serve serve <MODEL>` (Click CLI).
