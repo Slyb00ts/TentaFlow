@@ -348,13 +348,51 @@ install_ios_targets() {
     log_ok "iOS targety gotowe"
 }
 
-# --- Metal Toolchain (macOS only) ---
+# --- Pelne Xcode (macOS only) ---
+#
+# tentaflow/build.rs wywoluje `xcodebuild build -scheme MLXBridge` na
+# tentaflow-desktop/macos/swift/MLXBridge zeby zbudowac libMLXBridge.dylib +
+# default.metallib (Metal shadery dla mlx-swift). To wymaga PELNEGO Xcode
+# (Xcode.app), nie wystarczy `xcode-select --install` (CLT).
+# Bez tego build dziala, ale mlx-swift bridge sie nie buduje i MLX modele
+# (Bielik, Qwen) startuja z bledem "Failed to load default metallib".
+require_full_xcode() {
+    if [[ "$DISTRO" != "macos" ]]; then
+        return
+    fi
 
+    log_section "Pelne Xcode (wymagane do budowy libMLXBridge.dylib)"
+
+    if ! command -v xcodebuild &>/dev/null; then
+        log_warn "Brak xcodebuild — masz tylko Command Line Tools."
+        log_warn "Pobierz Xcode z App Store (free): https://apps.apple.com/pl/app/xcode/id497799835"
+        log_warn "Po instalacji przelacz toolchain:"
+        log_warn "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+        log_warn "Bez Xcode build skonczy sie OK, ale MLX modele nie zadzialaja."
+        return
+    fi
+
+    local xcode_dev
+    xcode_dev=$(xcode-select -p 2>/dev/null || echo "")
+    if [[ "$xcode_dev" != *"Xcode.app"* ]]; then
+        log_warn "Aktywne Developer Dir: $xcode_dev (to nie pelne Xcode)"
+        log_warn "Przelacz: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+        log_warn "Pomijam dalsze sprawdzenia Xcode."
+        return
+    fi
+
+    local xcv
+    xcv=$(xcodebuild -version 2>/dev/null | head -1)
+    log_ok "Xcode: $xcv"
+}
+
+# --- Metal Toolchain (macOS only) ---
+#
 # Xcode 16 wydzielil Metal Toolchain jako osobny komponent. Bez niego
-# mlx-sys pada przy kompilacji shaderow (.air) z bledem:
-#   "cannot execute tool 'metal' due to missing Metal Toolchain"
-# MLX jest wlaczone domyslnie na macOS (feature inference-mlx), wiec
-# ten krok jest konieczny do buildu glownej binarki na Apple Silicon.
+# `xcodebuild` na Swift Package z .metal sourcami nie zbuduje default.metallib
+# (mlx-swift kompiluje shadery shadery przy build framework'a). Bez metallib
+# MLX startuje z bledem "Failed to load default metallib" i modele zwracaja
+# bełkot lub w ogole nie startuja.
 install_metal_toolchain() {
     if [[ "$DISTRO" != "macos" ]]; then
         return
@@ -702,7 +740,26 @@ verify_installation() {
             fi
         done
 
-        # Metal Toolchain — wymagany przez mlx-sys przy kompilacji shaderow.
+        # xcodebuild — wymagany przez tentaflow/build.rs do zbudowania
+        # libMLXBridge.dylib (Swift bridge mlx-swift). Bez tego MLX modele
+        # uruchomione w runtime zwracaja "Failed to load default metallib".
+        if command -v xcodebuild &>/dev/null; then
+            log_ok "xcodebuild: $(xcodebuild -version 2>/dev/null | head -1)"
+            local xcode_dev
+            xcode_dev=$(xcode-select -p 2>/dev/null || echo "")
+            if [[ "$xcode_dev" == *"Xcode.app"* ]]; then
+                log_ok "Aktywne Developer Dir to pelne Xcode"
+            else
+                log_warn "Aktywne Developer Dir: $xcode_dev (NIE pelne Xcode)"
+                log_warn "  Przelacz: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+            fi
+        else
+            log_warn "xcodebuild: BRAK (wymagany do mlx-swift bridge — Bielik / Qwen / inne MLX)"
+            log_warn "  Pobierz Xcode z App Store"
+        fi
+
+        # Metal Toolchain — wymagany przez xcodebuild do kompilacji shaderow
+        # mlx-swift przy budowie libMLXBridge.dylib.
         if xcrun metal --version &>/dev/null; then
             log_ok "Metal Toolchain: dostepny"
         else
@@ -807,6 +864,7 @@ main() {
     install_wasm_target
     install_wasm_bindgen_cli
     install_ios_targets
+    require_full_xcode
     install_metal_toolchain
     install_ios_platform
 
