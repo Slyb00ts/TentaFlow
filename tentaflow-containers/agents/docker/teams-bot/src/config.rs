@@ -228,8 +228,12 @@ impl MeetingConfig {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
             vad_rms_threshold: std::env::var("VAD_RMS_THRESHOLD")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(100.0),
+            // Default true: the canvas avatar is the visible identity of the
+            // bot in the meeting tile. Without it Teams renders a generic
+            // initials circle and the user can't tell the bot ever joined.
+            // Operators can still flip it off via BOT_VIDEO_ENABLED=false.
             bot_video_enabled: std::env::var("BOT_VIDEO_ENABLED")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(true),
             echo_mode: std::env::var("ECHO_MODE")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
             summarization_interval_sec: std::env::var("SUMMARIZATION_INTERVAL_SEC")
@@ -316,7 +320,7 @@ mod tests {
         assert!(config.secret_key_path.is_none());
         assert!(!config.enable_lan_discovery);
         assert!(!config.enable_dht_discovery);
-        assert!(!config.bot_video_enabled, "bot_video_enabled domyslnie false");
+        assert!(config.bot_video_enabled, "bot_video_enabled domyslnie true (canvas avatar)");
         assert!(!config.echo_mode, "echo_mode domyslnie false");
     }
 
