@@ -23,12 +23,17 @@ bundle_path = "llm/python/tensorrt-llm"
 platforms = ["linux"]
 
 [[model_preset]]
-id = "qwen3-5-0-8b"
-display_name = "Qwen3.5 0.8B"
-repo = "Qwen/Qwen3.5-0.8B"
+id = "qwen2-5-0-5b-instruct"
+display_name = "Qwen2.5 0.5B Instruct"
+repo = "Qwen/Qwen2.5-0.5B-Instruct"
 recommended = true
 
 [[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen3.5 0.8B (wymaga trtllm 1.3+)"
+repo = "Qwen/Qwen3.5-0.8B"
+
+[[model_preset]]
 id = "llama-3-1-8b-instruct"
-display_name = "Llama 3.1 8B Instruct"
+display_name = "Llama 3.1 8B Instruct (gated)"
 repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
