@@ -309,9 +309,13 @@ function renderListSections() {
 
 function renderSection(title, list, kind, count = null) {
   const countBadge = count != null ? `<span class="section-count">${count}</span>` : '';
+  // Sekcja "This node" ma jeden node — full-width tile zamiast jednej z 2
+  // kolumn w 2-column grid (mockup pokazywal mainpc na pelnej szerokosci
+  // i to dawalo "centralna karta z gauges + connectivity panes").
+  const gridMod = kind === 'local' ? ' mesh-grid--single' : '';
   return `
     <h3 class="mesh-section-title">${escapeHtml(title)}${countBadge}</h3>
-    <div class="mesh-grid">
+    <div class="mesh-grid${gridMod}">
       ${list.map(n => renderNodeCard(n, kind)).join('')}
     </div>
   `;

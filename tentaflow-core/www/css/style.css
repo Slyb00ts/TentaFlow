@@ -913,6 +913,10 @@ input, textarea, select {
   gap: 14px;
   margin-bottom: 12px;
 }
+/* Sekcja "This node" — single full-width tile zamiast jednej kolumny z 2.
+   Mockup zaznaczal ten kafelek jako "centralna karta sidebara" w mesh page,
+   z 4 gauges + 2-pane connectivity (bind + relay) na pelnej szerokosci. */
+.mesh-grid--single { grid-template-columns: 1fr; }
 .mesh-card {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -962,51 +966,55 @@ input, textarea, select {
 .tag-status.offline { background: var(--bg-3); color: var(--text-3); }
 .tag-status.pending { background: rgba(245,158,11,0.15); color: var(--warning); }
 
-/* Gauges */
+/* Gauges — kazdy gauge w osobnym kontenerze (.gauge dziala jak stat-cell
+   z mockupa: bg-3 + border + padding). Bez wrapper'a ringi "lewitowaly"
+   bezposrednio na karcie i caly main tile wygladal placko. */
 .gauges {
   display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
   margin-bottom: 14px;
 }
-.gauge { text-align: center; }
+.gauge {
+  text-align: center;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+}
 .gauge-ring {
-  width: 68px; height: 68px; border-radius: 50%;
-  margin: 0 auto 6px;
-  background: conic-gradient(var(--success) calc(var(--pct) * 1%), rgba(255,255,255,0.06) 0);
+  width: 64px; height: 64px; border-radius: 50%;
+  margin: 0 auto 8px;
+  background: conic-gradient(var(--success) calc(var(--pct) * 1%), var(--bg-2) 0);
   position: relative;
   display: flex; align-items: center; justify-content: center;
-  filter: drop-shadow(0 0 6px rgba(34, 197, 94, 0.18));
-  transition: background 0.3s ease, filter 0.3s ease;
+  transition: background 0.3s ease;
 }
 .gauge-ring::before {
-  content: ""; position: absolute; inset: 7px;
-  background: var(--bg-card); border-radius: 50%;
-  box-shadow: inset 0 0 0 1px var(--border);
+  content: ""; position: absolute; inset: 6px;
+  background: var(--bg-3); border-radius: 50%;
 }
 .gauge-ring.warm {
-  background: conic-gradient(var(--warning) calc(var(--pct) * 1%), rgba(255,255,255,0.06) 0);
-  filter: drop-shadow(0 0 8px rgba(245, 158, 11, 0.28));
+  background: conic-gradient(var(--warning) calc(var(--pct) * 1%), var(--bg-2) 0);
 }
 .gauge-ring.hot {
-  background: conic-gradient(var(--danger, #ef4444) calc(var(--pct) * 1%), rgba(255,255,255,0.06) 0);
-  filter: drop-shadow(0 0 10px rgba(239, 68, 68, 0.35));
+  background: conic-gradient(var(--danger, #ef4444) calc(var(--pct) * 1%), var(--bg-2) 0);
 }
 .gauge-ring.dim {
-  background: rgba(255,255,255,0.04);
-  filter: none;
+  background: var(--bg-2);
 }
 .gauge-val {
   position: relative; z-index: 1;
-  font-size: 15px; font-weight: 800; color: var(--text);
+  font-size: 14px; font-weight: 700; color: var(--text);
   line-height: 1.05;
-  letter-spacing: -0.02em;
 }
 .gauge-val span {
-  display: block; font-size: 9px; font-weight: 600;
-  color: var(--text-3); margin-top: 2px;
-  letter-spacing: 0.04em; text-transform: uppercase;
+  /* Inline obok wartosci ("17.4 GB" zamiast "17.4" + linia "GB"). */
+  display: inline;
+  font-size: 10px; font-weight: 600;
+  color: var(--text-3);
+  margin-left: 2px;
 }
-.gauge-label { font-size: 10px; font-weight: 700; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.06em; }
-.gauge-sub { font-size: 10px; color: var(--text-3); margin-top: 2px; }
+.gauge-label { font-size: 10px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 4px; }
+.gauge-sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
 
 /* Meta items */
 .mesh-card-meta {
@@ -2203,6 +2211,7 @@ input, textarea, select {
   .mesh-grid { grid-template-columns: 1fr; }
   .mesh-detail-grid { grid-template-columns: 1fr; }
   .gauges { grid-template-columns: repeat(2, 1fr); }
+  .gauge { padding: 10px; }
   .gauge-ring { width: 56px; height: 56px; }
   .catalog-grid { grid-template-columns: 1fr; }
   .target-grid { grid-template-columns: 1fr; }
@@ -4184,6 +4193,22 @@ tf-screen {
 }
 .tf-detail-header .d-actions {
   display: flex; gap: 8px; align-items: center; flex-shrink: 0;
+}
+
+/* Mobile: bez tego Pair button nachodzil na relay/bind pille w d-badges
+   bo flex z gap 18px squeezowal d-actions w te same linie co badges.
+   Wrap + d-actions full-width pod meta. */
+@media (max-width: 640px) {
+  .tf-detail-header { flex-wrap: wrap; gap: 12px; }
+  .tf-detail-header .d-meta { flex: 1 1 calc(100% - 78px); }
+  .tf-detail-header .d-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+  .tf-detail-header .d-actions .tf-btn {
+    flex: 1;
+    justify-content: center;
+  }
 }
 
 /* Karta sekcyjna dla tresci widokow detail — stack pod .tf-detail-header,
