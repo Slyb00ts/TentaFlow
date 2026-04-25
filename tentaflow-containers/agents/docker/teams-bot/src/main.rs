@@ -73,6 +73,45 @@ async fn send_backend_update(
     }
 }
 
+/// Generuje 2s 440Hz sine wave (16kHz mono i16 LE) i wysyla przez
+/// audio_playback do JS mic injection. Diagnostyka pipeline'u TX
+/// niezalezna od routera/TTS — uzywamy gdy chcemy zweryfikowac
+/// MediaStreamTrackGenerator -> getUserMedia -> Teams MediaAgent ->
+/// remote bez calego stacku TTS. Aktywuje sie env-em
+/// `BOT_TEST_TONE_ON_JOIN=1`.
+async fn play_test_tone(
+    audio_playback: &Arc<crate::audio::AudioPlayback>,
+    is_bot_speaking: &Arc<AtomicBool>,
+) {
+    const SR: u32 = 16_000;
+    const FREQ: f64 = 440.0;
+    const DUR_MS: u64 = 2_000;
+    const AMP: f64 = 0.3 * (i16::MAX as f64);
+    let n = (SR as u64 * DUR_MS / 1000) as usize;
+    let mut pcm_bytes: Vec<u8> = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64 / SR as f64;
+        let s = (t * FREQ * 2.0 * std::f64::consts::PI).sin();
+        let v = (s * AMP) as i16;
+        pcm_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    is_bot_speaking.store(true, Ordering::Relaxed);
+    match audio_playback.send(pcm_bytes) {
+        Ok(()) => {
+            tracing::info!(duration_ms = DUR_MS, freq = FREQ, "TEST tone wyslany do mic");
+            let flag = Arc::clone(is_bot_speaking);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(DUR_MS + 250)).await;
+                flag.store(false, Ordering::Relaxed);
+            });
+        }
+        Err(e) => {
+            tracing::warn!("play_test_tone: audio_playback.send failed: {}", e);
+            is_bot_speaking.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Announces the bot itself as a meeting participant. The DOM observer
 /// (`dom_observer`) intentionally filters the bot row out, so without this
 /// the GUI roster stays empty until a remote participant is detected.
@@ -360,6 +399,18 @@ async fn main() -> Result<()> {
         Some(SummarizerHandle { shutdown_tx: tx, join })
     }
 
+    // 3b. Most audio WebSocket — server musi byc UP zanim JS w Chromium
+    //     pierwszy raz wykona connectWs(), inaczej widzimy spam "WS blad" /
+    //     "WS zamkniety" do czasu az server zacznie nasluchiwac. Roster i
+    //     active_speaker NIE ida tym kanalem (zasila je dom_observer).
+    let (mut audio_capture, audio_playback) = audio::start_bridge().await?;
+    let audio_playback = Arc::new(audio_playback);
+    // Guard feedback-loop — gdy bot odtwarza TTS przez mic injection, capture
+    // (z HTMLMediaElement i pc.ontrack) moze ponownie zlapac ten sam glos
+    // przez echo konferencji. Bez tego STT zapetla sie na wlasnych odpowiedziach.
+    let is_bot_speaking = Arc::new(AtomicBool::new(false));
+    tracing::info!("Most audio WebSocket uruchomiony na 127.0.0.1:9999");
+
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
     let mut _chromium: Option<chromiumoxide::browser::Browser> = None;
     let mut page = if !config.meeting_url.is_empty() {
@@ -430,24 +481,22 @@ async fn main() -> Result<()> {
         dom_observer_handle = Some(observer);
         send_backend_update(&router_client_handle, &meeting_id, &config).await;
         send_bot_participant_joined(&router_client_handle, &meeting_id, &config.bot_name).await;
+        if std::env::var("BOT_TEST_TONE_ON_JOIN").ok().as_deref() == Some("1") {
+            // 1.5s opoznienie zeby Teams MediaAgent zdazyl podlaczyc track
+            // przed pierwszym AudioData write — bez tego frames trafiaja do
+            // void zanim peer connection zaczyna ich uzywac.
+            let pb = Arc::clone(&audio_playback);
+            let speaking = Arc::clone(&is_bot_speaking);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                play_test_tone(&pb, &speaking).await;
+            });
+        }
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
         None
     };
-
-    // 5. Uruchom most audio WebSocket (wstrzykniety JS w Chromium <-> Rust)
-    // Zastepuje wczesniejsze parec/pacat — audio przechwytywane na poziomie
-    // HTMLMediaElement w Chromium przez captureStream(), bez PulseAudio monitor.
-    // Roster i active_speaker NIE ida juz tym kanalem — zasila je dom_observer
-    // przez CDP binding push (patrz src/dom_observer.rs).
-    let (mut audio_capture, audio_playback) = audio::start_bridge().await?;
-    let audio_playback = Arc::new(audio_playback);
-    // Guard feedback-loop — gdy bot odtwarza TTS przez mic injection, capture
-    // (z HTMLMediaElement i pc.ontrack) moze ponownie zlapac ten sam glos
-    // przez echo konferencji. Bez tego STT zapetla sie na wlasnych odpowiedziach.
-    let is_bot_speaking = Arc::new(AtomicBool::new(false));
-    tracing::info!("Most audio WebSocket uruchomiony na 127.0.0.1:9999");
 
     // 6. Inicjalizacja VAD
     let mut vad_detector = vad::VadDetector::new(

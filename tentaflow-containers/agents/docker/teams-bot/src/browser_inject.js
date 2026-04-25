@@ -490,6 +490,11 @@
       micGenerator = new MediaStreamTrackGenerator({ kind: 'audio' });
       micWriter = micGenerator.writable.getWriter();
       micBaseTimestamp = 0;
+      // Eksponuj na window zeby post-join replaceTrack mogl wymusic ze
+      // KAZDY audio sender w pc uzywa naszego micGenerator. Bez tego
+      // Teams ma drugi audio sender z Chromium fake-input ktory wysyla
+      // pusty PCM, a nasz track jest disabled.
+      window.__tentaflowMicGenerator = micGenerator;
     } catch (e) {
       console.warn('[tentaflow] Blad tworzenia MediaStreamTrackGenerator', e);
       return;
