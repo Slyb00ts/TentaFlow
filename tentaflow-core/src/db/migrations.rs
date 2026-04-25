@@ -1702,5 +1702,23 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
               ('mesh.iroh_relay_url', 'https://relay.nextapp.pl');
         ",
     ),
+    (
+        58,
+        "meeting_sessions_backend_models",
+        "
+            -- Backend model identifiers reported by the bot via
+            -- MeetingEventPayload::BackendUpdate. Persisted so that a live view
+            -- mounted AFTER the broadcast still sees the BACKEND panel populated
+            -- (STT/TTS/summarization/diarization + counters). Numeric columns
+            -- stay NULL until the bot reports a concrete value.
+            ALTER TABLE meeting_sessions ADD COLUMN backend_stt_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_tts_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_summarization_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_diarization_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_streaming_latency_ms INTEGER;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_enrolled_speakers INTEGER;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_total_participants INTEGER;
+        ",
+    ),
 ]
 }

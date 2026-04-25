@@ -4115,6 +4115,13 @@ pub mod transcripts {
         pub lifecycle_stage: Option<String>,
         pub lifecycle_details: Option<String>,
         pub lifecycle_updated_at: Option<String>,
+        pub backend_stt_model: Option<String>,
+        pub backend_tts_model: Option<String>,
+        pub backend_summarization_model: Option<String>,
+        pub backend_diarization_model: Option<String>,
+        pub backend_streaming_latency_ms: Option<i64>,
+        pub backend_enrolled_speakers: Option<i64>,
+        pub backend_total_participants: Option<i64>,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -4162,7 +4169,10 @@ pub mod transcripts {
          (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id), \
          s.status, s.ended_at, s.container_id, s.container_name, \
          s.quic_port, s.vnc_port, s.novnc_port, s.bot_endpoint_id, s.platform, s.owner_user_id, \
-         s.lifecycle_stage, s.lifecycle_details, s.lifecycle_updated_at";
+         s.lifecycle_stage, s.lifecycle_details, s.lifecycle_updated_at, \
+         s.backend_stt_model, s.backend_tts_model, s.backend_summarization_model, \
+         s.backend_diarization_model, s.backend_streaming_latency_ms, \
+         s.backend_enrolled_speakers, s.backend_total_participants";
 
     fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         Ok(SessionRow {
@@ -4186,6 +4196,13 @@ pub mod transcripts {
             lifecycle_stage: row.get(17)?,
             lifecycle_details: row.get(18)?,
             lifecycle_updated_at: row.get(19)?,
+            backend_stt_model: row.get(20)?,
+            backend_tts_model: row.get(21)?,
+            backend_summarization_model: row.get(22)?,
+            backend_diarization_model: row.get(23)?,
+            backend_streaming_latency_ms: row.get(24)?,
+            backend_enrolled_speakers: row.get(25)?,
+            backend_total_participants: row.get(26)?,
         })
     }
 
@@ -4424,6 +4441,49 @@ pub mod transcripts {
                  last_activity_at = datetime('now')
              WHERE meeting_key = ?1",
             rusqlite::params![meeting_key, stage, details, now],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the backend model identifiers reported by the bot via
+    /// `MeetingEventPayload::BackendUpdate`. The live view replays these on
+    /// mount so the BACKEND panel survives broadcasts that fired before the
+    /// dashboard was open. No-op when the meeting_key is unknown — the bot
+    /// occasionally races the host on session creation and we don't want a
+    /// stray event to fail the reverse request flow.
+    pub fn update_session_backend(
+        pool: &DbPool,
+        meeting_key: &str,
+        stt: &str,
+        tts: &str,
+        summarization: &str,
+        diarization: &str,
+        streaming_latency_ms: Option<i64>,
+        enrolled_speakers: Option<i64>,
+        total_participants: Option<i64>,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET backend_stt_model = ?2,
+                 backend_tts_model = ?3,
+                 backend_summarization_model = ?4,
+                 backend_diarization_model = ?5,
+                 backend_streaming_latency_ms = ?6,
+                 backend_enrolled_speakers = ?7,
+                 backend_total_participants = ?8,
+                 last_activity_at = datetime('now')
+             WHERE meeting_key = ?1",
+            rusqlite::params![
+                meeting_key,
+                stt,
+                tts,
+                summarization,
+                diarization,
+                streaming_latency_ms,
+                enrolled_speakers,
+                total_participants,
+            ],
         )?;
         Ok(())
     }

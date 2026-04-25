@@ -68,6 +68,15 @@ pub struct SessionDescriptor {
     pub lifecycle_stage: Option<String>,
     /// Opcjonalne szczegóły ostatniego stage (np. treść błędu przy `failed`).
     pub lifecycle_details: Option<String>,
+    /// Last `BackendUpdate` payload from the bot, persisted on the row so the
+    /// live view can replay it on mount. `None` until the bot reports.
+    pub backend_stt_model: Option<String>,
+    pub backend_tts_model: Option<String>,
+    pub backend_summarization_model: Option<String>,
+    pub backend_diarization_model: Option<String>,
+    pub backend_streaming_latency_ms: Option<i64>,
+    pub backend_enrolled_speakers: Option<i64>,
+    pub backend_total_participants: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -345,6 +354,13 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
         flow_alias: DEFAULT_FLOW_ALIAS.to_string(),
         lifecycle_stage: row.lifecycle_stage.clone(),
         lifecycle_details: row.lifecycle_details.clone(),
+        backend_stt_model: row.backend_stt_model.clone(),
+        backend_tts_model: row.backend_tts_model.clone(),
+        backend_summarization_model: row.backend_summarization_model.clone(),
+        backend_diarization_model: row.backend_diarization_model.clone(),
+        backend_streaming_latency_ms: row.backend_streaming_latency_ms,
+        backend_enrolled_speakers: row.backend_enrolled_speakers,
+        backend_total_participants: row.backend_total_participants,
     }
 }
 
