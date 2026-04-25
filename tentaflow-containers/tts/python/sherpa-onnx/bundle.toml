@@ -1,0 +1,46 @@
+# =============================================================================
+# Plik: tts/python/sherpa-onnx/bundle.toml
+# Opis: sherpa-onnx jako Python bundle z PyPI wheels — cross-platform
+#       (Linux x86_64 + aarch64, macOS aarch64, Windows x86_64). Pakiet
+#       'sherpa-onnx' z PyPI dostarcza prebuilt binaries dla onnxruntime
+#       i wszystkich platform; nie wymaga lokalnego cmake.
+#       Server.py jest cienkim FastAPI shim'em wokol sherpa_onnx.OfflineTts
+#       (model VITS Piper) dostarczajacym OpenAI-compatible /tts endpoint.
+# =============================================================================
+
+[bundle]
+engine = "sherpa-onnx"
+description = "sherpa-onnx TTS via ONNX Runtime (PyPI, pinned 1.12.40)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "sherpa-onnx==1.12.40"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-5020}"]
+internal_port = 5020
+
+[requires]
+gpu_memory_gb = 0
+disk_gb = 2
+# sherpa-onnx PyPI ma wheels dla wszystkich tych platform — zero local build.
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cpu"
+extras = []
+
+[[install_variants]]
+backend = "cuda"
+# CUDA backend dla onnxruntime — sherpa-onnx wykrywa onnxruntime-gpu
+# automatycznie gdy zainstalowane. Wsparcie dla wielu CUDA wersji.
+extras = ["onnxruntime-gpu"]
+
+[[install_variants]]
+backend = "rocm"
+extras = []
+
+[[install_variants]]
+backend = "metal"
+extras = []
