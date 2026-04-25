@@ -27,9 +27,11 @@ export function mount(canvas) {
   let points = [];
 
   const resize = () => {
-    const rect = canvas.getBoundingClientRect();
-    width = Math.max(1, Math.round(rect.width));
-    height = Math.max(1, Math.round(rect.height));
+    const cssWidth = canvas.clientWidth || canvas.offsetWidth;
+    const cssHeight = canvas.clientHeight || canvas.offsetHeight;
+    const rect = (cssWidth > 0 && cssHeight > 0) ? null : canvas.getBoundingClientRect();
+    width = Math.max(1, Math.round(cssWidth || rect?.width || 1));
+    height = Math.max(1, Math.round(cssHeight || rect?.height || 1));
     canvas.width = width * dpr;
     canvas.height = height * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);

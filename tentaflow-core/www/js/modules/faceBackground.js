@@ -259,6 +259,23 @@ const state = {
   shakeDuration: 0.8,
 };
 
+function setFaceLayerOpacity(opacity) {
+  const value = String(opacity);
+  if (state.glowCanvas) state.glowCanvas.style.opacity = value;
+  if (state.canvas) state.canvas.style.opacity = value;
+}
+
+function resetFaceLayerStyles() {
+  if (state.glowCanvas) {
+    state.glowCanvas.style.transition = '';
+    state.glowCanvas.style.opacity = '';
+  }
+  if (state.canvas) {
+    state.canvas.style.transition = '';
+    state.canvas.style.opacity = '';
+  }
+}
+
 /**
  * Oblicza `workVertices = BASE + Σ weight_i * DELTA_i`. Pomija blendshape'y
  * z wagą poniżej progu. Dla blink/eyebrow używa masek left/right do
@@ -1120,6 +1137,7 @@ export const FaceBackground = {
     state.glowCanvas = glowCanvas;
     state.glowCtx = glowCanvas.getContext('2d', { alpha: true });
     state.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    resetFaceLayerStyles();
 
     // Reset harmonogramu idle-animacji na start sesji.
     state.phase = 0;
@@ -1203,8 +1221,9 @@ export const FaceBackground = {
     if (state.reducedMotion) {
       // Tryb oszczędny — natychmiast mountujemy UI, krótki fade canvasa.
       onMidpoint();
-      state.canvas.style.transition = 'opacity 0.2s linear';
-      state.canvas.style.opacity = '0';
+      if (state.glowCanvas) state.glowCanvas.style.transition = 'opacity 0.2s linear';
+      if (state.canvas) state.canvas.style.transition = 'opacity 0.2s linear';
+      setFaceLayerOpacity('0');
       setTimeout(() => {
         FaceBackground.hide();
         onComplete();
@@ -1238,7 +1257,7 @@ export const FaceBackground = {
     // wystarcza). Twarz w ostatnich 30% fade-outuje wiec wizualnie bez roznicy.
     const isMobile = isMobileViewport();
     const scaleEnd = isMobile ? 18 : 13;
-    const DURATION = 2600;
+    const DURATION = 1600;
     const FADE_START_T = 0.7;
     // Niewielki offset UI na prawo i w dol — srodek wykrytych vertices oka
     // jest troche wyzej/lewo niz srodek tęczówki (blink porusza gornie
@@ -1307,9 +1326,9 @@ export const FaceBackground = {
       }
 
       // 5. Fade-out canvasa w ostatnich ~30% czasu — twarz znika, UI zostaje.
-      if (t > FADE_START_T && state.canvas) {
+      if (t > FADE_START_T && (state.canvas || state.glowCanvas)) {
         const ft = (t - FADE_START_T) / (1 - FADE_START_T);
-        state.canvas.style.opacity = (1 - ft).toFixed(3);
+        setFaceLayerOpacity((1 - ft).toFixed(3));
       }
 
       if (t < 1) {
