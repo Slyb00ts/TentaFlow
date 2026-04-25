@@ -1122,12 +1122,14 @@ async fn do_python_bundle_native_deploy(
             pid,
         ));
         let auto_pin = is_orchestrator_model(&engine.engine_id, &model_repo);
+        let affinity = parse_gpu_affinity(config.gpu_ids.as_deref());
         crate::memory::guard_global().register(
             service_name.clone(),
             guard_engine,
             vram_estimate,
             auto_pin,
             false,
+            affinity,
         );
 
         log_line(
@@ -1272,6 +1274,28 @@ fn native_service_name(engine: &EngineMeta, config: &DeployConfig, model_repo: &
     let engine_slug = slugify_name(&engine.engine_id);
     let model_slug = slugify_name(model_repo);
     format!("{}-native-{}", engine_slug, model_slug)
+}
+
+/// Konwersja `config.gpu_ids: Option<Vec<String>>` -> GpuAffinity.
+/// Brak / pusta lista / "all" -> All. Pojedynczy idx -> Single. Wiele -> Multi.
+fn parse_gpu_affinity(gpu_ids: Option<&[String]>) -> crate::memory::GpuAffinity {
+    use crate::memory::GpuAffinity;
+    let ids = match gpu_ids {
+        Some(v) if !v.is_empty() => v,
+        _ => return GpuAffinity::All,
+    };
+    if ids.iter().any(|s| s.eq_ignore_ascii_case("all")) {
+        return GpuAffinity::All;
+    }
+    if ids.iter().any(|s| s.eq_ignore_ascii_case("cpu")) {
+        return GpuAffinity::Cpu;
+    }
+    let parsed: Vec<usize> = ids.iter().filter_map(|s| s.parse().ok()).collect();
+    match parsed.len() {
+        0 => GpuAffinity::All,
+        1 => GpuAffinity::Single(parsed[0]),
+        _ => GpuAffinity::Multi(parsed),
+    }
 }
 
 /// Czy model powinien byc auto-pinned w MemoryGuard (zawsze warm, nie evict).

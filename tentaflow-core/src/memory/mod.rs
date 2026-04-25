@@ -15,4 +15,4 @@ mod state;
 pub use engine::LoadableEngine;
 pub use guard::{global as guard_global, MemoryGuard};
 pub use impls::{estimate_vram_for_model, DockerEngine, EmbeddedEngine, PythonBundleEngine};
-pub use state::{LoadState, ServiceMemState};
+pub use state::{GpuAffinity, LoadState, ServiceMemState};
