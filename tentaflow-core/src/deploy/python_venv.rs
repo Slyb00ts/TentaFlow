@@ -60,6 +60,15 @@ pub struct InstallVariant {
     pub extras_no_build_isolation: Vec<String>,
     #[serde(default)]
     pub install_hint: Option<String>,
+    /// Pakiety force-reinstallowane PO calym install flow (lock + extras +
+    /// main + extras_no_build_isolation). Naprawia sytuacje gdy main package
+    /// upstream upgraduje wersje, ktore my musimy trzymac na konkretnej
+    /// wartosci (np. coqui-tts 0.27.4 wymaga transformers >=4.50, ale Coqui
+    /// XTTS gpt.py uzywa transformers.pytorch_utils.isin_mps_friendly ktore
+    /// usunieto w >=4.57). force_pins z `--force-reinstall --no-deps`
+    /// nadpisuje resolver decision bez zmiany topologii grafu zaleznosci.
+    #[serde(default)]
+    pub force_pins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -922,6 +931,17 @@ fn install_deps(
         }
     }
 
+    // Force pins — ostatnia faza, nadpisuje wersje ktorych resolver wybral
+    // wbrew naszym ograniczeniom. Wymuszane bezposrednio z `pip install
+    // --force-reinstall --no-deps <pkg==ver>`.
+    if let Some(v) = variant {
+        for pkg in &v.force_pins {
+            installer
+                .install_force_pin(pkg)
+                .with_context(|| format!("force-pin {}", pkg))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1280,6 +1300,19 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("--no-build-isolation").arg(pkg);
+        run_with_logs(&mut c, &self.log)
+    }
+    /// `pip install --force-reinstall --no-deps <pkg>` — nadpisuje wersje
+    /// ktora resolver wybral, bez ruszania grafu zaleznosci. Uzywane do
+    /// wymuszenia konkretnej wersji deps po main package install (force_pins
+    /// w bundle.toml).
+    fn install_force_pin(&self, pkg: &str) -> Result<()> {
+        (self.log)(&format!("pip: install --force-reinstall --no-deps {}", pkg));
+        let mut c = self.cmd();
+        c.arg("install");
+        self.add_index(&mut c);
+        self.add_install_flags(&mut c);
+        c.arg("--force-reinstall").arg("--no-deps").arg(pkg);
         run_with_logs(&mut c, &self.log)
     }
 }
