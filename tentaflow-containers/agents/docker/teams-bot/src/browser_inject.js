@@ -36,10 +36,23 @@
   window.__tentaflowVideoAvailable = false;
   console.log('[tentaflow] Bridge audio startuje w', href);
 
-  // Lista aktywnych interwalow — posprzatamy je w cleanupTentaflow() gdy WS sie zamknie.
+  // Two interval pools. Audio bridge intervals (mic capture, roster scan,
+  // active speaker) get torn down whenever the audio websocket disconnects
+  // because they push data through that socket — keeping them alive after
+  // the bridge dies just produces noise. The video pipeline has nothing to
+  // do with the audio websocket: the canvas captureStream feeds Teams
+  // directly, so killing the draw loop on WS close left Teams holding the
+  // last frame (usually still mostly empty) forever and the tile rendered
+  // black. Keep video intervals in their own pool so cleanupTentaflow()
+  // does not touch them.
   const __tfIntervals = [];
+  const __tfVideoIntervals = [];
   function registerInterval(id) {
     __tfIntervals.push(id);
+    return id;
+  }
+  function registerVideoInterval(id) {
+    __tfVideoIntervals.push(id);
     return id;
   }
   function cleanupTentaflow() {
@@ -1021,15 +1034,16 @@
         console.warn('[tentaflow] video draw error:', e && e.message ? e.message : e);
       }
     };
-    registerInterval(setInterval(drawAndWrite, Math.round(1000 / FPS)));
+    // Video draw loop lives in its own pool — the audio bridge WS reconnect
+    // pump used to wipe every interval (including this draw loop) on every
+    // hiccup, so the canvas froze and Teams kept showing whatever was on
+    // the framebuffer when the draw stopped (usually mostly empty = black
+    // tile).
+    registerVideoInterval(setInterval(drawAndWrite, Math.round(1000 / FPS)));
     window.__tentaflowVideoAvailable = true;
     if (window.__tentaflowBridge) window.__tentaflowBridge.videoSetupDone = true;
     console.log('[tentaflow] Video injection zainicjalizowane (' + W + 'x' + H + ' @ ' + FPS + 'fps)');
-    // Periodic heartbeat: prove the draw loop is alive and the canvas is
-    // actually attached to the rendered tree. If muted stays true after
-    // the first second the compositor never picked up our canvas — see
-    // the appendChild block above.
-    registerInterval(setInterval(() => {
+    registerVideoInterval(setInterval(() => {
       try {
         console.log('[tentaflow][video] tick muted=' + videoGenerator.muted +
           ' enabled=' + videoGenerator.enabled +
