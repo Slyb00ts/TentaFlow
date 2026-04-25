@@ -470,7 +470,10 @@ impl Router {
 
     /// Przywraca natywne serwisy (in-process MLX/llama.cpp) z bazy po restarcie.
     /// Skanuje DB pod katem serwisow z deploy_mode=native, laduje model i rejestruje.
-    pub async fn restore_native_services(&self) {
+    pub async fn restore_native_services(
+        &self,
+        settings_cipher: &std::sync::Arc<crate::crypto::SettingsCipher>,
+    ) {
         let db = match &self.db {
             Some(db) => db,
             None => {
@@ -503,6 +506,24 @@ impl Router {
             // Pomijaj serwisy oznaczone jako stopped
             if svc.status == "stopped" {
                 debug!("Pomijam zatrzymany serwis '{}' (stopped)", svc.name);
+                continue;
+            }
+
+            // Natywny python-bundle (vllm, vllm-metal, sglang, xtts, voxcpm, ...)
+            // — proces HTTP server OpenAI-compatible uruchamiany z venva w cache.
+            // Sprawdz czy poprzedni PID wciaz zyje; jesli tak — tylko rejestrujemy
+            // backend (live rekonekcja). Jesli proces padl — relaunchujemy z
+            // istniejacego venv (bez reinstall wheeli).
+            if config["runtime"].as_str() == Some("python-bundle") {
+                if let Err(e) = self
+                    .restore_python_bundle_service(db, settings_cipher, &svc, &config)
+                    .await
+                {
+                    warn!(
+                        "restore python-bundle '{}': {:#} — pomijam, user moze wlaczyc recznie",
+                        svc.name, e
+                    );
+                }
                 continue;
             }
 
@@ -661,6 +682,163 @@ impl Router {
                 .register_local_inference_model(&svc.name);
             info!("Natywny serwis '{}' przywrocony pomyslnie", svc.name);
         }
+    }
+
+    /// Restore path dla `runtime=python-bundle`: jesli PID w config_json zyje
+    /// i HTTP /v1/models odpowiada — tylko rejestruje backend w ServiceManager.
+    /// Jesli PID martwy — wola python_venv::relaunch zeby spawnowac proces z
+    /// cache'owanego venva (bez ponownej instalacji wheels) i aktualizuje
+    /// PID w DB. Zwraca blad tylko gdy bundle nie da sie zrelaunchowac (np.
+    /// cache venv usuniety) — wtedy caller powinien pozostawic serwis bez
+    /// zmian i czekac na recznego reinstall z GUI.
+    async fn restore_python_bundle_service(
+        &self,
+        db: &crate::db::DbPool,
+        settings_cipher: &std::sync::Arc<crate::crypto::SettingsCipher>,
+        svc: &crate::db::models::DbService,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        use crate::config::{ConnectionType, ServiceBackend};
+        use crate::routing::backend::BackendClient;
+
+        let engine_id = config["engine"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("brak config.engine"))?
+            .to_string();
+        let host_port = config["port"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("brak config.port"))? as u16;
+        let instance_name = config["instance_name"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| svc.name.clone());
+        let stored_pid = config["pid"].as_u64().map(|p| p as u32);
+
+        // 1) Sprawdz czy stary PID jeszcze zyje. Proces python moze zyc dalej
+        //    po crashu tentaflow (Unix fork survives parent exit).
+        let alive = stored_pid
+            .map(crate::deploy::process_ctl::is_alive)
+            .unwrap_or(false);
+
+        let pid_after_restore: u32 = if alive {
+            info!(
+                service = %svc.name, pid = stored_pid.unwrap_or(0),
+                "python-bundle: poprzedni proces zyje — tylko rejestruje backend"
+            );
+            stored_pid.unwrap_or(0)
+        } else {
+            info!(
+                service = %svc.name, engine = %engine_id,
+                "python-bundle: PID martwy, relaunchuje z cache venv"
+            );
+
+            let hf_token = crate::db::repository::get_setting_secure(db, "hf_token", settings_cipher)
+                .unwrap_or_default()
+                .unwrap_or_default();
+            let _ = crate::paths::ensure_models_dirs();
+            let hf_home = crate::paths::hf_home();
+            let torch_home = crate::paths::torch_home();
+
+            let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            env.insert("PORT".to_string(), host_port.to_string());
+            if let Some(model) = config["deployed_model"].as_str() {
+                if !model.is_empty() {
+                    env.insert("MODEL".to_string(), model.to_string());
+                }
+            }
+            if !hf_token.is_empty() {
+                env.insert("HF_TOKEN".to_string(), hf_token.clone());
+                env.insert("HUGGING_FACE_HUB_TOKEN".to_string(), hf_token);
+            }
+            env.insert("HF_HOME".to_string(), hf_home.to_string_lossy().into_owned());
+            env.insert(
+                "HUGGINGFACE_HUB_CACHE".to_string(),
+                hf_home.to_string_lossy().into_owned(),
+            );
+            env.insert(
+                "TRANSFORMERS_CACHE".to_string(),
+                hf_home.to_string_lossy().into_owned(),
+            );
+            env.insert(
+                "TORCH_HOME".to_string(),
+                torch_home.to_string_lossy().into_owned(),
+            );
+
+            let req = crate::deploy::python_venv::NativeDeployRequest {
+                engine: engine_id.clone(),
+                instance_name: Some(instance_name.clone()),
+                env,
+            };
+            let running = tokio::task::spawn_blocking(move || {
+                crate::deploy::python_venv::relaunch(&req)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking relaunch: {}", e))??;
+
+            let new_pid = running.child.id();
+            std::mem::forget(running.child);
+
+            // Zaktualizuj PID w config_json zeby nastepny restart tentaflow
+            // mogl znow sprawdzic i zdecydowac czy relaunch nie jest potrzebny.
+            let mut new_config = config.clone();
+            new_config["pid"] = serde_json::Value::from(new_pid);
+            let config_json = new_config.to_string();
+            let strategy = "first_available";
+            let model_category = if svc.service_type == "llm" {
+                Some("llm")
+            } else {
+                None
+            };
+            crate::db::repository::update_service(
+                db,
+                svc.id,
+                &svc.name,
+                &svc.service_type,
+                strategy,
+                model_category,
+                "active",
+                &config_json,
+            )?;
+            new_pid
+        };
+
+        // 2) Rejestracja backendu HTTP — router zacznie routowac do procesu.
+        // Dummy api_key bo BackendClient::new wymaga jakiegokolwiek tokenu do
+        // budowy `Bearer` headera; lokalne silniki OSS go nie sprawdzaja.
+        // model_name_override: vLLM zna model pod HF repo name (np.
+        // "Qwen/Qwen3.5-0.8B"), a router dispatchuje pod service name (np.
+        // "tentaflow-vllm-metal-2izlb"). Override podmienia nazwe przed wyslaniem.
+        let model_override = config["deployed_model"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let base_url = format!("http://127.0.0.1:{}/v1", host_port);
+        let sb = ServiceBackend {
+            connection: ConnectionType::OpenAIApi {
+                url: base_url.clone(),
+                api_key: Some("sk-tentaflow-local".to_string()),
+                api_key_env: None,
+                extra_headers: vec![],
+                custom_endpoint: None,
+                request_format: None,
+                tts_config: None,
+            },
+            max_concurrent: 50,
+            timeout_ms: 600_000,
+            weight: 1,
+            model_name_override: model_override,
+            health_check_path: Some("/v1/models".to_string()),
+        };
+        let client = BackendClient::new(sb, None)
+            .map_err(|e| anyhow::anyhow!("BackendClient::new: {}", e))?;
+        self.service_manager
+            .register_dynamic_http_backend(&svc.name, std::sync::Arc::new(client));
+
+        info!(
+            service = %svc.name, pid = pid_after_restore, url = %base_url,
+            "python-bundle: restore OK, HTTP backend zarejestrowany"
+        );
+        Ok(())
     }
 
     /// Rejestruje natywny serwis in-process w mesh registry,

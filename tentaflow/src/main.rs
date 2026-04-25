@@ -352,7 +352,7 @@ async fn run_server(args: Args) -> Result<()> {
     // Restore native services (in-process MLX/llama.cpp) from DB. Done after
     // mesh attachment so register_native_service_in_mesh can publish them to
     // the mesh service registry.
-    router.restore_native_services().await;
+    router.restore_native_services(&settings_cipher).await;
 
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();

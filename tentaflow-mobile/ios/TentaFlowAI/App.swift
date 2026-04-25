@@ -53,16 +53,24 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         MLXSwiftEngine.shared.registerWithRust()
         NSLog("[TentaFlow] MLX callbacks zarejestrowane")
 
-        // Uruchom natywny mDNS discovery (Apple Network framework — dziala na iOS)
-        let nodeId = UUID().uuidString
-        NSLog("[TentaFlow] mDNS discovery start (nodeId=\(nodeId.prefix(8))...)")
-        NativeDiscovery.shared.start(nodeId: nodeId, port: 8090)
-        NSLog("[TentaFlow] mDNS discovery started")
-
-        // Uruchom Rust core — serwisy startuja w osobnym watku, nie blokuje main thread
+        // Uruchom Rust core — serwisy startuja w osobnym watku, nie blokuje main thread.
+        // MeshSecurity (z ktorej bierze sie nasz node_id iroh) inicjalizuje sie w tle,
+        // wiec NativeDiscovery startujemy dopiero po 4s zeby mesh byl gotowy i FFI
+        // add_discovered_peer dzialalo od pierwszej proby.
         NSLog("[TentaFlow] Wywolanie tentaflow_mobile_start()...")
         tentaflow_mobile_start()
         NSLog("[TentaFlow] tentaflow_mobile_start() zwrocilo — serwisy startuja w tle")
+
+        // Odroczone uruchomienie LAN discovery — Rust MESH_HANDLE musi byc gotowy
+        // zanim Swift NWBrowser zacznie karmic peerow. Rust core potrzebuje ~4s
+        // na bootstrap iroh (captive portal probe + relay handshake + DHT).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            // Nie znamy jeszcze iroh node_id (to public_key_hex z MeshSecurity),
+            // ale NativeDiscovery uzywa go tylko do filtrowania siebie samego.
+            // Pusty string bezpieczny — nie wyklucza nic (i tak Rust odrzuci self).
+            NSLog("[TentaFlow] NativeDiscovery.start() po opoznieniu 4s")
+            NativeDiscovery.shared.start(nodeId: "", port: 8090)
+        }
 
         // Sprawdz port 8090 po kilku sekundach
         DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) {

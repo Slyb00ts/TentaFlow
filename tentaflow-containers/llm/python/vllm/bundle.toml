@@ -1,6 +1,8 @@
 # =============================================================================
 # Plik: python-bundles/vllm/bundle.toml
-# Opis: vLLM z git HEAD, wieloplatformowo (CUDA / ROCm 7 / Metal).
+# Opis: vLLM z git HEAD, CUDA (Linux/Windows) albo ROCm (Linux). Dla macOS
+#       Apple Silicon uzywamy osobnego silnika `vllm-metal` (bundle
+#       ../vllm-metal/bundle.toml) — plugin MLX, inny flow instalacji.
 # =============================================================================
 
 [bundle]
@@ -27,7 +29,7 @@ internal_port = 8000
 [requires]
 gpu_memory_gb = 8
 disk_gb = 20
-platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64", "macos-aarch64"]
+platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 
 [[install_variants]]
 backend = "cuda"
@@ -39,8 +41,3 @@ backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
 extras = []
 install_hint = "VLLM_TARGET_DEVICE=rocm"
-
-[[install_variants]]
-backend = "metal"
-extras = ["mlx-lm", "mlx"]
-install_hint = "VLLM_TARGET_DEVICE=mlx"
