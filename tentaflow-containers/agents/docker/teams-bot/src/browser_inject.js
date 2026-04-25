@@ -495,11 +495,40 @@
         console.log('[tentaflow] Przechwycono getUserMedia audio:', !!constraints.audio,
           'video:', !!constraints.video);
 
+        // Teams' MediaAgent ('Active device not found') refuses every
+        // frame from a track whose settings.deviceId is not present in
+        // enumerateDevices(). Patch getSettings() on the synthetic tracks
+        // to claim the same deviceId / groupId as the real Chromium fake
+        // input. Without this the test harness shows healthy stream but
+        // Teams renders the tile black.
+        let realVid = null;
+        let realAud = null;
+        try {
+          const realDevs = await navigator.mediaDevices.enumerateDevices();
+          realVid = realDevs.find((d) => d.kind === 'videoinput') || null;
+          realAud = realDevs.find((d) => d.kind === 'audioinput') || null;
+        } catch (_) {}
+        const reportSettings = (track, real) => {
+          if (!track || !real) return;
+          try {
+            const orig = (track.getSettings && track.getSettings()) || {};
+            const patched = Object.assign({}, orig, {
+              deviceId: real.deviceId,
+              groupId: real.groupId || orig.groupId,
+            });
+            Object.defineProperty(track, 'getSettings', {
+              configurable: true,
+              value: () => Object.assign({}, patched),
+            });
+          } catch (_) {}
+        };
         const combined = new MediaStream();
         if (constraints.audio && micGenerator) {
+          reportSettings(micGenerator, realAud);
           combined.addTrack(micGenerator);
         }
         if (constraints.video && videoGenerator) {
+          reportSettings(videoGenerator, realVid);
           combined.addTrack(videoGenerator);
         }
         if (combined.getTracks().length > 0) return combined;
