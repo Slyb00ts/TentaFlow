@@ -17,8 +17,18 @@ version = "0.13.0"
 context_path = "llm/docker/tensorrt-llm"
 platforms = ["linux", "windows"]
 
+[deploy.native]
+runtime = "python-bundle"
+bundle_path = "llm/python/tensorrt-llm"
+platforms = ["linux"]
+
+[[model_preset]]
+id = "qwen3-5-0-8b"
+display_name = "Qwen3.5 0.8B"
+repo = "Qwen/Qwen3.5-0.8B"
+recommended = true
+
 [[model_preset]]
 id = "llama-3-1-8b-instruct"
 display_name = "Llama 3.1 8B Instruct"
 repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-recommended = true

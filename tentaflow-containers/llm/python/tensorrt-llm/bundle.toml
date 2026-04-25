@@ -1,0 +1,38 @@
+# =============================================================================
+# Plik: python-bundles/tensorrt-llm/bundle.toml
+# Opis: TensorRT-LLM (NVIDIA) jako native bundle. Pakiet `tensorrt_llm` z PyPI
+#       dostarcza `tensorrt_llm.serve.openai_server` ktory wystawia OpenAI-
+#       compatible API. Wymaga CUDA 12.x i kompatybilnego sterownika
+#       (nasze testowe RTX 4090 + 595.x driver = ok). Linux-only — windows
+#       wsparcie eksperymentalne, na razie ograniczamy do linux-x86_64.
+# =============================================================================
+
+[bundle]
+engine = "tensorrt-llm"
+description = "NVIDIA TensorRT-LLM OpenAI-compatible server (PyPI)"
+python_version = "3.12"
+source = "pypi"
+pypi_package = "tensorrt-llm"
+
+[launch]
+command = "python"
+args = [
+    "-m", "tensorrt_llm.serve.openai_server",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8087}",
+    "--model", "${MODEL}",
+    "--tp_size", "${TP:-1}",
+    "--max_batch_size", "${MAX_BATCH_SIZE:-8}",
+    "--kv_cache_free_gpu_memory_fraction", "${KV_FRACTION:-0.85}",
+]
+internal_port = 8087
+
+[requires]
+gpu_memory_gb = 12
+disk_gb = 30
+platforms = ["linux-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://pypi.nvidia.com"
+extras = []
