@@ -120,8 +120,9 @@ pub fn plan_install(engine_id: &str, platform: &Platform) -> Result<InstallPlan,
             },
         ],
         ("mlx", Platform::MacOS) => vec![
-            // MLX dziala natywnie in-process przez mlx-rs (Rust Metal bindings)
-            // Nie wymaga Pythona — model jest ladowany bezposrednio przez InferenceManager
+            // MLX dziala in-process przez Swift bridge (mlx-swift / MLXLLM) —
+            // bootstrap libMLXBridge.dylib przy starcie binarki. Nie wymaga
+            // Pythona; model laduje InferenceManager przez MlxSwiftEngine.
         ],
         ("llamacpp", Platform::MacOS) => vec![
             InstallStep::CheckBinary {
@@ -206,7 +207,7 @@ pub fn plan_run(
             model_id: model_id.to_string(),
             model_path: model_path.clone(),
             port,
-            // MLX uzywa in-process InferenceManager (mlx-rs + Metal) — brak osobnego procesu.
+            // MLX uzywa in-process InferenceManager (Swift bridge przez libMLXBridge.dylib).
             // Komenda jest pusta — model jest ladowany przez InferenceManager::load_model().
             command: String::new(),
             args: vec![],
@@ -413,7 +414,7 @@ pub async fn start_engine(
 pub fn check_engine_installed(engine_id: &str, platform: &Platform) -> bool {
     let binary = match (engine_id, platform) {
         ("ollama", _) => "ollama",
-        ("mlx", _) => return true, // MLX jest wbudowany (in-process via mlx-rs)
+        ("mlx", _) => return true, // MLX jest wbudowany (in-process via libMLXBridge.dylib / Swift bridge)
         ("llamacpp", _) => "llama-server",
         _ => return false,
     };
