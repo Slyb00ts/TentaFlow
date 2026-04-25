@@ -4246,6 +4246,49 @@ fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_
     // wprost do live view po reload. Bez nich chip zawsze zostaje JOINING.
     set(&o, "lifecycleStage", s.lifecycle_stage.into());
     set(&o, "lifecycleDetails", s.lifecycle_details.into());
+    // Backend models — empty string / -1 from the host means "not reported yet";
+    // we surface JS null in that case so the live view can show a placeholder.
+    let opt_str = |v: String| -> wasm_bindgen::JsValue {
+        if v.is_empty() {
+            wasm_bindgen::JsValue::NULL
+        } else {
+            v.into()
+        }
+    };
+    let opt_num = |v: i64| -> wasm_bindgen::JsValue {
+        if v < 0 {
+            wasm_bindgen::JsValue::NULL
+        } else {
+            (v as f64).into()
+        }
+    };
+    set(&o, "backendSttModel", opt_str(s.backend_stt_model));
+    set(&o, "backendTtsModel", opt_str(s.backend_tts_model));
+    set(
+        &o,
+        "backendSummarizationModel",
+        opt_str(s.backend_summarization_model),
+    );
+    set(
+        &o,
+        "backendDiarizationModel",
+        opt_str(s.backend_diarization_model),
+    );
+    set(
+        &o,
+        "backendStreamingLatencyMs",
+        opt_num(s.backend_streaming_latency_ms),
+    );
+    set(
+        &o,
+        "backendEnrolledSpeakers",
+        opt_num(s.backend_enrolled_speakers),
+    );
+    set(
+        &o,
+        "backendTotalParticipants",
+        opt_num(s.backend_total_participants),
+    );
     o
 }
 
