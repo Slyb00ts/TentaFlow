@@ -47,7 +47,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
     let router = ctx.state.router.clone();
     tokio::spawn(async move {
-        let messages: Vec<Message> = stream_req
+        let mut messages: Vec<Message> = stream_req
             .messages
             .iter()
             .map(|m| Message {
@@ -57,14 +57,36 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             })
             .collect();
 
+        // Brak system promptu = model nie wie ze ma byc asystentem (zwlaszcza
+        // przy malych base modelach). Wstrzyknij domyslny gdy zaden message
+        // nie ma role=system.
+        let has_system = messages.iter().any(|m| m.role == "system");
+        if !has_system {
+            messages.insert(
+                0,
+                Message {
+                    role: "system".to_string(),
+                    content: Some(MessageContent::Text(
+                        "You are a helpful AI assistant. Answer concisely and on-topic. \
+                         Match the user's language."
+                            .to_string(),
+                    )),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Sane sampling defaults dla chat. Bez nich vllm bierze temperature=1.0
+        // (zbyt randomowe dla 0.8B base/quantized) i max_tokens=None (generuje
+        // do max_model_len = bełkot do EOS). GUI moze nadpisac w request.
         let request = ChatCompletionRequest {
             model: stream_req.model_id.clone(),
             messages,
-            temperature: stream_req.temperature,
-            max_tokens: stream_req.max_tokens,
-            top_p: None,
-            frequency_penalty: None,
-            presence_penalty: None,
+            temperature: Some(stream_req.temperature.unwrap_or(0.7)),
+            max_tokens: Some(stream_req.max_tokens.unwrap_or(1024)),
+            top_p: Some(0.9),
+            frequency_penalty: Some(0.0),
+            presence_penalty: Some(0.0),
             stop: None,
             stream: true,
             user: None,
