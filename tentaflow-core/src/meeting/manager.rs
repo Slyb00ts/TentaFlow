@@ -62,6 +62,21 @@ pub struct SessionDescriptor {
     pub summarization_alias: String,
     pub tts_alias: String,
     pub flow_alias: String,
+    /// Aktualny etap lifecycle bota. `None` gdy sesja jeszcze nie dotknęła
+    /// żadnego stage (np. świeża sesja idle w DB). Patrz `LIFECYCLE_*` w
+    /// `tentaflow_protocol`.
+    pub lifecycle_stage: Option<String>,
+    /// Opcjonalne szczegóły ostatniego stage (np. treść błędu przy `failed`).
+    pub lifecycle_details: Option<String>,
+    /// Last `BackendUpdate` payload from the bot, persisted on the row so the
+    /// live view can replay it on mount. `None` until the bot reports.
+    pub backend_stt_model: Option<String>,
+    pub backend_tts_model: Option<String>,
+    pub backend_summarization_model: Option<String>,
+    pub backend_diarization_model: Option<String>,
+    pub backend_streaming_latency_ms: Option<i64>,
+    pub backend_enrolled_speakers: Option<i64>,
+    pub backend_total_participants: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -182,6 +197,17 @@ impl MeetingManager {
                     rusqlite::params![session_id, outcome.container_id],
                 );
                 drop(conn);
+                // Docker zwrócił success — kontener istnieje. Bot potwierdzi własne
+                // `container_spawned` gdy QUIC server w środku wystartuje, ale już
+                // tu stage jest prawdziwy z perspektywy hosta.
+                if let Err(e) = repository::transcripts::update_session_lifecycle(
+                    &self.db,
+                    &meeting_key,
+                    tentaflow_protocol::LIFECYCLE_CONTAINER_SPAWNED,
+                    None,
+                ) {
+                    warn!("update_session_lifecycle (container_spawned): {}", e);
+                }
                 info!(
                     session = session_id,
                     bot_endpoint_id = %bot_endpoint_id,
@@ -235,15 +261,30 @@ impl MeetingManager {
     /// Zatrzymuje sesję: wyrejestruj z ServiceManager → stop+rm kontener →
     /// release portów → status=ended. Kolejność: najpierw odłącz router
     /// (żeby nie walił reconnect loopem w umierający kontener), potem stop.
+    ///
+    /// `docker stop` waits up to 10s for SIGTERM grace before killing, and
+    /// that wait used to block the dispatcher slot of the calling WSS
+    /// connection — every other binary request from that user queued behind
+    /// Leave for the full grace period. We now do the synchronous bookkeeping
+    /// that the GUI needs to see immediately (status=leaving, service
+    /// unregistered) and detach the slow container teardown into a background
+    /// task. The session row flips to `ended` once that task finishes.
     pub async fn leave_session(&self, session_id: i64) -> Result<()> {
         repository::transcripts::set_session_status(&self.db, session_id, "leaving")?;
         if let Some(ref sm) = self.service_manager {
             sm.remove_quic_service(&Self::service_name(session_id), "meeting-bot");
         }
-        let _ = container::stop(session_id).await;
-        port_pool::release_for_session(&self.db, session_id)?;
-        repository::transcripts::mark_session_ended(&self.db, session_id)?;
-        info!(session = session_id, "Meeting session zakonczona");
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let _ = container::stop(session_id).await;
+            if let Err(e) = port_pool::release_for_session(&db, session_id) {
+                warn!(session = session_id, "release_for_session: {}", e);
+            }
+            if let Err(e) = repository::transcripts::mark_session_ended(&db, session_id) {
+                warn!(session = session_id, "mark_session_ended: {}", e);
+            }
+            info!(session = session_id, "Meeting session zakonczona");
+        });
         Ok(())
     }
 
@@ -311,6 +352,15 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
         summarization_alias: DEFAULT_SUMMARIZATION_ALIAS.to_string(),
         tts_alias: DEFAULT_TTS_ALIAS.to_string(),
         flow_alias: DEFAULT_FLOW_ALIAS.to_string(),
+        lifecycle_stage: row.lifecycle_stage.clone(),
+        lifecycle_details: row.lifecycle_details.clone(),
+        backend_stt_model: row.backend_stt_model.clone(),
+        backend_tts_model: row.backend_tts_model.clone(),
+        backend_summarization_model: row.backend_summarization_model.clone(),
+        backend_diarization_model: row.backend_diarization_model.clone(),
+        backend_streaming_latency_ms: row.backend_streaming_latency_ms,
+        backend_enrolled_speakers: row.backend_enrolled_speakers,
+        backend_total_participants: row.backend_total_participants,
     }
 }
 

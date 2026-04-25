@@ -847,6 +847,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::DeploymentBody(ReqRedeploy { serviceId, forceIfActiveSessions }) */
+  serviceRedeployRequest(correlationId, { serviceId, forceIfActiveSessions = false }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceRedeployRequest(Number(serviceId), !!forceIfActiveSessions);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ServiceDeployRequest { engineId, modelId, deployMethod, nodeId: Uint8Array(32) } */
   serviceDeployRequest(correlationId, { engineId, modelId, deployMethod, nodeId }, sequence = 1) {
     assertReady();
@@ -1043,6 +1055,34 @@ export const encode = {
   deploymentLogStreamRequest(correlationId, { deployId, replayTail = true }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeDeploymentLogStreamRequest(String(deployId || ''), !!replayTail);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Subscribe — otwiera tunel RFB dla sesji meeting, chunki to RFB bytes z kontenera. */
+  vncTunnelOpenRequest(correlationId, { sessionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVncTunnelOpenRequest(Number(sessionId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** One-shot — wysyła RFB input (keyboard/mouse) z przeglądarki do kontenera. */
+  vncTunnelSendRequest(correlationId, { tunnelId, bytes }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVncTunnelSendRequest(String(tunnelId), bytes);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** One-shot — zamyka tunel RFB i zwalnia zasoby po stronie backendu. */
+  vncTunnelCloseRequest(correlationId, { tunnelId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVncTunnelCloseRequest(String(tunnelId));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** One-shot — capture screenshot (PNG) or DOM (HTML) from the bot's Chromium page. */
+  browserCaptureRequest(correlationId, { sessionId, kind, fullPage = false }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBrowserCaptureRequest(Number(sessionId), String(kind), !!fullPage);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -1248,6 +1288,79 @@ export const encode = {
     const values = entries.map((e) => String(e.value));
     const isSecrets = new Uint8Array(entries.map((e) => (e.isSecret ? 1 : 0)));
     const body = _wasm.encodeSettingsUpdateBatch(keys, values, isSecrets);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
+  // Network (interfejsy hosta + konfiguracja bind/filter mesh)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::NetworkBody(NetworkPayload::ReqInterfacesList) — unit. */
+  networkInterfacesListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNetworkInterfacesListRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NetworkBody(NetworkPayload::ReqConfigGet) — unit. */
+  networkConfigGetRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNetworkConfigGetRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NetworkBody(NetworkPayload::ReqRelayStatus) — unit. */
+  networkRelayStatusRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNetworkRelayStatusRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::NetworkBody(NetworkPayload::ReqConfigUpdate(NetworkConfig)).
+   * `payload` akceptuje pola w camelCase lub snake_case (alias), co upraszcza
+   * integracje z istniejacym kodem GUI.
+   */
+  networkConfigUpdateRequest(correlationId, payload, sequence = 1) {
+    assertReady();
+    const bindMode = String(payload.bindMode ?? payload.bind_mode ?? 'auto');
+    const bindIpv4 = String(payload.bindIpv4 ?? payload.bind_ipv4 ?? '');
+    const hideDocker = !!(payload.hideDocker ?? payload.hide_docker);
+    const hideLinkLocal = !!(payload.hideLinkLocal ?? payload.hide_link_local);
+    const hideLoopback = !!(payload.hideLoopback ?? payload.hide_loopback);
+    const hideCgnat = !!(payload.hideCgnat ?? payload.hide_cgnat);
+    const preferSameSubnet = !!(payload.preferSameSubnet ?? payload.prefer_same_subnet);
+    const irohRelayUrl = String(payload.irohRelayUrl ?? payload.iroh_relay_url ?? '');
+    const body = _wasm.encodeNetworkConfigUpdateRequest(
+      bindMode,
+      bindIpv4,
+      hideDocker,
+      hideLinkLocal,
+      hideLoopback,
+      hideCgnat,
+      preferSameSubnet,
+      irohRelayUrl,
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

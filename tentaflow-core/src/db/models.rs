@@ -19,6 +19,11 @@ pub struct DbService {
     pub updated_at: String,
     pub service_uuid: Option<String>,
     pub node_id: Option<String>,
+    /// Sha256 of the container source tree captured at deploy time.
+    /// Compared against the compile-time manifest hash to flag updates.
+    /// NULL for rows created before migration 56.
+    #[serde(default)]
+    pub deployed_source_hash: Option<String>,
 }
 
 /// Backend serwisu

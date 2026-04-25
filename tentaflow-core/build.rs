@@ -615,6 +615,14 @@ mod services_manifest_build {
         pub deploy: DeploySection,
         #[serde(default, rename = "model_preset")]
         pub model_presets: Vec<ModelPreset>,
+        /// Sha256 of the docker build context tree; empty string when the
+        /// manifest has no [deploy.docker] or uses compose_path only.
+        #[serde(default)]
+        pub docker_source_hash: String,
+        /// Sha256 of the native build tree (binary/python-bundle); empty for
+        /// embedded/external runtimes.
+        #[serde(default)]
+        pub native_source_hash: String,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -939,6 +947,87 @@ mod services_manifest_build {
     }
 }
 
+/// Files/extensions excluded from the deterministic source-tree hash. These
+/// are either local build artifacts, editor cruft, or virtualenv state that
+/// must not affect whether a container source is considered "updated".
+const HASH_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+];
+
+const HASH_SKIP_FILES: &[&str] = &[".DS_Store", "Thumbs.db"];
+
+/// Returns true when the path component should be skipped while walking the
+/// source tree for hashing.
+fn hash_should_skip(name: &str) -> bool {
+    if HASH_SKIP_DIRS.iter().any(|d| *d == name) {
+        return true;
+    }
+    if HASH_SKIP_FILES.iter().any(|f| *f == name) {
+        return true;
+    }
+    if name.ends_with(".pyc") || name.ends_with(".pyo") {
+        return true;
+    }
+    false
+}
+
+/// Computes a deterministic sha256 of all files under `root`. The relative
+/// path (with `/` separators) is mixed into the hash, so renames and moves
+/// change the digest. Returns an empty string when `root` does not exist.
+fn compute_source_hash(root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use walkdir::WalkDir;
+
+    if !root.is_dir() {
+        return String::new();
+    }
+
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        !hash_should_skip(&name)
+    });
+
+    for entry in walker.flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = match entry.path().strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        files.push((rel, entry.path().to_path_buf()));
+    }
+
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    for (rel, abs) in &files {
+        hasher.update(rel.as_bytes());
+        hasher.update([0u8]);
+        match std::fs::read(abs) {
+            Ok(bytes) => hasher.update(&bytes),
+            Err(e) => {
+                println!(
+                    "cargo:warning=compute_source_hash: skip {}: {}",
+                    abs.display(),
+                    e
+                );
+            }
+        }
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn generate_services_manifest(out_dir: &Path) {
     use services_manifest_build::{validate, ServiceManifest};
     use std::collections::HashSet;
@@ -1011,7 +1100,7 @@ fn generate_services_manifest(out_dir: &Path) {
             Err(e) => panic!("Nie mozna odczytac manifestu '{}': {}", file.display(), e),
         };
 
-        let manifest: ServiceManifest = match toml::from_str(&content) {
+        let mut manifest: ServiceManifest = match toml::from_str(&content) {
             Ok(m) => m,
             Err(e) => panic!("Bledny TOML w manifescie '{}':\n  {}", file.display(), e),
         };
@@ -1028,6 +1117,28 @@ fn generate_services_manifest(out_dir: &Path) {
                 file.display(),
                 joined
             );
+        }
+
+        // Compute source-tree hashes for docker and native deploy variants.
+        // These seed the `deployed_source_hash` column for each service row
+        // and later let the dashboard flag "update available".
+        if let Some(docker) = manifest.deploy.docker.as_ref() {
+            if let Some(ctx) = docker.context_path.as_deref() {
+                let ctx_path = containers_dir.join(ctx);
+                println!("cargo:rerun-if-changed={}", ctx_path.display());
+                manifest.docker_source_hash = compute_source_hash(&ctx_path);
+            }
+        }
+        if let Some(native) = manifest.deploy.native.as_ref() {
+            let native_root = native
+                .binary_path
+                .as_deref()
+                .or(native.bundle_path.as_deref());
+            if let Some(rel) = native_root {
+                let path = containers_dir.join(rel);
+                println!("cargo:rerun-if-changed={}", path.display());
+                manifest.native_source_hash = compute_source_hash(&path);
+            }
         }
 
         // Globalna unikalnosc engine.id cross-file (poza 4 regulami per-file).

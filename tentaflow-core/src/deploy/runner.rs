@@ -24,7 +24,7 @@ use crate::crypto::SettingsCipher;
 use crate::db::repository as repository;
 use crate::db::repository::deployments as deployments_repo;
 use crate::db::DbPool;
-use crate::deploy::log_bus::{self, BusMessage, LogLine};
+use crate::deploy::log_bus::{self, BusMessage};
 use crate::routing::service_manager::ServiceManager;
 use crate::services::manifest::ModelPreset;
 
@@ -348,6 +348,7 @@ async fn do_docker_deploy(
             }
         }
         register_on_demand_service(db, &engine.engine_id, &engine.category, &image_tag);
+        persist_source_hash(db, &engine.engine_id, "docker", &engine.engine_id);
         log_line(db, deploy_id, tx, "log", "serwis zarejestrowany (on_demand)");
         finish_success(
             db,
@@ -417,6 +418,7 @@ async fn do_docker_deploy(
         host_port,
         node_id,
     );
+    persist_source_hash(db, &engine.engine_id, "docker", &engine.engine_id);
     log_line(db, deploy_id, tx, "log", "serwis zarejestrowany w routerze");
 
     finish_success(
@@ -735,6 +737,8 @@ async fn do_embedded_native_deploy(
             service_manager.register_local_inference_model(&model_repo);
             service_manager.register_local_inference_model(&service_name);
 
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+
             log_line(
                 db,
                 deploy_id,
@@ -780,6 +784,8 @@ async fn do_embedded_native_deploy(
                 &config_json,
                 "single",
             )?;
+
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
             log_line(
                 db,
@@ -1426,6 +1432,41 @@ fn find_gguf_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Stores the source-tree hash of the just-deployed engine against the row
+/// in `services` identified by `service_name`. Failures are warned and
+/// swallowed — the deployment itself already succeeded and this bookkeeping
+/// must not fail the caller.
+fn persist_source_hash(db: &DbPool, engine_id: &str, deploy_method: &str, service_name: &str) {
+    let registry = crate::services::manifest::registry();
+    let Some(manifest) = registry.by_id(engine_id) else {
+        return;
+    };
+    let hash = match deploy_method {
+        "docker" => manifest.docker_source_hash.as_str(),
+        "native" => manifest.native_source_hash.as_str(),
+        _ => return,
+    };
+    if hash.is_empty() {
+        return;
+    }
+    let services = match crate::db::repository::list_services(db) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("persist_source_hash: list_services: {}", e);
+            return;
+        }
+    };
+    let Some(row) = services.into_iter().find(|s| s.name == service_name) else {
+        return;
+    };
+    if let Err(e) = crate::db::repository::set_deployed_source_hash(db, row.id, hash) {
+        warn!(
+            "persist_source_hash({}): set_deployed_source_hash: {}",
+            engine_id, e
+        );
+    }
+}
+
 fn register_service(
     db: &DbPool,
     service_manager: &Arc<ServiceManager>,
@@ -1579,36 +1620,9 @@ fn parse_progress_line(
     None
 }
 
-fn log_line(
-    db: &DbPool,
-    deploy_id: &str,
-    tx: &broadcast::Sender<BusMessage>,
-    kind: &str,
-    line: &str,
-) {
-    let _ = deployments_repo::append_log_line(db, deploy_id, line);
-    let _ = tx.send(BusMessage::Line(LogLine {
-        deploy_id: deploy_id.to_string(),
-        kind: kind.to_string(),
-        line: line.to_string(),
-        phase: String::new(),
-        progress_pct: 0,
-        ts_ms: log_bus::now_ms(),
-    }));
-}
-
-fn progress(db: &DbPool, deploy_id: &str, tx: &broadcast::Sender<BusMessage>, pct: u32) {
-    let _ = deployments_repo::set_status(db, deploy_id, "building", "building", pct);
-    let _ = tx.send(BusMessage::Line(LogLine {
-        deploy_id: deploy_id.to_string(),
-        kind: "progress".to_string(),
-        line: String::new(),
-        phase: "building".to_string(),
-        progress_pct: pct,
-        ts_ms: log_bus::now_ms(),
-    }));
-}
-
+use log_bus::{finish_success, log_line, progress};
+// Wraps `log_bus::phase` so the runner also emits an `info!` span — helpful
+// when tailing tentaflow logs. Other callers can use `log_bus::phase` directly.
 fn phase(
     db: &DbPool,
     deploy_id: &str,
@@ -1617,38 +1631,8 @@ fn phase(
     pct: u32,
     phase_name: &str,
 ) {
-    let _ = deployments_repo::set_status(db, deploy_id, status, phase_name, pct);
-    let _ = tx.send(BusMessage::Line(LogLine {
-        deploy_id: deploy_id.to_string(),
-        kind: "phase".to_string(),
-        line: phase_name.to_string(),
-        phase: phase_name.to_string(),
-        progress_pct: pct,
-        ts_ms: log_bus::now_ms(),
-    }));
+    log_bus::phase(db, deploy_id, tx, status, pct, phase_name);
     info!(deploy_id = %deploy_id, status = %status, phase = %phase_name, pct, "deployment phase");
-}
-
-async fn finish_success(
-    db: &DbPool,
-    deploy_id: &str,
-    tx: &broadcast::Sender<BusMessage>,
-    start_ms: i64,
-    image_tag: String,
-    container_name: String,
-) {
-    let _ = deployments_repo::mark_finished(db, deploy_id, "success", None);
-    let _ = tx.send(BusMessage::End {
-        deploy_id: deploy_id.to_string(),
-        final_status: "success".to_string(),
-        image_tag,
-        container_name,
-        error_message: String::new(),
-        duration_ms: log_bus::now_ms() - start_ms,
-    });
-    // Daj szansę subscriberom otrzymać End zanim zamkniemy kanał.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    log_bus::close(deploy_id);
 }
 
 /// Pakuje `root` do `tar_builder`, pomijając symlinki i foldery target/,

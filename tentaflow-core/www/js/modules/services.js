@@ -15,6 +15,8 @@ import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
 import { TfWindow } from '/js/components/tf-window.js';
+import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
+import { openUpdateModal } from '/js/modules/services/update-modal.js';
 
 let services = [];
 let aliases = [];
@@ -85,6 +87,7 @@ async function loadAll() {
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
       ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
+      ManifestStore.init().catch(() => false),
     ]);
     services = svc || [];
     aliases = al || [];
@@ -215,6 +218,23 @@ function bindTabEvents() {
       stopService(b.dataset.svcDelete, b.dataset.svcName);
     };
   });
+  body.querySelectorAll('[data-svc-update]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const svc = services.find((x) => String(x.id) === b.dataset.svcUpdate);
+      if (svc) {
+        openUpdateModal({
+          service: svc,
+          onUpdated: async () => {
+            services = await ApiBinary.list('serviceListRequest').catch(() => services);
+            patchListTab();
+            updateSubtitle();
+            updateTabCounts();
+          },
+        });
+      }
+    };
+  });
   body.querySelectorAll('[data-empty-cta]').forEach((b) => {
     b.onclick = () => Router.navigate('catalog');
   });
@@ -273,6 +293,7 @@ function renderRow(s) {
   const deployMode = extractDeployMode(cfg);
   const nodeLabel = s.nodeHostname
     || (s.nodeId ? `${s.nodeId.slice(0, 12)}…` : I18n.t('services.deploy_local'));
+  const updateInfo = evaluateUpdate(s, cfg);
   const isOnDemand = String(s.status || '').toLowerCase() === 'on_demand' || !!cfg?.on_demand;
   const onDemandLabel = I18n.t('services.status.on_demand');
   const quicAddrCell = isOnDemand
@@ -287,6 +308,7 @@ function renderRow(s) {
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
           <strong style="color: var(--accent-2);">${escapeHtml(s.name)}</strong>
           ${deployMode ? `<span class="scope-chip mesh-admin">${escapeHtml(deployMode)}</span>` : ''}
+          ${updateInfo.badge ? `<tf-chip status="${updateInfo.badge.variant}" dot>${escapeHtml(I18n.t(updateInfo.badge.labelKey))}</tf-chip>` : ''}
         </div>
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_type'))}"><span class="scope-chip ${typeChipClass(s.serviceType)}">${escapeHtml((s.serviceType || '').toUpperCase())}</span></td>
@@ -295,6 +317,11 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}">${quicStatusCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;">
+        ${updateInfo.canRebuild ? (() => {
+          const labelKey = updateInfo.updateAvailable ? 'services.update_button' : 'services.rebuild_button';
+          const variant = updateInfo.updateAvailable ? 'primary' : 'ghost';
+          return `<tf-button variant="${variant}" size="sm" icon="refresh" data-svc-update="${escapeAttr(s.id)}" title="${escapeAttr(I18n.t(labelKey))}">${escapeHtml(I18n.t(labelKey))}</tf-button>`;
+        })() : ''}
         <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
       </td>
     </tr>
@@ -780,6 +807,59 @@ function extractQuicAddr(cfg) {
   if (cfg.quic_url) return String(cfg.quic_url).replace(/^quic:\/\//, '');
   if (cfg.quic_port && cfg.agent_domain) return `${cfg.agent_domain}:${cfg.quic_port}`;
   return '';
+}
+
+/// Determines whether the deployed instance is out of date vs. the manifest's
+/// current source hash. Returns:
+///   - showButton: render the "Update" action button
+///   - badge: { variant, labelKey } or null (chip rendered next to service name)
+/// External / embedded / unknown-method deployments never show the button
+/// because we have no source tree to rebuild from.
+function evaluateUpdate(service, cfg) {
+  // On-demand services like teams-bot register without engine_id in config_json,
+  // so fall back to service.name which equals the manifest engine.id for them.
+  const engineId = service.engineId || cfg?.engine_id || cfg?.engineId || service.name || '';
+  // Registrations in the wild use deploy_mode, deploy_method, camelCase, or
+  // snake_case interchangeably — accept any of them rather than forcing a
+  // migration of existing rows.
+  const rawMethod = (
+    service.deployMethod
+    || cfg?.deploy_method
+    || cfg?.deployMethod
+    || cfg?.deploy_mode
+    || cfg?.deployMode
+    || ''
+  ).toLowerCase();
+  if (!engineId || !ManifestStore.isLoaded()) {
+    return { canRebuild: false, badge: null };
+  }
+  if (rawMethod === 'external') {
+    return { canRebuild: false, badge: { variant: 'info', labelKey: 'services.update_managed_externally' } };
+  }
+  if (rawMethod !== 'docker' && rawMethod !== 'native') {
+    return { canRebuild: false, badge: null };
+  }
+  const manifest = ManifestStore.byId(engineId);
+  if (!manifest) {
+    return { canRebuild: false, badge: null };
+  }
+  const manifestHash = rawMethod === 'docker'
+    ? (manifest.docker_source_hash || '')
+    : (manifest.native_source_hash || '');
+  if (!manifestHash) {
+    // Source-less deploy kind (embedded feature-flag, or manifest predates the
+    // hash feature) — nothing to compare, nothing to update.
+    return { canRebuild: false, badge: null };
+  }
+  const deployedHash = service.deployedSourceHash || '';
+  const updateAvailable = deployedHash !== manifestHash;
+  return {
+    canRebuild: true,
+    updateAvailable,
+    badge: updateAvailable
+      ? { variant: 'warn', labelKey: 'services.update_available' }
+      : null,
+  };
 }
 
 function extractDeployMode(cfg) {

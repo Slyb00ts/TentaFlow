@@ -331,6 +331,11 @@ pub struct ServiceSummary {
     pub engine_id: Option<String>,
     /// Identyfikator modelu (jesli serwis obsluguje konkretny model).
     pub model_id: Option<String>,
+    /// Source-tree hash captured at last deploy. `None` for instances created
+    /// before the update-detection feature. GUI compares this with the
+    /// manifest's current `docker_source_hash`/`native_source_hash` to decide
+    /// whether an update is available.
+    pub deployed_source_hash: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -912,6 +917,74 @@ pub struct SettingEntry {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct SettingsUpdateRequest {
     pub entries: Vec<SettingEntry>,
+}
+
+// =============================================================================
+// Mesh & Network settings (IPv4-only enumeracja NIC + reguly bind/advertise)
+// =============================================================================
+
+/// Pojedynczy interfejs sieciowy hosta z adresami IPv4 (v6 odrzucane).
+/// `kind` jest znormalizowaną kategorią dla GUI (nie surowy `InterfaceType`).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceInfo {
+    pub name: String,
+    pub mac: String,
+    pub ipv4_addrs: Vec<String>,
+    pub mtu: u32,
+    /// "ethernet" | "wifi" | "loopback" | "docker" | "tunnel" | "virtual" | "unknown"
+    pub kind: String,
+    pub is_up: bool,
+    pub description: String,
+}
+
+/// Perzistowana konfiguracja mesh networking. `bind_mode="auto"` pozwala iroh
+/// bindowac 0.0.0.0, `"custom"` wymusza `bind_ipv4`. Flagi `hide_*` filtruja
+/// adresy wysylane peerom. `iroh_relay_url` pusty = default N0 preset.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkConfig {
+    /// "auto" | "custom"
+    pub bind_mode: String,
+    pub bind_ipv4: String,
+    pub hide_docker: bool,
+    pub hide_link_local: bool,
+    pub hide_loopback: bool,
+    pub hide_cgnat: bool,
+    pub prefer_same_subnet: bool,
+    pub iroh_relay_url: String,
+}
+
+/// Snapshot zdrowia relay iroh — co backend wie o aktualnym stanie polaczenia
+/// z konfigurowanym serwerem relay + faktyczny adres bind iroh endpointu.
+/// `rtt_ms == 0` gdy relay unreachable; `last_success_unix_secs == 0` gdy nigdy
+/// nie udalo sie zpingowac. `status` jest jedna z czterech wartosci:
+/// `"connected" | "degraded" | "unreachable" | "disabled"`.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelayHealthInfo {
+    pub url: String,
+    pub reachable: bool,
+    pub rtt_ms: u32,
+    pub last_check_unix_secs: i64,
+    pub last_success_unix_secs: i64,
+    pub status: String,
+    /// Realny adres bind iroh endpointu (np. "192.168.0.93:8090" lub
+    /// "0.0.0.0:8090" gdy fallback z custom IP). To jest to co iroh REALNIE
+    /// zbindowal, nie zadanie z DB — dzieki temu GUI moze pokazac fallback.
+    pub bind_addr_actual: String,
+}
+
+/// Skonsolidowany payload dla Mesh & Network settings — 6 logicznych variantow
+/// (interfaces list req/res, config get req/res, config update req/res) zajmuje
+/// 1 slot w `MessageBody` zeby zmiescic sie w 256-variant limicie rkyv.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum NetworkPayload {
+    ReqInterfacesList,
+    ResInterfacesList { interfaces: Vec<NetworkInterfaceInfo> },
+    ReqConfigGet,
+    ResConfigGet(NetworkConfig),
+    ReqConfigUpdate(NetworkConfig),
+    ResConfigUpdate { restart_required: bool },
+    ReqRelayStatus,
+    ResRelayStatus(RelayHealthInfo),
 }
 
 // =============================================================================
@@ -2239,6 +2312,46 @@ pub enum DeploymentPayload {
     ReqLogStream(DeploymentLogStreamRequest),
     StreamChunk(DeploymentStreamChunk),
     StreamEnd(DeploymentStreamEnd),
+    /// Redeploy an already-deployed service from a refreshed source tree.
+    /// Caller obtains the streaming deploy_id in `ResRedeploy` and then
+    /// subscribes through the existing `ReqLogStream` flow.
+    ReqRedeploy(ServiceRedeployRequest),
+    ResRedeploy(ServiceRedeployResponse),
+}
+
+/// Possible `status` values returned in `ServiceRedeployResponse`. Kept as
+/// constants so dispatch handler and GUI share one source of truth.
+pub const REDEPLOY_STATUS_STARTED: &str = "started";
+pub const REDEPLOY_STATUS_ACTIVE_SESSIONS: &str = "active_sessions";
+pub const REDEPLOY_STATUS_NO_SOURCE: &str = "no_source";
+pub const REDEPLOY_STATUS_UNSUPPORTED: &str = "unsupported";
+pub const REDEPLOY_STATUS_NOT_FOUND: &str = "not_found";
+pub const REDEPLOY_STATUS_FAILED: &str = "failed";
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRedeployRequest {
+    pub service_id: i64,
+    /// For agents (teams-bot): when `false` and the engine has live meeting
+    /// sessions, handler returns `active_sessions` without stopping anything.
+    /// GUI is expected to ask the user first; backend does not re-prompt.
+    pub force_if_active_sessions: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRedeployResponse {
+    /// One of the `REDEPLOY_STATUS_*` constants.
+    pub status: String,
+    /// Streaming id — subscribe via `DeploymentLogStreamRequest{deploy_id}`.
+    /// Empty unless `status == "started"`.
+    pub deploy_id: String,
+    /// New manifest source hash once rebuild succeeds. Empty while the job
+    /// runs — the GUI reads the final value from the `services` row after
+    /// the stream ends.
+    pub new_hash: String,
+    /// Human-readable detail for non-success statuses.
+    pub error: String,
+    /// Populated when `status == "active_sessions"`; zero otherwise.
+    pub active_session_count: u32,
 }
 
 // =============================================================================
@@ -2263,6 +2376,22 @@ pub struct MeetingSessionDescriptor {
     pub bot_endpoint_id: String,
     pub container_name: String,
     pub owner_user_id: i64,
+    /// Aktualny etap lifecycle bota (patrz `LIFECYCLE_*` w `types.rs`).
+    /// Pusty string gdy sesja jeszcze nie dotknęła żadnego etapu.
+    pub lifecycle_stage: String,
+    /// Opcjonalne szczegóły ostatniego etapu (np. treść błędu przy `failed`).
+    /// Pusty string = brak dodatkowych informacji.
+    pub lifecycle_details: String,
+    /// Backend models reported by the bot via BackendUpdate. Empty string
+    /// when the bot has not reported the field yet (live view shows a
+    /// placeholder). Numeric counters use `-1` as the same sentinel.
+    pub backend_stt_model: String,
+    pub backend_tts_model: String,
+    pub backend_summarization_model: String,
+    pub backend_diarization_model: String,
+    pub backend_streaming_latency_ms: i64,
+    pub backend_enrolled_speakers: i64,
+    pub backend_total_participants: i64,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -2446,6 +2575,135 @@ pub struct MeetingTranscriptExportResponse {
     pub content: String,
 }
 
+// =============================================================================
+// Meeting VNC tunnel — same-node websockify bridge through dashboard WSS.
+// =============================================================================
+//
+// Phase A: frontend opens `VncTunnelOpenRequest{session_id}` as a subscription.
+// Handler bridges a TCP connection to the container's novnc port (websockify)
+// and streams RFB bytes back as `VncTunnelChunk`. Reverse direction (keyboard/
+// mouse events) uses one-shot `VncTunnelSendRequest{tunnel_id, bytes}`. On TCP
+// end a `VncTunnelStreamEnd` is emitted and the tunnel entry is cleaned up.
+// Cross-node forwarding over iroh is reserved for phase B (remote_node status).
+
+pub const VNC_TUNNEL_OPEN_OK: &str = "ok";
+pub const VNC_TUNNEL_OPEN_NOT_FOUND: &str = "not_found";
+pub const VNC_TUNNEL_OPEN_FORBIDDEN: &str = "forbidden";
+pub const VNC_TUNNEL_OPEN_NO_PORT: &str = "no_port";
+pub const VNC_TUNNEL_OPEN_REMOTE_NODE: &str = "remote_node";
+pub const VNC_TUNNEL_OPEN_FAILED: &str = "failed";
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelOpenRequest {
+    pub session_id: i64,
+}
+
+/// First frame on the subscription stream. When `status != "ok"`, the stream
+/// also ends immediately and `tunnel_id` is empty.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelOpenResponse {
+    pub status: String,
+    pub tunnel_id: String,
+    pub error: String,
+}
+
+/// RFB bytes read from the container TCP socket, pushed to the browser.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelChunk {
+    pub tunnel_id: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Browser → container RFB bytes (keyboard/mouse, client init). One-shot.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelSendRequest {
+    pub tunnel_id: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelSendResponse {
+    pub ok: bool,
+    pub error: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelCloseRequest {
+    pub tunnel_id: String,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelCloseResponse {
+    pub ok: bool,
+}
+
+/// Emitted as the terminal stream chunk when the container-side TCP socket
+/// closes (either EOF, I/O error, or handler-initiated shutdown).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct VncTunnelStreamEnd {
+    pub tunnel_id: String,
+    pub reason: String,
+}
+
+/// Single inner enum carrying every VNC tunnel message so the top-level
+/// `MessageBody` spends only one variant slot on the feature.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum VncTunnelPayload {
+    ReqOpen(VncTunnelOpenRequest),
+    ResOpen(VncTunnelOpenResponse),
+    Chunk(VncTunnelChunk),
+    ReqSend(VncTunnelSendRequest),
+    ResSend(VncTunnelSendResponse),
+    ReqClose(VncTunnelCloseRequest),
+    ResClose(VncTunnelCloseResponse),
+    StreamEnd(VncTunnelStreamEnd),
+}
+
+// =============================================================================
+// Meeting Browser Capture — jednorazowe zapytania do teams-bot po screenshot
+// albo snapshot DOM aktywnej strony Chromium. Dashboard pyta przez WSS,
+// handler otwiera bistream do bota i dostaje `BrowserResult` w `ModelResponse`.
+// =============================================================================
+
+pub const BROWSER_CAPTURE_OK: &str = "ok";
+pub const BROWSER_CAPTURE_NOT_FOUND: &str = "not_found";
+pub const BROWSER_CAPTURE_FORBIDDEN: &str = "forbidden";
+pub const BROWSER_CAPTURE_REMOTE_NODE: &str = "remote_node";
+pub const BROWSER_CAPTURE_FAILED: &str = "failed";
+
+pub const BROWSER_CAPTURE_KIND_SCREENSHOT: &str = "screenshot";
+pub const BROWSER_CAPTURE_KIND_DOM: &str = "dom";
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCaptureRequest {
+    pub session_id: i64,
+    /// `"screenshot"` albo `"dom"`. Inna wartość => `status="failed"`.
+    pub kind: String,
+    /// Ignorowane gdy `kind="dom"`. Dla screenshota: true => cała strona ze
+    /// scrollowaniem, false => tylko viewport.
+    pub full_page: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCaptureResponse {
+    pub status: String,
+    pub kind: String,
+    /// Populated gdy `kind="screenshot"` i `status="ok"`.
+    pub png: Vec<u8>,
+    /// Populated gdy `kind="dom"` i `status="ok"`.
+    pub html: String,
+    /// Opis błędu gdy `status != "ok"`.
+    pub error: String,
+}
+
+/// Single inner enum carrying both browser capture messages so the top-level
+/// `MessageBody` spends only one variant slot on the feature.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum BrowserCapturePayload {
+    Request(BrowserCaptureRequest),
+    Response(BrowserCaptureResponse),
+}
+
 /// Zbiorczy payload Meeting Bot (req + res w jednym enumie). Handler rozpoznaje
 /// wariant i zwraca odpowiedni Res*. Pozwala na jeden wariant w MessageBody.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -2494,6 +2752,14 @@ pub struct TranslateResponse {
     pub detected_source_lang: Option<String>,
     pub model_used: String,
     pub tokens_used: i32,
+}
+
+// Skonsolidowane w `TranslatePayload` — 1 slot w `MessageBody` zamiast 2,
+// zeby zmiescic sie w limicie 256 wariantow rkyv 0.8.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum TranslatePayload {
+    Req(TranslateRequest),
+    Res(TranslateResponse),
 }
 
 // =============================================================================
@@ -2840,6 +3106,10 @@ pub enum MessageBody {
     SettingsUpdateRequestBody(SettingsUpdateRequest),
     SettingsUpdateResponse { applied: u32 },
 
+    // ---- Mesh & Network settings (enumeracja NIC + bind/advertise rules) ----
+    // Skonsolidowane w `NetworkPayload` — 1 slot w enum (256-variant limit rkyv).
+    NetworkBody(NetworkPayload),
+
     // ---- Dashboard (R-LIST + subscription candidate) ----
     DashboardMetricsRequest,
     DashboardMetricsResponse(DashboardSnapshot),
@@ -2942,6 +3212,12 @@ pub enum MessageBody {
     // ---- Meeting Bot (single-variant, req+res w inner enum) ----
     MeetingBody(MeetingPayload),
 
+    // ---- Meeting VNC tunnel (one slot for entire R-STREAM + two one-shot RPCs) ----
+    VncTunnelBody(VncTunnelPayload),
+
+    // ---- Meeting browser capture (one-shot RPC: screenshot / DOM snapshot) ----
+    BrowserCaptureBody(BrowserCapturePayload),
+
     // ---- Meeting live broadcast (unsolicited push, correlation_id=0) ----
     // Pushowany z writer task w ws_binary po każdym sukcesie
     // `persist_meeting_event`. Filtr ownership (owner_user_id) stosowany
@@ -2957,8 +3233,7 @@ pub enum MessageBody {
     SystemEventBody(SystemEventPayload),
 
     // ---- Translate (LLM-backed) ----
-    TranslateRequestBody(TranslateRequest),
-    TranslateResponseBody(TranslateResponse),
+    TranslateBody(TranslatePayload),
 
     // ---- Users list (Admin) ----
     // UsersList* consolidated into IamBody (below) jako ReqListUsers/ResListUsers.
