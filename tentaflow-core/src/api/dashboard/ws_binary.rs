@@ -388,111 +388,62 @@ pub async fn handle_ws_connection<S>(
 
                     tokio::spawn(async move {
                         let mut rx = rx;
-                        // Batch writer: drain do BATCH_MAX events w jednym
-                        // sink.lock, feed po kolei (no flush per frame),
-                        // flush raz na koniec batch'u. Dla szybkich silnikow
-                        // (~900 tok/s na hi-end GPU) zmniejsza liczbe syscall
-                        // write i mutex acquire ~16x. recv_many naturalnie
-                        // grupuje pending events bez explicit timera —
-                        // pierwsza recv blokuje, kolejne sa drained from
-                        // channel buffer (subscription mpsc cap 64).
-                        const BATCH_MAX: usize = 16;
-                        let mut buffer: Vec<SubscriptionEvent> =
-                            Vec::with_capacity(BATCH_MAX);
-                        let mut stream_finished = false;
-
-                        loop {
-                            buffer.clear();
-                            let n = rx.recv_many(&mut buffer, BATCH_MAX).await;
-                            if n == 0 {
-                                break; // channel closed
-                            }
-
-                            // Encode wszystkie frame'y z batch'u przed sink.lock —
-                            // rkyv encode jest CPU bound, lepiej zrobic to bez
-                            // trzymania mutex'a (inne writer task moga rownolegle).
-                            type Frame = (Vec<u8>, bool); // (bytes, is_terminal)
-                            let mut frames: Vec<Frame> = Vec::with_capacity(n * 3);
-
-                            for event in buffer.drain(..) {
-                                match event {
-                                    SubscriptionEvent::Chunk(chunk_body) => {
-                                        if let Some(b) = encode_envelope_bytes(
-                                            correlation_id,
-                                            next_seq(&seq_clone),
-                                            message_kind,
-                                            &chunk_body,
-                                            EnvelopeFlags::IS_STREAM_CHUNK,
-                                        ) {
-                                            frames.push((b, false));
-                                        }
-                                    }
-                                    SubscriptionEvent::End(final_body) => {
-                                        let token = resume_token::issue(
-                                            correlation_id as u128,
-                                            seq_clone.load(Ordering::SeqCst),
-                                            originating_user_id,
-                                            &resume_secret_clone,
-                                        );
-                                        if let Some(b) = encode_envelope_bytes(
-                                            correlation_id,
-                                            next_seq(&seq_clone),
-                                            message_kind,
-                                            &MessageBody::SubscribeResumeOffer {
-                                                resume_token: token,
-                                            },
-                                            EnvelopeFlags::empty(),
-                                        ) {
-                                            frames.push((b, false));
-                                        }
-                                        let body = final_body
-                                            .unwrap_or(MessageBody::MetaCancelStream);
-                                        if let Some(b) = encode_envelope_bytes(
-                                            correlation_id,
-                                            next_seq(&seq_clone),
-                                            message_kind,
-                                            &body,
-                                            EnvelopeFlags::IS_STREAM_END,
-                                        ) {
-                                            frames.push((b, true));
-                                        }
-                                        stream_finished = true;
-                                    }
-                                    SubscriptionEvent::Error(err) => {
-                                        if let Some(b) = encode_envelope_bytes(
-                                            correlation_id,
-                                            next_seq(&seq_clone),
-                                            message_kind,
-                                            &MessageBody::Error(err),
-                                            EnvelopeFlags::IS_ERROR
-                                                | EnvelopeFlags::IS_STREAM_END,
-                                        ) {
-                                            frames.push((b, true));
-                                        }
-                                        stream_finished = true;
-                                    }
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                SubscriptionEvent::Chunk(chunk_body) => {
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &chunk_body,
+                                        EnvelopeFlags::IS_STREAM_CHUNK,
+                                    )
+                                    .await;
                                 }
-                            }
-
-                            // Single sink.lock acquire — send wszystkie frames
-                            // pod tym samym mutexem (zmniejsza kontestowanie
-                            // z innymi writer tasks: broadcasty heartbeat,
-                            // mesh updates). Uzywamy `send` (= feed + flush)
-                            // per frame zamiast feed-N + flush bo tungstenite
-                            // moze miec write buffer limit ktory zatka caly
-                            // stream gdy zbyt wiele feed'ow przed flush.
-                            if !frames.is_empty() {
-                                let mut guard = sink_clone.lock().await;
-                                for (bytes, _) in frames {
-                                    if guard.send(Message::Binary(bytes.into())).await.is_err() {
-                                        stream_finished = true;
-                                        break;
-                                    }
+                                SubscriptionEvent::End(final_body) => {
+                                    let token = resume_token::issue(
+                                        correlation_id as u128,
+                                        seq_clone.load(Ordering::SeqCst),
+                                        originating_user_id,
+                                        &resume_secret_clone,
+                                    );
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &MessageBody::SubscribeResumeOffer {
+                                            resume_token: token,
+                                        },
+                                        EnvelopeFlags::empty(),
+                                    )
+                                    .await;
+                                    let body =
+                                        final_body.unwrap_or_else(|| MessageBody::MetaCancelStream);
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &body,
+                                        EnvelopeFlags::IS_STREAM_END,
+                                    )
+                                    .await;
+                                    break;
                                 }
-                            }
-
-                            if stream_finished {
-                                break;
+                                SubscriptionEvent::Error(err) => {
+                                    let _ = send_body(
+                                        &sink_clone,
+                                        correlation_id,
+                                        next_seq(&seq_clone),
+                                        message_kind,
+                                        &MessageBody::Error(err),
+                                        EnvelopeFlags::IS_ERROR | EnvelopeFlags::IS_STREAM_END,
+                                    )
+                                    .await;
+                                    break;
+                                }
                             }
                         }
                         // Cleanup po naturalnym koncu (writer task wie kiedy stream sie konczy).
