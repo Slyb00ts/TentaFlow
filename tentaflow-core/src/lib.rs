@@ -23,6 +23,7 @@ pub mod prompt_registry;
 pub mod routing;
 pub mod services;
 pub mod stt;
+pub mod tts;
 
 #[cfg(feature = "inference-diarization")]
 pub mod diarization;
