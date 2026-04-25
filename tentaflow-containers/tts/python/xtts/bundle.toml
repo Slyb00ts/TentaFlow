@@ -32,9 +32,9 @@ extras = ["torch==2.4.0", "torchaudio==2.4.0"]
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
 # usunieta w >=4.57). Force-pin nadpisuje resolver po main install.
 force_pins = [
-    "transformers==4.49.0",
-    "tokenizers==0.21.0",
-    "huggingface-hub==0.26.5",
+    "transformers==4.55.4",
+    "tokenizers==0.21.4",
+    "huggingface-hub==0.34.4",
 ]
 
 [[install_variants]]
@@ -46,9 +46,9 @@ extras = ["torch==2.4.0", "torchaudio==2.4.0"]
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
 # usunieta w >=4.57). Force-pin nadpisuje resolver po main install.
 force_pins = [
-    "transformers==4.49.0",
-    "tokenizers==0.21.0",
-    "huggingface-hub==0.26.5",
+    "transformers==4.55.4",
+    "tokenizers==0.21.4",
+    "huggingface-hub==0.34.4",
 ]
 
 [[install_variants]]
@@ -59,7 +59,7 @@ extras = ["torch==2.4.0", "torchaudio==2.4.0"]
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
 # usunieta w >=4.57). Force-pin nadpisuje resolver po main install.
 force_pins = [
-    "transformers==4.49.0",
-    "tokenizers==0.21.0",
-    "huggingface-hub==0.26.5",
+    "transformers==4.55.4",
+    "tokenizers==0.21.4",
+    "huggingface-hub==0.34.4",
 ]
