@@ -13,6 +13,7 @@ use chromiumoxide::page::Page;
 use futures::StreamExt;
 use tentaflow_protocol::{
     MeetingEventPayload, LIFECYCLE_BROWSER_LAUNCHED, LIFECYCLE_JOINED, LIFECYCLE_JOINING,
+    LIFECYCLE_LOBBY_WAITING,
     LIFECYCLE_NAVIGATING, LIFECYCLE_PREJOIN_READY,
 };
 use tokio::sync::Mutex;
@@ -305,13 +306,25 @@ pub async fn join_meeting(
         );
     }
 
-    // Czekamy na potwierdzenie ze jestesmy w spotkaniu (po auto-join lub manualnym VNC)
+    // Czekamy na potwierdzenie ze jestesmy w spotkaniu (po auto-join lub manualnym VNC).
+    // Lobby state needs its own emit so the dashboard can distinguish "waiting
+    // to be admitted" from "in the meeting"; we also de-bounce the lobby emit
+    // so it only fires once per polling burst.
+    let mut emitted_lobby = false;
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
-        if is_in_meeting(&page).await? {
-            tracing::info!("Pomyslnie dolaczono do spotkania");
-            emit_lifecycle(router, meeting_key, LIFECYCLE_JOINED, None).await;
-            return Ok(page);
+        match detect_meeting_progress(&page).await? {
+            MeetingProgress::InMeeting => {
+                tracing::info!("Pomyslnie dolaczono do spotkania");
+                emit_lifecycle(router, meeting_key, LIFECYCLE_JOINED, None).await;
+                return Ok(page);
+            }
+            MeetingProgress::Lobby if !emitted_lobby => {
+                tracing::info!("Bot w lobby — czekamy na admit hosta");
+                emit_lifecycle(router, meeting_key, LIFECYCLE_LOBBY_WAITING, None).await;
+                emitted_lobby = true;
+            }
+            _ => {}
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -342,41 +355,109 @@ async fn click_when_present(
     anyhow::bail!("Timeout czekajac na element: {}", label)
 }
 
-/// Sprawdza czy jestesmy w aktywnym spotkaniu (wykrywanie elementow UI).
-/// Dziala zarowno dla klasycznego Teams jak i light-meetings experience.
-async fn is_in_meeting(page: &Page) -> Result<bool> {
-    // Teams 2026 uses button id="hangup-button" (title="Leave") plus a handful of
-    // stable data-tid hooks on the stage wrappers. Older Teams builds still ship
-    // the data-tid="hangup-button" / "call-end" variants, so keep both families.
-    let in_meeting = page
+/// Three-state classification of where the bot's Chromium currently sits in
+/// the Teams join flow. We used to flatten this into a single is_in_meeting()
+/// boolean, but the call controls (#hangup-button, #mic-button) are also
+/// rendered inside the lobby waiting screen — flipping LIFECYCLE_JOINED the
+/// moment those appeared made the dashboard report LIVE while the bot was
+/// still waiting to be admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeetingProgress {
+    /// No call surface yet — still in prejoin / device picker / loading.
+    NotYet,
+    /// Lobby panel is showing. The "Waiting for someone to let you in"
+    /// screen — the bot has clicked Join, the meeting page acknowledged
+    /// it, but the host has not admitted us. Mic/Hangup buttons exist but
+    /// are wired to lobby controls.
+    Lobby,
+    /// Real call surface — the stage layout is live and the bot is in the
+    /// meeting proper.
+    InMeeting,
+}
+
+async fn detect_meeting_progress(page: &Page) -> Result<MeetingProgress> {
+    let raw = page
         .evaluate(
             r#"
             (function() {
-                if (document.querySelector('#hangup-button')) return true;
-                if (document.querySelector('#mic-button')) return true;
-                if (document.querySelector('[data-tid="modern-stage-wrapper"]')) return true;
-                if (document.querySelector('[data-tid="calling-right-side-panel"]')) return true;
-                if (document.querySelector('[data-tid="MixedStage-wrapper"]')) return true;
-                if (document.querySelector('[data-tid="call-end"]')) return true;
-                if (document.querySelector('[data-tid="toggle-mute"]')) return true;
-                if (document.querySelector('[data-tid="toggle-video"]')) return true;
-                if (document.querySelector('[data-tid="calling-bar"]')) return true;
-                if (document.querySelector('[data-tid="hangup-button"]')) return true;
-                if (document.querySelector('[aria-label="Leave"], [aria-label="Hang up"], [aria-label="Leave call"]')) return true;
-                if (document.querySelector('button[title="Leave"]')) return true;
-                const audios = document.querySelectorAll('audio');
-                for (const a of audios) {
-                    if (a.srcObject && a.srcObject.getAudioTracks && a.srcObject.getAudioTracks().length > 0) return true;
+                // Lobby probes first — Teams light-meetings shows a 'When the
+                // meeting starts' / 'Someone will let you in soon' panel and
+                // tags it with data-tid="prejoin-meet-now" or text on the
+                // page. Classic Teams uses data-tid="lobby-screen" or aria-live
+                // 'You're in the lobby'.
+                const bodyText = (document.body && document.body.innerText) || '';
+                const lobbyPhrases = [
+                    'someone in the meeting will let you in',
+                    "you're in the lobby",
+                    'someone will let you in',
+                    'when you are admitted',
+                    'when you\'re admitted',
+                    'waiting for the host',
+                    'kogos w spotkaniu wpusci',
+                    'oczekiwanie na wpuszczenie',
+                    'gdy zostaniesz wpuszczony',
+                ];
+                const lower = bodyText.toLowerCase();
+                const phraseHit = lobbyPhrases.some((p) => lower.indexOf(p) !== -1);
+                const lobbyTids = ['lobby-screen', 'lobby-wait-screen',
+                    'prejoin-meeting-info', 'lobby-waiting-room'];
+                const lobbyTidHit = lobbyTids.some((t) =>
+                    document.querySelector('[data-tid="' + t + '"]'));
+                const inLobby = phraseHit || lobbyTidHit;
+
+                // True call indicators — the stage wrapper plus visible
+                // remote tiles or the participant roster reporting >1.
+                const stage = document.querySelector('[data-tid="MixedStage-wrapper"]')
+                    || document.querySelector('[data-tid="stage-layouts-renderer"]');
+                let stageTiles = 0;
+                if (stage) {
+                    stageTiles = stage.querySelectorAll('[data-tid][data-stream-type]').length;
                 }
-                return false;
+                // Roster button shows participant badge; lobby usually shows '1' (only us).
+                const rosterBadge = document.querySelector('#roster-button [data-tid="toolbar-item-badge"]');
+                const rosterCount = rosterBadge ? parseInt(rosterBadge.textContent.trim(), 10) || 0 : 0;
+                const remoteAudio = (function() {
+                    const audios = document.querySelectorAll('audio');
+                    for (const a of audios) {
+                        if (a.srcObject && a.srcObject.getAudioTracks
+                            && a.srcObject.getAudioTracks().length > 0) return true;
+                    }
+                    return false;
+                })();
+
+                // Real meeting if stage exists with multiple tiles, OR roster
+                // shows more than just us, OR remote audio is wired up.
+                const inCall = (!!stage && stageTiles >= 2)
+                    || rosterCount >= 2
+                    || remoteAudio;
+
+                // Any prejoin/call surface at all.
+                const anySurface = !!stage
+                    || !!document.querySelector('#hangup-button')
+                    || !!document.querySelector('#mic-button')
+                    || !!document.querySelector('[data-tid="hangup-button"]')
+                    || !!document.querySelector('[data-tid="calling-right-side-panel"]');
+
+                if (inCall) return 'in_meeting';
+                if (inLobby) return 'lobby';
+                if (anySurface) return 'lobby';
+                return 'not_yet';
             })()
             "#,
         )
         .await
-        .map(|v| v.into_value::<bool>().unwrap_or(false))
-        .unwrap_or(false);
+        .map(|v| v.into_value::<String>().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(match raw.as_str() {
+        "in_meeting" => MeetingProgress::InMeeting,
+        "lobby" => MeetingProgress::Lobby,
+        _ => MeetingProgress::NotYet,
+    })
+}
 
-    Ok(in_meeting)
+/// Backwards-compatible alias for callers that only need the boolean.
+async fn is_in_meeting(page: &Page) -> Result<bool> {
+    Ok(detect_meeting_progress(page).await? == MeetingProgress::InMeeting)
 }
 
 /// Sprawdza czy Teams przekierowalo na strone logowania (sesja wygasla)

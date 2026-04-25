@@ -60,7 +60,8 @@ const LIFECYCLE_STEPS = [
   { key: 'navigating',        labelKey: 'meeting.lifecycle_navigating' },
   { key: 'prejoin_ready',     labelKey: 'meeting.lifecycle_prejoin_ready' },
   { key: 'joining',           labelKey: 'meeting.lifecycle_joining' },
-  { key: 'joined',             labelKey: 'meeting.lifecycle_joined' },
+  { key: 'lobby_waiting',     labelKey: 'meeting.lifecycle_lobby_waiting' },
+  { key: 'joined',            labelKey: 'meeting.lifecycle_joined' },
 ];
 
 // Safety net: bot container sometimes hangs on OAuth / lobby. Bail after 90s
