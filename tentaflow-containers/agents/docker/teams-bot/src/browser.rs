@@ -18,7 +18,7 @@ use tentaflow_protocol::{
 use tokio::sync::Mutex;
 
 use crate::config::MeetingConfig;
-use crate::dom_observer::{self, DomObserver};
+use crate::dom_observer::{self, DomObserver, RosterState, SpeakerState};
 use crate::quic_server::RouterClient;
 
 /// Uchwyt do opcjonalnego RouterClient współdzielonego z main.rs — gdy None,
@@ -184,6 +184,8 @@ pub async fn join_meeting(
     config: &MeetingConfig,
     router: &RouterHandle,
     meeting_key: &str,
+    roster_state: RosterState,
+    speaker_state: SpeakerState,
 ) -> Result<(Page, DomObserver)> {
     use chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams;
 
@@ -225,6 +227,8 @@ pub async fn join_meeting(
         router.clone(),
         meeting_key.to_string(),
         config.bot_name.clone(),
+        roster_state,
+        speaker_state,
     )
     .await?;
     tracing::info!("DOM observer (push-based) uruchomiony");

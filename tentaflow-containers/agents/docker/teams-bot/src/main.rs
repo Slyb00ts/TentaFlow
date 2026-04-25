@@ -298,6 +298,13 @@ async fn main() -> Result<()> {
     // Handle skanera uczestnikow — analogicznie per-session.
     let mut dom_observer_handle: Option<dom_observer::DomObserver> = None;
 
+    // Stan rosteru i aktywnego mowcy — zasilane przez dom_observer (push DOM
+    // bridge), odczytywane w STT pipeline jako extra_meta. Trzymane na poziomie
+    // calego sidecara, zeby przezyc LeaveMeeting / ponowny JoinMeeting bez
+    // przedlokowania rzeczy ktore i tak dom_observer zaraz zaktualizuje.
+    let current_roster: Arc<RwLock<Vec<RosterEntry>>> = Arc::new(RwLock::new(Vec::new()));
+    let current_active_speaker: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
     // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
     // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
     // Prompt pobierany jest z DB routera przez reverse QUIC (handler `PromptFetch`).
@@ -390,6 +397,8 @@ async fn main() -> Result<()> {
             &config,
             &router_client_handle,
             &meeting_id,
+            Arc::clone(&current_roster),
+            Arc::clone(&current_active_speaker),
         )
         .await
         {
@@ -430,105 +439,15 @@ async fn main() -> Result<()> {
     // 5. Uruchom most audio WebSocket (wstrzykniety JS w Chromium <-> Rust)
     // Zastepuje wczesniejsze parec/pacat — audio przechwytywane na poziomie
     // HTMLMediaElement w Chromium przez captureStream(), bez PulseAudio monitor.
-    let (mut audio_capture, audio_playback, mut roster_rx, mut speaker_rx) =
-        audio::start_bridge().await?;
+    // Roster i active_speaker NIE ida juz tym kanalem — zasila je dom_observer
+    // przez CDP binding push (patrz src/dom_observer.rs).
+    let (mut audio_capture, audio_playback) = audio::start_bridge().await?;
     let audio_playback = Arc::new(audio_playback);
     // Guard feedback-loop — gdy bot odtwarza TTS przez mic injection, capture
     // (z HTMLMediaElement i pc.ontrack) moze ponownie zlapac ten sam glos
     // przez echo konferencji. Bez tego STT zapetla sie na wlasnych odpowiedziach.
     let is_bot_speaking = Arc::new(AtomicBool::new(false));
     tracing::info!("Most audio WebSocket uruchomiony na 127.0.0.1:9999");
-
-    // Stan rostera i aktywnego mowcy dzielony z taskami receiverow.
-    // Roster wysylany jest w metadata STT, active_speaker tak samo.
-    let current_roster: Arc<RwLock<Vec<RosterEntry>>> = Arc::new(RwLock::new(Vec::new()));
-    let current_active_speaker: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-
-    {
-        let roster_state = Arc::clone(&current_roster);
-        tokio::spawn(async move {
-            // Telemetria selektorow — jesli DOM Teams sie zmieni, roster bedzie
-            // pusty; pod 3 pod rzad ostrzegamy (moze pomoc w diagnostyce bez SSH).
-            let mut empty_count: u32 = 0;
-            while let Some(list) = roster_rx.rx.recv().await {
-                if list.is_empty() {
-                    empty_count = empty_count.saturating_add(1);
-                    if empty_count >= 3 {
-                        tracing::warn!(
-                            empty_count,
-                            "roster empty {} times — Teams DOM may have changed",
-                            empty_count
-                        );
-                    }
-                } else {
-                    empty_count = 0;
-                }
-                *roster_state.write().await = list;
-            }
-        });
-    }
-    {
-        let speaker_state = Arc::clone(&current_active_speaker);
-        let router_for_speaker = Arc::clone(&router_client_handle);
-        tokio::spawn(async move {
-            let mut none_count: u32 = 0;
-            while let Some(name) = speaker_rx.rx.recv().await {
-                if name.is_none() {
-                    none_count = none_count.saturating_add(1);
-                    if none_count == 10 {
-                        tracing::warn!(
-                            none_count,
-                            "active_speaker None {} times — check data-is-presenter selector",
-                            none_count
-                        );
-                    }
-                } else {
-                    none_count = 0;
-                }
-                // Porównaj ze stanem poprzednim — emit ParticipantUpdate tylko
-                // przy realnej zmianie Some(X)->Some(Y) albo None->Some(Y).
-                // Przejście Some->None (opuszczenie mównicy) zostawiamy ciche —
-                // nie znamy speaker_id bez nowej wartości, a dashboard liczy
-                // "active_now" jako ostatni znany.
-                let prev = speaker_state.read().await.clone();
-                *speaker_state.write().await = name.clone();
-                if let Some(new_name) = name {
-                    if prev.as_deref() != Some(new_name.as_str()) {
-                        let client = {
-                            let guard = router_for_speaker.lock().await;
-                            guard.as_ref().cloned()
-                        };
-                        if let Some(client) = client {
-                            if let Some(meeting_id) = client.current_meeting_id() {
-                                let ts = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as i64)
-                                    .unwrap_or(0);
-                                if let Err(e) = client
-                                    .send_meeting_event(
-                                        &meeting_id,
-                                        ts,
-                                        MeetingEventPayload::ParticipantUpdate {
-                                            speaker_id: new_name.clone(),
-                                            speaker_name: Some(new_name.clone()),
-                                            status: "active_now".to_string(),
-                                            last_spoken_ago_sec: None,
-                                        },
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "send_meeting_event ParticipantUpdate failed: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
 
     // 6. Inicjalizacja VAD
     let mut vad_detector = vad::VadDetector::new(
@@ -965,6 +884,8 @@ async fn main() -> Result<()> {
                                     &config,
                                     &router_client_handle,
                                     &meeting_id,
+                                    Arc::clone(&current_roster),
+                                    Arc::clone(&current_active_speaker),
                                 )
                                 .await
                                 {

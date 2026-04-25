@@ -20,11 +20,11 @@ pub const BRIDGE_ADDR: &str = "127.0.0.1:9999";
 /// Rozmiar bufora kanalu capture (liczba chunkow)
 const CAPTURE_BUFFER: usize = 64;
 
-/// Pojedynczy wpis listy uczestnikow spotkania
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Pojedynczy wpis listy uczestnikow spotkania. Zasilany od dom_observer
+/// (push-based DOM bridge); main.rs uzywa go do STT metadata (`roster` JSON).
+#[derive(Debug, Clone)]
 pub struct RosterEntry {
     pub name: String,
-    #[serde(default)]
     pub status: String,
 }
 
@@ -38,16 +38,6 @@ impl AudioCapture {
     pub async fn next_chunk(&mut self) -> Option<Vec<i16>> {
         self.rx.recv().await
     }
-}
-
-/// Kanal odbioru aktualizacji rosteru (pelna lista przy kazdym tick 3s)
-pub struct RosterReceiver {
-    pub rx: mpsc::Receiver<Vec<RosterEntry>>,
-}
-
-/// Kanal odbioru zmian aktywnego mowcy (None = brak mowcy)
-pub struct ActiveSpeakerReceiver {
-    pub rx: mpsc::Receiver<Option<String>>,
 }
 
 /// Rozbija payload TTS na surowe bajty PCM i16 LE. Dla WAV parsuje chunki
@@ -125,10 +115,8 @@ impl AudioPlayback {
 /// polaczenie od wstrzyknietego JS (re-accept po rozlaczeniu).
 /// Zwraca AudioCapture i AudioPlayback ktore maja ten sam interfejs co poprzednia
 /// implementacja (zero zmian w main.rs pipeline).
-pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback, RosterReceiver, ActiveSpeakerReceiver)> {
+pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback)> {
     let (capture_tx, capture_rx) = mpsc::channel::<Vec<i16>>(CAPTURE_BUFFER);
-    let (roster_tx, roster_rx) = mpsc::channel::<Vec<RosterEntry>>(8);
-    let (speaker_tx, speaker_rx) = mpsc::channel::<Option<String>>(32);
     let playback_tx_slot: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(StdMutex::new(None));
 
     let listener = TcpListener::bind(BRIDGE_ADDR).await
@@ -144,16 +132,12 @@ pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback, RosterReceiv
                 Ok((stream, addr)) => {
                     tracing::info!(peer = %addr, "JS bridge polaczony");
                     let capture_tx_conn = capture_tx.clone();
-                    let roster_tx_conn = roster_tx.clone();
-                    let speaker_tx_conn = speaker_tx.clone();
                     let playback_slot_conn = Arc::clone(&playback_slot_accept);
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_bridge_connection(
                             stream,
                             capture_tx_conn,
-                            roster_tx_conn,
-                            speaker_tx_conn,
                             playback_slot_conn,
                         ).await {
                             tracing::warn!("Bridge polaczenie zakonczone: {}", e);
@@ -171,8 +155,6 @@ pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback, RosterReceiv
     Ok((
         AudioCapture { rx: capture_rx },
         AudioPlayback { tx: playback_tx_slot },
-        RosterReceiver { rx: roster_rx },
-        ActiveSpeakerReceiver { rx: speaker_rx },
     ))
 }
 
@@ -181,8 +163,6 @@ pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback, RosterReceiv
 async fn handle_bridge_connection(
     tcp: tokio::net::TcpStream,
     capture_tx: mpsc::Sender<Vec<i16>>,
-    roster_tx: mpsc::Sender<Vec<RosterEntry>>,
-    speaker_tx: mpsc::Sender<Option<String>>,
     playback_slot: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
 ) -> Result<()> {
     let ws_stream = tokio_tungstenite::accept_async(tcp).await
@@ -241,36 +221,6 @@ async fn handle_bridge_connection(
                             tracing::info!(frame = frame_count, samples = samples.len(), rms = format!("{:.1}", rms), "Capture PCM");
                         }
                         if capture_tx.send(samples).await.is_err() {
-                            break;
-                        }
-                    }
-                    // 0x03 = roster snapshot (JSON UTF-8)
-                    0x03 => {
-                        let payload = &data[1..];
-                        match serde_json::from_slice::<Vec<RosterEntry>>(payload) {
-                            Ok(list) => {
-                                tracing::debug!(count = list.len(), "Roster update");
-                                // try_send: gdy konsument nie nadaza, dropujemy stary
-                                // snapshot — za chwile przyjdzie nowszy (polling 3s).
-                                if let Err(mpsc::error::TrySendError::Closed(_)) = roster_tx.try_send(list) {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Blad parsowania roster JSON: {}", e);
-                            }
-                        }
-                    }
-                    // 0x04 = active speaker change (nazwa UTF-8 albo pusty = brak)
-                    0x04 => {
-                        let payload = &data[1..];
-                        let name = if payload.is_empty() {
-                            None
-                        } else {
-                            Some(String::from_utf8_lossy(payload).to_string())
-                        };
-                        tracing::debug!(?name, "Active speaker change");
-                        if let Err(mpsc::error::TrySendError::Closed(_)) = speaker_tx.try_send(name) {
                             break;
                         }
                     }

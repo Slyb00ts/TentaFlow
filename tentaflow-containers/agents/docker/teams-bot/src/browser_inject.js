@@ -562,106 +562,9 @@
     if (window.__tentaflowBridge) window.__tentaflowBridge.micSetupDone = true;
   }
 
-  // --------------------------------------------------------------------------
-  // Roster scraping — lista uczestnikow spotkania
-  // Teams renderuje panel uczestnikow w [data-tid="roster-panel"]. Gdy panel
-  // jest zamkniety korzystamy z aria-label kafelkow video jako fallback.
-  // --------------------------------------------------------------------------
-  function getRosterList() {
-    const seen = new Map();
-    const rosterItems = document.querySelectorAll(
-      '[data-tid="roster-panel"] li[role="option"], [data-tid="roster-panel"] [role="treeitem"]'
-    );
-    rosterItems.forEach((item) => {
-      // Tylko dedykowane selektory — item.textContent zgarnialby caly widget
-      // z roli, statusem, odznakami itd., co psuje liste i metadata STT.
-      const nameEl = item.querySelector('.ts-tooltip-trigger, [data-tid="roster-participant-name"]');
-      if (!nameEl) return;
-      const name = (nameEl.textContent || '').trim();
-      if (!name) return;
-      const statusEl = item.querySelector('[data-tid="roster-participant-status"]');
-      const status = statusEl ? (statusEl.textContent || '').trim() : 'present';
-      if (!seen.has(name)) seen.set(name, { name, status });
-    });
-    if (seen.size === 0) {
-      // Fallback: kafelki video (gdy panel roster zamkniety)
-      document.querySelectorAll('[aria-label^="Video of"], [aria-label^="Video tile"]').forEach((tile) => {
-        const label = tile.getAttribute('aria-label') || '';
-        const m = label.match(/Video (?:of|tile, )\s*(.+?)(?:,|$)/i);
-        if (m && m[1]) {
-          const name = m[1].trim();
-          if (!seen.has(name)) seen.set(name, { name, status: 'present' });
-        }
-      });
-    }
-    return Array.from(seen.values());
-  }
-
-  function sendRoster() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      const roster = getRosterList();
-      const json = JSON.stringify(roster);
-      const payload = new TextEncoder().encode(json);
-      const buf = new ArrayBuffer(1 + payload.byteLength);
-      const u8 = new Uint8Array(buf);
-      u8[0] = 0x03;
-      u8.set(payload, 1);
-      ws.send(buf);
-    } catch (e) {
-      console.warn('[tentaflow] sendRoster blad:', e);
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // Active speaker tracking — kto aktualnie mowi
-  // Teams oznacza aktywnego mowce klasa active-speaker na kafelku wideo oraz
-  // atrybutem [data-is-presenter="true"]. Dostepny tez aria-label "... is speaking".
-  // --------------------------------------------------------------------------
-  function getActiveSpeaker() {
-    const presenter = document.querySelector('[data-is-presenter="true"]');
-    if (presenter) {
-      const label = presenter.getAttribute('aria-label') || presenter.textContent || '';
-      const m = label.match(/^(.+?)(?:,|$)/);
-      if (m && m[1]) return m[1].trim();
-    }
-    const active = document.querySelector('.active-speaker, [data-tid="active-speaker"]');
-    if (active) {
-      const nameEl = active.querySelector('.ts-tooltip-trigger, [data-tid="participant-name"]');
-      if (nameEl) {
-        const name = (nameEl.textContent || '').trim();
-        if (name) return name;
-      }
-      const label = active.getAttribute('aria-label') || '';
-      const m = label.match(/^(.+?)(?:,|$)/);
-      if (m && m[1]) return m[1].trim();
-    }
-    const speakingEl = document.querySelector('[aria-label*="is speaking"]');
-    if (speakingEl) {
-      const label = speakingEl.getAttribute('aria-label') || '';
-      const m = label.match(/^(.+?)\s+is speaking/i);
-      if (m && m[1]) return m[1].trim();
-    }
-    return null;
-  }
-
-  let lastActiveSpeaker = null;
-  function sendActiveSpeakerIfChanged() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try {
-      const current = getActiveSpeaker();
-      if (current === lastActiveSpeaker) return;
-      lastActiveSpeaker = current;
-      const payload = current ? new TextEncoder().encode(current) : new Uint8Array(0);
-      const buf = new ArrayBuffer(1 + payload.byteLength);
-      const u8 = new Uint8Array(buf);
-      u8[0] = 0x04;
-      if (payload.byteLength > 0) u8.set(payload, 1);
-      ws.send(buf);
-    } catch (e) {
-      console.warn('[tentaflow] sendActiveSpeakerIfChanged blad:', e);
-    }
-  }
+  // Roster i active-speaker zostaly przeniesione do installTentaflowDomBridge()
+  // ponizej (push-based przez CDP binding `__tentaflowEvent`). Stary pollingowy
+  // pipeline przez WS port 9999 (opcodes 0x03 / 0x04) zostal usuniety.
 
   // --------------------------------------------------------------------------
   // Video injection — kamerka bota (avatar 640x480 @ 30fps)
@@ -1103,12 +1006,9 @@
       console.warn('[tentaflow] install observer blad', e);
     }
     connectWs();
-    // Polling roster (3s) i active-speaker (500ms) idzie przez WS (port 9999)
-    // i zasila audio.rs metadata enrichment dla STT. Push lifecycle/participant
-    // events do Rust idzie osobnym kanalem (CDP binding) zainstalowanym przez
-    // installTentaflowDomBridge() ponizej.
-    registerInterval(setInterval(sendRoster, 3000));
-    registerInterval(setInterval(sendActiveSpeakerIfChanged, 500));
+    // Roster + active-speaker NIE leci juz przez WS — zasila je push CDP
+    // bridge nizej (installTentaflowDomBridge), ktory tez zasila Arcs w
+    // main.rs uzywane do STT extra_meta. Jeden kanal, mniej duplikatu.
     try {
       installTentaflowDomBridge();
     } catch (e) {
