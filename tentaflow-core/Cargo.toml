@@ -5,19 +5,28 @@ edition = "2021"
 description = "TentaFlow Core — wspolna biblioteka dla Router, Desktop i Mobile"
 
 [features]
-default = []
+default = ["inference-whisper"]
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# whisper-rs i llama-cpp-2 obie linkuja wlasna kopie ggml — nie da sie ich
+# laczyc razem (linker zwraca duplicate symbol: ggml_*). whisper-rs sterowane
+# osobnym feature flagiem zeby `cargo build --features inference-llamacpp`
+# nie probowal automatycznie wciagac whisper-rs.
+inference-whisper = ["dep:whisper-rs"]
 inference-mlx = ["dep:mlx-rs", "dep:mlx-models", "dep:tokenizers"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
 inference-mlx-swift = []  # bridge do Swift MLX na iOS — implementacja w Fazie 3
 metrics-prometheus = ["dep:prometheus"]
 rdma-probe = []
-gpu-cuda = ["inference-llamacpp", "llama-cpp-2/cuda", "whisper-rs/cuda"]
-gpu-vulkan = ["inference-llamacpp", "llama-cpp-2/vulkan", "whisper-rs/vulkan"]
-gpu-rocm = ["inference-llamacpp", "llama-cpp-2/rocm", "whisper-rs/hipblas"]
-gpu-metal = ["inference-llamacpp", "llama-cpp-2/metal", "whisper-rs/metal"]
+gpu-cuda = ["inference-llamacpp", "llama-cpp-2/cuda"]
+gpu-vulkan = ["inference-llamacpp", "llama-cpp-2/vulkan"]
+gpu-rocm = ["inference-llamacpp", "llama-cpp-2/rocm"]
+gpu-metal = ["inference-llamacpp", "llama-cpp-2/metal"]
+gpu-cuda-whisper = ["inference-whisper", "whisper-rs/cuda"]
+gpu-vulkan-whisper = ["inference-whisper", "whisper-rs/vulkan"]
+gpu-rocm-whisper = ["inference-whisper", "whisper-rs/hipblas"]
+gpu-metal-whisper = ["inference-whisper", "whisper-rs/metal"]
 
 [dependencies]
 # Protocol (zawsze)
@@ -130,7 +139,7 @@ mlx-models = { path = "../mlx-models", optional = true }
 tokenizers = { version = "0.22.2", optional = true }
 
 # STT — Whisper (optional)
-whisper-rs = "0.16.0"
+whisper-rs = { version = "0.16.0", optional = true }
 hound = "3.5.1"
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm"] }
 

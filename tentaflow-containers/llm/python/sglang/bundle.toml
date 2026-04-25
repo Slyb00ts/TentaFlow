@@ -16,8 +16,9 @@ args = [
     "--port", "${PORT:-30000}",
     "--tp", "${TP:-1}",
     "--mem-fraction-static", "${MEM_FRACTION:-0.85}",
-    "--attention-backend", "triton",
-    "--sampling-backend", "pytorch",
+    # Domyslny attention-backend (flashinfer) jest stabilny dla wiekszosci
+    # modeli HF. Triton mialismy z dotnet/nextapp dla Bielika, ale na
+    # Qwen3.5 scheduler crashuje przy first prefill (event_loop exception).
 ]
 internal_port = 30000
 
