@@ -4536,6 +4536,17 @@ pub fn network_dispatch(
             P::ResConfigGet(cfg)
         }
         P::ReqConfigUpdate(new_cfg) => {
+            tracing::info!(
+                bind_mode = %new_cfg.bind_mode,
+                bind_ipv4 = %new_cfg.bind_ipv4,
+                relay = %new_cfg.iroh_relay_url,
+                hide_docker = new_cfg.hide_docker,
+                hide_link_local = new_cfg.hide_link_local,
+                hide_loopback = new_cfg.hide_loopback,
+                hide_cgnat = new_cfg.hide_cgnat,
+                prefer_same_subnet = new_cfg.prefer_same_subnet,
+                "network_dispatch: ReqConfigUpdate received"
+            );
             if new_cfg.bind_mode != "auto" && new_cfg.bind_mode != "custom" {
                 return Err(ProtocolError::bad_request(
                     "bind_mode must be 'auto' or 'custom'",
