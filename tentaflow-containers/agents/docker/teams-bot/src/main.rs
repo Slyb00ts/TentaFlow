@@ -73,6 +73,44 @@ async fn send_backend_update(
     }
 }
 
+/// Announces the bot itself as a meeting participant. The DOM scanner
+/// (`participant_scanner`) intentionally filters the bot row out, so without
+/// this the GUI roster stays empty until a remote participant is detected.
+/// Emitted once per join, right after `LIFECYCLE_JOINED`.
+async fn send_bot_participant_joined(
+    router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+    meeting_id: &str,
+    bot_name: &str,
+) {
+    let client = {
+        let guard = router.lock().await;
+        guard.as_ref().cloned()
+    };
+    let Some(client) = client else {
+        tracing::debug!("send_bot_participant_joined: router client niedostepny");
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = client
+        .send_meeting_event(
+            meeting_id,
+            ts,
+            MeetingEventPayload::ParticipantUpdate {
+                speaker_id: bot_name.to_string(),
+                speaker_name: Some(bot_name.to_string()),
+                status: "joined".to_string(),
+                last_spoken_ago_sec: None,
+            },
+        )
+        .await
+    {
+        tracing::warn!("send_meeting_event ParticipantUpdate(bot) failed: {}", e);
+    }
+}
+
 /// Emituje pojedynczy `LifecycleUpdate` z main.rs. Browser.rs ma własny emitter
 /// dla stage'y wewnątrz `join_meeting`; ta funkcja pokrywa stage'y na poziomie
 /// main loop (container_spawned potwierdzenie przez bota, failed przy błędzie
@@ -168,10 +206,17 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // chromiumoxide::handler emits a torrent of "WS Invalid message: data did
+    // not match any variant of untagged enum Message" warnings whenever
+    // Chromium ships a CDP message variant the library does not yet know
+    // about. Hundreds per second drown out our own logs. Default the crate
+    // to error-level so RUST_LOG=info on the bot still works without the
+    // noise; users can override with RUST_LOG=...,chromiumoxide=info if they
+    // want the firehose back.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+                .unwrap_or_else(|_| EnvFilter::new("info,chromiumoxide=error")),
         )
         .init();
 
@@ -358,6 +403,7 @@ async fn main() -> Result<()> {
             config.bot_name.clone(),
         ));
         send_backend_update(&router_client_handle, &meeting_id, &config).await;
+        send_bot_participant_joined(&router_client_handle, &meeting_id, &config.bot_name).await;
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
@@ -933,7 +979,14 @@ async fn main() -> Result<()> {
                                             &config,
                                         )
                                         .await;
+                                        send_bot_participant_joined(
+                                            &router_client_handle,
+                                            &meeting_id,
+                                            &config.bot_name,
+                                        )
+                                        .await;
                                         let _ = response_tx.send(format!(
+
                                             "OK: dolaczono do spotkania (meeting_id={})",
                                             meeting_id
                                         ));

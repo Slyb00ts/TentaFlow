@@ -2361,6 +2361,16 @@ pub struct MeetingSessionDescriptor {
     /// Opcjonalne szczegóły ostatniego etapu (np. treść błędu przy `failed`).
     /// Pusty string = brak dodatkowych informacji.
     pub lifecycle_details: String,
+    /// Backend models reported by the bot via BackendUpdate. Empty string
+    /// when the bot has not reported the field yet (live view shows a
+    /// placeholder). Numeric counters use `-1` as the same sentinel.
+    pub backend_stt_model: String,
+    pub backend_tts_model: String,
+    pub backend_summarization_model: String,
+    pub backend_diarization_model: String,
+    pub backend_streaming_latency_ms: i64,
+    pub backend_enrolled_speakers: i64,
+    pub backend_total_participants: i64,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]

@@ -71,6 +71,13 @@ fn desc_to_proto(d: crate::meeting::SessionDescriptor) -> MeetingSessionDescript
         owner_user_id: d.owner_user_id.unwrap_or(0),
         lifecycle_stage: d.lifecycle_stage.unwrap_or_default(),
         lifecycle_details: d.lifecycle_details.unwrap_or_default(),
+        backend_stt_model: d.backend_stt_model.unwrap_or_default(),
+        backend_tts_model: d.backend_tts_model.unwrap_or_default(),
+        backend_summarization_model: d.backend_summarization_model.unwrap_or_default(),
+        backend_diarization_model: d.backend_diarization_model.unwrap_or_default(),
+        backend_streaming_latency_ms: d.backend_streaming_latency_ms.unwrap_or(-1),
+        backend_enrolled_speakers: d.backend_enrolled_speakers.unwrap_or(-1),
+        backend_total_participants: d.backend_total_participants.unwrap_or(-1),
     }
 }
 
@@ -94,6 +101,13 @@ fn empty_desc() -> MeetingSessionDescriptor {
         owner_user_id: 0,
         lifecycle_stage: String::new(),
         lifecycle_details: String::new(),
+        backend_stt_model: String::new(),
+        backend_tts_model: String::new(),
+        backend_summarization_model: String::new(),
+        backend_diarization_model: String::new(),
+        backend_streaming_latency_ms: -1,
+        backend_enrolled_speakers: -1,
+        backend_total_participants: -1,
     }
 }
 

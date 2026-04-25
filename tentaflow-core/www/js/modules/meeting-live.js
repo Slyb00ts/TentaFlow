@@ -115,6 +115,33 @@ function resetState(meetingKey) {
   state.lifecycleDetails = '';
 }
 
+// Hydrates state.backend from a MeetingSessionDescriptor returned by the
+// backend. Lets the live view render the BACKEND panel on mount even if the
+// bot's BackendUpdate broadcast fired before this dashboard was open.
+// Wasm bridge maps "not reported yet" to JS null/empty — only overwrite the
+// in-memory value when the descriptor carries a concrete one so a later
+// MeetingEvent broadcast can still refine it.
+function seedBackendFromDescriptor(desc) {
+  if (!desc) return;
+  if (desc.backendSttModel) state.backend.sttModel = String(desc.backendSttModel);
+  if (desc.backendTtsModel) state.backend.ttsModel = String(desc.backendTtsModel);
+  if (desc.backendSummarizationModel) {
+    state.backend.summarizationModel = String(desc.backendSummarizationModel);
+  }
+  if (desc.backendDiarizationModel) {
+    state.backend.diarizationModel = String(desc.backendDiarizationModel);
+  }
+  if (desc.backendStreamingLatencyMs != null) {
+    state.backend.streamingLatencyMs = Number(desc.backendStreamingLatencyMs);
+  }
+  if (desc.backendEnrolledSpeakers != null) {
+    state.backend.enrolledSpeakers = Number(desc.backendEnrolledSpeakers);
+  }
+  if (desc.backendTotalParticipants != null) {
+    state.backend.totalParticipants = Number(desc.backendTotalParticipants);
+  }
+}
+
 // --- Data loading -----------------------------------------------------------
 
 async function loadInitialData() {
@@ -130,6 +157,7 @@ async function loadInitialData() {
       state.sessionDetail = match;
       if (match.lifecycleStage) state.lifecycleStage = match.lifecycleStage;
       if (match.lifecycleDetails) state.lifecycleDetails = match.lifecycleDetails;
+      seedBackendFromDescriptor(match);
     }
   } catch (e) {
     toast(e?.message || I18n.t('meeting.live.load_failed'), 'error');
@@ -146,6 +174,7 @@ async function loadInitialData() {
         state.sessionDetail = det.session;
         if (det.session.lifecycleStage) state.lifecycleStage = det.session.lifecycleStage;
         if (det.session.lifecycleDetails) state.lifecycleDetails = det.session.lifecycleDetails;
+        seedBackendFromDescriptor(det.session);
       }
       const entries = Array.isArray(det?.transcripts) ? det.transcripts : [];
       // Mapujemy stary format transcript entry na live event shape.
