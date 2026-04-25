@@ -474,19 +474,21 @@ pub async fn handle_ws_connection<S>(
                                 }
                             }
 
-                            // Single sink.lock acquire — feed wszystkie frames,
-                            // flush raz. Mniej kontesty z innymi writer tasks
-                            // (broadcasty heartbeat, mesh updates).
+                            // Single sink.lock acquire — send wszystkie frames
+                            // pod tym samym mutexem (zmniejsza kontestowanie
+                            // z innymi writer tasks: broadcasty heartbeat,
+                            // mesh updates). Uzywamy `send` (= feed + flush)
+                            // per frame zamiast feed-N + flush bo tungstenite
+                            // moze miec write buffer limit ktory zatka caly
+                            // stream gdy zbyt wiele feed'ow przed flush.
                             if !frames.is_empty() {
                                 let mut guard = sink_clone.lock().await;
-                                for (bytes, _) in &frames {
-                                    if guard.feed(Message::Binary(bytes.clone().into())).await.is_err() {
-                                        // klient odpadl — przerwij batch
+                                for (bytes, _) in frames {
+                                    if guard.send(Message::Binary(bytes.into())).await.is_err() {
                                         stream_finished = true;
                                         break;
                                     }
                                 }
-                                let _ = guard.flush().await;
                             }
 
                             if stream_finished {
