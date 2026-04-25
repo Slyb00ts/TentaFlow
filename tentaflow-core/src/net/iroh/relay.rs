@@ -16,6 +16,11 @@ use iroh::RelayUrl;
 /// Klucz w tabeli `settings` dla URL serwera relay iroh.
 pub const RELAY_URL_SETTING_KEY: &str = "mesh.iroh_relay_url";
 
+/// Domyslny relay TentaFlow uzywany gdy DB ani config.toml nie maja
+/// wlasnego URL. Self-hosted iroh-relay pod nextapp.pl, dostepny po
+/// HTTPS. Zastepuje pre-iroh-0.98 default `use.iroh.network` ktory padl.
+pub const DEFAULT_RELAY_URL: &str = "https://relay.nextapp.pl";
+
 /// Zwraca `Some(RelayUrl)` gdy admin skonfigurowal custom relay (DB lub
 /// config.toml), albo `None` gdy nic nie ustawiono — wtedy iroh uzywa
 /// wbudowanego presetu N0 z 4 produkcyjnymi relayami. Niepoprawny URL
@@ -47,13 +52,13 @@ pub fn load_relay_url(db: Option<&DbPool>, mesh_cfg: Option<&MeshConfig>) -> Opt
                 Err(err) => tracing::warn!(
                     raw = %trimmed,
                     error = %err,
-                    "Nieprawidlowy iroh relay URL w config.toml — uzywam presetu N0"
+                    "Nieprawidlowy iroh relay URL w config.toml — uzywam DEFAULT_RELAY_URL"
                 ),
             }
         }
     }
 
-    None
+    parse_relay_url(DEFAULT_RELAY_URL).ok()
 }
 
 /// Parsuje `raw` jako URL i wymusza scheme `http`/`https`. Inne schematy

@@ -7,6 +7,7 @@
 mod audio;
 mod browser;
 mod config;
+mod participant_scanner;
 mod quic_server;
 mod summarizer;
 mod vad;
@@ -23,7 +24,7 @@ use crate::audio::RosterEntry;
 use crate::config::MeetingConfig;
 use crate::summarizer::{TranscriptBuffer, TranscriptEntry};
 use crate::vad::VadResult;
-use tentaflow_protocol::MeetingEventPayload;
+use tentaflow_protocol::{MeetingEventPayload, LIFECYCLE_CONTAINER_SPAWNED, LIFECYCLE_FAILED};
 
 /// Model diarization jest skonfigurowany hardcoded po stronie routera (mesh
 /// config — jeden pipeline pyannote w tej wersji). Bot nie wie który konkretnie
@@ -72,6 +73,81 @@ async fn send_backend_update(
     }
 }
 
+/// Announces the bot itself as a meeting participant. The DOM scanner
+/// (`participant_scanner`) intentionally filters the bot row out, so without
+/// this the GUI roster stays empty until a remote participant is detected.
+/// Emitted once per join, right after `LIFECYCLE_JOINED`.
+async fn send_bot_participant_joined(
+    router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+    meeting_id: &str,
+    bot_name: &str,
+) {
+    let client = {
+        let guard = router.lock().await;
+        guard.as_ref().cloned()
+    };
+    let Some(client) = client else {
+        tracing::debug!("send_bot_participant_joined: router client niedostepny");
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = client
+        .send_meeting_event(
+            meeting_id,
+            ts,
+            MeetingEventPayload::ParticipantUpdate {
+                speaker_id: bot_name.to_string(),
+                speaker_name: Some(bot_name.to_string()),
+                status: "joined".to_string(),
+                last_spoken_ago_sec: None,
+            },
+        )
+        .await
+    {
+        tracing::warn!("send_meeting_event ParticipantUpdate(bot) failed: {}", e);
+    }
+}
+
+/// Emituje pojedynczy `LifecycleUpdate` z main.rs. Browser.rs ma własny emitter
+/// dla stage'y wewnątrz `join_meeting`; ta funkcja pokrywa stage'y na poziomie
+/// main loop (container_spawned potwierdzenie przez bota, failed przy błędzie
+/// join).
+async fn emit_lifecycle(
+    router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+    meeting_id: &str,
+    stage: &str,
+    details: Option<String>,
+) {
+    let client = {
+        let guard = router.lock().await;
+        guard.as_ref().cloned()
+    };
+    let Some(client) = client else {
+        tracing::debug!(stage, "emit_lifecycle: router client niedostepny — pomijam");
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = client
+        .send_meeting_event(
+            meeting_id,
+            ts,
+            MeetingEventPayload::LifecycleUpdate {
+                stage: stage.to_string(),
+                details,
+            },
+        )
+        .await
+    {
+        tracing::warn!("emit_lifecycle({}) failed: {}", stage, e);
+    }
+}
+
 /// Uchwyt aktualnie uruchomionej petli summarizera dla sesji spotkania.
 /// Przy LeaveMeeting / nowym JoinMeeting stary handle jest zamykany, a w jego
 /// miejsce spawnujemy nowy — meeting_key musi pasowac do biezacej sesji.
@@ -87,6 +163,37 @@ impl SummarizerHandle {
     }
 }
 
+/// Uchwyt skanera uczestnikow — periodycznie czyta DOM Teams i emituje
+/// `ParticipantUpdate { joined|left }`. Osobny handle od summarizera zeby
+/// LeaveMeeting / kolejny JoinMeeting moglo go czysto zamknac.
+struct ScannerHandle {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl ScannerHandle {
+    async fn stop(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.join.await;
+    }
+}
+
+/// Spawnuje task participant_scanner dla aktywnej sesji. Scanner zyje tak dlugo
+/// jak strona (Page) — po LeaveMeeting / Join nowej sesji caller musi wywolac
+/// `stop()` na zwroconym handle.
+fn spawn_participant_scanner(
+    page: chromiumoxide::Page,
+    router: Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
+    meeting_key: String,
+    bot_name: String,
+) -> ScannerHandle {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let join = tokio::spawn(async move {
+        participant_scanner::run(page, router, meeting_key, bot_name, rx).await;
+    });
+    ScannerHandle { shutdown_tx: tx, join }
+}
+
 /// Sidecar meeting bot — automatyzacja spotkan Teams z pipeline audio
 #[derive(Parser, Debug)]
 #[command(name = "tentaflow-meeting")]
@@ -99,10 +206,17 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // chromiumoxide::handler emits a torrent of "WS Invalid message: data did
+    // not match any variant of untagged enum Message" warnings whenever
+    // Chromium ships a CDP message variant the library does not yet know
+    // about. Hundreds per second drown out our own logs. Default the crate
+    // to error-level so RUST_LOG=info on the bot still works without the
+    // noise; users can override with RUST_LOG=...,chromiumoxide=info if they
+    // want the firehose back.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+                .unwrap_or_else(|_| EnvFilter::new("info,chromiumoxide=error")),
         )
         .init();
 
@@ -124,6 +238,7 @@ async fn main() -> Result<()> {
     let quic = quic_server::MeetingQuicServer::new(transport_config);
     let transcript_tx = quic.transcript_sender();
     let router_client_handle = quic.router_client_handle();
+    let page_slot = quic.page_slot();
     let mut command_rx = quic.command_receiver().await
         .expect("command_receiver powinien byc dostepny przy pierwszym wywolaniu");
 
@@ -134,17 +249,24 @@ async fn main() -> Result<()> {
     });
     tracing::info!(port = config.transport_port, "Serwer iroh kontenera uruchomiony");
 
-    // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do STT/TTS)
-    tracing::info!("Czekam na polaczenie routera...");
-    loop {
-        let guard = router_client_handle.lock().await;
-        if guard.is_some() {
-            break;
+    // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do STT/TTS).
+    // SKIP_ROUTER_WAIT=1 pozwala uruchomic bota w trybie dev bez routera —
+    // Chromium i pipeline video startuja, audio capture do routera failuje
+    // best-effort.
+    if std::env::var("SKIP_ROUTER_WAIT").ok().as_deref() != Some("1") {
+        tracing::info!("Czekam na polaczenie routera...");
+        loop {
+            let guard = router_client_handle.lock().await;
+            if guard.is_some() {
+                break;
+            }
+            drop(guard);
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
-        drop(guard);
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tracing::info!("Router polaczony — STT/TTS dostepne");
+    } else {
+        tracing::warn!("SKIP_ROUTER_WAIT=1 — uruchamiam bota bez czekania na router (tryb dev)");
     }
-    tracing::info!("Router polaczony — STT/TTS dostepne");
 
     // Rolling buffer transkrypcji — summarizer czyta go co N sekund.
     // Trzymany tu, a nie w summarizerze, zeby main loop mogl pushowac wpisy
@@ -158,6 +280,8 @@ async fn main() -> Result<()> {
 
     // Handle summarizera dla aktywnej sesji — None gdy bot nie jest w spotkaniu.
     let mut summarizer_handle: Option<SummarizerHandle> = None;
+    // Handle skanera uczestnikow — analogicznie per-session.
+    let mut scanner_handle: Option<ScannerHandle> = None;
 
     // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
     // musi byc wczesniej zamkniety przez caller — ta funkcja nie czysci.
@@ -217,12 +341,11 @@ async fn main() -> Result<()> {
     // 4. Uruchom przegladarke i dolacz do spotkania (jesli URL podany)
     let mut _chromium: Option<chromiumoxide::browser::Browser> = None;
     let mut page = if !config.meeting_url.is_empty() {
-        let browser = browser::launch_chromium(&config).await?;
-        let p = browser::join_meeting(&browser, &config.meeting_url, &config).await?;
-        _chromium = Some(browser);
-        tracing::info!("Dolaczono do spotkania");
-        // Auto-join — ustaw meeting_id w RouterClient i spawn summarizer. Bez
-        // meeting_id router nie przypisze transkryptu/summary do sesji.
+        // meeting_id potrzebujemy zanim wywolamy browser::join_meeting —
+        // lifecycle events (browser_launched / navigating / prejoin_ready /
+        // joining / joined) beda wysylane z meeting_key = meeting_id. Router
+        // po stronie hosta utworzyl juz wpis meeting_sessions pod tym kluczem
+        // (przez MEETING_ID env), wiec LifecycleUpdate trafi do wlasciwej sesji.
         let meeting_id = config
             .meeting_id_override
             .clone()
@@ -233,6 +356,46 @@ async fn main() -> Result<()> {
                 c.set_meeting_id(meeting_id.clone());
             }
         }
+
+        // Bot potwierdza że żyje i gada z routerem. Manager hosta wstawil
+        // `container_spawned` po udanym `docker start`, ale ten event jest
+        // prawdziwym potwierdzeniem z perspektywy bota.
+        emit_lifecycle(
+            &router_client_handle,
+            &meeting_id,
+            LIFECYCLE_CONTAINER_SPAWNED,
+            None,
+        )
+        .await;
+
+        let browser = browser::launch_chromium(&config).await?;
+        let p = match browser::join_meeting(
+            &browser,
+            &config.meeting_url,
+            &config,
+            &router_client_handle,
+            &meeting_id,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                emit_lifecycle(
+                    &router_client_handle,
+                    &meeting_id,
+                    LIFECYCLE_FAILED,
+                    Some(format!("{e}")),
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        _chromium = Some(browser);
+        {
+            let mut slot = page_slot.lock().await;
+            *slot = Some(p.clone());
+        }
+        tracing::info!("Dolaczono do spotkania");
         summarizer_handle = spawn_summarizer(
             transcript_buffer.clone(),
             router_client_handle.clone(),
@@ -240,7 +403,14 @@ async fn main() -> Result<()> {
             &config,
         )
         .await;
+        scanner_handle = Some(spawn_participant_scanner(
+            p.clone(),
+            router_client_handle.clone(),
+            meeting_id.clone(),
+            config.bot_name.clone(),
+        ));
         send_backend_update(&router_client_handle, &meeting_id, &config).await;
+        send_bot_participant_joined(&router_client_handle, &meeting_id, &config.bot_name).await;
         Some(p)
     } else {
         tracing::info!("Brak meeting_url — kontener czeka na komende join przez QUIC");
@@ -727,6 +897,10 @@ async fn main() -> Result<()> {
                         if let Some(mut old_browser) = _chromium.take() {
                             tracing::info!("Zamykam poprzednia instancje Chromium");
                             page = None;
+                            {
+                                let mut slot = page_slot.lock().await;
+                                *slot = None;
+                            }
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
                         }
@@ -734,6 +908,9 @@ async fn main() -> Result<()> {
                         // dostanie swojego z nowym meeting_key. Buffer czyscimy zeby
                         // transkrypty z poprzedniego spotkania nie trafily do promptu.
                         if let Some(h) = summarizer_handle.take() {
+                            h.stop().await;
+                        }
+                        if let Some(h) = scanner_handle.take() {
                             h.stop().await;
                         }
                         transcript_buffer.lock().await.clear();
@@ -761,12 +938,33 @@ async fn main() -> Result<()> {
                             }
                         }
 
+                        // Bot potwierdza container_spawned przed launch'em — GUI
+                        // rozrozni "host spawnowal kontener" od "bot zaczal join".
+                        emit_lifecycle(
+                            &router_client_handle,
+                            &meeting_id,
+                            LIFECYCLE_CONTAINER_SPAWNED,
+                            None,
+                        )
+                        .await;
                         match browser::launch_chromium(&config).await {
                             Ok(browser) => {
-                                match browser::join_meeting(&browser, &meeting_url, &config).await {
+                                match browser::join_meeting(
+                                    &browser,
+                                    &meeting_url,
+                                    &config,
+                                    &router_client_handle,
+                                    &meeting_id,
+                                )
+                                .await
+                                {
                                     Ok(p) => {
                                         _chromium = Some(browser);
-                                        page = Some(p);
+                                        {
+                                            let mut slot = page_slot.lock().await;
+                                            *slot = Some(p.clone());
+                                        }
+                                        page = Some(p.clone());
                                         // Odpal summarizera dla nowej sesji —
                                         // meeting_key == meeting_id po stronie routera.
                                         summarizer_handle = spawn_summarizer(
@@ -776,44 +974,80 @@ async fn main() -> Result<()> {
                                             &config,
                                         )
                                         .await;
+                                        scanner_handle = Some(spawn_participant_scanner(
+                                            p.clone(),
+                                            router_client_handle.clone(),
+                                            meeting_id.clone(),
+                                            config.bot_name.clone(),
+                                        ));
                                         send_backend_update(
                                             &router_client_handle,
                                             &meeting_id,
                                             &config,
                                         )
                                         .await;
+                                        send_bot_participant_joined(
+                                            &router_client_handle,
+                                            &meeting_id,
+                                            &config.bot_name,
+                                        )
+                                        .await;
                                         let _ = response_tx.send(format!(
+
                                             "OK: dolaczono do spotkania (meeting_id={})",
                                             meeting_id
                                         ));
                                     }
                                     Err(e) => {
+                                        let err_msg = format!("{}", e);
+                                        emit_lifecycle(
+                                            &router_client_handle,
+                                            &meeting_id,
+                                            LIFECYCLE_FAILED,
+                                            Some(err_msg.clone()),
+                                        )
+                                        .await;
                                         // Wyczysc meeting_id bo join sie nie udal
                                         let client = router_client_handle.lock().await;
                                         if let Some(ref c) = *client {
                                             c.clear_meeting_id();
                                         }
-                                        let _ = response_tx.send(format!("BLAD: {}", e));
+                                        let _ = response_tx.send(format!("BLAD: {}", err_msg));
                                     }
                                 }
                             }
                             Err(e) => {
+                                let err_msg = format!("nie udalo sie uruchomic przegladarki: {}", e);
+                                emit_lifecycle(
+                                    &router_client_handle,
+                                    &meeting_id,
+                                    LIFECYCLE_FAILED,
+                                    Some(err_msg.clone()),
+                                )
+                                .await;
                                 let client = router_client_handle.lock().await;
                                 if let Some(ref c) = *client {
                                     c.clear_meeting_id();
                                 }
-                                let _ = response_tx.send(format!("BLAD: nie udalo sie uruchomic przegladarki: {}", e));
+                                let _ = response_tx.send(format!("BLAD: {}", err_msg));
                             }
                         }
                     }
                     Some(quic_server::MeetingCommand::LeaveMeeting { response_tx }) => {
                         tracing::info!("Komenda QUIC: opuszczanie spotkania");
                         page = None;
+                        {
+                            let mut slot = page_slot.lock().await;
+                            *slot = None;
+                        }
                         if let Some(mut old_browser) = _chromium.take() {
                             let _ = old_browser.close().await;
                             let _ = old_browser.wait().await;
                         }
                         if let Some(h) = summarizer_handle.take() {
+                            h.stop().await;
+                        }
+                        if let Some(h) = scanner_handle.take() {
                             h.stop().await;
                         }
                         transcript_buffer.lock().await.clear();
@@ -852,6 +1086,9 @@ async fn main() -> Result<()> {
     }
 
     if let Some(h) = summarizer_handle.take() {
+        h.stop().await;
+    }
+    if let Some(h) = scanner_handle.take() {
         h.stop().await;
     }
     let _ = shutdown_tx.send(true);

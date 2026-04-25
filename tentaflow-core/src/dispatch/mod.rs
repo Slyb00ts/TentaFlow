@@ -308,8 +308,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ChatStreamRequestBody(_) => "ChatStreamRequest",
         MessageBody::ChatStreamChunkBody(_) => "ChatStreamChunk",
         MessageBody::ChatStreamEndBody(_) => "ChatStreamEnd",
-        MessageBody::TranslateRequestBody(_) => "TranslateRequest",
-        MessageBody::TranslateResponseBody(_) => "TranslateResponse",
+        MessageBody::TranslateBody(p) => match p {
+            tentaflow_protocol::TranslatePayload::Req(_) => "TranslateRequest",
+            tentaflow_protocol::TranslatePayload::Res(_) => "TranslateResponse",
+        },
         MessageBody::ClusterListRequest => "ClusterListRequest",
         MessageBody::ClusterListResponseBody(_) => "ClusterListResponse",
         MessageBody::ClusterDetailRequestBody(_) => "ClusterDetailRequest",
@@ -368,8 +370,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ServiceDeployProgressBody(_) => "ServiceDeployProgress",
         MessageBody::ServiceStopRequest { .. } => "ServiceStopRequest",
         MessageBody::ServiceStopResponse { .. } => "ServiceStopResponse",
-        MessageBody::ServiceFlagsUpdateRequest { .. } => "ServiceFlagsUpdateRequest",
-        MessageBody::ServiceFlagsUpdateResponse { .. } => "ServiceFlagsUpdateResponse",
+        MessageBody::ServiceFlagsBody(p) => match p {
+            tentaflow_protocol::ServiceFlagsPayload::Req(_) => "ServiceFlagsUpdateRequest",
+            tentaflow_protocol::ServiceFlagsPayload::Res(_) => "ServiceFlagsUpdateResponse",
+        },
         MessageBody::ServiceQuicStatusRequest => "ServiceQuicStatusRequest",
         MessageBody::ServiceQuicStatusResponse { .. } => "ServiceQuicStatusResponse",
         MessageBody::PromptListRequest => "PromptListRequest",
@@ -402,6 +406,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::DeploymentPayload::ReqLogStream(_) => "DeploymentLogStreamRequest",
             tentaflow_protocol::DeploymentPayload::StreamChunk(_) => "DeploymentStreamChunk",
             tentaflow_protocol::DeploymentPayload::StreamEnd(_) => "DeploymentStreamEnd",
+            tentaflow_protocol::DeploymentPayload::ReqRedeploy(_) => "ServiceRedeployRequest",
+            tentaflow_protocol::DeploymentPayload::ResRedeploy(_) => "ServiceRedeployResponse",
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
@@ -470,6 +476,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "MeetingTranscriptExportResponse"
             }
         },
+        MessageBody::VncTunnelBody(p) => match p {
+            tentaflow_protocol::VncTunnelPayload::ReqOpen(_) => "VncTunnelOpenRequest",
+            tentaflow_protocol::VncTunnelPayload::ResOpen(_) => "VncTunnelOpenResponse",
+            tentaflow_protocol::VncTunnelPayload::Chunk(_) => "VncTunnelChunk",
+            tentaflow_protocol::VncTunnelPayload::ReqSend(_) => "VncTunnelSendRequest",
+            tentaflow_protocol::VncTunnelPayload::ResSend(_) => "VncTunnelSendResponse",
+            tentaflow_protocol::VncTunnelPayload::ReqClose(_) => "VncTunnelCloseRequest",
+            tentaflow_protocol::VncTunnelPayload::ResClose(_) => "VncTunnelCloseResponse",
+            tentaflow_protocol::VncTunnelPayload::StreamEnd(_) => "VncTunnelStreamEnd",
+        },
+        MessageBody::BrowserCaptureBody(payload) => match payload {
+            tentaflow_protocol::BrowserCapturePayload::Request(_) => "BrowserCaptureRequest",
+            tentaflow_protocol::BrowserCapturePayload::Response(_) => "BrowserCaptureResponse",
+        },
         MessageBody::RegistryListRequest => "RegistryListRequest",
         MessageBody::RegistryListResponse { .. } => "RegistryListResponse",
         MessageBody::AuditEventBody(_) => "AuditEvent",
@@ -497,6 +517,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::SettingsListResponse { .. } => "SettingsListResponse",
         MessageBody::SettingsUpdateRequestBody(_) => "SettingsUpdateRequest",
         MessageBody::SettingsUpdateResponse { .. } => "SettingsUpdateResponse",
+        MessageBody::NetworkBody(p) => match p {
+            tentaflow_protocol::NetworkPayload::ReqInterfacesList => "NetworkInterfacesListRequest",
+            tentaflow_protocol::NetworkPayload::ResInterfacesList { .. } => {
+                "NetworkInterfacesListResponse"
+            }
+            tentaflow_protocol::NetworkPayload::ReqConfigGet => "NetworkConfigGetRequest",
+            tentaflow_protocol::NetworkPayload::ResConfigGet(_) => "NetworkConfigGetResponse",
+            tentaflow_protocol::NetworkPayload::ReqConfigUpdate(_) => "NetworkConfigUpdateRequest",
+            tentaflow_protocol::NetworkPayload::ResConfigUpdate { .. } => {
+                "NetworkConfigUpdateResponse"
+            }
+            tentaflow_protocol::NetworkPayload::ReqRelayStatus => "NetworkRelayStatusRequest",
+            tentaflow_protocol::NetworkPayload::ResRelayStatus(_) => "NetworkRelayStatusResponse",
+        },
         MessageBody::DashboardMetricsRequest => "DashboardMetricsRequest",
         MessageBody::DashboardMetricsResponse(_) => "DashboardMetricsResponse",
         MessageBody::MeshNodeListRequest => "MeshNodeListRequest",

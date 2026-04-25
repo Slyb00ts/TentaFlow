@@ -139,7 +139,7 @@ pub async fn translate(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
-        MessageBody::TranslateRequestBody(p) => p,
+        MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Req(p)) => p,
         _ => return Err(ProtocolError::bad_request("expected TranslateRequestBody")),
     };
 
@@ -258,7 +258,7 @@ text, with no explanations, quotes, preface or meta-commentary.",
         translated_text.chars().count(),
     );
 
-    Ok(MessageBody::TranslateResponseBody(TranslateResponse {
+    Ok(MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Res(TranslateResponse {
         translated_text,
         // Auto-detection of the source language is not surfaced by current
         // LLM backends; leaving None until a detector is wired in.
@@ -269,5 +269,5 @@ text, with no explanations, quotes, preface or meta-commentary.",
             response.model
         },
         tokens_used,
-    }))
+    })))
 }

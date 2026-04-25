@@ -44,16 +44,17 @@ function buildClient() {
  * loginie `setJwt()` zamyka i ponownie otwiera z JWT.
  */
 export async function initTransport() {
-  if (_client) return _client;
   await codecReady;
-  _client = buildClient();
   try {
-    await _client.connect();
+    return await getClient();
   } catch (e) {
-    // connect() sam zaplanuje reconnect. Overlay juz dostanie notify.
+    if (!_client) {
+      _client = buildClient();
+    }
+    // connect() samo zaplanuje reconnect. Overlay juz dostanie notify.
     console.warn('[api-binary] initial connect failed:', e?.message);
+    return _client;
   }
-  return _client;
 }
 
 async function getClient() {
@@ -146,6 +147,7 @@ export const ApiBinary = {
     } else {
       localStorage.removeItem(JWT_STORAGE_KEY);
     }
+    _connectingPromise = null;
     if (_client) {
       _client.close();
       _client = null;
@@ -168,6 +170,7 @@ export const ApiBinary = {
 
   clearSession() {
     localStorage.removeItem(JWT_STORAGE_KEY);
+    _connectingPromise = null;
     if (_client) {
       _client.close();
       _client = null;

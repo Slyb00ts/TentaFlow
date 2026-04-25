@@ -1828,6 +1828,19 @@ impl Router {
                     metrics: None,
                 }
             }
+            ModelPayload::Browser(_) => {
+                // Browser capture is dashboard → bot only; callbacks never carry it.
+                warn!("Unexpected Browser payload in chat callback");
+                ModelResponse {
+                    request_id,
+                    result: ModelResult::Error(ErrorInfo {
+                        error_type: ErrorType::InvalidRequest,
+                        message: "Browser is not valid in chat callbacks".to_string(),
+                        details: None,
+                    }),
+                    metrics: None,
+                }
+            }
         }
     }
 

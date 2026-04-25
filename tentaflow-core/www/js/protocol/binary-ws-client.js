@@ -16,6 +16,7 @@ import { openTransport, TRANSPORT_WEBTRANSPORT, TRANSPORT_WEBSOCKET } from './tr
 const DEFAULT_TIMEOUT_MS = 30_000;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+let GLOBAL_NEXT_SEQUENCE = 1n;
 
 export class BinaryWsClient {
   /**
@@ -39,8 +40,10 @@ export class BinaryWsClient {
     this.reconnectAttempt = 0;
     this.closed = false;
     this.outbox = [];
-    // Sequence per connection — server odrzuca <= last_seen, wiec MUSI rosnac.
-    this.nextSequence = 1n;
+    // Sequence jest globalnie monotoniczny per-page. Przy reconnect/auth-switch
+    // stary socket moze jeszcze chwile dozywac po stronie serwera, wiec reset do
+    // `1` bywa traktowany jako replay. Globalny licznik eliminuje ten wyścig.
+    this.nextSequence = GLOBAL_NEXT_SEQUENCE;
 
     this.jwtToken = opts.jwtToken ?? null;
     this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 15_000;
@@ -64,6 +67,8 @@ export class BinaryWsClient {
     // Dedup: emit onDisconnected tylko raz na kazdy prawdziwy disconnect,
     // nie per failed reconnect attempt.
     this._disconnectEmitted = false;
+    this._connectPromise = null;
+    this._transportGeneration = 0;
   }
 
   /**
@@ -93,31 +98,67 @@ export class BinaryWsClient {
    * Laczy i wykonuje handshake schema version. Rejectuje gdy serwer odrzuci.
    */
   async connect() {
+    if (this.connected && this.transport?.isOpen()) {
+      return this;
+    }
+    if (this._connectPromise) {
+      return this._connectPromise;
+    }
+    const attempt = this._connectImpl();
+    this._connectPromise = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (this._connectPromise === attempt) {
+        this._connectPromise = null;
+      }
+    }
+  }
+
+  async _connectImpl() {
     await codecReady;
     if (!this.nextCorrelationId) {
       this.nextCorrelationId = makeCorrelationIdGenerator();
     }
 
+    let transport = null;
+    let generation = this._transportGeneration;
     try {
-      this.transport = await openTransport({ jwtToken: this.jwtToken });
+      transport = await openTransport({ jwtToken: this.jwtToken });
+      generation = this._transportGeneration + 1;
+      this._transportGeneration = generation;
+      this.transport = transport;
       this.connected = true;
       this.reconnectAttempt = 0;
       this._disconnectEmitted = false;
-      this._transportUnsub = this.transport.onMessage((bytes) => this._handleBytes(bytes));
+      this._transportUnsub = transport.onMessage((bytes) => {
+        if (generation !== this._transportGeneration || this.transport !== transport) return;
+        this._handleBytes(bytes);
+      });
       // Podpinaj onClose — kiedy transport padnie, natychmiast reconnect.
-      if (this.transport.onClose) {
-        this._transportCloseUnsub = this.transport.onClose((info) => this._onTransportClose(info));
+      if (transport.onClose) {
+        this._transportCloseUnsub = transport.onClose((info) => this._onTransportClose(info, generation));
       }
-      console.info(`[ws] transport: ${this.transport.kind}`);
+      console.info(`[ws] transport: ${transport.kind}`);
       await this._handshake();
       this._lastHeartbeatReplyAt = Date.now();
       this._startHeartbeat();
       this._drainOutbox();
       this.onOpen();
+      return this;
     } catch (err) {
       this.connected = false;
-      if (this.transport) this.transport.close();
-      this.transport = null;
+      this._stopHeartbeat();
+      if (this._transportUnsub) this._transportUnsub();
+      if (this._transportCloseUnsub) this._transportCloseUnsub();
+      this._transportUnsub = null;
+      this._transportCloseUnsub = null;
+      if (this.transport === transport) {
+        this.transport = null;
+      }
+      if (transport) {
+        try { transport.close(); } catch { /* ignore */ }
+      }
       if (!this.closed) {
         // Emituj onDisconnected TYLKO przy pierwszej niudanej probie (transition).
         // Kolejne failed attempts leca tylko jako reconnect-attempt logi.
@@ -136,7 +177,8 @@ export class BinaryWsClient {
    * Wywolywany gdy transport.onClose wypali — zaplanuj reconnect
    * (chyba ze client zostal zamkniety rescznie przez close()).
    */
-  _onTransportClose(info) {
+  _onTransportClose(info, generation) {
+    if (generation !== this._transportGeneration) return;
     if (this.closed) return;
     if (!this.connected && !this.transport) return;
     console.warn('[ws] transport closed:', info);
@@ -151,7 +193,6 @@ export class BinaryWsClient {
       this.onDisconnected({ reason: info?.reason ?? 'unknown', code: info?.code });
     }
     this.onClose(info);
-    this.nextSequence = 1n;
     this._scheduleReconnect(info?.reason ?? 'closed');
   }
 
@@ -167,6 +208,7 @@ export class BinaryWsClient {
     }
     if (this._transportUnsub) this._transportUnsub();
     if (this._transportCloseUnsub) this._transportCloseUnsub();
+    this._transportGeneration += 1;
     if (this.transport) this.transport.close();
     this.transport = null;
     this.connected = false;
@@ -199,6 +241,9 @@ export class BinaryWsClient {
   takeSequence() {
     const seq = this.nextSequence;
     this.nextSequence = this.nextSequence + 1n;
+    if (this.nextSequence > GLOBAL_NEXT_SEQUENCE) {
+      GLOBAL_NEXT_SEQUENCE = this.nextSequence;
+    }
     return seq;
   }
 

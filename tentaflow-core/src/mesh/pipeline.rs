@@ -16,10 +16,14 @@ use crate::config::MeshConfig;
 use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
+use crate::mesh::relay_health::{spawn_relay_health_monitor, RelayHealth};
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
+use parking_lot::RwLock as PlRwLock;
+use tokio_util::sync::CancellationToken;
 use crate::net::iroh::pairing::{
-    load_trusted_contact_hints, store_trusted_contact_hints, PairingContactHints,
+    load_trusted_contact_hints, merge_contact_hints, store_trusted_contact_hints,
+    PairingContactHints,
 };
 use crate::routing::live_metrics;
 
@@ -76,11 +80,19 @@ pub struct MeshPipelineHandles {
     pub quic_mesh: Option<Arc<IrohMeshManager>>,
     /// MeshSecurity — tozsamosc Ed25519, trusted_keys, pairing.
     pub security: Option<Arc<MeshSecurity>>,
+    /// Snapshot zdrowia relay (URL, RTT, status, faktyczny bind addr) odswiezany
+    /// w tle co 30s. Wstrzykiwany do `AppState.mesh_relay_health` zeby handler
+    /// `NetworkRelayStatusRequest` mogl czytac stan bez dodatkowego I/O.
+    pub relay_health: Arc<PlRwLock<RelayHealth>>,
+    /// Cancellation token dla zadan w tle uruchomionych w pipeline (m.in.
+    /// monitor relay). Trzymany zeby `shutdown()` mogl czysto zatrzymac petle.
+    pub background_shutdown: CancellationToken,
 }
 
 impl MeshPipelineHandles {
     /// Graceful shutdown — zamyka iroh endpoint i wszystkie polaczenia.
     pub async fn shutdown(mut self) {
+        self.background_shutdown.cancel();
         if let Some(ref qm) = self.quic_mesh {
             qm.send_node_leaving().await;
             qm.shutdown().await;
@@ -136,9 +148,42 @@ pub async fn start_mesh_pipeline(
         }
     }
 
+    // Bind address: domyslnie `0.0.0.0:port` (mode=auto). Gdy user wybral
+    // `custom` i wpisal istniejace IPv4 hosta — iroh bindne sie tylko na ten
+    // jeden interfejs. Fallback do 0.0.0.0 z warnem gdy custom IP znikloby z
+    // systemu (np. VPN wylaczony po restartcie).
+    let bind_addr = match &db_pool {
+        Some(db) => crate::mesh::network_interfaces::resolve_bind_addr(db, mesh_port),
+        None => std::net::SocketAddr::from(([0u8, 0, 0, 0], mesh_port)),
+    };
+    tracing::info!(
+        bind_addr = %bind_addr,
+        relay = ?relay_url.as_ref().map(|r| r.to_string()),
+        "mesh init: resolved bind + relay (z ustawien GUI / config.toml)"
+    );
+
+    // Klon URL relay zachowujemy zeby spawn_relay_health_monitor mogl pingowac
+    // ten sam endpoint co iroh — `IrohMeshConfig` zjada `relay_url` mov'em.
+    let relay_url_for_health = relay_url.clone();
+    let bind_addr_actual = bind_addr.to_string();
+    let relay_health = Arc::new(PlRwLock::new(RelayHealth::initial_pending(
+        relay_url_for_health
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_default(),
+        bind_addr_actual.clone(),
+    )));
+    let background_shutdown = CancellationToken::new();
+    spawn_relay_health_monitor(
+        relay_url_for_health,
+        bind_addr_actual,
+        relay_health.clone(),
+        background_shutdown.clone(),
+    );
+
     let iroh_cfg = IrohMeshConfig {
         node_id: app_node_id.clone(),
-        bind_addr: std::net::SocketAddr::from(([0, 0, 0, 0], mesh_port)),
+        bind_addr,
         relay_url,
         enable_lan_discovery: mesh_config.mdns_enabled,
         enable_dht_discovery: enable_dht,
@@ -156,6 +201,7 @@ pub async fn start_mesh_pipeline(
                 &config.role,
                 mesh_port,
                 &local_node_info,
+                db_pool.as_ref(),
             );
 
             {
@@ -332,7 +378,11 @@ pub async fn start_mesh_pipeline(
                 local_node_id.clone(),
                 docker_cache,
             );
-            spawn_slow_refresh(mesh_peer_store.clone(), local_node_id.clone());
+            spawn_slow_refresh(
+                mesh_peer_store.clone(),
+                local_node_id.clone(),
+                db_pool.clone(),
+            );
             spawn_liveness_timer(
                 mesh_peer_store.clone(),
                 quic_mesh.clone(),
@@ -349,6 +399,8 @@ pub async fn start_mesh_pipeline(
                 mdns: None,
                 quic_mesh: Some(quic_mesh),
                 security: Some(mesh_security),
+                relay_health,
+                background_shutdown,
             })
         }
         Err(e) => {
@@ -360,11 +412,14 @@ pub async fn start_mesh_pipeline(
                 &config.role,
                 mesh_port,
                 &local_node_info,
+                db_pool.as_ref(),
             );
             Ok(MeshPipelineHandles {
                 mdns: None,
                 quic_mesh: None,
                 security: Some(mesh_security),
+                relay_health,
+                background_shutdown,
             })
         }
     }
@@ -376,8 +431,22 @@ fn upsert_local_peer(
     role: &str,
     mesh_port: u16,
     local_node_info: &NodeInfo,
+    db_pool: Option<&crate::db::DbPool>,
 ) {
-    let local_addresses = node_info_collector::collect_local_addresses();
+    let raw_addresses = node_info_collector::collect_local_addresses();
+    // IPv4 only + user-defined hide_* filtry. Bez DB (test/embed) przepuszczamy
+    // IPv4 wszystkie, IPv6 ucinamy zawsze — mesh nie obsluguje v6.
+    let local_addresses = match db_pool {
+        Some(db) => {
+            let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
+            let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+            crate::mesh::network_interfaces::filter_advertise_ips(&raw_addresses, &filters, &kind_map)
+        }
+        None => raw_addresses
+            .into_iter()
+            .filter(|ip| ip.is_ipv4())
+            .collect(),
+    };
     let local_os_distro = node_info_collector::collect_os_distro();
     let (docker_available, docker_version) = node_info_collector::collect_docker_info();
 
@@ -414,36 +483,24 @@ fn upsert_local_peer(
     });
 }
 
-fn merge_contact_hints(
-    current: Option<PairingContactHints>,
-    fresh: PairingContactHints,
-) -> PairingContactHints {
-    let mut merged = current.unwrap_or_default();
-    if merged.node_id.is_empty() {
-        merged.node_id = fresh.node_id.clone();
-    }
-    if merged.public_key_hex.is_empty() && !fresh.public_key_hex.is_empty() {
-        merged.public_key_hex = fresh.public_key_hex.clone();
-    }
-    if merged.hostname.is_empty() && !fresh.hostname.is_empty() {
-        merged.hostname = fresh.hostname.clone();
-    }
-    if merged.relay_url.is_empty() && !fresh.relay_url.is_empty() {
-        merged.relay_url = fresh.relay_url.clone();
-    }
-    for addr in fresh.addresses {
-        if !addr.is_empty() && !merged.addresses.contains(&addr) {
-            merged.addresses.push(addr);
-        }
-    }
-    merged
-}
-
 fn trusted_contact_hints_for_peer(
     security: &MeshSecurity,
     node_id: &str,
 ) -> Option<PairingContactHints> {
     load_trusted_contact_hints(&security.db, node_id).ok().flatten()
+}
+
+fn prefer_address_first(addresses: &mut Vec<String>, preferred: Option<&str>) {
+    let Some(preferred) = preferred else {
+        return;
+    };
+    let Some(index) = addresses.iter().position(|addr| addr == preferred) else {
+        return;
+    };
+    if index > 0 {
+        let preferred = addresses.remove(index);
+        addresses.insert(0, preferred);
+    }
 }
 
 /// [SCALE] Handler PeerConnected wywolywany w tokio::spawn z per-peer lockiem
@@ -581,17 +638,57 @@ async fn handle_peer_connected(
         if let Some(ref sec) = mesh_security {
             if let Some((hostname, addresses, port)) = peer_store.contact_snapshot(&node_id) {
                 if !addresses.is_empty() && port > 0 {
-                    let direct_addresses: Vec<String> = addresses
+                    // Filtr IPv4 + advertise rules: do trusted_contact:* wrzucamy
+                    // tylko to co user pozwolil widziec zdalnie (hide_docker/
+                    // hide_cgnat itp.). Bez filtra peerzy dostawali np. adresy
+                    // docker bridge, ktore sa nieosiagalne z zewnatrz hosta.
+                    let filters = crate::mesh::network_interfaces::load_advertise_filters(&sec.db);
+                    let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+                    let filtered_ips = crate::mesh::network_interfaces::filter_advertise_ips(
+                        &addresses, &filters, &kind_map,
+                    );
+                    if filtered_ips.is_empty() {
+                        debug!(
+                            peer_id = %node_id,
+                            "contact_snapshot: wszystkie adresy odrzucone przez advertise filters — pomijam persist"
+                        );
+                    } else {
+                    let mut direct_addresses: Vec<String> = filtered_ips
                         .iter()
                         .map(|ip| format!("{}:{}", ip, port))
                         .collect();
+                    let snapshot = qm_events.connection_snapshot(&node_id);
+                    let selected_address = snapshot.as_ref().and_then(|c| c.address.as_deref());
+                    let selected_is_direct = snapshot
+                        .as_ref()
+                        .map(|c| c.transport.as_str() == "p2p")
+                        .unwrap_or(false);
+                    if selected_is_direct {
+                        prefer_address_first(&mut direct_addresses, selected_address);
+                    }
+                    // Gdy user wlaczyl prefer_same_subnet, po filtrze przestawiamy
+                    // adres z tej samej /24 co peer na poczatek listy.
+                    if crate::mesh::network_interfaces::load_prefer_same_subnet(&sec.db) {
+                        crate::mesh::network_interfaces::sort_prefer_same_subnet(
+                            &mut direct_addresses,
+                            selected_address,
+                        );
+                    }
                     let addr_str = direct_addresses.join(",");
+                    tracing::info!(
+                        peer = %node_id,
+                        raw_count = addresses.len(),
+                        filtered_count = direct_addresses.len(),
+                        advertised = %addr_str,
+                        "advertise to peer: addresses po filtrach"
+                    );
                     let _ = crate::db::repository::update_trusted_node_addresses(
                         &sec.db, &node_id, &addr_str,
                     );
-                    let relay_url = qm_events
-                        .relay_url()
-                        .map(|url| url.to_string())
+                    let relay_url = snapshot
+                        .as_ref()
+                        .and_then(|c| c.relay_url.clone())
+                        .or_else(|| qm_events.relay_url().map(|url| url.to_string()))
                         .unwrap_or_default();
                     let current = load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
                     let hints = merge_contact_hints(
@@ -605,6 +702,7 @@ async fn handle_peer_connected(
                         },
                     );
                     let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
+                    }
                 }
             }
         }
@@ -795,18 +893,10 @@ fn spawn_quic_event_handler(
                         if peer_store.is_quic_connected(&entry.node_id) {
                             continue;
                         }
-                        // Cooldown — nie probuj ponownie przez 30s nawet jesli ten
-                        // sam peer zostanie anonsowany znowu.
-                        let recent = last_dial_at
-                            .get(&entry.node_id)
-                            .map(|t| {
-                                t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
-                            })
-                            .unwrap_or(false);
-                        if recent {
-                            continue;
-                        }
-                        last_dial_at.insert(entry.node_id.clone(), std::time::Instant::now());
+                        let target_trusted = match &mesh_security {
+                            Some(sec) => sec.is_trusted(&entry.node_id),
+                            None => false,
+                        };
 
                         let addrs: Vec<std::net::IpAddr> = entry
                             .direct_addrs
@@ -830,19 +920,39 @@ fn spawn_quic_event_handler(
                             peer_store.set_hostname(&entry.node_id, &entry.hostname);
                         }
                         peer_store.set_status(&entry.node_id, "discovered");
+                        if !target_trusted {
+                            continue;
+                        }
+                        let recent = last_dial_at
+                            .get(&entry.node_id)
+                            .map(|t| {
+                                t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
+                            })
+                            .unwrap_or(false);
+                        if recent {
+                            continue;
+                        }
+                        last_dial_at.insert(entry.node_id.clone(), std::time::Instant::now());
+                        let hints = match &mesh_security {
+                            Some(sec) => merge_contact_hints(
+                                load_trusted_contact_hints(&sec.db, &entry.node_id)
+                                    .ok()
+                                    .flatten(),
+                                PairingContactHints {
+                                    node_id: entry.node_id.clone(),
+                                    public_key_hex: String::new(),
+                                    hostname: entry.hostname.clone(),
+                                    addresses: entry.direct_addrs.clone(),
+                                    relay_url: String::new(),
+                                },
+                            ),
+                            None => continue,
+                        };
 
-                        // Auto-dial — iroh sam zajmuje sie NAT traversal + relay gdy
-                        // direct addr nie dziala.
                         let target = entry.node_id.clone();
                         let qm = qm_events.clone();
-                        let dial_addr = entry
-                            .direct_addrs
-                            .iter()
-                            .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
-                            .next()
-                            .unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
                         tokio::spawn(async move {
-                            match qm.connect_to_peer(&target, dial_addr).await {
+                            match qm.connect_to_peer_with_hints(&hints).await {
                                 Ok(_) => debug!(peer = %target, "Auto-dial (KnownPeers): OK"),
                                 Err(e) => debug!(peer = %target, "Auto-dial (KnownPeers): {}", e),
                             }
@@ -1026,18 +1136,34 @@ fn spawn_quic_event_handler(
                             if peer_store.is_quic_connected(&entry.node_id) {
                                 continue;
                             }
+                            let recent = last_dial_at
+                                .get(&entry.node_id)
+                                .map(|t| {
+                                    t.elapsed()
+                                        < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
+                                })
+                                .unwrap_or(false);
+                            if recent {
+                                continue;
+                            }
+                            last_dial_at
+                                .insert(entry.node_id.clone(), std::time::Instant::now());
                             let target = entry.node_id.clone();
                             let qm = qm_events.clone();
-                            let addrs: Vec<std::net::SocketAddr> = entry
-                                .direct_addrs
-                                .iter()
-                                .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
-                                .collect();
+                            let hints = merge_contact_hints(
+                                load_trusted_contact_hints(&sec.db, &entry.node_id)
+                                    .ok()
+                                    .flatten(),
+                                PairingContactHints {
+                                    node_id: entry.node_id.clone(),
+                                    public_key_hex: String::new(),
+                                    hostname: entry.hostname.clone(),
+                                    addresses: entry.direct_addrs.clone(),
+                                    relay_url: String::new(),
+                                },
+                            );
                             tokio::spawn(async move {
-                                let dial_addr = addrs.into_iter().next().unwrap_or_else(|| {
-                                    std::net::SocketAddr::from(([0, 0, 0, 0], 0))
-                                });
-                                match qm.connect_to_peer(&target, dial_addr).await {
+                                match qm.connect_to_peer_with_hints(&hints).await {
                                     Ok(_) => debug!(
                                         peer = %target,
                                         "Auto-dial z TopologyAnnounce udany — iroh polaczony"
@@ -1940,13 +2066,32 @@ fn collect_local_models(
 
 /// Slow refresh — co 60s odswiezaj wolno-zmienne dane lokalnego noda:
 /// adresy IP, Docker availability/version, OS distro.
-fn spawn_slow_refresh(peer_store: MeshPeerStore, local_node_id: String) {
+fn spawn_slow_refresh(
+    peer_store: MeshPeerStore,
+    local_node_id: String,
+    db_pool: Option<crate::db::DbPool>,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
+            let db_for_task = db_pool.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let addresses = node_info_collector::collect_local_addresses();
+                let raw = node_info_collector::collect_local_addresses();
+                // Ta sama logika co w `upsert_local_peer`: IPv4 only + advertise
+                // filtry z settings. User moze przez 60s zmienic flagi i nie
+                // chcemy zeby stary set adresow wrocil do peer_store.
+                let addresses = match db_for_task.as_ref() {
+                    Some(db) => {
+                        let filters =
+                            crate::mesh::network_interfaces::load_advertise_filters(db);
+                        let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
+                        crate::mesh::network_interfaces::filter_advertise_ips(
+                            &raw, &filters, &kind_map,
+                        )
+                    }
+                    None => raw.into_iter().filter(|ip| ip.is_ipv4()).collect(),
+                };
                 let (docker_available, docker_version) = node_info_collector::collect_docker_info();
                 let os_info = node_info_collector::collect_os_distro();
                 (addresses, docker_available, docker_version, os_info)
