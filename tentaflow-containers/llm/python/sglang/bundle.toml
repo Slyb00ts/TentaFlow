@@ -1,11 +1,14 @@
 [bundle]
 engine = "sglang"
-description = "SGLang serwer LLM z structured outputs (git HEAD)"
+description = "SGLang serwer LLM z structured outputs (PyPI)"
 python_version = "3.12"
-source = "git"
-git_repo = "https://github.com/sgl-project/sglang.git"
-git_ref = "main"
-install_subdir = "python"
+# Editable install z git'owej HEAD (install_subdir=python) nie eksponowal
+# top-level pakietu `sglang` — `python -m sglang.launch_server` rzucal
+# ModuleNotFoundError. PyPI wheel `sglang[all]` instaluje pakiet poprawnie
+# wraz z extras (sgl-kernel, openai, anthropic), ten sam wzorzec dziala w
+# referencyjnym kontenerze lmsysorg/sglang z naszego dotnetowego stacka.
+source = "pypi"
+pypi_package = "sglang[all]"
 
 [launch]
 command = "python"
@@ -16,6 +19,8 @@ args = [
     "--port", "${PORT:-30000}",
     "--tp", "${TP:-1}",
     "--mem-fraction-static", "${MEM_FRACTION:-0.85}",
+    "--attention-backend", "triton",
+    "--sampling-backend", "pytorch",
 ]
 internal_port = 30000
 

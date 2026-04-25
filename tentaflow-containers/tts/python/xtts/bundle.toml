@@ -21,13 +21,16 @@ platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu124"
-extras = []
+# coqui-ai-TTS na main nie deklaruje torch jako runtime dep (zalozenie ze
+# user instaluje go z extra-index PyTorch). Wymuszamy torch + torchaudio
+# zeby nasz server.py (`import torch`) sie nie wywalal.
+extras = ["torch", "torchaudio"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = []
+extras = ["torch", "torchaudio"]
 
 [[install_variants]]
 backend = "metal"
-extras = []
+extras = ["torch", "torchaudio"]
