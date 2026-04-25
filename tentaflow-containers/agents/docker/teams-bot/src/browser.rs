@@ -98,9 +98,22 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         .window_size(1920, 1080)
         .user_data_dir(user_data_dir)
         .arg("use-fake-ui-for-media-stream")
+        // The fake device flag gives Chromium a synthetic video/audio device
+        // to publish in enumerateDevices(). Without it Chromium reported real
+        // (none) and Teams cached 'No available camera found' the moment the
+        // prejoin dialog rendered, which left the camera button aria-disabled
+        // — clicking it after that did nothing and Teams never asked for our
+        // canvas track via getUserMedia.
+        .arg("use-fake-device-for-media-stream")
         .arg("autoplay-policy=no-user-gesture-required")
         .arg("enable-features=MediaStreamTrackGenerator")
-        .arg("disable-gpu")
+        // --disable-gpu tears down the WebRTC video pipeline: canvas
+        // captureStream() reported the track as live but the encoder never
+        // got composited frames. swiftshader provides a software GL backend
+        // that's enough for canvas readbacks and WebRTC encoding inside the
+        // headless container.
+        .arg("use-gl=swiftshader")
+        .arg("enable-unsafe-swiftshader")
         .arg("disable-blink-features=AutomationControlled")
         .arg("ignore-certificate-errors")
         .build()
