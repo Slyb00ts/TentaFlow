@@ -680,6 +680,15 @@
       if (!tracks.length) throw new Error('captureStream returned no video tracks');
       videoGenerator = tracks[0];
       try { videoGenerator.contentHint = 'motion'; } catch (_) {}
+      // Diagnostic shapshot the moment the stream is built — reveals whether
+      // captureStream produces a unmuted track at all (ie. whether the
+      // compositor is wired) before the meeting page even sees us.
+      console.log('[tentaflow][video] track ready, muted=' + videoGenerator.muted +
+        ' enabled=' + videoGenerator.enabled + ' state=' + videoGenerator.readyState +
+        ' settings=' + JSON.stringify(videoGenerator.getSettings()));
+      videoGenerator.addEventListener('mute', () => console.warn('[tentaflow][video] track became MUTED'));
+      videoGenerator.addEventListener('unmute', () => console.log('[tentaflow][video] track became UNMUTED'));
+      videoGenerator.addEventListener('ended', () => console.warn('[tentaflow][video] track ENDED'));
     } catch (e) {
       console.warn('[tentaflow] Blad tworzenia video stream', e);
       videoGenerator = null;
@@ -967,6 +976,18 @@
     window.__tentaflowVideoAvailable = true;
     if (window.__tentaflowBridge) window.__tentaflowBridge.videoSetupDone = true;
     console.log('[tentaflow] Video injection zainicjalizowane (' + W + 'x' + H + ' @ ' + FPS + 'fps)');
+    // Periodic heartbeat: prove the draw loop is alive and the canvas is
+    // actually attached to the rendered tree. If muted stays true after
+    // the first second the compositor never picked up our canvas — see
+    // the appendChild block above.
+    registerInterval(setInterval(() => {
+      try {
+        console.log('[tentaflow][video] tick muted=' + videoGenerator.muted +
+          ' enabled=' + videoGenerator.enabled +
+          ' canvasInDom=' + canvas.isConnected +
+          ' canvasParent=' + (canvas.parentNode ? canvas.parentNode.nodeName : 'null'));
+      } catch (_) {}
+    }, 5000));
   }
 
   function handleMicPcm(i16) {
