@@ -26,13 +26,13 @@ extra_index = "https://download.pytorch.org/whl/cu124"
 # Od coqui-tts 0.27.4 PyTorch nie jest pulled jako runtime dep — musimy
 # zainstalowac go sami. transformers<4.50 zeby zachowac isin_mps_friendly
 # (Coqui XTTS gpt.py zalezy od tego API).
-extras = ["torch==2.4.0", "torchaudio==2.4.0", "transformers<4.50"]
+extras = ["torch==2.4.0", "torchaudio==2.4.0", "transformers==4.49.0"]
 
 [[install_variants]]
 backend = "rocm"
 extra_index = "https://download.pytorch.org/whl/rocm7.0"
-extras = ["torch==2.4.0", "torchaudio==2.4.0", "transformers<4.50"]
+extras = ["torch==2.4.0", "torchaudio==2.4.0", "transformers==4.49.0"]
 
 [[install_variants]]
 backend = "metal"
-extras = ["torch==2.4.0", "torchaudio==2.4.0", "transformers<4.50"]
+extras = ["torch==2.4.0", "torchaudio==2.4.0", "transformers==4.49.0"]
