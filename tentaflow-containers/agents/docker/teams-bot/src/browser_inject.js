@@ -480,9 +480,40 @@
         }
         console.log('[tentaflow] Przechwycono getUserMedia audio:', !!constraints.audio,
           'video:', !!constraints.video);
+
+        // Teams' MediaAgent looks up the track-reported deviceId in
+        // enumerateDevices() and rejects every frame from a track whose
+        // deviceId is not in that list — that was the 'Active device not
+        // found' warning we kept seeing in the bot logs while the canvas
+        // track itself was perfectly healthy. Force the synthetic tracks to
+        // claim the same deviceId Chromium publishes for its built-in fake
+        // input, so the lookup succeeds.
+        const realDevs = await origEnum();
+        const realVid = realDevs.find((d) => d.kind === 'videoinput');
+        const realAud = realDevs.find((d) => d.kind === 'audioinput');
+        const reportSettings = (track, real) => {
+          if (!track || !real) return;
+          try {
+            const orig = (track.getSettings && track.getSettings()) || {};
+            const patched = Object.assign({}, orig, {
+              deviceId: real.deviceId,
+              groupId: real.groupId || orig.groupId,
+            });
+            Object.defineProperty(track, 'getSettings', {
+              configurable: true,
+              value: () => Object.assign({}, patched),
+            });
+          } catch (_) {}
+        };
         const combined = new MediaStream();
-        if (constraints.audio && micGenerator) combined.addTrack(micGenerator);
-        if (constraints.video && videoGenerator) combined.addTrack(videoGenerator);
+        if (constraints.audio && micGenerator) {
+          reportSettings(micGenerator, realAud);
+          combined.addTrack(micGenerator);
+        }
+        if (constraints.video && videoGenerator) {
+          reportSettings(videoGenerator, realVid);
+          combined.addTrack(videoGenerator);
+        }
         if (combined.getTracks().length > 0) return combined;
         return origGum(constraints);
       } catch (e) {
@@ -500,23 +531,35 @@
     const origEnum = navigator.mediaDevices.enumerateDevices
       ? navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices)
       : async () => [];
+    // Chromium already publishes fake mic/camera/speaker entries when started
+    // with --use-fake-ui-for-media-stream. Adding a parallel "tentaflow-*"
+    // device confused Teams' MediaAgent: getUserMedia returned our canvas
+    // track, MediaAgent looked up the track's deviceId in enumerateDevices,
+    // failed to find it (because the track had its own captureStream-assigned
+    // id and our injected device had "tentaflow-*"), and rejected every
+    // frame as 'Active device not found'. The tile rendered black even
+    // though the track itself was unmuted/live.
+    //
+    // Override enumerateDevices to relabel Chromium's existing fake devices
+    // so Teams shows them as 'TentaFlow Bot Camera/Mic/Speaker' but keeps
+    // the real (Chromium-internal) deviceIds. The id mapping then survives
+    // the MediaAgent lookup.
     navigator.mediaDevices.enumerateDevices = async function () {
       let real = [];
       try { real = await origEnum(); } catch (_) { real = []; }
-      const fake = [];
-      const hasReal = (kind) => real.some((d) => d.kind === kind);
-      const makeDevice = (kind, label) => ({
-        deviceId: 'tentaflow-' + kind,
-        groupId: 'tentaflow-group',
-        kind,
-        label,
-        toJSON() { return { deviceId: this.deviceId, groupId: this.groupId, kind: this.kind, label: this.label }; },
+      return real.map((d) => {
+        let label = d.label;
+        if (d.kind === 'audioinput') label = 'TentaFlow Bot Mic';
+        else if (d.kind === 'videoinput') label = 'TentaFlow Bot Camera';
+        else if (d.kind === 'audiooutput') label = 'TentaFlow Bot Speaker';
+        return Object.assign(Object.create(MediaDeviceInfo.prototype || Object.prototype), {
+          deviceId: d.deviceId,
+          groupId: d.groupId,
+          kind: d.kind,
+          label,
+          toJSON() { return { deviceId: this.deviceId, groupId: this.groupId, kind: this.kind, label: this.label }; },
+        });
       });
-      if (micGenerator && !hasReal('audioinput')) fake.push(makeDevice('audioinput', 'TentaFlow Bot Mic'));
-      if (videoGenerator && !hasReal('videoinput')) fake.push(makeDevice('videoinput', 'TentaFlow Bot Camera'));
-      // audiooutput needs to exist or Teams disables the speaker selector.
-      if (!real.some((d) => d.kind === 'audiooutput')) fake.push(makeDevice('audiooutput', 'TentaFlow Bot Speaker'));
-      return real.concat(fake);
     };
 
     if (window.__tentaflowBridge) window.__tentaflowBridge.micSetupDone = true;
