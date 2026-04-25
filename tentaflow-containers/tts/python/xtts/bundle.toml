@@ -31,7 +31,11 @@ extras = ["torch==2.4.0", "torchaudio==2.4.0"]
 # upgraduje transformers do 5.6.2 i Coqui XTTS gpt.py crashuje na
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
 # usunieta w >=4.57). Force-pin nadpisuje resolver po main install.
-force_pins = ["transformers==4.49.0"]
+force_pins = [
+    "transformers==4.49.0",
+    "tokenizers==0.21.0",
+    "huggingface-hub==0.26.5",
+]
 
 [[install_variants]]
 backend = "rocm"
@@ -41,7 +45,11 @@ extras = ["torch==2.4.0", "torchaudio==2.4.0"]
 # upgraduje transformers do 5.6.2 i Coqui XTTS gpt.py crashuje na
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
 # usunieta w >=4.57). Force-pin nadpisuje resolver po main install.
-force_pins = ["transformers==4.49.0"]
+force_pins = [
+    "transformers==4.49.0",
+    "tokenizers==0.21.0",
+    "huggingface-hub==0.26.5",
+]
 
 [[install_variants]]
 backend = "metal"
@@ -50,4 +58,8 @@ extras = ["torch==2.4.0", "torchaudio==2.4.0"]
 # upgraduje transformers do 5.6.2 i Coqui XTTS gpt.py crashuje na
 # `from transformers.pytorch_utils import isin_mps_friendly` (funkcja
 # usunieta w >=4.57). Force-pin nadpisuje resolver po main install.
-force_pins = ["transformers==4.49.0"]
+force_pins = [
+    "transformers==4.49.0",
+    "tokenizers==0.21.0",
+    "huggingface-hub==0.26.5",
+]
