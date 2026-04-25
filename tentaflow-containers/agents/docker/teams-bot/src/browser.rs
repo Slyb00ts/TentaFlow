@@ -462,6 +462,93 @@ pub async fn join_meeting(
         tracing::info!(report = %report, "Post-join camera toggle result");
     }
 
+    // Post-join unmute + replaceTrack na wszystkich audio senders zeby
+    // KAZDY pc.transceiver audio uzywal naszego micGenerator. Teams w
+    // anonim joinach tworzy 2 audio sendery: jeden z naszego getUserMedia
+    // override (micGenerator, ale Teams go disabuje) i drugi z Chromium
+    // fake-input (enabled, ale wysyla pusty PCM). Bez replaceTrack tone
+    // idzie do disabled sendera = void. Dumpujemy stan przed i po.
+    let unmute_report = page
+        .evaluate(
+            r#"
+            (async function() {
+                const result = {
+                    unmuteAttempted: false,
+                    unmuteClicked: false,
+                    replacedAudio: 0,
+                    enabledOurTrack: 0,
+                    sendersBefore: [],
+                    sendersAfter: [],
+                };
+                const sels = [
+                    '#mic-button',
+                    '[data-tid="toggle-mute"]',
+                    'button[aria-label*="microphone" i]',
+                    'button[aria-label*="mikrofon" i]',
+                    'button[aria-label*="unmute" i]',
+                ];
+                for (const sel of sels) {
+                    const btn = document.querySelector(sel);
+                    if (btn) {
+                        result.unmuteAttempted = true;
+                        const pressed = btn.getAttribute('aria-pressed') === 'true'
+                            || btn.getAttribute('aria-checked') === 'true';
+                        const muted = (btn.getAttribute('aria-label') || '').toLowerCase().includes('unmute');
+                        if (pressed || muted) {
+                            try { btn.click(); result.unmuteClicked = true; } catch (_) {}
+                        }
+                        break;
+                    }
+                }
+                const dumpSenders = (pcs) => {
+                    const out = [];
+                    for (const pc of pcs) {
+                        try {
+                            for (const s of pc.getSenders()) {
+                                const t = s.track;
+                                out.push(t ? {
+                                    kind: t.kind, id: t.id,
+                                    enabled: t.enabled, muted: t.muted,
+                                    readyState: t.readyState,
+                                } : null);
+                            }
+                        } catch (_) {}
+                    }
+                    return out;
+                };
+                const pcs = (window.__tentaflowPeerConnections instanceof Set)
+                    ? Array.from(window.__tentaflowPeerConnections) : [];
+                result.sendersBefore = dumpSenders(pcs);
+                const mic = window.__tentaflowMicGenerator;
+                if (mic) {
+                    for (const pc of pcs) {
+                        for (const s of pc.getSenders()) {
+                            if (s.track && s.track.kind === 'audio') {
+                                try {
+                                    await s.replaceTrack(mic);
+                                    result.replacedAudio += 1;
+                                } catch (e) {
+                                    console.warn('[tentaflow] replaceTrack failed:', e);
+                                }
+                            }
+                        }
+                    }
+                    // micGenerator track muszi byc enabled, inaczej Chromium
+                    // dropuje frames przed enkoderem.
+                    if (mic.enabled !== true) {
+                        try { mic.enabled = true; result.enabledOurTrack = 1; } catch (_) {}
+                    }
+                }
+                result.sendersAfter = dumpSenders(pcs);
+                return JSON.stringify(result);
+            })()
+            "#,
+        )
+        .await
+        .map(|v| v.into_value::<String>().unwrap_or_default())
+        .unwrap_or_default();
+    tracing::info!(report = %unmute_report, "Post-join unmute + senders dump");
+
     Ok((page, observer))
 }
 
