@@ -19,8 +19,11 @@ use rkyv::{Archive, Deserialize, Serialize};
 /// Lekki widok modelu w katalogu.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ModelSummary {
-    /// Np. "llama-3.2-1b-instruct".
+    /// Np. "tentaflow-vllm-metal-2izlb" — service name (do dispatchu).
     pub id: String,
+    /// User-friendly etykieta dla GUI: HF repo modelu (np. "Qwen/Qwen3.5-0.8B")
+    /// gdy znany, inaczej service name jako fallback.
+    pub display_name: String,
     /// Rodzina: "llm", "tts", "stt", "embedding", itd.
     pub category: String,
     /// Silnik ktory uruchamia model: "llama-cpp", "mlx", "vllm"...
@@ -2980,6 +2983,7 @@ mod tests {
     fn sample_model() -> ModelSummary {
         ModelSummary {
             id: "llama-3.2-1b-instruct".to_string(),
+            display_name: "meta-llama/Llama-3.2-1B-Instruct".to_string(),
             category: "llm".to_string(),
             engine_id: "llama-cpp".to_string(),
             availability: "ready".to_string(),

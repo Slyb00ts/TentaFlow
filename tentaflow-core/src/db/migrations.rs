@@ -1659,5 +1659,21 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE services_new RENAME TO services;
         ",
     ),
+    (
+        55,
+        "services_pinned_paused_for_memory_guard",
+        "
+            -- MemoryGuard persistence — pinned (zawsze warm, nie evict) + paused
+            -- (skip autostart). Domyslnie 0/0 dla istniejacych wpisow; auto-pin
+            -- ustawiany przez deploy dla orchestratora (Qwen 0.8B, Whisper, sherpa).
+            ALTER TABLE services ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE services ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
+            -- Szacowana pamiec VRAM/RAM modelu w MB. NULL = brak oszacowania
+            -- (guard uzyje heurystyki estimate_vram_for_model).
+            ALTER TABLE services ADD COLUMN vram_estimate_mb INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_services_pinned ON services(pinned);
+            CREATE INDEX IF NOT EXISTS idx_services_paused ON services(paused);
+        ",
+    ),
 ]
 }
