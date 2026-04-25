@@ -312,11 +312,11 @@ function renderRow(s) {
         <tf-button variant="${s.pinned ? 'primary' : 'ghost'}" size="sm" icon="lock"
           data-svc-pin="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
           data-pinned="${s.pinned ? '1' : '0'}"
-          title="${escapeAttr(s.pinned ? 'Pinned: zawsze warm' : 'Pin: zawsze warm, nie evict')}"></tf-button>
+          title="${escapeAttr(I18n.t(s.pinned ? 'services.tooltip_pin_on' : 'services.tooltip_pin_off'))}"></tf-button>
         <tf-button variant="${s.paused ? 'warning' : 'ghost'}" size="sm" icon="${s.paused ? 'play' : 'pause'}"
           data-svc-pause="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
           data-paused="${s.paused ? '1' : '0'}"
-          title="${escapeAttr(s.paused ? 'Wznow: serwis startuje z programem' : 'Pauza: zwolnij VRAM, skip autostart')}"></tf-button>
+          title="${escapeAttr(I18n.t(s.paused ? 'services.tooltip_pause_on' : 'services.tooltip_pause_off'))}"></tf-button>
         <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
       </td>
     </tr>
@@ -802,15 +802,15 @@ async function toggleServiceFlag(id, name, { pinned, paused }) {
       paused,
     });
     if (r.ok) {
-      const action = pinned !== undefined
-        ? (pinned ? `Przypiety: ${name}` : `Odpiety: ${name}`)
-        : (paused ? `Pauza: ${name} (VRAM zwolniony)` : `Wznowiony: ${name}`);
-      toast(action, 'success');
+      let key;
+      if (pinned !== undefined) key = pinned ? 'services.toast_pinned' : 'services.toast_unpinned';
+      else key = paused ? 'services.toast_paused' : 'services.toast_resumed';
+      toast(I18n.t(key, { name }), 'success');
       services = await ApiBinary.list('serviceListRequest');
       patchListTab();
     }
   } catch (err) {
-    toast(`Blad: ${err.message}`, 'error');
+    toast(I18n.t('services.toast_flag_error', { error: err.message }), 'error');
   }
 }
 
