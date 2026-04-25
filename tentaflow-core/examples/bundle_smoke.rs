@@ -55,6 +55,18 @@ async fn main() -> Result<()> {
     if engine == "xtts" {
         env.insert("COQUI_TOS_AGREED".to_string(), "1".to_string());
     }
+    // Domyslny UV_HTTP_TIMEOUT=30s nie wystarcza dla nvidia-cublas (>1 GB)
+    // i innych ciezkich wheels CUDA. Bezpieczne 10 min na pobranie.
+    std::env::set_var("UV_HTTP_TIMEOUT", "600");
+    // tensorrt-llm wewnetrznie ladowal UCX (InfiniBand transport) i probowal
+    // alokowac registered memory; bez `ulimit -l unlimited` proba `ibv_reg_mr`
+    // pada, a serwer zostaje w petli logow bez odpowiedzi. Wymuszamy TCP-only
+    // transport — szkodzi tylko gdy ktos REALNIE chce IB, czego w smoke tescie
+    // RTX 4090 nie testujemy.
+    if engine == "tensorrt-llm" {
+        env.insert("UCX_TLS".to_string(), "tcp".to_string());
+        env.insert("OMPI_MCA_opal_cuda_support".to_string(), "false".to_string());
+    }
     if let Ok(token) = std::env::var("HF_TOKEN") {
         env.insert("HF_TOKEN".to_string(), token);
     }
@@ -97,6 +109,27 @@ async fn main() -> Result<()> {
         started_at.elapsed().as_secs_f32(),
         running.internal_port
     );
+
+    // Subprocess silnika (uvicorn / vllm / sglang / trtllm) ma piped stdout +
+    // stderr (Stdio::piped() w spawn_engine). Bez aktywnego czytania pipe
+    // moze sie zapelnic i proces zawiesi sie cicho — a my nie zobaczymy
+    // dlaczego nie odpowiada na health probe. Spawnujemy 2 watki ktore
+    // forwarduja kazda linie do naszego stderr z prefiksem [engine].
+    use std::io::{BufRead, BufReader};
+    if let Some(out) = running.child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().flatten() {
+                eprintln!("[engine-out] {}", line);
+            }
+        });
+    }
+    if let Some(err) = running.child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().flatten() {
+                eprintln!("[engine-err] {}", line);
+            }
+        });
+    }
 
     let port = running.internal_port;
     let base_url = format!("http://127.0.0.1:{port}");
