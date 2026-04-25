@@ -36,11 +36,14 @@ use serde::Deserialize;
 use tentaflow_protocol::{
     MeetingEventPayload, LIFECYCLE_JOINED, LIFECYCLE_LOBBY_WAITING,
 };
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, RwLock};
 
+use crate::audio::RosterEntry;
 use crate::quic_server::RouterClient;
 
 pub type RouterHandle = Arc<Mutex<Option<Arc<RouterClient>>>>;
+pub type RosterState = Arc<RwLock<Vec<RosterEntry>>>;
+pub type SpeakerState = Arc<RwLock<Option<String>>>;
 
 /// JS-side event name registered as a CDP binding. Must match the constant
 /// used inside `browser_inject.js`.
@@ -147,11 +150,17 @@ impl DomObserver {
 /// the forwarding task. Must be called *before* the page navigates to the
 /// Teams URL — `evaluate_on_new_document` already injects the JS observer,
 /// and the binding has to exist when that JS runs.
+///
+/// `roster_state` / `speaker_state` are also written from the forwarding task
+/// so STT metadata enrichment in main.rs (transcribe extra_meta `roster` /
+/// `active_speaker`) keeps working without the old WS-poll pipeline.
 pub async fn start(
     page: Page,
     router: RouterHandle,
     meeting_key: String,
     bot_name: String,
+    roster_state: RosterState,
+    speaker_state: SpeakerState,
 ) -> Result<DomObserver> {
     page.execute(AddBindingParams::new(BINDING_NAME))
         .await
@@ -223,30 +232,30 @@ pub async fn start(
                             if known.insert(id.clone(), who.clone()).is_none() {
                                 tracing::info!(participant = %who, "dom_observer: participant joined");
                                 emit_participant(&router, &meeting_key, &id, &who, "joined").await;
+                                sync_roster(&roster_state, &known).await;
                             }
                         }
                         DomEvent::ParticipantLeft { id, name } => {
-                            let who = match known.remove(&id) {
+                            let removed = known.remove(&id);
+                            let who = match removed {
                                 Some(prev) => prev,
                                 None => name.unwrap_or_else(|| id.clone()),
                             };
-                            // Teams dla anonimowych dolaczen dodaje sufix
-                            // "(Unverified)" / " (External)" do display name.
-                            // Filtrujemy bot przez prefix match — "DevBot"
-                            // pasuje do "DevBot (Unverified)" itp.
                             if who.starts_with(&bot_name) {
                                 continue;
                             }
                             tracing::info!(participant = %who, "dom_observer: participant left");
                             emit_participant(&router, &meeting_key, &id, &who, "left").await;
+                            sync_roster(&roster_state, &known).await;
                         }
                         DomEvent::ActiveSpeaker { id, name } => {
                             let who = name.or_else(|| id.as_ref().and_then(|tid| known.get(tid).cloned()));
                             if current_speaker == who { continue; }
                             current_speaker = who.clone();
-                            if let Some(n) = who {
+                            *speaker_state.write().await = current_speaker.clone();
+                            if let Some(ref n) = current_speaker {
                                 tracing::info!(speaker = %n, "dom_observer: active speaker");
-                                emit_participant(&router, &meeting_key, id.as_deref().unwrap_or(&n), &n, "speaking").await;
+                                emit_participant(&router, &meeting_key, id.as_deref().unwrap_or(n), n, "speaking").await;
                             } else {
                                 tracing::info!("dom_observer: active speaker cleared");
                             }
@@ -311,6 +320,18 @@ async fn emit_participant(
     {
         tracing::warn!("dom_observer emit_participant({}, {}): {}", speaker_name, status, e);
     }
+}
+
+/// Snapshotuje aktualny `known` map jako Vec<RosterEntry> dla STT metadata.
+/// Bot jest juz odfiltrowany na poziomie wstawiania do `known`.
+async fn sync_roster(state: &RosterState, known: &HashMap<String, String>) {
+    let mut entries: Vec<RosterEntry> = known
+        .values()
+        .map(|name| RosterEntry { name: name.clone(), status: String::new() })
+        .collect();
+    // Stabilna kolejnosc — main.rs serializuje to do JSON metadata.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    *state.write().await = entries;
 }
 
 fn ts_ms() -> i64 {
