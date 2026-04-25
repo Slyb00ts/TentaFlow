@@ -127,5 +127,5 @@ pub use message_body::{
     BROWSER_CAPTURE_REMOTE_NODE,
     SystemEventPayload,
     GroupInfo, IamPayload, PermissionEntry,
-    TranslateRequest, TranslateResponse, UserInfo, UserOAuthAccountRow, UsersListResponse,
+    TranslatePayload, TranslateRequest, TranslateResponse, UserInfo, UserOAuthAccountRow, UsersListResponse,
 };

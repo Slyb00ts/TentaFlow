@@ -30,7 +30,7 @@ function defaultConfig() {
     hideLoopback: true,
     hideCgnat: false,
     preferSameSubnet: true,
-    irohRelayUrl: '',
+    irohRelayUrl: 'https://relay.nextapp.pl',
   };
 }
 
