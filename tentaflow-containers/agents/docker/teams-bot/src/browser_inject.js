@@ -644,12 +644,28 @@
       return;
     }
     const W = 640, H = 480;
-    // Use a real (off-screen DOM) canvas — OffscreenCanvas does not have
-    // .captureStream(). The element is never appended so it never paints to
-    // the document; it just holds the framebuffer the stream samples from.
+    // captureStream samples whatever the compositor draws for this canvas.
+    // A canvas that is never attached to the document never gets composited,
+    // so the resulting MediaStreamTrack stays live-but-muted forever — that
+    // is exactly the symptom we hit, Teams renders a black tile while the
+    // track reports muted=true. Append the canvas off-screen at 1x1 so it
+    // counts as part of the rendered tree without taking visible space.
     const canvas = document.createElement('canvas');
     canvas.width = W;
     canvas.height = H;
+    canvas.style.cssText =
+      'position:fixed;left:-99999px;top:-99999px;width:1px;height:1px;' +
+      'pointer-events:none;opacity:0.001;';
+    const attachCanvas = () => {
+      if (!canvas.isConnected && document.body) {
+        document.body.appendChild(canvas);
+      }
+    };
+    if (document.body) {
+      attachCanvas();
+    } else {
+      document.addEventListener('DOMContentLoaded', attachCanvas, { once: true });
+    }
     videoCanvas = canvas;
     // alpha: false hands the encoder an opaque RGB buffer. Without it the
     // canvas keeps an alpha channel, the captured stream produces RGBA, and
