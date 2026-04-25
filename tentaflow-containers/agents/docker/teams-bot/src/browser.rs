@@ -131,6 +131,40 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         }
     });
 
+    // Force-grant camera, microphone and the related media-capture permissions
+    // for Teams' origins. Without this navigator.permissions.query returned
+    // 'prompt' (or 'denied') for anonymous joiners — Teams then rendered the
+    // 'Camera/Mic is not available — Go to your device settings' UFD and the
+    // toggle stayed aria-disabled. The Chromium CDP setPermission call works
+    // at the browser level and is honoured by every later getUserMedia call,
+    // unlike --use-fake-ui-for-media-stream which only suppresses the UI
+    // prompt without changing the stored permission state.
+    {
+        use chromiumoxide::cdp::browser_protocol::browser::{
+            PermissionDescriptor, PermissionSetting, SetPermissionParams,
+        };
+        let names = ["camera", "microphone", "midi", "midi-sysex"];
+        let origins = [
+            "https://teams.microsoft.com",
+            "https://teams.live.com",
+        ];
+        for origin in origins.iter() {
+            for name in names.iter() {
+                let params = SetPermissionParams {
+                    permission: PermissionDescriptor::new(*name),
+                    setting: PermissionSetting::Granted,
+                    origin: Some((*origin).to_string()),
+                    embedded_origin: None,
+                    browser_context_id: None,
+                };
+                if let Err(e) = browser.execute(params).await {
+                    tracing::warn!(origin = origin, name = name, "setPermission failed: {}", e);
+                }
+            }
+        }
+        tracing::info!("Camera/microphone permissions granted for Teams origins");
+    }
+
     // TODO: Wczytanie cookies z config.auth_cookies_path
     // Cookies Teams sa wymagane do automatycznej autoryzacji.
     // Format: JSON array z polami name, value, domain, path, httpOnly, secure
