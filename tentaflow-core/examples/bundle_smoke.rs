@@ -25,7 +25,9 @@ use anyhow::{anyhow, Result};
 use tentaflow_core::deploy::python_venv::{deploy_with_logs, NativeDeployRequest};
 
 const HEALTH_TIMEOUT_SECS: u64 = 600; // 10 min na ladowanie modelu
-const SMOKE_REQUEST_TIMEOUT_SECS: u64 = 120;
+// sglang/vllm/trtllm robia JIT compile triton kerneli przy pierwszym chat
+// request — moze trwac kilka min. Drugi request bedzie szybki (cached).
+const SMOKE_REQUEST_TIMEOUT_SECS: u64 = 600;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
@@ -58,6 +60,11 @@ async fn main() -> Result<()> {
     // Domyslny UV_HTTP_TIMEOUT=30s nie wystarcza dla nvidia-cublas (>1 GB)
     // i innych ciezkich wheels CUDA. Bezpieczne 10 min na pobranie.
     std::env::set_var("UV_HTTP_TIMEOUT", "600");
+    // sglang 0.5.10+ zalezy od flash-attn-4 ktory jest pre-release (>=4.0.0b4).
+    // Bez UV_PRERELEASE=allow uv resolver odrzuca i deploy pada na install
+    // glownego pakietu. Allow obejmuje wszystkie silniki — pre-release deps
+    // zdarzaja sie regularnie w nowoczesnym ML stacku (vllm, trtllm itd.).
+    std::env::set_var("UV_PRERELEASE", "allow");
     // tensorrt-llm wewnetrznie ladowal UCX (InfiniBand transport) i probowal
     // alokowac registered memory; bez `ulimit -l unlimited` proba `ibv_reg_mr`
     // pada, a serwer zostaje w petli logow bez odpowiedzi. Wymuszamy TCP-only
