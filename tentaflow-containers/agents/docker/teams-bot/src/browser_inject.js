@@ -640,6 +640,11 @@
     }
     try {
       videoGenerator = new MediaStreamTrackGenerator({ kind: 'video' });
+      // Hint to the encoder that the source is animated content rather than
+      // a still slideshow. Without it Teams' WebRTC pipeline picks a long
+      // keyframe interval and rendered our tile as black until the very
+      // first delta frame arrived.
+      try { videoGenerator.contentHint = 'motion'; } catch (_) {}
       videoWriter = videoGenerator.writable.getWriter();
     } catch (e) {
       console.warn('[tentaflow] Blad tworzenia video generator', e);
@@ -655,7 +660,15 @@
     // dropped.
     const canvas = new OffscreenCanvas(W, H);
     const ctx = canvas.getContext('2d', { alpha: false });
-    let baseTs = 0;
+    // VideoFrame.timestamp must read as monotonic microseconds against the
+    // same clock the WebRTC encoder uses. We were starting at 0 and
+    // incrementing by frameIntervalUs, which made the codec interpret the
+    // first frames as decades old (epoch 1970) and drop them — Teams kept
+    // showing the placeholder black tile because no frame ever made it
+    // through. Anchor on performance.now() so timestamps line up with the
+    // rest of the page's media clock.
+    const tsAnchor = performance.now() * 1000;
+    let baseTs = tsAnchor;
     // 30 FPS keeps the wireframe motion smooth through Teams' video pipeline.
     // VideoFrame objects are cheap with OffscreenCanvas and Chromium reuses the
     // underlying GPU buffer, so the ~800-edge stroke pass per frame is fine.
@@ -929,8 +942,13 @@
         }
 
         bitmap = canvas.transferToImageBitmap();
-        frame = new VideoFrame(bitmap, { timestamp: baseTs });
-        baseTs += frameIntervalUs;
+        // Use the actual wall-clock since anchor instead of a stepped
+        // counter. If a frame is dropped or the loop is throttled the next
+        // frame still has a sensible timestamp; a stepped counter would
+        // accumulate drift and push frames into the future.
+        const ts = Math.round(performance.now() * 1000);
+        frame = new VideoFrame(bitmap, { timestamp: ts });
+        baseTs = ts;
         await videoWriter.write(frame);
       } catch (e) {
         // Tearing down the whole bridge on a single bad frame killed audio
