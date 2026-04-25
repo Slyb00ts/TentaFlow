@@ -382,21 +382,62 @@ pub async fn join_meeting(
                                 'button[aria-label*="kamera" i]',
                                 'button[title*="camera" i]',
                             ];
-                            for (let i = 0; i < 30; i++) {
+                            const findBtn = () => {
                                 for (const sel of sels) {
-                                    const btn = document.querySelector(sel);
-                                    if (!btn) continue;
-                                    const disabled = btn.disabled
-                                        || btn.getAttribute('aria-disabled') === 'true';
-                                    if (disabled) continue;
-                                    const pressed = btn.getAttribute('aria-pressed') === 'true'
-                                        || btn.getAttribute('aria-checked') === 'true';
-                                    if (!pressed) btn.click();
-                                    return JSON.stringify({ ok: true, selector: sel, pressed });
+                                    const b = document.querySelector(sel);
+                                    if (b) return { btn: b, sel };
+                                }
+                                return null;
+                            };
+                            const click = (btn) => {
+                                try { btn.removeAttribute('disabled'); } catch (_) {}
+                                try { btn.removeAttribute('aria-disabled'); } catch (_) {}
+                                btn.click();
+                            };
+                            // Ten-second window to find an *enabled* button.
+                            for (let i = 0; i < 20; i++) {
+                                const found = findBtn();
+                                if (found) {
+                                    const disabled = found.btn.disabled
+                                        || found.btn.getAttribute('aria-disabled') === 'true';
+                                    if (!disabled) {
+                                        const pressed = found.btn.getAttribute('aria-pressed') === 'true'
+                                            || found.btn.getAttribute('aria-checked') === 'true';
+                                        if (!pressed) click(found.btn);
+                                        return JSON.stringify({ ok: true, selector: found.sel, mode: 'enabled-click', pressed });
+                                    }
                                 }
                                 await new Promise((r) => setTimeout(r, 500));
                             }
-                            return JSON.stringify({ ok: false, reason: 'no enabled camera button after 15s' });
+                            // Fallback A: try the camera button anyway after stripping disabled.
+                            const found = findBtn();
+                            if (found) {
+                                try { click(found.btn); } catch (_) {}
+                            }
+                            // Fallback B: directly call getUserMedia({video:true}) so our
+                            // override fires and the canvas track lands in the Chromium
+                            // media pipeline. Teams' WebRTC stack often picks up the
+                            // active stream even if its UI never enables the toggle.
+                            let gumOk = false;
+                            try {
+                                const stream = await navigator.mediaDevices.getUserMedia({
+                                    video: true,
+                                    audio: true,
+                                });
+                                gumOk = !!stream && stream.getVideoTracks().length > 0;
+                                window.__tentaflowForcedStream = stream;
+                            } catch (e) {
+                                return JSON.stringify({
+                                    ok: false,
+                                    reason: 'gum forced call rejected: ' + (e && e.message ? e.message : String(e)),
+                                });
+                            }
+                            return JSON.stringify({
+                                ok: gumOk,
+                                mode: 'forced-gum',
+                                fallbackClick: !!found,
+                                reason: 'no enabled camera button — used forced getUserMedia',
+                            });
                         })()
                         "#,
                     ).await;
