@@ -42,6 +42,7 @@ docker run -d --name bot-dev \
   -e BOT_VIDEO_ENABLED=true \
   -e RUST_LOG="info,chromiumoxide=error" \
   -e SKIP_ROUTER_WAIT=1 \
+  -e BOT_TEST_TONE_ON_JOIN=1 \
   tentaflow/teams-bot:dev >/dev/null
 
 echo "    container running, waiting ${SECS}s..."

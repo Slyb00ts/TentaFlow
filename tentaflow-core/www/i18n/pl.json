@@ -1477,6 +1477,7 @@
     "pair_qr_hex_label": "Hex node ID",
     "pair_qr_pin_label": "PIN (ważny 60s)",
     "pair_qr_refresh_in": "Odświeża się za",
+    "pair_qr_refresh_pin": "Odśwież PIN",
     "pair_id_hint": "Użyj jak mDNS nie działa (różne VLAN-y, firewall, WiFi z izolacją klientów). Hex znajdziesz na drugim nodzie w zakładce Paruj · Zeskanuj kodem.",
     "pair_scan_camera": "Zeskanuj kamerą",
     "qr_scanner_title": "Skanowanie kodu QR",

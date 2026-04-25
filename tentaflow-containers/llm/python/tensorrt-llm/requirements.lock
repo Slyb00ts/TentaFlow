@@ -1,0 +1,6 @@
+# Lock pliku zostawiamy minimalny — tensorrt-llm pociaga komplet zaleznosci
+# (torch, transformers, mpi4py, tensorrt) sam, a wymuszanie wersji w lock'u
+# zwykle psuje matchowanie z prebuilt wheelami NVIDIA. uv tworzy wlasny lock
+# w trakcie pierwszej instalacji.
+fastapi
+uvicorn[standard]
