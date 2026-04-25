@@ -13,10 +13,12 @@ pub mod gossip;
 pub mod ibverbs_ffi;
 pub mod iroh_manager;
 pub mod network_config;
+pub mod network_interfaces;
 pub mod node_info_collector;
 pub mod peer_manager;
 pub mod peer_store;
 pub mod pipeline;
+pub mod relay_health;
 #[cfg(any(feature = "rdma-probe", target_os = "macos"))]
 pub mod rdma_probe;
 pub mod security;

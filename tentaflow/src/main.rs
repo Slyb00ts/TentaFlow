@@ -231,6 +231,9 @@ async fn run_server(args: Args) -> Result<()> {
         None;
     let mut mesh_security_for_server: Option<Arc<tentaflow_core::mesh::security::MeshSecurity>> =
         None;
+    let mut mesh_relay_health_for_server: Option<
+        Arc<parking_lot::RwLock<tentaflow_core::mesh::relay_health::RelayHealth>>,
+    > = None;
     let local_node_id_for_server: Arc<str> = Arc::from(local_node_id_str.as_str());
     let _mesh_handles;
 
@@ -256,6 +259,7 @@ async fn run_server(args: Args) -> Result<()> {
                 Ok(handles) => {
                     quic_mesh_for_server = handles.quic_mesh.clone();
                     mesh_security_for_server = handles.security.clone();
+                    mesh_relay_health_for_server = Some(handles.relay_health.clone());
 
                     // Podepnij mesh do routera — umozliwia forwarding requestow do zdalnych nodow.
                     // node_id = mesh_security.public_key_hex() juz na starcie, wiec quic_mesh
@@ -391,6 +395,7 @@ async fn run_server(args: Args) -> Result<()> {
         quic_mesh_for_server,
         local_node_id_for_server,
         mesh_security_for_server,
+        mesh_relay_health_for_server,
     )?;
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");

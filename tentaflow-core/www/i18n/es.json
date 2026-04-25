@@ -1944,6 +1944,12 @@
       "export_empty": "Nada para exportar",
       "export_failed": "Error al exportar",
       "vnc_unavailable": "Vista previa VNC no disponible para esta sesión",
+      "vnc_error_not_found": "Sesión VNC no encontrada",
+      "vnc_error_forbidden": "Acceso denegado a la vista previa VNC",
+      "vnc_error_no_port": "Puerto VNC no asignado para esta sesión",
+      "vnc_error_remote_node": "La sesión está en otro nodo — la vista previa VNC estará disponible en la fase B",
+      "vnc_error_failed": "Error del túnel VNC: {message}",
+      "vnc_disconnected": "Conexión VNC perdida",
       "missing_key": "Clave de reunión faltante",
       "load_failed": "No se pudo cargar la sesión",
       "open_button": "Vista en vivo"
