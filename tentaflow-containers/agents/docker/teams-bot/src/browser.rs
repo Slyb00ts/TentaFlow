@@ -481,6 +481,10 @@ pub async fn join_meeting(
                     dismissedAreYouSure: false,
                     sendersBefore: [],
                     sendersAfter: [],
+                    renegotiationAttempts: 0,
+                    renegotiationOk: 0,
+                    renegotiationErrors: [],
+                    sdpDump: [],
                 };
 
                 // Teams light-meetings dla anonim joinerow zaraz po joined
@@ -568,6 +572,9 @@ pub async fn join_meeting(
                 const TRY_DELAY_MS = 500;
                 const replacedAudioSenders = new WeakSet();
                 const replacedVideoSenders = new WeakSet();
+                // PC-i, w ktorych wymusilismy direction=sendrecv na video
+                // transceiverze. Po petli odpalamy renegocjacje tylko na nich.
+                const directionForcedPCs = new Set();
                 for (let attempt = 0; attempt < TRIES; attempt++) {
                     // Re-dismiss modal — Teams potrafi go ponownie wyrenderowac.
                     try { dismissAreYouSure(); } catch (_) {}
@@ -588,6 +595,19 @@ pub async fn join_meeting(
                                     await s.replaceTrack(vid);
                                     result.replacedVideo += 1;
                                     replacedVideoSenders.add(s);
+                                    // Teams dla anonim guesta negocjuje video
+                                    // transceiver jako recvonly/inactive, wiec
+                                    // nawet po replaceTrack encoder nie pali.
+                                    // Wymuszamy sendrecv; renegocjacja ponizej.
+                                    try {
+                                        const tr = pc.getTransceivers().find((t) => t.sender === s);
+                                        if (tr && (tr.direction !== 'sendrecv' || tr.currentDirection !== 'sendrecv')) {
+                                            tr.direction = 'sendrecv';
+                                            directionForcedPCs.add(pc);
+                                        }
+                                    } catch (e) {
+                                        console.warn('[tentaflow] force sendrecv failed:', e);
+                                    }
                                 }
                             } catch (e) {
                                 console.warn('[tentaflow] replaceTrack failed:', e);
@@ -596,6 +616,19 @@ pub async fn join_meeting(
                     }
                     if (result.replacedAudio > 0 && result.replacedVideo > 0) break;
                     await new Promise((r) => setTimeout(r, TRY_DELAY_MS));
+                }
+                // Client-initiated renegocjacja na PC-ach gdzie wymusilismy
+                // sendrecv. Teams moze odrzucic answer (anonim guest) — to OK,
+                // raportujemy stan zamiast cichego fail.
+                for (const pc of directionForcedPCs) {
+                    result.renegotiationAttempts += 1;
+                    try {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        result.renegotiationOk += 1;
+                    } catch (e) {
+                        result.renegotiationErrors.push(String((e && e.message) || e));
+                    }
                 }
                 if (mic && mic.enabled !== true) {
                     try { mic.enabled = true; result.enabledOurTrack = 1; } catch (_) {}
@@ -644,9 +677,56 @@ pub async fn join_meeting(
                                 }
                             });
                             out.trackId = s.track.id;
+                            // Direction transceivera jest kluczowa: jesli
+                            // currentDirection != sendrecv -> SRTP video nie
+                            // leci do Teams niezaleznie od mediaSource.
+                            try {
+                                for (const t of pc.getTransceivers()) {
+                                    if (t.sender === s) {
+                                        out.transceiverDirection = t.direction;
+                                        out.transceiverCurrentDirection = t.currentDirection;
+                                        out.transceiverMid = t.mid;
+                                        break;
+                                    }
+                                }
+                            } catch (_) {}
                             result.videoStats.push(out);
                         } catch (_) {}
                     }
+                }
+                // Wyciaga sekcje m=video z SDP wraz z pierwszymi 5 a= linii
+                // dotyczacymi direction. To jedyny pewny artefakt diagnostyczny
+                // mowiacy czy Teams negocjuje sendrecv czy recvonly/inactive.
+                function extractVideoMSection(sdp) {
+                    if (!sdp) return null;
+                    const lines = sdp.split(/\r?\n/);
+                    let start = -1;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (lines[i].startsWith('m=video')) { start = i; break; }
+                    }
+                    if (start < 0) return null;
+                    let end = lines.length;
+                    for (let i = start + 1; i < lines.length; i++) {
+                        if (lines[i].startsWith('m=')) { end = i; break; }
+                    }
+                    const section = lines.slice(start, end);
+                    const directionLines = [];
+                    for (const ln of section) {
+                        if (/^a=(sendrecv|sendonly|recvonly|inactive)/.test(ln)) {
+                            directionLines.push(ln);
+                            if (directionLines.length >= 5) break;
+                        }
+                    }
+                    return { mLine: section[0], directionLines: directionLines };
+                }
+                for (const pc of pcs) {
+                    try {
+                        result.sdpDump.push({
+                            localType: pc.localDescription ? pc.localDescription.type : null,
+                            localSdpVideo: extractVideoMSection(pc.localDescription && pc.localDescription.sdp),
+                            remoteSdpVideo: extractVideoMSection(pc.remoteDescription && pc.remoteDescription.sdp),
+                        });
+                    } catch (_) {}
                 }
                 return JSON.stringify(result);
             })()
