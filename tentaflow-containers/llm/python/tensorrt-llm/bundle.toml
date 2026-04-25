@@ -14,15 +14,18 @@ source = "pypi"
 pypi_package = "tensorrt-llm==1.2.0"
 
 [launch]
-command = "python"
+# Wlasciwy entry point to `trtllm-serve serve <MODEL>` (Click CLI).
+# `python -m tensorrt_llm.serve.openai_server` to modul biblioteki bez
+# argparse — uruchamiany bezposrednio nigdy nie wstaje.
+command = "trtllm-serve"
 args = [
-    "-m", "tensorrt_llm.serve.openai_server",
+    "serve",
+    "${MODEL}",
     "--host", "127.0.0.1",
     "--port", "${PORT:-8087}",
-    "--model", "${MODEL}",
     "--tp_size", "${TP:-1}",
     "--max_batch_size", "${MAX_BATCH_SIZE:-8}",
-    "--kv_cache_free_gpu_memory_fraction", "${KV_FRACTION:-0.85}",
+    "--free_gpu_memory_fraction", "${KV_FRACTION:-0.85}",
 ]
 internal_port = 8087
 

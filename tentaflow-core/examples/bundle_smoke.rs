@@ -73,6 +73,24 @@ async fn main() -> Result<()> {
     if engine == "tensorrt-llm" {
         env.insert("UCX_TLS".to_string(), "tcp".to_string());
         env.insert("OMPI_MCA_opal_cuda_support".to_string(), "false".to_string());
+        // Wymus loopback tylko — bez tego trtllm/MPI prubuje dialowac na docker
+        // bridge (172.17.0.1) i ginie z "Connection timed out" na port 1027.
+        env.insert("OMPI_MCA_btl_tcp_if_include".to_string(), "lo".to_string());
+        env.insert("OMPI_MCA_oob_tcp_if_include".to_string(), "lo".to_string());
+        // Single-GPU bez MPI runtime — trtllm wymusi sam tp=1 ale to ucisza
+        // MPI socket discovery przy starcie.
+        env.insert("OMPI_MCA_btl".to_string(), "self,vader,tcp".to_string());
+    }
+    if engine == "sglang" {
+        // sglang 0.5.10 + tvm_ffi probuje wykryc GPU arch automatycznie i
+        // gdy CUDA detection failuje (np. multi-arch builds, hyrbid drivers)
+        // spada na ROCm fallback ktore tez umiera. Wymuszamy CUDA arch list
+        // dla popularnych compute capabilities (8.9 = Ada/RTX 4090, 8.0 =
+        // Ampere/A100, 9.0 = Hopper/H100).
+        env.insert(
+            "TVM_FFI_CUDA_ARCH_LIST".to_string(),
+            "8.0;8.9;9.0".to_string(),
+        );
     }
     if let Ok(token) = std::env::var("HF_TOKEN") {
         env.insert("HF_TOKEN".to_string(), token);
