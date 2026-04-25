@@ -4658,3 +4658,135 @@ tf-screen {
 
 /* Drobny fix: grupa filtr-chipow w toolbarze wspoldzieli gap z tf-filter-group. */
 .tf-filter-group { display: inline-flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+/* === Mesh: relay status + transport per peer === */
+
+/* 2-pane "Mesh bind | Relay" pokazywany na karcie This node — pokazuje
+   gdzie iroh nasluchuje i status polaczenia z relay-em. */
+.local-connectivity {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}
+.local-conn-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+}
+.local-conn-card .lc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.local-conn-card .lc-head svg {
+  width: 14px;
+  height: 14px;
+  color: var(--accent-2);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+.local-conn-card .lc-title {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.local-conn-card .lc-status { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; }
+.local-conn-card .lc-body {
+  font-size: 12.5px;
+  color: var(--text);
+  line-height: 1.55;
+}
+.local-conn-card .lc-body code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 11.5px;
+  color: var(--accent-2);
+  background: var(--bg-input);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.local-conn-card .lc-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 4px;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+}
+.lc-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.lc-dot.ok  { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.lc-dot.warn { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+.lc-dot.err { background: var(--danger);  box-shadow: 0 0 6px var(--danger); }
+.lc-status-text {
+  color: var(--success);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.lc-status-text.warn { color: var(--warning); }
+.lc-status-text.err  { color: var(--danger); }
+
+/* Pojedynczy row "Transport: <pill> <addr> <RTT>" pod gauges peera. */
+.net-conn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-top: 12px;
+  font-size: 11.5px;
+}
+.net-conn-row .label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-right: 4px;
+}
+.net-conn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 11px;
+}
+.net-conn-pill.p2p       { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+.net-conn-pill.relay     { background: rgba(96, 165, 250, 0.12); color: var(--info); }
+.net-conn-pill.relay-bad { background: rgba(239, 68, 68, 0.12);  color: var(--danger); }
+.net-conn-pill svg {
+  width: 10px;
+  height: 10px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+}
+.net-conn-row .addr {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+  color: var(--text-2);
+}
+.net-conn-row .rtt {
+  color: var(--text-3);
+  margin-left: auto;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+}
+
+@media (max-width: 768px) {
+  .local-connectivity { grid-template-columns: 1fr; }
+}

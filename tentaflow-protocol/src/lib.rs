@@ -62,7 +62,7 @@ pub use message_body::{
     MessageBody, ModelDetail, ModelInstallRequest, ModelSummary, PiiRule,
     PromptDetail, PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
     ServiceCreateRequest, ServiceDeployProgress, ServiceDeployRequest, ServiceQuicStatus,
-    NetworkConfig, NetworkInterfaceInfo, NetworkPayload,
+    NetworkConfig, NetworkInterfaceInfo, NetworkPayload, RelayHealthInfo,
     ServiceSummary, ServiceUpdateRequest, SettingEntry, SettingsUpdateRequest,
     SsoProviderCreateRequest, SsoProviderCreateResponse, SsoProviderDeleteRequest,
     SsoProviderDeleteResponse, SsoProviderEntry, SsoProvidersListResponse,

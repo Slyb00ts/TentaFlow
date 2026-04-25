@@ -524,6 +524,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::NetworkPayload::ResConfigUpdate { .. } => {
                 "NetworkConfigUpdateResponse"
             }
+            tentaflow_protocol::NetworkPayload::ReqRelayStatus => "NetworkRelayStatusRequest",
+            tentaflow_protocol::NetworkPayload::ResRelayStatus(_) => "NetworkRelayStatusResponse",
         },
         MessageBody::DashboardMetricsRequest => "DashboardMetricsRequest",
         MessageBody::DashboardMetricsResponse(_) => "DashboardMetricsResponse",

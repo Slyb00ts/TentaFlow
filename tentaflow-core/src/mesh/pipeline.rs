@@ -16,8 +16,11 @@ use crate::config::MeshConfig;
 use crate::mesh::iroh_manager::{IrohMeshConfig, IrohMeshEvent, IrohMeshManager};
 use crate::mesh::node_info_collector;
 use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, NodeInfo};
+use crate::mesh::relay_health::{spawn_relay_health_monitor, RelayHealth};
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
+use parking_lot::RwLock as PlRwLock;
+use tokio_util::sync::CancellationToken;
 use crate::net::iroh::pairing::{
     load_trusted_contact_hints, merge_contact_hints, store_trusted_contact_hints,
     PairingContactHints,
@@ -77,11 +80,19 @@ pub struct MeshPipelineHandles {
     pub quic_mesh: Option<Arc<IrohMeshManager>>,
     /// MeshSecurity — tozsamosc Ed25519, trusted_keys, pairing.
     pub security: Option<Arc<MeshSecurity>>,
+    /// Snapshot zdrowia relay (URL, RTT, status, faktyczny bind addr) odswiezany
+    /// w tle co 30s. Wstrzykiwany do `AppState.mesh_relay_health` zeby handler
+    /// `NetworkRelayStatusRequest` mogl czytac stan bez dodatkowego I/O.
+    pub relay_health: Arc<PlRwLock<RelayHealth>>,
+    /// Cancellation token dla zadan w tle uruchomionych w pipeline (m.in.
+    /// monitor relay). Trzymany zeby `shutdown()` mogl czysto zatrzymac petle.
+    pub background_shutdown: CancellationToken,
 }
 
 impl MeshPipelineHandles {
     /// Graceful shutdown — zamyka iroh endpoint i wszystkie polaczenia.
     pub async fn shutdown(mut self) {
+        self.background_shutdown.cancel();
         if let Some(ref qm) = self.quic_mesh {
             qm.send_node_leaving().await;
             qm.shutdown().await;
@@ -149,6 +160,25 @@ pub async fn start_mesh_pipeline(
         bind_addr = %bind_addr,
         relay = ?relay_url.as_ref().map(|r| r.to_string()),
         "mesh init: resolved bind + relay (z ustawien GUI / config.toml)"
+    );
+
+    // Klon URL relay zachowujemy zeby spawn_relay_health_monitor mogl pingowac
+    // ten sam endpoint co iroh — `IrohMeshConfig` zjada `relay_url` mov'em.
+    let relay_url_for_health = relay_url.clone();
+    let bind_addr_actual = bind_addr.to_string();
+    let relay_health = Arc::new(PlRwLock::new(RelayHealth::initial_pending(
+        relay_url_for_health
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_default(),
+        bind_addr_actual.clone(),
+    )));
+    let background_shutdown = CancellationToken::new();
+    spawn_relay_health_monitor(
+        relay_url_for_health,
+        bind_addr_actual,
+        relay_health.clone(),
+        background_shutdown.clone(),
     );
 
     let iroh_cfg = IrohMeshConfig {
@@ -369,6 +399,8 @@ pub async fn start_mesh_pipeline(
                 mdns: None,
                 quic_mesh: Some(quic_mesh),
                 security: Some(mesh_security),
+                relay_health,
+                background_shutdown,
             })
         }
         Err(e) => {
@@ -386,6 +418,8 @@ pub async fn start_mesh_pipeline(
                 mdns: None,
                 quic_mesh: None,
                 security: Some(mesh_security),
+                relay_health,
+                background_shutdown,
             })
         }
     }
