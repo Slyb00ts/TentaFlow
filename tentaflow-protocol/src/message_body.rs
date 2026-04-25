@@ -2723,6 +2723,14 @@ pub struct TranslateResponse {
     pub tokens_used: i32,
 }
 
+// Skonsolidowane w `TranslatePayload` — 1 slot w `MessageBody` zamiast 2,
+// zeby zmiescic sie w limicie 256 wariantow rkyv 0.8.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum TranslatePayload {
+    Req(TranslateRequest),
+    Res(TranslateResponse),
+}
+
 // =============================================================================
 // Users list (Admin only) — rozszerzone metadane konta z last_login.
 // =============================================================================
@@ -3194,8 +3202,7 @@ pub enum MessageBody {
     SystemEventBody(SystemEventPayload),
 
     // ---- Translate (LLM-backed) ----
-    TranslateRequestBody(TranslateRequest),
-    TranslateResponseBody(TranslateResponse),
+    TranslateBody(TranslatePayload),
 
     // ---- Users list (Admin) ----
     // UsersList* consolidated into IamBody (below) jako ReqListUsers/ResListUsers.
