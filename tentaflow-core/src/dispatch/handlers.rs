@@ -4424,7 +4424,7 @@ fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::Netwo
     );
     let iroh_relay_url = repository::get_setting(pool, crate::net::iroh::relay::RELAY_URL_SETTING_KEY)
         .map_err(db_err)?
-        .unwrap_or_default();
+        .unwrap_or_else(|| crate::net::iroh::relay::DEFAULT_RELAY_URL.to_string());
 
     Ok(tentaflow_protocol::NetworkConfig {
         bind_mode,

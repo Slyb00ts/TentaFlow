@@ -308,8 +308,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::ChatStreamRequestBody(_) => "ChatStreamRequest",
         MessageBody::ChatStreamChunkBody(_) => "ChatStreamChunk",
         MessageBody::ChatStreamEndBody(_) => "ChatStreamEnd",
-        MessageBody::TranslateRequestBody(_) => "TranslateRequest",
-        MessageBody::TranslateResponseBody(_) => "TranslateResponse",
+        MessageBody::TranslateBody(p) => match p {
+            tentaflow_protocol::TranslatePayload::Req(_) => "TranslateRequest",
+            tentaflow_protocol::TranslatePayload::Res(_) => "TranslateResponse",
+        },
         MessageBody::ClusterListRequest => "ClusterListRequest",
         MessageBody::ClusterListResponseBody(_) => "ClusterListResponse",
         MessageBody::ClusterDetailRequestBody(_) => "ClusterDetailRequest",

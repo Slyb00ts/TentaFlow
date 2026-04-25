@@ -1698,7 +1698,8 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
               ('mesh.advertise_hide_link_local', '1'),
               ('mesh.advertise_hide_loopback', '1'),
               ('mesh.advertise_hide_cgnat', '0'),
-              ('mesh.advertise_prefer_same_subnet', '1');
+              ('mesh.advertise_prefer_same_subnet', '1'),
+              ('mesh.iroh_relay_url', 'https://relay.nextapp.pl');
         ",
     ),
 ]

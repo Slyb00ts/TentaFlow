@@ -326,12 +326,14 @@ pub fn encode_translate_request(
     target_lang: String,
     tone: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::TranslateRequestBody(TranslateRequest {
-        source_text,
-        source_lang,
-        target_lang,
-        tone,
-    }))
+    encode_body_inner(&MessageBody::TranslateBody(
+        tentaflow_protocol::TranslatePayload::Req(TranslateRequest {
+            source_text,
+            source_lang,
+            target_lang,
+            tone,
+        }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1976,14 +1978,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "promptTokens", (end.prompt_tokens as u32).into());
             set(&obj, "completionTokens", (end.completion_tokens as u32).into());
         }
-        MessageBody::TranslateRequestBody(req) => {
+        MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Req(req)) => {
             set(&obj, "variant", "TranslateRequest".into());
             set(&obj, "sourceText", req.source_text.into());
             set(&obj, "sourceLang", req.source_lang.into());
             set(&obj, "targetLang", req.target_lang.into());
             if let Some(tone) = req.tone { set(&obj, "tone", tone.into()); }
         }
-        MessageBody::TranslateResponseBody(resp) => {
+        MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Res(resp)) => {
             set(&obj, "variant", "TranslateResponse".into());
             set(&obj, "translatedText", resp.translated_text.into());
             if let Some(d) = resp.detected_source_lang { set(&obj, "detectedSourceLang", d.into()); }
