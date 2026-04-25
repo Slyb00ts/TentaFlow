@@ -1659,5 +1659,66 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE services_new RENAME TO services;
         ",
     ),
+    (
+        55,
+        "meeting_sessions_lifecycle_stage",
+        "
+            -- Real lifecycle stage of the meeting bot, updated both by the host
+            -- (initial 'container_spawned' after docker spawn) and by the bot
+            -- itself (LifecycleUpdate events from browser.rs at browser_launched,
+            -- navigating, prejoin_ready, joining, joined, failed). Independent
+            -- from the existing coarse `status` column (idle/joining/active/ended)
+            -- which tracks container availability.
+            ALTER TABLE meeting_sessions ADD COLUMN lifecycle_stage TEXT DEFAULT 'idle';
+            ALTER TABLE meeting_sessions ADD COLUMN lifecycle_details TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN lifecycle_updated_at TEXT;
+        ",
+    ),
+    (
+        56,
+        "services_source_hash",
+        "
+            -- Sha256 of the container source tree captured when the service
+            -- was deployed. Compared against the compile-time hash in the
+            -- manifest registry to flag 'update available' in the dashboard.
+            -- NULL for rows created before this migration (treated as unknown).
+            ALTER TABLE services ADD COLUMN deployed_source_hash TEXT;
+        ",
+    ),
+    (
+        57,
+        "mesh_network_settings_defaults",
+        "
+            -- Seed domyslnych ustawien mesh & network (bind mode + advertise filters).
+            -- Kolumna `is_secret` w settings nie istnieje — tabela ma (key, value, updated_at).
+            INSERT OR IGNORE INTO settings(key, value) VALUES
+              ('mesh.bind_mode', 'auto'),
+              ('mesh.bind_ipv4', ''),
+              ('mesh.advertise_hide_docker', '1'),
+              ('mesh.advertise_hide_link_local', '1'),
+              ('mesh.advertise_hide_loopback', '1'),
+              ('mesh.advertise_hide_cgnat', '0'),
+              ('mesh.advertise_prefer_same_subnet', '1'),
+              ('mesh.iroh_relay_url', 'https://relay.nextapp.pl');
+        ",
+    ),
+    (
+        58,
+        "meeting_sessions_backend_models",
+        "
+            -- Backend model identifiers reported by the bot via
+            -- MeetingEventPayload::BackendUpdate. Persisted so that a live view
+            -- mounted AFTER the broadcast still sees the BACKEND panel populated
+            -- (STT/TTS/summarization/diarization + counters). Numeric columns
+            -- stay NULL until the bot reports a concrete value.
+            ALTER TABLE meeting_sessions ADD COLUMN backend_stt_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_tts_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_summarization_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_diarization_model TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_streaming_latency_ms INTEGER;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_enrolled_speakers INTEGER;
+            ALTER TABLE meeting_sessions ADD COLUMN backend_total_participants INTEGER;
+        ",
+    ),
 ]
 }

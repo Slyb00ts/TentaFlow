@@ -15,10 +15,13 @@ use std::net::{TcpListener, UdpSocket};
 
 use crate::db::{repository, DbPool};
 
-/// Zakresy portów (inclusive start, exclusive end).
+/// Zakresy portów (inclusive start, exclusive end). VNC i noVNC nie mogą
+/// nakładać się — wcześniejsza para 6100-7000 / 6800-7100 współdzieliła
+/// 6800-6999 i pula realnie kurczyła się do ~700 + ~200 zamiast deklarowanego
+/// rozmiaru. Teraz każdy zakres jest wyłączny.
 pub const QUIC_RANGE: (u16, u16) = (7000, 8000);
-pub const VNC_RANGE: (u16, u16) = (6100, 7000);
-pub const NOVNC_RANGE: (u16, u16) = (6800, 7100);
+pub const VNC_RANGE: (u16, u16) = (5100, 6100);
+pub const NOVNC_RANGE: (u16, u16) = (6100, 7000);
 
 pub const KIND_QUIC: &str = "quic";
 pub const KIND_VNC: &str = "vnc";

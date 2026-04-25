@@ -741,6 +741,27 @@ pub enum ModelPayload {
     /// Używane przez kontenery (np. meeting-bot) żeby nie duplikować treści
     /// promptów po stronie obrazów. Router odpowiada `ModelResult::PromptFetched`.
     PromptFetch(PromptFetchRequest),
+
+    /// Browser - operacje na aktywnej stronie Chromium w kontenerze teams-bot
+    /// (screenshot przez CDP, snapshot DOM). Router adresuje bota przez
+    /// `ServiceManager::get_quic_llm_client("meeting-bot-{session_id}")`.
+    Browser(BrowserPayload),
+}
+
+/// Operacje inspekcji uruchomionej strony przeglądarki w kontenerze bota.
+/// Wspólne użycie: diagnostyka meetingu z dashboardu (co bot aktualnie widzi).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BrowserPayload {
+    pub operation: BrowserOperation,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum BrowserOperation {
+    /// PNG screenshot. `full_page=true` scrolluje i składa całą stronę;
+    /// `false` zwraca tylko viewport (znacznie szybsze, bez stitchowania).
+    Screenshot { full_page: bool },
+    /// Zwraca `document.documentElement.outerHTML` po aktualnym renderingu.
+    Dom,
 }
 
 // ============================================================================
@@ -836,7 +857,34 @@ pub enum MeetingEventPayload {
         enrolled_speakers: Option<u32>,
         total_participants: Option<u32>,
     },
+    /// Etap cyklu życia sesji meeting bota. Emitowany przez bota przy przejściach
+    /// kluczowych fazami (spawn kontenera → chromium → prejoin → joined). Router
+    /// persistuje aktualny stage w `meeting_sessions.lifecycle_stage`, broadcast
+    /// do GUI idzie przez ten sam kanał co pozostałe MeetingEventPayload.
+    LifecycleUpdate {
+        /// Jeden ze stage stringów — patrz `LIFECYCLE_*` constants.
+        stage: String,
+        /// Opcjonalny komunikat błędu lub informacja diagnostyczna (np. przy
+        /// `LIFECYCLE_FAILED` pełny tekst błędu z `join_meeting`).
+        details: Option<String>,
+    },
 }
+
+/// Etapy cyklu życia sesji meeting bota. Używane w
+/// `MeetingEventPayload::LifecycleUpdate::stage` oraz w kolumnie
+/// `meeting_sessions.lifecycle_stage`. Zachować tę listę jako single source
+/// of truth — bot i router trzymają się tych samych stringów.
+pub const LIFECYCLE_CONTAINER_SPAWNED: &str = "container_spawned";
+pub const LIFECYCLE_BROWSER_LAUNCHED: &str = "browser_launched";
+pub const LIFECYCLE_NAVIGATING: &str = "navigating";
+pub const LIFECYCLE_PREJOIN_READY: &str = "prejoin_ready";
+pub const LIFECYCLE_JOINING: &str = "joining";
+/// Bot kliknal Join, ale host jeszcze go nie wpuscil — ekran "Someone in the
+/// meeting will let you in soon". Wyemitowane po Joining gdy DOM lobby jest
+/// rozpoznany. Pozwala GUI rozroznic "czekamy w lobby" od pelnego JOINED.
+pub const LIFECYCLE_LOBBY_WAITING: &str = "lobby_waiting";
+pub const LIFECYCLE_JOINED: &str = "joined";
+pub const LIFECYCLE_FAILED: &str = "failed";
 
 /// Pojedynczy action item przesyłany w `ActionItemsUpdate`.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -1983,8 +2031,22 @@ pub enum ModelResult {
     /// rozwiązanym językiem — może się różnić od żądanego jeśli zadziałał fallback).
     PromptFetched(PromptFetchResponse),
 
+    /// Browser - wynik `BrowserPayload` (screenshot, DOM, albo błąd).
+    Browser(BrowserResult),
+
     /// Error
     Error(ErrorInfo),
+}
+
+/// Wynik operacji browser wykonanej przez teams-bot.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum BrowserResult {
+    /// Surowy PNG (bajty). Rozmiar ograniczony framingiem rkyv (16 MiB).
+    Screenshot { png: Vec<u8> },
+    /// `outerHTML` dokumentu.
+    Dom { html: String },
+    /// Błąd po stronie bota — np. brak aktywnej strony albo timeout CDP.
+    Error { message: String },
 }
 
 /// Odpowiedź na `PromptFetchRequest`. `resolved_language` mówi kontenerowi

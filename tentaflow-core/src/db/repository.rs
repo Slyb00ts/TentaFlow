@@ -28,6 +28,7 @@ fn row_to_service(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbService> {
         updated_at: row.get(8)?,
         service_uuid: row.get(9)?,
         node_id: row.get(10)?,
+        deployed_source_hash: row.get(11)?,
     })
 }
 
@@ -162,7 +163,7 @@ fn row_to_flow_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowExec
 
 // --- Services ---
 
-const SERVICE_COLS: &str = "id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id";
+const SERVICE_COLS: &str = "id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id, deployed_source_hash";
 const BACKEND_COLS: &str = "id, service_id, connection_type, config_json, max_concurrent, timeout_ms, weight, model_name_override, health_check_path, is_active";
 
 pub fn list_services(pool: &DbPool) -> Result<Vec<DbService>> {
@@ -184,7 +185,7 @@ pub fn list_services_with_backends(
     let conn = acquire(pool)?;
 
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.name, s.service_type, s.strategy, s.model_category, s.status, s.config_json, s.created_at, s.updated_at, s.service_uuid, s.node_id, \
+        "SELECT s.id, s.name, s.service_type, s.strategy, s.model_category, s.status, s.config_json, s.created_at, s.updated_at, s.service_uuid, s.node_id, s.deployed_source_hash, \
          b.id, b.service_id, b.connection_type, b.config_json, b.max_concurrent, b.timeout_ms, b.weight, b.model_name_override, b.health_check_path, b.is_active \
          FROM services s LEFT JOIN service_backends b ON s.id = b.service_id ORDER BY s.name, b.id",
     )?;
@@ -209,24 +210,25 @@ pub fn list_services_with_backends(
                 updated_at: row.get(8)?,
                 service_uuid: row.get(9)?,
                 node_id: row.get(10)?,
+                deployed_source_hash: row.get(11)?,
             };
             services.push((service, Vec::new()));
             last_service_id = Some(svc_id);
         }
 
-        let backend_id: Option<i64> = row.get(11)?;
+        let backend_id: Option<i64> = row.get(12)?;
         if backend_id.is_some() {
             let backend = DbServiceBackend {
-                id: row.get(11)?,
-                service_id: row.get(12)?,
-                connection_type: row.get(13)?,
-                config_json: row.get(14)?,
-                max_concurrent: row.get(15)?,
-                timeout_ms: row.get(16)?,
-                weight: row.get(17)?,
-                model_name_override: row.get(18)?,
-                health_check_path: row.get(19)?,
-                is_active: row.get(20)?,
+                id: row.get(12)?,
+                service_id: row.get(13)?,
+                connection_type: row.get(14)?,
+                config_json: row.get(15)?,
+                max_concurrent: row.get(16)?,
+                timeout_ms: row.get(17)?,
+                weight: row.get(18)?,
+                model_name_override: row.get(19)?,
+                health_check_path: row.get(20)?,
+                is_active: row.get(21)?,
             };
             if let Some(last) = services.last_mut() {
                 last.1.push(backend);
@@ -325,6 +327,18 @@ pub fn set_service_node_id(pool: &DbPool, id: i64, node_id: Option<&str>) -> Res
     conn.execute(
         "UPDATE services SET node_id = ?2, updated_at = datetime('now') WHERE id = ?1",
         rusqlite::params![id, node_id],
+    )?;
+    Ok(())
+}
+
+/// Records the sha256 of the container source tree captured at deploy time.
+/// Used by the dashboard to detect whether a running service is out of date
+/// relative to the compile-time manifest hash.
+pub fn set_deployed_source_hash(pool: &DbPool, service_id: i64, hash: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE services SET deployed_source_hash = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![service_id, hash],
     )?;
     Ok(())
 }
@@ -4098,6 +4112,16 @@ pub mod transcripts {
         pub bot_endpoint_id: Option<String>,
         pub platform: Option<String>,
         pub owner_user_id: Option<i64>,
+        pub lifecycle_stage: Option<String>,
+        pub lifecycle_details: Option<String>,
+        pub lifecycle_updated_at: Option<String>,
+        pub backend_stt_model: Option<String>,
+        pub backend_tts_model: Option<String>,
+        pub backend_summarization_model: Option<String>,
+        pub backend_diarization_model: Option<String>,
+        pub backend_streaming_latency_ms: Option<i64>,
+        pub backend_enrolled_speakers: Option<i64>,
+        pub backend_total_participants: Option<i64>,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -4144,7 +4168,11 @@ pub mod transcripts {
         "s.id, s.meeting_key, s.meeting_url, s.title, s.started_at, s.last_activity_at, \
          (SELECT COUNT(*) FROM meeting_transcripts t WHERE t.session_id = s.id), \
          s.status, s.ended_at, s.container_id, s.container_name, \
-         s.quic_port, s.vnc_port, s.novnc_port, s.bot_endpoint_id, s.platform, s.owner_user_id";
+         s.quic_port, s.vnc_port, s.novnc_port, s.bot_endpoint_id, s.platform, s.owner_user_id, \
+         s.lifecycle_stage, s.lifecycle_details, s.lifecycle_updated_at, \
+         s.backend_stt_model, s.backend_tts_model, s.backend_summarization_model, \
+         s.backend_diarization_model, s.backend_streaming_latency_ms, \
+         s.backend_enrolled_speakers, s.backend_total_participants";
 
     fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         Ok(SessionRow {
@@ -4165,6 +4193,16 @@ pub mod transcripts {
             bot_endpoint_id: row.get(14)?,
             platform: row.get(15)?,
             owner_user_id: row.get(16)?,
+            lifecycle_stage: row.get(17)?,
+            lifecycle_details: row.get(18)?,
+            lifecycle_updated_at: row.get(19)?,
+            backend_stt_model: row.get(20)?,
+            backend_tts_model: row.get(21)?,
+            backend_summarization_model: row.get(22)?,
+            backend_diarization_model: row.get(23)?,
+            backend_streaming_latency_ms: row.get(24)?,
+            backend_enrolled_speakers: row.get(25)?,
+            backend_total_participants: row.get(26)?,
         })
     }
 
@@ -4376,6 +4414,76 @@ pub mod transcripts {
             "UPDATE meeting_sessions SET status = ?2, last_activity_at = datetime('now')
              WHERE id = ?1",
             rusqlite::params![id, status],
+        )?;
+        Ok(())
+    }
+
+    /// Zapisuje aktualny etap lifecycle bota — wolany zarówno z host managera
+    /// (po udanym docker spawn), jak i z routera po otrzymaniu
+    /// `MeetingEventPayload::LifecycleUpdate` od bota. `meeting_key` zamiast
+    /// `session_id` bo bot nie zna wewnętrznego id, operuje na swoim kluczu.
+    /// No-op gdy sesji o tym meeting_key nie ma — bot nie powinien emitować
+    /// lifecycle events dla nieznanej sesji, ale nie chcemy twardego błędu
+    /// który zabija cały reverse request flow.
+    pub fn update_session_lifecycle(
+        pool: &DbPool,
+        meeting_key: &str,
+        stage: &str,
+        details: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET lifecycle_stage = ?2,
+                 lifecycle_details = ?3,
+                 lifecycle_updated_at = ?4,
+                 last_activity_at = datetime('now')
+             WHERE meeting_key = ?1",
+            rusqlite::params![meeting_key, stage, details, now],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the backend model identifiers reported by the bot via
+    /// `MeetingEventPayload::BackendUpdate`. The live view replays these on
+    /// mount so the BACKEND panel survives broadcasts that fired before the
+    /// dashboard was open. No-op when the meeting_key is unknown — the bot
+    /// occasionally races the host on session creation and we don't want a
+    /// stray event to fail the reverse request flow.
+    pub fn update_session_backend(
+        pool: &DbPool,
+        meeting_key: &str,
+        stt: &str,
+        tts: &str,
+        summarization: &str,
+        diarization: &str,
+        streaming_latency_ms: Option<i64>,
+        enrolled_speakers: Option<i64>,
+        total_participants: Option<i64>,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET backend_stt_model = ?2,
+                 backend_tts_model = ?3,
+                 backend_summarization_model = ?4,
+                 backend_diarization_model = ?5,
+                 backend_streaming_latency_ms = ?6,
+                 backend_enrolled_speakers = ?7,
+                 backend_total_participants = ?8,
+                 last_activity_at = datetime('now')
+             WHERE meeting_key = ?1",
+            rusqlite::params![
+                meeting_key,
+                stt,
+                tts,
+                summarization,
+                diarization,
+                streaming_latency_ms,
+                enrolled_speakers,
+                total_participants,
+            ],
         )?;
         Ok(())
     }
