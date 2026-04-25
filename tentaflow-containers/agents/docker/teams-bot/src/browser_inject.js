@@ -648,8 +648,13 @@
       return;
     }
     const W = 640, H = 480;
+    // alpha: false hands the encoder an opaque RGB buffer. Without it the
+    // OffscreenCanvas keeps an alpha channel, transferToImageBitmap produces
+    // RGBA, and Teams' video pipeline has historically rendered such frames
+    // as a black tile when the upstream encoder picks YUV420 with the alpha
+    // dropped.
     const canvas = new OffscreenCanvas(W, H);
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { alpha: false });
     let baseTs = 0;
     // 30 FPS keeps the wireframe motion smooth through Teams' video pipeline.
     // VideoFrame objects are cheap with OffscreenCanvas and Chromium reuses the
@@ -928,7 +933,11 @@
         baseTs += frameIntervalUs;
         await videoWriter.write(frame);
       } catch (e) {
-        cleanupTentaflow();
+        // Tearing down the whole bridge on a single bad frame killed audio
+        // capture too — for instance an ImageBitmap allocation hiccup once
+        // every few minutes used to silence the bot. Log instead, drop this
+        // frame, and let the next interval try again.
+        console.warn('[tentaflow] video frame error:', e && e.message ? e.message : e);
       } finally {
         if (frame) { try { frame.close(); } catch (_) {} }
         if (bitmap && bitmap.close) { try { bitmap.close(); } catch (_) {} }
