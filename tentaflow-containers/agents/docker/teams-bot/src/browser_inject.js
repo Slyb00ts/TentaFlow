@@ -458,31 +458,6 @@
     registerInterval(setInterval(healthCheck, 2000));
   }
 
-  // Teams' light-meetings UI carries 'Camera/Mic is not available — Go to
-  // your device settings' for anonymous joiners even though Chromium
-  // publishes the fake devices we asked for. The cause is a stricter
-  // permission gate: Teams calls navigator.permissions.query and treats
-  // anything other than 'granted' as 'no device'. Force-grant camera and
-  // microphone so the toggle button is enabled and getUserMedia can fire.
-  if (navigator && navigator.permissions && navigator.permissions.query) {
-    const origPermQuery = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = function (desc) {
-      try {
-        if (desc && (desc.name === 'camera' || desc.name === 'microphone')) {
-          return Promise.resolve({
-            state: 'granted',
-            status: 'granted',
-            onchange: null,
-            addEventListener() {},
-            removeEventListener() {},
-            dispatchEvent() { return false; },
-          });
-        }
-      } catch (_) {}
-      return origPermQuery(desc);
-    };
-    console.log('[tentaflow] permissions.query patched (camera+microphone always granted)');
-  }
 
   // --------------------------------------------------------------------------
   // Microphone injection — monkey-patch getUserMedia
@@ -520,37 +495,11 @@
         console.log('[tentaflow] Przechwycono getUserMedia audio:', !!constraints.audio,
           'video:', !!constraints.video);
 
-        // Teams' MediaAgent looks up the track-reported deviceId in
-        // enumerateDevices() and rejects every frame from a track whose
-        // deviceId is not in that list — that was the 'Active device not
-        // found' warning we kept seeing in the bot logs while the canvas
-        // track itself was perfectly healthy. Force the synthetic tracks to
-        // claim the same deviceId Chromium publishes for its built-in fake
-        // input, so the lookup succeeds.
-        const realDevs = await origEnum();
-        const realVid = realDevs.find((d) => d.kind === 'videoinput');
-        const realAud = realDevs.find((d) => d.kind === 'audioinput');
-        const reportSettings = (track, real) => {
-          if (!track || !real) return;
-          try {
-            const orig = (track.getSettings && track.getSettings()) || {};
-            const patched = Object.assign({}, orig, {
-              deviceId: real.deviceId,
-              groupId: real.groupId || orig.groupId,
-            });
-            Object.defineProperty(track, 'getSettings', {
-              configurable: true,
-              value: () => Object.assign({}, patched),
-            });
-          } catch (_) {}
-        };
         const combined = new MediaStream();
         if (constraints.audio && micGenerator) {
-          reportSettings(micGenerator, realAud);
           combined.addTrack(micGenerator);
         }
         if (constraints.video && videoGenerator) {
-          reportSettings(videoGenerator, realVid);
           combined.addTrack(videoGenerator);
         }
         if (combined.getTracks().length > 0) return combined;
@@ -562,44 +511,15 @@
     };
 
     // Teams calls enumerateDevices() before ever touching getUserMedia.
-    // Without overriding it, the container reports zero audio/video inputs
-    // and the meeting UI shows "No available camera/microphone found",
-    // never giving our getUserMedia override a chance to fire. Inject one
-    // synthetic input per kind that we actually back with a generator so
-    // Teams can build its device dropdown.
-    const origEnum = navigator.mediaDevices.enumerateDevices
-      ? navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices)
-      : async () => [];
-    // Chromium already publishes fake mic/camera/speaker entries when started
-    // with --use-fake-ui-for-media-stream. Adding a parallel "tentaflow-*"
-    // device confused Teams' MediaAgent: getUserMedia returned our canvas
-    // track, MediaAgent looked up the track's deviceId in enumerateDevices,
-    // failed to find it (because the track had its own captureStream-assigned
-    // id and our injected device had "tentaflow-*"), and rejected every
-    // frame as 'Active device not found'. The tile rendered black even
-    // though the track itself was unmuted/live.
-    //
-    // Override enumerateDevices to relabel Chromium's existing fake devices
-    // so Teams shows them as 'TentaFlow Bot Camera/Mic/Speaker' but keeps
-    // the real (Chromium-internal) deviceIds. The id mapping then survives
-    // the MediaAgent lookup.
-    navigator.mediaDevices.enumerateDevices = async function () {
-      let real = [];
-      try { real = await origEnum(); } catch (_) { real = []; }
-      return real.map((d) => {
-        let label = d.label;
-        if (d.kind === 'audioinput') label = 'TentaFlow Bot Mic';
-        else if (d.kind === 'videoinput') label = 'TentaFlow Bot Camera';
-        else if (d.kind === 'audiooutput') label = 'TentaFlow Bot Speaker';
-        return Object.assign(Object.create(MediaDeviceInfo.prototype || Object.prototype), {
-          deviceId: d.deviceId,
-          groupId: d.groupId,
-          kind: d.kind,
-          label,
-          toJSON() { return { deviceId: this.deviceId, groupId: this.groupId, kind: this.kind, label: this.label }; },
-        });
-      });
-    };
+    // We deliberately do NOT override enumerateDevices, do NOT touch
+    // navigator.permissions.query, and do NOT patch track.getSettings().
+    // Stacking these proxies on top of Chromium's native device pipeline
+    // ended up making Teams render the camera/mic toggles aria-disabled
+    // (rolling your own PermissionStatus shape that does not satisfy
+    // Teams' duck-typing, or relabelling enumerateDevices entries that
+    // Teams cross-references in ways the override can't anticipate).
+    // Browser.setPermission via CDP and getUserMedia replacement are
+    // sufficient.
 
     if (window.__tentaflowBridge) window.__tentaflowBridge.micSetupDone = true;
   }
