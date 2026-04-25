@@ -4,14 +4,58 @@
 //       wykrywanie aktywnego mowcy, injekcja mostu audio (browser_inject.js).
 // =============================================================================
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
+use tentaflow_protocol::{
+    MeetingEventPayload, LIFECYCLE_BROWSER_LAUNCHED, LIFECYCLE_JOINED, LIFECYCLE_JOINING,
+    LIFECYCLE_LOBBY_WAITING,
+    LIFECYCLE_NAVIGATING, LIFECYCLE_PREJOIN_READY,
+};
+use tokio::sync::Mutex;
 
 use crate::config::MeetingConfig;
+use crate::quic_server::RouterClient;
+
+/// Uchwyt do opcjonalnego RouterClient współdzielonego z main.rs — gdy None,
+/// `join_meeting` po prostu pomija wysyłanie lifecycle events (np. w trybie
+/// stand-alone bez hosta). Meeting_key identyfikuje sesję po stronie routera.
+pub type RouterHandle = Arc<Mutex<Option<Arc<RouterClient>>>>;
+
+/// Wysyła pojedynczy `LifecycleUpdate` bez twardej zależności od aktualnego
+/// stanu routera — błąd/brak klienta jest logowany i połykany, żeby diagnostyka
+/// nie zabiła flow dołączania.
+async fn emit_lifecycle(router: &RouterHandle, meeting_key: &str, stage: &str, details: Option<String>) {
+    let client = {
+        let guard = router.lock().await;
+        guard.as_ref().cloned()
+    };
+    let Some(client) = client else {
+        tracing::debug!(stage, "emit_lifecycle: router client niedostepny — pomijam");
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if let Err(e) = client
+        .send_meeting_event(
+            meeting_key,
+            ts,
+            MeetingEventPayload::LifecycleUpdate {
+                stage: stage.to_string(),
+                details,
+            },
+        )
+        .await
+    {
+        tracing::warn!("emit_lifecycle({}) failed: {}", stage, e);
+    }
+}
 
 /// Maksymalny czas oczekiwania na dolaczenie do spotkania (5 minut)
 const JOIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -56,7 +100,13 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         .arg("use-fake-ui-for-media-stream")
         .arg("autoplay-policy=no-user-gesture-required")
         .arg("enable-features=MediaStreamTrackGenerator")
-        .arg("disable-gpu")
+        // --disable-gpu tears down the WebRTC video pipeline: canvas
+        // captureStream() reported the track as live but the encoder never
+        // got composited frames. swiftshader provides a software GL backend
+        // that's enough for canvas readbacks and WebRTC encoding inside the
+        // headless container.
+        .arg("use-gl=swiftshader")
+        .arg("enable-unsafe-swiftshader")
         .arg("disable-blink-features=AutomationControlled")
         .arg("ignore-certificate-errors")
         .build()
@@ -74,6 +124,40 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         }
     });
 
+    // Force-grant camera, microphone and the related media-capture permissions
+    // for Teams' origins. Without this navigator.permissions.query returned
+    // 'prompt' (or 'denied') for anonymous joiners — Teams then rendered the
+    // 'Camera/Mic is not available — Go to your device settings' UFD and the
+    // toggle stayed aria-disabled. The Chromium CDP setPermission call works
+    // at the browser level and is honoured by every later getUserMedia call,
+    // unlike --use-fake-ui-for-media-stream which only suppresses the UI
+    // prompt without changing the stored permission state.
+    {
+        use chromiumoxide::cdp::browser_protocol::browser::{
+            PermissionDescriptor, PermissionSetting, SetPermissionParams,
+        };
+        let names = ["camera", "microphone", "midi", "midi-sysex"];
+        let origins = [
+            "https://teams.microsoft.com",
+            "https://teams.live.com",
+        ];
+        for origin in origins.iter() {
+            for name in names.iter() {
+                let params = SetPermissionParams {
+                    permission: PermissionDescriptor::new(*name),
+                    setting: PermissionSetting::Granted,
+                    origin: Some((*origin).to_string()),
+                    embedded_origin: None,
+                    browser_context_id: None,
+                };
+                if let Err(e) = browser.execute(params).await {
+                    tracing::warn!(origin = origin, name = name, "setPermission failed: {}", e);
+                }
+            }
+        }
+        tracing::info!("Camera/microphone permissions granted for Teams origins");
+    }
+
     // TODO: Wczytanie cookies z config.auth_cookies_path
     // Cookies Teams sa wymagane do automatycznej autoryzacji.
     // Format: JSON array z polami name, value, domain, path, httpOnly, secure
@@ -85,9 +169,20 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     Ok(browser)
 }
 
-/// Nawiguje do URL spotkania Teams i dolacza jako gosc lub czeka na logowanie VNC
-pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) -> Result<Page> {
+/// Nawiguje do URL spotkania Teams i dolacza jako gosc lub czeka na logowanie VNC.
+/// Emituje `LifecycleUpdate` events do routera na każdym kluczowym przejściu:
+/// `browser_launched` (caller już po `launch_chromium`) → `navigating` → `prejoin_ready`
+/// → `joining` → `joined`.
+pub async fn join_meeting(
+    browser: &Browser,
+    url: &str,
+    config: &MeetingConfig,
+    router: &RouterHandle,
+    meeting_key: &str,
+) -> Result<Page> {
     use chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams;
+
+    emit_lifecycle(router, meeting_key, LIFECYCLE_BROWSER_LAUNCHED, None).await;
 
     // Otworz pusta strone, zainstaluj init script PRZED nawigacja do Teams.
     // Dzieki temu monkey-patch getUserMedia jest aktywny zanim Teams go wywola.
@@ -111,26 +206,46 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
     // NIE wywolujemy wait_for_navigation — Teams robi chain redirectow
     // (launcher.html → v2 → light-meetings) i event 'navigation done' nigdy
     // nie przychodzi. Nasz polling click_when_present sam poczeka na DOM.
+    emit_lifecycle(router, meeting_key, LIFECYCLE_NAVIGATING, None).await;
     page.goto(url).await?;
     tracing::info!(url = url, "Nawigacja do spotkania Teams rozpoczeta");
 
     // Czekamy na zaladowanie strony light-meetings
     tokio::time::sleep(Duration::from_secs(3)).await;
 
+    // Prejoin DOM powinien być dostępny po 3s — emitujemy stage zanim
+    // klikniemy "Continue without audio or video" / kamerę.
+    emit_lifecycle(router, meeting_key, LIFECYCLE_PREJOIN_READY, None).await;
+
     // KROK 1: Dialog "Are you sure you don't want audio or video?"
     // Gdy bot_video_enabled=true NIE klikamy "Continue without" — zamiast tego
-    // wlaczamy kamere w prejoin zeby MSTG video-track byl aktywny. Najpierw
-    // jednak pytamy JS czy MSTG/OffscreenCanvas faktycznie zostaly zainicjalizowane —
-    // w przeciwnym razie wlaczenie kamery w UI stworzy czarny strumien.
+    // wlaczamy kamere w prejoin zeby canvas captureStream video-track byl
+    // aktywny. Init script jest doklejany na document_start ale samo
+    // setupVideoInjection wykonuje sie asynchronicznie — daj mu chwile
+    // przed sprawdzeniem flagi.
     let video_available = if config.bot_video_enabled {
-        page.evaluate("!!window.__tentaflowVideoAvailable").await
-            .map(|v| v.into_value::<bool>().unwrap_or(false))
-            .unwrap_or(false)
+        let mut available = false;
+        for _ in 0..20 {
+            let v = page
+                .evaluate("!!window.__tentaflowVideoAvailable")
+                .await
+                .map(|v| v.into_value::<bool>().unwrap_or(false))
+                .unwrap_or(false);
+            if v {
+                available = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        available
     } else {
         false
     };
     if config.bot_video_enabled && !video_available {
-        tracing::warn!("bot_video_enabled=true ale MSTG/OffscreenCanvas niedostepne — fallback na 'Continue without'");
+        tracing::warn!(
+            "bot_video_enabled=true ale window.__tentaflowVideoAvailable nie ustawione \
+             po 2s — canvas/captureStream niedostepne, fallback na 'Continue without'"
+        );
     }
     if config.bot_video_enabled && video_available {
         tracing::info!("bot_video_enabled=true — wlaczam kamere w prejoin");
@@ -200,6 +315,7 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
 
     // KROK 3: Klikniecie "Join now"
     tracing::info!("Klikanie przycisku 'Join now'");
+    emit_lifecycle(router, meeting_key, LIFECYCLE_JOINING, None).await;
     let joined = click_when_present(
         &page,
         r#"
@@ -230,12 +346,107 @@ pub async fn join_meeting(browser: &Browser, url: &str, config: &MeetingConfig) 
         );
     }
 
-    // Czekamy na potwierdzenie ze jestesmy w spotkaniu (po auto-join lub manualnym VNC)
+    // Czekamy na potwierdzenie ze jestesmy w spotkaniu (po auto-join lub manualnym VNC).
+    // Lobby state needs its own emit so the dashboard can distinguish "waiting
+    // to be admitted" from "in the meeting"; we also de-bounce the lobby emit
+    // so it only fires once per polling burst.
+    let mut emitted_lobby = false;
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
-        if is_in_meeting(&page).await? {
-            tracing::info!("Pomyslnie dolaczono do spotkania");
-            return Ok(page);
+        match detect_meeting_progress(&page).await? {
+            MeetingProgress::InMeeting => {
+                tracing::info!("Pomyslnie dolaczono do spotkania");
+                emit_lifecycle(router, meeting_key, LIFECYCLE_JOINED, None).await;
+                if config.bot_video_enabled {
+                    // Camera controls are disabled while the prejoin/lobby
+                    // screen is up, so the toggle click we did earlier was a
+                    // no-op. After the in-call surface renders, re-enable
+                    // the camera so getUserMedia fires and our canvas track
+                    // reaches Teams. We log a JSON status object back so the
+                    // bot logs reveal whether we actually clicked, which
+                    // selector matched, or why we gave up.
+                    let res = page.evaluate(
+                        r#"
+                        (async function() {
+                            const sels = [
+                                '#video-button',
+                                '[data-tid="toggle-video"]',
+                                'button[aria-label*="camera" i]',
+                                'button[aria-label*="kamera" i]',
+                                'button[title*="camera" i]',
+                            ];
+                            const findBtn = () => {
+                                for (const sel of sels) {
+                                    const b = document.querySelector(sel);
+                                    if (b) return { btn: b, sel };
+                                }
+                                return null;
+                            };
+                            const click = (btn) => {
+                                try { btn.removeAttribute('disabled'); } catch (_) {}
+                                try { btn.removeAttribute('aria-disabled'); } catch (_) {}
+                                btn.click();
+                            };
+                            // Ten-second window to find an *enabled* button.
+                            for (let i = 0; i < 20; i++) {
+                                const found = findBtn();
+                                if (found) {
+                                    const disabled = found.btn.disabled
+                                        || found.btn.getAttribute('aria-disabled') === 'true';
+                                    if (!disabled) {
+                                        const pressed = found.btn.getAttribute('aria-pressed') === 'true'
+                                            || found.btn.getAttribute('aria-checked') === 'true';
+                                        if (!pressed) click(found.btn);
+                                        return JSON.stringify({ ok: true, selector: found.sel, mode: 'enabled-click', pressed });
+                                    }
+                                }
+                                await new Promise((r) => setTimeout(r, 500));
+                            }
+                            // Fallback A: try the camera button anyway after stripping disabled.
+                            const found = findBtn();
+                            if (found) {
+                                try { click(found.btn); } catch (_) {}
+                            }
+                            // Fallback B: directly call getUserMedia({video:true}) so our
+                            // override fires and the canvas track lands in the Chromium
+                            // media pipeline. Teams' WebRTC stack often picks up the
+                            // active stream even if its UI never enables the toggle.
+                            let gumOk = false;
+                            try {
+                                const stream = await navigator.mediaDevices.getUserMedia({
+                                    video: true,
+                                    audio: true,
+                                });
+                                gumOk = !!stream && stream.getVideoTracks().length > 0;
+                                window.__tentaflowForcedStream = stream;
+                            } catch (e) {
+                                return JSON.stringify({
+                                    ok: false,
+                                    reason: 'gum forced call rejected: ' + (e && e.message ? e.message : String(e)),
+                                });
+                            }
+                            return JSON.stringify({
+                                ok: gumOk,
+                                mode: 'forced-gum',
+                                fallbackClick: !!found,
+                                reason: 'no enabled camera button — used forced getUserMedia',
+                            });
+                        })()
+                        "#,
+                    ).await;
+                    let report = res
+                        .map(|v| v.into_value::<String>().unwrap_or_default())
+                        .unwrap_or_default();
+                    tracing::info!(report = %report, "Post-join camera toggle result");
+                }
+                return Ok(page);
+            }
+            MeetingProgress::Lobby if !emitted_lobby => {
+                tracing::info!("Bot w lobby — czekamy na admit hosta");
+                emit_lifecycle(router, meeting_key, LIFECYCLE_LOBBY_WAITING, None).await;
+                emitted_lobby = true;
+            }
+            _ => {}
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -266,36 +477,110 @@ async fn click_when_present(
     anyhow::bail!("Timeout czekajac na element: {}", label)
 }
 
-/// Sprawdza czy jestesmy w aktywnym spotkaniu (wykrywanie elementow UI).
-/// Dziala zarowno dla klasycznego Teams jak i light-meetings experience.
-async fn is_in_meeting(page: &Page) -> Result<bool> {
-    let in_meeting = page
+/// Three-state classification of where the bot's Chromium currently sits in
+/// the Teams join flow. We used to flatten this into a single is_in_meeting()
+/// boolean, but the call controls (#hangup-button, #mic-button) are also
+/// rendered inside the lobby waiting screen — flipping LIFECYCLE_JOINED the
+/// moment those appeared made the dashboard report LIVE while the bot was
+/// still waiting to be admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeetingProgress {
+    /// No call surface yet — still in prejoin / device picker / loading.
+    NotYet,
+    /// Lobby panel is showing. The "Waiting for someone to let you in"
+    /// screen — the bot has clicked Join, the meeting page acknowledged
+    /// it, but the host has not admitted us. Mic/Hangup buttons exist but
+    /// are wired to lobby controls.
+    Lobby,
+    /// Real call surface — the stage layout is live and the bot is in the
+    /// meeting proper.
+    InMeeting,
+}
+
+async fn detect_meeting_progress(page: &Page) -> Result<MeetingProgress> {
+    let raw = page
         .evaluate(
             r#"
             (function() {
-                // Light-meetings experience — po dolaczeniu sa przyciski mic/camera/hangup
-                if (document.querySelector('[data-tid="call-end"]')) return true;
-                if (document.querySelector('[data-tid="toggle-mute"]')) return true;
-                if (document.querySelector('[data-tid="toggle-video"]')) return true;
-                // Klasyczny Teams
-                if (document.querySelector('[data-tid="calling-bar"]')) return true;
-                if (document.querySelector('[data-tid="hangup-button"]')) return true;
-                // Fallback po aria-label
-                if (document.querySelector('[aria-label="Leave"], [aria-label="Hang up"], [aria-label="Leave call"]')) return true;
-                // Obecnosc elementu audio z active stream (WebRTC peer connection ustanowiony)
-                const audios = document.querySelectorAll('audio');
-                for (const a of audios) {
-                    if (a.srcObject && a.srcObject.getAudioTracks && a.srcObject.getAudioTracks().length > 0) return true;
+                // Lobby probes first — Teams light-meetings shows a 'When the
+                // meeting starts' / 'Someone will let you in soon' panel and
+                // tags it with data-tid="prejoin-meet-now" or text on the
+                // page. Classic Teams uses data-tid="lobby-screen" or aria-live
+                // 'You're in the lobby'.
+                const bodyText = (document.body && document.body.innerText) || '';
+                const lobbyPhrases = [
+                    'someone in the meeting will let you in',
+                    "you're in the lobby",
+                    'someone will let you in',
+                    'when you are admitted',
+                    'when you\'re admitted',
+                    'waiting for the host',
+                    'kogos w spotkaniu wpusci',
+                    'oczekiwanie na wpuszczenie',
+                    'gdy zostaniesz wpuszczony',
+                ];
+                const lower = bodyText.toLowerCase();
+                const phraseHit = lobbyPhrases.some((p) => lower.indexOf(p) !== -1);
+                const lobbyTids = ['lobby-screen', 'lobby-wait-screen',
+                    'prejoin-meeting-info', 'lobby-waiting-room',
+                    'calling-lobby-screen'];
+                const lobbyTidHit = lobbyTids.some((t) =>
+                    document.querySelector('[data-tid="' + t + '"]'));
+                const inLobby = phraseHit || lobbyTidHit;
+
+                // True call indicators — the stage wrapper plus visible
+                // remote tiles or the participant roster reporting >1.
+                const stage = document.querySelector('[data-tid="MixedStage-wrapper"]')
+                    || document.querySelector('[data-tid="stage-layouts-renderer"]');
+                let stageTiles = 0;
+                if (stage) {
+                    stageTiles = stage.querySelectorAll('[data-tid][data-stream-type]').length;
                 }
-                return false;
+                // Roster button shows participant badge; lobby usually shows '1' (only us).
+                const rosterBadge = document.querySelector('#roster-button [data-tid="toolbar-item-badge"]');
+                const rosterCount = rosterBadge ? parseInt(rosterBadge.textContent.trim(), 10) || 0 : 0;
+                const remoteAudio = (function() {
+                    const audios = document.querySelectorAll('audio');
+                    for (const a of audios) {
+                        if (a.srcObject && a.srcObject.getAudioTracks
+                            && a.srcObject.getAudioTracks().length > 0) return true;
+                    }
+                    return false;
+                })();
+
+                // Real meeting if stage exists with multiple tiles, OR roster
+                // shows more than just us, OR remote audio is wired up.
+                const inCall = (!!stage && stageTiles >= 2)
+                    || rosterCount >= 2
+                    || remoteAudio;
+
+                // Any prejoin/call surface at all.
+                const anySurface = !!stage
+                    || !!document.querySelector('#hangup-button')
+                    || !!document.querySelector('#mic-button')
+                    || !!document.querySelector('[data-tid="hangup-button"]')
+                    || !!document.querySelector('[data-tid="calling-right-side-panel"]');
+
+                if (inCall) return 'in_meeting';
+                if (inLobby) return 'lobby';
+                if (anySurface) return 'lobby';
+                return 'not_yet';
             })()
             "#,
         )
         .await
-        .map(|v| v.into_value::<bool>().unwrap_or(false))
-        .unwrap_or(false);
+        .map(|v| v.into_value::<String>().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(match raw.as_str() {
+        "in_meeting" => MeetingProgress::InMeeting,
+        "lobby" => MeetingProgress::Lobby,
+        _ => MeetingProgress::NotYet,
+    })
+}
 
-    Ok(in_meeting)
+/// Backwards-compatible alias for callers that only need the boolean.
+async fn is_in_meeting(page: &Page) -> Result<bool> {
+    Ok(detect_meeting_progress(page).await? == MeetingProgress::InMeeting)
 }
 
 /// Sprawdza czy Teams przekierowalo na strone logowania (sesja wygasla)

@@ -326,12 +326,14 @@ pub fn encode_translate_request(
     target_lang: String,
     tone: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::TranslateRequestBody(TranslateRequest {
-        source_text,
-        source_lang,
-        target_lang,
-        tone,
-    }))
+    encode_body_inner(&MessageBody::TranslateBody(
+        tentaflow_protocol::TranslatePayload::Req(TranslateRequest {
+            source_text,
+            source_lang,
+            target_lang,
+            tone,
+        }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -816,6 +818,81 @@ pub fn encode_deployment_log_stream_request(
             replay_tail,
         },
     )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::DeploymentBody(DeploymentPayload::ReqRedeploy). Force flag asks
+/// backend to terminate active sessions (agents) rather than returning
+/// `active_sessions`.
+#[wasm_bindgen(js_name = encodeServiceRedeployRequest)]
+pub fn encode_service_redeploy_request(
+    service_id: f64,
+    force_if_active_sessions: bool,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{DeploymentPayload, ServiceRedeployRequest};
+    encode_body_inner(&MessageBody::DeploymentBody(DeploymentPayload::ReqRedeploy(
+        ServiceRedeployRequest {
+            service_id: service_id as i64,
+            force_if_active_sessions,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+// ---- Meeting VNC tunnel (same-node websockify bridge) ----
+
+/// MessageBody::VncTunnelBody(ReqOpen) — start streaming tunnel for session.
+#[wasm_bindgen(js_name = encodeVncTunnelOpenRequest)]
+pub fn encode_vnc_tunnel_open_request(session_id: f64) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{VncTunnelOpenRequest, VncTunnelPayload};
+    encode_body_inner(&MessageBody::VncTunnelBody(VncTunnelPayload::ReqOpen(
+        VncTunnelOpenRequest {
+            session_id: session_id as i64,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::VncTunnelBody(ReqSend) — browser → container RFB bytes.
+#[wasm_bindgen(js_name = encodeVncTunnelSendRequest)]
+pub fn encode_vnc_tunnel_send_request(
+    tunnel_id: String,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{VncTunnelPayload, VncTunnelSendRequest};
+    encode_body_inner(&MessageBody::VncTunnelBody(VncTunnelPayload::ReqSend(
+        VncTunnelSendRequest { tunnel_id, bytes },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::VncTunnelBody(ReqClose) — tear down tunnel explicitly.
+#[wasm_bindgen(js_name = encodeVncTunnelCloseRequest)]
+pub fn encode_vnc_tunnel_close_request(tunnel_id: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{VncTunnelCloseRequest, VncTunnelPayload};
+    encode_body_inner(&MessageBody::VncTunnelBody(VncTunnelPayload::ReqClose(
+        VncTunnelCloseRequest { tunnel_id },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
+// ---- Meeting browser capture (screenshot / DOM snapshot) ----
+
+/// MessageBody::BrowserCaptureRequest — one-shot capture of the bot's page.
+#[wasm_bindgen(js_name = encodeBrowserCaptureRequest)]
+pub fn encode_browser_capture_request(
+    session_id: f64,
+    kind: String,
+    full_page: bool,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{BrowserCapturePayload, BrowserCaptureRequest};
+    encode_body_inner(&MessageBody::BrowserCaptureBody(
+        BrowserCapturePayload::Request(BrowserCaptureRequest {
+            session_id: session_id as i64,
+            kind,
+            full_page,
+        }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1352,11 +1429,15 @@ pub fn encode_service_flags_update_request(
 ) -> Result<Vec<u8>, JsError> {
     let pinned_opt = if pinned < 0 { None } else { Some(pinned != 0) };
     let paused_opt = if paused < 0 { None } else { Some(paused != 0) };
-    encode_body_inner(&MessageBody::ServiceFlagsUpdateRequest {
-        service_id,
-        pinned: pinned_opt,
-        paused: paused_opt,
-    })
+    encode_body_inner(&MessageBody::ServiceFlagsBody(
+        tentaflow_protocol::ServiceFlagsPayload::Req(
+            tentaflow_protocol::ServiceFlagsUpdateRequest {
+                service_id,
+                pinned: pinned_opt,
+                paused: paused_opt,
+            },
+        ),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1922,14 +2003,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "promptTokens", (end.prompt_tokens as u32).into());
             set(&obj, "completionTokens", (end.completion_tokens as u32).into());
         }
-        MessageBody::TranslateRequestBody(req) => {
+        MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Req(req)) => {
             set(&obj, "variant", "TranslateRequest".into());
             set(&obj, "sourceText", req.source_text.into());
             set(&obj, "sourceLang", req.source_lang.into());
             set(&obj, "targetLang", req.target_lang.into());
             if let Some(tone) = req.tone { set(&obj, "tone", tone.into()); }
         }
-        MessageBody::TranslateResponseBody(resp) => {
+        MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Res(resp)) => {
             set(&obj, "variant", "TranslateResponse".into());
             set(&obj, "translatedText", resp.translated_text.into());
             if let Some(d) = resp.detected_source_lang { set(&obj, "detectedSourceLang", d.into()); }
@@ -2525,6 +2606,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 }
                 set(&item, "pinned", s.pinned.into());
                 set(&item, "paused", s.paused.into());
+                if let Some(h) = s.deployed_source_hash {
+                    set(&item, "deployedSourceHash", h.into());
+                }
                 arr.push(&item.into());
             }
             set(&obj, "services", arr.into());
@@ -2605,30 +2689,24 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "ServiceStopResponse".into());
             set(&obj, "stopped", stopped.into());
         }
-        MessageBody::ServiceFlagsUpdateRequest {
-            service_id,
-            pinned,
-            paused,
-        } => {
-            set(&obj, "variant", "ServiceFlagsUpdateRequest".into());
-            set(&obj, "serviceId", service_id.into());
-            if let Some(p) = pinned {
-                set(&obj, "pinned", p.into());
+        MessageBody::ServiceFlagsBody(payload) => match payload {
+            tentaflow_protocol::ServiceFlagsPayload::Req(r) => {
+                set(&obj, "variant", "ServiceFlagsUpdateRequest".into());
+                set(&obj, "serviceId", r.service_id.into());
+                if let Some(p) = r.pinned {
+                    set(&obj, "pinned", p.into());
+                }
+                if let Some(p) = r.paused {
+                    set(&obj, "paused", p.into());
+                }
             }
-            if let Some(p) = paused {
-                set(&obj, "paused", p.into());
+            tentaflow_protocol::ServiceFlagsPayload::Res(r) => {
+                set(&obj, "variant", "ServiceFlagsUpdateResponse".into());
+                set(&obj, "ok", r.ok.into());
+                set(&obj, "pinned", r.pinned.into());
+                set(&obj, "paused", r.paused.into());
             }
-        }
-        MessageBody::ServiceFlagsUpdateResponse {
-            ok,
-            pinned,
-            paused,
-        } => {
-            set(&obj, "variant", "ServiceFlagsUpdateResponse".into());
-            set(&obj, "ok", ok.into());
-            set(&obj, "pinned", pinned.into());
-            set(&obj, "paused", paused.into());
-        }
+        },
         MessageBody::PromptListRequest => {
             set(&obj, "variant", "PromptListRequest".into());
         }
@@ -3995,6 +4073,29 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MeetingBody(p) => {
             meeting_payload_to_js(&obj, p);
         }
+        MessageBody::VncTunnelBody(p) => {
+            vnc_tunnel_payload_to_js(&obj, p);
+        }
+        MessageBody::BrowserCaptureBody(payload) => match payload {
+            tentaflow_protocol::BrowserCapturePayload::Request(r) => {
+                set(&obj, "variant", "BrowserCaptureRequest".into());
+                set(&obj, "sessionId", (r.session_id as f64).into());
+                set(&obj, "session_id", (r.session_id as f64).into());
+                set(&obj, "kind", r.kind.into());
+                set(&obj, "fullPage", r.full_page.into());
+                set(&obj, "full_page", r.full_page.into());
+            }
+            tentaflow_protocol::BrowserCapturePayload::Response(r) => {
+                set(&obj, "variant", "BrowserCaptureResponse".into());
+                set(&obj, "status", r.status.into());
+                set(&obj, "kind", r.kind.into());
+                // Browser → JS: surowy PNG jako Uint8Array, DOM jako string.
+                let png = js_sys::Uint8Array::from(r.png.as_slice());
+                set(&obj, "png", png.into());
+                set(&obj, "html", r.html.into());
+                set(&obj, "error", r.error.into());
+            }
+        },
         MessageBody::MeetingLiveEventBody(event) => {
             set(&obj, "variant", "MeetingLiveEventBody".into());
             set(&obj, "meetingKey", event.meeting_key.clone().into());
@@ -4002,6 +4103,63 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             let payload = js_sys::Object::new();
             meeting_event_payload_to_js(&payload, event.payload);
             set(&obj, "payload", payload.into());
+        }
+        MessageBody::NetworkBody(p) => {
+            use tentaflow_protocol::NetworkPayload as NP;
+            match p {
+                NP::ReqInterfacesList => {
+                    set(&obj, "variant", "NetworkInterfacesListRequest".into());
+                }
+                NP::ResInterfacesList { interfaces } => {
+                    set(&obj, "variant", "NetworkInterfacesListResponse".into());
+                    let arr = js_sys::Array::new();
+                    for iface in interfaces.iter() {
+                        arr.push(&network_interface_info_to_js(iface).into());
+                    }
+                    set(&obj, "interfaces", arr.into());
+                }
+                NP::ReqConfigGet => {
+                    set(&obj, "variant", "NetworkConfigGetRequest".into());
+                }
+                NP::ResConfigGet(cfg) => {
+                    set(&obj, "variant", "NetworkConfigGetResponse".into());
+                    set(&obj, "config", network_config_to_js(&cfg).into());
+                }
+                NP::ReqConfigUpdate(cfg) => {
+                    set(&obj, "variant", "NetworkConfigUpdateRequest".into());
+                    set(&obj, "config", network_config_to_js(&cfg).into());
+                }
+                NP::ResConfigUpdate { restart_required } => {
+                    set(&obj, "variant", "NetworkConfigUpdateResponse".into());
+                    set(&obj, "restartRequired", restart_required.into());
+                    set(&obj, "restart_required", restart_required.into());
+                }
+                NP::ReqRelayStatus => {
+                    set(&obj, "variant", "NetworkRelayStatusRequest".into());
+                }
+                NP::ResRelayStatus(info) => {
+                    set(&obj, "variant", "NetworkRelayStatusResponse".into());
+                    set(&obj, "url", info.url.clone().into());
+                    set(&obj, "reachable", info.reachable.into());
+                    set(&obj, "rttMs", (info.rtt_ms as f64).into());
+                    set(&obj, "rtt_ms", (info.rtt_ms as f64).into());
+                    set(&obj, "lastCheckUnixSecs", (info.last_check_unix_secs as f64).into());
+                    set(&obj, "last_check_unix_secs", (info.last_check_unix_secs as f64).into());
+                    set(
+                        &obj,
+                        "lastSuccessUnixSecs",
+                        (info.last_success_unix_secs as f64).into(),
+                    );
+                    set(
+                        &obj,
+                        "last_success_unix_secs",
+                        (info.last_success_unix_secs as f64).into(),
+                    );
+                    set(&obj, "status", info.status.clone().into());
+                    set(&obj, "bindAddrActual", info.bind_addr_actual.clone().into());
+                    set(&obj, "bind_addr_actual", info.bind_addr_actual.clone().into());
+                }
+            }
         }
     }
     Ok(obj.into())
@@ -4119,6 +4277,19 @@ fn deployment_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::Deploym
             set(obj, "errorMessage", e.error_message.into());
             set(obj, "durationMs", (e.duration_ms as f64).into());
         }
+        DP::ReqRedeploy(req) => {
+            set(obj, "variant", "ServiceRedeployRequest".into());
+            set(obj, "serviceId", (req.service_id as f64).into());
+            set(obj, "forceIfActiveSessions", req.force_if_active_sessions.into());
+        }
+        DP::ResRedeploy(resp) => {
+            set(obj, "variant", "ServiceRedeployResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "deployId", resp.deploy_id.into());
+            set(obj, "newHash", resp.new_hash.into());
+            set(obj, "error", resp.error.into());
+            set(obj, "activeSessionCount", (resp.active_session_count as f64).into());
+        }
     }
 }
 
@@ -4140,6 +4311,54 @@ fn meeting_session_to_js(s: tentaflow_protocol::MeetingSessionDescriptor) -> js_
     set(&o, "botEndpointId", s.bot_endpoint_id.into());
     set(&o, "containerName", s.container_name.into());
     set(&o, "ownerUserId", (s.owner_user_id as f64).into());
+    // Lifecycle pola są kluczowe dla live view (chip LIVE/JOINING) i dla
+    // onJoinClick który decyduje czy wracać do joining screen czy nawigować
+    // wprost do live view po reload. Bez nich chip zawsze zostaje JOINING.
+    set(&o, "lifecycleStage", s.lifecycle_stage.into());
+    set(&o, "lifecycleDetails", s.lifecycle_details.into());
+    // Backend models — empty string / -1 from the host means "not reported yet";
+    // we surface JS null in that case so the live view can show a placeholder.
+    let opt_str = |v: String| -> wasm_bindgen::JsValue {
+        if v.is_empty() {
+            wasm_bindgen::JsValue::NULL
+        } else {
+            v.into()
+        }
+    };
+    let opt_num = |v: i64| -> wasm_bindgen::JsValue {
+        if v < 0 {
+            wasm_bindgen::JsValue::NULL
+        } else {
+            (v as f64).into()
+        }
+    };
+    set(&o, "backendSttModel", opt_str(s.backend_stt_model));
+    set(&o, "backendTtsModel", opt_str(s.backend_tts_model));
+    set(
+        &o,
+        "backendSummarizationModel",
+        opt_str(s.backend_summarization_model),
+    );
+    set(
+        &o,
+        "backendDiarizationModel",
+        opt_str(s.backend_diarization_model),
+    );
+    set(
+        &o,
+        "backendStreamingLatencyMs",
+        opt_num(s.backend_streaming_latency_ms),
+    );
+    set(
+        &o,
+        "backendEnrolledSpeakers",
+        opt_num(s.backend_enrolled_speakers),
+    );
+    set(
+        &o,
+        "backendTotalParticipants",
+        opt_num(s.backend_total_participants),
+    );
     o
 }
 
@@ -4155,6 +4374,50 @@ fn meeting_entry_to_js(e: tentaflow_protocol::MeetingTranscriptEntry) -> js_sys:
     set(&o, "text", e.text.into());
     set(&o, "model", e.model.into());
     o
+}
+
+fn vnc_tunnel_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::VncTunnelPayload) {
+    use tentaflow_protocol::VncTunnelPayload as VP;
+    match p {
+        VP::ReqOpen(r) => {
+            set(obj, "variant", "VncTunnelOpenRequest".into());
+            set(obj, "sessionId", (r.session_id as f64).into());
+        }
+        VP::ResOpen(r) => {
+            set(obj, "variant", "VncTunnelOpenResponse".into());
+            set(obj, "status", r.status.into());
+            set(obj, "tunnelId", r.tunnel_id.into());
+            set(obj, "error", r.error.into());
+        }
+        VP::Chunk(c) => {
+            set(obj, "variant", "VncTunnelChunk".into());
+            set(obj, "tunnelId", c.tunnel_id.into());
+            set(obj, "bytes", js_sys::Uint8Array::from(c.bytes.as_slice()).into());
+        }
+        VP::ReqSend(r) => {
+            set(obj, "variant", "VncTunnelSendRequest".into());
+            set(obj, "tunnelId", r.tunnel_id.into());
+            set(obj, "bytes", js_sys::Uint8Array::from(r.bytes.as_slice()).into());
+        }
+        VP::ResSend(r) => {
+            set(obj, "variant", "VncTunnelSendResponse".into());
+            set(obj, "ok", r.ok.into());
+            set(obj, "error", r.error.into());
+        }
+        VP::ReqClose(r) => {
+            set(obj, "variant", "VncTunnelCloseRequest".into());
+            set(obj, "tunnelId", r.tunnel_id.into());
+        }
+        VP::ResClose(r) => {
+            set(obj, "variant", "VncTunnelCloseResponse".into());
+            set(obj, "ok", r.ok.into());
+        }
+        VP::StreamEnd(e) => {
+            set(obj, "variant", "VncTunnelStreamEnd".into());
+            set(obj, "tunnelId", e.tunnel_id.into());
+            set(obj, "reason", e.reason.into());
+        }
+    }
 }
 
 fn meeting_payload_to_js(obj: &js_sys::Object, p: tentaflow_protocol::MeetingPayload) {
@@ -4377,6 +4640,13 @@ fn meeting_event_payload_to_js(
             }
             if let Some(v) = total_participants {
                 set(&data, "totalParticipants", (v as f64).into());
+            }
+        }
+        EP::LifecycleUpdate { stage, details } => {
+            set(obj, "type", "LifecycleUpdate".into());
+            set(&data, "stage", stage.into());
+            if let Some(d) = details {
+                set(&data, "details", d.into());
             }
         }
     }
@@ -5308,4 +5578,101 @@ pub fn encode_iam_list_perms_resource(resource_type: String, resource_id: String
 #[wasm_bindgen(js_name = encodeIamListPermsForSubjectRequest)]
 pub fn encode_iam_list_perms_subject(subject_type: String, subject_id: f64) -> Result<Vec<u8>, JsError> {
     encode_iam(IamPayload::ReqListPermsForSubject { subject_type, subject_id: subject_id as i64 })
+}
+
+// =============================================================================
+// Network settings encoders (interfejsy hosta + konfiguracja bind/filter).
+// Wrapuja NetworkPayload w MessageBody::NetworkBody i serializuja rkyv.
+// =============================================================================
+
+use tentaflow_protocol::{NetworkConfig, NetworkInterfaceInfo, NetworkPayload};
+
+fn encode_network(payload: NetworkPayload) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::NetworkBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// Konwertuje pojedynczy `NetworkInterfaceInfo` na JS object dla GUI.
+fn network_interface_info_to_js(iface: &NetworkInterfaceInfo) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "name", iface.name.clone().into());
+    set(&obj, "mac", iface.mac.clone().into());
+    let ipv4 = js_sys::Array::new();
+    for addr in iface.ipv4_addrs.iter() {
+        ipv4.push(&JsValue::from_str(addr));
+    }
+    set(&obj, "ipv4Addrs", ipv4.clone().into());
+    set(&obj, "ipv4_addrs", ipv4.into());
+    set(&obj, "mtu", (iface.mtu as f64).into());
+    set(&obj, "kind", iface.kind.clone().into());
+    set(&obj, "isUp", iface.is_up.into());
+    set(&obj, "is_up", iface.is_up.into());
+    set(&obj, "description", iface.description.clone().into());
+    obj
+}
+
+/// Konwertuje `NetworkConfig` na JS object z polami w camelCase i snake_case
+/// (parzysta dostepnosc dla istniejacych konsumentow w GUI).
+fn network_config_to_js(cfg: &NetworkConfig) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "bindMode", cfg.bind_mode.clone().into());
+    set(&obj, "bind_mode", cfg.bind_mode.clone().into());
+    set(&obj, "bindIpv4", cfg.bind_ipv4.clone().into());
+    set(&obj, "bind_ipv4", cfg.bind_ipv4.clone().into());
+    set(&obj, "hideDocker", cfg.hide_docker.into());
+    set(&obj, "hide_docker", cfg.hide_docker.into());
+    set(&obj, "hideLinkLocal", cfg.hide_link_local.into());
+    set(&obj, "hide_link_local", cfg.hide_link_local.into());
+    set(&obj, "hideLoopback", cfg.hide_loopback.into());
+    set(&obj, "hide_loopback", cfg.hide_loopback.into());
+    set(&obj, "hideCgnat", cfg.hide_cgnat.into());
+    set(&obj, "hide_cgnat", cfg.hide_cgnat.into());
+    set(&obj, "preferSameSubnet", cfg.prefer_same_subnet.into());
+    set(&obj, "prefer_same_subnet", cfg.prefer_same_subnet.into());
+    set(&obj, "irohRelayUrl", cfg.iroh_relay_url.clone().into());
+    set(&obj, "iroh_relay_url", cfg.iroh_relay_url.clone().into());
+    obj
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqInterfacesList).
+#[wasm_bindgen(js_name = encodeNetworkInterfacesListRequest)]
+pub fn encode_network_interfaces_list_request() -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqInterfacesList)
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqConfigGet).
+#[wasm_bindgen(js_name = encodeNetworkConfigGetRequest)]
+pub fn encode_network_config_get_request() -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqConfigGet)
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqRelayStatus).
+#[wasm_bindgen(js_name = encodeNetworkRelayStatusRequest)]
+pub fn encode_network_relay_status_request() -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqRelayStatus)
+}
+
+/// MessageBody::NetworkBody(NetworkPayload::ReqConfigUpdate(NetworkConfig { .. })).
+/// Pola przekazywane jako typed args (no serde-wasm-bindgen); strony JS i WASM
+/// zgodne z definicja `NetworkConfig` w `tentaflow-protocol`.
+#[wasm_bindgen(js_name = encodeNetworkConfigUpdateRequest)]
+pub fn encode_network_config_update_request(
+    bind_mode: String,
+    bind_ipv4: String,
+    hide_docker: bool,
+    hide_link_local: bool,
+    hide_loopback: bool,
+    hide_cgnat: bool,
+    prefer_same_subnet: bool,
+    iroh_relay_url: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_network(NetworkPayload::ReqConfigUpdate(NetworkConfig {
+        bind_mode,
+        bind_ipv4,
+        hide_docker,
+        hide_link_local,
+        hide_loopback,
+        hide_cgnat,
+        prefer_same_subnet,
+        iroh_relay_url,
+    }))
 }

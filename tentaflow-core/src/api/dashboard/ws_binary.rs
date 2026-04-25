@@ -270,6 +270,21 @@ pub async fn handle_ws_connection<S>(
                     continue;
                 }
 
+                // Klient JS po setJwt() / reconnect / nowej karcie startuje
+                // licznik od 1 (`GLOBAL_NEXT_SEQUENCE` w binary-ws-client.js).
+                // Jezeli ta sama TCP/WS connection przezyla taki reset (rzadki
+                // race przy switchu auth), serwerowy `last_client_sequence` ma
+                // jeszcze stara wartosc — `sequence == 1` traktujemy jako
+                // legalny sygnal "fresh client" i zerujemy licznik. Replay
+                // protection ma sens dla mesh peer-to-peer (publiczna siec);
+                // dla dashboard WS pod TLS+JWT to tylko sanity check kolejnosci.
+                if envelope.sequence == 1 && last_client_sequence > 0 {
+                    tracing::info!(
+                        prev = last_client_sequence,
+                        "binary-WS: client sequence reset to 1 — przyjmuje jako fresh client"
+                    );
+                    last_client_sequence = 0;
+                }
                 if envelope.sequence <= last_client_sequence {
                     warn!(
                         "binary-WS: sequence {} <= {} — odrzucam (replay)",

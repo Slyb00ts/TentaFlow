@@ -33,6 +33,10 @@ const state = {
   aiInsightsEnabled: true,
   activeTab: 'transcript',
   groupsCollapsed: { pending: false, done: true, cancelled: true },
+  // Bot lifecycle — 'joined' means the LIVE chip is real; other values mean
+  // the bot is still setting up and we show a pending chip instead.
+  lifecycleStage: 'idle',
+  lifecycleDetails: '',
 };
 
 let unsubscribeLive = null;
@@ -107,6 +111,35 @@ function resetState(meetingKey) {
   state.aiInsightsEnabled = true;
   state.activeTab = 'transcript';
   state.groupsCollapsed = { pending: false, done: true, cancelled: true };
+  state.lifecycleStage = 'idle';
+  state.lifecycleDetails = '';
+}
+
+// Hydrates state.backend from a MeetingSessionDescriptor returned by the
+// backend. Lets the live view render the BACKEND panel on mount even if the
+// bot's BackendUpdate broadcast fired before this dashboard was open.
+// Wasm bridge maps "not reported yet" to JS null/empty — only overwrite the
+// in-memory value when the descriptor carries a concrete one so a later
+// MeetingEvent broadcast can still refine it.
+function seedBackendFromDescriptor(desc) {
+  if (!desc) return;
+  if (desc.backendSttModel) state.backend.sttModel = String(desc.backendSttModel);
+  if (desc.backendTtsModel) state.backend.ttsModel = String(desc.backendTtsModel);
+  if (desc.backendSummarizationModel) {
+    state.backend.summarizationModel = String(desc.backendSummarizationModel);
+  }
+  if (desc.backendDiarizationModel) {
+    state.backend.diarizationModel = String(desc.backendDiarizationModel);
+  }
+  if (desc.backendStreamingLatencyMs != null) {
+    state.backend.streamingLatencyMs = Number(desc.backendStreamingLatencyMs);
+  }
+  if (desc.backendEnrolledSpeakers != null) {
+    state.backend.enrolledSpeakers = Number(desc.backendEnrolledSpeakers);
+  }
+  if (desc.backendTotalParticipants != null) {
+    state.backend.totalParticipants = Number(desc.backendTotalParticipants);
+  }
 }
 
 // --- Data loading -----------------------------------------------------------
@@ -122,6 +155,9 @@ async function loadInitialData() {
     if (match) {
       sessionId = match.sessionId;
       state.sessionDetail = match;
+      if (match.lifecycleStage) state.lifecycleStage = match.lifecycleStage;
+      if (match.lifecycleDetails) state.lifecycleDetails = match.lifecycleDetails;
+      seedBackendFromDescriptor(match);
     }
   } catch (e) {
     toast(e?.message || I18n.t('meeting.live.load_failed'), 'error');
@@ -134,7 +170,12 @@ async function loadInitialData() {
         sessionId,
         includeTranscripts: true,
       });
-      if (det?.session) state.sessionDetail = det.session;
+      if (det?.session) {
+        state.sessionDetail = det.session;
+        if (det.session.lifecycleStage) state.lifecycleStage = det.session.lifecycleStage;
+        if (det.session.lifecycleDetails) state.lifecycleDetails = det.session.lifecycleDetails;
+        seedBackendFromDescriptor(det.session);
+      }
       const entries = Array.isArray(det?.transcripts) ? det.transcripts : [];
       // Mapujemy stary format transcript entry na live event shape.
       state.transcript = entries.map((t) => ({
@@ -319,6 +360,11 @@ function applyLiveEvent(timestampMs, type, data) {
       };
       break;
     }
+    case 'LifecycleUpdate': {
+      state.lifecycleStage = String(data.stage || state.lifecycleStage);
+      state.lifecycleDetails = data.details ? String(data.details) : '';
+      break;
+    }
     default:
       // Nieznane warianty ignorujemy (forward-compat).
       break;
@@ -390,25 +436,50 @@ function renderHeader() {
   const sub = `${I18n.t('meeting.live.subtitle_participants', { n: participantsCount })} · ${durationLabel} · ${escapeHtml(platform)}`;
   // Ikona video (lucide).
   const ico = '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>';
+  const chip = renderLifecycleChip();
   host.className = 'tf-detail-header';
   host.innerHTML = `
     <div class="big-ico">${ico}</div>
     <div class="d-meta">
       <div class="d-name">
         ${escapeHtml(title)}
-        <tf-chip status="ok" dot>${escapeHtml(I18n.t('meeting.live.chip_live'))}</tf-chip>
+        ${chip}
       </div>
       <div class="d-sub">${sub}</div>
     </div>
     <div class="d-actions">
       <tf-button variant="ghost" icon="desktop" id="meet-live-vnc-btn">${escapeHtml(I18n.t('meeting.live.action_btn_screen'))}</tf-button>
+      <tf-button variant="ghost" icon="code" id="meet-live-diag-btn">${escapeHtml(I18n.t('meeting.live.action_btn_diag'))}</tf-button>
       <tf-button variant="ghost" icon="share" id="meet-live-dl-btn">${escapeHtml(I18n.t('meeting.live.action_btn_download'))}</tf-button>
       <tf-button variant="danger" icon="logout" id="meet-live-leave-btn">${escapeHtml(I18n.t('meeting.live.action_btn_leave'))}</tf-button>
     </div>
   `;
   byId('meet-live-vnc-btn')?.addEventListener('click', onOpenVnc);
+  byId('meet-live-diag-btn')?.addEventListener('click', onOpenDiag);
   byId('meet-live-dl-btn')?.addEventListener('click', onDownloadTranscript);
   byId('meet-live-leave-btn')?.addEventListener('click', onLeave);
+}
+
+function renderLifecycleChip() {
+  const stage = state.lifecycleStage || 'idle';
+  if (stage === 'joined') {
+    return `<tf-chip status="ok" dot>${escapeHtml(I18n.t('meeting.live.chip_live'))}</tf-chip>`;
+  }
+  if (stage === 'failed') {
+    return `<tf-chip status="err" dot>${escapeHtml(I18n.t('meeting.status_error'))}</tf-chip>`;
+  }
+  // Lobby gets its own short chip label and a different colour so the user
+  // sees at a glance that the bot is blocked on the host's admit action,
+  // not on something the dashboard can fix.
+  if (stage === 'lobby_waiting') {
+    return `<tf-chip status="warn" dot>${escapeHtml(I18n.t('meeting.live.chip_lobby'))}</tf-chip>`;
+  }
+  // Any pre-'joined' stage — show the stage label so the user knows why LIVE
+  // has not turned on yet (the backend may take ~20s to reach joined).
+  const labelKey = `meeting.lifecycle_${stage}`;
+  const label = I18n.t(labelKey);
+  const resolved = label === labelKey ? I18n.t('meeting.status_joining') : label;
+  return `<tf-chip status="warn" dot>${escapeHtml(resolved)}</tf-chip>`;
 }
 
 function renderBody() {
@@ -781,32 +852,290 @@ function footerHtml() {
 
 async function onOpenVnc() {
   const s = state.sessionDetail;
-  if (!s || !s.novncPort) {
+  if (!s || !Number.isFinite(s.sessionId)) {
     toast(I18n.t('meeting.live.vnc_unavailable'), 'warn');
     return;
   }
-  const scheme = location.protocol;
-  const url = `${scheme}//${location.hostname}:${s.novncPort}/vnc.html?autoconnect=1&resize=scale&host=${location.hostname}&port=${s.novncPort}`;
+
   const win = document.createElement('tf-window');
   win.setAttribute('title', I18n.t('meeting.live.action_btn_screen'));
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('width', '960');
+  // Use the full default button set so users can minimize / maximize; mark the
+  // window draggable and resizable so noVNC scales to whatever size the user
+  // settles on (scaleViewport=true preserves the captured aspect ratio by
+  // letterboxing inside the bounds).
+  win.setAttribute('draggable', '');
+  win.setAttribute('resizable', '');
+  win.setAttribute('width', '1024');
+  win.setAttribute('height', '640');
+  win.setAttribute('min-width', '480');
+  win.setAttribute('min-height', '320');
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
   const body = document.createElement('div');
   body.slot = 'body';
-  body.style.padding = '0';
-  body.innerHTML = `<iframe src="${escapeAttr(url)}" style="width:100%;height:560px;border:0;background:#000;" allowfullscreen></iframe>`;
+  body.className = 'meet-vnc-body';
+  const screen = document.createElement('div');
+  screen.className = 'meet-vnc-screen';
+  body.appendChild(screen);
   win.appendChild(body);
   const backdrop = document.createElement('div');
   backdrop.className = 'tf-window-backdrop';
   document.body.append(backdrop, win);
+
+  let rfb = null;
+  let transport = null;
+  let disposed = false;
+
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    try { rfb?.disconnect(); } catch (_) {}
+    try { transport?.close(); } catch (_) {}
+    if (win.parentNode) win.remove();
+    if (backdrop.parentNode) backdrop.remove();
+  };
   win.addEventListener('action', (e) => {
-    if (e.detail?.action === 'close') {
-      win.remove();
-      backdrop.remove();
-    }
+    if (e.detail?.action === 'close') cleanup();
   });
+
+  const showStatusToast = ({ status, error }) => {
+    if (disposed) return;
+    if (status === 'ok') return;
+    const keyByStatus = {
+      not_found: 'meeting.live.vnc_error_not_found',
+      forbidden: 'meeting.live.vnc_error_forbidden',
+      no_port: 'meeting.live.vnc_error_no_port',
+      remote_node: 'meeting.live.vnc_error_remote_node',
+    };
+    const key = keyByStatus[status] || 'meeting.live.vnc_error_failed';
+    const msg = key === 'meeting.live.vnc_error_failed'
+      ? I18n.t(key, { message: error || '' })
+      : I18n.t(key);
+    toast(msg, 'error');
+    cleanup();
+  };
+
+  try {
+    const [{ default: RFB }, { VncApiBinaryTransport }] = await Promise.all([
+      import('/js/vendor/novnc/core/rfb.js'),
+      import('/js/modules/meeting/vnc-transport.js'),
+    ]);
+    transport = new VncApiBinaryTransport(Number(s.sessionId));
+    rfb = new RFB(screen, transport, { shared: true });
+    rfb.scaleViewport = true;
+    rfb.resizeSession = false;
+    rfb.addEventListener('disconnect', (ev) => {
+      if (disposed) return;
+      if (!ev?.detail?.clean) {
+        toast(I18n.t('meeting.live.vnc_disconnected'), 'warn');
+      }
+      cleanup();
+    });
+    await transport.start(showStatusToast);
+  } catch (err) {
+    console.error('[meeting-live] vnc open failed:', err);
+    toast(I18n.t('meeting.live.vnc_error_failed', { message: err?.message || '' }), 'error');
+    cleanup();
+  }
+}
+
+async function onOpenDiag() {
+  const s = state.sessionDetail;
+  if (!s || !Number.isFinite(s.sessionId)) {
+    toast(I18n.t('meeting.live.vnc_unavailable'), 'warn');
+    return;
+  }
+  const sessionId = Number(s.sessionId);
+
+  const win = document.createElement('tf-window');
+  win.setAttribute('title', I18n.t('meeting.live.diag_title'));
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', '860');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+
+  const body = document.createElement('div');
+  body.slot = 'body';
+  body.className = 'diag-window-body';
+
+  const actions = document.createElement('div');
+  actions.className = 'diag-actions';
+  const btnShot = document.createElement('tf-button');
+  btnShot.setAttribute('variant', 'primary');
+  btnShot.setAttribute('icon', 'camera');
+  btnShot.textContent = I18n.t('meeting.live.diag_screenshot_viewport');
+  const btnShotFull = document.createElement('tf-button');
+  btnShotFull.setAttribute('variant', 'ghost');
+  btnShotFull.setAttribute('icon', 'camera');
+  btnShotFull.textContent = I18n.t('meeting.live.diag_screenshot_full');
+  const btnDom = document.createElement('tf-button');
+  btnDom.setAttribute('variant', 'ghost');
+  btnDom.setAttribute('icon', 'code');
+  btnDom.textContent = I18n.t('meeting.live.diag_dump_dom');
+  actions.append(btnShot, btnShotFull, btnDom);
+
+  const result = document.createElement('div');
+  result.className = 'diag-result';
+  const empty = document.createElement('div');
+  empty.className = 'diag-empty';
+  empty.textContent = I18n.t('meeting.live.diag_empty');
+  result.appendChild(empty);
+
+  body.append(actions, result);
+  win.appendChild(body);
+  const backdrop = document.createElement('div');
+  backdrop.className = 'tf-window-backdrop';
+  document.body.append(backdrop, win);
+
+  // Track blob URLs created inside this window so we can revoke them on close.
+  const objectUrls = [];
+  const trackUrl = (url) => { objectUrls.push(url); return url; };
+
+  let disposed = false;
+  const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
+    for (const u of objectUrls) { try { URL.revokeObjectURL(u); } catch (_) {} }
+    objectUrls.length = 0;
+    if (win.parentNode) win.remove();
+    if (backdrop.parentNode) backdrop.remove();
+  };
+  win.addEventListener('action', (e) => {
+    if (e.detail?.action === 'close') cleanup();
+  });
+
+  const setBusy = (busy) => {
+    for (const b of [btnShot, btnShotFull, btnDom]) {
+      if (busy) b.setAttribute('disabled', '');
+      else b.removeAttribute('disabled');
+    }
+  };
+
+  const showLoading = () => {
+    result.innerHTML = '';
+    const load = document.createElement('div');
+    load.className = 'diag-empty';
+    load.textContent = I18n.t('meeting.live.diag_loading');
+    result.appendChild(load);
+  };
+
+  const handleError = ({ status, error }) => {
+    const keyByStatus = {
+      not_found: 'meeting.live.diag_error_not_found',
+      forbidden: 'meeting.live.diag_error_forbidden',
+      remote_node: 'meeting.live.diag_error_remote_node',
+    };
+    const key = keyByStatus[status] || 'meeting.live.diag_error_failed';
+    const msg = key === 'meeting.live.diag_error_failed'
+      ? I18n.t(key, { message: error || status || '' })
+      : I18n.t(key);
+    toast(msg, 'error');
+    result.innerHTML = '';
+    const fail = document.createElement('div');
+    fail.className = 'diag-empty';
+    fail.textContent = msg;
+    result.appendChild(fail);
+  };
+
+  const renderScreenshot = (pngBytes) => {
+    // Reset panel (shared for screenshot + DOM) and revoke previous URLs.
+    for (const u of objectUrls) { try { URL.revokeObjectURL(u); } catch (_) {} }
+    objectUrls.length = 0;
+    result.innerHTML = '';
+    const blob = new Blob([pngBytes], { type: 'image/png' });
+    const url = trackUrl(URL.createObjectURL(blob));
+    const toolbar = document.createElement('div');
+    toolbar.className = 'diag-actions';
+    const dl = document.createElement('tf-button');
+    dl.setAttribute('variant', 'ghost');
+    dl.setAttribute('icon', 'share');
+    dl.textContent = I18n.t('meeting.live.diag_download');
+    dl.addEventListener('click', () => {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `meeting-${sessionId}-screenshot-${Date.now()}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    });
+    toolbar.appendChild(dl);
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = 'screenshot';
+    result.append(toolbar, img);
+  };
+
+  const renderDom = (html) => {
+    for (const u of objectUrls) { try { URL.revokeObjectURL(u); } catch (_) {} }
+    objectUrls.length = 0;
+    result.innerHTML = '';
+    const toolbar = document.createElement('div');
+    toolbar.className = 'diag-actions';
+    const copyBtn = document.createElement('tf-button');
+    copyBtn.setAttribute('variant', 'ghost');
+    copyBtn.setAttribute('icon', 'copy');
+    copyBtn.textContent = I18n.t('meeting.live.diag_copy');
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(html);
+        toast(I18n.t('meeting.live.diag_copy_ok'), 'success');
+      } catch (err) {
+        toast(err?.message || 'Clipboard error', 'error');
+      }
+    });
+    const dlBtn = document.createElement('tf-button');
+    dlBtn.setAttribute('variant', 'ghost');
+    dlBtn.setAttribute('icon', 'share');
+    dlBtn.textContent = I18n.t('meeting.live.diag_download');
+    dlBtn.addEventListener('click', () => {
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = trackUrl(URL.createObjectURL(blob));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `meeting-${sessionId}-dom-${Date.now()}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    });
+    toolbar.append(copyBtn, dlBtn);
+    const pre = document.createElement('pre');
+    // Large dumps: show as text only; parsing HTML into DOM would be slow and unsafe.
+    pre.textContent = html;
+    result.append(toolbar, pre);
+  };
+
+  const runCapture = async (kind, fullPage) => {
+    if (disposed) return;
+    setBusy(true);
+    showLoading();
+    try {
+      const resp = await ApiBinary.one('browserCaptureRequest', {
+        sessionId,
+        kind,
+        fullPage: !!fullPage,
+      });
+      if (disposed) return;
+      if (resp?.status !== 'ok') {
+        handleError({ status: resp?.status, error: resp?.error });
+        return;
+      }
+      if (kind === 'screenshot') {
+        const png = resp.png instanceof Uint8Array ? resp.png : new Uint8Array(resp.png || []);
+        renderScreenshot(png);
+      } else {
+        renderDom(String(resp.html ?? ''));
+      }
+    } catch (err) {
+      if (disposed) return;
+      handleError({ status: 'failed', error: err?.message || '' });
+    } finally {
+      if (!disposed) setBusy(false);
+    }
+  };
+
+  btnShot.addEventListener('click', () => runCapture('screenshot', false));
+  btnShotFull.addEventListener('click', () => runCapture('screenshot', true));
+  btnDom.addEventListener('click', () => runCapture('dom', false));
 }
 
 async function onDownloadTranscript() {

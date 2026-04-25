@@ -1944,6 +1944,12 @@
       "export_empty": "Nichts zu exportieren",
       "export_failed": "Export fehlgeschlagen",
       "vnc_unavailable": "VNC-Vorschau für diese Sitzung nicht verfügbar",
+      "vnc_error_not_found": "VNC-Sitzung nicht gefunden",
+      "vnc_error_forbidden": "Zugriff auf VNC-Vorschau verweigert",
+      "vnc_error_no_port": "Kein VNC-Port für diese Sitzung zugewiesen",
+      "vnc_error_remote_node": "Sitzung läuft auf einem anderen Mesh-Knoten — VNC-Vorschau folgt in Phase B",
+      "vnc_error_failed": "VNC-Tunnelfehler: {message}",
+      "vnc_disconnected": "VNC-Verbindung verloren",
       "missing_key": "Meeting-Schlüssel fehlt",
       "load_failed": "Sitzung konnte nicht geladen werden",
       "open_button": "Live-Ansicht"

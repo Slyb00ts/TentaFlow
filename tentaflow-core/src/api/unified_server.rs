@@ -54,6 +54,7 @@ pub fn start_unified_server(
     quic_mesh: Option<Arc<IrohMeshManager>>,
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
+    mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
 ) -> Result<()> {
     start_unified_server_with_permissions(
         config,
@@ -65,6 +66,7 @@ pub fn start_unified_server(
         local_node_id,
         mesh_security,
         None,
+        mesh_relay_health,
     )
 }
 
@@ -79,6 +81,7 @@ pub fn start_unified_server_with_permissions(
     local_node_id: Arc<str>,
     mesh_security: Option<Arc<MeshSecurity>>,
     permission_checker: Option<Arc<crate::addon::permissions::PermissionChecker>>,
+    mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
 ) -> Result<()> {
     if !config.protocols.openai_api.enabled {
         info!("Unified HTTP server wylaczony w konfiguracji");
@@ -129,6 +132,7 @@ pub fn start_unified_server_with_permissions(
     let local_node_id = local_node_id.clone();
     let mesh_security = mesh_security.clone();
     let permission_checker = permission_checker.clone();
+    let mesh_relay_health = mesh_relay_health.clone();
 
     // Wbudowane certyfikaty TLS z katalogu certs/ repozytorium
     let tls_acceptor = {
@@ -264,6 +268,7 @@ pub fn start_unified_server_with_permissions(
             let lni = local_node_id.clone();
             let msec = mesh_security.clone();
             let pc = permission_checker.clone();
+            let mrh = mesh_relay_health.clone();
             let license: Arc<dyn crate::license::LicenseChecker> =
                 Arc::new(crate::license::StaticLicenseChecker::free());
 
@@ -293,6 +298,7 @@ pub fn start_unified_server_with_permissions(
                     let lni = lni.clone();
                     let msec = msec.clone();
                     let pc = pc.clone();
+                    let mrh = mrh.clone();
                     let lic = license.clone();
                     let ra = remote_addr_str.clone();
                     async move {
@@ -374,7 +380,7 @@ pub fn start_unified_server_with_permissions(
                         } else {
                             let resp = crate::api::dashboard::server::handle_request(
                                 req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc,
-                                lic, ra,
+                                lic, mrh, ra,
                             )
                             .await?;
                             let resp = resp.map(|body| {

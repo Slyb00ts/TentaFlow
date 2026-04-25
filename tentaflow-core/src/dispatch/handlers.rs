@@ -1885,6 +1885,7 @@ pub fn service_list(
                 model_id,
                 pinned: s.pinned,
                 paused: s.paused,
+                deployed_source_hash: s.deployed_source_hash,
             }
         })
         .collect();
@@ -2291,7 +2292,7 @@ pub async fn service_stop(
     Ok(MessageBody::ServiceStopResponse { stopped: true })
 }
 
-#[handler(variant = "ServiceFlagsUpdateRequest", since = (1, 0))]
+#[handler(variant = "ServiceFlagsBody", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
 pub async fn service_flags_update(
@@ -2299,11 +2300,9 @@ pub async fn service_flags_update(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let (service_id_str, pinned_opt, paused_opt) = match req {
-        MessageBody::ServiceFlagsUpdateRequest {
-            service_id,
-            pinned,
-            paused,
-        } => (service_id, *pinned, *paused),
+        MessageBody::ServiceFlagsBody(tentaflow_protocol::ServiceFlagsPayload::Req(r)) => {
+            (&r.service_id, r.pinned, r.paused)
+        }
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ServiceFlagsUpdateRequest",
@@ -2354,11 +2353,15 @@ pub async fn service_flags_update(
         Some(&ctx.state.local_node_id),
     );
 
-    Ok(MessageBody::ServiceFlagsUpdateResponse {
-        ok: true,
-        pinned: final_pinned,
-        paused: final_paused,
-    })
+    Ok(MessageBody::ServiceFlagsBody(
+        tentaflow_protocol::ServiceFlagsPayload::Res(
+            tentaflow_protocol::ServiceFlagsUpdateResponse {
+                ok: true,
+                pinned: final_pinned,
+                paused: final_paused,
+            },
+        ),
+    ))
 }
 
 // =============================================================================
@@ -3809,6 +3812,104 @@ pub fn deployment_list(
 }
 
 // =============================================================================
+// Service redeploy - rebuild already-deployed service from refreshed sources.
+// =============================================================================
+
+#[handler(variant = "ServiceRedeployRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_redeploy(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqRedeploy(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected ReqRedeploy")),
+    };
+    if payload.service_id <= 0 {
+        return Err(ProtocolError::bad_request("service_id must be positive"));
+    }
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.redeploy",
+        Some(&payload.service_id.to_string()),
+        Some(&format!("force={}", payload.force_if_active_sessions)),
+    );
+
+    let outcome = crate::deploy::redeploy::start_redeploy(
+        ctx.state.db.clone(),
+        ctx.state.service_manager.clone(),
+        payload.service_id,
+        payload.force_if_active_sessions,
+    )
+    .await;
+
+    let response = match outcome {
+        crate::deploy::redeploy::RedeployOutcome::Started { deploy_id } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_STARTED.to_string(),
+                deploy_id,
+                new_hash: String::new(),
+                error: String::new(),
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::ActiveSessions { count } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_ACTIVE_SESSIONS.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: String::new(),
+                active_session_count: count,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::NoSource => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_NO_SOURCE.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: "manifest exposes no source_hash for this engine/deploy_mode"
+                    .to_string(),
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::Unsupported { reason } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_UNSUPPORTED.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: reason,
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::NotFound => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_NOT_FOUND.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error: format!("service id {} does not exist", payload.service_id),
+                active_session_count: 0,
+            }
+        }
+        crate::deploy::redeploy::RedeployOutcome::Failed { error } => {
+            tentaflow_protocol::ServiceRedeployResponse {
+                status: tentaflow_protocol::REDEPLOY_STATUS_FAILED.to_string(),
+                deploy_id: String::new(),
+                new_hash: String::new(),
+                error,
+                active_session_count: 0,
+            }
+        }
+    };
+    Ok(MessageBody::DeploymentBody(
+        tentaflow_protocol::DeploymentPayload::ResRedeploy(response),
+    ))
+}
+
+// =============================================================================
 // Addons + Users listy (FAZA 6 — REST → binary dla badge counts w nav)
 // =============================================================================
 
@@ -4417,4 +4518,284 @@ register_iam_variant!(
 register_iam_variant!(
     "IamListPermsForSubjectRequest",
     "tentaflow_ws_handler_iam_list_perms_subject"
+);
+
+// =============================================================================
+// Mesh & Network settings (enumeracja IPv4 NIC + bind/advertise rules)
+// =============================================================================
+
+/// Klucze settings dla mesh network config. Kolejnosc i nazwy musza sie zgadzac
+/// z migracja V57 i z polami `tentaflow_protocol::NetworkConfig`.
+mod network_config_keys {
+    pub const BIND_MODE: &str = "mesh.bind_mode";
+    pub const BIND_IPV4: &str = "mesh.bind_ipv4";
+    pub const HIDE_DOCKER: &str = "mesh.advertise_hide_docker";
+    pub const HIDE_LINK_LOCAL: &str = "mesh.advertise_hide_link_local";
+    pub const HIDE_LOOPBACK: &str = "mesh.advertise_hide_loopback";
+    pub const HIDE_CGNAT: &str = "mesh.advertise_hide_cgnat";
+    pub const PREFER_SAME_SUBNET: &str = "mesh.advertise_prefer_same_subnet";
+}
+
+fn parse_bool_setting(raw: &Option<String>, default: bool) -> bool {
+    match raw.as_deref() {
+        Some("1") | Some("true") => true,
+        Some("0") | Some("false") => false,
+        _ => default,
+    }
+}
+
+fn bool_to_setting(v: bool) -> &'static str {
+    if v {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::NetworkConfig, ProtocolError> {
+    use network_config_keys::*;
+    let pool = &ctx.state.db;
+
+    let bind_mode = repository::get_setting(pool, BIND_MODE)
+        .map_err(db_err)?
+        .unwrap_or_else(|| "auto".to_string());
+    let bind_ipv4 = repository::get_setting(pool, BIND_IPV4)
+        .map_err(db_err)?
+        .unwrap_or_default();
+    let hide_docker =
+        parse_bool_setting(&repository::get_setting(pool, HIDE_DOCKER).map_err(db_err)?, true);
+    let hide_link_local = parse_bool_setting(
+        &repository::get_setting(pool, HIDE_LINK_LOCAL).map_err(db_err)?,
+        true,
+    );
+    let hide_loopback = parse_bool_setting(
+        &repository::get_setting(pool, HIDE_LOOPBACK).map_err(db_err)?,
+        true,
+    );
+    let hide_cgnat = parse_bool_setting(
+        &repository::get_setting(pool, HIDE_CGNAT).map_err(db_err)?,
+        false,
+    );
+    let prefer_same_subnet = parse_bool_setting(
+        &repository::get_setting(pool, PREFER_SAME_SUBNET).map_err(db_err)?,
+        true,
+    );
+    let iroh_relay_url = repository::get_setting(pool, crate::net::iroh::relay::RELAY_URL_SETTING_KEY)
+        .map_err(db_err)?
+        .unwrap_or_else(|| crate::net::iroh::relay::DEFAULT_RELAY_URL.to_string());
+
+    Ok(tentaflow_protocol::NetworkConfig {
+        bind_mode,
+        bind_ipv4,
+        hide_docker,
+        hide_link_local,
+        hide_loopback,
+        hide_cgnat,
+        prefer_same_subnet,
+        iroh_relay_url,
+    })
+}
+
+/// Jeden handler dispatchuje wszystkie warianty `NetworkPayload`. Macro
+/// `#[handler(variant = "NetworkBody")]` rejestruje go pod "NetworkBody",
+/// a `register_network_variant!` ponizej re-rejestruje pod nazwami inner
+/// payloadu — tak zeby `variant_name_of()` trafialo w HashMap.
+#[handler(variant = "NetworkBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn network_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::NetworkPayload as P;
+    let payload = match req {
+        MessageBody::NetworkBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected NetworkBody")),
+    };
+
+    let res = match payload {
+        P::ReqInterfacesList => {
+            let interfaces = crate::mesh::network_interfaces::list_interfaces();
+            tracing::info!(
+                count = interfaces.len(),
+                names = ?interfaces.iter().map(|i| &i.name).collect::<Vec<_>>(),
+                "network_dispatch: ReqInterfacesList"
+            );
+            P::ResInterfacesList { interfaces }
+        }
+        P::ReqConfigGet => {
+            let cfg = load_network_config(ctx)?;
+            P::ResConfigGet(cfg)
+        }
+        P::ReqConfigUpdate(new_cfg) => {
+            tracing::info!(
+                bind_mode = %new_cfg.bind_mode,
+                bind_ipv4 = %new_cfg.bind_ipv4,
+                relay = %new_cfg.iroh_relay_url,
+                hide_docker = new_cfg.hide_docker,
+                hide_link_local = new_cfg.hide_link_local,
+                hide_loopback = new_cfg.hide_loopback,
+                hide_cgnat = new_cfg.hide_cgnat,
+                prefer_same_subnet = new_cfg.prefer_same_subnet,
+                "network_dispatch: ReqConfigUpdate received"
+            );
+            if new_cfg.bind_mode != "auto" && new_cfg.bind_mode != "custom" {
+                return Err(ProtocolError::bad_request(
+                    "bind_mode must be 'auto' or 'custom'",
+                ));
+            }
+
+            if new_cfg.bind_mode == "custom" {
+                let parsed: std::net::Ipv4Addr = new_cfg.bind_ipv4.parse().map_err(|_| {
+                    ProtocolError::bad_request(format!(
+                        "bind_ipv4 '{}' is not a valid IPv4 address",
+                        new_cfg.bind_ipv4
+                    ))
+                })?;
+                let found = crate::mesh::network_interfaces::list_interfaces()
+                    .into_iter()
+                    .flat_map(|i| i.ipv4_addrs)
+                    .any(|a| {
+                        a.parse::<std::net::Ipv4Addr>()
+                            .map(|v| v == parsed)
+                            .unwrap_or(false)
+                    });
+                if !found {
+                    return Err(ProtocolError::bad_request(format!(
+                        "bind_ipv4 '{}' is not present on any local interface",
+                        new_cfg.bind_ipv4
+                    )));
+                }
+            }
+
+            // Porownanie stanu z DB -> decyzja czy potrzebny restart silnika iroh.
+            // Zmiany filtrow advertise sa stosowane dynamicznie, restart tylko gdy
+            // zmieni sie bind_mode / bind_ipv4 / relay URL (wymaga rebuild endpointu).
+            let previous = load_network_config(ctx)?;
+            let restart_required = previous.bind_mode != new_cfg.bind_mode
+                || previous.bind_ipv4 != new_cfg.bind_ipv4
+                || previous.iroh_relay_url != new_cfg.iroh_relay_url;
+
+            use network_config_keys::*;
+            let pool = &ctx.state.db;
+            repository::set_setting(pool, BIND_MODE, &new_cfg.bind_mode).map_err(db_err)?;
+            repository::set_setting(pool, BIND_IPV4, &new_cfg.bind_ipv4).map_err(db_err)?;
+            repository::set_setting(pool, HIDE_DOCKER, bool_to_setting(new_cfg.hide_docker))
+                .map_err(db_err)?;
+            repository::set_setting(
+                pool,
+                HIDE_LINK_LOCAL,
+                bool_to_setting(new_cfg.hide_link_local),
+            )
+            .map_err(db_err)?;
+            repository::set_setting(pool, HIDE_LOOPBACK, bool_to_setting(new_cfg.hide_loopback))
+                .map_err(db_err)?;
+            repository::set_setting(pool, HIDE_CGNAT, bool_to_setting(new_cfg.hide_cgnat))
+                .map_err(db_err)?;
+            repository::set_setting(
+                pool,
+                PREFER_SAME_SUBNET,
+                bool_to_setting(new_cfg.prefer_same_subnet),
+            )
+            .map_err(db_err)?;
+            repository::set_setting(
+                pool,
+                crate::net::iroh::relay::RELAY_URL_SETTING_KEY,
+                &new_cfg.iroh_relay_url,
+            )
+            .map_err(db_err)?;
+
+            let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+            audit(
+                ctx,
+                user_id,
+                "mesh.network_config.update",
+                Some("mesh.network_config"),
+                Some(&format!(
+                    "bind_mode={} restart_required={}",
+                    new_cfg.bind_mode, restart_required
+                )),
+            );
+
+            P::ResConfigUpdate { restart_required }
+        }
+        P::ReqRelayStatus => {
+            // Snapshot stanu relay z background monitora; gdy mesh nie wystartowal
+            // (np. mesh.enabled=false), zwracamy "disabled" z pustym URL.
+            let info = match &ctx.state.mesh_relay_health {
+                Some(state) => {
+                    let g = state.read();
+                    tentaflow_protocol::RelayHealthInfo {
+                        url: g.url.clone(),
+                        reachable: g.reachable,
+                        rtt_ms: g.rtt_ms.unwrap_or(0),
+                        last_check_unix_secs: g.last_check_unix_secs,
+                        last_success_unix_secs: g.last_success_unix_secs.unwrap_or(0),
+                        status: g.status.clone(),
+                        bind_addr_actual: g.bind_addr_actual.clone(),
+                    }
+                }
+                None => tentaflow_protocol::RelayHealthInfo {
+                    url: String::new(),
+                    reachable: false,
+                    rtt_ms: 0,
+                    last_check_unix_secs: 0,
+                    last_success_unix_secs: 0,
+                    status: "disabled".to_string(),
+                    bind_addr_actual: String::new(),
+                },
+            };
+            P::ResRelayStatus(info)
+        }
+        P::ResInterfacesList { .. }
+        | P::ResConfigGet(_)
+        | P::ResConfigUpdate { .. }
+        | P::ResRelayStatus(_) => {
+            return Err(ProtocolError::bad_request(
+                "response variants are not accepted as requests",
+            ));
+        }
+    };
+
+    Ok(MessageBody::NetworkBody(res))
+}
+
+// Re-rejestruje `network_dispatch` pod inner-payload variant names tak, zeby
+// `variant_name_of()` -> Registry::find() je znajdowalo.
+macro_rules! register_network_variant {
+    ($variant:literal, $metric:literal) => {
+        register_network_variant!($variant, $metric, Admin);
+    };
+    ($variant:literal, $metric:literal, $auth:ident) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: crate::dispatch::SessionAuthKind::$auth,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_network_dispatch,
+            }
+        }
+    };
+}
+
+register_network_variant!(
+    "NetworkInterfacesListRequest",
+    "tentaflow_ws_handler_network_interfaces_list"
+);
+register_network_variant!(
+    "NetworkConfigGetRequest",
+    "tentaflow_ws_handler_network_config_get"
+);
+register_network_variant!(
+    "NetworkConfigUpdateRequest",
+    "tentaflow_ws_handler_network_config_update"
+);
+// Status relay jest informacja read-only dla zwyklych userow na ekranie Mesh —
+// nie wymaga roli admina. Zwykly UserSession wystarcza.
+register_network_variant!(
+    "NetworkRelayStatusRequest",
+    "tentaflow_ws_handler_network_relay_status",
+    UserSession
 );
