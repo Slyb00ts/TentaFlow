@@ -45,6 +45,15 @@ async fn main() -> Result<()> {
     let mut env: HashMap<String, String> = HashMap::new();
     if let Some(m) = &model {
         env.insert("MODEL".to_string(), m.clone());
+        // Setujemy tez w naszym procesie zeby smoke_llm widzial nazwe modelu
+        // przy budowaniu requestu (vllm /v1/chat/completions wymaga model name).
+        std::env::set_var("MODEL", m);
+    }
+    // Coqui XTTS v2 wymaga jawnej akceptacji licencji CPML — bez tego
+    // `from TTS.api import TTS; TTS(...)` rzuca exception przy pierwszym
+    // call'u i serwer pada zanim odpowie na health probe.
+    if engine == "xtts" {
+        env.insert("COQUI_TOS_AGREED".to_string(), "1".to_string());
     }
     if let Ok(token) = std::env::var("HF_TOKEN") {
         env.insert("HF_TOKEN".to_string(), token);
@@ -109,9 +118,22 @@ async fn main() -> Result<()> {
         false
     };
 
-    eprintln!("\n--- killing process pid={} ---", running.child.id());
+    let pid = running.child.id();
+    eprintln!("\n--- killing process pid={} (+ children) ---", pid);
+    // Engine'y typu vllm spawn'uja child process EngineCore poza grupa parenta.
+    // Najpewniejsza metoda na czystki: pkill -P (children parenta) + kill parent.
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-P", &pid.to_string()])
+        .status();
     let _ = running.child.kill();
     let _ = running.child.wait();
+    // Drugi sweep — dziadek-dzieci (np. vllm.engine spawnowany przez api_server,
+    // ktorzy biegna z `--port <N>` w argv). Pattern musi zawierac caly fragment
+    // bo pkill nie traktuje "--" jako separatora.
+    let port_pattern = format!("port {}", running.internal_port);
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", &port_pattern])
+        .status();
 
     eprintln!(
         "\n=== SUMMARY {}: deploy_ok=true health_ok={} smoke_ok={} elapsed={:.1}s ===",
