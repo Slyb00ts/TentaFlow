@@ -316,9 +316,18 @@
   // placeholder albo wyciszona kopia).
   function hookRTCPeerConnection() {
     if (typeof RTCPeerConnection === 'undefined') return;
+    if (!(window.__tentaflowPeerConnections instanceof Set)) {
+      window.__tentaflowPeerConnections = new Set();
+    }
     const OrigPC = window.RTCPeerConnection;
     function PatchedPC(...args) {
       const pc = new OrigPC(...args);
+      window.__tentaflowPeerConnections.add(pc);
+      pc.addEventListener('connectionstatechange', function () {
+        if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+          window.__tentaflowPeerConnections.delete(pc);
+        }
+      });
       console.log('[tentaflow] RTCPeerConnection utworzony');
       pc.addEventListener('track', (event) => {
         const track = event.track;
@@ -1094,11 +1103,300 @@
       console.warn('[tentaflow] install observer blad', e);
     }
     connectWs();
-    // Polling roster (3s) i active-speaker (500ms)
+    // Polling roster (3s) i active-speaker (500ms) idzie przez WS (port 9999)
+    // i zasila audio.rs metadata enrichment dla STT. Push lifecycle/participant
+    // events do Rust idzie osobnym kanalem (CDP binding) zainstalowanym przez
+    // installTentaflowDomBridge() ponizej.
     registerInterval(setInterval(sendRoster, 3000));
     registerInterval(setInterval(sendActiveSpeakerIfChanged, 500));
+    try {
+      installTentaflowDomBridge();
+    } catch (e) {
+      console.warn('[tentaflow] installTentaflowDomBridge blad', e);
+    }
     if (window.__tentaflowBridge) window.__tentaflowBridge.setupDone = true;
     console.log('[tentaflow] Bridge audio zainicjalizowany');
+  }
+
+  // ==========================================================================
+  // Push-based DOM event bridge -> Rust (CDP binding `__tentaflowEvent`).
+  // ==========================================================================
+  // Zastepuje pollingowy `participant_scanner.rs` (`page.evaluate` co 3s)
+  // i pollingowa petle `detect_meeting_progress` w browser.rs (`page.evaluate`
+  // co 500ms-2s z body.innerText). MutationObserver fires na realnej zmianie
+  // DOM; rAF dedupluje serie mutacji w jeden skan; 1s safety interval pokrywa
+  // edge case'y gdy obserwator przegapi przejscie (np. iframe, dynamic root).
+  //
+  // Komunikacja: window.__tentaflowEvent(JSON.stringify({ type, ...data })).
+  // Funkcja jest rejestrowana przez Rust przez CDP `Runtime.addBinding` przed
+  // nawigacja do Teams (browser.rs::join_meeting -> dom_observer::start).
+  function installTentaflowDomBridge() {
+    let scheduled = false;
+    let knownTiles = new Map(); // data-tid -> display name
+    let lobbyEmitted = false;
+    let joinedEmitted = false;
+    let lastSpeakerKey = null;
+
+    function emit(type, data) {
+      if (typeof window.__tentaflowEvent !== 'function') return;
+      try {
+        const payload = Object.assign({ type: type }, data || {});
+        window.__tentaflowEvent(JSON.stringify(payload));
+      } catch (e) {
+        // Cicho — binding moze byc nieobecny w niektorych iframe'ach.
+      }
+    }
+
+    function tileDisplayName(tile) {
+      // aria-label zawiera realna nazwe uczestnika (np. "Jan Kowalski, video, ...");
+      // data-tid jest internal id Teams i nie nadaje sie do GUI.
+      const al = tile.getAttribute('aria-label') || '';
+      const trimmed = al.split(',')[0].trim();
+      return trimmed || tile.getAttribute('data-tid') || '';
+    }
+
+    function detectLobby() {
+      const tids = ['lobby-screen', 'lobby-wait-screen', 'prejoin-meeting-info',
+        'lobby-waiting-room', 'calling-lobby-screen'];
+      for (const t of tids) {
+        if (document.querySelector('[data-tid="' + t + '"]')) return true;
+      }
+      // Phrase scan ograniczony do prejoin/lobby kontenerow — body.innerText
+      // serializuje setki KB i kosztuje 30-150ms. Tu querySelectorAll po
+      // konkretnych prefixach wyciaga ~5-50 elementow.
+      const candidates = document.querySelectorAll(
+        '[data-tid^="prejoin"], [data-tid^="lobby"], [data-tid="calling-lobby-screen"]');
+      for (const el of candidates) {
+        const text = (el.innerText || '').toLowerCase();
+        if (text.indexOf('let you in') !== -1
+          || text.indexOf("you're in the lobby") !== -1
+          || text.indexOf('wpusci') !== -1
+          || text.indexOf('admit') !== -1) return true;
+      }
+      return false;
+    }
+
+    function detectJoined() {
+      const stage = document.querySelector('[data-tid="MixedStage-wrapper"]')
+        || document.querySelector('[data-tid="stage-layouts-renderer"]');
+      if (stage) {
+        const tileCount = stage.querySelectorAll('[data-tid][data-stream-type]').length;
+        if (tileCount >= 2) return true;
+      }
+      const rosterBadge = document.querySelector('#roster-button [data-tid="toolbar-item-badge"]');
+      if (rosterBadge) {
+        const n = parseInt((rosterBadge.textContent || '').trim(), 10) || 0;
+        if (n >= 2) return true;
+      }
+      // Active remote audio = realna rozmowa.
+      const audios = document.querySelectorAll('audio');
+      for (const a of audios) {
+        if (a.srcObject && a.srcObject.getAudioTracks
+          && a.srcObject.getAudioTracks().length > 0) return true;
+      }
+      return false;
+    }
+
+    // Speaker detection — kolejnosc selektorow ta sama co w istniejacej
+    // getActiveSpeaker() (sendActiveSpeakerIfChanged przez WS), ktora byla
+    // zwalidowana na realnym DOM Teams. Zwracamy {id, name}: id to data-tid
+    // tile'a (lub null gdy znamy tylko nazwe), name to display name.
+    function detectActiveSpeaker() {
+      // 1. Presenter — najpewniejszy sygnal dominujacego mowcy.
+      const presenter = document.querySelector('[data-is-presenter="true"]');
+      if (presenter) {
+        const label = presenter.getAttribute('aria-label') || presenter.textContent || '';
+        const m = label.match(/^(.+?)(?:,|$)/);
+        const name = m && m[1] ? m[1].trim() : null;
+        if (name) return { id: presenter.getAttribute('data-tid') || null, name: name };
+      }
+      // 2. Klasa active-speaker / data-tid active-speaker — current dominant.
+      const active = document.querySelector('.active-speaker, [data-tid="active-speaker"]');
+      if (active) {
+        const nameEl = active.querySelector('.ts-tooltip-trigger, [data-tid="participant-name"]');
+        if (nameEl) {
+          const name = (nameEl.textContent || '').trim();
+          if (name) return { id: active.getAttribute('data-tid') || null, name: name };
+        }
+        const label = active.getAttribute('aria-label') || '';
+        const m = label.match(/^(.+?)(?:,|$)/);
+        if (m && m[1]) return { id: active.getAttribute('data-tid') || null, name: m[1].trim() };
+      }
+      // 3. aria-label "X is speaking" — fallback gdy nie ma klasowych markerow.
+      const speakingEl = document.querySelector('[aria-label*="is speaking"]');
+      if (speakingEl) {
+        const label = speakingEl.getAttribute('aria-label') || '';
+        const m = label.match(/^(.+?)\s+is speaking/i);
+        if (m && m[1]) return { id: speakingEl.getAttribute('data-tid') || null, name: m[1].trim() };
+      }
+      return null;
+    }
+
+    function scan() {
+      scheduled = false;
+      try {
+        if (!lobbyEmitted && detectLobby()) {
+          lobbyEmitted = true;
+          emit('lobby');
+        }
+        if (!joinedEmitted && detectJoined()) {
+          joinedEmitted = true;
+          emit('joined');
+        }
+        const tiles = document.querySelectorAll('[data-tid][data-stream-type]');
+        const current = new Map();
+        for (const tile of tiles) {
+          const tid = tile.getAttribute('data-tid');
+          if (!tid) continue;
+          current.set(tid, tileDisplayName(tile));
+        }
+        for (const [tid, name] of current) {
+          if (!knownTiles.has(tid)) {
+            emit('participant_joined', { id: tid, name: name });
+          }
+        }
+        for (const [tid, name] of knownTiles) {
+          if (!current.has(tid)) {
+            emit('participant_left', { id: tid, name: name });
+          }
+        }
+        knownTiles = current;
+
+        const sp = detectActiveSpeaker();
+        const key = sp ? (sp.id || sp.name || '') : '';
+        if (key !== lastSpeakerKey) {
+          lastSpeakerKey = key;
+          emit('active_speaker', {
+            id: sp ? sp.id : null,
+            name: sp ? sp.name : null,
+          });
+        }
+      } catch (e) {
+        console.warn('[tentaflow] dom_bridge scan blad:', e);
+      }
+    }
+
+    function schedule() {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(scan);
+    }
+
+    const obs = new MutationObserver(schedule);
+    function attach() {
+      if (!document.body) {
+        setTimeout(attach, 50);
+        return;
+      }
+      obs.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['class', 'data-tid', 'aria-label', 'aria-pressed', 'data-stream-type']
+      });
+      schedule();
+      // Safety-net 1s — pokryje przegapiona mutacje w iframe / shadow root.
+      // Nie polling 500ms, tylko brakujacy edge-case net.
+      // UWAGA: NIE uzywamy registerInterval bo cleanupTentaflow() (WS close)
+      // by to zniszczyl. Bridge przezywa rozlaczenia WS audio.
+      setInterval(schedule, 1000);
+    }
+    attach();
+    console.log('[tentaflow] DOM event bridge zainstalowany (push via addBinding)');
+
+    // Active speaker via WebRTC audioLevel — deterministyczne i odporne na
+    // zmiany DOM. Teams light-meetings ma obfuscowane klasy CSS-in-JS bez
+    // markera "speaking", wiec polegamy na inbound-rtp audioLevel z
+    // RTCPeerConnection.getStats().
+    //
+    // Hystereza + debounce: bez tego speaker oscyluje miedzy sylabami (level
+    // spada do 0 w ulamkowych pauzach miedzy slowami).
+    //   * START_LEVEL — minimum zeby zaczac uznawac kogos za speakera
+    //   * HOLD_LEVEL — minimum zeby przedluzyc trwajacego speakera
+    //   * SILENCE_HOLD_MS — czas trzymania speakera mimo levelu < HOLD
+    const SPEAKER_START_LEVEL = 0.03;
+    const SPEAKER_HOLD_LEVEL = 0.005;
+    const SPEAKER_SILENCE_HOLD_MS = 700;
+    const SPEAKER_POLL_MS = 250;
+    let lastBindingSpeaker = null;
+    let silenceSince = 0;
+
+    function trackedPeerConnections() {
+      // hookRTCPeerConnection() wczesniej w pliku rejestruje wszystkie pc w
+      // window.__tentaflowPeerConnections (Set). Bezpieczny fallback gdy hook
+      // jeszcze nie zdazyl uzbroic.
+      const set = window.__tentaflowPeerConnections;
+      return set instanceof Set ? Array.from(set) : [];
+    }
+
+    function findRemoteName() {
+      // Wez pierwszy remote tile (nie nasz). data-tid w light-meetings == name.
+      const tiles = document.querySelectorAll('[data-tid][data-stream-type]');
+      const ourName = (window.__tentaflowBotName || '').toString();
+      for (const t of tiles) {
+        const name = t.getAttribute('data-tid') || '';
+        // Teams dodaje " (Unverified)" / " (External)" — startsWith filtruje
+        // i bota gdy ourName="DevBot" pasuje do "DevBot (Unverified)".
+        if (name && !(ourName && name.indexOf(ourName) === 0)) {
+          return name;
+        }
+      }
+      return null;
+    }
+
+    async function maxInboundAudioLevel() {
+      const pcs = trackedPeerConnections();
+      if (pcs.length === 0) return 0;
+      let best = 0;
+      for (const pc of pcs) {
+        try {
+          const stats = await pc.getStats();
+          stats.forEach(function (rep) {
+            if (rep.type === 'inbound-rtp' && rep.kind === 'audio') {
+              const lvl = typeof rep.audioLevel === 'number' ? rep.audioLevel : 0;
+              if (lvl > best) best = lvl;
+            }
+          });
+        } catch (_) {}
+      }
+      return best;
+    }
+
+    setInterval(async function () {
+      try {
+        const level = await maxInboundAudioLevel();
+        const now = Date.now();
+        let nextSpeaker = lastBindingSpeaker;
+        if (lastBindingSpeaker) {
+          // Trwajacy speaker — trzymamy az level spadnie ponizej HOLD na
+          // dluzej niz SILENCE_HOLD_MS. To absorbuje pauzy miedzy sylabami.
+          if (level >= SPEAKER_HOLD_LEVEL) {
+            silenceSince = 0;
+          } else {
+            if (silenceSince === 0) silenceSince = now;
+            if (now - silenceSince >= SPEAKER_SILENCE_HOLD_MS) {
+              nextSpeaker = null;
+              silenceSince = 0;
+            }
+          }
+        } else {
+          // Nikt nie mowi — start dopiero przy levelu >= START.
+          if (level >= SPEAKER_START_LEVEL) {
+            nextSpeaker = findRemoteName();
+            silenceSince = 0;
+          }
+        }
+        if (nextSpeaker !== lastBindingSpeaker) {
+          lastBindingSpeaker = nextSpeaker;
+          emit('active_speaker', {
+            id: nextSpeaker,
+            name: nextSpeaker,
+          });
+        }
+      } catch (_) {
+        // getStats moze rzucic gdy pc jest closed mid-poll — silent.
+      }
+    }, SPEAKER_POLL_MS);
   }
 
   if (document.readyState === 'loading') {
