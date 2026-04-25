@@ -1883,6 +1883,8 @@ pub fn service_list(
                 started_at_epoch: parse_ts_opt(&Some(s.created_at)),
                 engine_id,
                 model_id,
+                pinned: s.pinned,
+                paused: s.paused,
             }
         })
         .collect();
@@ -2287,6 +2289,76 @@ pub async fn service_stop(
     );
 
     Ok(MessageBody::ServiceStopResponse { stopped: true })
+}
+
+#[handler(variant = "ServiceFlagsUpdateRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_flags_update(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let (service_id_str, pinned_opt, paused_opt) = match req {
+        MessageBody::ServiceFlagsUpdateRequest {
+            service_id,
+            pinned,
+            paused,
+        } => (service_id, *pinned, *paused),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServiceFlagsUpdateRequest",
+            ))
+        }
+    };
+    let service_id: i64 = service_id_str
+        .parse()
+        .map_err(|_| ProtocolError::bad_request("service_id must be integer"))?;
+
+    let svc = repository::list_services(&ctx.state.db)
+        .map_err(db_err)?
+        .into_iter()
+        .find(|s| s.id == service_id)
+        .ok_or_else(|| ProtocolError::not_found("service not found"))?;
+
+    if let Some(p) = pinned_opt {
+        repository::set_service_pinned(&ctx.state.db, service_id, p).map_err(db_err)?;
+        let _ = crate::memory::guard_global().set_pinned(&svc.name, p);
+    }
+    if let Some(p) = paused_opt {
+        repository::set_service_paused(&ctx.state.db, service_id, p).map_err(db_err)?;
+        let _ = crate::memory::guard_global().set_paused(&svc.name, p);
+        // Pause = natychmiast zwolnij VRAM (nie czekaj do restartu).
+        if p {
+            if let Err(e) = crate::memory::guard_global().force_unload(&svc.name).await {
+                tracing::warn!(service = %svc.name, error = %e,
+                    "service_flags_update: force_unload przy pause nieudany");
+            }
+        }
+    }
+
+    let final_pinned = pinned_opt.unwrap_or(svc.pinned);
+    let final_paused = paused_opt.unwrap_or(svc.paused);
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        user_id,
+        None,
+        "service.flags_update",
+        Some(&format!(
+            "service:{} pinned={} paused={}",
+            service_id, final_pinned, final_paused
+        )),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+
+    Ok(MessageBody::ServiceFlagsUpdateResponse {
+        ok: true,
+        pinned: final_pinned,
+        paused: final_paused,
+    })
 }
 
 // =============================================================================
