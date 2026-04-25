@@ -922,6 +922,18 @@ pub fn delete_model_entry(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Usuwa wszystkie wpisy model_registry powiazane z danym serwisem.
+/// Wolane przy service_stop — bez tego stare modele MLX/llama.cpp zostaja
+/// w GUI jako "Załadowane" mimo ze ich serwis juz nie istnieje.
+pub fn delete_model_entries_by_service(pool: &DbPool, service_id: i64) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let removed = conn.execute(
+        "DELETE FROM model_registry WHERE service_id = ?1",
+        rusqlite::params![service_id],
+    )?;
+    Ok(removed)
+}
+
 // --- Model Aliases ---
 
 const MODEL_ALIAS_COLS: &str = "id, alias, target_model, is_active, fallback_targets, strategy";
