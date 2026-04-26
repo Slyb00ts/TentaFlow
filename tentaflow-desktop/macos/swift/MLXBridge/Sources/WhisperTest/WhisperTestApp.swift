@@ -16,9 +16,15 @@ import MLXBridge
 struct WhisperTest {
     static func main() async {
         let args = CommandLine.arguments
+        // Tryb apple-tts: pierwszy argument `--apple-tts` przekierowuje
+        // dispatcha do `AppleTtsCli.main`.
+        if args.count >= 2, args[1] == "--apple-tts" {
+            await AppleTtsCli.main(Array(args[1...]))
+            return
+        }
         guard args.count >= 3 else {
             print("Usage: WhisperTest <model_dir> <wav_file> [language]")
-            print("       <wav_file> must be PCM 16-bit mono 16 kHz.")
+            print("       WhisperTest --apple-tts <text> <language> <out.wav>")
             exit(2)
         }
         let modelDir = args[1]

@@ -179,118 +179,12 @@ pub async fn prepare_model(mlx_repo_id: &str) -> Result<PathBuf> {
     Ok(target)
 }
 
-/// Sprawdza czy dany kandydat dylib ma obok `mlx-swift_Cmlx.bundle` z metallib —
-/// bez tego MLX kernels Metal nie wystartuja. Preferujemy lokalizacje "kompletne".
-fn dylib_has_metallib(p: &std::path::Path) -> bool {
-    let dir = match p.parent() {
-        Some(d) => d,
-        None => return false,
-    };
-    dir.join("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib")
-        .exists()
-}
-
-fn locate_dylib() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?.to_path_buf();
-    // 1. Obok binarki — wariant produkcyjny (build.rs `tentaflow/` kopiuje tu
-    //    razem z bundle).
-    // 2. Frameworks/ w bundlu macOS.
-    // 3+. Workspace fallback: szukamy `tentaflow/target/{debug,release}/`,
-    //     `tentaflow-desktop/target/...`, oraz katalogu .build SwiftPM.
-    //     PREFERUJEMY te z bundle obok (dylib + metallib).
-    let mut all_candidates: Vec<PathBuf> = Vec::new();
-    all_candidates.push(exe_dir.join("libMLXBridge.dylib"));
-    all_candidates.push(exe_dir.join("../Frameworks/libMLXBridge.dylib"));
-
-    let mut current = exe_dir.clone();
-    for _ in 0..6 {
-        for sub in [
-            "tentaflow/target/release/libMLXBridge.dylib",
-            "tentaflow/target/debug/libMLXBridge.dylib",
-            "tentaflow-desktop/target/release/libMLXBridge.dylib",
-            "tentaflow-desktop/target/debug/libMLXBridge.dylib",
-            "tentaflow-desktop/macos/swift/MLXBridge/.build/arm64-apple-macosx/release/libMLXBridge.dylib",
-        ] {
-            all_candidates.push(current.join(sub));
-        }
-        match current.parent() {
-            Some(p) => current = p.to_path_buf(),
-            None => break,
-        }
-    }
-    // Najpierw lokalizacja kompletna (z bundle), potem cokolwiek.
-    if let Some(found) = all_candidates.iter().find(|p| p.exists() && dylib_has_metallib(p)) {
-        return Some(found.clone());
-    }
-    all_candidates.into_iter().find(|p| p.exists())
-}
-
-/// Cmlx (Metal kernels mlx-swift) szuka metallibu w 3 miejscach:
-///   1. `{dylib_dir}/mlx.metallib`
-///   2. `{dylib_dir}/Resources/mlx.metallib`
-///   3. `Bundle.main.bundleURL` + `mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib`
-///
-/// Kopiujemy `default.metallib` jako `{dylib_dir}/mlx.metallib` (sciezka 1) —
-/// najprostsze i niezalezne od `Bundle.main`. Zrodlem jest skompilowany
-/// SwiftPM bundle z `.build/release/` lub Xcode `build/Release/`. Idempotentne.
-fn ensure_metallib_next_to(dylib: &std::path::Path) -> () {
-    let dir = match dylib.parent() {
-        Some(d) => d,
-        None => return,
-    };
-    let target = dir.join("mlx.metallib");
-    if target.exists() {
-        return;
-    }
-    // Lokalizacje gotowego `default.metallib` znalezione w workspace.
-    // Pierwsza istniejaca jest dobra.
-    let bundle_subpath = "mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib";
-    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or(manifest.clone());
-    let candidates = [
-        // 1. Bezposrednio obok dylib (jezeli build.rs skopiowal bundle).
-        dir.join(bundle_subpath),
-        // 2. SwiftPM .build dir.
-        workspace_root.join(format!(
-            "tentaflow-desktop/macos/swift/MLXBridge/.build/arm64-apple-macosx/release/{}",
-            bundle_subpath
-        )),
-        workspace_root.join(format!(
-            "tentaflow-desktop/macos/swift/MLXBridge/.build/arm64-apple-macosx/debug/{}",
-            bundle_subpath
-        )),
-        // 3. Xcode build (uzywany przez tentaflow/build.rs).
-        workspace_root.join(format!(
-            "tentaflow-desktop/macos/swift/MLXBridge/build-xcode/Build/Products/Release/{}",
-            bundle_subpath
-        )),
-    ];
-    for src in &candidates {
-        if src.exists() {
-            if let Err(e) = std::fs::copy(src, &target) {
-                tracing::warn!(
-                    "[mlx-whisper] copy {} -> {}: {}",
-                    src.display(),
-                    target.display(),
-                    e
-                );
-            } else {
-                info!(
-                    "[mlx-whisper] mlx.metallib zainstalowane: {} -> {}",
-                    src.display(),
-                    target.display()
-                );
-            }
-            return;
-        }
-    }
-    tracing::warn!(
-        "[mlx-whisper] nie znaleziono default.metallib w zadnym znanym SwiftPM/Xcode build dir — Metal kernels moga sie nie zaladowac"
-    );
+// Helpery `locate_dylib` + `ensure_metallib_next_to` zostaly przeniesione do
+// `crate::macos_ffi` zeby mogly z nich korzystac inne moduly Apple-specific
+// (apple_tts, mlx_kokoro). Lokalne fn ponizej deleguja do wspoldzielonego.
+fn locate_dylib() -> Option<PathBuf> { crate::macos_ffi::locate_mlx_bridge_dylib() }
+fn ensure_metallib_next_to(dylib: &std::path::Path) {
+    crate::macos_ffi::ensure_mlx_metallib_next_to(dylib)
 }
 
 fn open_bridge() -> Result<Bridge> {

@@ -26,6 +26,11 @@ inference-mlx = ["dep:tokenizers"]
 # i wola `MLXWhisper_*` z naszego portu whisper.py do mlx-swift. Aktywne tylko
 # na macOS / iOS gdzie dylib istnieje.
 inference-mlx-whisper = ["dep:libloading"]
+# Apple AVSpeechSynthesizer TTS — natywne glosy systemowe (Zosia, Daniel,
+# Samantha...). Dziala tylko na macOS/iOS. dlopen libMLXBridge.dylib.
+inference-apple-tts = ["dep:libloading"]
+# Kokoro 82M TTS przez mlx-swift port. macOS/iOS only.
+inference-mlx-kokoro = ["dep:libloading"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
 metrics-prometheus = ["dep:prometheus"]
