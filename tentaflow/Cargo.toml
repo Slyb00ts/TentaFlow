@@ -42,7 +42,7 @@ axoupdater = { version = "0.9", features = ["blocking"] }
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i
 # src/mlx_swift_init.rs.
 [target.'cfg(target_os = "macos")'.dependencies]
-tentaflow-core = { path = "../tentaflow-core", features = ["inference-mlx"] }
+tentaflow-core = { path = "../tentaflow-core", features = ["inference-mlx", "inference-mlx-whisper"] }
 libloading = "0.8"
 
 [profile.release]

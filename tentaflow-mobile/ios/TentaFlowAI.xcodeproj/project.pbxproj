@@ -7,22 +7,39 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		15411774C6A85B958F8E8203 /* WhisperAudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1639DC5A7CBB492B9DE5F2AD /* WhisperAudio.swift */; };
+		21FC5E44642C4756703D9C90 /* WhisperDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 571AB1133F353570AFEBD0FB /* WhisperDecoder.swift */; };
+		23A218F422D6B64281F9DF5D /* MLXRandom in Frameworks */ = {isa = PBXBuildFile; productRef = 33745B1592517CCC56D466CB /* MLXRandom */; };
 		275C52482F6EBF9300AF3541 /* MLXEmbedders in Frameworks */ = {isa = PBXBuildFile; productRef = 275C52472F6EBF9300AF3541 /* MLXEmbedders */; };
 		275C524A2F6EBF9300AF3541 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 275C52492F6EBF9300AF3541 /* MLXLLM */; };
 		275C524C2F6EBF9300AF3541 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524B2F6EBF9300AF3541 /* MLXLMCommon */; };
 		275C524E2F6EBF9300AF3541 /* MLXMNIST in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524D2F6EBF9300AF3541 /* MLXMNIST */; };
 		275C52502F6EBF9300AF3541 /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = 275C524F2F6EBF9300AF3541 /* MLXVLM */; };
 		275C52522F6EC6CE00AF3541 /* MLXSwiftEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */; };
+		3E021B2A14CDE1919DDB0412 /* MLXNN in Frameworks */ = {isa = PBXBuildFile; productRef = AAEA1E451AB2CA1194FD1225 /* MLXNN */; };
+		4F1C2E51E2A3622A2F2D7F38 /* Transformers in Frameworks */ = {isa = PBXBuildFile; productRef = 2D6C6E12DBC53A0D10C6B05C /* Transformers */; };
+		8B1EB5ECD7F8F14E5BEAEDAA /* MLXFast in Frameworks */ = {isa = PBXBuildFile; productRef = F7784328F624698C39AD20C2 /* MLXFast */; };
+		8B59B1D0425A2020FCAF5AD9 /* WhisperModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD7575C171E9112E6F63B7A9 /* WhisperModel.swift */; };
+		90187D738F58266106C4804F /* WhisperTokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AF3E069D016DA9BCC8E2468 /* WhisperTokenizer.swift */; };
 		A0000001 /* DeviceInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000002 /* DeviceInfo.swift */; };
 		A0000003 /* NativeDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000004 /* NativeDiscovery.swift */; };
 		A1000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* App.swift */; };
 		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* ContentView.swift */; };
 		A1000003 /* libtentaflow_mobile.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000003 /* libtentaflow_mobile.a */; };
 		A1000004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000004 /* Assets.xcassets */; };
+		ACDAE2B27538BDC68BD49BE7 /* WhisperEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FF1F1B0AE2CC24E493179EC /* WhisperEngine.swift */; };
+		D2942AA34CCC4E85F41229DE /* WhisperLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E2BF368B5697E31775093F6 /* WhisperLoader.swift */; };
+		D84385F8D8DC1FC7B110FD46 /* WhisperConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF27372E3CE0E9A08BCC3F52 /* WhisperConfig.swift */; };
+		EE761ADA29EC7F9DF9F2B066 /* MLXFFT in Frameworks */ = {isa = PBXBuildFile; productRef = 6CDD0465CA0FD0D9425608F2 /* MLXFFT */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		0AF3E069D016DA9BCC8E2468 /* WhisperTokenizer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperTokenizer.swift; sourceTree = "<group>"; };
+		1639DC5A7CBB492B9DE5F2AD /* WhisperAudio.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperAudio.swift; sourceTree = "<group>"; };
 		275C52512F6EC6CE00AF3541 /* MLXSwiftEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MLXSwiftEngine.swift; sourceTree = "<group>"; };
+		2E2BF368B5697E31775093F6 /* WhisperLoader.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperLoader.swift; sourceTree = "<group>"; };
+		571AB1133F353570AFEBD0FB /* WhisperDecoder.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperDecoder.swift; sourceTree = "<group>"; };
+		6FF1F1B0AE2CC24E493179EC /* WhisperEngine.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperEngine.swift; sourceTree = "<group>"; };
 		A0000002 /* DeviceInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceInfo.swift; sourceTree = "<group>"; };
 		A0000004 /* NativeDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeDiscovery.swift; sourceTree = "<group>"; };
 		A2000001 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
@@ -32,6 +49,8 @@
 		A2000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A2000006 /* TentaFlowAI-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "TentaFlowAI-Bridging-Header.h"; sourceTree = "<group>"; };
 		A2000010 /* TentaFlowAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TentaFlowAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AF27372E3CE0E9A08BCC3F52 /* WhisperConfig.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperConfig.swift; sourceTree = "<group>"; };
+		DD7575C171E9112E6F63B7A9 /* WhisperModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WhisperModel.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -45,6 +64,11 @@
 				275C52482F6EBF9300AF3541 /* MLXEmbedders in Frameworks */,
 				275C524C2F6EBF9300AF3541 /* MLXLMCommon in Frameworks */,
 				A1000003 /* libtentaflow_mobile.a in Frameworks */,
+				3E021B2A14CDE1919DDB0412 /* MLXNN in Frameworks */,
+				EE761ADA29EC7F9DF9F2B066 /* MLXFFT in Frameworks */,
+				8B1EB5ECD7F8F14E5BEAEDAA /* MLXFast in Frameworks */,
+				23A218F422D6B64281F9DF5D /* MLXRandom in Frameworks */,
+				4F1C2E51E2A3622A2F2D7F38 /* Transformers in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -71,6 +95,7 @@
 				A2000004 /* Assets.xcassets */,
 				A2000005 /* Info.plist */,
 				A2000006 /* TentaFlowAI-Bridging-Header.h */,
+				EBE3A1DEF5510D79FEEB7552 /* Whisper */,
 			);
 			path = TentaFlowAI;
 			sourceTree = "<group>";
@@ -91,6 +116,21 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
+		EBE3A1DEF5510D79FEEB7552 /* Whisper */ = {
+			isa = PBXGroup;
+			children = (
+				AF27372E3CE0E9A08BCC3F52 /* WhisperConfig.swift */,
+				DD7575C171E9112E6F63B7A9 /* WhisperModel.swift */,
+				2E2BF368B5697E31775093F6 /* WhisperLoader.swift */,
+				1639DC5A7CBB492B9DE5F2AD /* WhisperAudio.swift */,
+				0AF3E069D016DA9BCC8E2468 /* WhisperTokenizer.swift */,
+				571AB1133F353570AFEBD0FB /* WhisperDecoder.swift */,
+				6FF1F1B0AE2CC24E493179EC /* WhisperEngine.swift */,
+			);
+			name = Whisper;
+			path = Whisper;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -107,6 +147,13 @@
 			dependencies = (
 			);
 			name = TentaFlowAI;
+			packageProductDependencies = (
+				AAEA1E451AB2CA1194FD1225 /* MLXNN */,
+				6CDD0465CA0FD0D9425608F2 /* MLXFFT */,
+				F7784328F624698C39AD20C2 /* MLXFast */,
+				33745B1592517CCC56D466CB /* MLXRandom */,
+				2D6C6E12DBC53A0D10C6B05C /* Transformers */,
+			);
 			productName = TentaFlowAI;
 			productReference = A2000010 /* TentaFlowAI.app */;
 			productType = "com.apple.product-type.application";
@@ -164,6 +211,13 @@
 				A1000001 /* App.swift in Sources */,
 				275C52522F6EC6CE00AF3541 /* MLXSwiftEngine.swift in Sources */,
 				A1000002 /* ContentView.swift in Sources */,
+				D84385F8D8DC1FC7B110FD46 /* WhisperConfig.swift in Sources */,
+				8B59B1D0425A2020FCAF5AD9 /* WhisperModel.swift in Sources */,
+				D2942AA34CCC4E85F41229DE /* WhisperLoader.swift in Sources */,
+				15411774C6A85B958F8E8203 /* WhisperAudio.swift in Sources */,
+				90187D738F58266106C4804F /* WhisperTokenizer.swift in Sources */,
+				21FC5E44642C4756703D9C90 /* WhisperDecoder.swift in Sources */,
+				ACDAE2B27538BDC68BD49BE7 /* WhisperEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -373,6 +427,31 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
 			productName = MLXVLM;
+		};
+		2D6C6E12DBC53A0D10C6B05C /* Transformers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = Transformers;
+		};
+		33745B1592517CCC56D466CB /* MLXRandom */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXRandom;
+		};
+		6CDD0465CA0FD0D9425608F2 /* MLXFFT */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXFFT;
+		};
+		AAEA1E451AB2CA1194FD1225 /* MLXNN */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXNN;
+		};
+		F7784328F624698C39AD20C2 /* MLXFast */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 275C52462F6EBF9300AF3541 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXFast;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

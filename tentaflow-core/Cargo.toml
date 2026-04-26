@@ -22,6 +22,10 @@ inference-sherpa = ["dep:sherpa-rs"]
 # zostal usuniety bo Rust port ma bug w 4-bit forward pass — Bielik / Qwen
 # generowaly losowe tokeny.
 inference-mlx = ["dep:tokenizers"]
+# MLX Whisper przez Swift bridge — laduje libMLXBridge.dylib runtime'em (dlopen)
+# i wola `MLXWhisper_*` z naszego portu whisper.py do mlx-swift. Aktywne tylko
+# na macOS / iOS gdzie dylib istnieje.
+inference-mlx-whisper = ["dep:libloading"]
 inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
 metrics-prometheus = ["dep:prometheus"]
@@ -146,6 +150,8 @@ tokenizers = { version = "0.22.2", optional = true }
 
 # STT — Whisper (optional)
 whisper-rs = { version = "0.16.0", optional = true }
+# dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
+libloading = { version = "0.8", optional = true }
 sherpa-rs = { version = "0.6.8", optional = true }
 hound = "3.5.1"
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm"] }

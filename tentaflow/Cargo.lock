@@ -7177,6 +7177,7 @@ dependencies = [
  "jsonwebtoken",
  "lazy_static",
  "libc",
+ "libloading",
  "llama-cpp-2",
  "mdns-sd",
  "multer",
