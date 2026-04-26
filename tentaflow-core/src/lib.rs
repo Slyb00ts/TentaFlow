@@ -26,6 +26,13 @@ pub mod services;
 pub mod stt;
 pub mod tts;
 
+#[cfg(any(
+    feature = "inference-mlx-whisper",
+    feature = "inference-apple-tts",
+    feature = "inference-mlx-kokoro"
+))]
+pub mod macos_ffi;
+
 #[cfg(feature = "inference-diarization")]
 pub mod diarization;
 

@@ -1,15 +1,27 @@
 // =============================================================================
 // Plik: tts/mod.rs
 // Opis: Embedded TTS engines — wkompilowane bezposrednio w binarke przez
-//       Cargo features. Aktualnie tylko `inference-sherpa` (sherpa-onnx
-//       VITS Piper). Symetria do `inference/` (LLM) i `stt/` (Whisper).
+//       Cargo features. Symetria do `inference/` (LLM) i `stt/` (Whisper).
+//
+//       Aktualnie wspierane:
+//         - `inference-sherpa` (sherpa-onnx VITS Piper)
+//         - `inference-apple-tts` (AVSpeechSynthesizer, macOS/iOS only)
+//         - `inference-mlx-kokoro` (Kokoro 82M przez mlx-swift, macOS/iOS)
 // =============================================================================
 
 #[cfg(feature = "inference-sherpa")]
 pub mod sherpa;
 
+#[cfg(feature = "inference-apple-tts")]
+pub mod apple_tts;
+
+#[cfg(feature = "inference-mlx-kokoro")]
+pub mod mlx_kokoro;
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Informacje o zaladowanym modelu TTS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,4 +66,65 @@ pub trait TtsEngine: Send + Sync {
     fn load_model(&mut self, model_dir: &Path) -> anyhow::Result<TtsModelInfo>;
     fn synthesize(&self, params: SynthesizeParams) -> anyhow::Result<SynthesizeResult>;
     fn model_info(&self) -> Option<&TtsModelInfo>;
+}
+
+// =============================================================================
+// TtsManager — analog SttManager. Trzyma zarejestrowane engine'y po nazwie i
+// pozwala routerowi syntezowac przez wybrany backend.
+// =============================================================================
+
+static SHARED_TTS: std::sync::OnceLock<Arc<RwLock<TtsManager>>> = std::sync::OnceLock::new();
+
+pub fn shared_tts_manager() -> Arc<RwLock<TtsManager>> {
+    SHARED_TTS
+        .get_or_init(|| Arc::new(RwLock::new(TtsManager::new())))
+        .clone()
+}
+
+/// Manager wszystkich embedded silnikow TTS. Klucz = backend_name (z manifestu
+/// `engine.id`). Rejestracja przez `register(name, engine)`; deploy handler
+/// w `deploy/runner.rs` woła `register` + `load_model` przy embedded native deploy.
+pub struct TtsManager {
+    engines: std::collections::HashMap<String, Box<dyn TtsEngine>>,
+}
+
+impl TtsManager {
+    pub fn new() -> Self {
+        Self { engines: std::collections::HashMap::new() }
+    }
+
+    pub fn register(&mut self, name: impl Into<String>, engine: Box<dyn TtsEngine>) {
+        self.engines.insert(name.into(), engine);
+    }
+
+    pub fn unregister(&mut self, name: &str) {
+        self.engines.remove(name);
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.engines.contains_key(name)
+    }
+
+    pub fn list(&self) -> Vec<String> {
+        self.engines.keys().cloned().collect()
+    }
+
+    /// Wybiera silnik po `engine_id` i wykonuje synteze. Jezeli silnik nie
+    /// jest zarejestrowany, zwraca blad — caller (router) moze wtedy
+    /// fallbackowac na zewnetrzny QUIC TTS sidecar.
+    pub fn synthesize(&self, engine_id: &str, params: SynthesizeParams) -> anyhow::Result<SynthesizeResult> {
+        let engine = self
+            .engines
+            .get(engine_id)
+            .ok_or_else(|| anyhow::anyhow!("TTS engine '{}' nie zarejestrowany", engine_id))?;
+        engine.synthesize(params)
+    }
+
+    pub fn model_info(&self, engine_id: &str) -> Option<TtsModelInfo> {
+        self.engines.get(engine_id).and_then(|e| e.model_info().cloned())
+    }
+}
+
+impl Default for TtsManager {
+    fn default() -> Self { Self::new() }
 }
