@@ -13,6 +13,7 @@ use std::process::Command;
 
 fn main() {
     build_mlx_bridge();
+    build_kokoro_bridge();
     build_meeting_bot();
 }
 
@@ -123,6 +124,71 @@ fn build_mlx_bridge() {
         "cargo:rustc-link-arg=-Wl,-rpath,{}",
         target_dir.display()
     );
+}
+
+// ----- Kokoro Swift bridge (macOS only) --------------------------------------
+//
+// Buduje libKokoroBridge.dylib (Kokoro 82M MLX TTS — niezalezny od MLXBridge
+// bo wymaga nowszego mlx-swift). Identyczny przeplyw co MLXBridge: xcodebuild
+// → kopia dylib + Cmlx bundle → install_name_tool. Bundle Cmlx jest WSPOLNY
+// (ten sam mlx-swift), wiec nie nadpisujemy go jezeli juz istnieje.
+fn build_kokoro_bridge() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "macos" {
+        return;
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let package_dir = manifest_dir
+        .parent()
+        .expect("tentaflow-core/.. musi istniec")
+        .join("tentaflow-desktop/macos/swift/KokoroBridge");
+    let package_swift = package_dir.join("Package.swift");
+    if !package_swift.exists() {
+        println!("cargo:warning=tentaflow: brak {}, omijam KokoroBridge", package_swift.display());
+        return;
+    }
+    println!("cargo:rerun-if-changed={}/Package.swift", package_dir.display());
+    println!("cargo:rerun-if-changed={}/Sources", package_dir.display());
+
+    let cargo_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let xcode_arch = match cargo_arch.as_str() {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let xcode_build_dir = package_dir.join("build-xcode");
+    let xcode_status = Command::new("xcodebuild")
+        .args([
+            "-scheme", "KokoroBridge",
+            "-destination", &format!("platform=macOS,arch={}", xcode_arch),
+            "-configuration", "Release",
+            "-derivedDataPath",
+        ])
+        .arg(&xcode_build_dir)
+        .arg("build")
+        .current_dir(&package_dir)
+        .status();
+    if !matches!(xcode_status, Ok(s) if s.success()) {
+        println!("cargo:warning=tentaflow: xcodebuild KokoroBridge nieudane");
+        return;
+    }
+    let products = xcode_build_dir.join("Build/Products/Release");
+    let framework_binary =
+        products.join("PackageFrameworks/KokoroBridge.framework/Versions/A/KokoroBridge");
+    if !framework_binary.exists() {
+        println!("cargo:warning=tentaflow: brak {}", framework_binary.display());
+        return;
+    }
+    let target_dir = cargo_target_dir();
+    let dylib_dest = target_dir.join("libKokoroBridge.dylib");
+    if let Err(e) = std::fs::copy(&framework_binary, &dylib_dest) {
+        println!("cargo:warning=tentaflow: copy KokoroBridge dylib: {}", e);
+        return;
+    }
+    let _ = Command::new("install_name_tool")
+        .args(["-id", "@rpath/libKokoroBridge.dylib"])
+        .arg(&dylib_dest)
+        .status();
+    println!("cargo:warning=tentaflow: KokoroBridge gotowy ({})", dylib_dest.display());
 }
 
 // ----- Meeting bot (all platforms) -------------------------------------------
