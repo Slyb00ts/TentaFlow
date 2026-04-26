@@ -1,0 +1,53 @@
+# Manifest serwisu MLX Whisper — wbudowany silnik STT na bazie portu
+# whisper.py z mlx-examples na mlx-swift. Dziala wylacznie na Apple Silicon
+# (macOS / iOS); router laduje go po wybraniu w wizardzie deployu.
+#
+# Roznice wzgledem zwyklego whisper.cpp (`whisper`):
+#   - korzysta z modeli `mlx-community/whisper-*` (4-bit kwantyzacja)
+#   - ~40% szybsza inferencja na M-series dzieki Metal Performance Shaders
+#   - jeden artefakt dziala i na desktop macOS i na iOS (bez Pythona / Dockera)
+#
+# Implementacja: `tentaflow-desktop/macos/swift/MLXBridge/Sources/MLXBridge/Whisper/`
+# (Swift dylib) + `tentaflow-core/src/stt/mlx_whisper.rs` (Rust SttEngine).
+
+[engine]
+id = "mlx-whisper"
+category = "stt"
+resource_kind = "ai"
+name = "MLX Whisper"
+description_pl = "Whisper przepisany na mlx-swift dla Apple Silicon. ~40% szybszy niz whisper.cpp."
+description_en = "Whisper ported to mlx-swift for Apple Silicon. ~40% faster than whisper.cpp."
+homepage = "https://github.com/ml-explore/mlx-examples/tree/main/whisper"
+license = "Apache-2.0"
+icon = "whisper"
+default_port = 5031
+api = "openai-compatible"
+version = "0.1.0"
+
+# Brak [deploy.docker] / [deploy.external] — MLX dziala wylacznie natywnie
+# na Apple GPU. Linux/Windows musza siegnac po `whisper` (whisper.cpp).
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx-whisper"
+
+[[model_preset]]
+id = "whisper-large-v3-turbo-4bit"
+display_name = "Whisper Large v3 Turbo 4-bit"
+repo = "mlx-community/whisper-large-v3-turbo-4bit"
+recommended = true
+
+[[model_preset]]
+id = "whisper-large-v3-4bit"
+display_name = "Whisper Large v3 4-bit"
+repo = "mlx-community/whisper-large-v3-4bit"
+
+[[model_preset]]
+id = "whisper-medium-mlx"
+display_name = "Whisper Medium (MLX)"
+repo = "mlx-community/whisper-medium-mlx"
+
+[[model_preset]]
+id = "whisper-small-mlx"
+display_name = "Whisper Small (MLX)"
+repo = "mlx-community/whisper-small-mlx"
