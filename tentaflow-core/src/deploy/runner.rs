@@ -901,6 +901,65 @@ async fn do_embedded_native_deploy(
             finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
             Ok(())
         }
+        #[cfg(feature = "inference-apple-tts")]
+        ("tts", "apple-tts") => {
+            let service_name = config
+                .container_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "apple-tts-native".to_string());
+            // Glos wybierany przez `model_repo` (`zosia-pl`, `samantha-en`...).
+            // Apple nie pobiera niczego z dysku — model_path = "system".
+            let voice_id = resolve_model_repo(engine, config)
+                .unwrap_or_else(|_| "zosia-pl".to_string());
+
+            phase(db, deploy_id, tx, "running", 75, "init apple tts");
+            let mut engine_impl = crate::tts::apple_tts::AppleTtsEngine::new();
+            let info = <crate::tts::apple_tts::AppleTtsEngine as crate::tts::TtsEngine>::load_model(
+                &mut engine_impl,
+                std::path::Path::new("system"),
+            )
+            .context("init apple-tts (brak libMLXBridge.dylib?)")?;
+            // Rejestracja w globalnym TtsManager pod kluczem service_name —
+            // router znajduje silnik po nazwie serwisu albo po backend_name.
+            {
+                let shared = crate::tts::shared_tts_manager();
+                let mut mgr = shared.write().await;
+                mgr.register(service_name.clone(), Box::new(engine_impl));
+            }
+
+            phase(db, deploy_id, tx, "registering", 92, "register service");
+            let config_json = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "apple-tts",
+                "manifest_engine_id": engine.engine_id,
+                "deployed_model": voice_id,
+                "model_path": "system",
+                "service_type": "tts",
+                "sample_rate": info.sample_rate,
+            })
+            .to_string();
+            upsert_native_service(
+                db,
+                node_id,
+                &service_name,
+                "tts",
+                Some("tts"),
+                &config_json,
+                "single",
+            )?;
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+            log_line(
+                db,
+                deploy_id,
+                tx,
+                "log",
+                &format!("Apple TTS gotowe: {}", service_name),
+            );
+            let _ = service_manager;
+            finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+            Ok(())
+        }
         #[cfg(feature = "inference-mlx-whisper")]
         ("stt", "mlx-whisper") => {
             let model_repo = resolve_model_repo(engine, config)
