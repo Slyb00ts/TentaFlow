@@ -1,0 +1,28 @@
+# Manifest serwisu Kyutai TTS — streaming TTS od Kyutai Labs.
+# Model bazowy: `kyutai/tts-1.6b-en_fr` (1.8B params), CC-BY 4.0.
+# Architektura: Moshi-style hierarchical Transformer + Mimi codec.
+# Wymaga PyTorch — Docker dla wszystkich platform.
+
+[engine]
+id = "kyutai-tts"
+category = "tts"
+resource_kind = "ai"
+name = "Kyutai TTS"
+description_pl = "Streaming TTS Kyutai 1.8B (EN+FR). Architektura Moshi + Mimi codec, voice conditioning."
+description_en = "Streaming Kyutai TTS 1.8B (EN/FR). Moshi-style + Mimi codec, voice conditioning."
+homepage = "https://kyutai.org/next/tts"
+license = "CC-BY 4.0 (weights), Apache-2.0/MIT (code)"
+icon = "kyutai"
+default_port = 5023
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.docker]
+context_path = "tts/docker/kyutai-tts"
+platforms = ["linux", "windows", "macos"]
+
+[[model_preset]]
+id = "tts-1-6b-en-fr"
+display_name = "Kyutai TTS 1.6B (EN+FR)"
+repo = "kyutai/tts-1.6b-en_fr"
+recommended = true

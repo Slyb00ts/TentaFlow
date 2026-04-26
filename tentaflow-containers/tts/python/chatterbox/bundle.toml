@@ -1,0 +1,36 @@
+[bundle]
+engine = "chatterbox"
+description = "Chatterbox Multilingual TTS (Resemble AI, 23 jezyki + PL)"
+python_version = "3.11"
+source = "pypi"
+package = "chatterbox-tts"
+package_version = "0.1.7"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8087}"]
+internal_port = 8087
+
+[requires]
+gpu_memory_gb = 6
+disk_gb = 5
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu124"
+extras = []
+
+[[install_variants]]
+backend = "rocm"
+extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extras = []
+
+[[install_variants]]
+backend = "metal"
+extras = []
+
+[[install_variants]]
+backend = "cpu"
+extras = []
