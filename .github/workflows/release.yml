@@ -372,6 +372,19 @@ jobs:
           # cache_id z matrix.include (bez przecinkow, latwy do czytania).
           key: cargo-${{ matrix.cache_id }}-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Download Silero VAD (teams-bot native)
+        shell: bash
+        run: |
+          # tentaflow/build.rs kopiuje model obok binarki jesli istnieje;
+          # bez tego bot uzywa fallback RMS (gorsza jakosc VAD).
+          MODEL_DIR="tentaflow-containers/agents/native/teams-bot/models"
+          MODEL_FILE="$MODEL_DIR/silero_vad.onnx"
+          mkdir -p "$MODEL_DIR"
+          if [[ ! -f "$MODEL_FILE" ]]; then
+            curl -fL "https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx" \
+              -o "$MODEL_FILE" || echo "::warning::Silero VAD download failed — bot uzyje fallback RMS"
+          fi
+
       - name: Build tentaflow (all available GPU backends)
         working-directory: tentaflow
         shell: bash
@@ -432,6 +445,23 @@ jobs:
           cp scripts/install/ai.tentaflow.plist "$STAGE/" 2>/dev/null || true
           cp LICENSE README.md "$STAGE/" 2>/dev/null || true
 
+          # tentaflow-meeting (sidecar Teams) + Silero VAD model. Buildowane przez
+          # `tentaflow/build.rs` razem z glowna binarka. Dystrybucja: obie binarki
+          # obok siebie + model VAD obok zeby `default_vad_model_path` w config.rs
+          # je znalazl przez `current_exe()`.
+          MEETING_BIN="tentaflow/target/${{ matrix.target }}/release/tentaflow-meeting"
+          if [[ -f "$MEETING_BIN" ]]; then
+            cp "$MEETING_BIN" "$STAGE/"
+            echo "Staged tentaflow-meeting"
+          else
+            echo "::warning::brak $MEETING_BIN — teams-bot native nie bedzie dzialal"
+          fi
+          VAD_MODEL="tentaflow/target/${{ matrix.target }}/release/silero_vad.onnx"
+          if [[ -f "$VAD_MODEL" ]]; then
+            cp "$VAD_MODEL" "$STAGE/"
+            echo "Staged silero_vad.onnx"
+          fi
+
           # macOS: dorzucamy Swift MLX bridge — libMLXBridge.dylib + Metal
           # shaders bundle. Bez tego MlxSwiftEngine nie ma do czego wolac
           # callbackow runtime (`Failed to load default metallib`) i Bielik
@@ -465,6 +495,18 @@ jobs:
           Copy-Item "tentaflow/target/${{ matrix.target }}/release/tentaflow.exe" "$stage/"
           Copy-Item "tentaflow/config.toml" "$stage/config.example.toml" -ErrorAction SilentlyContinue
           Copy-Item "LICENSE","README.md" $stage -ErrorAction SilentlyContinue
+          $meetingBin = "tentaflow/target/${{ matrix.target }}/release/tentaflow-meeting.exe"
+          if (Test-Path $meetingBin) {
+              Copy-Item $meetingBin "$stage/"
+              Write-Host "Staged tentaflow-meeting.exe"
+          } else {
+              Write-Host "::warning::brak $meetingBin — teams-bot native nie bedzie dzialal"
+          }
+          $vadModel = "tentaflow/target/${{ matrix.target }}/release/silero_vad.onnx"
+          if (Test-Path $vadModel) {
+              Copy-Item $vadModel "$stage/"
+              Write-Host "Staged silero_vad.onnx"
+          }
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           Get-FileHash "$stage.zip" -Algorithm SHA256 | Format-List > "$stage.zip.sha256"
 

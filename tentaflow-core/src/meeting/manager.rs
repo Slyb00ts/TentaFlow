@@ -15,7 +15,44 @@ use crate::db::{repository, DbPool};
 use crate::routing::service_manager::ServiceManager;
 
 use super::container::{self, SpawnRequest};
+use super::native;
 use super::port_pool;
+
+/// Tryb uruchomienia bota — wykrywany w `start_session` przez query do tabeli
+/// `services` i pole `config_json.deploy_mode`. Default Docker (zachowanie pre-v0.0.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotBackend {
+    Docker,
+    Native,
+}
+
+/// Patrzy w `services` i decyduje czy teams-bot ma byc uruchomiony jako
+/// subprocess (`runtime=binary` po `deploy.native`) czy kontener Docker.
+/// Brak wpisu = Docker (wstecznie kompatybilne — przed dodaniem native
+/// botow tabela `services` nie zawierala teams-bota wcale).
+fn detect_backend(db: &DbPool) -> BotBackend {
+    let services = match repository::list_services(db) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("detect_backend: list_services blad ({}), fallback Docker", e);
+            return BotBackend::Docker;
+        }
+    };
+    for svc in &services {
+        let config: serde_json::Value =
+            serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
+        let engine = config["engine"].as_str().or(config["manifest_engine_id"].as_str());
+        if engine != Some("teams-bot") {
+            continue;
+        }
+        let deploy_mode = config["deploy_mode"].as_str().unwrap_or("");
+        let runtime = config["runtime"].as_str().unwrap_or("");
+        if deploy_mode == "native" && runtime == "binary" {
+            return BotBackend::Native;
+        }
+    }
+    BotBackend::Docker
+}
 
 #[derive(Debug, Clone)]
 pub struct StartSessionRequest {
@@ -145,91 +182,142 @@ impl MeetingManager {
             drop(conn);
         }
 
-        let ports = match port_pool::allocate_for_session(&self.db, session_id) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = repository::transcripts::mark_session_ended(&self.db, session_id);
-                return Err(anyhow!("alokacja portow: {e}"));
-            }
-        };
+        let backend = detect_backend(&self.db);
+        info!(session = session_id, ?backend, "Meeting session — wybrany backend");
 
         // Generuj secret key bota — iroh::SecretKey ma endpoint_id (public key) wbudowany.
         let secret = SecretKey::generate();
         let secret_key_hex = hex::encode(secret.to_bytes());
         let bot_endpoint_id = hex::encode(secret.public().as_bytes());
 
-        repository::transcripts::update_session_spawned(
-            &self.db,
-            session_id,
-            "",
-            &container::container_name(session_id),
-            ports.quic,
-            ports.vnc,
-            ports.novnc,
-            &bot_endpoint_id,
-            &secret_key_hex,
-            &req.platform,
-            req.owner_user_id,
-        )?;
-
         // Efektywne aliasy — nadpisanie od callera lub domyślne z T1.5.
         let (stt_alias, summarization_alias, tts_alias, flow_alias) = resolve_aliases(&req);
 
-        let spawn_req = SpawnRequest {
-            session_id,
-            meeting_url: req.meeting_url.clone(),
-            meeting_key: meeting_key.clone(),
-            ports,
-            secret_key_hex: secret_key_hex.clone(),
-            bot_name: req.bot_name.clone(),
-            stt_alias: stt_alias.clone(),
-            summarization_alias: summarization_alias.clone(),
-            tts_alias: tts_alias.clone(),
-            flow_alias: flow_alias.clone(),
+        // Alokuj porty + spawn — drogi rozne per backend, ale na koniec obie maja
+        // ten sam efekt: serwis zarejestrowany w ServiceManager z iroh URL i
+        // direct_addr 127.0.0.1:<quic_port>.
+        let quic_port = match backend {
+            BotBackend::Docker => {
+                let ports = match port_pool::allocate_for_session(&self.db, session_id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = repository::transcripts::mark_session_ended(&self.db, session_id);
+                        return Err(anyhow!("alokacja portow: {e}"));
+                    }
+                };
+
+                repository::transcripts::update_session_spawned(
+                    &self.db,
+                    session_id,
+                    "",
+                    &container::container_name(session_id),
+                    ports.quic,
+                    ports.vnc,
+                    ports.novnc,
+                    &bot_endpoint_id,
+                    &secret_key_hex,
+                    &req.platform,
+                    req.owner_user_id,
+                )?;
+
+                let spawn_req = SpawnRequest {
+                    session_id,
+                    meeting_url: req.meeting_url.clone(),
+                    meeting_key: meeting_key.clone(),
+                    ports,
+                    secret_key_hex: secret_key_hex.clone(),
+                    bot_name: req.bot_name.clone(),
+                    stt_alias: stt_alias.clone(),
+                    summarization_alias: summarization_alias.clone(),
+                    tts_alias: tts_alias.clone(),
+                    flow_alias: flow_alias.clone(),
+                };
+
+                match container::spawn(&spawn_req).await {
+                    Ok(outcome) => {
+                        let conn = self.db.lock().unwrap();
+                        let _ = conn.execute(
+                            "UPDATE meeting_sessions SET container_id = ?2 WHERE id = ?1",
+                            rusqlite::params![session_id, outcome.container_id],
+                        );
+                        drop(conn);
+                    }
+                    Err(e) => {
+                        warn!("Spawn kontenera nieudany: {}", e);
+                        let _ = port_pool::release_for_session(&self.db, session_id);
+                        let _ = repository::transcripts::mark_session_ended(&self.db, session_id);
+                        return Err(anyhow!("spawn kontenera: {e}"));
+                    }
+                }
+                ports.quic
+            }
+            BotBackend::Native => {
+                let ports = match port_pool::allocate_for_native_session(&self.db, session_id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = repository::transcripts::mark_session_ended(&self.db, session_id);
+                        return Err(anyhow!("alokacja portow native: {e}"));
+                    }
+                };
+
+                repository::transcripts::update_session_spawned_native(
+                    &self.db,
+                    session_id,
+                    &native::container_name(session_id),
+                    ports.quic,
+                    &bot_endpoint_id,
+                    &secret_key_hex,
+                    &req.platform,
+                    req.owner_user_id,
+                )?;
+
+                let spawn_req = native::SpawnRequest {
+                    session_id,
+                    meeting_url: req.meeting_url.clone(),
+                    meeting_key: meeting_key.clone(),
+                    ports,
+                    secret_key_hex: secret_key_hex.clone(),
+                    bot_name: req.bot_name.clone(),
+                    stt_alias: stt_alias.clone(),
+                    summarization_alias: summarization_alias.clone(),
+                    tts_alias: tts_alias.clone(),
+                    flow_alias: flow_alias.clone(),
+                };
+
+                if let Err(e) = native::spawn(&spawn_req).await {
+                    warn!("Spawn subprocess (native) nieudany: {}", e);
+                    let _ = port_pool::release_for_session(&self.db, session_id);
+                    let _ = repository::transcripts::mark_session_ended(&self.db, session_id);
+                    return Err(anyhow!("spawn subprocess: {e}"));
+                }
+                ports.quic
+            }
         };
 
-        match container::spawn(&spawn_req).await {
-            Ok(outcome) => {
-                // Uaktualnij rzeczywisty container_id zwrocony przez docker.
-                let conn = self.db.lock().unwrap();
-                let _ = conn.execute(
-                    "UPDATE meeting_sessions SET container_id = ?2 WHERE id = ?1",
-                    rusqlite::params![session_id, outcome.container_id],
-                );
-                drop(conn);
-                // Docker zwrócił success — kontener istnieje. Bot potwierdzi własne
-                // `container_spawned` gdy QUIC server w środku wystartuje, ale już
-                // tu stage jest prawdziwy z perspektywy hosta.
-                if let Err(e) = repository::transcripts::update_session_lifecycle(
-                    &self.db,
-                    &meeting_key,
-                    tentaflow_protocol::LIFECYCLE_CONTAINER_SPAWNED,
-                    None,
-                ) {
-                    warn!("update_session_lifecycle (container_spawned): {}", e);
-                }
-                info!(
-                    session = session_id,
-                    bot_endpoint_id = %bot_endpoint_id,
-                    "Meeting session spawnowana"
-                );
-            }
-            Err(e) => {
-                // Rollback — zwolnij porty, oznacz ended.
-                warn!("Spawn kontenera nieudany: {}", e);
-                let _ = port_pool::release_for_session(&self.db, session_id);
-                let _ = repository::transcripts::mark_session_ended(&self.db, session_id);
-                return Err(anyhow!("spawn kontenera: {e}"));
-            }
+        // Stage `container_spawned` jest semantycznie "host wystartowal sidecar"
+        // (kontener LUB subprocess). Bot potwierdzi swoj wlasny `container_spawned`
+        // przez QUIC zaraz potem.
+        if let Err(e) = repository::transcripts::update_session_lifecycle(
+            &self.db,
+            &meeting_key,
+            tentaflow_protocol::LIFECYCLE_CONTAINER_SPAWNED,
+            None,
+        ) {
+            warn!("update_session_lifecycle (container_spawned): {}", e);
         }
+        info!(
+            session = session_id,
+            bot_endpoint_id = %bot_endpoint_id,
+            ?backend,
+            "Meeting session spawnowana"
+        );
 
-        // Rejestracja w ServiceManager — router spawnuje meeting_bot_connection_loop
-        // który łączy się do bota przez iroh. Direct addr 127.0.0.1:<quic_port>
-        // omija LAN discovery (bridge network nie widoczna przez mDNS hosta).
+        // Rejestracja w ServiceManager — taka sama dla Docker i native (router
+        // laczy sie tym samym mechanizmem iroh, niezaleznie od backendu).
         if let Some(ref sm) = self.service_manager {
             let service_name = Self::service_name(session_id);
             let iroh_url = format!("iroh://{}", bot_endpoint_id);
-            let direct_addrs = vec![format!("127.0.0.1:{}", ports.quic)];
+            let direct_addrs = vec![format!("127.0.0.1:{}", quic_port)];
             sm.register_quic_service_with_addrs(
                 service_name,
                 "meeting-bot",
@@ -241,7 +329,7 @@ impl MeetingManager {
         } else {
             warn!(
                 session = session_id,
-                "brak ServiceManager — kontener uruchomiony ale router nie połączy się"
+                "brak ServiceManager — bot uruchomiony ale router nie połączy się"
             );
         }
 
@@ -274,16 +362,24 @@ impl MeetingManager {
         if let Some(ref sm) = self.service_manager {
             sm.remove_quic_service(&Self::service_name(session_id), "meeting-bot");
         }
+        let backend = detect_backend(&self.db);
         let db = self.db.clone();
         tokio::spawn(async move {
-            let _ = container::stop(session_id).await;
+            match backend {
+                BotBackend::Docker => {
+                    let _ = container::stop(session_id).await;
+                }
+                BotBackend::Native => {
+                    let _ = native::stop(session_id).await;
+                }
+            }
             if let Err(e) = port_pool::release_for_session(&db, session_id) {
                 warn!(session = session_id, "release_for_session: {}", e);
             }
             if let Err(e) = repository::transcripts::mark_session_ended(&db, session_id) {
                 warn!(session = session_id, "mark_session_ended: {}", e);
             }
-            info!(session = session_id, "Meeting session zakonczona");
+            info!(session = session_id, ?backend, "Meeting session zakonczona");
         });
         Ok(())
     }
@@ -291,6 +387,7 @@ impl MeetingManager {
     /// Sprząta sesje które zostały jako "active" po unclean shutdown.
     pub async fn cleanup_on_startup(&self) -> Result<()> {
         let _ = container::cleanup_stale_containers().await;
+        let _ = native::cleanup_stale().await;
         let stale = repository::transcripts::list_stale_sessions(&self.db)?;
         for row in stale {
             warn!(

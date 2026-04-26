@@ -62,7 +62,12 @@
     }
   }
 
-  const WS_URL = 'ws://127.0.0.1:9999/bridge';
+  // Port mostu WS jest dynamiczny: dla native bota MeetingManager alokuje port
+  // i wstrzykuje go przez `window.__tfBridgePort` przed zaladowaniem strony
+  // (evaluate_on_new_document w browser.rs). Docker dziala w izolowanym
+  // network namespace, wiec stary fallback 9999 jest tam wciaz prawidlowy.
+  const BRIDGE_PORT = (typeof window !== 'undefined' && window.__tfBridgePort) || 9999;
+  const WS_URL = `ws://127.0.0.1:${BRIDGE_PORT}/bridge`;
   const TARGET_RATE = 16000;
 
   // Reconnect z backoffem
