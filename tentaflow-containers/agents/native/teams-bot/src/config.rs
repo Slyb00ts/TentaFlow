@@ -176,12 +176,79 @@ fn default_meeting_language() -> String {
     "pl".to_string()
 }
 
+/// Domyslna sciezka do modelu Silero VAD. Sprawdza po kolei:
+/// 1. `/opt/models/silero_vad.onnx` (Docker)
+/// 2. plik obok binarki `tentaflow-meeting`/`silero_vad.onnx` (native install)
+/// 3. `<cache_dir>/tentaflow/teams-bot/silero_vad.onnx` (native fallback)
+/// Zwraca pierwsza istniejaca sciezke, albo None — wtedy VadDetector przejdzie
+/// na RMS fallback (gorsza jakosc, ale bot dziala).
+fn default_vad_model_path() -> Option<String> {
+    let docker_path = std::path::PathBuf::from("/opt/models/silero_vad.onnx");
+    if docker_path.is_file() {
+        return Some(docker_path.to_string_lossy().into_owned());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("silero_vad.onnx");
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+            // Fallback dwa poziomy w gore — gdy binarka jest w target/release/
+            // a model jest obok manifestu w native/teams-bot/models/.
+            let near_repo = dir.join("models").join("silero_vad.onnx");
+            if near_repo.is_file() {
+                return Some(near_repo.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if let Some(cache) = dirs_cache_dir() {
+        let candidate = cache
+            .join("tentaflow")
+            .join("teams-bot")
+            .join("silero_vad.onnx");
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Lekka kopia `dirs::cache_dir()` zeby nie wciagac calej zaleznosci `dirs`
+/// tylko po jeden lookup. Zwraca rozsadny default cache dir per platforma.
+fn dirs_cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        if cfg!(target_os = "macos") {
+            return Some(std::path::PathBuf::from(home).join("Library").join("Caches"));
+        }
+        if cfg!(target_os = "linux") {
+            if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+                return Some(std::path::PathBuf::from(xdg));
+            }
+            return Some(std::path::PathBuf::from(home).join(".cache"));
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return Some(std::path::PathBuf::from(local));
+        }
+    }
+    None
+}
+
 impl MeetingConfig {
     /// Laduje konfiguracje z pliku TOML lub zmiennych srodowiskowych
     pub fn load(path: &Path) -> Result<Self> {
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Nie mozna odczytac pliku konfiguracji: {}", path.display()))?;
+
+            // Pusty plik / specjalny `/dev/null` -> traktuj jak brak konfigu i
+            // uzyj env-owej sciezki. Native subprocess bota wskazuje na pusty
+            // sentinel zeby wymusic from_env (Docker uzywa tylko env, ale w
+            // niektorych testach plik moze byc pusty).
+            if content.trim().is_empty() {
+                return Self::from_env();
+            }
 
             let config: MeetingConfig = toml::from_str(&content)
                 .with_context(|| format!("Bledny format TOML w: {}", path.display()))?;
@@ -211,7 +278,7 @@ impl MeetingConfig {
             audio_device: std::env::var("AUDIO_DEVICE").ok(),
             vad_model_path: std::env::var("VAD_MODEL_PATH")
                 .ok()
-                .or_else(|| Some("/opt/models/silero_vad.onnx".to_string())),
+                .or_else(default_vad_model_path),
             stt_alias: std::env::var("STT_ALIAS")
                 .unwrap_or_else(|_| "teams-stt".to_string()),
             summarization_alias: std::env::var("SUMMARIZATION_ALIAS")

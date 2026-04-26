@@ -671,6 +671,43 @@ install_rocm() {
 
 # --- Weryfikacja ---
 
+download_meeting_bot_assets() {
+    log_section "Pobieranie assetow teams-bot (Silero VAD)"
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local model_dir="${script_dir}/tentaflow-containers/agents/native/teams-bot/models"
+    local model_file="${model_dir}/silero_vad.onnx"
+    local silero_url="https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx"
+
+    if [[ -f "$model_file" ]]; then
+        log_ok "Silero VAD juz istnieje ($(du -h "$model_file" | cut -f1))"
+        return
+    fi
+
+    mkdir -p "$model_dir"
+    log_info "Pobieram Silero VAD: $silero_url"
+    if command -v curl &>/dev/null; then
+        if curl -fL "$silero_url" -o "$model_file"; then
+            log_ok "Silero VAD pobrany ($(du -h "$model_file" | cut -f1))"
+            INSTALLED+=("silero_vad.onnx (teams-bot)")
+        else
+            log_warn "Nie udalo sie pobrac Silero VAD — bot uzyje fallback RMS (gorsza jakosc VAD)"
+            rm -f "$model_file"
+        fi
+    elif command -v wget &>/dev/null; then
+        if wget -q -O "$model_file" "$silero_url"; then
+            log_ok "Silero VAD pobrany ($(du -h "$model_file" | cut -f1))"
+            INSTALLED+=("silero_vad.onnx (teams-bot)")
+        else
+            log_warn "Nie udalo sie pobrac Silero VAD — bot uzyje fallback RMS"
+            rm -f "$model_file"
+        fi
+    else
+        log_warn "Brak curl ani wget — pomijam pobieranie Silero VAD"
+    fi
+}
+
 verify_installation() {
     log_section "Weryfikacja instalacji"
 
@@ -788,6 +825,36 @@ verify_installation() {
         ok=false
     fi
 
+    # Chrome / Chromium — opcjonalne, wymagane tylko jesli user wdrozy
+    # teams-bota w trybie native (deploy.native). Docker tryb ma chromium
+    # wbudowany w obraz. Brak nie blokuje setup, tylko warning.
+    local found_browser=""
+    if [[ "$DISTRO" == "macos" ]]; then
+        for app in \
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+            "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"; do
+            if [[ -x "$app" ]]; then
+                found_browser="$app"
+                break
+            fi
+        done
+    else
+        for bin in chromium chromium-browser google-chrome google-chrome-stable brave-browser microsoft-edge; do
+            if command -v "$bin" &>/dev/null; then
+                found_browser=$(command -v "$bin")
+                break
+            fi
+        done
+    fi
+    if [[ -n "$found_browser" ]]; then
+        log_ok "Chrome/Chromium: $found_browser (wymagane dla teams-bot native)"
+    else
+        log_warn "Chrome/Chromium: BRAK — teams-bot w trybie native nie zadziala"
+        log_warn "  Docker tryb dziala bez tego (chromium w obrazie)"
+    fi
+
     # Opcjonalne: CUDA
     if [[ "$INSTALL_CUDA" == true ]]; then
         if command -v nvcc &>/dev/null; then
@@ -879,6 +946,8 @@ main() {
     if [[ "$INSTALL_ROCM" == true ]]; then
         install_rocm
     fi
+
+    download_meeting_bot_assets
 
     verify_installation
     print_summary
