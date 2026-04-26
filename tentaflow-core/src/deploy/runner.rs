@@ -901,6 +901,56 @@ async fn do_embedded_native_deploy(
             finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
             Ok(())
         }
+        #[cfg(feature = "inference-mlx-kokoro")]
+        ("tts", "kokoro") if std::env::consts::OS == "macos" => {
+            let model_repo = resolve_model_repo(engine, config)
+                .unwrap_or_else(|_| "mlx-community/Kokoro-82M-bf16".to_string());
+            let service_name = config
+                .container_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "kokoro-tts-native".to_string());
+
+            phase(db, deploy_id, tx, "building", 20, "download kokoro");
+            let resolved = crate::tts::mlx_kokoro::prepare_model(&model_repo)
+                .await
+                .with_context(|| format!("prepare kokoro model '{}'", model_repo))?;
+
+            phase(db, deploy_id, tx, "running", 75, "load kokoro");
+            let mut engine_impl = crate::tts::mlx_kokoro::MlxKokoroEngine::new();
+            let info = <crate::tts::mlx_kokoro::MlxKokoroEngine as crate::tts::TtsEngine>::load_model(
+                &mut engine_impl,
+                &resolved,
+            )
+            .context("load kokoro w Swift bridge")?;
+
+            {
+                let shared = crate::tts::shared_tts_manager();
+                let mut mgr = shared.write().await;
+                mgr.register(service_name.clone(), Box::new(engine_impl));
+            }
+
+            phase(db, deploy_id, tx, "registering", 92, "register service");
+            let config_json = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "kokoro",
+                "manifest_engine_id": engine.engine_id,
+                "deployed_model": model_repo,
+                "model_path": resolved.to_string_lossy(),
+                "service_type": "tts",
+                "sample_rate": info.sample_rate,
+            })
+            .to_string();
+            upsert_native_service(
+                db, node_id, &service_name, "tts", Some("tts"),
+                &config_json, "single",
+            )?;
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+            log_line(db, deploy_id, tx, "log", &format!("Kokoro TTS gotowe: {}", service_name));
+            let _ = service_manager;
+            finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+            Ok(())
+        }
         #[cfg(feature = "inference-apple-tts")]
         ("tts", "apple-tts") => {
             let service_name = config

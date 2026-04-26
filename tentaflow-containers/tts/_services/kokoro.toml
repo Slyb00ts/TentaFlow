@@ -1,0 +1,37 @@
+# Manifest serwisu Kokoro 82M — szybki TTS angielski.
+# Apple Silicon: natywny MLX port (mlalma/KokoroSwift) przez libKokoroBridge.dylib.
+# Linux/Windows: Docker z `kokoro-onnx` Python + FastAPI.
+
+[engine]
+id = "kokoro"
+category = "tts"
+resource_kind = "ai"
+name = "Kokoro 82M"
+description_pl = "Lekki TTS 82M parametrow (~165 MB). Natywny MLX na Apple Silicon, ONNX na Linuksie/Windowsie."
+description_en = "Lightweight 82M-param TTS. Native MLX on Apple Silicon, ONNX runtime on Linux/Windows."
+homepage = "https://huggingface.co/hexgrad/Kokoro-82M"
+license = "Apache-2.0"
+icon = "kokoro"
+default_port = 5022
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.docker]
+context_path = "tts/docker/kokoro"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx-kokoro"
+
+[[model_preset]]
+id = "kokoro-v1-mlx-bf16"
+display_name = "Kokoro v1.0 MLX bf16 (Apple)"
+repo = "mlx-community/Kokoro-82M-bf16"
+recommended = true
+
+[[model_preset]]
+id = "kokoro-v1-onnx"
+display_name = "Kokoro v1.0 ONNX (Linux/Windows)"
+repo = "onnx-community/Kokoro-82M-v1.0-ONNX"

@@ -1,0 +1,33 @@
+# Manifest serwisu Chatterbox Multilingual TTS — Resemble AI, MIT.
+# 23 jezyki (EN, PL, DE, FR, ES, IT, RU, JA, ZH, AR, HI, KO, NL, PT, ...).
+# Voice cloning przez audio prompt (3-10 s WAV).
+# python-bundle: macOS (MPS), Linux (CUDA/CPU), Windows. Bez iOS — Pythona brak.
+
+[engine]
+id = "chatterbox"
+category = "tts"
+resource_kind = "ai"
+name = "Chatterbox Multilingual"
+description_pl = "Multilingual TTS od Resemble AI (23 jezyki + PL). Voice cloning przez nagranie wzorcowe."
+description_en = "Resemble AI Multilingual TTS (23 languages + Polish). Voice cloning via audio prompt."
+homepage = "https://github.com/resemble-ai/chatterbox"
+license = "MIT"
+icon = "chatterbox"
+default_port = 5024
+api = "openai-compatible"
+version = "0.1.7"
+
+[deploy.docker]
+context_path = "tts/docker/chatterbox"
+platforms = ["linux", "windows"]
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "python-bundle"
+bundle_path = "tts/python/chatterbox"
+
+[[model_preset]]
+id = "chatterbox-multilingual"
+display_name = "Chatterbox Multilingual"
+repo = "ResembleAI/chatterbox"
+recommended = true
