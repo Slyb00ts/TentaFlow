@@ -78,10 +78,16 @@ const AUDIO_BRIDGE_JS: &str = include_str!("browser_inject.js");
 /// przy drugim launch'u blokuje sie na "profile locked".
 pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     let instance_id = uuid::Uuid::new_v4().to_string();
-    let user_data_dir = format!("/tmp/chromium-meeting-bot-{}", &instance_id[..8]);
-    let user_data_dir = user_data_dir.as_str();
-    let prefs_dir = format!("{}/Default", user_data_dir);
+    // std::env::temp_dir() — przenosne miedzy linux (/tmp), macOS (/var/folders/...)
+    // i Windows (C:\Users\<user>\AppData\Local\Temp). Docker dziala dalej tak samo
+    // bo tam temp_dir() == /tmp.
+    let user_data_dir_path = std::env::temp_dir()
+        .join(format!("chromium-meeting-bot-{}", &instance_id[..8]));
+    let user_data_dir = user_data_dir_path.to_string_lossy().to_string();
+    let prefs_dir = user_data_dir_path.join("Default");
     std::fs::create_dir_all(&prefs_dir).ok();
+    let user_data_dir = user_data_dir.as_str();
+    let prefs_dir = prefs_dir.to_string_lossy().to_string();
     tracing::info!(user_data_dir, "Uruchamianie Chromium z unikalnym profilem");
     // content_settings: 1 = allow, 2 = block
     // - media_stream_mic: allow (bot musi mowic przez Teams)
@@ -92,13 +98,33 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     //   Teams meeting (LAN access dla STUN/connectivity probes). Pre-allow
     //   DLA KONKRETNEJ DOMENY omija popup bez nadawania permissji globalnie.
     std::fs::write(
-        format!("{}/Preferences", prefs_dir),
+        format!("{}/Preferences", prefs_dir.as_str()),
         r#"{"profile":{"content_settings":{"exceptions":{"media_stream_mic":{"*,*":{"setting":1}},"media_stream_camera":{"*,*":{"setting":2}},"notifications":{"*,*":{"setting":2}},"loopback_network":{"https://teams.microsoft.com:443,*":{"setting":1},"https://teams.live.com:443,*":{"setting":1}}}}}}"#,
     ).ok();
 
-    let browser_config = BrowserConfig::builder()
-        .chrome_executable("/usr/bin/chromium")
-        .with_head()
+    let chrome_exe = find_chromium_executable()
+        .ok_or_else(|| anyhow::anyhow!(
+            "Nie znaleziono Chromium/Chrome — zainstaluj przegladarke (Chromium, Google Chrome, Brave lub Edge)"
+        ))?;
+    tracing::info!(path = %chrome_exe.display(), "Wybrana binarka Chromium");
+
+    // Tryb headless sterowany env-em `TENTAFLOW_HEADLESS` (default: headless=new
+    // dla natywnego deploya, zeby nie wyskakiwalo okno Chrome). Stary `--headless`
+    // (HeadlessMode::True) nie zenkoduje canvas captureStream — uzywamy New.
+    // `TENTAFLOW_HEADLESS=0` wymusza tryb z oknem (przydatne do debugowania
+    // lokalnie albo w Dockerze gdzie Xvfb i tak daje wirtualny display).
+    let headless_disabled = std::env::var("TENTAFLOW_HEADLESS")
+        .ok()
+        .map(|v| matches!(v.as_str(), "0" | "false" | "no"))
+        .unwrap_or(false);
+    let mut builder = BrowserConfig::builder()
+        .chrome_executable(&chrome_exe);
+    builder = if headless_disabled {
+        builder.with_head()
+    } else {
+        builder.new_headless_mode()
+    };
+    let browser_config = builder
         .no_sandbox()
         .window_size(1920, 1080)
         .user_data_dir(user_data_dir)
@@ -114,6 +140,15 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         .arg("enable-unsafe-swiftshader")
         .arg("disable-blink-features=AutomationControlled")
         .arg("ignore-certificate-errors")
+        // Wymuszamy Linux Chromium UA zeby Teams nie serwowal wariantu
+        // launcher.html z `msLaunch=true&directDl=true` ktory na macOS/Windows
+        // probuje odpalic handler protokolu `msteams://` i zawiesza navigation
+        // na 30s+. Docker dziala bo Linux Chromium dostaje wariant launchera
+        // bez deeplinkow do desktop app.
+        .arg("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+        // Blokuje dialog "Open in app" dla zarejestrowanych protokolow
+        // (msteams://, zoommtg:// itp.) na realnym Chrome poza Dockerem.
+        .arg("disable-features=ExternalProtocolDialog")
         .build()
         .map_err(|e| anyhow::anyhow!("Blad konfiguracji Chromium: {}", e))?;
 
@@ -202,9 +237,18 @@ pub async fn join_meeting(
         .map_err(|e| anyhow::anyhow!("Blad setBypassCSP: {}", e))?;
     tracing::info!("CSP wylaczone dla strony (setBypassCSP=true)");
 
+    // Port mostu WS dla tej sesji — JS w `browser_inject.js` czyta
+    // `window.__tfBridgePort` zeby wiedziec do ktorego portu sie podlaczyc.
+    // Native bot dostaje port przez env `TENTAFLOW_BRIDGE_PORT` (per-sesja
+    // alokacja w MeetingManager); Docker uzywa default 9999.
+    let bridge_port = crate::audio::bridge_port();
+    let bridge_port_js = format!("window.__tfBridgePort = {};", bridge_port);
+    page.evaluate_on_new_document(bridge_port_js).await
+        .map_err(|e| anyhow::anyhow!("Blad evaluate_on_new_document(bridgePort): {}", e))?;
+
     page.evaluate_on_new_document(AUDIO_BRIDGE_JS).await
         .map_err(|e| anyhow::anyhow!("Blad evaluate_on_new_document: {}", e))?;
-    tracing::info!("Zarejestrowano init script (audio bridge) dla wszystkich dokumentow");
+    tracing::info!(bridge_port, "Zarejestrowano init script (audio bridge) dla wszystkich dokumentow");
 
     // Bot display name dostepny dla JS (uzywany przez detector active speakera
     // do filtrowania wlasnego tile'a). Cudzyslowy w nazwie escapowane na wszelki
@@ -241,8 +285,16 @@ pub async fn join_meeting(
     // (launcher.html → v2 → light-meetings) i event 'navigation done' nigdy
     // nie przychodzi. Nasz polling click_when_present sam poczeka na DOM.
     emit_lifecycle(router, meeting_key, LIFECYCLE_NAVIGATING, None).await;
-    page.goto(url).await?;
-    tracing::info!(url = url, "Nawigacja do spotkania Teams rozpoczeta");
+    // Teams launcher.html z `msLaunch=true` potrafi nigdy nie odpalic eventu
+    // `load` (czeka na handler `msteams://`). CDP `Page.navigate` zwroci wtedy
+    // dopiero po 30s default timeoucie i propaguje blad. Polling DOM (ponizej)
+    // sam dosiegnie do prejoin/lobby/joined niezaleznie od tego czy load
+    // sie dokonczyl, wiec timeoutujemy nav agresywnie i jedziemy dalej.
+    match tokio::time::timeout(Duration::from_secs(8), page.goto(url)).await {
+        Ok(Ok(_)) => tracing::info!(url = url, "Nawigacja do spotkania Teams rozpoczeta"),
+        Ok(Err(e)) => tracing::warn!(url = url, "page.goto zwrocil blad (kontynuujemy z pollingiem DOM): {}", e),
+        Err(_) => tracing::warn!(url = url, "page.goto przekroczyl 8s (kontynuujemy z pollingiem DOM)"),
+    }
 
     // Czekamy na zaladowanie strony light-meetings
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -867,4 +919,80 @@ async fn spawn_console_forwarder(page: &Page) {
             tracing::warn!("Nie udalo sie uruchomic forwardera konsoli: {}", e);
         }
     }
+}
+
+/// Lokalizuje binarke Chromium/Chrome w zaleznosci od platformy. Sprawdza
+/// kolejno: env `TENTAFLOW_CHROMIUM_PATH` → typowe sciezki systemowe → PATH.
+/// Zwraca pierwszy istniejacy plik.
+///
+/// Linux (Docker i natywny): `/usr/bin/chromium`, `chromium-browser`, `google-chrome`.
+/// macOS: `/Applications/Google Chrome.app`, Brave, Edge.
+/// Windows: standardowe `Program Files` + PATH.
+pub fn find_chromium_executable() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    if let Ok(p) = std::env::var("TENTAFLOW_CHROMIUM_PATH") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    } else if cfg!(target_os = "windows") {
+        &[
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Chromium\Application\chrome.exe",
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+    } else {
+        // linux + reszta unixow
+        &[
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/snap/bin/chromium",
+            "/usr/bin/brave-browser",
+            "/usr/bin/microsoft-edge",
+        ]
+    };
+    for path in candidates {
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    // Fallback — szukaj w PATH (uzywa `which`/`where`)
+    let names: &[&str] = if cfg!(target_os = "windows") {
+        &["chrome.exe", "chromium.exe", "msedge.exe", "brave.exe"]
+    } else {
+        &["chromium", "chromium-browser", "google-chrome", "brave-browser"]
+    };
+    for name in names {
+        if let Some(found) = which_in_path(name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn which_in_path(name: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }

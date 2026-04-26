@@ -4412,6 +4412,44 @@ pub mod transcripts {
 
     /// Pełne wypełnienie sesji po udanym spawnie kontenera.
     #[allow(clippy::too_many_arguments)]
+    /// Wariant `update_session_spawned` dla bota natywnego (subprocess) — bez
+    /// portow VNC/noVNC bo nie ma zdalnego desktopu. `container_id` jest pusty
+    /// (nie ma kontenera), `container_name` zachowuje konwencje
+    /// `meeting-bot-<session_id>` zeby GUI mialo to samo do wyswietlenia.
+    pub fn update_session_spawned_native(
+        pool: &DbPool,
+        id: i64,
+        container_name: &str,
+        quic_port: u16,
+        bot_endpoint_id: &str,
+        bot_secret_key_hex: &str,
+        platform: &str,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET status = 'joining',
+                 container_id = '', container_name = ?2,
+                 quic_port = ?3, vnc_port = NULL, novnc_port = NULL,
+                 bot_endpoint_id = ?4, bot_secret_key_hex = ?5,
+                 platform = ?6, owner_user_id = COALESCE(owner_user_id, ?7),
+                 last_activity_at = datetime('now'),
+                 ended_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                container_name,
+                quic_port as i64,
+                bot_endpoint_id,
+                bot_secret_key_hex,
+                platform,
+                owner_user_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn update_session_spawned(
         pool: &DbPool,
         id: i64,

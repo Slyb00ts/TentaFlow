@@ -10,6 +10,7 @@
 
 pub mod container;
 pub mod manager;
+pub mod native;
 pub mod port_pool;
 
 pub use manager::{MeetingManager, SessionDescriptor, StartSessionRequest};
