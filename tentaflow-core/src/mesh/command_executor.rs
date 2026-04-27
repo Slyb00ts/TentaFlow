@@ -11,13 +11,33 @@ use tracing::{info, warn};
 use zeroize::Zeroize;
 
 use crate::mesh::security::MeshSecurity;
-use tentaflow_protocol::mesh::MeshCommandType;
+use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
 
 /// Odpowiedz na komende mesh — mapowana 1:1 na MeshMessage::MeshCommandResponse
 pub struct CommandResponse {
-    pub success: bool,
-    pub output: String,
+    pub ok: bool,
+    pub payload: MeshCommandResponsePayload,
     pub error: Option<String>,
+}
+
+impl CommandResponse {
+    /// Pomocniczy konstruktor sukcesu z dowolnym payloadem.
+    fn ok(payload: MeshCommandResponsePayload) -> Self {
+        Self {
+            ok: true,
+            payload,
+            error: None,
+        }
+    }
+
+    /// Pomocniczy konstruktor bledu — payload Empty + komunikat.
+    fn fail(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            payload: MeshCommandResponsePayload::Empty,
+            error: Some(error.into()),
+        }
+    }
 }
 
 /// Executor komend mesh — weryfikuje trust i wykonuje komendy od zdalnych nodow
@@ -37,11 +57,7 @@ impl MeshCommandExecutor {
                 from = %from_node_id,
                 "Odrzucono komende od niezaufanego noda"
             );
-            return CommandResponse {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Node {} nie jest zaufany", from_node_id)),
-            };
+            return CommandResponse::fail(format!("Node {} nie jest zaufany", from_node_id));
         }
 
         info!(
@@ -60,23 +76,17 @@ impl MeshCommandExecutor {
                     .await
             }
 
-            MeshCommandType::ListContainers => CommandResponse {
-                success: true,
-                output: "[]".to_string(),
-                error: None,
-            },
+            MeshCommandType::ListContainers => {
+                CommandResponse::ok(MeshCommandResponsePayload::ContainerList(Vec::new()))
+            }
 
-            MeshCommandType::ListImages => CommandResponse {
-                success: true,
-                output: "[]".to_string(),
-                error: None,
-            },
+            MeshCommandType::ListImages => {
+                CommandResponse::ok(MeshCommandResponsePayload::ImageList(Vec::new()))
+            }
 
-            MeshCommandType::AddService { .. } => CommandResponse {
-                success: true,
-                output: "Service registration queued".to_string(),
-                error: None,
-            },
+            MeshCommandType::AddService { .. } => CommandResponse::ok(
+                MeshCommandResponsePayload::Text("Service registration queued".to_string()),
+            ),
 
             MeshCommandType::NetworkConfig {
                 interface,
@@ -107,21 +117,11 @@ impl MeshCommandExecutor {
                 })
                 .await;
                 match result {
-                    Ok(Ok(output)) => CommandResponse {
-                        success: true,
-                        output,
-                        error: None,
-                    },
-                    Ok(Err(e)) => CommandResponse {
-                        success: false,
-                        output: String::new(),
-                        error: Some(e.to_string()),
-                    },
-                    Err(e) => CommandResponse {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Blad watku: {}", e)),
-                    },
+                    Ok(Ok(output)) => {
+                        CommandResponse::ok(MeshCommandResponsePayload::Text(output))
+                    }
+                    Ok(Err(e)) => CommandResponse::fail(e.to_string()),
+                    Err(e) => CommandResponse::fail(format!("Blad watku: {}", e)),
                 }
             }
 
@@ -133,11 +133,9 @@ impl MeshCommandExecutor {
             | MeshCommandType::ContainerRestart { .. }
             | MeshCommandType::ContainerRemove { .. }
             | MeshCommandType::ContainerLogs { .. }
-            | MeshCommandType::SystemPrune { .. } => CommandResponse {
-                success: false,
-                output: String::new(),
-                error: Some("Docker commands not yet implemented".to_string()),
-            },
+            | MeshCommandType::SystemPrune { .. } => {
+                CommandResponse::fail("Docker commands not yet implemented")
+            }
 
             MeshCommandType::BandwidthProbe {
                 target_ip,
@@ -165,11 +163,7 @@ impl MeshCommandExecutor {
                         let (tcp_port, tcp_handle) = match tcp_result {
                             Ok((port, handle)) => (port, Some(handle)),
                             Err(e) => {
-                                return CommandResponse {
-                                    success: false,
-                                    output: String::new(),
-                                    error: Some(format!("TCP server failed: {}", e)),
-                                };
+                                return CommandResponse::fail(format!("TCP server failed: {}", e));
                             }
                         };
 
@@ -211,15 +205,10 @@ impl MeshCommandExecutor {
                         }
 
                         // Zwroc OBA porty — klient sprobuje RDMA, jesli fail uzyje TCP
-                        CommandResponse {
-                            success: true,
-                            output: serde_json::json!({
-                                "port": tcp_port,
-                                "rdma_port": server_rdma_port,
-                            })
-                            .to_string(),
-                            error: None,
-                        }
+                        CommandResponse::ok(MeshCommandResponsePayload::BandwidthProbeServerStarted {
+                            tcp_port,
+                            rdma_port: server_rdma_port,
+                        })
                     }
                     "client" => {
                         // Probuj RDMA jesli serwer zwrocil rdma_port > 0
@@ -240,19 +229,16 @@ impl MeshCommandExecutor {
                                 .await
                                 {
                                     Ok(result) => {
-                                        return CommandResponse {
-                                            success: true,
-                                            output: serde_json::json!({
-                                                "bandwidth_mbps": result.bandwidth_mbps,
-                                                "bytes_transferred": result.bytes_transferred,
-                                                "duration_ms": result.duration_ms,
-                                                "latency_us": result.latency_us,
-                                                "streams_completed": 1,
-                                                "rdma": true,
-                                            })
-                                            .to_string(),
-                                            error: None,
-                                        };
+                                        return CommandResponse::ok(
+                                            MeshCommandResponsePayload::BandwidthProbeClientResult {
+                                                bandwidth_mbps: result.bandwidth_mbps,
+                                                bytes_transferred: result.bytes_transferred,
+                                                duration_ms: result.duration_ms,
+                                                latency_us: result.latency_us,
+                                                streams_completed: 1,
+                                                rdma: true,
+                                            },
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::warn!("RDMA client failed, fallback TCP: {}", e);
@@ -272,41 +258,36 @@ impl MeshCommandExecutor {
                         )
                         .await
                         {
-                            Ok(result) => {
-                                let output = serde_json::json!({
-                                    "bandwidth_mbps": result.bandwidth_mbps,
-                                    "bytes_transferred": result.bytes_transferred,
-                                    "duration_ms": result.duration_ms,
-                                    "latency_us": result.latency_us,
-                                    "streams_completed": result.streams_completed,
-                                })
-                                .to_string();
-                                CommandResponse {
-                                    success: true,
-                                    output,
-                                    error: None,
-                                }
-                            }
-                            Err(e) => CommandResponse {
-                                success: false,
-                                output: String::new(),
-                                error: Some(e.to_string()),
-                            },
+                            Ok(result) => CommandResponse::ok(
+                                MeshCommandResponsePayload::BandwidthProbeClientResult {
+                                    bandwidth_mbps: result.bandwidth_mbps,
+                                    bytes_transferred: result.bytes_transferred,
+                                    duration_ms: result.duration_ms,
+                                    latency_us: result.latency_us,
+                                    streams_completed: result.streams_completed,
+                                    rdma: false,
+                                },
+                            ),
+                            Err(e) => CommandResponse::fail(e.to_string()),
                         }
                     }
-                    _ => CommandResponse {
-                        success: false,
-                        output: String::new(),
-                        error: Some("Nieznany tryb probing".to_string()),
-                    },
+                    _ => CommandResponse::fail("Nieznany tryb probing"),
                 }
             }
 
-            MeshCommandType::BandwidthProbeCancel => CommandResponse {
-                success: true,
-                output: String::new(),
-                error: None,
-            },
+            MeshCommandType::BandwidthProbeCancel => {
+                CommandResponse::ok(MeshCommandResponsePayload::Empty)
+            }
+
+            // PR2 (typed protocol) — adaptery Nsight zostana podpiete w PR3.
+            // Egzekutor odrzuca komendy do czasu wlaczenia handlerow profilera.
+            MeshCommandType::NsightStart(_)
+            | MeshCommandType::NsightStop(_)
+            | MeshCommandType::NsightSessions(_)
+            | MeshCommandType::NsightReport(_)
+            | MeshCommandType::NsightDelete(_) => {
+                CommandResponse::fail("Nsight commands not yet wired (PR3)")
+            }
         }
     }
 
@@ -323,34 +304,21 @@ impl MeshCommandExecutor {
                 let key_path = dir.join("key.pem");
 
                 if let Err(e) = tokio::fs::write(&cert_path, cert_pem).await {
-                    return CommandResponse {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Blad zapisu cert.pem: {}", e)),
-                    };
+                    return CommandResponse::fail(format!("Blad zapisu cert.pem: {}", e));
                 }
 
                 if let Err(e) = tokio::fs::write(&key_path, key_pem).await {
-                    return CommandResponse {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Blad zapisu key.pem: {}", e)),
-                    };
+                    return CommandResponse::fail(format!("Blad zapisu key.pem: {}", e));
                 }
 
                 info!(dir = %dir.display(), "Certyfikaty zapisane");
 
-                CommandResponse {
-                    success: true,
-                    output: format!("Certyfikaty zapisane w {}", dir.display()),
-                    error: None,
-                }
+                CommandResponse::ok(MeshCommandResponsePayload::Text(format!(
+                    "Certyfikaty zapisane w {}",
+                    dir.display()
+                )))
             }
-            Err(msg) => CommandResponse {
-                success: false,
-                output: String::new(),
-                error: Some(msg),
-            },
+            Err(msg) => CommandResponse::fail(msg),
         }
     }
 

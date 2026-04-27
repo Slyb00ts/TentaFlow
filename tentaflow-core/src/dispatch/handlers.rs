@@ -2818,6 +2818,8 @@ fn store_peer_to_proto(
                 })
                 .collect(),
         }),
+        nsys_available: false,
+        nsys_version: String::new(),
     }
 }
 
@@ -2925,6 +2927,8 @@ pub fn mesh_node_list(
             route: None,
             platform: String::new(),
             connection: None,
+            nsys_available: false,
+            nsys_version: String::new(),
         });
     }
 

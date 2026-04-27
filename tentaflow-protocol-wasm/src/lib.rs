@@ -2032,24 +2032,26 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "ClusterUpdateResponse".into());
             set(&obj, "ok", resp.ok.into());
         }
-        MessageBody::MeshTrustRevoked(evt) => {
-            set(&obj, "variant", "MeshTrustRevoked".into());
-            set(
-                &obj,
-                "revokedNodeId",
-                js_sys::Uint8Array::from(&evt.revoked_node_id[..]).into(),
-            );
-            set(&obj, "reason", evt.reason.into());
-            set(&obj, "revokedAtEpoch", evt.revoked_at_epoch.into());
-        }
-        MessageBody::MeshTrustedKeysSync(evt) => {
-            set(&obj, "variant", "MeshTrustedKeysSync".into());
-            let arr = js_sys::Array::new();
-            for k in evt.trusted_keys {
-                arr.push(&js_sys::Uint8Array::from(&k[..]).into());
+        MessageBody::MeshTrustEventBody(payload) => match payload {
+            tentaflow_protocol::MeshTrustEventPayload::Revoked(evt) => {
+                set(&obj, "variant", "MeshTrustRevoked".into());
+                set(
+                    &obj,
+                    "revokedNodeId",
+                    js_sys::Uint8Array::from(&evt.revoked_node_id[..]).into(),
+                );
+                set(&obj, "reason", evt.reason.into());
+                set(&obj, "revokedAtEpoch", evt.revoked_at_epoch.into());
             }
-            set(&obj, "trustedKeys", arr.into());
-            set(&obj, "epoch", (evt.epoch as u32).into());
+            tentaflow_protocol::MeshTrustEventPayload::KeysSync(evt) => {
+                set(&obj, "variant", "MeshTrustedKeysSync".into());
+                let arr = js_sys::Array::new();
+                for k in evt.trusted_keys {
+                    arr.push(&js_sys::Uint8Array::from(&k[..]).into());
+                }
+                set(&obj, "trustedKeys", arr.into());
+                set(&obj, "epoch", (evt.epoch as u32).into());
+            }
         }
         MessageBody::SubscribeResumeRequest { resume_token } => {
             set(&obj, "variant", "SubscribeResumeRequest".into());
@@ -4160,6 +4162,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&obj, "bind_addr_actual", info.bind_addr_actual.clone().into());
                 }
             }
+        }
+        MessageBody::NsightBody(_) => {
+            // Nsight encode/decode w GUI dolaczy w PR4 — ten arm tylko sygnalizuje
+            // wariant bez wyciagania pol, zeby wasm-bindgen nie krzyczal o
+            // non-exhaustive match.
+            set(&obj, "variant", "NsightBody".into());
         }
     }
     Ok(obj.into())

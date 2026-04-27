@@ -136,6 +136,7 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
                         temperature_c: 0,
                         power_draw_w: None,
                         power_limit_w: None,
+                        vendor: crate::mesh::peer_store::GpuVendor::Other,
                     }
                 })
                 .collect()
