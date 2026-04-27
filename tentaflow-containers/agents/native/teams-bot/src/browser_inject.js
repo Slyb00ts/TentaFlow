@@ -3773,6 +3773,10 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
           joinedEmitted = true;
           emit('joined');
         }
+        // Snapshot rosteru: zamiast diff per-tile emit'ujemy całą aktualną
+        // listę jednym eventem. Native dom_observer porównuje z poprzednim
+        // stanem znanym lokalnie, a router robi tylko broadcast — koszt
+        // sieciowy = 1 RT zamiast N.
         const tiles = document.querySelectorAll('[data-tid][data-stream-type]');
         const current = new Map();
         for (const tile of tiles) {
@@ -3780,17 +3784,22 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
           if (!tid) continue;
           current.set(tid, tileDisplayName(tile));
         }
-        for (const [tid, name] of current) {
-          if (!knownTiles.has(tid)) {
-            emit('participant_joined', { id: tid, name: name });
+        // Skip jeśli stan rosteru się nie zmienił od poprzedniego scan'u —
+        // unikamy zalewania routera identycznymi snapshotami przy idle Teams.
+        let changed = current.size !== knownTiles.size;
+        if (!changed) {
+          for (const [tid, name] of current) {
+            if (knownTiles.get(tid) !== name) { changed = true; break; }
           }
         }
-        for (const [tid, name] of knownTiles) {
-          if (!current.has(tid)) {
-            emit('participant_left', { id: tid, name: name });
+        if (changed) {
+          const entries = [];
+          for (const [tid, name] of current) {
+            entries.push({ id: tid, name: name });
           }
+          emit('roster_snapshot', { entries: entries });
+          knownTiles = current;
         }
-        knownTiles = current;
 
         const sp = detectActiveSpeaker();
         const key = sp ? (sp.id || sp.name || '') : '';

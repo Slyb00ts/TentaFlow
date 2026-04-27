@@ -116,7 +116,9 @@ async fn play_test_tone(
 /// Announces the bot itself as a meeting participant. The DOM observer
 /// (`dom_observer`) intentionally filters the bot row out, so without this
 /// the GUI roster stays empty until a remote participant is detected.
-/// Emitted once per join, right after `LIFECYCLE_JOINED`.
+/// Emitted once per join, right after `LIFECYCLE_JOINED`. Wysyła
+/// `RosterSnapshot` zawierający tylko bota — pierwszy DOM scan dom_observera
+/// (z bot'em wstrzykniętym przez queue_roster_snapshot) zaraz to nadpisze.
 async fn send_bot_participant_joined(
     router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
     meeting_id: &str,
@@ -138,16 +140,18 @@ async fn send_bot_participant_joined(
         .send_meeting_event(
             meeting_id,
             ts,
-            MeetingEventPayload::ParticipantUpdate {
-                speaker_id: bot_name.to_string(),
-                speaker_name: Some(bot_name.to_string()),
-                status: "joined".to_string(),
-                last_spoken_ago_sec: None,
+            MeetingEventPayload::RosterSnapshot {
+                entries: vec![tentaflow_protocol::RosterEntry {
+                    speaker_id: bot_name.to_string(),
+                    speaker_name: Some(bot_name.to_string()),
+                    status: "joined".to_string(),
+                    last_spoken_ago_sec: None,
+                }],
             },
         )
         .await
     {
-        tracing::warn!("send_meeting_event ParticipantUpdate(bot) failed: {}", e);
+        tracing::warn!("send_meeting_event RosterSnapshot(bot) failed: {}", e);
     }
 }
 

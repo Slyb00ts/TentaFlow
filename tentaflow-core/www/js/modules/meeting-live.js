@@ -306,19 +306,28 @@ function applyLiveEvent(timestampMs, type, data) {
       }
       break;
     }
-    case 'ParticipantUpdate': {
-      const id = String(data.speakerId || '');
-      if (!id) break;
-      const prev = state.participants.get(id) || {};
-      state.participants.set(id, {
-        speakerId: id,
-        speakerName: data.speakerName || prev.speakerName || id,
-        isEnrolled: prev.isEnrolled || false,
-        status: String(data.status || prev.status || 'joined'),
-        lastSpokenAt: data.lastSpokenAgoSec != null
-          ? timestampMs - Number(data.lastSpokenAgoSec) * 1000
-          : prev.lastSpokenAt || 0,
-      });
+    case 'RosterSnapshot': {
+      // Snapshot zastępuje cały roster — bot wysyła go raz na DOM scan.
+      // Brak entry = brak uczestnika (a nie "wyszedł" jako osobny event).
+      // Zachowujemy `isEnrolled` z poprzedniego stanu, bo to pole
+      // wzbogacane jest przez TranscriptEntry, nie przez snapshot.
+      const entries = Array.isArray(data.entries) ? data.entries : [];
+      const next = new Map();
+      for (const entry of entries) {
+        const id = String(entry.speakerId || '');
+        if (!id) continue;
+        const prev = state.participants.get(id) || {};
+        next.set(id, {
+          speakerId: id,
+          speakerName: entry.speakerName || prev.speakerName || id,
+          isEnrolled: prev.isEnrolled || false,
+          status: String(entry.status || 'joined'),
+          lastSpokenAt: entry.lastSpokenAgoSec != null
+            ? timestampMs - Number(entry.lastSpokenAgoSec) * 1000
+            : prev.lastSpokenAt || 0,
+        });
+      }
+      state.participants = next;
       break;
     }
     case 'SummaryUpdate': {
