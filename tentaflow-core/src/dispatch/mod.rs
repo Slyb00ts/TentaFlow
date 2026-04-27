@@ -475,6 +475,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MeetingPayload::ResTranscriptExport(_) => {
                 "MeetingTranscriptExportResponse"
             }
+            tentaflow_protocol::MeetingPayload::ReqWakeWord(_) => "MeetingWakeWordRequest",
+            tentaflow_protocol::MeetingPayload::ResWakeWord(_) => "MeetingWakeWordResponse",
         },
         MessageBody::VncTunnelBody(p) => match p {
             tentaflow_protocol::VncTunnelPayload::ReqOpen(_) => "VncTunnelOpenRequest",
