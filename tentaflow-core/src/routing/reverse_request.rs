@@ -197,6 +197,9 @@ pub async fn dispatch_reverse_request(
                 if let (AudioOperation::STT { audio_data, .. }, Some(ref mid), Some(pool)) =
                     (&audio_payload.operation, &meeting_id, router.db.clone())
                 {
+                    // audio_data jest Vec<u8> z deserializacji rkyv. Tu jest jedyny
+                    // klon do diarization — fork odpala sie rownolegle ze STT
+                    // (oba widza ten sam buffer; spawn_blocking przejmuje wlasnosc).
                     let audio_clone = audio_data.clone();
                     let mid_clone = mid.clone();
                     Some(tokio::task::spawn_blocking(move || {

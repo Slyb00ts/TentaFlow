@@ -650,7 +650,7 @@ impl BackendClient {
         );
 
         // Utworz multipart/form-data request
-        let file_part = reqwest::multipart::Part::bytes(request.file)
+        let file_part = reqwest::multipart::Part::bytes(request.file.as_ref().to_vec())
             .file_name(request.filename.clone())
             .mime_str("audio/mpeg")
             .map_err(|e| CoreError::InternalError {

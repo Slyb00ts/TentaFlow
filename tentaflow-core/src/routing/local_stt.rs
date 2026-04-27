@@ -45,7 +45,7 @@ impl LocalSttHandler {
         // Zbuduj TranscribeParams z TranscriptionRequest.
         // Domyslny jezyk: polski (jesli request.language nie jest ustawiony)
         let params = TranscribeParams {
-            audio_data: request.file.clone(),
+            audio_data: std::sync::Arc::clone(&request.file),
             language: request.language.clone().or_else(|| Some("pl".to_string())),
             translate: false,
             word_timestamps: request
