@@ -2690,7 +2690,7 @@ fn all_gpus_to_proto(gpus: &[StoreGpu]) -> Vec<tentaflow_protocol::MeshNodeGpuIn
         .collect()
 }
 
-fn store_peer_to_proto(
+async fn store_peer_to_proto(
     p: &StorePeerInfo,
     local_node_id: &str,
     is_trusted: bool,
@@ -2797,7 +2797,7 @@ fn store_peer_to_proto(
     // tick heartbeatu). Dla peerow czytamy ostatni snapshot z peer_store —
     // jest aktualizowany przy kazdym odebranym heartbeacie.
     let (nsys_available, nsys_version) = if is_local {
-        let cap = crate::profiling::detect_capability_sync();
+        let cap = crate::profiling::detect_capability().await;
         (cap.available, cap.version)
     } else {
         (p.nsys_available, p.nsys_version.clone())
@@ -2859,7 +2859,7 @@ fn is_loopback_or_local_dup(p: &StorePeerInfo, local_node_id: &str) -> bool {
 #[handler(variant = "MeshNodeListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn mesh_node_list(
+pub async fn mesh_node_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -2876,37 +2876,39 @@ pub fn mesh_node_list(
     let trusted_ids: std::collections::HashSet<String> =
         trusted_db.iter().map(|t| t.node_id.clone()).collect();
 
-    let mut nodes: Vec<tentaflow_protocol::MeshNodeInfo> = peers
+    let mut nodes: Vec<tentaflow_protocol::MeshNodeInfo> = Vec::new();
+    for p in peers
         .iter()
         .filter(|p| p.node_id == local_node_id || !is_loopback_or_local_dup(p, local_node_id))
-        .map(|p| {
-            let is_local = p.node_id == local_node_id;
-            let is_trusted = is_local
-                || trusted_ids.contains(&p.node_id)
-                || ctx
-                    .state
-                    .mesh_security
-                    .as_ref()
-                    .map_or(false, |s| s.is_trusted(&p.node_id));
-            let route = if is_local {
-                Some(tentaflow_protocol::MeshNodeRoute {
-                    hops: 0,
-                    direct: true,
-                    next_hop: None,
+    {
+        let is_local = p.node_id == local_node_id;
+        let is_trusted = is_local
+            || trusted_ids.contains(&p.node_id)
+            || ctx
+                .state
+                .mesh_security
+                .as_ref()
+                .map_or(false, |s| s.is_trusted(&p.node_id));
+        let route = if is_local {
+            Some(tentaflow_protocol::MeshNodeRoute {
+                hops: 0,
+                direct: true,
+                next_hop: None,
+            })
+        } else {
+            store
+                .get_route(&p.node_id)
+                .map(|r| tentaflow_protocol::MeshNodeRoute {
+                    hops: r.hops as u32,
+                    direct: r.direct,
+                    next_hop: if r.direct {
+                        None
+                    } else {
+                        Some(r.next_hop.clone())
+                    },
                 })
-            } else {
-                store
-                    .get_route(&p.node_id)
-                    .map(|r| tentaflow_protocol::MeshNodeRoute {
-                        hops: r.hops as u32,
-                        direct: r.direct,
-                        next_hop: if r.direct {
-                            None
-                        } else {
-                            Some(r.next_hop.clone())
-                        },
-                    })
-            };
+        };
+        nodes.push(
             store_peer_to_proto(
                 p,
                 local_node_id,
@@ -2914,8 +2916,9 @@ pub fn mesh_node_list(
                 route,
                 connection_map.get(&p.node_id).cloned(),
             )
-        })
-        .collect();
+            .await,
+        );
+    }
 
     let peer_ids: std::collections::HashSet<String> =
         peers.iter().map(|p| p.node_id.clone()).collect();
@@ -2963,7 +2966,7 @@ pub fn mesh_node_list(
 #[handler(variant = "MeshNodeDetailRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn mesh_node_detail(
+pub async fn mesh_node_detail(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
@@ -3014,7 +3017,7 @@ pub fn mesh_node_detail(
         .quic_mesh
         .as_ref()
         .and_then(|qm| qm.connection_snapshot(&payload.node_id));
-    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection);
+    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection).await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
     ))

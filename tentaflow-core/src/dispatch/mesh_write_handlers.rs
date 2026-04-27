@@ -1,10 +1,8 @@
 // =============================================================================
 // Plik: dispatch/mesh_write_handlers.rs
-// Opis: Async handlery operacji zapisu mesh (FAZA 1b): pairing/trust/connect/
-//       command/network-config. Wszystkie sa NATYWNIE async — bez block_on
-//       ani tokio::Handle::current. Reuzywaja domenowe helpery z
-//       api/dashboard/api_mesh.rs (te same co REST wczesniej wolal), ale
-//       mapuja rezultat (u16, json) na MessageBody variants.
+// Opis: Async handlery operacji zapisu mesh: pairing/trust/connect/command/
+//       network-config oraz Nsight profiling dispatch. Reuzywaja domenowe
+//       helpery z api/dashboard/api_mesh.rs i mapuja rezultaty na MessageBody.
 // =============================================================================
 
 use std::net::{IpAddr, SocketAddr};
@@ -567,22 +565,24 @@ pub async fn mesh_node_network_config(
 // 9. NsightBody — start/stop/sessions/report/delete sesji profilowania.
 // =============================================================================
 
-/// Mapuje `ProfilingError` na `ProtocolError`. NotAvailable/Busy → Internal,
-/// brak rozroznienia bo `ProtocolErrorCode` nie ma `Conflict`/`ServiceUnavailable`.
-/// Tresc komunikatu jest jednoznaczna, GUI moze rozpoznac po prefiksie.
+/// Mapuje `ProfilingError` na `ProtocolError` z deterministycznymi kodami,
+/// zeby GUI moglo rozroznic stany bez parsowania komunikatow.
 fn profiling_err_to_proto(e: crate::profiling::ProfilingError) -> ProtocolError {
     use crate::profiling::ProfilingError as PE;
     match e {
         PE::NotAvailable => ProtocolError::new(
-            ProtocolErrorCode::Internal,
+            ProtocolErrorCode::NotAvailable,
             "nsys not available on this node",
         ),
         PE::Busy => ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            "another profiling session is already running",
+            ProtocolErrorCode::Conflict,
+            "profiling already in progress",
         ),
         PE::NotFound(s) => ProtocolError::not_found(format!("session not found: {}", s)),
         PE::InvalidSessionId => ProtocolError::bad_request("invalid session id format"),
+        PE::InvalidLabel(reason) => {
+            ProtocolError::bad_request(format!("invalid label: {}", reason))
+        }
         PE::InvalidDuration(d) => {
             ProtocolError::bad_request(format!("invalid duration: {}s", d))
         }
@@ -663,10 +663,30 @@ async fn handle_nsight_local(
     match payload {
         NsightPayload::StartRequest(req) => {
             let storage = local_profile_storage(ctx);
+            let scope_str = format!("{:?}", req.scope);
+            let label_for_audit = req.label.clone();
+            let duration_for_audit = req.duration_secs;
             let (session_id, started_at_ms) = NSYS_RUNNER
                 .start(req.scope, req.duration_secs, req.label, &storage)
                 .await
                 .map_err(profiling_err_to_proto)?;
+            let details = serde_json::json!({
+                "session_id": session_id,
+                "scope": scope_str,
+                "label": label_for_audit,
+                "duration_secs": duration_for_audit,
+            })
+            .to_string();
+            let _ = repository::log_audit(
+                &ctx.state.db,
+                None,
+                None,
+                "nsight.start",
+                Some(&format!("session:{}", session_id)),
+                Some(&details),
+                None,
+                Some(ctx.state.local_node_id.as_ref()),
+            );
             Ok(NsightPayload::StartResponse(NsightStartResponse {
                 session_id,
                 started_at_ms,
@@ -678,6 +698,16 @@ async fn handle_nsight_local(
                 .stop(&req.session_id, &storage)
                 .await
                 .map_err(profiling_err_to_proto)?;
+            let _ = repository::log_audit(
+                &ctx.state.db,
+                None,
+                None,
+                "nsight.stop",
+                Some(&format!("session:{}", req.session_id)),
+                Some(&format!("{:?}", status)),
+                None,
+                Some(ctx.state.local_node_id.as_ref()),
+            );
             Ok(NsightPayload::StopResponse(NsightStopResponse {
                 session_id: req.session_id,
                 status,
@@ -710,8 +740,6 @@ async fn handle_nsight_local(
         }
         NsightPayload::DownloadRequest(req) => {
             let storage = local_profile_storage(ctx);
-            // Walidacja session_id idzie przez raw_report_path -> session_dir;
-            // chroni przed path-traversal (regex ^[0-9a-f]{32}$).
             let path = storage
                 .raw_report_path(&req.session_id)
                 .map_err(profiling_err_to_proto)?;
@@ -854,8 +882,7 @@ mod nsight_tests {
     }
 
     /// `req.node_id` ustawiony na lokalny node musi isc lokalna sciezka. Bez nsys
-    /// w PATH dostaniemy `Internal("nsys not available")` z `profiling_err_to_proto`.
-    /// Test passuje gdy widzimy ten konkretny komunikat (a nie np. crash forwardera).
+    /// w PATH dostaniemy `NotAvailable` z `profiling_err_to_proto`.
     #[tokio::test]
     async fn nsight_start_local_node_routes_locally() {
         let ctx = admin_ctx();
@@ -867,8 +894,8 @@ mod nsight_tests {
             label: "test".into(),
         }));
         let res = nsight_dispatch(&body, &ctx).await;
-        // Bez nsys w PATH dostajemy NotAvailable → Internal. Wazne ze nie poszlo
-        // do mesh forwardera (bo `quic_mesh = None` dalby inny komunikat).
+        // Bez nsys w PATH dostajemy NotAvailable. Wazne ze nie poszlo do mesh
+        // forwardera (bo `quic_mesh = None` dalby inny komunikat o mesh managerze).
         match res {
             Err(e) => assert!(
                 e.message.contains("nsys not available")
