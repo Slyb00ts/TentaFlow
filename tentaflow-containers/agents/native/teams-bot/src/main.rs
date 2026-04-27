@@ -5,6 +5,7 @@
 // =============================================================================
 
 mod audio;
+mod audio_ring;
 mod browser;
 mod config;
 mod dom_observer;
@@ -658,8 +659,8 @@ async fn main() -> Result<()> {
     // Ring buffer pre-padding — zawsze trzymamy ostatnie 250ms audio zeby
     // dolaczyc je gdy VAD wykryje poczatek mowy. Dzieki temu Whisper dostaje
     // troche kontekstu przed pierwszym slowem.
-    let mut prepad_buffer: std::collections::VecDeque<i16> =
-        std::collections::VecDeque::with_capacity(PREPAD_SAMPLES);
+    let mut prepad_buffer: crate::audio_ring::PrepadRing<PREPAD_SAMPLES> =
+        crate::audio_ring::PrepadRing::new();
 
     // Licznik ciszy po mowie — zbiera POSTPAD_SAMPLES ciszy zeby wyslac
     // segment z zakonczeniem slow.
@@ -707,12 +708,7 @@ async fn main() -> Result<()> {
                 let vad_result = vad_detector.process_chunk(&chunk);
 
                 // Aktualizuj ring buffer pre-pad niezaleznie od VAD
-                for &s in chunk.iter() {
-                    if prepad_buffer.len() >= PREPAD_SAMPLES {
-                        prepad_buffer.pop_front();
-                    }
-                    prepad_buffer.push_back(s);
-                }
+                prepad_buffer.extend_from_slice(&chunk);
 
                 tracing::debug!(
                     chunk = chunk_count,
@@ -729,7 +725,7 @@ async fn main() -> Result<()> {
                     VadResult::Speech => {
                         // Poczatek mowy po ciszy — dolacz pre-pad
                         if speech_buffer.is_empty() {
-                            speech_buffer.extend(prepad_buffer.iter().copied());
+                            prepad_buffer.drain_into(&mut speech_buffer);
                         }
                         speech_buffer.extend_from_slice(&chunk);
                         collecting_silence_tail = false;
