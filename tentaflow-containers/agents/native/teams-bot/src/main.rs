@@ -248,9 +248,24 @@ async fn gate_and_respond(
     let mode = config.response_mode.as_str();
     let allow = match mode {
         "always" => true,
-        "wake_word" => matches_wake_word(text, &config.wake_words),
+        "wake_word" => {
+            let m = matches_wake_word(text, &config.wake_words);
+            if !m {
+                tracing::info!(
+                    mode = %mode,
+                    wake_words = %config.wake_words,
+                    "skip LLM — brak wake_word w tekscie"
+                );
+            }
+            m
+        }
         "wake_word_intent" => {
             if !matches_wake_word(text, &config.wake_words) {
+                tracing::info!(
+                    mode = %mode,
+                    wake_words = %config.wake_words,
+                    "skip LLM — brak wake_word w tekscie"
+                );
                 false
             } else {
                 tracing::info!(
