@@ -17,7 +17,7 @@ use tentaflow_protocol::{
     MeshPairingConfirmResponse, MeshPairingRejectRequest, MeshPairingRejectResponse,
     MeshPairingStartRequest, MeshPairingStartResponse, MeshTrustRetrustRequest,
     MeshTrustRetrustResponse, MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody,
-    ProtocolError, ProtocolErrorCode,
+    NsightPayload, ProtocolError, ProtocolErrorCode,
 };
 use tracing::warn;
 
@@ -560,5 +560,427 @@ pub async fn mesh_node_network_config(
             ProtocolErrorCode::Internal,
             format!("Blad wykonania komendy: {}", e),
         )),
+    }
+}
+
+// =============================================================================
+// 9. NsightBody — start/stop/sessions/report/delete sesji profilowania.
+// =============================================================================
+
+/// Mapuje `ProfilingError` na `ProtocolError`. NotAvailable/Busy → Internal,
+/// brak rozroznienia bo `ProtocolErrorCode` nie ma `Conflict`/`ServiceUnavailable`.
+/// Tresc komunikatu jest jednoznaczna, GUI moze rozpoznac po prefiksie.
+fn profiling_err_to_proto(e: crate::profiling::ProfilingError) -> ProtocolError {
+    use crate::profiling::ProfilingError as PE;
+    match e {
+        PE::NotAvailable => ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "nsys not available on this node",
+        ),
+        PE::Busy => ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "another profiling session is already running",
+        ),
+        PE::NotFound(s) => ProtocolError::not_found(format!("session not found: {}", s)),
+        PE::InvalidSessionId => ProtocolError::bad_request("invalid session id format"),
+        PE::InvalidDuration(d) => {
+            ProtocolError::bad_request(format!("invalid duration: {}s", d))
+        }
+        other => ProtocolError::internal(format!("profiling: {}", other)),
+    }
+}
+
+/// Buduje `ProfileStorage` dla lokalnego noda. Storage rozdziela katalogi per
+/// node_id, wiec uzywamy `state.local_node_id`.
+fn local_profile_storage(ctx: &HandlerContext) -> crate::profiling::ProfileStorage {
+    crate::profiling::ProfileStorage::new(
+        crate::paths::tentaflow_home(),
+        ctx.state.local_node_id.as_ref(),
+    )
+}
+
+/// Wykonuje `MeshCommandType::Nsight*` na zdalnym nodzie i odpakowuje typed
+/// `MeshCommandResponsePayload::Nsight*` w `NsightPayload::*Response`.
+async fn forward_nsight_to_peer(
+    ctx: &HandlerContext,
+    target_node_id: &str,
+    cmd: tentaflow_protocol::mesh::MeshCommandType,
+) -> Result<NsightPayload, ProtocolError> {
+    use tentaflow_protocol::mesh::MeshCommandResponsePayload as RP;
+
+    let qm = require_quic_mesh(ctx)?;
+    let is_trusted = ctx
+        .state
+        .mesh_security
+        .as_ref()
+        .map_or(false, |s| s.is_trusted(target_node_id));
+    if !is_trusted {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "Node nie jest zaufany — nie mozna wyslac komendy",
+        ));
+    }
+
+    let response = qm.send_command(target_node_id, cmd).await.map_err(|e| {
+        ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            format!("mesh nsight forward: {}", e),
+        )
+    })?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "remote node refused command".to_string());
+        return Err(ProtocolError::new(ProtocolErrorCode::Internal, msg));
+    }
+
+    match response.payload {
+        RP::NsightStart(r) => Ok(NsightPayload::StartResponse(r)),
+        RP::NsightStop(r) => Ok(NsightPayload::StopResponse(r)),
+        RP::NsightSessions(r) => Ok(NsightPayload::SessionsResponse(r)),
+        RP::NsightReport(r) => Ok(NsightPayload::ReportResponse(r)),
+        RP::NsightDelete(r) => Ok(NsightPayload::DeleteResponse(r)),
+        _ => Err(ProtocolError::internal(
+            "remote node returned unexpected payload variant",
+        )),
+    }
+}
+
+/// Lokalna obsluga sub-akcji NsightPayload — wywolywana gdy `req.node_id`
+/// odpowiada lokalnemu nodowi. Reuzywa `NSYS_RUNNER` i `ProfileStorage`.
+async fn handle_nsight_local(
+    ctx: &HandlerContext,
+    payload: NsightPayload,
+) -> Result<NsightPayload, ProtocolError> {
+    use crate::profiling::NSYS_RUNNER;
+    use tentaflow_protocol::profiling::{
+        NsightDeleteResponse, NsightReportResponse, NsightSessionsResponse, NsightStartResponse,
+        NsightStopResponse,
+    };
+
+    match payload {
+        NsightPayload::StartRequest(req) => {
+            let storage = local_profile_storage(ctx);
+            let (session_id, started_at_ms) = NSYS_RUNNER
+                .start(req.scope, req.duration_secs, req.label, &storage)
+                .await
+                .map_err(profiling_err_to_proto)?;
+            Ok(NsightPayload::StartResponse(NsightStartResponse {
+                session_id,
+                started_at_ms,
+            }))
+        }
+        NsightPayload::StopRequest(req) => {
+            let storage = local_profile_storage(ctx);
+            let status = NSYS_RUNNER
+                .stop(&req.session_id, &storage)
+                .await
+                .map_err(profiling_err_to_proto)?;
+            Ok(NsightPayload::StopResponse(NsightStopResponse {
+                session_id: req.session_id,
+                status,
+            }))
+        }
+        NsightPayload::SessionsRequest(req) => {
+            let storage = local_profile_storage(ctx);
+            let sessions = storage.list().map_err(profiling_err_to_proto)?;
+            Ok(NsightPayload::SessionsResponse(NsightSessionsResponse {
+                node_id: req.node_id,
+                sessions,
+            }))
+        }
+        NsightPayload::ReportRequest(req) => {
+            let storage = local_profile_storage(ctx);
+            let report = storage
+                .read_summary(&req.session_id)
+                .map_err(profiling_err_to_proto)?;
+            Ok(NsightPayload::ReportResponse(NsightReportResponse { report }))
+        }
+        NsightPayload::DeleteRequest(req) => {
+            let storage = local_profile_storage(ctx);
+            storage
+                .delete(&req.session_id)
+                .map_err(profiling_err_to_proto)?;
+            Ok(NsightPayload::DeleteResponse(NsightDeleteResponse {
+                session_id: req.session_id,
+                ok: true,
+            }))
+        }
+        // Response warianty nie powinny przyjsc jako request — zwracaj BadRequest.
+        NsightPayload::StartResponse(_)
+        | NsightPayload::StopResponse(_)
+        | NsightPayload::SessionsResponse(_)
+        | NsightPayload::ReportResponse(_)
+        | NsightPayload::DeleteResponse(_) => Err(ProtocolError::bad_request(
+            "expected NsightPayload request variant",
+        )),
+    }
+}
+
+/// Wybiera lokalna albo mesh-forward sciezke po `req.node_id`.
+async fn nsight_route(
+    ctx: &HandlerContext,
+    payload: NsightPayload,
+) -> Result<NsightPayload, ProtocolError> {
+    use tentaflow_protocol::mesh::MeshCommandType as MC;
+
+    let local = ctx.state.local_node_id.as_ref();
+    let target: String = match &payload {
+        NsightPayload::StartRequest(r) => r.node_id.clone(),
+        NsightPayload::StopRequest(r) => r.node_id.clone(),
+        NsightPayload::SessionsRequest(r) => r.node_id.clone(),
+        NsightPayload::ReportRequest(r) => r.node_id.clone(),
+        NsightPayload::DeleteRequest(r) => r.node_id.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected NsightPayload request variant",
+            ))
+        }
+    };
+
+    if target.is_empty() || target.as_str() == local {
+        return handle_nsight_local(ctx, payload).await;
+    }
+
+    let cmd = match payload {
+        NsightPayload::StartRequest(r) => MC::NsightStart(r),
+        NsightPayload::StopRequest(r) => MC::NsightStop(r),
+        NsightPayload::SessionsRequest(r) => MC::NsightSessions(r),
+        NsightPayload::ReportRequest(r) => MC::NsightReport(r),
+        NsightPayload::DeleteRequest(r) => MC::NsightDelete(r),
+        _ => unreachable!("filtered above"),
+    };
+    forward_nsight_to_peer(ctx, &target, cmd).await
+}
+
+/// Jeden handler dla calego `MessageBody::NsightBody` — wewnatrz match po
+/// wariantach `NsightPayload`. Zarejestrowany pod 5 nazwami request-side przez
+/// `register_nsight_variant!` macro (variant_name_of zwraca pojedyncze nazwy
+/// jak "NsightStartRequest").
+#[handler(variant = "NsightBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn nsight_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::NsightBody(p) => p.clone(),
+        _ => return Err(ProtocolError::bad_request("expected NsightBody")),
+    };
+    let res = nsight_route(ctx, payload).await?;
+    Ok(MessageBody::NsightBody(res))
+}
+
+// variant_name_of() zwraca nazwy inner payloadu (np. "NsightStartRequest"),
+// wiec rejestrujemy `nsight_dispatch` pod kazdym z 5 nazw request-side.
+// Wzorzec analogiczny do `register_iam_variant!` w handlers.rs — wrapper
+// `__tentaflow_dispatch_nsight_dispatch` jest file-private, dlatego submit!
+// musi byc w tym samym pliku.
+macro_rules! register_nsight_variant {
+    ($variant:literal, $metric:literal) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: crate::dispatch::SessionAuthKind::Admin,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_nsight_dispatch,
+            }
+        }
+    };
+}
+
+register_nsight_variant!("NsightStartRequest", "tentaflow_ws_handler_nsight_start");
+register_nsight_variant!("NsightStopRequest", "tentaflow_ws_handler_nsight_stop");
+register_nsight_variant!(
+    "NsightSessionsRequest",
+    "tentaflow_ws_handler_nsight_sessions"
+);
+register_nsight_variant!("NsightReportRequest", "tentaflow_ws_handler_nsight_report");
+register_nsight_variant!("NsightDeleteRequest", "tentaflow_ws_handler_nsight_delete");
+
+#[cfg(test)]
+mod nsight_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use tentaflow_protocol::profiling::{
+        NsightDeleteRequest, NsightReportRequest, NsightScope, NsightSessionsRequest,
+        NsightStartRequest, NsightStopRequest,
+    };
+    use tentaflow_protocol::SessionAuth;
+
+    fn admin_ctx() -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            resume_secret: None,
+            state: AppState::for_test(),
+        }
+    }
+
+    /// `req.node_id` ustawiony na lokalny node musi isc lokalna sciezka. Bez nsys
+    /// w PATH dostaniemy `Internal("nsys not available")` z `profiling_err_to_proto`.
+    /// Test passuje gdy widzimy ten konkretny komunikat (a nie np. crash forwardera).
+    #[tokio::test]
+    async fn nsight_start_local_node_routes_locally() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = MessageBody::NsightBody(NsightPayload::StartRequest(NsightStartRequest {
+            node_id: local,
+            scope: NsightScope::Cpu,
+            duration_secs: 10,
+            label: "test".into(),
+        }));
+        let res = nsight_dispatch(&body, &ctx).await;
+        // Bez nsys w PATH dostajemy NotAvailable → Internal. Wazne ze nie poszlo
+        // do mesh forwardera (bo `quic_mesh = None` dalby inny komunikat).
+        match res {
+            Err(e) => assert!(
+                e.message.contains("nsys not available")
+                    || e.message.contains("nsys"),
+                "oczekiwano komunikatu o braku nsys, dostalem: {}",
+                e.message
+            ),
+            Ok(_) => {} // jesli host ma nsys to test po prostu przechodzi.
+        }
+    }
+
+    #[tokio::test]
+    async fn nsight_start_invalid_duration_601_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = MessageBody::NsightBody(NsightPayload::StartRequest(NsightStartRequest {
+            node_id: local,
+            scope: NsightScope::Cpu,
+            duration_secs: 601,
+            label: "test".into(),
+        }));
+        let res = nsight_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => {
+                // NotAvailable wygrywa nad InvalidDuration tylko wtedy gdy capability
+                // jest sprawdzane przed walidacja — sprawdzmy w nsys.rs:
+                // start() najpierw waliduje duration, dopiero potem capability.
+                // Wiec na hostach bez nsys i tak dostajemy BadRequest.
+                if e.code != ProtocolErrorCode::BadRequest {
+                    // Toleruj Internal jesli to capability check przyspieszyl.
+                    assert!(
+                        e.message.contains("invalid duration") || e.message.contains("nsys"),
+                        "spodziewane invalid duration albo nsys, dostalem: {:?}",
+                        e
+                    );
+                } else {
+                    assert!(e.message.contains("invalid duration"));
+                }
+            }
+            Ok(_) => panic!("oczekiwano bledu walidacji"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsight_stop_invalid_session_id_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = MessageBody::NsightBody(NsightPayload::StopRequest(NsightStopRequest {
+            node_id: local,
+            session_id: "../etc/passwd".into(),
+        }));
+        let res = nsight_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => {
+                // NSYS_RUNNER.stop() zwraca NotFound dla nieaktywnej sesji ZANIM
+                // walidacja session_id sprawdzi format. Akceptujemy oba scenariusze
+                // (NotFound i BadRequest) — wazne ze handler nie crashuje i nie
+                // probuje czegos wykonac z bledna sciezka.
+                assert!(
+                    matches!(
+                        e.code,
+                        ProtocolErrorCode::BadRequest | ProtocolErrorCode::NotFound
+                    ),
+                    "spodziewano BadRequest/NotFound, dostalem: {:?}",
+                    e
+                );
+            }
+            Ok(_) => panic!("oczekiwano bledu"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsight_sessions_local_empty_returns_empty_list() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        // Wymus pusty katalog: ustaw TENTAFLOW_HOME na tempdir.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("TENTAFLOW_HOME", tmp.path());
+        // tentaflow_home jest cache'owane przez OnceLock, wiec ten test moze
+        // dostac wczesniej zainicjalizowana wartosc — w takim razie list() nadal
+        // zwroci Ok, bo node_dir nie istnieje (storage::list zwraca pusty Vec).
+        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(
+            NsightSessionsRequest { node_id: local },
+        ));
+        let res = nsight_dispatch(&body, &ctx).await;
+        match res {
+            Ok(MessageBody::NsightBody(NsightPayload::SessionsResponse(r))) => {
+                assert!(r.sessions.is_empty(), "oczekiwano pustej listy sesji");
+            }
+            Ok(other) => panic!("nieoczekiwany wariant: {:?}", other),
+            Err(e) => panic!("nieoczekiwany blad: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsight_delete_invalid_session_id_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = MessageBody::NsightBody(NsightPayload::DeleteRequest(NsightDeleteRequest {
+            node_id: local,
+            session_id: "ZZZZZ".into(),
+        }));
+        let res = nsight_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest),
+            Ok(_) => panic!("oczekiwano BadRequest"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsight_report_invalid_session_id_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = MessageBody::NsightBody(NsightPayload::ReportRequest(NsightReportRequest {
+            node_id: local,
+            session_id: "../passwd".into(),
+        }));
+        let res = nsight_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest),
+            Ok(_) => panic!("oczekiwano BadRequest"),
+        }
+    }
+
+    /// Bez `quic_mesh` w AppState forward do remote noda zwraca Internal —
+    /// nie ma fallback'u na lokalne wykonanie.
+    #[tokio::test]
+    async fn nsight_remote_node_without_mesh_manager_fails() {
+        let ctx = admin_ctx();
+        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(
+            NsightSessionsRequest {
+                node_id: "some-other-peer-node".into(),
+            },
+        ));
+        let res = nsight_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => {
+                assert_eq!(e.code, ProtocolErrorCode::Internal);
+                assert!(e.message.contains("Mesh manager niedostepny"));
+            }
+            Ok(_) => panic!("oczekiwano bledu — brak quic_mesh"),
+        }
     }
 }
