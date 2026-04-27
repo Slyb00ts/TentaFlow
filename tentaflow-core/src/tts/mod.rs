@@ -9,6 +9,11 @@
 //         - `inference-mlx-kokoro` (Kokoro 82M przez mlx-swift, macOS/iOS)
 // =============================================================================
 
+/// Cache regul czyszczenia TTS (emoji strip + reguly z `tts_cleaning_rules`).
+/// Modul niezalezny od backendu — uzywany przez routing/tts.rs przed dispatch
+/// oraz przez flow_engine adapter `tts_clean`.
+pub mod clean_cache;
+
 #[cfg(feature = "inference-sherpa")]
 pub mod sherpa;
 

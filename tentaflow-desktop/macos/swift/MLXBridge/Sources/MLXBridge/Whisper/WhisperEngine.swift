@@ -192,11 +192,26 @@ public final class MLXWhisperEngine {
             // Whisper standardowy filter ciszy: gdy `<|nospeech|>` dominuje
             // i avgLogprob jest niski, calkowicie ignorujemy okno (zamiast
             // emitowac halucynacje typu "Thank you for watching").
-            let isSilence = result.noSpeechProb > 0.6 && result.avgLogprob < -1.0
-            let text = isSilence
+            //   - noSpeech AND niska pewnosc — to OpenAI default (wymaga obu)
+            //   - compressionRatio > 2.4 — powtarzalny tekst (to klasyczna
+            //     petla halucynacji, np. "tak tak tak tak..."); Whisper default
+            //   - blacklista znanych outrow podcastowych (PL/EN) — Whisper byl
+            //     trenowany na YT/podcastach, na ciszy odpala wyuczone outro
+            //     z dobrymi statystykami (low noSpeech, ok logprob), wiec
+            //     filtry probabilistyczne ich nie lapia
+            let decodedText = tokenizer.decode(tokens: result.tokens)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let isSilenceProb = result.noSpeechProb > 0.6 && result.avgLogprob < -1.0
+            let isRepeatLoop = result.compressionRatio > 2.4
+            let isKnownHallucination = WhisperHallucinationFilter.isHallucination(decodedText)
+            let text: String = (isSilenceProb || isRepeatLoop || isKnownHallucination)
                 ? ""
-                : tokenizer.decode(tokens: result.tokens)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : decodedText
+            if isKnownHallucination {
+                print("[MLXWhisper] odrzucono halucynacje (known phrase): \(decodedText.prefix(80))")
+            } else if isRepeatLoop {
+                print("[MLXWhisper] odrzucono halucynacje (compression=\(String(format: "%.2f", result.compressionRatio))): \(decodedText.prefix(80))")
+            }
             // Decyduj o seek na podstawie ostatniego znalezionego timestampa.
             // Gdy go brak (model nie zamkanl okna timestampem) idziemy pelne 30s.
             let advance: Int

@@ -1,0 +1,27 @@
+# =============================================================================
+# Manifest serwisu MiVOLO v2 — wiek + plec z twarzy/sylwetki.
+# SOTA 2024 (~2.7 MAE wiek). Apache-2.0. Embedded native przez tract-onnx.
+# =============================================================================
+
+[engine]
+id = "mivolo"
+category = "vision"
+name = "MiVOLO v2"
+description_pl = "Klasyfikator wieku i plci z twarzy/sylwetki. SOTA 2024, ~2.7 MAE na IMDB-clean."
+description_en = "Age + gender classifier from face/body. SOTA 2024, ~2.7 MAE on IMDB-clean."
+homepage = "https://github.com/WildChlamydia/MiVOLO"
+license = "Apache-2.0"
+icon = "mivolo"
+default_port = 0
+api = "custom"
+version = "v2-2024"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+
+[[model_preset]]
+id = "mivolo-v2-imdb"
+display_name = "MiVOLO v2 (IMDB)"
+repo = "WildChlamydia/MiVOLO"
+recommended = true

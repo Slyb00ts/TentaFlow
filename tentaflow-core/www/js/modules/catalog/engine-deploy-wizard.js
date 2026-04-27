@@ -126,7 +126,11 @@ async function fetchNodes() {
   try {
     const resp = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
     if (Array.isArray(resp) && resp.length > 0) {
-      return resp.filter((n) => n && (n.is_trusted === true || n.is_local === true));
+      // MeshNodeInfo proto nie ma pola `is_trusted` — backend zwraca tylko
+      // `source` ("local"|"trusted"|"discovered"). Dlatego filtrujemy po
+      // is_local + source==="trusted", inaczej paired peery wypadaja z
+      // listy i wizard pokazuje tylko lokalny node.
+      return resp.filter((n) => n && (n.is_local === true || n.source === 'trusted'));
     }
   } catch (err) {
     console.warn('[wizard] fetchNodes:', err);

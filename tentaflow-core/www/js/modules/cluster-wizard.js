@@ -93,9 +93,9 @@ async function loadNodes() {
     const all = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
     availableNodes = (Array.isArray(all) ? all : []).filter(n => {
       if (n.is_local) return true;
-      const trust = String(n.trust || '').toLowerCase();
-      const trusted = trust === 'trusted' || trust === 'paired' || n.is_trusted === true;
-      return trusted;
+      // MeshNodeInfo proto nie ma `is_trusted`/`trust`. Backend wystawia
+      // tylko `source` ("local"|"trusted"|"discovered"); paired = "trusted".
+      return String(n.source || '').toLowerCase() === 'trusted';
     });
     availableNodes.sort((a, b) => {
       if (a.is_local && !b.is_local) return -1;

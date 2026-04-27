@@ -2581,6 +2581,8 @@ pub fn tts_rule_create(
     )
     .map_err(db_err)?;
 
+    crate::tts::clean_cache::refresh(&ctx.state.db);
+
     Ok(MessageBody::TtsRuleCreateResponse {
         rule_id: rule_id.to_string(),
     })
@@ -2601,6 +2603,7 @@ pub fn tts_rule_delete(
         .parse()
         .map_err(|_| ProtocolError::bad_request("rule_id must be integer"))?;
     repository::delete_tts_cleaning_rule(&ctx.state.db, rule_id).map_err(db_err)?;
+    crate::tts::clean_cache::refresh(&ctx.state.db);
     Ok(MessageBody::TtsRuleDeleteResponse { deleted: true })
 }
 

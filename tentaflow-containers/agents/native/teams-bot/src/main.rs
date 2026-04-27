@@ -248,9 +248,24 @@ async fn gate_and_respond(
     let mode = config.response_mode.as_str();
     let allow = match mode {
         "always" => true,
-        "wake_word" => matches_wake_word(text, &config.wake_words_compiled),
+        "wake_word" => {
+            let m = matches_wake_word(text, &config.wake_words_compiled);
+            if !m {
+                tracing::info!(
+                    mode = %mode,
+                    wake_words = %config.wake_words,
+                    "skip LLM — brak wake_word w tekscie"
+                );
+            }
+            m
+        }
         "wake_word_intent" => {
             if !matches_wake_word(text, &config.wake_words_compiled) {
+                tracing::info!(
+                    mode = %mode,
+                    wake_words = %config.wake_words,
+                    "skip LLM — brak wake_word w tekscie"
+                );
                 false
             } else {
                 tracing::info!(
@@ -283,6 +298,12 @@ async fn gate_and_respond(
         Ok(Ok(resp)) => {
             let trimmed = resp.content.trim().to_string();
             if trimmed.is_empty() || trimmed.contains("<NO_RESPONSE>") {
+                tracing::info!(
+                    alias = %config.llm_alias,
+                    resolved = %resp.resolved_model,
+                    raw_len = trimmed.len(),
+                    "LLM zwrocil pusty/<NO_RESPONSE> — bot milczy"
+                );
                 None
             } else {
                 tracing::info!(
