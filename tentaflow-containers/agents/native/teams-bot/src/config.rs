@@ -80,9 +80,29 @@ pub struct MeetingConfig {
     #[serde(default)]
     pub respond_enabled: bool,
 
+    /// Tryb aktywacji odpowiedzi:
+    ///   - `always` — kazda wypowiedz idzie do LLM (drogie, glosne, debug)
+    ///   - `wake_word` — tylko gdy `wake_word` w wypowiedzi (proste)
+    ///   - `wake_word_intent` — wake_word + LLM klasyfikacja czy to realne
+    ///     pytanie do bota (DEFAULT, pasywne dopoki ktos go nie zawola)
+    /// Caller dashboard moze nadpisac envem RESPONSE_MODE.
+    #[serde(default = "default_response_mode")]
+    pub response_mode: String,
+
+    /// Slowa kluczowe (po przecinku) ktore aktywuja odpowiedz.
+    /// Dopasowanie case-insensitive, fragment slowa wystarczy. Pusta lista =
+    /// zawsze aktywne (rownowazne z `response_mode=always`).
+    #[serde(default = "default_wake_words")]
+    pub wake_words: String,
+
     /// Systemowy prompt dla LLM odpowiadajacego (rola bota w spotkaniu).
     #[serde(default = "default_response_prompt")]
     pub response_prompt: String,
+
+    /// Prompt dla LLM-classifier rozpoznajacego intencje. Musi zwrocic
+    /// dokladnie `TAK` lub `NIE`. Mowa idzie jako user message.
+    #[serde(default = "default_intent_prompt")]
+    pub intent_prompt: String,
 
     /// Nazwa bota wyswietlana w spotkaniu Teams
     #[serde(default = "default_bot_name")]
@@ -185,6 +205,25 @@ fn default_response_prompt() -> String {
 zdania), tylko gdy ktos zadaje konkretne pytanie skierowane do bota lub gdy \
 twoja interwencja moze pomoc. Jezeli mowa nie wymaga reakcji, odpowiedz \
 dokladnie '<NO_RESPONSE>' bez zadnego innego tekstu.".to_string()
+}
+
+fn default_response_mode() -> String {
+    "wake_word_intent".to_string()
+}
+
+fn default_wake_words() -> String {
+    // Domyslnie pasujemy na imie bota (jarvis), kilka wariantow.
+    "jarvis,tentaflow,asystencie,asystent,bot".to_string()
+}
+
+fn default_intent_prompt() -> String {
+    "Jestes klasyfikatorem intencji w spotkaniu Teams. Mowca uzyl slowa \
+aktywujacego (np. 'jarvis'). Twoje zadanie: ocenic czy ta wypowiedz to \
+faktyczne pytanie/prosba SKIEROWANE do bota-asystenta (np. 'jarvis powiedz nam \
+ile mamy czasu', 'asystencie podsumuj'), czy tylko mimochodem padlo to slowo \
+(np. 'spotkalem dzis Jarvisa w robocie'). Odpowiedz DOKLADNIE jednym slowem: \
+TAK jezeli to wezwanie do bota, NIE w przeciwnym wypadku. Bez kropek, bez \
+wyjasnien.".to_string()
 }
 
 fn default_summarization_interval_sec() -> u64 {
@@ -322,6 +361,12 @@ impl MeetingConfig {
                 .unwrap_or(false),
             response_prompt: std::env::var("RESPONSE_PROMPT")
                 .unwrap_or_else(|_| default_response_prompt()),
+            response_mode: std::env::var("RESPONSE_MODE")
+                .unwrap_or_else(|_| default_response_mode()),
+            wake_words: std::env::var("WAKE_WORDS")
+                .unwrap_or_else(|_| default_wake_words()),
+            intent_prompt: std::env::var("INTENT_PROMPT")
+                .unwrap_or_else(|_| default_intent_prompt()),
             bot_name: std::env::var("BOT_NAME")
                 .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
