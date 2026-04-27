@@ -168,6 +168,19 @@ async fn handle_reverse_stream(
         std::mem::discriminant(&request.payload)
     );
 
+    // Streamujaca sciezka TTS: bot ustawia stream=true + payload Audio(TTS),
+    // router odpowiada seria ModelStreamChunk z AudioChunk(pcm) zakonczona
+    // Done. Pozwala botowi pchac probki do mikrofonu na biezaco zamiast
+    // czekac na pelny WAV.
+    if request.stream {
+        if let tentaflow_protocol::ModelPayload::Audio(ref audio_payload) = request.payload {
+            if let tentaflow_protocol::AudioOperation::TTS { .. } = audio_payload.operation {
+                handle_tts_stream(send, router, request).await;
+                return;
+            }
+        }
+    }
+
     // Routuj request w zaleznosci od typu payload
     let response = dispatch_reverse_request(&router, request).await;
 
@@ -189,6 +202,112 @@ async fn handle_reverse_stream(
             service_name, response.request_id
         );
     }
+}
+
+/// Obsluguje streamujaca synteze mowy. Wysyla seria ModelStreamChunk:
+///   1) AudioChunk(pcm_bytes) — N razy, kazdy chunk to ~100 ms PCM
+///   2) Done { final_metrics: None } — terminator
+/// W razie bledu syntezy wysyla Error chunk + Done, zeby klient nie
+/// zawisl czekajac na ramki ktorych nie bedzie.
+async fn handle_tts_stream(
+    mut send: iroh::endpoint::SendStream,
+    router: Router,
+    request: tentaflow_protocol::ModelRequest,
+) {
+    use tentaflow_protocol::{
+        AudioOperation, ErrorInfo, ErrorType, ModelPayload, ModelStreamChunk, StreamChunkType,
+    };
+
+    let request_id = request.request_id.clone();
+
+    // Wyluskaj parametry TTS bez clone calego payloadu
+    let (model, input, voice, format, speed) = match request.payload {
+        ModelPayload::Audio(p) => match p.operation {
+            AudioOperation::TTS {
+                model,
+                input,
+                voice,
+                format,
+                speed,
+            } => (model, input, voice, format, speed),
+            _ => return,
+        },
+        _ => return,
+    };
+
+    let tts_request = crate::api::openai::types::TTSRequest {
+        model,
+        input,
+        voice,
+        // Wymuszamy "pcm" — chunki maja byc raw PCM bez WAV headera. Jesli
+        // klient prosil o wav/mp3, i tak strippujemy w synthesize_speech_stream,
+        // ale "pcm" zaoszczedzi pracy backendowi.
+        response_format: Some("pcm".to_string()),
+        speed,
+    };
+    let _ = format; // honorujemy "pcm" niezaleznie od pola w request
+
+    // Buforujemy chunki w mpsc, zeby synthesize_speech_stream (synchroniczny
+    // closure) nie musial trzymac referencji do `send`. Backend produkuje
+    // chunki na mpsc, ten task czyta i wysyla po sieci.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let synth_task = tokio::spawn(async move {
+        router
+            .synthesize_speech_stream(&tts_request, |chunk_bytes| {
+                tx.send(chunk_bytes).map_err(|e| {
+                    crate::error::CoreError::InternalError {
+                        message: format!("TTS chunk_sink kanal zamkniety: {}", e),
+                        source: None,
+                    }
+                    .into()
+                })
+            })
+            .await
+    });
+
+    // Konsument: kazdy chunk z mpsc -> wysylka jako AudioChunk frame.
+    let mut client_dropped = false;
+    while let Some(pcm) = rx.recv().await {
+        let chunk = ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::AudioChunk(pcm),
+        };
+        if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &chunk).await {
+            warn!("TTS stream: blad wysylki AudioChunk: {:?}", e);
+            client_dropped = true;
+            break;
+        }
+    }
+
+    // Zaczekaj na wynik syntezy zeby wyslac koncowy chunk (Done lub Error).
+    let final_chunk = match synth_task.await {
+        Ok(Ok(())) => ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Done { final_metrics: None },
+        },
+        Ok(Err(e)) => ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Error(ErrorInfo {
+                error_type: ErrorType::InternalError,
+                message: format!("Blad TTS streaming: {}", e),
+                details: None,
+            }),
+        },
+        Err(join_err) => ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Error(ErrorInfo {
+                error_type: ErrorType::InternalError,
+                message: format!("TTS task panika: {}", join_err),
+                details: None,
+            }),
+        },
+    };
+    if !client_dropped {
+        if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &final_chunk).await {
+            warn!("TTS stream: blad wysylki final chunk: {:?}", e);
+        }
+    }
+    let _ = send.finish();
 }
 
 /// Dispatchuje odwrotny request przez odpowiednia metode Routera. Dostepne
