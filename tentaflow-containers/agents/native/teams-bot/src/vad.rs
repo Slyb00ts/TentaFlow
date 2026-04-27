@@ -42,7 +42,18 @@ pub struct VadDetector {
 
     /// Czy poprzedni chunk byl mowa
     was_speech: bool,
+
+    /// Reusable buffer dla konwersji i16 → f32 — clear() zachowuje capacity,
+    /// dzieki czemu unikamy realokacji per chunk audio (~4 alloc/s na sesje).
+    f32_buf: Vec<f32>,
+
+    /// Reusable buffer dla zero-padded ogonka (ostatnie okno gdy chunk
+    /// nie jest wielokrotnoscia 512 sampli).
+    tail_buf: Vec<f32>,
 }
+
+/// Precomputed reciprocal — mnozenie ~3-5 cycles vs dzielenie ~10 cycles na f32.
+const I16_TO_F32_SCALE: f32 = 1.0 / 32768.0;
 
 impl VadDetector {
     /// Tworzy nowy detektor VAD.
@@ -80,6 +91,8 @@ impl VadDetector {
             silence_chunks: 0,
             silence_chunks_threshold,
             was_speech: false,
+            f32_buf: Vec::with_capacity(8192),
+            tail_buf: vec![0.0_f32; SILERO_WINDOW],
         })
     }
 
@@ -121,19 +134,31 @@ impl VadDetector {
     /// Uruchamia Silero VAD na chunku. Dzieli chunk na sub-windows 512 sampli
     /// (wymagany rozmiar Silero) i zwraca true jesli max prob > threshold.
     fn run_silero(&mut self, samples: &[i16]) -> bool {
-        let silero = match self.silero.as_mut() {
+        // Split-borrow: rozdzielamy pola zeby silero (&mut) i f32_buf (&) mogly
+        // wspolistniec — Rust nie pozwala na to przez self.silero.as_mut() + self.f32_buf.
+        let Self {
+            silero,
+            f32_buf,
+            tail_buf,
+            speech_threshold,
+            ..
+        } = self;
+
+        let silero = match silero.as_mut() {
             Some(s) => s,
             None => return false,
         };
 
-        // Konwersja i16 → f32 [-1, 1]
-        let f32_samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+        // Konwersja i16 → f32 [-1, 1] do reusable bufora. clear() zachowuje
+        // capacity wiec po pierwszym chunku unikamy realokacji. extend(map)
+        // jest wyraznie szybszy niz petla push() (auto-wektoryzacja LLVM).
+        f32_buf.clear();
+        f32_buf.extend(samples.iter().map(|&s| s as f32 * I16_TO_F32_SCALE));
 
-        // Dziel na bloki 512 sampli — bierzemy max prob po wszystkich oknach
         let mut max_prob = 0.0_f32;
         let mut any_window_processed = false;
 
-        for window in f32_samples.chunks_exact(SILERO_WINDOW) {
+        for window in f32_buf.chunks_exact(SILERO_WINDOW) {
             match silero.predict(window) {
                 Ok(prob) => {
                     any_window_processed = true;
@@ -148,14 +173,17 @@ impl VadDetector {
             }
         }
 
-        // Obsluga ogonka — jesli chunk nie jest wielokrotnoscia 512,
-        // dopad zerami ostatnie okno i puszcz przez model.
-        let tail_len = f32_samples.len() % SILERO_WINDOW;
+        // Obsluga ogonka — jesli chunk nie jest wielokrotnoscia 512, dopad
+        // zerami ostatnie okno (tail_buf jest pre-alokowany na SILERO_WINDOW).
+        let tail_len = f32_buf.len() % SILERO_WINDOW;
         if tail_len > 0 {
-            let mut padded = vec![0.0_f32; SILERO_WINDOW];
-            let tail_start = f32_samples.len() - tail_len;
-            padded[..tail_len].copy_from_slice(&f32_samples[tail_start..]);
-            if let Ok(prob) = silero.predict(&padded) {
+            let tail_start = f32_buf.len() - tail_len;
+            tail_buf[..tail_len].copy_from_slice(&f32_buf[tail_start..]);
+            // Zero-pad reszty okna (poprzednia iteracja mogla zostawic stare dane).
+            for slot in tail_buf[tail_len..].iter_mut() {
+                *slot = 0.0;
+            }
+            if let Ok(prob) = silero.predict(tail_buf.as_slice()) {
                 any_window_processed = true;
                 if prob > max_prob {
                     max_prob = prob;
@@ -163,7 +191,7 @@ impl VadDetector {
             }
         }
 
-        any_window_processed && max_prob > self.speech_threshold
+        any_window_processed && max_prob > *speech_threshold
     }
 }
 
