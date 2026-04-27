@@ -81,6 +81,14 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
 
     let pool = Arc::new(Mutex::new(conn));
     set_global_pool(pool.clone());
+
+    // Czyszczenie sierot po historycznych usunieciach serwisow sprzed
+    // kaskadowego `delete_service` (FK byl wczesniej `ON DELETE SET NULL`).
+    // Bez tego GUI pokazywal duchy modeli blokujace re-deploy.
+    if let Err(e) = repository::prune_orphaned_quic_models(&pool) {
+        tracing::warn!("prune_orphaned_quic_models przy starcie: {}", e);
+    }
+
     info!("Baza danych zainicjalizowana pomyslnie");
 
     Ok(pool)

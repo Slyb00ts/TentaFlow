@@ -407,7 +407,18 @@ pub fn update_service(
 }
 
 pub fn delete_service(pool: &DbPool, id: i64) -> Result<()> {
+    // FK `model_registry.service_id` ma ON DELETE SET NULL (sierocce wpisy w GUI po usunieciu serwisu)
+    // — kasujemy modele jawnie zeby UI byl spojny. service_backends ma ON DELETE CASCADE,
+    // ale wykonujemy DELETE jawnie dla symetrii z `delete_service_cascade_by_name`.
     let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM service_backends WHERE service_id = ?1",
+        rusqlite::params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM model_registry WHERE service_id = ?1",
+        rusqlite::params![id],
+    )?;
     conn.execute("DELETE FROM services WHERE id = ?1", rusqlite::params![id])?;
     Ok(())
 }
@@ -1000,6 +1011,72 @@ pub fn delete_model_entry(pool: &DbPool, id: i64) -> Result<()> {
         rusqlite::params![id],
     )?;
     Ok(())
+}
+
+/// Re-linkuje istniejacy wpis `model_registry` (po `model_name`) na nowy
+/// `service_id`, aktualizujac rownoczesnie `service_type`, `config_json`,
+/// `is_active=1` i `connection_type='local'`. Idempotentne i atomowe — caly
+/// UPDATE jest pojedynczym statement SQL.
+///
+/// DLACZEGO: Re-deploy po wczesniejszym delete zostawial w bazie sierote
+/// (`service_id=NULL`, bo do FIX 1 FK byl `ON DELETE SET NULL`). Bez relinka
+/// `ensure_model_registry_entry` widzial istniejacy `model_name` i robil
+/// early return — nowy serwis dostawal `services.id`, ale routing TTS/STT/LLM
+/// nie znajdowal backendu (model.service_id dalej NULL).
+pub fn relink_model_entry_to_service(
+    pool: &DbPool,
+    model_name: &str,
+    service_id: i64,
+    service_type: &str,
+    config_json: &str,
+) -> Result<usize> {
+    let conn = acquire(pool)?;
+    // Schema CHECK pozwala tylko ('quic','openai_api','internal'). Native
+    // deploy (libloading w procesie) = `internal`. Nie nadpisujemy connection_type
+    // jezeli istniejacy wpis mial juz inny prawidlowy typ — UPDATE bez tego pola
+    // zachowuje istniejaca wartosc (kompatybilnosc z modelami zarejestrowanymi
+    // przez inne sciezki, np. openai_api).
+    let updated = conn.execute(
+        "UPDATE model_registry \
+         SET service_id = ?2, service_type = ?3, config_json = ?4, \
+             is_active = 1 \
+         WHERE model_name = ?1",
+        rusqlite::params![model_name, service_id, service_type, config_json],
+    )?;
+    Ok(updated)
+}
+
+/// Czysci sieroty po historycznych usunieciach serwisow sprzed kaskadowego
+/// `delete_service` (gdy FK `model_registry.service_id` byl `ON DELETE SET NULL`).
+/// Schema CHECK na `connection_type` to ('quic','openai_api','internal') —
+/// `quic` bezpiecznie kasujemy bo to zawsze osobny serwis. `internal` z
+/// `service_id IS NULL` jest niejednoznaczny (legitne globale + sieroty po
+/// natywnych deploy'ach), wiec kasujemy tylko te dopasowane do znanych
+/// prefiksow nazw silnikow natywnych (apple-tts-, kokoro-, llamacpp-,
+/// whisper-, mlx-) — pokrywa historyczne sieroty bez usuniecia legitnych
+/// globali typu zewnetrzne API.
+pub fn prune_orphaned_quic_models(pool: &DbPool) -> Result<u32> {
+    let conn = acquire(pool)?;
+    let mut total = 0u32;
+    total += conn.execute(
+        "DELETE FROM model_registry \
+         WHERE service_id IS NULL AND connection_type = 'quic'",
+        rusqlite::params![],
+    )? as u32;
+    total += conn.execute(
+        "DELETE FROM model_registry \
+         WHERE service_id IS NULL AND connection_type = 'internal' \
+           AND (model_name LIKE 'apple-tts-%' \
+             OR model_name LIKE 'kokoro-%' \
+             OR model_name LIKE 'llamacpp-%' \
+             OR model_name LIKE 'whisper-%' \
+             OR model_name LIKE 'mlx-%')",
+        rusqlite::params![],
+    )? as u32;
+    if total > 0 {
+        tracing::info!(count = total, "Usunieto osierocone wpisy model_registry");
+    }
+    Ok(total)
 }
 
 /// Usuwa wszystkie wpisy model_registry powiazane z danym serwisem.
@@ -9092,5 +9169,222 @@ mod meeting_summary_action_items_tests {
         let items = list_action_items_for_meeting(&db, sid, None).unwrap();
         assert!(summaries.is_empty(), "summaries niezcascadowane");
         assert!(items.is_empty(), "action items niezcascadowane");
+    }
+}
+
+#[cfg(test)]
+mod delete_service_cascade_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn setup_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("nie udalo sie utworzyc test DB")
+    }
+
+    #[test]
+    fn delete_service_cascades_model_registry_rows() {
+        // FK `model_registry.service_id` ma ON DELETE SET NULL, wiec bez jawnego
+        // DELETE w `delete_service` modele zostawalyby sierotami widocznymi w GUI.
+        let db = setup_db();
+
+        let service_id = create_service(
+            &db,
+            "test-tts-service",
+            "tts",
+            "single",
+            Some("tts"),
+            "{}",
+        )
+        .expect("create_service failed");
+
+        let model_id = create_model_entry(
+            &db,
+            &NewModelEntry {
+                model_name: "test-tts-model",
+                display_name: Some("Test TTS"),
+                service_type: "tts",
+                connection_type: "quic",
+                service_id: Some(service_id),
+                flow_id: None,
+                is_public: false,
+                config_json: "{}",
+            },
+        )
+        .expect("create_model_entry failed");
+
+        // Sanity: model istnieje przed kasowaniem.
+        let before: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_registry WHERE id = ?1",
+                rusqlite::params![model_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(before, 1, "model powinien istniec przed delete_service");
+
+        delete_service(&db, service_id).expect("delete_service failed");
+
+        let conn = db.lock().unwrap();
+        let services_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM services WHERE id = ?1",
+                rusqlite::params![service_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(services_after, 0, "services row powinien byc usuniety");
+
+        let models_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM model_registry WHERE id = ?1",
+                rusqlite::params![model_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            models_after, 0,
+            "model_registry row powinien byc skasowany kaskadowo (zero sierot)"
+        );
+    }
+
+    #[test]
+    fn relink_model_entry_repoints_orphan_to_new_service() {
+        // Symulacja stanu sprzed FIX 1: model_registry zostal sierota (service_id=NULL),
+        // potem user zdeployowal serwis ponownie pod ta sama nazwa modelu.
+        let db = setup_db();
+
+        let orphan_id = create_model_entry(
+            &db,
+            &NewModelEntry {
+                model_name: "apple-tts-zosia-pl",
+                display_name: Some("Apple TTS"),
+                service_type: "tts",
+                connection_type: "local",
+                service_id: None,
+                flow_id: None,
+                is_public: true,
+                config_json: "{}",
+            },
+        )
+        .expect("create orphan failed");
+
+        let new_service = create_service(
+            &db,
+            "apple-tts-native",
+            "tts",
+            "single",
+            Some("tts"),
+            "{}",
+        )
+        .expect("create_service failed");
+
+        let updated = relink_model_entry_to_service(
+            &db,
+            "apple-tts-zosia-pl",
+            new_service,
+            "tts",
+            r#"{"deploy_mode":"native"}"#,
+        )
+        .expect("relink failed");
+        assert_eq!(updated, 1, "powinien byc dokladnie jeden UPDATE");
+
+        let entry = get_model_entry(&db, orphan_id).unwrap().expect("entry znika");
+        assert_eq!(entry.service_id, Some(new_service), "service_id nie przepiety");
+        assert_eq!(entry.is_active, true, "is_active powinno byc true");
+        assert!(entry.config_json.contains("native"), "config_json nie zaktualizowany");
+
+        // Idempotencja: drugi call nadal updateuje 1 wiersz, ale stan ten sam.
+        let again = relink_model_entry_to_service(
+            &db,
+            "apple-tts-zosia-pl",
+            new_service,
+            "tts",
+            r#"{"deploy_mode":"native"}"#,
+        )
+        .expect("relink2 failed");
+        assert_eq!(again, 1, "drugi relink dalej UPDATE-uje ten sam wiersz");
+    }
+
+    #[test]
+    fn prune_orphaned_quic_models_skips_legitimate_globals() {
+        let db = setup_db();
+
+        // 1. Quic orphan — DO usuniecia.
+        create_model_entry(
+            &db,
+            &NewModelEntry {
+                model_name: "quic-orphan",
+                display_name: None,
+                service_type: "tts",
+                connection_type: "quic",
+                service_id: None,
+                flow_id: None,
+                is_public: false,
+                config_json: "{}",
+            },
+        )
+        .unwrap();
+
+        // 2. Local orphan — rowniez DO usuniecia (sierota po embedded deploy).
+        create_model_entry(
+            &db,
+            &NewModelEntry {
+                model_name: "local-orphan",
+                display_name: None,
+                service_type: "tts",
+                connection_type: "local",
+                service_id: None,
+                flow_id: None,
+                is_public: false,
+                config_json: "{}",
+            },
+        )
+        .unwrap();
+
+        // 3. OpenAI globalny model — service_id=NULL ale to legitne.
+        let openai_id = create_model_entry(
+            &db,
+            &NewModelEntry {
+                model_name: "gpt-4",
+                display_name: Some("OpenAI GPT-4"),
+                service_type: "chat",
+                connection_type: "openai_api",
+                service_id: None,
+                flow_id: None,
+                is_public: true,
+                config_json: "{}",
+            },
+        )
+        .unwrap();
+
+        // 4. Quic z poprawnym service_id — NIE moze byc ruszony.
+        let svc = create_service(&db, "live-svc", "tts", "single", Some("tts"), "{}").unwrap();
+        let live_id = create_model_entry(
+            &db,
+            &NewModelEntry {
+                model_name: "live-model",
+                display_name: None,
+                service_type: "tts",
+                connection_type: "quic",
+                service_id: Some(svc),
+                flow_id: None,
+                is_public: false,
+                config_json: "{}",
+            },
+        )
+        .unwrap();
+
+        let removed = prune_orphaned_quic_models(&db).expect("prune failed");
+        assert_eq!(removed, 2, "powinny zniknac tylko quic+local sieroty");
+
+        // openai global i live model przezyly.
+        assert!(get_model_entry(&db, openai_id).unwrap().is_some(), "openai global skasowany!");
+        assert!(get_model_entry(&db, live_id).unwrap().is_some(), "live model skasowany!");
+
+        // Drugi call to no-op.
+        let again = prune_orphaned_quic_models(&db).unwrap();
+        assert_eq!(again, 0, "drugi prune nic nie znajduje");
     }
 }

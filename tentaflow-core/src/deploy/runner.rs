@@ -998,7 +998,9 @@ async fn do_embedded_native_deploy(
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "apple-tts-native".to_string());
             // Glos wybierany przez `model_repo` (`zosia-pl`, `samantha-en`...).
-            // Apple nie pobiera niczego z dysku — model_path = "system".
+            // Apple nie pobiera modelu z dysku (uzywa głosów systemowych macOS) —
+            // przekazujemy stalą "apple-tts" jako logiczny identyfikator silnika;
+            // placeholder "system" powodowal mylące target=system w logach routera i w GUI.
             let voice_id = resolve_model_repo(engine, config)
                 .unwrap_or_else(|_| "zosia-pl".to_string());
 
@@ -1006,7 +1008,7 @@ async fn do_embedded_native_deploy(
             let mut engine_impl = crate::tts::apple_tts::AppleTtsEngine::new();
             let info = <crate::tts::apple_tts::AppleTtsEngine as crate::tts::TtsEngine>::load_model(
                 &mut engine_impl,
-                std::path::Path::new("system"),
+                std::path::Path::new("apple-tts"),
             )
             .context("init apple-tts (brak libMLXBridge.dylib?)")?;
             // Rejestracja w globalnym TtsManager pod kluczem service_name —
@@ -1023,7 +1025,7 @@ async fn do_embedded_native_deploy(
                 "engine": "apple-tts",
                 "manifest_engine_id": engine.engine_id,
                 "deployed_model": voice_id,
-                "model_path": "system",
+                "model_path": "apple-tts",
                 "service_type": "tts",
                 "sample_rate": info.sample_rate,
             })
@@ -1904,16 +1906,37 @@ fn ensure_model_registry_entry(
     config_json: &str,
 ) {
     use crate::db::models::NewModelEntry;
-    // Check existing — `list_models` zwraca wszystkie wpisy.
-    let existing = crate::db::repository::list_model_entries(db, 0, 1000).unwrap_or_default();
-    if existing.iter().any(|m| m.model_name == model_name) {
-        return;
+    // Re-deploy po wczesniejszym delete: model_registry sierota (service_id=NULL)
+    // musi byc przepiety na nowy service_id. Jezeli wpis juz wskazuje na ten
+    // sam service_id — relink jest no-op (idempotencja przez UPDATE).
+    match crate::db::repository::get_model_by_name(db, model_name) {
+        Ok(Some(_)) => {
+            if let Err(e) = crate::db::repository::relink_model_entry_to_service(
+                db, model_name, service_id, service_type, config_json,
+            ) {
+                tracing::warn!(
+                    "ensure_model_registry_entry({}): relink failed: {}",
+                    model_name,
+                    e
+                );
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                "ensure_model_registry_entry({}): get_model_by_name: {}",
+                model_name,
+                e
+            );
+            return;
+        }
     }
     let params = NewModelEntry {
         model_name,
         display_name: Some(display_name),
         service_type,
-        connection_type: "local",
+        connection_type: "internal",
         service_id: Some(service_id),
         flow_id: None,
         is_public: true,

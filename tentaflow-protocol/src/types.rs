@@ -865,6 +865,25 @@ pub enum MeetingEventPayload {
         /// `LIFECYCLE_FAILED` pełny tekst błędu z `join_meeting`).
         details: Option<String>,
     },
+    /// Klatka wideo per-uczestnik scrappowana z `<video>` elementu kafelka
+    /// w DOM Teams. Bot wysyła ją w cyklu (domyślnie 1 fps) wyłącznie dla
+    /// kafelków z aktywnym `MediaStream` (kamera włączona). `jpeg` to surowe
+    /// bajty już zdekodowane z base64 — transport JS→Rust idzie przez
+    /// `__tentaflowEvent` (JSON-only binding), więc base64 jest jedynie
+    /// kodowaniem na granicy CDP; po stronie Rust żyje już binarnie i rkyv
+    /// pcha to jako `Vec<u8>` bez ponownego kodowania.
+    VideoFrame {
+        /// `data-tid` kafelka — w obecnym Teams to nazwa uczestnika, traktujemy
+        /// jednak jako opaque id (może się zmienić w przyszłych wersjach UI).
+        participant_id: String,
+        /// Display name z `tileDisplayName` — None gdy DOM nie udostępnia
+        /// czytelnej nazwy (skrajny edge case przy świeżo dołączającym kafelku).
+        name: Option<String>,
+        /// Unix epoch ms momentu capture po stronie strony.
+        ts_ms: u64,
+        /// JPEG bytes (q≈0.6, max ~320px szerokości).
+        jpeg: Vec<u8>,
+    },
 }
 
 /// Etapy cyklu życia sesji meeting bota. Używane w
@@ -893,6 +912,21 @@ pub struct RosterEntry {
     pub status: String,
     /// Sekundy od ostatniej mowy; `None` gdy jeszcze nie mówił.
     pub last_spoken_ago_sec: Option<u32>,
+    /// Czy kafelek ma aktywny strumień wideo (kamera włączona). Pochodzi
+    /// z `data-stream-type=Video` lub obecności żywego `<video>` elementu.
+    /// GUI wykorzystuje to żeby pokazać badge kamery i decydować czy ma
+    /// sens renderować podgląd `VideoFrame` dla tego uczestnika.
+    pub has_video: bool,
+    /// Czy kafelek raportuje aktywny strumień audio. Wyznaczane z obecności
+    /// `data-stream-type=Audio` w DOM oraz odsłuchu mute markerów.
+    pub has_audio: bool,
+    /// Uczestnik widoczny wśród kafelków sceny (MixedStage / only-videos).
+    /// Może być `false` gdy ktoś jest tylko w panelu rosteru bez kamery.
+    pub in_stage: bool,
+    /// Uczestnik widoczny w panelu rosteru/People. Wraz z `in_stage=false`
+    /// daje GUI sygnał że to off-camera participant — kluczowe dla pełnej
+    /// listy uczestników (scena gubi nieaktywnych mówców).
+    pub in_roster: bool,
 }
 
 /// Pojedynczy action item przesyłany w `ActionItemsUpdate`.
@@ -3807,6 +3841,10 @@ mod meeting_event_tests {
                     _ => "left".to_string(),
                 },
                 last_spoken_ago_sec: if i % 2 == 0 { Some(i as u32) } else { None },
+                has_video: i % 2 == 0,
+                has_audio: i % 3 != 0,
+                in_stage: i % 4 != 0,
+                in_roster: true,
             })
             .collect();
 

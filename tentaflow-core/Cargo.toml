@@ -8,10 +8,9 @@ description = "TentaFlow Core — wspolna biblioteka dla Router, Desktop i Mobil
 default = ["inference-whisper"]
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
-# whisper-rs i llama-cpp-2 obie linkuja wlasna kopie ggml — nie da sie ich
-# laczyc razem (linker zwraca duplicate symbol: ggml_*). whisper-rs sterowane
-# osobnym feature flagiem zeby `cargo build --features inference-llamacpp`
-# nie probowal automatycznie wciagac whisper-rs.
+# whisper-rs i llama-cpp-2 obie linkuja wlasna kopie ggml. Duplicate symbols
+# (ggml_*) rozwiazane przez `-Wl,--allow-multiple-definition` w
+# `.cargo/config.toml` — obie crate moga byc zalinkowane jednoczesnie.
 inference-whisper = ["dep:whisper-rs"]
 # sherpa-onnx jako embedded TTS — bindings do sherpa-onnx + onnxruntime
 # z crate sherpa-rs. Niezalezny linker space (nie kolizja z ggml).
@@ -35,14 +34,13 @@ inference-diarization = ["dep:tentaflow-voice"]
 dashboard-api = ["dep:axum", "dep:tower", "dep:tower-http"]
 metrics-prometheus = ["dep:prometheus"]
 rdma-probe = []
-gpu-cuda = ["inference-llamacpp", "llama-cpp-2/cuda"]
-gpu-vulkan = ["inference-llamacpp", "llama-cpp-2/vulkan"]
-gpu-rocm = ["inference-llamacpp", "llama-cpp-2/rocm"]
-gpu-metal = ["inference-llamacpp", "llama-cpp-2/metal"]
-gpu-cuda-whisper = ["inference-whisper", "whisper-rs/cuda"]
-gpu-vulkan-whisper = ["inference-whisper", "whisper-rs/vulkan"]
-gpu-rocm-whisper = ["inference-whisper", "whisper-rs/hipblas"]
-gpu-metal-whisper = ["inference-whisper", "whisper-rs/metal"]
+# Jedna flaga GPU per backend — wlacza akceleracje dla LLM (llama.cpp) i STT
+# (whisper). Duplicate ggml_* symbols rozwiazane przez
+# `-Wl,--allow-multiple-definition` w `.cargo/config.toml`.
+gpu-cuda = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/cuda", "whisper-rs/cuda"]
+gpu-vulkan = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/vulkan", "whisper-rs/vulkan"]
+gpu-rocm = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/rocm", "whisper-rs/hipblas"]
+gpu-metal = ["inference-llamacpp", "inference-whisper", "llama-cpp-2/metal", "whisper-rs/metal"]
 
 [dependencies]
 # Protocol (zawsze)
