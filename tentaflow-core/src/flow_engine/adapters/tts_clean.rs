@@ -6,67 +6,24 @@
 // =============================================================================
 
 use anyhow::Result;
-use regex::RegexBuilder;
 use serde_json::Value;
-use tracing::{debug, warn};
 
-use crate::db::{repository, DbPool};
+use crate::db::DbPool;
 use crate::flow_engine::adapters::output::resolve_passthrough_text;
 use crate::flow_engine::adapters::NodeAdapter;
 use crate::flow_engine::types::{FlowContext, FlowNode};
 
-const REGEX_SIZE_LIMIT: usize = 1_000_000;
-
-/// Aplikuje reguly czyszczenia TTS (abbreviation / regex_remove / emoji_range
-/// / phonetic) na tekscie wejsciowym i zwraca JSON z wyczyszczonym tekstem.
+/// Aplikuje reguly czyszczenia TTS na tekscie wejsciowym. Deleguje do
+/// `crate::tts::clean_cache::clean` ktore: (1) stripuje emoji, (2) czyta
+/// reguly z cache (lazy-load + refresh przy CRUD na tts_cleaning_rules).
+/// Wczesniej kazdy run flow robil DB hit + kompilacje regexow per request.
 pub async fn apply_tts_clean(db: &DbPool, node: &FlowNode, ctx: &FlowContext) -> Result<Value> {
-    let db_clone = db.clone();
-    let rules =
-        tokio::task::spawn_blocking(move || repository::list_tts_cleaning_rules_active(&db_clone))
-            .await??;
-    let mut text = resolve_passthrough_text(node, ctx);
-
-    for rule in &rules {
-        match rule.rule_type.as_str() {
-            "abbreviation" => {
-                if let Some(ref replacement) = rule.replacement {
-                    text = text.replace(&rule.pattern, replacement);
-                }
-            }
-            "regex_remove" | "emoji_range" => {
-                match RegexBuilder::new(&rule.pattern)
-                    .size_limit(REGEX_SIZE_LIMIT)
-                    .build()
-                {
-                    Ok(re) => {
-                        let replacement = rule.replacement.as_deref().unwrap_or("");
-                        text = re.replace_all(&text, replacement).to_string();
-                    }
-                    Err(e) => {
-                        warn!(
-                            rule_id = rule.id,
-                            pattern = %rule.pattern,
-                            error = %e,
-                            "TTS clean: niepoprawny regex"
-                        );
-                    }
-                }
-            }
-            "phonetic" => {
-                if let Some(ref replacement) = rule.replacement {
-                    text = text.replace(&rule.pattern, replacement);
-                }
-            }
-            other => {
-                debug!(rule_type = other, "TTS clean: nieznany typ reguly");
-            }
-        }
-    }
+    let raw = resolve_passthrough_text(node, ctx);
+    let text = crate::tts::clean_cache::clean(&raw, db);
 
     Ok(serde_json::json!({
         "type": "tts_cleaned",
         "text": text,
-        "rules_applied": rules.len(),
     }))
 }
 

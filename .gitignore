@@ -155,4 +155,4 @@ tests/e2e/test-results/
 test-results/
 *.backup
 .gstack/
-notes/*.md
+notes/*.md.claude/

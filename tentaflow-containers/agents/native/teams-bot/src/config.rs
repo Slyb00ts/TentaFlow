@@ -208,14 +208,22 @@ fn default_llm_alias() -> String {
 }
 
 fn default_response_prompt() -> String {
-    "Jestes uprzejmym asystentem w spotkaniu Teams. Odpowiadasz krotko (1-2 \
-zdania), tylko gdy ktos zadaje konkretne pytanie skierowane do bota lub gdy \
-twoja interwencja moze pomoc. Jezeli mowa nie wymaga reakcji, odpowiedz \
-dokladnie '<NO_RESPONSE>' bez zadnego innego tekstu.".to_string()
+    // ZAWSZE odpowiadaj. Bez instrukcji ucieczki typu `<NO_RESPONSE>` ani
+    // klauzul "tylko gdy zadaje pytanie" — bot dostaje wylacznie wypowiedzi
+    // ze slowem aktywujacym (response_mode=wake_word), wiec mowca jasno
+    // skierowal sie do bota i oczekuje reakcji. Krotko, po polsku, do rzeczy.
+    "Jestes asystentem na spotkaniu Teams. Odpowiadaj zawsze, po polsku, \
+1-2 zdaniami."
+        .to_string()
 }
 
 fn default_response_mode() -> String {
-    "wake_word_intent".to_string()
+    // TYMCZASOWO: tryb intent classifier wylaczony (false-negative na
+    // "Czesc Jarvis!" — LLM uznawal powitanie za nie-prosbe). Default =
+    // sam wake_word: bot zawsze odpowiada gdy w transkrypcie pojawi sie
+    // slowo aktywujace. Po dostrojeniu intent_prompt mozna wrocic do
+    // "wake_word_intent".
+    "wake_word".to_string()
 }
 
 fn default_wake_words() -> String {
