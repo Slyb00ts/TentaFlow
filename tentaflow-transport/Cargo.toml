@@ -32,3 +32,8 @@ hex = "0.4"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = "0.3"
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "noop"
+harness = false
