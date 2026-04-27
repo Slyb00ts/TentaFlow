@@ -193,9 +193,23 @@ pub async fn meeting_session_start(
         } else {
             Some(r.llm_alias.clone())
         },
-        // Bot odpowiada w real-time tylko gdy caller jawnie poda llm_alias.
-        // Dashboard moze dodac osobny przycisk respond_enabled.
-        respond_enabled: if r.llm_alias.is_empty() { Some(false) } else { Some(true) },
+        // Bot odpowiada w real-time gdy:
+        //   - caller wprost poda llm_alias w payload (jawnie chce odpowiedzi), LUB
+        //   - alias `teams-llm` w DB ma niepusty `target_model` (deploy LLM
+        //     wpial cos do aliasu, np. przez auto-bind albo recznie w UI)
+        // Bez tego respond_enabled=false → bot tylko transkrybuje + summary.
+        respond_enabled: {
+            let has_explicit = !r.llm_alias.is_empty();
+            let has_default_alias = crate::db::repository::resolve_model_alias(
+                &ctx.state.db,
+                "teams-llm",
+            )
+            .ok()
+            .flatten()
+            .map(|a| !a.target_model.trim().is_empty())
+            .unwrap_or(false);
+            Some(has_explicit || has_default_alias)
+        },
         // Default: pasywny tryb wake_word_intent (bot odpowiada tylko gdy
         // ktos powie "jarvis"/"asystencie" + LLM uzna to za realne pytanie).
         // Dashboard moze nadpisac jezeli protocol zostanie rozszerzony.

@@ -956,6 +956,11 @@ async fn main() -> Result<()> {
                                     &text,
                                 ).await
                             } else {
+                                tracing::info!(
+                                    respond_enabled = config.respond_enabled,
+                                    llm_alias_empty = config.llm_alias.trim().is_empty(),
+                                    "skip LLM response (bot pasywny — sprawdz respond_enabled / llm_alias)"
+                                );
                                 None
                             };
                             if let Some(reply) = response_text {
