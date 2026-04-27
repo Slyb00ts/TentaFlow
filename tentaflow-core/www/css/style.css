@@ -2071,6 +2071,46 @@ input, textarea, select {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px;
 }
 .gpu-card .card-head { color: var(--accent-1); }
+.gpu-card .card-head .gpu-card-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.gpu-card .card-head { display: flex; align-items: center; gap: 8px; }
+
+/* =============================================================================
+   Nsight Systems profiling — modal startu, badge sesji, lista sesji
+   ============================================================================= */
+
+.nsight-form { display: grid; gap: 12px; }
+.nsight-form .field-label {
+  display: block; font-size: 11px; font-weight: 600;
+  color: var(--text-2); margin-bottom: 4px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.nsight-form .field { display: flex; flex-direction: column; }
+.nsight-form .field.hidden { display: none; }
+.nsight-form .form-error {
+  color: var(--danger); font-size: 12px; min-height: 16px;
+}
+
+/* Active recording badge w topbar */
+.nsight-rec-wrap {
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.nsight-rec-wrap tf-chip { font-variant-numeric: tabular-nums; }
+
+/* Sessions list */
+.sessions-card { padding: 0; overflow: hidden; }
+.sessions-card .empty {
+  padding: 18px; text-align: center; color: var(--text-3); font-size: 12px;
+}
+.sessions-card tf-table { display: block; width: 100%; }
+.sessions-card .session-actions { white-space: nowrap; }
+.sessions-card .session-actions tf-button { margin-left: 4px; }
+.sessions-card .session-scope { font-family: 'SF Mono', monospace; font-size: 11px; }
+.sessions-card .session-error {
+  color: var(--danger); font-size: 11px; margin-top: 2px;
+}
+
+/* Profile button na karcie GPU */
+.gpu-card .card-head tf-button { flex-shrink: 0; }
 
 /* Network interfaces */
 .network-card { padding: 0; }

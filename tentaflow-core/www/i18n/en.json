@@ -1490,6 +1490,69 @@
     "qr_scan_busy": "Camera is in use by another application.",
     "qr_scan_insecure": "Scanning requires HTTPS. Open the app over https://"
   },
+  "nsight": {
+    "profile_btn": "Profile",
+    "profile_node_btn": "Profile node",
+    "modal": {
+      "title": "Nsight Systems profiling"
+    },
+    "scope": {
+      "label": "What to profile",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "both": "CPU + GPU"
+    },
+    "gpu": {
+      "label": "GPU card",
+      "all": "All NVIDIA cards"
+    },
+    "duration": {
+      "label": "Duration (s)",
+      "30s": "30 s",
+      "60s": "60 s",
+      "120s": "120 s",
+      "manual": "Manual stop"
+    },
+    "label": {
+      "label": "Label",
+      "placeholder": "e.g. inference qwen3"
+    },
+    "start": "Start",
+    "stop": "Stop",
+    "cancel": "Cancel",
+    "recording": "Recording",
+    "session": {
+      "started": "Session started",
+      "finished": "Session finished",
+      "error": "Profiling error",
+      "in_progress": "in progress..."
+    },
+    "sessions": {
+      "title": "Profiling sessions",
+      "empty": "No sessions",
+      "col": {
+        "timestamp": "Timestamp",
+        "label": "Label",
+        "scope": "Scope",
+        "duration": "Duration",
+        "status": "Status",
+        "actions": "Actions"
+      }
+    },
+    "action": {
+      "open": "Open report",
+      "download": "Download .nsys-rep",
+      "delete": "Delete",
+      "confirm_delete": "Delete profiling session? This cannot be undone."
+    },
+    "error": {
+      "busy": "Another session is already running",
+      "not_available": "nsys is not available on this node",
+      "invalid_duration": "Invalid duration",
+      "invalid_scope": "Invalid profiling scope",
+      "session_not_found": "Session not found"
+    }
+  },
   "clusters": {
     "title": "Clusters",
     "new": "New cluster",

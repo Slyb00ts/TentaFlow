@@ -1490,6 +1490,69 @@
     "qr_scan_busy": "Kamera jest używana przez inną aplikację.",
     "qr_scan_insecure": "Skanowanie wymaga HTTPS. Otwórz aplikację przez https://"
   },
+  "nsight": {
+    "profile_btn": "Profil",
+    "profile_node_btn": "Profilowanie noda",
+    "modal": {
+      "title": "Profilowanie Nsight Systems"
+    },
+    "scope": {
+      "label": "Co profilować",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "both": "CPU + GPU"
+    },
+    "gpu": {
+      "label": "Karta GPU",
+      "all": "Wszystkie karty NVIDIA"
+    },
+    "duration": {
+      "label": "Czas (s)",
+      "30s": "30 s",
+      "60s": "60 s",
+      "120s": "120 s",
+      "manual": "Manualny stop"
+    },
+    "label": {
+      "label": "Etykieta",
+      "placeholder": "np. inference qwen3"
+    },
+    "start": "Start",
+    "stop": "Stop",
+    "cancel": "Anuluj",
+    "recording": "Nagrywanie",
+    "session": {
+      "started": "Sesja uruchomiona",
+      "finished": "Sesja zakończona",
+      "error": "Błąd profilowania",
+      "in_progress": "trwa..."
+    },
+    "sessions": {
+      "title": "Sesje profilowania",
+      "empty": "Brak sesji",
+      "col": {
+        "timestamp": "Czas",
+        "label": "Etykieta",
+        "scope": "Zakres",
+        "duration": "Czas trwania",
+        "status": "Status",
+        "actions": "Akcje"
+      }
+    },
+    "action": {
+      "open": "Otwórz raport",
+      "download": "Pobierz .nsys-rep",
+      "delete": "Usuń",
+      "confirm_delete": "Usunąć sesję profilowania? Operacja jest nieodwracalna."
+    },
+    "error": {
+      "busy": "Inna sesja jest już uruchomiona",
+      "not_available": "nsys nie jest dostępny na tym nodzie",
+      "invalid_duration": "Niewłaściwy czas trwania",
+      "invalid_scope": "Niewłaściwy zakres profilowania",
+      "session_not_found": "Sesja nie znaleziona"
+    }
+  },
   "clusters": {
     "title": "Clusters",
     "new": "Nowy cluster",
