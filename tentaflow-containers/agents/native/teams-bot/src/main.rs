@@ -9,6 +9,7 @@ mod audio_ring;
 mod browser;
 mod config;
 mod dom_observer;
+mod intent_classifier;
 mod quic_server;
 mod sentence_buffer;
 mod summarizer;
@@ -208,40 +209,6 @@ fn matches_wake_word(text: &str, wake_words: &[String]) -> bool {
     wake_words.iter().any(|w| lower.contains(w.as_str()))
 }
 
-/// Pyta LLM-classifier czy wypowiedz to faktyczne pytanie do bota. Zwraca
-/// true jezeli model zwrocil "TAK" (case-insensitive). Przy timeout/bledzie
-/// fallback false — bezpieczniej nie odpowiadac niz halucynowac.
-async fn intent_says_yes(
-    client: &Arc<crate::quic_server::RouterClient>,
-    config: &MeetingConfig,
-    text: &str,
-) -> bool {
-    let messages = vec![
-        ("system".to_string(), config.intent_prompt.clone()),
-        ("user".to_string(), text.to_string()),
-    ];
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        client.chat_completion(&config.llm_alias, messages),
-    )
-    .await
-    {
-        Ok(Ok(resp)) => {
-            let answer = resp.content.trim().to_uppercase();
-            tracing::debug!(answer = %answer, "intent classifier zwrocil");
-            answer.starts_with("TAK")
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("intent classifier failed: {}", e);
-            false
-        }
-        Err(_) => {
-            tracing::warn!("intent classifier timeout 10s");
-            false
-        }
-    }
-}
-
 /// Decyduje czy bot odpowiada na wypowiedz, i jezeli tak — generuje odpowiedz
 /// przez LLM streaming + sentence-boundary parser. Wola `on_sentence(zdanie)`
 /// dla kazdego kompletnego zdania natychmiast po jego dosklejeniu w buforze
@@ -281,11 +248,16 @@ async fn gate_and_respond(
                 );
                 false
             } else {
+                let intent = crate::intent_classifier::local_intent_classifier(
+                    text,
+                    &config.wake_words_compiled,
+                );
                 tracing::info!(
                     text = %text.chars().take(60).collect::<String>(),
-                    "wake_word match — pytam intent classifier"
+                    intent = intent,
+                    "wake_word match — lokalny intent classifier"
                 );
-                intent_says_yes(client, config, text).await
+                intent
             }
         }
         other => {
@@ -1052,12 +1024,12 @@ async fn main() -> Result<()> {
                             //   2. respond_enabled + llm_alias wpiety
                             //   3. response_mode determinuje kiedy odpalamy LLM:
                             //        - "always": kazda wypowiedz
-                            //        - "wake_word": tylko gdy wake_word w tekscie
-                            //        - "wake_word_intent" (default): wake_word + LLM-classifier
+                            //        - "wake_word" (default): tylko gdy wake_word w tekscie
+                            //        - "wake_word_intent": wake_word + lokalny klasyfikator
                             //   4. response generation: LLM moze zwrocic <NO_RESPONSE>
                             //
-                            // Pasywny tryb (default `wake_word_intent`) gwarantuje
-                            // 0 LLM calls dla normalnej rozmowy bez wezwania bota.
+                            // Pasywny default `wake_word` gwarantuje 0 LLM calls dla
+                            // normalnej rozmowy bez wezwania bota.
                             // Echo mode i streaming LLM rozbiegaja sie tutaj:
                             //   - echo_mode: pojedynczy passthrough -> jeden TTS
                             //     call (brak korzysci ze streamingu, tekst znamy
