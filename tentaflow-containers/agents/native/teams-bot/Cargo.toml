@@ -80,3 +80,7 @@ harness = false
 [[bench]]
 name = "sentence_buffer"
 harness = false
+
+[[bench]]
+name = "intent_classifier"
+harness = false
