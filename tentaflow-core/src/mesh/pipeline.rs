@@ -204,6 +204,19 @@ pub async fn start_mesh_pipeline(
                 db_pool.as_ref(),
             );
 
+            // Wstrzykujemy executor PRZED uruchomieniem accept loopa, zeby
+            // pierwsza komenda od peera zastala go juz wpietego. Bez tego okno
+            // pomiedzy `start()` a `set_command_executor` powodowalo by zwroty
+            // "command executor not configured" przy szybkim reconnectcie.
+            {
+                let executor = Arc::new(crate::mesh::command_executor::MeshCommandExecutor::new(
+                    mesh_security.clone(),
+                    local_node_id.clone(),
+                    crate::paths::tentaflow_home().to_path_buf(),
+                ));
+                quic_mesh.set_command_executor(executor).await;
+            }
+
             {
                 let qm = quic_mesh.clone();
                 tokio::spawn(async move {
@@ -480,6 +493,8 @@ fn upsert_local_peer(
         models: vec![],
         active_requests: 0,
         tokens_per_sec: 0.0,
+        nsys_available: false,
+        nsys_version: String::new(),
     });
 }
 
@@ -1351,6 +1366,8 @@ fn spawn_quic_event_handler(
                             metrics.swap_used_mb,
                             metrics.active_requests,
                             metrics.tokens_per_sec,
+                            metrics.nsys_available,
+                            metrics.nsys_version,
                         );
 
                         // Aktualizuj topologie peera na podstawie jego connected_peers
@@ -1900,6 +1917,12 @@ fn spawn_heartbeat_sender(
                 // "aktywne" i tok/s w Mesh UI per-node.
                 let (active_requests, tokens_per_sec) = routing_metrics_snapshot();
 
+                // Capability nsys propagujemy w kazdym heartbeacie: peerzy
+                // przy reconnect powinni miec aktualny stan. Detekcja jest
+                // cache'owana (~5s) wewnatrz NsysRunner, wiec wolanie z petli
+                // 2 Hz nie odpala kosztownego `which`/`--version` w kazdym ticku.
+                let nsys_cap = crate::profiling::detect_capability().await;
+
                 let hb = HeartbeatMetrics {
                     cpu_usage_percent: m.cpu_usage_percent,
                     ram_used_mb: m.ram_used_mb,
@@ -1913,6 +1936,8 @@ fn spawn_heartbeat_sender(
                     connected_peers: connected_peers.clone(),
                     active_requests,
                     tokens_per_sec,
+                    nsys_available: nsys_cap.available,
+                    nsys_version: nsys_cap.version,
                 };
 
                 // Aktualizuj metryki lokalnego noda w store (klonowanie z hb)
@@ -1929,6 +1954,8 @@ fn spawn_heartbeat_sender(
                     hb.swap_used_mb,
                     hb.active_requests,
                     hb.tokens_per_sec,
+                    hb.nsys_available,
+                    hb.nsys_version.clone(),
                 );
 
                 // Aktualizuj topologie lokalnego noda

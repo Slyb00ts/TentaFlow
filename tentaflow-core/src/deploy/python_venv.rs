@@ -1522,6 +1522,7 @@ mod tests {
                 extras: vec![],
                 extras_no_build_isolation: vec![],
                 install_hint: None,
+                force_pins: vec![],
             },
             InstallVariant {
                 backend: "rocm".into(),
@@ -1529,6 +1530,7 @@ mod tests {
                 extras: vec![],
                 extras_no_build_isolation: vec![],
                 install_hint: None,
+                force_pins: vec![],
             },
             InstallVariant {
                 backend: "metal".into(),
@@ -1536,6 +1538,7 @@ mod tests {
                 extras: vec!["vllm-metal".into()],
                 extras_no_build_isolation: vec![],
                 install_hint: None,
+                force_pins: vec![],
             },
         ];
         let v = pick_install_variant(&variants, "rocm").unwrap().unwrap();

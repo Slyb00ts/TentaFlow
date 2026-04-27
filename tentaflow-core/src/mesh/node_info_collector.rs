@@ -46,6 +46,53 @@ lazy_static::lazy_static! {
 
 }
 
+/// Klasyfikacja producenta GPU po fragmentach nazwy adaptera. Heurystyka
+/// case-insensitive — wystarczajaca dla wgpu adapter_info.name (Vulkan/Metal/DX12
+/// zwracaja oficjalne marketingowe nazwy w stylu "NVIDIA GeForce RTX 4090").
+pub fn infer_vendor(name: &str) -> crate::mesh::peer_store::GpuVendor {
+    use crate::mesh::peer_store::GpuVendor;
+    let n = name.to_lowercase();
+    if n.contains("nvidia")
+        || n.contains("geforce")
+        || n.contains("rtx")
+        || n.contains("gtx")
+        || n.contains("tesla")
+        || n.contains("quadro")
+        || n.contains("a100")
+        || n.contains("h100")
+        || n.contains("h200")
+        || n.contains("gh200")
+    {
+        GpuVendor::Nvidia
+    } else if n.contains("amd")
+        || n.contains("radeon")
+        || n.contains("rx ")
+        || n.contains("vega")
+        || n.contains("instinct")
+        || n.contains("mi100")
+        || n.contains("mi200")
+        || n.contains("mi300")
+    {
+        GpuVendor::Amd
+    } else if n.contains("intel")
+        || n.contains("iris")
+        || n.contains("arc ")
+        || n.contains("uhd")
+        || n.contains("hd graphics")
+    {
+        GpuVendor::Intel
+    } else if n.contains("apple")
+        || n.contains("m1")
+        || n.contains("m2")
+        || n.contains("m3")
+        || n.contains("m4")
+    {
+        GpuVendor::Apple
+    } else {
+        GpuVendor::Other
+    }
+}
+
 /// GPU z wgpu — enumerowane w tle. NIE blokuje startu mesh.
 /// None = jeszcze nie gotowe lub nie zainicjalizowane, Some = wynik.
 static WGPU_RESULT: std::sync::OnceLock<Mutex<Option<Vec<PeerGpuInfo>>>> =
@@ -128,6 +175,7 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
                         .unwrap_or(&info.name)
                         .trim()
                         .to_string();
+                    let vendor = infer_vendor(&clean_name);
                     PeerGpuInfo {
                         name: clean_name,
                         vram_total_mb: 0,
@@ -136,6 +184,7 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
                         temperature_c: 0,
                         power_draw_w: None,
                         power_limit_w: None,
+                        vendor,
                     }
                 })
                 .collect()
@@ -1510,5 +1559,45 @@ pub fn collect_os_distro() -> String {
         os_name
     } else {
         format!("{} {}", os_name, os_version)
+    }
+}
+
+#[cfg(test)]
+mod vendor_tests {
+    use super::infer_vendor;
+    use crate::mesh::peer_store::GpuVendor;
+
+    #[test]
+    fn infer_vendor_nvidia() {
+        assert_eq!(infer_vendor("NVIDIA GeForce RTX 4090"), GpuVendor::Nvidia);
+        assert_eq!(infer_vendor("NVIDIA H100 PCIe"), GpuVendor::Nvidia);
+        assert_eq!(infer_vendor("Tesla V100"), GpuVendor::Nvidia);
+    }
+
+    #[test]
+    fn infer_vendor_amd() {
+        assert_eq!(infer_vendor("AMD Radeon RX 7900 XTX"), GpuVendor::Amd);
+        assert_eq!(infer_vendor("Radeon Vega 56"), GpuVendor::Amd);
+        assert_eq!(infer_vendor("AMD Instinct MI300X"), GpuVendor::Amd);
+    }
+
+    #[test]
+    fn infer_vendor_intel() {
+        assert_eq!(infer_vendor("Intel(R) Arc A770"), GpuVendor::Intel);
+        assert_eq!(infer_vendor("Intel UHD Graphics 770"), GpuVendor::Intel);
+        assert_eq!(infer_vendor("Intel Iris Xe"), GpuVendor::Intel);
+    }
+
+    #[test]
+    fn infer_vendor_apple() {
+        assert_eq!(infer_vendor("Apple M3 Max"), GpuVendor::Apple);
+        assert_eq!(infer_vendor("Apple M1 Pro"), GpuVendor::Apple);
+    }
+
+    #[test]
+    fn infer_vendor_other() {
+        assert_eq!(infer_vendor("Mali-G77"), GpuVendor::Other);
+        assert_eq!(infer_vendor("Adreno 660"), GpuVendor::Other);
+        assert_eq!(infer_vendor(""), GpuVendor::Other);
     }
 }

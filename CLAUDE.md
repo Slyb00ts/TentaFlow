@@ -265,6 +265,65 @@ Implementacja: `tentaflow-core/src/api/dashboard/api_services_manifest.rs`.
 6. `cargo build` w `tentaflow-core/` — walidacja + auto-generacja Rust + JS rejestru
 7. Reload GUI — kafelek silnika pojawi się dynamicznie z manifestu
 
+## Profilowanie Nsight Systems
+
+Profilowanie CPU + GPU (NVIDIA Nsight Systems) per-card / per-node sterowane z GUI. Sesja jest uruchamiana lokalnie albo na zaufanym nodzie mesh przez forwarding rkyv; raport jest renderowany w przeglądarce bez zewnętrznego viewera.
+
+### Architektura
+
+- **`tentaflow-core/src/profiling/`** — runner `nsys`, parser SQLite eksportu, builder timeline, storage (FIFO 20 sesji), capability detection (`nsys --version`, cache 5s).
+- **`tentaflow-protocol/src/profiling.rs`** — typy rkyv: `NsightScope`, `ProfileReport`, oraz `NsightPayload` z 5+1 parami request/response.
+- **`tentaflow-core/src/dispatch/mesh_write_handlers.rs`** — 6 handlerów (`start`, `stop`, `sessions`, `report`, `delete`, `download`), `policy=Admin`.
+- **`tentaflow-core/src/dispatch/command_executor.rs`** — wykonanie zdalne; forwarding przez `MeshCommandType::Nsight*` (typed payloady rkyv, tylko trusted peer).
+- **`tentaflow-core/src/mesh/peer_store.rs`** — propagacja capability `nsys_available` + `nsys_version` przez `HeartbeatMetrics`.
+- **GUI**: `tentaflow-core/www/js/modules/mesh-detail-nsight.js` (modal startu, badge REC z countdown, lista sesji), `tentaflow-core/www/js/modules/profile-report.js` (6 KPI tiles, 7 zakładek `tf-tabs`: Overview / GPU Kernels / CUDA APIs / Memory / CPU Samples / NVTX / Timeline; vanilla SVG line chart per karta dla SM / Memory / Power). Routing: `Router.navigate('profile-report', { nodeId, sessionId })`. Per-card przycisk "Profile" widoczny gdy `gpu.vendor === 'Nvidia'` ORAZ `node.nsys_available`.
+
+### Tryby profilowania
+
+| `NsightScope` | Flagi `nsys profile` |
+|---------------|----------------------|
+| `Cpu` | `--sample=cpu --trace=osrt --gpu-metrics-device=none` |
+| `GpuIndex(i)` | `--sample=none --trace=cuda,cudnn,cublas,nvtx --gpu-metrics-device=<i>` |
+| `GpuAll` | `--sample=none --trace=cuda,cudnn,cublas,nvtx --gpu-metrics-device=all` |
+| `BothIndex(i)` | `--sample=cpu --trace=cuda,cudnn,cublas,osrt,nvtx --gpu-metrics-device=<i>` |
+| `BothAll` | `--sample=cpu --trace=cuda,cudnn,cublas,osrt,nvtx --gpu-metrics-device=all` |
+
+### Wymagania
+
+- `nsys` w `PATH` (CUDA Toolkit z Nsight Systems). Detekcja przez `nsys --version`, capability cache 5s.
+- DGX Spark / arm64-sbsa: brak specjalnych ścieżek — wystarczy zainstalowany Nsight Systems dla arm64.
+- Sesja działa lokalnie na nodzie posiadającym GPU; mesh forwarding jest tylko transportem żądań.
+
+### Limity
+
+- 1 aktywna sesja per nod (kolejne `start` odrzucane).
+- `duration_seconds` ∈ `0..=600` (`0` = manual stop przez `nsight.stop`).
+- `label` ≤ 128 znaków, bez znaków kontrolnych.
+- Storage FIFO: maks 20 sesji per nod; rotacja sierot starszych niż 1h bez `summary.bin`.
+
+### Storage layout
+
+```
+<TENTAFLOW_HOME>/nsight/<node_id>/<session_id>/
+├── report.nsys-rep    # surowy raport nsys
+└── summary.bin        # rkyv ProfileReport (parsed timeline + KPI)
+```
+
+`session_id` walidowane regex `^[a-f0-9]{16,32}$`. Przed `nsys export` runner robi `tokio::fs::symlink_metadata` na ścieżce wyjściowej (anty path-traversal).
+
+### Bezpieczeństwo
+
+- Shell injection: każdy argument `nsys` jest oddzielnym `String`, zero `format!()` shell concat.
+- Resource exhaustion: limity (1 sesja/nod, FIFO 20, duration ≤ 600s, label ≤ 128).
+- Permission: handlery `policy=Admin`; mesh route akceptuje wyłącznie trusted peerów.
+
+### Audit events
+
+`repository::log_audit` zapisuje:
+
+- `nsight.start` — przy starcie sesji (lokalnej lub zdalnej).
+- `nsight.stop` — przy ręcznym lub automatycznym (timeout) zakończeniu.
+
 ## Chat pipeline po cleanup
 
 Router chat obsługuje dokładnie dwie ścieżki:
