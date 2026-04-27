@@ -9,12 +9,35 @@ use crate::net::quic::QuicClient;
 use crate::routing::Router;
 
 use anyhow::Context;
-use std::sync::Arc;
+use dashmap::DashMap;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 /// Maksymalny rozmiar odwrotnego requestu od kontenera (10 MB)
 const MAX_REVERSE_REQUEST_SIZE: usize = 10_000_000;
+
+/// Cache `meeting_key -> session_id` współdzielony przez wszystkie wywołania
+/// `persist_meeting_event`. Każdy MeetingEvent (TranscriptEntry, ParticipantUpdate,
+/// BackendUpdate, …) trafia do reverse handlera setki razy w trakcie spotkania —
+/// `get_or_create_session` to synchroniczny rusqlite call (~5–30 ms). Cache redukuje
+/// to do ~50 ns DashMap hit po pierwszym uderzeniu w danej sesji.
+///
+/// Wpisy są ważne do końca procesu (sesje nie są usuwane w trakcie życia routera).
+/// Gdy admin usunie meeting w GUI, wywołanie `invalidate_meeting_session` musi
+/// wyczyścić wpis — inaczej kolejny event z tym kluczem trafiłby na zerwany
+/// foreign-key. Obecnie żadna ścieżka produkcyjna nie kasuje sesji, więc helper
+/// czeka na podpięcie przy delete-meeting endpoint.
+fn meeting_session_cache() -> &'static DashMap<String, i64> {
+    static CACHE: OnceLock<DashMap<String, i64>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+/// Czyści wpis cache `meeting_key -> session_id`. Wołane przy usunięciu sesji
+/// z DB (delete meeting endpoint). Jeśli nic nie ma w cache — no-op.
+pub fn invalidate_meeting_session(meeting_key: &str) {
+    meeting_session_cache().remove(meeting_key);
+}
 
 /// Uruchamia petle accept_bi na polaczeniu QUIC do kontenera.
 /// Kazdy przychodzacy strumien to ModelRequest od kontenera, ktory
@@ -485,21 +508,43 @@ fn handle_prompt_fetch(
     }
 }
 
+/// Resolvuje `meeting_key` do `session_id` przez cache; przy miss woła
+/// `get_or_create_session` (synchroniczne rusqlite) i zapisuje wynik.
+/// Wołane wyłącznie z wariantów które faktycznie zapisują do DB —
+/// pure-broadcast warianty (TranscriptEntry/ParticipantUpdate) pomijają to
+/// całkiem i nie obciążają SQLite.
+fn resolve_session_id_cached(
+    pool: &crate::db::DbPool,
+    meeting_key: &str,
+) -> std::result::Result<i64, String> {
+    if let Some(cached) = meeting_session_cache().get(meeting_key) {
+        return Ok(*cached);
+    }
+    let id = crate::db::repository::transcripts::get_or_create_session(
+        pool,
+        meeting_key,
+        None,
+        None,
+    )
+    .map_err(|e| format!("MeetingEvent: resolve session '{}' failed: {}", meeting_key, e))?;
+    meeting_session_cache().insert(meeting_key.to_string(), id);
+    Ok(id)
+}
+
 /// Persistuje pojedynczy MeetingEvent do DB. Wydzielone zeby mozna testowac
 /// logike bez budowania calego Routera (Router + QUIC + mesh to ciezkie setup).
+///
+/// Każdy wariant decyduje sam, czy potrzebuje `session_id`. Warianty które
+/// tylko logują (TranscriptEntry, ParticipantUpdate) nie odpytują DB w ogóle —
+/// SQLite hit dla setek per-meeting eventów byłby pasożytniczy. Warianty
+/// zapisujące (Summary, ActionItems, Backend, Lifecycle) idą przez
+/// `resolve_session_id_cached`, więc po pierwszym evencie sesja siedzi
+/// w DashMap i kolejne eventy nie dotykają SQLite na resolve.
 fn persist_meeting_event(
     pool: &crate::db::DbPool,
     event: tentaflow_protocol::MeetingEventData,
 ) -> std::result::Result<(), String> {
     use tentaflow_protocol::MeetingEventPayload;
-
-    let session_id = crate::db::repository::transcripts::get_or_create_session(
-        pool,
-        &event.meeting_key,
-        None,
-        None,
-    )
-    .map_err(|e| format!("MeetingEvent: resolve session '{}' failed: {}", event.meeting_key, e))?;
 
     match event.payload {
         MeetingEventPayload::SummaryUpdate {
@@ -507,6 +552,7 @@ fn persist_meeting_event(
             summary_text,
             model,
         } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             crate::db::repository::transcripts::insert_meeting_summary(
                 pool,
                 session_id,
@@ -524,6 +570,7 @@ fn persist_meeting_event(
             );
         }
         MeetingEventPayload::ActionItemsUpdate { items } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             let count = items.len();
             for item in items {
                 crate::db::repository::transcripts::upsert_meeting_action_item(
@@ -543,8 +590,8 @@ fn persist_meeting_event(
         // TranscriptEntry nie jest persistowany tym handlerem: chunki transkryptu
         // trafiają do DB osobną ścieżką (STT ModelRequest z metadata meeting_id →
         // transcript_store). Ten wariant istnieje wyłącznie po to, żeby dashboard
-        // dostał live broadcast (layer dopinany przez subskrybentów eventów;
-        // persist DB pozostaje pojedynczy punkt prawdy — transcript_store).
+        // dostał live broadcast — broadcast woła caller z `meeting_key`, więc
+        // `session_id` nie jest tu potrzebny i pomijamy SQLite hit całkowicie.
         MeetingEventPayload::TranscriptEntry {
             speaker_id,
             text,
@@ -553,8 +600,8 @@ fn persist_meeting_event(
             ..
         } => {
             info!(
-                "MeetingEvent TranscriptEntry: session_id={} speaker={} model={} latency_ms={} text_len={}",
-                session_id,
+                "MeetingEvent TranscriptEntry: meeting_key={} speaker={} model={} latency_ms={} text_len={}",
+                event.meeting_key,
                 speaker_id,
                 resolved_stt_model,
                 latency_ms,
@@ -564,20 +611,23 @@ fn persist_meeting_event(
         // ParticipantUpdate: brak tabeli participants per-session. Roster + active
         // speaker to stan runtime'owy trzymany w pamięci bota i broadcastowany
         // live. Zapis do DB nie jest potrzebny — rekonstrukcja możliwa z
-        // transcript_entries (DISTINCT speaker_name).
+        // transcript_entries (DISTINCT speaker_name). Pomijamy session resolve.
         MeetingEventPayload::ParticipantUpdate {
             speaker_id,
             status,
             ..
         } => {
             info!(
-                "MeetingEvent ParticipantUpdate: session_id={} speaker={} status={}",
-                session_id, speaker_id, status
+                "MeetingEvent ParticipantUpdate: meeting_key={} speaker={} status={}",
+                event.meeting_key, speaker_id, status
             );
         }
         // BackendUpdate: persisted on meeting_sessions so a live view mounted
         // after the broadcast still sees the BACKEND panel populated. The same
         // event is broadcast to dashboards; this branch only owns DB durability.
+        // `update_session_backend` operuje po `meeting_key` (a nie session_id),
+        // ale i tak rozgrzewamy cache, żeby kolejne warianty zapisujące miały
+        // ścieżkę bez SQLite na resolve.
         MeetingEventPayload::BackendUpdate {
             stt_model,
             tts_model,
@@ -587,6 +637,7 @@ fn persist_meeting_event(
             enrolled_speakers,
             total_participants,
         } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             if let Err(e) = crate::db::repository::transcripts::update_session_backend(
                 pool,
                 &event.meeting_key,
@@ -610,6 +661,7 @@ fn persist_meeting_event(
         // od tego, czy WSS broadcast już trafił. Broadcast i tak idzie równolegle
         // przez publish() w callerze.
         MeetingEventPayload::LifecycleUpdate { stage, details } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             if let Err(e) = crate::db::repository::transcripts::update_session_lifecycle(
                 pool,
                 &event.meeting_key,
@@ -969,12 +1021,14 @@ mod tests {
         assert_eq!(cnt, 1);
     }
 
-    // Handler musi akceptować TranscriptEntry bez błędu i bez wpisów do
-    // meeting_summaries / meeting_action_items — persist chunków leci przez
-    // transcript_store, nie przez ten handler.
+    // Handler musi akceptować TranscriptEntry bez błędu i nie wpisywać niczego do
+    // DB — persist chunków leci przez transcript_store, a sam wariant istnieje
+    // wyłącznie dla live broadcastu. Po optymalizacji R-3/R-4 handler nawet nie
+    // resolvuje session_id (skip SQLite hit dla setek per-meeting eventów).
     #[test]
-    fn persist_handler_transcript_entry_is_noop_but_creates_session() {
+    fn persist_handler_transcript_entry_is_noop_and_skips_session_resolve() {
         let db = setup_test_db();
+        invalidate_meeting_session("m-te-1");
         let event = MeetingEventData {
             meeting_key: "m-te-1".to_string(),
             timestamp_ms: 100,
@@ -991,24 +1045,24 @@ mod tests {
         };
         persist_meeting_event(&db, event).expect("persist transcript entry");
 
-        let sid = crate::db::repository::transcripts::get_or_create_session(
-            &db, "m-te-1", None, None,
-        )
-        .unwrap();
-        let summaries =
-            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
-        let actions =
-            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
-                .unwrap();
-        assert!(summaries.is_empty(), "TranscriptEntry nie wpisuje summary");
-        assert!(actions.is_empty(), "TranscriptEntry nie wpisuje action items");
+        // TranscriptEntry NIE tworzy session row — meeting_sessions zostaje puste
+        // dopóki nie przyjdzie wariant zapisujący (Summary, ActionItems, …) albo
+        // STT chunk (transcript_store).
+        let sid_opt =
+            crate::db::repository::transcripts::session_id_by_meeting_key(&db, "m-te-1").unwrap();
+        assert!(
+            sid_opt.is_none(),
+            "TranscriptEntry nie powinien tworzyć session row"
+        );
     }
 
     // ParticipantUpdate: handler nie persistuje nigdzie — sprawdzamy że nie
-    // zwraca błędu i nie tworzy rekordów w tabelach zapisywanych.
+    // zwraca błędu i nie dotyka SQLite (po optymalizacji R-3/R-4 pomijamy
+    // session resolve całkowicie).
     #[test]
-    fn persist_handler_participant_update_is_noop() {
+    fn persist_handler_participant_update_is_noop_and_skips_session_resolve() {
         let db = setup_test_db();
+        invalidate_meeting_session("m-pu-1");
         let event = MeetingEventData {
             meeting_key: "m-pu-1".to_string(),
             timestamp_ms: 100,
@@ -1021,17 +1075,124 @@ mod tests {
         };
         persist_meeting_event(&db, event).expect("persist participant update");
 
-        let sid = crate::db::repository::transcripts::get_or_create_session(
-            &db, "m-pu-1", None, None,
-        )
-        .unwrap();
-        let summaries =
-            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
-        let actions =
-            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
-                .unwrap();
-        assert!(summaries.is_empty());
-        assert!(actions.is_empty());
+        let sid_opt =
+            crate::db::repository::transcripts::session_id_by_meeting_key(&db, "m-pu-1").unwrap();
+        assert!(
+            sid_opt.is_none(),
+            "ParticipantUpdate nie powinien tworzyć session row"
+        );
+    }
+
+    // Cache hit: pierwszy event z meeting_key idzie przez get_or_create_session,
+    // drugi z tym samym kluczem trafia w DashMap. Sprawdzamy przez wstawienie
+    // ręcznie nieistniejącego id do cache i obserwację, że handler go używa
+    // bez tworzenia nowej sesji w DB.
+    #[test]
+    fn meeting_session_cache_hits_skip_db() {
+        let db = setup_test_db();
+        let key = "m-cache-hit-1";
+        invalidate_meeting_session(key);
+
+        // Pierwszy event populuje cache realnym session_id z DB.
+        let event1 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 1,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d1".to_string(),
+                summary_text: "s1".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event1).expect("first persist");
+
+        // Cache musi mieć teraz wpis.
+        let cached = meeting_session_cache().get(key).map(|v| *v);
+        assert!(cached.is_some(), "cache nie został zapełniony po pierwszym evencie");
+        let real_sid = cached.unwrap();
+
+        // Kasujemy sesję bezpośrednio z DB (cascade FK usunie summary). Cache
+        // nadal trzyma stary id — gdyby handler szedł do DB, get_or_create_session
+        // utworzyłby nowe id. Jeśli używa cache, drugi insert poleci na stare id
+        // i FK error potwierdzi cache hit.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+            conn.execute(
+                "DELETE FROM meeting_sessions WHERE id = ?1",
+                rusqlite::params![real_sid],
+            )
+            .unwrap();
+        }
+
+        let event2 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 2,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d2".to_string(),
+                summary_text: "s2".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        let res = persist_meeting_event(&db, event2);
+        assert!(
+            res.is_err(),
+            "cache hit musi reużyć stary session_id; insert powinien fail-FK po DELETE sesji"
+        );
+
+        // Po użytku tego testu czyścimy cache, żeby nie dziedziczyć stanu.
+        invalidate_meeting_session(key);
+    }
+
+    // Po `invalidate_meeting_session` kolejny event musi ponownie odpytać DB
+    // i utworzyć/znaleźć sesję — czyli faktycznie zapisać do meeting_sessions.
+    #[test]
+    fn meeting_session_cache_invalidate_forces_db_resolve() {
+        let db = setup_test_db();
+        let key = "m-cache-inv-1";
+        invalidate_meeting_session(key);
+
+        let event1 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 1,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d".to_string(),
+                summary_text: "s".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event1).expect("first persist");
+        let sid_first = meeting_session_cache().get(key).map(|v| *v).unwrap();
+
+        // Kasujemy sesję i invalidujemy cache — kolejny event musi utworzyć nowy
+        // wpis w meeting_sessions z nowym id i odświeżyć cache.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+            conn.execute(
+                "DELETE FROM meeting_sessions WHERE id = ?1",
+                rusqlite::params![sid_first],
+            )
+            .unwrap();
+        }
+        invalidate_meeting_session(key);
+
+        let event2 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 2,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d2".to_string(),
+                summary_text: "s2".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event2).expect("second persist after invalidate");
+        let sid_second = meeting_session_cache().get(key).map(|v| *v).unwrap();
+        assert_ne!(
+            sid_first, sid_second,
+            "po invalidate handler musi pobrać świeży session_id z DB"
+        );
+
+        invalidate_meeting_session(key);
     }
 
     // BackendUpdate: persisted on meeting_sessions so a live view mounted
