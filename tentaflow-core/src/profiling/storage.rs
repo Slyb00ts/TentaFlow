@@ -165,14 +165,48 @@ impl ProfileStorage {
 
     /// Usuwa najstarsze sesje powyzej limitu `MAX_SESSIONS_PER_NODE`. Jako
     /// kryterium wieku uzywa `started_at_ms` zapisanego w summary.bin.
+    /// Drugi pass sprzata "osierocone" katalogi sesji (alokowane, ale `nsys`
+    /// padl przed zapisem `summary.bin`) starsze niz 1h, zeby disk nie rosl
+    /// w nieskonczonosc po crashach.
     pub fn rotate(&self) -> Result<(), ProfilingError> {
         let entries = self.list()?;
-        if entries.len() <= MAX_SESSIONS_PER_NODE {
+        if entries.len() > MAX_SESSIONS_PER_NODE {
+            for old in entries.iter().skip(MAX_SESSIONS_PER_NODE) {
+                let _ = self.delete(&old.session_id);
+            }
+        }
+        self.rotate_orphans()?;
+        Ok(())
+    }
+
+    fn rotate_orphans(&self) -> Result<(), ProfilingError> {
+        let dir = self.node_dir();
+        if !dir.exists() {
             return Ok(());
         }
-        // entries sa desc po started_at_ms — najstarsze sa na koncu.
-        for old in entries.iter().skip(MAX_SESSIONS_PER_NODE) {
-            let _ = self.delete(&old.session_id);
+        let now = std::time::SystemTime::now();
+        let stale_threshold = std::time::Duration::from_secs(3600);
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if validate_session_id(&name).is_err() {
+                continue;
+            }
+            let session_dir = entry.path();
+            if session_dir.join("summary.bin").exists() {
+                continue;
+            }
+            let mtime = match fs::metadata(&session_dir).and_then(|m| m.modified()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let age = now.duration_since(mtime).unwrap_or_default();
+            if age >= stale_threshold {
+                let _ = fs::remove_dir_all(&session_dir);
+            }
         }
         Ok(())
     }
@@ -253,6 +287,31 @@ mod tests {
         st.write_summary(&sid, &rep).unwrap();
         let read = st.read_summary(&sid).unwrap();
         assert_eq!(read, rep);
+    }
+
+    #[test]
+    fn storage_rotate_removes_old_orphans() {
+        // Osierocony katalog (bez summary.bin) starszy niz 1h ma byc usuniety
+        // przez rotate(); mlodszy musi pozostac.
+        let (tmp, st) = make_storage();
+        // Symuluj alokacje: 2 katalogi sesji bez summary.bin.
+        let (sid_old, rep_old) = st.allocate("x", &NsightScope::Cpu).unwrap();
+        let (sid_new, rep_new) = st.allocate("x", &NsightScope::Cpu).unwrap();
+        // Zapisz dummy report.nsys-rep w obu (1MB nie jest wymagany, byle plik istnial).
+        std::fs::write(&rep_old, b"dummy").unwrap();
+        std::fs::write(&rep_new, b"dummy").unwrap();
+
+        // Cofnij mtime starszego katalogu o 2h.
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let ft = filetime::FileTime::from_system_time(two_hours_ago);
+        let old_dir = tmp.path().join("nsight").join("node-test").join(&sid_old);
+        filetime::set_file_mtime(&old_dir, ft).unwrap();
+
+        st.rotate().unwrap();
+
+        let new_dir = tmp.path().join("nsight").join("node-test").join(&sid_new);
+        assert!(!old_dir.exists(), "stary osierocony katalog powinien byc usuniety");
+        assert!(new_dir.exists(), "swiezy osierocony katalog ma pozostac");
     }
 
     #[test]

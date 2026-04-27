@@ -10,12 +10,10 @@ pub mod storage;
 pub mod timeline;
 
 pub use nsys::{
-    detect_capability, detect_capability_sync, ActiveSession, NsysCapability, NsysRunner,
-    ProfilingError,
+    detect_capability, ActiveSession, NsysCapability, NsysRunner, ProfilingError,
 };
 pub use parser::{parse_nsys_stats_json, parse_stats_json_str, ParsedStats};
 pub use storage::{ProfileStorage, MAX_SESSIONS_PER_NODE};
-pub use timeline::extract_gpu_timeline;
 
 use std::sync::{Arc, LazyLock};
 

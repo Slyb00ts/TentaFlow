@@ -5,10 +5,10 @@
 //       per scope, SIGTERM przy stop (potrzebny zeby nsys flush'l plik).
 // =============================================================================
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex as SyncMutex;
 use regex::Regex;
 use std::sync::LazyLock;
 use tentaflow_protocol::profiling::{
@@ -24,6 +24,8 @@ use super::timeline::extract_gpu_timeline;
 
 /// Maksymalna dozwolona dlugosc sesji w sekundach. Powyzej -> InvalidDuration.
 const MAX_DURATION_SECS: u32 = 600;
+/// Maksymalna dlugosc etykiety sesji (znaki Unicode). Powyzej -> InvalidLabel.
+const MAX_LABEL_CHARS: usize = 128;
 /// Cache TTL dla wyniku `nsys --version`.
 const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5);
 /// Twardy timeout na `nsys stats` + `nsys export` w stop'ie.
@@ -63,6 +65,8 @@ pub enum ProfilingError {
     NotFound(String),
     #[error("invalid session id format")]
     InvalidSessionId,
+    #[error("invalid label: {0}")]
+    InvalidLabel(&'static str),
     #[error("invalid duration: {0}s (must be 0..={max})", max = MAX_DURATION_SECS)]
     InvalidDuration(u32),
     #[error("nsys process failed: {0}")]
@@ -76,11 +80,9 @@ pub enum ProfilingError {
 }
 
 /// Runner trzymajacy lock per-nod (jedna aktywna sesja) + cache capability.
-/// Cache jest synchroniczny (`parking_lot`), zeby capability moglo byc czytane
-/// z handlerow `#[handler]` ktore nie sa async.
 pub struct NsysRunner {
     active: Mutex<Option<ActiveSlot>>,
-    cap_cache: SyncMutex<Option<(Instant, NsysCapability)>>,
+    cap_cache: Mutex<Option<(Instant, NsysCapability)>>,
 }
 
 impl Default for NsysRunner {
@@ -93,7 +95,7 @@ impl NsysRunner {
     pub fn new() -> Self {
         Self {
             active: Mutex::new(None),
-            cap_cache: SyncMutex::new(None),
+            cap_cache: Mutex::new(None),
         }
     }
 
@@ -101,7 +103,7 @@ impl NsysRunner {
     /// MeshNodeInfo collectora) jest tanie po pierwszym razie.
     pub async fn capability(&self) -> NsysCapability {
         {
-            let cache = self.cap_cache.lock();
+            let cache = self.cap_cache.lock().await;
             if let Some((t, cap)) = cache.as_ref() {
                 if t.elapsed() < CAPABILITY_CACHE_TTL {
                     return cap.clone();
@@ -109,23 +111,7 @@ impl NsysRunner {
             }
         }
         let cap = probe_capability().await;
-        *self.cap_cache.lock() = Some((Instant::now(), cap.clone()));
-        cap
-    }
-
-    /// Synchroniczny wariant — uzywany z `#[handler]` ktore nie sa async.
-    /// Pierwsze wywolanie spawnuje `nsys --version` blokujaco; kolejne idzie z cache 5s.
-    pub fn capability_sync(&self) -> NsysCapability {
-        {
-            let cache = self.cap_cache.lock();
-            if let Some((t, cap)) = cache.as_ref() {
-                if t.elapsed() < CAPABILITY_CACHE_TTL {
-                    return cap.clone();
-                }
-            }
-        }
-        let cap = probe_capability_sync();
-        *self.cap_cache.lock() = Some((Instant::now(), cap.clone()));
+        *self.cap_cache.lock().await = Some((Instant::now(), cap.clone()));
         cap
     }
 
@@ -146,6 +132,7 @@ impl NsysRunner {
         if duration_secs > MAX_DURATION_SECS {
             return Err(ProfilingError::InvalidDuration(duration_secs));
         }
+        validate_label(&label)?;
 
         let cap = self.capability().await;
         if !cap.available {
@@ -215,7 +202,9 @@ impl NsysRunner {
 
         // SIGTERM zamiast SIGKILL — nsys potrzebuje signala TERM zeby wywolac
         // teardown i flush'nac dane do `.nsys-rep`. SIGKILL zostawia plik
-        // czesciowy/uszkodzony.
+        // czesciowy/uszkodzony. PID race nie wystepuje: wciaz trzymamy `child`
+        // (kill_on_drop=true), wiec OS nie zrecyklowal slotu PID przed
+        // bezposrednio nastepujacym `child.wait()`.
         send_sigterm(session.child_pid);
 
         let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
@@ -308,7 +297,8 @@ async fn finalize_session(
         _ => Vec::new(),
     };
 
-    let timeline = extract_gpu_timeline(&session.output_path, &gpu_targets)
+    let power_limits = query_power_limits(&gpu_targets).await;
+    let timeline = extract_gpu_timeline(&session.output_path, &gpu_targets, &power_limits)
         .await
         .unwrap_or_default();
 
@@ -420,46 +410,47 @@ async fn probe_capability() -> NsysCapability {
     }
 }
 
-fn probe_capability_sync() -> NsysCapability {
-    let output = match std::process::Command::new("nsys").arg("--version").output() {
-        Ok(o) => o,
-        Err(_) => {
-            return NsysCapability {
-                available: false,
-                version: String::new(),
-            }
-        }
-    };
-    if !output.status.success() {
-        return NsysCapability {
-            available: false,
-            version: String::new(),
-        };
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{stdout}\n{stderr}");
-    static VERSION_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(\d+\.\d+\.\d+(?:\.\d+)?)").expect("valid version regex"));
-    let version = VERSION_RE
-        .captures(&combined)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_default();
-    NsysCapability {
-        available: true,
-        version,
-    }
-}
-
 /// Async wykrywanie. Wynik cache'owany 5s przez NSYS_RUNNER.
 pub async fn detect_capability() -> NsysCapability {
     super::NSYS_RUNNER.capability().await
 }
 
-/// Synchroniczne wykrywanie — uzywane z handlerow dispatch ktore sa sync.
-pub fn detect_capability_sync() -> NsysCapability {
-    super::NSYS_RUNNER.capability_sync()
+fn validate_label(label: &str) -> Result<(), ProfilingError> {
+    if label.chars().count() > MAX_LABEL_CHARS {
+        return Err(ProfilingError::InvalidLabel("label exceeds 128 chars"));
+    }
+    if label.chars().any(|c| c.is_control()) {
+        return Err(ProfilingError::InvalidLabel("label contains control chars"));
+    }
+    Ok(())
+}
+
+/// Pyta `nvidia-smi` o `power.limit` per GPU index. Zwraca pusta mape gdy
+/// nvidia-smi nie ma w PATH albo gdy zadne GPU nie pasuje (CPU-only sesja).
+async fn query_power_limits(targets: &[NsightGpuTarget]) -> HashMap<u8, f32> {
+    let mut out = HashMap::new();
+    for t in targets {
+        let res = Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=power.limit",
+                "--format=csv,noheader,nounits",
+                "-i",
+            ])
+            .arg(t.idx.to_string())
+            .output()
+            .await;
+        let Ok(output) = res else { continue };
+        if !output.status.success() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = s.lines().next() {
+            if let Ok(w) = line.trim().parse::<f32>() {
+                out.insert(t.idx, w);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
