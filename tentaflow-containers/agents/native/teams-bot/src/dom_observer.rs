@@ -14,10 +14,17 @@
 //     now call `window.__tentaflowEvent(jsonStr)` and Chromium emits a
 //     `Runtime.bindingCalled` event over the same DevTools WebSocket that
 //     chromiumoxide already uses. No polling, no roundtrip per check.
-//   * Spawns a tokio task that subscribes to `EventBindingCalled` and routes
-//     each event JSON to either the meeting protocol (lifecycle / participant
-//     update) or an internal state-machine (lobby/joined detection so
-//     `wait_for_joined` can replace the polling loop in browser.rs).
+//   * Splits processing into two cooperating tasks:
+//       - listener: konsumuje `EventBindingCalled`, robi LOKALNE update'y
+//         stanu (znani uczestnicy, aktywny mowca, lifecycle watch) i wpycha
+//         wynikowy `MeetingEvent` do mpsc.
+//       - writer: drainuje mpsc i wykonuje QUIC `send_meeting_event`
+//         rownolegle (semaphore cap = 8). Bez tego 5 osob dolaczajacych w
+//         jednym DOM scan'ie powodowalo 5 x ~150ms RT sequencyjnie.
+//   * Buduje JSON snapshot rosteru (Arc<String>) atomowo przy KAZDEJ zmianie
+//     `known` mapy i wystawia go przez `ArcSwap`. STT hot path w main.rs
+//     bierze go jednym `load_full()` zamiast `RwLock.read().await + serde_json
+//     ::to_string` per segment.
 //
 // The matching JS side lives in `browser_inject.js` — a single MutationObserver
 // scheduled through requestAnimationFrame that pushes events when the Teams
@@ -29,25 +36,40 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use arc_swap::ArcSwap;
 use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 use serde::Deserialize;
 use tentaflow_protocol::{
-    MeetingEventPayload, LIFECYCLE_JOINED, LIFECYCLE_LOBBY_WAITING,
+    MeetingEventPayload, RosterEntry, LIFECYCLE_JOINED, LIFECYCLE_LOBBY_WAITING,
 };
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock, Semaphore};
 
-use crate::audio::RosterEntry;
 use crate::quic_server::RouterClient;
 
 pub type RouterHandle = Arc<Mutex<Option<Arc<RouterClient>>>>;
-pub type RosterState = Arc<RwLock<Vec<RosterEntry>>>;
 pub type SpeakerState = Arc<RwLock<Option<String>>>;
+/// Atomowy snapshot rosteru jako gotowy JSON (Vec<String> nazw uczestnikow,
+/// po sanityzacji). Pusta lista koduje sie jako `"[]"`. Czytanie z STT hot
+/// path: `roster_snapshot.load_full()` -> `Arc<String>` (zero alokacji,
+/// jeden atomic load).
+pub type RosterSnapshotJson = Arc<ArcSwap<String>>;
 
 /// JS-side event name registered as a CDP binding. Must match the constant
 /// used inside `browser_inject.js`.
 const BINDING_NAME: &str = "__tentaflowEvent";
+
+/// Maksymalna liczba rownoleglych emitow QUIC. Przy 5 uczestnikach dolaczajacych
+/// w tym samym DOM scan'ie chcemy zeby wszystkie poszly rownolegle, ale nie
+/// pozwalamy zdziczec gdy Teams "wybuchnie" listą 50 osob.
+const EMIT_CONCURRENCY: usize = 8;
+
+/// Limity sanityzacji rosteru — chronia przed metadata-bomb z zlosliwie
+/// zbugowanej strony Teams. Lustrzane do tego co main.rs robil wczesniej
+/// inline na hot path (50 nazw x 128 znakow).
+const MAX_ROSTER_NAMES: usize = 50;
+const MAX_ROSTER_NAME_LEN: usize = 128;
 
 /// State of the join flow as inferred from DOM events. The polling loop in
 /// `browser.rs` previously baked this into a 500ms ticker; now the observer
@@ -65,18 +87,39 @@ pub enum JoinState {
 enum DomEvent {
     Lobby,
     Joined,
-    ParticipantJoined { id: String, name: Option<String> },
-    ParticipantLeft { id: String, name: Option<String> },
+    /// Pełny snapshot rosteru — JS emituje to raz na DOM scan zamiast
+    /// per-tile joined/left. `entries` zawiera *aktualną* listę kafelków
+    /// (poza bot'em — filtrujemy w listenerze po nazwie).
+    RosterSnapshot { entries: Vec<RosterTile> },
     ActiveSpeaker { id: Option<String>, name: Option<String> },
     /// Untyped fallback so a JS-side schema bump doesn't kill the listener.
     #[serde(other)]
     Unknown,
 }
 
+/// Pojedynczy kafelek z DOM Teams — surowy zapis z `browser_inject.js`.
+/// Konwertujemy do `RosterEntry` dopiero przy emit do routera (po filtracji
+/// bot'a i sanityzacji nazwy).
+#[derive(Debug, Deserialize)]
+struct RosterTile {
+    id: String,
+    name: Option<String>,
+}
+
+/// Pojedynczy rekord przekazywany z listener -> writer. `meeting_key` jest
+/// klonowany per-event (caly listener trzyma jeden String, ale writer spawnuje
+/// async taski rownolegle — kazdy potrzebuje wlasnej kopii).
+struct PendingEmit {
+    meeting_key: String,
+    timestamp_ms: i64,
+    payload: MeetingEventPayload,
+}
+
 pub struct DomObserver {
     shutdown_tx: watch::Sender<bool>,
     state_rx: watch::Receiver<JoinState>,
-    join: tokio::task::JoinHandle<()>,
+    listener_join: tokio::task::JoinHandle<()>,
+    writer_join: tokio::task::JoinHandle<()>,
 }
 
 impl DomObserver {
@@ -142,25 +185,28 @@ impl DomObserver {
 
     pub async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
-        let _ = self.join.await;
+        // Listener zamyka mpsc tx -> writer wychodzi z petli.
+        let _ = self.listener_join.await;
+        let _ = self.writer_join.await;
     }
 }
 
 /// Register the JS binding, subscribe to the resulting CDP events, and spawn
-/// the forwarding task. Must be called *before* the page navigates to the
+/// the forwarding tasks. Must be called *before* the page navigates to the
 /// Teams URL — `evaluate_on_new_document` already injects the JS observer,
 /// and the binding has to exist when that JS runs.
 ///
-/// `roster_state` / `speaker_state` are also written from the forwarding task
-/// so STT metadata enrichment in main.rs (transcribe extra_meta `roster` /
-/// `active_speaker`) keeps working without the old WS-poll pipeline.
+/// `speaker_state` jest dalej `RwLock<Option<String>>` — main.rs odczytuje go
+/// w STT hot path (cheap clone Option<String>), a contention jest praktycznie
+/// zerowy. `roster_snapshot` to ArcSwap: dom_observer publikuje gotowy JSON
+/// po kazdej zmianie `known`, main.rs robi tylko `load_full()`.
 pub async fn start(
     page: Page,
     router: RouterHandle,
     meeting_key: String,
     bot_name: String,
-    roster_state: RosterState,
     speaker_state: SpeakerState,
+    roster_snapshot: RosterSnapshotJson,
 ) -> Result<DomObserver> {
     page.execute(AddBindingParams::new(BINDING_NAME))
         .await
@@ -174,7 +220,21 @@ pub async fn start(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let (state_tx, state_rx) = watch::channel(JoinState::NotYet);
 
-    let join = tokio::spawn(async move {
+    // Bounded ale "wystarczajaco duzy" buffor — pojedynczy Teams scan z 50
+    // uczestnikami wygeneruje ~50 eventow naraz. Bounded bo nie chcemy
+    // unbounded growth gdy router jest rozlaczony i writer zatka sie na
+    // `send_meeting_event` (aktualnie writer trzyma <= EMIT_CONCURRENCY
+    // in-flight, reszta czeka w mpsc). 256 to ~3x maksymalny realny burst.
+    let (emit_tx, mut emit_rx) = mpsc::channel::<PendingEmit>(256);
+
+    // Listener: caly state-machine + sanityzacja rosteru. Zero awaitow QUIC.
+    let listener_meeting_key = meeting_key.clone();
+    let listener_bot_name = bot_name.clone();
+    let listener_speaker_state = speaker_state.clone();
+    let listener_roster_snapshot = roster_snapshot.clone();
+    let listener_emit_tx = emit_tx.clone();
+    let mut listener_shutdown_rx = shutdown_rx.clone();
+    let listener_join = tokio::spawn(async move {
         // Per-tile last known display name, keyed on data-tid. Lets us emit
         // `participant_left` with a meaningful name field when a tile vanishes
         // from the DOM. Bot's own tile is filtered by name on emit so we
@@ -182,11 +242,16 @@ pub async fn start(
         let mut known: HashMap<String, String> = HashMap::new();
         let mut current_speaker: Option<String> = None;
 
+        // Inicjalny snapshot — pusta lista. Bez tego pierwszy STT przed
+        // pierwszym ParticipantJoined dostalby Default::default() z ArcSwap'a
+        // (czyli niezdefiniowany kontrakt).
+        listener_roster_snapshot.store(Arc::new("[]".to_string()));
+
         loop {
             tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        tracing::debug!("dom_observer: shutdown");
+                changed = listener_shutdown_rx.changed() => {
+                    if changed.is_err() || *listener_shutdown_rx.borrow() {
+                        tracing::debug!("dom_observer: listener shutdown");
                         return;
                     }
                 }
@@ -209,56 +274,80 @@ pub async fn start(
                         DomEvent::Lobby => {
                             if !matches!(*state_tx.borrow(), JoinState::Lobby | JoinState::Joined) {
                                 tracing::info!("dom_observer: lobby");
-                                emit_lifecycle(&router, &meeting_key, LIFECYCLE_LOBBY_WAITING).await;
+                                queue_lifecycle(
+                                    &listener_emit_tx,
+                                    &listener_meeting_key,
+                                    LIFECYCLE_LOBBY_WAITING,
+                                );
                                 let _ = state_tx.send(JoinState::Lobby);
                             }
                         }
                         DomEvent::Joined => {
                             if !matches!(*state_tx.borrow(), JoinState::Joined) {
                                 tracing::info!("dom_observer: joined");
-                                emit_lifecycle(&router, &meeting_key, LIFECYCLE_JOINED).await;
+                                queue_lifecycle(
+                                    &listener_emit_tx,
+                                    &listener_meeting_key,
+                                    LIFECYCLE_JOINED,
+                                );
                                 let _ = state_tx.send(JoinState::Joined);
                             }
                         }
-                        DomEvent::ParticipantJoined { id, name } => {
-                            let who = name.unwrap_or_else(|| id.clone());
-                            // Teams dla anonimowych dolaczen dodaje sufix
-                            // "(Unverified)" / " (External)" do display name.
-                            // Filtrujemy bot przez prefix match — "DevBot"
-                            // pasuje do "DevBot (Unverified)" itp.
-                            if who.starts_with(&bot_name) {
-                                continue;
+                        DomEvent::RosterSnapshot { entries } => {
+                            // Zbuduj nowy stan `known` z snapshotu (po filtracji
+                            // bota). Logujemy delty względem poprzedniego stanu —
+                            // do telemetrii — ale do routera idzie 1 batch event.
+                            let mut next: HashMap<String, String> = HashMap::new();
+                            for tile in &entries {
+                                let who = tile.name.clone().unwrap_or_else(|| tile.id.clone());
+                                // Teams dla anonimowych dolaczen dodaje sufix
+                                // "(Unverified)" / " (External)" do display name.
+                                // Filtrujemy bota przez prefix match.
+                                if who.starts_with(&listener_bot_name) {
+                                    continue;
+                                }
+                                next.insert(tile.id.clone(), who);
                             }
-                            if known.insert(id.clone(), who.clone()).is_none() {
-                                tracing::info!(participant = %who, "dom_observer: participant joined");
-                                emit_participant(&router, &meeting_key, &id, &who, "joined").await;
-                                sync_roster(&roster_state, &known).await;
+                            for (id, who) in &next {
+                                if !known.contains_key(id) {
+                                    tracing::info!(participant = %who, "dom_observer: participant joined");
+                                }
                             }
-                        }
-                        DomEvent::ParticipantLeft { id, name } => {
-                            let removed = known.remove(&id);
-                            let who = match removed {
-                                Some(prev) => prev,
-                                None => name.unwrap_or_else(|| id.clone()),
-                            };
-                            if who.starts_with(&bot_name) {
-                                continue;
+                            for (id, who) in &known {
+                                if !next.contains_key(id) {
+                                    tracing::info!(participant = %who, "dom_observer: participant left");
+                                }
                             }
-                            tracing::info!(participant = %who, "dom_observer: participant left");
-                            emit_participant(&router, &meeting_key, &id, &who, "left").await;
-                            sync_roster(&roster_state, &known).await;
+                            known = next;
+                            publish_roster_snapshot(&listener_roster_snapshot, &known);
+                            queue_roster_snapshot(
+                                &listener_emit_tx,
+                                &listener_meeting_key,
+                                &known,
+                                &listener_bot_name,
+                            );
                         }
                         DomEvent::ActiveSpeaker { id, name } => {
                             let who = name.or_else(|| id.as_ref().and_then(|tid| known.get(tid).cloned()));
                             if current_speaker == who { continue; }
                             current_speaker = who.clone();
-                            *speaker_state.write().await = current_speaker.clone();
+                            // Wpisanie do RwLock<Option<String>> jest swapem — taniej
+                            // niz utrzymanie kolejnego ArcSwap, a STT hot path i tak
+                            // klonuje Option<String> kazdorazowo.
+                            *listener_speaker_state.write().await = current_speaker.clone();
                             if let Some(ref n) = current_speaker {
-                                tracing::info!(speaker = %n, "dom_observer: active speaker");
-                                emit_participant(&router, &meeting_key, id.as_deref().unwrap_or(n), n, "speaking").await;
+                                // Active speaker zmienia sie przy kazdym przebiciu
+                                // glosu — przy zywej dyskusji 5-10 razy/min. Info
+                                // poziom zalewa logi; debug wystarcza do diagnozy.
+                                tracing::debug!(speaker = %n, "dom_observer: active speaker");
                             } else {
-                                tracing::info!("dom_observer: active speaker cleared");
+                                tracing::debug!("dom_observer: active speaker cleared");
                             }
+                            // Active speaker jest osobno raportowany do GUI poprzez
+                            // następny RosterSnapshot (status="speaking" dla aktualnego
+                            // mówcy). Nie wysyłamy osobnego eventu per zmianę mówcy —
+                            // przy żywej dyskusji to byłoby 5-10 RT/min bez wartości
+                            // dodanej (snapshot i tak idzie z każdym DOM scan'em).
                         }
                         DomEvent::Unknown => {}
                     }
@@ -267,71 +356,161 @@ pub async fn start(
         }
     });
 
-    Ok(DomObserver { shutdown_tx, state_rx, join })
+    // Drop'nij oryginalny tx — tylko klony w listenerze trzymaja kanal otwarty.
+    // Gdy listener zakonczy, writer zauwazy `recv() == None` i wyjdzie.
+    drop(emit_tx);
+
+    let writer_router = router.clone();
+    let writer_join = tokio::spawn(async move {
+        let semaphore = Arc::new(Semaphore::new(EMIT_CONCURRENCY));
+        let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                maybe = emit_rx.recv() => {
+                    let Some(emit) = maybe else { break; };
+                    // Permit ogranicza liczbe rownoleglych QUIC RT do EMIT_CONCURRENCY.
+                    // Acquire jest async, ale w praktyce blokuje tylko gdy 8+ emitow
+                    // wisi w locie — wtedy chcemy backpressure, nie spawn floodu.
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    let router_inner = writer_router.clone();
+                    inflight.spawn(async move {
+                        let _permit = permit;
+                        dispatch_emit(&router_inner, emit).await;
+                    });
+                    // Gdy taski sie konczą, sprzątaj — bez tego JoinSet rosnie
+                    // przez cala sesje (kazdy zakonczony task zostaje az do drain).
+                    while let Some(res) = inflight.try_join_next() {
+                        if let Err(e) = res {
+                            tracing::debug!("emit task join: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+        // Drainuj pozostale w locie zanim wyjdziemy — inaczej zostaja bez
+        // czekania, czesto odcinajac wlasnie wyslane PairingConfirm/Joined.
+        while let Some(res) = inflight.join_next().await {
+            if let Err(e) = res {
+                tracing::debug!("emit task join (drain): {}", e);
+            }
+        }
+    });
+
+    Ok(DomObserver { shutdown_tx, state_rx, listener_join, writer_join })
 }
 
-async fn emit_lifecycle(router: &RouterHandle, meeting_key: &str, stage: &str) {
-    let client = {
-        let guard = router.lock().await;
-        guard.as_ref().cloned()
+/// Wpycha lifecycle event do mpsc. Przy pelnym kanale (256 wpisow w locie)
+/// trace warning i drop — to safety valve gdy router wisi i nie chcemy zjesc
+/// pamieci listenera.
+fn queue_lifecycle(tx: &mpsc::Sender<PendingEmit>, meeting_key: &str, stage: &str) {
+    let event = PendingEmit {
+        meeting_key: meeting_key.to_string(),
+        timestamp_ms: ts_ms(),
+        payload: MeetingEventPayload::LifecycleUpdate {
+            stage: stage.to_string(),
+            details: None,
+        },
     };
-    let Some(client) = client else { return; };
-    let ts = ts_ms();
-    if let Err(e) = client
-        .send_meeting_event(
-            meeting_key,
-            ts,
-            MeetingEventPayload::LifecycleUpdate {
-                stage: stage.to_string(),
-                details: None,
-            },
-        )
-        .await
-    {
-        tracing::warn!("dom_observer emit_lifecycle({}): {}", stage, e);
+    if let Err(e) = tx.try_send(event) {
+        tracing::warn!("dom_observer: lifecycle queue full ({}): {}", stage, e);
     }
 }
 
-async fn emit_participant(
-    router: &RouterHandle,
+/// Buduje `RosterSnapshot` z aktualnego stanu `known` i wpycha do mpsc.
+/// Wszystkie wpisy mają `status="joined"` — opuszczenie sesji jest reprezentowane
+/// przez NIEOBECNOŚĆ wpisu w kolejnym snapshocie (bo to snapshot, nie diff).
+fn queue_roster_snapshot(
+    tx: &mpsc::Sender<PendingEmit>,
     meeting_key: &str,
-    speaker_id: &str,
-    speaker_name: &str,
-    status: &str,
+    known: &HashMap<String, String>,
+    bot_name: &str,
 ) {
+    // Bot jest filtrowany z DOM rosteru (żeby dom_observer nie raportował go
+    // jako zdalnego uczestnika), ale GUI musi go widzieć — wstrzykujemy go
+    // jako pierwszy entry. ID = nazwa bota (stabilne, unikalne w obrębie sesji).
+    let mut entries: Vec<RosterEntry> = Vec::with_capacity(known.len() + 1);
+    entries.push(RosterEntry {
+        speaker_id: bot_name.to_string(),
+        speaker_name: Some(bot_name.to_string()),
+        status: "joined".to_string(),
+        last_spoken_ago_sec: None,
+    });
+    entries.extend(known.iter().map(|(id, name)| RosterEntry {
+        speaker_id: id.clone(),
+        speaker_name: Some(name.clone()),
+        status: "joined".to_string(),
+        last_spoken_ago_sec: None,
+    }));
+    let event = PendingEmit {
+        meeting_key: meeting_key.to_string(),
+        timestamp_ms: ts_ms(),
+        payload: MeetingEventPayload::RosterSnapshot { entries },
+    };
+    if let Err(e) = tx.try_send(event) {
+        tracing::warn!(
+            "dom_observer: roster snapshot queue full (size={}): {}",
+            known.len(),
+            e
+        );
+    }
+}
+
+/// Wykonuje pojedynczy `send_meeting_event`. Lock na router jest brany na czas
+/// jednego emit'a — gdy router rekonektuje sie miedzy eventami, nastepny dostanie
+/// nowy Arc<RouterClient>.
+async fn dispatch_emit(router: &RouterHandle, emit: PendingEmit) {
     let client = {
         let guard = router.lock().await;
         guard.as_ref().cloned()
     };
     let Some(client) = client else { return; };
-    let ts = ts_ms();
+    let label = emit_label(&emit.payload);
     if let Err(e) = client
-        .send_meeting_event(
-            meeting_key,
-            ts,
-            MeetingEventPayload::ParticipantUpdate {
-                speaker_id: speaker_id.to_string(),
-                speaker_name: Some(speaker_name.to_string()),
-                status: status.to_string(),
-                last_spoken_ago_sec: None,
-            },
-        )
+        .send_meeting_event(&emit.meeting_key, emit.timestamp_ms, emit.payload)
         .await
     {
-        tracing::warn!("dom_observer emit_participant({}, {}): {}", speaker_name, status, e);
+        tracing::warn!("dom_observer emit({}) failed: {}", label, e);
     }
 }
 
-/// Snapshotuje aktualny `known` map jako Vec<RosterEntry> dla STT metadata.
-/// Bot jest juz odfiltrowany na poziomie wstawiania do `known`.
-async fn sync_roster(state: &RosterState, known: &HashMap<String, String>) {
-    let mut entries: Vec<RosterEntry> = known
+/// Przebudowuje JSON snapshot rosteru i atomowo go publikuje. Wykonywane
+/// SYNCHRONICZNIE w listenerze przy kazdej zmianie `known` — alokacja jednego
+/// Vec<String> + `serde_json::to_string` kosztuje ~10us przy 50 nazwach.
+/// Dzieki temu STT hot path bierze gotowy `Arc<String>` jednym `load_full()`.
+fn publish_roster_snapshot(slot: &RosterSnapshotJson, known: &HashMap<String, String>) {
+    let mut names: Vec<String> = known
         .values()
-        .map(|name| RosterEntry { name: name.clone(), status: String::new() })
+        .take(MAX_ROSTER_NAMES)
+        .map(|name| {
+            name.chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_ROSTER_NAME_LEN)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
         .collect();
-    // Stabilna kolejnosc — main.rs serializuje to do JSON metadata.
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    *state.write().await = entries;
+    names.sort();
+    let json = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string());
+    slot.store(Arc::new(json));
+}
+
+fn emit_label(payload: &MeetingEventPayload) -> &'static str {
+    match payload {
+        MeetingEventPayload::LifecycleUpdate { .. } => "lifecycle",
+        MeetingEventPayload::RosterSnapshot { .. } => "roster",
+        MeetingEventPayload::TranscriptEntry { .. } => "transcript",
+        MeetingEventPayload::SummaryUpdate { .. } => "summary",
+        MeetingEventPayload::ActionItemsUpdate { .. } => "action_items",
+        MeetingEventPayload::BackendUpdate { .. } => "backend",
+    }
 }
 
 fn ts_ms() -> i64 {

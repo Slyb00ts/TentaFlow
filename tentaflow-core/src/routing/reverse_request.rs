@@ -9,12 +9,35 @@ use crate::net::quic::QuicClient;
 use crate::routing::Router;
 
 use anyhow::Context;
-use std::sync::Arc;
+use dashmap::DashMap;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 /// Maksymalny rozmiar odwrotnego requestu od kontenera (10 MB)
 const MAX_REVERSE_REQUEST_SIZE: usize = 10_000_000;
+
+/// Cache `meeting_key -> session_id` współdzielony przez wszystkie wywołania
+/// `persist_meeting_event`. Każdy MeetingEvent (TranscriptEntry, RosterSnapshot,
+/// BackendUpdate, …) trafia do reverse handlera setki razy w trakcie spotkania —
+/// `get_or_create_session` to synchroniczny rusqlite call (~5–30 ms). Cache redukuje
+/// to do ~50 ns DashMap hit po pierwszym uderzeniu w danej sesji.
+///
+/// Wpisy są ważne do końca procesu (sesje nie są usuwane w trakcie życia routera).
+/// Gdy admin usunie meeting w GUI, wywołanie `invalidate_meeting_session` musi
+/// wyczyścić wpis — inaczej kolejny event z tym kluczem trafiłby na zerwany
+/// foreign-key. Obecnie żadna ścieżka produkcyjna nie kasuje sesji, więc helper
+/// czeka na podpięcie przy delete-meeting endpoint.
+fn meeting_session_cache() -> &'static DashMap<String, i64> {
+    static CACHE: OnceLock<DashMap<String, i64>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+/// Czyści wpis cache `meeting_key -> session_id`. Wołane przy usunięciu sesji
+/// z DB (delete meeting endpoint). Jeśli nic nie ma w cache — no-op.
+pub fn invalidate_meeting_session(meeting_key: &str) {
+    meeting_session_cache().remove(meeting_key);
+}
 
 /// Uruchamia petle accept_bi na polaczeniu QUIC do kontenera.
 /// Kazdy przychodzacy strumien to ModelRequest od kontenera, ktory
@@ -145,6 +168,29 @@ async fn handle_reverse_stream(
         std::mem::discriminant(&request.payload)
     );
 
+    // Streamujaca sciezka TTS: bot ustawia stream=true + payload Audio(TTS),
+    // router odpowiada seria ModelStreamChunk z AudioChunk(pcm) zakonczona
+    // Done. Pozwala botowi pchac probki do mikrofonu na biezaco zamiast
+    // czekac na pelny WAV.
+    //
+    // Streamujaca sciezka Completion: stream=true + payload Completion zwraca
+    // serie TextDelta zakonczona Done. Bot uzywa tego do tokeno-strumienia
+    // odpowiedzi LLM, parsuje granice zdan i odpala TTS na kazde pelne zdanie
+    // (sentence-boundary pipeline) — pierwszy chunk audio idzie do mikrofonu
+    // dlugo zanim LLM skonczy generowac.
+    if request.stream {
+        if let tentaflow_protocol::ModelPayload::Audio(ref audio_payload) = request.payload {
+            if let tentaflow_protocol::AudioOperation::TTS { .. } = audio_payload.operation {
+                handle_tts_stream(send, router, request).await;
+                return;
+            }
+        }
+        if let tentaflow_protocol::ModelPayload::Completion(_) = request.payload {
+            handle_completion_stream(send, router, request).await;
+            return;
+        }
+    }
+
     // Routuj request w zaleznosci od typu payload
     let response = dispatch_reverse_request(&router, request).await;
 
@@ -166,6 +212,224 @@ async fn handle_reverse_stream(
             service_name, response.request_id
         );
     }
+}
+
+/// Obsluguje streamujaca synteze mowy. Wysyla seria ModelStreamChunk:
+///   1) AudioChunk(pcm_bytes) — N razy, kazdy chunk to ~100 ms PCM
+///   2) Done { final_metrics: None } — terminator
+/// W razie bledu syntezy wysyla Error chunk + Done, zeby klient nie
+/// zawisl czekajac na ramki ktorych nie bedzie.
+async fn handle_tts_stream(
+    mut send: iroh::endpoint::SendStream,
+    router: Router,
+    request: tentaflow_protocol::ModelRequest,
+) {
+    use tentaflow_protocol::{
+        AudioOperation, ErrorInfo, ErrorType, ModelPayload, ModelStreamChunk, StreamChunkType,
+    };
+
+    let request_id = request.request_id.clone();
+
+    // Wyluskaj parametry TTS bez clone calego payloadu
+    let (model, input, voice, format, speed) = match request.payload {
+        ModelPayload::Audio(p) => match p.operation {
+            AudioOperation::TTS {
+                model,
+                input,
+                voice,
+                format,
+                speed,
+            } => (model, input, voice, format, speed),
+            _ => return,
+        },
+        _ => return,
+    };
+
+    let tts_request = crate::api::openai::types::TTSRequest {
+        model,
+        input,
+        voice,
+        // Wymuszamy "pcm" — chunki maja byc raw PCM bez WAV headera. Jesli
+        // klient prosil o wav/mp3, i tak strippujemy w synthesize_speech_stream,
+        // ale "pcm" zaoszczedzi pracy backendowi.
+        response_format: Some("pcm".to_string()),
+        speed,
+    };
+    let _ = format; // honorujemy "pcm" niezaleznie od pola w request
+
+    // Buforujemy chunki w mpsc, zeby synthesize_speech_stream (synchroniczny
+    // closure) nie musial trzymac referencji do `send`. Backend produkuje
+    // chunki na mpsc, ten task czyta i wysyla po sieci.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let synth_task = tokio::spawn(async move {
+        router
+            .synthesize_speech_stream(&tts_request, |chunk_bytes| {
+                tx.send(chunk_bytes).map_err(|e| {
+                    crate::error::CoreError::InternalError {
+                        message: format!("TTS chunk_sink kanal zamkniety: {}", e),
+                        source: None,
+                    }
+                    .into()
+                })
+            })
+            .await
+    });
+
+    // Konsument: kazdy chunk z mpsc -> wysylka jako AudioChunk frame.
+    let mut client_dropped = false;
+    while let Some(pcm) = rx.recv().await {
+        let chunk = ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::AudioChunk(pcm),
+        };
+        if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &chunk).await {
+            warn!("TTS stream: blad wysylki AudioChunk: {:?}", e);
+            client_dropped = true;
+            break;
+        }
+    }
+
+    // Zaczekaj na wynik syntezy zeby wyslac koncowy chunk (Done lub Error).
+    let final_chunk = match synth_task.await {
+        Ok(Ok(())) => ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Done { final_metrics: None },
+        },
+        Ok(Err(e)) => ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Error(ErrorInfo {
+                error_type: ErrorType::InternalError,
+                message: format!("Blad TTS streaming: {}", e),
+                details: None,
+            }),
+        },
+        Err(join_err) => ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Error(ErrorInfo {
+                error_type: ErrorType::InternalError,
+                message: format!("TTS task panika: {}", join_err),
+                details: None,
+            }),
+        },
+    };
+    if !client_dropped {
+        if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &final_chunk).await {
+            warn!("TTS stream: blad wysylki final chunk: {:?}", e);
+        }
+    }
+    let _ = send.finish();
+}
+
+/// Obsluguje streamujace chat completion od kontenera (bot meetingowy):
+/// kazdy delta-token z `route_chat_completion_stream` przepakowywany jest
+/// w `ModelStreamChunk::TextDelta`. Po wyczerpaniu strumienia wysylamy
+/// `Done`. Brak buforowania — token leci do bota natychmiast po wyprodukowaniu
+/// przez backend, dzieki czemu sentence-boundary parser bota odpala TTS dla
+/// pierwszego zdania zanim LLM dokonczy generowanie reszty odpowiedzi.
+async fn handle_completion_stream(
+    mut send: iroh::endpoint::SendStream,
+    router: Router,
+    request: tentaflow_protocol::ModelRequest,
+) {
+    use futures::StreamExt;
+    use tentaflow_protocol::{ErrorInfo, ErrorType, ModelStreamChunk, StreamChunkType};
+
+    let request_id = request.request_id.clone();
+
+    let completion_payload = match &request.payload {
+        tentaflow_protocol::ModelPayload::Completion(p) => p,
+        _ => return,
+    };
+
+    let mut chat_request = match build_chat_request(completion_payload) {
+        Ok(mut r) => {
+            r.stream = true;
+            r
+        }
+        Err(e) => {
+            let err_chunk = ModelStreamChunk {
+                request_id: request_id.clone(),
+                chunk: StreamChunkType::Error(ErrorInfo {
+                    error_type: ErrorType::InvalidRequest,
+                    message: e,
+                    details: None,
+                }),
+            };
+            let _ = tentaflow_transport::framing::write_frame(&mut send, &err_chunk).await;
+            let _ = send.finish();
+            return;
+        }
+    };
+    // upewniamy sie ze stream flag jest ustawiona — niektore sciezki
+    // route_chat_completion_stream gateuja tryb streaming wlasnie tym polem.
+    chat_request.stream = true;
+
+    let route_result = match router.route_chat_completion_stream(chat_request).await {
+        Ok(r) => r,
+        Err(e) => {
+            let err_chunk = ModelStreamChunk {
+                request_id: request_id.clone(),
+                chunk: StreamChunkType::Error(ErrorInfo {
+                    error_type: ErrorType::InternalError,
+                    message: format!("route_chat_completion_stream: {}", e),
+                    details: None,
+                }),
+            };
+            let _ = tentaflow_transport::framing::write_frame(&mut send, &err_chunk).await;
+            let _ = send.finish();
+            return;
+        }
+    };
+
+    let mut stream = route_result.response;
+    let mut errored = false;
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chat_chunk) => {
+                // OpenAI-format chunk -> wyciagamy delta.content; pomijamy
+                // chunki bez tekstu (np. role-only first chunk).
+                if let Some(choice) = chat_chunk.choices.into_iter().next() {
+                    if let Some(text) = choice.delta.content {
+                        if !text.is_empty() {
+                            let frame = ModelStreamChunk {
+                                request_id: request_id.clone(),
+                                chunk: StreamChunkType::TextDelta(text),
+                            };
+                            if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &frame).await {
+                                warn!("Completion stream: blad wysylki TextDelta: {:?}", e);
+                                errored = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let err_chunk = ModelStreamChunk {
+                    request_id: request_id.clone(),
+                    chunk: StreamChunkType::Error(ErrorInfo {
+                        error_type: ErrorType::InternalError,
+                        message: format!("Completion stream blad: {}", e),
+                        details: None,
+                    }),
+                };
+                let _ = tentaflow_transport::framing::write_frame(&mut send, &err_chunk).await;
+                errored = true;
+                break;
+            }
+        }
+    }
+
+    if !errored {
+        let done = ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Done { final_metrics: None },
+        };
+        if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &done).await {
+            warn!("Completion stream: blad wysylki Done: {:?}", e);
+        }
+    }
+    let _ = send.finish();
 }
 
 /// Dispatchuje odwrotny request przez odpowiednia metode Routera. Dostepne
@@ -197,6 +461,9 @@ pub async fn dispatch_reverse_request(
                 if let (AudioOperation::STT { audio_data, .. }, Some(ref mid), Some(pool)) =
                     (&audio_payload.operation, &meeting_id, router.db.clone())
                 {
+                    // audio_data jest Vec<u8> z deserializacji rkyv. Tu jest jedyny
+                    // klon do diarization — fork odpala sie rownolegle ze STT
+                    // (oba widza ten sam buffer; spawn_blocking przejmuje wlasnosc).
                     let audio_clone = audio_data.clone();
                     let mid_clone = mid.clone();
                     Some(tokio::task::spawn_blocking(move || {
@@ -353,7 +620,7 @@ pub async fn dispatch_reverse_request(
 
             // Zachowujemy kopie do live broadcastu przed move do persist.
             // Persist moze nie zapisywac danego wariantu do DB (TranscriptEntry,
-            // ParticipantUpdate, BackendUpdate tylko logują), ale broadcastujemy
+            // RosterSnapshot, BackendUpdate tylko logują), ale broadcastujemy
             // WSZYSTKIE — GUI potrzebuje pełnego stream'u do live view.
             let live_event = tentaflow_protocol::MeetingLiveEvent {
                 meeting_key: event.meeting_key.clone(),
@@ -482,21 +749,43 @@ fn handle_prompt_fetch(
     }
 }
 
+/// Resolvuje `meeting_key` do `session_id` przez cache; przy miss woła
+/// `get_or_create_session` (synchroniczne rusqlite) i zapisuje wynik.
+/// Wołane wyłącznie z wariantów które faktycznie zapisują do DB —
+/// pure-broadcast warianty (TranscriptEntry/RosterSnapshot) pomijają to
+/// całkiem i nie obciążają SQLite.
+fn resolve_session_id_cached(
+    pool: &crate::db::DbPool,
+    meeting_key: &str,
+) -> std::result::Result<i64, String> {
+    if let Some(cached) = meeting_session_cache().get(meeting_key) {
+        return Ok(*cached);
+    }
+    let id = crate::db::repository::transcripts::get_or_create_session(
+        pool,
+        meeting_key,
+        None,
+        None,
+    )
+    .map_err(|e| format!("MeetingEvent: resolve session '{}' failed: {}", meeting_key, e))?;
+    meeting_session_cache().insert(meeting_key.to_string(), id);
+    Ok(id)
+}
+
 /// Persistuje pojedynczy MeetingEvent do DB. Wydzielone zeby mozna testowac
 /// logike bez budowania calego Routera (Router + QUIC + mesh to ciezkie setup).
+///
+/// Każdy wariant decyduje sam, czy potrzebuje `session_id`. Warianty które
+/// tylko logują (TranscriptEntry, RosterSnapshot) nie odpytują DB w ogóle —
+/// SQLite hit dla setek per-meeting eventów byłby pasożytniczy. Warianty
+/// zapisujące (Summary, ActionItems, Backend, Lifecycle) idą przez
+/// `resolve_session_id_cached`, więc po pierwszym evencie sesja siedzi
+/// w DashMap i kolejne eventy nie dotykają SQLite na resolve.
 fn persist_meeting_event(
     pool: &crate::db::DbPool,
     event: tentaflow_protocol::MeetingEventData,
 ) -> std::result::Result<(), String> {
     use tentaflow_protocol::MeetingEventPayload;
-
-    let session_id = crate::db::repository::transcripts::get_or_create_session(
-        pool,
-        &event.meeting_key,
-        None,
-        None,
-    )
-    .map_err(|e| format!("MeetingEvent: resolve session '{}' failed: {}", event.meeting_key, e))?;
 
     match event.payload {
         MeetingEventPayload::SummaryUpdate {
@@ -504,6 +793,7 @@ fn persist_meeting_event(
             summary_text,
             model,
         } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             crate::db::repository::transcripts::insert_meeting_summary(
                 pool,
                 session_id,
@@ -521,6 +811,7 @@ fn persist_meeting_event(
             );
         }
         MeetingEventPayload::ActionItemsUpdate { items } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             let count = items.len();
             for item in items {
                 crate::db::repository::transcripts::upsert_meeting_action_item(
@@ -540,8 +831,8 @@ fn persist_meeting_event(
         // TranscriptEntry nie jest persistowany tym handlerem: chunki transkryptu
         // trafiają do DB osobną ścieżką (STT ModelRequest z metadata meeting_id →
         // transcript_store). Ten wariant istnieje wyłącznie po to, żeby dashboard
-        // dostał live broadcast (layer dopinany przez subskrybentów eventów;
-        // persist DB pozostaje pojedynczy punkt prawdy — transcript_store).
+        // dostał live broadcast — broadcast woła caller z `meeting_key`, więc
+        // `session_id` nie jest tu potrzebny i pomijamy SQLite hit całkowicie.
         MeetingEventPayload::TranscriptEntry {
             speaker_id,
             text,
@@ -550,31 +841,31 @@ fn persist_meeting_event(
             ..
         } => {
             info!(
-                "MeetingEvent TranscriptEntry: session_id={} speaker={} model={} latency_ms={} text_len={}",
-                session_id,
+                "MeetingEvent TranscriptEntry: meeting_key={} speaker={} model={} latency_ms={} text_len={}",
+                event.meeting_key,
                 speaker_id,
                 resolved_stt_model,
                 latency_ms,
                 text.len()
             );
         }
-        // ParticipantUpdate: brak tabeli participants per-session. Roster + active
-        // speaker to stan runtime'owy trzymany w pamięci bota i broadcastowany
-        // live. Zapis do DB nie jest potrzebny — rekonstrukcja możliwa z
-        // transcript_entries (DISTINCT speaker_name).
-        MeetingEventPayload::ParticipantUpdate {
-            speaker_id,
-            status,
-            ..
-        } => {
+        // RosterSnapshot: brak tabeli participants per-session. Roster to stan
+        // runtime'owy trzymany w pamięci bota i broadcastowany live. Zapis do
+        // DB nie jest potrzebny — rekonstrukcja możliwa z transcript_entries
+        // (DISTINCT speaker_name). Pomijamy session resolve.
+        MeetingEventPayload::RosterSnapshot { entries } => {
             info!(
-                "MeetingEvent ParticipantUpdate: session_id={} speaker={} status={}",
-                session_id, speaker_id, status
+                "MeetingEvent RosterSnapshot: meeting_key={} count={}",
+                event.meeting_key,
+                entries.len()
             );
         }
         // BackendUpdate: persisted on meeting_sessions so a live view mounted
         // after the broadcast still sees the BACKEND panel populated. The same
         // event is broadcast to dashboards; this branch only owns DB durability.
+        // `update_session_backend` operuje po `meeting_key` (a nie session_id),
+        // ale i tak rozgrzewamy cache, żeby kolejne warianty zapisujące miały
+        // ścieżkę bez SQLite na resolve.
         MeetingEventPayload::BackendUpdate {
             stt_model,
             tts_model,
@@ -584,6 +875,7 @@ fn persist_meeting_event(
             enrolled_speakers,
             total_participants,
         } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             if let Err(e) = crate::db::repository::transcripts::update_session_backend(
                 pool,
                 &event.meeting_key,
@@ -607,6 +899,7 @@ fn persist_meeting_event(
         // od tego, czy WSS broadcast już trafił. Broadcast i tak idzie równolegle
         // przez publish() w callerze.
         MeetingEventPayload::LifecycleUpdate { stage, details } => {
+            let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             if let Err(e) = crate::db::repository::transcripts::update_session_lifecycle(
                 pool,
                 &event.meeting_key,
@@ -966,12 +1259,14 @@ mod tests {
         assert_eq!(cnt, 1);
     }
 
-    // Handler musi akceptować TranscriptEntry bez błędu i bez wpisów do
-    // meeting_summaries / meeting_action_items — persist chunków leci przez
-    // transcript_store, nie przez ten handler.
+    // Handler musi akceptować TranscriptEntry bez błędu i nie wpisywać niczego do
+    // DB — persist chunków leci przez transcript_store, a sam wariant istnieje
+    // wyłącznie dla live broadcastu. Po optymalizacji R-3/R-4 handler nawet nie
+    // resolvuje session_id (skip SQLite hit dla setek per-meeting eventów).
     #[test]
-    fn persist_handler_transcript_entry_is_noop_but_creates_session() {
+    fn persist_handler_transcript_entry_is_noop_and_skips_session_resolve() {
         let db = setup_test_db();
+        invalidate_meeting_session("m-te-1");
         let event = MeetingEventData {
             meeting_key: "m-te-1".to_string(),
             timestamp_ms: 100,
@@ -988,47 +1283,165 @@ mod tests {
         };
         persist_meeting_event(&db, event).expect("persist transcript entry");
 
-        let sid = crate::db::repository::transcripts::get_or_create_session(
-            &db, "m-te-1", None, None,
-        )
-        .unwrap();
-        let summaries =
-            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
-        let actions =
-            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
-                .unwrap();
-        assert!(summaries.is_empty(), "TranscriptEntry nie wpisuje summary");
-        assert!(actions.is_empty(), "TranscriptEntry nie wpisuje action items");
+        // TranscriptEntry NIE tworzy session row — meeting_sessions zostaje puste
+        // dopóki nie przyjdzie wariant zapisujący (Summary, ActionItems, …) albo
+        // STT chunk (transcript_store).
+        let sid_opt =
+            crate::db::repository::transcripts::session_id_by_meeting_key(&db, "m-te-1").unwrap();
+        assert!(
+            sid_opt.is_none(),
+            "TranscriptEntry nie powinien tworzyć session row"
+        );
     }
 
-    // ParticipantUpdate: handler nie persistuje nigdzie — sprawdzamy że nie
-    // zwraca błędu i nie tworzy rekordów w tabelach zapisywanych.
+    // RosterSnapshot: handler nie persistuje nigdzie — sprawdzamy że nie
+    // zwraca błędu i nie dotyka SQLite (po optymalizacji R-3/R-4 pomijamy
+    // session resolve całkowicie). Snapshot z N entries traktujemy tak samo
+    // jak pojedynczy event — koszt persist O(0) niezależnie od N.
     #[test]
-    fn persist_handler_participant_update_is_noop() {
+    fn persist_handler_roster_snapshot_is_noop_and_skips_session_resolve() {
         let db = setup_test_db();
+        invalidate_meeting_session("m-rs-1");
         let event = MeetingEventData {
-            meeting_key: "m-pu-1".to_string(),
+            meeting_key: "m-rs-1".to_string(),
             timestamp_ms: 100,
-            payload: MeetingEventPayload::ParticipantUpdate {
-                speaker_id: "SPEAKER_02".to_string(),
-                speaker_name: Some("Bob".to_string()),
-                status: "active_now".to_string(),
-                last_spoken_ago_sec: None,
+            payload: MeetingEventPayload::RosterSnapshot {
+                entries: vec![
+                    RosterEntry {
+                        speaker_id: "SPEAKER_01".to_string(),
+                        speaker_name: Some("Alice".to_string()),
+                        status: "joined".to_string(),
+                        last_spoken_ago_sec: None,
+                    },
+                    RosterEntry {
+                        speaker_id: "SPEAKER_02".to_string(),
+                        speaker_name: Some("Bob".to_string()),
+                        status: "speaking".to_string(),
+                        last_spoken_ago_sec: Some(2),
+                    },
+                ],
             },
         };
-        persist_meeting_event(&db, event).expect("persist participant update");
+        persist_meeting_event(&db, event).expect("persist roster snapshot");
 
-        let sid = crate::db::repository::transcripts::get_or_create_session(
-            &db, "m-pu-1", None, None,
-        )
-        .unwrap();
-        let summaries =
-            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
-        let actions =
-            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
-                .unwrap();
-        assert!(summaries.is_empty());
-        assert!(actions.is_empty());
+        let sid_opt =
+            crate::db::repository::transcripts::session_id_by_meeting_key(&db, "m-rs-1").unwrap();
+        assert!(
+            sid_opt.is_none(),
+            "RosterSnapshot nie powinien tworzyć session row"
+        );
+    }
+
+    // Cache hit: pierwszy event z meeting_key idzie przez get_or_create_session,
+    // drugi z tym samym kluczem trafia w DashMap. Sprawdzamy przez wstawienie
+    // ręcznie nieistniejącego id do cache i obserwację, że handler go używa
+    // bez tworzenia nowej sesji w DB.
+    #[test]
+    fn meeting_session_cache_hits_skip_db() {
+        let db = setup_test_db();
+        let key = "m-cache-hit-1";
+        invalidate_meeting_session(key);
+
+        // Pierwszy event populuje cache realnym session_id z DB.
+        let event1 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 1,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d1".to_string(),
+                summary_text: "s1".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event1).expect("first persist");
+
+        // Cache musi mieć teraz wpis.
+        let cached = meeting_session_cache().get(key).map(|v| *v);
+        assert!(cached.is_some(), "cache nie został zapełniony po pierwszym evencie");
+        let real_sid = cached.unwrap();
+
+        // Kasujemy sesję bezpośrednio z DB (cascade FK usunie summary). Cache
+        // nadal trzyma stary id — gdyby handler szedł do DB, get_or_create_session
+        // utworzyłby nowe id. Jeśli używa cache, drugi insert poleci na stare id
+        // i FK error potwierdzi cache hit.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+            conn.execute(
+                "DELETE FROM meeting_sessions WHERE id = ?1",
+                rusqlite::params![real_sid],
+            )
+            .unwrap();
+        }
+
+        let event2 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 2,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d2".to_string(),
+                summary_text: "s2".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        let res = persist_meeting_event(&db, event2);
+        assert!(
+            res.is_err(),
+            "cache hit musi reużyć stary session_id; insert powinien fail-FK po DELETE sesji"
+        );
+
+        // Po użytku tego testu czyścimy cache, żeby nie dziedziczyć stanu.
+        invalidate_meeting_session(key);
+    }
+
+    // Po `invalidate_meeting_session` kolejny event musi ponownie odpytać DB
+    // i utworzyć/znaleźć sesję — czyli faktycznie zapisać do meeting_sessions.
+    #[test]
+    fn meeting_session_cache_invalidate_forces_db_resolve() {
+        let db = setup_test_db();
+        let key = "m-cache-inv-1";
+        invalidate_meeting_session(key);
+
+        let event1 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 1,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d".to_string(),
+                summary_text: "s".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event1).expect("first persist");
+        let sid_first = meeting_session_cache().get(key).map(|v| *v).unwrap();
+
+        // Kasujemy sesję i invalidujemy cache — kolejny event musi utworzyć nowy
+        // wpis w meeting_sessions z nowym id i odświeżyć cache.
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+            conn.execute(
+                "DELETE FROM meeting_sessions WHERE id = ?1",
+                rusqlite::params![sid_first],
+            )
+            .unwrap();
+        }
+        invalidate_meeting_session(key);
+
+        let event2 = MeetingEventData {
+            meeting_key: key.to_string(),
+            timestamp_ms: 2,
+            payload: MeetingEventPayload::SummaryUpdate {
+                decisions_text: "d2".to_string(),
+                summary_text: "s2".to_string(),
+                model: "m".to_string(),
+            },
+        };
+        persist_meeting_event(&db, event2).expect("second persist after invalidate");
+        let sid_second = meeting_session_cache().get(key).map(|v| *v).unwrap();
+        assert_ne!(
+            sid_first, sid_second,
+            "po invalidate handler musi pobrać świeży session_id z DB"
+        );
+
+        invalidate_meeting_session(key);
     }
 
     // BackendUpdate: persisted on meeting_sessions so a live view mounted

@@ -686,7 +686,7 @@ async fn handle_audio_transcriptions(
 
     // Utworz TranscriptionRequest
     let transcription_request = TranscriptionRequest {
-        file: file_bytes,
+        file: std::sync::Arc::from(file_bytes.into_boxed_slice()),
         filename: fname,
         model: model_name.clone(),
         language,
