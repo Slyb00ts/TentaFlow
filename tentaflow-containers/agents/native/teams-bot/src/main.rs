@@ -187,19 +187,18 @@ async fn emit_lifecycle(
     }
 }
 
-/// Sprawdza czy ktorekolwiek z `wake_words` (CSV) wystepuje w tekscie
-/// (case-insensitive, fragment slowa OK). Pusta lista wake_words = zawsze TRUE.
-fn matches_wake_word(text: &str, wake_words_csv: &str) -> bool {
-    let words: Vec<String> = wake_words_csv
-        .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if words.is_empty() {
+/// Sprawdza czy ktorekolwiek z precompiled `wake_words` wystepuje w tekscie
+/// (case-insensitive, fragment slowa OK). Pusta lista = zawsze TRUE.
+/// `wake_words` musi byc juz znormalizowane (trim + lowercase) — robi to
+/// `MeetingConfig::validate` przy starcie, zeby hot-path STT nie alokowal.
+fn matches_wake_word(text: &str, wake_words: &[String]) -> bool {
+    if wake_words.is_empty() {
         return true;
     }
+    // Pojedyncza alokacja per call — Polish text wymaga full Unicode lowercase
+    // (np. "GŁOSU" -> "głosu"), `eq_ignore_ascii_case` nie wystarczy.
     let lower = text.to_lowercase();
-    words.iter().any(|w| lower.contains(w.as_str()))
+    wake_words.iter().any(|w| lower.contains(w.as_str()))
 }
 
 /// Pyta LLM-classifier czy wypowiedz to faktyczne pytanie do bota. Zwraca
@@ -248,9 +247,9 @@ async fn gate_and_respond(
     let mode = config.response_mode.as_str();
     let allow = match mode {
         "always" => true,
-        "wake_word" => matches_wake_word(text, &config.wake_words),
+        "wake_word" => matches_wake_word(text, &config.wake_words_compiled),
         "wake_word_intent" => {
-            if !matches_wake_word(text, &config.wake_words) {
+            if !matches_wake_word(text, &config.wake_words_compiled) {
                 false
             } else {
                 tracing::info!(
