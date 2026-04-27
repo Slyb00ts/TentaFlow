@@ -206,10 +206,17 @@ impl MeetingManager {
             .response_mode
             .clone()
             .unwrap_or_else(|| "wake_word_intent".to_string());
-        let wake_words = req
-            .wake_words
-            .clone()
-            .unwrap_or_else(|| "jarvis,tentaflow,asystencie,asystent,bot".to_string());
+        // Wake-words: caller (dashboard / CLI) moze nadpisac, inaczej
+        // bierzemy aktualna liste z DB (tabela `teams_bot_wake_words` —
+        // tylko `enabled=1`). Pusta DB → fallback na hardcoded default.
+        let wake_words = req.wake_words.clone().unwrap_or_else(|| {
+            let from_db = repository::enabled_wake_words_csv(&self.db).unwrap_or_default();
+            if from_db.is_empty() {
+                "jarvis,tentaflow,asystencie,asystent,bot".to_string()
+            } else {
+                from_db
+            }
+        });
 
         // Alokuj porty + spawn — drogi rozne per backend, ale na koniec obie maja
         // ten sam efekt: serwis zarejestrowany w ServiceManager z iroh URL i

@@ -6,6 +6,7 @@
 use super::{
     api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_fast_path, api_flows,
     api_hub, api_models, api_pii_rules, api_prompts, api_registries, api_services, api_tts_rules,
+    api_wake_words,
     auth, static_files,
 };
 use crate::db::{self, DbPool};
@@ -1349,6 +1350,17 @@ fn route_api(
             handle_result(api_fast_path::handle_create(db, body), 400)
         }
 
+        // Teams Bot Wake Words
+        (&Method::GET, "/api/wake-words") => {
+            handle_result(api_wake_words::handle_list(db), 500)
+        }
+        (&Method::POST, "/api/wake-words") => {
+            if let Some(err) = require_admin(claims, db) {
+                return err;
+            }
+            handle_result(api_wake_words::handle_create(db, body), 400)
+        }
+
         // TTS Rules
         (&Method::GET, "/api/tts-rules") => {
             let offset = parse_query_param(query, "offset", 0);
@@ -1586,6 +1598,25 @@ fn route_api(
                             return admin_err();
                         }
                         handle_result(api_tts_rules::handle_delete(db, id), 500)
+                    }
+                    _ => (405, r#"{"error":"Method not allowed"}"#.to_string()),
+                };
+            }
+
+            // Wake-words /:id (PATCH toggle, DELETE).
+            if let Some(id) = extract_id_from_path(path, "/api/wake-words/") {
+                return match *method {
+                    Method::PATCH => {
+                        if require_admin(claims, db).is_some() {
+                            return admin_err();
+                        }
+                        handle_result(api_wake_words::handle_toggle(db, id, body), 400)
+                    }
+                    Method::DELETE => {
+                        if require_admin(claims, db).is_some() {
+                            return admin_err();
+                        }
+                        handle_result(api_wake_words::handle_delete(db, id), 500)
                     }
                     _ => (405, r#"{"error":"Method not allowed"}"#.to_string()),
                 };
