@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 const MAX_REVERSE_REQUEST_SIZE: usize = 10_000_000;
 
 /// Cache `meeting_key -> session_id` współdzielony przez wszystkie wywołania
-/// `persist_meeting_event`. Każdy MeetingEvent (TranscriptEntry, ParticipantUpdate,
+/// `persist_meeting_event`. Każdy MeetingEvent (TranscriptEntry, RosterSnapshot,
 /// BackendUpdate, …) trafia do reverse handlera setki razy w trakcie spotkania —
 /// `get_or_create_session` to synchroniczny rusqlite call (~5–30 ms). Cache redukuje
 /// to do ~50 ns DashMap hit po pierwszym uderzeniu w danej sesji.
@@ -379,7 +379,7 @@ pub async fn dispatch_reverse_request(
 
             // Zachowujemy kopie do live broadcastu przed move do persist.
             // Persist moze nie zapisywac danego wariantu do DB (TranscriptEntry,
-            // ParticipantUpdate, BackendUpdate tylko logują), ale broadcastujemy
+            // RosterSnapshot, BackendUpdate tylko logują), ale broadcastujemy
             // WSZYSTKIE — GUI potrzebuje pełnego stream'u do live view.
             let live_event = tentaflow_protocol::MeetingLiveEvent {
                 meeting_key: event.meeting_key.clone(),
@@ -511,7 +511,7 @@ fn handle_prompt_fetch(
 /// Resolvuje `meeting_key` do `session_id` przez cache; przy miss woła
 /// `get_or_create_session` (synchroniczne rusqlite) i zapisuje wynik.
 /// Wołane wyłącznie z wariantów które faktycznie zapisują do DB —
-/// pure-broadcast warianty (TranscriptEntry/ParticipantUpdate) pomijają to
+/// pure-broadcast warianty (TranscriptEntry/RosterSnapshot) pomijają to
 /// całkiem i nie obciążają SQLite.
 fn resolve_session_id_cached(
     pool: &crate::db::DbPool,
@@ -535,7 +535,7 @@ fn resolve_session_id_cached(
 /// logike bez budowania calego Routera (Router + QUIC + mesh to ciezkie setup).
 ///
 /// Każdy wariant decyduje sam, czy potrzebuje `session_id`. Warianty które
-/// tylko logują (TranscriptEntry, ParticipantUpdate) nie odpytują DB w ogóle —
+/// tylko logują (TranscriptEntry, RosterSnapshot) nie odpytują DB w ogóle —
 /// SQLite hit dla setek per-meeting eventów byłby pasożytniczy. Warianty
 /// zapisujące (Summary, ActionItems, Backend, Lifecycle) idą przez
 /// `resolve_session_id_cached`, więc po pierwszym evencie sesja siedzi
@@ -608,18 +608,15 @@ fn persist_meeting_event(
                 text.len()
             );
         }
-        // ParticipantUpdate: brak tabeli participants per-session. Roster + active
-        // speaker to stan runtime'owy trzymany w pamięci bota i broadcastowany
-        // live. Zapis do DB nie jest potrzebny — rekonstrukcja możliwa z
-        // transcript_entries (DISTINCT speaker_name). Pomijamy session resolve.
-        MeetingEventPayload::ParticipantUpdate {
-            speaker_id,
-            status,
-            ..
-        } => {
+        // RosterSnapshot: brak tabeli participants per-session. Roster to stan
+        // runtime'owy trzymany w pamięci bota i broadcastowany live. Zapis do
+        // DB nie jest potrzebny — rekonstrukcja możliwa z transcript_entries
+        // (DISTINCT speaker_name). Pomijamy session resolve.
+        MeetingEventPayload::RosterSnapshot { entries } => {
             info!(
-                "MeetingEvent ParticipantUpdate: meeting_key={} speaker={} status={}",
-                event.meeting_key, speaker_id, status
+                "MeetingEvent RosterSnapshot: meeting_key={} count={}",
+                event.meeting_key,
+                entries.len()
             );
         }
         // BackendUpdate: persisted on meeting_sessions so a live view mounted
@@ -1056,30 +1053,41 @@ mod tests {
         );
     }
 
-    // ParticipantUpdate: handler nie persistuje nigdzie — sprawdzamy że nie
+    // RosterSnapshot: handler nie persistuje nigdzie — sprawdzamy że nie
     // zwraca błędu i nie dotyka SQLite (po optymalizacji R-3/R-4 pomijamy
-    // session resolve całkowicie).
+    // session resolve całkowicie). Snapshot z N entries traktujemy tak samo
+    // jak pojedynczy event — koszt persist O(0) niezależnie od N.
     #[test]
-    fn persist_handler_participant_update_is_noop_and_skips_session_resolve() {
+    fn persist_handler_roster_snapshot_is_noop_and_skips_session_resolve() {
         let db = setup_test_db();
-        invalidate_meeting_session("m-pu-1");
+        invalidate_meeting_session("m-rs-1");
         let event = MeetingEventData {
-            meeting_key: "m-pu-1".to_string(),
+            meeting_key: "m-rs-1".to_string(),
             timestamp_ms: 100,
-            payload: MeetingEventPayload::ParticipantUpdate {
-                speaker_id: "SPEAKER_02".to_string(),
-                speaker_name: Some("Bob".to_string()),
-                status: "active_now".to_string(),
-                last_spoken_ago_sec: None,
+            payload: MeetingEventPayload::RosterSnapshot {
+                entries: vec![
+                    RosterEntry {
+                        speaker_id: "SPEAKER_01".to_string(),
+                        speaker_name: Some("Alice".to_string()),
+                        status: "joined".to_string(),
+                        last_spoken_ago_sec: None,
+                    },
+                    RosterEntry {
+                        speaker_id: "SPEAKER_02".to_string(),
+                        speaker_name: Some("Bob".to_string()),
+                        status: "speaking".to_string(),
+                        last_spoken_ago_sec: Some(2),
+                    },
+                ],
             },
         };
-        persist_meeting_event(&db, event).expect("persist participant update");
+        persist_meeting_event(&db, event).expect("persist roster snapshot");
 
         let sid_opt =
-            crate::db::repository::transcripts::session_id_by_meeting_key(&db, "m-pu-1").unwrap();
+            crate::db::repository::transcripts::session_id_by_meeting_key(&db, "m-rs-1").unwrap();
         assert!(
             sid_opt.is_none(),
-            "ParticipantUpdate nie powinien tworzyć session row"
+            "RosterSnapshot nie powinien tworzyć session row"
         );
     }
 

@@ -4749,21 +4749,22 @@ fn meeting_event_payload_to_js(
             set(&data, "resolvedSttModel", resolved_stt_model.into());
             set(&data, "latencyMs", (latency_ms as f64).into());
         }
-        EP::ParticipantUpdate {
-            speaker_id,
-            speaker_name,
-            status,
-            last_spoken_ago_sec,
-        } => {
-            set(obj, "type", "ParticipantUpdate".into());
-            set(&data, "speakerId", speaker_id.into());
-            if let Some(n) = speaker_name {
-                set(&data, "speakerName", n.into());
+        EP::RosterSnapshot { entries } => {
+            set(obj, "type", "RosterSnapshot".into());
+            let arr = js_sys::Array::new();
+            for entry in entries {
+                let eo = js_sys::Object::new();
+                set(&eo, "speakerId", entry.speaker_id.into());
+                if let Some(n) = entry.speaker_name {
+                    set(&eo, "speakerName", n.into());
+                }
+                set(&eo, "status", entry.status.into());
+                if let Some(s) = entry.last_spoken_ago_sec {
+                    set(&eo, "lastSpokenAgoSec", (s as f64).into());
+                }
+                arr.push(&eo.into());
             }
-            set(&data, "status", status.into());
-            if let Some(s) = last_spoken_ago_sec {
-                set(&data, "lastSpokenAgoSec", (s as f64).into());
-            }
+            set(&data, "entries", arr.into());
         }
         EP::BackendUpdate {
             stt_model,

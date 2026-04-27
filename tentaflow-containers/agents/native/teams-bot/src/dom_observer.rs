@@ -42,7 +42,7 @@ use chromiumoxide::page::Page;
 use futures::StreamExt;
 use serde::Deserialize;
 use tentaflow_protocol::{
-    MeetingEventPayload, LIFECYCLE_JOINED, LIFECYCLE_LOBBY_WAITING,
+    MeetingEventPayload, RosterEntry, LIFECYCLE_JOINED, LIFECYCLE_LOBBY_WAITING,
 };
 use tokio::sync::{mpsc, watch, Mutex, RwLock, Semaphore};
 
@@ -87,12 +87,23 @@ pub enum JoinState {
 enum DomEvent {
     Lobby,
     Joined,
-    ParticipantJoined { id: String, name: Option<String> },
-    ParticipantLeft { id: String, name: Option<String> },
+    /// Pełny snapshot rosteru — JS emituje to raz na DOM scan zamiast
+    /// per-tile joined/left. `entries` zawiera *aktualną* listę kafelków
+    /// (poza bot'em — filtrujemy w listenerze po nazwie).
+    RosterSnapshot { entries: Vec<RosterTile> },
     ActiveSpeaker { id: Option<String>, name: Option<String> },
     /// Untyped fallback so a JS-side schema bump doesn't kill the listener.
     #[serde(other)]
     Unknown,
+}
+
+/// Pojedynczy kafelek z DOM Teams — surowy zapis z `browser_inject.js`.
+/// Konwertujemy do `RosterEntry` dopiero przy emit do routera (po filtracji
+/// bot'a i sanityzacji nazwy).
+#[derive(Debug, Deserialize)]
+struct RosterTile {
+    id: String,
+    name: Option<String>,
 }
 
 /// Pojedynczy rekord przekazywany z listener -> writer. `meeting_key` jest
@@ -282,45 +293,39 @@ pub async fn start(
                                 let _ = state_tx.send(JoinState::Joined);
                             }
                         }
-                        DomEvent::ParticipantJoined { id, name } => {
-                            let who = name.unwrap_or_else(|| id.clone());
-                            // Teams dla anonimowych dolaczen dodaje sufix
-                            // "(Unverified)" / " (External)" do display name.
-                            // Filtrujemy bot przez prefix match — "DevBot"
-                            // pasuje do "DevBot (Unverified)" itp.
-                            if who.starts_with(&listener_bot_name) {
-                                continue;
+                        DomEvent::RosterSnapshot { entries } => {
+                            // Zbuduj nowy stan `known` z snapshotu (po filtracji
+                            // bota). Logujemy delty względem poprzedniego stanu —
+                            // do telemetrii — ale do routera idzie 1 batch event.
+                            let mut next: HashMap<String, String> = HashMap::new();
+                            for tile in &entries {
+                                let who = tile.name.clone().unwrap_or_else(|| tile.id.clone());
+                                // Teams dla anonimowych dolaczen dodaje sufix
+                                // "(Unverified)" / " (External)" do display name.
+                                // Filtrujemy bota przez prefix match.
+                                if who.starts_with(&listener_bot_name) {
+                                    continue;
+                                }
+                                next.insert(tile.id.clone(), who);
                             }
-                            if known.insert(id.clone(), who.clone()).is_none() {
-                                tracing::info!(participant = %who, "dom_observer: participant joined");
-                                queue_participant(
-                                    &listener_emit_tx,
-                                    &listener_meeting_key,
-                                    &id,
-                                    &who,
-                                    "joined",
-                                );
-                                publish_roster_snapshot(&listener_roster_snapshot, &known);
+                            for (id, who) in &next {
+                                if !known.contains_key(id) {
+                                    tracing::info!(participant = %who, "dom_observer: participant joined");
+                                }
                             }
-                        }
-                        DomEvent::ParticipantLeft { id, name } => {
-                            let removed = known.remove(&id);
-                            let who = match removed {
-                                Some(prev) => prev,
-                                None => name.unwrap_or_else(|| id.clone()),
-                            };
-                            if who.starts_with(&listener_bot_name) {
-                                continue;
+                            for (id, who) in &known {
+                                if !next.contains_key(id) {
+                                    tracing::info!(participant = %who, "dom_observer: participant left");
+                                }
                             }
-                            tracing::info!(participant = %who, "dom_observer: participant left");
-                            queue_participant(
+                            known = next;
+                            publish_roster_snapshot(&listener_roster_snapshot, &known);
+                            queue_roster_snapshot(
                                 &listener_emit_tx,
                                 &listener_meeting_key,
-                                &id,
-                                &who,
-                                "left",
+                                &known,
+                                &listener_bot_name,
                             );
-                            publish_roster_snapshot(&listener_roster_snapshot, &known);
                         }
                         DomEvent::ActiveSpeaker { id, name } => {
                             let who = name.or_else(|| id.as_ref().and_then(|tid| known.get(tid).cloned()));
@@ -335,16 +340,14 @@ pub async fn start(
                                 // glosu — przy zywej dyskusji 5-10 razy/min. Info
                                 // poziom zalewa logi; debug wystarcza do diagnozy.
                                 tracing::debug!(speaker = %n, "dom_observer: active speaker");
-                                queue_participant(
-                                    &listener_emit_tx,
-                                    &listener_meeting_key,
-                                    id.as_deref().unwrap_or(n),
-                                    n,
-                                    "speaking",
-                                );
                             } else {
                                 tracing::debug!("dom_observer: active speaker cleared");
                             }
+                            // Active speaker jest osobno raportowany do GUI poprzez
+                            // następny RosterSnapshot (status="speaking" dla aktualnego
+                            // mówcy). Nie wysyłamy osobnego eventu per zmianę mówcy —
+                            // przy żywej dyskusji to byłoby 5-10 RT/min bez wartości
+                            // dodanej (snapshot i tak idzie z każdym DOM scan'em).
                         }
                         DomEvent::Unknown => {}
                     }
@@ -421,27 +424,41 @@ fn queue_lifecycle(tx: &mpsc::Sender<PendingEmit>, meeting_key: &str, stage: &st
     }
 }
 
-fn queue_participant(
+/// Buduje `RosterSnapshot` z aktualnego stanu `known` i wpycha do mpsc.
+/// Wszystkie wpisy mają `status="joined"` — opuszczenie sesji jest reprezentowane
+/// przez NIEOBECNOŚĆ wpisu w kolejnym snapshocie (bo to snapshot, nie diff).
+fn queue_roster_snapshot(
     tx: &mpsc::Sender<PendingEmit>,
     meeting_key: &str,
-    speaker_id: &str,
-    speaker_name: &str,
-    status: &str,
+    known: &HashMap<String, String>,
+    bot_name: &str,
 ) {
+    // Bot jest filtrowany z DOM rosteru (żeby dom_observer nie raportował go
+    // jako zdalnego uczestnika), ale GUI musi go widzieć — wstrzykujemy go
+    // jako pierwszy entry. ID = nazwa bota (stabilne, unikalne w obrębie sesji).
+    let mut entries: Vec<RosterEntry> = Vec::with_capacity(known.len() + 1);
+    entries.push(RosterEntry {
+        speaker_id: bot_name.to_string(),
+        speaker_name: Some(bot_name.to_string()),
+        status: "joined".to_string(),
+        last_spoken_ago_sec: None,
+    });
+    entries.extend(known.iter().map(|(id, name)| RosterEntry {
+        speaker_id: id.clone(),
+        speaker_name: Some(name.clone()),
+        status: "joined".to_string(),
+        last_spoken_ago_sec: None,
+    }));
     let event = PendingEmit {
         meeting_key: meeting_key.to_string(),
         timestamp_ms: ts_ms(),
-        payload: MeetingEventPayload::ParticipantUpdate {
-            speaker_id: speaker_id.to_string(),
-            speaker_name: Some(speaker_name.to_string()),
-            status: status.to_string(),
-            last_spoken_ago_sec: None,
-        },
+        payload: MeetingEventPayload::RosterSnapshot { entries },
     };
     if let Err(e) = tx.try_send(event) {
         tracing::warn!(
-            "dom_observer: participant queue full ({}, {}): {}",
-            speaker_name, status, e
+            "dom_observer: roster snapshot queue full (size={}): {}",
+            known.len(),
+            e
         );
     }
 }
@@ -488,7 +505,7 @@ fn publish_roster_snapshot(slot: &RosterSnapshotJson, known: &HashMap<String, St
 fn emit_label(payload: &MeetingEventPayload) -> &'static str {
     match payload {
         MeetingEventPayload::LifecycleUpdate { .. } => "lifecycle",
-        MeetingEventPayload::ParticipantUpdate { .. } => "participant",
+        MeetingEventPayload::RosterSnapshot { .. } => "roster",
         MeetingEventPayload::TranscriptEntry { .. } => "transcript",
         MeetingEventPayload::SummaryUpdate { .. } => "summary",
         MeetingEventPayload::ActionItemsUpdate { .. } => "action_items",
