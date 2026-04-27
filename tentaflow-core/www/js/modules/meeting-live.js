@@ -41,6 +41,19 @@ const state = {
 
 let unsubscribeLive = null;
 let footerTimer = null;
+// Coalesce wielu eventow w jednej klatce — bez tego batch rosteru (np. 5
+// uczestnikow w jednym tick'u) wymusza N pelnych re-renderow.
+let pendingRenderRaf = 0;
+
+// Laczy wiele wywolan w jeden render na klatce. Synchroniczny renderAll()
+// zostaje dla initial load i akcji uzytkownika, gdzie nie ma kontencji eventow.
+function scheduleRender() {
+  if (pendingRenderRaf) return;
+  pendingRenderRaf = requestAnimationFrame(() => {
+    pendingRenderRaf = 0;
+    renderAll();
+  });
+}
 
 // --- Lifecycle --------------------------------------------------------------
 
@@ -71,6 +84,10 @@ const MeetingLiveScreen = {
   },
   unmount() {
     stopFooterTimer();
+    if (pendingRenderRaf) {
+      cancelAnimationFrame(pendingRenderRaf);
+      pendingRenderRaf = 0;
+    }
     if (unsubscribeLive) {
       try { unsubscribeLive(); } catch (_) { /* no-op */ }
       unsubscribeLive = null;
@@ -249,7 +266,7 @@ async function subscribeLive() {
       const payload = body.payload;
       if (!payload || !payload.type) return;
       applyLiveEvent(Number(body.timestampMs || Date.now()), payload.type, payload.data || {});
-      renderAll();
+      scheduleRender();
     });
   } catch (e) {
     console.warn('[meeting-live] subscribeLive failed:', e?.message);
