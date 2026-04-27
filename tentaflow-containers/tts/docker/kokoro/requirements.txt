@@ -1,0 +1,6 @@
+kokoro-onnx==0.4.9
+fastapi==0.118.0
+uvicorn[standard]==0.34.0
+soundfile==0.13.0
+huggingface_hub==1.8.0
+numpy<2.0

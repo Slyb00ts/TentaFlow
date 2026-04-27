@@ -167,6 +167,86 @@ fn row_to_flow_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowExec
     })
 }
 
+// --- Teams Bot Wake Words ---
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WakeWord {
+    pub id: i64,
+    pub word: String,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+/// Lista wszystkich slow aktywujacych (wlaczonych i wylaczonych).
+pub fn list_wake_words(pool: &DbPool) -> Result<Vec<WakeWord>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, word, enabled, created_at FROM teams_bot_wake_words ORDER BY word",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(WakeWord {
+                id: r.get(0)?,
+                word: r.get(1)?,
+                enabled: r.get::<_, i64>(2)? != 0,
+                created_at: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Lista samych wlaczonych slow w postaci CSV — uzywane przy spawn bota.
+pub fn enabled_wake_words_csv(pool: &DbPool) -> Result<String> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT word FROM teams_bot_wake_words WHERE enabled = 1 ORDER BY word",
+    )?;
+    let words: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(words.join(","))
+}
+
+/// Dodaje slowo (idempotentnie). Zwraca id istniejacego/nowego rekordu.
+pub fn add_wake_word(pool: &DbPool, word: &str) -> Result<i64> {
+    let trimmed = word.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("wake_word puste");
+    }
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO teams_bot_wake_words (word, enabled) VALUES (?1, 1)",
+        rusqlite::params![trimmed],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM teams_bot_wake_words WHERE word = ?1",
+        rusqlite::params![trimmed],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+/// Usuwa slowo po id.
+pub fn delete_wake_word(pool: &DbPool, id: i64) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "DELETE FROM teams_bot_wake_words WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Toggle enabled/disabled. Zwraca nowy stan.
+pub fn set_wake_word_enabled(pool: &DbPool, id: i64, enabled: bool) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE teams_bot_wake_words SET enabled = ?2 WHERE id = ?1",
+        rusqlite::params![id, if enabled { 1 } else { 0 }],
+    )?;
+    Ok(())
+}
+
 // --- Services ---
 
 const SERVICE_COLS: &str = "id, name, service_type, strategy, model_category, status, config_json, created_at, updated_at, service_uuid, node_id, pinned, paused, vram_estimate_mb, deployed_source_hash";
@@ -4412,6 +4492,44 @@ pub mod transcripts {
 
     /// Pełne wypełnienie sesji po udanym spawnie kontenera.
     #[allow(clippy::too_many_arguments)]
+    /// Wariant `update_session_spawned` dla bota natywnego (subprocess) — bez
+    /// portow VNC/noVNC bo nie ma zdalnego desktopu. `container_id` jest pusty
+    /// (nie ma kontenera), `container_name` zachowuje konwencje
+    /// `meeting-bot-<session_id>` zeby GUI mialo to samo do wyswietlenia.
+    pub fn update_session_spawned_native(
+        pool: &DbPool,
+        id: i64,
+        container_name: &str,
+        quic_port: u16,
+        bot_endpoint_id: &str,
+        bot_secret_key_hex: &str,
+        platform: &str,
+        owner_user_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = pool.lock().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET status = 'joining',
+                 container_id = '', container_name = ?2,
+                 quic_port = ?3, vnc_port = NULL, novnc_port = NULL,
+                 bot_endpoint_id = ?4, bot_secret_key_hex = ?5,
+                 platform = ?6, owner_user_id = COALESCE(owner_user_id, ?7),
+                 last_activity_at = datetime('now'),
+                 ended_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                container_name,
+                quic_port as i64,
+                bot_endpoint_id,
+                bot_secret_key_hex,
+                platform,
+                owner_user_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn update_session_spawned(
         pool: &DbPool,
         id: i64,

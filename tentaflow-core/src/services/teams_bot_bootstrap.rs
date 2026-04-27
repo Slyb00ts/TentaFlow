@@ -10,11 +10,29 @@ use crate::db::models::FlowParams;
 use crate::db::{repository, DbPool};
 
 /// Nazwy aliasów używanych przez teams-bota — pusty `target_model` sygnalizuje
-/// że user powinien przypisać konkretny model w UI.
-const TEAMS_ALIASES: &[&str] = &["teams-stt", "teams-summarization", "teams-tts"];
+/// że user powinien przypisać konkretny model w UI. `teams-llm` jest LLM
+/// generujacy odpowiedzi bota w real-time, oddzielny od `teams-summarization`
+/// ktory robi okresowe podsumowania.
+const TEAMS_ALIASES: &[&str] = &[
+    "teams-stt",
+    "teams-summarization",
+    "teams-tts",
+    "teams-llm",
+];
 
 /// Nazwa domyślnego flow dla teams-bota.
 const TEAMS_FLOW_NAME: &str = "teams-flow";
+
+/// Domyslne wake-words dodawane przy pierwszym deploy teams-bota.
+/// Edytowalne przez UI/API; po edycji tabela jest "user-managed" — nie
+/// nadpisujemy. Ten seed dotyka tylko pustej tabeli.
+const DEFAULT_WAKE_WORDS: &[&str] = &[
+    "jarvis",
+    "tentaflow",
+    "asystencie",
+    "asystent",
+    "bot",
+];
 
 /// Tworzy (jeśli brak) domyślne aliasy i flow dla teams-bota. Bezpieczna do
 /// wywołania wielokrotnie — istniejące wpisy nie są modyfikowane, żeby nie
@@ -24,6 +42,20 @@ pub async fn ensure_teams_bot_defaults(pool: &DbPool) -> Result<()> {
         ensure_alias(pool, alias)?;
     }
     ensure_teams_flow(pool)?;
+    ensure_default_wake_words(pool)?;
+    Ok(())
+}
+
+/// Idempotentnie seeduje domyslne wake-words gdy tabela jest pusta. Po
+/// pierwszej edycji uzytkownika (dodanie/usuniecie) zostawiamy w spokoju.
+fn ensure_default_wake_words(pool: &DbPool) -> Result<()> {
+    let existing = repository::list_wake_words(pool)?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+    for w in DEFAULT_WAKE_WORDS {
+        let _ = repository::add_wake_word(pool, w);
+    }
     Ok(())
 }
 
