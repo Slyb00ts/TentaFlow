@@ -47,4 +47,5 @@ pub mod license;
 pub mod lifecycle_signal;
 pub mod meeting;
 pub mod paths;
+pub mod profiling;
 pub mod system_check;
