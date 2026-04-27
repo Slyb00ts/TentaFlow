@@ -29,6 +29,11 @@ pub struct ResolvedRoute {
 pub enum BackendHandle {
     LocalLlm,
     LocalStt,
+    /// In-process TTS (Apple AVSpeech, Kokoro MLX, sherpa-onnx) zarejestrowany
+    /// w `crate::tts::shared_tts_manager()`. Klucz = service_name z deploy
+    /// handlera (np. `apple-tts-native`). Dispatcher woła `synthesize` na
+    /// silniku przez spawn_blocking + manager.read().
+    LocalTts(String),
     QuicLlm(String),
     QuicStt(String),
     QuicTts(String),
@@ -44,6 +49,7 @@ impl BackendHandle {
         match self {
             BackendHandle::LocalLlm => "local_llm",
             BackendHandle::LocalStt => "local_stt",
+            BackendHandle::LocalTts(_) => "local_tts",
             BackendHandle::QuicLlm(_) => "quic_llm",
             BackendHandle::QuicStt(_) => "quic_stt",
             BackendHandle::QuicTts(_) => "quic_tts",
@@ -182,6 +188,18 @@ impl Router {
 
         if self.service_manager.has_quic_tts_service(target) {
             backends.push(BackendHandle::QuicTts(target.to_string()));
+        }
+
+        // Embedded TTS (Apple AVSpeech / Kokoro MLX / sherpa) sa
+        // zarejestrowane w `shared_tts_manager()`, NIE w `quic_tts_services`.
+        // Bez tego sprawdzenia router probowal MeshForward na wlasny node
+        // (filter `svc.node_id == local_node` skipuje go) i konczyl na
+        // 'TTS nie znaleziono backendow'. `try_read` non-blocking — write
+        // lock to tylko podczas register/unregister przy deploy.
+        if let Ok(guard) = crate::tts::shared_tts_manager().try_read() {
+            if guard.has(target) {
+                backends.push(BackendHandle::LocalTts(target.to_string()));
+            }
         }
 
         if self.service_manager.has_quic_embedding_service(target) {
