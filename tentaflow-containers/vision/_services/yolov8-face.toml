@@ -1,0 +1,28 @@
+# =============================================================================
+# Manifest serwisu YOLOv8-face — detekcja twarzy w obrazie.
+# Embedded native: model ONNX wkompilowany w binarke przez build.rs,
+# inference przez tract-onnx (pure Rust, wszystkie platformy).
+# =============================================================================
+
+[engine]
+id = "yolov8-face"
+category = "vision"
+name = "YOLOv8 Face"
+description_pl = "Detekcja twarzy w obrazie. Lekki model ~12 MB, wykrywa twarze + 5 keypointow (oczy, nos, usta)."
+description_en = "Face detection. Lightweight ~12 MB model, returns faces + 5 keypoints (eyes, nose, mouth)."
+homepage = "https://github.com/akanametov/yolov8-face"
+license = "AGPL-3.0"
+icon = "yolo"
+default_port = 0
+api = "custom"
+version = "n-2024"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+
+[[model_preset]]
+id = "yolov8n-face"
+display_name = "YOLOv8n Face"
+repo = "akanametov/yolov8-face"
+recommended = true

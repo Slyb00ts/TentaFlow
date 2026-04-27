@@ -1,0 +1,27 @@
+# =============================================================================
+# Manifest serwisu HSEmotion — rozpoznawanie emocji z twarzy.
+# Najlzejszy z dobrych (~10 MB, ~50ms CPU), Apache-2.0.
+# =============================================================================
+
+[engine]
+id = "hsemotion"
+category = "vision"
+name = "HSEmotion"
+description_pl = "Rozpoznawanie emocji z twarzy (8 klas: neutral, happy, sad, surprise, fear, disgust, anger, contempt). ~10 MB, ~50 ms CPU."
+description_en = "Face emotion recognition (8 classes). ~10 MB, ~50 ms CPU."
+homepage = "https://github.com/HSE-asavchenko/face-emotion-recognition"
+license = "Apache-2.0"
+icon = "emotion"
+default_port = 0
+api = "custom"
+version = "enet-b0-2024"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+
+[[model_preset]]
+id = "hsemotion-enet-b0"
+display_name = "HSEmotion EfficientNet-B0 (8 emocji)"
+repo = "HSE-asavchenko/face-emotion-recognition"
+recommended = true

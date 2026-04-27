@@ -1,0 +1,27 @@
+# =============================================================================
+# Manifest serwisu EmoNet — emocje + valence/arousal (continuous).
+# Bardziej szczegolowy niz HSEmotion (zwraca 2D affect space). BSD-3-Clause.
+# =============================================================================
+
+[engine]
+id = "emonet"
+category = "vision"
+name = "EmoNet"
+description_pl = "Emocje + ciagle valence/arousal z twarzy. Bardziej zniuansowany niz klasyczny FER."
+description_en = "Emotions + continuous valence/arousal from face. More nuanced than classic FER."
+homepage = "https://github.com/face-analysis/emonet"
+license = "BSD-3-Clause"
+icon = "emonet"
+default_port = 0
+api = "custom"
+version = "8-emotions-2021"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+
+[[model_preset]]
+id = "emonet-8"
+display_name = "EmoNet 8 emocji + valence/arousal"
+repo = "face-analysis/emonet"
+recommended = true
