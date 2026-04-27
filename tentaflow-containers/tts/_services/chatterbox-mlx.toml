@@ -1,0 +1,49 @@
+# Manifest serwisu Chatterbox MLX — wariant Apple Silicon przez `mlx-audio`.
+# 16 jezykow w tym polski. Quantize 4-bit/8-bit/fp16 do wyboru. Dziala TYLKO
+# na Apple Silicon (mlx-audio wymaga MLX = Apple GPU). Linux/Win uzywaja
+# zwyklego `chatterbox` (manifest `chatterbox.toml`).
+
+[engine]
+id = "chatterbox-mlx"
+category = "tts"
+resource_kind = "ai"
+name = "Chatterbox MLX (Apple)"
+description_pl = "Chatterbox 23 jezyki + PL przez mlx-audio. Apple Silicon natywnie. 4bit/8bit/fp16."
+description_en = "Chatterbox multilingual via mlx-audio on Apple Silicon. 4/8-bit + fp16 variants."
+homepage = "https://huggingface.co/mlx-community/chatterbox-turbo-4bit"
+license = "MIT"
+icon = "chatterbox"
+default_port = 5025
+api = "openai-compatible"
+version = "0.4.2"
+
+[deploy.native]
+platforms = ["macos"]
+runtime = "python-bundle"
+bundle_path = "tts/python/chatterbox-mlx"
+
+[[model_preset]]
+id = "chatterbox-turbo-4bit"
+display_name = "Chatterbox Turbo 4-bit (~250 MB)"
+repo = "mlx-community/chatterbox-turbo-4bit"
+recommended = true
+
+[[model_preset]]
+id = "chatterbox-turbo-8bit"
+display_name = "Chatterbox Turbo 8-bit (~500 MB)"
+repo = "mlx-community/chatterbox-turbo-8bit"
+
+[[model_preset]]
+id = "chatterbox-turbo-fp16"
+display_name = "Chatterbox Turbo fp16 (~1 GB)"
+repo = "mlx-community/chatterbox-turbo-fp16"
+
+[[model_preset]]
+id = "chatterbox-fp16"
+display_name = "Chatterbox v1 fp16 (~1.5 GB)"
+repo = "mlx-community/chatterbox-fp16"
+
+[[model_preset]]
+id = "chatterbox-4bit"
+display_name = "Chatterbox v1 4-bit (~400 MB)"
+repo = "mlx-community/chatterbox-4bit"
