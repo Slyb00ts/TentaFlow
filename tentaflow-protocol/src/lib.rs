@@ -24,10 +24,17 @@ pub mod types;
 pub mod mesh;
 pub mod envelope;
 pub mod message_body;
+pub mod pii;
 pub mod profiling;
+pub mod vision;
 
 pub use types::*;
 pub use mesh::*;
+pub use pii::PiiRulePayload;
+pub use vision::{
+    VisionFaceDet, VisionImageFormat, VisionInferRequest, VisionInferResponse,
+    VisionInferResult, VisionInferPayload,
+};
 pub use profiling::{
     GpuUtilSample, GpuUtilSeries, NsightDeleteRequest, NsightDeleteResponse,
     NsightDownloadRequest, NsightDownloadResponse, NsightGpuTarget,
