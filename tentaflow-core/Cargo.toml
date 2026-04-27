@@ -111,6 +111,15 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 
+# Vision inference — pure Rust ONNX runtime (tract). Zawsze wkompilowany dla
+# wszystkich platform (linux/macos/windows/ios/android), bez ABI-hellu z ort.
+# Uzywany do YOLOv8-face / SCRFD / MiVOLO v2 / HSEmotion / EmoNet — modele
+# embedowane w binarce przez build.rs::embed_vision_models. Latencja CPU
+# ~10-30 ms/twarz na M1; akceptowalnie szybko, jednolicie cross-platform.
+tract-onnx = { version = "0.21", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+ndarray = "0.16"
+
 # Embedowanie kontekstu kontenerow w binarce (deploy::bundle)
 flate2 = "1.1.9"
 tar = "0.4.45"

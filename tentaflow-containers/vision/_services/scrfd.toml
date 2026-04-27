@@ -1,0 +1,27 @@
+# =============================================================================
+# Manifest serwisu SCRFD — detekcja twarzy (InsightFace).
+# Lekki (~3 MB), niska latencja, MIT license. Embedded native przez tract-onnx.
+# =============================================================================
+
+[engine]
+id = "scrfd"
+category = "vision"
+name = "SCRFD Face"
+description_pl = "Detekcja twarzy SCRFD od InsightFace. ~3 MB, MIT, najszybsza w pipelinie face."
+description_en = "InsightFace SCRFD face detector. ~3 MB, MIT, fastest in face pipeline."
+homepage = "https://github.com/deepinsight/insightface/tree/master/detection/scrfd"
+license = "MIT"
+icon = "scrfd"
+default_port = 0
+api = "custom"
+version = "2.5g-kps"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows", "ios", "android"]
+runtime = "embedded"
+
+[[model_preset]]
+id = "scrfd-2-5g-kps"
+display_name = "SCRFD 2.5G + Keypoints"
+repo = "deepinsight/insightface"
+recommended = true
