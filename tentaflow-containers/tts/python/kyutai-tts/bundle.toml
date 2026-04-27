@@ -1,0 +1,22 @@
+[bundle]
+engine = "kyutai-tts"
+description = "Kyutai Pocket TTS — 100M params, CPU, 6x realtime"
+python_version = "3.12"
+source = "pypi"
+package = "pocket-tts"
+package_version = "2.0.0"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8088}"]
+internal_port = 8088
+
+[requires]
+gpu_memory_gb = 0
+disk_gb = 1
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]
+
+[[install_variants]]
+backend = "cpu"
+extras = []
