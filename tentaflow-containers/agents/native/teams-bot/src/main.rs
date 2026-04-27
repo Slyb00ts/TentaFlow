@@ -187,6 +187,124 @@ async fn emit_lifecycle(
     }
 }
 
+/// Sprawdza czy ktorekolwiek z `wake_words` (CSV) wystepuje w tekscie
+/// (case-insensitive, fragment slowa OK). Pusta lista wake_words = zawsze TRUE.
+fn matches_wake_word(text: &str, wake_words_csv: &str) -> bool {
+    let words: Vec<String> = wake_words_csv
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if words.is_empty() {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    words.iter().any(|w| lower.contains(w.as_str()))
+}
+
+/// Pyta LLM-classifier czy wypowiedz to faktyczne pytanie do bota. Zwraca
+/// true jezeli model zwrocil "TAK" (case-insensitive). Przy timeout/bledzie
+/// fallback false — bezpieczniej nie odpowiadac niz halucynowac.
+async fn intent_says_yes(
+    client: &Arc<crate::quic_server::RouterClient>,
+    config: &MeetingConfig,
+    text: &str,
+) -> bool {
+    let messages = vec![
+        ("system".to_string(), config.intent_prompt.clone()),
+        ("user".to_string(), text.to_string()),
+    ];
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.chat_completion(&config.llm_alias, messages),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let answer = resp.content.trim().to_uppercase();
+            tracing::debug!(answer = %answer, "intent classifier zwrocil");
+            answer.starts_with("TAK")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("intent classifier failed: {}", e);
+            false
+        }
+        Err(_) => {
+            tracing::warn!("intent classifier timeout 10s");
+            false
+        }
+    }
+}
+
+/// Decyduje czy bot odpowiada na wypowiedz, i jezeli tak — generuje odpowiedz
+/// przez LLM. Zwraca tekst odpowiedzi albo None (bot milczy). Tryb gatowania
+/// wybiera `config.response_mode`.
+async fn gate_and_respond(
+    config: &MeetingConfig,
+    client: &Arc<crate::quic_server::RouterClient>,
+    text: &str,
+) -> Option<String> {
+    // Etap 1: gating wedlug response_mode.
+    let mode = config.response_mode.as_str();
+    let allow = match mode {
+        "always" => true,
+        "wake_word" => matches_wake_word(text, &config.wake_words),
+        "wake_word_intent" => {
+            if !matches_wake_word(text, &config.wake_words) {
+                false
+            } else {
+                tracing::info!(
+                    text = %text.chars().take(60).collect::<String>(),
+                    "wake_word match — pytam intent classifier"
+                );
+                intent_says_yes(client, config, text).await
+            }
+        }
+        other => {
+            tracing::warn!(mode = %other, "nieznany response_mode — domyslnie pasywny");
+            false
+        }
+    };
+    if !allow {
+        return None;
+    }
+
+    // Etap 2: generuj odpowiedz przez LLM (alias `llm_alias`).
+    let messages = vec![
+        ("system".to_string(), config.response_prompt.clone()),
+        ("user".to_string(), text.to_string()),
+    ];
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client.chat_completion(&config.llm_alias, messages),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let trimmed = resp.content.trim().to_string();
+            if trimmed.is_empty() || trimmed.contains("<NO_RESPONSE>") {
+                None
+            } else {
+                tracing::info!(
+                    alias = %config.llm_alias,
+                    resolved = %resp.resolved_model,
+                    "LLM response: {}",
+                    trimmed.chars().take(120).collect::<String>()
+                );
+                Some(trimmed)
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("LLM response failed: {}", e);
+            None
+        }
+        Err(_) => {
+            tracing::warn!("LLM response timeout 20s");
+            None
+        }
+    }
+}
+
 /// Uchwyt aktualnie uruchomionej petli summarizera dla sesji spotkania.
 /// Przy LeaveMeeting / nowym JoinMeeting stary handle jest zamykany, a w jego
 /// miejsce spawnujemy nowy — meeting_key musi pasowac do biezacej sesji.
@@ -816,14 +934,34 @@ async fn main() -> Result<()> {
                                 }
                             }
 
-                            // TTS uruchamiamy TYLKO w echo_mode (tryb testowy). Bez tego
-                            // bot powtarza co uslyszal = nieskonczony feedback loop, nawet
-                            // ze self-speaking guardem. Docelowo LLM response pojdzie osobnym
-                            // polem w ModelResponse i wtedy to bedzie branch na llm_response.
-                            if config.echo_mode {
+                            // Pelny pipeline z gatowaniem aktywacji:
+                            //   1. echo_mode -> bot powtarza dokladnie (test)
+                            //   2. respond_enabled + llm_alias wpiety
+                            //   3. response_mode determinuje kiedy odpalamy LLM:
+                            //        - "always": kazda wypowiedz
+                            //        - "wake_word": tylko gdy wake_word w tekscie
+                            //        - "wake_word_intent" (default): wake_word + LLM-classifier
+                            //   4. response generation: LLM moze zwrocic <NO_RESPONSE>
+                            //
+                            // Pasywny tryb (default `wake_word_intent`) gwarantuje
+                            // 0 LLM calls dla normalnej rozmowy bez wezwania bota.
+                            let response_text: Option<String> = if config.echo_mode {
+                                Some(text.clone())
+                            } else if config.respond_enabled
+                                && !config.llm_alias.trim().is_empty()
+                            {
+                                gate_and_respond(
+                                    &config,
+                                    &client,
+                                    &text,
+                                ).await
+                            } else {
+                                None
+                            };
+                            if let Some(reply) = response_text {
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(30),
-                                    client.synthesize(&text, "", tts_alias),
+                                    client.synthesize(&reply, "", tts_alias),
                                 ).await {
                                     Ok(Ok(audio_bytes)) => {
                                         match audio::parse_audio_payload(audio_bytes)

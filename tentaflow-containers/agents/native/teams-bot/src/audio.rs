@@ -14,8 +14,24 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-/// Adres mostu WebSocket — JS w Chromium laczy sie tutaj
-pub const BRIDGE_ADDR: &str = "127.0.0.1:9999";
+/// Domyslny port mostu WebSocket. Docker uzywa 9999 (1 sesja per kontener,
+/// brak kolizji). Native uruchamia wiele sesji w tym samym network namespace,
+/// wiec port jest dynamiczny — `MeetingManager` alokuje go z `port_pool`
+/// i przekazuje przez env `TENTAFLOW_BRIDGE_PORT`.
+pub const DEFAULT_BRIDGE_PORT: u16 = 9999;
+
+/// Zwraca port mostu WS — env `TENTAFLOW_BRIDGE_PORT` ma priorytet.
+pub fn bridge_port() -> u16 {
+    std::env::var("TENTAFLOW_BRIDGE_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_BRIDGE_PORT)
+}
+
+/// Adres bind mostu WebSocket dla zadanego portu.
+pub fn bridge_addr(port: u16) -> String {
+    format!("127.0.0.1:{}", port)
+}
 
 /// Rozmiar bufora kanalu capture (liczba chunkow)
 const CAPTURE_BUFFER: usize = 64;
@@ -116,21 +132,29 @@ impl AudioPlayback {
 /// Zwraca AudioCapture i AudioPlayback ktore maja ten sam interfejs co poprzednia
 /// implementacja (zero zmian w main.rs pipeline).
 pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback)> {
+    start_bridge_on(bridge_port()).await
+}
+
+/// Wariant `start_bridge` z jawnym portem — uzywany w testach i przy
+/// integracji z managerem ktory chce alokowac port samodzielnie.
+pub async fn start_bridge_on(port: u16) -> Result<(AudioCapture, AudioPlayback)> {
     let (capture_tx, capture_rx) = mpsc::channel::<Vec<i16>>(CAPTURE_BUFFER);
     let playback_tx_slot: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(StdMutex::new(None));
 
-    let listener = TcpListener::bind(BRIDGE_ADDR).await
-        .map_err(|e| anyhow::anyhow!("Nie udalo sie otworzyc {}: {}", BRIDGE_ADDR, e))?;
-    tracing::info!(addr = BRIDGE_ADDR, "Most audio WebSocket nasluchuje");
+    let addr = bridge_addr(port);
+    let listener = TcpListener::bind(&addr).await
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie otworzyc {}: {}", addr, e))?;
+    tracing::info!(addr = %addr, "Most audio WebSocket nasluchuje");
 
     let playback_slot_accept = Arc::clone(&playback_tx_slot);
+    let bind_addr = addr.clone();
 
     // Task akceptujacy polaczenia od JS (Chromium injekcja)
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, addr)) => {
-                    tracing::info!(peer = %addr, "JS bridge polaczony");
+                Ok((stream, peer)) => {
+                    tracing::info!(peer = %peer, "JS bridge polaczony");
                     let capture_tx_conn = capture_tx.clone();
                     let playback_slot_conn = Arc::clone(&playback_slot_accept);
 
@@ -145,7 +169,7 @@ pub async fn start_bridge() -> Result<(AudioCapture, AudioPlayback)> {
                     });
                 }
                 Err(e) => {
-                    tracing::error!("Blad accept na {}: {}", BRIDGE_ADDR, e);
+                    tracing::error!("Blad accept na {}: {}", bind_addr, e);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }

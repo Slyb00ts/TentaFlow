@@ -44,14 +44,14 @@ WORKDIR /build
 COPY tentaflow-protocol/ tentaflow-protocol/
 COPY tentaflow-transport/ tentaflow-transport/
 COPY tentaflow-voice/ tentaflow-voice/
-COPY tentaflow-containers/agents/docker/teams-bot/ tentaflow-containers/agents/docker/teams-bot/
+COPY tentaflow-containers/agents/native/teams-bot/ tentaflow-containers/agents/native/teams-bot/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --manifest-path tentaflow-containers/agents/docker/teams-bot/Cargo.toml \
+    cargo build --release --manifest-path tentaflow-containers/agents/native/teams-bot/Cargo.toml --bin tentaflow-meeting \
     && mkdir -p /artifacts \
-    && cp /build/tentaflow-containers/agents/docker/teams-bot/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
+    && cp /build/tentaflow-containers/agents/native/teams-bot/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
     && strip /artifacts/tentaflow-meeting
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ COPY tentaflow-containers/agents/docker/teams-bot/pulseaudio.conf /etc/pulse/def
 
 # Model Silero VAD (diarization jest w routerze, nie w bocie)
 RUN mkdir -p /opt/models
-COPY tentaflow-containers/agents/docker/teams-bot/models/silero_vad.onnx /opt/models/silero_vad.onnx
+COPY tentaflow-containers/agents/native/teams-bot/models/silero_vad.onnx /opt/models/silero_vad.onnx
 
 # Binary z etapu budowania (skopiowane poza cache mount do /artifacts)
 COPY --from=builder /artifacts/tentaflow-meeting /usr/local/bin/tentaflow-meeting

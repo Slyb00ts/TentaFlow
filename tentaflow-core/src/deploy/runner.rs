@@ -60,6 +60,7 @@ pub async fn run_deployment(
     db: DbPool,
     service_manager: Arc<ServiceManager>,
     settings_cipher: Arc<SettingsCipher>,
+    router: Arc<crate::routing::router::Router>,
     deploy_id: String,
     engine_id: String,
     deploy_method: String,
@@ -117,6 +118,7 @@ pub async fn run_deployment(
                 &db,
                 &service_manager,
                 &settings_cipher,
+                &router,
                 &deploy_id,
                 &tx,
                 &engine,
@@ -614,6 +616,7 @@ async fn do_native_deploy(
     db: &DbPool,
     service_manager: &Arc<ServiceManager>,
     settings_cipher: &Arc<SettingsCipher>,
+    router: &Arc<crate::routing::router::Router>,
     deploy_id: &str,
     tx: &broadcast::Sender<BusMessage>,
     engine: &EngineMeta,
@@ -640,6 +643,7 @@ async fn do_native_deploy(
             do_embedded_native_deploy(
                 db,
                 service_manager,
+                router,
                 deploy_id,
                 tx,
                 engine,
@@ -650,14 +654,16 @@ async fn do_native_deploy(
             .await
         }
         "binary" => {
-            log_line(db, deploy_id, tx, "log", "runtime=binary — TODO build.sh");
-            // Build binary przez build.sh w bundle — pełna implementacja wymaga
-            // streamingu stdout ze skryptu. Dla kompletności ta ścieżka istnieje
-            // ale obecnie wymaga że admin sam zbuduje binarkę poza flow.
-            // Zwracamy jawny błąd żeby nie udawać sukcesu.
-            Err(anyhow!(
-                "runtime=binary: build.sh scripted path jeszcze nie zintegrowany w runner — uruchom skrypt ręcznie"
-            ))
+            do_binary_native_deploy(
+                db,
+                deploy_id,
+                tx,
+                engine,
+                node_id,
+                config,
+                start_ms,
+            )
+            .await
         }
         "python-bundle" => {
             do_python_bundle_native_deploy(
@@ -677,9 +683,112 @@ async fn do_native_deploy(
     }
 }
 
+/// Deploy native runtime=binary: zaklada ze binarka jest juz zbudowana i lezy
+/// obok `tentaflow` (zasluga `tentaflow/build.rs`). Funkcja sprawdza obecnosc
+/// binarki na dysku i rejestruje serwis w DB. Faktyczne uruchomienie procesu
+/// dzieje sie per-zadanie — np. dla teams-bota MeetingManager spawnuje
+/// `tentaflow-meeting` osobno per spotkanie.
+async fn do_binary_native_deploy(
+    db: &DbPool,
+    deploy_id: &str,
+    tx: &broadcast::Sender<BusMessage>,
+    engine: &EngineMeta,
+    node_id: &str,
+    config: &DeployConfig,
+    start_ms: i64,
+) -> Result<()> {
+    // Mapowanie engine_id -> nazwa binarki. Aktualnie tylko teams-bot, ale
+    // dodawanie kolejnych engineow runtime=binary sprowadza sie do dorzucenia
+    // entry w tym matchu i odpowiedniej zaleznosci w `tentaflow/build.rs`.
+    let bin_name: &str = match engine.engine_id.as_str() {
+        "teams-bot" => {
+            if cfg!(target_os = "windows") {
+                "tentaflow-meeting.exe"
+            } else {
+                "tentaflow-meeting"
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "runtime=binary: brak mapowania engine_id '{}' na binarke",
+                other
+            );
+        }
+    };
+
+    phase(db, deploy_id, tx, "building", 30, "weryfikacja binarki natywnej");
+
+    let exe = std::env::current_exe()
+        .context("nie udalo sie ustalic sciezki biezacej binarki tentaflow")?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("biezaca binarka nie ma katalogu nadrzednego"))?;
+    let bin_path = exe_dir.join(bin_name);
+    if !bin_path.is_file() {
+        anyhow::bail!(
+            "Binarka {} nie istnieje obok tentaflow ({}). Zbuduj projekt 'cargo build --release' \
+             zeby tentaflow/build.rs zbudowal sidecar bota.",
+            bin_name,
+            bin_path.display()
+        );
+    }
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        &format!("Binarka znaleziona: {}", bin_path.display()),
+    );
+
+    let service_name = config
+        .container_name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{}-native", slugify_name(&engine.engine_id)));
+
+    phase(db, deploy_id, tx, "registering", 92, "rejestracja serwisu native");
+
+    // services.service_type ma CHECK constraint na lp ('agent', 'tool', ...).
+    // engine.category z manifestu jest plural ('agents', 'tools') wiec mapujemy
+    // przez service_type_from_category zanim trafi do DB.
+    let svc_type = service_type_from_category(&engine.category);
+    let config_json = serde_json::json!({
+        "deploy_mode": "native",
+        "runtime": "binary",
+        "engine": engine.engine_id,
+        "manifest_engine_id": engine.engine_id,
+        "service_type": svc_type,
+        "binary_path": bin_path.to_string_lossy(),
+    })
+    .to_string();
+
+    upsert_native_service(
+        db,
+        node_id,
+        &service_name,
+        svc_type,
+        None,
+        &config_json,
+        "first_available",
+    )?;
+
+    persist_source_hash(db, &engine.engine_id, "native", &service_name);
+
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        &format!("natywny serwis zarejestrowany: {}", service_name),
+    );
+    finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+    Ok(())
+}
+
 async fn do_embedded_native_deploy(
     db: &DbPool,
     service_manager: &Arc<ServiceManager>,
+    router: &Arc<crate::routing::router::Router>,
     deploy_id: &str,
     tx: &broadcast::Sender<BusMessage>,
     engine: &EngineMeta,
@@ -775,7 +884,7 @@ async fn do_embedded_native_deploy(
             })
             .to_string();
 
-            upsert_native_service(
+            let service_id = upsert_native_service(
                 db,
                 node_id,
                 &service_name,
@@ -784,6 +893,23 @@ async fn do_embedded_native_deploy(
                 &config_json,
                 "single",
             )?;
+            ensure_model_registry_entry(
+                db,
+                "whisper-large-v3-turbo",
+                "Whisper Large V3 Turbo",
+                "stt",
+                service_id,
+                &config_json,
+            );
+
+            // Rejestruj w mesh — bez tego router widzi serwis w DB ale nie
+            // wie ze jest live na tym nodzie (Mesh STT serwis nie polaczony).
+            router.register_native_service_in_mesh(
+                &service_name, "stt",
+                vec!["whisper-large-v3-turbo".to_string()],
+                Some("whisper".to_string()),
+                vec![stt_info.size_bytes / (1024 * 1024)],
+            );
 
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
@@ -794,6 +920,227 @@ async fn do_embedded_native_deploy(
                 "log",
                 &format!("natywny serwis zarejestrowany: {}", service_name),
             );
+            finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+            Ok(())
+        }
+        #[cfg(feature = "inference-mlx-kokoro")]
+        ("tts", "kokoro") if std::env::consts::OS == "macos" => {
+            let model_repo = resolve_model_repo(engine, config)
+                .unwrap_or_else(|_| "mlx-community/Kokoro-82M-bf16".to_string());
+            let service_name = config
+                .container_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "kokoro-tts-native".to_string());
+
+            phase(db, deploy_id, tx, "building", 20, "download kokoro");
+            let resolved = crate::tts::mlx_kokoro::prepare_model(&model_repo)
+                .await
+                .with_context(|| format!("prepare kokoro model '{}'", model_repo))?;
+
+            phase(db, deploy_id, tx, "running", 75, "load kokoro");
+            let mut engine_impl = crate::tts::mlx_kokoro::MlxKokoroEngine::new();
+            let info = <crate::tts::mlx_kokoro::MlxKokoroEngine as crate::tts::TtsEngine>::load_model(
+                &mut engine_impl,
+                &resolved,
+            )
+            .context("load kokoro w Swift bridge")?;
+
+            {
+                let shared = crate::tts::shared_tts_manager();
+                let mut mgr = shared.write().await;
+                mgr.register(service_name.clone(), Box::new(engine_impl));
+            }
+
+            phase(db, deploy_id, tx, "registering", 92, "register service");
+            let config_json = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "kokoro",
+                "manifest_engine_id": engine.engine_id,
+                "deployed_model": model_repo,
+                "model_path": resolved.to_string_lossy(),
+                "service_type": "tts",
+                "sample_rate": info.sample_rate,
+            })
+            .to_string();
+            let service_id = upsert_native_service(
+                db, node_id, &service_name, "tts", Some("tts"),
+                &config_json, "single",
+            )?;
+            ensure_model_registry_entry(
+                db,
+                &model_repo,
+                &format!("Kokoro 82M MLX ({})", model_repo),
+                "tts",
+                service_id,
+                &config_json,
+            );
+            router.register_native_service_in_mesh(
+                &service_name, "tts",
+                vec![model_repo.clone()],
+                Some("kokoro".to_string()),
+                vec![info.sample_rate as u64 / 1000],  // placeholder
+            );
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+            log_line(db, deploy_id, tx, "log", &format!("Kokoro TTS gotowe: {}", service_name));
+            let _ = service_manager;
+            finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+            Ok(())
+        }
+        #[cfg(feature = "inference-apple-tts")]
+        ("tts", "apple-tts") => {
+            let service_name = config
+                .container_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "apple-tts-native".to_string());
+            // Glos wybierany przez `model_repo` (`zosia-pl`, `samantha-en`...).
+            // Apple nie pobiera niczego z dysku — model_path = "system".
+            let voice_id = resolve_model_repo(engine, config)
+                .unwrap_or_else(|_| "zosia-pl".to_string());
+
+            phase(db, deploy_id, tx, "running", 75, "init apple tts");
+            let mut engine_impl = crate::tts::apple_tts::AppleTtsEngine::new();
+            let info = <crate::tts::apple_tts::AppleTtsEngine as crate::tts::TtsEngine>::load_model(
+                &mut engine_impl,
+                std::path::Path::new("system"),
+            )
+            .context("init apple-tts (brak libMLXBridge.dylib?)")?;
+            // Rejestracja w globalnym TtsManager pod kluczem service_name —
+            // router znajduje silnik po nazwie serwisu albo po backend_name.
+            {
+                let shared = crate::tts::shared_tts_manager();
+                let mut mgr = shared.write().await;
+                mgr.register(service_name.clone(), Box::new(engine_impl));
+            }
+
+            phase(db, deploy_id, tx, "registering", 92, "register service");
+            let config_json = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "apple-tts",
+                "manifest_engine_id": engine.engine_id,
+                "deployed_model": voice_id,
+                "model_path": "system",
+                "service_type": "tts",
+                "sample_rate": info.sample_rate,
+            })
+            .to_string();
+            let service_id = upsert_native_service(
+                db,
+                node_id,
+                &service_name,
+                "tts",
+                Some("tts"),
+                &config_json,
+                "single",
+            )?;
+            ensure_model_registry_entry(
+                db,
+                &format!("apple-tts-{}", voice_id),
+                &format!("Apple TTS ({})", voice_id),
+                "tts",
+                service_id,
+                &config_json,
+            );
+            router.register_native_service_in_mesh(
+                &service_name, "tts",
+                vec![voice_id.clone()],
+                Some("apple-tts".to_string()),
+                vec![0],
+            );
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+            log_line(
+                db,
+                deploy_id,
+                tx,
+                "log",
+                &format!("Apple TTS gotowe: {}", service_name),
+            );
+            let _ = service_manager;
+            finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+            Ok(())
+        }
+        #[cfg(feature = "inference-mlx-whisper")]
+        ("stt", "mlx-whisper") => {
+            let model_repo = resolve_model_repo(engine, config)
+                .unwrap_or_else(|_| "mlx-community/whisper-large-v3-turbo-4bit".to_string());
+            let service_name = config
+                .container_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "mlx-whisper-stt-native".to_string());
+
+            phase(db, deploy_id, tx, "building", 20, "download mlx whisper");
+            // `prepare_model` pobiera oba HF repo (mlx-community + openai
+            // tokenizer) do scalonego cache i zwraca sciezke. Synchroniczne
+            // hf-hub w spawn_blocking jest po stronie funkcji.
+            let resolved = crate::stt::mlx_whisper::prepare_model(&model_repo)
+                .await
+                .with_context(|| format!("prepare mlx-whisper model '{}'", model_repo))?;
+
+            phase(db, deploy_id, tx, "running", 75, "load mlx whisper");
+            let shared = crate::stt::shared_stt_manager();
+            let stt_info = {
+                let mut mgr = shared.write().await;
+                mgr.load_model(&resolved, None, Some("mlx-whisper")).await
+            }
+            .context("load mlx-whisper model")?;
+
+            phase(db, deploy_id, tx, "registering", 92, "register service");
+            let config_json = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "mlx-whisper",
+                "manifest_engine_id": engine.engine_id,
+                "deployed_model": model_repo,
+                "model_path": stt_info.path,
+                "service_type": "stt",
+            })
+            .to_string();
+
+            let service_id = upsert_native_service(
+                db,
+                node_id,
+                &service_name,
+                "stt",
+                Some("stt"),
+                &config_json,
+                "single",
+            )?;
+            // mlx-whisper bug fix: dodaj wpis w model_registry zeby model byl
+            // widoczny w panelu Modele (wczesniej tylko Serwisy).
+            ensure_model_registry_entry(
+                db,
+                &model_repo,
+                &format!("MLX Whisper ({})", model_repo),
+                "stt",
+                service_id,
+                &config_json,
+            );
+
+            // Rejestracja mesh — bez tego router zwraca "Mesh STT serwis nie
+            // polaczony". Wczesniej tylko `restore_native_services` przy
+            // starcie tentaflow to robil; po deployu trzeba wprost.
+            router.register_native_service_in_mesh(
+                &service_name, "stt",
+                vec![model_repo.clone()],
+                Some("mlx-whisper".to_string()),
+                vec![stt_info.size_bytes / (1024 * 1024)],
+            );
+
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+
+            log_line(
+                db,
+                deploy_id,
+                tx,
+                "log",
+                &format!("natywny serwis zarejestrowany: {}", service_name),
+            );
+            // service_manager nieuzywany dla STT — istniejacy whisper case
+            // tez go pomija. Adresacja jako `meeting-bot` -> mesh -> stt
+            // dziala przez `routing/handlers/stt.rs`, ktore wybiera serwis
+            // po `service_type=stt` z tabeli `services`.
+            let _ = service_manager;
             finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
             Ok(())
         }
@@ -1419,6 +1766,44 @@ fn upsert_native_service(
     }
 
     Ok(row_id)
+}
+
+/// Rejestruje wpis w `model_registry` dla nowo zdeployowanego embedded silnika.
+/// Wczesniej deploy embedded (Whisper, Apple TTS, Kokoro, llama.cpp...) tworzyl
+/// tylko `services` row — w panelu "Modele" silnik byl niewidoczny mimo ze w
+/// "Serwisach" istnial. Po tej funkcji model pojawia sie w obu zakladkach.
+/// Idempotentne: jezeli wpis o `model_name` juz istnieje, nie duplikuje.
+fn ensure_model_registry_entry(
+    db: &DbPool,
+    model_name: &str,
+    display_name: &str,
+    service_type: &str,
+    service_id: i64,
+    config_json: &str,
+) {
+    use crate::db::models::NewModelEntry;
+    // Check existing — `list_models` zwraca wszystkie wpisy.
+    let existing = crate::db::repository::list_model_entries(db, 0, 1000).unwrap_or_default();
+    if existing.iter().any(|m| m.model_name == model_name) {
+        return;
+    }
+    let params = NewModelEntry {
+        model_name,
+        display_name: Some(display_name),
+        service_type,
+        connection_type: "local",
+        service_id: Some(service_id),
+        flow_id: None,
+        is_public: true,
+        config_json,
+    };
+    if let Err(e) = crate::db::repository::create_model_entry(db, &params) {
+        tracing::warn!(
+            "ensure_model_registry_entry({}): {}",
+            model_name,
+            e
+        );
+    }
 }
 
 /// Rejestruje HTTP backend (OpenAI-compatible) dla natywnie uruchomionego

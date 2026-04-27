@@ -568,6 +568,28 @@ pub struct PiiRule {
 }
 
 // =============================================================================
+// Teams-bot wake words — slowa aktywujace odpowiedz bota
+// =============================================================================
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct WakeWord {
+    pub id: i64,
+    pub word: String,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+/// Sub-action `WakeWordRequest` — list/create/toggle/delete.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum WakeWordOp {
+    List,
+    Create { word: String },
+    Toggle { id: i64, enabled: bool },
+    Delete { id: i64 },
+}
+
+
+// =============================================================================
 // Fast-path patterns — bypass routing for known prompts (migration-map #61-#64)
 // =============================================================================
 
@@ -2776,6 +2798,19 @@ pub enum MeetingPayload {
     ResActionItemStatusUpdate(MeetingActionItemStatusUpdateResponse),
     ReqTranscriptExport(MeetingTranscriptExportRequest),
     ResTranscriptExport(MeetingTranscriptExportResponse),
+    /// Wake-words CRUD: list/create/toggle/delete (1 sub-action)
+    ReqWakeWord(MeetingWakeWordRequest),
+    ResWakeWord(MeetingWakeWordResponse),
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingWakeWordRequest {
+    pub op: WakeWordOp,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingWakeWordResponse {
+    pub words: Vec<WakeWord>,
 }
 
 // =============================================================================
@@ -3078,6 +3113,7 @@ pub enum MessageBody {
     // ---- PII rules ----
     PiiRuleListRequest,
     PiiRuleListResponse { rules: Vec<PiiRule> },
+
 
     // ---- Fast-path patterns ----
     FastPathListRequest,

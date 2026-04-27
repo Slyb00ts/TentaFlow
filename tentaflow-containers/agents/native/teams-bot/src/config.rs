@@ -63,10 +63,46 @@ pub struct MeetingConfig {
     #[serde(default = "default_tts_alias")]
     pub tts_alias: String,
 
+    /// Alias LLM uzywany do generowania ODPOWIEDZI bota w real-time
+    /// (oddzielny od `summarization_alias` ktory tylko robi summary).
+    /// Pusty string lub brak modelu wpiętego pod ten alias = bot nie odpowiada.
+    #[serde(default = "default_llm_alias")]
+    pub llm_alias: String,
+
     /// Alias flow w routerze (rezerwacja — flow jest rozwiazywany przez router,
     /// bot trzyma pole dla spojnosci i przyszlego uzycia).
     #[serde(default = "default_flow_alias")]
     pub flow_alias: String,
+
+    /// Czy bot ma odpowiadac w meeting'u (LLM -> TTS). Wymaga `llm_alias`
+    /// wpietego na model. Default false zeby starsze deploymenty nie zaczęly
+    /// nagle rozmawiać.
+    #[serde(default)]
+    pub respond_enabled: bool,
+
+    /// Tryb aktywacji odpowiedzi:
+    ///   - `always` — kazda wypowiedz idzie do LLM (drogie, glosne, debug)
+    ///   - `wake_word` — tylko gdy `wake_word` w wypowiedzi (proste)
+    ///   - `wake_word_intent` — wake_word + LLM klasyfikacja czy to realne
+    ///     pytanie do bota (DEFAULT, pasywne dopoki ktos go nie zawola)
+    /// Caller dashboard moze nadpisac envem RESPONSE_MODE.
+    #[serde(default = "default_response_mode")]
+    pub response_mode: String,
+
+    /// Slowa kluczowe (po przecinku) ktore aktywuja odpowiedz.
+    /// Dopasowanie case-insensitive, fragment slowa wystarczy. Pusta lista =
+    /// zawsze aktywne (rownowazne z `response_mode=always`).
+    #[serde(default = "default_wake_words")]
+    pub wake_words: String,
+
+    /// Systemowy prompt dla LLM odpowiadajacego (rola bota w spotkaniu).
+    #[serde(default = "default_response_prompt")]
+    pub response_prompt: String,
+
+    /// Prompt dla LLM-classifier rozpoznajacego intencje. Musi zwrocic
+    /// dokladnie `TAK` lub `NIE`. Mowa idzie jako user message.
+    #[serde(default = "default_intent_prompt")]
+    pub intent_prompt: String,
 
     /// Nazwa bota wyswietlana w spotkaniu Teams
     #[serde(default = "default_bot_name")]
@@ -160,6 +196,36 @@ fn default_flow_alias() -> String {
     "teams-flow".to_string()
 }
 
+fn default_llm_alias() -> String {
+    "teams-llm".to_string()
+}
+
+fn default_response_prompt() -> String {
+    "Jestes uprzejmym asystentem w spotkaniu Teams. Odpowiadasz krotko (1-2 \
+zdania), tylko gdy ktos zadaje konkretne pytanie skierowane do bota lub gdy \
+twoja interwencja moze pomoc. Jezeli mowa nie wymaga reakcji, odpowiedz \
+dokladnie '<NO_RESPONSE>' bez zadnego innego tekstu.".to_string()
+}
+
+fn default_response_mode() -> String {
+    "wake_word_intent".to_string()
+}
+
+fn default_wake_words() -> String {
+    // Domyslnie pasujemy na imie bota (jarvis), kilka wariantow.
+    "jarvis,tentaflow,asystencie,asystent,bot".to_string()
+}
+
+fn default_intent_prompt() -> String {
+    "Jestes klasyfikatorem intencji w spotkaniu Teams. Mowca uzyl slowa \
+aktywujacego (np. 'jarvis'). Twoje zadanie: ocenic czy ta wypowiedz to \
+faktyczne pytanie/prosba SKIEROWANE do bota-asystenta (np. 'jarvis powiedz nam \
+ile mamy czasu', 'asystencie podsumuj'), czy tylko mimochodem padlo to slowo \
+(np. 'spotkalem dzis Jarvisa w robocie'). Odpowiedz DOKLADNIE jednym slowem: \
+TAK jezeli to wezwanie do bota, NIE w przeciwnym wypadku. Bez kropek, bez \
+wyjasnien.".to_string()
+}
+
 fn default_summarization_interval_sec() -> u64 {
     60
 }
@@ -176,12 +242,79 @@ fn default_meeting_language() -> String {
     "pl".to_string()
 }
 
+/// Domyslna sciezka do modelu Silero VAD. Sprawdza po kolei:
+/// 1. `/opt/models/silero_vad.onnx` (Docker)
+/// 2. plik obok binarki `tentaflow-meeting`/`silero_vad.onnx` (native install)
+/// 3. `<cache_dir>/tentaflow/teams-bot/silero_vad.onnx` (native fallback)
+/// Zwraca pierwsza istniejaca sciezke, albo None — wtedy VadDetector przejdzie
+/// na RMS fallback (gorsza jakosc, ale bot dziala).
+fn default_vad_model_path() -> Option<String> {
+    let docker_path = std::path::PathBuf::from("/opt/models/silero_vad.onnx");
+    if docker_path.is_file() {
+        return Some(docker_path.to_string_lossy().into_owned());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("silero_vad.onnx");
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+            // Fallback dwa poziomy w gore — gdy binarka jest w target/release/
+            // a model jest obok manifestu w native/teams-bot/models/.
+            let near_repo = dir.join("models").join("silero_vad.onnx");
+            if near_repo.is_file() {
+                return Some(near_repo.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if let Some(cache) = dirs_cache_dir() {
+        let candidate = cache
+            .join("tentaflow")
+            .join("teams-bot")
+            .join("silero_vad.onnx");
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Lekka kopia `dirs::cache_dir()` zeby nie wciagac calej zaleznosci `dirs`
+/// tylko po jeden lookup. Zwraca rozsadny default cache dir per platforma.
+fn dirs_cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        if cfg!(target_os = "macos") {
+            return Some(std::path::PathBuf::from(home).join("Library").join("Caches"));
+        }
+        if cfg!(target_os = "linux") {
+            if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+                return Some(std::path::PathBuf::from(xdg));
+            }
+            return Some(std::path::PathBuf::from(home).join(".cache"));
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return Some(std::path::PathBuf::from(local));
+        }
+    }
+    None
+}
+
 impl MeetingConfig {
     /// Laduje konfiguracje z pliku TOML lub zmiennych srodowiskowych
     pub fn load(path: &Path) -> Result<Self> {
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("Nie mozna odczytac pliku konfiguracji: {}", path.display()))?;
+
+            // Pusty plik / specjalny `/dev/null` -> traktuj jak brak konfigu i
+            // uzyj env-owej sciezki. Native subprocess bota wskazuje na pusty
+            // sentinel zeby wymusic from_env (Docker uzywa tylko env, ale w
+            // niektorych testach plik moze byc pusty).
+            if content.trim().is_empty() {
+                return Self::from_env();
+            }
 
             let config: MeetingConfig = toml::from_str(&content)
                 .with_context(|| format!("Bledny format TOML w: {}", path.display()))?;
@@ -211,7 +344,7 @@ impl MeetingConfig {
             audio_device: std::env::var("AUDIO_DEVICE").ok(),
             vad_model_path: std::env::var("VAD_MODEL_PATH")
                 .ok()
-                .or_else(|| Some("/opt/models/silero_vad.onnx".to_string())),
+                .or_else(default_vad_model_path),
             stt_alias: std::env::var("STT_ALIAS")
                 .unwrap_or_else(|_| "teams-stt".to_string()),
             summarization_alias: std::env::var("SUMMARIZATION_ALIAS")
@@ -220,6 +353,20 @@ impl MeetingConfig {
                 .unwrap_or_else(|_| "teams-tts".to_string()),
             flow_alias: std::env::var("FLOW_ALIAS")
                 .unwrap_or_else(|_| "teams-flow".to_string()),
+            llm_alias: std::env::var("LLM_ALIAS")
+                .unwrap_or_else(|_| "teams-llm".to_string()),
+            respond_enabled: std::env::var("RESPOND_ENABLED")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false),
+            response_prompt: std::env::var("RESPONSE_PROMPT")
+                .unwrap_or_else(|_| default_response_prompt()),
+            response_mode: std::env::var("RESPONSE_MODE")
+                .unwrap_or_else(|_| default_response_mode()),
+            wake_words: std::env::var("WAKE_WORDS")
+                .unwrap_or_else(|_| default_wake_words()),
+            intent_prompt: std::env::var("INTENT_PROMPT")
+                .unwrap_or_else(|_| default_intent_prompt()),
             bot_name: std::env::var("BOT_NAME")
                 .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
