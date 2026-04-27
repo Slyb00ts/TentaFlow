@@ -103,7 +103,10 @@ impl RouterClient {
         language: Option<String>,
         extra_metadata: Vec<(String, String)>,
     ) -> Result<String> {
-        let audio_bytes: Vec<u8> = audio_pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // Zero-copy reinterpretacja i16 -> u8 LE w jednym memcpy zamiast 2N alokacji
+        // i osobnych zapisow per sample. Bezpieczne na little-endian (x86_64,
+        // aarch64 — wszystkie hosty na ktorych deployujemy teams-bota).
+        let audio_bytes: Vec<u8> = bytemuck::cast_slice::<i16, u8>(audio_pcm).to_vec();
 
         let mut meta: Vec<(String, String)> = Vec::new();
         if let Some(mid) = self.current_meeting_id() {
