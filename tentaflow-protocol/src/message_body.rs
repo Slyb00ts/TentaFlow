@@ -3114,9 +3114,9 @@ pub enum MessageBody {
     TtsRuleDeleteRequest { rule_id: String },
     TtsRuleDeleteResponse { deleted: bool },
 
-    // ---- PII rules ----
-    PiiRuleListRequest,
-    PiiRuleListResponse { rules: Vec<PiiRule> },
+    // ---- PII rules (spakowane w inner enum dla oszczednosci slotu) ----
+    // Patrz NsightBody i VisionBody — limit 256 wariantow w MessageBody.
+    PiiRuleBody(crate::pii::PiiRulePayload),
 
 
     // ---- Fast-path patterns ----
@@ -3328,6 +3328,11 @@ pub enum MessageBody {
     // ---- Nsight profiling (single-variant, req+res w inner enum) ----
     // 10 par request/response w jednym slocie — rkyv 0.8 ma twardy limit 256.
     NsightBody(crate::profiling::NsightPayload),
+
+    // ---- Vision inference (single-slot, req+res w inner enum) ----
+    // Slot odzyskany przez konsolidacje PiiRuleListRequest/Response do
+    // PiiRuleBody. Patrz NsightBody jako wzor inner-enum pack.
+    VisionBody(crate::vision::VisionInferPayload),
 
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
