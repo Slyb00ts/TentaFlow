@@ -25,6 +25,11 @@ futures = "0.3"
 # WebSocket serwer localhost — most audio miedzy Chromium (JS) a Rust
 tokio-tungstenite = "0.24"
 
+# Lock-free atomic snapshot — uzywany dla roster JSON cache (dom_observer ->
+# STT hot path). Pozwala uniknac async RwLock + serde_json::to_string per
+# segment STT.
+arc-swap = "1.7.1"
+
 # Silero VAD — pure Rust implementation z tentaflow-voice
 tentaflow-voice = { path = "../../../../tentaflow-voice" }
 parking_lot = "0.12"
@@ -50,7 +55,7 @@ async-trait = "0.1"
 bytemuck = "1"
 
 [dev-dependencies]
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 
 [[bench]]
 name = "noop"
@@ -66,4 +71,8 @@ harness = false
 
 [[bench]]
 name = "prepad_ringbuffer"
+harness = false
+
+[[bench]]
+name = "roster_emit_concurrency"
 harness = false
