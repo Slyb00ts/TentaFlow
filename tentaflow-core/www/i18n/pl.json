@@ -1551,6 +1551,63 @@
       "invalid_duration": "Niewłaściwy czas trwania",
       "invalid_scope": "Niewłaściwy zakres profilowania",
       "session_not_found": "Sesja nie znaleziona"
+    },
+    "report": {
+      "title": "Raport profilowania",
+      "back": "Wróć",
+      "meta": {
+        "hostname": "Host",
+        "started": "Start",
+        "duration": "Czas trwania",
+        "nsys_version": "nsys",
+        "gpu_targets": "GPU"
+      },
+      "kpi": {
+        "gpu_active": "GPU active",
+        "cpu_active": "CPU active",
+        "kernel_count": "Kernele",
+        "cuda_api_count": "CUDA API",
+        "peak_vram": "Peak VRAM",
+        "samples": "Próbki"
+      },
+      "tab": {
+        "overview": "Przegląd",
+        "kernels": "GPU Kernels",
+        "cuda": "CUDA APIs",
+        "memory": "Memory",
+        "cpu": "CPU",
+        "nvtx": "NVTX",
+        "timeline": "Timeline"
+      },
+      "col": {
+        "name": "Nazwa",
+        "total_ms": "Total (ms)",
+        "calls": "Wywołania",
+        "avg_ms": "Średnia (ms)",
+        "pct": "%"
+      },
+      "timeline": {
+        "legend": {
+          "sm": "SM %",
+          "mem": "Memory %",
+          "power": "Power %"
+        }
+      },
+      "empty": {
+        "timeline": "Brak danych timeline (nsys uruchomiony bez --gpu-metrics-device)",
+        "cpu_samples": "Brak próbek CPU",
+        "nvtx": "Brak ranges NVTX"
+      },
+      "action": {
+        "download": "Pobierz .nsys-rep",
+        "delete": "Usuń sesję"
+      },
+      "confirm_delete": "Usunąć sesję profilowania?",
+      "error": {
+        "load": "Nie udało się załadować raportu",
+        "delete": "Nie udało się usunąć sesji",
+        "download": "Nie udało się pobrać pliku"
+      }
     }
   },
   "clusters": {
