@@ -834,15 +834,12 @@ pub enum MeetingEventPayload {
         /// Czas end-to-end STT (wysłanie audio → otrzymanie tekstu) w ms.
         latency_ms: u64,
     },
-    /// Zmiana statusu uczestnika: dołączenie, wyjście, aktywny mówca.
-    /// `status` to stringified enum — bot wysyła `"joined"`, `"left"`,
-    /// `"active_now"`. Dashboard odfiltrowuje nieznane warianty bez błędu.
-    ParticipantUpdate {
-        speaker_id: String,
-        speaker_name: Option<String>,
-        status: String,
-        /// Sekundy od ostatniej mowy; `None` gdy jeszcze nie mówił.
-        last_spoken_ago_sec: Option<u32>,
+    /// Pełny snapshot rosteru po stronie bota. Każda emisja ZASTĘPUJE
+    /// poprzedni stan (snapshot, nie diff). Bot wysyła go raz na DOM scan
+    /// zamiast N osobnych eventów per uczestnik — O(N) RT → O(1).
+    /// Pusta lista = nikt poza botem nie jest widoczny.
+    RosterSnapshot {
+        entries: Vec<RosterEntry>,
     },
     /// Info o modelach używanych w sesji. Bot wysyła raz po join_meeting.
     /// Router przed broadcastem rozwija aliasy (`teams-stt` → rzeczywisty
@@ -885,6 +882,18 @@ pub const LIFECYCLE_JOINING: &str = "joining";
 pub const LIFECYCLE_LOBBY_WAITING: &str = "lobby_waiting";
 pub const LIFECYCLE_JOINED: &str = "joined";
 pub const LIFECYCLE_FAILED: &str = "failed";
+
+/// Pojedynczy uczestnik w `RosterSnapshot`. `status` to stringified enum
+/// — bot wysyła `"joined"`, `"left"`, `"speaking"`. Dashboard odfiltrowuje
+/// nieznane warianty bez błędu.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct RosterEntry {
+    pub speaker_id: String,
+    pub speaker_name: Option<String>,
+    pub status: String,
+    /// Sekundy od ostatniej mowy; `None` gdy jeszcze nie mówił.
+    pub last_spoken_ago_sec: Option<u32>,
+}
 
 /// Pojedynczy action item przesyłany w `ActionItemsUpdate`.
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -3783,20 +3792,30 @@ mod meeting_event_tests {
         }
     }
 
-    // Roundtrip ParticipantUpdate — sprawdza warianty z/bez last_spoken_ago_sec.
+    // Roundtrip RosterSnapshot — batch z 50 uczestników, mix statusów i pól
+    // opcjonalnych. Sprawdza że Vec<RosterEntry> przechodzi rkyv encode/decode
+    // bez utraty danych przy realnych rozmiarach burst'u Teams.
     #[test]
-    fn rkyv_roundtrip_meeting_event_participant_update() {
-        let request = ModelRequest {
-            request_id: "req-pu-1".to_string(),
-            payload: ModelPayload::MeetingEvent(MeetingEventData {
-                meeting_key: "mkey-pu".to_string(),
-                timestamp_ms: 1_700_000_003_000,
-                payload: MeetingEventPayload::ParticipantUpdate {
-                    speaker_id: "SPEAKER_02".to_string(),
-                    speaker_name: Some("Bob".to_string()),
-                    status: "active_now".to_string(),
-                    last_spoken_ago_sec: Some(3),
+    fn rkyv_roundtrip_meeting_event_roster_snapshot() {
+        let entries: Vec<RosterEntry> = (0..50)
+            .map(|i| RosterEntry {
+                speaker_id: format!("SPEAKER_{:02}", i),
+                speaker_name: if i % 3 == 0 { None } else { Some(format!("User {}", i)) },
+                status: match i % 3 {
+                    0 => "joined".to_string(),
+                    1 => "speaking".to_string(),
+                    _ => "left".to_string(),
                 },
+                last_spoken_ago_sec: if i % 2 == 0 { Some(i as u32) } else { None },
+            })
+            .collect();
+
+        let request = ModelRequest {
+            request_id: "req-rs-1".to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: "mkey-rs".to_string(),
+                timestamp_ms: 1_700_000_003_000,
+                payload: MeetingEventPayload::RosterSnapshot { entries: entries.clone() },
             }),
             stream: false,
             metadata: None,
@@ -3809,18 +3828,11 @@ mod meeting_event_tests {
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
-                MeetingEventPayload::ParticipantUpdate {
-                    speaker_id,
-                    speaker_name,
-                    status,
-                    last_spoken_ago_sec,
-                } => {
-                    assert_eq!(speaker_id, "SPEAKER_02");
-                    assert_eq!(speaker_name.as_deref(), Some("Bob"));
-                    assert_eq!(status, "active_now");
-                    assert_eq!(last_spoken_ago_sec, Some(3));
+                MeetingEventPayload::RosterSnapshot { entries: decoded_entries } => {
+                    assert_eq!(decoded_entries.len(), 50);
+                    assert_eq!(decoded_entries, entries);
                 }
-                _ => panic!("expected ParticipantUpdate"),
+                _ => panic!("expected RosterSnapshot"),
             },
             _ => panic!("expected MeetingEvent variant"),
         }

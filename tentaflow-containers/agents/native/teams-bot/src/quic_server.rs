@@ -103,7 +103,10 @@ impl RouterClient {
         language: Option<String>,
         extra_metadata: Vec<(String, String)>,
     ) -> Result<String> {
-        let audio_bytes: Vec<u8> = audio_pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // Zero-copy reinterpretacja i16 -> u8 LE w jednym memcpy zamiast 2N alokacji
+        // i osobnych zapisow per sample. Bezpieczne na little-endian (x86_64,
+        // aarch64 — wszystkie hosty na ktorych deployujemy teams-bota).
+        let audio_bytes: Vec<u8> = bytemuck::cast_slice::<i16, u8>(audio_pcm).to_vec();
 
         let mut meta: Vec<(String, String)> = Vec::new();
         if let Some(mid) = self.current_meeting_id() {
@@ -250,13 +253,116 @@ impl RouterClient {
         }
     }
 
-    /// Wysyla tekst do TTS przez router (alias podany w `model`).
-    pub async fn synthesize(
+    /// Streamujace chat completion: otwiera bidi stream do routera z
+    /// `stream=true`, czyta `ModelStreamChunk` w petli i wola `on_delta(text)`
+    /// dla kazdego `TextDelta`. Zwraca pelny zaakumulowany tekst (do logow /
+    /// summary). Pozwala botowi parsowac granice zdan i odpalac TTS dla
+    /// pierwszego zdania zanim LLM dokonczy generowanie reszty.
+    ///
+    /// Kontrakt callbacka: synchronny, nie powinien blokowac (router
+    /// generuje delty tak szybko jak LLM je produkuje).
+    pub async fn chat_completion_stream<F>(
+        &self,
+        model_alias: &str,
+        messages: Vec<(String, String)>,
+        mut on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
+        let msgs: Vec<Message> = messages
+            .into_iter()
+            .map(|(role, content)| Message { role, content })
+            .collect();
+
+        let mut meta: Vec<(String, String)> = Vec::new();
+        if let Some(mid) = self.current_meeting_id() {
+            meta.push(("meeting_id".to_string(), mid));
+        }
+        let metadata = if meta.is_empty() { None } else { Some(meta) };
+
+        let request = ModelRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            payload: ModelPayload::Completion(CompletionPayload {
+                model: model_alias.to_string(),
+                prompt: None,
+                messages: msgs,
+                temperature: Some(0.2),
+                max_tokens: Some(1024),
+                top_p: None,
+                stop: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                tts_options: None,
+                memory_options: None,
+                audio_input: None,
+                prefix_cache_id: None,
+                prefix_text: None,
+            }),
+            stream: true,
+            metadata,
+            session_id: None,
+        };
+
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi do routera (chat stream): {e}"))?;
+
+        write_frame(&mut send, &request)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ModelRequest (chat stream): {e}"))?;
+        send.finish().ok();
+
+        let mut full_text = String::with_capacity(512);
+        loop {
+            let chunk = read_frame::<ModelStreamChunk>(&mut recv)
+                .await
+                .map_err(|e| anyhow::anyhow!("read ModelStreamChunk (chat): {e}"))?;
+            let Some(chunk) = chunk else {
+                // Strumien zamkniety bez Done — traktujemy jako koniec
+                // (router moze zakonczyc FIN-em po ostatnim TextDelta).
+                return Ok(full_text);
+            };
+            match chunk.chunk {
+                StreamChunkType::TextDelta(delta) => {
+                    on_delta(&delta);
+                    full_text.push_str(&delta);
+                }
+                StreamChunkType::Done { .. } => return Ok(full_text),
+                StreamChunkType::Error(err) => {
+                    anyhow::bail!("chat stream blad: {}", err.message);
+                }
+                // Pozostale typy (Metadata, ReasoningDelta, IntentInfo) nie sa
+                // tu konsumowane — bot karmi sentence-buffer wylacznie wlasciwa
+                // tresc odpowiedzi.
+                other => {
+                    debug!("chat stream: pominiety chunk: {:?}", other);
+                }
+            }
+        }
+    }
+
+    /// Streamujaca synteza mowy: otwiera bidi stream do routera, wysyla
+    /// `ModelRequest` z `stream=true`, czyta `ModelStreamChunk` w petli.
+    /// Dla kazdego `AudioChunk(bytes)` wola `on_chunk(pcm)` — caller
+    /// dostaje raw PCM (16 kHz mono i16 LE) i moze pchac do mikrofonu na
+    /// biezaco zamiast czekac na pelny bufor.
+    ///
+    /// Kontrakt callbacka: zwroc `Ok(())` zeby kontynuowac, `Err(_)` zeby
+    /// zerwac strumien. Callback nie powinien blokowac — backend produkuje
+    /// chunki tak szybko jak potrafi sie.
+    pub async fn synthesize_stream<F>(
         &self,
         text: &str,
         voice: &str,
         model: &str,
-    ) -> Result<Vec<u8>> {
+        mut on_chunk: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<u8>) -> Result<()>,
+    {
         let request = ModelRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload: ModelPayload::Audio(AudioPayload {
@@ -268,19 +374,47 @@ impl RouterClient {
                     speed: None,
                 },
             }),
-            stream: false,
+            stream: true,
             metadata: None,
             session_id: None,
         };
 
-        let response = self.send_request(&request).await?;
-        match response.result {
-            ModelResult::Audio(audio) => match audio.data {
-                AudioResultData::Audio(bytes) => Ok(bytes),
-                _ => anyhow::bail!("TTS zwrocil nieoczekiwany typ danych"),
-            },
-            ModelResult::Error(e) => anyhow::bail!("TTS blad: {}", e.message),
-            _ => anyhow::bail!("Nieoczekiwany typ odpowiedzi TTS"),
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi do routera (TTS stream): {e}"))?;
+
+        write_frame(&mut send, &request)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ModelRequest (TTS stream): {e}"))?;
+        send.finish().ok();
+
+        loop {
+            let chunk = read_frame::<ModelStreamChunk>(&mut recv)
+                .await
+                .map_err(|e| anyhow::anyhow!("read ModelStreamChunk: {e}"))?;
+            let Some(chunk) = chunk else {
+                // Strumien zamkniety bez Done — traktujemy jako koniec
+                // (sztywne wymagania na Done dawalyby false-positive errory
+                // przy benignym FIN od routera).
+                return Ok(());
+            };
+            match chunk.chunk {
+                StreamChunkType::AudioChunk(pcm) => {
+                    on_chunk(pcm)?;
+                }
+                StreamChunkType::Done { .. } => return Ok(()),
+                StreamChunkType::Error(err) => {
+                    anyhow::bail!("TTS stream blad: {}", err.message);
+                }
+                // Pozostale typy (TextDelta, Metadata itp.) dla TTS sa
+                // nieoczekiwane — logujemy i ignorujemy zamiast bail!,
+                // zeby przejsciowe nieoczekiwane chunki nie zrywaly sesji.
+                other => {
+                    debug!("TTS stream: nieoczekiwany typ chunka: {:?}", other);
+                }
+            }
         }
     }
 }

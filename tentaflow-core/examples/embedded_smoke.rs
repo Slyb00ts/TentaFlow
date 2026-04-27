@@ -59,7 +59,7 @@ async fn run_whisper(
         let trans_started = Instant::now();
         let result = engine
             .transcribe(TranscribeParams {
-                audio_data,
+                audio_data: std::sync::Arc::from(audio_data.into_boxed_slice()),
                 language: None,
                 translate: false,
                 word_timestamps: false,

@@ -83,8 +83,10 @@ pub struct MeetingConfig {
     /// Tryb aktywacji odpowiedzi:
     ///   - `always` — kazda wypowiedz idzie do LLM (drogie, glosne, debug)
     ///   - `wake_word` — tylko gdy `wake_word` w wypowiedzi (proste)
-    ///   - `wake_word_intent` — wake_word + LLM klasyfikacja czy to realne
-    ///     pytanie do bota (DEFAULT, pasywne dopoki ktos go nie zawola)
+    ///   - `wake_word_intent` — wake_word + lokalny klasyfikator intencji
+    ///     (regex/keyword, mikrosekundy — patrz `intent_classifier.rs`).
+    ///     Akceptuje pytania ('?'), czasowniki rozkazujace i dluzsze
+    ///     wypowiedzi; odrzuca krotkie powitania (<=3 slowa).
     /// Caller dashboard moze nadpisac envem RESPONSE_MODE.
     #[serde(default = "default_response_mode")]
     pub response_mode: String,
@@ -95,14 +97,16 @@ pub struct MeetingConfig {
     #[serde(default = "default_wake_words")]
     pub wake_words: String,
 
+    /// Lista wake_words po splitcie/trim/lowercase, kompilowana raz w
+    /// `validate()`. Trzymana zeby `matches_wake_word` na hot-pathie STT
+    /// nie alokowal Vec/String per kazda wypowiedz. `#[serde(skip)]` —
+    /// zrodlem prawdy jest `wake_words` (CSV z TOML/env).
+    #[serde(skip)]
+    pub wake_words_compiled: Vec<String>,
+
     /// Systemowy prompt dla LLM odpowiadajacego (rola bota w spotkaniu).
     #[serde(default = "default_response_prompt")]
     pub response_prompt: String,
-
-    /// Prompt dla LLM-classifier rozpoznajacego intencje. Musi zwrocic
-    /// dokladnie `TAK` lub `NIE`. Mowa idzie jako user message.
-    #[serde(default = "default_intent_prompt")]
-    pub intent_prompt: String,
 
     /// Nazwa bota wyswietlana w spotkaniu Teams
     #[serde(default = "default_bot_name")]
@@ -211,27 +215,16 @@ fn default_response_prompt() -> String {
 }
 
 fn default_response_mode() -> String {
-    // TYMCZASOWO: tryb intent classifier wylaczony (false-negative na
-    // "Czesc Jarvis!" — LLM uznawal powitanie za nie-prosbe). Default =
-    // sam wake_word: bot zawsze odpowiada gdy w transkrypcie pojawi sie
-    // slowo aktywujace. Po dostrojeniu intent_prompt mozna wrocic do
-    // "wake_word_intent".
+    // Default = sam wake_word: bot zawsze odpowiada gdy w transkrypcie
+    // pojawi sie slowo aktywujace. `wake_word_intent` jest dostepny dla
+    // operatorow ktorzy chca dodatkowo odsiac krotkie powitania —
+    // klasyfikacja jest lokalna (regex/keyword), bez LLM call.
     "wake_word".to_string()
 }
 
 fn default_wake_words() -> String {
     // Domyslnie pasujemy na imie bota (jarvis), kilka wariantow.
     "jarvis,tentaflow,asystencie,asystent,bot".to_string()
-}
-
-fn default_intent_prompt() -> String {
-    "Jestes klasyfikatorem intencji w spotkaniu Teams. Mowca uzyl slowa \
-aktywujacego (np. 'jarvis'). Twoje zadanie: ocenic czy ta wypowiedz to \
-faktyczne pytanie/prosba SKIEROWANE do bota-asystenta (np. 'jarvis powiedz nam \
-ile mamy czasu', 'asystencie podsumuj'), czy tylko mimochodem padlo to slowo \
-(np. 'spotkalem dzis Jarvisa w robocie'). Odpowiedz DOKLADNIE jednym slowem: \
-TAK jezeli to wezwanie do bota, NIE w przeciwnym wypadku. Bez kropek, bez \
-wyjasnien.".to_string()
 }
 
 fn default_summarization_interval_sec() -> u64 {
@@ -324,7 +317,7 @@ impl MeetingConfig {
                 return Self::from_env();
             }
 
-            let config: MeetingConfig = toml::from_str(&content)
+            let mut config: MeetingConfig = toml::from_str(&content)
                 .with_context(|| format!("Bledny format TOML w: {}", path.display()))?;
 
             config.validate()?;
@@ -336,7 +329,7 @@ impl MeetingConfig {
 
     /// Laduje konfiguracje ze zmiennych srodowiskowych (fallback gdy brak pliku TOML)
     fn from_env() -> Result<Self> {
-        let config = MeetingConfig {
+        let mut config = MeetingConfig {
             meeting_url: std::env::var("MEETING_URL").unwrap_or_default(),
             auth_cookies_path: std::env::var("AUTH_COOKIES_PATH")
                 .unwrap_or_else(|_| "/tmp/cookies.json".to_string()),
@@ -373,8 +366,7 @@ impl MeetingConfig {
                 .unwrap_or_else(|_| default_response_mode()),
             wake_words: std::env::var("WAKE_WORDS")
                 .unwrap_or_else(|_| default_wake_words()),
-            intent_prompt: std::env::var("INTENT_PROMPT")
-                .unwrap_or_else(|_| default_intent_prompt()),
+            wake_words_compiled: Vec::new(),
             bot_name: std::env::var("BOT_NAME")
                 .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
@@ -406,14 +398,24 @@ impl MeetingConfig {
         Ok(config)
     }
 
-    /// Walidacja poprawnosci konfiguracji
-    fn validate(&self) -> Result<()> {
+    /// Walidacja poprawnosci konfiguracji. Przy okazji kompiluje
+    /// `wake_words_compiled` z CSV `wake_words` raz, zeby hot-path
+    /// `matches_wake_word` nie powtarzal split/trim/lowercase per
+    /// kazdy STT result.
+    fn validate(&mut self) -> Result<()> {
         // meeting_url moze byc pusty — kontener startuje bez spotkania,
         // URL podaje sie pozniej komenda join przez QUIC
 
         if self.chunk_duration_ms < 100 || self.chunk_duration_ms > 5000 {
             anyhow::bail!("chunk_duration_ms musi byc w zakresie 100-5000");
         }
+
+        self.wake_words_compiled = self
+            .wake_words
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         Ok(())
     }
@@ -509,7 +511,7 @@ mod tests {
             auth_cookies_path = "/tmp/cookies.json"
         "#;
 
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        let mut config: MeetingConfig = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_ok());
     }
 
@@ -522,7 +524,7 @@ mod tests {
             chunk_duration_ms = 50
         "#;
 
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        let mut config: MeetingConfig = toml::from_str(toml_str).unwrap();
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("chunk_duration_ms"));
@@ -537,7 +539,7 @@ mod tests {
             chunk_duration_ms = 10000
         "#;
 
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        let mut config: MeetingConfig = toml::from_str(toml_str).unwrap();
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("chunk_duration_ms"));
@@ -556,7 +558,7 @@ mod tests {
                 duration
             );
 
-            let config: MeetingConfig = toml::from_str(&toml_str).unwrap();
+            let mut config: MeetingConfig = toml::from_str(&toml_str).unwrap();
             assert!(config.validate().is_ok(), "chunk_duration_ms={} powinno przejsc", duration);
         }
     }

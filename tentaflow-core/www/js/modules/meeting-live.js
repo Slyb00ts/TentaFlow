@@ -41,6 +41,19 @@ const state = {
 
 let unsubscribeLive = null;
 let footerTimer = null;
+// Coalesce wielu eventow w jednej klatce — bez tego batch rosteru (np. 5
+// uczestnikow w jednym tick'u) wymusza N pelnych re-renderow.
+let pendingRenderRaf = 0;
+
+// Laczy wiele wywolan w jeden render na klatce. Synchroniczny renderAll()
+// zostaje dla initial load i akcji uzytkownika, gdzie nie ma kontencji eventow.
+function scheduleRender() {
+  if (pendingRenderRaf) return;
+  pendingRenderRaf = requestAnimationFrame(() => {
+    pendingRenderRaf = 0;
+    renderAll();
+  });
+}
 
 // --- Lifecycle --------------------------------------------------------------
 
@@ -71,6 +84,10 @@ const MeetingLiveScreen = {
   },
   unmount() {
     stopFooterTimer();
+    if (pendingRenderRaf) {
+      cancelAnimationFrame(pendingRenderRaf);
+      pendingRenderRaf = 0;
+    }
     if (unsubscribeLive) {
       try { unsubscribeLive(); } catch (_) { /* no-op */ }
       unsubscribeLive = null;
@@ -249,7 +266,7 @@ async function subscribeLive() {
       const payload = body.payload;
       if (!payload || !payload.type) return;
       applyLiveEvent(Number(body.timestampMs || Date.now()), payload.type, payload.data || {});
-      renderAll();
+      scheduleRender();
     });
   } catch (e) {
     console.warn('[meeting-live] subscribeLive failed:', e?.message);
@@ -289,19 +306,28 @@ function applyLiveEvent(timestampMs, type, data) {
       }
       break;
     }
-    case 'ParticipantUpdate': {
-      const id = String(data.speakerId || '');
-      if (!id) break;
-      const prev = state.participants.get(id) || {};
-      state.participants.set(id, {
-        speakerId: id,
-        speakerName: data.speakerName || prev.speakerName || id,
-        isEnrolled: prev.isEnrolled || false,
-        status: String(data.status || prev.status || 'joined'),
-        lastSpokenAt: data.lastSpokenAgoSec != null
-          ? timestampMs - Number(data.lastSpokenAgoSec) * 1000
-          : prev.lastSpokenAt || 0,
-      });
+    case 'RosterSnapshot': {
+      // Snapshot zastępuje cały roster — bot wysyła go raz na DOM scan.
+      // Brak entry = brak uczestnika (a nie "wyszedł" jako osobny event).
+      // Zachowujemy `isEnrolled` z poprzedniego stanu, bo to pole
+      // wzbogacane jest przez TranscriptEntry, nie przez snapshot.
+      const entries = Array.isArray(data.entries) ? data.entries : [];
+      const next = new Map();
+      for (const entry of entries) {
+        const id = String(entry.speakerId || '');
+        if (!id) continue;
+        const prev = state.participants.get(id) || {};
+        next.set(id, {
+          speakerId: id,
+          speakerName: entry.speakerName || prev.speakerName || id,
+          isEnrolled: prev.isEnrolled || false,
+          status: String(entry.status || 'joined'),
+          lastSpokenAt: entry.lastSpokenAgoSec != null
+            ? timestampMs - Number(entry.lastSpokenAgoSec) * 1000
+            : prev.lastSpokenAt || 0,
+        });
+      }
+      state.participants = next;
       break;
     }
     case 'SummaryUpdate': {

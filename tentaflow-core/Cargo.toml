@@ -237,3 +237,12 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 wasmtime = "43.0.1"
 tempfile = "3"
 filetime = "0.2"
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "noop"
+harness = false
+
+[[bench]]
+name = "audio_pipeline_clones"
+harness = false

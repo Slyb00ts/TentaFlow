@@ -41,8 +41,9 @@ pub struct SttModelInfo {
 /// Parametry transkrypcji audio
 #[derive(Debug, Clone)]
 pub struct TranscribeParams {
-    /// Surowe dane audio (WAV/PCM/itp.)
-    pub audio_data: Vec<u8>,
+    /// Surowe dane audio (WAV/PCM/itp.). Arc<[u8]> dzielony z routerem
+    /// zeby uniknac kopiowania bufora przy kazdym przekazaniu do silnika.
+    pub audio_data: Arc<[u8]>,
     /// Jezyk zrodlowy (None = auto-detekcja)
     pub language: Option<String>,
     /// Tlumacz na angielski
@@ -60,7 +61,7 @@ pub struct TranscribeParams {
 impl Default for TranscribeParams {
     fn default() -> Self {
         Self {
-            audio_data: Vec::new(),
+            audio_data: Arc::from(Vec::<u8>::new().into_boxed_slice()),
             language: None,
             translate: false,
             word_timestamps: false,

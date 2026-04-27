@@ -1475,7 +1475,7 @@ impl Router {
                         };
 
                         let transcription_request = TranscriptionRequest {
-                            file: audio_data,
+                            file: std::sync::Arc::from(audio_data.into_boxed_slice()),
                             filename,
                             model: model.clone(),
                             language,

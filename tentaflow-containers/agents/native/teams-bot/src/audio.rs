@@ -36,14 +36,6 @@ pub fn bridge_addr(port: u16) -> String {
 /// Rozmiar bufora kanalu capture (liczba chunkow)
 const CAPTURE_BUFFER: usize = 64;
 
-/// Pojedynczy wpis listy uczestnikow spotkania. Zasilany od dom_observer
-/// (push-based DOM bridge); main.rs uzywa go do STT metadata (`roster` JSON).
-#[derive(Debug, Clone)]
-pub struct RosterEntry {
-    pub name: String,
-    pub status: String,
-}
-
 /// Odbiornik probek PCM z Chromium (monoton 16kHz i16, chunki ~256ms)
 pub struct AudioCapture {
     rx: mpsc::Receiver<Vec<i16>>,
@@ -54,49 +46,6 @@ impl AudioCapture {
     pub async fn next_chunk(&mut self) -> Option<Vec<i16>> {
         self.rx.recv().await
     }
-}
-
-/// Rozbija payload TTS na surowe bajty PCM i16 LE. Dla WAV parsuje chunki
-/// (fmt, data) zamiast slepo pomijac 44 bajty — naglowek moze miec dodatkowe
-/// chunki (LIST/INFO) i dane moga zaczynac sie pod innym offsetem.
-/// Dla WAV wymaga PCM mono 16 kHz 16-bit, w przeciwnym razie zwraca blad.
-pub fn parse_audio_payload(bytes: Vec<u8>) -> Result<Vec<u8>> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Ok(bytes);
-    }
-    let mut cursor = 12usize;
-    let mut fmt_ok = false;
-    let mut data_start: Option<usize> = None;
-    while cursor + 8 <= bytes.len() {
-        let chunk_id = &bytes[cursor..cursor + 4];
-        let chunk_size = u32::from_le_bytes(
-            bytes[cursor + 4..cursor + 8].try_into().map_err(|_| anyhow!("WAV chunk size read"))?,
-        ) as usize;
-        let body = cursor + 8;
-        if chunk_id == b"fmt " && body + 16 <= bytes.len() {
-            let format = u16::from_le_bytes(bytes[body..body + 2].try_into().unwrap());
-            let channels = u16::from_le_bytes(bytes[body + 2..body + 4].try_into().unwrap());
-            let sample_rate = u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap());
-            let bits = u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap());
-            if format != 1 || channels != 1 || sample_rate != 16000 || bits != 16 {
-                return Err(anyhow!(
-                    "unsupported WAV: fmt={} ch={} sr={} bits={}",
-                    format, channels, sample_rate, bits
-                ));
-            }
-            fmt_ok = true;
-        } else if chunk_id == b"data" {
-            data_start = Some(body);
-            break;
-        }
-        // chunk_size moze byc nieparzysty — spec wymaga pad byte
-        cursor = body + chunk_size + (chunk_size & 1);
-    }
-    if !fmt_ok {
-        return Err(anyhow!("WAV without fmt chunk"));
-    }
-    let start = data_start.ok_or_else(|| anyhow!("WAV without data chunk"))?;
-    Ok(bytes[start..].to_vec())
 }
 
 /// Wysylka probek PCM do Chromium (mic injection bota).
@@ -302,49 +251,4 @@ mod tests {
         assert_eq!(samples, vec![256]);
     }
 
-    fn build_wav(sample_rate: u32, channels: u16, bits: u16, data: &[u8]) -> Vec<u8> {
-        let mut w = Vec::new();
-        w.extend_from_slice(b"RIFF");
-        w.extend_from_slice(&(36u32 + data.len() as u32).to_le_bytes());
-        w.extend_from_slice(b"WAVE");
-        w.extend_from_slice(b"fmt ");
-        w.extend_from_slice(&16u32.to_le_bytes());
-        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        w.extend_from_slice(&channels.to_le_bytes());
-        w.extend_from_slice(&sample_rate.to_le_bytes());
-        let byte_rate = sample_rate * channels as u32 * (bits as u32 / 8);
-        w.extend_from_slice(&byte_rate.to_le_bytes());
-        let block_align = channels * (bits / 8);
-        w.extend_from_slice(&block_align.to_le_bytes());
-        w.extend_from_slice(&bits.to_le_bytes());
-        w.extend_from_slice(b"data");
-        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        w.extend_from_slice(data);
-        w
-    }
-
-    #[test]
-    fn parse_audio_payload_raw_passthrough() {
-        let raw = vec![1, 2, 3, 4];
-        assert_eq!(parse_audio_payload(raw.clone()).unwrap(), raw);
-    }
-
-    #[test]
-    fn parse_audio_payload_valid_wav() {
-        let pcm = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let wav = build_wav(16000, 1, 16, &pcm);
-        assert_eq!(parse_audio_payload(wav).unwrap(), pcm);
-    }
-
-    #[test]
-    fn parse_audio_payload_rejects_bad_sample_rate() {
-        let wav = build_wav(44100, 1, 16, &[0; 4]);
-        assert!(parse_audio_payload(wav).is_err());
-    }
-
-    #[test]
-    fn parse_audio_payload_rejects_stereo() {
-        let wav = build_wav(16000, 2, 16, &[0; 4]);
-        assert!(parse_audio_payload(wav).is_err());
-    }
 }
