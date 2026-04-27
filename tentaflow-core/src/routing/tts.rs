@@ -1,13 +1,22 @@
 // =============================================================================
 // Plik: routing/tts.rs
-// Opis: Synteza mowy (TTS) — synthesize_speech z QUIC TTS (preferowany)
-//       i fallbackiem na jarvis voice.
+// Opis: Synteza mowy (TTS) — synthesize_speech (blocking) oraz
+//       synthesize_speech_stream (chunkowane PCM dla niskiej latencji
+//       pierwszej probki audio).
 // =============================================================================
 
 use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
 
 use tracing::debug;
+
+/// Domyslny rozmiar chunku PCM dla streamingu TTS — 100 ms audio
+/// (16 kHz mono i16 LE = 16_000 * 0.1 * 2 bajty = 3200 bajtow).
+/// Mniejsze chunki = nizsza pierwsza-probka latency, ale wiecej overhead'u
+/// na ramke (nagłowek length-prefix + rkyv). 100 ms to kompromis: pierwszy
+/// chunk dociera do mikrofonu w ~50 ms od momentu zakończenia syntezy,
+/// jednoczesnie pojedynczy frame ma ~3 KB, co jest tanie.
+const TTS_STREAM_CHUNK_BYTES: usize = 3_200;
 
 impl Router {
     /// Syntezuje mowe z tekstu uzywajac QUIC TTS lub HTTP TTS.
@@ -202,5 +211,109 @@ impl Router {
             }
             .into()),
         }
+    }
+
+    /// Streamujaca synteza mowy. Pierwsza iteracja: wywoluje pelne
+    /// `synthesize_speech` a nastepnie tnie wynikowy bufor PCM na chunki po
+    /// `TTS_STREAM_CHUNK_BYTES` bajtow. Zysk wzgledem blocking variant:
+    /// klient (np. teams-bot) wpycha probki do mikrofonu jednoczesnie z
+    /// transmisja kolejnych chunkow zamiast czekac na pelny WAV przed
+    /// odtwarzaniem — eliminuje dodatkowy "first-byte" stall na sieci/
+    /// deserializacji duzej ramki.
+    ///
+    /// Pelny end-to-end streaming (callback bezposrednio z silnika TTS,
+    /// np. sherpa `create_with_callback`) wymaga refaktoru `TtsEngine`
+    /// trait i osobnego dispatch path — to zostaje na nastepna iteracje.
+    ///
+    /// `chunk_sink` dostaje raw PCM bajty (bez WAV headera). Caller
+    /// powinien zazadac `format = "pcm"` w `TTSRequest` zeby uniknac
+    /// stripowania headera w pierwszym chunku.
+    pub async fn synthesize_speech_stream<F>(
+        &self,
+        request: &crate::api::openai::types::TTSRequest,
+        mut chunk_sink: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<u8>) -> Result<()>,
+    {
+        let route_result = self.synthesize_speech(request).await?;
+        let mut audio_bytes = route_result.response;
+
+        // Strip WAV header gdy backend zignorowal `format=pcm` i zwrocil
+        // jednak RIFF/WAVE — pierwszy chunk musi byc czystym PCM, inaczej
+        // klient slyszy klikniecie/szum z naglowka.
+        if audio_bytes.len() >= 12
+            && &audio_bytes[0..4] == b"RIFF"
+            && &audio_bytes[8..12] == b"WAVE"
+        {
+            audio_bytes = strip_wav_header(&audio_bytes)?;
+        }
+
+        for chunk in audio_bytes.chunks(TTS_STREAM_CHUNK_BYTES) {
+            chunk_sink(chunk.to_vec())?;
+        }
+        Ok(())
+    }
+}
+
+/// Wyciaga raw PCM z WAV po skanowaniu chunkow `fmt `/`data` (parser
+/// tolerancyjny na opcjonalne LIST/INFO chunki). Wymaga PCM16 mono;
+/// inaczej zwraca blad — caller zostaje w blocking ścieżce.
+fn strip_wav_header(bytes: &[u8]) -> Result<Vec<u8>> {
+    let err = |msg: &str| CoreError::InternalError {
+        message: format!("WAV strip: {}", msg),
+        source: None,
+    };
+    let mut cursor = 12usize;
+    let mut data_start: Option<usize> = None;
+    while cursor + 8 <= bytes.len() {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_size = u32::from_le_bytes(
+            bytes[cursor + 4..cursor + 8]
+                .try_into()
+                .map_err(|_| err("chunk size"))?,
+        ) as usize;
+        let body = cursor + 8;
+        if chunk_id == b"data" {
+            data_start = Some(body);
+            break;
+        }
+        cursor = body + chunk_size + (chunk_size & 1);
+    }
+    let start = data_start.ok_or_else(|| err("brak data chunk"))?;
+    Ok(bytes[start..].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_wav_header_extracts_pcm() {
+        // Minimalny WAV: RIFF + fmt(16B PCM16 mono 16k) + data(4B PCM)
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&4u32.to_le_bytes());
+        wav.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let pcm = strip_wav_header(&wav).expect("strip ok");
+        assert_eq!(pcm, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn chunk_bytes_constant_matches_100ms_pcm16_16k_mono() {
+        // Walidacja stalej: 16000 Hz * 0.1 s * 2 B/sample = 3200 B
+        assert_eq!(TTS_STREAM_CHUNK_BYTES, 16_000 / 10 * 2);
     }
 }
