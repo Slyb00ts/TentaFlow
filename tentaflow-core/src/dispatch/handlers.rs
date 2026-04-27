@@ -501,6 +501,18 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         .find(|s| s.name == *model_id)
         .ok_or_else(|| ProtocolError::not_found("model not found"))?;
 
+    // Cascade — usun wpisy w `model_registry` powiazane z tym serwisem,
+    // inaczej zostaja jako sierota w panelu Modele po deleted serwisu.
+    if let Err(e) = repository::delete_model_entries_by_service(&ctx.state.db, svc.id) {
+        tracing::warn!(service_id = svc.id, "delete_model_entries_by_service: {}", e);
+    }
+    // Wyrejestruj z mesh registry, inaczej router dalej forwarduje requesty
+    // na nieistniejacy serwis ("Mesh STT serwis nie polaczony").
+    let mesh_service_id = format!("native-{}-{}", svc.service_type, svc.name);
+    ctx.state
+        .router
+        .unregister_native_service_from_mesh(&mesh_service_id);
+
     repository::delete_service(&ctx.state.db, svc.id).map_err(db_err)?;
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));

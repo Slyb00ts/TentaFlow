@@ -103,7 +103,8 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
     Ok((200, serde_json::to_string(&service)?))
 }
 
-/// DELETE /api/services/:id - usun serwis
+/// DELETE /api/services/:id - usun serwis (kasuje rowniez powiazane wpisy
+/// `model_registry`, zeby model nie zostal w panelu Modele jako sierota).
 pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     let existing = db::repository::get_service(pool, id)?;
     if existing.is_none() {
@@ -113,6 +114,9 @@ pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
         ));
     }
 
+    if let Err(e) = db::repository::delete_model_entries_by_service(pool, id) {
+        tracing::warn!(service_id = id, "delete_model_entries_by_service: {}", e);
+    }
     db::repository::delete_service(pool, id)?;
     Ok((200, r#"{"ok":true}"#.to_string()))
 }
