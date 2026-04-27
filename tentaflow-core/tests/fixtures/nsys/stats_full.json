@@ -1,0 +1,36 @@
+[
+  {
+    "reportName": "gpukernsum",
+    "data": [
+      { "Name": "ampere_sgemm_64x32_nn", "Time(ns)": 5000000000, "Calls": 100, "Avg(ns)": 50000000 },
+      { "Name": "elementwise_kernel", "Time(ns)": 2000000000, "Calls": 200, "Avg(ns)": 10000000 },
+      { "Name": "softmax_kernel", "Time(ns)": 1000000000, "Calls": 50, "Avg(ns)": 20000000 }
+    ]
+  },
+  {
+    "reportName": "cudaapisum",
+    "data": [
+      { "Name": "cudaLaunchKernel", "Time(ns)": 3000000000, "Calls": 350, "Avg(ns)": 8571428 },
+      { "Name": "cudaMemcpyAsync", "Time(ns)": 500000000, "Calls": 100, "Avg(ns)": 5000000 }
+    ]
+  },
+  {
+    "reportName": "gpumemsizesum",
+    "data": [
+      { "Name": "[CUDA memcpy HtoD]", "Time(ns)": 100000000, "Calls": 50, "Avg(ns)": 2000000 }
+    ]
+  },
+  {
+    "reportName": "osrtsum",
+    "data": [
+      { "Name": "poll", "Time(ns)": 2000000000, "Calls": 100, "Avg(ns)": 20000000 },
+      { "Name": "pthread_cond_wait", "Time(ns)": 1500000000, "Calls": 200, "Avg(ns)": 7500000 }
+    ]
+  },
+  {
+    "reportName": "nvtxsum",
+    "data": [
+      { "Name": "forward_pass", "Time(ns)": 4000000000, "Calls": 10, "Avg(ns)": 400000000 }
+    ]
+  }
+]
