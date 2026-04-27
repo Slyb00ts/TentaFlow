@@ -1551,6 +1551,63 @@
       "invalid_duration": "Invalid duration",
       "invalid_scope": "Invalid profiling scope",
       "session_not_found": "Session not found"
+    },
+    "report": {
+      "title": "Profiling report",
+      "back": "Back",
+      "meta": {
+        "hostname": "Host",
+        "started": "Started",
+        "duration": "Duration",
+        "nsys_version": "nsys",
+        "gpu_targets": "GPU"
+      },
+      "kpi": {
+        "gpu_active": "GPU active",
+        "cpu_active": "CPU active",
+        "kernel_count": "Kernels",
+        "cuda_api_count": "CUDA API",
+        "peak_vram": "Peak VRAM",
+        "samples": "Samples"
+      },
+      "tab": {
+        "overview": "Overview",
+        "kernels": "GPU Kernels",
+        "cuda": "CUDA APIs",
+        "memory": "Memory",
+        "cpu": "CPU",
+        "nvtx": "NVTX",
+        "timeline": "Timeline"
+      },
+      "col": {
+        "name": "Name",
+        "total_ms": "Total (ms)",
+        "calls": "Calls",
+        "avg_ms": "Avg (ms)",
+        "pct": "%"
+      },
+      "timeline": {
+        "legend": {
+          "sm": "SM %",
+          "mem": "Memory %",
+          "power": "Power %"
+        }
+      },
+      "empty": {
+        "timeline": "No timeline data (nsys started without --gpu-metrics-device)",
+        "cpu_samples": "No CPU samples",
+        "nvtx": "No NVTX ranges"
+      },
+      "action": {
+        "download": "Download .nsys-rep",
+        "delete": "Delete session"
+      },
+      "confirm_delete": "Delete profiling session?",
+      "error": {
+        "load": "Failed to load report",
+        "delete": "Failed to delete session",
+        "download": "Failed to download file"
+      }
     }
   },
   "clusters": {
