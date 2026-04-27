@@ -76,3 +76,7 @@ harness = false
 [[bench]]
 name = "roster_emit_concurrency"
 harness = false
+
+[[bench]]
+name = "sentence_buffer"
+harness = false

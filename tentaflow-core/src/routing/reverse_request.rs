@@ -172,12 +172,22 @@ async fn handle_reverse_stream(
     // router odpowiada seria ModelStreamChunk z AudioChunk(pcm) zakonczona
     // Done. Pozwala botowi pchac probki do mikrofonu na biezaco zamiast
     // czekac na pelny WAV.
+    //
+    // Streamujaca sciezka Completion: stream=true + payload Completion zwraca
+    // serie TextDelta zakonczona Done. Bot uzywa tego do tokeno-strumienia
+    // odpowiedzi LLM, parsuje granice zdan i odpala TTS na kazde pelne zdanie
+    // (sentence-boundary pipeline) — pierwszy chunk audio idzie do mikrofonu
+    // dlugo zanim LLM skonczy generowac.
     if request.stream {
         if let tentaflow_protocol::ModelPayload::Audio(ref audio_payload) = request.payload {
             if let tentaflow_protocol::AudioOperation::TTS { .. } = audio_payload.operation {
                 handle_tts_stream(send, router, request).await;
                 return;
             }
+        }
+        if let tentaflow_protocol::ModelPayload::Completion(_) = request.payload {
+            handle_completion_stream(send, router, request).await;
+            return;
         }
     }
 
@@ -305,6 +315,118 @@ async fn handle_tts_stream(
     if !client_dropped {
         if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &final_chunk).await {
             warn!("TTS stream: blad wysylki final chunk: {:?}", e);
+        }
+    }
+    let _ = send.finish();
+}
+
+/// Obsluguje streamujace chat completion od kontenera (bot meetingowy):
+/// kazdy delta-token z `route_chat_completion_stream` przepakowywany jest
+/// w `ModelStreamChunk::TextDelta`. Po wyczerpaniu strumienia wysylamy
+/// `Done`. Brak buforowania — token leci do bota natychmiast po wyprodukowaniu
+/// przez backend, dzieki czemu sentence-boundary parser bota odpala TTS dla
+/// pierwszego zdania zanim LLM dokonczy generowanie reszty odpowiedzi.
+async fn handle_completion_stream(
+    mut send: iroh::endpoint::SendStream,
+    router: Router,
+    request: tentaflow_protocol::ModelRequest,
+) {
+    use futures::StreamExt;
+    use tentaflow_protocol::{ErrorInfo, ErrorType, ModelStreamChunk, StreamChunkType};
+
+    let request_id = request.request_id.clone();
+
+    let completion_payload = match &request.payload {
+        tentaflow_protocol::ModelPayload::Completion(p) => p,
+        _ => return,
+    };
+
+    let mut chat_request = match build_chat_request(completion_payload) {
+        Ok(mut r) => {
+            r.stream = true;
+            r
+        }
+        Err(e) => {
+            let err_chunk = ModelStreamChunk {
+                request_id: request_id.clone(),
+                chunk: StreamChunkType::Error(ErrorInfo {
+                    error_type: ErrorType::InvalidRequest,
+                    message: e,
+                    details: None,
+                }),
+            };
+            let _ = tentaflow_transport::framing::write_frame(&mut send, &err_chunk).await;
+            let _ = send.finish();
+            return;
+        }
+    };
+    // upewniamy sie ze stream flag jest ustawiona — niektore sciezki
+    // route_chat_completion_stream gateuja tryb streaming wlasnie tym polem.
+    chat_request.stream = true;
+
+    let route_result = match router.route_chat_completion_stream(chat_request).await {
+        Ok(r) => r,
+        Err(e) => {
+            let err_chunk = ModelStreamChunk {
+                request_id: request_id.clone(),
+                chunk: StreamChunkType::Error(ErrorInfo {
+                    error_type: ErrorType::InternalError,
+                    message: format!("route_chat_completion_stream: {}", e),
+                    details: None,
+                }),
+            };
+            let _ = tentaflow_transport::framing::write_frame(&mut send, &err_chunk).await;
+            let _ = send.finish();
+            return;
+        }
+    };
+
+    let mut stream = route_result.response;
+    let mut errored = false;
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chat_chunk) => {
+                // OpenAI-format chunk -> wyciagamy delta.content; pomijamy
+                // chunki bez tekstu (np. role-only first chunk).
+                if let Some(choice) = chat_chunk.choices.into_iter().next() {
+                    if let Some(text) = choice.delta.content {
+                        if !text.is_empty() {
+                            let frame = ModelStreamChunk {
+                                request_id: request_id.clone(),
+                                chunk: StreamChunkType::TextDelta(text),
+                            };
+                            if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &frame).await {
+                                warn!("Completion stream: blad wysylki TextDelta: {:?}", e);
+                                errored = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let err_chunk = ModelStreamChunk {
+                    request_id: request_id.clone(),
+                    chunk: StreamChunkType::Error(ErrorInfo {
+                        error_type: ErrorType::InternalError,
+                        message: format!("Completion stream blad: {}", e),
+                        details: None,
+                    }),
+                };
+                let _ = tentaflow_transport::framing::write_frame(&mut send, &err_chunk).await;
+                errored = true;
+                break;
+            }
+        }
+    }
+
+    if !errored {
+        let done = ModelStreamChunk {
+            request_id: request_id.clone(),
+            chunk: StreamChunkType::Done { final_metrics: None },
+        };
+        if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &done).await {
+            warn!("Completion stream: blad wysylki Done: {:?}", e);
         }
     }
     let _ = send.finish();
