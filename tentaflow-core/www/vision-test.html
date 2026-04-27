@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TentaFlow — Vision test</title>
+  <style>
+    body { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+           background: #0b0e1a; color: #e6e8ef; margin: 0; padding: 20px; }
+    h1 { font-size: 18px; margin: 0 0 16px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    label { color: #9aa0b4; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+    input, select, button { background: #1a1d2e; color: #e6e8ef; border: 1px solid #2a2e44;
+                            padding: 6px 10px; border-radius: 6px; font: inherit; }
+    button { cursor: pointer; background: #5468ff; border-color: #5468ff; color: white; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .stage { position: relative; display: inline-block; max-width: 100%; margin-top: 16px;
+             border: 1px solid #2a2e44; border-radius: 8px; overflow: hidden; }
+    canvas { display: block; max-width: 100%; }
+    pre { background: #1a1d2e; padding: 12px; border-radius: 8px; max-height: 320px;
+          overflow: auto; font-size: 12px; color: #cdd0e0; white-space: pre-wrap; }
+    .err { color: #ff6b6b; }
+    .meta { color: #9aa0b4; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Vision inference test</h1>
+  <p class="meta">Wymaga: zalogowanej sesji (otworz <a href="/" style="color:#5468ff">/</a> i zaloguj sie),
+     zdeployowanego serwisu vision (Services → Add service → Vision → wybierz silnik).</p>
+
+  <div class="row">
+    <label for="svc">service_name</label>
+    <input id="svc" type="text" placeholder="np. tentaflow-scrfd-abc12" style="min-width:280px">
+    <label for="img">obraz</label>
+    <input id="img" type="file" accept="image/jpeg,image/png,image/webp">
+    <button id="btn" disabled>Detect</button>
+  </div>
+
+  <div class="row">
+    <span id="status" class="meta">Czekam na obraz…</span>
+  </div>
+
+  <div class="stage">
+    <canvas id="canvas" width="320" height="180"></canvas>
+  </div>
+
+  <h2 style="font-size:14px; margin-top:20px">Surowy wynik (JSON)</h2>
+  <pre id="out">—</pre>
+
+  <script type="module">
+    import { initTransport, ApiBinary } from '/js/protocol/api-binary-shim.js';
+
+    const svc = document.getElementById('svc');
+    const fileInput = document.getElementById('img');
+    const btn = document.getElementById('btn');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const out = document.getElementById('out');
+    const statusEl = document.getElementById('status');
+
+    let imgBytes = null;
+    let imgBitmap = null;
+
+    function setStatus(text, isErr = false) {
+      statusEl.textContent = text;
+      statusEl.className = isErr ? 'err' : 'meta';
+    }
+
+    fileInput.addEventListener('change', async (e) => {
+      const f = e.target.files?.[0];
+      if (!f) return;
+      const ab = await f.arrayBuffer();
+      imgBytes = new Uint8Array(ab);
+      imgBitmap = await createImageBitmap(f);
+      canvas.width = imgBitmap.width;
+      canvas.height = imgBitmap.height;
+      ctx.drawImage(imgBitmap, 0, 0);
+      btn.disabled = !svc.value.trim();
+      setStatus(`Załadowano ${f.name} — ${imgBitmap.width}×${imgBitmap.height}`);
+    });
+
+    svc.addEventListener('input', () => {
+      btn.disabled = !(svc.value.trim() && imgBytes);
+    });
+
+    btn.addEventListener('click', async () => {
+      const serviceName = svc.value.trim();
+      if (!serviceName || !imgBytes) return;
+      btn.disabled = true;
+      setStatus('Wysylam request…');
+      const t0 = performance.now();
+      try {
+        const resp = await ApiBinary.action('visionInferRequest', {
+          serviceName,
+          image: imgBytes,
+        });
+        const elapsed = (performance.now() - t0).toFixed(0);
+        out.textContent = JSON.stringify(resp, null, 2);
+        renderResult(resp);
+        setStatus(`OK — ${resp.latencyMs ?? '?'} ms server, ${elapsed} ms total`);
+      } catch (err) {
+        out.textContent = String(err?.message ?? err);
+        setStatus(`Blad: ${err?.message ?? err}`, true);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    function renderResult(resp) {
+      if (!imgBitmap) return;
+      ctx.drawImage(imgBitmap, 0, 0);
+      if (resp?.kind === 'faces' && Array.isArray(resp.faces)) {
+        ctx.lineWidth = 2;
+        ctx.font = '14px system-ui';
+        for (const f of resp.faces) {
+          ctx.strokeStyle = '#5cff9d';
+          ctx.strokeRect(f.x1, f.y1, f.x2 - f.x1, f.y2 - f.y1);
+          ctx.fillStyle = '#5cff9d';
+          ctx.fillText(`${(f.score * 100).toFixed(0)}%`, f.x1, f.y1 - 4);
+          ctx.fillStyle = '#ff5c5c';
+          for (const [kx, ky] of f.keypoints || []) {
+            ctx.beginPath();
+            ctx.arc(kx, ky, 3, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      } else if (resp?.kind === 'age_gender') {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(8, 8, 240, 56);
+        ctx.fillStyle = '#5cff9d';
+        ctx.font = '16px system-ui';
+        ctx.fillText(`Wiek: ~${(resp.ageYears ?? 0).toFixed(1)} lat`, 16, 28);
+        const m = (resp.genderMaleProb ?? 0.5);
+        ctx.fillText(`Plec: ${m > 0.5 ? 'M' : 'K'} (${(Math.max(m, 1 - m) * 100).toFixed(0)}%)`, 16, 50);
+      } else if (resp?.kind === 'emotion') {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(8, 8, 240, 32);
+        ctx.fillStyle = '#5cff9d';
+        ctx.font = '18px system-ui';
+        ctx.fillText(`${resp.label}`, 16, 30);
+      }
+    }
+
+    initTransport().then(() => {
+      setStatus('Transport OK. Wybierz obraz i podaj service_name.');
+    }).catch((e) => {
+      setStatus(`initTransport: ${e?.message ?? e}`, true);
+    });
+  </script>
+</body>
+</html>
