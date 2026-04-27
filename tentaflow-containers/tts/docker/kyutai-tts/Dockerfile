@@ -1,18 +1,15 @@
 # =============================================================================
-# Plik: Dockerfile (Kyutai TTS via moshi)
-# Opis: Streaming TTS Kyutai 1.8B (model.id `kyutai/tts-1.6b-en_fr`).
-#       Oparte o `moshi` Python package + Mimi codec. CPU/CUDA. EN+FR.
-#       Voices z `kyutai/tts-voices` repo.
+# Plik: Dockerfile (Kyutai Pocket TTS — maly model 100M, CPU)
+# Opis: Lekki obraz Linux/Win/Mac. ~200 MB model, ~6x realtime na M-series CPU.
 # =============================================================================
 
 FROM python:3.12-slim
 
 ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
-    KYUTAI_PORT=8881 \
-    HF_HOME=/app/cache/huggingface \
-    TORCH_HOME=/app/cache/torch \
-    KYUTAI_DEVICE=cpu
+    POCKET_TTS_PORT=8088 \
+    POCKET_TTS_LANGUAGE=english \
+    HF_HOME=/app/cache/huggingface
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
@@ -25,14 +22,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Pre-download wagi modelu ~3.6 GB + 8 default voices przy buildzie (kompromis:
-# wieksze warstwy obrazu, ale predszy pierwszy run).
-RUN python -c "from huggingface_hub import snapshot_download; \
-snapshot_download('kyutai/tts-1.6b-en_fr', allow_patterns=['*.safetensors','*.json','*.txt']); \
-snapshot_download('kyutai/tts-voices', allow_patterns=['expresso/*.safetensors'])"
+# Pre-download wagi pocket-tts przy buildzie. ~200 MB.
+RUN python -c "from pocket_tts import TTSModel; TTSModel.load_model()"
 
 COPY server.py /app/
 
-EXPOSE 8881
+EXPOSE 8088
 
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${KYUTAI_PORT:-8881}"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${POCKET_TTS_PORT:-8088}"]
