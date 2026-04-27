@@ -463,30 +463,12 @@ pub struct MeshFullState {
 /// Obejmuje operacje Docker, certyfikaty i serwisy.
 #[derive(Archive, Deserialize, Serialize, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshCommandType {
-    /// Pobranie obrazu Docker
-    PullImage { image: String, tag: String },
-    /// Deploy docker-compose stack
-    DeployStack {
-        stack_name: String,
-        compose_yaml: String,
-        registry_auth: Option<MeshRegistryAuth>,
-    },
-    /// Usuniecie stacka
-    RemoveStack { stack_name: String },
     /// Uruchomienie kontenera
     ContainerStart { container_id: String },
     /// Zatrzymanie kontenera
     ContainerStop { container_id: String },
     /// Restart kontenera
     ContainerRestart { container_id: String },
-    /// Usuniecie kontenera
-    ContainerRemove { container_id: String, force: bool },
-    /// Pobranie logow kontenera
-    ContainerLogs {
-        container_id: String,
-        tail_lines: u32,
-        follow: bool,
-    },
     /// Lista kontenerow
     ListContainers,
     /// Lista obrazow Docker
@@ -588,30 +570,6 @@ pub enum MeshCommandResponsePayload {
 impl std::fmt::Debug for MeshCommandType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PullImage { image, tag } => {
-                f.debug_struct("PullImage")
-                    .field("image", image)
-                    .field("tag", tag)
-                    .finish()
-            }
-            Self::DeployStack { stack_name, compose_yaml, registry_auth } => {
-                let masked_auth = registry_auth.as_ref().map(|auth| {
-                    format!(
-                        "MeshRegistryAuth {{ server: {:?}, username: {:?}, password: \"***\" }}",
-                        auth.server, auth.username
-                    )
-                });
-                f.debug_struct("DeployStack")
-                    .field("stack_name", stack_name)
-                    .field("compose_yaml", compose_yaml)
-                    .field("registry_auth", &masked_auth)
-                    .finish()
-            }
-            Self::RemoveStack { stack_name } => {
-                f.debug_struct("RemoveStack")
-                    .field("stack_name", stack_name)
-                    .finish()
-            }
             Self::ContainerStart { container_id } => {
                 f.debug_struct("ContainerStart")
                     .field("container_id", container_id)
@@ -625,19 +583,6 @@ impl std::fmt::Debug for MeshCommandType {
             Self::ContainerRestart { container_id } => {
                 f.debug_struct("ContainerRestart")
                     .field("container_id", container_id)
-                    .finish()
-            }
-            Self::ContainerRemove { container_id, force } => {
-                f.debug_struct("ContainerRemove")
-                    .field("container_id", container_id)
-                    .field("force", force)
-                    .finish()
-            }
-            Self::ContainerLogs { container_id, tail_lines, follow } => {
-                f.debug_struct("ContainerLogs")
-                    .field("container_id", container_id)
-                    .field("tail_lines", tail_lines)
-                    .field("follow", follow)
                     .finish()
             }
             Self::ListContainers => write!(f, "ListContainers"),
@@ -707,31 +652,6 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("session_id", &req.session_id)
                 .finish(),
         }
-    }
-}
-
-// =============================================================================
-// Dane uwierzytelniania rejestru Docker
-// =============================================================================
-
-/// Dane logowania do prywatnego rejestru Docker.
-#[derive(Archive, Deserialize, Serialize, Clone, SerdeSerialize, SerdeDeserialize)]
-pub struct MeshRegistryAuth {
-    /// Adres serwera rejestru
-    pub server: String,
-    /// Nazwa uzytkownika
-    pub username: String,
-    /// Haslo
-    pub password: String,
-}
-
-impl std::fmt::Debug for MeshRegistryAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MeshRegistryAuth")
-            .field("server", &self.server)
-            .field("username", &self.username)
-            .field("password", &"***")
-            .finish()
     }
 }
 

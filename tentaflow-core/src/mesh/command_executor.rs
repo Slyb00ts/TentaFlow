@@ -139,16 +139,17 @@ impl MeshCommandExecutor {
                 }
             }
 
-            MeshCommandType::PullImage { .. }
-            | MeshCommandType::DeployStack { .. }
-            | MeshCommandType::RemoveStack { .. }
-            | MeshCommandType::ContainerStart { .. }
-            | MeshCommandType::ContainerStop { .. }
-            | MeshCommandType::ContainerRestart { .. }
-            | MeshCommandType::ContainerRemove { .. }
-            | MeshCommandType::ContainerLogs { .. }
-            | MeshCommandType::SystemPrune { .. } => {
-                CommandResponse::fail("Docker commands not yet implemented")
+            MeshCommandType::ContainerStart { container_id } => {
+                self.handle_container_start(&container_id).await
+            }
+            MeshCommandType::ContainerStop { container_id } => {
+                self.handle_container_stop(&container_id).await
+            }
+            MeshCommandType::ContainerRestart { container_id } => {
+                self.handle_container_restart(&container_id).await
+            }
+            MeshCommandType::SystemPrune { volumes } => {
+                self.handle_system_prune(volumes).await
             }
 
             MeshCommandType::BandwidthProbe {
@@ -544,11 +545,219 @@ impl MeshCommandExecutor {
             Err(e) => CommandResponse::fail(format!("nsight download: {}", e)),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Docker handlery (bollard) — operacje na lokalnym daemonie Docker
+    // wykonywane na zlecenie zaufanego peera. Polaczenie nawiazywane on-demand,
+    // tym samym kanalem co `deploy/docker.rs` (unix socket / npipe).
+    // -------------------------------------------------------------------------
+
+    #[cfg(feature = "docker")]
+    async fn connect_docker() -> Result<bollard::Docker, String> {
+        bollard::Docker::connect_with_local_defaults()
+            .map_err(|e| format!("Polaczenie z Docker daemon nieudane: {}", e))
+    }
+
+    /// Walidacja identyfikatora kontenera — Docker akceptuje hex (12/64 znakow)
+    /// albo nazwy `[a-zA-Z0-9][a-zA-Z0-9_.-]+`. Odrzucamy puste, znaki kontrolne
+    /// i typowe wektory injection (slash, dwukropek, spacja).
+    fn validate_container_id(id: &str) -> Result<(), String> {
+        if id.is_empty() {
+            return Err("container_id pusty".to_string());
+        }
+        if id.len() > 128 {
+            return Err("container_id za dlugi".to_string());
+        }
+        let ok = id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+        if !ok {
+            return Err("container_id zawiera niedozwolone znaki".to_string());
+        }
+        Ok(())
+    }
+
+    async fn handle_container_start(&self, container_id: &str) -> CommandResponse {
+        if let Err(e) = Self::validate_container_id(container_id) {
+            return CommandResponse::fail(e);
+        }
+        #[cfg(feature = "docker")]
+        {
+            let docker = match Self::connect_docker().await {
+                Ok(d) => d,
+                Err(e) => return CommandResponse::fail(e),
+            };
+            match docker
+                .start_container(
+                    container_id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+            {
+                Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+                Err(e) => CommandResponse::fail(format!("start_container: {}", e)),
+            }
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = container_id;
+            CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
+        }
+    }
+
+    async fn handle_container_stop(&self, container_id: &str) -> CommandResponse {
+        if let Err(e) = Self::validate_container_id(container_id) {
+            return CommandResponse::fail(e);
+        }
+        #[cfg(feature = "docker")]
+        {
+            let docker = match Self::connect_docker().await {
+                Ok(d) => d,
+                Err(e) => return CommandResponse::fail(e),
+            };
+            match docker.stop_container(container_id, None).await {
+                Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+                Err(e) => CommandResponse::fail(format!("stop_container: {}", e)),
+            }
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = container_id;
+            CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
+        }
+    }
+
+    async fn handle_container_restart(&self, container_id: &str) -> CommandResponse {
+        if let Err(e) = Self::validate_container_id(container_id) {
+            return CommandResponse::fail(e);
+        }
+        #[cfg(feature = "docker")]
+        {
+            let docker = match Self::connect_docker().await {
+                Ok(d) => d,
+                Err(e) => return CommandResponse::fail(e),
+            };
+            match docker.restart_container(container_id, None).await {
+                Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+                Err(e) => CommandResponse::fail(format!("restart_container: {}", e)),
+            }
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = container_id;
+            CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
+        }
+    }
+
+    /// SystemPrune wola docker prune dla kontenerow + obrazow (oraz volumes
+    /// jesli `volumes=true`). Zwraca text z laczna iloscia odzyskanej przestrzeni.
+    async fn handle_system_prune(&self, volumes: bool) -> CommandResponse {
+        #[cfg(feature = "docker")]
+        {
+            let docker = match Self::connect_docker().await {
+                Ok(d) => d,
+                Err(e) => return CommandResponse::fail(e),
+            };
+
+            let containers = match docker
+                .prune_containers(None::<bollard::query_parameters::PruneContainersOptions>)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return CommandResponse::fail(format!("prune_containers: {}", e)),
+            };
+            let images = match docker
+                .prune_images(None::<bollard::query_parameters::PruneImagesOptions>)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return CommandResponse::fail(format!("prune_images: {}", e)),
+            };
+            let volumes_resp = if volumes {
+                match docker
+                    .prune_volumes(None::<bollard::query_parameters::PruneVolumesOptions>)
+                    .await
+                {
+                    Ok(r) => Some(r),
+                    Err(e) => return CommandResponse::fail(format!("prune_volumes: {}", e)),
+                }
+            } else {
+                None
+            };
+
+            let containers_count = containers
+                .containers_deleted
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let containers_bytes = containers.space_reclaimed.unwrap_or(0);
+            let images_count = images
+                .images_deleted
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let images_bytes = images.space_reclaimed.unwrap_or(0);
+            let (volumes_count, volumes_bytes) = match volumes_resp {
+                Some(v) => (
+                    v.volumes_deleted.as_ref().map(|v| v.len()).unwrap_or(0),
+                    v.space_reclaimed.unwrap_or(0),
+                ),
+                None => (0usize, 0i64),
+            };
+
+            let total_bytes = containers_bytes + images_bytes + volumes_bytes;
+            let summary = format!(
+                "Prune ok: containers={} ({} B), images={} ({} B), volumes={} ({} B), total reclaimed={} B",
+                containers_count,
+                containers_bytes,
+                images_count,
+                images_bytes,
+                volumes_count,
+                volumes_bytes,
+                total_bytes
+            );
+            CommandResponse::ok(MeshCommandResponsePayload::Text(summary))
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = volumes;
+            CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_container_id_accepts_hex_and_names() {
+        assert!(MeshCommandExecutor::validate_container_id("abcdef0123456789").is_ok());
+        assert!(MeshCommandExecutor::validate_container_id("tentaflow-llm.0").is_ok());
+        assert!(MeshCommandExecutor::validate_container_id("my_container").is_ok());
+    }
+
+    #[test]
+    fn validate_container_id_rejects_injection_vectors() {
+        assert!(MeshCommandExecutor::validate_container_id("").is_err());
+        assert!(MeshCommandExecutor::validate_container_id("foo bar").is_err());
+        assert!(MeshCommandExecutor::validate_container_id("foo/../bar").is_err());
+        assert!(MeshCommandExecutor::validate_container_id("foo;rm -rf /").is_err());
+        assert!(MeshCommandExecutor::validate_container_id("foo:bar").is_err());
+        let long = "a".repeat(200);
+        assert!(MeshCommandExecutor::validate_container_id(&long).is_err());
+    }
+
+    #[tokio::test]
+    async fn container_start_rejects_invalid_id_without_docker_call() {
+        let executor = create_test_executor();
+        let resp = executor.handle_container_start("foo bar").await;
+        assert!(!resp.ok);
+        assert!(resp
+            .error
+            .unwrap_or_default()
+            .contains("niedozwolone znaki"));
+    }
 
     #[test]
     fn odrzuca_path_traversal() {
