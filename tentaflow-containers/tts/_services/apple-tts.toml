@@ -23,7 +23,9 @@ version = "1.0.0"
 [deploy.native]
 platforms = ["macos", "ios"]
 runtime = "embedded"
-feature_flag = "inference-apple-tts"
+# Brak feature_flag — apple-tts (AVSpeechSynthesizer) jest ZAWSZE
+# wkompilowany na macOS/iOS, gated tylko przez target_os, nie przez Cargo
+# feature. Uzytkownik nie ma jak go wylaczyc i nie powinien.
 
 [[model_preset]]
 id = "zosia-pl"

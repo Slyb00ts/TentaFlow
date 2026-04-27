@@ -49,6 +49,20 @@ def healthz():
     return {"status": "ok", "sample_rate": SAMPLE_RATE, "model": MODEL_REPO}
 
 
+# OpenAI-compatible stub — Tentaflow deploy runner czeka na 200 z /v1/models
+# zanim oznaczy serwis jako gotowy. Bez tego progress utyka na 86% / 404.
+@app.get("/v1/models")
+def list_models():
+    return {
+        "object": "list",
+        "data": [{
+            "id": MODEL_REPO,
+            "object": "model",
+            "owned_by": "chatterbox-mlx",
+        }],
+    }
+
+
 @app.get("/v1/audio/voices")
 def list_voices():
     return {"languages": SUPPORTED_LANGS, "voice_cloning_via_audio_prompt": True}

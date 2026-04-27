@@ -29,9 +29,15 @@ pub mod audio_models;
 pub mod vision;
 pub mod vision_models;
 
+// macos_ffi: dlopen helpery dla libMLXBridge.dylib. Zawsze aktywne na
+// macOS/iOS (apple-tts), oraz pod feature flags mlx-whisper/mlx-kokoro
+// gdziekolwiek indziej (te dwa featury wlaczaja go na desktop macOS,
+// gdzie target gate i tak by go aktywował, ale zachowujemy explicit dla
+// czytelnosci). Na Linux/Windows: niedostepne.
 #[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
     feature = "inference-mlx-whisper",
-    feature = "inference-apple-tts",
     feature = "inference-mlx-kokoro"
 ))]
 pub mod macos_ffi;

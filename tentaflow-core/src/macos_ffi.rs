@@ -7,8 +7,9 @@
 // =============================================================================
 
 #![cfg(any(
+    target_os = "macos",
+    target_os = "ios",
     feature = "inference-mlx-whisper",
-    feature = "inference-apple-tts",
     feature = "inference-mlx-kokoro"
 ))]
 
