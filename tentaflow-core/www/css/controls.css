@@ -1013,6 +1013,7 @@ tf-tabs {
 .tf-chip.online  { background: rgba(16, 185, 129, 0.15); color: #10b981; }
 .tf-chip.offline { background: rgba(106, 113, 150, 0.18); color: #6a7196; }
 .tf-chip.pending { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.tf-chip.recording { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
 
 /* API key scopes */
 .tf-chip.scope-chat       { background: rgba(96, 165, 250, 0.15);  color: #60a5fa; }
@@ -1045,6 +1046,11 @@ tf-chip[clickable]:focus-visible > .tf-chip {
 .tf-chip.pending .tf-chip-dot {
   animation: tf-chip-pending-pulse 1.2s ease-in-out infinite;
 }
+/* recording — szybsza, mocniejsza pulsacja (REC). Krotszy okres niz default
+   sygnalizuje aktywne nagrywanie a nie zwykly status. */
+.tf-chip.recording .tf-chip-dot {
+  animation: tf-chip-recording-pulse 1s ease-in-out infinite;
+}
 @keyframes tf-chip-pulse {
   0%, 100% { box-shadow: 0 0 0 0 currentColor; }
   50%      { box-shadow: 0 0 8px 2px currentColor; }
@@ -1052,6 +1058,10 @@ tf-chip[clickable]:focus-visible > .tf-chip {
 @keyframes tf-chip-pending-pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.5; }
+}
+@keyframes tf-chip-recording-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+  50%      { box-shadow: 0 0 6px 3px currentColor; opacity: 0.85; }
 }
 
 /* =============================================================================

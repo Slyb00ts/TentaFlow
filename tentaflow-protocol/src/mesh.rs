@@ -7,6 +7,12 @@
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
+use crate::profiling::{
+    NsightDeleteRequest, NsightDeleteResponse, NsightDownloadRequest, NsightDownloadResponse,
+    NsightReportRequest, NsightReportResponse, NsightSessionsRequest, NsightSessionsResponse,
+    NsightStartRequest, NsightStartResponse, NsightStopRequest, NsightStopResponse,
+};
+
 fn default_service_status() -> String {
     "running".to_string()
 }
@@ -257,12 +263,12 @@ pub enum MeshMessage {
         command: MeshCommandType,
     },
 
-    /// Odpowiedz na komende zarzadzania
+    /// Odpowiedz na komende zarzadzania — typed payload zamiast goluego stringa.
     MeshCommandResponse {
         command_id: String,
         from_node_id: String,
-        success: bool,
-        output: String,
+        ok: bool,
+        payload: MeshCommandResponsePayload,
         error: Option<String>,
     },
 
@@ -457,30 +463,12 @@ pub struct MeshFullState {
 /// Obejmuje operacje Docker, certyfikaty i serwisy.
 #[derive(Archive, Deserialize, Serialize, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshCommandType {
-    /// Pobranie obrazu Docker
-    PullImage { image: String, tag: String },
-    /// Deploy docker-compose stack
-    DeployStack {
-        stack_name: String,
-        compose_yaml: String,
-        registry_auth: Option<MeshRegistryAuth>,
-    },
-    /// Usuniecie stacka
-    RemoveStack { stack_name: String },
     /// Uruchomienie kontenera
     ContainerStart { container_id: String },
     /// Zatrzymanie kontenera
     ContainerStop { container_id: String },
     /// Restart kontenera
     ContainerRestart { container_id: String },
-    /// Usuniecie kontenera
-    ContainerRemove { container_id: String, force: bool },
-    /// Pobranie logow kontenera
-    ContainerLogs {
-        container_id: String,
-        tail_lines: u32,
-        follow: bool,
-    },
     /// Lista kontenerow
     ListContainers,
     /// Lista obrazow Docker
@@ -517,35 +505,71 @@ pub enum MeshCommandType {
     },
     /// Anulowanie probing sesji
     BandwidthProbeCancel,
+
+    /// Nsight: start sesji profilowania na zdalnym nodzie.
+    NsightStart(NsightStartRequest),
+    /// Nsight: zatrzymanie biezacej sesji.
+    NsightStop(NsightStopRequest),
+    /// Nsight: lista sesji widocznych na nodzie.
+    NsightSessions(NsightSessionsRequest),
+    /// Nsight: pobranie sparsowanego raportu.
+    NsightReport(NsightReportRequest),
+    /// Nsight: usuniecie raportu i metadanych sesji.
+    NsightDelete(NsightDeleteRequest),
+    /// Nsight: pobranie surowego pliku `.nsys-rep` (binary blob).
+    NsightDownload(NsightDownloadRequest),
+}
+
+// =============================================================================
+// Typed payload odpowiedzi na komende mesh
+// =============================================================================
+
+/// Typed payload odpowiedzi na `MeshCommandType`. Zastepuje `output: String`,
+/// zeby kazda komenda miala scisle zdefiniowany typ wyniku — bez parsowania
+/// JSON-a w warstwie aplikacyjnej.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub enum MeshCommandResponsePayload {
+    /// Komendy void — zwracaja sam status (start/stop/restart/remove kontenera,
+    /// add service, deploy stack, pull image, provision certs, bandwidth-cancel).
+    Empty,
+    /// Lista kontenerow zwracana przez `ListContainers`.
+    ContainerList(Vec<MeshContainerInfo>),
+    /// Lista obrazow zwracana przez `ListImages`.
+    ImageList(Vec<String>),
+    /// Wynik probing przepustowosci (server side: porty otwarte do polaczenia).
+    BandwidthProbeServerStarted {
+        tcp_port: u16,
+        rdma_port: u16,
+    },
+    /// Wynik probing przepustowosci (client side: zmierzone metryki).
+    BandwidthProbeClientResult {
+        bandwidth_mbps: f64,
+        bytes_transferred: u64,
+        duration_ms: u64,
+        latency_us: u64,
+        streams_completed: u8,
+        rdma: bool,
+    },
+    /// Nieforemny tekst — uzywany tylko dla `SystemPrune` (human-readable summary
+    /// zwracane przez Docker daemon) i `NetworkConfig` (diagnostyczny output).
+    Text(String),
+    /// Nsight: potwierdzenie startu sesji.
+    NsightStart(NsightStartResponse),
+    /// Nsight: status po wyslaniu stop.
+    NsightStop(NsightStopResponse),
+    /// Nsight: lista sesji widocznych na nodzie.
+    NsightSessions(NsightSessionsResponse),
+    /// Nsight: pelny raport sesji.
+    NsightReport(NsightReportResponse),
+    /// Nsight: potwierdzenie usuniecia.
+    NsightDelete(NsightDeleteResponse),
+    /// Nsight: surowa zawartosc pliku `.nsys-rep`.
+    NsightDownload(NsightDownloadResponse),
 }
 
 impl std::fmt::Debug for MeshCommandType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PullImage { image, tag } => {
-                f.debug_struct("PullImage")
-                    .field("image", image)
-                    .field("tag", tag)
-                    .finish()
-            }
-            Self::DeployStack { stack_name, compose_yaml, registry_auth } => {
-                let masked_auth = registry_auth.as_ref().map(|auth| {
-                    format!(
-                        "MeshRegistryAuth {{ server: {:?}, username: {:?}, password: \"***\" }}",
-                        auth.server, auth.username
-                    )
-                });
-                f.debug_struct("DeployStack")
-                    .field("stack_name", stack_name)
-                    .field("compose_yaml", compose_yaml)
-                    .field("registry_auth", &masked_auth)
-                    .finish()
-            }
-            Self::RemoveStack { stack_name } => {
-                f.debug_struct("RemoveStack")
-                    .field("stack_name", stack_name)
-                    .finish()
-            }
             Self::ContainerStart { container_id } => {
                 f.debug_struct("ContainerStart")
                     .field("container_id", container_id)
@@ -559,19 +583,6 @@ impl std::fmt::Debug for MeshCommandType {
             Self::ContainerRestart { container_id } => {
                 f.debug_struct("ContainerRestart")
                     .field("container_id", container_id)
-                    .finish()
-            }
-            Self::ContainerRemove { container_id, force } => {
-                f.debug_struct("ContainerRemove")
-                    .field("container_id", container_id)
-                    .field("force", force)
-                    .finish()
-            }
-            Self::ContainerLogs { container_id, tail_lines, follow } => {
-                f.debug_struct("ContainerLogs")
-                    .field("container_id", container_id)
-                    .field("tail_lines", tail_lines)
-                    .field("follow", follow)
                     .finish()
             }
             Self::ListContainers => write!(f, "ListContainers"),
@@ -610,32 +621,37 @@ impl std::fmt::Debug for MeshCommandType {
                     .finish()
             }
             Self::BandwidthProbeCancel => write!(f, "BandwidthProbeCancel"),
+            Self::NsightStart(req) => f
+                .debug_struct("NsightStart")
+                .field("node_id", &req.node_id)
+                .field("label", &req.label)
+                .field("duration_secs", &req.duration_secs)
+                .finish(),
+            Self::NsightStop(req) => f
+                .debug_struct("NsightStop")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::NsightSessions(req) => f
+                .debug_struct("NsightSessions")
+                .field("node_id", &req.node_id)
+                .finish(),
+            Self::NsightReport(req) => f
+                .debug_struct("NsightReport")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::NsightDelete(req) => f
+                .debug_struct("NsightDelete")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::NsightDownload(req) => f
+                .debug_struct("NsightDownload")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
         }
-    }
-}
-
-// =============================================================================
-// Dane uwierzytelniania rejestru Docker
-// =============================================================================
-
-/// Dane logowania do prywatnego rejestru Docker.
-#[derive(Archive, Deserialize, Serialize, Clone, SerdeSerialize, SerdeDeserialize)]
-pub struct MeshRegistryAuth {
-    /// Adres serwera rejestru
-    pub server: String,
-    /// Nazwa uzytkownika
-    pub username: String,
-    /// Haslo
-    pub password: String,
-}
-
-impl std::fmt::Debug for MeshRegistryAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MeshRegistryAuth")
-            .field("server", &self.server)
-            .field("username", &self.username)
-            .field("password", &"***")
-            .finish()
     }
 }
 
@@ -1498,6 +1514,146 @@ mod tests {
                 assert_eq!(state.version_vector.len(), 2);
             }
             _ => panic!("Oczekiwano wariantu FullStateExchange"),
+        }
+    }
+
+    #[test]
+    fn mesh_command_response_nsight_payload_round_trip() {
+        use crate::profiling::{
+            GpuUtilSample, GpuUtilSeries, NsightGpuTarget, NsightReportResponse, NsightScope,
+            ProfileKpi, ProfileMeta, ProfileReport, ProfileTopRow,
+        };
+
+        // Duzy raport: 50 kerneli, 3 GPU x 600 sample.
+        let kernels: Vec<ProfileTopRow> = (0..50)
+            .map(|i| ProfileTopRow {
+                name: format!("kernel_{}", i),
+                total_ms: i as f64,
+                calls: i as u64,
+                avg_ms: 0.5,
+                pct: i as f32,
+            })
+            .collect();
+        let series: Vec<GpuUtilSeries> = (0..3u8)
+            .map(|gpu_idx| GpuUtilSeries {
+                gpu_idx,
+                power_limit_w: 450.0,
+                samples: (0..600u32)
+                    .map(|t| GpuUtilSample {
+                        t_ms: t,
+                        sm_pct: (t % 101) as u8,
+                        mem_pct: (t % 101) as u8,
+                        vram_used_mb: t,
+                        power_w: t as f32,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let payload = MeshCommandResponsePayload::NsightReport(NsightReportResponse {
+            report: ProfileReport {
+                meta: ProfileMeta {
+                    session_id: "s1".into(),
+                    label: "load".into(),
+                    scope: NsightScope::BothAll,
+                    hostname: "spark".into(),
+                    started_at_ms: 1,
+                    duration_ms: 30_000,
+                    nsys_version: "2024.5.1".into(),
+                    gpu_targets: vec![NsightGpuTarget {
+                        idx: 0,
+                        name: "RTX 4090".into(),
+                    }],
+                },
+                kpi: ProfileKpi::default(),
+                gpu_kernels_top: kernels,
+                cuda_api_top: Vec::new(),
+                gpu_mem_ops: Vec::new(),
+                cpu_samples_top: Vec::new(),
+                nvtx_ranges_top: Vec::new(),
+                gpu_util_timeline: series,
+            },
+        });
+
+        let msg = MeshMessage::MeshCommandResponse {
+            command_id: "cmd-1".into(),
+            from_node_id: "node-a".into(),
+            ok: true,
+            payload,
+            error: None,
+        };
+        let bytes = msg.serialize_rkyv().expect("encode");
+        let archived = MeshMessage::deserialize_rkyv(&bytes).expect("decode");
+        match archived {
+            ArchivedMeshMessage::MeshCommandResponse {
+                command_id,
+                ok,
+                error,
+                ..
+            } => {
+                assert_eq!(command_id.as_str(), "cmd-1");
+                assert!(*ok);
+                assert!(error.is_none());
+            }
+            _ => panic!("Oczekiwano MeshCommandResponse"),
+        }
+    }
+
+    #[test]
+    fn mesh_command_type_nsight_start_round_trip() {
+        use crate::profiling::{NsightScope, NsightStartRequest};
+        let cmd = MeshCommandType::NsightStart(NsightStartRequest {
+            node_id: "node-x".into(),
+            scope: NsightScope::GpuIndex(0),
+            duration_secs: 60,
+            label: "warmup".into(),
+        });
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cmd).expect("encode");
+        let decoded =
+            rkyv::from_bytes::<MeshCommandType, rkyv::rancor::Error>(&bytes).expect("decode");
+        match decoded {
+            MeshCommandType::NsightStart(req) => {
+                assert_eq!(req.node_id, "node-x");
+                assert_eq!(req.label, "warmup");
+                assert_eq!(req.duration_secs, 60);
+            }
+            _ => panic!("Oczekiwano MeshCommandType::NsightStart"),
+        }
+    }
+
+    #[test]
+    fn mesh_command_response_payload_variants_round_trip() {
+        use crate::profiling::{NsightStartResponse, NsightStopResponse, NsightSessionStatus};
+
+        let payloads = vec![
+            MeshCommandResponsePayload::Empty,
+            MeshCommandResponsePayload::ImageList(vec!["img-a".into(), "img-b".into()]),
+            MeshCommandResponsePayload::BandwidthProbeServerStarted {
+                tcp_port: 5001,
+                rdma_port: 5002,
+            },
+            MeshCommandResponsePayload::BandwidthProbeClientResult {
+                bandwidth_mbps: 9876.5,
+                bytes_transferred: 1_000_000,
+                duration_ms: 2000,
+                latency_us: 120,
+                streams_completed: 4u8,
+                rdma: false,
+            },
+            MeshCommandResponsePayload::Text("Total reclaimed space: 1.2GB".into()),
+            MeshCommandResponsePayload::NsightStart(NsightStartResponse {
+                session_id: "s1".into(),
+                started_at_ms: 1,
+            }),
+            MeshCommandResponsePayload::NsightStop(NsightStopResponse {
+                session_id: "s1".into(),
+                status: NsightSessionStatus::Done,
+            }),
+        ];
+        for p in payloads {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&p).expect("encode");
+            rkyv::from_bytes::<MeshCommandResponsePayload, rkyv::rancor::Error>(&bytes)
+                .expect("decode");
         }
     }
 }

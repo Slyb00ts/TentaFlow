@@ -42,6 +42,7 @@ import TranslateScreen from '/js/modules/translate.js';
 import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
+import ProfileReportScreen from '/js/modules/profile-report.js';
 import { makeComingSoonScreen } from '/js/modules/coming-soon.js';
 
 // Helper: SVG <use> reference do inline sprite.
@@ -386,6 +387,7 @@ async function renderApp() {
   Router.register('meeting-live', MeetingLiveScreen);
   Router.register('translate',      TranslateScreen);
   Router.register('mesh-user',      makeComingSoonScreen('mesh_user', 'network'));
+  Router.register('profile-report', ProfileReportScreen);
 
   paint();
 

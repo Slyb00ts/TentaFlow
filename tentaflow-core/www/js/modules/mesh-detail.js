@@ -21,6 +21,15 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
+import {
+  initNsight,
+  cleanupNsight,
+  loadSessions as loadNsightSessions,
+  topbarHtml as nsightTopbarHtml,
+  gpuProfileButtonHtml as nsightGpuProfileButtonHtml,
+  sessionsSectionHtml as nsightSessionsSectionHtml,
+  bindNsightActions,
+} from '/js/modules/mesh-detail-nsight.js';
 
 let currentNodeId = null;
 let nodeData = null;
@@ -43,6 +52,10 @@ const MeshDetailScreen = {
     content.innerHTML = renderSkeleton();
     bindBack(content);
 
+    // Modul nsight rerenderuje detail po starcie/stopie/usuwaniu sesji
+    // niezaleznie od interval'u (lepszy UX niz czekanie do kolejnego tick'a).
+    initNsight({ onChange: () => renderDetail() });
+
     await loadNode();
     renderDetail();
 
@@ -59,6 +72,7 @@ const MeshDetailScreen = {
       document.removeEventListener('visibilitychange', visibilityListener);
       visibilityListener = null;
     }
+    cleanupNsight();
     currentNodeId = null;
     nodeData = null;
   },
@@ -78,6 +92,11 @@ async function loadNode() {
   } catch (err) {
     const age = lastFetchAt ? (Date.now() - lastFetchAt) / 1000 : Infinity;
     if (age > 30) wasDisconnected = true;
+  }
+  // Lista sesji nsight w drugiej rownoleglej drodze — niezalezna od heartbeatu.
+  // Bledy sa swallow'owane wewnatrz modulu, wiec nie kasujemy nodeData.
+  if (nodeData && nodeData.nsys_available === true) {
+    await loadNsightSessions(currentNodeId);
   }
 }
 
@@ -184,12 +203,13 @@ function renderDetail() {
           <div class="name">${escapeHtml(hostname)}${n.is_local ? ` <tf-chip status="accent">${escapeHtml(I18n.t('mesh.local'))}</tf-chip>` : ''}</div>
           ${statusChip}
         </div>
-        <div class="mesh-detail-actions"></div>
+        <div class="mesh-detail-actions">${nsightTopbarHtml(n)}</div>
       </div>
       <div class="mesh-detail-sysinfo">${systemInfo}</div>
       ${vramBar}
       <div class="mesh-detail-grid">${cpuMemory}</div>
       ${gpuCards}
+      ${nsightSessionsSectionHtml(n)}
       ${networkInterfaces}
       ${modelsList}
       ${containersTable}
@@ -197,6 +217,7 @@ function renderDetail() {
   `;
   bindBack(content);
   bindContainerActions(content);
+  bindNsightActions(content, n);
 }
 
 function isOnline(n) {
@@ -313,9 +334,13 @@ function buildGpuCards(n) {
     const power = (g.power_draw_w != null && g.power_limit_w)
       ? `${Math.round(g.power_draw_w)}W / ${Math.round(g.power_limit_w)}W`
       : (g.power_draw_w != null ? `${Math.round(g.power_draw_w)}W` : '—');
+    const profileBtn = nsightGpuProfileButtonHtml(n, g, idx);
     return `
       <div class="mesh-detail-card gpu-card">
-        <div class="card-head">GPU ${idx}: ${escapeHtml(g.name || '—')}</div>
+        <div class="card-head">
+          <span class="gpu-card-title">GPU ${idx}: ${escapeHtml(g.name || '—')}</span>
+          ${profileBtn}
+        </div>
         <div class="row"><span>${escapeHtml(I18n.t('mesh.usage'))}</span><span>${Math.round(usage)}%</span></div>
         <div class="bar"><div class="bar-fill ${gaugeLevel(usage)}" style="width:${Math.min(100, usage)}%"></div></div>
         <div class="row"><span>VRAM</span><span>${formatMb(g.vram_used_mb || 0)} / ${formatMb(g.vram_total_mb || 0)}</span></div>
