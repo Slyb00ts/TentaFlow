@@ -10,7 +10,7 @@
 import { escapeHtml, escapeAttr, toast, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
-import { nsightStart, nsightStop, nsightSessions, nsightDelete } from '/js/protocol/nsight.js';
+import { nsightStart, nsightStop, nsightSessions, nsightDelete, nsightDownload } from '/js/protocol/nsight.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-select.js';
@@ -148,10 +148,9 @@ function sessionRowHtml(s) {
     ? `<div class="session-error" title="${escapeAttr(s.error)}">${escapeHtml(truncate(s.error, 80))}</div>`
     : '';
   const isRunning = s.status === 'Running' || s.status === 'Stopping';
-  const reportDisabled = isRunning ? 'disabled' : '';
-  // Pobranie .nsys-rep wymaga chunked binary protocol (PR6) — przycisk jest
-  // widoczny ale wylaczony, zeby user widzial co bedzie dostepne.
-  const downloadDisabled = 'disabled';
+  const isDone = s.status === 'Done';
+  const reportDisabled = isDone ? '' : 'disabled';
+  const downloadDisabled = isDone ? '' : 'disabled';
   return `
     <tr data-session-id="${escapeAttr(s.sessionId)}">
       <td>${escapeHtml(ts)}</td>
@@ -209,6 +208,31 @@ export function bindNsightActions(root, node) {
       if (!sid) return;
       const { Router } = await import('/js/router.js');
       Router.navigate('profile-report', { nodeId: node.node_id, sessionId: sid });
+      return;
+    }
+    if (action === 'nsight-download') {
+      const sid = btn.dataset.sessionId;
+      if (!sid) return;
+      try {
+        const resp = await nsightDownload({ nodeId: node.node_id, sessionId: sid });
+        const bytes = resp?.bytes;
+        const filename = resp?.filename || `${sid}.nsys-rep`;
+        if (!bytes || !(bytes.byteLength || bytes.length)) {
+          throw new Error('empty payload');
+        }
+        const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const blob = new Blob([u8], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (err) {
+        toast(`${I18n.t('nsight.session.error')}: ${err.message || err}`, 'error');
+      }
       return;
     }
     if (action === 'nsight-delete') {
