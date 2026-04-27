@@ -879,7 +879,7 @@ async fn do_embedded_native_deploy(
             })
             .to_string();
 
-            upsert_native_service(
+            let service_id = upsert_native_service(
                 db,
                 node_id,
                 &service_name,
@@ -888,6 +888,14 @@ async fn do_embedded_native_deploy(
                 &config_json,
                 "single",
             )?;
+            ensure_model_registry_entry(
+                db,
+                "whisper-large-v3-turbo",
+                "Whisper Large V3 Turbo",
+                "stt",
+                service_id,
+                &config_json,
+            );
 
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
@@ -941,10 +949,18 @@ async fn do_embedded_native_deploy(
                 "sample_rate": info.sample_rate,
             })
             .to_string();
-            upsert_native_service(
+            let service_id = upsert_native_service(
                 db, node_id, &service_name, "tts", Some("tts"),
                 &config_json, "single",
             )?;
+            ensure_model_registry_entry(
+                db,
+                &model_repo,
+                &format!("Kokoro 82M MLX ({})", model_repo),
+                "tts",
+                service_id,
+                &config_json,
+            );
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
             log_line(db, deploy_id, tx, "log", &format!("Kokoro TTS gotowe: {}", service_name));
             let _ = service_manager;
@@ -989,7 +1005,7 @@ async fn do_embedded_native_deploy(
                 "sample_rate": info.sample_rate,
             })
             .to_string();
-            upsert_native_service(
+            let service_id = upsert_native_service(
                 db,
                 node_id,
                 &service_name,
@@ -998,6 +1014,14 @@ async fn do_embedded_native_deploy(
                 &config_json,
                 "single",
             )?;
+            ensure_model_registry_entry(
+                db,
+                &format!("apple-tts-{}", voice_id),
+                &format!("Apple TTS ({})", voice_id),
+                "tts",
+                service_id,
+                &config_json,
+            );
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
             log_line(
                 db,
@@ -1047,7 +1071,7 @@ async fn do_embedded_native_deploy(
             })
             .to_string();
 
-            upsert_native_service(
+            let service_id = upsert_native_service(
                 db,
                 node_id,
                 &service_name,
@@ -1056,6 +1080,16 @@ async fn do_embedded_native_deploy(
                 &config_json,
                 "single",
             )?;
+            // mlx-whisper bug fix: dodaj wpis w model_registry zeby model byl
+            // widoczny w panelu Modele (wczesniej tylko Serwisy).
+            ensure_model_registry_entry(
+                db,
+                &model_repo,
+                &format!("MLX Whisper ({})", model_repo),
+                "stt",
+                service_id,
+                &config_json,
+            );
 
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
@@ -1696,6 +1730,44 @@ fn upsert_native_service(
     }
 
     Ok(row_id)
+}
+
+/// Rejestruje wpis w `model_registry` dla nowo zdeployowanego embedded silnika.
+/// Wczesniej deploy embedded (Whisper, Apple TTS, Kokoro, llama.cpp...) tworzyl
+/// tylko `services` row — w panelu "Modele" silnik byl niewidoczny mimo ze w
+/// "Serwisach" istnial. Po tej funkcji model pojawia sie w obu zakladkach.
+/// Idempotentne: jezeli wpis o `model_name` juz istnieje, nie duplikuje.
+fn ensure_model_registry_entry(
+    db: &DbPool,
+    model_name: &str,
+    display_name: &str,
+    service_type: &str,
+    service_id: i64,
+    config_json: &str,
+) {
+    use crate::db::models::NewModelEntry;
+    // Check existing — `list_models` zwraca wszystkie wpisy.
+    let existing = crate::db::repository::list_model_entries(db, 0, 1000).unwrap_or_default();
+    if existing.iter().any(|m| m.model_name == model_name) {
+        return;
+    }
+    let params = NewModelEntry {
+        model_name,
+        display_name: Some(display_name),
+        service_type,
+        connection_type: "local",
+        service_id: Some(service_id),
+        flow_id: None,
+        is_public: true,
+        config_json,
+    };
+    if let Err(e) = crate::db::repository::create_model_entry(db, &params) {
+        tracing::warn!(
+            "ensure_model_registry_entry({}): {}",
+            model_name,
+            e
+        );
+    }
 }
 
 /// Rejestruje HTTP backend (OpenAI-compatible) dla natywnie uruchomionego

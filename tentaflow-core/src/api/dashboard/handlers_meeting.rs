@@ -175,16 +175,27 @@ pub async fn meeting_session_start(
         } else {
             Some(r.tts_alias.clone())
         },
-        // Wire protocol ma jedno pole llm_alias — teams-bot (T1.5) rozdziela
-        // LLM na summarization (końcowe podsumowanie) i flow (orchestrator).
-        // Póki frontend/protocol nie dodadzą flow_alias osobno, pojedynczy wire
-        // alias trafia do summarization; flow_alias używa domyślnego teams-flow.
+        // Wire protocol ma jedno pole llm_alias — teams-bot rozdziela LLM na:
+        //   * summarization (okresowe podsumowanie, default teams-summarization)
+        //   * llm (real-time odpowiedzi bota, default teams-llm)
+        //   * flow (orchestrator, default teams-flow)
+        // Aktualnie wire `llm_alias` mapuje sie i na summarization i na llm
+        // jednoczesnie — caller posylajacy `llm_alias` chce miec ten sam model
+        // na obu rolach. Operator moze pozniej rozdzielic w dashboardzie.
         summarization_alias: if r.llm_alias.is_empty() {
             None
         } else {
             Some(r.llm_alias.clone())
         },
         flow_alias: None,
+        llm_alias: if r.llm_alias.is_empty() {
+            None
+        } else {
+            Some(r.llm_alias.clone())
+        },
+        // Bot odpowiada w real-time tylko gdy caller jawnie poda llm_alias.
+        // Dashboard moze dodac osobny przycisk respond_enabled.
+        respond_enabled: if r.llm_alias.is_empty() { Some(false) } else { Some(true) },
     };
     let desc = ctx
         .state

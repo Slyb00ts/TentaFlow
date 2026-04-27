@@ -63,10 +63,26 @@ pub struct MeetingConfig {
     #[serde(default = "default_tts_alias")]
     pub tts_alias: String,
 
+    /// Alias LLM uzywany do generowania ODPOWIEDZI bota w real-time
+    /// (oddzielny od `summarization_alias` ktory tylko robi summary).
+    /// Pusty string lub brak modelu wpiętego pod ten alias = bot nie odpowiada.
+    #[serde(default = "default_llm_alias")]
+    pub llm_alias: String,
+
     /// Alias flow w routerze (rezerwacja — flow jest rozwiazywany przez router,
     /// bot trzyma pole dla spojnosci i przyszlego uzycia).
     #[serde(default = "default_flow_alias")]
     pub flow_alias: String,
+
+    /// Czy bot ma odpowiadac w meeting'u (LLM -> TTS). Wymaga `llm_alias`
+    /// wpietego na model. Default false zeby starsze deploymenty nie zaczęly
+    /// nagle rozmawiać.
+    #[serde(default)]
+    pub respond_enabled: bool,
+
+    /// Systemowy prompt dla LLM odpowiadajacego (rola bota w spotkaniu).
+    #[serde(default = "default_response_prompt")]
+    pub response_prompt: String,
 
     /// Nazwa bota wyswietlana w spotkaniu Teams
     #[serde(default = "default_bot_name")]
@@ -158,6 +174,17 @@ fn default_tts_alias() -> String {
 
 fn default_flow_alias() -> String {
     "teams-flow".to_string()
+}
+
+fn default_llm_alias() -> String {
+    "teams-llm".to_string()
+}
+
+fn default_response_prompt() -> String {
+    "Jestes uprzejmym asystentem w spotkaniu Teams. Odpowiadasz krotko (1-2 \
+zdania), tylko gdy ktos zadaje konkretne pytanie skierowane do bota lub gdy \
+twoja interwencja moze pomoc. Jezeli mowa nie wymaga reakcji, odpowiedz \
+dokladnie '<NO_RESPONSE>' bez zadnego innego tekstu.".to_string()
 }
 
 fn default_summarization_interval_sec() -> u64 {
@@ -287,6 +314,14 @@ impl MeetingConfig {
                 .unwrap_or_else(|_| "teams-tts".to_string()),
             flow_alias: std::env::var("FLOW_ALIAS")
                 .unwrap_or_else(|_| "teams-flow".to_string()),
+            llm_alias: std::env::var("LLM_ALIAS")
+                .unwrap_or_else(|_| "teams-llm".to_string()),
+            respond_enabled: std::env::var("RESPOND_ENABLED")
+                .ok()
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false),
+            response_prompt: std::env::var("RESPONSE_PROMPT")
+                .unwrap_or_else(|_| default_response_prompt()),
             bot_name: std::env::var("BOT_NAME")
                 .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
