@@ -95,6 +95,13 @@ pub struct MeetingConfig {
     #[serde(default = "default_wake_words")]
     pub wake_words: String,
 
+    /// Lista wake_words po splitcie/trim/lowercase, kompilowana raz w
+    /// `validate()`. Trzymana zeby `matches_wake_word` na hot-pathie STT
+    /// nie alokowal Vec/String per kazda wypowiedz. `#[serde(skip)]` —
+    /// zrodlem prawdy jest `wake_words` (CSV z TOML/env).
+    #[serde(skip)]
+    pub wake_words_compiled: Vec<String>,
+
     /// Systemowy prompt dla LLM odpowiadajacego (rola bota w spotkaniu).
     #[serde(default = "default_response_prompt")]
     pub response_prompt: String,
@@ -316,7 +323,7 @@ impl MeetingConfig {
                 return Self::from_env();
             }
 
-            let config: MeetingConfig = toml::from_str(&content)
+            let mut config: MeetingConfig = toml::from_str(&content)
                 .with_context(|| format!("Bledny format TOML w: {}", path.display()))?;
 
             config.validate()?;
@@ -328,7 +335,7 @@ impl MeetingConfig {
 
     /// Laduje konfiguracje ze zmiennych srodowiskowych (fallback gdy brak pliku TOML)
     fn from_env() -> Result<Self> {
-        let config = MeetingConfig {
+        let mut config = MeetingConfig {
             meeting_url: std::env::var("MEETING_URL").unwrap_or_default(),
             auth_cookies_path: std::env::var("AUTH_COOKIES_PATH")
                 .unwrap_or_else(|_| "/tmp/cookies.json".to_string()),
@@ -365,6 +372,7 @@ impl MeetingConfig {
                 .unwrap_or_else(|_| default_response_mode()),
             wake_words: std::env::var("WAKE_WORDS")
                 .unwrap_or_else(|_| default_wake_words()),
+            wake_words_compiled: Vec::new(),
             intent_prompt: std::env::var("INTENT_PROMPT")
                 .unwrap_or_else(|_| default_intent_prompt()),
             bot_name: std::env::var("BOT_NAME")
@@ -398,14 +406,24 @@ impl MeetingConfig {
         Ok(config)
     }
 
-    /// Walidacja poprawnosci konfiguracji
-    fn validate(&self) -> Result<()> {
+    /// Walidacja poprawnosci konfiguracji. Przy okazji kompiluje
+    /// `wake_words_compiled` z CSV `wake_words` raz, zeby hot-path
+    /// `matches_wake_word` nie powtarzal split/trim/lowercase per
+    /// kazdy STT result.
+    fn validate(&mut self) -> Result<()> {
         // meeting_url moze byc pusty — kontener startuje bez spotkania,
         // URL podaje sie pozniej komenda join przez QUIC
 
         if self.chunk_duration_ms < 100 || self.chunk_duration_ms > 5000 {
             anyhow::bail!("chunk_duration_ms musi byc w zakresie 100-5000");
         }
+
+        self.wake_words_compiled = self
+            .wake_words
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         Ok(())
     }
@@ -501,7 +519,7 @@ mod tests {
             auth_cookies_path = "/tmp/cookies.json"
         "#;
 
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        let mut config: MeetingConfig = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_ok());
     }
 
@@ -514,7 +532,7 @@ mod tests {
             chunk_duration_ms = 50
         "#;
 
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        let mut config: MeetingConfig = toml::from_str(toml_str).unwrap();
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("chunk_duration_ms"));
@@ -529,7 +547,7 @@ mod tests {
             chunk_duration_ms = 10000
         "#;
 
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        let mut config: MeetingConfig = toml::from_str(toml_str).unwrap();
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("chunk_duration_ms"));
@@ -548,7 +566,7 @@ mod tests {
                 duration
             );
 
-            let config: MeetingConfig = toml::from_str(&toml_str).unwrap();
+            let mut config: MeetingConfig = toml::from_str(&toml_str).unwrap();
             assert!(config.validate().is_ok(), "chunk_duration_ms={} powinno przejsc", duration);
         }
     }

@@ -59,3 +59,7 @@ harness = false
 [[bench]]
 name = "vad_chunk_processing"
 harness = false
+
+[[bench]]
+name = "wake_word_match"
+harness = false
