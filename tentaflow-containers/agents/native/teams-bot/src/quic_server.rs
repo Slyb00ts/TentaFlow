@@ -253,13 +253,25 @@ impl RouterClient {
         }
     }
 
-    /// Wysyla tekst do TTS przez router (alias podany w `model`).
-    pub async fn synthesize(
+    /// Streamujaca synteza mowy: otwiera bidi stream do routera, wysyla
+    /// `ModelRequest` z `stream=true`, czyta `ModelStreamChunk` w petli.
+    /// Dla kazdego `AudioChunk(bytes)` wola `on_chunk(pcm)` — caller
+    /// dostaje raw PCM (16 kHz mono i16 LE) i moze pchac do mikrofonu na
+    /// biezaco zamiast czekac na pelny bufor.
+    ///
+    /// Kontrakt callbacka: zwroc `Ok(())` zeby kontynuowac, `Err(_)` zeby
+    /// zerwac strumien. Callback nie powinien blokowac — backend produkuje
+    /// chunki tak szybko jak potrafi sie.
+    pub async fn synthesize_stream<F>(
         &self,
         text: &str,
         voice: &str,
         model: &str,
-    ) -> Result<Vec<u8>> {
+        mut on_chunk: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Vec<u8>) -> Result<()>,
+    {
         let request = ModelRequest {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload: ModelPayload::Audio(AudioPayload {
@@ -271,19 +283,47 @@ impl RouterClient {
                     speed: None,
                 },
             }),
-            stream: false,
+            stream: true,
             metadata: None,
             session_id: None,
         };
 
-        let response = self.send_request(&request).await?;
-        match response.result {
-            ModelResult::Audio(audio) => match audio.data {
-                AudioResultData::Audio(bytes) => Ok(bytes),
-                _ => anyhow::bail!("TTS zwrocil nieoczekiwany typ danych"),
-            },
-            ModelResult::Error(e) => anyhow::bail!("TTS blad: {}", e.message),
-            _ => anyhow::bail!("Nieoczekiwany typ odpowiedzi TTS"),
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi do routera (TTS stream): {e}"))?;
+
+        write_frame(&mut send, &request)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ModelRequest (TTS stream): {e}"))?;
+        send.finish().ok();
+
+        loop {
+            let chunk = read_frame::<ModelStreamChunk>(&mut recv)
+                .await
+                .map_err(|e| anyhow::anyhow!("read ModelStreamChunk: {e}"))?;
+            let Some(chunk) = chunk else {
+                // Strumien zamkniety bez Done — traktujemy jako koniec
+                // (sztywne wymagania na Done dawalyby false-positive errory
+                // przy benignym FIN od routera).
+                return Ok(());
+            };
+            match chunk.chunk {
+                StreamChunkType::AudioChunk(pcm) => {
+                    on_chunk(pcm)?;
+                }
+                StreamChunkType::Done { .. } => return Ok(()),
+                StreamChunkType::Error(err) => {
+                    anyhow::bail!("TTS stream blad: {}", err.message);
+                }
+                // Pozostale typy (TextDelta, Metadata itp.) dla TTS sa
+                // nieoczekiwane — logujemy i ignorujemy zamiast bail!,
+                // zeby przejsciowe nieoczekiwane chunki nie zrywaly sesji.
+                other => {
+                    debug!("TTS stream: nieoczekiwany typ chunka: {:?}", other);
+                }
+            }
         }
     }
 }

@@ -13,7 +13,7 @@ mod quic_server;
 mod summarizer;
 mod vad;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arc_swap::ArcSwap;
 use clap::Parser;
 use std::path::PathBuf;
@@ -996,35 +996,56 @@ async fn main() -> Result<()> {
                                 None
                             };
                             if let Some(reply) = response_text {
-                                match tokio::time::timeout(
+                                // Streamujace TTS: bot odbiera AudioChunk(pcm) i pcha
+                                // do mikrofonu na biezaco. Total bytes liczymy zeby
+                                // zaplanowac deferred clear is_bot_speaking po
+                                // czasie odtwarzania ostatniego chunka.
+                                is_bot_speaking.store(true, Ordering::Relaxed);
+                                let total_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                                let total_clone = Arc::clone(&total_bytes);
+                                let playback_for_chunks = Arc::clone(&audio_playback);
+                                let stream_result = tokio::time::timeout(
                                     std::time::Duration::from_secs(30),
-                                    client.synthesize(&reply, "", tts_alias),
-                                ).await {
-                                    Ok(Ok(audio_bytes)) => {
-                                        match audio::parse_audio_payload(audio_bytes)
-                                            .context("parse tts wav")
-                                        {
-                                            Ok(pcm) => {
-                                                // Zablokuj capture na czas odtwarzania (len bajtow / 2 bps / sr).
-                                                let duration_ms = (pcm.len() as u64) * 1000 / (2 * 16_000);
-                                                is_bot_speaking.store(true, Ordering::Relaxed);
-                                                if let Err(e) = audio_playback.send(pcm) {
-                                                    tracing::warn!("Nie udalo sie wyslac TTS do mic bota: {}", e);
-                                                    is_bot_speaking.store(false, Ordering::Relaxed);
-                                                } else {
-                                                    tracing::info!(duration_ms, "TTS wyslany do mikrofonu bota");
-                                                    let flag = Arc::clone(&is_bot_speaking);
-                                                    tokio::spawn(async move {
-                                                        tokio::time::sleep(std::time::Duration::from_millis(duration_ms + 250)).await;
-                                                        flag.store(false, Ordering::Relaxed);
-                                                    });
-                                                }
-                                            }
-                                            Err(e) => tracing::warn!("TTS WAV malformed: {:#}", e),
-                                        }
+                                    client.synthesize_stream(&reply, "", tts_alias, move |pcm| {
+                                        total_clone.fetch_add(pcm.len(), Ordering::Relaxed);
+                                        playback_for_chunks
+                                            .send(pcm)
+                                            .map_err(|e| anyhow::anyhow!(
+                                                "audio_playback.send: {}", e
+                                            ))
+                                    }),
+                                ).await;
+                                let bytes = total_bytes.load(Ordering::Relaxed);
+                                // 16 kHz mono i16 LE = 32_000 B/s
+                                let duration_ms = (bytes as u64) * 1000 / 32_000;
+                                match stream_result {
+                                    Ok(Ok(())) => {
+                                        tracing::info!(
+                                            bytes,
+                                            duration_ms,
+                                            "TTS streaming zakonczony"
+                                        );
+                                        let flag = Arc::clone(&is_bot_speaking);
+                                        // Safety guard: nawet gdyby duration_ms == 0
+                                        // (zerowy stream), trzymamy flage min. 250 ms
+                                        // zeby capture nie wbil sie w trakcie zamykania
+                                        // mic injection w JS.
+                                        let hold_ms = duration_ms.max(250) + 250;
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_millis(hold_ms),
+                                            ).await;
+                                            flag.store(false, Ordering::Relaxed);
+                                        });
                                     }
-                                    Ok(Err(e)) => tracing::warn!("Blad TTS: {}", e),
-                                    Err(_) => tracing::warn!("TTS timeout po 30s"),
+                                    Ok(Err(e)) => {
+                                        tracing::warn!("Blad TTS streaming: {:#}", e);
+                                        is_bot_speaking.store(false, Ordering::Relaxed);
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!("TTS streaming timeout po 30s");
+                                        is_bot_speaking.store(false, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
