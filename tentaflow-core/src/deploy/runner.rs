@@ -910,6 +910,8 @@ async fn do_embedded_native_deploy(
                 Some("whisper".to_string()),
                 vec![stt_info.size_bytes / (1024 * 1024)],
             );
+            // Auto-bind alias `teams-stt` jezeli pusty.
+            auto_bind_teams_alias_if_empty(db, "teams-stt", &service_name, router);
 
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
@@ -981,6 +983,7 @@ async fn do_embedded_native_deploy(
                 Some("kokoro".to_string()),
                 vec![info.sample_rate as u64 / 1000],  // placeholder
             );
+            auto_bind_teams_alias_if_empty(db, "teams-tts", &service_name, router);
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
             log_line(db, deploy_id, tx, "log", &format!("Kokoro TTS gotowe: {}", service_name));
             let _ = service_manager;
@@ -1048,6 +1051,7 @@ async fn do_embedded_native_deploy(
                 Some("apple-tts".to_string()),
                 vec![0],
             );
+            auto_bind_teams_alias_if_empty(db, "teams-tts", &service_name, router);
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
             log_line(
                 db,
@@ -1126,6 +1130,7 @@ async fn do_embedded_native_deploy(
                 Some("mlx-whisper".to_string()),
                 vec![stt_info.size_bytes / (1024 * 1024)],
             );
+            auto_bind_teams_alias_if_empty(db, "teams-stt", &service_name, router);
 
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
@@ -1766,6 +1771,46 @@ fn upsert_native_service(
     }
 
     Ok(row_id)
+}
+
+/// Auto-wiazanie aliasu teams-* do swiezo zdeployowanego serwisu, jezeli alias
+/// ma puste `target_model` (defaultowy stan po `ensure_teams_bot_defaults`).
+/// Bez tego router nie umie zresolvowac `teams-stt` -> konkretny model i bot
+/// dostaje "Mesh STT serwis nie polaczony". User wciaz moze zmienic w UI.
+fn auto_bind_teams_alias_if_empty(
+    db: &DbPool,
+    alias_name: &str,
+    target_service: &str,
+    router: &Arc<crate::routing::router::Router>,
+) {
+    use crate::db::repository;
+    let alias = match repository::resolve_model_alias(db, alias_name) {
+        Ok(Some(a)) => a,
+        _ => return,
+    };
+    if !alias.target_model.trim().is_empty() {
+        return; // user juz cos przypial — szanujemy
+    }
+    if let Err(e) = repository::update_model_alias(
+        db,
+        alias.id,
+        &alias.alias,
+        target_service,
+        true,
+        alias.fallback_targets.as_deref(),
+        alias.strategy.as_deref(),
+    ) {
+        tracing::warn!("auto_bind_teams_alias({}): {}", alias_name, e);
+        return;
+    }
+    // Wymus przeladowanie alias_cache w routerze (in-memory) zeby zmiana
+    // dzialala od razu, a nie po nastepnym sync z DB.
+    router.reload_alias_cache();
+    tracing::info!(
+        "Auto-wiazany alias '{}' -> '{}' (deployed STT/TTS service)",
+        alias_name,
+        target_service
+    );
 }
 
 /// Rejestruje wpis w `model_registry` dla nowo zdeployowanego embedded silnika.
