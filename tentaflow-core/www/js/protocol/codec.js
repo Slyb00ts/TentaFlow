@@ -1261,6 +1261,31 @@ export const encode = {
     );
   },
 
+  /**
+   * MessageBody::VisionBody(InferRequest). Dwa formaty obrazka:
+   *   - encoded JPEG/PNG/WEBP: podajesz tylko `image` (Uint8Array), bez width/height.
+   *   - raw RGB row-major: podajesz `image` + `width` + `height`.
+   *
+   * @param {string} correlationId
+   * @param {{ serviceName: string, image: Uint8Array, width?: number, height?: number }} args
+   * @param {number} sequence
+   */
+  visionInferRequest(correlationId, { serviceName, image, width, height }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVisionInferRequest(
+      serviceName,
+      image,
+      typeof width === 'number' ? width : undefined,
+      typeof height === 'number' ? height : undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // Fast-path patterns
   // -------------------------------------------------------------------------
