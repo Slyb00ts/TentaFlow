@@ -431,16 +431,25 @@ pub async fn mesh_node_command(
     };
 
     match qm.send_command(node_id, cmd).await {
-        Ok(response) => Ok(MessageBody::MeshNodeCommandResponseBody(
-            MeshNodeCommandResponse {
-                ok: response.success,
-                output: if response.output.is_empty() {
+        Ok(response) => {
+            // Typed payload → human-readable output dla dashboardu (pojedyncze pole
+            // `output: Option<String>` w MeshNodeCommandResponse). Serializujemy
+            // payload jako JSON, zeby UI moglo wyrenderowac strukturalna odpowiedz.
+            let output = match &response.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::Empty => None,
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::Text(t) if t.is_empty() => {
                     None
-                } else {
-                    Some(response.output)
+                }
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::Text(t) => Some(t.clone()),
+                other => serde_json::to_string(other).ok(),
+            };
+            Ok(MessageBody::MeshNodeCommandResponseBody(
+                MeshNodeCommandResponse {
+                    ok: response.ok,
+                    output,
                 },
-            },
-        )),
+            ))
+        }
         Err(e) => {
             warn!(node_id = %node_id, error = %e, "mesh_node_command failed");
             Err(ProtocolError::new(
@@ -537,13 +546,13 @@ pub async fn mesh_node_network_config(
                 None,
                 "mesh.network_config",
                 Some(&format!("node:{}/iface:{}", node_id, interface_name)),
-                Some(if response.success { "ok" } else { "failed" }),
+                Some(if response.ok { "ok" } else { "failed" }),
                 None,
                 Some(ctx.state.local_node_id.as_ref()),
             );
             Ok(MessageBody::MeshNodeNetworkConfigResponseBody(
                 MeshNodeNetworkConfigResponse {
-                    ok: response.success,
+                    ok: response.ok,
                 },
             ))
         }

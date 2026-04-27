@@ -67,6 +67,17 @@ pub struct MeshPeerInfo {
     pub tokens_per_sec: f32,
 }
 
+/// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
+/// (np. NVIDIA Nsight Systems wymaga `vendor == Nvidia`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Other,
+}
+
 /// Informacje o GPU peera
 #[derive(Debug, Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
 pub struct PeerGpuInfo {
@@ -77,6 +88,9 @@ pub struct PeerGpuInfo {
     pub temperature_c: u32,
     pub power_draw_w: Option<f32>,
     pub power_limit_w: Option<f32>,
+    /// Producent GPU — wykrywany po nazwie/PCI. Domyslnie `Other` dopoki
+    /// detekcja nie jest podlaczona (PR2 doda klasyfikacje).
+    pub vendor: GpuVendor,
 }
 
 /// Informacje o nodzie — wymieniane przez QUIC po polaczeniu
@@ -796,6 +810,54 @@ impl MeshPeerStore {
             models: vec![],
             active_requests: 0,
             tokens_per_sec: 0.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_gpu_info_with_vendor_round_trip() {
+        let gpu = PeerGpuInfo {
+            name: "NVIDIA RTX 4090".to_string(),
+            vram_total_mb: 24576,
+            vram_used_mb: 8192,
+            usage_percent: 73.5,
+            temperature_c: 68,
+            power_draw_w: Some(310.0),
+            power_limit_w: Some(450.0),
+            vendor: GpuVendor::Nvidia,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gpu).expect("encode");
+        let decoded =
+            rkyv::from_bytes::<PeerGpuInfo, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        assert_eq!(decoded.name, gpu.name);
+        assert_eq!(decoded.vram_total_mb, gpu.vram_total_mb);
+        assert_eq!(decoded.vram_used_mb, gpu.vram_used_mb);
+        assert!((decoded.usage_percent - gpu.usage_percent).abs() < f32::EPSILON);
+        assert_eq!(decoded.temperature_c, gpu.temperature_c);
+        assert_eq!(decoded.power_draw_w, gpu.power_draw_w);
+        assert_eq!(decoded.power_limit_w, gpu.power_limit_w);
+        assert_eq!(decoded.vendor, GpuVendor::Nvidia);
+    }
+
+    #[test]
+    fn gpu_vendor_all_variants_round_trip() {
+        for v in [
+            GpuVendor::Nvidia,
+            GpuVendor::Amd,
+            GpuVendor::Intel,
+            GpuVendor::Apple,
+            GpuVendor::Other,
+        ] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).expect("encode");
+            let decoded =
+                rkyv::from_bytes::<GpuVendor, rkyv::rancor::Error>(&bytes).expect("decode");
+            assert_eq!(decoded, v);
         }
     }
 }
