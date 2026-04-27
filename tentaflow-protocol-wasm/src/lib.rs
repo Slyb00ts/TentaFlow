@@ -5260,6 +5260,8 @@ fn protocol_error_code_name(code: ProtocolErrorCode) -> &'static str {
         ProtocolErrorCode::Internal => "Internal",
         ProtocolErrorCode::NotFound => "NotFound",
         ProtocolErrorCode::BadRequest => "BadRequest",
+        ProtocolErrorCode::Conflict => "Conflict",
+        ProtocolErrorCode::NotAvailable => "NotAvailable",
     }
 }
 
