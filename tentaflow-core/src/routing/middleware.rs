@@ -196,10 +196,20 @@ impl Router {
             backends.push(BackendHandle::Rag(target.to_string()));
         }
 
-        // Mesh — szukaj na zdalnych nodach
+        // Mesh — szukaj na zdalnych nodach. KRYTYCZNE: pomijaj wlasny node,
+        // bo dla embedded STT/TTS (mlx-whisper, apple-tts, kokoro) ten sam
+        // serwis byl rejestrowany TYM ZE w mesh registry (zeby inne nody
+        // widzialy) PLUS jest dostepny lokalnie. Bez tego filtru dispatcher
+        // probuje MeshForward przez QUIC do siebie samego, dostaje
+        // 'Mesh STT serwis nie polaczony' bo nie ma quic clienta na
+        // wlasnym embedded silniku.
         let registry = self.service_manager.mesh_registry.read();
         if let Some(ref reg) = *registry {
+            let local_node = reg.local_node_id().to_string();
             for svc in reg.visible_services() {
+                if svc.node_id == local_node {
+                    continue;
+                }
                 if svc.models.iter().any(|m| m == target) && svc.status == "running" {
                     backends.push(BackendHandle::MeshForward(
                         svc.node_id.clone(),
