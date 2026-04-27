@@ -903,8 +903,25 @@ async fn spawn_console_forwarder(page: &Page) {
                         })
                         .collect();
                     let msg = args_text.join(" ");
-                    // Filtruj szum (wiadomosci z naszego bridge maja prefix "[tentaflow]")
-                    if msg.contains("[tentaflow]") {
+                    // Spam'owe wiadomosci z browser_inject.js (audio pipeline
+                    // rebuild co 5s, AudioContext state, video tick co 5s,
+                    // track UNMUTE/ENDED na każdym renegotiate) — daj je na
+                    // `debug!` zeby normalny `info` log byl czytelny. Istotne
+                    // (transkrypty, bledy) zostają na info/warn.
+                    let is_noise = msg.contains("REBUILD capture pipeline")
+                        || msg.contains("rebuild — re-attach")
+                        || msg.contains("AudioContext state:")
+                        || msg.contains("ScriptProcessor podlaczony")
+                        || msg.contains("Podlaczono stream z")
+                        || msg.contains("track UNMUTE")
+                        || msg.contains("track ENDED")
+                        || msg.contains("[tentaflow][video] tick")
+                        || msg.contains("Wyslano chunk 500ms")
+                        || msg.contains("track.stop() zablokowany");
+
+                    if is_noise {
+                        tracing::debug!(target: "js_console", level = %level, "{}", msg);
+                    } else if msg.contains("[tentaflow]") {
                         tracing::info!(target: "js_console", level = %level, "{}", msg);
                     } else if level.to_lowercase().contains("error") {
                         tracing::warn!(target: "js_console", level = %level, "{}", msg);

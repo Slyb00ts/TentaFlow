@@ -206,10 +206,37 @@ impl Router {
 
         match route_result {
             Ok(result) => Ok(result),
-            Err(_) => Err(CoreError::ModelNotFound {
-                model_name: format!("TTS nie znaleziono backendow dla modelu '{}'", tts_model),
+            Err(_) => {
+                // Diagnostyka: gdy alias (np. `teams-tts`) faktycznie istnieje
+                // w DB ale `target_model` jest pusty albo wskazuje na nieistniejacy
+                // serwis, log pokazuje user'owi co dokladnie trzeba zrobic.
+                if let Some(ref db) = self.db {
+                    if let Ok(Some(alias)) = crate::db::repository::resolve_model_alias(db, &tts_model) {
+                        if alias.target_model.trim().is_empty() {
+                            tracing::warn!(
+                                alias = %tts_model,
+                                "TTS: alias istnieje ale target_model jest pusty — zdeployuj jakikolwiek TTS (Apple/Kokoro/Sherpa) zeby sie auto-wpial"
+                            );
+                        } else {
+                            tracing::warn!(
+                                alias = %tts_model,
+                                target = %alias.target_model,
+                                "TTS: alias wskazuje na '{}' ale serwis nie ma backendu QUIC (deploy?, mesh disconnect?)",
+                                alias.target_model
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            model = %tts_model,
+                            "TTS: model nie jest aliasem ani serwisem — sprawdz czy serwis TTS jest zdeployowany"
+                        );
+                    }
+                }
+                Err(CoreError::ModelNotFound {
+                    model_name: format!("TTS nie znaleziono backendow dla modelu '{}'", tts_model),
+                }
+                .into())
             }
-            .into()),
         }
     }
 
