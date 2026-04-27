@@ -36,14 +36,6 @@ pub fn bridge_addr(port: u16) -> String {
 /// Rozmiar bufora kanalu capture (liczba chunkow)
 const CAPTURE_BUFFER: usize = 64;
 
-/// Pojedynczy wpis listy uczestnikow spotkania. Zasilany od dom_observer
-/// (push-based DOM bridge); main.rs uzywa go do STT metadata (`roster` JSON).
-#[derive(Debug, Clone)]
-pub struct RosterEntry {
-    pub name: String,
-    pub status: String,
-}
-
 /// Odbiornik probek PCM z Chromium (monoton 16kHz i16, chunki ~256ms)
 pub struct AudioCapture {
     rx: mpsc::Receiver<Vec<i16>>,
