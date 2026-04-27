@@ -156,3 +156,5 @@ test-results/
 *.backup
 .gstack/
 notes/*.md.claude/
+
+.claude/
