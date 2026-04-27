@@ -1,28 +1,33 @@
-# Manifest serwisu Kyutai TTS — streaming TTS od Kyutai Labs.
-# Model bazowy: `kyutai/tts-1.6b-en_fr` (1.8B params), CC-BY 4.0.
-# Architektura: Moshi-style hierarchical Transformer + Mimi codec.
-# Wymaga PyTorch — Docker dla wszystkich platform.
+# Manifest serwisu Kyutai Pocket TTS — UWAGA: maly model 100M params (~200 MB).
+# Dziala na CPU bez GPU, 6x realtime na MacBook Air M4. Strumieniowy.
+# 200 ms latencji do pierwszego chunka, English only (wiecej jezykow w planie).
+# python-bundle dla wszystkich platform desktop + Docker dla Linux/Windows.
 
 [engine]
 id = "kyutai-tts"
 category = "tts"
 resource_kind = "ai"
-name = "Kyutai TTS"
-description_pl = "Streaming TTS Kyutai 1.8B (EN+FR). Architektura Moshi + Mimi codec, voice conditioning."
-description_en = "Streaming Kyutai TTS 1.8B (EN/FR). Moshi-style + Mimi codec, voice conditioning."
-homepage = "https://kyutai.org/next/tts"
-license = "CC-BY 4.0 (weights), Apache-2.0/MIT (code)"
+name = "Kyutai Pocket TTS"
+description_pl = "Maly TTS 100M parametrow (~200 MB). Streaming, CPU-only, ~6x realtime na M-series. EN."
+description_en = "Tiny 100M-param TTS (~200 MB). Streaming, CPU-only, ~6x realtime on M-series. EN."
+homepage = "https://kyutai.org/pocket-tts"
+license = "CC-BY 4.0"
 icon = "kyutai"
 default_port = 5023
 api = "openai-compatible"
-version = "1.0.0"
+version = "2.0.0"
 
 [deploy.docker]
 context_path = "tts/docker/kyutai-tts"
 platforms = ["linux", "windows", "macos"]
 
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "python-bundle"
+bundle_path = "tts/python/kyutai-tts"
+
 [[model_preset]]
-id = "tts-1-6b-en-fr"
-display_name = "Kyutai TTS 1.6B (EN+FR)"
-repo = "kyutai/tts-1.6b-en_fr"
+id = "pocket-tts-en"
+display_name = "Pocket TTS (EN, 100M, CPU)"
+repo = "kyutai/pocket-tts-without-voice-cloning"
 recommended = true
