@@ -5973,6 +5973,21 @@ fn nsight_payload_to_js(obj: &js_sys::Object, payload: tentaflow_protocol::Nsigh
             set(obj, "sessionId", r.session_id.into());
             set(obj, "ok", r.ok.into());
         }
+        NP::DownloadRequest(r) => {
+            set(obj, "variant", "NsightDownloadRequest".into());
+            set(obj, "nodeId", r.node_id.into());
+            set(obj, "sessionId", r.session_id.into());
+        }
+        NP::DownloadResponse(r) => {
+            set(obj, "variant", "NsightDownloadResponse".into());
+            set(obj, "sessionId", r.session_id.into());
+            set(obj, "filename", r.filename.into());
+            set(
+                obj,
+                "bytes",
+                js_sys::Uint8Array::from(r.bytes.as_slice()).into(),
+            );
+        }
     }
 }
 
@@ -6034,6 +6049,17 @@ pub fn encode_nsight_delete_request(
 ) -> Result<Vec<u8>, JsError> {
     encode_nsight(tentaflow_protocol::NsightPayload::DeleteRequest(
         tentaflow_protocol::NsightDeleteRequest { node_id, session_id },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::DownloadRequest(..)).
+#[wasm_bindgen(js_name = encodeNsightDownloadRequest)]
+pub fn encode_nsight_download_request(
+    node_id: String,
+    session_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_nsight(tentaflow_protocol::NsightPayload::DownloadRequest(
+        tentaflow_protocol::NsightDownloadRequest { node_id, session_id },
     ))
 }
 

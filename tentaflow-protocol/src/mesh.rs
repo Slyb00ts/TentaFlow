@@ -8,9 +8,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 use crate::profiling::{
-    NsightDeleteRequest, NsightDeleteResponse, NsightReportRequest, NsightReportResponse,
-    NsightSessionsRequest, NsightSessionsResponse, NsightStartRequest, NsightStartResponse,
-    NsightStopRequest, NsightStopResponse,
+    NsightDeleteRequest, NsightDeleteResponse, NsightDownloadRequest, NsightDownloadResponse,
+    NsightReportRequest, NsightReportResponse, NsightSessionsRequest, NsightSessionsResponse,
+    NsightStartRequest, NsightStartResponse, NsightStopRequest, NsightStopResponse,
 };
 
 fn default_service_status() -> String {
@@ -534,6 +534,8 @@ pub enum MeshCommandType {
     NsightReport(NsightReportRequest),
     /// Nsight: usuniecie raportu i metadanych sesji.
     NsightDelete(NsightDeleteRequest),
+    /// Nsight: pobranie surowego pliku `.nsys-rep` (binary blob).
+    NsightDownload(NsightDownloadRequest),
 }
 
 // =============================================================================
@@ -579,6 +581,8 @@ pub enum MeshCommandResponsePayload {
     NsightReport(NsightReportResponse),
     /// Nsight: potwierdzenie usuniecia.
     NsightDelete(NsightDeleteResponse),
+    /// Nsight: surowa zawartosc pliku `.nsys-rep`.
+    NsightDownload(NsightDownloadResponse),
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -694,6 +698,11 @@ impl std::fmt::Debug for MeshCommandType {
                 .finish(),
             Self::NsightDelete(req) => f
                 .debug_struct("NsightDelete")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::NsightDownload(req) => f
+                .debug_struct("NsightDownload")
                 .field("node_id", &req.node_id)
                 .field("session_id", &req.session_id)
                 .finish(),

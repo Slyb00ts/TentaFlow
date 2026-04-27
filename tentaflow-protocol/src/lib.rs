@@ -29,7 +29,8 @@ pub mod profiling;
 pub use types::*;
 pub use mesh::*;
 pub use profiling::{
-    GpuUtilSample, GpuUtilSeries, NsightDeleteRequest, NsightDeleteResponse, NsightGpuTarget,
+    GpuUtilSample, GpuUtilSeries, NsightDeleteRequest, NsightDeleteResponse,
+    NsightDownloadRequest, NsightDownloadResponse, NsightGpuTarget,
     NsightReportRequest, NsightReportResponse, NsightScope, NsightSessionEntry,
     NsightSessionStatus, NsightSessionsRequest, NsightSessionsResponse, NsightStartRequest,
     NsightStartResponse, NsightStopRequest, NsightStopResponse, NsightPayload, ProfileKpi,
