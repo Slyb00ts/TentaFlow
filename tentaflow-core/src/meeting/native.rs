@@ -30,6 +30,8 @@ pub struct SpawnRequest {
     pub summarization_alias: String,
     pub tts_alias: String,
     pub flow_alias: String,
+    pub llm_alias: String,
+    pub respond_enabled: bool,
 }
 
 /// Wynik spawn — PID subprocesu (do logowania) + nazwa "kontenera" zgodna
@@ -109,6 +111,8 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
         .env("SUMMARIZATION_ALIAS", &req.summarization_alias)
         .env("TTS_ALIAS", &req.tts_alias)
         .env("FLOW_ALIAS", &req.flow_alias)
+        .env("LLM_ALIAS", &req.llm_alias)
+        .env("RESPOND_ENABLED", if req.respond_enabled { "true" } else { "false" })
         .env("TRANSPORT_PORT", req.ports.quic.to_string())
         .env("TENTAFLOW_BRIDGE_PORT", req.ports.bridge.to_string())
         // Native = host network namespace, broadcast mDNS i DHT bylby widoczny

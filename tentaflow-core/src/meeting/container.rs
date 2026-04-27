@@ -36,6 +36,10 @@ pub struct SpawnRequest {
     pub summarization_alias: String,
     pub tts_alias: String,
     pub flow_alias: String,
+    /// Alias LLM odpowiadającego (real-time chat). Zwykle `teams-llm`.
+    pub llm_alias: String,
+    /// Czy bot ma odpowiadać w meetingu (LLM → TTS).
+    pub respond_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +274,8 @@ pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
         format!("SUMMARIZATION_ALIAS={}", req.summarization_alias),
         format!("TTS_ALIAS={}", req.tts_alias),
         format!("FLOW_ALIAS={}", req.flow_alias),
+        format!("LLM_ALIAS={}", req.llm_alias),
+        format!("RESPOND_ENABLED={}", if req.respond_enabled { "true" } else { "false" }),
     ]
 }
 
@@ -294,6 +300,8 @@ mod tests {
             summarization_alias: sum.to_string(),
             tts_alias: tts.to_string(),
             flow_alias: flow.to_string(),
+            llm_alias: "teams-llm".to_string(),
+            respond_enabled: false,
         }
     }
 

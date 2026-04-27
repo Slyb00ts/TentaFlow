@@ -10,8 +10,15 @@ use crate::db::models::FlowParams;
 use crate::db::{repository, DbPool};
 
 /// Nazwy aliasów używanych przez teams-bota — pusty `target_model` sygnalizuje
-/// że user powinien przypisać konkretny model w UI.
-const TEAMS_ALIASES: &[&str] = &["teams-stt", "teams-summarization", "teams-tts"];
+/// że user powinien przypisać konkretny model w UI. `teams-llm` jest LLM
+/// generujacy odpowiedzi bota w real-time, oddzielny od `teams-summarization`
+/// ktory robi okresowe podsumowania.
+const TEAMS_ALIASES: &[&str] = &[
+    "teams-stt",
+    "teams-summarization",
+    "teams-tts",
+    "teams-llm",
+];
 
 /// Nazwa domyślnego flow dla teams-bota.
 const TEAMS_FLOW_NAME: &str = "teams-flow";

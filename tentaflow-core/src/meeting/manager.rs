@@ -65,6 +65,8 @@ pub struct StartSessionRequest {
     pub summarization_alias: Option<String>,
     pub tts_alias: Option<String>,
     pub flow_alias: Option<String>,
+    pub llm_alias: Option<String>,
+    pub respond_enabled: Option<bool>,
 }
 
 /// Domyślne aliasy przekazywane do kontenera teams-bota, jeśli caller nie
@@ -74,6 +76,7 @@ pub const DEFAULT_STT_ALIAS: &str = "teams-stt";
 pub const DEFAULT_SUMMARIZATION_ALIAS: &str = "teams-summarization";
 pub const DEFAULT_TTS_ALIAS: &str = "teams-tts";
 pub const DEFAULT_FLOW_ALIAS: &str = "teams-flow";
+pub const DEFAULT_LLM_ALIAS: &str = "teams-llm";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDescriptor {
@@ -191,7 +194,9 @@ impl MeetingManager {
         let bot_endpoint_id = hex::encode(secret.public().as_bytes());
 
         // Efektywne aliasy — nadpisanie od callera lub domyślne z T1.5.
-        let (stt_alias, summarization_alias, tts_alias, flow_alias) = resolve_aliases(&req);
+        let (stt_alias, summarization_alias, tts_alias, flow_alias, llm_alias) =
+            resolve_aliases(&req);
+        let respond_enabled = req.respond_enabled.unwrap_or(false);
 
         // Alokuj porty + spawn — drogi rozne per backend, ale na koniec obie maja
         // ten sam efekt: serwis zarejestrowany w ServiceManager z iroh URL i
@@ -231,6 +236,8 @@ impl MeetingManager {
                     summarization_alias: summarization_alias.clone(),
                     tts_alias: tts_alias.clone(),
                     flow_alias: flow_alias.clone(),
+                    llm_alias: llm_alias.clone(),
+                    respond_enabled,
                 };
 
                 match container::spawn(&spawn_req).await {
@@ -282,6 +289,8 @@ impl MeetingManager {
                     summarization_alias: summarization_alias.clone(),
                     tts_alias: tts_alias.clone(),
                     flow_alias: flow_alias.clone(),
+                    llm_alias: llm_alias.clone(),
+                    respond_enabled,
                 };
 
                 if let Err(e) = native::spawn(&spawn_req).await {
@@ -464,7 +473,7 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
 /// Rozwiązuje aliasy z requesta do konkretnych stringów, używając domyślnych
 /// teams-* gdy caller nie nadpisze. Wyodrębnione żeby można było testować
 /// niezależnie od spawna kontenera.
-fn resolve_aliases(req: &StartSessionRequest) -> (String, String, String, String) {
+fn resolve_aliases(req: &StartSessionRequest) -> (String, String, String, String, String) {
     (
         req.stt_alias
             .clone()
@@ -478,14 +487,17 @@ fn resolve_aliases(req: &StartSessionRequest) -> (String, String, String, String
         req.flow_alias
             .clone()
             .unwrap_or_else(|| DEFAULT_FLOW_ALIAS.to_string()),
+        req.llm_alias
+            .clone()
+            .unwrap_or_else(|| DEFAULT_LLM_ALIAS.to_string()),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_aliases, StartSessionRequest, DEFAULT_FLOW_ALIAS, DEFAULT_STT_ALIAS,
-        DEFAULT_SUMMARIZATION_ALIAS, DEFAULT_TTS_ALIAS,
+        resolve_aliases, StartSessionRequest, DEFAULT_FLOW_ALIAS, DEFAULT_LLM_ALIAS,
+        DEFAULT_STT_ALIAS, DEFAULT_SUMMARIZATION_ALIAS, DEFAULT_TTS_ALIAS,
     };
     use crate::db::migrations;
     use crate::db::repository;
@@ -510,23 +522,26 @@ mod tests {
             summarization_alias: sum.map(String::from),
             tts_alias: tts.map(String::from),
             flow_alias: flow.map(String::from),
+            llm_alias: None,
+            respond_enabled: None,
         }
     }
 
     #[test]
     fn resolve_aliases_falls_back_to_teams_defaults() {
         let req = make_req(None, None, None, None);
-        let (stt, sum, tts, flow) = resolve_aliases(&req);
+        let (stt, sum, tts, flow, llm) = resolve_aliases(&req);
         assert_eq!(stt, DEFAULT_STT_ALIAS);
         assert_eq!(sum, DEFAULT_SUMMARIZATION_ALIAS);
         assert_eq!(tts, DEFAULT_TTS_ALIAS);
         assert_eq!(flow, DEFAULT_FLOW_ALIAS);
+        assert_eq!(llm, DEFAULT_LLM_ALIAS);
     }
 
     #[test]
     fn resolve_aliases_honors_caller_overrides() {
         let req = make_req(Some("a"), Some("b"), Some("c"), Some("d"));
-        let (stt, sum, tts, flow) = resolve_aliases(&req);
+        let (stt, sum, tts, flow, _llm) = resolve_aliases(&req);
         assert_eq!(stt, "a");
         assert_eq!(sum, "b");
         assert_eq!(tts, "c");
@@ -536,7 +551,7 @@ mod tests {
     #[test]
     fn resolve_aliases_mixes_override_and_default() {
         let req = make_req(Some("custom-stt"), None, None, Some("custom-flow"));
-        let (stt, sum, tts, flow) = resolve_aliases(&req);
+        let (stt, sum, tts, flow, _llm) = resolve_aliases(&req);
         assert_eq!(stt, "custom-stt");
         assert_eq!(sum, DEFAULT_SUMMARIZATION_ALIAS);
         assert_eq!(tts, DEFAULT_TTS_ALIAS);
