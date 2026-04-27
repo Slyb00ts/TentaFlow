@@ -94,6 +94,38 @@ impl Router {
                 let handle = handle.clone();
                 async move {
                     match &handle {
+                        BackendHandle::LocalTts(name) => {
+                            // In-process syntezator (Apple/Kokoro/sherpa)
+                            // zarejestrowany w shared_tts_manager. Synteza
+                            // jest sync (Swift FFI / native), wiec idziemy
+                            // przez spawn_blocking zeby nie zatrzymywac
+                            // tokio reactor'a.
+                            let name = name.clone();
+                            let text = input_c.clone();
+                            let speed_v = speed;
+                            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, u32)> {
+                                let mgr = crate::tts::shared_tts_manager();
+                                let guard = mgr.blocking_read();
+                                let out = guard.synthesize(
+                                    &name,
+                                    crate::tts::SynthesizeParams {
+                                        text,
+                                        speaker_id: 0,
+                                        speed: speed_v,
+                                    },
+                                )?;
+                                Ok((out.samples, out.sample_rate))
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("LocalTts join: {e}"))??;
+                            let (samples, sr) = res;
+                            // Pakujemy jako WAV PCM16 — `synthesize_speech_stream`
+                            // strip'uje header tolerancyjnie. Surowe i16 LE
+                            // bez header'a tez by zadzialalo, ale WAV jest
+                            // bezpieczniejszy jezeli ktos uzywa wyniku spoza
+                            // streama (np. blocking sciezka z dashboardu).
+                            Ok(samples_to_wav_pcm16(&samples, sr))
+                        }
                         BackendHandle::QuicTts(name) => {
                             let quic_client = this
                                 .service_manager
@@ -281,6 +313,34 @@ impl Router {
         }
         Ok(())
     }
+}
+
+/// Pakuje samples f32 [-1, 1] do WAV PCM16 mono. Header 44B + dane.
+/// Apple/Kokoro zwracaja f32; downstream (`synthesize_speech_stream`)
+/// strip'uje WAV header i wysyla raw PCM klientowi.
+fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let n = samples.len();
+    let data_size = (n * 2) as u32;
+    let mut out = Vec::with_capacity(44 + n * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36u32 + data_size).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * 2;
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_size.to_le_bytes());
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 /// Wyciaga raw PCM z WAV po skanowaniu chunkow `fmt `/`data` (parser
