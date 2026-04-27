@@ -1736,5 +1736,21 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE meeting_sessions ADD COLUMN backend_total_participants INTEGER;
         ",
     ),
+    (
+        60,
+        "teams_bot_wake_words",
+        "
+            -- Slowa aktywujace odpowiedz teams-bota (wake words).
+            -- Kazdy wpis = jedno slowo (case-insensitive substring match w mowie).
+            -- Domyslne wartosci sa wstawiane przy starcie tentaflow przez
+            -- `ensure_teams_bot_defaults`, jezeli tabela jest pusta.
+            CREATE TABLE IF NOT EXISTS teams_bot_wake_words (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                word TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        ",
+    ),
 ]
 }

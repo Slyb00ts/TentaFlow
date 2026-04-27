@@ -535,9 +535,12 @@ impl Router {
                 continue;
             }
 
-            // Natywny STT (Whisper)
+            // Natywny STT (whisper.cpp lub mlx-whisper) — oba wpinaja sie
+            // w shared_stt_manager przez ten sam mechanizm `load_model`
+            // z preferred_backend = engine_id.
             if svc.service_type == "stt" {
-                if config["engine"].as_str() != Some("whisper") {
+                let engine_id = config["engine"].as_str().unwrap_or("");
+                if !matches!(engine_id, "whisper" | "mlx-whisper") {
                     continue;
                 }
                 let model_path_str = config["model_path"].as_str().unwrap_or("");
@@ -553,18 +556,20 @@ impl Router {
                 }
 
                 info!(
-                    "Przywracanie natywnego STT '{}': model={}",
+                    "Przywracanie natywnego STT '{}': engine={} model={}",
                     svc.name,
+                    engine_id,
                     model_path.display()
                 );
 
                 let shared_stt = crate::stt::shared_stt_manager();
                 let mp = model_path.clone();
+                let preferred = engine_id.to_string();
                 let load_result = tokio::task::spawn_blocking(move || {
                     let rt = tokio::runtime::Handle::current();
                     rt.block_on(async {
                         let mut mgr = shared_stt.write().await;
-                        mgr.load_model(&mp, None, None).await
+                        mgr.load_model(&mp, None, Some(&preferred)).await
                     })
                 })
                 .await;
@@ -573,10 +578,14 @@ impl Router {
                     Ok(Ok(stt_info)) => {
                         info!("Przywrocono STT '{}' ({})", stt_info.name, stt_info.device);
                         let size_mb = stt_info.size_bytes / (1024 * 1024);
+                        let model_label = config["deployed_model"]
+                            .as_str()
+                            .unwrap_or("whisper-large-v3-turbo")
+                            .to_string();
                         self.register_native_service_in_mesh(
                             &svc.name,
                             "stt",
-                            vec!["whisper-large-v3-turbo".to_string()],
+                            vec![model_label],
                             Some(stt_info.backend.clone()),
                             vec![size_mb],
                         );
@@ -588,6 +597,59 @@ impl Router {
                         warn!("Blad tasku STT '{}': {}", svc.name, e);
                     }
                 }
+                continue;
+            }
+
+            // Natywny TTS embedded (apple-tts, kokoro). Rejestruje silnik
+            // w shared_tts_manager() pod nazwa serwisu zeby router mogl
+            // dispatche'owac /v1/audio/speech do tej instancji.
+            if svc.service_type == "tts" {
+                let engine_id = config["engine"].as_str().unwrap_or("");
+                #[cfg(feature = "inference-apple-tts")]
+                if engine_id == "apple-tts" {
+                    info!("Przywracanie Apple TTS '{}'", svc.name);
+                    let mut e = crate::tts::apple_tts::AppleTtsEngine::new();
+                    use crate::tts::TtsEngine;
+                    if let Err(err) = e.load_model(std::path::Path::new("system")) {
+                        warn!("Apple TTS restore '{}': {}", svc.name, err);
+                    } else {
+                        let shared = crate::tts::shared_tts_manager();
+                        let mut mgr = shared.write().await;
+                        mgr.register(svc.name.clone(), Box::new(e));
+                        self.register_native_service_in_mesh(
+                            &svc.name, "tts",
+                            vec![config["deployed_model"].as_str().unwrap_or("zosia-pl").to_string()],
+                            Some("apple-tts".to_string()), vec![0],
+                        );
+                    }
+                    continue;
+                }
+                #[cfg(feature = "inference-mlx-kokoro")]
+                if engine_id == "kokoro" {
+                    let model_path_str = config["model_path"].as_str().unwrap_or("");
+                    let model_path = std::path::PathBuf::from(model_path_str);
+                    if !model_path.exists() {
+                        warn!("Kokoro restore '{}': brak sciezki {}", svc.name, model_path.display());
+                        continue;
+                    }
+                    info!("Przywracanie Kokoro TTS '{}': model={}", svc.name, model_path.display());
+                    let mut e = crate::tts::mlx_kokoro::MlxKokoroEngine::new();
+                    use crate::tts::TtsEngine;
+                    if let Err(err) = e.load_model(&model_path) {
+                        warn!("Kokoro restore '{}': {}", svc.name, err);
+                    } else {
+                        let shared = crate::tts::shared_tts_manager();
+                        let mut mgr = shared.write().await;
+                        mgr.register(svc.name.clone(), Box::new(e));
+                        self.register_native_service_in_mesh(
+                            &svc.name, "tts",
+                            vec![config["deployed_model"].as_str().unwrap_or("kokoro").to_string()],
+                            Some("kokoro".to_string()), vec![0],
+                        );
+                    }
+                    continue;
+                }
+                let _ = engine_id;
                 continue;
             }
 

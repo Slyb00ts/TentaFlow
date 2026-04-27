@@ -22,17 +22,32 @@ use crate::db::{repository, DbPool};
 pub const QUIC_RANGE: (u16, u16) = (7000, 8000);
 pub const VNC_RANGE: (u16, u16) = (5100, 6100);
 pub const NOVNC_RANGE: (u16, u16) = (6100, 7000);
+/// Zakres dla mostu WS audio (bot natywny). Docker dziala w wlasnym network
+/// namespace, wiec uzywa stalego portu 9999 wewnatrz kontenera. Native bot
+/// dziala w network namespace hosta, kazda sesja musi miec wlasny port.
+pub const BRIDGE_RANGE: (u16, u16) = (9000, 9900);
 
 pub const KIND_QUIC: &str = "quic";
 pub const KIND_VNC: &str = "vnc";
 pub const KIND_NOVNC: &str = "novnc";
+pub const KIND_BRIDGE: &str = "bridge";
 
-/// Trójka portów zaalokowanych dla jednej sesji.
+/// Trójka portów zaalokowanych dla jednej sesji w Dockerze (QUIC + VNC + noVNC
+/// dla podgladu kontenera). Bridge port nie jest tu potrzebny, bo Docker ma
+/// wlasny network namespace.
 #[derive(Debug, Clone, Copy)]
 pub struct AllocatedPorts {
     pub quic: u16,
     pub vnc: u16,
     pub novnc: u16,
+}
+
+/// Para portow dla sesji native (QUIC + bridge WS audio). VNC nie jest
+/// potrzebne — bot otwiera Chromium na wyswietlaczu uzytkownika.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeAllocatedPorts {
+    pub quic: u16,
+    pub bridge: u16,
 }
 
 /// Alokuje trzy niezależne porty, zapisuje rezerwację w DB pod `session_id`.
@@ -61,6 +76,28 @@ pub fn allocate_for_session(pool: &DbPool, session_id: i64) -> Result<AllocatedP
         }
     };
     Ok(AllocatedPorts { quic, vnc, novnc })
+}
+
+/// Alokuje porty native: QUIC (UDP) + bridge WS (TCP). Brak VNC/noVNC.
+pub fn allocate_for_native_session(
+    pool: &DbPool,
+    session_id: i64,
+) -> Result<NativeAllocatedPorts> {
+    let quic = match reserve_one(pool, session_id, KIND_QUIC, QUIC_RANGE, PortKind::Udp) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = repository::transcripts::release_session_ports(pool, session_id);
+            return Err(e);
+        }
+    };
+    let bridge = match reserve_one(pool, session_id, KIND_BRIDGE, BRIDGE_RANGE, PortKind::Tcp) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = repository::transcripts::release_session_ports(pool, session_id);
+            return Err(e);
+        }
+    };
+    Ok(NativeAllocatedPorts { quic, bridge })
 }
 
 /// Zwalnia wszystkie porty przypisane do sesji.

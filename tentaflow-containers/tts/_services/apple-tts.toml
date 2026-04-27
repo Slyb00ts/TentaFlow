@@ -1,0 +1,47 @@
+# Manifest serwisu Apple TTS — natywny `AVSpeechSynthesizer` macOS/iOS.
+# Glosy zainstalowane w systemie: Zosia (pl-PL), Daniel (en-GB),
+# Samantha (en-US), Karen (en-AU) i ~70 innych. Bez sieci, bez modelu na
+# dysku — caly silnik jest w systemie operacyjnym.
+#
+# Implementacja: `tentaflow-desktop/macos/swift/MLXBridge/Sources/MLXBridge/Tts/AppleTtsEngine.swift`
+# (Swift dylib) + `tentaflow-core/src/tts/apple_tts.rs` (Rust TtsEngine).
+
+[engine]
+id = "apple-tts"
+category = "tts"
+resource_kind = "ai"
+name = "Apple TTS"
+description_pl = "Natywny synteza mowy macOS/iOS przez AVSpeechSynthesizer. Polski glos Zosia bez instalacji."
+description_en = "Native macOS/iOS speech synthesis via AVSpeechSynthesizer. Polish Zosia voice built-in."
+homepage = "https://developer.apple.com/documentation/avfoundation/avspeechsynthesizer"
+license = "Proprietary (Apple system)"
+icon = "apple"
+default_port = 5021
+api = "openai-compatible"
+version = "1.0.0"
+
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-apple-tts"
+
+[[model_preset]]
+id = "zosia-pl"
+display_name = "Zosia (pl-PL)"
+repo = "system"
+recommended = true
+
+[[model_preset]]
+id = "samantha-en"
+display_name = "Samantha (en-US)"
+repo = "system"
+
+[[model_preset]]
+id = "daniel-en-gb"
+display_name = "Daniel (en-GB)"
+repo = "system"
+
+[[model_preset]]
+id = "karen-en-au"
+display_name = "Karen (en-AU)"
+repo = "system"

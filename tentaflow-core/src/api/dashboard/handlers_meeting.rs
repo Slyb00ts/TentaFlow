@@ -175,16 +175,32 @@ pub async fn meeting_session_start(
         } else {
             Some(r.tts_alias.clone())
         },
-        // Wire protocol ma jedno pole llm_alias — teams-bot (T1.5) rozdziela
-        // LLM na summarization (końcowe podsumowanie) i flow (orchestrator).
-        // Póki frontend/protocol nie dodadzą flow_alias osobno, pojedynczy wire
-        // alias trafia do summarization; flow_alias używa domyślnego teams-flow.
+        // Wire protocol ma jedno pole llm_alias — teams-bot rozdziela LLM na:
+        //   * summarization (okresowe podsumowanie, default teams-summarization)
+        //   * llm (real-time odpowiedzi bota, default teams-llm)
+        //   * flow (orchestrator, default teams-flow)
+        // Aktualnie wire `llm_alias` mapuje sie i na summarization i na llm
+        // jednoczesnie — caller posylajacy `llm_alias` chce miec ten sam model
+        // na obu rolach. Operator moze pozniej rozdzielic w dashboardzie.
         summarization_alias: if r.llm_alias.is_empty() {
             None
         } else {
             Some(r.llm_alias.clone())
         },
         flow_alias: None,
+        llm_alias: if r.llm_alias.is_empty() {
+            None
+        } else {
+            Some(r.llm_alias.clone())
+        },
+        // Bot odpowiada w real-time tylko gdy caller jawnie poda llm_alias.
+        // Dashboard moze dodac osobny przycisk respond_enabled.
+        respond_enabled: if r.llm_alias.is_empty() { Some(false) } else { Some(true) },
+        // Default: pasywny tryb wake_word_intent (bot odpowiada tylko gdy
+        // ktos powie "jarvis"/"asystencie" + LLM uzna to za realne pytanie).
+        // Dashboard moze nadpisac jezeli protocol zostanie rozszerzony.
+        response_mode: None,
+        wake_words: None,
     };
     let desc = ctx
         .state
@@ -664,6 +680,63 @@ pub fn meeting_transcript_export(
 
     Ok(MessageBody::MeetingBody(MeetingPayload::ResTranscriptExport(
         MeetingTranscriptExportResponse { content: out },
+    )))
+}
+
+// =============================================================================
+// Wake-words CRUD (1 sub-action: list/create/toggle/delete). Pojedynczy
+// handler bo limit 256 wariantow MessageBody — caller robi router-side
+// dispatch przez `WakeWordOp` enum. Wynik to zawsze pelna lista (klient nie
+// musi robic refetch po mutacji).
+// =============================================================================
+
+#[handler(variant = "MeetingWakeWordRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn meeting_wake_word(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = meeting_payload(req)?;
+    let MeetingPayload::ReqWakeWord(r) = payload else {
+        return Err(bad_request("expected ReqWakeWord"));
+    };
+    use tentaflow_protocol::WakeWordOp;
+    use crate::db::repository;
+    match &r.op {
+        WakeWordOp::List => {}
+        WakeWordOp::Create { word } => {
+            let trimmed = word.trim();
+            if trimmed.is_empty() || trimmed.len() > 64 {
+                return Err(bad_request("wake word puste lub za dlugie (max 64)"));
+            }
+            if trimmed.contains(',') {
+                return Err(bad_request("przecinek niedozwolony (separator CSV)"));
+            }
+            repository::add_wake_word(&ctx.state.db, trimmed).map_err(internal)?;
+        }
+        WakeWordOp::Toggle { id, enabled } => {
+            repository::set_wake_word_enabled(&ctx.state.db, *id, *enabled)
+                .map_err(internal)?;
+        }
+        WakeWordOp::Delete { id } => {
+            repository::delete_wake_word(&ctx.state.db, *id).map_err(internal)?;
+        }
+    }
+    let words = repository::list_wake_words(&ctx.state.db).map_err(internal)?;
+    let proto_words: Vec<tentaflow_protocol::WakeWord> = words
+        .into_iter()
+        .map(|w| tentaflow_protocol::WakeWord {
+            id: w.id,
+            word: w.word,
+            enabled: w.enabled,
+            created_at: w.created_at,
+        })
+        .collect();
+    Ok(MessageBody::MeetingBody(MeetingPayload::ResWakeWord(
+        tentaflow_protocol::MeetingWakeWordResponse {
+            words: proto_words,
+        },
     )))
 }
 

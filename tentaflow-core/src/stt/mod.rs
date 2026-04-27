@@ -6,6 +6,8 @@
 pub mod audio;
 #[cfg(feature = "inference-whisper")]
 pub mod whisper;
+#[cfg(feature = "inference-mlx-whisper")]
+pub mod mlx_whisper;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -166,6 +168,13 @@ impl SttManager {
 
         #[cfg(feature = "inference-whisper")]
         engines.push(Box::new(whisper::WhisperEngine::new()));
+
+        // mlx-whisper PRZED whisper.cpp — gdy uzytkownik ma macOS i wybral
+        // engine "mlx-whisper" przez preferred_backend, zostanie znaleziony.
+        // Bez preferred_backend nadal idziemy na pierwszy (whisper.cpp), zeby
+        // istniejaca konfiguracja nie zmienila zachowania niezauwazenie.
+        #[cfg(feature = "inference-mlx-whisper")]
+        engines.push(Box::new(mlx_whisper::MlxWhisperEngine::new()));
 
         Self {
             engines,
