@@ -40,12 +40,12 @@ pub type ForwardHandler = Arc<
         + Sync,
 >;
 
-/// Odpowiedz komendy mesh — compat z QuicMeshManager.
+/// Odpowiedz komendy mesh — typed payload zamiast string output.
 #[derive(Debug, Clone)]
 pub struct CommandWaitResponse {
     pub command_id: String,
-    pub success: bool,
-    pub output: String,
+    pub ok: bool,
+    pub payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
     pub error: Option<String>,
 }
 
@@ -1200,8 +1200,8 @@ impl IrohMeshManager {
         self.send_command_and_wait_bytes(target_node_id, command_id, data, Duration::from_secs(600))
             .await
             .map(|r| crate::mesh::command_executor::CommandResponse {
-                success: r.success,
-                output: r.output,
+                ok: r.ok,
+                payload: r.payload,
                 error: r.error,
             })
     }
@@ -1264,20 +1264,20 @@ impl IrohMeshManager {
         }
     }
 
-    /// Rozwiazuje oczekujacego waiter gdy nadejdzie CommandResponse.
+    /// Rozwiazuje oczekujacego waiter gdy nadejdzie CommandResponse z typed payloadem.
     pub async fn resolve_command_waiter(
         &self,
         command_id: &str,
-        success: bool,
-        output: &str,
-        error: Option<&str>,
+        ok: bool,
+        payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
+        error: Option<String>,
     ) -> bool {
         if let Some((_, tx)) = self.command_waiters.remove(command_id) {
             let _ = tx.send(CommandWaitResponse {
                 command_id: command_id.to_string(),
-                success,
-                output: output.to_string(),
-                error: error.map(String::from),
+                ok,
+                payload,
+                error,
             });
             true
         } else {
@@ -1294,17 +1294,19 @@ impl IrohMeshManager {
 
     /// Obsluzyc odpowiedz na komende otrzymana od peera.
     pub async fn handle_command_response_received(&self, _from_node_id: &str, data: &[u8]) {
-        // Parse JSON: { command_id, success, output, error? } i rozwiaz waiter.
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
-            let command_id = val.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
-            let success = val
-                .get("success")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let output = val.get("output").and_then(|v| v.as_str()).unwrap_or("");
-            let error = val.get("error").and_then(|v| v.as_str());
-            if !command_id.is_empty() {
-                self.resolve_command_waiter(command_id, success, output, error)
+        // Wire format: JSON envelope { command_id, ok, payload, error? } gdzie
+        // `payload` to serde-zserializowany MeshCommandResponsePayload.
+        #[derive(serde::Deserialize)]
+        struct ResponseEnvelope {
+            command_id: String,
+            ok: bool,
+            payload: tentaflow_protocol::mesh::MeshCommandResponsePayload,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        if let Ok(env) = serde_json::from_slice::<ResponseEnvelope>(data) {
+            if !env.command_id.is_empty() {
+                self.resolve_command_waiter(&env.command_id, env.ok, env.payload, env.error)
                     .await;
             }
         }

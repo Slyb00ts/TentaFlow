@@ -563,6 +563,7 @@ impl PeerManager {
                             temperature_c: f32::from(g.temperature_c) as u32,
                             power_draw_w: None,
                             power_limit_w: None,
+                            vendor: crate::mesh::peer_store::GpuVendor::Other,
                         })
                         .collect();
 
@@ -1198,6 +1199,7 @@ mod tests {
             temperature_c: 70,
             power_draw_w: None,
             power_limit_w: None,
+            vendor: crate::mesh::peer_store::GpuVendor::Other,
         }];
 
         mgr.update_peer_metrics("peer-1", 45.0, 8000, 16000, gpus, 2.5, 10);
@@ -1345,6 +1347,7 @@ mod tests {
                 temperature_c: 60,
                 power_draw_w: None,
                 power_limit_w: None,
+                vendor: crate::mesh::peer_store::GpuVendor::Other,
             },
             PeerGpuInfo {
                 name: "GPU 1".to_string(),
@@ -1354,6 +1357,7 @@ mod tests {
                 temperature_c: 65,
                 power_draw_w: None,
                 power_limit_w: None,
+                vendor: crate::mesh::peer_store::GpuVendor::Other,
             },
         ];
         mgr.update_peer_metrics("peer-1", 30.0, 8000, 16000, gpus, 2.0, 5);
