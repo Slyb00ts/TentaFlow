@@ -1385,6 +1385,80 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Nsight (NVIDIA Nsight Systems profiling) — start/stop/sessions/report/delete
+  // -------------------------------------------------------------------------
+
+  /**
+   * MessageBody::NsightBody(NsightPayload::StartRequest).
+   * `scope` przyjmuje przyjazna dla UI forme:
+   *   - 'cpu' | 'gpu_all' | 'both_all'
+   *   - { kind: 'gpu_index', idx: 3 } | { kind: 'both_index', idx: 1 }
+   */
+  nsightStartRequest(correlationId, { nodeId, scope, durationSecs, label }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNsightStartRequest(
+      String(nodeId),
+      scope,
+      Number(durationSecs) >>> 0,
+      String(label ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NsightBody(NsightPayload::StopRequest). */
+  nsightStopRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNsightStopRequest(String(nodeId), String(sessionId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NsightBody(NsightPayload::SessionsRequest). */
+  nsightSessionsRequest(correlationId, { nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNsightSessionsRequest(String(nodeId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NsightBody(NsightPayload::ReportRequest). */
+  nsightReportRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNsightReportRequest(String(nodeId), String(sessionId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::NsightBody(NsightPayload::DeleteRequest). */
+  nsightDeleteRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNsightDeleteRequest(String(nodeId), String(sessionId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // SSO / TLS / NGC (FAZA 4)
   // -------------------------------------------------------------------------
 
