@@ -153,6 +153,23 @@ pub struct NsightDeleteResponse {
     pub ok: bool,
 }
 
+/// Request pobrania surowego pliku `.nsys-rep` (do otwarcia w nsys-ui).
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NsightDownloadRequest {
+    pub node_id: String,
+    pub session_id: String,
+}
+
+/// Odpowiedz: cala zawartosc pliku `.nsys-rep` jako jeden binary blob.
+/// `bytes` ma rzad 1-50 MB; rkyv pakuje to w pojedynczy alloc dla Vec<u8>.
+#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NsightDownloadResponse {
+    pub session_id: String,
+    /// Sugerowana nazwa pliku do zapisu po stronie klienta.
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
 // =============================================================================
 // Raport profilowania (ProfileReport + sub-struktury)
 // =============================================================================
@@ -274,6 +291,8 @@ pub enum NsightPayload {
     ReportResponse(NsightReportResponse),
     DeleteRequest(NsightDeleteRequest),
     DeleteResponse(NsightDeleteResponse),
+    DownloadRequest(NsightDownloadRequest),
+    DownloadResponse(NsightDownloadResponse),
 }
 
 // =============================================================================
@@ -407,6 +426,28 @@ mod tests {
         for v in &variants {
             let decoded = round_trip!(NsightScope, v.clone());
             assert_eq!(&decoded, v);
+        }
+    }
+
+    #[test]
+    fn nsight_download_response_large_blob_round_trip() {
+        // Smoke: 1 MB binary blob musi przejsc rkyv encode/decode bez utraty.
+        let bytes: Vec<u8> = (0..(1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        let resp = NsightDownloadResponse {
+            session_id: "sess-binary".to_string(),
+            filename: "nsight-sess-binary.nsys-rep".to_string(),
+            bytes: bytes.clone(),
+        };
+        let payload = NsightPayload::DownloadResponse(resp.clone());
+        let decoded = round_trip!(NsightPayload, payload.clone());
+        match decoded {
+            NsightPayload::DownloadResponse(d) => {
+                assert_eq!(d.session_id, resp.session_id);
+                assert_eq!(d.filename, resp.filename);
+                assert_eq!(d.bytes.len(), bytes.len());
+                assert_eq!(d.bytes, bytes);
+            }
+            _ => panic!("oczekiwano DownloadResponse"),
         }
     }
 

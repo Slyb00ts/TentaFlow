@@ -348,6 +348,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::NsightPayload::ReportResponse(_) => "NsightReportResponse",
             tentaflow_protocol::NsightPayload::DeleteRequest(_) => "NsightDeleteRequest",
             tentaflow_protocol::NsightPayload::DeleteResponse(_) => "NsightDeleteResponse",
+            tentaflow_protocol::NsightPayload::DownloadRequest(_) => "NsightDownloadRequest",
+            tentaflow_protocol::NsightPayload::DownloadResponse(_) => "NsightDownloadResponse",
         },
         MessageBody::SubscribeResumeRequest { .. } => "SubscribeResumeRequest",
         MessageBody::SubscribeResumeAck { .. } => "SubscribeResumeAck",

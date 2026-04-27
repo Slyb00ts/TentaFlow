@@ -1458,6 +1458,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::NsightBody(NsightPayload::DownloadRequest). */
+  nsightDownloadRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeNsightDownloadRequest(String(nodeId), String(sessionId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // SSO / TLS / NGC (FAZA 4)
   // -------------------------------------------------------------------------
