@@ -682,29 +682,61 @@ download_meeting_bot_assets() {
 
     if [[ -f "$model_file" ]]; then
         log_ok "Silero VAD juz istnieje ($(du -h "$model_file" | cut -f1))"
-        return
+    else
+        mkdir -p "$model_dir"
+        log_info "Pobieram Silero VAD: $silero_url"
+        if command -v curl &>/dev/null; then
+            if curl -fL "$silero_url" -o "$model_file"; then
+                log_ok "Silero VAD pobrany ($(du -h "$model_file" | cut -f1))"
+                INSTALLED+=("silero_vad.onnx (teams-bot)")
+            else
+                log_warn "Nie udalo sie pobrac Silero VAD — bot uzyje fallback RMS (gorsza jakosc VAD)"
+                rm -f "$model_file"
+            fi
+        elif command -v wget &>/dev/null; then
+            if wget -q -O "$model_file" "$silero_url"; then
+                log_ok "Silero VAD pobrany ($(du -h "$model_file" | cut -f1))"
+                INSTALLED+=("silero_vad.onnx (teams-bot)")
+            else
+                log_warn "Nie udalo sie pobrac Silero VAD — bot uzyje fallback RMS"
+                rm -f "$model_file"
+            fi
+        else
+            log_warn "Brak curl ani wget — pomijam pobieranie Silero VAD"
+        fi
     fi
 
-    mkdir -p "$model_dir"
-    log_info "Pobieram Silero VAD: $silero_url"
-    if command -v curl &>/dev/null; then
-        if curl -fL "$silero_url" -o "$model_file"; then
-            log_ok "Silero VAD pobrany ($(du -h "$model_file" | cut -f1))"
-            INSTALLED+=("silero_vad.onnx (teams-bot)")
-        else
-            log_warn "Nie udalo sie pobrac Silero VAD — bot uzyje fallback RMS (gorsza jakosc VAD)"
-            rm -f "$model_file"
-        fi
-    elif command -v wget &>/dev/null; then
-        if wget -q -O "$model_file" "$silero_url"; then
-            log_ok "Silero VAD pobrany ($(du -h "$model_file" | cut -f1))"
-            INSTALLED+=("silero_vad.onnx (teams-bot)")
-        else
-            log_warn "Nie udalo sie pobrac Silero VAD — bot uzyje fallback RMS"
-            rm -f "$model_file"
-        fi
+    # Diarization (WeSpeaker ResNet34 LM — 192-dim speaker embedding) —
+    # uzywany przez tentaflow-voice w trakcie STT zeby etykietowac mowcow.
+    # Bez tego diarization sie wylacza i wszyscy mowcy sa "Nieznany".
+    # Konkretny model zgadza sie z arch komentowana w wespeaker.rs (ECAPA-TDNN
+    # style 192-dim output), ale `wespeaker-voxceleb-resnet34-LM` to ResNet34
+    # — uzywamy dla najwyzszej dokladnosci (~26 MB).
+    local diar_dir="${script_dir}/models/diarization"
+    local diar_file="${diar_dir}/embedding.onnx"
+    local diar_url="https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/main/voxceleb_resnet34_LM.onnx"
+    if [[ -f "$diar_file" ]]; then
+        log_ok "WeSpeaker juz istnieje ($(du -h "$diar_file" | cut -f1))"
     else
-        log_warn "Brak curl ani wget — pomijam pobieranie Silero VAD"
+        mkdir -p "$diar_dir"
+        log_info "Pobieram WeSpeaker ResNet34 LM: $diar_url"
+        if command -v curl &>/dev/null; then
+            if curl -fL "$diar_url" -o "$diar_file"; then
+                log_ok "WeSpeaker pobrany ($(du -h "$diar_file" | cut -f1))"
+                INSTALLED+=("embedding.onnx (diarization)")
+            else
+                log_warn "Nie udalo sie pobrac WeSpeaker — diarization wylaczone (mowcy 'Nieznany')"
+                rm -f "$diar_file"
+            fi
+        elif command -v wget &>/dev/null; then
+            if wget -q -O "$diar_file" "$diar_url"; then
+                log_ok "WeSpeaker pobrany ($(du -h "$diar_file" | cut -f1))"
+                INSTALLED+=("embedding.onnx (diarization)")
+            else
+                log_warn "Nie udalo sie pobrac WeSpeaker — diarization wylaczone"
+                rm -f "$diar_file"
+            fi
+        fi
     fi
 }
 

@@ -459,25 +459,11 @@ fn walk_size(dir: &Path) -> Option<u64> {
     Some(total)
 }
 
-/// Minimalny parser WAV — przyjmuje PCM 16-bit mono LE. Pomija header (44 B)
-/// i konwertuje samples Int16 -> Float32 [-1, 1]. Caller (router/audio bridge)
-/// zapewnia ten format; format mismatch leci jako blad zamiast zgadywania.
+/// Dekoder audio: uzywa wspoldzielonego `crate::stt::audio::decode_to_pcm_f32`
+/// ktory akceptuje WAV / MP3 / OGG / raw PCM 16-bit LE 16 kHz mono. Bez tego
+/// teams-bot dostawal "Nie-WAV input" bo wysyla raw PCM bez RIFF headera
+/// (oszczedzajac na 44 B per chunk audio).
 fn decode_wav_to_f32(audio: &[u8]) -> Result<Vec<f32>> {
-    if audio.len() < 44 {
-        anyhow::bail!("WAV za krotki: {} B", audio.len());
-    }
-    // Walidujemy podstawowe pola RIFF zeby nie probowac dekodowac np. mp3.
-    if &audio[0..4] != b"RIFF" || &audio[8..12] != b"WAVE" {
-        anyhow::bail!("Nie-WAV input (brak RIFF/WAVE w headerze)");
-    }
-    let body = &audio[44..];
-    let n = body.len() / 2;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let lo = body[2 * i] as i16;
-        let hi = body[2 * i + 1] as i16;
-        let sample = (hi << 8) | (lo & 0xFF);
-        out.push(sample as f32 / 32768.0);
-    }
-    Ok(out)
+    crate::stt::audio::decode_to_pcm_f32(audio)
+        .map_err(|e| anyhow::anyhow!("decode audio: {}", e))
 }
