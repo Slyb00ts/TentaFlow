@@ -89,7 +89,14 @@ impl IrohEndpoint {
             ))
             .build();
 
-        let mut builder = Endpoint::builder(presets::N0::default())
+        // `presets::Minimal` daje tylko CryptoProvider (TLS) bez dodawania
+        // publishera pkarr ani relayow N0. Wczesniej uzywalismy `presets::N0`
+        // ktory zawsze pchal `PkarrPublisher::n0_dns()` -> publish do
+        // `https://dns.iroh.link/pkarr` i logowal `UnknownIssuer` w sieciach
+        // gdzie cert chain n0 nie jest zaufany. Skoro mamy wlasny relay
+        // (`relay.nextapp.pl`) i wlasne discovery (LAN mDNS + DHT mainline +
+        // trusted_contact hints), pkarr-DNS n0 nie jest nam potrzebny.
+        let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(config.secret_key.clone())
             .alpns(vec![
                 ALPN_MESH.to_vec(),
@@ -100,11 +107,18 @@ impl IrohEndpoint {
             .bind_addr(config.bind_addr)
             .map_err(|e| IrohEndpointError::InvalidBind(format!("{e:?}")))?;
 
-        if let Some(relay_url) = config.relay_url.clone() {
-            builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay_url)));
-        }
+        // Relay: zawsze ustawiamy custom map. `load_relay_url` w wywolawcy
+        // gwarantuje fallback do `relay.nextapp.pl`; jezeli mimo to dostaniemy
+        // None, wylaczamy relay calkowicie zamiast pozwolic iroh wpasc na
+        // staging/canary preset N0.
+        builder = match config.relay_url.clone() {
+            Some(url) => builder.relay_mode(RelayMode::Custom(RelayMap::from(url))),
+            None => builder.relay_mode(RelayMode::Disabled),
+        };
 
-        // DNS i Pkarr publisher uzywaja domyslnej n0 konfiguracji przez preset N0.
+        // Pkarr/DNS n0 swiadomie nie podlaczone — patrz komentarz przy
+        // `presets::Minimal` wyzej. `_` na importy zostawia je w prelude
+        // gdyby pozniejsza konfiguracja chciala je opcjonalnie dolaczyc.
         let _ = PkarrPublisher::n0_dns;
         let _ = DnsAddressLookup::n0_dns;
 
