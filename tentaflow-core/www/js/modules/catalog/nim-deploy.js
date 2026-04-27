@@ -18,7 +18,8 @@ export async function openNimDeployModal(container, preselectedNode = null) {
   let nodes = [];
   try {
     const resp = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
-    nodes = (resp || []).filter((n) => n.is_trusted === true || n.is_local === true);
+    // MeshNodeInfo proto nie ma `is_trusted` — uzywamy `source==="trusted"`.
+    nodes = (resp || []).filter((n) => n.is_local === true || n.source === 'trusted');
   } catch {
     // ignore
   }
