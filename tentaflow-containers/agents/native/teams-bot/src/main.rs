@@ -816,14 +816,59 @@ async fn main() -> Result<()> {
                                 }
                             }
 
-                            // TTS uruchamiamy TYLKO w echo_mode (tryb testowy). Bez tego
-                            // bot powtarza co uslyszal = nieskonczony feedback loop, nawet
-                            // ze self-speaking guardem. Docelowo LLM response pojdzie osobnym
-                            // polem w ModelResponse i wtedy to bedzie branch na llm_response.
-                            if config.echo_mode {
+                            // Pelen pipeline: LLM generuje odpowiedz na podstawie
+                            // ostatniej wypowiedzi, TTS syntezuje ja i odtwarza
+                            // przez mikrofon bota. Aktywne tylko gdy
+                            // `respond_enabled=true` i `llm_alias` ma wpiety model.
+                            // LLM moze odmowic odpowiedzi przez specjalny token
+                            // `<NO_RESPONSE>` — wtedy nic nie wysylamy do TTS.
+                            //
+                            // `echo_mode` zachowane jako tryb testowy (bot powtarza
+                            // input dokladnie); ma priorytet nad LLM zeby latwo
+                            // testowac TTS niezaleznie od LLM.
+                            let response_text: Option<String> = if config.echo_mode {
+                                Some(text.clone())
+                            } else if config.respond_enabled
+                                && !config.llm_alias.trim().is_empty()
+                            {
+                                let messages = vec![
+                                    ("system".to_string(), config.response_prompt.clone()),
+                                    ("user".to_string(), text.clone()),
+                                ];
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(20),
+                                    client.chat_completion(&config.llm_alias, messages),
+                                ).await {
+                                    Ok(Ok(resp)) => {
+                                        let trimmed = resp.content.trim().to_string();
+                                        if trimmed.is_empty() || trimmed.contains("<NO_RESPONSE>") {
+                                            None
+                                        } else {
+                                            tracing::info!(
+                                                alias = %config.llm_alias,
+                                                resolved = %resp.resolved_model,
+                                                "LLM response: {}",
+                                                trimmed.chars().take(120).collect::<String>()
+                                            );
+                                            Some(trimmed)
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::warn!("LLM response failed: {}", e);
+                                        None
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!("LLM response timeout 20s");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(reply) = response_text {
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(30),
-                                    client.synthesize(&text, "", tts_alias),
+                                    client.synthesize(&reply, "", tts_alias),
                                 ).await {
                                     Ok(Ok(audio_bytes)) => {
                                         match audio::parse_audio_payload(audio_bytes)
