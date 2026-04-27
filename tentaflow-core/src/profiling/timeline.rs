@@ -5,7 +5,8 @@
 //       sampling z Nsight).
 // =============================================================================
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 
 use rusqlite::Connection;
 use tentaflow_protocol::profiling::{GpuUtilSample, GpuUtilSeries, NsightGpuTarget};
@@ -29,16 +30,18 @@ const BIN_MS: u32 = 100;
 /// Eksportuje `.nsys-rep` do SQLite i wyciaga timeline GPU jako serie probek
 /// po 100ms. Brak tabeli `GPU_METRICS` (sesja bez `--gpu-metrics-device`)
 /// zwraca pusty Vec — to nie jest blad.
-pub async fn extract_gpu_timeline(
+pub(crate) async fn extract_gpu_timeline(
     rep_path: &Path,
     gpu_targets: &[NsightGpuTarget],
+    power_limits: &HashMap<u8, f32>,
 ) -> Result<Vec<GpuUtilSeries>, ProfilingError> {
-    let mut sqlite_path = PathBuf::from(rep_path);
-    let new_ext = match rep_path.extension().and_then(|e| e.to_str()) {
-        Some(_) => "sqlite",
-        None => "sqlite",
-    };
-    sqlite_path.set_extension(new_ext);
+    // Refuse symlinks: rep_path must be a regular file inside our storage tree.
+    let meta = tokio::fs::symlink_metadata(rep_path).await?;
+    if meta.file_type().is_symlink() {
+        return Err(ProfilingError::Parse("rep_path is symlink".into()));
+    }
+
+    let sqlite_path = rep_path.with_extension("sqlite");
 
     if !sqlite_path.exists() {
         let output = Command::new("nsys")
@@ -98,14 +101,12 @@ pub async fn extract_gpu_timeline(
 
     let mut out: Vec<GpuUtilSeries> = Vec::new();
     for (device_id, samples) in per_device {
-        let power_limit = gpu_targets
-            .iter()
-            .find(|t| t.idx == device_id)
-            .map(|_| 0.0_f32)
-            .unwrap_or(0.0);
+        // Mute unused-warning while keeping API stable for future per-target metadata.
+        let _ = gpu_targets;
+        let power_limit_w = power_limits.get(&device_id).copied().unwrap_or(0.0);
         out.push(GpuUtilSeries {
             gpu_idx: device_id,
-            power_limit_w: power_limit,
+            power_limit_w,
             samples: bin_samples_100ms(samples),
         });
     }
@@ -113,8 +114,9 @@ pub async fn extract_gpu_timeline(
     Ok(out)
 }
 
-/// Agreguje raw probki nsys (typowo 10ms) do binow 100ms — srednia sm/mem/vram,
-/// max power w binie. Pierwsza probka definiuje t=0; reszta liczy offset w ms.
+/// Agreguje raw probki nsys (typowo 10ms) do binow 100ms — srednia sm/mem,
+/// max vram/power w binie. VRAM uzywa max bo to peak occupancy w okienku jest
+/// istotny dla diagnostyki OOM, nie srednia. Pierwsza probka definiuje t=0.
 fn bin_samples_100ms(raw: Vec<RawGpuSample>) -> Vec<GpuUtilSample> {
     if raw.is_empty() {
         return Vec::new();
@@ -132,7 +134,7 @@ fn bin_samples_100ms(raw: Vec<RawGpuSample>) -> Vec<GpuUtilSample> {
         let n = group.len() as f32;
         let sm_avg: f32 = group.iter().map(|s| s.sm_active).sum::<f32>() / n;
         let dram_avg: f32 = group.iter().map(|s| s.dram_active).sum::<f32>() / n;
-        let vram_avg: f32 = group.iter().map(|s| s.fb_used_mb as f32).sum::<f32>() / n;
+        let vram_max: u32 = group.iter().map(|s| s.fb_used_mb).max().unwrap_or(0);
         let power_max: f32 = group
             .iter()
             .map(|s| s.power_w)
@@ -141,7 +143,7 @@ fn bin_samples_100ms(raw: Vec<RawGpuSample>) -> Vec<GpuUtilSample> {
             t_ms: bin_t,
             sm_pct: sm_avg.clamp(0.0, 100.0) as u8,
             mem_pct: dram_avg.clamp(0.0, 100.0) as u8,
-            vram_used_mb: vram_avg as u32,
+            vram_used_mb: vram_max,
             power_w: if power_max.is_finite() { power_max } else { 0.0 },
         });
     }

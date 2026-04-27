@@ -60,6 +60,10 @@ pub enum ProtocolErrorCode {
     NotFound = 9,
     /// Niepoprawne argumenty requestu (walidacja pol).
     BadRequest = 10,
+    /// Stan zasobu wyklucza wykonanie operacji (np. inna sesja juz trwa).
+    Conflict = 11,
+    /// Funkcjonalnosc niedostepna na tym nodzie (brak narzedzia/feature flagi).
+    NotAvailable = 12,
 }
 
 /// Ujednolicony blad protokolu. Zwracany jako `MessageBody::Error(..)` z flagą
