@@ -73,7 +73,7 @@ impl Router {
                                 payload: ModelPayload::Audio(AudioPayload {
                                     operation: AudioOperation::STT {
                                         model: name.clone(),
-                                        audio_data: req.file.clone(),
+                                        audio_data: req.file.as_ref().to_vec(),
                                         language: req.language.clone(),
                                         response_format: req.response_format.clone(),
                                         prompt: req.prompt.clone(),
@@ -160,7 +160,7 @@ impl Router {
                                 payload: ModelPayload::Audio(AudioPayload {
                                     operation: AudioOperation::STT {
                                         model: svc.clone(),
-                                        audio_data: req.file.clone(),
+                                        audio_data: req.file.as_ref().to_vec(),
                                         language: req.language.clone(),
                                         response_format: req.response_format.clone(),
                                         prompt: req.prompt.clone(),
@@ -293,7 +293,7 @@ impl Router {
 
                 // Utworz request transkrypcji i przekaz do route_audio_transcription
                 let request = crate::api::openai::types::TranscriptionRequest {
-                    file: audio_data.clone(),
+                    file: std::sync::Arc::from(audio_data.clone().into_boxed_slice()),
                     filename: "audio.wav".to_string(),
                     model: model.clone(),
                     language: language.clone(),

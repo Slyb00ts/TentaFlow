@@ -645,8 +645,10 @@ pub struct TTSRequest {
 /// inna niz JSON. Ta struktura reprezentuje pola formularza.
 #[derive(Debug, Clone)]
 pub struct TranscriptionRequest {
-    /// Plik audio (multipart field: "file")
-    pub file: Vec<u8>,
+    /// Plik audio (multipart field: "file"). Arc<[u8]> zeby caly pipeline
+    /// STT (route -> dispatch closure -> diarization fork -> local_stt)
+    /// dzielil ten sam blok PCM przez refcount zamiast klonowac kazda kopie.
+    pub file: std::sync::Arc<[u8]>,
 
     /// Nazwa pliku
     pub filename: String,

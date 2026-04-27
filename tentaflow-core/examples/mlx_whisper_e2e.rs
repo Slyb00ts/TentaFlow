@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     let audio_data = std::fs::read(&wav)?;
     println!("[e2e] transcribing {} ({} bytes)...", wav.display(), audio_data.len());
     let params = TranscribeParams {
-        audio_data,
+        audio_data: std::sync::Arc::from(audio_data.into_boxed_slice()),
         language: Some(language.clone()),
         ..Default::default()
     };
