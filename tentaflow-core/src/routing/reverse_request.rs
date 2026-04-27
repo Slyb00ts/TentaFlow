@@ -898,6 +898,26 @@ fn persist_meeting_event(
         // żeby reload GUI w trakcie joiningu zobaczył aktualny etap bez zależności
         // od tego, czy WSS broadcast już trafił. Broadcast i tak idzie równolegle
         // przez publish() w callerze.
+        // VideoFrame: per-uczestnik klatka wideo do live broadcastu. Nie
+        // persistujemy do DB — frames lecą wyłącznie do dashboard subscribers
+        // przez ten sam kanał co pozostałe MeetingEventPayload (publish() w
+        // callerze). Trzymanie histori klatek w SQLite zalałoby bazę
+        // (1 fps × 320x180 JPEG q=0.6 ≈ 15 KB → 54 MB / godzinę / uczestnika).
+        MeetingEventPayload::VideoFrame {
+            participant_id,
+            name,
+            ts_ms,
+            jpeg,
+        } => {
+            info!(
+                "MeetingEvent VideoFrame: meeting_key={} participant={} name={:?} ts_ms={} bytes={}",
+                event.meeting_key,
+                participant_id,
+                name,
+                ts_ms,
+                jpeg.len()
+            );
+        }
         MeetingEventPayload::LifecycleUpdate { stage, details } => {
             let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
             if let Err(e) = crate::db::repository::transcripts::update_session_lifecycle(
@@ -1312,12 +1332,20 @@ mod tests {
                         speaker_name: Some("Alice".to_string()),
                         status: "joined".to_string(),
                         last_spoken_ago_sec: None,
+                        has_video: true,
+                        has_audio: true,
+                        in_stage: true,
+                        in_roster: true,
                     },
                     RosterEntry {
                         speaker_id: "SPEAKER_02".to_string(),
                         speaker_name: Some("Bob".to_string()),
                         status: "speaking".to_string(),
                         last_spoken_ago_sec: Some(2),
+                        has_video: false,
+                        has_audio: true,
+                        in_stage: false,
+                        in_roster: true,
                     },
                 ],
             },

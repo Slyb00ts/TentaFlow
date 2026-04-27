@@ -149,6 +149,10 @@ async fn send_bot_participant_joined(
                     speaker_name: Some(bot_name.to_string()),
                     status: "joined".to_string(),
                     last_spoken_ago_sec: None,
+                    has_video: false,
+                    has_audio: false,
+                    in_stage: false,
+                    in_roster: true,
                 }],
             },
         )

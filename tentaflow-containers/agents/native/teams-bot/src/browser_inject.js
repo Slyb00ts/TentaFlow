@@ -3664,12 +3664,24 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
       }
     }
 
+    // data-tid w obecnym Teams light-meetings to czesto realna nazwa
+    // uczestnika (np. "Piotr Jarocki"), ale React commit phase potrafi tam
+    // chwilowo wpisac hash GUID (40+ znakow hex). Dlatego order: aria-label
+    // (najpewniejsze, "Imie Nazwisko, video, ..." na video tiles), potem
+    // child `[data-tid="participant-name"]` (panel People), a data-tid
+    // bierzemy tylko gdy NIE wyglada na hash. null = skip ten tile.
     function tileDisplayName(tile) {
-      // aria-label zawiera realna nazwe uczestnika (np. "Jan Kowalski, video, ...");
-      // data-tid jest internal id Teams i nie nadaje sie do GUI.
       const al = tile.getAttribute('aria-label') || '';
-      const trimmed = al.split(',')[0].trim();
-      return trimmed || tile.getAttribute('data-tid') || '';
+      const trimmedAl = al.split(',')[0].trim();
+      if (trimmedAl) return trimmedAl;
+      const nameEl = tile.querySelector('[data-tid="participant-name"]');
+      if (nameEl) {
+        const t = (nameEl.textContent || '').trim();
+        if (t) return t;
+      }
+      const tid = tile.getAttribute('data-tid') || '';
+      if (tid && !/^[a-f0-9-]{20,}$/i.test(tid)) return tid;
+      return null;
     }
 
     function detectLobby() {
@@ -3759,7 +3771,161 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
         const m = label.match(/^(.+?)\s+is speaking/i);
         if (m && m[1]) return { id: speakingEl.getAttribute('data-tid') || null, name: m[1].trim() };
       }
+      // 4. voice-level outline — Teams renderuje animowana ramke wokol kafelka
+      // aktywnego mowcy (`data-tid="voice-level-stream-outline"` albo klasa
+      // zawierajaca "voice-level"). Kafelek z taka ramka = aktywny speaker.
+      // Wazne gdy starsza klasowa heurystyka (.active-speaker) nie zadziala
+      // w light-meetings z obfuscowanym CSS-in-JS.
+      const outline = document.querySelector(
+        '[data-tid="voice-level-stream-outline"], [class*="voice-level"]'
+      );
+      if (outline) {
+        const tile = outline.closest('[data-tid][data-stream-type], [data-tid="participant-list-item"]');
+        if (tile) {
+          const name = tileDisplayName(tile);
+          if (name) return { id: tile.getAttribute('data-tid') || null, name: name };
+        }
+      }
       return null;
+    }
+
+    // Cache OffscreenCanvas per kafelek z kamera. Klucz = data-tid kafelka.
+    // Trzymamy canvas zeby nie alokowac go per klatka — drawImage + convertToBlob
+    // jest tani gdy wymiary sie nie zmieniaja.
+    const videoCanvases = new Map(); // data-tid -> { canvas, ctx, w, h }
+
+    // Buduje listę kafelków łącząc trzy źródła Teams: kafelki sceny
+    // (`[data-tid][data-stream-type]`), panel People (`participant-list-item`)
+    // oraz dynamiczne `people-list-item*`. Deduplikacja po lower-case nazwie:
+    // ten sam uczestnik widoczny w MixedStage + People to jeden wpis (in_stage
+    // ∧ in_roster). Off-camera user, ktory NIE jest na scenie, ma in_stage=false
+    // — bez tego pkt 1 z requirementu (sidebar) by go gubil.
+    function collectRosterEntries() {
+      const byKey = new Map(); // lower-case name -> entry
+      function pushTile(tile, fromStage, fromRoster) {
+        const name = tileDisplayName(tile);
+        if (!name) return;
+        const tid = tile.getAttribute('data-tid') || name;
+        const streamType = tile.getAttribute('data-stream-type') || '';
+        const hasVideoAttr = streamType === 'Video' || streamType.indexOf('Video') !== -1;
+        const hasAudioAttr = streamType === 'Audio' || streamType.indexOf('Audio') !== -1;
+        // Realny `<video>` z aktywnym MediaStream uznajemy jako has_video
+        // niezaleznie od atrybutu — atrybut potrafi opozniac sie wzgledem
+        // realnej negocjacji RTC.
+        let hasLiveVideo = hasVideoAttr;
+        if (!hasLiveVideo) {
+          const v = tile.querySelector('video');
+          if (v && v.srcObject && v.srcObject.getVideoTracks
+              && v.srcObject.getVideoTracks().length > 0
+              && v.videoWidth > 0) {
+            hasLiveVideo = true;
+          }
+        }
+        const key = name.toLowerCase();
+        const prev = byKey.get(key);
+        if (prev) {
+          prev.has_video = prev.has_video || hasLiveVideo;
+          prev.has_audio = prev.has_audio || hasAudioAttr;
+          prev.in_stage = prev.in_stage || fromStage;
+          prev.in_roster = prev.in_roster || fromRoster;
+        } else {
+          byKey.set(key, {
+            id: tid,
+            name: name,
+            has_video: hasLiveVideo,
+            has_audio: hasAudioAttr,
+            in_stage: fromStage,
+            in_roster: fromRoster,
+          });
+        }
+      }
+      // Kafelki sceny (video/audio strumienie aktywnych uczestnikow).
+      document.querySelectorAll('[data-tid][data-stream-type]').forEach(function (t) {
+        pushTile(t, true, false);
+      });
+      // Roster panel (sidebar People). Selektory pokrywaja wariacje light-meetings:
+      // - `[data-tid="participant-list-item"]` (klasyczny full-meeting roster)
+      // - `[data-tid^="people-list-item"]` (light-meetings w nowym UI)
+      // - `[role="listitem"]` wewnatrz `[data-tid="people-roster"]` / `[data-tid="roster"]`
+      const rosterSelectors = [
+        '[data-tid="participant-list-item"]',
+        '[data-tid^="people-list-item"]',
+        '[data-tid="people-roster"] [role="listitem"]',
+        '[data-tid="roster"] [role="listitem"]',
+      ];
+      document.querySelectorAll(rosterSelectors.join(',')).forEach(function (t) {
+        pushTile(t, false, true);
+      });
+      return Array.from(byKey.values());
+    }
+
+    function captureFrames(now) {
+      // Klatki dla kafelkow z aktywnym wideo. Bez zewnetrznych OffscreenCanvas
+      // tainted issue: MediaStream z RTCPeerConnection nie ma origin per W3C
+      // spec — canvas nie jest tainted, drawImage + convertToBlob dziala bez
+      // crossOrigin issues. Dlatego nie potrzebujemy CORS proxy.
+      const seen = new Set();
+      const tiles = document.querySelectorAll('[data-tid][data-stream-type="Video"]');
+      tiles.forEach(function (tile) {
+        const tid = tile.getAttribute('data-tid');
+        if (!tid) return;
+        const name = tileDisplayName(tile);
+        if (!name) return;
+        const video = tile.querySelector('video');
+        if (!video || !video.srcObject) return;
+        if (typeof MediaStream === 'undefined' || !(video.srcObject instanceof MediaStream)) return;
+        if (video.readyState < 2 || video.videoWidth <= 0) return;
+        seen.add(tid);
+        // Skala do max 320px szerokosci (zachowujac proporcje). Wiekszy
+        // rozmiar dla podgladu w GUI nie ma sensu i zwieksza koszt JPEG encode.
+        const targetW = Math.min(video.videoWidth, 320);
+        const scale = targetW / video.videoWidth;
+        const targetH = Math.max(1, Math.round(video.videoHeight * scale));
+        let entry = videoCanvases.get(tid);
+        if (!entry || entry.w !== targetW || entry.h !== targetH) {
+          const canvas = (typeof OffscreenCanvas !== 'undefined')
+            ? new OffscreenCanvas(targetW, targetH)
+            : Object.assign(document.createElement('canvas'), { width: targetW, height: targetH });
+          const ctx = canvas.getContext('2d');
+          entry = { canvas: canvas, ctx: ctx, w: targetW, h: targetH };
+          videoCanvases.set(tid, entry);
+        }
+        try {
+          entry.ctx.drawImage(video, 0, 0, entry.w, entry.h);
+        } catch (e) {
+          return;
+        }
+        const toBlobPromise = entry.canvas.convertToBlob
+          ? entry.canvas.convertToBlob({ type: 'image/jpeg', quality: 0.6 })
+          : new Promise(function (resolve) {
+              entry.canvas.toBlob(function (b) { resolve(b); }, 'image/jpeg', 0.6);
+            });
+        toBlobPromise.then(function (blob) {
+          if (!blob) return;
+          return blob.arrayBuffer().then(function (buf) {
+            const bytes = new Uint8Array(buf);
+            // btoa pracuje na binary string — chunked build, bez stack overflow
+            // przy duzych tablicach (apply spread limit ~64k).
+            let binary = '';
+            const chunk = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunk) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+            }
+            const b64 = btoa(binary);
+            emit('video_frame', {
+              participant_id: tid,
+              name: name,
+              ts_ms: now,
+              jpeg_b64: b64,
+            });
+          });
+        }).catch(function () {});
+      });
+      // Prune cache dla kafelkow ktore zniknely — bez tego canvasy zywa az
+      // do unload strony.
+      for (const tid of Array.from(videoCanvases.keys())) {
+        if (!seen.has(tid)) videoCanvases.delete(tid);
+      }
     }
 
     function scan() {
@@ -3777,26 +3943,28 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
         // listę jednym eventem. Native dom_observer porównuje z poprzednim
         // stanem znanym lokalnie, a router robi tylko broadcast — koszt
         // sieciowy = 1 RT zamiast N.
-        const tiles = document.querySelectorAll('[data-tid][data-stream-type]');
+        const entries = collectRosterEntries();
         const current = new Map();
-        for (const tile of tiles) {
-          const tid = tile.getAttribute('data-tid');
-          if (!tid) continue;
-          current.set(tid, tileDisplayName(tile));
+        for (const e of entries) {
+          current.set(e.id, e);
         }
         // Skip jeśli stan rosteru się nie zmienił od poprzedniego scan'u —
         // unikamy zalewania routera identycznymi snapshotami przy idle Teams.
         let changed = current.size !== knownTiles.size;
         if (!changed) {
-          for (const [tid, name] of current) {
-            if (knownTiles.get(tid) !== name) { changed = true; break; }
+          for (const [tid, e] of current) {
+            const prev = knownTiles.get(tid);
+            if (!prev
+                || prev.name !== e.name
+                || prev.has_video !== e.has_video
+                || prev.has_audio !== e.has_audio
+                || prev.in_stage !== e.in_stage
+                || prev.in_roster !== e.in_roster) {
+              changed = true; break;
+            }
           }
         }
         if (changed) {
-          const entries = [];
-          for (const [tid, name] of current) {
-            entries.push({ id: tid, name: name });
-          }
           emit('roster_snapshot', { entries: entries });
           knownTiles = current;
         }
@@ -3822,6 +3990,8 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
     }
 
     const obs = new MutationObserver(schedule);
+    let safetyIntervalId = null;
+    let videoCaptureIntervalId = null;
     function attach() {
       if (!document.body) {
         setTimeout(attach, 50);
@@ -3834,10 +4004,29 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
         attributeFilter: ['class', 'data-tid', 'aria-label', 'aria-pressed', 'data-stream-type']
       });
       schedule();
-      // MutationObserver z subtree:true + attributeFilter pokrywa wszystkie
-      // zmiany rosteru Teams light-meetings. Wczesniej dzialal tu setInterval
-      // 1s "safety-net" — zbedny CPU bo observer juz lapie tych samych eventow.
+      // MutationObserver gubi zmiany w Shadow DOM oraz w React commit phase,
+      // gdy mutacje są flushowane w microtasku przed pełnym attach observera
+      // — interval safety-net pokrywa edge cases (Teams light-meetings,
+      // dynamiczny iframe roster) bez polegania na DOM mutations. 1500 ms
+      // jest na tyle rzadkie, ze koszt CPU pojedynczego scanu jest pomijalny.
+      safetyIntervalId = setInterval(scan, 1500);
+      const captureMs = (typeof window.__tentaflowVideoCaptureMs === 'number'
+        && window.__tentaflowVideoCaptureMs > 0)
+        ? window.__tentaflowVideoCaptureMs : 1000;
+      videoCaptureIntervalId = setInterval(function () {
+        captureFrames(Date.now());
+      }, captureMs);
     }
+    // Reset hook — jesli Rust kiedykolwiek zechce wymienic bridge w locie,
+    // wywola __tentaflowDomBridgeReset() i poprzednie intervale przestana
+    // zywic stary listener. Wczesniej brak cleanupu prowadzil do zombie
+    // intervals przy hot-reloadzie skryptu.
+    window.__tentaflowDomBridgeReset = function () {
+      try { obs.disconnect(); } catch (_) {}
+      if (safetyIntervalId) { clearInterval(safetyIntervalId); safetyIntervalId = null; }
+      if (videoCaptureIntervalId) { clearInterval(videoCaptureIntervalId); videoCaptureIntervalId = null; }
+      videoCanvases.clear();
+    };
     attach();
     console.log('[tentaflow] DOM event bridge zainstalowany (push via addBinding)');
 
@@ -3875,16 +4064,18 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
     }
 
     function findRemoteName() {
-      // Wez pierwszy remote tile (nie nasz). data-tid w light-meetings == name.
+      // Wez pierwszy remote tile (nie nasz). data-tid w light-meetings to
+      // czesto nazwa, ale bezpieczniej wziac displayName z helpera.
+      // Filtr bota: exact match lub `<botName> (` (sufix Teams typu
+      // " (Unverified)"/" (External)"). Prefix-match po samym name'ie wycinal
+      // np. "Botanik" gdy bot nazywal sie "Bot".
       const tiles = document.querySelectorAll('[data-tid][data-stream-type]');
       const ourName = (window.__tentaflowBotName || '').toString();
       for (const t of tiles) {
-        const name = t.getAttribute('data-tid') || '';
-        // Teams dodaje " (Unverified)" / " (External)" — startsWith filtruje
-        // i bota gdy ourName="DevBot" pasuje do "DevBot (Unverified)".
-        if (name && !(ourName && name.indexOf(ourName) === 0)) {
-          return name;
-        }
+        const name = tileDisplayName(t);
+        if (!name) continue;
+        if (ourName && (name === ourName || name.indexOf(ourName + ' (') === 0)) continue;
+        return name;
       }
       return null;
     }

@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
+use base64::Engine;
 use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
@@ -66,10 +67,16 @@ const BINDING_NAME: &str = "__tentaflowEvent";
 const EMIT_CONCURRENCY: usize = 8;
 
 /// Limity sanityzacji rosteru — chronia przed metadata-bomb z zlosliwie
-/// zbugowanej strony Teams. Lustrzane do tego co main.rs robil wczesniej
-/// inline na hot path (50 nazw x 128 znakow).
-const MAX_ROSTER_NAMES: usize = 50;
+/// zbugowanej strony Teams. 500 nazw pokrywa nawet duze wszechfirmowe
+/// town-halle; wczesniej 50 ucinalo realny roster przy 60+ uczestnikach.
+const MAX_ROSTER_NAMES: usize = 500;
 const MAX_ROSTER_NAME_LEN: usize = 128;
+
+/// Maksymalny rozmiar dekodowanej klatki wideo. JPEG q=0.6 przy 320px
+/// realistycznie ma 15-40 KB, ale Teams custom backgrounds + slajdy o duzym
+/// kontracie potrafia wyskoczyc do ~200 KB. 2 MB to twardy limit anty-DoS:
+/// klatka wieksza znaczy ze cos jest zle (zly encode, zlosliwy payload).
+const MAX_VIDEO_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// State of the join flow as inferred from DOM events. The polling loop in
 /// `browser.rs` previously baked this into a 500ms ticker; now the observer
@@ -92,6 +99,16 @@ enum DomEvent {
     /// (poza bot'em — filtrujemy w listenerze po nazwie).
     RosterSnapshot { entries: Vec<RosterTile> },
     ActiveSpeaker { id: Option<String>, name: Option<String> },
+    /// Klatka wideo zescrappowana z `<video>` jednego kafelka. JS koduje JPEG
+    /// jako base64 — binding `__tentaflowEvent` nosi tylko JSON, wiec binarka
+    /// musi przejechac base64. W listenerze dekodujemy do `Vec<u8>` raz i
+    /// dalej idzie binarnie przez rkyv.
+    VideoFrame {
+        participant_id: String,
+        name: Option<String>,
+        ts_ms: u64,
+        jpeg_b64: String,
+    },
     /// Untyped fallback so a JS-side schema bump doesn't kill the listener.
     #[serde(other)]
     Unknown,
@@ -99,11 +116,22 @@ enum DomEvent {
 
 /// Pojedynczy kafelek z DOM Teams — surowy zapis z `browser_inject.js`.
 /// Konwertujemy do `RosterEntry` dopiero przy emit do routera (po filtracji
-/// bot'a i sanityzacji nazwy).
+/// bot'a i sanityzacji nazwy). Pola `has_*` / `in_*` sa Option<bool> —
+/// browser_inject.js domyslnie je wystawia, ale defaultujemy do `false`,
+/// zeby starszy injectowany skrypt (po hot-reloadzie samego Rust binarka,
+/// przed odswiezeniem strony Teams) nie wywalil deserializacji.
 #[derive(Debug, Deserialize)]
 struct RosterTile {
     id: String,
     name: Option<String>,
+    #[serde(default)]
+    has_video: bool,
+    #[serde(default)]
+    has_audio: bool,
+    #[serde(default)]
+    in_stage: bool,
+    #[serde(default)]
+    in_roster: bool,
 }
 
 /// Pojedynczy rekord przekazywany z listener -> writer. `meeting_key` jest
@@ -113,6 +141,18 @@ struct PendingEmit {
     meeting_key: String,
     timestamp_ms: i64,
     payload: MeetingEventPayload,
+}
+
+/// Lokalny stan kafelka po deduplikacji rosteru. Agreguje sygnaly
+/// `in_stage`/`in_roster` (ten sam uczestnik moze sie pojawic w obu miejscach
+/// — sceny i panelu People) zamiast raportowac dwa razy.
+#[derive(Debug, Clone)]
+struct RosterTileMeta {
+    name: String,
+    has_video: bool,
+    has_audio: bool,
+    in_stage: bool,
+    in_roster: bool,
 }
 
 pub struct DomObserver {
@@ -220,12 +260,12 @@ pub async fn start(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let (state_tx, state_rx) = watch::channel(JoinState::NotYet);
 
-    // Bounded ale "wystarczajaco duzy" buffor — pojedynczy Teams scan z 50
-    // uczestnikami wygeneruje ~50 eventow naraz. Bounded bo nie chcemy
-    // unbounded growth gdy router jest rozlaczony i writer zatka sie na
-    // `send_meeting_event` (aktualnie writer trzyma <= EMIT_CONCURRENCY
-    // in-flight, reszta czeka w mpsc). 256 to ~3x maksymalny realny burst.
-    let (emit_tx, mut emit_rx) = mpsc::channel::<PendingEmit>(256);
+    // Bounded buffor — przy 50+ uczestnikach jeden DOM scan generuje
+    // 1 RosterSnapshot + N×VideoFrame (1 fps per kafelek z kamera). Po stronie
+    // writera trzymamy <= EMIT_CONCURRENCY in-flight, reszta czeka w mpsc.
+    // 1024 daje bezpieczny zapas (ok. 32 KB pamieci na slot pointerow), zeby
+    // burst dolaczen + pierwsza fala klatek wideo nie wpadl od razu w drop.
+    let (emit_tx, mut emit_rx) = mpsc::channel::<PendingEmit>(1024);
 
     // Listener: caly state-machine + sanityzacja rosteru. Zero awaitow QUIC.
     let listener_meeting_key = meeting_key.clone();
@@ -239,7 +279,7 @@ pub async fn start(
         // `participant_left` with a meaningful name field when a tile vanishes
         // from the DOM. Bot's own tile is filtered by name on emit so we
         // never broadcast ourselves as a remote participant.
-        let mut known: HashMap<String, String> = HashMap::new();
+        let mut known: HashMap<String, RosterTileMeta> = HashMap::new();
         let mut current_speaker: Option<String> = None;
 
         // Inicjalny snapshot — pusta lista. Bez tego pierwszy STT przed
@@ -294,28 +334,47 @@ pub async fn start(
                             }
                         }
                         DomEvent::RosterSnapshot { entries } => {
-                            // Zbuduj nowy stan `known` z snapshotu (po filtracji
-                            // bota). Logujemy delty względem poprzedniego stanu —
-                            // do telemetrii — ale do routera idzie 1 batch event.
-                            let mut next: HashMap<String, String> = HashMap::new();
+                            // Snapshot z JS to UNION sceny + panelu People.
+                            // Browser_inject deduplikuje po lower-case nazwie,
+                            // ale dla bezpieczenstwa robimy merge tutaj — gdyby
+                            // ten sam uczestnik trafil dwa razy (np. ze swoim
+                            // `data-tid` w MixedStage i z innym id w roster
+                            // panel), agregujemy `in_stage`/`in_roster` flagi.
+                            let mut next: HashMap<String, RosterTileMeta> = HashMap::new();
                             for tile in &entries {
                                 let who = tile.name.clone().unwrap_or_else(|| tile.id.clone());
                                 // Teams dla anonimowych dolaczen dodaje sufix
-                                // "(Unverified)" / " (External)" do display name.
-                                // Filtrujemy bota przez prefix match.
-                                if who.starts_with(&listener_bot_name) {
+                                // " (Unverified)" / " (External)" do display
+                                // name. Bota filtrujemy gdy nazwa jest dokladnie
+                                // jego albo gdy ma sufix " (..." — prefix match
+                                // wycinal "Botanik" gdy bot nazywal sie "Bot".
+                                let is_bot = who == listener_bot_name
+                                    || who.starts_with(&format!("{} (", listener_bot_name));
+                                if is_bot {
                                     continue;
                                 }
-                                next.insert(tile.id.clone(), who);
+                                let entry = next.entry(tile.id.clone()).or_insert_with(|| {
+                                    RosterTileMeta {
+                                        name: who.clone(),
+                                        has_video: false,
+                                        has_audio: false,
+                                        in_stage: false,
+                                        in_roster: false,
+                                    }
+                                });
+                                entry.has_video |= tile.has_video;
+                                entry.has_audio |= tile.has_audio;
+                                entry.in_stage |= tile.in_stage;
+                                entry.in_roster |= tile.in_roster;
                             }
-                            for (id, who) in &next {
+                            for (id, meta) in &next {
                                 if !known.contains_key(id) {
-                                    tracing::info!(participant = %who, "dom_observer: participant joined");
+                                    tracing::info!(participant = %meta.name, "dom_observer: participant joined");
                                 }
                             }
-                            for (id, who) in &known {
+                            for (id, meta) in &known {
                                 if !next.contains_key(id) {
-                                    tracing::info!(participant = %who, "dom_observer: participant left");
+                                    tracing::info!(participant = %meta.name, "dom_observer: participant left");
                                 }
                             }
                             known = next;
@@ -327,8 +386,50 @@ pub async fn start(
                                 &listener_bot_name,
                             );
                         }
+                        DomEvent::VideoFrame { participant_id, name, ts_ms, jpeg_b64 } => {
+                            // Base64 → bajty raz, na granicy CDP. Przy zlosliwie
+                            // wielkim payloadzie (poza limitem) dropujemy bez
+                            // dispatchu — chronimy router przed payload bombem.
+                            let jpeg = match base64::engine::general_purpose::STANDARD
+                                .decode(jpeg_b64.as_bytes())
+                            {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        participant = %participant_id,
+                                        "video_frame: bad base64: {}",
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+                            if jpeg.len() > MAX_VIDEO_FRAME_BYTES {
+                                tracing::warn!(
+                                    participant = %participant_id,
+                                    bytes = jpeg.len(),
+                                    limit = MAX_VIDEO_FRAME_BYTES,
+                                    "video_frame: drop (rozmiar powyzej limitu)"
+                                );
+                                continue;
+                            }
+                            tracing::debug!(
+                                participant = %name.clone().unwrap_or_else(|| participant_id.clone()),
+                                size_kb = jpeg.len() / 1024,
+                                "video frame received"
+                            );
+                            queue_video_frame(
+                                &listener_emit_tx,
+                                &listener_meeting_key,
+                                participant_id,
+                                name,
+                                ts_ms,
+                                jpeg,
+                            );
+                        }
                         DomEvent::ActiveSpeaker { id, name } => {
-                            let who = name.or_else(|| id.as_ref().and_then(|tid| known.get(tid).cloned()));
+                            let who = name.or_else(|| {
+                                id.as_ref().and_then(|tid| known.get(tid).map(|m| m.name.clone()))
+                            });
                             if current_speaker == who { continue; }
                             current_speaker = who.clone();
                             // Wpisanie do RwLock<Option<String>> jest swapem — taniej
@@ -430,7 +531,7 @@ fn queue_lifecycle(tx: &mpsc::Sender<PendingEmit>, meeting_key: &str, stage: &st
 fn queue_roster_snapshot(
     tx: &mpsc::Sender<PendingEmit>,
     meeting_key: &str,
-    known: &HashMap<String, String>,
+    known: &HashMap<String, RosterTileMeta>,
     bot_name: &str,
 ) {
     // Bot jest filtrowany z DOM rosteru (żeby dom_observer nie raportował go
@@ -442,12 +543,20 @@ fn queue_roster_snapshot(
         speaker_name: Some(bot_name.to_string()),
         status: "joined".to_string(),
         last_spoken_ago_sec: None,
+        has_video: false,
+        has_audio: false,
+        in_stage: false,
+        in_roster: true,
     });
-    entries.extend(known.iter().map(|(id, name)| RosterEntry {
+    entries.extend(known.iter().map(|(id, meta)| RosterEntry {
         speaker_id: id.clone(),
-        speaker_name: Some(name.clone()),
+        speaker_name: Some(meta.name.clone()),
         status: "joined".to_string(),
         last_spoken_ago_sec: None,
+        has_video: meta.has_video,
+        has_audio: meta.has_audio,
+        in_stage: meta.in_stage,
+        in_roster: meta.in_roster,
     }));
     let event = PendingEmit {
         meeting_key: meeting_key.to_string(),
@@ -455,11 +564,41 @@ fn queue_roster_snapshot(
         payload: MeetingEventPayload::RosterSnapshot { entries },
     };
     if let Err(e) = tx.try_send(event) {
-        tracing::warn!(
-            "dom_observer: roster snapshot queue full (size={}): {}",
+        // Pelny kanal = router stoi i 1024 sloty zalane. Logujemy ERROR
+        // (nie WARN) zeby rozroznic to od pojedynczego retry'a — kolejny
+        // snapshot pojdzie automatycznie z nastepnego scan'u, wiec nie
+        // tracimy danych dlugofalowo, ale operator musi zobaczyc problem.
+        tracing::error!(
+            "dom_observer: roster snapshot queue full (size={}): {} — drop",
             known.len(),
             e
         );
+    }
+}
+
+/// Wpycha klatke wideo do mpsc. Drop przy pelnym kanale jest akceptowalny —
+/// wideo idzie 1 fps i kolejna klatka pojdzie za 1s. Liczymy sie z tym, ze
+/// pod ciezkim obciazeniem GUI dostanie nizszy fps zamiast OOM lub stall.
+fn queue_video_frame(
+    tx: &mpsc::Sender<PendingEmit>,
+    meeting_key: &str,
+    participant_id: String,
+    name: Option<String>,
+    ts_ms_value: u64,
+    jpeg: Vec<u8>,
+) {
+    let event = PendingEmit {
+        meeting_key: meeting_key.to_string(),
+        timestamp_ms: ts_ms(),
+        payload: MeetingEventPayload::VideoFrame {
+            participant_id,
+            name,
+            ts_ms: ts_ms_value,
+            jpeg,
+        },
+    };
+    if let Err(e) = tx.try_send(event) {
+        tracing::debug!("dom_observer: video frame queue full: {}", e);
     }
 }
 
@@ -485,12 +624,13 @@ async fn dispatch_emit(router: &RouterHandle, emit: PendingEmit) {
 /// SYNCHRONICZNIE w listenerze przy kazdej zmianie `known` — alokacja jednego
 /// Vec<String> + `serde_json::to_string` kosztuje ~10us przy 50 nazwach.
 /// Dzieki temu STT hot path bierze gotowy `Arc<String>` jednym `load_full()`.
-fn publish_roster_snapshot(slot: &RosterSnapshotJson, known: &HashMap<String, String>) {
+fn publish_roster_snapshot(slot: &RosterSnapshotJson, known: &HashMap<String, RosterTileMeta>) {
     let mut names: Vec<String> = known
         .values()
         .take(MAX_ROSTER_NAMES)
-        .map(|name| {
-            name.chars()
+        .map(|meta| {
+            meta.name
+                .chars()
                 .filter(|c| !c.is_control())
                 .take(MAX_ROSTER_NAME_LEN)
                 .collect::<String>()
@@ -510,6 +650,7 @@ fn emit_label(payload: &MeetingEventPayload) -> &'static str {
         MeetingEventPayload::SummaryUpdate { .. } => "summary",
         MeetingEventPayload::ActionItemsUpdate { .. } => "action_items",
         MeetingEventPayload::BackendUpdate { .. } => "backend",
+        MeetingEventPayload::VideoFrame { .. } => "video_frame",
     }
 }
 

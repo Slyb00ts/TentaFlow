@@ -201,8 +201,10 @@ impl SttEngine for WhisperEngine {
         let loaded = tokio::task::spawn_blocking(move || {
             let mut ctx_params = WhisperContextParameters::default();
 
-            // GPU: jesli device zawiera "gpu" lub "cuda", wlacz akceleracje
-            if device_str.contains("gpu") || device_str.contains("cuda") {
+            // GPU: zawsze probujemy wlaczyc, niezaleznie od ustawienia aliasu.
+            // whisper.cpp ignoruje use_gpu jesli build nie ma GPU backendu
+            // (CPU fallback). Eksplicytne `device="cpu"` w aliasie wymusza CPU.
+            if !device_str.eq_ignore_ascii_case("cpu") {
                 ctx_params.use_gpu(true);
             }
 
