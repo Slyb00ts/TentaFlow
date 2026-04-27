@@ -2793,13 +2793,14 @@ fn store_peer_to_proto(
         (Some(total), Some(used), Some(load))
     };
 
-    // nsys_available wypelniamy tylko dla lokalnego noda; pole peerow przyjdzie
-    // w heartbeat/NodeInfo wiremu po wpieciu w mesh (PR3+).
+    // Lokalnie pytamy detektora bezposrednio (swiezy wynik bez czekania na
+    // tick heartbeatu). Dla peerow czytamy ostatni snapshot z peer_store —
+    // jest aktualizowany przy kazdym odebranym heartbeacie.
     let (nsys_available, nsys_version) = if is_local {
         let cap = crate::profiling::detect_capability_sync();
         (cap.available, cap.version)
     } else {
-        (false, String::new())
+        (p.nsys_available, p.nsys_version.clone())
     };
 
     tentaflow_protocol::MeshNodeInfo {

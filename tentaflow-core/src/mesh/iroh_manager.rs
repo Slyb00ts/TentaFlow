@@ -274,6 +274,10 @@ pub struct IrohMeshManager {
     /// Stan logowania per-peer: kiedy ostatnio zalogowalismy discovery oraz
     /// ile bylo kolejnych nieudanych dialow. Sluzy do tlumienia spamu.
     peer_log_state: DashMap<String, PeerLogState>,
+    /// Executor komend mesh — wstrzykiwany przez pipeline po stworzeniu managera.
+    /// `None` w testach ktore nie potrzebuja egzekucji komend; produkcyjnie
+    /// pipeline ZAWSZE wpina realny executor zanim zacznie nasluchiwac eventow.
+    command_executor: AsyncRwLock<Option<Arc<crate::mesh::command_executor::MeshCommandExecutor>>>,
 }
 
 #[derive(Default)]
@@ -320,7 +324,19 @@ impl IrohMeshManager {
             service_reg,
             dial_locks: DashMap::with_capacity(256),
             peer_log_state: DashMap::with_capacity(256),
+            command_executor: AsyncRwLock::new(None),
         }))
+    }
+
+    /// Wstrzykuje executor komend mesh. Pipeline wola to raz, zaraz po stworzeniu
+    /// managera. Bez tego `handle_command_received` odpowie peerowi bledem
+    /// "no command executor", co od razu unaocznia brakujace okablowanie zamiast
+    /// po cichu ignorowac komendy.
+    pub async fn set_command_executor(
+        &self,
+        executor: Arc<crate::mesh::command_executor::MeshCommandExecutor>,
+    ) {
+        *self.command_executor.write().await = Some(executor);
     }
 
     /// Discovery spamuje na kazdy mDNS tick — logujemy pierwsze odkrycie peera
@@ -1285,11 +1301,100 @@ impl IrohMeshManager {
         }
     }
 
-    /// Obsluzyc komende otrzymana od peera — wywolac wlasciwy executor.
-    pub async fn handle_command_received(&self, _from_node_id: &str, _data: &[u8]) {
-        // Delegacja do executor-a odbywa sie na poziomie peer_manager / pipeline.
-        // Ta metoda jest zachowana dla compat ale nie wykonuje akcji — wlasciwa
-        // logika jest po stronie callerow konsumujacych `IrohMeshEvent::MeshCommandReceived`.
+    /// Obsluzyc komende otrzymana od peera — dekoduje envelope JSON, deleguje do
+    /// `MeshCommandExecutor` (z weryfikacja trust), serializuje wynik i odsyla
+    /// peerowi przez `MESH_MSG_COMMAND_RESPONSE`. Wire format jest symetryczny
+    /// z `send_command`/`send_command_and_wait` — taki sam envelope po obu
+    /// stronach upraszcza debug i pozwala probnym narzedziom (CLI) gadac.
+    pub async fn handle_command_received(&self, from_node_id: &str, data: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct RequestEnvelope {
+            command_id: String,
+            #[serde(default)]
+            sender_node_id: String,
+            command: tentaflow_protocol::mesh::MeshCommandType,
+        }
+
+        #[derive(serde::Serialize)]
+        struct ResponseEnvelope<'a> {
+            command_id: &'a str,
+            ok: bool,
+            payload: &'a tentaflow_protocol::mesh::MeshCommandResponsePayload,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<&'a str>,
+        }
+
+        let envelope: RequestEnvelope = match serde_json::from_slice(data) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(from = %from_node_id, "Niepoprawny envelope MeshCommand: {}", e);
+                return;
+            }
+        };
+
+        // Bierzemy tozsamosc nadawcy z transportu (iroh EndpointId), nie z pola
+        // w envelope — pole serwuje tylko jako audit hint, gdyby ktos podszywal
+        // sie w envelope to i tak `is_trusted` sprawdzi prawdziwy `from_node_id`.
+        let _ = envelope.sender_node_id;
+
+        let executor = match self.command_executor.read().await.clone() {
+            Some(e) => e,
+            None => {
+                warn!(
+                    from = %from_node_id,
+                    cmd = %envelope.command_id,
+                    "MeshCommand odebrana zanim wstrzyknieto executor — odsylam blad"
+                );
+                let resp = ResponseEnvelope {
+                    command_id: &envelope.command_id,
+                    ok: false,
+                    payload: &tentaflow_protocol::mesh::MeshCommandResponsePayload::Empty,
+                    error: Some("command executor not configured"),
+                };
+                if let Ok(bytes) = serde_json::to_vec(&resp) {
+                    let _ = self
+                        .send_to_peer(
+                            from_node_id,
+                            tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
+                            &bytes,
+                        )
+                        .await;
+                }
+                return;
+            }
+        };
+
+        let response = executor.execute(from_node_id, envelope.command).await;
+        let resp_envelope = ResponseEnvelope {
+            command_id: &envelope.command_id,
+            ok: response.ok,
+            payload: &response.payload,
+            error: response.error.as_deref(),
+        };
+        match serde_json::to_vec(&resp_envelope) {
+            Ok(bytes) => {
+                if let Err(e) = self
+                    .send_to_peer(
+                        from_node_id,
+                        tentaflow_protocol::mesh::MESH_MSG_COMMAND_RESPONSE,
+                        &bytes,
+                    )
+                    .await
+                {
+                    warn!(
+                        to = %from_node_id,
+                        cmd = %envelope.command_id,
+                        "Nie udalo sie odeslac MeshCommandResponse: {}", e
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    cmd = %envelope.command_id,
+                    "Nie udalo sie zserializowac MeshCommandResponse: {}", e
+                );
+            }
+        }
     }
 
     /// Obsluzyc odpowiedz na komende otrzymana od peera.
