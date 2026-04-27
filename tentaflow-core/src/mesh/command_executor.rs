@@ -155,7 +155,7 @@ impl MeshCommandExecutor {
             MeshCommandType::BandwidthProbe {
                 target_ip,
                 target_port,
-                rdma_port,
+                rdma_port: _,
                 bind_interface,
                 duration_ms,
                 mode,

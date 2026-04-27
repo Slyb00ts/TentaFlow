@@ -22,6 +22,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use tract_onnx::prelude::TValue;
+
 use anyhow::{anyhow, Context, Result};
 use tract_onnx::prelude::*;
 
@@ -106,7 +108,7 @@ impl FaceDetector for ScrfdEngine {
             buckets.push(TensorBucket {
                 head,
                 anchors: n,
-                tensor: Arc::clone(t),
+                tensor: t.clone(),
             });
         }
 
@@ -171,7 +173,7 @@ enum Head {
 struct TensorBucket {
     head: Head,
     anchors: usize,
-    tensor: Arc<Tensor>,
+    tensor: TValue,
 }
 
 fn find_bucket(buckets: &[TensorBucket], head: Head, anchors: usize) -> Option<&TensorBucket> {

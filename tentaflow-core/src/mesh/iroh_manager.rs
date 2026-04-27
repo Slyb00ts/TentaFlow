@@ -1469,7 +1469,7 @@ impl IrohMeshManagerRef {
         connection: Connection,
         connection_id: u64,
     ) {
-        let mut close_reason: Option<String> = None;
+        let close_reason: Option<String>;
         loop {
             let recv = match connection.accept_uni().await {
                 Ok(r) => r,

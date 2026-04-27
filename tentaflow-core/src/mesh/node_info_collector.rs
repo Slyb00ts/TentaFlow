@@ -1365,6 +1365,7 @@ fn detect_gateway(name: &str) -> String {
     let mut cache = GATEWAY_CACHE.lock();
     // Odswiezaj co 30s
     if cache.0.elapsed() > Duration::from_secs(30) {
+        #[allow(unused_mut)]
         let mut gateways = HashMap::new();
         #[cfg(target_os = "linux")]
         {
