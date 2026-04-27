@@ -83,8 +83,10 @@ pub struct MeetingConfig {
     /// Tryb aktywacji odpowiedzi:
     ///   - `always` — kazda wypowiedz idzie do LLM (drogie, glosne, debug)
     ///   - `wake_word` — tylko gdy `wake_word` w wypowiedzi (proste)
-    ///   - `wake_word_intent` — wake_word + LLM klasyfikacja czy to realne
-    ///     pytanie do bota (DEFAULT, pasywne dopoki ktos go nie zawola)
+    ///   - `wake_word_intent` — wake_word + lokalny klasyfikator intencji
+    ///     (regex/keyword, mikrosekundy — patrz `intent_classifier.rs`).
+    ///     Akceptuje pytania ('?'), czasowniki rozkazujace i dluzsze
+    ///     wypowiedzi; odrzuca krotkie powitania (<=3 slowa).
     /// Caller dashboard moze nadpisac envem RESPONSE_MODE.
     #[serde(default = "default_response_mode")]
     pub response_mode: String,
@@ -105,11 +107,6 @@ pub struct MeetingConfig {
     /// Systemowy prompt dla LLM odpowiadajacego (rola bota w spotkaniu).
     #[serde(default = "default_response_prompt")]
     pub response_prompt: String,
-
-    /// Prompt dla LLM-classifier rozpoznajacego intencje. Musi zwrocic
-    /// dokladnie `TAK` lub `NIE`. Mowa idzie jako user message.
-    #[serde(default = "default_intent_prompt")]
-    pub intent_prompt: String,
 
     /// Nazwa bota wyswietlana w spotkaniu Teams
     #[serde(default = "default_bot_name")]
@@ -218,27 +215,16 @@ fn default_response_prompt() -> String {
 }
 
 fn default_response_mode() -> String {
-    // TYMCZASOWO: tryb intent classifier wylaczony (false-negative na
-    // "Czesc Jarvis!" — LLM uznawal powitanie za nie-prosbe). Default =
-    // sam wake_word: bot zawsze odpowiada gdy w transkrypcie pojawi sie
-    // slowo aktywujace. Po dostrojeniu intent_prompt mozna wrocic do
-    // "wake_word_intent".
+    // Default = sam wake_word: bot zawsze odpowiada gdy w transkrypcie
+    // pojawi sie slowo aktywujace. `wake_word_intent` jest dostepny dla
+    // operatorow ktorzy chca dodatkowo odsiac krotkie powitania —
+    // klasyfikacja jest lokalna (regex/keyword), bez LLM call.
     "wake_word".to_string()
 }
 
 fn default_wake_words() -> String {
     // Domyslnie pasujemy na imie bota (jarvis), kilka wariantow.
     "jarvis,tentaflow,asystencie,asystent,bot".to_string()
-}
-
-fn default_intent_prompt() -> String {
-    "Jestes klasyfikatorem intencji w spotkaniu Teams. Mowca uzyl slowa \
-aktywujacego (np. 'jarvis'). Twoje zadanie: ocenic czy ta wypowiedz to \
-faktyczne pytanie/prosba SKIEROWANE do bota-asystenta (np. 'jarvis powiedz nam \
-ile mamy czasu', 'asystencie podsumuj'), czy tylko mimochodem padlo to slowo \
-(np. 'spotkalem dzis Jarvisa w robocie'). Odpowiedz DOKLADNIE jednym slowem: \
-TAK jezeli to wezwanie do bota, NIE w przeciwnym wypadku. Bez kropek, bez \
-wyjasnien.".to_string()
 }
 
 fn default_summarization_interval_sec() -> u64 {
@@ -381,8 +367,6 @@ impl MeetingConfig {
             wake_words: std::env::var("WAKE_WORDS")
                 .unwrap_or_else(|_| default_wake_words()),
             wake_words_compiled: Vec::new(),
-            intent_prompt: std::env::var("INTENT_PROMPT")
-                .unwrap_or_else(|_| default_intent_prompt()),
             bot_name: std::env::var("BOT_NAME")
                 .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
