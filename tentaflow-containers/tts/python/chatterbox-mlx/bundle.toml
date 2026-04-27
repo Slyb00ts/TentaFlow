@@ -1,0 +1,22 @@
+[bundle]
+engine = "chatterbox-mlx"
+description = "Chatterbox MLX (mlx-audio) dla Apple Silicon"
+python_version = "3.12"
+source = "pypi"
+package = "mlx-audio"
+package_version = "0.4.2"
+
+[launch]
+command = "uvicorn"
+args = ["--app-dir", "${BUNDLE_DIR}", "server:app",
+        "--host", "127.0.0.1", "--port", "${PORT:-8089}"]
+internal_port = 8089
+
+[requires]
+gpu_memory_gb = 2
+disk_gb = 2
+platforms = ["macos-aarch64"]
+
+[[install_variants]]
+backend = "metal"
+extras = []
