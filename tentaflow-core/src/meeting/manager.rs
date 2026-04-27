@@ -205,7 +205,9 @@ impl MeetingManager {
         let response_mode = req
             .response_mode
             .clone()
-            .unwrap_or_else(|| "wake_word_intent".to_string());
+            // TYMCZASOWO: tryb intent classifier wylaczony — patrz komentarz
+            // przy default_response_mode w teams-bot/src/config.rs.
+            .unwrap_or_else(|| "wake_word".to_string());
         // Wake-words: caller (dashboard / CLI) moze nadpisac, inaczej
         // bierzemy aktualna liste z DB (tabela `teams_bot_wake_words` —
         // tylko `enabled=1`). Pusta DB → fallback na hardcoded default.
