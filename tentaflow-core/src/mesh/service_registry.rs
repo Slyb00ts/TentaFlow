@@ -69,6 +69,13 @@ impl MeshServiceRegistry {
         }
     }
 
+    /// ID lokalnego noda — uzywane przez router zeby pominac MeshForward na
+    /// samego siebie. Bez tego embedded STT/TTS lapie sie do MeshForward
+    /// gdzie router probuje QUIC clienta zamiast wywolac engine in-process.
+    pub fn local_node_id(&self) -> &str {
+        &self.local_node_id
+    }
+
     /// Rejestruj lokalny serwis
     pub fn register_local(&self, service: MeshServiceInfo) {
         info!(
