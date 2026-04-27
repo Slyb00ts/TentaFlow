@@ -67,6 +67,11 @@ pub struct StartSessionRequest {
     pub flow_alias: Option<String>,
     pub llm_alias: Option<String>,
     pub respond_enabled: Option<bool>,
+    /// Tryb aktywacji odpowiedzi: `always`/`wake_word`/`wake_word_intent`.
+    /// Default `wake_word_intent` (pasywny dopoki ktos nie wezwie bota).
+    pub response_mode: Option<String>,
+    /// CSV slow aktywujacych. Pusta lista = zawsze aktywne (rownowazne always).
+    pub wake_words: Option<String>,
 }
 
 /// Domyślne aliasy przekazywane do kontenera teams-bota, jeśli caller nie
@@ -197,6 +202,14 @@ impl MeetingManager {
         let (stt_alias, summarization_alias, tts_alias, flow_alias, llm_alias) =
             resolve_aliases(&req);
         let respond_enabled = req.respond_enabled.unwrap_or(false);
+        let response_mode = req
+            .response_mode
+            .clone()
+            .unwrap_or_else(|| "wake_word_intent".to_string());
+        let wake_words = req
+            .wake_words
+            .clone()
+            .unwrap_or_else(|| "jarvis,tentaflow,asystencie,asystent,bot".to_string());
 
         // Alokuj porty + spawn — drogi rozne per backend, ale na koniec obie maja
         // ten sam efekt: serwis zarejestrowany w ServiceManager z iroh URL i
@@ -238,6 +251,8 @@ impl MeetingManager {
                     flow_alias: flow_alias.clone(),
                     llm_alias: llm_alias.clone(),
                     respond_enabled,
+                    response_mode: response_mode.clone(),
+                    wake_words: wake_words.clone(),
                 };
 
                 match container::spawn(&spawn_req).await {
@@ -291,6 +306,8 @@ impl MeetingManager {
                     flow_alias: flow_alias.clone(),
                     llm_alias: llm_alias.clone(),
                     respond_enabled,
+                    response_mode: response_mode.clone(),
+                    wake_words: wake_words.clone(),
                 };
 
                 if let Err(e) = native::spawn(&spawn_req).await {
@@ -524,6 +541,8 @@ mod tests {
             flow_alias: flow.map(String::from),
             llm_alias: None,
             respond_enabled: None,
+            response_mode: None,
+            wake_words: None,
         }
     }
 

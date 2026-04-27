@@ -40,6 +40,10 @@ pub struct SpawnRequest {
     pub llm_alias: String,
     /// Czy bot ma odpowiadać w meetingu (LLM → TTS).
     pub respond_enabled: bool,
+    /// Tryb aktywacji: `always`/`wake_word`/`wake_word_intent` (default).
+    pub response_mode: String,
+    /// CSV slow aktywujacych ("jarvis,bot,asystencie,...").
+    pub wake_words: String,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +280,8 @@ pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
         format!("FLOW_ALIAS={}", req.flow_alias),
         format!("LLM_ALIAS={}", req.llm_alias),
         format!("RESPOND_ENABLED={}", if req.respond_enabled { "true" } else { "false" }),
+        format!("RESPONSE_MODE={}", req.response_mode),
+        format!("WAKE_WORDS={}", req.wake_words),
     ]
 }
 
@@ -302,6 +308,8 @@ mod tests {
             flow_alias: flow.to_string(),
             llm_alias: "teams-llm".to_string(),
             respond_enabled: false,
+            response_mode: "wake_word_intent".to_string(),
+            wake_words: "jarvis,bot".to_string(),
         }
     }
 

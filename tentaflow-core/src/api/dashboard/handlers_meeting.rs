@@ -196,6 +196,11 @@ pub async fn meeting_session_start(
         // Bot odpowiada w real-time tylko gdy caller jawnie poda llm_alias.
         // Dashboard moze dodac osobny przycisk respond_enabled.
         respond_enabled: if r.llm_alias.is_empty() { Some(false) } else { Some(true) },
+        // Default: pasywny tryb wake_word_intent (bot odpowiada tylko gdy
+        // ktos powie "jarvis"/"asystencie" + LLM uzna to za realne pytanie).
+        // Dashboard moze nadpisac jezeli protocol zostanie rozszerzony.
+        response_mode: None,
+        wake_words: None,
     };
     let desc = ctx
         .state
