@@ -2,7 +2,7 @@
 // Plik: tf-chip.js
 // Opis: Komponent <tf-chip status="..." dot> — status pill.
 //       Wspierane statusy: ok | warn | err | info | accent |
-//       online | offline | pending (node states) |
+//       online | offline | pending | recording (node / capture states) |
 //       scope-chat | scope-deploy | scope-mesh-read | scope-mesh-admin |
 //       scope-trace | scope-license (API key scopes).
 //       Light DOM + klasa .tf-chip, opcjonalna pulsujaca kropka.
@@ -11,7 +11,7 @@
 
 const STATUS_CLASSES = new Set([
   'ok', 'warn', 'err', 'info', 'accent',
-  'online', 'offline', 'pending',
+  'online', 'offline', 'pending', 'recording',
   'scope-chat', 'scope-deploy', 'scope-mesh-read',
   'scope-mesh-admin', 'scope-trace', 'scope-license',
 ]);
