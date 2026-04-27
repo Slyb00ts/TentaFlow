@@ -2625,7 +2625,90 @@ pub fn pii_rule_list(
             action: r.replacement,
         })
         .collect();
-    Ok(MessageBody::PiiRuleListResponse { rules: summaries })
+    Ok(MessageBody::PiiRuleBody(
+        tentaflow_protocol::PiiRulePayload::ListResponse { rules: summaries },
+    ))
+}
+
+/// Vision inference: face detection / age+gender / emotion. Caller dostaje
+/// `service_name` z deploy handler runtime=embedded i przekazuje obrazek
+/// jako encoded JPEG/PNG/WEBP albo raw RGB. Wynik to inner-enum
+/// VisionInferResult (Faces / AgeGender / Emotion) zaleznie od typu
+/// silnika ktory wisi pod `service_name` w `vision::registry`.
+#[handler(variant = "VisionInferRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn vision_infer(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::VisionBody(tentaflow_protocol::VisionInferPayload::InferRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected VisionBody/InferRequest")),
+    };
+
+    let started = std::time::Instant::now();
+    let (rgb, w, h) = match &payload.format {
+        tentaflow_protocol::VisionImageFormat::RawRgb { width, height } => {
+            let expected = (*width as usize) * (*height as usize) * 3;
+            if payload.image.len() != expected {
+                return Err(ProtocolError::bad_request(
+                    "RawRgb: rozmiar bufora nie pasuje do width*height*3",
+                ));
+            }
+            (payload.image.clone(), *width, *height)
+        }
+        tentaflow_protocol::VisionImageFormat::Encoded => {
+            let img = image::load_from_memory(&payload.image)
+                .map_err(|e| ProtocolError::bad_request(&format!("decode: {e}")))?;
+            use image::GenericImageView;
+            let (w, h) = img.dimensions();
+            (img.to_rgb8().into_raw(), w, h)
+        }
+    };
+
+    let out = crate::vision::infer(&payload.service_name, &rgb, w, h)
+        .map_err(|e| ProtocolError::internal(&format!("vision::infer: {e}")))?;
+
+    let result = match out {
+        crate::vision::InferOutput::Faces(faces) => {
+            tentaflow_protocol::VisionInferResult::Faces(
+                faces
+                    .into_iter()
+                    .map(|f| tentaflow_protocol::VisionFaceDet {
+                        x1: f.bbox.0,
+                        y1: f.bbox.1,
+                        x2: f.bbox.2,
+                        y2: f.bbox.3,
+                        score: f.score,
+                        keypoints: f
+                            .keypoints
+                            .map(|k| k.iter().map(|p| (p.0, p.1)).collect())
+                            .unwrap_or_default(),
+                    })
+                    .collect(),
+            )
+        }
+        crate::vision::InferOutput::AgeGender(ag) => tentaflow_protocol::VisionInferResult::AgeGender {
+            age_years: ag.age_years,
+            gender_male_prob: ag.gender_male_prob,
+        },
+        crate::vision::InferOutput::Emotion(em) => tentaflow_protocol::VisionInferResult::Emotion {
+            label: em.label,
+            probabilities: em.probabilities,
+            valence: em.valence,
+            arousal: em.arousal,
+        },
+    };
+
+    let resp = tentaflow_protocol::VisionInferResponse {
+        service_name: payload.service_name.clone(),
+        result,
+        latency_ms: started.elapsed().as_millis() as u64,
+    };
+    Ok(MessageBody::VisionBody(
+        tentaflow_protocol::VisionInferPayload::InferResponse(resp),
+    ))
 }
 
 #[handler(variant = "FastPathListRequest", since = (1, 0))]
