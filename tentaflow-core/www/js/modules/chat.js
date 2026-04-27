@@ -359,7 +359,14 @@ const ChatScreen = {
     nextMsgId = maxId + 1;
 
     try {
-      modelOptions = await ApiBinary.list('modelListRequest');
+      const all = await ApiBinary.list('modelListRequest');
+      // Chat obsluguje tylko modele LLM. Bez filtru w dropdownie pojawialy sie
+      // serwisy STT/TTS (np. tentaflow-mlx-whisper-XXX) i klikniecie konczylo
+      // sie bledem "Model nie zostal znaleziony w konfiguracji".
+      modelOptions = (all || []).filter((m) => {
+        const cat = (m.category || m.service_type || '').toLowerCase();
+        return cat === '' || cat === 'llm';
+      });
     } catch {
       modelOptions = [];
     }

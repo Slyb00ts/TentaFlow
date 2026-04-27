@@ -61,7 +61,8 @@ async function loadTargets() {
         ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
         ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => []),
       ]);
-      const list = (nodesResp || []).filter((n) => n?.is_trusted === true || n?.is_local === true);
+      // MeshNodeInfo proto nie ma `is_trusted` — patrz engine-deploy-wizard.
+      const list = (nodesResp || []).filter((n) => n?.is_local === true || n?.source === 'trusted');
       if (list.length > 0) {
         nodes = list;
         clusters = clustersResp || [];

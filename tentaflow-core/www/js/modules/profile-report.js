@@ -179,7 +179,6 @@ async function goBackToMesh() {
   await MeshDetailScreen.show(currentNodeIdSnapshot());
 }
 
-let _backNodeId = null;
 function currentNodeIdSnapshot() {
   // currentNodeId moze byc juz wyzerowane przez cleanup() — bierz snapshot.
   return _backNodeId;
