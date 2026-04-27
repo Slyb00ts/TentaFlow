@@ -35,9 +35,76 @@ public enum AppleTTSEngine {
         }
     }
 
-    /// Synteza tekstu. `voiceId` to `AVSpeechSynthesisVoice.identifier` (np.
-    /// "com.apple.voice.compact.pl-PL.Zosia"); `nil` wybiera domyslny dla `language`.
-    /// `language` typu "pl-PL", "en-US". `rate` 0.0-1.0 (0.5 = AVSpeechUtteranceDefaultSpeechRate).
+    /// Synchroniczna wersja syntezy uzywana przez cdecl FFI. Nie spawnuje
+    /// Taska — wewnetrzny `synth.write` callback jest wywolywany na biezacym
+    /// thread (Rust spawn_blocking → tu). Wczesniej uzylismy Task + semaphore,
+    /// ale to dawalo deadlock gdy caller blokowal main thread.
+    public static func synthesizeSync(
+        text: String,
+        voiceId: String? = nil,
+        language: String = "en-US",
+        rate: Float = AVSpeechUtteranceDefaultSpeechRate
+    ) -> AppleTTSResult? {
+        // AVSpeechSynthesizer.write wywoluje callback przez CFRunLoop.main
+        // (lub current). Gdy caller jest Rust thread bez RunLoop, callback
+        // nigdy nie sie nie odpala — pusty bufor. Rozwiazanie: dispatch
+        // synchronicznie na main queue przez `DispatchQueue.main.sync`,
+        // ktore CFRunLoop main przeprocesuje. Caller (Rust spawn_blocking)
+        // musi NIE byc na main queue — w naszym setupie spawn_blocking idzie
+        // na thread pool, wiec OK.
+        let utterance = AVSpeechUtterance(string: text)
+        if let voiceId, let v = AVSpeechSynthesisVoice(identifier: voiceId) {
+            utterance.voice = v
+        } else if let v = AVSpeechSynthesisVoice(language: language) {
+            utterance.voice = v
+        }
+        utterance.rate = max(AVSpeechUtteranceMinimumSpeechRate,
+                             min(AVSpeechUtteranceMaximumSpeechRate, rate))
+
+        // Wszystko ponizej musi sie dziac na MAIN thread bo AVSpeechSynthesizer
+        // dispatches callbacks z main runloop. Sami sterujemy run-loop az do
+        // pojawienia sie pustego bufora (sygnal konca).
+        let runOnMain: () -> AppleTTSResult? = {
+            let box = SynthBox()
+            var samples: [Float] = []
+            var detectedRate: Int = 0
+            var done = false
+            box.synth.write(utterance) { buffer in
+                if done { return }
+                guard let pcmBuffer = buffer as? AVAudioPCMBuffer else { return }
+                let frameLen = Int(pcmBuffer.frameLength)
+                detectedRate = Int(pcmBuffer.format.sampleRate)
+                if frameLen == 0 {
+                    done = true
+                    return
+                }
+                if let f32 = pcmBuffer.floatChannelData {
+                    samples.append(contentsOf: UnsafeBufferPointer(start: f32[0], count: frameLen))
+                } else if let i16 = pcmBuffer.int16ChannelData {
+                    let buf = UnsafeBufferPointer(start: i16[0], count: frameLen)
+                    samples.reserveCapacity(samples.count + frameLen)
+                    for s in buf { samples.append(Float(s) / 32768.0) }
+                }
+            }
+            // Pompuj run loop az synth.write skonczy generacje. Limit 60 s.
+            let deadline = Date(timeIntervalSinceNow: 60)
+            while !done && Date() < deadline {
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+            }
+            if !done { return nil }
+            return AppleTTSResult(pcm: samples, sampleRate: detectedRate)
+        }
+        if Thread.isMainThread {
+            return runOnMain()
+        } else {
+            var out: AppleTTSResult? = nil
+            DispatchQueue.main.sync { out = runOnMain() }
+            return out
+        }
+    }
+
+    /// Async wersja syntezy — uzywana z poziomu Swift bez cdecl. Zachowana dla
+    /// CLI testow i przyszlej integracji iOS gdzie continuation jest naturalne.
     public static func synthesize(
         text: String,
         voiceId: String? = nil,
@@ -129,22 +196,14 @@ public func MLXAppleTTS_synthesize(
     let voiceIdStr = voiceId.flatMap { String(cString: $0) }
     let languageStr = language.flatMap { String(cString: $0) } ?? "en-US"
 
-    let semaphore = DispatchSemaphore(value: 0)
-    var result: AppleTTSResult? = nil
-    Task {
-        do {
-            result = try await AppleTTSEngine.synthesize(
-                text: text,
-                voiceId: voiceIdStr,
-                language: languageStr,
-                rate: rate
-            )
-        } catch {
-            print("[AppleTTS] synthesize error: \(error)")
-        }
-        semaphore.signal()
-    }
-    semaphore.wait()
+    // Uzywamy synchronicznego wariantu — Task + semaphore.wait dawal deadlock
+    // gdy caller (Rust dlsym) wywolywal nas z main thread.
+    let result = AppleTTSEngine.synthesizeSync(
+        text: text,
+        voiceId: voiceIdStr,
+        language: languageStr,
+        rate: rate
+    )
     guard let r = result, !r.pcm.isEmpty else { return nil }
 
     outSampleRate.pointee = Int32(r.sampleRate)
