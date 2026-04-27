@@ -24,9 +24,18 @@ pub mod types;
 pub mod mesh;
 pub mod envelope;
 pub mod message_body;
+pub mod profiling;
 
 pub use types::*;
 pub use mesh::*;
+pub use profiling::{
+    GpuUtilSample, GpuUtilSeries, NsightDeleteRequest, NsightDeleteResponse,
+    NsightDownloadRequest, NsightDownloadResponse, NsightGpuTarget,
+    NsightReportRequest, NsightReportResponse, NsightScope, NsightSessionEntry,
+    NsightSessionStatus, NsightSessionsRequest, NsightSessionsResponse, NsightStartRequest,
+    NsightStartResponse, NsightStopRequest, NsightStopResponse, NsightPayload, ProfileKpi,
+    ProfileMeta, ProfileReport, ProfileTopRow,
+};
 pub use envelope::{
     message_kind, Envelope, EnvelopeFlags, Routing, SessionAuth, SignedSessionClaim,
     SCHEMA_VERSION,
@@ -58,7 +67,8 @@ pub use message_body::{
     MeshPairingStartResponse, MeshPeerSummary, MeshPendingListResponse, MeshPendingPair,
     MeshServicesEntry, MeshServicesListResponse, MeshTrustRetrustRequest,
     MeshTrustRetrustResponse, MeshTrustRevokeRequest, MeshTrustRevokeResponse,
-    MeshTrustRevokedEvent, MeshTrustedKeysSyncEvent, MeshTrustedListResponse, MeshTrustedNode,
+    MeshTrustRevokedEvent, MeshTrustEventPayload, MeshTrustedKeysSyncEvent,
+    MeshTrustedListResponse, MeshTrustedNode,
     MeetingWakeWordRequest, MeetingWakeWordResponse,
     MessageBody, ModelDetail, ModelInstallRequest, ModelSummary, PiiRule,
     WakeWord, WakeWordOp,

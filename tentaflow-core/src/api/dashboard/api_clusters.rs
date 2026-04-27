@@ -577,6 +577,8 @@ async fn probe_pair(
         num_streams,
     };
 
+    use tentaflow_protocol::mesh::MeshCommandResponsePayload;
+
     let local_node_id_srv = qm.node_id().to_string();
     let server_response = if iface_b.node_id == local_node_id_srv {
         tracing::info!(
@@ -597,15 +599,18 @@ async fn probe_pair(
                 });
                 crate::mesh::iroh_manager::CommandWaitResponse {
                     command_id: String::new(),
-                    success: true,
-                    output: serde_json::json!({"port": port}).to_string(),
+                    ok: true,
+                    payload: MeshCommandResponsePayload::BandwidthProbeServerStarted {
+                        tcp_port: port,
+                        rdma_port: 0,
+                    },
                     error: None,
                 }
             }
             Err(e) => crate::mesh::iroh_manager::CommandWaitResponse {
                 command_id: String::new(),
-                success: false,
-                output: String::new(),
+                ok: false,
+                payload: MeshCommandResponsePayload::Empty,
                 error: Some(e.to_string()),
             },
         }
@@ -615,12 +620,12 @@ async fn probe_pair(
             .await?
     };
     tracing::info!(
-        "  Server response: success={} output={}",
-        server_response.success,
-        server_response.output
+        "  Server response: ok={} payload={:?}",
+        server_response.ok,
+        server_response.payload,
     );
 
-    if !server_response.success {
+    if !server_response.ok {
         return Ok(PairProbeResult {
             node_a: iface_a.node_id.clone(),
             node_b: iface_b.node_id.clone(),
@@ -633,11 +638,19 @@ async fn probe_pair(
         });
     }
 
-    // Parsuj porty z odpowiedzi serwera (TCP + opcjonalnie RDMA)
-    let server_json =
-        serde_json::from_str::<serde_json::Value>(&server_response.output).unwrap_or_default();
-    let port: u16 = server_json["port"].as_u64().unwrap_or(0) as u16;
-    let rdma_port: u16 = server_json["rdma_port"].as_u64().unwrap_or(0) as u16;
+    // Wyciagnij porty z typed payloadu — kazdy inny wariant to blad protokolu.
+    let (port, rdma_port): (u16, u16) = match server_response.payload {
+        MeshCommandResponsePayload::BandwidthProbeServerStarted {
+            tcp_port,
+            rdma_port,
+        } => (tcp_port, rdma_port),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Nieoczekiwany payload odpowiedzi serwera probing: {:?}",
+                other
+            ));
+        }
+    };
 
     if port == 0 {
         return Err(anyhow::anyhow!("Serwer nie zwrocil portu TCP"));
@@ -675,28 +688,25 @@ async fn probe_pair(
         )
         .await
         {
-            Ok(result) => {
-                let output = serde_json::json!({
-                    "bandwidth_mbps": result.bandwidth_mbps,
-                    "bytes_transferred": result.bytes_transferred,
-                    "duration_ms": result.duration_ms,
-                    "latency_us": result.latency_us,
-                    "streams_completed": result.streams_completed,
-                })
-                .to_string();
-                crate::mesh::iroh_manager::CommandWaitResponse {
-                    command_id: String::new(),
-                    success: true,
-                    output,
-                    error: None,
-                }
-            }
+            Ok(result) => crate::mesh::iroh_manager::CommandWaitResponse {
+                command_id: String::new(),
+                ok: true,
+                payload: MeshCommandResponsePayload::BandwidthProbeClientResult {
+                    bandwidth_mbps: result.bandwidth_mbps,
+                    bytes_transferred: result.bytes_transferred,
+                    duration_ms: result.duration_ms,
+                    latency_us: result.latency_us,
+                    streams_completed: result.streams_completed,
+                    rdma: false,
+                },
+                error: None,
+            },
             Err(e) => {
                 tracing::error!("  Lokalny probe client failed: {}", e);
                 crate::mesh::iroh_manager::CommandWaitResponse {
                     command_id: String::new(),
-                    success: false,
-                    output: String::new(),
+                    ok: false,
+                    payload: MeshCommandResponsePayload::Empty,
                     error: Some(e.to_string()),
                 }
             }
@@ -712,16 +722,20 @@ async fn probe_pair(
             .await?
     };
     tracing::info!(
-        "  Client response: success={} output={}",
-        client_response.success,
-        client_response.output
+        "  Client response: ok={} payload={:?}",
+        client_response.ok,
+        client_response.payload,
     );
 
-    let client_json =
-        serde_json::from_str::<serde_json::Value>(&client_response.output).unwrap_or_default();
-    let bandwidth_mbps = client_json["bandwidth_mbps"].as_f64().unwrap_or(0.0);
-    let mut latency_us = client_json["latency_us"].as_f64().unwrap_or(0.0) as u64;
-    let is_rdma = client_json["rdma"].as_bool().unwrap_or(false);
+    let (bandwidth_mbps, mut latency_us, is_rdma) = match &client_response.payload {
+        MeshCommandResponsePayload::BandwidthProbeClientResult {
+            bandwidth_mbps,
+            latency_us,
+            rdma,
+            ..
+        } => (*bandwidth_mbps, *latency_us, *rdma),
+        _ => (0.0, 0u64, false),
+    };
 
     // Fallback: uzyj QUIC RTT jesli probe nie zmierzyl latency
     if latency_us == 0 {
@@ -737,7 +751,7 @@ async fn probe_pair(
         interface_b: iface_b.name.clone(),
         bandwidth_mbps,
         latency_us,
-        reachable: client_response.success && bandwidth_mbps > 0.0,
+        reachable: client_response.ok && bandwidth_mbps > 0.0,
         rdma: iface_a.rdma_available && iface_b.rdma_available || is_rdma,
     };
 

@@ -1,0 +1,15 @@
+[
+  {
+    "reportName": "gpukernsum",
+    "data": [
+      { "Name": "ampere_sgemm_64x32_nn", "Time(ns)": 5000000000, "Calls": 100, "Avg(ns)": 50000000 },
+      { "Name": "elementwise_kernel", "Time(ns)": 2000000000, "Calls": 200, "Avg(ns)": 10000000 }
+    ]
+  },
+  {
+    "reportName": "cudaapisum",
+    "data": [
+      { "Name": "cudaLaunchKernel", "Time(ns)": 3000000000, "Calls": 300, "Avg(ns)": 10000000 }
+    ]
+  }
+]

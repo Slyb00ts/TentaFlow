@@ -60,6 +60,10 @@ pub enum ProtocolErrorCode {
     NotFound = 9,
     /// Niepoprawne argumenty requestu (walidacja pol).
     BadRequest = 10,
+    /// Stan zasobu wyklucza wykonanie operacji (np. inna sesja juz trwa).
+    Conflict = 11,
+    /// Funkcjonalnosc niedostepna na tym nodzie (brak narzedzia/feature flagi).
+    NotAvailable = 12,
 }
 
 /// Ujednolicony blad protokolu. Zwracany jako `MessageBody::Error(..)` z flagą
@@ -627,6 +631,16 @@ pub struct MeshTrustedKeysSyncEvent {
     pub epoch: u32,
 }
 
+/// Inner-enum pack — wszystkie trust eventy w jednym slocie MessageBody.
+/// Konsolidacja zwalnia slot pod nowe warianty (rkyv 0.8 ma twardy limit 256).
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum MeshTrustEventPayload {
+    /// Broadcast cofniecia trust (mesh discriminant 0x23).
+    Revoked(MeshTrustRevokedEvent),
+    /// Post-pairing sync listy zaufanych kluczy (mesh discriminant 0x24).
+    KeysSync(MeshTrustedKeysSyncEvent),
+}
+
 // =============================================================================
 // Mesh peers (R-LIST + W-ACTION archetypy, migration-map #87-#92)
 // =============================================================================
@@ -755,6 +769,11 @@ pub struct MeshNodeInfo {
     pub route: Option<MeshNodeRoute>,
     pub platform: String,
     pub connection: Option<MeshConnectionInfo>,
+    /// Czy `nsys` (NVIDIA Nsight Systems) jest dostepny na nodzie — wymagany do
+    /// uruchomienia sesji profilowania GPU.
+    pub nsys_available: bool,
+    /// Wykryta wersja `nsys` (np. "2024.5.1"); pusty string gdy niedostepny.
+    pub nsys_version: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -3001,9 +3020,8 @@ pub enum MessageBody {
     MeshPairInitRequestBody(MeshPairInitRequest),
     MeshPairInitResponseBody(MeshPairInitResponse),
 
-    // ---- Mesh trust events (broadcast / sync) ----
-    MeshTrustRevoked(MeshTrustRevokedEvent),
-    MeshTrustedKeysSync(MeshTrustedKeysSyncEvent),
+    // ---- Mesh trust events (broadcast / sync) — skonsolidowane w jeden slot ----
+    MeshTrustEventBody(MeshTrustEventPayload),
 
     // ---- Mesh extended (read-only + admin actions) ----
     MeshNodeListRequest,
@@ -3306,6 +3324,10 @@ pub enum MessageBody {
     // ---- Users list (Admin) ----
     // UsersList* consolidated into IamBody (below) jako ReqListUsers/ResListUsers.
     IamBody(IamPayload),
+
+    // ---- Nsight profiling (single-variant, req+res w inner enum) ----
+    // 10 par request/response w jednym slocie — rkyv 0.8 ma twardy limit 256.
+    NsightBody(crate::profiling::NsightPayload),
 
     // ---- Error ----
     /// Ujednolicony blad. Towarzyszy `EnvelopeFlags::IS_ERROR`.
@@ -3611,21 +3633,55 @@ mod tests {
 
     #[test]
     fn mesh_trust_revoked_round_trip() {
-        let evt = MessageBody::MeshTrustRevoked(MeshTrustRevokedEvent {
-            revoked_node_id: [0xAAu8; 32],
-            reason: "key compromise detected".to_string(),
-            revoked_at_epoch: 1_700_500_000,
-        });
+        let evt = MessageBody::MeshTrustEventBody(MeshTrustEventPayload::Revoked(
+            MeshTrustRevokedEvent {
+                revoked_node_id: [0xAAu8; 32],
+                reason: "key compromise detected".to_string(),
+                revoked_at_epoch: 1_700_500_000,
+            },
+        ));
         assert_eq!(round_trip(evt.clone()), evt);
     }
 
     #[test]
     fn mesh_trusted_keys_sync_round_trip() {
-        let evt = MessageBody::MeshTrustedKeysSync(MeshTrustedKeysSyncEvent {
-            trusted_keys: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
-            epoch: 42,
-        });
+        let evt = MessageBody::MeshTrustEventBody(MeshTrustEventPayload::KeysSync(
+            MeshTrustedKeysSyncEvent {
+                trusted_keys: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
+                epoch: 42,
+            },
+        ));
         assert_eq!(round_trip(evt.clone()), evt);
+    }
+
+    #[test]
+    fn nsight_body_round_trip() {
+        use crate::profiling::{NsightPayload, NsightScope, NsightStartRequest};
+        let body = MessageBody::NsightBody(NsightPayload::StartRequest(NsightStartRequest {
+            node_id: "node-x".into(),
+            scope: NsightScope::BothAll,
+            duration_secs: 30,
+            label: "deep-profile".into(),
+        }));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn consolidated_trust_event_payload_round_trip() {
+        let revoked =
+            MeshTrustEventPayload::Revoked(MeshTrustRevokedEvent {
+                revoked_node_id: [0x11u8; 32],
+                reason: "replay attack".into(),
+                revoked_at_epoch: 1_700_600_000,
+            });
+        let sync = MeshTrustEventPayload::KeysSync(MeshTrustedKeysSyncEvent {
+            trusted_keys: vec![[7u8; 32]],
+            epoch: 9,
+        });
+        for payload in [revoked, sync] {
+            let body = MessageBody::MeshTrustEventBody(payload);
+            assert_eq!(round_trip(body.clone()), body);
+        }
     }
 
     #[test]

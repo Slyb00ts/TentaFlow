@@ -1490,6 +1490,126 @@
     "qr_scan_busy": "Kamera jest używana przez inną aplikację.",
     "qr_scan_insecure": "Skanowanie wymaga HTTPS. Otwórz aplikację przez https://"
   },
+  "nsight": {
+    "profile_btn": "Profil",
+    "profile_node_btn": "Profilowanie noda",
+    "modal": {
+      "title": "Profilowanie Nsight Systems"
+    },
+    "scope": {
+      "label": "Co profilować",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "both": "CPU + GPU"
+    },
+    "gpu": {
+      "label": "Karta GPU",
+      "all": "Wszystkie karty NVIDIA"
+    },
+    "duration": {
+      "label": "Czas (s)",
+      "30s": "30 s",
+      "60s": "60 s",
+      "120s": "120 s",
+      "manual": "Manualny stop"
+    },
+    "label": {
+      "label": "Etykieta",
+      "placeholder": "np. inference qwen3"
+    },
+    "start": "Start",
+    "stop": "Stop",
+    "cancel": "Anuluj",
+    "recording": "Nagrywanie",
+    "session": {
+      "started": "Sesja uruchomiona",
+      "finished": "Sesja zakończona",
+      "error": "Błąd profilowania",
+      "in_progress": "trwa..."
+    },
+    "sessions": {
+      "title": "Sesje profilowania",
+      "empty": "Brak sesji",
+      "col": {
+        "timestamp": "Czas",
+        "label": "Etykieta",
+        "scope": "Zakres",
+        "duration": "Czas trwania",
+        "status": "Status",
+        "actions": "Akcje"
+      }
+    },
+    "action": {
+      "open": "Otwórz raport",
+      "download": "Pobierz .nsys-rep",
+      "delete": "Usuń",
+      "confirm_delete": "Usunąć sesję profilowania? Operacja jest nieodwracalna."
+    },
+    "error": {
+      "busy": "Inna sesja jest już uruchomiona",
+      "not_available": "nsys nie jest dostępny na tym nodzie",
+      "invalid_duration": "Niewłaściwy czas trwania",
+      "invalid_scope": "Niewłaściwy zakres profilowania",
+      "session_not_found": "Sesja nie znaleziona"
+    },
+    "report": {
+      "title": "Raport profilowania",
+      "back": "Wróć",
+      "meta": {
+        "hostname": "Host",
+        "started": "Start",
+        "duration": "Czas trwania",
+        "nsys_version": "nsys",
+        "gpu_targets": "GPU"
+      },
+      "kpi": {
+        "gpu_active": "GPU active",
+        "cpu_active": "CPU active",
+        "kernel_count": "Kernele",
+        "cuda_api_count": "CUDA API",
+        "peak_vram": "Peak VRAM",
+        "samples": "Próbki"
+      },
+      "tab": {
+        "overview": "Przegląd",
+        "kernels": "GPU Kernels",
+        "cuda": "CUDA APIs",
+        "memory": "Memory",
+        "cpu": "CPU",
+        "nvtx": "NVTX",
+        "timeline": "Timeline"
+      },
+      "col": {
+        "name": "Nazwa",
+        "total_ms": "Total (ms)",
+        "calls": "Wywołania",
+        "avg_ms": "Średnia (ms)",
+        "pct": "%"
+      },
+      "timeline": {
+        "legend": {
+          "sm": "SM %",
+          "mem": "Memory %",
+          "power": "Power %"
+        }
+      },
+      "empty": {
+        "timeline": "Brak danych timeline (nsys uruchomiony bez --gpu-metrics-device)",
+        "cpu_samples": "Brak próbek CPU",
+        "nvtx": "Brak ranges NVTX"
+      },
+      "action": {
+        "download": "Pobierz .nsys-rep",
+        "delete": "Usuń sesję"
+      },
+      "confirm_delete": "Usunąć sesję profilowania?",
+      "error": {
+        "load": "Nie udało się załadować raportu",
+        "delete": "Nie udało się usunąć sesji",
+        "download": "Nie udało się pobrać pliku"
+      }
+    }
+  },
   "clusters": {
     "title": "Clusters",
     "new": "Nowy cluster",

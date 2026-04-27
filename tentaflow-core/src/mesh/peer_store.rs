@@ -65,6 +65,24 @@ pub struct MeshPeerInfo {
     /// Wygenerowane tokenow/sekunde w ostatnim oknie metryk.
     #[serde(default)]
     pub tokens_per_sec: f32,
+    /// Czy peer ma zainstalowany `nsys` (NVIDIA Nsight Systems CLI). GUI uzywa
+    /// tego pola do warunkowego pokazywania przycisku Profile na karcie peera.
+    #[serde(default)]
+    pub nsys_available: bool,
+    /// Wersja `nsys` zaraportowana przez peera (pusta gdy `nsys_available=false`).
+    #[serde(default)]
+    pub nsys_version: String,
+}
+
+/// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
+/// (np. NVIDIA Nsight Systems wymaga `vendor == Nvidia`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+pub enum GpuVendor {
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Other,
 }
 
 /// Informacje o GPU peera
@@ -77,6 +95,9 @@ pub struct PeerGpuInfo {
     pub temperature_c: u32,
     pub power_draw_w: Option<f32>,
     pub power_limit_w: Option<f32>,
+    /// Producent GPU — wykrywany po nazwie/PCI. Domyslnie `Other` dopoki
+    /// detekcja nie jest podlaczona (PR2 doda klasyfikacje).
+    pub vendor: GpuVendor,
 }
 
 /// Informacje o nodzie — wymieniane przez QUIC po polaczeniu
@@ -139,6 +160,12 @@ pub struct HeartbeatMetrics {
     pub active_requests: u32,
     /// Wygenerowane tokeny/sekunde w oknie metrycznym (tylko LLM).
     pub tokens_per_sec: f32,
+    /// Capability flag: `true` gdy peer wykryl dziajace `nsys` w PATH. Propaguje
+    /// sie z heartbeatami tak, zeby GUI nie musialo pingowac peera dla samego
+    /// wyswietlenia przycisku Profile.
+    pub nsys_available: bool,
+    /// Wersja `nsys` (pusta gdy `nsys_available=false`).
+    pub nsys_version: String,
 }
 
 /// Broadcast z lista modeli zaladowanych/dostepnych na nodzie. Wysylany co
@@ -529,6 +556,8 @@ impl MeshPeerStore {
         swap_used_mb: u64,
         active_requests: u32,
         tokens_per_sec: f32,
+        nsys_available: bool,
+        nsys_version: String,
     ) {
         let mut entry = self
             .peers
@@ -544,6 +573,8 @@ impl MeshPeerStore {
         entry.swap_used_mb = swap_used_mb;
         entry.active_requests = active_requests;
         entry.tokens_per_sec = tokens_per_sec;
+        entry.nsys_available = nsys_available;
+        entry.nsys_version = nsys_version;
         if !platform.is_empty() {
             entry.platform = platform;
         }
@@ -796,6 +827,86 @@ impl MeshPeerStore {
             models: vec![],
             active_requests: 0,
             tokens_per_sec: 0.0,
+            nsys_available: false,
+            nsys_version: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_gpu_info_with_vendor_round_trip() {
+        let gpu = PeerGpuInfo {
+            name: "NVIDIA RTX 4090".to_string(),
+            vram_total_mb: 24576,
+            vram_used_mb: 8192,
+            usage_percent: 73.5,
+            temperature_c: 68,
+            power_draw_w: Some(310.0),
+            power_limit_w: Some(450.0),
+            vendor: GpuVendor::Nvidia,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gpu).expect("encode");
+        let decoded =
+            rkyv::from_bytes::<PeerGpuInfo, rkyv::rancor::Error>(&bytes).expect("decode");
+
+        assert_eq!(decoded.name, gpu.name);
+        assert_eq!(decoded.vram_total_mb, gpu.vram_total_mb);
+        assert_eq!(decoded.vram_used_mb, gpu.vram_used_mb);
+        assert!((decoded.usage_percent - gpu.usage_percent).abs() < f32::EPSILON);
+        assert_eq!(decoded.temperature_c, gpu.temperature_c);
+        assert_eq!(decoded.power_draw_w, gpu.power_draw_w);
+        assert_eq!(decoded.power_limit_w, gpu.power_limit_w);
+        assert_eq!(decoded.vendor, GpuVendor::Nvidia);
+    }
+
+    #[test]
+    fn gpu_vendor_all_variants_round_trip() {
+        for v in [
+            GpuVendor::Nvidia,
+            GpuVendor::Amd,
+            GpuVendor::Intel,
+            GpuVendor::Apple,
+            GpuVendor::Other,
+        ] {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).expect("encode");
+            let decoded =
+                rkyv::from_bytes::<GpuVendor, rkyv::rancor::Error>(&bytes).expect("decode");
+            assert_eq!(decoded, v);
+        }
+    }
+
+    /// Heartbeat z polami `nsys_available` / `nsys_version` round-trip rkyv —
+    /// peer odbierajacy ramke musi widziec capability nadawcy. Walidacja
+    /// schematu po dodaniu pol w PR3b (advertisement Nsight w heartbeat).
+    #[test]
+    fn nsight_capability_in_heartbeat_round_trip() {
+        let hb = HeartbeatMetrics {
+            cpu_usage_percent: 12.5,
+            ram_used_mb: 2048,
+            gpus: vec![],
+            containers: vec![],
+            networks: vec![],
+            platform: "linux".to_string(),
+            cpu_temperature_c: Some(55.0),
+            swap_total_mb: 0,
+            swap_used_mb: 0,
+            connected_peers: vec!["abc".to_string()],
+            active_requests: 1,
+            tokens_per_sec: 42.0,
+            nsys_available: true,
+            nsys_version: "2024.5.1".to_string(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&hb).expect("encode");
+        let decoded =
+            rkyv::from_bytes::<HeartbeatMetrics, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert!(decoded.nsys_available);
+        assert_eq!(decoded.nsys_version, "2024.5.1");
+        assert_eq!(decoded.platform, "linux");
+        assert_eq!(decoded.connected_peers, vec!["abc".to_string()]);
     }
 }
