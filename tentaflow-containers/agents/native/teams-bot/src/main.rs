@@ -298,6 +298,12 @@ async fn gate_and_respond(
         Ok(Ok(resp)) => {
             let trimmed = resp.content.trim().to_string();
             if trimmed.is_empty() || trimmed.contains("<NO_RESPONSE>") {
+                tracing::info!(
+                    alias = %config.llm_alias,
+                    resolved = %resp.resolved_model,
+                    raw_len = trimmed.len(),
+                    "LLM zwrocil pusty/<NO_RESPONSE> — bot milczy"
+                );
                 None
             } else {
                 tracing::info!(

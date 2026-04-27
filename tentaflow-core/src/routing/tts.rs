@@ -46,7 +46,17 @@ impl Router {
         use tentaflow_protocol::*;
 
         let model = &request.model;
-        let input = &request.input;
+        // Wyczysc input przed dispatch: strip emoji + aplikuj reguly
+        // `tts_cleaning_rules` z DB (cachowane w pamieci, refresh przy CRUD).
+        // Bez tego TTS musial wymawiac surowe emoji / skroty / dziwne pattern'y
+        // co dawalo cisze albo zlamana prozodie. Dziala tylko gdy router ma
+        // db Pool — fallback do raw inputu gdy db=None.
+        let cleaned_input = if let Some(ref db) = self.db {
+            crate::tts::clean_cache::clean(&request.input, db)
+        } else {
+            request.input.clone()
+        };
+        let input = &cleaned_input;
         let voice = &request.voice;
         let speed = request.speed.unwrap_or(1.0);
         let format = request.response_format.as_deref().unwrap_or("wav");
