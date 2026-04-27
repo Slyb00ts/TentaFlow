@@ -2592,6 +2592,7 @@ pub fn tts_rule_delete(
     Ok(MessageBody::TtsRuleDeleteResponse { deleted: true })
 }
 
+
 #[handler(variant = "PiiRuleListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -3686,11 +3687,13 @@ pub fn service_manifest_deploy(
     let method_task = payload.deploy_method.clone();
     let node_id_task = payload.node_id.clone();
     let config_json_task = config_json.clone();
+    let router_task = ctx.state.router.clone();
     tokio::spawn(async move {
         crate::deploy::runner::run_deployment(
             db_clone,
             service_manager,
             settings_cipher,
+            router_task,
             deploy_id_task,
             engine_id_task,
             method_task,

@@ -60,6 +60,7 @@ pub async fn run_deployment(
     db: DbPool,
     service_manager: Arc<ServiceManager>,
     settings_cipher: Arc<SettingsCipher>,
+    router: Arc<crate::routing::router::Router>,
     deploy_id: String,
     engine_id: String,
     deploy_method: String,
@@ -640,6 +641,7 @@ async fn do_native_deploy(
             do_embedded_native_deploy(
                 db,
                 service_manager,
+                router,
                 deploy_id,
                 tx,
                 engine,
@@ -784,6 +786,7 @@ async fn do_binary_native_deploy(
 async fn do_embedded_native_deploy(
     db: &DbPool,
     service_manager: &Arc<ServiceManager>,
+    router: &Arc<crate::routing::router::Router>,
     deploy_id: &str,
     tx: &broadcast::Sender<BusMessage>,
     engine: &EngineMeta,
@@ -897,6 +900,15 @@ async fn do_embedded_native_deploy(
                 &config_json,
             );
 
+            // Rejestruj w mesh — bez tego router widzi serwis w DB ale nie
+            // wie ze jest live na tym nodzie (Mesh STT serwis nie polaczony).
+            router.register_native_service_in_mesh(
+                &service_name, "stt",
+                vec!["whisper-large-v3-turbo".to_string()],
+                Some("whisper".to_string()),
+                vec![stt_info.size_bytes / (1024 * 1024)],
+            );
+
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
             log_line(
@@ -961,6 +973,12 @@ async fn do_embedded_native_deploy(
                 service_id,
                 &config_json,
             );
+            router.register_native_service_in_mesh(
+                &service_name, "tts",
+                vec![model_repo.clone()],
+                Some("kokoro".to_string()),
+                vec![info.sample_rate as u64 / 1000],  // placeholder
+            );
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
             log_line(db, deploy_id, tx, "log", &format!("Kokoro TTS gotowe: {}", service_name));
             let _ = service_manager;
@@ -1021,6 +1039,12 @@ async fn do_embedded_native_deploy(
                 "tts",
                 service_id,
                 &config_json,
+            );
+            router.register_native_service_in_mesh(
+                &service_name, "tts",
+                vec![voice_id.clone()],
+                Some("apple-tts".to_string()),
+                vec![0],
             );
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
             log_line(
@@ -1089,6 +1113,16 @@ async fn do_embedded_native_deploy(
                 "stt",
                 service_id,
                 &config_json,
+            );
+
+            // Rejestracja mesh — bez tego router zwraca "Mesh STT serwis nie
+            // polaczony". Wczesniej tylko `restore_native_services` przy
+            // starcie tentaflow to robil; po deployu trzeba wprost.
+            router.register_native_service_in_mesh(
+                &service_name, "stt",
+                vec![model_repo.clone()],
+                Some("mlx-whisper".to_string()),
+                vec![stt_info.size_bytes / (1024 * 1024)],
             );
 
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
