@@ -3825,11 +3825,9 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
         attributeFilter: ['class', 'data-tid', 'aria-label', 'aria-pressed', 'data-stream-type']
       });
       schedule();
-      // Safety-net 1s — pokryje przegapiona mutacje w iframe / shadow root.
-      // Nie polling 500ms, tylko brakujacy edge-case net.
-      // UWAGA: NIE uzywamy registerInterval bo cleanupTentaflow() (WS close)
-      // by to zniszczyl. Bridge przezywa rozlaczenia WS audio.
-      setInterval(schedule, 1000);
+      // MutationObserver z subtree:true + attributeFilter pokrywa wszystkie
+      // zmiany rosteru Teams light-meetings. Wczesniej dzialal tu setInterval
+      // 1s "safety-net" — zbedny CPU bo observer juz lapie tych samych eventow.
     }
     attach();
     console.log('[tentaflow] DOM event bridge zainstalowany (push via addBinding)');
@@ -3845,15 +3843,17 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
     //   * HOLD_LEVEL — minimum zeby przedluzyc trwajacego speakera
     //   * SILENCE_HOLD_MS — czas trzymania speakera mimo levelu < HOLD
     //
-    // POLL_MS=50 daje 20Hz sampling — Chromium internal audioLevel stats
-    // aktualizuja sie co ~20ms, wiec 50ms jest blisko realnego limitu tej
-    // techniki. getStats() jest lokalny (~100-500us), 20Hz × kilka pc to
-    // pomijalny CPU. SILENCE_HOLD_MS=300 — szybciej kasuje po koncu zdania,
+    // Adaptive sampling: 50ms (20Hz) gdy ktos mowi, 200ms (5Hz) w ciszy.
+    // Chromium internal audioLevel stats aktualizuja sie co ~20ms; 50ms jest
+    // blisko realnego limitu tej techniki gdy mamy aktywnego speakera. W idle
+    // wystarczy 5Hz zeby zalapac poczatek wypowiedzi w <=200ms — i tak czekamy
+    // SILENCE_HOLD_MS=300 zanim uznamy ze ktos przestal mowic. SILENCE_HOLD_MS
     // dalej debounce'uje pauzy miedzy sylabami.
     const SPEAKER_START_LEVEL = 0.03;
     const SPEAKER_HOLD_LEVEL = 0.005;
     const SPEAKER_SILENCE_HOLD_MS = 300;
-    const SPEAKER_POLL_MS = 50;
+    const SPEAKER_POLL_ACTIVE_MS = 50;
+    const SPEAKER_POLL_IDLE_MS = 200;
     let lastBindingSpeaker = null;
     let silenceSince = 0;
 
@@ -3898,7 +3898,7 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
       return best;
     }
 
-    setInterval(async function () {
+    async function pollActiveSpeaker() {
       try {
         const level = await maxInboundAudioLevel();
         const now = Date.now();
@@ -3932,7 +3932,12 @@ const FACEMESH_DENSE = [...FACEMESH_CONTOURS, ...FACEMESH_FILL];
       } catch (_) {
         // getStats moze rzucic gdy pc jest closed mid-poll — silent.
       }
-    }, SPEAKER_POLL_MS);
+      // Aktywny speaker => szybkie 20Hz sampling, idle => 5Hz. setTimeout
+      // recursion (zamiast setInterval) zeby zmieniac tempo bez recreate'a.
+      const nextDelay = lastBindingSpeaker ? SPEAKER_POLL_ACTIVE_MS : SPEAKER_POLL_IDLE_MS;
+      setTimeout(pollActiveSpeaker, nextDelay);
+    }
+    setTimeout(pollActiveSpeaker, SPEAKER_POLL_ACTIVE_MS);
   }
 
   if (document.readyState === 'loading') {
