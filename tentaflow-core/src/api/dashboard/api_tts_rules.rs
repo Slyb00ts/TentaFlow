@@ -66,6 +66,7 @@ pub fn handle_create(pool: &DbPool, body: &[u8]) -> Result<(u16, String)> {
         &req.language,
         req.priority.unwrap_or(0),
     )?;
+    crate::tts::clean_cache::refresh(pool);
     let item = db::repository::get_tts_cleaning_rule(pool, id)?;
     Ok((201, serde_json::to_string(&item)?))
 }
@@ -111,6 +112,7 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
     };
 
     db::repository::update_tts_cleaning_rule(pool, &params)?;
+    crate::tts::clean_cache::refresh(pool);
     let item = db::repository::get_tts_cleaning_rule(pool, id)?;
     Ok((200, serde_json::to_string(&item)?))
 }
@@ -126,5 +128,6 @@ pub fn handle_delete(pool: &DbPool, id: i64) -> Result<(u16, String)> {
     }
 
     db::repository::delete_tts_cleaning_rule(pool, id)?;
+    crate::tts::clean_cache::refresh(pool);
     Ok((200, r#"{"ok":true}"#.to_string()))
 }
