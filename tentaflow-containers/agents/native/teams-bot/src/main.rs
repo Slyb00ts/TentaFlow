@@ -14,6 +14,7 @@ mod summarizer;
 mod vad;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +22,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
-use crate::audio::RosterEntry;
 use crate::config::MeetingConfig;
 use crate::summarizer::{TranscriptBuffer, TranscriptEntry};
 use crate::vad::VadResult;
@@ -480,7 +480,12 @@ async fn main() -> Result<()> {
     // bridge), odczytywane w STT pipeline jako extra_meta. Trzymane na poziomie
     // calego sidecara, zeby przezyc LeaveMeeting / ponowny JoinMeeting bez
     // przedlokowania rzeczy ktore i tak dom_observer zaraz zaktualizuje.
-    let current_roster: Arc<RwLock<Vec<RosterEntry>>> = Arc::new(RwLock::new(Vec::new()));
+    //
+    // Roster jest trzymany juz jako gotowy JSON snapshot (ArcSwap<String>) —
+    // dom_observer przebudowuje go raz przy zmianie `known`, STT hot path bierze
+    // go jednym `load_full()` zamiast async RwLock + serde_json::to_string per
+    // segment.
+    let roster_snapshot: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from(Arc::new("[]".to_string())));
     let current_active_speaker: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
     // Spawnuje summarizer dla podanego meeting_key. Stary handle (jesli byl)
@@ -587,8 +592,8 @@ async fn main() -> Result<()> {
             &config,
             &router_client_handle,
             &meeting_id,
-            Arc::clone(&current_roster),
             Arc::clone(&current_active_speaker),
+            Arc::clone(&roster_snapshot),
         )
         .await
         {
@@ -835,26 +840,13 @@ async fn main() -> Result<()> {
 
                     // Doklej kontekst spotkania do metadata STT — router uzywa
                     // go do diarization, logow i ewentualnej generacji odpowiedzi.
-                    // Sanityzacja: obcinamy znaki kontrolne i limitujemy dlugosc zeby
-                    // zlosliwa/zbugowana strona Teams nie wstrzyknela metadata-bomb.
+                    // Sanityzacja rosteru jest juz zrobiona po stronie dom_observer
+                    // (raz, przy kazdej zmianie `known`); tutaj tylko bierzemy
+                    // gotowy JSON jednym atomic load'em.
                     let mut extra_meta: Vec<(String, String)> = Vec::new();
-                    {
-                        let roster_snapshot = current_roster.read().await;
-                        let names: Vec<String> = roster_snapshot
-                            .iter()
-                            .take(50)
-                            .map(|r| r.name.chars()
-                                .filter(|c| !c.is_control())
-                                .take(128)
-                                .collect::<String>())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        drop(roster_snapshot);
-                        if !names.is_empty() {
-                            if let Ok(json) = serde_json::to_string(&names) {
-                                extra_meta.push(("roster".to_string(), json));
-                            }
-                        }
+                    let roster_json = roster_snapshot.load_full();
+                    if roster_json.as_str() != "[]" {
+                        extra_meta.push(("roster".to_string(), (*roster_json).clone()));
                     }
                     if let Some(ref speaker) = *current_active_speaker.read().await {
                         let cleaned: String = speaker.chars()
@@ -895,7 +887,11 @@ async fn main() -> Result<()> {
                     let stt_latency_ms = stt_started.elapsed().as_millis() as u64;
                     match stt_result {
                         Ok(text) if !text.is_empty() => {
-                            tracing::info!(text = %text, latency_ms = stt_latency_ms, "STT zwrocilo transkrypt");
+                            // Pelen tekst per segment + latency to spam na info —
+                            // przy zywej rozmowie 10-30 wpisow/min, wszystkie z
+                            // duzym `text` polem. Demotujemy do debug; podsumowanie
+                            // info dostarcza linijka "Wysylam segment do STT" wyzej.
+                            tracing::debug!(text = %text, latency_ms = stt_latency_ms, "STT zwrocilo transkrypt");
                             let _ = transcript_tx.send(("Nieznany".to_string(), text.clone(), timestamp_ms));
 
                             // Wpis do rolling bufferu summarizera. Speaker name
@@ -921,33 +917,46 @@ async fn main() -> Result<()> {
                             // lookup z voice_profiles). Persist chunka do DB leci
                             // osobno przez STT metadata `meeting_id` → transcript_store,
                             // więc ten event nie duplikuje zapisu.
+                            //
+                            // Fire-and-forget: broadcast TranscriptEntry to nowy
+                            // bi-stream QUIC RT do routera (~50-200ms). Blokowanie
+                            // na nim opoznialoby start LLM przy kazdej wypowiedzi
+                            // dokladnie o ten czas. Spawnujemy w tle, bledy idzie
+                            // do warn — nie ma czego retryowac.
                             if let Some(meeting_id) = client.current_meeting_id() {
-                                if let Err(e) = client
-                                    .send_meeting_event(
-                                        &meeting_id,
-                                        timestamp_ms as i64,
-                                        MeetingEventPayload::TranscriptEntry {
-                                            speaker_id: speaker_label.clone(),
-                                            speaker_name: if speaker_label == "Nieznany" {
-                                                None
-                                            } else {
-                                                Some(speaker_label.clone())
+                                let bcast_client = Arc::clone(&client);
+                                let bcast_speaker = speaker_label.clone();
+                                let bcast_text = text.clone();
+                                let bcast_alias = stt_alias.to_string();
+                                tokio::spawn(async move {
+                                    let speaker_name = if bcast_speaker == "Nieznany" {
+                                        None
+                                    } else {
+                                        Some(bcast_speaker.clone())
+                                    };
+                                    if let Err(e) = bcast_client
+                                        .send_meeting_event(
+                                            &meeting_id,
+                                            timestamp_ms as i64,
+                                            MeetingEventPayload::TranscriptEntry {
+                                                speaker_id: bcast_speaker,
+                                                speaker_name,
+                                                is_enrolled: false,
+                                                speaker_confidence: None,
+                                                text: bcast_text,
+                                                language: None,
+                                                resolved_stt_model: bcast_alias,
+                                                latency_ms: stt_latency_ms,
                                             },
-                                            is_enrolled: false,
-                                            speaker_confidence: None,
-                                            text: text.clone(),
-                                            language: None,
-                                            resolved_stt_model: stt_alias.to_string(),
-                                            latency_ms: stt_latency_ms,
-                                        },
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "send_meeting_event TranscriptEntry failed: {}",
-                                        e
-                                    );
-                                }
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "send_meeting_event TranscriptEntry (bg) failed: {}",
+                                            e
+                                        );
+                                    }
+                                });
                             }
 
                             // Pelny pipeline z gatowaniem aktywacji:
@@ -972,7 +981,10 @@ async fn main() -> Result<()> {
                                     &text,
                                 ).await
                             } else {
-                                tracing::info!(
+                                // Konfiguracja bota nie zmienia sie w trakcie sesji,
+                                // wiec ten log powtarza sie identycznie per kazdy
+                                // segment STT. Debug wystarcza.
+                                tracing::debug!(
                                     respond_enabled = config.respond_enabled,
                                     llm_alias_empty = config.llm_alias.trim().is_empty(),
                                     "skip LLM response (bot pasywny — sprawdz respond_enabled / llm_alias)"
@@ -1092,8 +1104,8 @@ async fn main() -> Result<()> {
                                     &config,
                                     &router_client_handle,
                                     &meeting_id,
-                                    Arc::clone(&current_roster),
                                     Arc::clone(&current_active_speaker),
+                                    Arc::clone(&roster_snapshot),
                                 )
                                 .await
                                 {
