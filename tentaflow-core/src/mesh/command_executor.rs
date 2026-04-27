@@ -298,6 +298,7 @@ impl MeshCommandExecutor {
             MeshCommandType::NsightSessions(req) => self.handle_nsight_sessions(req).await,
             MeshCommandType::NsightReport(req) => self.handle_nsight_report(req).await,
             MeshCommandType::NsightDelete(req) => self.handle_nsight_delete(req).await,
+            MeshCommandType::NsightDownload(req) => self.handle_nsight_download(req).await,
         }
     }
 
@@ -511,6 +512,36 @@ impl MeshCommandExecutor {
                 CommandResponse::fail(format!("session not found: {}", s))
             }
             Err(e) => CommandResponse::fail(format!("nsight delete: {}", e)),
+        }
+    }
+
+    async fn handle_nsight_download(
+        &self,
+        req: tentaflow_protocol::profiling::NsightDownloadRequest,
+    ) -> CommandResponse {
+        let storage = self.profile_storage();
+        let path = match storage.raw_report_path(&req.session_id) {
+            Ok(p) => p,
+            Err(ProfilingError::InvalidSessionId) => {
+                return CommandResponse::fail("invalid session id".to_string());
+            }
+            Err(e) => return CommandResponse::fail(format!("nsight download: {}", e)),
+        };
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                let filename = format!("nsight-{}.nsys-rep", req.session_id);
+                CommandResponse::ok(MeshCommandResponsePayload::NsightDownload(
+                    tentaflow_protocol::profiling::NsightDownloadResponse {
+                        session_id: req.session_id,
+                        filename,
+                        bytes,
+                    },
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                CommandResponse::fail(format!("session not found: {}", req.session_id))
+            }
+            Err(e) => CommandResponse::fail(format!("nsight download: {}", e)),
         }
     }
 }

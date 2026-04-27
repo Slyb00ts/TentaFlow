@@ -75,3 +75,12 @@ export async function nsightReport({ nodeId, sessionId }) {
 export async function nsightDelete({ nodeId, sessionId }) {
   return ApiBinary.one('nsightDeleteRequest', { nodeId, sessionId });
 }
+
+/**
+ * Pobranie surowego pliku `.nsys-rep` (binary blob) — do otwarcia w nsys-ui.
+ *
+ * @returns {Promise<{ sessionId: string, filename: string, bytes: Uint8Array }>}
+ */
+export async function nsightDownload({ nodeId, sessionId }) {
+  return ApiBinary.one('nsightDownloadRequest', { nodeId, sessionId });
+}

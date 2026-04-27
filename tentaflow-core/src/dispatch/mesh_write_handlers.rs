@@ -641,6 +641,7 @@ async fn forward_nsight_to_peer(
         RP::NsightSessions(r) => Ok(NsightPayload::SessionsResponse(r)),
         RP::NsightReport(r) => Ok(NsightPayload::ReportResponse(r)),
         RP::NsightDelete(r) => Ok(NsightPayload::DeleteResponse(r)),
+        RP::NsightDownload(r) => Ok(NsightPayload::DownloadResponse(r)),
         _ => Err(ProtocolError::internal(
             "remote node returned unexpected payload variant",
         )),
@@ -655,8 +656,8 @@ async fn handle_nsight_local(
 ) -> Result<NsightPayload, ProtocolError> {
     use crate::profiling::NSYS_RUNNER;
     use tentaflow_protocol::profiling::{
-        NsightDeleteResponse, NsightReportResponse, NsightSessionsResponse, NsightStartResponse,
-        NsightStopResponse,
+        NsightDeleteResponse, NsightDownloadResponse, NsightReportResponse,
+        NsightSessionsResponse, NsightStartResponse, NsightStopResponse,
     };
 
     match payload {
@@ -707,12 +708,34 @@ async fn handle_nsight_local(
                 ok: true,
             }))
         }
+        NsightPayload::DownloadRequest(req) => {
+            let storage = local_profile_storage(ctx);
+            // Walidacja session_id idzie przez raw_report_path -> session_dir;
+            // chroni przed path-traversal (regex ^[0-9a-f]{32}$).
+            let path = storage
+                .raw_report_path(&req.session_id)
+                .map_err(profiling_err_to_proto)?;
+            let bytes = tokio::fs::read(&path).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ProtocolError::not_found(format!("session not found: {}", req.session_id))
+                } else {
+                    ProtocolError::internal(format!("nsight download: {}", e))
+                }
+            })?;
+            let filename = format!("nsight-{}.nsys-rep", req.session_id);
+            Ok(NsightPayload::DownloadResponse(NsightDownloadResponse {
+                session_id: req.session_id,
+                filename,
+                bytes,
+            }))
+        }
         // Response warianty nie powinny przyjsc jako request — zwracaj BadRequest.
         NsightPayload::StartResponse(_)
         | NsightPayload::StopResponse(_)
         | NsightPayload::SessionsResponse(_)
         | NsightPayload::ReportResponse(_)
-        | NsightPayload::DeleteResponse(_) => Err(ProtocolError::bad_request(
+        | NsightPayload::DeleteResponse(_)
+        | NsightPayload::DownloadResponse(_) => Err(ProtocolError::bad_request(
             "expected NsightPayload request variant",
         )),
     }
@@ -732,6 +755,7 @@ async fn nsight_route(
         NsightPayload::SessionsRequest(r) => r.node_id.clone(),
         NsightPayload::ReportRequest(r) => r.node_id.clone(),
         NsightPayload::DeleteRequest(r) => r.node_id.clone(),
+        NsightPayload::DownloadRequest(r) => r.node_id.clone(),
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected NsightPayload request variant",
@@ -749,6 +773,7 @@ async fn nsight_route(
         NsightPayload::SessionsRequest(r) => MC::NsightSessions(r),
         NsightPayload::ReportRequest(r) => MC::NsightReport(r),
         NsightPayload::DeleteRequest(r) => MC::NsightDelete(r),
+        NsightPayload::DownloadRequest(r) => MC::NsightDownload(r),
         _ => unreachable!("filtered above"),
     };
     forward_nsight_to_peer(ctx, &target, cmd).await
@@ -801,14 +826,18 @@ register_nsight_variant!(
 );
 register_nsight_variant!("NsightReportRequest", "tentaflow_ws_handler_nsight_report");
 register_nsight_variant!("NsightDeleteRequest", "tentaflow_ws_handler_nsight_delete");
+register_nsight_variant!(
+    "NsightDownloadRequest",
+    "tentaflow_ws_handler_nsight_download"
+);
 
 #[cfg(test)]
 mod nsight_tests {
     use super::*;
     use crate::dispatch::state::AppState;
     use tentaflow_protocol::profiling::{
-        NsightDeleteRequest, NsightReportRequest, NsightScope, NsightSessionsRequest,
-        NsightStartRequest, NsightStopRequest,
+        NsightDeleteRequest, NsightDownloadRequest, NsightReportRequest, NsightScope,
+        NsightSessionsRequest, NsightStartRequest, NsightStopRequest,
     };
     use tentaflow_protocol::SessionAuth;
 
@@ -907,6 +936,53 @@ mod nsight_tests {
                     e
                 );
             }
+            Ok(_) => panic!("oczekiwano bledu"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsight_download_invalid_session_id_is_bad_request() {
+        // Walidacja regexem `^[0-9a-f]{32}$` w `session_dir` chroni przed
+        // path-traversal — proba odczytu `../etc/passwd` musi konczyc sie
+        // BadRequest, bez dotykania filesystemu.
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = MessageBody::NsightBody(NsightPayload::DownloadRequest(NsightDownloadRequest {
+            node_id: local,
+            session_id: "../etc/passwd".into(),
+        }));
+        let res = nsight_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => assert_eq!(
+                e.code,
+                ProtocolErrorCode::BadRequest,
+                "spodziewano BadRequest, dostalem: {:?}",
+                e
+            ),
+            Ok(_) => panic!("oczekiwano bledu walidacji"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsight_download_unknown_session_is_not_found() {
+        // Poprawny format session_id ale plik `.nsys-rep` nie istnieje.
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("TENTAFLOW_HOME", tmp.path());
+        let body = MessageBody::NsightBody(NsightPayload::DownloadRequest(NsightDownloadRequest {
+            node_id: local,
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        }));
+        let res = nsight_dispatch(&body, &ctx).await;
+        std::env::remove_var("TENTAFLOW_HOME");
+        match res {
+            Err(e) => assert_eq!(
+                e.code,
+                ProtocolErrorCode::NotFound,
+                "spodziewano NotFound, dostalem: {:?}",
+                e
+            ),
             Ok(_) => panic!("oczekiwano bledu"),
         }
     }
