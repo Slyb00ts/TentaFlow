@@ -1149,11 +1149,88 @@ async fn do_embedded_native_deploy(
             finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
             Ok(())
         }
+        ("vision", engine_id) => {
+            let kind = crate::vision::VisionEngineKind::from_id(engine_id)
+                .ok_or_else(|| anyhow!("vision: nieznany engine_id '{}'", engine_id))?;
+
+            let service_name = config
+                .container_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!("tentaflow-{}-{}", engine_id, slugify_name(&random_suffix()))
+                });
+
+            phase(db, deploy_id, tx, "running", 70, "load vision model");
+
+            let model_path = crate::vision::model_path_for(kind).ok_or_else(|| {
+                anyhow!(
+                    "vision/{}: ONNX nie embedowany w binarce (uruchom setup.sh + cargo build)",
+                    engine_id
+                )
+            })?;
+
+            let loaded = crate::vision::load_engine(kind, &model_path)
+                .with_context(|| format!("load vision/{} z {}", engine_id, model_path.display()))?;
+
+            crate::vision::register_engine(service_name.clone(), loaded);
+
+            phase(db, deploy_id, tx, "registering", 92, "register service");
+
+            let config_json = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "tract-onnx",
+                "manifest_engine_id": engine.engine_id,
+                "deployed_model": engine_id,
+                "model_path": model_path.display().to_string(),
+                "service_type": "vision",
+            })
+            .to_string();
+
+            let _service_id = upsert_native_service(
+                db,
+                node_id,
+                &service_name,
+                "vision",
+                Some("vision"),
+                &config_json,
+                "single",
+            )?;
+
+            // Mesh registration — przy multi-node deploy router widzi serwis
+            // jako resolvable. Uzywamy `engine_id` jako 'model name' w mesh
+            // — caller rozpoznaje vision po `service_type=vision`.
+            router.register_native_service_in_mesh(
+                &service_name,
+                "vision",
+                vec![engine_id.to_string()],
+                Some("tract-onnx".to_string()),
+                vec![std::fs::metadata(&model_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0)],
+            );
+
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+
+            log_line(
+                db,
+                deploy_id,
+                tx,
+                "log",
+                &format!("vision serwis zarejestrowany: {}", service_name),
+            );
+            let _ = service_manager;
+            finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+            Ok(())
+        }
         _ => Err(anyhow!(
             "runtime=embedded dla '{}' nie ma jeszcze zintegrowanego flow deploymentu",
             engine.engine_id
         )),
     }
+}
+
+fn random_suffix() -> String {
+    use rand::distr::{Alphanumeric, SampleString};
+    Alphanumeric.sample_string(&mut rand::rng(), 5).to_lowercase()
 }
 
 /// Deploy native runtime=python-bundle: wywoluje `deploy::python_venv::deploy_with_logs`

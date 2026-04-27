@@ -527,8 +527,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::TtsRuleCreateResponse { .. } => "TtsRuleCreateResponse",
         MessageBody::TtsRuleDeleteRequest { .. } => "TtsRuleDeleteRequest",
         MessageBody::TtsRuleDeleteResponse { .. } => "TtsRuleDeleteResponse",
-        MessageBody::PiiRuleListRequest => "PiiRuleListRequest",
-        MessageBody::PiiRuleListResponse { .. } => "PiiRuleListResponse",
+        MessageBody::PiiRuleBody(p) => match p {
+            tentaflow_protocol::PiiRulePayload::ListRequest => "PiiRuleListRequest",
+            tentaflow_protocol::PiiRulePayload::ListResponse { .. } => "PiiRuleListResponse",
+        },
+        MessageBody::VisionBody(p) => match p {
+            tentaflow_protocol::VisionInferPayload::InferRequest(_) => "VisionInferRequest",
+            tentaflow_protocol::VisionInferPayload::InferResponse(_) => "VisionInferResponse",
+        },
         MessageBody::FastPathListRequest => "FastPathListRequest",
         MessageBody::FastPathListResponse { .. } => "FastPathListResponse",
         MessageBody::SettingsListRequest => "SettingsListRequest",

@@ -22,9 +22,12 @@ pub mod mivolo;
 pub mod hsemotion;
 pub mod emonet;
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use parking_lot::RwLock;
 
 /// Bbox + 5 keypoints + score. Wspolny typ dla wszystkich face detectorow.
 #[derive(Debug, Clone)]
@@ -108,21 +111,131 @@ impl VisionEngineKind {
     }
 }
 
-/// Otwiera ONNX z embedded resource extraction (`vision_models::*_path()`)
-/// i zwraca pre-built tract `TypedRunnableModel`. Wolany przez deploy handler
-/// przy rejestracji serwisu vision/* — silnik trzymany w `Arc` w
-/// `service_manager::vision_engines` (do zaimplementowania).
-pub fn load_engine(kind: VisionEngineKind, model_path: &Path) -> Result<()> {
-    // Sygnatura tymczasowa — typ wracajacy bedzie `Box<dyn FaceDetector>` /
-    // `Box<dyn AgeGenderEngine>` / `Box<dyn EmotionClassifier>` po
-    // implementacji kazdego silnika. Zostawiamy Result<()> jako sentinel
-    // ze model sie laduje + tract akceptuje pliki — pelna integracja
-    // dispatchu inference w nastepnym kroku.
+/// Tagged Arc — registry trzyma jednorodny typ a inference dispatcher
+/// matchuje per-kind przy zapytaniu.
+pub enum LoadedEngine {
+    FaceDetector(Arc<dyn FaceDetector>),
+    AgeGender(Arc<dyn AgeGenderEngine>),
+    Emotion(Arc<dyn EmotionClassifier>),
+    /// Stub — load() przeszedl walidacje ONNX'a ale silnik nie ma jeszcze
+    /// pelnej implementacji `detect/predict/classify`. Zwracany dla
+    /// EmoNet (brak ONNX) jako placeholder.
+    Stub,
+}
+
+/// Globalny registry zaladowanych silnikow — `OnceLock` lazy init, `RwLock`
+/// dla per-deploy upsert. Klucz: `service_name` (typowo `tentaflow-<engine>-<rand>`),
+/// zeby kilka instancji tego samego enginu na jednym hoscie nie sie nadpisywalo.
+static REGISTRY: OnceLock<RwLock<HashMap<String, LoadedEngine>>> = OnceLock::new();
+
+fn registry() -> &'static RwLock<HashMap<String, LoadedEngine>> {
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Wkłada zaladowany silnik do registry pod kluczem `service_name`. Wolany
+/// przez deploy handler. Stary wpis (gdy redeploy) jest zastapiony.
+pub fn register_engine(service_name: String, engine: LoadedEngine) {
+    registry().write().insert(service_name, engine);
+}
+
+/// Usuwa silnik z registry (np. przy stop service / delete service).
+pub fn unregister_engine(service_name: &str) -> bool {
+    registry().write().remove(service_name).is_some()
+}
+
+/// Zwraca clone Arc-a do FaceDetectora pod `service_name`. Inne traity
+/// (`AgeGender`, `Emotion`) maja wlasne gettery — Rust nie pozwala na
+/// `dyn Trait` downcast, wiec rozdzielamy. None gdy klucz nie istnieje
+/// albo jego LoadedEngine jest innego typu.
+pub fn get_face_detector(service_name: &str) -> Option<Arc<dyn FaceDetector>> {
+    let guard = registry().read();
+    match guard.get(service_name)? {
+        LoadedEngine::FaceDetector(d) => Some(Arc::clone(d)),
+        _ => None,
+    }
+}
+
+pub fn get_age_gender(service_name: &str) -> Option<Arc<dyn AgeGenderEngine>> {
+    let guard = registry().read();
+    match guard.get(service_name)? {
+        LoadedEngine::AgeGender(e) => Some(Arc::clone(e)),
+        _ => None,
+    }
+}
+
+pub fn get_emotion(service_name: &str) -> Option<Arc<dyn EmotionClassifier>> {
+    let guard = registry().read();
+    match guard.get(service_name)? {
+        LoadedEngine::Emotion(e) => Some(Arc::clone(e)),
+        _ => None,
+    }
+}
+
+/// Otwiera ONNX z `vision_models::*_path()` i zwraca `LoadedEngine` zdatny
+/// do wpisania do registry. Wolany przez deploy handler runtime=embedded.
+pub fn load_engine(kind: VisionEngineKind, model_path: &Path) -> Result<LoadedEngine> {
     match kind {
-        VisionEngineKind::Scrfd => scrfd::load(model_path).map(|_| ()),
-        VisionEngineKind::Yolov8Face => yolov8_face::load(model_path).map(|_| ()),
-        VisionEngineKind::Mivolo => mivolo::load(model_path).map(|_| ()),
-        VisionEngineKind::Hsemotion => hsemotion::load(model_path).map(|_| ()),
-        VisionEngineKind::Emonet => emonet::load(model_path).map(|_| ()),
+        VisionEngineKind::Scrfd => {
+            let e = scrfd::load(model_path)?;
+            Ok(LoadedEngine::FaceDetector(Arc::new(e)))
+        }
+        VisionEngineKind::Yolov8Face => {
+            let e = yolov8_face::load(model_path)?;
+            Ok(LoadedEngine::FaceDetector(Arc::new(e)))
+        }
+        VisionEngineKind::Mivolo => {
+            let e = mivolo::load(model_path)?;
+            Ok(LoadedEngine::AgeGender(Arc::new(e)))
+        }
+        VisionEngineKind::Hsemotion => {
+            let e = hsemotion::load(model_path)?;
+            Ok(LoadedEngine::Emotion(Arc::new(e)))
+        }
+        VisionEngineKind::Emonet => {
+            // emonet::load() zwraca Err gdy ONNX brak — propagujemy to
+            // bo bez modelu deploy nie powinien tworzyc serwisu.
+            let _ = emonet::load(model_path)?;
+            Ok(LoadedEngine::Stub)
+        }
+    }
+}
+
+/// Mapuje engine_id do sciezki ONNX'a wyekstrahowanego z embedded blob'a.
+/// Zwraca None gdy build.rs nie embedowal pliku (pusty placeholder).
+pub fn model_path_for(kind: VisionEngineKind) -> Option<std::path::PathBuf> {
+    match kind {
+        VisionEngineKind::Yolov8Face => crate::vision_models::yolov8_face_path(),
+        VisionEngineKind::Scrfd => crate::vision_models::scrfd_path(),
+        VisionEngineKind::Mivolo => crate::vision_models::mivolo_age_path(),
+        VisionEngineKind::Hsemotion => crate::vision_models::hsemotion_path(),
+        VisionEngineKind::Emonet => crate::vision_models::emonet_path(),
+    }
+}
+
+/// Wynik inference w jednolitym formacie — uzywany przez dispatch handler,
+/// niezalezne od ktorego silnika (FaceDetector / AgeGender / Emotion).
+#[derive(Debug, Clone)]
+pub enum InferOutput {
+    Faces(Vec<FaceDetection>),
+    AgeGender(AgeGender),
+    Emotion(EmotionResult),
+}
+
+/// Inference dispatch — bierze service_name z registry i wola odpowiedni
+/// trait na obrazku RGB. Bezstanowe; wszystkie silniki sa Send+Sync wiec
+/// caller moze to wywolywac z dowolnego watka tokio bez extra synchronizacji.
+pub fn infer(service_name: &str, image_rgb: &[u8], width: u32, height: u32) -> Result<InferOutput> {
+    let guard = registry().read();
+    let engine = guard
+        .get(service_name)
+        .ok_or_else(|| anyhow!("vision: brak zaladowanego silnika '{}'", service_name))?;
+    match engine {
+        LoadedEngine::FaceDetector(d) => Ok(InferOutput::Faces(d.detect(image_rgb, width, height)?)),
+        LoadedEngine::AgeGender(e) => Ok(InferOutput::AgeGender(e.predict(image_rgb, width, height)?)),
+        LoadedEngine::Emotion(e) => Ok(InferOutput::Emotion(e.classify(image_rgb, width, height)?)),
+        LoadedEngine::Stub => Err(anyhow!(
+            "vision: silnik '{}' jest stubem (brak modelu lub niewpiety inference)",
+            service_name
+        )),
     }
 }

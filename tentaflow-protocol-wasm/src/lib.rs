@@ -1819,10 +1819,40 @@ pub fn encode_tts_rule_delete_request(rule_id: String) -> Result<Vec<u8>, JsErro
 
 // --- PII rules ------------------------------------------------------------
 
-/// MessageBody::PiiRuleListRequest (unit).
+/// MessageBody::PiiRuleBody(ListRequest) — wire-compat z dawnym
+/// PiiRuleListRequest, JS API niezmienione.
 #[wasm_bindgen(js_name = encodePiiRuleListRequest)]
 pub fn encode_pii_rule_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::PiiRuleListRequest).map_err(|e| JsError::new(&e))
+    encode_body_inner(&MessageBody::PiiRuleBody(
+        tentaflow_protocol::PiiRulePayload::ListRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::VisionBody(InferRequest) — encoder Vision inference.
+#[wasm_bindgen(js_name = encodeVisionInferRequest)]
+pub fn encode_vision_infer_request(
+    service_name: String,
+    image: Vec<u8>,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Vec<u8>, JsError> {
+    let format = match (width, height) {
+        (Some(w), Some(h)) => tentaflow_protocol::VisionImageFormat::RawRgb {
+            width: w,
+            height: h,
+        },
+        _ => tentaflow_protocol::VisionImageFormat::Encoded,
+    };
+    let req = tentaflow_protocol::VisionInferRequest {
+        service_name,
+        image,
+        format,
+    };
+    encode_body_inner(&MessageBody::VisionBody(
+        tentaflow_protocol::VisionInferPayload::InferRequest(req),
+    ))
+    .map_err(|e| JsError::new(&e))
 }
 
 // --- Fast-path ------------------------------------------------------------
@@ -2923,22 +2953,89 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "TtsRuleDeleteResponse".into());
             set(&obj, "deleted", deleted.into());
         }
-        MessageBody::PiiRuleListRequest => {
-            set(&obj, "variant", "PiiRuleListRequest".into());
-        }
-        MessageBody::PiiRuleListResponse { rules } => {
-            set(&obj, "variant", "PiiRuleListResponse".into());
-            let arr = js_sys::Array::new();
-            for r in rules {
-                let item = js_sys::Object::new();
-                set(&item, "id", r.id.into());
-                set(&item, "kind", r.kind.into());
-                set(&item, "regex", r.regex.into());
-                set(&item, "action", r.action.into());
-                arr.push(&item.into());
+        MessageBody::PiiRuleBody(p) => match p {
+            tentaflow_protocol::PiiRulePayload::ListRequest => {
+                set(&obj, "variant", "PiiRuleListRequest".into());
             }
-            set(&obj, "rules", arr.into());
-        }
+            tentaflow_protocol::PiiRulePayload::ListResponse { rules } => {
+                set(&obj, "variant", "PiiRuleListResponse".into());
+                let arr = js_sys::Array::new();
+                for r in rules {
+                    let item = js_sys::Object::new();
+                    set(&item, "id", r.id.into());
+                    set(&item, "kind", r.kind.into());
+                    set(&item, "regex", r.regex.into());
+                    set(&item, "action", r.action.into());
+                    arr.push(&item.into());
+                }
+                set(&obj, "rules", arr.into());
+            }
+        },
+        MessageBody::VisionBody(p) => match p {
+            tentaflow_protocol::VisionInferPayload::InferRequest(_) => {
+                set(&obj, "variant", "VisionInferRequest".into());
+            }
+            tentaflow_protocol::VisionInferPayload::InferResponse(r) => {
+                set(&obj, "variant", "VisionInferResponse".into());
+                set(&obj, "serviceName", r.service_name.into());
+                set(&obj, "latencyMs", (r.latency_ms as f64).into());
+                match r.result {
+                    tentaflow_protocol::VisionInferResult::Faces(faces) => {
+                        set(&obj, "kind", "faces".into());
+                        let arr = js_sys::Array::new();
+                        for f in faces {
+                            let item = js_sys::Object::new();
+                            set(&item, "x1", f.x1.into());
+                            set(&item, "y1", f.y1.into());
+                            set(&item, "x2", f.x2.into());
+                            set(&item, "y2", f.y2.into());
+                            set(&item, "score", f.score.into());
+                            let kp_arr = js_sys::Array::new();
+                            for (x, y) in f.keypoints {
+                                let pt = js_sys::Array::new();
+                                pt.push(&x.into());
+                                pt.push(&y.into());
+                                kp_arr.push(&pt.into());
+                            }
+                            set(&item, "keypoints", kp_arr.into());
+                            arr.push(&item.into());
+                        }
+                        set(&obj, "faces", arr.into());
+                    }
+                    tentaflow_protocol::VisionInferResult::AgeGender {
+                        age_years,
+                        gender_male_prob,
+                    } => {
+                        set(&obj, "kind", "age_gender".into());
+                        set(&obj, "ageYears", age_years.into());
+                        set(&obj, "genderMaleProb", gender_male_prob.into());
+                    }
+                    tentaflow_protocol::VisionInferResult::Emotion {
+                        label,
+                        probabilities,
+                        valence,
+                        arousal,
+                    } => {
+                        set(&obj, "kind", "emotion".into());
+                        set(&obj, "label", label.into());
+                        let arr = js_sys::Array::new();
+                        for (k, v) in probabilities {
+                            let pair = js_sys::Array::new();
+                            pair.push(&k.into());
+                            pair.push(&v.into());
+                            arr.push(&pair.into());
+                        }
+                        set(&obj, "probabilities", arr.into());
+                        if let Some(v) = valence {
+                            set(&obj, "valence", v.into());
+                        }
+                        if let Some(a) = arousal {
+                            set(&obj, "arousal", a.into());
+                        }
+                    }
+                }
+            }
+        },
         MessageBody::FastPathListRequest => {
             set(&obj, "variant", "FastPathListRequest".into());
         }
