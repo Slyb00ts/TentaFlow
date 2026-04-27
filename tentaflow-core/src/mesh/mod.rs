@@ -12,6 +12,8 @@ pub mod gossip;
 #[cfg(all(feature = "rdma-probe", target_os = "linux"))]
 pub mod ibverbs_ffi;
 pub mod iroh_manager;
+#[cfg(target_os = "macos")]
+pub mod macos_gpu_metrics;
 pub mod network_config;
 pub mod network_interfaces;
 pub mod node_info_collector;

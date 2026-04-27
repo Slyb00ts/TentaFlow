@@ -605,7 +605,7 @@ impl Router {
             // dispatche'owac /v1/audio/speech do tej instancji.
             if svc.service_type == "tts" {
                 let engine_id = config["engine"].as_str().unwrap_or("");
-                #[cfg(feature = "inference-apple-tts")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if engine_id == "apple-tts" {
                     info!("Przywracanie Apple TTS '{}'", svc.name);
                     let mut e = crate::tts::apple_tts::AppleTtsEngine::new();

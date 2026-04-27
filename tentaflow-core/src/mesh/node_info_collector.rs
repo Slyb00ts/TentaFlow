@@ -488,7 +488,11 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
 
     // macOS — ioreg (Apple Silicon)
     #[cfg(target_os = "macos")]
-    enrich_macos_live(&mut gpus);
+    {
+        enrich_macos_live(&mut gpus);
+        // IOReport (energy/power) + IOHIDEventSystemClient (temperatury) — bez sudo.
+        crate::mesh::macos_gpu_metrics::enrich_macos_thermal_power(&mut gpus);
+    }
 
     // Android — sysfs kgsl/mali/thermal
     #[cfg(target_os = "linux")]

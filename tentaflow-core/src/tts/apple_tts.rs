@@ -5,7 +5,7 @@
 //       macOS — iOS tez moze, ale tam nie ma Rusta uzywajacego tego trait'u.
 // =============================================================================
 
-#![cfg(feature = "inference-apple-tts")]
+#![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use std::ffi::{c_char, c_void, CString};
 use std::path::Path;
