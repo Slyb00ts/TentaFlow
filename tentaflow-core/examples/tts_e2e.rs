@@ -1,5 +1,5 @@
 // Quick e2e test: Apple TTS + Kokoro Apple MLX integration in same binary.
-#![cfg(all(feature = "inference-apple-tts", feature = "inference-mlx-kokoro"))]
+#![cfg(all(any(target_os = "macos", target_os = "ios"), feature = "inference-mlx-kokoro"))]
 
 use anyhow::Result;
 use std::path::Path;

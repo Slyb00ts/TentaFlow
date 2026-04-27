@@ -990,7 +990,7 @@ async fn do_embedded_native_deploy(
             finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
             Ok(())
         }
-        #[cfg(feature = "inference-apple-tts")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         ("tts", "apple-tts") => {
             let service_name = config
                 .container_name

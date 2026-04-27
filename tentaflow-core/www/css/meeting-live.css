@@ -216,28 +216,38 @@
 .meet-kv-row .v.warn { color: var(--warning); }
 .meet-kv-row .v.err { color: var(--danger); }
 
-/* Status footer glued to the bottom of the viewport regardless of the
-   flex chain of tf-screen. We tried position:sticky and :has() on the
-   scroll container — both lose to the tall scroll region above when the
-   transcript is short. position:fixed keeps the footer visible and the
-   body reserves padding-bottom so the last line of content is never
-   hidden under the bar. */
+/* Status footer sticks to the bottom of the meeting-live page area (inside
+   .main scroll container), not the full viewport. tf-screen-body flexes to
+   fill main height; #meet-live-body grows to push the footer down when
+   transcript is short, otherwise the footer stays glued to bottom edge
+   while the user scrolls the transcript. */
+body:has(#meeting-live-root) tf-screen,
+body:has(#meeting-live-root) .tf-screen-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
 body:has(#meeting-live-root) #meet-live-body {
-  padding-bottom: 56px;
+  flex: 1 0 auto;
 }
 .meet-footer {
-  position: fixed;
-  left: 0;
-  right: 0;
+  position: sticky;
   bottom: 0;
   z-index: 20;
   display: flex; align-items: center; justify-content: space-between;
   gap: 14px; flex-wrap: wrap;
   padding: 10px 26px;
+  /* Negatywne marginesy zrownuja stopke z krawedziami .main (ktora ma
+     padding 24/32 desktop, 12/14 mobile). Dzieki temu border-top idzie
+     full-width strony bez zostawiania bocznych szczelin. */
+  margin: 0 -32px -24px;
   border-top: 1px solid var(--border);
   background: var(--bg-2);
   font-size: 11.5px;
   color: var(--text-3);
+}
+@media (max-width: 767px) {
+  .meet-footer { margin: 0 -14px calc(-12px - env(safe-area-inset-bottom)); padding: 10px 14px; }
 }
 
 /* VNC preview window layout. noVNC canvas fills the body; scaleViewport in

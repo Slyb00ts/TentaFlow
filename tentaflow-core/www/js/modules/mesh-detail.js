@@ -1,18 +1,17 @@
 // =============================================================================
 // Plik: modules/mesh-detail.js
-// Opis: Drill-down view pojedynczego noda mesh. Topbar (back + hostname +
-//       status + add service), system info row, VRAM summary (suma po GPU),
-//       2-kolumnowy CPU + Memory, karty per-GPU (usage + VRAM + temp + power),
-//       sekcja network interfaces, tabela kontenerow. Auto-refresh 2s gdy
-//       tab widoczny, 5s gdy ukryty. UI na komponentach tf-* (button, chip).
+// Opis: Drill-down view pojedynczego noda mesh — redesign 2026-04-27.
+//       Layout zgodny z Mesh & Network settings: tf-screen shell, breadcrumb,
+//       detail-header (big-ico + meta + actions), section cards z uppercase
+//       tytulami w accent-2. Sekcje: System info, Resource usage (CPU+RAM),
+//       GPUs, Profiling sessions (nsight), Network interfaces (tabela + mobile
+//       cards), Loaded models, Containers. Zero zakladek — wszystko w jednym
+//       scrollu. Auto-refresh 2s/5s. Pelna responsywnosc do 320px.
 // =============================================================================
 
 import {
-  byId,
   escapeHtml,
   escapeAttr,
-  apiGet,
-  apiPost,
   toast,
   formatMb,
   formatBytes,
@@ -52,8 +51,6 @@ const MeshDetailScreen = {
     content.innerHTML = renderSkeleton();
     bindBack(content);
 
-    // Modul nsight rerenderuje detail po starcie/stopie/usuwaniu sesji
-    // niezaleznie od interval'u (lepszy UX niz czekanie do kolejnego tick'a).
     initNsight({ onChange: () => renderDetail() });
 
     await loadNode();
@@ -93,8 +90,6 @@ async function loadNode() {
     const age = lastFetchAt ? (Date.now() - lastFetchAt) / 1000 : Infinity;
     if (age > 30) wasDisconnected = true;
   }
-  // Lista sesji nsight w drugiej rownoleglej drodze — niezalezna od heartbeatu.
-  // Bledy sa swallow'owane wewnatrz modulu, wiec nie kasujemy nodeData.
   if (nodeData && nodeData.nsys_available === true) {
     await loadNsightSessions(currentNodeId);
   }
@@ -109,15 +104,12 @@ function setupRefresh() {
       MeshDetailScreen.cleanup();
       return;
     }
-    // Router mogl nas w miedzyczasie zastapic innym widokiem w #main.
-    // Jesli .mesh-detail zniknelo, cleanup + stop — inaczej interval dalej
-    // nadpisywalby swiezo zrenderowana strone docelowa.
-    if (!document.querySelector('.mesh-detail')) {
+    if (!document.querySelector('.nd-shell')) {
       MeshDetailScreen.cleanup();
       return;
     }
     await loadNode();
-    if (currentNodeId && document.querySelector('.mesh-detail')) {
+    if (currentNodeId && document.querySelector('.nd-shell')) {
       renderDetail();
     }
   }, interval);
@@ -127,7 +119,7 @@ function setupRefresh() {
 
 function bindBack(root) {
   root.addEventListener('click', (e) => {
-    const back = e.target.closest('#btn-back-mesh');
+    const back = e.target.closest('#btn-back-mesh, .nd-back-crumb');
     if (back) {
       MeshDetailScreen.cleanup();
       import('/js/router.js').then(({ Router }) => Router.navigate('mesh'));
@@ -142,107 +134,68 @@ function gaugeLevel(pct) {
   return '';
 }
 
-// ---- Render --------------------------------------------------------------
-
-function renderSkeleton() {
-  return `
-    <div class="mesh-detail">
-      <div class="mesh-detail-topbar">
-        <tf-button variant="ghost" size="sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</tf-button>
-        <div class="mesh-detail-title"><span class="skeleton" style="display:inline-block;width:200px;height:24px;"></span></div>
-      </div>
-      <div class="mesh-detail-vram"><div class="skeleton" style="width:100%;height:32px;"></div></div>
-      <div class="mesh-detail-grid">
-        <div class="mesh-detail-card"><div class="skeleton" style="width:100%;height:120px;"></div></div>
-        <div class="mesh-detail-card"><div class="skeleton" style="width:100%;height:120px;"></div></div>
-      </div>
-    </div>
-  `;
-}
-
-function renderDetail() {
-  const content = document.getElementById('main');
-  if (!content) return;
-
-  if (!nodeData) {
-    content.innerHTML = `
-      <div class="mesh-detail">
-        <div class="mesh-detail-topbar">
-          <tf-button variant="ghost" size="sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</tf-button>
-        </div>
-        <div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('mesh.load_error'))}</div></div>
-      </div>
-    `;
-    bindBack(content);
-    return;
-  }
-
-  const n = nodeData;
-  const hostname = n.hostname || n.node_id?.slice(0, 12) || I18n.t('mesh.unknown_host');
-  const online = isOnline(n);
-  const statusChip = online
-    ? `<tf-chip status="online" dot>${escapeHtml(I18n.t('mesh.online'))}</tf-chip>`
-    : `<tf-chip status="offline" dot>${escapeHtml(I18n.t('mesh.offline'))}</tf-chip>`;
-
-  const systemInfo = buildSystemInfo(n);
-  const vramBar = buildVramSummary(n);
-  const cpuMemory = buildCpuMemory(n);
-  const gpuCards = buildGpuCards(n);
-  const networkInterfaces = buildNetworkInterfaces(n);
-  const containersTable = buildContainersTable(n);
-  const modelsList = buildModelsList(n);
-
-  const ageSec = lastFetchAt ? Math.round((Date.now() - lastFetchAt) / 1000) : 0;
-  const freshness = ageSec < 5 ? '' : ageSec <= 30 ? ' stale' : ' disconnected';
-
-  content.innerHTML = `
-    <div class="mesh-detail${freshness}">
-      <div class="mesh-detail-topbar">
-        <tf-button variant="ghost" size="sm" id="btn-back-mesh">← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}</tf-button>
-        <div class="mesh-detail-title">
-          <div class="name">${escapeHtml(hostname)}${n.is_local ? ` <tf-chip status="accent">${escapeHtml(I18n.t('mesh.local'))}</tf-chip>` : ''}</div>
-          ${statusChip}
-        </div>
-        <div class="mesh-detail-actions">${nsightTopbarHtml(n)}</div>
-      </div>
-      <div class="mesh-detail-sysinfo">${systemInfo}</div>
-      ${vramBar}
-      <div class="mesh-detail-grid">${cpuMemory}</div>
-      ${gpuCards}
-      ${nsightSessionsSectionHtml(n)}
-      ${networkInterfaces}
-      ${modelsList}
-      ${containersTable}
-    </div>
-  `;
-  bindBack(content);
-  bindContainerActions(content);
-  bindNsightActions(content, n);
-}
-
 function isOnline(n) {
   const s = String(n.status || '').toLowerCase();
   if (n.is_local) return true;
   return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
 }
 
-function buildSystemInfo(n) {
-  const parts = [];
-  if (n.os_info) parts.push(escapeHtml(n.os_info));
-  if (n.docker_version) parts.push(`Docker ${escapeHtml(n.docker_version)}`);
-  const gpuSummary = Array.isArray(n.gpus) && n.gpus.length > 0
-    ? n.gpus.map(g => g.name).filter(Boolean).join(', ')
-    : null;
-  if (gpuSummary) parts.push(escapeHtml(gpuSummary));
-  if (n.connection && n.connection.transport) {
-    const transport = connectionTransportLabel(n.connection.transport);
-    const scope = n.connection.scope ? connectionScopeLabel(n.connection.scope) : '';
-    const addr = n.connection.address ? escapeHtml(n.connection.address) : '—';
-    const value = [transport, scope].filter(Boolean).join(' · ');
-    parts.push(`${escapeHtml(I18n.t('mesh.connection'))}: ${escapeHtml(value)} · ${addr}`);
+function shortId(id) {
+  if (!id) return '';
+  return id.length > 12 ? id.slice(0, 12) : id;
+}
+
+function freshnessClass() {
+  const age = lastFetchAt ? (Date.now() - lastFetchAt) / 1000 : 0;
+  if (age < 5) return '';
+  if (age <= 30) return ' stale';
+  return ' disconnected';
+}
+
+function ifaceRoleClass(iface) {
+  const t = String(iface.interface_type || '').toLowerCase();
+  if (t === 'thunderbolt') return 'tb';
+  if (t === 'wifi' || t === 'wireless') return 'wifi';
+  if (t === 'vpn' || t === 'wireguard' || t === 'tailscale') return 'vpn';
+  if (t === 'virtual' || t === 'docker' || t === 'bridge') return 'virt';
+  if (t === 'loopback') return 'loop';
+  return 'lan';
+}
+
+function ifaceRoleLabel(iface) {
+  const cls = ifaceRoleClass(iface);
+  switch (cls) {
+    case 'tb': return 'TB';
+    case 'wifi': return 'Wi-Fi';
+    case 'vpn': return 'VPN';
+    case 'virt': return 'Virtual';
+    case 'loop': return 'Loopback';
+    default: return 'LAN';
   }
-  if (parts.length === 0) return '<span class="muted">—</span>';
-  return parts.map(p => `<span>${p}</span>`).join(' · ');
+}
+
+function ifaceIconSvg(iface) {
+  const cls = ifaceRoleClass(iface);
+  switch (cls) {
+    case 'tb':
+      return '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
+    case 'wifi':
+      return '<svg viewBox="0 0 24 24"><path d="M5 13a10 10 0 0 1 14 0M8.5 16.5a5 5 0 0 1 7 0M12 20h.01M2 8.82a15 15 0 0 1 20 0"/></svg>';
+    case 'vpn':
+      return '<svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+    case 'virt':
+      return '<svg viewBox="0 0 24 24"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg>';
+    case 'loop':
+      return '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/></svg>';
+    default:
+      return '<svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4M9 19v2M15 19v2"/></svg>';
+  }
+}
+
+function speedLabel(mbps) {
+  if (!mbps) return '—';
+  if (mbps >= 1000) return `${Math.round(mbps / 1000)} G`;
+  return `${mbps} M`;
 }
 
 function connectionTransportLabel(value) {
@@ -258,29 +211,220 @@ function connectionScopeLabel(value) {
   return value || '';
 }
 
-function buildVramSummary(n) {
-  const gpus = Array.isArray(n.gpus) ? n.gpus : [];
-  if (gpus.length === 0) {
-    return `<div class="mesh-detail-vram muted">${escapeHtml(I18n.t('mesh.no_gpu'))}</div>`;
-  }
-  const used = gpus.reduce((s, g) => s + (g.vram_used_mb || 0), 0);
-  const total = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
-  if (total === 0) {
-    return `<div class="mesh-detail-vram muted">${escapeHtml(I18n.t('mesh.no_gpu'))}</div>`;
-  }
-  const pct = Math.round((used / total) * 100);
+// ---- Skeleton ------------------------------------------------------------
+
+function renderSkeleton() {
   return `
-    <div class="mesh-detail-vram">
-      <div class="mesh-detail-vram-head">
-        <span class="label">${escapeHtml(I18n.t('mesh.vram_summary'))}</span>
-        <span class="value">${formatMb(used)} / ${formatMb(total)} (${pct}%)</span>
+    <div class="nd-shell">
+      <div class="nd-head">
+        <div class="nd-head__crumbs">
+          <div class="nd-breadcrumb">
+            <span class="crumb nd-back-crumb">Mesh</span>
+            <span class="sep"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></span>
+            <span class="crumb current">…</span>
+          </div>
+        </div>
+        <div class="nd-head__header">
+          <div class="nd-detail-header">
+            <div class="big-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="M3 13h18M8 21h8M12 17v4"/></svg></div>
+            <div class="d-meta">
+              <div class="d-name"><span class="skeleton" style="display:inline-block;width:200px;height:24px;"></span></div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="bar"><div class="bar-fill ${gaugeLevel(pct)}" style="width:${pct}%"></div></div>
     </div>
   `;
 }
 
-function buildCpuMemory(n) {
+// ---- Render --------------------------------------------------------------
+
+function renderDetail() {
+  const content = document.getElementById('main');
+  if (!content) return;
+
+  if (!nodeData) {
+    content.innerHTML = `
+      <div class="nd-shell">
+        <div class="nd-head">
+          <div class="nd-head__crumbs">
+            <div class="nd-breadcrumb">
+              <span class="crumb nd-back-crumb">${escapeHtml(I18n.t('mesh.back_to_mesh'))}</span>
+            </div>
+          </div>
+        </div>
+        <div class="nd-body">
+          <div class="nd-empty">${escapeHtml(I18n.t('mesh.load_error') || 'Nie udalo sie zaladowac danych noda')}</div>
+        </div>
+      </div>
+    `;
+    bindBack(content);
+    return;
+  }
+
+  const n = nodeData;
+  const hostname = n.hostname || shortId(n.node_id) || I18n.t('mesh.unknown_host');
+  const online = isOnline(n);
+
+  content.innerHTML = `
+    <div class="nd-shell${freshnessClass()}">
+      ${renderHead(n, hostname, online)}
+      <div class="nd-body">
+        ${renderSystemInfo(n)}
+        ${renderResources(n)}
+        ${renderGpus(n)}
+        ${renderProfilingWrap(n)}
+        ${renderNetwork(n)}
+        ${renderModels(n)}
+        ${renderContainers(n)}
+      </div>
+    </div>
+  `;
+  bindBack(content);
+  bindContainerActions(content);
+  bindNsightActions(content, n);
+}
+
+function renderHead(n, hostname, online) {
+  const conn = n.connection || {};
+  const transport = conn.transport ? connectionTransportLabel(conn.transport) : null;
+  const scope = conn.scope ? connectionScopeLabel(conn.scope) : '';
+  const addr = conn.address || '';
+
+  const subParts = [];
+  if (n.os_info) {
+    subParts.push(`<span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>${escapeHtml(n.os_info)}</span>`);
+  }
+  if (n.docker_version) {
+    subParts.push(`<span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg>Docker ${escapeHtml(n.docker_version)}</span>`);
+  }
+  if (transport) {
+    const txt = [transport, scope].filter(Boolean).join(' · ');
+    subParts.push(`<span class="nd-conn-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>${escapeHtml(txt)}${addr ? ` · <span class="addr">${escapeHtml(addr)}</span>` : ''}</span>`);
+  }
+
+  const badges = [];
+  badges.push(online
+    ? `<span class="nd-stat-pill ok dot live">${escapeHtml(I18n.t('mesh.online'))}</span>`
+    : `<span class="nd-stat-pill off dot">${escapeHtml(I18n.t('mesh.offline'))}</span>`);
+  if (n.is_local) badges.push(`<span class="nd-stat-pill info">${escapeHtml(I18n.t('mesh.local'))}</span>`);
+  if (n.nsys_available === true) {
+    const ver = n.nsys_version ? ` ${escapeHtml(n.nsys_version)}` : '';
+    badges.push(`<span class="nd-stat-pill info">nsys${ver}</span>`);
+  }
+
+  const idChip = n.node_id ? `<span class="id-mono">${escapeHtml(shortId(n.node_id))}</span>` : '';
+
+  return `
+    <header class="nd-head">
+      <nav class="nd-head__crumbs">
+        <div class="nd-breadcrumb">
+          <span class="crumb nd-back-crumb">${escapeHtml(I18n.t('mesh.title') || 'Mesh')}</span>
+          <span class="sep"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></span>
+          <span class="crumb current">${escapeHtml(hostname)}</span>
+        </div>
+      </nav>
+      <div class="nd-head__header">
+        <div class="nd-detail-header">
+          <div class="big-ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="14" rx="2"/><path d="M3 13h18M8 21h8M12 17v4"/>
+            </svg>
+            <span class="live-dot${online ? '' : ' off'}"></span>
+          </div>
+          <div class="d-meta">
+            <div class="d-name">
+              ${escapeHtml(hostname)}
+              ${idChip}
+            </div>
+            ${subParts.length ? `<div class="d-sub">${subParts.join('')}</div>` : ''}
+            <div class="d-badges">${badges.join('')}</div>
+          </div>
+          <div class="d-actions">
+            ${nsightTopbarHtml(n)}
+            <tf-button variant="ghost" size="sm" id="btn-back-mesh">
+              ← ${escapeHtml(I18n.t('mesh.back_to_mesh'))}
+            </tf-button>
+          </div>
+        </div>
+      </div>
+    </header>
+  `;
+}
+
+function renderSystemInfo(n) {
+  const ageSec = lastFetchAt ? Math.max(0, Math.round((Date.now() - lastFetchAt) / 1000)) : 0;
+  const stats = [];
+  if (n.cpu_model || n.cpu_count) {
+    stats.push({
+      label: 'CPU',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/><path d="M3 9h3M3 12h3M3 15h3M18 9h3M18 12h3M18 15h3M9 3v3M12 3v3M15 3v3M9 18v3M12 18v3M15 18v3"/></svg>',
+      value: n.cpu_model || `${n.cpu_count} ${I18n.t('mesh.cpu_cores')}`,
+    });
+  }
+  if (n.cpu_count) {
+    stats.push({
+      label: I18n.t('mesh.cores') || 'Cores',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z"/><path d="M3 9h18M3 15h18"/></svg>',
+      value: `${n.cpu_count} ${I18n.t('mesh.cpu_cores')}`,
+    });
+  }
+  if (n.ram_total_mb) {
+    stats.push({
+      label: I18n.t('mesh.memory') || 'RAM',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><path d="M7 6V4M11 6V4M15 6V4M19 6V4"/></svg>',
+      value: formatMb(n.ram_total_mb),
+    });
+  }
+  if (n.os_info) {
+    stats.push({
+      label: 'OS',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M3 12h18"/></svg>',
+      value: n.os_info,
+      mono: true,
+    });
+  }
+  if (n.docker_version) {
+    stats.push({
+      label: 'Docker',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/></svg>',
+      value: n.docker_version,
+      mono: true,
+    });
+  }
+  const gpuSummary = Array.isArray(n.gpus) && n.gpus.length > 0
+    ? n.gpus.map(g => g.name).filter(Boolean).join(', ')
+    : null;
+  if (gpuSummary) {
+    stats.push({
+      label: 'GPU',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><circle cx="9" cy="12" r="2"/></svg>',
+      value: gpuSummary,
+    });
+  }
+
+  if (stats.length === 0) return '';
+
+  const cells = stats.map(s => `
+    <div class="nd-stat">
+      <div class="l">${s.icon}${escapeHtml(s.label)}</div>
+      <div class="v${s.mono ? ' mono' : ''}" title="${escapeAttr(s.value)}">${escapeHtml(s.value)}</div>
+    </div>
+  `).join('');
+
+  return `
+    <div class="nd-section">
+      <h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 2"/></svg>
+        ${escapeHtml(I18n.t('mesh.info') || 'System info')}
+        <span class="h-actions">${escapeHtml(I18n.t('mesh.last_fetch') || 'Ostatnia aktualizacja')}: <strong style="color:var(--text-2);">${ageSec} s</strong></span>
+      </h3>
+      <div class="nd-stat-grid">${cells}</div>
+    </div>
+  `;
+}
+
+function renderResources(n) {
   const cpuPct = n.cpu_usage ?? n.cpu_usage_percent;
   const cpuTemp = n.cpu_temperature_c;
   const ramUsed = n.ram_used_mb;
@@ -288,176 +432,348 @@ function buildCpuMemory(n) {
   const swapUsed = n.swap_used_mb;
   const swapTotal = n.swap_total_mb;
 
-  const cpuBar = cpuPct != null
-    ? `<div class="bar"><div class="bar-fill ${gaugeLevel(cpuPct)}" style="width:${Math.min(100, Math.max(0, cpuPct))}%"></div></div>`
-    : '';
-  const cpuTempRow = cpuTemp != null
-    ? `<div class="row"><span>${escapeHtml(I18n.t('mesh.temperature'))}</span><span>${Math.round(cpuTemp)}°C</span></div>`
-    : '';
-  const cpuCoresRow = n.cpu_count
-    ? `<div class="row"><span>${escapeHtml(I18n.t('mesh.cores'))}</span><span>${n.cpu_count}</span></div>`
-    : '';
+  if (cpuPct == null && ramUsed == null) return '';
+
+  const cpuFill = cpuPct != null ? Math.min(100, Math.max(0, Math.round(cpuPct))) : 0;
+  const cpuLevel = gaugeLevel(cpuPct);
+  const cpuBig = cpuPct != null ? `${Math.round(cpuPct)}%` : '—';
 
   const ramPct = (ramUsed != null && ramTotal) ? Math.round((ramUsed / ramTotal) * 100) : null;
-  const ramBar = ramPct != null
-    ? `<div class="bar"><div class="bar-fill ${gaugeLevel(ramPct)}" style="width:${ramPct}%"></div></div>`
-    : '';
+  const ramLevel = gaugeLevel(ramPct);
+  const ramBig = ramUsed != null ? formatMb(ramUsed) : '—';
 
-  const swapRow = (swapTotal != null && swapTotal > 0)
-    ? `
-      <div class="row"><span>${escapeHtml(I18n.t('mesh.swap'))}</span><span>${formatMb(swapUsed || 0)} / ${formatMb(swapTotal)}</span></div>
-      <div class="bar"><div class="bar-fill ${gaugeLevel(Math.round((swapUsed || 0) / swapTotal * 100))}" style="width:${Math.round((swapUsed || 0) / swapTotal * 100)}%"></div></div>
-    `
-    : '';
+  const swapPct = (swapUsed != null && swapTotal && swapTotal > 0)
+    ? Math.round((swapUsed / swapTotal) * 100) : null;
+
+  const cpuMini = [];
+  if (cpuTemp != null) cpuMini.push({ l: I18n.t('mesh.temperature') || 'Temp', v: `${Math.round(cpuTemp)}°C` });
+  if (n.cpu_count) cpuMini.push({ l: I18n.t('mesh.cores') || 'Cores', v: `${n.cpu_count}` });
+  if (n.load_avg_1) cpuMini.push({ l: 'Load', v: Number(n.load_avg_1).toFixed(2) });
+
+  const cpuCard = cpuPct != null ? `
+    <div class="nd-rcard">
+      <div class="rc-head">
+        <div class="title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/><path d="M3 9h3M3 12h3M3 15h3M18 9h3M18 12h3M18 15h3M9 3v3M12 3v3M15 3v3M9 18v3M12 18v3M15 18v3"/></svg>
+          ${escapeHtml(I18n.t('mesh.cpu'))}
+        </div>
+        <div class="big">${escapeHtml(cpuBig)}</div>
+      </div>
+      <div class="nd-meter">
+        <div class="nd-meter-bar ${cpuLevel}"><div class="fill" style="width:${cpuFill}%;"></div></div>
+        <div class="nd-meter-foot"><span>${100 - cpuFill}% idle</span>${cpuTemp != null ? `<span>${Math.round(cpuTemp)}°C</span>` : ''}</div>
+      </div>
+      ${cpuMini.length ? `<div class="mini-stats">${cpuMini.map(m => `<div class="mini-stat"><div class="ml">${escapeHtml(m.l)}</div><div class="mv">${escapeHtml(m.v)}</div></div>`).join('')}</div>` : ''}
+    </div>
+  ` : '';
+
+  const ramCard = ramUsed != null ? `
+    <div class="nd-rcard">
+      <div class="rc-head">
+        <div class="title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><path d="M7 6V4M11 6V4M15 6V4M19 6V4"/></svg>
+          ${escapeHtml(I18n.t('mesh.ram') || 'RAM')}
+        </div>
+        <div class="big">${escapeHtml(ramBig)}</div>
+      </div>
+      <div class="nd-meter">
+        <div class="nd-meter-head"><span class="t">RAM</span><span class="v">${formatMb(ramUsed)} / ${formatMb(ramTotal || 0)}${ramPct != null ? ` · ${ramPct}%` : ''}</span></div>
+        <div class="nd-meter-bar ${ramLevel}"><div class="fill" style="width:${ramPct || 0}%;"></div></div>
+      </div>
+      ${swapTotal && swapTotal > 0 ? `
+        <div class="nd-meter">
+          <div class="nd-meter-head"><span class="t">${escapeHtml(I18n.t('mesh.swap') || 'Swap')}</span><span class="v">${formatMb(swapUsed || 0)} / ${formatMb(swapTotal)}${swapPct != null ? ` · ${swapPct}%` : ''}</span></div>
+          <div class="nd-meter-bar ${gaugeLevel(swapPct)}"><div class="fill" style="width:${swapPct || 0}%;"></div></div>
+        </div>
+      ` : ''}
+    </div>
+  ` : '';
 
   return `
-    <div class="mesh-detail-card">
-      <div class="card-head">${escapeHtml(I18n.t('mesh.cpu'))} ${cpuPct != null ? `<span class="card-value">${Math.round(cpuPct)}%</span>` : ''}</div>
-      ${cpuBar}
-      ${cpuCoresRow}
-      ${cpuTempRow}
-    </div>
-    <div class="mesh-detail-card">
-      <div class="card-head">${escapeHtml(I18n.t('mesh.memory'))} ${ramUsed != null && ramTotal ? `<span class="card-value">${formatMb(ramUsed)} / ${formatMb(ramTotal)}</span>` : ''}</div>
-      ${ramBar}
-      ${swapRow}
+    <div class="nd-section">
+      <h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg>
+        ${escapeHtml(I18n.t('mesh.resources') || 'Resource usage')}
+        <span class="h-actions"><span class="nd-stat-pill ok dot live">live</span></span>
+      </h3>
+      <div class="nd-resource-grid">${cpuCard}${ramCard}</div>
     </div>
   `;
 }
 
-function buildGpuCards(n) {
+function renderGpus(n) {
   const gpus = Array.isArray(n.gpus) ? n.gpus : [];
   if (gpus.length === 0) return '';
+
+  const usedTotal = gpus.reduce((s, g) => s + (g.vram_used_mb || 0), 0);
+  const totalTotal = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
+  const summary = totalTotal > 0
+    ? `VRAM: <strong style="color:var(--text);">${formatMb(usedTotal)} / ${formatMb(totalTotal)}</strong>`
+    : '';
+
   const cards = gpus.map((g, idx) => {
     const usage = g.usage_percent ?? 0;
+    const usagePct = Math.min(100, Math.max(0, Math.round(usage)));
     const vramPct = g.vram_total_mb ? Math.round((g.vram_used_mb / g.vram_total_mb) * 100) : 0;
     const power = (g.power_draw_w != null && g.power_limit_w)
-      ? `${Math.round(g.power_draw_w)}W / ${Math.round(g.power_limit_w)}W`
-      : (g.power_draw_w != null ? `${Math.round(g.power_draw_w)}W` : '—');
+      ? `${Math.round(g.power_draw_w)} / ${Math.round(g.power_limit_w)} W`
+      : (g.power_draw_w != null ? `${Math.round(g.power_draw_w)} W` : '—');
+    const temp = g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '—';
+    const fan = g.fan_speed_percent != null ? `${Math.round(g.fan_speed_percent)}%` : '—';
     const profileBtn = nsightGpuProfileButtonHtml(n, g, idx);
+    const vendor = [g.driver_version ? `driver ${g.driver_version}` : null, g.cuda_version ? `CUDA ${g.cuda_version}` : null]
+      .filter(Boolean).join(' · ');
+
     return `
-      <div class="mesh-detail-card gpu-card">
-        <div class="card-head">
-          <span class="gpu-card-title">GPU ${idx}: ${escapeHtml(g.name || '—')}</span>
-          ${profileBtn}
+      <div class="nd-gpu">
+        <div class="gc-head">
+          <div class="gc-title-wrap">
+            <span class="gc-idx">${idx}</span>
+            <span class="gc-name">${escapeHtml(g.name || '—')}</span>
+            ${vendor ? `<div class="gc-vendor">${escapeHtml(vendor)}</div>` : ''}
+          </div>
+          <div class="gc-actions">${profileBtn}</div>
         </div>
-        <div class="row"><span>${escapeHtml(I18n.t('mesh.usage'))}</span><span>${Math.round(usage)}%</span></div>
-        <div class="bar"><div class="bar-fill ${gaugeLevel(usage)}" style="width:${Math.min(100, usage)}%"></div></div>
-        <div class="row"><span>VRAM</span><span>${formatMb(g.vram_used_mb || 0)} / ${formatMb(g.vram_total_mb || 0)}</span></div>
-        <div class="bar"><div class="bar-fill ${gaugeLevel(vramPct)}" style="width:${vramPct}%"></div></div>
-        <div class="row"><span>${escapeHtml(I18n.t('mesh.temperature'))}</span><span>${g.temperature_c != null ? g.temperature_c + '°C' : '—'}</span></div>
-        <div class="row"><span>${escapeHtml(I18n.t('mesh.power'))}</span><span>${power}</span></div>
+        <div class="gc-meters">
+          <div class="nd-meter">
+            <div class="nd-meter-head"><span class="t">${escapeHtml(I18n.t('mesh.usage') || 'Usage')}</span><span class="v">${usagePct}%</span></div>
+            <div class="nd-meter-bar ${gaugeLevel(usagePct)}"><div class="fill" style="width:${usagePct}%;"></div></div>
+          </div>
+          <div class="nd-meter">
+            <div class="nd-meter-head"><span class="t">VRAM</span><span class="v">${formatMb(g.vram_used_mb || 0)} / ${formatMb(g.vram_total_mb || 0)} · ${vramPct}%</span></div>
+            <div class="nd-meter-bar ${gaugeLevel(vramPct)}"><div class="fill" style="width:${vramPct}%;"></div></div>
+          </div>
+        </div>
+        <div class="gc-foot">
+          <div class="stat"><div class="l">${escapeHtml(I18n.t('mesh.gpu_temp') || 'Temp')}</div><div class="v">${escapeHtml(temp)}</div></div>
+          <div class="stat"><div class="l">${escapeHtml(I18n.t('mesh.gpu_power') || 'Power')}</div><div class="v">${escapeHtml(power)}</div></div>
+          <div class="stat"><div class="l">Fan</div><div class="v">${escapeHtml(fan)}</div></div>
+        </div>
       </div>
     `;
   }).join('');
+
+  // Auto-dense gdy >= 6 GPU (typowe rigi 8x). Mniejsze karty bez 'driver/CUDA'
+  // line, ciasniejsze odstepy. Manual toggle via przycisk w headerze.
+  const dense = gpus.length >= 6;
   return `
-    <h3 class="mesh-section-title">${escapeHtml(I18n.t('mesh.gpu_section'))}</h3>
-    <div class="mesh-detail-gpu-grid">${cards}</div>
+    <div class="nd-section">
+      <h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><circle cx="9" cy="12" r="2"/><circle cx="16" cy="12" r="1.2"/></svg>
+        GPU
+        <span class="count-pill">${gpus.length}</span>
+        ${summary ? `<span class="h-actions">${summary}</span>` : ''}
+      </h3>
+      <div class="nd-gpu-grid${dense ? ' dense' : ''}">${cards}</div>
+    </div>
   `;
 }
 
-function buildNetworkInterfaces(n) {
+function renderProfilingWrap(n) {
+  const html = nsightSessionsSectionHtml(n);
+  if (!html) return '';
+  // Nsight modul zwraca wlasny <h3> + <div class="mesh-detail-card sessions-card">...</div>.
+  // Owijamy to w nasza section card, zeby header byl spojny ze stylem (uppercase accent-2).
+  return `<div class="nd-section">${html}</div>`;
+}
+
+function renderNetwork(n) {
   const ifaces = Array.isArray(n.network_interfaces) ? n.network_interfaces : [];
   if (ifaces.length === 0) return '';
+
   const rows = ifaces.map(i => {
     const up = i.link_up;
-    const dot = up ? '<span class="net-dot up"></span>' : '<span class="net-dot down"></span>';
-    const speed = i.speed_mbps ? (i.speed_mbps >= 1000 ? `${(i.speed_mbps / 1000).toFixed(0)}G` : `${i.speed_mbps}M`) : (up ? '—' : I18n.t('mesh.no_link'));
-    const ip = i.ipv4_address || (up ? '—' : I18n.t('mesh.no_link'));
+    const speed = speedLabel(i.speed_mbps);
+    const ipv4 = i.ipv4_address || (up ? '—' : (I18n.t('mesh.network_no_link') || '—'));
+    const ipv6 = i.ipv6_address || '';
     const rx = i.rx_bytes_per_sec || 0;
     const tx = i.tx_bytes_per_sec || 0;
-    const bw = `↓ ${formatBytes(rx)}/s · ↑ ${formatBytes(tx)}/s`;
+    const role = ifaceRoleClass(i);
+    const roleLabel = ifaceRoleLabel(i);
+
     const badges = [];
-    if (i.interface_type === 'thunderbolt') {
-      badges.push('<span class="net-badge tb"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" fill="currentColor"/></svg>TB</span>');
-    }
-    if (i.rdma_available) badges.push('<span class="net-badge rdma">RDMA</span>');
-    if (i.roce_available) badges.push('<span class="net-badge roce">RoCE</span>');
-    if (i.numa_node != null && i.numa_node >= 0) {
-      badges.push(`<span class="net-badge numa">NUMA${i.numa_node}</span>`);
-    }
-    const nameIcon = i.interface_type === 'thunderbolt'
-      ? '<svg class="net-iface-icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>'
-      : '';
+    if (i.interface_type === 'thunderbolt') badges.push('<span class="nd-net-badge tb">TB</span>');
+    if (i.rdma_available) badges.push('<span class="nd-net-badge rdma">RDMA</span>');
+    if (i.roce_available) badges.push('<span class="nd-net-badge roce">RoCE</span>');
+    if (i.numa_node != null && i.numa_node >= 0) badges.push(`<span class="nd-net-badge numa">NUMA${i.numa_node}</span>`);
+
+    const statusPill = up
+      ? '<span class="nd-stat-pill ok dot">UP</span>'
+      : '<span class="nd-stat-pill off">DOWN</span>';
+
     return `
-      <div class="net-row">
-        ${dot}
-        <span class="net-name">${nameIcon}${escapeHtml(i.name || '—')}</span>
-        <span class="net-speed">${escapeHtml(speed)}</span>
-        <span class="net-ip">${escapeHtml(ip)}</span>
-        <span class="net-bw">${escapeHtml(bw)}</span>
-        <span class="net-badges">${badges.join('')}</span>
+      <tr>
+        <td>
+          <div class="nd-acell">
+            <div class="nd-aicon">${ifaceIconSvg(i)}</div>
+            <div>
+              <div class="nd-aname">${escapeHtml(i.name || '—')}</div>
+              ${i.description ? `<div class="nd-asub">${escapeHtml(i.description)}</div>` : ''}
+            </div>
+          </div>
+        </td>
+        <td>
+          <div class="nd-mono">${escapeHtml(ipv4)}</div>
+          ${ipv6 ? `<div class="nd-mono-sub">${escapeHtml(ipv6)}</div>` : ''}
+        </td>
+        <td><span class="nd-rolepill ${role}">${escapeHtml(roleLabel)}</span></td>
+        <td><span class="nd-mono">${escapeHtml(speed)}</span></td>
+        <td><div class="nd-bw"><span class="down">↓ ${formatBytes(rx)}/s</span><span class="up">↑ ${formatBytes(tx)}/s</span></div></td>
+        <td>${badges.length ? `<span class="nd-net-badges">${badges.join('')}</span>` : '—'}</td>
+        <td>${statusPill}</td>
+      </tr>
+    `;
+  }).join('');
+
+  const mobileCards = ifaces.map(i => {
+    const up = i.link_up;
+    const speed = speedLabel(i.speed_mbps);
+    const ipv4 = i.ipv4_address || '—';
+    const rx = i.rx_bytes_per_sec || 0;
+    const tx = i.tx_bytes_per_sec || 0;
+    const statusPill = up ? '<span class="nd-stat-pill ok dot">UP</span>' : '<span class="nd-stat-pill off">DOWN</span>';
+    return `
+      <div class="nd-net-card-m">
+        <div class="nh">
+          <div class="nd-aicon">${ifaceIconSvg(i)}</div>
+          <div class="nh-meta">
+            <div class="nd-aname">${escapeHtml(i.name || '—')}</div>
+            <div class="nd-asub">${escapeHtml(ifaceRoleLabel(i))}${i.description ? ' · ' + escapeHtml(i.description) : ''}</div>
+          </div>
+          ${statusPill}
+        </div>
+        <div class="nb">
+          <div><div class="k">IPv4</div><div class="v">${escapeHtml(ipv4)}</div></div>
+          <div><div class="k">Speed</div><div class="v">${escapeHtml(speed)}</div></div>
+          <div><div class="k">↓</div><div class="v">${formatBytes(rx)}/s</div></div>
+          <div><div class="k">↑</div><div class="v">${formatBytes(tx)}/s</div></div>
+        </div>
       </div>
     `;
   }).join('');
+
   return `
-    <h3 class="mesh-section-title">${escapeHtml(I18n.t('mesh.network_section'))}</h3>
-    <div class="mesh-detail-card network-card">${rows}</div>
+    <div class="nd-section flush">
+      <h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4"/></svg>
+        ${escapeHtml(I18n.t('mesh.network_section') || 'Network')}
+        <span class="count-pill">${ifaces.length}</span>
+      </h3>
+      <div class="nd-table-wrap">
+        <table class="nd-table">
+          <thead>
+            <tr>
+              <th>${escapeHtml(I18n.t('mesh.iface') || 'Interfejs')}</th>
+              <th>${escapeHtml(I18n.t('mesh.ip') || 'IP')}</th>
+              <th>${escapeHtml(I18n.t('mesh.role') || 'Rodzaj')}</th>
+              <th>Speed</th>
+              <th>Bandwidth</th>
+              <th>Capabilities</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="nd-net-cards">${mobileCards}</div>
+    </div>
   `;
 }
 
-function buildModelsList(n) {
+function renderModels(n) {
   const models = Array.isArray(n.models) ? n.models : [];
   if (models.length === 0) return '';
+
   const rows = models.map(m => {
+    const loaded = !!m.loaded;
+    const statusPill = loaded
+      ? `<span class="nd-stat-pill ok dot">${escapeHtml(I18n.t('mesh.loaded') || 'loaded')}</span>`
+      : `<span class="nd-stat-pill off">${escapeHtml(I18n.t('mesh.unloaded') || 'unloaded')}</span>`;
     return `
-      <div class="model-row">
-        <span class="model-kind">${escapeHtml(m.kind || '—')}</span>
-        <span class="model-alias"><code>${escapeHtml(m.alias || '—')}</code></span>
-        <span class="model-backend">${escapeHtml(m.backend || '—')}</span>
-        ${m.size_mb ? `<span class="model-size">${formatMb(m.size_mb)}</span>` : ''}
-        ${m.loaded ? `<tf-chip status="online" dot>${escapeHtml(I18n.t('mesh.loaded'))}</tf-chip>` : `<tf-chip status="offline">${escapeHtml(I18n.t('mesh.unloaded'))}</tf-chip>`}
+      <div class="nd-model">
+        <span class="kind">${escapeHtml(m.kind || '—')}</span>
+        <span class="alias" title="${escapeAttr(m.alias || '')}">${escapeHtml(m.alias || '—')}</span>
+        <span class="backend">${escapeHtml(m.backend || '—')}</span>
+        <span class="size">${m.size_mb ? formatMb(m.size_mb) : '—'}</span>
+        ${statusPill}
       </div>
     `;
   }).join('');
+
   return `
-    <h3 class="mesh-section-title">${escapeHtml(I18n.t('mesh.models_section'))}<span class="section-count">${models.length}</span></h3>
-    <div class="mesh-detail-card models-card">${rows}</div>
+    <div class="nd-section">
+      <h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        ${escapeHtml(I18n.t('mesh.models_section') || 'Models')}
+        <span class="count-pill">${models.length}</span>
+      </h3>
+      <div class="nd-models">${rows}</div>
+    </div>
   `;
 }
 
-function buildContainersTable(n) {
+function renderContainers(n) {
   const containers = Array.isArray(n.containers) ? n.containers : [];
   if (containers.length === 0) return '';
+
   const rows = containers.map(c => {
     const statusLower = String(c.status || '').toLowerCase();
     const running = statusLower.includes('up') || statusLower.includes('running');
-    const statusClass = running ? 'running' : (statusLower.includes('exited') ? 'exited' : '');
+    const exited = statusLower.includes('exited');
+    let statusPill;
+    if (running) statusPill = `<span class="nd-stat-pill ok dot live">${escapeHtml(c.status || 'Running')}</span>`;
+    else if (exited) statusPill = `<span class="nd-stat-pill off">${escapeHtml(c.status || 'Exited')}</span>`;
+    else statusPill = `<span class="nd-stat-pill warn">${escapeHtml(c.status || '—')}</span>`;
+
     const cpuPct = c.cpu_percent != null ? `${c.cpu_percent.toFixed(1)}%` : '—';
     const mem = c.memory_limit_mb
       ? `${formatMb(c.memory_mb || 0)} / ${formatMb(c.memory_limit_mb)}`
       : formatMb(c.memory_mb || 0);
+
     const actions = running
       ? `<tf-button variant="ghost" size="sm" data-container-action="stop" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.stop'))}</tf-button>
          <tf-button variant="ghost" size="sm" data-container-action="restart" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.restart'))}</tf-button>`
-      : `<tf-button variant="ghost" size="sm" data-container-action="start" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.start'))}</tf-button>`;
+      : `<tf-button variant="primary" size="sm" data-container-action="start" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.start'))}</tf-button>`;
+
     return `
       <tr>
-        <td><strong>${escapeHtml(c.name || '—')}</strong></td>
-        <td><code>${escapeHtml(c.image || '—')}</code></td>
-        <td><span class="container-status ${statusClass}">${escapeHtml(c.status || '—')}</span></td>
-        <td>${escapeHtml(cpuPct)}</td>
-        <td>${escapeHtml(mem)}</td>
-        <td class="actions">${actions}</td>
+        <td>
+          <div class="nd-cname">
+            <span class="nd-aicon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg></span>
+            ${escapeHtml(c.name || '—')}
+          </div>
+        </td>
+        <td><span class="nd-cimg">${escapeHtml(c.image || '—')}</span></td>
+        <td>${statusPill}</td>
+        <td><span class="nd-mono">${escapeHtml(cpuPct)}</span></td>
+        <td><span class="nd-mono">${escapeHtml(mem)}</span></td>
+        <td class="actions-col"><div class="nd-row-actions">${actions}</div></td>
       </tr>
     `;
   }).join('');
+
   return `
-    <h3 class="mesh-section-title">${escapeHtml(I18n.t('mesh.containers'))}<span class="section-count">${containers.length}</span></h3>
-    <div class="mesh-detail-card">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>${escapeHtml(I18n.t('mesh.container_name'))}</th>
-            <th>${escapeHtml(I18n.t('mesh.container_image'))}</th>
-            <th>${escapeHtml(I18n.t('mesh.container_status'))}</th>
-            <th>CPU</th>
-            <th>RAM</th>
-            <th>${escapeHtml(I18n.t('mesh.container_actions'))}</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
+    <div class="nd-section flush">
+      <h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg>
+        ${escapeHtml(I18n.t('mesh.containers'))}
+        <span class="count-pill">${containers.length}</span>
+      </h3>
+      <div class="nd-table-wrap">
+        <table class="nd-table">
+          <thead>
+            <tr>
+              <th>${escapeHtml(I18n.t('mesh.container_name'))}</th>
+              <th>${escapeHtml(I18n.t('mesh.container_image'))}</th>
+              <th>${escapeHtml(I18n.t('mesh.container_status'))}</th>
+              <th>CPU</th>
+              <th>RAM</th>
+              <th class="actions-col">${escapeHtml(I18n.t('mesh.container_actions'))}</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
     </div>
   `;
 }

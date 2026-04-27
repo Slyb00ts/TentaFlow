@@ -5,7 +5,7 @@
 //
 //       Aktualnie wspierane:
 //         - `inference-sherpa` (sherpa-onnx VITS Piper)
-//         - `inference-apple-tts` (AVSpeechSynthesizer, macOS/iOS only)
+//         - apple-tts (AVSpeechSynthesizer, ZAWSZE na macOS/iOS — bez feature flag)
 //         - `inference-mlx-kokoro` (Kokoro 82M przez mlx-swift, macOS/iOS)
 // =============================================================================
 
@@ -17,7 +17,10 @@ pub mod clean_cache;
 #[cfg(feature = "inference-sherpa")]
 pub mod sherpa;
 
-#[cfg(feature = "inference-apple-tts")]
+// Apple TTS jest ZAWSZE skompilowany na macOS/iOS — bez feature flag.
+// AVSpeechSynthesizer to systemowy silnik, nie wymaga zewnetrznych deps,
+// uzytkownik nie ma jak go wylaczyc i nie powinien.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod apple_tts;
 
 #[cfg(feature = "inference-mlx-kokoro")]
