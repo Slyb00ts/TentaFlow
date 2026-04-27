@@ -25,6 +25,7 @@ pub mod routing;
 pub mod services;
 pub mod stt;
 pub mod tts;
+pub mod audio_models;
 
 #[cfg(any(
     feature = "inference-mlx-whisper",

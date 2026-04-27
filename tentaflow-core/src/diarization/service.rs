@@ -47,8 +47,46 @@ const MIN_AUDIO_SAMPLES: usize = 16000; // 1.0s @ 16kHz
 const MAX_AUDIO_SAMPLES: usize = 24000; // 1.5s @ 16kHz
 
 fn default_model_path() -> String {
-    std::env::var("DIARIZATION_MODEL_PATH")
-        .unwrap_or_else(|_| "models/diarization/embedding.onnx".to_string())
+    if let Ok(p) = std::env::var("DIARIZATION_MODEL_PATH") {
+        return p;
+    }
+    // Embedded w binarce przez `tentaflow-core/build.rs::embed_audio_models`.
+    // Runtime ekstrahuje do `~/Library/Application Support/tentaflow/models/
+    // diarization/embedding.onnx` przy pierwszym wywolaniu (idempotentne).
+    // Bez zewnetrznych zaleznosci, dziala tez na zbudowanej dystrybucji.
+    if let Some(p) = crate::audio_models::diarization_embedding_path() {
+        return p.to_string_lossy().to_string();
+    }
+    // Fallback — gdy build.rs nie pobral (offline build) szukamy w
+    // typowych miejscach z workspace.
+    let candidates: Vec<std::path::PathBuf> = {
+        let mut v: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                v.push(dir.join("models/diarization/embedding.onnx"));
+                let mut p = dir.to_path_buf();
+                for _ in 0..4 {
+                    if let Some(parent) = p.parent() {
+                        p = parent.to_path_buf();
+                        v.push(p.join("models/diarization/embedding.onnx"));
+                    }
+                }
+            }
+        }
+        v.push(std::path::PathBuf::from(
+            "models/diarization/embedding.onnx",
+        ));
+        v
+    };
+    for c in &candidates {
+        if c.exists() {
+            return c.to_string_lossy().to_string();
+        }
+    }
+    candidates
+        .first()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "models/diarization/embedding.onnx".to_string())
 }
 
 /// Lazy-init WeSpeaker extractor (thread-safe, lazily loaded raz na runtime)
