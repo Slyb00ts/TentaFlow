@@ -8,41 +8,43 @@
 # =============================================================================
 
 [build]
-# Cargo by default uzywa wszystkich logicznych CPU. Na M-series (8c hybrid:
-# 4P+4E) explicit jobs = num_cpus = 8 zapewnia ze rustc dostaje wszystkie
-# rdzenie nawet w shellach gdzie cargo gubilo tę detekcje (np. Docker exec).
+# Cargo by default uzywa wszystkich logicznych CPU. Explicit zeby cargo
+# nie gubilo detekcji w niektorych shellach (Docker exec, CI, niestandardowy
+# init). 8 = num_cpus na primary dev maszynie M-series; na innych systemach
+# rustc i tak respektuje cargo --jobs jeśli przekażesz niższą wartość.
 jobs = 8
 
-# Incremental compilation cache zostaje miedzy buildami. Domyslnie wlaczone
-# dla profile.dev, tu wymuszamy tez dla release zeby `cargo build --release`
-# po malej zmianie nie kompilowal calego drzewa od zera (~10 min -> ~30s
-# dla zmiany w pojedynczym .rs).
+# Incremental compilation cache zostaje miedzy buildami — kluczowe dla
+# szybkich iteracji. Po zmianie 1 pliku rustc rekompiluje TYLKO ten plik
+# zamiast calego drzewa.
 incremental = true
 
-# rustc messages format: short = jedna linia per error/warning. Domyslny
-# "human" wypisuje pelne ramki ze strzaleczkami i kontekstem zrodla — w
-# pipeline cargo build daje koszmar przy 200+ warningach z third-party
-# crate'ow. "short" = kompaktowy log, latwiej zobaczyc co konkretnie sie
-# popsulo.
-# message-format = "short"   # opcjonalne, odkomentuj jak chcesz cisze
+# Sccache jako rustc wrapper — cache'uje skompilowane jednostki na dysku,
+# wspoldzielone miedzy clean buildami i miedzy projektami. Zainstaluj raz
+# `brew install sccache` (macOS) / `cargo install sccache` (linux) i ten
+# wpis zacznie dzialac. Bez sccache w PATH rustc po prostu padnie z
+# "sccache: command not found" — wtedy zakomentuj linijke ponizej.
+#
+# Pierwszy clean build per zmieniony crate jest tak samo wolny (cache miss).
+# DRUGI clean build (po `cargo clean`) odpala z cache i jest 5-10x szybszy.
+# Sccache pisze do ~/Library/Caches/Mozilla.sccache (domyslnie 10 GB cache).
+rustc-wrapper = "sccache"
 
-# Linker — Apple ld jest wolny dla duzych binarek (sherpa + onnxruntime +
-# wgpu + iroh = 200+ MB unstripped). Lista alternatyw aktywnych przez
-# rustflags ponizej. ZA­DRY ustawia OS-specific linker.
+# Sprawdz statystyki cache hit rate kiedykolwiek przez `sccache --show-stats`.
+
 [target.aarch64-apple-darwin]
-# Apple Silicon native. lld dziala ale wymaga zewnetrznej instalacji
-# (brew install llvm). Bez lld zostawiamy domyslny ld64 — szybsze niz
-# linux/gnu_ld ale i tak najwolniejsza czesc buildu na release-fast.
+# Apple Silicon native. Domyslny ld64 (Apple) jest najszybszym linkerem
+# na macOS — szybszy niz lld dla typical Rust binaries. Bez zmian.
 
 [target.x86_64-apple-darwin]
 # Intel Mac legacy.
 
 [target.x86_64-unknown-linux-gnu]
-# Linux x86_64. Mold jest 5-10x szybszy niz GNU ld dla duzych binarek.
-# Aktywuj jezeli masz zainstalowany:
+# Linux x86_64. Mold jest 5-10x szybszy niz GNU ld dla duzych binarek
+# (sherpa + onnxruntime + wgpu + iroh = 200+ MB unstripped). Aktywacja:
 #   sudo apt install mold       # debian/ubuntu
 #   sudo dnf install mold       # fedora
-# A potem odkomentuj linijke ponizej.
+# A potem odkomentuj 2 linijki ponizej.
 # linker = "clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
@@ -51,13 +53,89 @@ incremental = true
 # linker = "clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
-# Wrapper rustc — sccache cache'uje skompilowane crate'y miedzy clean
-# buildami i miedzy projektami. ~70% szybsze drugie clean build'y po
-# `cargo clean`.
-# Aktywacja:
-#   brew install sccache    # macOS
-#   cargo install sccache   # cross-platform
-# A potem odkomentuj linijke ponizej. Bez sccache w PATH cargo tylko
-# warnuje i kontynuuje normalnie, ale ZALECANE ZAINSTALOWAC.
-# [build]
-# rustc-wrapper = "sccache"
+# =============================================================================
+# Selective opt-level dla heavy dependencies w dev profile.
+# =============================================================================
+# `cargo build` (bez --release) domyslnie kompiluje WSZYSTKO bez optymalizacji
+# (opt-level=0). To OK dla naszego kodu — szybki rebuild po zmianie. Ale dla
+# heavy C/C++ deps (sherpa-onnx, llama.cpp, whisper.cpp, ggml) opt-level=0
+# daje DRAMATYCZNE spowolnienie runtime'u (np. inferencja 50x wolniejsza
+# zamiast 10ms -> 500ms). Trzymamy opt-level=3 tylko dla nich; te crate'y
+# kompiluja sie raz przy clean buildzie i potem siedza w cache.
+[profile.dev.package."sherpa-rs"]
+opt-level = 3
+[profile.dev.package."sherpa-rs-sys"]
+opt-level = 3
+[profile.dev.package."whisper-rs"]
+opt-level = 3
+[profile.dev.package."whisper-rs-sys"]
+opt-level = 3
+[profile.dev.package."llama-cpp-2"]
+opt-level = 3
+[profile.dev.package."llama-cpp-sys-2"]
+opt-level = 3
+[profile.dev.package."tract-onnx"]
+opt-level = 3
+[profile.dev.package."tract-core"]
+opt-level = 3
+[profile.dev.package."tract-linalg"]
+opt-level = 3
+[profile.dev.package."onnxruntime-sys"]
+opt-level = 3
+# Crypto deps — bez tego TLS handshake przy starcie tentaflow trwa kilkadziesiat
+# sekund w dev. Z opt=3 dla ring/aes-gcm/sha2/chacha20 = milisekundy.
+[profile.dev.package."ring"]
+opt-level = 3
+[profile.dev.package."aes-gcm"]
+opt-level = 3
+[profile.dev.package."chacha20poly1305"]
+opt-level = 3
+[profile.dev.package."sha2"]
+opt-level = 3
+[profile.dev.package."argon2"]
+opt-level = 3
+[profile.dev.package."ed25519-dalek"]
+opt-level = 3
+[profile.dev.package."x25519-dalek"]
+opt-level = 3
+[profile.dev.package."curve25519-dalek"]
+opt-level = 3
+# Image processing — yolov8/scrfd/mivolo runtime musi byc szybkie nawet w dev.
+[profile.dev.package."image"]
+opt-level = 3
+[profile.dev.package."ndarray"]
+opt-level = 3
+# Compression — flate2/zstd dekompresuje WASM addons + container_bundle.
+[profile.dev.package."flate2"]
+opt-level = 3
+[profile.dev.package."zstd"]
+opt-level = 3
+[profile.dev.package."zstd-safe"]
+opt-level = 3
+[profile.dev.package."zstd-sys"]
+opt-level = 3
+
+# To samo dla profile.test (cargo test) — testy uzywajace sherpa/whisper/
+# llama bez opt=3 to recipe na timeout.
+[profile.test.package."sherpa-rs"]
+opt-level = 3
+[profile.test.package."whisper-rs-sys"]
+opt-level = 3
+[profile.test.package."llama-cpp-sys-2"]
+opt-level = 3
+[profile.test.package."ring"]
+opt-level = 3
+
+# =============================================================================
+# Network: Cargo registry / git fetching
+# =============================================================================
+# Sparse protocol dla crates.io — pobiera tylko zalezne crate'y zamiast
+# klonowac calej registry. Domyslnie wlaczone od Rust 1.70+ ale upewniamy
+# sie ze nie ma jakies nadpisanie z innego config'a wyzej w drzewie.
+[registries.crates-io]
+protocol = "sparse"
+
+# Wiecej rownoleglych pobierania crate'ow przy pierwszym `cargo fetch`.
+[net]
+retry = 3
+git-fetch-with-cli = true
