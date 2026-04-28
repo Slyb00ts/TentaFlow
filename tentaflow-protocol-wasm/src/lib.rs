@@ -5162,6 +5162,10 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         set(&obj, "route", route.into());
     }
     set(&obj, "platform", n.platform.clone().into());
+    set(&obj, "nsys_available", n.nsys_available.into());
+    set(&obj, "nsysAvailable", n.nsys_available.into());
+    set(&obj, "nsys_version", n.nsys_version.clone().into());
+    set(&obj, "nsysVersion", n.nsys_version.into());
     obj
 }
 
