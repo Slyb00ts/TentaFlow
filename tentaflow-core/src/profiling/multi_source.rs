@@ -99,11 +99,30 @@ impl ParserRegistry {
     /// Build a registry pre-populated with parsers for every collector
     /// currently registered by `CollectorRegistry::discover()`.
     pub fn default_registry() -> Self {
+        use crate::profiling::collectors as c;
         let mut r = Self::new();
-        r.register(
-            "nvidia.nsys.gpu".to_string(),
-            Arc::new(crate::profiling::collectors::NvidiaNsysParser),
-        );
+        // NVIDIA Nsight Systems SQLite parser.
+        r.register("nvidia.nsys.gpu".to_string(), Arc::new(c::NvidiaNsysParser));
+        // Linux no-priv parsers.
+        r.register("linux.proc.cpu_util".to_string(), Arc::new(c::linux::cpu_util::LinuxProcCpuUtilParser));
+        r.register("linux.proc.ram".to_string(), Arc::new(c::linux::ram::LinuxProcRamParser));
+        r.register("linux.iostat.disk".to_string(), Arc::new(c::linux::disk::LinuxIostatDiskParser));
+        r.register("linux.rapl.power".to_string(), Arc::new(c::linux::rapl_power::LinuxRaplPowerParser));
+        r.register("linux.nvsmi.gpu_util".to_string(), Arc::new(c::linux::nvsmi_gpu::LinuxNvsmiGpuParser));
+        // Linux GPU vendor parsers.
+        r.register("linux.rocsmi.gpu_util".to_string(), Arc::new(c::linux_gpu::rocsmi_util::LinuxRocmSmiGpuParser));
+        r.register("linux.rocprof.gpu_kernels".to_string(), Arc::new(c::linux_gpu::rocprof_kernels::LinuxRocprofKernelsParser));
+        r.register("linux.intel_gpu_top.gpu".to_string(), Arc::new(c::linux_gpu::intel_gpu_top::LinuxIntelGpuTopParser));
+        // macOS parsers.
+        r.register("macos.vm_stat.ram".to_string(), Arc::new(c::macos::vm_stat_ram::MacosVmStatRamParser));
+        r.register("macos.iostat.disk".to_string(), Arc::new(c::macos::iostat_disk::MacosIostatDiskParser));
+        r.register("macos.powermetrics.power".to_string(), Arc::new(c::macos::powermetrics_power::MacosPowermetricsPowerParser));
+        r.register("macos.powermetrics.gpu".to_string(), Arc::new(c::macos::powermetrics_gpu::MacosPowermetricsGpuParser));
+        // Windows PDH parsers.
+        r.register("windows.pdh.cpu_util".to_string(), Arc::new(c::windows::pdh_cpu_util::WindowsPdhCpuUtilParser));
+        r.register("windows.pdh.ram".to_string(), Arc::new(c::windows::pdh_ram::WindowsPdhRamParser));
+        r.register("windows.pdh.disk".to_string(), Arc::new(c::windows::pdh_disk::WindowsPdhDiskParser));
+        r.register("windows.pdh.gpu".to_string(), Arc::new(c::windows::pdh_gpu::WindowsPdhGpuParser));
         r
     }
 }

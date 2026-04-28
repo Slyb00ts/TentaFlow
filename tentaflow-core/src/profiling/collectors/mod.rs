@@ -14,6 +14,7 @@ use tentaflow_protocol::profiling::{
 pub mod elevation;
 pub mod intern;
 pub mod linux;
+pub mod linux_gpu;
 pub mod macos;
 pub mod nvidia_nsys;
 pub mod nvidia_nsys_parser;
