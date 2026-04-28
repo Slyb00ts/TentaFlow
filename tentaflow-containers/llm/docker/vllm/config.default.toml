@@ -1,11 +1,18 @@
+# =============================================================================
+# Plik: config.default.toml
+# Opis: Fallback dla sidecara w obrazie - nadpisany przez /data/config.toml
+#       wygenerowany przez tentaflow-core/src/deploy/runner.rs przy deployu.
+# =============================================================================
 service_name = "llm-vllm"
-model_aliases = ["default"]
+model_aliases = []
 
-[quic]
+[transport]
 port = 5000
+enable_lan_discovery = false
+enable_dht_discovery = false
 
 [role]
 kind = "reverse_proxy"
-upstream_url = "http://127.0.0.1:8000"
-timeout_ms = 300000
+upstream_url = "http://127.0.0.1:8000/v1"
 api = "open_ai"
+timeout_ms = 600000
