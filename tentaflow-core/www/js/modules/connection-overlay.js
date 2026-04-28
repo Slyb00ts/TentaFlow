@@ -25,7 +25,9 @@ let hideTimer = null;
 let state = 'ok'; // ok | disconnected | reconnecting
 let nextAttemptAt = 0;
 let ringMax = 1;
-let raf = null;
+let countdownTimer = null;
+let lastSecondsShown = -1;
+let ringCirc = 0;
 
 function timeStr() {
   return new Date().toTimeString().slice(0, 8);
@@ -113,9 +115,9 @@ function build() {
   logEl = card.querySelector('.conn-log');
 
   // Inicjalny stroke-dasharray dla pierscienia (r=20 → circ = 2π·20 ≈ 125.66).
-  const circ = 2 * Math.PI * 20;
+  ringCirc = 2 * Math.PI * 20;
   if (ring) {
-    ring.setAttribute('stroke-dasharray', String(circ));
+    ring.setAttribute('stroke-dasharray', String(ringCirc));
     ring.style.strokeDashoffset = '0';
   }
 
@@ -128,21 +130,48 @@ function build() {
     ApiBinary.clearSession();
     window.location.href = '/';
   });
+}
 
-  // W widocznosci strony odswiez ring gladko — requestAnimationFrame raz na sekund.
-  const tick = () => {
-    if (state === 'disconnected' && nextAttemptAt > 0) {
-      const remainingMs = Math.max(0, nextAttemptAt - Date.now());
-      const seconds = Math.ceil(remainingMs / 1000);
-      if (countdownEl) countdownEl.textContent = seconds > 0 ? `${seconds}s` : '…';
-      if (ring && ringMax > 0) {
-        const frac = remainingMs / ringMax;
-        ring.style.strokeDashoffset = String(circ * (1 - frac));
-      }
-    }
-    raf = requestAnimationFrame(tick);
-  };
-  raf = requestAnimationFrame(tick);
+// Countdown text update — uruchamiany tylko gdy state === 'disconnected'.
+// Wczesniej byla petla requestAnimationFrame 60fps z DOM write per frame nawet
+// gdy overlay byl niewidoczny — przegladarka palila ~5-15% CPU stale. Teraz
+// 1 Hz setInterval zatrzymywany w hide(), zero CPU gdy ok.
+function updateCountdown() {
+  if (state !== 'disconnected' || nextAttemptAt <= 0) return;
+  const remainingMs = Math.max(0, nextAttemptAt - Date.now());
+  const seconds = Math.ceil(remainingMs / 1000);
+  if (seconds === lastSecondsShown) return; // dedup — write tylko gdy zmiana
+  lastSecondsShown = seconds;
+  if (countdownEl) countdownEl.textContent = seconds > 0 ? `${seconds}s` : '…';
+}
+
+function startCountdown() {
+  if (countdownTimer) return;
+  updateCountdown();
+  countdownTimer = setInterval(updateCountdown, 1000);
+}
+
+function stopCountdown() {
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+  lastSecondsShown = -1;
+}
+
+// Ring fill animation jest robiona przez CSS transition (one-shot per
+// reconnect-scheduled event) — GPU sam interpoluje przez delayMs ms,
+// brak udzialu JS. Stary kod robil 60 DOM writes/sec dla tej samej animacji.
+function armRingTransition(delayMs) {
+  if (!ring || ringCirc <= 0) return;
+  // Reset bez transition (instant skok do 0), force reflow, potem ustaw
+  // transition na delayMs i docelowa wartosc — przegladarka GPU-composite.
+  ring.style.transition = 'none';
+  ring.style.strokeDashoffset = '0';
+  // eslint-disable-next-line no-unused-expressions
+  ring.getBoundingClientRect();
+  ring.style.transition = `stroke-dashoffset ${delayMs}ms linear`;
+  ring.style.strokeDashoffset = String(ringCirc);
 }
 
 function targetEl() {
@@ -164,11 +193,20 @@ function show() {
     clearTimeout(hideTimer);
     hideTimer = null;
   }
+  startCountdown();
 }
 
 function hide() {
   if (!el) return;
   if (hideTimer) clearTimeout(hideTimer);
+  // Zatrzymaj countdown od razu — visible class odpadnie po AUTO_HIDE_DELAY_MS,
+  // ale nie ma sensu palic CPU w czasie fade-out.
+  stopCountdown();
+  // Reset ring transition — uniknie animacji przy ponownym pojawieniu sie.
+  if (ring) {
+    ring.style.transition = 'none';
+    ring.style.strokeDashoffset = '0';
+  }
   hideTimer = setTimeout(() => {
     el.classList.remove('visible');
     const app = targetEl();
@@ -203,17 +241,21 @@ export function init() {
         addLogEntry('err', I18n.t('connection.log_lost', { reason: ev.info?.reason ?? '' }));
         show();
         break;
-      case 'reconnect-scheduled':
+      case 'reconnect-scheduled': {
         state = 'disconnected';
-        nextAttemptAt = Date.now() + (ev.info?.delayMs ?? 0);
-        ringMax = ev.info?.delayMs ?? 1;
+        const delayMs = ev.info?.delayMs ?? 0;
+        nextAttemptAt = Date.now() + delayMs;
+        ringMax = delayMs || 1;
         updateAttemptLine(ev.info?.attempt ?? 0);
         addLogEntry('warn', I18n.t('connection.log_retry_scheduled', {
           attempt: ev.info?.attempt ?? 0,
-          delay: Math.round((ev.info?.delayMs ?? 0) / 1000),
+          delay: Math.round(delayMs / 1000),
         }));
         show();
+        // CSS transition robi caly ring fill bez JS per-frame ticka.
+        armRingTransition(delayMs);
         break;
+      }
       case 'reconnect-attempt':
         addLogEntry('info', I18n.t('connection.log_retry_attempt', { attempt: ev.info?.attempt ?? 0 }));
         break;
@@ -242,7 +284,7 @@ export function init() {
 /** Destroy — do testow / HMR. */
 export function destroy() {
   if (!mounted) return;
-  if (raf) cancelAnimationFrame(raf);
+  stopCountdown();
   if (hideTimer) clearTimeout(hideTimer);
   if (el && el.parentNode) el.parentNode.removeChild(el);
   el = null;
