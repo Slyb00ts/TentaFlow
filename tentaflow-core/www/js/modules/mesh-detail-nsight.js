@@ -71,11 +71,27 @@ function hasNvidiaGpu(node) {
   return gpus.some((g) => g && String(g.vendor || '').toLowerCase() === 'nvidia');
 }
 
-// Czy node wspiera profilowanie (heartbeat raportuje nsys_available + jest NVIDIA).
+// Czy node wspiera klasyczne nsight profilowanie (NVIDIA + nsys w PATH).
 export function isNsightCapable(node) {
   if (!node) return false;
   if (node.nsys_available !== true) return false;
   return hasNvidiaGpu(node);
+}
+
+// Czy node ma JAKIEKOLWIEK kolektory profilowania multi-source dostepne
+// (Linux/macOS/Windows CPU/RAM/Disk/Power/GPU). Heartbeat advertise'uje liste
+// id-ow kolektorow (np. 'macos.powermetrics.gpu', 'linux.proc.cpu_util').
+// Pusta lista = peer nie obsluguje multi-source profiling V2.
+export function hasProfilingCollectors(node) {
+  if (!node) return false;
+  const list = node.profiling_collectors_available;
+  return Array.isArray(list) && list.length > 0;
+}
+
+// Wspolny gate na pokazanie przycisku Profile w GUI: albo legacy nsys
+// (NVIDIA host) albo multi-source collectors (kazda platforma).
+export function isProfileCapable(node) {
+  return isNsightCapable(node) || hasProfilingCollectors(node);
 }
 
 // Wykrywa platforme docelowa do wyboru komendy instalacji. Preferuje `node.platform`
@@ -125,7 +141,9 @@ export function topbarHtml(node) {
         </tf-button>
       </span>
     `);
-  } else if (isNsightCapable(node)) {
+  } else if (isProfileCapable(node)) {
+    // Pokazujemy Profile button gdy node ma ALBO nsys (NVIDIA) ALBO
+    // dostepne kolektory multi-source (Linux/macOS/Windows CPU/GPU/IO).
     parts.push(`
       <tf-button size="sm" variant="ghost" data-action="nsight-profile-node" title="${escapeAttr(I18n.t('nsight.profile_node_btn'))}">
         <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-record"/></svg>
@@ -139,9 +157,9 @@ export function topbarHtml(node) {
         ${escapeHtml(I18n.t('nsight.status.unavailable'))}
       </tf-chip>
     `);
-  } else if (!hasNvidiaGpu(node)) {
-    // Brak NVIDIA = nsys nigdy nie bedzie dostepny (Apple Silicon, AMD-only itp.).
-    // Chip informacyjny, disabled-look, zeby uzytkownik wiedzial dlaczego brak przycisku.
+  } else {
+    // Brak nsys i brak collectorow = naprawde nic nie potrafi profilowac.
+    // Pokazujemy informacyjny chip zeby user wiedzial dlaczego brak przycisku.
     parts.push(`
       <tf-chip status="muted" title="${escapeAttr(I18n.t('nsight.status.no_nvidia_tooltip'))}">
         ${escapeHtml(I18n.t('nsight.status.no_nvidia'))}
