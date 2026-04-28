@@ -1,0 +1,382 @@
+/* =============================================================================
+   Plik: profile-flamegraph.css
+   Opis: Style zakladki CPU Flamegraph w Profile Report — toolbar, breadcrumb,
+         flamegraph SVG, side panel "Selected frame", differential legend.
+         Reuzywa zmiennych z profiling.css / style.css. Dark theme only.
+   ============================================================================= */
+
+.flamegraph-root {
+  --fg-row-h: 22px;
+  --fg-bg: var(--tf-bg-input, #0b0e22);
+  --fg-border: var(--tf-border, #1f2548);
+  --fg-text: var(--tf-text, #e8ebf5);
+  --fg-text-2: var(--tf-text-2, #a0a8c8);
+  --fg-text-3: var(--tf-text-3, #6a7196);
+  --fg-accent: var(--tf-accent-1, #6366f1);
+  --fg-accent-2: var(--tf-accent-2, #a78bfa);
+  --fg-success: var(--tf-success, #22c55e);
+  --fg-danger: var(--tf-danger, #ef4444);
+  --fg-warning: var(--tf-warning, #f59e0b);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  font-family: 'Manrope', system-ui, sans-serif;
+  color: var(--fg-text);
+}
+
+/* Toolbar -------------------------------------------------------------------- */
+.flamegraph-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--tf-bg-3, #111535);
+  border: 1px solid var(--fg-border);
+  border-radius: var(--tf-radius, 10px);
+}
+.flamegraph-toolbar tf-searchbox { flex: 1 1 240px; min-width: 200px; }
+.flamegraph-toolbar .ftb-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--fg-text-3);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.flamegraph-toolbar .ftb-slider {
+  width: 110px;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--tf-bg-2, #0a0d24);
+  border: 1px solid var(--fg-border);
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+}
+.flamegraph-toolbar .ftb-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--fg-accent-2);
+  border: 2px solid var(--tf-bg-input, #0b0e22);
+  cursor: pointer;
+}
+.flamegraph-toolbar .ftb-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--fg-accent-2);
+  border: 2px solid var(--tf-bg-input, #0b0e22);
+  cursor: pointer;
+}
+.flamegraph-toolbar .ftb-slider-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--fg-text-2);
+  min-width: 38px;
+  text-align: right;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.flamegraph-toolbar tf-toggle { vertical-align: middle; }
+
+/* Breadcrumb ----------------------------------------------------------------- */
+.flamegraph-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--fg-text-3);
+}
+.flamegraph-breadcrumb .fbc-item {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--tf-bg-3, #111535);
+  border: 1px solid var(--fg-border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  color: var(--fg-text-2);
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.flamegraph-breadcrumb .fbc-item:hover {
+  background: var(--tf-bg-card-hover, #1a1f45);
+  color: var(--fg-text);
+  border-color: var(--tf-border-hover, #2f3668);
+}
+.flamegraph-breadcrumb .fbc-item.current {
+  background: rgba(99, 102, 241, 0.14);
+  border-color: rgba(167, 139, 250, 0.4);
+  color: var(--fg-text);
+  cursor: default;
+}
+.flamegraph-breadcrumb .fbc-sep {
+  color: var(--fg-text-3);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Differential range pickers ------------------------------------------------- */
+.flamegraph-diff-bar {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  padding: 12px;
+  background: var(--tf-bg-2, #0a0d24);
+  border: 1px dashed rgba(167, 139, 250, 0.35);
+  border-radius: var(--tf-radius, 10px);
+}
+.flamegraph-diff-range {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.flamegraph-diff-range .fdr-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--fg-accent-2);
+}
+.flamegraph-diff-range .fdr-inputs {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.flamegraph-diff-range input[type="number"] {
+  flex: 1;
+  background: var(--fg-bg);
+  border: 1px solid var(--fg-border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--fg-text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  outline: none;
+}
+.flamegraph-diff-range input[type="number"]:focus {
+  border-color: var(--fg-accent);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+}
+.flamegraph-diff-range .fdr-unit {
+  font-size: 11px;
+  color: var(--fg-text-3);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Differential color legend (visible only in diff mode) */
+.flamegraph-diff-legend {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--fg-text-3);
+  padding: 6px 12px;
+}
+.flamegraph-diff-legend .fdl-bar {
+  width: 140px;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #16a34a 0%, #4b5563 50%, #dc2626 100%);
+  border: 1px solid var(--fg-border);
+}
+.flamegraph-diff-legend .fdl-end {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--fg-text-2);
+  font-weight: 700;
+}
+
+/* Layout: chart + side panel ------------------------------------------------- */
+.flamegraph-layout {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .flamegraph-layout { grid-template-columns: 1fr; }
+}
+
+.flamegraph-wrap {
+  background: var(--fg-bg);
+  border: 1px solid var(--fg-border);
+  border-radius: var(--tf-radius, 10px);
+  padding: 10px;
+  overflow-x: auto;
+  overflow-y: visible;
+  position: relative;
+  outline: none;
+}
+.flamegraph-wrap:focus-visible {
+  border-color: var(--fg-accent);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+}
+.flamegraph-svg {
+  display: block;
+  width: 100%;
+  min-width: 920px;
+  user-select: none;
+}
+
+.flame-rect {
+  cursor: pointer;
+  transition: filter 0.08s, opacity 0.08s;
+  stroke: rgba(10, 13, 36, 0.65);
+  stroke-width: 0.6;
+}
+.flame-rect:hover { filter: brightness(1.18); }
+.flame-rect.dim { opacity: 0.28; }
+.flame-rect.match { stroke: var(--fg-accent-2); stroke-width: 1.5; }
+.flame-rect.selected {
+  stroke: var(--fg-accent-2);
+  stroke-width: 2;
+  stroke-dasharray: 3 2;
+}
+.flame-label {
+  fill: #0a0d24;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  pointer-events: none;
+  dominant-baseline: middle;
+}
+.flame-label.light { fill: #e8ebf5; }
+
+.flamegraph-foot {
+  font-size: 11px;
+  color: var(--fg-text-3);
+  font-family: 'JetBrains Mono', monospace;
+  padding: 8px 12px;
+  margin-top: 10px;
+  background: var(--tf-bg-3, #111535);
+  border: 1px dashed var(--fg-border);
+  border-radius: 6px;
+}
+
+/* Side panel ----------------------------------------------------------------- */
+.flamegraph-panel {
+  background: var(--tf-bg-2, #0a0d24);
+  border: 1px solid var(--tf-border-hover, #2f3668);
+  border-radius: var(--tf-radius, 10px);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: sticky;
+  top: 12px;
+  min-height: 240px;
+}
+.flamegraph-panel .fp-head {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--fg-accent-2);
+}
+.flamegraph-panel .fp-symbol {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--fg-text);
+  word-break: break-all;
+  line-height: 1.4;
+}
+.flamegraph-panel .fp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+}
+.flamegraph-panel .fp-row .l { color: var(--fg-text-3); }
+.flamegraph-panel .fp-row .r {
+  color: var(--fg-text);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  text-align: right;
+  word-break: break-all;
+}
+.flamegraph-panel .fp-section {
+  border-top: 1px dashed var(--fg-border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.flamegraph-panel .fp-section-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--fg-text-3);
+}
+.flamegraph-panel .fp-children {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.flamegraph-panel .fp-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  font-size: 11.5px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 4px 6px;
+  cursor: pointer;
+  transition: all 0.1s;
+}
+.flamegraph-panel .fp-child:hover {
+  background: var(--tf-bg-3, #111535);
+  border-color: var(--fg-border);
+}
+.flamegraph-panel .fp-child .sym {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--fg-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.flamegraph-panel .fp-child .pct {
+  color: var(--fg-text-2);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+}
+
+.flamegraph-panel .fp-empty {
+  font-size: 12px;
+  color: var(--fg-text-3);
+  text-align: center;
+  padding: 20px 0;
+  font-style: italic;
+}
+
+/* Tooltip on hover ----------------------------------------------------------- */
+.flamegraph-tooltip {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  background: var(--tf-bg-2, #0a0d24);
+  border: 1px solid var(--tf-border-hover, #2f3668);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--fg-text);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  max-width: 360px;
+  opacity: 0;
+  transition: opacity 0.08s;
+}
+.flamegraph-tooltip.visible { opacity: 1; }
+.flamegraph-tooltip .tt-sym { color: var(--fg-accent-2); font-weight: 700; }
+.flamegraph-tooltip .tt-meta { color: var(--fg-text-3); font-size: 10.5px; margin-top: 2px; }
+.flamegraph-tooltip .tt-delta-up { color: var(--fg-danger); }
+.flamegraph-tooltip .tt-delta-down { color: var(--fg-success); }
