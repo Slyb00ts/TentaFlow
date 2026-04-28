@@ -11,6 +11,11 @@ use crate::profiling::{
     NsightDeleteRequest, NsightDeleteResponse, NsightDownloadRequest, NsightDownloadResponse,
     NsightReportRequest, NsightReportResponse, NsightSessionsRequest, NsightSessionsResponse,
     NsightStartRequest, NsightStartResponse, NsightStopRequest, NsightStopResponse,
+    ProfilingActiveInfoRequest, ProfilingActiveInfoResponse, ProfilingDeleteRequest,
+    ProfilingDeleteResponse, ProfilingDownloadRequest, ProfilingDownloadResponse,
+    ProfilingReportRequest, ProfilingReportResponse, ProfilingSessionsRequest,
+    ProfilingSessionsResponse, ProfilingStartRequest, ProfilingStartResponse, ProfilingStopRequest,
+    ProfilingStopResponse,
 };
 
 fn default_service_status() -> String {
@@ -518,6 +523,21 @@ pub enum MeshCommandType {
     NsightDelete(NsightDeleteRequest),
     /// Nsight: pobranie surowego pliku `.nsys-rep` (binary blob).
     NsightDownload(NsightDownloadRequest),
+
+    /// Profiling V2 (multi-source): start sesji.
+    ProfilingStart(ProfilingStartRequest),
+    /// Profiling V2: stop sesji + zwrot pelnego raportu.
+    ProfilingStop(ProfilingStopRequest),
+    /// Profiling V2: lista sesji widocznych na nodzie.
+    ProfilingSessions(ProfilingSessionsRequest),
+    /// Profiling V2: pobranie raportu (envelope V1/V2).
+    ProfilingReport(ProfilingReportRequest),
+    /// Profiling V2: usuniecie sesji.
+    ProfilingDelete(ProfilingDeleteRequest),
+    /// Profiling V2: pobranie tar.gz z calym katalogiem sesji.
+    ProfilingDownload(ProfilingDownloadRequest),
+    /// Profiling V2: snapshot aktywnej sesji (Some) albo None.
+    ProfilingActiveInfo(ProfilingActiveInfoRequest),
 }
 
 // =============================================================================
@@ -565,6 +585,21 @@ pub enum MeshCommandResponsePayload {
     NsightDelete(NsightDeleteResponse),
     /// Nsight: surowa zawartosc pliku `.nsys-rep`.
     NsightDownload(NsightDownloadResponse),
+
+    /// Profiling V2: potwierdzenie startu sesji.
+    ProfilingStart(ProfilingStartResponse),
+    /// Profiling V2: zatrzymanie + raport ProfileReportV2.
+    ProfilingStop(ProfilingStopResponse),
+    /// Profiling V2: lista sesji.
+    ProfilingSessions(ProfilingSessionsResponse),
+    /// Profiling V2: envelope (V1/V2) raportu.
+    ProfilingReport(ProfilingReportResponse),
+    /// Profiling V2: potwierdzenie usuniecia.
+    ProfilingDelete(ProfilingDeleteResponse),
+    /// Profiling V2: tar.gz katalogu sesji.
+    ProfilingDownload(ProfilingDownloadResponse),
+    /// Profiling V2: snapshot aktywnej sesji.
+    ProfilingActiveInfo(ProfilingActiveInfoResponse),
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -650,6 +685,40 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("NsightDownload")
                 .field("node_id", &req.node_id)
                 .field("session_id", &req.session_id)
+                .finish(),
+            Self::ProfilingStart(req) => f
+                .debug_struct("ProfilingStart")
+                .field("node_id", &req.node_id)
+                .field("label", &req.label)
+                .field("elevation_password", &"***")
+                .finish(),
+            Self::ProfilingStop(req) => f
+                .debug_struct("ProfilingStop")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::ProfilingSessions(req) => f
+                .debug_struct("ProfilingSessions")
+                .field("node_id", &req.node_id)
+                .finish(),
+            Self::ProfilingReport(req) => f
+                .debug_struct("ProfilingReport")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::ProfilingDelete(req) => f
+                .debug_struct("ProfilingDelete")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::ProfilingDownload(req) => f
+                .debug_struct("ProfilingDownload")
+                .field("node_id", &req.node_id)
+                .field("session_id", &req.session_id)
+                .finish(),
+            Self::ProfilingActiveInfo(req) => f
+                .debug_struct("ProfilingActiveInfo")
+                .field("node_id", &req.node_id)
                 .finish(),
         }
     }

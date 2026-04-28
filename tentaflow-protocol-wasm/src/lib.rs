@@ -5166,6 +5166,16 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "nsysAvailable", n.nsys_available.into());
     set(&obj, "nsys_version", n.nsys_version.clone().into());
     set(&obj, "nsysVersion", n.nsys_version.into());
+    let collectors_arr = js_sys::Array::new();
+    for cid in &n.profiling_collectors_available {
+        collectors_arr.push(&js_sys::JsString::from(cid.as_str()).into());
+    }
+    set(
+        &obj,
+        "profiling_collectors_available",
+        collectors_arr.clone().into(),
+    );
+    set(&obj, "profilingCollectorsAvailable", collectors_arr.into());
     obj
 }
 
@@ -6140,6 +6150,7 @@ fn nsight_payload_to_js(obj: &js_sys::Object, payload: tentaflow_protocol::Nsigh
                 js_sys::Uint8Array::from(r.bytes.as_slice()).into(),
             );
         }
+        NP::Profiling(p) => profiling_payload_fill_obj(obj, &p),
     }
 }
 
@@ -6212,6 +6223,852 @@ pub fn encode_nsight_download_request(
 ) -> Result<Vec<u8>, JsError> {
     encode_nsight(tentaflow_protocol::NsightPayload::DownloadRequest(
         tentaflow_protocol::NsightDownloadRequest { node_id, session_id },
+    ))
+}
+
+// =============================================================================
+// Multi-source profiling (V2) — encode/decode dla 7 par r/r.
+// Pakowane w `MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload))`,
+// zeby nie konsumowac kolejnych slotow rkyv w MessageBody.
+// =============================================================================
+
+fn gpu_vendor_to_js(v: &tentaflow_protocol::GpuVendor) -> JsValue {
+    use tentaflow_protocol::GpuVendor as V;
+    match v {
+        V::Nvidia => "nvidia".into(),
+        V::Amd => "amd".into(),
+        V::Intel => "intel".into(),
+        V::Apple => "apple".into(),
+    }
+}
+
+fn gpu_vendor_from_str(s: &str) -> Result<tentaflow_protocol::GpuVendor, JsError> {
+    use tentaflow_protocol::GpuVendor as V;
+    match s.to_ascii_lowercase().as_str() {
+        "nvidia" => Ok(V::Nvidia),
+        "amd" => Ok(V::Amd),
+        "intel" => Ok(V::Intel),
+        "apple" => Ok(V::Apple),
+        other => Err(JsError::new(&format!(
+            "gpu vendor: nieznany '{other}' (oczekiwany nvidia|amd|intel|apple)"
+        ))),
+    }
+}
+
+fn gpu_targets_to_js(t: &tentaflow_protocol::GpuTargets) -> JsValue {
+    use tentaflow_protocol::GpuTargets as G;
+    match t {
+        G::None => "none".into(),
+        G::All => "all".into(),
+        G::Indices(idx) => {
+            let arr = js_sys::Array::new();
+            for i in idx {
+                arr.push(&(*i as f64).into());
+            }
+            let o = js_sys::Object::new();
+            set(&o, "indices", arr.into());
+            o.into()
+        }
+        G::ByVendor(v) => {
+            let o = js_sys::Object::new();
+            set(&o, "byVendor", gpu_vendor_to_js(v));
+            o.into()
+        }
+    }
+}
+
+fn gpu_targets_from_js(value: &JsValue) -> Result<tentaflow_protocol::GpuTargets, JsError> {
+    use tentaflow_protocol::GpuTargets as G;
+    if let Some(s) = value.as_string() {
+        return match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(G::None),
+            "all" => Ok(G::All),
+            other => Err(JsError::new(&format!(
+                "gpuTargets: nieznany string '{other}' (oczekiwany none|all albo obiekt)"
+            ))),
+        };
+    }
+    if value.is_object() {
+        let obj: &js_sys::Object = value.unchecked_ref();
+        let indices_js = js_sys::Reflect::get(obj, &"indices".into())
+            .map_err(|_| JsError::new("gpuTargets: blad odczytu pola"))?;
+        if !indices_js.is_undefined() && !indices_js.is_null() {
+            if !indices_js.is_array() {
+                return Err(JsError::new("gpuTargets.indices: oczekiwana tablica liczb"));
+            }
+            let arr = js_sys::Array::from(&indices_js);
+            let mut out = Vec::with_capacity(arr.length() as usize);
+            for i in 0..arr.length() {
+                let v = arr.get(i);
+                let n = v
+                    .as_f64()
+                    .ok_or_else(|| JsError::new("gpuTargets.indices: element musi byc liczba"))?;
+                if !(0.0..=u32::MAX as f64).contains(&n) || n.fract() != 0.0 {
+                    return Err(JsError::new(
+                        "gpuTargets.indices: liczba poza zakresem u32 lub niecalkowita",
+                    ));
+                }
+                out.push(n as u32);
+            }
+            return Ok(G::Indices(out));
+        }
+        let by_vendor = js_sys::Reflect::get(obj, &"byVendor".into())
+            .map_err(|_| JsError::new("gpuTargets: blad odczytu byVendor"))?;
+        if !by_vendor.is_undefined() && !by_vendor.is_null() {
+            let s = by_vendor
+                .as_string()
+                .ok_or_else(|| JsError::new("gpuTargets.byVendor: oczekiwany string"))?;
+            return Ok(G::ByVendor(gpu_vendor_from_str(&s)?));
+        }
+        return Err(JsError::new(
+            "gpuTargets: obiekt musi miec pole 'indices' albo 'byVendor'",
+        ));
+    }
+    Err(JsError::new(
+        "gpuTargets: oczekiwany 'none'|'all' albo obiekt {indices}|{byVendor}",
+    ))
+}
+
+fn profile_target_to_js(t: &tentaflow_protocol::ProfileTarget) -> JsValue {
+    use tentaflow_protocol::ProfileTarget as T;
+    match t {
+        T::SystemWide => "system_wide".into(),
+        T::OwnProcess => "own_process".into(),
+        T::Pid(pid) => {
+            let o = js_sys::Object::new();
+            set(&o, "pid", (*pid as f64).into());
+            o.into()
+        }
+    }
+}
+
+fn profile_target_from_js(value: &JsValue) -> Result<tentaflow_protocol::ProfileTarget, JsError> {
+    use tentaflow_protocol::ProfileTarget as T;
+    if let Some(s) = value.as_string() {
+        return match s.as_str() {
+            "system_wide" | "SystemWide" => Ok(T::SystemWide),
+            "own_process" | "OwnProcess" => Ok(T::OwnProcess),
+            other => Err(JsError::new(&format!(
+                "target: nieznany string '{other}' (oczekiwany system_wide|own_process albo {{pid}})"
+            ))),
+        };
+    }
+    if value.is_object() {
+        let obj: &js_sys::Object = value.unchecked_ref();
+        let pid_js = js_sys::Reflect::get(obj, &"pid".into())
+            .map_err(|_| JsError::new("target: blad odczytu 'pid'"))?;
+        let pid = pid_js
+            .as_f64()
+            .ok_or_else(|| JsError::new("target.pid: oczekiwana liczba"))?;
+        if !(0.0..=u32::MAX as f64).contains(&pid) || pid.fract() != 0.0 {
+            return Err(JsError::new("target.pid: liczba poza zakresem u32"));
+        }
+        return Ok(T::Pid(pid as u32));
+    }
+    Err(JsError::new(
+        "target: oczekiwany string albo obiekt {pid: u32}",
+    ))
+}
+
+fn profile_source_flags_from_js(
+    value: &JsValue,
+) -> Result<tentaflow_protocol::ProfileSourceFlags, JsError> {
+    let n = value
+        .as_f64()
+        .ok_or_else(|| JsError::new("sources: oczekiwana liczba (bitmask u32)"))?;
+    if !(0.0..=u32::MAX as f64).contains(&n) || n.fract() != 0.0 {
+        return Err(JsError::new("sources: liczba poza zakresem u32"));
+    }
+    Ok(tentaflow_protocol::ProfileSourceFlags(n as u32))
+}
+
+fn profile_scope_from_js(value: &JsValue) -> Result<tentaflow_protocol::ProfileScope, JsError> {
+    if !value.is_object() {
+        return Err(JsError::new("scope: oczekiwany obiekt"));
+    }
+    let obj: &js_sys::Object = value.unchecked_ref();
+
+    let sources_js = js_sys::Reflect::get(obj, &"sources".into())
+        .map_err(|_| JsError::new("scope: brak pola 'sources'"))?;
+    let sources = profile_source_flags_from_js(&sources_js)?;
+
+    let gpu_js = js_sys::Reflect::get(obj, &"gpuTargets".into())
+        .map_err(|_| JsError::new("scope: brak pola 'gpuTargets'"))?;
+    let gpu_targets = gpu_targets_from_js(&gpu_js)?;
+
+    let hz_js = js_sys::Reflect::get(obj, &"cpuSamplingHz".into())
+        .map_err(|_| JsError::new("scope: brak pola 'cpuSamplingHz'"))?;
+    let hz = hz_js
+        .as_f64()
+        .ok_or_else(|| JsError::new("scope.cpuSamplingHz: oczekiwana liczba"))?;
+    if !(0.0..=u32::MAX as f64).contains(&hz) || hz.fract() != 0.0 {
+        return Err(JsError::new("scope.cpuSamplingHz: niecalkowita lub poza u32"));
+    }
+    let cpu_sampling_hz = hz as u32;
+
+    let target_js = js_sys::Reflect::get(obj, &"target".into())
+        .map_err(|_| JsError::new("scope: brak pola 'target'"))?;
+    let target = profile_target_from_js(&target_js)?;
+
+    let dur_js = js_sys::Reflect::get(obj, &"durationSeconds".into())
+        .map_err(|_| JsError::new("scope: brak pola 'durationSeconds'"))?;
+    let dur = dur_js
+        .as_f64()
+        .ok_or_else(|| JsError::new("scope.durationSeconds: oczekiwana liczba"))?;
+    if !(0.0..=u32::MAX as f64).contains(&dur) || dur.fract() != 0.0 {
+        return Err(JsError::new(
+            "scope.durationSeconds: niecalkowita lub poza u32",
+        ));
+    }
+    let duration_seconds = dur as u32;
+
+    let label_js = js_sys::Reflect::get(obj, &"label".into())
+        .map_err(|_| JsError::new("scope: brak pola 'label'"))?;
+    let label = label_js
+        .as_string()
+        .ok_or_else(|| JsError::new("scope.label: oczekiwany string"))?;
+
+    let scope = tentaflow_protocol::ProfileScope {
+        sources,
+        gpu_targets,
+        cpu_sampling_hz,
+        target,
+        duration_seconds,
+        label,
+    };
+    scope
+        .validate()
+        .map_err(|e| JsError::new(&format!("invalid scope: {e}")))?;
+    Ok(scope)
+}
+
+fn profile_scope_to_js(s: &tentaflow_protocol::ProfileScope) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "sources", (s.sources.0 as f64).into());
+    set(&o, "gpuTargets", gpu_targets_to_js(&s.gpu_targets));
+    set(&o, "cpuSamplingHz", (s.cpu_sampling_hz as f64).into());
+    set(&o, "target", profile_target_to_js(&s.target));
+    set(&o, "durationSeconds", (s.duration_seconds as f64).into());
+    set(&o, "label", s.label.clone().into());
+    o.into()
+}
+
+fn event_category_to_js(c: tentaflow_protocol::EventCategory) -> JsValue {
+    use tentaflow_protocol::EventCategory as E;
+    match c {
+        E::CpuSample => "cpu_sample",
+        E::CpuCounter => "cpu_counter",
+        E::CpuUtil => "cpu_util",
+        E::RamSample => "ram_sample",
+        E::RamBandwidth => "ram_bandwidth",
+        E::DiskIoBurst => "disk_io_burst",
+        E::GpuKernel => "gpu_kernel",
+        E::GpuApiCall => "gpu_api_call",
+        E::GpuUtilSample => "gpu_util_sample",
+        E::GpuMemSample => "gpu_mem_sample",
+        E::GpuMemTransfer => "gpu_mem_transfer",
+        E::PowerSample => "power_sample",
+        E::NvtxRange => "nvtx_range",
+        E::NetworkSample => "network_sample",
+        E::Custom => "custom",
+    }
+    .into()
+}
+
+fn power_domain_to_js(d: &tentaflow_protocol::PowerDomain) -> JsValue {
+    use tentaflow_protocol::PowerDomain as P;
+    match d {
+        P::CpuPkg => "cpu_pkg".into(),
+        P::CpuCore => "cpu_core".into(),
+        P::Dram => "dram".into(),
+        P::Ane => "ane".into(),
+        P::Soc => "soc".into(),
+        P::Other => "other".into(),
+        P::Gpu(idx) => {
+            let o = js_sys::Object::new();
+            set(&o, "kind", "gpu".into());
+            set(&o, "index", (*idx as f64).into());
+            o.into()
+        }
+    }
+}
+
+fn counter_kind_to_js(k: &tentaflow_protocol::CounterKind) -> JsValue {
+    use tentaflow_protocol::CounterKind as C;
+    match k {
+        C::Ipc => "ipc".into(),
+        C::CacheMissL1 => "cache_miss_l1".into(),
+        C::CacheMissL2 => "cache_miss_l2".into(),
+        C::CacheMissL3 => "cache_miss_l3".into(),
+        C::BranchMiss => "branch_miss".into(),
+        C::ContextSwitches => "context_switches".into(),
+        C::PageFaults => "page_faults".into(),
+        C::TlbMiss => "tlb_miss".into(),
+        C::Custom(name) => {
+            let o = js_sys::Object::new();
+            set(&o, "kind", "custom".into());
+            set(&o, "name", name.clone().into());
+            o.into()
+        }
+    }
+}
+
+fn transfer_kind_to_js(k: tentaflow_protocol::TransferKind) -> JsValue {
+    use tentaflow_protocol::TransferKind as T;
+    match k {
+        T::H2D => "h2d",
+        T::D2H => "d2h",
+        T::D2D => "d2d",
+        T::UnifiedAccess => "unified_access",
+    }
+    .into()
+}
+
+fn collector_status_to_js(s: &tentaflow_protocol::CollectorStatus) -> JsValue {
+    use tentaflow_protocol::CollectorStatus as S;
+    let o = js_sys::Object::new();
+    match s {
+        S::Used => set(&o, "kind", "used".into()),
+        S::SkippedUnavailable(reason) => {
+            set(&o, "kind", "skipped_unavailable".into());
+            set(&o, "reason", reason.clone().into());
+        }
+        S::SkippedRequiresElevation => set(&o, "kind", "skipped_requires_elevation".into()),
+        S::Failed(reason) => {
+            set(&o, "kind", "failed".into());
+            set(&o, "reason", reason.clone().into());
+        }
+    }
+    o.into()
+}
+
+fn collector_run_info_to_js(c: &tentaflow_protocol::CollectorRunInfo) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "id", c.id.clone().into());
+    set(&o, "status", collector_status_to_js(&c.status));
+    set(&o, "samplesCollected", (c.samples_collected as f64).into());
+    set(&o, "rawSizeBytes", (c.raw_size_bytes as f64).into());
+    set(&o, "primaryCategory", event_category_to_js(c.primary_category));
+    set(&o, "durationNs", (c.duration_ns as f64).into());
+    o.into()
+}
+
+fn frame_to_js(f: &tentaflow_protocol::Frame) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "symbol", f.symbol.clone().into());
+    set(&o, "module", f.module.clone().into());
+    set(
+        &o,
+        "file",
+        match &f.file {
+            Some(s) => s.clone().into(),
+            None => JsValue::NULL,
+        },
+    );
+    set(
+        &o,
+        "line",
+        match f.line {
+            Some(n) => (n as f64).into(),
+            None => JsValue::NULL,
+        },
+    );
+    o.into()
+}
+
+fn u32_array_to_js(arr: &[u32]) -> JsValue {
+    let out = js_sys::Array::new();
+    for v in arr {
+        out.push(&(*v as f64).into());
+    }
+    out.into()
+}
+
+fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
+    use tentaflow_protocol::EventPayload as P;
+    let o = js_sys::Object::new();
+    match p {
+        P::CpuSample { tid, cpu, stack_id } => {
+            set(&o, "kind", "cpu_sample".into());
+            set(&o, "tid", (*tid as f64).into());
+            set(&o, "cpu", (*cpu as f64).into());
+            set(&o, "stackId", (*stack_id as f64).into());
+        }
+        P::CpuCounter { kind, value } => {
+            set(&o, "kind", "cpu_counter".into());
+            set(&o, "counter", counter_kind_to_js(kind));
+            set(&o, "value", (*value).into());
+        }
+        P::CpuUtil { core, util_pct, freq_mhz } => {
+            set(&o, "kind", "cpu_util".into());
+            set(&o, "core", (*core as f64).into());
+            set(&o, "utilPct", (*util_pct as f64).into());
+            set(&o, "freqMhz", (*freq_mhz as f64).into());
+        }
+        P::RamSample {
+            used_bytes,
+            available_bytes,
+            page_faults_per_s,
+        } => {
+            set(&o, "kind", "ram_sample".into());
+            set(&o, "usedBytes", (*used_bytes as f64).into());
+            set(&o, "availableBytes", (*available_bytes as f64).into());
+            set(&o, "pageFaultsPerS", (*page_faults_per_s as f64).into());
+        }
+        P::RamBandwidth { read_bps, write_bps } => {
+            set(&o, "kind", "ram_bandwidth".into());
+            set(&o, "readBps", (*read_bps as f64).into());
+            set(&o, "writeBps", (*write_bps as f64).into());
+        }
+        P::DiskIoBurst {
+            device_name_id,
+            read_bps,
+            write_bps,
+            iops_r,
+            iops_w,
+            await_ms_p99,
+        } => {
+            set(&o, "kind", "disk_io_burst".into());
+            // Device label is interned in `ProfileReportV2.names`; the GUI
+            // resolves the string via `names[deviceNameId]`.
+            set(&o, "deviceNameId", (*device_name_id as f64).into());
+            set(&o, "readBps", (*read_bps as f64).into());
+            set(&o, "writeBps", (*write_bps as f64).into());
+            set(&o, "iopsR", (*iops_r as f64).into());
+            set(&o, "iopsW", (*iops_w as f64).into());
+            set(&o, "awaitMsP99", (*await_ms_p99 as f64).into());
+        }
+        P::GpuKernel {
+            device_id,
+            name_id,
+            grid,
+            block,
+            shared_mem_bytes,
+        } => {
+            set(&o, "kind", "gpu_kernel".into());
+            set(&o, "deviceId", (*device_id as f64).into());
+            set(&o, "nameId", (*name_id as f64).into());
+            set(&o, "grid", u32_array_to_js(grid));
+            set(&o, "block", u32_array_to_js(block));
+            set(&o, "sharedMemBytes", (*shared_mem_bytes as f64).into());
+        }
+        P::GpuApiCall {
+            device_id,
+            name_id,
+            return_code,
+        } => {
+            set(&o, "kind", "gpu_api_call".into());
+            set(&o, "deviceId", (*device_id as f64).into());
+            set(&o, "nameId", (*name_id as f64).into());
+            set(&o, "returnCode", (*return_code as f64).into());
+        }
+        P::GpuUtilSample {
+            device_id,
+            compute_pct,
+            mem_pct,
+            mem_used_bytes,
+            temp_c,
+        } => {
+            set(&o, "kind", "gpu_util_sample".into());
+            set(&o, "deviceId", (*device_id as f64).into());
+            set(&o, "computePct", (*compute_pct as f64).into());
+            set(&o, "memPct", (*mem_pct as f64).into());
+            set(&o, "memUsedBytes", (*mem_used_bytes as f64).into());
+            set(&o, "tempC", (*temp_c as f64).into());
+        }
+        P::GpuMemSample {
+            device_id,
+            allocated_bytes,
+            free_bytes,
+        } => {
+            set(&o, "kind", "gpu_mem_sample".into());
+            set(&o, "deviceId", (*device_id as f64).into());
+            set(&o, "allocatedBytes", (*allocated_bytes as f64).into());
+            set(&o, "freeBytes", (*free_bytes as f64).into());
+        }
+        P::GpuMemTransfer {
+            device_id,
+            kind,
+            bytes,
+        } => {
+            set(&o, "kind", "gpu_mem_transfer".into());
+            set(&o, "deviceId", (*device_id as f64).into());
+            set(&o, "transferKind", transfer_kind_to_js(*kind));
+            set(&o, "bytes", (*bytes as f64).into());
+        }
+        P::PowerSample { domain, watts } => {
+            set(&o, "kind", "power_sample".into());
+            set(&o, "domain", power_domain_to_js(domain));
+            set(&o, "watts", (*watts as f64).into());
+        }
+        P::NvtxRange {
+            device_id,
+            name_id,
+            color,
+        } => {
+            set(&o, "kind", "nvtx_range".into());
+            set(&o, "deviceId", (*device_id as f64).into());
+            set(&o, "nameId", (*name_id as f64).into());
+            set(&o, "color", (*color as f64).into());
+        }
+        P::NetworkSample {
+            iface_name_id,
+            rx_bps,
+            tx_bps,
+            rx_pps,
+            tx_pps,
+        } => {
+            set(&o, "kind", "network_sample".into());
+            // Interface label is interned in `ProfileReportV2.names`.
+            set(&o, "ifaceNameId", (*iface_name_id as f64).into());
+            set(&o, "rxBps", (*rx_bps as f64).into());
+            set(&o, "txBps", (*tx_bps as f64).into());
+            set(&o, "rxPps", (*rx_pps as f64).into());
+            set(&o, "txPps", (*tx_pps as f64).into());
+        }
+        P::Custom { name_id, value } => {
+            set(&o, "kind", "custom".into());
+            set(&o, "nameId", (*name_id as f64).into());
+            set(&o, "value", (*value).into());
+        }
+    }
+    o.into()
+}
+
+fn timeline_event_to_js(e: &tentaflow_protocol::TimelineEvent) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "sourceIdx", (e.source_idx as f64).into());
+    set(&o, "tStartNs", (e.t_start_ns as f64).into());
+    set(&o, "tEndNs", (e.t_end_ns as f64).into());
+    set(&o, "category", event_category_to_js(e.category));
+    set(&o, "laneHint", (e.lane_hint as f64).into());
+    set(&o, "payload", event_payload_to_js(&e.payload));
+    o.into()
+}
+
+fn clock_samples_to_js(c: &tentaflow_protocol::ClockSamples) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "collectorId", c.collector_id.clone().into());
+    let pairs = js_sys::Array::new();
+    for (a, b) in &c.pairs {
+        let p = js_sys::Array::new();
+        p.push(&(*a as f64).into());
+        p.push(&(*b as f64).into());
+        pairs.push(&p.into());
+    }
+    set(&o, "pairs", pairs.into());
+    o.into()
+}
+
+fn drift_report_to_js(d: &tentaflow_protocol::DriftReport) -> JsValue {
+    let o = js_sys::Object::new();
+    let arr = js_sys::Array::new();
+    for s in &d.per_collector {
+        arr.push(&clock_samples_to_js(s));
+    }
+    set(&o, "perCollector", arr.into());
+    set(&o, "maxObservedDriftNs", (d.max_observed_drift_ns as f64).into());
+    set(&o, "exceededTolerance", d.exceeded_tolerance.into());
+    set(&o, "toleranceNs", (d.tolerance_ns as f64).into());
+    o.into()
+}
+
+fn profile_report_v2_to_js(r: &tentaflow_protocol::ProfileReportV2) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "schemaVersion", (r.schema_version as f64).into());
+    set(&o, "sessionId", r.session_id.clone().into());
+    set(&o, "nodeId", r.node_id.clone().into());
+    set(&o, "scope", profile_scope_to_js(&r.scope));
+    set(&o, "t0MonotonicNs", (r.t0_monotonic_ns as f64).into());
+    set(&o, "t0WallclockUnixNs", (r.t0_wallclock_unix_ns as f64).into());
+    set(&o, "durationNs", (r.duration_ns as f64).into());
+
+    let collectors = js_sys::Array::new();
+    for c in &r.collectors {
+        collectors.push(&collector_run_info_to_js(c));
+    }
+    set(&o, "collectors", collectors.into());
+
+    let events = js_sys::Array::new();
+    for e in &r.events {
+        events.push(&timeline_event_to_js(e));
+    }
+    set(&o, "events", events.into());
+
+    let frames = js_sys::Array::new();
+    for f in &r.frames {
+        frames.push(&frame_to_js(f));
+    }
+    set(&o, "frames", frames.into());
+
+    let stacks = js_sys::Array::new();
+    for stack in &r.stacks {
+        stacks.push(&u32_array_to_js(stack));
+    }
+    set(&o, "stacks", stacks.into());
+
+    let names = js_sys::Array::new();
+    for n in &r.names {
+        names.push(&JsValue::from_str(n));
+    }
+    set(&o, "names", names.into());
+
+    set(&o, "driftReport", drift_report_to_js(&r.drift_report));
+
+    let warnings = js_sys::Array::new();
+    for w in &r.warnings {
+        warnings.push(&JsValue::from_str(w));
+    }
+    set(&o, "warnings", warnings.into());
+
+    o.into()
+}
+
+fn profile_report_envelope_to_js(env: &tentaflow_protocol::ProfileReportEnvelope) -> JsValue {
+    use tentaflow_protocol::ProfileReportEnvelope as E;
+    let o = js_sys::Object::new();
+    match env {
+        E::V1Legacy(report) => {
+            set(&o, "kind", "v1_legacy".into());
+            set(&o, "report", profile_report_to_js(report).into());
+        }
+        E::V2(report) => {
+            set(&o, "kind", "v2".into());
+            set(&o, "report", profile_report_v2_to_js(report));
+        }
+    }
+    o.into()
+}
+
+fn profiling_skipped_collector_to_js(
+    s: &tentaflow_protocol::ProfilingSkippedCollector,
+) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "id", s.id.clone().into());
+    set(&o, "reason", s.reason.clone().into());
+    o.into()
+}
+
+fn profiling_session_entry_to_js(e: &tentaflow_protocol::ProfilingSessionEntry) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "sessionId", e.session_id.clone().into());
+    set(&o, "label", e.label.clone().into());
+    set(&o, "startedAt", e.started_at.clone().into());
+    set(&o, "durationNs", (e.duration_ns as f64).into());
+    set(&o, "kind", e.kind.clone().into());
+    let cols = js_sys::Array::new();
+    for c in &e.collectors_used {
+        cols.push(&JsValue::from_str(c));
+    }
+    set(&o, "collectorsUsed", cols.into());
+    set(&o, "sizeBytes", (e.size_bytes as f64).into());
+    o.into()
+}
+
+fn profiling_active_session_info_to_js(
+    info: &tentaflow_protocol::ProfilingActiveSessionInfo,
+) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "sessionId", info.session_id.clone().into());
+    set(&o, "nodeId", info.node_id.clone().into());
+    set(&o, "label", info.label.clone().into());
+    set(&o, "startedAtUnixNs", (info.started_at_unix_ns as f64).into());
+    set(&o, "plannedDurationNs", (info.planned_duration_ns as f64).into());
+    set(&o, "elapsedNs", (info.elapsed_ns as f64).into());
+    let running = js_sys::Array::new();
+    for c in &info.collectors_running {
+        running.push(&JsValue::from_str(c));
+    }
+    set(&o, "collectorsRunning", running.into());
+    let skipped = js_sys::Array::new();
+    for s in &info.collectors_skipped {
+        skipped.push(&profiling_skipped_collector_to_js(s));
+    }
+    set(&o, "collectorsSkipped", skipped.into());
+    o.into()
+}
+
+/// Wypelnia `obj` polami pojedynczego wariantu `ProfilingPayload`.
+fn profiling_payload_fill_obj(obj: &js_sys::Object, payload: &tentaflow_protocol::ProfilingPayload) {
+    use tentaflow_protocol::ProfilingPayload as P;
+    match payload {
+        P::StartRequest(r) => {
+            set(obj, "variant", "ProfilingStartRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+            set(obj, "scope", profile_scope_to_js(&r.scope));
+            set(obj, "label", r.label.clone().into());
+            // Hasla nie eksponujemy w decode (bezpieczenstwo); JS dostaje tylko fakt obecnosci.
+            set(obj, "hasElevationPassword", (!r.elevation_password.is_empty()).into());
+        }
+        P::StartResponse(r) => {
+            set(obj, "variant", "ProfilingStartResponse".into());
+            set(obj, "sessionId", r.session_id.clone().into());
+            set(obj, "startedAtUnixNs", (r.started_at_unix_ns as f64).into());
+            let started = js_sys::Array::new();
+            for c in &r.collectors_started {
+                started.push(&JsValue::from_str(c));
+            }
+            set(obj, "collectorsStarted", started.into());
+            let skipped = js_sys::Array::new();
+            for s in &r.collectors_skipped {
+                skipped.push(&profiling_skipped_collector_to_js(s));
+            }
+            set(obj, "collectorsSkipped", skipped.into());
+        }
+        P::StopRequest(r) => {
+            set(obj, "variant", "ProfilingStopRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+            set(obj, "sessionId", r.session_id.clone().into());
+        }
+        P::StopResponse(r) => {
+            set(obj, "variant", "ProfilingStopResponse".into());
+            set(obj, "sessionId", r.session_id.clone().into());
+            set(obj, "report", profile_report_v2_to_js(&r.report));
+        }
+        P::SessionsRequest(r) => {
+            set(obj, "variant", "ProfilingSessionsRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+        }
+        P::SessionsResponse(r) => {
+            set(obj, "variant", "ProfilingSessionsResponse".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+            let entries = js_sys::Array::new();
+            for e in &r.entries {
+                entries.push(&profiling_session_entry_to_js(e));
+            }
+            set(obj, "entries", entries.into());
+        }
+        P::ReportRequest(r) => {
+            set(obj, "variant", "ProfilingReportRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+            set(obj, "sessionId", r.session_id.clone().into());
+        }
+        P::ReportResponse(r) => {
+            set(obj, "variant", "ProfilingReportResponse".into());
+            set(obj, "envelope", profile_report_envelope_to_js(&r.envelope));
+        }
+        P::DeleteRequest(r) => {
+            set(obj, "variant", "ProfilingDeleteRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+            set(obj, "sessionId", r.session_id.clone().into());
+        }
+        P::DeleteResponse(r) => {
+            set(obj, "variant", "ProfilingDeleteResponse".into());
+            set(obj, "sessionId", r.session_id.clone().into());
+            set(obj, "deleted", r.deleted.into());
+        }
+        P::DownloadRequest(r) => {
+            set(obj, "variant", "ProfilingDownloadRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+            set(obj, "sessionId", r.session_id.clone().into());
+        }
+        P::DownloadResponse(r) => {
+            set(obj, "variant", "ProfilingDownloadResponse".into());
+            set(obj, "sessionId", r.session_id.clone().into());
+            set(obj, "filename", r.filename.clone().into());
+            set(
+                obj,
+                "tarballBytes",
+                js_sys::Uint8Array::from(r.tarball_bytes.as_slice()).into(),
+            );
+        }
+        P::ActiveInfoRequest(r) => {
+            set(obj, "variant", "ProfilingActiveInfoRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+        }
+        P::ActiveInfoResponse(r) => {
+            set(obj, "variant", "ProfilingActiveInfoResponse".into());
+            match &r.info {
+                Some(info) => set(obj, "info", profiling_active_session_info_to_js(info)),
+                None => set(obj, "info", JsValue::NULL),
+            }
+        }
+    }
+}
+
+fn encode_profiling(p: tentaflow_protocol::ProfilingPayload) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::NsightBody(
+        tentaflow_protocol::NsightPayload::Profiling(p),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::StartRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingStartRequest)]
+pub fn encode_profiling_start_request(
+    node_id: String,
+    scope: JsValue,
+    label: String,
+    elevation_password: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    let scope = profile_scope_from_js(&scope)?;
+    encode_profiling(tentaflow_protocol::ProfilingPayload::StartRequest(
+        tentaflow_protocol::ProfilingStartRequest {
+            node_id,
+            scope,
+            label,
+            elevation_password: elevation_password.unwrap_or_default(),
+        },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::StopRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingStopRequest)]
+pub fn encode_profiling_stop_request(
+    node_id: String,
+    session_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_profiling(tentaflow_protocol::ProfilingPayload::StopRequest(
+        tentaflow_protocol::ProfilingStopRequest { node_id, session_id },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::SessionsRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingSessionsRequest)]
+pub fn encode_profiling_sessions_request(node_id: String) -> Result<Vec<u8>, JsError> {
+    encode_profiling(tentaflow_protocol::ProfilingPayload::SessionsRequest(
+        tentaflow_protocol::ProfilingSessionsRequest { node_id },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ReportRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingReportRequest)]
+pub fn encode_profiling_report_request(
+    node_id: String,
+    session_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_profiling(tentaflow_protocol::ProfilingPayload::ReportRequest(
+        tentaflow_protocol::ProfilingReportRequest { node_id, session_id },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::DeleteRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingDeleteRequest)]
+pub fn encode_profiling_delete_request(
+    node_id: String,
+    session_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_profiling(tentaflow_protocol::ProfilingPayload::DeleteRequest(
+        tentaflow_protocol::ProfilingDeleteRequest { node_id, session_id },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::DownloadRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingDownloadRequest)]
+pub fn encode_profiling_download_request(
+    node_id: String,
+    session_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_profiling(tentaflow_protocol::ProfilingPayload::DownloadRequest(
+        tentaflow_protocol::ProfilingDownloadRequest { node_id, session_id },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ActiveInfoRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingActiveInfoRequest)]
+pub fn encode_profiling_active_info_request(node_id: String) -> Result<Vec<u8>, JsError> {
+    encode_profiling(tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(
+        tentaflow_protocol::ProfilingActiveInfoRequest { node_id },
     ))
 }
 

@@ -495,6 +495,7 @@ fn upsert_local_peer(
         tokens_per_sec: 0.0,
         nsys_available: false,
         nsys_version: String::new(),
+        profiling_collectors_available: Vec::new(),
     });
 }
 
@@ -1368,6 +1369,7 @@ fn spawn_quic_event_handler(
                             metrics.tokens_per_sec,
                             metrics.nsys_available,
                             metrics.nsys_version,
+                            metrics.profiling_collectors_available,
                         );
 
                         // Aktualizuj topologie peera na podstawie jego connected_peers
@@ -1903,6 +1905,12 @@ fn spawn_heartbeat_sender(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         let mut heartbeat_count: u64 = 0;
+        // Probe cache for `CollectorRegistry::probe_available_ids`: raw probes
+        // shell out (`which`, `--version`) per collector, so calling all 17
+        // every 500 ms heartbeat = ~34 syscalls/s of pure noise. We refresh
+        // at most once every 30 s; capability changes propagate next epoch.
+        const PROBE_TTL: Duration = Duration::from_secs(30);
+        let mut probe_cache: Option<(std::time::Instant, Vec<String>)> = None;
         loop {
             interval.tick().await;
             let metrics =
@@ -1923,6 +1931,32 @@ fn spawn_heartbeat_sender(
                 // 2 Hz nie odpala kosztownego `which`/`--version` w kazdym ticku.
                 let nsys_cap = crate::profiling::detect_capability().await;
 
+                // Multi-source profiling capability. The discover() set is
+                // static, but probe() per collector can shell out, so we only
+                // refresh when the cached snapshot is older than PROBE_TTL.
+                // Probe runs on the blocking pool — never block the heartbeat
+                // task on `which`/binary detection.
+                let profiling_collectors_available = {
+                    let cached = probe_cache
+                        .as_ref()
+                        .filter(|(t, _)| t.elapsed() < PROBE_TTL)
+                        .map(|(_, ids)| ids.clone());
+                    match cached {
+                        Some(ids) => ids,
+                        None => {
+                            let ids = tokio::task::spawn_blocking(|| {
+                                crate::profiling::collectors::CollectorRegistry::probe_available_ids(
+                                    &crate::profiling::COLLECTOR_REGISTRY,
+                                )
+                            })
+                            .await
+                            .unwrap_or_default();
+                            probe_cache = Some((std::time::Instant::now(), ids.clone()));
+                            ids
+                        }
+                    }
+                };
+
                 let hb = HeartbeatMetrics {
                     cpu_usage_percent: m.cpu_usage_percent,
                     ram_used_mb: m.ram_used_mb,
@@ -1938,6 +1972,7 @@ fn spawn_heartbeat_sender(
                     tokens_per_sec,
                     nsys_available: nsys_cap.available,
                     nsys_version: nsys_cap.version,
+                    profiling_collectors_available,
                 };
 
                 // Aktualizuj metryki lokalnego noda w store (klonowanie z hb)
@@ -1956,6 +1991,7 @@ fn spawn_heartbeat_sender(
                     hb.tokens_per_sec,
                     hb.nsys_available,
                     hb.nsys_version.clone(),
+                    hb.profiling_collectors_available.clone(),
                 );
 
                 // Aktualizuj topologie lokalnego noda
