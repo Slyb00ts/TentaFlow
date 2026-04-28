@@ -63,7 +63,12 @@ class TfSelect extends HTMLElement {
     if (name) this._select.name = name;
   }
 
-  _onChange() {
+  _onChange(e) {
+    // Native <select> emituje wlasny `change` event ktory bubbles przez
+    // light DOM tf-select'a. Bez stopPropagation caller (np. login.js)
+    // dostawal DWA eventy: pierwszy native (bez detail) -> crash przy
+    // e.detail.value, drugi CustomEvent z detail.
+    e.stopPropagation();
     this.setAttribute('value', this._select.value);
     this.dispatchEvent(new CustomEvent('change', {
       bubbles: true,
