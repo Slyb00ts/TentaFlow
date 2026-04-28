@@ -112,9 +112,44 @@ function t(path, vars = null) {
   return interpolate(value, vars);
 }
 
+// Próbuje pobrać zapisaną w backendzie preferencję języka. Best-effort:
+// brak sesji (401) jest cichy, błędy sieciowe nie blokują startu UI.
+async function syncFromBackend() {
+  try {
+    const res = await fetch('/api/me/preferences', { credentials: 'include' });
+    if (res.status === 401) return;
+    if (!res.ok) {
+      console.warn('[i18n] syncFromBackend HTTP', res.status);
+      return;
+    }
+    const data = await res.json();
+    if (data && typeof data.language === 'string'
+        && SUPPORTED_LANGS.some((l) => l.code === data.language)
+        && data.language !== currentLang) {
+      await loadTranslations(data.language);
+      applyDataI18n();
+    }
+  } catch (err) {
+    console.warn('[i18n] syncFromBackend network error', err);
+  }
+}
+
+// Zapisuje wybór języka po stronie backendu. Zwraca status żeby caller
+// mógł odróżnić błąd HTTP (toast) od network error (cichy log).
+async function syncToBackend(lang) {
+  const res = await fetch('/api/me/preferences', {
+    method: 'PUT',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ language: lang }),
+  });
+  return res;
+}
+
 async function init() {
   const lang = detectLanguage();
   await loadTranslations(lang);
+  await syncFromBackend();
   applyDataI18n();
 }
 
@@ -125,6 +160,20 @@ async function setLanguage(lang) {
   }
   await loadTranslations(lang);
   applyDataI18n();
+  // Backend sync best-effort — network error nie powinien blokować UI,
+  // więc rzucamy tylko gdy backend odpowiedział statusem 4xx/5xx.
+  try {
+    const res = await syncToBackend(lang);
+    if (!res.ok && res.status !== 401) {
+      console.warn('[i18n] syncToBackend HTTP', res.status);
+      throw new Error(`HTTP ${res.status}`);
+    }
+  } catch (err) {
+    if (err && err.message && err.message.startsWith('HTTP ')) {
+      throw err;
+    }
+    console.warn('[i18n] syncToBackend network error', err);
+  }
   for (const listener of listeners) {
     try {
       listener(lang);

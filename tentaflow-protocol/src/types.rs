@@ -1330,6 +1330,7 @@ pub enum ImageOperation {
 ///         voice: "alloy".to_string(),
 ///         format: Some("mp3".to_string()),
 ///         speed: Some(1.0),
+///         language: Some("en".to_string()),
 ///     },
 /// };
 /// ```
@@ -1358,6 +1359,10 @@ pub enum AudioOperation {
 
         /// Prędkość (0.25 - 4.0, default: 1.0)
         speed: Option<f32>,
+
+        /// Język syntezy (ISO-639-1, np. "en", "pl", "fr", "es", "de").
+        /// None = backend wybiera domyślny.
+        language: Option<String>,
     },
 
     /// Speech-to-Text (STT)

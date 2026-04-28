@@ -220,6 +220,7 @@ impl Router {
                 voice,
                 format,
                 speed,
+                language,
             } => {
                 debug!("Audio TTS: model={}, dlugosc_tekstu={}", model, input.len());
 
@@ -230,6 +231,7 @@ impl Router {
                     voice: voice.clone(),
                     response_format: format.clone(),
                     speed: *speed,
+                    language: language.clone(),
                 };
 
                 match self.synthesize_speech(&tts_request).await {

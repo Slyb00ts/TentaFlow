@@ -69,6 +69,7 @@ impl Router {
         let voice = &request.voice;
         let speed = request.speed.unwrap_or(1.0);
         let format = request.response_format.as_deref().unwrap_or("wav");
+        let language = request.language.clone();
 
         debug!(
             "synthesize_speech: model={}, voice={}, format={}, input_len={}",
@@ -85,12 +86,14 @@ impl Router {
             let input_c = input.clone();
             let voice_c = voice.clone();
             let format_c = format.to_string();
+            let language_c = language.clone();
             self.dispatch_with_fallback(model, 0, |handle| {
                 let this = this.clone();
                 let model_c = model_c.clone();
                 let input_c = input_c.clone();
                 let voice_c = voice_c.clone();
                 let format_c = format_c.clone();
+                let language_c = language_c.clone();
                 let handle = handle.clone();
                 async move {
                     match &handle {
@@ -146,6 +149,7 @@ impl Router {
                                 voice: voice_c.clone(),
                                 response_format: Some(format_c.clone()),
                                 speed: Some(speed),
+                                language: language_c.clone(),
                             };
                             backend.audio_speech(&req).await
                         }
@@ -169,6 +173,7 @@ impl Router {
                                         voice: voice_c,
                                         format: Some(format_c),
                                         speed: Some(speed),
+                                        language: language_c,
                                     },
                                 }),
                                 stream: false,
@@ -225,6 +230,7 @@ impl Router {
                                         voice: voice_c,
                                         format: Some(format_c),
                                         speed: Some(speed),
+                                        language: language_c,
                                     },
                                 }),
                                 stream: false,

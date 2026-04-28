@@ -115,6 +115,10 @@ impl NodeAdapter for TtsNodeAdapter {
                                 voice: voice.to_string(),
                                 format: Some(format.to_string()),
                                 speed: Some(speed),
+                                language: node_config
+                                    .get("language")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
                             },
                         }),
                         stream: false,

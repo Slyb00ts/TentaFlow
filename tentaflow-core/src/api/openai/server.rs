@@ -434,7 +434,7 @@ async fn handle_audio_tts(
         }
     };
 
-    let tts_request: TTSRequest = match serde_json::from_slice(&body_bytes) {
+    let mut tts_request: TTSRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
             return Ok(error_response(
@@ -445,11 +445,28 @@ async fn handle_audio_tts(
         }
     };
 
+    // Rozwiazanie pola `language`: body klienta -> preferencja uzytkownika -> "en".
+    // Pozwala wymusic jezyk per-request, a jesli brak — backend dostaje jawna
+    // wartosc zamiast polegac na ukrytym domyslnym ustawieniu silnika TTS.
+    if tts_request.language.is_none() {
+        if let (Some(ref ctx), Some(ref db)) = (user_ctx.as_ref(), router.db.as_ref()) {
+            if let Ok(Some(lang)) =
+                crate::db::repository::get_user_preferred_language(db, ctx.user_id)
+            {
+                tts_request.language = Some(lang);
+            }
+        }
+    }
+    if tts_request.language.is_none() {
+        tts_request.language = Some("en".to_string());
+    }
+
     info!(
-        "TTS request: model={}, voice={}, input_len={}",
+        "TTS request: model={}, voice={}, input_len={}, language={:?}",
         tts_request.model,
         tts_request.voice,
-        tts_request.input.len()
+        tts_request.input.len(),
+        tts_request.language
     );
 
     // Wywolaj Router.synthesize_speech()

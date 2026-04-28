@@ -2299,6 +2299,7 @@
     "subtitle": "Tes préférences personnelles",
     "language_title": "Langue",
     "language_hint": "Les changements s’appliquent immédiatement et sont mémorisés sur cet appareil.",
+    "save_ok": "Préférence de langue enregistrée",
     "save_error": "Impossible d’enregistrer les paramètres"
   },
   "flows_user": {
