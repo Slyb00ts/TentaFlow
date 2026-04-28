@@ -16,6 +16,10 @@ default_port = 8000
 api = "openai-compatible"
 version = "0.6.3"
 
+[deploy.docker]
+context_path = "llm/docker/vllm"
+platforms = ["linux", "windows"]
+
 [deploy.native]
 platforms = ["linux", "windows"]
 runtime = "python-bundle"
