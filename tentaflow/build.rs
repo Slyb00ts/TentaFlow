@@ -18,20 +18,30 @@ fn main() {
     build_meeting_bot();
 }
 
-// ----- Linux rpath = $ORIGIN -------------------------------------------------
-// sherpa-rs kopiuje libsherpa-onnx-c-api.so + libonnxruntime.so do
-// target/<profile>/ przy pierwszym buildzie. Bez ustawionego rpath binarka
-// szuka tych libsow tylko w systemowych sciezkach (/usr/lib, LD_LIBRARY_PATH)
-// i pada z "error while loading shared libraries". Rpath $ORIGIN mowi
-// linkerowi: szukaj obok exe. macOS uzywa @loader_path (ustawione w
-// build_mlx_bridge), wiec ta funkcja jest no-op dla macOS i tylko dotyczy
-// targetow ktore generuja .so (Linux primary).
+// ----- Linux linker flags ----------------------------------------------------
+// 1. Rpath $ORIGIN: sherpa-rs kopiuje libsherpa-onnx-c-api.so +
+//    libonnxruntime.so do target/<profile>/ przy pierwszym buildzie. Bez
+//    ustawionego rpath binarka szuka tych libsow tylko w systemowych sciezkach
+//    (/usr/lib, LD_LIBRARY_PATH) i pada z "error while loading shared
+//    libraries". Rpath $ORIGIN mowi linkerowi: szukaj obok exe. macOS uzywa
+//    @loader_path (ustawione w build_mlx_bridge).
+// 2. --allow-multiple-definition: whisper-rs (whisper-rs-sys) i llama-cpp-2
+//    (llama-cpp-sys-2) OBIE staty­cznie linkuja wlasna kopie ggml-quants.c
+//    (whisper.cpp i llama.cpp uzywaja tego samego ggml runtime'u). Linker
+//    GNU ld widzi te same symbole `quantize_*`, `ggml_validate_row_data` itd.
+//    w obu rlibach i wykrzykuje "multiple definition". Funkcje sa bit-by-bit
+//    identyczne (te same tagi wersji ggml), wiec --allow-multiple-definition
+//    ka linkerowi wybrac pierwsza i ignorowac kolejne. Komentarz w
+//    tentaflow-core/Cargo.toml:11-14 ostrzegal o tym konflikcie — alternatywa
+//    bylaby wykluczenie inference-whisper przy gpu-cuda/vulkan/rocm, ale
+//    user moze potrzebowac obu jednoczesnie (LLM + STT lokalnie).
 fn set_linux_rpath() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "linux" {
         return;
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
 }
 
 // ----- MLX Swift bridge (macOS only) -----------------------------------------
