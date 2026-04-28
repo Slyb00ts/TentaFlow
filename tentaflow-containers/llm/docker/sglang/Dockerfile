@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config libssl-dev cmake build-essential \
     && rm -rf /var/lib/apt/lists/*
 COPY tentaflow-protocol /build/tentaflow-protocol
+COPY tentaflow-transport /build/tentaflow-transport
 COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
 WORKDIR /build/tentaflow-containers/sidecar
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -18,17 +19,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv git curl ca-certificates build-essential \
+      python3 python3-pip python3-venv python3-dev git curl ca-certificates build-essential \
+      gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/sglang-venv
 ENV PATH="/opt/sglang-venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel
 
-WORKDIR /build
-RUN git clone https://github.com/sgl-project/sglang.git
-WORKDIR /build/sglang
-RUN pip install --no-cache-dir -e "python[all]" --extra-index-url https://download.pytorch.org/whl/cu126
+# SGLang z PyPI wheel (0.5.10.post1, kwiecien 2026). Wymaga torch z cu126 wheels.
+RUN pip install --no-cache-dir \
+      --extra-index-url https://download.pytorch.org/whl/cu126 \
+      torch torchvision \
+    && pip install --no-cache-dir "sglang[all]==0.5.10.post1"
 
 COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
 COPY tentaflow-containers/llm/docker/sglang/config.default.toml /app/config.default.toml

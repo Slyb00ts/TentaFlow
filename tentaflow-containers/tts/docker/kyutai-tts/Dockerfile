@@ -1,32 +1,47 @@
 # =============================================================================
-# Plik: Dockerfile (Kyutai Pocket TTS — maly model 100M, CPU)
-# Opis: Lekki obraz Linux/Win/Mac. ~200 MB model, ~6x realtime na M-series CPU.
+# Plik: Dockerfile
+# Opis: Sidecar QUIC + kyutai-tts TTS server. Sidecar tlumaczy iroh requesty na
+#       lokalny HTTP 8088 gdzie nasluchuje uvicorn server.py.
 # =============================================================================
+
+FROM rust:slim-bookworm AS sidecar-builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev cmake build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY tentaflow-protocol /build/tentaflow-protocol
+COPY tentaflow-transport /build/tentaflow-transport
+COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
+WORKDIR /build/tentaflow-containers/sidecar
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/tentaflow-containers/sidecar/target \
+    cargo build --release --bin tentaflow-sidecar \
+    && cp target/release/tentaflow-sidecar /tentaflow-sidecar
 
 FROM python:3.12-slim
 
 ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
-    POCKET_TTS_PORT=8088 \
-    POCKET_TTS_LANGUAGE=english \
     HF_HOME=/app/cache/huggingface
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libsndfile1 \
-        ffmpeg \
-        ca-certificates \
+        libsndfile1 ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY tentaflow-containers/tts/docker/kyutai-tts/requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
-
-# Pre-download wagi pocket-tts przy buildzie. ~200 MB.
 RUN python -c "from pocket_tts import TTSModel; TTSModel.load_model()"
+COPY tentaflow-containers/tts/docker/kyutai-tts/server.py /app/server.py
 
-COPY server.py /app/
+COPY --from=sidecar-builder /tentaflow-sidecar /usr/local/bin/tentaflow-sidecar
+COPY tentaflow-containers/tts/docker/kyutai-tts/config.default.toml /app/config.default.toml
+COPY tentaflow-containers/tts/docker/kyutai-tts/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 8088
+EXPOSE 5000/udp
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD pgrep tentaflow-sidecar || exit 1
 
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${POCKET_TTS_PORT:-8088}"]
+ENTRYPOINT ["/app/entrypoint.sh"]

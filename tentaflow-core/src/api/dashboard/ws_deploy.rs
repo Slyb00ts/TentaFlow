@@ -348,8 +348,18 @@ async fn deploy_bundled_container(
     env.entry("TORCH_HOME".into())
         .or_insert_with(|| format!("{}/torch", container_path));
 
+    // Pelny context_path z manifestu (np. "llm/docker/vllm") — `bundle_name`
+    // ze starego mappingu ("llm-vllm") byl prefixem sprzed reorganizacji
+    // tentaflow-containers do category-based layoutu i daje zepsuta sciezke.
+    // Fallback do `bundle_name` gdy manifest niedostepny: zachowanie zgodne
+    // z legacy silnikami spoza Service Manifest registry.
+    let context_path = crate::services::manifest::registry()
+        .by_id(&config.engine)
+        .and_then(|e| e.deploy.docker.as_ref().and_then(|d| d.context_path.clone()))
+        .unwrap_or_else(|| bundle_name.to_string());
+
     let deploy_req = crate::deploy::docker::DeployRequest {
-        container: bundle_name.to_string(),
+        container: context_path,
         image_tag: Some(format!("tentaflow/{}:latest", bundle_name)),
         instance_name,
         ports,

@@ -7,21 +7,22 @@
 # odbywa sie przez `pip install -e .` z klona repo. Ta lock sluzy do
 # pre-cache'owania wheels torch/xformers/flash-attn przed bootstrapem.
 
-# Core — bez sufixu `+cu124` zeby `--extra-index-url` z bundle.toml
+# Core — bez sufixu `+cu130` zeby `--extra-index-url` z bundle.toml
 # install_variants zadecydowal ktora wariant wheela uv pobierze:
-#   * variant `cuda` + extra_index cu124 -> torch-2.5.1+cu124-cp3X-linux_x86_64.whl
-#   * variant `rocm` + extra_index rocm  -> torch-2.5.1+rocmX.Y-...
-#   * variant `cpu`  (brak extra_index)  -> torch-2.5.1-...-manylinux_x86_64 (CPU)
-# Pin `+cu124` zalamywal sie na aarch64 i innych platformach gdzie cu124
-# wheels nie istnieja — uv mowil "no wheels with a matching platform tag".
-torch==2.5.1
-torchvision==0.20.1
-torchaudio==2.5.1
+#   * variant `cuda` + extra_index cu130 -> torch-2.11.0+cu130-cp3X-manylinux_2_28_<arch>.whl
+#   * variant `rocm` + extra_index rocm  -> torch-2.11.0+rocmX.Y-...
+#   * variant `cpu`  (brak extra_index)  -> torch-2.11.0-...-manylinux_2_28_<arch> (CPU)
+# vLLM 0.20.0 wymaga PyTorch 2.11 jako baseline; cu130 wheels istnieja dla
+# x86_64 i aarch64 (potrzebne dla DGX Spark / Grace Blackwell).
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
 
 # vLLM deps (pobierane z https://github.com/vllm-project/vllm/blob/main/requirements-cuda.txt)
 # Sidecar python_venv pobiera je wprost z requirements-cuda.txt HEAD;
 # ten plik tylko aktualizuje kilka najciezszych wheels do wstepnego cache.
 
-# Runtime tooling
-uvicorn[standard]==0.32.0
-fastapi==0.115.5
+# Runtime tooling - bez pinow, vLLM 0.20.0 sam zaciagnie kompatybilne fastapi/uvicorn.
+# (vLLM 0.20 wymaga model-hosting-container-standards >= 0.1.13, ktore zalezy
+# od starlette >= 0.49 - to koliduje z fastapi == 0.115.5 ktore pinuje
+# starlette < 0.42).

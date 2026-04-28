@@ -1369,11 +1369,23 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         }
     }
 
-    // Piped stdout/stderr zeby runner mogl forwardowac logi silnika (m.in.
-    // HuggingFace model download po starcie vLLM) do deploy_log w GUI
-    // zamiast do stdout tentaflow. Runner odczytuje przez child.stdout.take()
-    // i spawnuje watki czytajace linia po linii.
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Stdout/stderr -> <venv>/engine.log. `Stdio::piped()` bez aktywnego
+    // readera zapycha bufor pipe (~64KB) i Python blokuje na write podczas
+    // ladowania modelu — vLLM widziany z zewnatrz jako "wisi przy starcie".
+    // Plik jest tez jedynym sposobem diagnostyki padajacego silnika
+    // (Connection refused z 127.0.0.1:8000 nic nie mowi o przyczynie).
+    let log_path = venv.join("engine.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .with_context(|| format!("open engine log {}", log_path.display()))?;
+    let log_file_err = log_file
+        .try_clone()
+        .context("clone engine log fd dla stderr")?;
+    cmd.stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err));
 
     let child = cmd.spawn().with_context(|| format!("spawn {:?}", exe))?;
     Ok(child)

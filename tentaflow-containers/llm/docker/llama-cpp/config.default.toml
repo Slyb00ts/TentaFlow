@@ -1,21 +1,18 @@
 # =============================================================================
 # Plik: config.default.toml
-# Opis: Domyslna konfiguracja sidecara dla kontenera llm-llamacpp.
-#       Mozna nadpisac przez volume /data/config.toml.
+# Opis: Fallback configu sidecara - nadpisany przez /data/config.toml
+#       generowany przez tentaflow-core/src/deploy/runner.rs przy deployu.
 # =============================================================================
-
 service_name = "llm-llamacpp"
-# Aliasy modeli jakie ten kontener serwuje — publikowane w ServiceAnnounce do routera.
-# Routing po aliasie: router dostaje "bielik" → ten kontener.
-model_aliases = ["default"]
+model_aliases = []
 
-[quic]
+[transport]
 port = 5000
-# Bez cert/key → sidecar generuje self-signed dla localhost. Produkcja powinna
-# montowac /data/certs/{cert.pem,key.pem}.
+enable_lan_discovery = false
+enable_dht_discovery = false
 
 [role]
 kind = "reverse_proxy"
 upstream_url = "http://127.0.0.1:8080"
-timeout_ms = 120000
-api = "open_ai"
+api = "llama_cpp"
+timeout_ms = 300000

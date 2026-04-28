@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY tentaflow-protocol /build/tentaflow-protocol
+COPY tentaflow-transport /build/tentaflow-transport
 COPY tentaflow-containers/sidecar /build/tentaflow-containers/sidecar
 
 WORKDIR /build/tentaflow-containers/sidecar

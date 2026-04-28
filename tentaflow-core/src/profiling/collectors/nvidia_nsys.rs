@@ -110,7 +110,12 @@ impl ProfileCollector for NvidiaNsysCollector {
         std::fs::create_dir_all(&ctx.output_dir)?;
 
         let report_path = ctx.output_dir.join(REPORT_FILENAME);
-        let args = build_nsys_args(&nsight_scope, &report_path);
+        // duration_secs forwarded — nsys 2025.x wymaga target-command (sleep)
+        // na koncu argumentow; build_nsys_args dokleja `sleep <duration>`.
+        // Manual mode (orchestrator-driven stop) → duration=0 → bardzo dlugi
+        // sleep ktory SIGTERM przerywa.
+        let duration_secs = ctx.scope.duration_seconds;
+        let args = build_nsys_args(&nsight_scope, &report_path, duration_secs);
 
         let child = Command::new(nsys_path)
             .args(&args)

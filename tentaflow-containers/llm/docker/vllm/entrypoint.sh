@@ -1,42 +1,49 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: Uruchamia vLLM OpenAI API server w tle (127.0.0.1:8000) + sidecar QUIC.
+# Opis: Uruchamia sidecar QUIC + vLLM OpenAI API rownolegle. Sidecar nasluchuje
+#       iroh natychmiast (klient tentaflow widzi peera od razu); vLLM laduje
+#       model w tle. Logi obu procesow trafiaja na stdout kontenera z prefixem.
+#       PID 1 czeka na pierwszego z procesow ktory padnie - druga konczymy
+#       grzecznie i exit z jego kodem (docker restart policy decyduje co dalej).
 # =============================================================================
 
-set -eo pipefail
+set -uo pipefail
 
 CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 [[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
 
-MODEL="${MODEL:?MODEL env required, np. 'speakleash/Bielik-11B-v2.6-Instruct-AWQ'}"
+MODEL="${MODEL:?MODEL env required, np. 'Qwen/Qwen2.5-0.5B-Instruct'}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_ARGS="${VLLM_ARGS:---dtype auto --gpu-memory-utilization 0.9 --max-model-len 8192}"
+
+echo "[entrypoint] sidecar config=$CONFIG_PATH"
+NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
+  | sed -u 's/^/[sidecar] /' &
+SIDECAR_PID=$!
+echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
 echo "[entrypoint] vllm serve $MODEL na 127.0.0.1:$VLLM_PORT"
 # shellcheck disable=SC2086
 vllm serve "$MODEL" \
   --host 127.0.0.1 \
   --port "$VLLM_PORT" \
-  $VLLM_ARGS \
-  >/tmp/vllm.log 2>&1 &
+  $VLLM_ARGS 2>&1 \
+  | sed -u 's/^/[vllm] /' &
 VLLM_PID=$!
 echo "[entrypoint] vllm PID=$VLLM_PID"
 
-# vLLM startuje dlugo — czekamy do 10 min
-for i in $(seq 1 600); do
-  if curl -fsS "http://127.0.0.1:$VLLM_PORT/v1/models" >/dev/null 2>&1; then
-    echo "[entrypoint] vllm gotowy po ${i}s"
-    break
-  fi
-  sleep 1
-done
-
 cleanup() {
-  echo "[entrypoint] shutdown: zabijam vllm ($VLLM_PID)"
+  echo "[entrypoint] shutdown sidecar=$SIDECAR_PID vllm=$VLLM_PID"
+  kill -TERM "$SIDECAR_PID" 2>/dev/null || true
   kill -TERM "$VLLM_PID" 2>/dev/null || true
+  wait "$SIDECAR_PID" 2>/dev/null || true
   wait "$VLLM_PID" 2>/dev/null || true
 }
 trap cleanup SIGTERM SIGINT
 
-exec /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH"
+wait -n "$SIDECAR_PID" "$VLLM_PID"
+EXIT_CODE=$?
+echo "[entrypoint] proces ($EXIT_CODE) zakonczony - wychodze"
+cleanup
+exit $EXIT_CODE

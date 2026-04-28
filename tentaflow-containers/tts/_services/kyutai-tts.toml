@@ -13,7 +13,7 @@ description_en = "Tiny 100M-param TTS (~200 MB). Streaming, CPU-only, ~6x realti
 homepage = "https://kyutai.org/pocket-tts"
 license = "CC-BY 4.0"
 icon = "kyutai"
-default_port = 5023
+default_port = 8088
 api = "openai-compatible"
 version = "2.0.0"
 

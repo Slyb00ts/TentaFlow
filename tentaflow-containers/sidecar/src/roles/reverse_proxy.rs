@@ -13,9 +13,10 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use tentaflow_protocol::{
-    CompletionPayload, CompletionResult, EmbeddingsPayload, EmbeddingsResult, ErrorInfo,
-    ErrorType, ModelPayload, ModelRequest, ModelResponse, ModelResult, ModelStreamChunk,
-    StreamChunkType,
+    AudioOperation, AudioPayload, AudioResult, AudioResultData, CompletionPayload,
+    CompletionResult, EmbeddingsPayload, EmbeddingsResult, ErrorInfo, ErrorType, ModelPayload,
+    ModelRequest, ModelResponse, ModelResult, ModelStreamChunk, PrefixCacheInitRequest,
+    PrefixCacheInitResponse, StreamChunkType,
 };
 use tentaflow_transport::{
     build_server_endpoint, serve_model_requests, HandleError, ModelHandler, ModelOutcome,
@@ -57,6 +58,7 @@ pub async fn run(config: SidecarConfig) -> Result<()> {
     .await?;
 
     tracing::info!(
+        endpoint_id_full = %hex::encode(endpoint.id().as_bytes()),
         endpoint_id = %endpoint.id().fmt_short(),
         bind = %bind_addr,
         "Sidecar iroh endpoint gotowy"
@@ -248,20 +250,20 @@ impl ReverseProxyHandler {
         tokio::spawn(async move {
             let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
-            while let Some(chunk) = stream.next().await {
-                let Ok(bytes) = chunk else {
-                    let _ = tx
-                        .send(ModelStreamChunk {
-                            request_id: req_id.clone(),
-                            chunk: StreamChunkType::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: "upstream stream read error".into(),
-                                details: None,
-                            }),
-                        })
-                        .await;
-                    return;
+            let mut total_bytes: usize = 0;
+            let mut chunks_sent: usize = 0;
+            let mut explicit_done = false;
+            let mut error_msg: Option<String> = None;
+
+            'outer: while let Some(chunk) = stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error_msg = Some(format!("upstream stream read error: {}", e));
+                        break 'outer;
+                    }
                 };
+                total_bytes += bytes.len();
                 buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                 while let Some(idx) = buffer.find("\n\n") {
@@ -274,13 +276,8 @@ impl ReverseProxyHandler {
                         };
                         let data = data.trim();
                         if data == "[DONE]" {
-                            let _ = tx
-                                .send(ModelStreamChunk {
-                                    request_id: req_id.clone(),
-                                    chunk: StreamChunkType::Done { final_metrics: None },
-                                })
-                                .await;
-                            return;
+                            explicit_done = true;
+                            break 'outer;
                         }
                         let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
                             continue;
@@ -290,20 +287,189 @@ impl ReverseProxyHandler {
                             .and_then(|v| v.as_str())
                         {
                             if !delta.is_empty() {
-                                let _ = tx
+                                if tx
                                     .send(ModelStreamChunk {
                                         request_id: req_id.clone(),
                                         chunk: StreamChunkType::TextDelta(delta.to_string()),
                                     })
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    // Klient sie rozlaczyl - przerwij
+                                    return;
+                                }
+                                chunks_sent += 1;
+                            }
+                        }
+                        if let Some(reason) = json
+                            .pointer("/choices/0/finish_reason")
+                            .and_then(|v| v.as_str())
+                        {
+                            if !reason.is_empty() && reason != "null" {
+                                explicit_done = true;
                             }
                         }
                     }
                 }
             }
+
+            // Jesli upstream zamknal stream BEZ wyslania ani jednej delty,
+            // klient zobaczy "stream finished early (0 bytes read)". Wyslij
+            // explicit Error/Done zeby klient dostal czytelna informacje.
+            tracing::debug!(
+                request_id = %req_id,
+                total_bytes,
+                chunks_sent,
+                explicit_done,
+                "stream_chat_sse spawned task konczy"
+            );
+
+            if let Some(msg) = error_msg {
+                let _ = tx
+                    .send(ModelStreamChunk {
+                        request_id: req_id.clone(),
+                        chunk: StreamChunkType::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: msg,
+                            details: None,
+                        }),
+                    })
+                    .await;
+            } else if chunks_sent == 0 {
+                let _ = tx
+                    .send(ModelStreamChunk {
+                        request_id: req_id.clone(),
+                        chunk: StreamChunkType::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: format!(
+                                "upstream zwrocil pusty stream (read {total_bytes}B, 0 chunks). \
+                                 Sprawdz czy backend obsluguje OpenAI streaming i czy nie zwrocil bledu."
+                            ),
+                            details: None,
+                        }),
+                    })
+                    .await;
+            }
+
+            // Zawsze wyslij Done na koniec - inaczej klient widzi 'stream finished early'
+            let _ = tx
+                .send(ModelStreamChunk {
+                    request_id: req_id.clone(),
+                    chunk: StreamChunkType::Done { final_metrics: None },
+                })
+                .await;
         });
 
         Ok(ModelOutcome::Stream(rx))
+    }
+
+    /// PrefixCacheInit: backendy LLM (vLLM/sglang/llama.cpp) zarzadzaja KV cache
+    /// wewnetrznie - sidecar nie ma wlasnego cache. Zwracamy success no-op zeby
+    /// router nie traktowal tego jako bledu i nie zalewal logow.
+    async fn handle_prefix_cache_init(
+        &self,
+        req: &PrefixCacheInitRequest,
+    ) -> Result<ModelOutcome, HandleError> {
+        let cached = req.prompts.len() as u32;
+        Ok(ModelOutcome::Unary(ModelResponse {
+            request_id: req.request_id.clone(),
+            result: ModelResult::PrefixCacheInit(PrefixCacheInitResponse {
+                request_id: req.request_id.clone(),
+                success: true,
+                cached_count: cached,
+                errors: Vec::new(),
+                cache_memory_mb: None,
+            }),
+            metrics: None,
+        }))
+    }
+
+    /// Audio: TTS (text-to-speech) → POST /v1/audio/speech (JSON, response audio bytes)
+    /// STT (speech-to-text) → POST /v1/audio/transcriptions (multipart audio file)
+    async fn handle_audio(
+        &self,
+        request: &ModelRequest,
+        payload: &AudioPayload,
+    ) -> Result<ModelOutcome, HandleError> {
+        match &payload.operation {
+            AudioOperation::TTS { model, input, voice, format, speed, language: _ } => {
+                let url = format!(
+                    "{}/audio/speech",
+                    self.upstream.trim_end_matches('/')
+                );
+                let mut body = serde_json::json!({
+                    "model": model,
+                    "input": input,
+                    "voice": voice,
+                });
+                if let Some(f) = format { body["response_format"] = f.clone().into(); }
+                if let Some(s) = speed { body["speed"] = (*s).into(); }
+
+                let resp = self.client.post(&url).json(&body).send().await
+                    .map_err(|e| if e.is_timeout() { HandleError::Timeout } else { HandleError::UpstreamUnavailable(e.to_string()) })?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Ok(ModelOutcome::Unary(error_response(
+                        &request.request_id,
+                        &format!("upstream HTTP {}: {}", status, text),
+                    )));
+                }
+                let bytes = resp.bytes().await
+                    .map_err(|e| HandleError::Internal(format!("read upstream audio: {}", e)))?
+                    .to_vec();
+                Ok(ModelOutcome::Unary(ModelResponse {
+                    request_id: request.request_id.clone(),
+                    result: ModelResult::Audio(AudioResult {
+                        data: AudioResultData::Audio(bytes),
+                        model: model.clone(),
+                    }),
+                    metrics: None,
+                }))
+            }
+            AudioOperation::STT { model, audio_data, language, response_format, prompt, temperature, .. } => {
+                let url = format!(
+                    "{}/audio/transcriptions",
+                    self.upstream.trim_end_matches('/')
+                );
+                let mut form = reqwest::multipart::Form::new()
+                    .text("model", model.clone())
+                    .part("file", reqwest::multipart::Part::bytes(audio_data.clone())
+                        .file_name("audio.wav")
+                        .mime_str("audio/wav")
+                        .map_err(|e| HandleError::Internal(e.to_string()))?);
+                if let Some(l) = language { form = form.text("language", l.clone()); }
+                if let Some(rf) = response_format { form = form.text("response_format", rf.clone()); }
+                if let Some(p) = prompt { form = form.text("prompt", p.clone()); }
+                if let Some(t) = temperature { form = form.text("temperature", t.to_string()); }
+
+                let resp = self.client.post(&url).multipart(form).send().await
+                    .map_err(|e| if e.is_timeout() { HandleError::Timeout } else { HandleError::UpstreamUnavailable(e.to_string()) })?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Ok(ModelOutcome::Unary(error_response(
+                        &request.request_id,
+                        &format!("upstream HTTP {}: {}", status, text),
+                    )));
+                }
+                let json: serde_json::Value = resp.json().await
+                    .map_err(|e| HandleError::Internal(format!("parse STT JSON: {}", e)))?;
+                let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                Ok(ModelOutcome::Unary(ModelResponse {
+                    request_id: request.request_id.clone(),
+                    result: ModelResult::Audio(AudioResult {
+                        data: AudioResultData::Text(text),
+                        model: model.clone(),
+                    }),
+                    metrics: None,
+                }))
+            }
+            other => Err(HandleError::UnsupportedRequest(format!(
+                "AudioOperation {:?} nie obslugiwany przez ReverseProxy (na razie tylko TTS/STT)",
+                std::mem::discriminant(other)
+            ))),
+        }
     }
 
     async fn handle_embeddings(
@@ -389,6 +555,8 @@ impl ModelHandler for ReverseProxyHandler {
         match &request.payload {
             ModelPayload::Completion(p) => self.handle_chat(&request, p).await,
             ModelPayload::Embeddings(p) => self.handle_embeddings(&request, p).await,
+            ModelPayload::Audio(p) => self.handle_audio(&request, p).await,
+            ModelPayload::PrefixCacheInit(p) => self.handle_prefix_cache_init(p).await,
             other => Err(HandleError::UnsupportedRequest(format!(
                 "payload {:?} nie obslugiwany przez ReverseProxy",
                 std::mem::discriminant(other)

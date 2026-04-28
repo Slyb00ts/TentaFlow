@@ -14,7 +14,11 @@ use super::bundle;
 /// Konfiguracja deployu jednego kontenera.
 #[derive(Debug, Clone)]
 pub struct DeployRequest {
-    /// Nazwa kontenera w bundle (np. "llm-vllm")
+    /// Sciezka kontekstu wzgledem `tentaflow-containers/` w bundle, np.
+    /// "llm/docker/vllm" — `build_image` dokleja prefix i ladowa Dockerfile
+    /// z `tentaflow-containers/<container>/Dockerfile`. Historycznie pole
+    /// nazywalo sie "container" gdy struktura byla plaska (`llm-vllm/`),
+    /// po reorganizacji do category-based layoutu jest to context_path.
     pub container: String,
     /// Tag obrazu, domyslnie "tentaflow/<container>:latest"
     pub image_tag: Option<String>,
@@ -31,21 +35,38 @@ pub struct DeployRequest {
 }
 
 /// Buduje obraz Docker z embedowanego kontekstu i uruchamia kontener.
+/// Gdy obraz `image_tag` juz istnieje lokalnie, build jest pomijany — chroni
+/// to przed podwojnym buildem, gdy caller (np. `deploy::runner`) zbudowal go
+/// wczesniej przez CLI z BuildKitem (bollard nie wspiera `--mount=type=cache`
+/// z Dockerfile'i a takie mounty dziala tylko z BuildKit'em).
 pub async fn deploy(req: &DeployRequest) -> Result<String> {
     let docker = Docker::connect_with_local_defaults().context(
         "nie mozna polaczyc z Docker daemon (sprawdz czy dziala i uzytkownik ma uprawnienia)",
     )?;
-
-    let workdir = tempfile::tempdir().context("tworzenie tmpdir dla kontekstu")?;
-    bundle::extract_to(workdir.path()).context("rozpakowanie embedowanego bundle")?;
 
     let image_tag = req
         .image_tag
         .clone()
         .unwrap_or_else(|| format!("tentaflow/{}:latest", req.container));
 
-    build_image(&docker, workdir.path(), &req.container, &image_tag).await?;
+    if !image_exists(&docker, &image_tag).await? {
+        let workdir = tempfile::tempdir().context("tworzenie tmpdir dla kontekstu")?;
+        bundle::extract_to(workdir.path()).context("rozpakowanie embedowanego bundle")?;
+        build_image(&docker, workdir.path(), &req.container, &image_tag).await?;
+    }
+
     run_container(&docker, req, &image_tag).await
+}
+
+/// `docker inspect <tag>` przez bollard — true gdy obraz istnieje lokalnie.
+async fn image_exists(docker: &Docker, tag: &str) -> Result<bool> {
+    match docker.inspect_image(tag).await {
+        Ok(_) => Ok(true),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("inspect_image({}): {}", tag, e)),
+    }
 }
 
 async fn build_image(docker: &Docker, context: &Path, container: &str, tag: &str) -> Result<()> {
