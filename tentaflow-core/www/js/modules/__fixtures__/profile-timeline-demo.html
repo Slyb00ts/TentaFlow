@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UnifiedTimeline — fixture demo</title>
+<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/controls.css">
+<link rel="stylesheet" href="/css/profile-timeline.css">
+<style>
+  body { background: #050818; color: #e8ebf5; padding: 20px; font-family: 'Manrope', system-ui, sans-serif; }
+  #root { max-width: 1480px; margin: 0 auto; }
+  h1 { font-size: 18px; margin-bottom: 16px; }
+  .log {
+    margin-top: 16px; padding: 10px; background: #0b0e22;
+    border: 1px solid #1f2548; border-radius: 8px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: #a0a8c8; max-height: 160px; overflow: auto;
+  }
+</style>
+</head>
+<body>
+<div id="root">
+  <h1>UnifiedTimeline — fixture demo (300 events, 5s span)</h1>
+  <div id="container"></div>
+  <div class="log" id="log"></div>
+</div>
+
+<script type="module">
+window.__TF_PROFILING_FIXTURE = true;
+
+// ---- inline fixture generator ----
+const NS_S = 1_000_000_000;
+const DURATION = 5 * NS_S;
+
+const names = {
+  100: 'forward_pass',
+  101: 'backward_pass',
+  102: 'opt_step',
+  200: 'ampere_sgemm',
+  201: 'flash_attn_fwd',
+  202: 'layer_norm',
+  203: 'softmax_warp',
+  204: 'elementwise_mul',
+  300: 'rocblas_dgemm',
+  301: 'hip_attn_fwd',
+  gpu_0: 'GPU 0 NVIDIA RTX 4090',
+  gpu_1: 'GPU 1 AMD RX 7900 XTX',
+};
+
+const frames = [
+  { name: 'tokenize::lex' },
+  { name: 'json::parse' },
+  { name: 'memcpy' },
+  { name: '__pthread_cond_wait' },
+  { name: 'topk_sort' },
+];
+const stacks = [
+  [0], [1], [2], [3], [4], [0, 1], [1, 2], [2, 3],
+];
+
+const events = [];
+
+// CPU per-core util — 8 cores, 100 samples each
+for (let core = 0; core < 8; core++) {
+  for (let i = 0; i < 100; i++) {
+    const t = Math.floor((i / 100) * DURATION);
+    const util = 30 + 40 * Math.sin(i * 0.2 + core) + Math.random() * 20;
+    events.push({
+      source_idx: 0,
+      t_start_ns: t,
+      t_end_ns: t,
+      category: 'CpuUtil',
+      lane_hint: core,
+      payload: { core, util_pct: Math.max(0, Math.min(100, util)), freq_mhz: 3200 },
+    });
+  }
+}
+
+// CPU power
+for (let i = 0; i < 80; i++) {
+  const t = Math.floor((i / 80) * DURATION);
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'PowerSample',
+    lane_hint: 0,
+    payload: { domain: 'CpuPkg', watts: 60 + 30 * Math.sin(i * 0.15) + Math.random() * 10 },
+  });
+}
+
+// CPU samples
+for (let i = 0; i < 200; i++) {
+  const t = Math.floor(Math.random() * DURATION);
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'CpuSample',
+    lane_hint: 0,
+    payload: { tid: 1234, cpu: i % 8, stack_id: i % stacks.length },
+  });
+}
+
+// RAM used
+for (let i = 0; i < 50; i++) {
+  const t = Math.floor((i / 50) * DURATION);
+  const used = (8 + 4 * Math.sin(i * 0.3)) * 1e9;
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'RamSample',
+    lane_hint: 0,
+    payload: { used_bytes: used, available_bytes: 32e9 - used, page_faults_per_s: 100 },
+  });
+}
+
+// RAM bandwidth
+for (let i = 0; i < 50; i++) {
+  const t = Math.floor((i / 50) * DURATION);
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'RamBandwidth',
+    lane_hint: 0,
+    payload: {
+      read_bps: (5 + 3 * Math.sin(i * 0.4)) * 1e9,
+      write_bps: (3 + 2 * Math.cos(i * 0.4)) * 1e9,
+    },
+  });
+}
+
+// Disk
+for (let i = 0; i < 40; i++) {
+  const t = Math.floor((i / 40) * DURATION);
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'DiskIoBurst',
+    lane_hint: 0,
+    payload: {
+      device: 'nvme0n1',
+      read_bps: Math.random() * 500e6,
+      write_bps: Math.random() * 200e6,
+      iops_r: 8000,
+      iops_w: 2000,
+      await_ms_p99: 1.4,
+    },
+  });
+}
+
+// GPU 0 (NVIDIA) util & power
+for (let i = 0; i < 80; i++) {
+  const t = Math.floor((i / 80) * DURATION);
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'GpuUtilSample',
+    lane_hint: 0,
+    payload: {
+      device_id: 0,
+      compute_pct: 50 + 40 * Math.sin(i * 0.2),
+      mem_pct: 60 + 20 * Math.sin(i * 0.18 + 1),
+      mem_used_bytes: 14e9,
+      temp_c: 72,
+    },
+  });
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'PowerSample',
+    lane_hint: 0,
+    payload: { domain: { Gpu: 0 }, watts: 200 + 80 * Math.sin(i * 0.2) },
+  });
+}
+// GPU 0 kernels
+const kernelNames = [200, 201, 202, 203, 204];
+for (let i = 0; i < 60; i++) {
+  const t = Math.floor((i / 60) * DURATION) + Math.random() * 1e7;
+  const dur = 5e6 + Math.random() * 2e7;
+  events.push({
+    source_idx: 0,
+    t_start_ns: Math.floor(t),
+    t_end_ns: Math.floor(t + dur),
+    category: 'GpuKernel',
+    lane_hint: 0,
+    payload: {
+      device_id: 0,
+      name_id: kernelNames[i % kernelNames.length],
+      grid: [128, 1, 1], block: [256, 1, 1], shared_mem_bytes: 4096,
+    },
+  });
+}
+
+// GPU 1 (AMD) util
+for (let i = 0; i < 80; i++) {
+  const t = Math.floor((i / 80) * DURATION);
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'GpuUtilSample',
+    lane_hint: 1,
+    payload: {
+      device_id: 1,
+      compute_pct: 40 + 30 * Math.sin(i * 0.25),
+      mem_pct: 50 + 15 * Math.sin(i * 0.2 + 2),
+      mem_used_bytes: 10e9,
+      temp_c: 68,
+    },
+  });
+}
+for (let i = 0; i < 40; i++) {
+  const t = Math.floor((i / 40) * DURATION) + Math.random() * 2e7;
+  const dur = 8e6 + Math.random() * 3e7;
+  events.push({
+    source_idx: 0,
+    t_start_ns: Math.floor(t),
+    t_end_ns: Math.floor(t + dur),
+    category: 'GpuKernel',
+    lane_hint: 1,
+    payload: {
+      device_id: 1,
+      name_id: 300 + (i % 2),
+      grid: [64, 1, 1], block: [256, 1, 1], shared_mem_bytes: 2048,
+    },
+  });
+}
+
+// NVTX ranges
+const nvtxOrder = [100, 101, 102, 100, 101, 102];
+let nvtxStart = 0;
+nvtxOrder.forEach((nameId, i) => {
+  const w = (DURATION / nvtxOrder.length) * (0.6 + Math.random() * 0.5);
+  events.push({
+    source_idx: 0,
+    t_start_ns: Math.floor(nvtxStart),
+    t_end_ns: Math.floor(nvtxStart + w),
+    category: 'NvtxRange',
+    lane_hint: 0,
+    payload: { device_id: 0, name_id: nameId, color: 0xa78bfa },
+  });
+  nvtxStart += w;
+});
+
+// Network
+for (let i = 0; i < 40; i++) {
+  const t = Math.floor((i / 40) * DURATION);
+  events.push({
+    source_idx: 0,
+    t_start_ns: t,
+    t_end_ns: t,
+    category: 'NetworkSample',
+    lane_hint: 0,
+    payload: {
+      iface: 'eth0',
+      rx_bps: Math.random() * 1e9,
+      tx_bps: Math.random() * 5e8,
+      rx_pps: 10000,
+      tx_pps: 5000,
+    },
+  });
+}
+
+const data = {
+  events,
+  names,
+  frames,
+  stacks,
+  collectors: [{ id: 'fixture', primary_category: 'GpuKernel' }],
+  duration_ns: DURATION,
+  t0_wallclock_unix_ns: Date.now() * 1e6,
+};
+
+console.log(`UnifiedTimeline fixture: ${events.length} events, duration=${(DURATION / NS_S).toFixed(1)}s`);
+
+const log = (msg) => {
+  const el = document.getElementById('log');
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\n` + el.textContent;
+};
+
+// Try shared fixture file first; fall back to inline.
+async function main() {
+  let payload = data;
+  try {
+    const res = await fetch('/js/modules/__fixtures__/profile-report.json');
+    if (res.ok) {
+      payload = await res.json();
+      log(`loaded shared fixture: ${payload.events.length} events`);
+    } else {
+      log(`using inline fixture (${events.length} events)`);
+    }
+  } catch (err) {
+    log(`using inline fixture (${events.length} events) — ${err.message}`);
+  }
+  const { UnifiedTimeline } = await import('/js/modules/profile-timeline.js');
+  const tl = new UnifiedTimeline(document.getElementById('container'), payload);
+  tl.on('rangeSelected', (d) => log(`rangeSelected: ${(d.startNs / NS_S).toFixed(2)}s .. ${(d.endNs / NS_S).toFixed(2)}s`));
+  tl.on('eventClicked', (d) => log(`eventClicked: ${d.event.category} @ ${(d.event.t_start_ns / NS_S).toFixed(3)}s`));
+  tl.on('laneToggled', (d) => log(`laneToggled: ${d.laneId} → visible=${d.visible}`));
+  tl.on('openFlamegraph', (d) => log(`openFlamegraph: ${(d.startNs / NS_S).toFixed(2)}s .. ${(d.endNs / NS_S).toFixed(2)}s`));
+}
+main();
+</script>
+</body>
+</html>

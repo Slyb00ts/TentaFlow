@@ -29,6 +29,15 @@
   transition: opacity 0.3s ease, visibility 0s linear 0s;
 }
 
+/* Pauzuj wszystkie infinite animations (connDotPulse, connRingPulse) gdy
+   overlay invisible — visibility:hidden samo nie zatrzymuje compositora,
+   a animations sa cyklicznie liczone i palone CPU mimo ze user nic nie widzi.
+   `animation-play-state: paused` propaguje na descendants. */
+.conn-overlay:not(.visible) *,
+.conn-overlay:not(.visible) {
+  animation-play-state: paused !important;
+}
+
 .conn-overlay-card {
   width: 100%;
   max-width: 480px;

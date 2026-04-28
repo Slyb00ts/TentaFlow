@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -17,7 +17,21 @@ use tentaflow_protocol::profiling::{
 };
 use thiserror::Error;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+/// Process-wide async lock that serialises every `nsys profile` spawn within
+/// this binary. Both the legacy `NsysRunner` and the multi-source
+/// `NvidiaNsysCollector` acquire this lock before spawning a child so that the
+/// two orchestrators cannot launch overlapping captures even if a caller
+/// mistakenly drives both paths concurrently. The guard is held for the entire
+/// session lifetime and dropped when the runner stops or aborts.
+static NSYS_PROCESS_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
+
+/// Returns the shared, process-wide nsys spawn lock. Used by
+/// `collectors::nvidia_nsys` to serialise with the legacy `NsysRunner`.
+pub(crate) fn nsys_process_lock() -> Arc<Mutex<()>> {
+    Arc::clone(&NSYS_PROCESS_LOCK)
+}
 
 use super::parser::parse_nsys_stats_json;
 use super::storage::ProfileStorage;
@@ -60,6 +74,11 @@ pub struct ActiveSession {
 struct ActiveSlot {
     session: ActiveSession,
     child: Child,
+    /// Held for the duration of the session — released on `stop` / drop so the
+    /// process-wide nsys lock becomes available to the next caller (legacy or
+    /// multi-source).
+    _process_guard: OwnedMutexGuard<()>,
+    /// Auto-stop watchdog task (z main: hardening auto-stop fresh pid + wait timeout).
     auto_stop_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -152,6 +171,14 @@ impl NsysRunner {
             return Err(ProfilingError::Busy);
         }
 
+        // Try to acquire the process-wide nsys lock without blocking; another
+        // orchestrator (multi-source collector) holding it means an nsys child
+        // is already in flight from a parallel code path.
+        let process_guard = match Arc::clone(&NSYS_PROCESS_LOCK).try_lock_owned() {
+            Ok(g) => g,
+            Err(_) => return Err(ProfilingError::Busy),
+        };
+
         let (session_id, output_path) = storage.allocate(&label, &scope)?;
         let args = build_nsys_args(&scope, &output_path, duration_secs);
 
@@ -196,12 +223,10 @@ impl NsysRunner {
             auto_stop_at,
         };
 
-        // Auto-stop background task — bez tego sesja z `duration_secs > 0`
-        // leci w nieskonczonosc, bo nikt nie sprawdza `auto_stop_at`. Race
-        // z manualnym stop jest OK: drugi stop dostanie NotFound i zignoruje
-        // (slot zostal juz wyczyszczony przez pierwsze wywolanie). Trzymamy
-        // JoinHandle w slocie zeby abortowac przy stop() — inaczej task spi
-        // pelne `duration_secs` (do 600s) trzymajac klon storage'u.
+        // Auto-stop background task (main: hardening) — bez tego sesja
+        // z `duration_secs > 0` leci w nieskonczonosc. Trzymamy JoinHandle
+        // w slocie zeby abortowac przy stop() — inaczej task spi pelne
+        // `duration_secs` (do 600s) trzymajac klon storage'u.
         let auto_stop_handle = if duration_secs > 0 {
             let session_id_for_task = session_id.clone();
             let storage_for_task = storage.clone();
@@ -219,6 +244,8 @@ impl NsysRunner {
         *slot = Some(ActiveSlot {
             session,
             child,
+            // Foundation: process guard wspolny dla legacy + multi-source nsys.
+            _process_guard: process_guard,
             auto_stop_handle,
         });
         drop(slot);
@@ -245,6 +272,7 @@ impl NsysRunner {
         let ActiveSlot {
             session,
             mut child,
+            _process_guard,
             auto_stop_handle,
         } = slot;
         // Lock zwolniony przed dlugotrwalym parsowaniem — kolejny start moze
@@ -314,7 +342,7 @@ impl NsysRunner {
 /// metryki przez czas trwania sleepa. Manual-mode (`duration_secs == 0`)
 /// dostaje bardzo dlugi sleep — SIGTERM z `stop()` przerywa go i nsys
 /// wykonuje teardown z flushem `.nsys-rep`.
-fn build_nsys_args(scope: &NsightScope, output_path: &Path, duration_secs: u32) -> Vec<String> {
+pub(crate) fn build_nsys_args(scope: &NsightScope, output_path: &Path, duration_secs: u32) -> Vec<String> {
     let out = output_path.to_string_lossy().to_string();
     let mut args: Vec<String> = match scope {
         NsightScope::Cpu => vec![
@@ -451,7 +479,7 @@ fn unix_ms_now() -> u64 {
 /// przy CTRL_BREAK, ale do tego potrzebujemy job object — pozostawiamy proste
 /// zabicie procesu jako kompromis).
 #[cfg(unix)]
-fn send_sigterm(pid: u32) {
+pub(crate) fn send_sigterm(pid: u32) {
     if pid == 0 {
         return;
     }
@@ -462,7 +490,7 @@ fn send_sigterm(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn send_sigterm(_pid: u32) {
+pub(crate) fn send_sigterm(_pid: u32) {
     // Windows: brak SIGTERM. nsys na windowsach trzeba zatrzymywac przez `nsys stop`
     // albo CTRL_BREAK_EVENT na grupie procesow. Brak osobnego job object oznacza
     // ze tu polegamy na `kill_on_drop(true)` w spawnie + child.start_kill() ktore
@@ -482,9 +510,9 @@ pub(crate) fn nsys_binary() -> Option<&'static Path> {
             let resolved = resolve_nsys_path();
             match resolved.as_ref() {
                 Some(p) => tracing::info!(path = %p.display(), "nsys binary discovered"),
-                None => tracing::warn!(
-                    "nsys binary not found in PATH or standard NVIDIA locations"
-                ),
+                None => {
+                    tracing::warn!("nsys binary not found in PATH or standard NVIDIA locations")
+                }
             }
             resolved
         })
@@ -645,7 +673,7 @@ pub(crate) fn nsys_command() -> Result<Command, ProfilingError> {
 
 /// Bezposrednie wywolanie `nsys --version` — uzywane przez `capability()` i
 /// publicznie eksportowane przez `detect_capability` (dla collectora mesh).
-async fn probe_capability() -> NsysCapability {
+pub(crate) async fn probe_capability() -> NsysCapability {
     let Some(path) = nsys_binary() else {
         return NsysCapability {
             available: false,
@@ -736,7 +764,7 @@ mod tests {
 
     #[test]
     fn validate_scope_cpu() {
-        let args = build_nsys_args(&NsightScope::Cpu, &dummy_path());
+        let args = build_nsys_args(&NsightScope::Cpu, &dummy_path(), 0);
         assert!(args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--gpu-metrics-device=none".to_string()));
         assert!(!args.iter().any(|a| a.starts_with("--trace=cuda")));
@@ -744,7 +772,7 @@ mod tests {
 
     #[test]
     fn validate_scope_gpu_index_3() {
-        let args = build_nsys_args(&NsightScope::GpuIndex(3), &dummy_path());
+        let args = build_nsys_args(&NsightScope::GpuIndex(3), &dummy_path(), 0);
         assert!(args.contains(&"--gpu-metrics-device=3".to_string()));
         assert!(!args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--sample=none".to_string()));
@@ -752,13 +780,13 @@ mod tests {
 
     #[test]
     fn validate_scope_gpu_all() {
-        let args = build_nsys_args(&NsightScope::GpuAll, &dummy_path());
+        let args = build_nsys_args(&NsightScope::GpuAll, &dummy_path(), 0);
         assert!(args.contains(&"--gpu-metrics-device=all".to_string()));
     }
 
     #[test]
     fn validate_scope_both_index_0() {
-        let args = build_nsys_args(&NsightScope::BothIndex(0), &dummy_path());
+        let args = build_nsys_args(&NsightScope::BothIndex(0), &dummy_path(), 0);
         assert!(args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--gpu-metrics-device=0".to_string()));
         assert!(args
@@ -768,7 +796,7 @@ mod tests {
 
     #[test]
     fn validate_scope_both_all() {
-        let args = build_nsys_args(&NsightScope::BothAll, &dummy_path());
+        let args = build_nsys_args(&NsightScope::BothAll, &dummy_path(), 0);
         assert!(args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--gpu-metrics-device=all".to_string()));
     }
@@ -780,7 +808,12 @@ mod tests {
         let storage = ProfileStorage::new(tmp.path(), "n");
         // Wymusza walidacje duration PRZED probami spawnu nsys.
         let err = runner
-            .start(NsightScope::Cpu, MAX_DURATION_SECS + 1, "x".into(), &storage)
+            .start(
+                NsightScope::Cpu,
+                MAX_DURATION_SECS + 1,
+                "x".into(),
+                &storage,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ProfilingError::InvalidDuration(_)));

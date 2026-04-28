@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: profile-flamegraph-demo.html
+     Opis: Standalone demo zakladki CPU Flamegraph. Generuje fixture inline
+           (5000 CpuSample events, 200 unique frames, 50 unique stacks) i
+           pokazuje pelny flamegraph z drill-down, search, reverse, differential.
+     Uruchom: serwuj /www/ przez statyczny serwer (np. `python3 -m http.server`)
+              i otworz /js/modules/__fixtures__/profile-flamegraph-demo.html.
+     ============================================================================= -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU Flamegraph — demo</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/profiling.css">
+<link rel="stylesheet" href="/css/profile-flamegraph.css">
+<style>
+  body {
+    --tf-bg: #050818;
+    --tf-bg-2: #0a0d24;
+    --tf-bg-3: #111535;
+    --tf-bg-input: #0b0e22;
+    --tf-bg-card-hover: #1a1f45;
+    --tf-border: #1f2548;
+    --tf-border-hover: #2f3668;
+    --tf-text: #e8ebf5;
+    --tf-text-2: #a0a8c8;
+    --tf-text-3: #6a7196;
+    --tf-accent-1: #6366f1;
+    --tf-accent-2: #a78bfa;
+    --tf-success: #22c55e;
+    --tf-danger: #ef4444;
+    --tf-warning: #f59e0b;
+    --tf-radius: 10px;
+    background: #050818;
+    color: #e8ebf5;
+    font-family: 'Manrope', system-ui, sans-serif;
+    margin: 0;
+    padding: 24px;
+    min-height: 100vh;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; font-weight: 800; letter-spacing: -0.01em; }
+  .demo-sub { font-size: 12.5px; color: #6a7196; margin-bottom: 18px; }
+  .demo-card {
+    background: #0a0d24;
+    border: 1px solid #1f2548;
+    border-radius: 10px;
+    padding: 16px;
+  }
+</style>
+</head>
+<body>
+
+<h1>CPU Flamegraph — demo</h1>
+<div class="demo-sub">
+  5,000 synthetic <code>CpuSample</code> events · 50 unique stacks · 200 unique frames ·
+  Try: click frame, search "tokenize", toggle reverse / differential, slide Min %.
+</div>
+
+<div class="demo-card" id="flame-host"></div>
+
+<script type="module">
+  import { CpuFlamegraph } from '/js/modules/profile-flamegraph.js';
+
+  // ---- Fixture builder ----------------------------------------------------
+  // Frames are organised in a synthetic call graph rooted at "main", with a
+  // realistic skewed sample distribution (Zipfian over leaves) so the
+  // resulting flamegraph has clear hot paths to drill into.
+  function buildFixture() {
+    const modules = ['libtentaflow.so', 'libserde.so', 'libcudart.so', 'libpthread', 'libc', 'libtokenizers.so'];
+
+    // Symbol stems → expanded into ~200 frames.
+    const stems = [
+      'main', 'syscall', 'io_uring_submit', 'inference_loop', 'batch_decode',
+      'postprocess', 'tokenize::run', 'tokenize::lex', 'tokenize::utf8_next',
+      'vocab::lookup', 'vocab::extend', 'forward', 'cuda_launch', 'memcpy',
+      'memmove', 'sample::topk', 'topk_sort', 'cmp', 'swap', 'apply_repetition',
+      'json::parse', 'json::stringify', 'strdup', 'softmax', 'hash::insert',
+      'hash::lookup', 'murmur3', 'rotl', 'bsearch', 'decode',
+    ];
+
+    const frames = [];
+    const names = [];
+    const nameIdx = new Map();
+    const intern = (s) => {
+      if (nameIdx.has(s)) return nameIdx.get(s);
+      const id = names.length;
+      names.push(s);
+      nameIdx.set(s, id);
+      return id;
+    };
+
+    function addFrame(symbol, mod, file, line) {
+      const id = frames.length;
+      frames.push({ symbol, module: mod, file, line });
+      intern(symbol);
+      return id;
+    }
+
+    // Core stems → frames (one per stem).
+    const stemIds = stems.map((s, i) => addFrame(
+      s,
+      modules[i % modules.length],
+      `src/${s.replace(/::/g, '_').replace(/[^a-z0-9_]/gi, '')}.rs`,
+      40 + (i * 17) % 600,
+    ));
+
+    // Pad out to 200 with leaf-ish helpers.
+    const helperBase = ['inner', 'helper', 'fast', 'slow', 'check', 'iter', 'apply', 'reduce', 'merge', 'split'];
+    while (frames.length < 200) {
+      const i = frames.length;
+      const stem = stems[i % stems.length];
+      const sub = helperBase[i % helperBase.length];
+      addFrame(`${stem}::${sub}_${i}`, modules[i % modules.length], null, null);
+    }
+
+    // Build 50 unique stacks (leaf-first lists of frame ids).
+    // Use 5 "spines" descending from `main` and tack on varied leaves.
+    const mainId = stemIds[0];
+    const spines = [
+      [stemIds[0], stemIds[3], stemIds[4], stemIds[6], stemIds[7]],   // main → inference → batch_decode → tokenize::run → tokenize::lex
+      [stemIds[0], stemIds[3], stemIds[11], stemIds[12]],               // main → inference → forward → cuda_launch
+      [stemIds[0], stemIds[3], stemIds[15], stemIds[16]],               // main → inference → sample::topk → topk_sort
+      [stemIds[0], stemIds[5], stemIds[20], stemIds[21]],               // main → postprocess → json::parse → json::stringify
+      [stemIds[1], stemIds[2]],                                          // syscall → io_uring_submit
+    ];
+
+    const stacks = [];
+    for (let i = 0; i < 50; i++) {
+      const spine = spines[i % spines.length];
+      // Append 0..3 leaf frames from the helper pool to vary stacks.
+      const tail = [];
+      const tailLen = 1 + (i * 7) % 4;
+      for (let t = 0; t < tailLen; t++) {
+        const fid = 30 + ((i * 13 + t * 5) % (frames.length - 30));
+        tail.unshift(fid); // leaf-first: prepend so leaf is at index 0
+      }
+      // Spine is stored leaf-first too; spine[0] is `main` (root) so reverse it.
+      const spineLeafFirst = [...spine].reverse();
+      stacks.push([...tail, ...spineLeafFirst]);
+    }
+
+    // Generate 5000 CpuSample events with Zipfian skew over stacks.
+    const events = [];
+    const totalEvents = 5000;
+    const totalDurationNs = 60_000_000_000; // 60 seconds
+    let cumWeights = [];
+    let acc = 0;
+    for (let i = 0; i < stacks.length; i++) {
+      const w = 1 / (i + 1); // 1, 0.5, 0.33, ...
+      acc += w;
+      cumWeights.push(acc);
+    }
+    const totalW = acc;
+
+    // Stable PRNG so demo is reproducible.
+    let seed = 123456789;
+    function rand() {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    }
+
+    for (let i = 0; i < totalEvents; i++) {
+      const r = rand() * totalW;
+      let stackId = 0;
+      for (let j = 0; j < cumWeights.length; j++) {
+        if (r <= cumWeights[j]) { stackId = j; break; }
+      }
+      const t = Math.floor((i / totalEvents) * totalDurationNs);
+      events.push({
+        start_ns: t,
+        end_ns: t,
+        category: 'CpuSample',
+        payload: {
+          CpuSample: {
+            tid: 14872 + (stackId % 6),
+            cpu: stackId % 16,
+            stack_id: stackId,
+          },
+        },
+      });
+    }
+
+    return { events, frames, stacks, names, totalDurationNs, source: 'linux.perf.cpu_sampling', sampleHzApprox: 99 };
+  }
+
+  const fixture = buildFixture();
+  const host = document.getElementById('flame-host');
+  const flame = new CpuFlamegraph(host, fixture);
+
+  flame.on('frameSelected', (info) => {
+    console.log('frame selected:', info.frameId, info.node.name);
+  });
+
+  // Expose for ad-hoc poking from devtools.
+  window.__flame = flame;
+  window.__TF_PROFILING_FIXTURE = true;
+</script>
+
+</body>
+</html>
