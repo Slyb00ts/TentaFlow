@@ -62,8 +62,8 @@ async-stream = "0.3.6"
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
 # tentaflow-client/native i tentaflow-containers/sidecar.
-iroh = { version = "0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
-iroh-relay = { version = "0.98.0", default-features = false, features = ["server", "tls-ring"] }
+iroh = { version = "=0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
+iroh-relay = { version = "0.98.0", default-features = false, features = ["server"] }
 tentaflow-transport = { path = "../tentaflow-transport" }
 rustls = { version = "0.23.38", features = ["ring"] }
 tokio-rustls = "0.26.4"
@@ -256,3 +256,6 @@ harness = false
 [[bench]]
 name = "audio_pipeline_clones"
 harness = false
+
+[patch.crates-io]
+ed25519-dalek = { path = "../vendor/ed25519-dalek" }

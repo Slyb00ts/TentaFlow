@@ -12,7 +12,7 @@ path = "src/lib.rs"
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 
 # Transport
-iroh = { version = "0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
+iroh = { version = "=0.98.0", default-features = false, features = ["address-lookup-mdns", "address-lookup-pkarr-dht", "portmapper", "tls-ring"] }
 
 # Serialization
 rkyv = { version = "0.8.12", features = ["std", "bytecheck", "unaligned"] }
@@ -38,3 +38,6 @@ anyhow = "1"
 [[bench]]
 name = "noop"
 harness = false
+
+[patch.crates-io]
+ed25519-dalek = { path = "../vendor/ed25519-dalek" }
