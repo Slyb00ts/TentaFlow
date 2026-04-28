@@ -2911,6 +2911,14 @@ async fn store_peer_to_proto(
         (p.nsys_available, p.nsys_version.clone())
     };
 
+    let profiling_collectors_available = if is_local {
+        crate::profiling::collectors::CollectorRegistry::probe_available_ids(
+            &crate::profiling::COLLECTOR_REGISTRY,
+        )
+    } else {
+        p.profiling_collectors_available.clone()
+    };
+
     tentaflow_protocol::MeshNodeInfo {
         node_id: p.node_id.clone(),
         hostname: p.hostname.clone(),
@@ -2951,6 +2959,7 @@ async fn store_peer_to_proto(
         }),
         nsys_available,
         nsys_version,
+        profiling_collectors_available,
     }
 }
 
@@ -3063,6 +3072,7 @@ pub async fn mesh_node_list(
             connection: None,
             nsys_available: false,
             nsys_version: String::new(),
+            profiling_collectors_available: Vec::new(),
         });
     }
 

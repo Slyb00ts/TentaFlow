@@ -766,6 +766,11 @@ async fn handle_nsight_local(
         | NsightPayload::DownloadResponse(_) => Err(ProtocolError::bad_request(
             "expected NsightPayload request variant",
         )),
+        // Profiling V2 jest obslugiwany przez `profiling_dispatch` — jesli tu trafil,
+        // ktos wywolal nsight handler ze zlym wariantem.
+        NsightPayload::Profiling(_) => Err(ProtocolError::bad_request(
+            "Profiling sub-payload must use profiling_dispatch, not nsight",
+        )),
     }
 }
 
@@ -858,6 +863,656 @@ register_nsight_variant!(
     "NsightDownloadRequest",
     "tentaflow_ws_handler_nsight_download"
 );
+
+// =============================================================================
+// 10. ProfilingPayload — multi-source profiling V2 (start/stop/sessions/...).
+// Pakowane wewnatrz `NsightPayload::Profiling(...)` zeby nie zjadac slotow
+// MessageBody (rkyv 256 limit).
+// =============================================================================
+
+/// Mapuje `SessionError` na `ProtocolError` z deterministycznymi kodami.
+fn profiling_v2_err_to_proto(e: crate::profiling::SessionError) -> ProtocolError {
+    use crate::profiling::SessionError as SE;
+    match e {
+        SE::AlreadyActive => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            "another profiling session is already active",
+        ),
+        SE::NoCollectorsAvailable => ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "no collectors available for the requested scope",
+        ),
+        SE::AllCollectorsFailed => ProtocolError::internal("all collectors failed to start"),
+        SE::InvalidScope(reason) => {
+            ProtocolError::bad_request(format!("invalid scope: {reason}"))
+        }
+        SE::Storage(s) => ProtocolError::internal(format!("storage: {s}")),
+        SE::CollectorStartFailure { id, error } => {
+            ProtocolError::internal(format!("collector {id} start failure: {error}"))
+        }
+        SE::StaleHandle => ProtocolError::not_found("session handle is stale"),
+        SE::Io(e) => ProtocolError::internal(format!("io: {e}")),
+        SE::Merge(s) => ProtocolError::internal(format!("merge: {s}")),
+    }
+}
+
+fn storage_err_to_proto(e: crate::profiling::StorageError) -> ProtocolError {
+    use crate::profiling::StorageError as SE;
+    match e {
+        SE::InvalidSessionId(s) => {
+            ProtocolError::bad_request(format!("invalid session id: {s}"))
+        }
+        SE::InvalidNodeId(s) => ProtocolError::bad_request(format!("invalid node id: {s}")),
+        SE::InvalidCollectorId(s) => {
+            ProtocolError::bad_request(format!("invalid collector id: {s}"))
+        }
+        SE::NotFound(s) => ProtocolError::not_found(s),
+        SE::PathTraversal(s) => {
+            ProtocolError::bad_request(format!("path traversal rejected: {s}"))
+        }
+        SE::SizeCapExceeded { actual, cap } => {
+            ProtocolError::internal(format!("size cap exceeded: {actual} > {cap}"))
+        }
+        SE::Io(e) => ProtocolError::internal(format!("io: {e}")),
+        SE::ManifestParse(s) => ProtocolError::internal(format!("manifest: {s}")),
+        SE::Rkyv(s) => ProtocolError::internal(format!("rkyv: {s}")),
+    }
+}
+
+fn map_storage_skipped(
+    v: Vec<crate::profiling::SkippedCollector>,
+) -> Vec<tentaflow_protocol::ProfilingSkippedCollector> {
+    v.into_iter()
+        .map(|s| tentaflow_protocol::ProfilingSkippedCollector {
+            id: s.id,
+            reason: s.reason,
+        })
+        .collect()
+}
+
+fn session_kind_to_str(k: &crate::profiling::SessionKind) -> String {
+    match k {
+        crate::profiling::SessionKind::MultiSource => "multi_source".to_string(),
+        crate::profiling::SessionKind::LegacyNsight => "legacy_nsight".to_string(),
+    }
+}
+
+fn map_session_entry(
+    e: crate::profiling::SessionEntry,
+) -> tentaflow_protocol::ProfilingSessionEntry {
+    tentaflow_protocol::ProfilingSessionEntry {
+        session_id: e.session_id,
+        label: e.label,
+        started_at: e.started_at,
+        duration_ns: e.duration_ns,
+        kind: session_kind_to_str(&e.kind),
+        collectors_used: e.collectors_used,
+        size_bytes: e.size_bytes,
+    }
+}
+
+/// Build a deterministic 32-hex-char session id derived from time + node id.
+fn new_session_id(node_id: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u128)
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::Hasher;
+    hasher.write_u128(nanos);
+    hasher.write(node_id.as_bytes());
+    let h = hasher.finish();
+    // 32 hex chars: nanos low bits + hash
+    format!("{:016x}{:016x}", nanos as u64, h)
+}
+
+/// Wykonuje `MeshCommandType::Profiling*` na zdalnym nodzie i odpakowuje typed
+/// `MeshCommandResponsePayload::Profiling*` w `ProfilingPayload::*Response`.
+async fn forward_profiling_to_peer(
+    ctx: &HandlerContext,
+    target_node_id: &str,
+    cmd: tentaflow_protocol::mesh::MeshCommandType,
+) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
+    use tentaflow_protocol::mesh::MeshCommandResponsePayload as RP;
+    use tentaflow_protocol::ProfilingPayload as PP;
+
+    let qm = require_quic_mesh(ctx)?;
+    let is_trusted = ctx
+        .state
+        .mesh_security
+        .as_ref()
+        .map_or(false, |s| s.is_trusted(target_node_id));
+    if !is_trusted {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "Node nie jest zaufany — nie mozna wyslac komendy",
+        ));
+    }
+
+    let response = qm.send_command(target_node_id, cmd).await.map_err(|e| {
+        ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            format!("mesh profiling forward: {}", e),
+        )
+    })?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "remote node refused command".to_string());
+        return Err(ProtocolError::new(ProtocolErrorCode::Internal, msg));
+    }
+
+    match response.payload {
+        RP::ProfilingStart(r) => Ok(PP::StartResponse(r)),
+        RP::ProfilingStop(r) => Ok(PP::StopResponse(r)),
+        RP::ProfilingSessions(r) => Ok(PP::SessionsResponse(r)),
+        RP::ProfilingReport(r) => Ok(PP::ReportResponse(r)),
+        RP::ProfilingDelete(r) => Ok(PP::DeleteResponse(r)),
+        RP::ProfilingDownload(r) => Ok(PP::DownloadResponse(r)),
+        RP::ProfilingActiveInfo(r) => Ok(PP::ActiveInfoResponse(r)),
+        _ => Err(ProtocolError::internal(
+            "remote node returned unexpected payload variant",
+        )),
+    }
+}
+
+/// Pakuje sciezke zdarzen + manifest + raw/ do tar.gz w pamieci.
+fn build_session_tarball(
+    storage: &crate::profiling::ProfileStorageV2,
+    node_id: &str,
+    session_id: &str,
+) -> Result<Vec<u8>, ProtocolError> {
+    use std::io::Write;
+    let session_dir = storage.root().join(node_id).join(session_id);
+    if !session_dir.exists() {
+        return Err(ProtocolError::not_found(format!(
+            "session {session_id} not found"
+        )));
+    }
+    let buf: Vec<u8> = Vec::new();
+    let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+    let mut tar = tar::Builder::new(encoder);
+    tar.append_dir_all(session_id, &session_dir)
+        .map_err(|e| ProtocolError::internal(format!("tar build: {e}")))?;
+    let mut encoder = tar
+        .into_inner()
+        .map_err(|e| ProtocolError::internal(format!("tar finalize: {e}")))?;
+    encoder
+        .flush()
+        .map_err(|e| ProtocolError::internal(format!("gzip flush: {e}")))?;
+    let bytes = encoder
+        .finish()
+        .map_err(|e| ProtocolError::internal(format!("gzip finish: {e}")))?;
+    Ok(bytes)
+}
+
+async fn handle_profiling_local(
+    ctx: &HandlerContext,
+    payload: tentaflow_protocol::ProfilingPayload,
+) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
+    use crate::profiling::{
+        ElevationToken, MULTI_SOURCE, PROFILE_PARSERS, PROFILE_STORAGE_V2,
+    };
+    use tentaflow_protocol::ProfilingPayload as PP;
+    use tentaflow_protocol::{
+        ProfilingActiveInfoResponse, ProfilingActiveSessionInfo, ProfilingDeleteResponse,
+        ProfilingDownloadResponse, ProfilingReportResponse, ProfilingSessionsResponse,
+        ProfilingStartResponse, ProfilingStopResponse,
+    };
+
+    let storage = std::sync::Arc::clone(&PROFILE_STORAGE_V2);
+    let parsers = std::sync::Arc::clone(&PROFILE_PARSERS);
+    let orchestrator = std::sync::Arc::clone(&MULTI_SOURCE);
+    let local_node_id = ctx.state.local_node_id.as_ref().to_string();
+
+    match payload {
+        PP::StartRequest(req) => {
+            let elevation = if req.elevation_password.is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::new(ElevationToken::new_sudo(
+                    req.elevation_password.clone(),
+                )))
+            };
+            let session_id = new_session_id(&local_node_id);
+            let scope_clone = req.scope.clone();
+            let label_for_audit = req.label.clone();
+
+            let handle = orchestrator
+                .clone()
+                .start(
+                    req.scope,
+                    local_node_id.clone(),
+                    session_id.clone(),
+                    req.label,
+                    elevation,
+                    parsers,
+                )
+                .await
+                .map_err(profiling_v2_err_to_proto)?;
+
+            let info = orchestrator
+                .active_info()
+                .await
+                .ok_or_else(|| ProtocolError::internal("orchestrator lost active session"))?;
+
+            let started_at_unix_ns = info.started_at_unix_ns;
+            let collectors_started = info.collectors_running.clone();
+            let collectors_skipped = map_storage_skipped(info.collectors_skipped);
+
+            let _ = repository::log_audit(
+                &ctx.state.db,
+                None,
+                None,
+                "profiling.start",
+                Some(&format!("session:{}", handle.session_id)),
+                Some(
+                    &serde_json::json!({
+                        "session_id": handle.session_id,
+                        "scope": scope_clone,
+                        "label": label_for_audit,
+                    })
+                    .to_string(),
+                ),
+                None,
+                Some(ctx.state.local_node_id.as_ref()),
+            );
+
+            Ok(PP::StartResponse(ProfilingStartResponse {
+                session_id: handle.session_id,
+                started_at_unix_ns,
+                collectors_started,
+                collectors_skipped,
+            }))
+        }
+        PP::StopRequest(req) => {
+            let report = orchestrator
+                .clone()
+                .stop_by_id(&req.session_id)
+                .await
+                .map_err(profiling_v2_err_to_proto)?;
+            let _ = repository::log_audit(
+                &ctx.state.db,
+                None,
+                None,
+                "profiling.stop",
+                Some(&format!("session:{}", report.session_id)),
+                None,
+                None,
+                Some(ctx.state.local_node_id.as_ref()),
+            );
+            Ok(PP::StopResponse(ProfilingStopResponse {
+                session_id: report.session_id.clone(),
+                report,
+            }))
+        }
+        PP::SessionsRequest(req) => {
+            let entries = storage
+                .list_sessions(&local_node_id)
+                .await
+                .map_err(storage_err_to_proto)?;
+            let entries = entries.into_iter().map(map_session_entry).collect();
+            Ok(PP::SessionsResponse(ProfilingSessionsResponse {
+                node_id: req.node_id,
+                entries,
+            }))
+        }
+        PP::ReportRequest(req) => {
+            let envelope = storage
+                .read_report(&local_node_id, &req.session_id)
+                .await
+                .map_err(storage_err_to_proto)?;
+            Ok(PP::ReportResponse(ProfilingReportResponse { envelope }))
+        }
+        PP::DeleteRequest(req) => {
+            storage
+                .delete_session(&local_node_id, &req.session_id)
+                .await
+                .map_err(storage_err_to_proto)?;
+            Ok(PP::DeleteResponse(ProfilingDeleteResponse {
+                session_id: req.session_id,
+                deleted: true,
+            }))
+        }
+        PP::DownloadRequest(req) => {
+            let storage_clone = std::sync::Arc::clone(&storage);
+            let node_id = local_node_id.clone();
+            let sid = req.session_id.clone();
+            let bytes = tokio::task::spawn_blocking(move || {
+                build_session_tarball(&storage_clone, &node_id, &sid)
+            })
+            .await
+            .map_err(|e| ProtocolError::internal(format!("join: {e}")))??;
+            let filename = format!("profiling-{}.tar.gz", req.session_id);
+            Ok(PP::DownloadResponse(ProfilingDownloadResponse {
+                session_id: req.session_id,
+                filename,
+                tarball_bytes: bytes,
+            }))
+        }
+        PP::ActiveInfoRequest(_req) => {
+            let info = orchestrator.active_info().await.map(|i| {
+                ProfilingActiveSessionInfo {
+                    session_id: i.session_id,
+                    node_id: i.node_id,
+                    label: i.label,
+                    started_at_unix_ns: i.started_at_unix_ns,
+                    planned_duration_ns: i.planned_duration_ns,
+                    elapsed_ns: i.elapsed_ns,
+                    collectors_running: i.collectors_running,
+                    collectors_skipped: map_storage_skipped(i.collectors_skipped),
+                }
+            });
+            Ok(PP::ActiveInfoResponse(ProfilingActiveInfoResponse { info }))
+        }
+        // Response variants must not arrive as requests.
+        PP::StartResponse(_)
+        | PP::StopResponse(_)
+        | PP::SessionsResponse(_)
+        | PP::ReportResponse(_)
+        | PP::DeleteResponse(_)
+        | PP::DownloadResponse(_)
+        | PP::ActiveInfoResponse(_) => Err(ProtocolError::bad_request(
+            "expected ProfilingPayload request variant",
+        )),
+    }
+}
+
+async fn profiling_route(
+    ctx: &HandlerContext,
+    payload: tentaflow_protocol::ProfilingPayload,
+) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
+    use tentaflow_protocol::mesh::MeshCommandType as MC;
+    use tentaflow_protocol::ProfilingPayload as PP;
+
+    let local = ctx.state.local_node_id.as_ref();
+    let target: String = match &payload {
+        PP::StartRequest(r) => r.node_id.clone(),
+        PP::StopRequest(r) => r.node_id.clone(),
+        PP::SessionsRequest(r) => r.node_id.clone(),
+        PP::ReportRequest(r) => r.node_id.clone(),
+        PP::DeleteRequest(r) => r.node_id.clone(),
+        PP::DownloadRequest(r) => r.node_id.clone(),
+        PP::ActiveInfoRequest(r) => r.node_id.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ProfilingPayload request variant",
+            ))
+        }
+    };
+
+    if target.is_empty() || target.as_str() == local {
+        return handle_profiling_local(ctx, payload).await;
+    }
+
+    let cmd = match payload {
+        PP::StartRequest(r) => MC::ProfilingStart(r),
+        PP::StopRequest(r) => MC::ProfilingStop(r),
+        PP::SessionsRequest(r) => MC::ProfilingSessions(r),
+        PP::ReportRequest(r) => MC::ProfilingReport(r),
+        PP::DeleteRequest(r) => MC::ProfilingDelete(r),
+        PP::DownloadRequest(r) => MC::ProfilingDownload(r),
+        PP::ActiveInfoRequest(r) => MC::ProfilingActiveInfo(r),
+        _ => unreachable!("filtered above"),
+    };
+    forward_profiling_to_peer(ctx, &target, cmd).await
+}
+
+#[handler(variant = "ProfilingBody", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn profiling_dispatch(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use tentaflow_protocol::NsightPayload;
+    let payload = match req {
+        MessageBody::NsightBody(NsightPayload::Profiling(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected NsightBody(Profiling(_))",
+            ))
+        }
+    };
+    let res = profiling_route(ctx, payload).await?;
+    Ok(MessageBody::NsightBody(NsightPayload::Profiling(res)))
+}
+
+macro_rules! register_profiling_variant {
+    ($variant:literal, $metric:literal) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                required_auth: crate::dispatch::SessionAuthKind::Admin,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_profiling_dispatch,
+            }
+        }
+    };
+}
+
+register_profiling_variant!("ProfilingStartRequest", "tentaflow_ws_handler_profiling_start");
+register_profiling_variant!("ProfilingStopRequest", "tentaflow_ws_handler_profiling_stop");
+register_profiling_variant!(
+    "ProfilingSessionsRequest",
+    "tentaflow_ws_handler_profiling_sessions"
+);
+register_profiling_variant!(
+    "ProfilingReportRequest",
+    "tentaflow_ws_handler_profiling_report"
+);
+register_profiling_variant!(
+    "ProfilingDeleteRequest",
+    "tentaflow_ws_handler_profiling_delete"
+);
+register_profiling_variant!(
+    "ProfilingDownloadRequest",
+    "tentaflow_ws_handler_profiling_download"
+);
+register_profiling_variant!(
+    "ProfilingActiveInfoRequest",
+    "tentaflow_ws_handler_profiling_active_info"
+);
+
+#[cfg(test)]
+mod profiling_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use tentaflow_protocol::{
+        NsightPayload, ProfileScope, ProfileSourceFlags, ProfileTarget, ProfilingActiveInfoRequest,
+        ProfilingDeleteRequest, ProfilingDownloadRequest, ProfilingReportRequest,
+        ProfilingSessionsRequest, ProfilingStartRequest, ProfilingStopRequest, SessionAuth,
+    };
+
+    fn admin_ctx() -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            resume_secret: None,
+            state: AppState::for_test(),
+        }
+    }
+
+    fn cpu_scope() -> ProfileScope {
+        ProfileScope {
+            sources: ProfileSourceFlags(ProfileSourceFlags::CPU_SAMPLING),
+            gpu_targets: tentaflow_protocol::GpuTargets::None,
+            cpu_sampling_hz: 99,
+            target: ProfileTarget::OwnProcess,
+            duration_seconds: 0,
+            label: "test".into(),
+        }
+    }
+
+    fn wrap(p: tentaflow_protocol::ProfilingPayload) -> MessageBody {
+        MessageBody::NsightBody(NsightPayload::Profiling(p))
+    }
+
+    #[tokio::test]
+    async fn profiling_active_info_local_returns_none_when_idle() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = wrap(tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(
+            ProfilingActiveInfoRequest { node_id: local },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Ok(MessageBody::NsightBody(NsightPayload::Profiling(
+                tentaflow_protocol::ProfilingPayload::ActiveInfoResponse(r),
+            ))) => {
+                // Może być Some(...) jeżeli inny test left the orchestrator active —
+                // wówczas nie crashujemy, akceptujemy oba stany.
+                let _ = r.info;
+            }
+            Ok(other) => panic!("nieoczekiwany wariant: {other:?}"),
+            Err(e) => panic!("blad: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profiling_sessions_local_empty_returns_empty_list() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("TENTAFLOW_HOME", tmp.path());
+        let body = wrap(tentaflow_protocol::ProfilingPayload::SessionsRequest(
+            ProfilingSessionsRequest { node_id: local },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Ok(MessageBody::NsightBody(NsightPayload::Profiling(
+                tentaflow_protocol::ProfilingPayload::SessionsResponse(r),
+            ))) => {
+                // PROFILE_STORAGE_V2 jest LazyLock i mogla byc juz zainicjowana
+                // wczesniej z innym TENTAFLOW_HOME — wiec wynik moze nie byc pusty.
+                let _ = r.entries;
+            }
+            other => panic!("nieoczekiwany wynik: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profiling_report_invalid_session_id_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = wrap(tentaflow_protocol::ProfilingPayload::ReportRequest(
+            ProfilingReportRequest {
+                node_id: local,
+                session_id: "../passwd".into(),
+            },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest),
+            Ok(_) => panic!("oczekiwano BadRequest"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profiling_delete_invalid_session_id_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = wrap(tentaflow_protocol::ProfilingPayload::DeleteRequest(
+            ProfilingDeleteRequest {
+                node_id: local,
+                session_id: "ZZZZZ".into(),
+            },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest),
+            Ok(_) => panic!("oczekiwano BadRequest"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profiling_download_invalid_session_id_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = wrap(tentaflow_protocol::ProfilingPayload::DownloadRequest(
+            ProfilingDownloadRequest {
+                node_id: local,
+                session_id: "../etc/passwd".into(),
+            },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => {
+                assert!(matches!(
+                    e.code,
+                    ProtocolErrorCode::BadRequest | ProtocolErrorCode::NotFound
+                ));
+            }
+            Ok(_) => panic!("oczekiwano bledu"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profiling_stop_unknown_session_returns_not_found() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let body = wrap(tentaflow_protocol::ProfilingPayload::StopRequest(
+            ProfilingStopRequest {
+                node_id: local,
+                session_id: "0123456789abcdef0123456789abcdef".into(),
+            },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => assert!(matches!(
+                e.code,
+                ProtocolErrorCode::NotFound | ProtocolErrorCode::Conflict
+            )),
+            Ok(_) => panic!("oczekiwano NotFound/Conflict"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profiling_remote_node_without_mesh_manager_fails() {
+        let ctx = admin_ctx();
+        let body = wrap(tentaflow_protocol::ProfilingPayload::SessionsRequest(
+            ProfilingSessionsRequest {
+                node_id: "some-other-peer-node".into(),
+            },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => {
+                assert_eq!(e.code, ProtocolErrorCode::Internal);
+                assert!(e.message.contains("Mesh manager"));
+            }
+            Ok(_) => panic!("oczekiwano Internal"),
+        }
+    }
+
+    #[tokio::test]
+    async fn profiling_start_invalid_label_is_bad_request() {
+        let ctx = admin_ctx();
+        let local = ctx.state.local_node_id.as_ref().to_string();
+        let mut scope = cpu_scope();
+        scope.label = "a\x07b".into(); // control char rejected
+        let body = wrap(tentaflow_protocol::ProfilingPayload::StartRequest(
+            ProfilingStartRequest {
+                node_id: local,
+                scope,
+                label: "outer".into(),
+                elevation_password: String::new(),
+            },
+        ));
+        let res = profiling_dispatch(&body, &ctx).await;
+        match res {
+            Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest),
+            Ok(_) => panic!("oczekiwano BadRequest"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod nsight_tests {

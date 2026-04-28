@@ -212,10 +212,17 @@ libc = "0.2.185"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+# Parser plist do wynikow `powermetrics -f plist` (samplery cpu_power / gpu_power)
+plist = "1.7"
 
 # libloading jest required na macOS/iOS, bo apple-tts (AVSpeechSynthesizer
 # przez libMLXBridge.dylib) jest ZAWSZE skompilowany na tych targetach,

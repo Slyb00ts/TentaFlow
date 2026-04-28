@@ -1,0 +1,122 @@
+{
+  "sessions": [
+    {
+      "session_id": "f1a2b3c4d5e6f708",
+      "label": "qwen-7b inference benchmark",
+      "status": "completed",
+      "started_at_unix_ns": 1745740800000000000,
+      "duration_seconds": 300,
+      "size_bytes": 259014656,
+      "sources_used": [
+        { "id": "linux.perf.cpu_sampling", "label": "perf", "status": "ok" },
+        { "id": "nvidia.nsys.gpu", "label": "nsys", "status": "ok" },
+        { "id": "linux.proc.ram", "label": "ram", "status": "ok" },
+        { "id": "linux.iostat.disk", "label": "iostat", "status": "ok" }
+      ],
+      "has_flamegraph": true,
+      "gpu_count": 1,
+      "vendor": "nvidia"
+    },
+    {
+      "session_id": "a9b8c7d6e5f40312",
+      "label": "training step profile (full multi-source)",
+      "status": "completed",
+      "started_at_unix_ns": 1745737200000000000,
+      "duration_seconds": 600,
+      "size_bytes": 1073741824,
+      "sources_used": [
+        { "id": "linux.perf.cpu_sampling", "label": "perf", "status": "ok" },
+        { "id": "linux.perf.cpu_counters", "label": "counters", "status": "ok" },
+        { "id": "nvidia.nsys.gpu", "label": "nsys", "status": "ok" },
+        { "id": "linux.proc.ram", "label": "ram", "status": "ok" },
+        { "id": "linux.iostat.disk", "label": "iostat", "status": "ok" },
+        { "id": "linux.rapl.power", "label": "rapl", "status": "ok" },
+        { "id": "linux.proc.network", "label": "network", "status": "ok" }
+      ],
+      "has_flamegraph": true,
+      "gpu_count": 1,
+      "vendor": "nvidia"
+    },
+    {
+      "session_id": "1234567890abcdef",
+      "label": "stable-diffusion partial (sudo declined)",
+      "status": "completed",
+      "started_at_unix_ns": 1745726400000000000,
+      "duration_seconds": 180,
+      "size_bytes": 67108864,
+      "sources_used": [
+        { "id": "linux.proc.cpu_util", "label": "cpu_util", "status": "ok" },
+        { "id": "linux.proc.ram", "label": "ram", "status": "ok" },
+        { "id": "linux.perf.cpu_sampling", "label": "perf", "status": "bad" },
+        { "id": "linux.perf.cpu_counters", "label": "counters", "status": "bad" }
+      ],
+      "has_flamegraph": false,
+      "gpu_count": 0,
+      "vendor": null
+    },
+    {
+      "session_id": "deadbeefcafebabe",
+      "label": "failed run (nsys crash)",
+      "status": "failed",
+      "started_at_unix_ns": 1745719200000000000,
+      "duration_seconds": 12,
+      "size_bytes": 0,
+      "sources_used": [
+        { "id": "nvidia.nsys.gpu", "label": "nsys", "status": "bad" }
+      ],
+      "has_flamegraph": false,
+      "gpu_count": 1,
+      "vendor": "nvidia",
+      "error": "nsys exited with code 134 (SIGABRT)"
+    },
+    {
+      "session_id": "0badc0de01234567",
+      "label": "live capture (running)",
+      "status": "running",
+      "started_at_unix_ns": 1745747820000000000,
+      "duration_seconds": 300,
+      "size_bytes": 0,
+      "sources_used": [
+        { "id": "linux.perf.cpu_sampling", "label": "perf", "status": "ok" },
+        { "id": "nvidia.nsys.gpu", "label": "nsys", "status": "ok" },
+        { "id": "linux.rapl.power", "label": "rapl", "status": "ok" }
+      ],
+      "has_flamegraph": false,
+      "gpu_count": 1,
+      "vendor": "nvidia"
+    },
+    {
+      "session_id": "abc123def456ff00",
+      "label": "multi-GPU 3 vendors (NV+AMD+Intel)",
+      "status": "completed",
+      "started_at_unix_ns": 1745690400000000000,
+      "duration_seconds": 240,
+      "size_bytes": 524288000,
+      "sources_used": [
+        { "id": "linux.perf.cpu_sampling", "label": "perf", "status": "ok" },
+        { "id": "nvidia.nsys.gpu", "label": "nsys", "status": "ok" },
+        { "id": "amd.rocprof.gpu", "label": "rocprof", "status": "ok" },
+        { "id": "intel.vtune.gpu", "label": "vtune", "status": "warn" },
+        { "id": "linux.proc.ram", "label": "ram", "status": "ok" }
+      ],
+      "has_flamegraph": true,
+      "gpu_count": 3,
+      "vendor": "mixed"
+    },
+    {
+      "session_id": "f0e0d0c0b0a09080",
+      "label": "CPU-only quick check",
+      "status": "completed",
+      "started_at_unix_ns": 1745654400000000000,
+      "duration_seconds": 30,
+      "size_bytes": 8388608,
+      "sources_used": [
+        { "id": "linux.perf.cpu_sampling", "label": "perf", "status": "ok" },
+        { "id": "linux.proc.cpu_util", "label": "cpu_util", "status": "ok" }
+      ],
+      "has_flamegraph": true,
+      "gpu_count": 0,
+      "vendor": null
+    }
+  ]
+}

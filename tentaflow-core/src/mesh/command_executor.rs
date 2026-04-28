@@ -300,6 +300,16 @@ impl MeshCommandExecutor {
             MeshCommandType::NsightReport(req) => self.handle_nsight_report(req).await,
             MeshCommandType::NsightDelete(req) => self.handle_nsight_delete(req).await,
             MeshCommandType::NsightDownload(req) => self.handle_nsight_download(req).await,
+
+            MeshCommandType::ProfilingStart(req) => self.handle_profiling_start(req).await,
+            MeshCommandType::ProfilingStop(req) => self.handle_profiling_stop(req).await,
+            MeshCommandType::ProfilingSessions(req) => self.handle_profiling_sessions(req).await,
+            MeshCommandType::ProfilingReport(req) => self.handle_profiling_report(req).await,
+            MeshCommandType::ProfilingDelete(req) => self.handle_profiling_delete(req).await,
+            MeshCommandType::ProfilingDownload(req) => self.handle_profiling_download(req).await,
+            MeshCommandType::ProfilingActiveInfo(req) => {
+                self.handle_profiling_active_info(req).await
+            }
         }
     }
 
@@ -544,6 +554,228 @@ impl MeshCommandExecutor {
             }
             Err(e) => CommandResponse::fail(format!("nsight download: {}", e)),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-source profiling V2 handlery — wykonywane na nodzie odbierajacym
+    // komende mesh. Lokalny dispatch w `mesh_write_handlers.rs::handle_profiling_local`
+    // zawiera te sama logike (z dodatkowym audit log + auth) wolana przy local
+    // node_id. Tu obslugujemy peer-side, gdzie auth juz przeszlo przez `is_trusted`.
+    // -------------------------------------------------------------------------
+
+    fn map_skipped_v2(
+        v: Vec<crate::profiling::SkippedCollector>,
+    ) -> Vec<tentaflow_protocol::ProfilingSkippedCollector> {
+        v.into_iter()
+            .map(|s| tentaflow_protocol::ProfilingSkippedCollector {
+                id: s.id,
+                reason: s.reason,
+            })
+            .collect()
+    }
+
+    fn map_session_entry_v2(
+        e: crate::profiling::SessionEntry,
+    ) -> tentaflow_protocol::ProfilingSessionEntry {
+        let kind = match e.kind {
+            crate::profiling::SessionKind::MultiSource => "multi_source".to_string(),
+            crate::profiling::SessionKind::LegacyNsight => "legacy_nsight".to_string(),
+        };
+        tentaflow_protocol::ProfilingSessionEntry {
+            session_id: e.session_id,
+            label: e.label,
+            started_at: e.started_at,
+            duration_ns: e.duration_ns,
+            kind,
+            collectors_used: e.collectors_used,
+            size_bytes: e.size_bytes,
+        }
+    }
+
+    async fn handle_profiling_start(
+        &self,
+        req: tentaflow_protocol::ProfilingStartRequest,
+    ) -> CommandResponse {
+        use crate::profiling::{
+            ElevationToken, MULTI_SOURCE, PROFILE_PARSERS,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let elevation = if req.elevation_password.is_empty() {
+            None
+        } else {
+            Some(std::sync::Arc::new(ElevationToken::new_sudo(
+                req.elevation_password.clone(),
+            )))
+        };
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u128)
+            .unwrap_or(0);
+        let session_id = format!(
+            "{:016x}{:016x}",
+            nanos as u64,
+            (nanos >> 64) as u64 ^ 0x9e37_79b9_7f4a_7c15
+        );
+        let orchestrator = std::sync::Arc::clone(&MULTI_SOURCE);
+        let parsers = std::sync::Arc::clone(&PROFILE_PARSERS);
+        match orchestrator
+            .clone()
+            .start(
+                req.scope,
+                self.local_node_id.clone(),
+                session_id,
+                req.label,
+                elevation,
+                parsers,
+            )
+            .await
+        {
+            Ok(handle) => match orchestrator.active_info().await {
+                Some(info) => CommandResponse::ok(MeshCommandResponsePayload::ProfilingStart(
+                    tentaflow_protocol::ProfilingStartResponse {
+                        session_id: handle.session_id,
+                        started_at_unix_ns: info.started_at_unix_ns,
+                        collectors_started: info.collectors_running,
+                        collectors_skipped: Self::map_skipped_v2(info.collectors_skipped),
+                    },
+                )),
+                None => CommandResponse::fail("orchestrator lost active session".to_string()),
+            },
+            Err(e) => CommandResponse::fail(format!("profiling start: {}", e)),
+        }
+    }
+
+    async fn handle_profiling_stop(
+        &self,
+        req: tentaflow_protocol::ProfilingStopRequest,
+    ) -> CommandResponse {
+        use crate::profiling::MULTI_SOURCE;
+        let orchestrator = std::sync::Arc::clone(&MULTI_SOURCE);
+        match orchestrator.clone().stop_by_id(&req.session_id).await {
+            Ok(report) => CommandResponse::ok(MeshCommandResponsePayload::ProfilingStop(
+                tentaflow_protocol::ProfilingStopResponse {
+                    session_id: report.session_id.clone(),
+                    report,
+                },
+            )),
+            Err(e) => CommandResponse::fail(format!("profiling stop: {}", e)),
+        }
+    }
+
+    async fn handle_profiling_sessions(
+        &self,
+        req: tentaflow_protocol::ProfilingSessionsRequest,
+    ) -> CommandResponse {
+        use crate::profiling::PROFILE_STORAGE_V2;
+        match PROFILE_STORAGE_V2.list_sessions(&self.local_node_id).await {
+            Ok(entries) => {
+                let entries = entries.into_iter().map(Self::map_session_entry_v2).collect();
+                CommandResponse::ok(MeshCommandResponsePayload::ProfilingSessions(
+                    tentaflow_protocol::ProfilingSessionsResponse {
+                        node_id: req.node_id,
+                        entries,
+                    },
+                ))
+            }
+            Err(e) => CommandResponse::fail(format!("profiling sessions: {}", e)),
+        }
+    }
+
+    async fn handle_profiling_report(
+        &self,
+        req: tentaflow_protocol::ProfilingReportRequest,
+    ) -> CommandResponse {
+        use crate::profiling::PROFILE_STORAGE_V2;
+        match PROFILE_STORAGE_V2
+            .read_report(&self.local_node_id, &req.session_id)
+            .await
+        {
+            Ok(envelope) => CommandResponse::ok(MeshCommandResponsePayload::ProfilingReport(
+                tentaflow_protocol::ProfilingReportResponse { envelope },
+            )),
+            Err(e) => CommandResponse::fail(format!("profiling report: {}", e)),
+        }
+    }
+
+    async fn handle_profiling_delete(
+        &self,
+        req: tentaflow_protocol::ProfilingDeleteRequest,
+    ) -> CommandResponse {
+        use crate::profiling::PROFILE_STORAGE_V2;
+        match PROFILE_STORAGE_V2
+            .delete_session(&self.local_node_id, &req.session_id)
+            .await
+        {
+            Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::ProfilingDelete(
+                tentaflow_protocol::ProfilingDeleteResponse {
+                    session_id: req.session_id,
+                    deleted: true,
+                },
+            )),
+            Err(e) => CommandResponse::fail(format!("profiling delete: {}", e)),
+        }
+    }
+
+    async fn handle_profiling_download(
+        &self,
+        req: tentaflow_protocol::ProfilingDownloadRequest,
+    ) -> CommandResponse {
+        use crate::profiling::PROFILE_STORAGE_V2;
+        use std::io::Write;
+        let storage = std::sync::Arc::clone(&PROFILE_STORAGE_V2);
+        let node_id = self.local_node_id.clone();
+        let sid = req.session_id.clone();
+        let bytes_res = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            let session_dir = storage.root().join(&node_id).join(&sid);
+            if !session_dir.exists() {
+                return Err(format!("session {sid} not found"));
+            }
+            let buf: Vec<u8> = Vec::new();
+            let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            tar.append_dir_all(&sid, &session_dir)
+                .map_err(|e| format!("tar: {e}"))?;
+            let mut encoder = tar.into_inner().map_err(|e| format!("tar finalize: {e}"))?;
+            encoder.flush().map_err(|e| format!("gzip flush: {e}"))?;
+            encoder.finish().map_err(|e| format!("gzip finish: {e}"))
+        })
+        .await;
+        match bytes_res {
+            Ok(Ok(bytes)) => {
+                let filename = format!("profiling-{}.tar.gz", req.session_id);
+                CommandResponse::ok(MeshCommandResponsePayload::ProfilingDownload(
+                    tentaflow_protocol::ProfilingDownloadResponse {
+                        session_id: req.session_id,
+                        filename,
+                        tarball_bytes: bytes,
+                    },
+                ))
+            }
+            Ok(Err(msg)) => CommandResponse::fail(format!("profiling download: {msg}")),
+            Err(e) => CommandResponse::fail(format!("profiling download join: {e}")),
+        }
+    }
+
+    async fn handle_profiling_active_info(
+        &self,
+        _req: tentaflow_protocol::ProfilingActiveInfoRequest,
+    ) -> CommandResponse {
+        use crate::profiling::MULTI_SOURCE;
+        let info = MULTI_SOURCE.active_info().await.map(|i| {
+            tentaflow_protocol::ProfilingActiveSessionInfo {
+                session_id: i.session_id,
+                node_id: i.node_id,
+                label: i.label,
+                started_at_unix_ns: i.started_at_unix_ns,
+                planned_duration_ns: i.planned_duration_ns,
+                elapsed_ns: i.elapsed_ns,
+                collectors_running: i.collectors_running,
+                collectors_skipped: Self::map_skipped_v2(i.collectors_skipped),
+            }
+        });
+        CommandResponse::ok(MeshCommandResponsePayload::ProfilingActiveInfo(
+            tentaflow_protocol::ProfilingActiveInfoResponse { info },
+        ))
     }
 
     // -------------------------------------------------------------------------

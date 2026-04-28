@@ -36,12 +36,20 @@ pub use vision::{
     VisionInferResult, VisionInferPayload,
 };
 pub use profiling::{
-    GpuUtilSample, GpuUtilSeries, NsightDeleteRequest, NsightDeleteResponse,
-    NsightDownloadRequest, NsightDownloadResponse, NsightGpuTarget,
-    NsightReportRequest, NsightReportResponse, NsightScope, NsightSessionEntry,
+    ClockSamples, CollectorRunInfo, CollectorStatus, CounterKind, DriftReport, EventCategory,
+    EventPayload, Frame, GpuTargets, GpuUtilSample, GpuUtilSeries, GpuVendor, NsightDeleteRequest,
+    NsightDeleteResponse, NsightDownloadRequest, NsightDownloadResponse, NsightGpuTarget,
+    NsightPayload, NsightReportRequest, NsightReportResponse, NsightScope, NsightSessionEntry,
     NsightSessionStatus, NsightSessionsRequest, NsightSessionsResponse, NsightStartRequest,
-    NsightStartResponse, NsightStopRequest, NsightStopResponse, NsightPayload, ProfileKpi,
-    ProfileMeta, ProfileReport, ProfileTopRow,
+    NsightStartResponse, NsightStopRequest, NsightStopResponse, PowerDomain, ProfileKpi,
+    ProfileMeta, ProfileReport, ProfileReportEnvelope, ProfileReportV2, ProfileScope,
+    ProfileSourceFlags, ProfileTarget, ProfileTopRow, ProfilingActiveInfoRequest,
+    ProfilingActiveInfoResponse, ProfilingActiveSessionInfo, ProfilingDeleteRequest,
+    ProfilingDeleteResponse, ProfilingDownloadRequest, ProfilingDownloadResponse, ProfilingPayload,
+    ProfilingReportRequest, ProfilingReportResponse, ProfilingSessionEntry,
+    ProfilingSessionsRequest, ProfilingSessionsResponse, ProfilingSkippedCollector,
+    ProfilingStartRequest, ProfilingStartResponse, ProfilingStopRequest, ProfilingStopResponse,
+    TimelineEvent, TransferKind,
 };
 pub use envelope::{
     message_kind, Envelope, EnvelopeFlags, Routing, SessionAuth, SignedSessionClaim,
