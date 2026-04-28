@@ -9,6 +9,10 @@ mod audio_ring;
 mod browser;
 mod config;
 mod dom_observer;
+// Intent classifier tymczasowo nieuzywany — gating w `gate_and_respond`
+// jest wylaczony, bot odpowiada zawsze. Modul zostaje w drzewie zeby latwo
+// przywrocic po zmianie wymagan, zob. komentarz w gate_and_respond.
+#[allow(dead_code)]
 mod intent_classifier;
 mod quic_server;
 mod sentence_buffer;
@@ -203,6 +207,11 @@ async fn emit_lifecycle(
 /// (case-insensitive, fragment slowa OK). Pusta lista = zawsze TRUE.
 /// `wake_words` musi byc juz znormalizowane (trim + lowercase) — robi to
 /// `MeetingConfig::validate` przy starcie, zeby hot-path STT nie alokowal.
+///
+/// Tymczasowo nieuzywane — gating w `gate_and_respond` jest wylaczony,
+/// bot odpowiada zawsze. Zostaje w kodzie zeby latwo przywrocic gating
+/// po zmianie wymagan.
+#[allow(dead_code)]
 fn matches_wake_word(text: &str, wake_words: &[String]) -> bool {
     if wake_words.is_empty() {
         return true;
@@ -228,50 +237,17 @@ async fn gate_and_respond(
     text: &str,
     on_sentence: impl FnMut(String) + Send + 'static,
 ) -> Option<String> {
-    // Etap 1: gating wedlug response_mode.
-    let mode = config.response_mode.as_str();
-    let allow = match mode {
-        "always" => true,
-        "wake_word" => {
-            let m = matches_wake_word(text, &config.wake_words_compiled);
-            if !m {
-                tracing::info!(
-                    mode = %mode,
-                    wake_words = %config.wake_words,
-                    "skip LLM — brak wake_word w tekscie"
-                );
-            }
-            m
-        }
-        "wake_word_intent" => {
-            if !matches_wake_word(text, &config.wake_words_compiled) {
-                tracing::info!(
-                    mode = %mode,
-                    wake_words = %config.wake_words,
-                    "skip LLM — brak wake_word w tekscie"
-                );
-                false
-            } else {
-                let intent = crate::intent_classifier::local_intent_classifier(
-                    text,
-                    &config.wake_words_compiled,
-                );
-                tracing::info!(
-                    text = %text.chars().take(60).collect::<String>(),
-                    intent = intent,
-                    "wake_word match — lokalny intent classifier"
-                );
-                intent
-            }
-        }
-        other => {
-            tracing::warn!(mode = %other, "nieznany response_mode — domyslnie pasywny");
-            false
-        }
-    };
-    if !allow {
-        return None;
-    }
+    // Etap 1: gating CALKOWICIE WYLACZONY — bot zawsze odpowiada na kazda
+    // wypowiedz. Wczesniej dzialo sie tutaj wake-word matching + lokalny
+    // intent classifier (response_mode = always|wake_word|wake_word_intent),
+    // ale to powodowalo ze bot ignorowal wiekszosc pytan jezeli nie mial
+    // wake_word'a. Na chwile obecna jedziemy bez gating'u — kazda transkrypcja
+    // idzie do LLM. response_mode w configu jest ignorowane.
+    tracing::debug!(
+        text = %text.chars().take(60).collect::<String>(),
+        mode = %config.response_mode,
+        "gating bypassed — bot odpowiada zawsze"
+    );
 
     // Etap 2: streaming LLM. Kazdy delta-token pcha sentence_buffer; jak
     // tylko mamy pelne zdanie, wolamy on_sentence natychmiast — caller
