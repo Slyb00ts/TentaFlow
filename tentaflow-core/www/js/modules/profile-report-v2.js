@@ -14,14 +14,7 @@ import {
   eventsForDevice,
   uniqueDevices,
   unwrapPayload,
-  computeKpiCpu,
-  computeKpiGpu,
-  computeKpiPower,
-  computeKpiRam,
-  computeKpiDisk,
-  computeKpiNetwork,
-  aggregateKernels,
-  aggregateApiCalls,
+  computeAllKpis,
   buildQuickFindings,
   buildTimeSeries,
   renderLineChart,
@@ -196,6 +189,10 @@ function buildContext(report) {
     { id: 'sources',   label: 'Sources',        icon: 'list',     visible: true },
   ].filter((t) => t.visible);
 
+  // Single-pass aggregation across all events. Powers Overview + GPU tabs
+  // without re-walking events for each KPI.
+  const kpis = computeAllKpis(events, report.names || [], report.duration_ns);
+
   return {
     report,
     events,
@@ -205,6 +202,10 @@ function buildContext(report) {
     defaultTab: 'overview',
     counts: countUsedCollectors(report.collectors || []),
     hasGpu, hasDisk, hasPower, hasMemory, hasNetwork,
+    kpis,
+    // Lazy cache for rendered tab HTML — see renderTab. Most tabs are pure
+    // functions of ctx so we can cache the string and skip the work on revisit.
+    _tabHtml: new Map(),
   };
 }
 
@@ -439,17 +440,28 @@ async function handleRerun(ctx) {
 function renderTab(container, ctx, tabId) {
   const body = container.querySelector('#pr2-body');
   if (!body) return;
-  switch (tabId) {
-    case 'overview': body.innerHTML = renderOverviewTab(ctx); break;
-    case 'timeline': renderLazyTab(body, '/js/modules/profile-timeline.js', ctx, 'TimelineView'); break;
-    case 'flame':    renderLazyTab(body, '/js/modules/profile-flamegraph.js', ctx, 'FlamegraphView'); break;
-    case 'gpu':      body.innerHTML = renderGpuTab(ctx); bindGpuTab(body, ctx); break;
-    case 'memory':   body.innerHTML = renderMemoryTab(ctx); break;
-    case 'disk':     body.innerHTML = renderDiskTab(ctx); break;
-    case 'power':    body.innerHTML = renderPowerTab(ctx); break;
-    case 'sources':  body.innerHTML = renderSourcesTab(ctx); break;
-    default:         body.innerHTML = '';
+  // Lazy/dynamic tabs (timeline, flame) need a fresh mount because they
+  // attach Canvas/SVG and event listeners; we never cache their HTML.
+  if (tabId === 'timeline') { renderLazyTab(body, '/js/modules/profile-timeline.js', ctx, 'TimelineView'); return; }
+  if (tabId === 'flame')    { renderLazyTab(body, '/js/modules/profile-flamegraph.js', ctx, 'FlamegraphView'); return; }
+  // Pure-HTML tabs: cache the rendered string keyed by tabId. KPIs and
+  // device data on `ctx` are immutable for the lifetime of a report, so
+  // re-rendering on tab switch only repaints; the HTML itself is identical.
+  let html = ctx._tabHtml.get(tabId);
+  if (html === undefined) {
+    switch (tabId) {
+      case 'overview': html = renderOverviewTab(ctx); break;
+      case 'gpu':      html = renderGpuTab(ctx); break;
+      case 'memory':   html = renderMemoryTab(ctx); break;
+      case 'disk':     html = renderDiskTab(ctx); break;
+      case 'power':    html = renderPowerTab(ctx); break;
+      case 'sources':  html = renderSourcesTab(ctx); break;
+      default:         html = '';
+    }
+    ctx._tabHtml.set(tabId, html);
   }
+  body.innerHTML = html;
+  if (tabId === 'gpu') bindGpuTab(body, ctx);
 }
 
 // Lazy-load tabs (Timeline + Flamegraph) implemented by sibling agents. While
@@ -490,16 +502,17 @@ function pendingModuleBanner(modulePath, reason) {
 // =============================================================================
 
 function renderOverviewTab(ctx) {
-  const { events, devices, report, hasMemory, hasDisk, hasPower, hasNetwork } = ctx;
+  const { events, devices, report, hasMemory, hasDisk, hasPower, hasNetwork, kpis } = ctx;
   const names = report.names || [];
-  const cpu = computeKpiCpu(events, names);
-  const ram = computeKpiRam(events);
-  const disk = computeKpiDisk(events);
-  const power = computeKpiPower(events, report.duration_ns);
-  const net = computeKpiNetwork(events);
+  const cpu = kpis.cpu;
+  const ram = kpis.ram;
+  const disk = kpis.disk;
+  const power = kpis.power;
+  const net = kpis.net;
+  const gpuKpiOf = (id) => kpis.gpu.get(id) || { peakCompute: 0, peakMem: 0, memUsedBytes: 0, topKernel: null, topPct: 0, avgW: 0, peakW: 0, kernels: [], apis: [] };
 
   const gpuTiles = devices.slice(0, 3).map((d) => {
-    const k = computeKpiGpu(events, d.device_id, names);
+    const k = gpuKpiOf(d.device_id);
     const badge = vendorBadge(d.vendor);
     const topKernel = k.topKernel ? `${escape(k.topKernel)} ${formatPct(k.topPct)}` : '<span class="muted">no kernel data</span>';
     return `
@@ -685,9 +698,8 @@ function bindGpuTab(host, ctx) {
 }
 
 function renderGpuDeviceCard(ctx, d) {
-  const { events, report } = ctx;
-  const names = report.names || [];
-  const k = computeKpiGpu(events, d.device_id, names);
+  const { events, report, kpis } = ctx;
+  const k = kpis.gpu.get(d.device_id) || { peakCompute: 0, peakMem: 0, memUsedBytes: 0, topKernel: null, topPct: 0, avgW: 0, peakW: 0, kernels: [], apis: [] };
   const badge = vendorBadge(d.vendor);
 
   const collectorStatus = d.limited
@@ -755,8 +767,8 @@ function renderGpuDeviceCard(ctx, d) {
     </div>
   `;
 
-  // Kernels table.
-  const kernels = aggregateKernels(events, d.device_id, names);
+  // Kernels table — precomputed in single-pass aggregation.
+  const kernels = k.kernels;
   const kernelTable = kernels.length === 0
     ? `<div class="pr2-banner-degraded inline"><div>${d.vendor === 'apple' ? 'Per-kernel timings require Metal capture (Xcode Instruments).' : d.vendor === 'intel' ? 'Per-kernel timings require Intel GPA / Level Zero tracer.' : 'No kernel data captured.'}</div></div>`
     : `<table class="pr2-table">
@@ -764,8 +776,8 @@ function renderGpuDeviceCard(ctx, d) {
         <tbody>${kernels.slice(0, 30).map((r) => `<tr><td class="mono">${escape(r.name)}</td><td class="num mono">${formatInt(r.count)}</td><td class="num mono">${(r.totalNs / 1e6).toFixed(1)}</td><td class="num mono">${(r.avgNs / 1e3).toFixed(1)}</td><td class="num mono">${formatPct(r.pct)}</td></tr>`).join('')}</tbody>
       </table>`;
 
-  // API calls table.
-  const apis = aggregateApiCalls(events, d.device_id, names);
+  // API calls table — precomputed.
+  const apis = k.apis;
   const apiHeader = d.vendor === 'amd' ? 'HIP APIs' : d.vendor === 'intel' ? 'Level Zero APIs' : d.vendor === 'apple' ? 'Metal calls' : 'CUDA APIs';
   const apiTable = apis.length === 0
     ? `<div class="pr2-banner-degraded inline"><div>${d.vendor === 'apple' ? 'Use Xcode Instruments for Metal API tracing.' : 'No API call data captured.'}</div></div>`
@@ -936,16 +948,19 @@ function ramBandwidthSvg(readSeries, writeSeries) {
 // =============================================================================
 
 function renderDiskTab(ctx) {
-  const { events } = ctx;
+  const { events, report } = ctx;
+  const names = report.names || [];
+  const resolveDevice = (p) => (p && p.deviceNameId !== undefined ? names[p.deviceNameId] : null) || `disk_${p?.deviceNameId ?? '?'}`;
   const all = eventsForCategory(events, 'DiskIoBurst').map((e) => ({ t: e.t_start_ns, p: unwrapPayload(e.payload) })).filter((s) => s.p);
   if (all.length === 0) {
     return noDataCard('No disk IO samples collected.');
   }
   const byDevice = new Map();
   for (const s of all) {
-    const arr = byDevice.get(s.p.device) || [];
+    const dev = resolveDevice(s.p);
+    const arr = byDevice.get(dev) || [];
     arr.push(s);
-    byDevice.set(s.p.device, arr);
+    byDevice.set(dev, arr);
   }
   const cards = Array.from(byDevice.entries()).map(([device, samples]) => {
     const model = samples[0]?.p?.model || '';
@@ -1054,7 +1069,7 @@ function renderPowerTab(ctx) {
     }
   }
 
-  const power = computeKpiPower(events, report.duration_ns);
+  const power = ctx.kpis.power;
   const kWh = power.totalKj / 3600;
   const cost = kWh * 0.15;
 

@@ -351,7 +351,7 @@ impl CollectorParser for LinuxIostatDiskParser {
         &self,
         raw: RawCapture,
         _ctx: &SessionCtx,
-        _names: &mut NameInterner,
+        names: &mut NameInterner,
         _frames: &mut FrameInterner,
     ) -> Result<Vec<TimelineEvent>, CollectorError> {
         let Some(csv_path) = raw.artifacts.first() else {
@@ -378,11 +378,14 @@ impl CollectorParser for LinuxIostatDiskParser {
             }
         }
         device_names.sort();
-        let lane_index: HashMap<&str, u16> = device_names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.as_str(), i.min(u16::MAX as usize) as u16))
-            .collect();
+        // Intern each unique device name once; per-event payloads carry only
+        // the resulting u32 id (zero String allocs in the hot loop below).
+        let mut lane_index: HashMap<String, (u16, u32)> = HashMap::with_capacity(device_names.len());
+        for (i, n) in device_names.iter().enumerate() {
+            let lane = i.min(u16::MAX as usize) as u16;
+            let name_id = names.intern(n);
+            lane_index.insert(n.clone(), (lane, name_id));
+        }
 
         let mut events = Vec::new();
         for (idx, line) in content.lines().enumerate() {
@@ -397,13 +400,15 @@ impl CollectorParser for LinuxIostatDiskParser {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let device = cols[1].to_string();
             let read_bps: u64 = cols[2].parse().unwrap_or(0);
             let write_bps: u64 = cols[3].parse().unwrap_or(0);
             let iops_r: u32 = cols[4].parse().unwrap_or(0);
             let iops_w: u32 = cols[5].parse().unwrap_or(0);
             let await_ms: f32 = cols[6].parse().unwrap_or(0.0);
-            let lane = *lane_index.get(device.as_str()).unwrap_or(&0);
+            let (lane, device_name_id) = match lane_index.get(cols[1]) {
+                Some(v) => *v,
+                None => (0, names.intern(cols[1])),
+            };
             events.push(TimelineEvent {
                 source_idx: 0,
                 t_start_ns: ts,
@@ -411,7 +416,7 @@ impl CollectorParser for LinuxIostatDiskParser {
                 category: EventCategory::DiskIoBurst,
                 lane_hint: lane,
                 payload: EventPayload::DiskIoBurst {
-                    device,
+                    device_name_id,
                     read_bps,
                     write_bps,
                     iops_r,
@@ -558,10 +563,12 @@ mod tests {
             .unwrap();
         assert_eq!(evs.len(), 3);
         // Devices sorted alphabetically: nvme0n1=0, sda=1.
+        let names_vec = names.into_vec();
         let mut nvme_lane = None;
         let mut sda_lane = None;
         for e in &evs {
-            if let EventPayload::DiskIoBurst { device, .. } = &e.payload {
+            if let EventPayload::DiskIoBurst { device_name_id, .. } = &e.payload {
+                let device = &names_vec[*device_name_id as usize];
                 if device == "nvme0n1" {
                     nvme_lane = Some(e.lane_hint);
                 } else if device == "sda" {

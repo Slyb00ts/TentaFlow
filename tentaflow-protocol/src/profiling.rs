@@ -796,7 +796,11 @@ pub enum EventPayload {
         write_bps: u64,
     },
     DiskIoBurst {
-        device: String,
+        /// `device_name_id` indexes `ProfileReportV2.names`. Interning the
+        /// device label keeps disk-burst events on the hot merge path
+        /// allocation-free (one Vec<String> entry per unique device, not one
+        /// per emitted event).
+        device_name_id: u32,
         read_bps: u64,
         write_bps: u64,
         iops_r: u32,
@@ -843,7 +847,9 @@ pub enum EventPayload {
         color: u32,
     },
     NetworkSample {
-        iface: String,
+        /// `iface_name_id` indexes `ProfileReportV2.names`. Same rationale as
+        /// `DiskIoBurst::device_name_id` — keep per-event payloads alloc-free.
+        iface_name_id: u32,
         rx_bps: u64,
         tx_bps: u64,
         rx_pps: u32,
@@ -1751,7 +1757,7 @@ mod tests {
     #[test]
     fn event_payload_disk_io_burst_round_trip() {
         let e = rt_event(EventPayload::DiskIoBurst {
-            device: "nvme0n1".into(),
+            device_name_id: 7,
             read_bps: 1,
             write_bps: 2,
             iops_r: 3,
@@ -1837,7 +1843,7 @@ mod tests {
     #[test]
     fn event_payload_network_sample_round_trip() {
         let e = rt_event(EventPayload::NetworkSample {
-            iface: "eth0".into(),
+            iface_name_id: 5,
             rx_bps: 1,
             tx_bps: 2,
             rx_pps: 3,
@@ -2007,7 +2013,7 @@ mod tests {
                 watts: 220.0,
             }),
             rt_event(EventPayload::NetworkSample {
-                iface: "eth0".into(),
+                iface_name_id: 0,
                 rx_bps: 1000,
                 tx_bps: 2000,
                 rx_pps: 10,

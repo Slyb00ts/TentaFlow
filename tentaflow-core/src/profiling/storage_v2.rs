@@ -432,17 +432,28 @@ impl ProfileStorageV2 {
 // -----------------------------------------------------------------------------
 
 async fn compute_dir_size(dir: &Path) -> Result<u64, StorageError> {
+    // Whole walk runs on the blocking pool: sessions with thousands of raw
+    // files would otherwise issue thousands of `tokio::fs` calls (each
+    // `spawn_blocking` round-trip) and stall the runtime worker.
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || compute_dir_size_sync(&dir))
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("join: {e}"))))?
+}
+
+fn compute_dir_size_sync(dir: &Path) -> Result<u64, StorageError> {
     let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
     let mut total: u64 = 0;
     while let Some(d) = stack.pop() {
-        let mut rd = match fs::read_dir(&d).await {
+        let rd = match std::fs::read_dir(&d) {
             Ok(r) => r,
             // A symlink or vanished entry should not abort accounting.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(StorageError::Io(e)),
         };
-        while let Some(entry) = rd.next_entry().await? {
-            let md = fs::symlink_metadata(entry.path()).await?;
+        for entry in rd {
+            let entry = entry?;
+            let md = std::fs::symlink_metadata(entry.path())?;
             let ft = md.file_type();
             if ft.is_symlink() {
                 // Skip symlinks — anti-traversal guard, also prevents double counting.

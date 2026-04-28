@@ -11,12 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{oneshot, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use tentaflow_protocol::profiling::{
     ClockSamples, CollectorRunInfo, CollectorStatus, DriftReport, EventCategory, EventPayload,
-    ProfileReportV2, ProfileScope, TimelineEvent, DRIFT_TOLERANCE_NS,
+    Frame, ProfileReportV2, ProfileScope, TimelineEvent, DRIFT_TOLERANCE_NS,
     PROFILE_REPORT_V2_SCHEMA_VERSION,
 };
 
@@ -453,23 +453,54 @@ impl MultiSourceSession {
 
         let duration_ns = state.t0_instant.elapsed().as_nanos() as u64;
 
-        // Stop each collector synchronously inside spawn_blocking and gather raw captures.
+        // Preserve the original collector order so source_idx assignments stay
+        // deterministic regardless of how `JoinSet` happens to schedule tasks.
+        let collector_order: Vec<String> = state.running.keys().cloned().collect();
+
+        // Phase 1: stop every collector concurrently on the blocking pool.
+        // For 17 collectors with 50–500 ms shutdown cost each this turns a
+        // sequential ~8 s tail into the time of the slowest single stop.
+        let mut stop_set: JoinSet<(String, Result<crate::profiling::collectors::RawCapture, String>)> =
+            JoinSet::new();
+        for (id, handle) in state.running {
+            stop_set.spawn_blocking(move || {
+                let res = match handle.stop() {
+                    Ok(rc) => Ok(rc),
+                    Err(e) => Err(e.to_string()),
+                };
+                (id, res)
+            });
+        }
+        let mut raw_by_id: HashMap<
+            String,
+            Result<crate::profiling::collectors::RawCapture, String>,
+        > = HashMap::with_capacity(collector_order.len());
+        while let Some(joined) = stop_set.join_next().await {
+            match joined {
+                Ok((id, res)) => {
+                    raw_by_id.insert(id, res);
+                }
+                Err(e) => {
+                    // The join itself failed (panic/cancel). We cannot map it
+                    // to a specific collector id, so record under a synthetic
+                    // key that the merge loop will surface as a warning row.
+                    let id = format!("unknown.collector.join_failure.{}", raw_by_id.len());
+                    raw_by_id.insert(id, Err(format!("join: {e}")));
+                }
+            }
+        }
         let mut raw_results: Vec<(
             String,
             Result<crate::profiling::collectors::RawCapture, String>,
-        )> = Vec::new();
-        for (id, handle) in state.running {
-            let id_clone = id.clone();
-            let res = tokio::task::spawn_blocking(move || handle.stop())
-                .await
-                .map_err(|e| format!("join: {e}"));
-            let mapped: Result<crate::profiling::collectors::RawCapture, String> = match res {
-                Ok(Ok(rc)) => Ok(rc),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(e) => Err(e),
-            };
-            raw_results.push((id_clone, mapped));
+        )> = Vec::with_capacity(collector_order.len());
+        for id in &collector_order {
+            if let Some(r) = raw_by_id.remove(id) {
+                raw_results.push((id.clone(), r));
+            }
         }
+        // Append any leftover entries (e.g. join_failure synthetic ids) so
+        // they still surface as warnings later.
+        raw_results.extend(raw_by_id);
 
         // Per-collector parse with local interners. Then merge.
         let mut final_names = NameInterner::new();
@@ -491,7 +522,144 @@ impl MultiSourceSession {
             idx_of.insert(id.clone(), i_u16);
         }
 
+        // Phase 2: pre-resolve raw_dir for every collector that produced a
+        // capture. Resolving sequentially is cheap (each call is a couple of
+        // mkdir-p + symlink_metadata) — concurrency would only add task
+        // overhead. Failures here are non-fatal: parsing continues with raw_size=0.
+        let mut raw_dirs: HashMap<String, std::path::PathBuf> = HashMap::new();
+        for (collector_id, raw_or_err) in raw_results.iter() {
+            if raw_or_err.is_ok() {
+                if let Ok(p) = self
+                    .storage
+                    .collector_raw_dir(&state.node_id, &state.session_id, collector_id)
+                    .await
+                {
+                    raw_dirs.insert(collector_id.clone(), p);
+                }
+            }
+        }
+
+        // Phase 3: parse every successful capture in parallel on the blocking
+        // pool. Each task carries everything it needs (parser, ctx, raw)
+        // and returns its local interners + computed raw_size; the main task
+        // merges the results sequentially (cheap O(events)).
+        struct ParseOutcome {
+            collector_id: String,
+            samples: u64,
+            raw_size: u64,
+            // None = no parser registered (raw artifacts retained, no events).
+            parsed: Option<Result<ParsedFragment, String>>,
+            clock_samples: ClockSamples,
+        }
+        struct ParsedFragment {
+            events: Vec<TimelineEvent>,
+            local_names: Vec<String>,
+            local_frames: Vec<Frame>,
+            local_stacks: Vec<Vec<u32>>,
+        }
+
+        let mut parse_set: JoinSet<ParseOutcome> = JoinSet::new();
+        let mut stop_failures: Vec<(String, String)> = Vec::new();
+
         for (collector_id, raw_or_err) in raw_results {
+            match raw_or_err {
+                Err(err_msg) => {
+                    stop_failures.push((collector_id, err_msg));
+                }
+                Ok(raw) => {
+                    let raw_dir = raw_dirs.get(&collector_id).cloned();
+                    let parser = state.parsers.get(&collector_id);
+                    let ctx = SessionCtx {
+                        session_id: state.session_id.clone(),
+                        t0_monotonic_ns: 0,
+                        t0_wallclock_unix_ns: state.t0_wallclock_unix_ns,
+                        output_dir: raw_dir.clone().unwrap_or_default(),
+                        scope: state.scope.clone(),
+                        target_pid: match state.scope.target {
+                            tentaflow_protocol::profiling::ProfileTarget::Pid(p) => Some(p),
+                            _ => None,
+                        },
+                        elevation: None,
+                        planned_duration_ns: state.planned_duration_ns,
+                    };
+                    parse_set.spawn_blocking(move || {
+                        let samples = raw.samples_observed;
+                        let raw_size = raw_dir
+                            .as_ref()
+                            .and_then(|p| compute_dir_size_blocking(p.clone()).ok())
+                            .unwrap_or(0);
+                        let clock_samples = raw.clock_samples.clone();
+
+                        let parsed = parser.map(|p| {
+                            let mut local_names = NameInterner::new();
+                            let mut local_frames = FrameInterner::new();
+                            match p.parse(raw, &ctx, &mut local_names, &mut local_frames) {
+                                Ok(events) => {
+                                    let names_vec = local_names.into_vec();
+                                    let (frames_vec, stacks_vec) = local_frames.into_parts();
+                                    Ok(ParsedFragment {
+                                        events,
+                                        local_names: names_vec,
+                                        local_frames: frames_vec,
+                                        local_stacks: stacks_vec,
+                                    })
+                                }
+                                Err(e) => Err(e.to_string()),
+                            }
+                        });
+
+                        ParseOutcome {
+                            collector_id,
+                            samples,
+                            raw_size,
+                            parsed,
+                            clock_samples,
+                        }
+                    });
+                }
+            }
+        }
+
+        // Surface stop failures first so their `CollectorRunInfo` rows land
+        // in `collectors_info` before the parse outcomes (preserves the
+        // pre-refactor ordering for downstream consumers).
+        for (collector_id, err_msg) in stop_failures {
+            let primary = state
+                .primary_categories
+                .get(&collector_id)
+                .copied()
+                .unwrap_or(EventCategory::Custom);
+            warnings.push(format!("collector {collector_id} stop failed: {err_msg}"));
+            collectors_info.push(CollectorRunInfo {
+                id: collector_id,
+                status: CollectorStatus::Failed(err_msg),
+                samples_collected: 0,
+                raw_size_bytes: 0,
+                primary_category: primary,
+                duration_ns,
+            });
+        }
+
+        // Collect parse outcomes; we sort by source_idx so the final order
+        // matches the original `source_order` (== `raw_results` order from
+        // phase 1 reconstruction).
+        let mut outcomes: Vec<ParseOutcome> = Vec::new();
+        while let Some(joined) = parse_set.join_next().await {
+            match joined {
+                Ok(o) => outcomes.push(o),
+                Err(e) => warnings.push(format!("parser join failure: {e}")),
+            }
+        }
+        outcomes.sort_by_key(|o| *idx_of.get(&o.collector_id).unwrap_or(&u16::MAX));
+
+        for outcome in outcomes {
+            let ParseOutcome {
+                collector_id,
+                samples,
+                raw_size,
+                parsed,
+                clock_samples,
+            } = outcome;
             let primary = state
                 .primary_categories
                 .get(&collector_id)
@@ -499,122 +667,77 @@ impl MultiSourceSession {
                 .unwrap_or(EventCategory::Custom);
             let source_idx = *idx_of.get(&collector_id).expect("idx populated");
 
-            match raw_or_err {
-                Err(err_msg) => {
-                    warnings.push(format!("collector {collector_id} stop failed: {err_msg}"));
+            per_collector_clocks.push(clock_samples);
+
+            match parsed {
+                Some(Ok(fragment)) => {
+                    let ParsedFragment {
+                        mut events,
+                        local_names,
+                        local_frames,
+                        local_stacks,
+                    } = fragment;
+
+                    let name_remap: Vec<u32> = local_names
+                        .iter()
+                        .map(|s| final_names.intern(s))
+                        .collect();
+                    let frame_remap: Vec<u32> = local_frames
+                        .into_iter()
+                        .map(|f| final_frames.intern_frame(FrameKey::from(f)))
+                        .collect();
+                    let stack_remap: Vec<u32> = local_stacks
+                        .into_iter()
+                        .map(|s| {
+                            let translated: Vec<u32> = s
+                                .into_iter()
+                                .map(|fid| frame_remap[fid as usize])
+                                .collect();
+                            final_frames.intern_stack(translated)
+                        })
+                        .collect();
+
+                    for ev in events.iter_mut() {
+                        ev.source_idx = source_idx;
+                        remap_event_payload(&mut ev.payload, &name_remap, &stack_remap);
+                    }
+
+                    let event_count = events.len();
+                    all_events.append(&mut events);
+
                     collectors_info.push(CollectorRunInfo {
                         id: collector_id,
-                        status: CollectorStatus::Failed(err_msg),
-                        samples_collected: 0,
-                        raw_size_bytes: 0,
+                        status: CollectorStatus::Used,
+                        samples_collected: samples.max(event_count as u64),
+                        raw_size_bytes: raw_size,
                         primary_category: primary,
                         duration_ns,
                     });
                 }
-                Ok(raw) => {
-                    let samples = raw.samples_observed;
-                    let raw_size = self
-                        .storage
-                        .collector_raw_dir(&state.node_id, &state.session_id, &collector_id)
-                        .await
-                        .ok()
-                        .and_then(|p| compute_dir_size_blocking(p).ok())
-                        .unwrap_or(0);
-
-                    per_collector_clocks.push(raw.clock_samples.clone());
-
-                    // Run the parser, if registered, with private interners.
-                    if let Some(parser) = state.parsers.get(&collector_id) {
-                        let ctx = SessionCtx {
-                            session_id: state.session_id.clone(),
-                            t0_monotonic_ns: 0,
-                            t0_wallclock_unix_ns: state.t0_wallclock_unix_ns,
-                            output_dir: self
-                                .storage
-                                .collector_raw_dir(&state.node_id, &state.session_id, &collector_id)
-                                .await?,
-                            scope: state.scope.clone(),
-                            target_pid: match state.scope.target {
-                                tentaflow_protocol::profiling::ProfileTarget::Pid(p) => Some(p),
-                                _ => None,
-                            },
-                            elevation: None,
-                            planned_duration_ns: state.planned_duration_ns,
-                        };
-                        let mut local_names = NameInterner::new();
-                        let mut local_frames = FrameInterner::new();
-                        match parser.parse(raw, &ctx, &mut local_names, &mut local_frames) {
-                            Ok(mut events) => {
-                                let local_names_vec = local_names.into_vec();
-                                let (local_frames_vec, local_stacks_vec) =
-                                    local_frames.into_parts();
-
-                                // Build remap tables: local id -> final id.
-                                let name_remap: Vec<u32> = local_names_vec
-                                    .iter()
-                                    .map(|s| final_names.intern(s))
-                                    .collect();
-
-                                let frame_remap: Vec<u32> = local_frames_vec
-                                    .into_iter()
-                                    .map(|f| final_frames.intern_frame(FrameKey::from(f)))
-                                    .collect();
-
-                                let stack_remap: Vec<u32> = local_stacks_vec
-                                    .into_iter()
-                                    .map(|s| {
-                                        let translated: Vec<u32> = s
-                                            .into_iter()
-                                            .map(|fid| frame_remap[fid as usize])
-                                            .collect();
-                                        final_frames.intern_stack(translated)
-                                    })
-                                    .collect();
-
-                                for ev in events.iter_mut() {
-                                    ev.source_idx = source_idx;
-                                    remap_event_payload(&mut ev.payload, &name_remap, &stack_remap);
-                                }
-
-                                let event_count = events.len();
-                                all_events.append(&mut events);
-
-                                collectors_info.push(CollectorRunInfo {
-                                    id: collector_id,
-                                    status: CollectorStatus::Used,
-                                    samples_collected: samples.max(event_count as u64),
-                                    raw_size_bytes: raw_size,
-                                    primary_category: primary,
-                                    duration_ns,
-                                });
-                            }
-                            Err(e) => {
-                                let msg = format!("parse failed: {e}");
-                                warnings.push(format!("collector {collector_id}: {msg}"));
-                                collectors_info.push(CollectorRunInfo {
-                                    id: collector_id,
-                                    status: CollectorStatus::Failed(msg),
-                                    samples_collected: 0,
-                                    raw_size_bytes: raw_size,
-                                    primary_category: primary,
-                                    duration_ns,
-                                });
-                            }
-                        }
-                    } else {
-                        // No parser registered — record as Used with no events.
-                        warnings.push(format!(
-                            "collector {collector_id}: no parser registered, raw artifacts retained"
-                        ));
-                        collectors_info.push(CollectorRunInfo {
-                            id: collector_id,
-                            status: CollectorStatus::Used,
-                            samples_collected: samples,
-                            raw_size_bytes: raw_size,
-                            primary_category: primary,
-                            duration_ns,
-                        });
-                    }
+                Some(Err(e)) => {
+                    let msg = format!("parse failed: {e}");
+                    warnings.push(format!("collector {collector_id}: {msg}"));
+                    collectors_info.push(CollectorRunInfo {
+                        id: collector_id,
+                        status: CollectorStatus::Failed(msg),
+                        samples_collected: 0,
+                        raw_size_bytes: raw_size,
+                        primary_category: primary,
+                        duration_ns,
+                    });
+                }
+                None => {
+                    warnings.push(format!(
+                        "collector {collector_id}: no parser registered, raw artifacts retained"
+                    ));
+                    collectors_info.push(CollectorRunInfo {
+                        id: collector_id,
+                        status: CollectorStatus::Used,
+                        samples_collected: samples,
+                        raw_size_bytes: raw_size,
+                        primary_category: primary,
+                        duration_ns,
+                    });
                 }
             }
         }
@@ -766,6 +889,16 @@ fn remap_event_payload(payload: &mut EventPayload, name_remap: &[u32], stack_rem
         | EventPayload::Custom { name_id, .. } => {
             if let Some(new_id) = name_remap.get(*name_id as usize) {
                 *name_id = *new_id;
+            }
+        }
+        EventPayload::DiskIoBurst { device_name_id, .. } => {
+            if let Some(new_id) = name_remap.get(*device_name_id as usize) {
+                *device_name_id = *new_id;
+            }
+        }
+        EventPayload::NetworkSample { iface_name_id, .. } => {
+            if let Some(new_id) = name_remap.get(*iface_name_id as usize) {
+                *iface_name_id = *new_id;
             }
         }
         _ => {}
