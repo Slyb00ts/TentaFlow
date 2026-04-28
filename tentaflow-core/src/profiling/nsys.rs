@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -17,7 +17,21 @@ use tentaflow_protocol::profiling::{
 };
 use thiserror::Error;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+/// Process-wide async lock that serialises every `nsys profile` spawn within
+/// this binary. Both the legacy `NsysRunner` and the multi-source
+/// `NvidiaNsysCollector` acquire this lock before spawning a child so that the
+/// two orchestrators cannot launch overlapping captures even if a caller
+/// mistakenly drives both paths concurrently. The guard is held for the entire
+/// session lifetime and dropped when the runner stops or aborts.
+static NSYS_PROCESS_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
+
+/// Returns the shared, process-wide nsys spawn lock. Used by
+/// `collectors::nvidia_nsys` to serialise with the legacy `NsysRunner`.
+pub(crate) fn nsys_process_lock() -> Arc<Mutex<()>> {
+    Arc::clone(&NSYS_PROCESS_LOCK)
+}
 
 use super::parser::parse_nsys_stats_json;
 use super::storage::ProfileStorage;
@@ -54,6 +68,10 @@ pub struct ActiveSession {
 struct ActiveSlot {
     session: ActiveSession,
     child: Child,
+    /// Held for the duration of the session — released on `stop` / drop so the
+    /// process-wide nsys lock becomes available to the next caller (legacy or
+    /// multi-source).
+    _process_guard: OwnedMutexGuard<()>,
 }
 
 #[derive(Error, Debug)]
@@ -145,6 +163,14 @@ impl NsysRunner {
             return Err(ProfilingError::Busy);
         }
 
+        // Try to acquire the process-wide nsys lock without blocking; another
+        // orchestrator (multi-source collector) holding it means an nsys child
+        // is already in flight from a parallel code path.
+        let process_guard = match Arc::clone(&NSYS_PROCESS_LOCK).try_lock_owned() {
+            Ok(g) => g,
+            Err(_) => return Err(ProfilingError::Busy),
+        };
+
         let (session_id, output_path) = storage.allocate(&label, &scope)?;
         let args = build_nsys_args(&scope, &output_path);
 
@@ -174,7 +200,11 @@ impl NsysRunner {
             auto_stop_at,
         };
 
-        *slot = Some(ActiveSlot { session, child });
+        *slot = Some(ActiveSlot {
+            session,
+            child,
+            _process_guard: process_guard,
+        });
         Ok((session_id, started_at_ms))
     }
 
@@ -197,6 +227,7 @@ impl NsysRunner {
         let ActiveSlot {
             session,
             mut child,
+            _process_guard,
         } = slot;
         // Lock zwolniony przed dlugotrwalym parsowaniem — kolejny start moze
         // wystartowac jak tylko stop dolaczy proces dziecka.
@@ -232,7 +263,7 @@ impl NsysRunner {
 
 /// Buduje argumenty `nsys profile` dla danego `NsightScope`. Output_path jest
 /// jedynym argumentem branym z zewnatrz — walidowany przez storage przed wywolaniem.
-fn build_nsys_args(scope: &NsightScope, output_path: &Path) -> Vec<String> {
+pub(crate) fn build_nsys_args(scope: &NsightScope, output_path: &Path) -> Vec<String> {
     let out = output_path.to_string_lossy().to_string();
     match scope {
         NsightScope::Cpu => vec![
@@ -360,7 +391,7 @@ fn unix_ms_now() -> u64 {
 /// przy CTRL_BREAK, ale do tego potrzebujemy job object — pozostawiamy proste
 /// zabicie procesu jako kompromis).
 #[cfg(unix)]
-fn send_sigterm(pid: u32) {
+pub(crate) fn send_sigterm(pid: u32) {
     if pid == 0 {
         return;
     }
@@ -371,7 +402,7 @@ fn send_sigterm(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn send_sigterm(_pid: u32) {
+pub(crate) fn send_sigterm(_pid: u32) {
     // Windows: brak SIGTERM. nsys na windowsach trzeba zatrzymywac przez `nsys stop`
     // albo CTRL_BREAK_EVENT na grupie procesow. Brak osobnego job object oznacza
     // ze tu polegamy na `kill_on_drop(true)` w spawnie + child.start_kill() ktore
@@ -391,9 +422,9 @@ pub(crate) fn nsys_binary() -> Option<&'static Path> {
             let resolved = resolve_nsys_path();
             match resolved.as_ref() {
                 Some(p) => tracing::info!(path = %p.display(), "nsys binary discovered"),
-                None => tracing::warn!(
-                    "nsys binary not found in PATH or standard NVIDIA locations"
-                ),
+                None => {
+                    tracing::warn!("nsys binary not found in PATH or standard NVIDIA locations")
+                }
             }
             resolved
         })
@@ -554,7 +585,7 @@ pub(crate) fn nsys_command() -> Result<Command, ProfilingError> {
 
 /// Bezposrednie wywolanie `nsys --version` — uzywane przez `capability()` i
 /// publicznie eksportowane przez `detect_capability` (dla collectora mesh).
-async fn probe_capability() -> NsysCapability {
+pub(crate) async fn probe_capability() -> NsysCapability {
     let Some(path) = nsys_binary() else {
         return NsysCapability {
             available: false,
@@ -689,7 +720,12 @@ mod tests {
         let storage = ProfileStorage::new(tmp.path(), "n");
         // Wymusza walidacje duration PRZED probami spawnu nsys.
         let err = runner
-            .start(NsightScope::Cpu, MAX_DURATION_SECS + 1, "x".into(), &storage)
+            .start(
+                NsightScope::Cpu,
+                MAX_DURATION_SECS + 1,
+                "x".into(),
+                &storage,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ProfilingError::InvalidDuration(_)));
