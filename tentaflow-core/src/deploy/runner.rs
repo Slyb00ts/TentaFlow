@@ -1652,16 +1652,28 @@ async fn do_python_bundle_native_deploy(
             &format!("silnik odpowiedzial na {} — gotowy", health_url),
         );
     } else {
-        log_line(
-            db,
-            deploy_id,
-            tx,
-            "log",
-            &format!(
-                "timeout {}s czekania na /v1/models — silnik startuje dalej w tle, sprawdz Services",
-                health_timeout_secs
-            ),
+        // BLAD: silnik nie odpowiedzial w timeoucie. Nie rejestrujemy HTTP backendu
+        // bo router bedzie strzelal w martwy port (ECONNREFUSED) i wszystkie
+        // requesty bedą padaly. User musi zobaczyc deploy=failed z czytelnym
+        // komunikatem, sprawdzic logi engine.log w venv_dir i naprawic.
+        let log_path = running.venv_dir.join("engine.log");
+        let last_log = std::fs::read_to_string(&log_path)
+            .ok()
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().rev().take(20).collect();
+                lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+            })
+            .unwrap_or_else(|| format!("(brak {})", log_path.display()));
+        let err = format!(
+            "Bundle nie odpowiedzial na {} po {}s. Ostatnie 20 linii engine.log:\n{}",
+            health_url, health_timeout_secs, last_log
         );
+        log_line(db, deploy_id, tx, "log", &err);
+        // Zabij proces zeby nie zostawic zombie zajmujacego port
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        return Err(anyhow!(err));
     }
 
     phase(
@@ -1704,27 +1716,20 @@ async fn do_python_bundle_native_deploy(
     )?;
 
     // Wpis w tabeli `models` zeby GUI -> Models pokazal silnik po deployu.
-    // Dotad robily to tylko embedded branche (whisper/kokoro/apple-tts/sherpa/
-    // vision) — python-bundle deploy zapisywal tylko `services` i model byl
-    // niewidoczny w GUI Models view mimo dzialajacego serwisu.
-    let registry_name = if model_repo.is_empty() {
-        service_name.clone()
-    } else {
-        model_repo.clone()
-    };
-    let registry_display = if model_repo.is_empty() {
-        format!("{} (native)", engine.engine_id)
-    } else {
-        format!("{} ({})", engine.engine_id, model_repo)
-    };
-    ensure_model_registry_entry(
-        db,
-        &registry_name,
-        &registry_display,
-        &engine.category,
-        service_id,
-        &config_json,
-    );
+    // TYLKO gdy mamy prawdziwa nazwe modelu (HF repo). Bez tego GUI Models
+    // pokazywal nazwy serwisow (np. "tentaflow-vllm-9k5p0") jako modele -
+    // mylace dla usera, bo to jest service identifier nie model.
+    if !model_repo.is_empty() {
+        let display = format!("{} ({})", engine.engine_id, model_repo);
+        ensure_model_registry_entry(
+            db,
+            &model_repo,
+            &display,
+            &engine.category,
+            service_id,
+            &config_json,
+        );
+    }
 
     // Natychmiastowa rejestracja w ServiceManager — router zacznie routowac
     // /v1/chat/completions (i inne OpenAI endpointy) do naszego vLLM-Metal
