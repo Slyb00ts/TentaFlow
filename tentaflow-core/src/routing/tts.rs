@@ -126,6 +126,29 @@ impl Router {
                             // streama (np. blocking sciezka z dashboardu).
                             Ok(samples_to_wav_pcm16(&samples, sr))
                         }
+                        BackendHandle::Http(name) => {
+                            // Python-bundle TTS (chatterbox-mlx, kyutai-tts,
+                            // voxcpm, xtts) wystawiaja OpenAI-compatible
+                            // POST /v1/audio/speech. BackendClient z
+                            // register_native_http_backend ma juz zbudowany
+                            // audio_speech_url, model_name_override i auth.
+                            let backend = this.select_http_backend(name)
+                                .ok_or_else(|| anyhow::anyhow!("Brak HTTP backendow dla {}", name))?;
+                            debug!(
+                                "Using HTTP TTS backend: {} (url={})",
+                                name, backend.url()
+                            );
+                            // Skopiuj request bez `Cow` borrow — BackendClient
+                            // wykonuje async POST i potrzebuje 'static fields.
+                            let req = crate::api::openai::types::TTSRequest {
+                                model: model_c.clone(),
+                                input: input_c.clone(),
+                                voice: voice_c.clone(),
+                                response_format: Some(format_c.clone()),
+                                speed: Some(speed),
+                            };
+                            backend.audio_speech(&req).await
+                        }
                         BackendHandle::QuicTts(name) => {
                             let quic_client = this
                                 .service_manager
