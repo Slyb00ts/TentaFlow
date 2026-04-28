@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -147,7 +148,8 @@ impl NsysRunner {
         let (session_id, output_path) = storage.allocate(&label, &scope)?;
         let args = build_nsys_args(&scope, &output_path);
 
-        let child = Command::new("nsys")
+        let nsys_path = nsys_binary().ok_or(ProfilingError::NotAvailable)?;
+        let child = Command::new(nsys_path)
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -376,10 +378,190 @@ fn send_sigterm(_pid: u32) {
     // zostalo juz wywolane przed `wait()` w stop().
 }
 
+/// Cache wyniku auto-discovery binarki nsys. `None` oznacza ze nie znaleziono
+/// w PATH ani w typowych lokacjach NVIDIA — caly modul wtedy degraduje do
+/// `available: false` zamiast zwracac bledy spawnu.
+static NSYS_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Zwraca sciezke do nsys (cached). Pierwsze wywolanie odpala discovery i
+/// loguje wynik raz na cykl zycia procesu.
+pub(crate) fn nsys_binary() -> Option<&'static Path> {
+    NSYS_BINARY
+        .get_or_init(|| {
+            let resolved = resolve_nsys_path();
+            match resolved.as_ref() {
+                Some(p) => tracing::info!(path = %p.display(), "nsys binary discovered"),
+                None => tracing::warn!(
+                    "nsys binary not found in PATH or standard NVIDIA locations"
+                ),
+            }
+            resolved
+        })
+        .as_deref()
+}
+
+/// Sprawdza ze plik istnieje i (na unix) ma bit wykonywalny.
+fn is_executable_file(p: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Listuje `nsys` (i `nsys.exe` na windowsach) wewnatrz katalogu jezeli
+/// istnieje i jest wykonywalny. Zwraca pierwszego trafionego.
+fn nsys_in_dir(dir: &Path) -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["nsys.exe", "nsys"]
+    } else {
+        &["nsys"]
+    };
+    for n in names {
+        let candidate = dir.join(n);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Wlasciwa logika discovery — najpierw PATH, potem typowe lokacje NVIDIA.
+fn resolve_nsys_path() -> Option<PathBuf> {
+    // 1. PATH split — implementacja `which nsys` zeby uniknac dodatkowej zaleznosci.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Some(found) = nsys_in_dir(&dir) {
+                return Some(found);
+            }
+        }
+    }
+
+    // 2. Stale fixed kandydaci (Linux/DGX). NVIDIA installer zwykle laduje
+    //    nsys w jednym z ponizszych miejsc — szukamy zanim spadniemy do glob'a.
+    #[cfg(target_os = "linux")]
+    {
+        let fixed = [
+            "/usr/local/cuda/bin/nsys",
+            "/usr/local/cuda-13.2/bin/nsys",
+            "/usr/local/cuda-13.0/bin/nsys",
+            "/usr/local/cuda-12.6/bin/nsys",
+            "/usr/local/cuda-12.4/bin/nsys",
+        ];
+        for p in fixed {
+            let candidate = PathBuf::from(p);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+
+        // 3. Glob /opt/nvidia/nsight-systems/<ver>/bin/nsys oraz wariant
+        //    host-linux-x64 ze starszego installera. Sortujemy malejaco po
+        //    nazwie zeby najnowsza wersja wygrala.
+        if let Some(found) = scan_versioned_dir(
+            Path::new("/opt/nvidia/nsight-systems"),
+            &[Path::new("bin"), Path::new("host-linux-x64")],
+        ) {
+            return Some(found);
+        }
+
+        // 4. Glob /usr/local/cuda-*/bin/nsys (cuda toolkit per-wersja).
+        if let Ok(rd) = std::fs::read_dir("/usr/local") {
+            let mut cuda_dirs: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("cuda-"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            cuda_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            for d in cuda_dirs {
+                if let Some(found) = nsys_in_dir(&d.join("bin")) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let root = Path::new("C:\\Program Files\\NVIDIA Corporation");
+        if let Ok(rd) = std::fs::read_dir(root) {
+            let mut dirs: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("Nsight Systems"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            for d in dirs {
+                if let Some(found) = nsys_in_dir(&d.join("target-windows-x64")) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Skanuje `root/<wersja>/<subdir>/nsys` i zwraca najnowsza (lex desc)
+/// znaleziona binarke. Uzywane dla `/opt/nvidia/nsight-systems`.
+#[cfg(target_os = "linux")]
+fn scan_versioned_dir(root: &Path, subdirs: &[&Path]) -> Option<PathBuf> {
+    let rd = std::fs::read_dir(root).ok()?;
+    let mut versions: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    // Najnowsza wersja pierwsza (sortowanie malejace po nazwie katalogu).
+    versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    for v in versions {
+        for sub in subdirs {
+            if let Some(found) = nsys_in_dir(&v.join(sub)) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Tworzy `tokio::process::Command` z rozwiazana sciezka nsys. Zwraca
+/// `NotAvailable` gdy auto-discovery nie znalazlo binarki — uzywane przez
+/// parser i timeline (poza modulem `nsys`).
+pub(crate) fn nsys_command() -> Result<Command, ProfilingError> {
+    let path = nsys_binary().ok_or(ProfilingError::NotAvailable)?;
+    Ok(Command::new(path))
+}
+
 /// Bezposrednie wywolanie `nsys --version` — uzywane przez `capability()` i
 /// publicznie eksportowane przez `detect_capability` (dla collectora mesh).
 async fn probe_capability() -> NsysCapability {
-    let output = match Command::new("nsys").arg("--version").output().await {
+    let Some(path) = nsys_binary() else {
+        return NsysCapability {
+            available: false,
+            version: String::new(),
+        };
+    };
+    let output = match Command::new(path).arg("--version").output().await {
         Ok(o) => o,
         Err(_) => {
             return NsysCapability {
@@ -511,6 +693,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProfilingError::InvalidDuration(_)));
+    }
+
+    /// Sanity check: gdy PATH jest pusty i zadne fixed lokacje NVIDIA nie
+    /// istnieja (CI bez CUDA toolkit), `resolve_nsys_path` zwraca `None`
+    /// zamiast panikowac. Happy path zalezy od srodowiska, wiec nietestowany.
+    #[test]
+    fn resolve_nsys_path_handles_missing_path_gracefully() {
+        // SAFETY: test single-threaded modyfikuje ENV — cargo test domyslnie
+        // odpala testy w watkach, ale brak innych testow ktore czytaja PATH.
+        let saved = std::env::var_os("PATH");
+        // SAFETY: zmiana ENV jest unsafe od Rust 1.83 ze wzgledu na warunki
+        // wyscigu z innymi watkami; izolujemy w pojedynczym tescie.
+        unsafe {
+            std::env::set_var("PATH", "");
+        }
+        let result = resolve_nsys_path();
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        // Wynik moze byc Some jezeli na maszynie testowej istnieje
+        // /usr/local/cuda/bin/nsys — wtedy chcemy sprawdzic ze sciezka jest
+        // poprawna. W innym wypadku oczekujemy None bez paniki.
+        if let Some(p) = result {
+            assert!(p.exists(), "resolved path must exist if returned");
+        }
     }
 
     /// Test sprawdza Busy semantyke — wymaga zywego nsys i jest `#[ignore]`

@@ -10,9 +10,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 use tentaflow_protocol::profiling::{GpuUtilSample, GpuUtilSeries, NsightGpuTarget};
-use tokio::process::Command;
-
-use super::nsys::ProfilingError;
+use super::nsys::{nsys_command, ProfilingError};
 
 /// Surowa probka odczytana z SQLite — 1 wiersz `GPU_METRICS`.
 #[derive(Debug, Clone)]
@@ -44,7 +42,7 @@ pub(crate) async fn extract_gpu_timeline(
     let sqlite_path = rep_path.with_extension("sqlite");
 
     if !sqlite_path.exists() {
-        let output = Command::new("nsys")
+        let output = nsys_command()?
             .args(["export", "--type", "sqlite", "--output"])
             .arg(&sqlite_path)
             .arg(rep_path)
