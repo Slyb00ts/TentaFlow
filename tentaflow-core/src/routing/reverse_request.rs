@@ -627,6 +627,27 @@ pub async fn dispatch_reverse_request(
                 timestamp_ms: event.timestamp_ms,
                 payload: event.payload.clone(),
             };
+            // VideoFrame wyzwala vision pipeline (face → emotion + age/gender)
+            // — wynik leci jako osobny event `ParticipantAttributes` na ten
+            // sam broadcast bus. Pipeline ma własny throttle 1 inf/2s per
+            // uczestnik, więc bezpiecznie wołamy go na każdy frame.
+            if let tentaflow_protocol::MeetingEventPayload::VideoFrame {
+                participant_id,
+                name,
+                ts_ms,
+                jpeg,
+            } = &live_event.payload
+            {
+                crate::routing::video_pipeline::maybe_spawn_inference(
+                    pool.clone(),
+                    live_event.meeting_key.clone(),
+                    live_event.timestamp_ms,
+                    participant_id.clone(),
+                    name.clone(),
+                    *ts_ms,
+                    jpeg.clone(),
+                );
+            }
             match persist_meeting_event(pool, event) {
                 Ok(()) => {
                     crate::dispatch::meeting_live_broadcast::publish(live_event);
@@ -916,6 +937,17 @@ fn persist_meeting_event(
                 name,
                 ts_ms,
                 jpeg.len()
+            );
+        }
+        // ParticipantAttributes: w obecnym pipeline emitowany WYŁĄCZNIE przez
+        // `routing::video_pipeline` po inferencji vision modeli, czyli nigdy
+        // nie wpada tutaj jako reverse request od bota. Branch zachowany
+        // wyłącznie dla wyczerpania match'a — bot nie pcha takich eventów,
+        // a debug log byłby logiem-fantomem.
+        MeetingEventPayload::ParticipantAttributes { participant_id, .. } => {
+            debug!(
+                "MeetingEvent ParticipantAttributes (nieoczekiwany od bota): meeting_key={} participant={}",
+                event.meeting_key, participant_id
             );
         }
         MeetingEventPayload::LifecycleUpdate { stage, details } => {

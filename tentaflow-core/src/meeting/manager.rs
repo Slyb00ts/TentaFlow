@@ -82,6 +82,14 @@ pub const DEFAULT_SUMMARIZATION_ALIAS: &str = "teams-summarization";
 pub const DEFAULT_TTS_ALIAS: &str = "teams-tts";
 pub const DEFAULT_FLOW_ALIAS: &str = "teams-flow";
 pub const DEFAULT_LLM_ALIAS: &str = "teams-llm";
+/// Aliasy vision dla sesji meeting bota — face detection (SCRFD/YOLOv8-Face),
+/// emotion classifier (HSEmotion/EmoNet) i age+gender (MiVOLO). Pipeline
+/// per-uczestnik w `routing/reverse_request.rs::VideoFrame` rozwiązuje te
+/// aliasy do `service_name` zarejestrowanego w `vision::registry`. Pusty
+/// target = pipeline pomija inferencję (debug log), nie panikuje.
+pub const DEFAULT_VISION_FACE_ALIAS: &str = "teams-vision-face";
+pub const DEFAULT_VISION_EMOTION_ALIAS: &str = "teams-vision-emotion";
+pub const DEFAULT_VISION_AGE_ALIAS: &str = "teams-vision-age";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDescriptor {

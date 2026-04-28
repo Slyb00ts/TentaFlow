@@ -1284,6 +1284,41 @@ async fn do_embedded_native_deploy(
                 vec![std::fs::metadata(&model_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0)],
             );
 
+            // Auto-wiązanie aliasów teams-vision-* — pipeline meeting bota
+            // (`reverse_request.rs::VideoFrame`) rozwiązuje te aliasy do
+            // konkretnego service_name. Bez tego wymagałoby ręcznej konfiguracji
+            // po każdym deployu silnika vision. Mapowanie engine_id → alias:
+            //   SCRFD / YOLOv8-Face → teams-vision-face
+            //   HSEmotion / EmoNet  → teams-vision-emotion
+            //   MiVOLO              → teams-vision-age (zawiera też płeć)
+            match engine_id {
+                "scrfd" | "yolov8-face" => {
+                    auto_bind_teams_alias_if_empty(
+                        db,
+                        crate::meeting::manager::DEFAULT_VISION_FACE_ALIAS,
+                        &service_name,
+                        router,
+                    );
+                }
+                "hsemotion" | "emonet" => {
+                    auto_bind_teams_alias_if_empty(
+                        db,
+                        crate::meeting::manager::DEFAULT_VISION_EMOTION_ALIAS,
+                        &service_name,
+                        router,
+                    );
+                }
+                "mivolo" => {
+                    auto_bind_teams_alias_if_empty(
+                        db,
+                        crate::meeting::manager::DEFAULT_VISION_AGE_ALIAS,
+                        &service_name,
+                        router,
+                    );
+                }
+                _ => {}
+            }
+
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
 
             log_line(

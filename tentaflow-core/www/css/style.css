@@ -2112,6 +2112,71 @@ input, textarea, select {
 /* Profile button na karcie GPU */
 .gpu-card .card-head tf-button { flex-shrink: 0; }
 
+/* Karta z instrukcja instalacji nsys gdy NVIDIA GPU jest, ale brak nsys w PATH.
+   Border-left w kolorze warn rozni ja wizualnie od kart z danymi sesji. */
+.nsight-install-card {
+  margin-top: 12px;
+  padding: 14px 16px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn, orange);
+  border-radius: 6px;
+}
+.nsight-install-card h3.mesh-section-title { margin: 0 0 6px 0; }
+.nsight-install-desc {
+  margin: 0 0 12px 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.nsight-install-cmd-row { margin-bottom: 10px; }
+.nsight-install-cmd-row:last-of-type { margin-bottom: 0; }
+.nsight-install-cmd-label {
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+.nsight-install-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: 'SF Mono', Consolas, monospace;
+  font-size: 12px;
+}
+.nsight-install-cmd code {
+  flex: 1;
+  background: transparent;
+  color: var(--text-1);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.nsight-install-cmd tf-button { flex-shrink: 0; }
+.nsight-install-cmd-windows {
+  font-family: 'SF Mono', Consolas, monospace;
+  font-size: 12px;
+  padding: 6px 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.nsight-install-warn {
+  padding: 8px 10px;
+  background: var(--bg-3);
+  border-radius: 4px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.nsight-install-docs { margin-top: 10px; font-size: 11px; }
+.nsight-install-docs a { color: var(--accent-2); text-decoration: none; }
+.nsight-install-docs a:hover { text-decoration: underline; }
+
 /* Network interfaces */
 .network-card { padding: 0; }
 .net-row {

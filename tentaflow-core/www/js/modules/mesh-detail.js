@@ -27,6 +27,7 @@ import {
   topbarHtml as nsightTopbarHtml,
   gpuProfileButtonHtml as nsightGpuProfileButtonHtml,
   sessionsSectionHtml as nsightSessionsSectionHtml,
+  nsightInstallHintHtml,
   bindNsightActions,
 } from '/js/modules/mesh-detail-nsight.js';
 
@@ -570,11 +571,12 @@ function renderGpus(n) {
 }
 
 function renderProfilingWrap(n) {
-  const html = nsightSessionsSectionHtml(n);
-  if (!html) return '';
-  // Nsight modul zwraca wlasny <h3> + <div class="mesh-detail-card sessions-card">...</div>.
-  // Owijamy to w nasza section card, zeby header byl spojny ze stylem (uppercase accent-2).
-  return `<div class="nd-section">${html}</div>`;
+  const sessionsHtml = nsightSessionsSectionHtml(n);
+  const installHtml = nsightInstallHintHtml(n);
+  // Sessions widoczne tylko gdy nsys dziala. Install hint widoczny tylko gdy
+  // jest NVIDIA + brak nsys. Nigdy nie pokazemy obu naraz.
+  if (!sessionsHtml && !installHtml) return '';
+  return `<div class="nd-section">${sessionsHtml}${installHtml}</div>`;
 }
 
 function renderNetwork(n) {

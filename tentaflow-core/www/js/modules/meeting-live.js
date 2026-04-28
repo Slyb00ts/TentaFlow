@@ -391,6 +391,50 @@ function applyLiveEvent(timestampMs, type, data) {
       state.lifecycleDetails = data.details ? String(data.details) : '';
       break;
     }
+    case 'ParticipantAttributes': {
+      // Pipeline rozpoznawania emocji + wieku + płci. `participantId` z DOM
+      // Teams (typowo = display name) — `state.participants` jest jednak
+      // kluczowane po `speakerId` z diarization, więc dopasowujemy po
+      // nazwie. Dla wieloosobowego rosteru dopasowanie po name jest
+      // wystarczające dopóki dwóch uczestników nie ma identycznego
+      // displayName (Teams sam ich rozróżnia "Jan Kowalski" vs "Jan
+      // Kowalski (Guest)").
+      const haystack = String(data.name || data.participantId || '').trim().toLowerCase();
+      if (!haystack) break;
+      let target = null;
+      for (const p of state.participants.values()) {
+        const candidate = String(p.speakerName || p.speakerId || '').trim().toLowerCase();
+        if (candidate && candidate === haystack) {
+          target = p;
+          break;
+        }
+      }
+      if (!target) {
+        // Brak dopasowania w roster — dorzucamy tymczasowy wpis pod
+        // participantId, żeby badge mógł się pokazać zanim TranscriptEntry
+        // założy realny rekord po speakerId. RosterSnapshot i tak go
+        // potem nadpisze — tracimy tylko atrybuty na <=1 cykl.
+        const id = String(data.participantId || haystack);
+        target = {
+          speakerId: id,
+          speakerName: data.name || id,
+          isEnrolled: false,
+          status: 'joined',
+          lastSpokenAt: 0,
+        };
+        state.participants.set(id, target);
+      }
+      target.emotion = data.emotion || null;
+      target.emotionConfidence = typeof data.emotionConfidence === 'number'
+        ? data.emotionConfidence
+        : null;
+      target.age = typeof data.age === 'number' ? data.age : null;
+      target.genderMaleProb = typeof data.genderMaleProb === 'number'
+        ? data.genderMaleProb
+        : null;
+      target.attributesUpdatedAt = timestampMs;
+      break;
+    }
     default:
       // Nieznane warianty ignorujemy (forward-compat).
       break;
@@ -771,6 +815,24 @@ function renderParticipantsCard() {
   `;
 }
 
+// Mapowanie 8-klasowego AffectNet HSEmotion → emoji + tło badge'a. Kolejność
+// i nazwy zgodne z `EMOTION_LABELS` w `tentaflow-core/src/vision/hsemotion.rs`.
+const EMOTION_VISUAL = {
+  Happiness: { emoji: '😊', bg: '#10b981' },
+  Neutral:   { emoji: '😐', bg: '#6b7280' },
+  Sadness:   { emoji: '😢', bg: '#3b82f6' },
+  Surprise:  { emoji: '😲', bg: '#f59e0b' },
+  Fear:      { emoji: '😨', bg: '#8b5cf6' },
+  Anger:     { emoji: '😠', bg: '#ef4444' },
+  Disgust:   { emoji: '🤢', bg: '#84cc16' },
+  Contempt:  { emoji: '😒', bg: '#a16207' },
+};
+
+// Atrybuty starsze niż 5 s traktujemy jako "stale" — stale visual hint
+// (przyciemnione) bez całkowitego ukrywania, bo throttle vision pipeline
+// to 2 s i naturalnie zostawia okno bez świeżego sygnału.
+const ATTRIBUTES_STALE_AFTER_MS = 5_000;
+
 function renderParticipantRow(p) {
   const speakingNow = p.status === 'active_now' && (Date.now() - (p.lastSpokenAt || 0) < 5000);
   const sub = speakingNow
@@ -782,12 +844,47 @@ function renderParticipantRow(p) {
   const avatarClass = p.isEnrolled ? 'p-avatar' : 'p-avatar unknown';
   const rowClass = speakingNow ? 'meet-participant speaking' : 'meet-participant';
   const micSvg = '<svg class="p-mic" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>';
+
+  // Vision pipeline overlay: badge emocji nad awatarem + chip wiek/płeć
+  // pod nazwą. Renderujemy tylko gdy mamy aktualne dane — brak pól =
+  // tradycyjny widok bez badge'a.
+  const stale = p.attributesUpdatedAt
+    ? (Date.now() - p.attributesUpdatedAt) > ATTRIBUTES_STALE_AFTER_MS
+    : false;
+  const staleClass = stale ? ' stale' : '';
+  let emotionBadge = '';
+  if (p.emotion && EMOTION_VISUAL[p.emotion]) {
+    const v = EMOTION_VISUAL[p.emotion];
+    const conf = typeof p.emotionConfidence === 'number'
+      ? `${(p.emotionConfidence * 100).toFixed(0)}%`
+      : '';
+    const title = `${p.emotion}${conf ? ' ' + conf : ''}`;
+    emotionBadge = `<span class="p-emotion-badge${staleClass}" style="background:${v.bg}" title="${escapeAttr(title)}">${v.emoji}</span>`;
+  }
+  let attrsLine = '';
+  if (p.age != null || p.genderMaleProb != null) {
+    const parts = [];
+    if (typeof p.age === 'number') {
+      parts.push(`<span class="p-attr-age">~${Math.round(p.age)} ${I18n.t('meeting.live.attr_years_short')}</span>`);
+    }
+    if (typeof p.genderMaleProb === 'number') {
+      const isMale = p.genderMaleProb > 0.5;
+      const symbol = isMale ? '♂' : '♀';
+      parts.push(`<span class="p-attr-gender">${symbol}</span>`);
+    }
+    attrsLine = `<div class="p-attrs${staleClass}">${parts.join('')}</div>`;
+  }
+
   return `
     <div class="${rowClass}">
-      <div class="${avatarClass}">${escapeHtml(initials)}</div>
+      <div class="p-avatar-wrap">
+        <div class="${avatarClass}">${escapeHtml(initials)}</div>
+        ${emotionBadge}
+      </div>
       <div class="p-meta">
         <div class="p-name">${escapeHtml(p.speakerName || p.speakerId || '?')}</div>
         <div class="p-sub">${sub}</div>
+        ${attrsLine}
       </div>
       ${micSvg}
     </div>
