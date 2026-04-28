@@ -101,6 +101,28 @@ impl CollectorRegistry {
     pub fn is_empty(&self) -> bool {
         self.collectors.is_empty()
     }
+
+    /// Probe each registered collector and return the ids of every collector
+    /// reporting `Available` or `NeedsElevation` (i.e. potentially runnable on
+    /// this host). Used by heartbeat advertisement so peers know upfront which
+    /// data sources a node can actually offer.
+    pub fn probe_available_ids(registry: &Self) -> Vec<String> {
+        registry
+            .collectors
+            .iter()
+            .filter(|c| {
+                if !c.capability().platforms.supports_current() {
+                    return false;
+                }
+                matches!(
+                    c.probe(),
+                    super::ProbeResult::Available { .. }
+                        | super::ProbeResult::NeedsElevation { .. }
+                )
+            })
+            .map(|c| c.id().to_string())
+            .collect()
+    }
 }
 
 impl Default for CollectorRegistry {
