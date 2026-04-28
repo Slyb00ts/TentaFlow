@@ -55,20 +55,25 @@ strip = true
 # wielominutowego LTO + single-codegen. Buduj przez `cargo build --profile
 # release-fast`. Roznice vs release:
 #   * lto = "thin"        — 80% korzysci LTO za ~30% czasu (8x szybszy link)
-#   * codegen-units = 16  — wszystkie rdzenie dostaja prace, codegen rownolegly
-# W praktyce: full clean build tentaflow ~3-4x szybszy. Incremental rebuild
-# (po zmianie 1 pliku) ~5-6x szybszy bo nie odtwarza calego LTO module'u.
+#   * codegen-units = 32  — codegen rownolegly. Wartosc dobrana zeby maszyny
+#                            16/32 cpu mialy pelna paralelizacje (codegen
+#                            jest threadowany w rustc); na 8-cpu nadmiarowe
+#                            unity czekaja w kolejce — koszt minimalny.
+#                            Override per-machine ENV:
+#                              CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS=64
 # Binarka tylko ~2-5% wolniejsza w runtime — nieistotne dla dev.
 [profile.release-fast]
 inherits = "release"
 lto = "thin"
-codegen-units = 16
+codegen-units = 32
 strip = false   # debuginfo zostaje — backtrace przy crashu pokazuje funkcje
 
 # Szybszy dev `cargo build` (bez --release). Domyslny profil.dev ma
 # debug=true co daje GIGABYTOWE binarki i wolne linkowanie. Ograniczamy
 # do debug=1 (line numbers tylko, bez full debug-info) — backtrace dziala,
-# linker robi 3-5x mniej roboty.
+# linker robi 3-5x mniej roboty. codegen-units=256 daje cargo wystarczajaco
+# duzo malych jednostek zeby kazda maszyna (8/16/32 cpu) wykorzystala
+# wszystkie rdzenie rownolegle.
 [profile.dev]
 debug = 1
 incremental = true

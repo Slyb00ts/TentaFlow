@@ -8,11 +8,11 @@
 # =============================================================================
 
 [build]
-# Cargo by default uzywa wszystkich logicznych CPU. Explicit zeby cargo
-# nie gubilo detekcji w niektorych shellach (Docker exec, CI, niestandardowy
-# init). 8 = num_cpus na primary dev maszynie M-series; na innych systemach
-# rustc i tak respektuje cargo --jobs jeśli przekażesz niższą wartość.
-jobs = 8
+# `jobs` celowo nieustawione — Cargo automatycznie wykrywa wszystkie logiczne
+# CPU (`std::thread::available_parallelism`). Maszyny zespolu maja rozne
+# liczby rdzeni (10/16/32/...), hardcode bil maszyny z >8 CPU. Override
+# per-machine przez ENV: `export CARGO_BUILD_JOBS=N` w shell rc, albo
+# inline: `cargo build --jobs N`.
 
 # Incremental compilation cache zostaje miedzy buildami — kluczowe dla
 # szybkich iteracji. Po zmianie 1 pliku rustc rekompiluje TYLKO ten plik
@@ -22,32 +22,29 @@ incremental = true
 # Sccache jako rustc wrapper — cache'uje skompilowane jednostki na dysku,
 # wspoldzielone miedzy clean buildami i miedzy projektami.
 #
-# Aktywacja:
-#   * Zainstaluj raz: `brew install sccache` (macOS) / `cargo install sccache`
-#   * Wlacz przez ENV: `export RUSTC_WRAPPER=sccache` w ~/.zshrc / ~/.bashrc
-# Albo odkomentuj linijke ponizej (uwaga — zmusi WSZYSTKICH na repo do
-# instalacji sccache, bez tego `cargo build` padnie z "sccache: command
-# not found"). Domyslnie: opt-in przez ENV, nie commited.
+# Aktywacja per-machine (opt-in zeby nie wymuszac zaleznosci):
+#   1. Zainstaluj raz:
+#        macOS:        brew install sccache
+#        Linux/cross:  cargo install sccache
+#   2. Wlacz przez ENV w shell rc:
+#        export RUSTC_WRAPPER=sccache
+#        export SCCACHE_CACHE_SIZE=20G    # opcjonalnie, default 10G
+#   3. `source ~/.zshrc` (lub nowy terminal)
 #
 # Pierwszy clean build per zmieniony crate jest tak samo wolny (cache miss).
 # DRUGI clean build (po `cargo clean`) odpala z cache i jest 5-10x szybszy.
-# Sccache pisze do ~/Library/Caches/Mozilla.sccache (domyslnie 10 GB cache).
-# Sprawdz statystyki kiedykolwiek przez `sccache --show-stats`.
-# rustc-wrapper = "sccache"
+# Sccache pisze do ~/Library/Caches/Mozilla.sccache (macOS) /
+# ~/.cache/sccache (Linux). Sprawdz `sccache --show-stats`.
 
-[target.aarch64-apple-darwin]
-# Apple Silicon native. Domyslny ld64 (Apple) jest najszybszym linkerem
-# na macOS — szybszy niz lld dla typical Rust binaries. Bez zmian.
-
-[target.x86_64-apple-darwin]
-# Intel Mac legacy.
+# =============================================================================
+# Linker per-target — Apple ld64 jest najszybszy na macOS, na Linux mozesz
+# zyskac 5-10x na linkowaniu duzych binarek (200+ MB sherpa+wgpu+iroh)
+# instalujac mold lub lld i odkomentowujac sekcje ponizej.
+# =============================================================================
 
 [target.x86_64-unknown-linux-gnu]
-# Linux x86_64. Mold jest 5-10x szybszy niz GNU ld dla duzych binarek
-# (sherpa + onnxruntime + wgpu + iroh = 200+ MB unstripped). Aktywacja:
-#   sudo apt install mold       # debian/ubuntu
-#   sudo dnf install mold       # fedora
-# A potem odkomentuj 2 linijki ponizej.
+# Mold linker. Aktywacja: `sudo apt install mold` (debian/ubuntu) lub
+# `sudo dnf install mold` (fedora), potem odkomentuj 2 linijki:
 # linker = "clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
@@ -85,6 +82,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package."onnxruntime-sys"]
 opt-level = 3
+
 # Crypto deps — bez tego TLS handshake przy starcie tentaflow trwa kilkadziesiat
 # sekund w dev. Z opt=3 dla ring/aes-gcm/sha2/chacha20 = milisekundy.
 [profile.dev.package."ring"]
@@ -103,11 +101,13 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package."curve25519-dalek"]
 opt-level = 3
+
 # Image processing — yolov8/scrfd/mivolo runtime musi byc szybkie nawet w dev.
 [profile.dev.package."image"]
 opt-level = 3
 [profile.dev.package."ndarray"]
 opt-level = 3
+
 # Compression — flate2/zstd dekompresuje WASM addons + container_bundle.
 [profile.dev.package."flate2"]
 opt-level = 3
