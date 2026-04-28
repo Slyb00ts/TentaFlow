@@ -63,6 +63,7 @@ pub struct BackendClient {
 
     /// Pre-built URL dla /audio/transcriptions
     audio_transcriptions_url: String,
+    audio_speech_url: String,
 }
 
 impl BackendClient {
@@ -152,6 +153,7 @@ impl BackendClient {
         );
         let embeddings_url = format!("{}/embeddings", base);
         let audio_transcriptions_url = format!("{}/audio/transcriptions", base);
+        let audio_speech_url = format!("{}/audio/speech", base);
 
         debug!(
             "Backend client utworzony dla: {} (timeout: {}ms, circuit breaker: enabled)",
@@ -170,6 +172,7 @@ impl BackendClient {
             chat_completions_url,
             embeddings_url,
             audio_transcriptions_url,
+            audio_speech_url,
         })
     }
 
@@ -738,6 +741,82 @@ impl BackendClient {
         self.circuit_breaker.record_success();
 
         Ok(transcription_response)
+    }
+
+    /// Wysyla TTS request do backendu HTTP (OpenAI-compatible /audio/speech).
+    /// Uzywany przez python-bundle TTS (chatterbox-mlx, kyutai-tts, voxcpm,
+    /// xtts) ktore wystawiaja `/v1/audio/speech` zgodnie z OpenAI API.
+    /// Zwraca surowe bajty audio (WAV/PCM/MP3/Opus zaleznie od response_format).
+    pub async fn audio_speech(
+        &self,
+        request: &crate::api::openai::types::TTSRequest,
+    ) -> Result<Vec<u8>> {
+        self.check_circuit_breaker()?;
+
+        let url = &self.audio_speech_url;
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "input": request.input,
+            "voice": request.voice,
+        });
+        if let Some(fmt) = request.response_format.as_deref() {
+            body["response_format"] = serde_json::Value::String(fmt.to_string());
+        }
+        if let Some(speed) = request.speed {
+            if let Some(s) = serde_json::Number::from_f64(speed as f64) {
+                body["speed"] = serde_json::Value::Number(s);
+            }
+        }
+        // model_name_override: backend zna model pod inna nazwa (np. service_name
+        // -> faktyczny model w uvicorn). Podmieniamy `model` przed wyslaniem.
+        if let Some(override_name) = self.config.model_name_override.as_deref() {
+            body["model"] = serde_json::Value::String(override_name.to_string());
+        }
+
+        debug!(
+            "audio_speech POST {} (model={}, input_len={}, voice={})",
+            url, request.model, request.input.len(), request.voice
+        );
+
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", self.auth_header_value.as_str())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                let error = self.map_reqwest_error(e);
+                self.circuit_breaker.record_failure();
+                error
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            if status.is_server_error() {
+                self.circuit_breaker.record_failure();
+            }
+            let error_body = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Audio speech API error ({}): {}", status, error_body),
+                source: None,
+            }
+            .into());
+        }
+
+        let audio_bytes = response.bytes().await.map_err(|e| {
+            self.circuit_breaker.record_failure();
+            CoreError::BackendError {
+                backend_url: self.url.clone(),
+                message: format!("Audio speech body read: {}", e),
+                source: Some(e.into()),
+            }
+        })?;
+
+        self.circuit_breaker.record_success();
+        debug!("audio_speech response: {} bajtow audio", audio_bytes.len());
+        Ok(audio_bytes.to_vec())
     }
 
     /// Wysyla vision request do backendu (image understanding/OCR).

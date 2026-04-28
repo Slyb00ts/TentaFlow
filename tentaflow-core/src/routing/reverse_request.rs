@@ -930,7 +930,9 @@ fn persist_meeting_event(
             ts_ms,
             jpeg,
         } => {
-            info!(
+            // VideoFrame leci 1 fps per uczestnik — info-level spamowal logi.
+            // Debug zostawiony zeby diagnozowac pipeline gdy potrzeba.
+            tracing::debug!(
                 "MeetingEvent VideoFrame: meeting_key={} participant={} name={:?} ts_ms={} bytes={}",
                 event.meeting_key,
                 participant_id,
