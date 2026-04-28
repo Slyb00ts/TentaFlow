@@ -366,10 +366,18 @@ async fn do_docker_deploy(
 
     // LLM/STT/TTS/Embeddings — uruchomienie persistent kontenera.
     phase(db, deploy_id, tx, "running", 92, "docker run");
+    // Rozwiazujemy model przed startem kontenera, zeby:
+    //  1) nazwa serwisu zawierala slug modelu (analog do native — dwa modele
+    //     na tym samym engine, np. dwa vllm z roznymi modelami, nie koliduja),
+    //  2) po starcie miec czym zarejestrowac wpis w `models` i mapping
+    //     model_name -> service_name w ServiceManager (router routuje po HF
+    //     repo name, np. "Qwen/Qwen3.5-0.8B").
+    let model_repo = resolve_model_repo(engine, config).ok();
+    let service_name = docker_service_name(engine, config, model_repo.as_deref());
     let container_name = config
         .container_name
         .clone()
-        .unwrap_or_else(|| format!("tentaflow-{}", engine.engine_id));
+        .unwrap_or_else(|| service_name.clone());
     let host_port = config.port.unwrap_or(engine.default_port);
 
     let req = crate::deploy::docker::DeployRequest {
@@ -415,16 +423,46 @@ async fn do_docker_deploy(
 
     // Register service in DB + ServiceManager so router can route traffic.
     phase(db, deploy_id, tx, "registering", 96, "register service");
-    register_service(
+    let service_id = register_service(
         db,
         service_manager,
+        &service_name,
         &engine.engine_id,
         &engine.category,
         &created_name,
         host_port,
         node_id,
     );
-    persist_source_hash(db, &engine.engine_id, "docker", &engine.engine_id);
+    // Symetria z native LLM/STT/TTS/Embeddings: po register_service wpinamy
+    // model do tabeli `models` i mappingu routera. Bez tego zakladka Models
+    // jest pusta po docker deploy, a /v1/chat/completions z model="Qwen/..."
+    // zwraca "Model not found" (tylko nazwa serwisu trafia w routera).
+    if let (Some(model_name), Some(svc_id)) = (model_repo.as_deref(), service_id) {
+        let display_name = format!("{} ({})", model_name, engine.engine_id);
+        let registry_config = serde_json::json!({
+            "deploy_mode": "docker",
+            "engine": engine.engine_id,
+            "deployed_model": model_name,
+            "service_type": service_type_from_category(&engine.category),
+            "port": host_port,
+            "container_name": created_name,
+        })
+        .to_string();
+        ensure_model_registry_entry(
+            db,
+            model_name,
+            &display_name,
+            service_type_from_category(&engine.category),
+            svc_id,
+            &registry_config,
+        );
+        // Router potrzebuje obu mappingow: model_name -> service_name (dla
+        // dispatch po HF repo) oraz service_name jako "local model" (dla
+        // dispatch po nazwie serwisu).
+        service_manager.register_model_mapping(model_name, &service_name);
+        service_manager.register_local_inference_model(model_name);
+    }
+    persist_source_hash(db, &engine.engine_id, "docker", &service_name);
     log_line(db, deploy_id, tx, "log", "serwis zarejestrowany w routerze");
 
     finish_success(
@@ -1849,6 +1887,31 @@ fn native_service_name(engine: &EngineMeta, config: &DeployConfig, model_repo: &
     format!("{}-native-{}", engine_slug, model_slug)
 }
 
+/// Symetryczny do `native_service_name`: stabilna nazwa serwisu dla docker
+/// deploy. Bez tego dwa modele na tym samym engine (np. dwa vllm z roznymi
+/// model_repo) kolidowalyby pod nazwa = engine_id. Gdy nie znamy modelu (np.
+/// silnik bez `model_preset`), wracamy do `tentaflow-<engine_id>` zachowujac
+/// stare zachowanie.
+fn docker_service_name(
+    engine: &EngineMeta,
+    config: &DeployConfig,
+    model_repo: Option<&str>,
+) -> String {
+    if let Some(name) = config
+        .container_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    let engine_slug = slugify_name(&engine.engine_id);
+    match model_repo {
+        Some(repo) => format!("{}-docker-{}", engine_slug, slugify_name(repo)),
+        None => format!("tentaflow-{}", engine.engine_id),
+    }
+}
+
 /// Konwersja `config.gpu_ids: Option<Vec<String>>` -> GpuAffinity.
 /// Brak / pusta lista / "all" -> All. Pojedynczy idx -> Single. Wiele -> Multi.
 fn parse_gpu_affinity(gpu_ids: Option<&[String]>) -> crate::memory::GpuAffinity {
@@ -2219,30 +2282,36 @@ fn persist_source_hash(db: &DbPool, engine_id: &str, deploy_method: &str, servic
 fn register_service(
     db: &DbPool,
     service_manager: &Arc<ServiceManager>,
+    service_name: &str,
     engine_id: &str,
     category: &str,
     container_name: &str,
     host_port: u16,
     node_id: &str,
-) {
+) -> Option<i64> {
     // Wpis do tabeli services żeby startup restore_services mógł restaurować.
     let config_json = serde_json::json!({
         "deploy_mode": "docker",
         "image": format!("tentaflow/{}:latest", engine_id),
+        "manifest_engine_id": engine_id,
         "port": host_port,
         "container_name": container_name,
     })
     .to_string();
-    if let Err(e) = crate::db::repository::create_service(
+    let service_id = match crate::db::repository::create_service(
         db,
-        engine_id,
+        service_name,
         service_type_from_category(category),
         "first_available",
         Some(category),
         &config_json,
     ) {
-        warn!("create_service '{}': {}", engine_id, e);
-    }
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!("create_service '{}': {}", service_name, e);
+            None
+        }
+    };
     let _ = node_id; // node_id docelowo do multi-node routing — dla single-node nie używane
 
     // ServiceManager: rejestracja zależna od category. Dla LLM → quic_llm.
@@ -2251,10 +2320,11 @@ fn register_service(
         "stt" => "stt",
         "tts" => "tts",
         "embeddings" => "embedding",
-        _ => return,
+        _ => return service_id,
     };
     let url = format!("http://127.0.0.1:{}", host_port);
-    service_manager.register_quic_service(engine_id.to_string(), service_type, url, None, None);
+    service_manager.register_quic_service(service_name.to_string(), service_type, url, None, None);
+    service_id
 }
 
 /// Rejestruje wpis `services` dla silnika ktory nie utrzymuje persistent
