@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Plik: entrypoint.sh
-# Opis: Sidecar QUIC + voxcpm startuja rownolegle. Sidecar nasluchuje
-#       iroh natychmiast (klient widzi peera od razu); engine laduje model w
-#       tle. Logi obu na stdout kontenera. PID1 czeka na pierwszego upadku
-#       i grzecznie konczy drugiego.
+# Opis: Sidecar QUIC (5000/UDP) + uvicorn server (127.0.0.1:8088) startuja
+#       rownolegle. Logi obu na stdout. PID1 czeka na pierwszego upadku.
 # =============================================================================
 
 set -uo pipefail
@@ -12,7 +10,7 @@ set -uo pipefail
 CONFIG_PATH="${CONFIG_PATH:-/data/config.toml}"
 [[ -f "$CONFIG_PATH" ]] || CONFIG_PATH=/app/config.default.toml
 
-PORT="${VOXCPM_PORT:-8086}"
+PORT="${POCKET_TTS_PORT:-8088}"
 
 echo "[entrypoint] sidecar config=$CONFIG_PATH"
 NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
@@ -20,11 +18,11 @@ NO_COLOR=1 /usr/local/bin/tentaflow-sidecar --config "$CONFIG_PATH" 2>&1 \
 SIDECAR_PID=$!
 echo "[entrypoint] sidecar PID=$SIDECAR_PID"
 
-echo "[entrypoint] start voxcpm"
-uvicorn --app-dir /app server:app --host 127.0.0.1 --port "$PORT" 2>&1 \
-  | sed -u 's/^/[voxcpm] /' &
+echo "[entrypoint] start kyutai-tts server (uvicorn 127.0.0.1:$PORT)"
+uvicorn server:app --host 127.0.0.1 --port "$PORT" 2>&1 \
+  | sed -u 's/^/[kyutai-tts] /' &
 ENGINE_PID=$!
-echo "[entrypoint] voxcpm PID=$ENGINE_PID"
+echo "[entrypoint] kyutai-tts PID=$ENGINE_PID"
 
 cleanup() {
   echo "[entrypoint] shutdown sidecar=$SIDECAR_PID engine=$ENGINE_PID"

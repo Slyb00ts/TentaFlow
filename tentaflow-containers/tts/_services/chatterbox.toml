@@ -13,7 +13,7 @@ description_en = "Resemble AI Multilingual TTS (23 languages + Polish). Voice cl
 homepage = "https://github.com/resemble-ai/chatterbox"
 license = "MIT"
 icon = "chatterbox"
-default_port = 5024
+default_port = 8087
 api = "openai-compatible"
 version = "0.1.7"
 

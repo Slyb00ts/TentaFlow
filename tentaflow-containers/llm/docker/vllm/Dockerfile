@@ -25,7 +25,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # prebuilt extensions (vllm, xformers, flashinfer).
 FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip python3-venv curl ca-certificates \
+      python3 python3-pip python3-venv python3-dev curl ca-certificates \
+      gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/vllm-venv

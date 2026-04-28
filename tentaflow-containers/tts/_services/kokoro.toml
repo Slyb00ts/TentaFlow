@@ -12,7 +12,7 @@ description_en = "Lightweight 82M-param TTS. Native MLX on Apple Silicon, ONNX r
 homepage = "https://huggingface.co/hexgrad/Kokoro-82M"
 license = "Apache-2.0"
 icon = "kokoro"
-default_port = 5022
+default_port = 8880
 api = "openai-compatible"
 version = "1.0.0"
 

@@ -1753,6 +1753,14 @@ async fn do_python_bundle_native_deploy(
             ),
         );
     } else {
+        // ModelPool mapping - bez tego router nie znajdzie backendu po model_name.
+        // Dla LLM bundle (vllm/sglang/...) rejestrujemy alias model_repo -> service.
+        // Embedded native robi to samo (runner.rs:921); python-bundle musi tez.
+        if !model_repo.is_empty() {
+            _service_manager.register_model_mapping(&model_repo, &service_name);
+        }
+        _service_manager.register_model_mapping(&service_name, &service_name);
+
         // Rejestracja w MemoryGuard — process juz zyje (PID > 0), wiec
         // guard od razu zna ten serwis jako warm.
         let vram_estimate = crate::memory::estimate_vram_for_model(&model_repo);
