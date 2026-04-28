@@ -767,6 +767,9 @@ impl BackendClient {
                 body["speed"] = serde_json::Value::Number(s);
             }
         }
+        if let Some(lang) = request.language.as_deref() {
+            body["language"] = serde_json::Value::String(lang.to_string());
+        }
         // model_name_override: backend zna model pod inna nazwa (np. service_name
         // -> faktyczny model w uvicorn). Podmieniamy `model` przed wyslaniem.
         if let Some(override_name) = self.config.model_name_override.as_deref() {

@@ -11,6 +11,7 @@ pub mod api_dashboard;
 pub mod api_fast_path;
 pub mod api_flows;
 pub mod api_hub;
+pub mod api_me_preferences;
 pub mod api_mesh;
 pub mod api_models;
 pub mod api_nim;

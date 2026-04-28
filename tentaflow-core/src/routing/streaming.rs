@@ -630,6 +630,7 @@ impl Router {
                                     voice,
                                     response_format: Some("wav".to_string()),
                                     speed: Some(speed),
+                                    language: None,
                                 };
                                 router.synthesize_speech(&request).await.map(|r| r.response)
                             })

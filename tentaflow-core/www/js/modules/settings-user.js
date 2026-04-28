@@ -1,6 +1,6 @@
 // =============================================================================
 // File: modules/settings-user.js — User-level preferences (language). Backed by
-// I18n (localStorage-persisted) — no backend handler required.
+// I18n (localStorage-persisted) — synced with backend via /api/me/preferences.
 // =============================================================================
 
 import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
@@ -37,6 +37,7 @@ const SettingsUserScreen = {
     sel?.addEventListener('change', async (e) => {
       try {
         await I18n.setLanguage(e.target.value);
+        toast(I18n.t('settings_user.save_ok'), 'success');
       } catch (err) {
         toast(`${I18n.t('settings_user.save_error')}: ${err.message}`, 'error');
       }

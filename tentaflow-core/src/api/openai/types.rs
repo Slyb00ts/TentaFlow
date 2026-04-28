@@ -630,6 +630,11 @@ pub struct TTSRequest {
     /// Predkosc (0.25-4.0)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<f32>,
+
+    /// Jezyk syntezy (ISO-639-1: "en", "pl", "fr", "es", "de"). Gdy klient
+    /// nie poda, handler dolozy preferencje uzytkownika lub default "en".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 // Response dla TTS to raw audio bytes (Content-Type: audio/mpeg, etc.)
