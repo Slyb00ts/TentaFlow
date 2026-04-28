@@ -461,6 +461,7 @@ async fn do_docker_deploy(
         // dispatch po nazwie serwisu).
         service_manager.register_model_mapping(model_name, &service_name);
         service_manager.register_local_inference_model(model_name);
+        service_manager.register_local_inference_model(&service_name);
     }
     persist_source_hash(db, &engine.engine_id, "docker", &service_name);
     log_line(db, deploy_id, tx, "log", "serwis zarejestrowany w routerze");
