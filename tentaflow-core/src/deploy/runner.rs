@@ -1999,8 +1999,23 @@ fn auto_bind_teams_alias_if_empty(
         Ok(Some(a)) => a,
         _ => return,
     };
-    if !alias.target_model.trim().is_empty() {
-        return; // user juz cos przypial — szanujemy
+    let current = alias.target_model.trim();
+    if !current.is_empty() {
+        // Nadpisuj tylko jezeli aktualny target jest pusty albo wskazuje na
+        // serwis ktory NIE istnieje w DB (np. "system" zostawione po starym
+        // apple-tts deployu, albo nazwa serwisu usunietego rezcznie z bazy).
+        // Jezeli serwis o takiej nazwie istnieje — szanuj wybor uzytkownika.
+        let services_in_db = repository::list_services(db).unwrap_or_default();
+        let target_exists = services_in_db.iter().any(|s| s.name == current);
+        if target_exists {
+            return;
+        }
+        tracing::info!(
+            alias = %alias_name,
+            stale_target = %current,
+            new_target = %target_service,
+            "auto_bind_teams_alias: alias wskazywal na nieistniejacy serwis — nadpisuje"
+        );
     }
     if let Err(e) = repository::update_model_alias(
         db,

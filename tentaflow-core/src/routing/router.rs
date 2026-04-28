@@ -401,6 +401,19 @@ impl Router {
                         if !backend.is_active {
                             continue;
                         }
+                        // Native python-bundle / HTTP REST backendy (np. chatterbox-mlx,
+                        // kyutai-tts, voxcpm, vllm) sa rejestrowane przez
+                        // restore_native_services -> register_dynamic_http_backend.
+                        // Bez tego skipa load_db_services bralo ich `url` http://...,
+                        // dolejalo fallback QUIC port 5010 i probowalo dialowac iroh
+                        // peer'a — co konczylo sie "hex EndpointId: Odd number of
+                        // digits" na kazdym retry.
+                        if matches!(
+                            backend.connection_type.as_str(),
+                            "openai_api" | "http_api" | "http"
+                        ) {
+                            continue;
+                        }
                         let config: serde_json::Value =
                             serde_json::from_str(&backend.config_json).unwrap_or_default();
 
