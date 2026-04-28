@@ -355,15 +355,24 @@ async fn run_docker_redeploy(
     let host_port = stored_config.port.unwrap_or(default_port);
     phase(db, deploy_id, tx, "running", 93, "start_new");
 
+    // Re-uzywamy klucza Ed25519 wygenerowanego przy pierwszym deployu (idempotencja).
+    // Bez tego `EndpointId` zmienialby sie po kazdym redeployu i ServiceManager
+    // musialby renegocjowac klienta.
+    let sidecar = crate::deploy::runner::provision_docker_sidecar(
+        service_name,
+        engine_id,
+        default_port,
+        None,
+    )
+    .context("provision sidecar (key + config.toml) for redeploy")?;
+
     let req = crate::deploy::docker::DeployRequest {
-        // Pelny context_path z manifestu (np. "llm/docker/vllm") — patrz
-        // analogiczny komentarz w runner.rs. Stary engine_id daje zepsuta
-        // sciezke do Dockerfile po reorganizacji do category-based layoutu.
         container: context_path.clone(),
         image_tag: Some(image_tag.clone()),
         instance_name: Some(container_name.clone()),
-        ports: vec![(host_port.to_string(), format!("{}/tcp", default_port))],
-        volumes: Vec::new(),
+        // Sidecar wystawia QUIC na 5000/udp; wewnetrzny port silnika nie jest mapowany.
+        ports: vec![(host_port.to_string(), "5000/udp".to_string())],
+        volumes: vec![(sidecar.dir.display().to_string(), "/data".to_string())],
         env: std::collections::HashMap::new(),
         gpu: false,
     };
@@ -381,7 +390,13 @@ async fn run_docker_redeploy(
 
     // ---- phase 4: refresh service registration ----
     phase(db, deploy_id, tx, "registering", 97, "register");
-    refresh_service_manager(service_manager, &manifest.engine.category, service_name, host_port);
+    refresh_service_manager(
+        service_manager,
+        &manifest.engine.category,
+        service_name,
+        &sidecar.endpoint_id_hex,
+        host_port,
+    );
     log_line(db, deploy_id, tx, "log", "ServiceManager re-registered");
 
     Ok((image_tag, created))
@@ -411,9 +426,11 @@ fn refresh_service_manager(
     service_manager: &Arc<ServiceManager>,
     category: &crate::services::manifest::Category,
     service_name: &str,
+    endpoint_id_hex: &str,
     host_port: u16,
 ) {
-    let service_type = match format!("{:?}", category).to_lowercase().as_str() {
+    let category_str = format!("{:?}", category).to_lowercase();
+    let service_type = match category_str.as_str() {
         "llm" => "llm",
         "stt" => "stt",
         "tts" => "tts",
@@ -421,8 +438,13 @@ fn refresh_service_manager(
         _ => return,
     };
     service_manager.remove_quic_service(service_name, service_type);
-    let url = format!("http://127.0.0.1:{}", host_port);
-    service_manager.register_quic_service(service_name.to_string(), service_type, url, None, None);
+    crate::deploy::runner::register_docker_quic_service(
+        service_manager,
+        service_name,
+        &category_str,
+        endpoint_id_hex,
+        host_port,
+    );
 }
 
 // =============================================================================
