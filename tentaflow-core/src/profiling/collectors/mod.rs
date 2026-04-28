@@ -13,9 +13,12 @@ use tentaflow_protocol::profiling::{
 
 pub mod elevation;
 pub mod intern;
+pub mod linux;
+pub mod macos;
 pub mod nvidia_nsys;
 pub mod nvidia_nsys_parser;
 pub mod registry;
+pub mod windows;
 
 pub use elevation::{ElevationKind, ElevationToken};
 pub use intern::{FrameInterner, FrameKey, NameInterner};
