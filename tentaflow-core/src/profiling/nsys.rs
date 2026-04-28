@@ -29,8 +29,14 @@ const MAX_DURATION_SECS: u32 = 600;
 const MAX_LABEL_CHARS: usize = 128;
 /// Cache TTL dla wyniku `nsys --version`.
 const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5);
-/// Twardy timeout na `nsys stats` + `nsys export` w stop'ie.
-const POST_STOP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Twardy timeout na `nsys stats` + `nsys export` w stop'ie. 30s wystarcza
+/// na typowy raport; gdy parser/export wisi dluzej, lepiej zwrocic Failed
+/// niz blokowac UI uzytkownika kilka minut.
+const POST_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Czas na graceful shutdown nsys po SIGTERM zanim wymusimy SIGKILL. nsys
+/// uzywa SIGTERM do flush'a `.nsys-rep`; jezeli w 5s nie zareaguje, raport
+/// i tak bedzie niekompletny — wolimy odblokowac UI niz czekac dluzej.
+const SIGTERM_GRACE: Duration = Duration::from_secs(5);
 
 /// Wykryta dostepnosc Nsight Systems na lokalnej maszynie.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -175,6 +181,24 @@ impl NsysRunner {
         };
 
         *slot = Some(ActiveSlot { session, child });
+        drop(slot);
+
+        // Auto-stop background task — bez tego sesja z `duration_secs > 0`
+        // leci w nieskonczonosc, bo nikt nie sprawdza `auto_stop_at`. Race
+        // z manualnym stop jest OK: drugi stop dostanie NotFound i zignoruje
+        // (slot zostal juz wyczyszczony przez pierwsze wywolanie).
+        if duration_secs > 0 {
+            let session_id_for_task = session_id.clone();
+            let storage_for_task = storage.clone();
+            let sleep_for = Duration::from_secs(duration_secs as u64);
+            tokio::spawn(async move {
+                tokio::time::sleep(sleep_for).await;
+                let _ = super::NSYS_RUNNER
+                    .stop(&session_id_for_task, &storage_for_task)
+                    .await;
+            });
+        }
+
         Ok((session_id, started_at_ms))
     }
 
@@ -209,7 +233,18 @@ impl NsysRunner {
         // bezposrednio nastepujacym `child.wait()`.
         send_sigterm(session.child_pid);
 
-        let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        // Krotki grace na flush — nsys 2025.x potrafi ignorowac SIGTERM albo
+        // dlugo flush'owac. Po SIGTERM_GRACE wymuszamy SIGKILL, zeby nie
+        // blokowac UI 30s+ gdy proces nie reaguje. Czesciowy `.nsys-rep`
+        // i tak parsuje sie do `Failed` przez krotszy POST_STOP_TIMEOUT.
+        if tokio::time::timeout(SIGTERM_GRACE, child.wait()).await.is_err() {
+            tracing::warn!(
+                pid = session.child_pid,
+                "nsys did not exit within grace period, sending SIGKILL"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
 
         let result = tokio::time::timeout(POST_STOP_TIMEOUT, async {
             finalize_session(&session, storage).await

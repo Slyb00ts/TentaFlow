@@ -33,6 +33,7 @@ fn validate_session_id(s: &str) -> Result<(), ProfilingError> {
 }
 
 /// Storage sesji — root layout: `<root>/<node_id>/<session_id>/{report.nsys-rep, summary.bin}`.
+#[derive(Clone)]
 pub struct ProfileStorage {
     root: PathBuf,
     node_id: String,
