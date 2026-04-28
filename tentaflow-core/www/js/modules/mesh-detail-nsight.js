@@ -64,10 +64,11 @@ export async function loadSessions(nodeId) {
 }
 
 // Czy node ma jakikolwiek GPU NVIDIA (warunek wstepny — nsys ma sens tylko na NVIDIA).
+// Case-insensitive zeby wytrzymac drift backendu (lowercase / Capital / NVIDIA).
 function hasNvidiaGpu(node) {
   if (!node) return false;
   const gpus = Array.isArray(node.gpus) ? node.gpus : [];
-  return gpus.some((g) => g && g.vendor === 'Nvidia');
+  return gpus.some((g) => g && String(g.vendor || '').toLowerCase() === 'nvidia');
 }
 
 // Czy node wspiera profilowanie (heartbeat raportuje nsys_available + jest NVIDIA).
@@ -97,7 +98,7 @@ function detectPlatformForInstall(node) {
 // HTML do wstrzykniecia w `card-head` GPU. Pokazuje sie tylko dla NVIDIA + nsys.
 export function gpuProfileButtonHtml(node, gpu, idx) {
   if (!node || node.nsys_available !== true) return '';
-  if (!gpu || gpu.vendor !== 'Nvidia') return '';
+  if (!gpu || String(gpu.vendor || '').toLowerCase() !== 'nvidia') return '';
   return `
     <tf-button size="sm" variant="ghost" data-action="nsight-profile-card" data-gpu-idx="${idx}" title="${escapeAttr(I18n.t('nsight.profile_btn'))}">
       <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-record"/></svg>
@@ -389,7 +390,7 @@ function openStartModal(node, { defaultScope = 'both', defaultGpu = 'all' } = {}
     toast(I18n.t('nsight.error.busy'), 'warn');
     return;
   }
-  const gpus = Array.isArray(node.gpus) ? node.gpus.filter((g) => g && g.vendor === 'Nvidia') : [];
+  const gpus = Array.isArray(node.gpus) ? node.gpus.filter((g) => g && String(g.vendor || '').toLowerCase() === 'nvidia') : [];
   const gpuOptions = ['<option value="all">' + escapeHtml(I18n.t('nsight.gpu.all')) + '</option>']
     .concat(gpus.map((g, idx) => {
       const realIdx = Array.isArray(node.gpus) ? node.gpus.indexOf(g) : idx;
