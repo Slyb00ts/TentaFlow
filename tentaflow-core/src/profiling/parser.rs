@@ -192,7 +192,7 @@ pub async fn parse_nsys_stats_json(rep_path: &Path) -> Result<ParsedStats, Profi
         .args([
             "stats",
             "--report",
-            "cudaapisum,gpukernsum,gpumemsizesum,osrtsum,cpusample,nvtxsum",
+            "cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_size_sum,osrt_sum,nvtx_sum",
             "--format",
             "json",
             "--output",
