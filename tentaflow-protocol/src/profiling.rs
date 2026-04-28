@@ -293,6 +293,10 @@ pub enum NsightPayload {
     DeleteResponse(NsightDeleteResponse),
     DownloadRequest(NsightDownloadRequest),
     DownloadResponse(NsightDownloadResponse),
+    /// Multi-source profiling V2 — wszystkie pary request/response pakowane
+    /// w `ProfilingPayload`. Nested inner enum, zeby `MessageBody` (limit 256
+    /// wariantow rkyv 0.8) nie tracilo kolejnych 14 slotow.
+    Profiling(ProfilingPayload),
 }
 
 // =============================================================================
@@ -1193,6 +1197,197 @@ impl ProfileReport {
             warnings: Vec::new(),
         }
     }
+}
+
+// =============================================================================
+// Multi-source profiling (V2) — request / response payloads.
+// Mirrors the legacy `Nsight*` pairs but carries V2 types: ProfileScope,
+// ProfileReportV2, ProfileReportEnvelope, SessionEntry equivalents (kept here
+// to stay rkyv-friendly and not depend on tentaflow-core).
+// =============================================================================
+
+/// Lightweight session row used by `ProfilingSessionsResponse`. rkyv-friendly
+/// counterpart of `tentaflow_core::profiling::SessionEntry`.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingSessionEntry {
+    pub session_id: String,
+    pub label: String,
+    /// RFC3339 string.
+    pub started_at: String,
+    pub duration_ns: u64,
+    /// `"multi_source"` or `"legacy_nsight"`.
+    pub kind: String,
+    pub collectors_used: Vec<String>,
+    pub size_bytes: u64,
+}
+
+/// One skipped collector — mirrors the storage `SkippedCollector` so it can
+/// travel over rkyv without depending on serde JSON.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingSkippedCollector {
+    pub id: String,
+    pub reason: String,
+}
+
+/// Snapshot of the orchestrator's currently-active session, returned from
+/// `ProfilingActiveInfoResponse`.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingActiveSessionInfo {
+    pub session_id: String,
+    pub node_id: String,
+    pub label: String,
+    pub started_at_unix_ns: u64,
+    pub planned_duration_ns: u64,
+    pub elapsed_ns: u64,
+    pub collectors_running: Vec<String>,
+    pub collectors_skipped: Vec<ProfilingSkippedCollector>,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingStartRequest {
+    pub node_id: String,
+    pub scope: ProfileScope,
+    pub label: String,
+    /// Optional sudo password. Only used on Linux/macOS for collectors that
+    /// require it; never logged. Empty string ≡ no elevation.
+    pub elevation_password: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingStartResponse {
+    pub session_id: String,
+    pub started_at_unix_ns: u64,
+    pub collectors_started: Vec<String>,
+    pub collectors_skipped: Vec<ProfilingSkippedCollector>,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingStopRequest {
+    pub node_id: String,
+    pub session_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingStopResponse {
+    pub session_id: String,
+    pub report: ProfileReportV2,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingSessionsRequest {
+    pub node_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingSessionsResponse {
+    pub node_id: String,
+    pub entries: Vec<ProfilingSessionEntry>,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingReportRequest {
+    pub node_id: String,
+    pub session_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingReportResponse {
+    pub envelope: ProfileReportEnvelope,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingDeleteRequest {
+    pub node_id: String,
+    pub session_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingDeleteResponse {
+    pub session_id: String,
+    pub deleted: bool,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingDownloadRequest {
+    pub node_id: String,
+    pub session_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingDownloadResponse {
+    pub session_id: String,
+    /// Suggested filename — `profiling-<session_id>.tar.gz`.
+    pub filename: String,
+    /// Tar.gz of the session directory (manifest.json, summary.bin, raw/).
+    pub tarball_bytes: Vec<u8>,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
+pub struct ProfilingActiveInfoRequest {
+    pub node_id: String,
+}
+
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub struct ProfilingActiveInfoResponse {
+    /// `Some` while a session is running, `None` otherwise.
+    pub info: Option<ProfilingActiveSessionInfo>,
+}
+
+/// Inner-enum pack (mirrors `NsightPayload`) — keeps every multi-source
+/// profiling message in a single `MessageBody::ProfilingBody` slot to avoid
+/// using up the rkyv 256-variant budget of `MessageBody`.
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
+pub enum ProfilingPayload {
+    StartRequest(ProfilingStartRequest),
+    StartResponse(ProfilingStartResponse),
+    StopRequest(ProfilingStopRequest),
+    StopResponse(ProfilingStopResponse),
+    SessionsRequest(ProfilingSessionsRequest),
+    SessionsResponse(ProfilingSessionsResponse),
+    ReportRequest(ProfilingReportRequest),
+    ReportResponse(ProfilingReportResponse),
+    DeleteRequest(ProfilingDeleteRequest),
+    DeleteResponse(ProfilingDeleteResponse),
+    DownloadRequest(ProfilingDownloadRequest),
+    DownloadResponse(ProfilingDownloadResponse),
+    ActiveInfoRequest(ProfilingActiveInfoRequest),
+    ActiveInfoResponse(ProfilingActiveInfoResponse),
 }
 
 // =============================================================================

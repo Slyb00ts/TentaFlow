@@ -72,6 +72,11 @@ pub struct MeshPeerInfo {
     /// Wersja `nsys` zaraportowana przez peera (pusta gdy `nsys_available=false`).
     #[serde(default)]
     pub nsys_version: String,
+    /// Multi-source profiling: lista identyfikatorow kolektorow ktore peer
+    /// moze uruchomic (Available albo NeedsElevation). GUI uzywa tego do
+    /// wyswietlania checkbox'ow per zrodlo na ekranie Profile.
+    #[serde(default)]
+    pub profiling_collectors_available: Vec<String>,
 }
 
 /// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
@@ -166,6 +171,9 @@ pub struct HeartbeatMetrics {
     pub nsys_available: bool,
     /// Wersja `nsys` (pusta gdy `nsys_available=false`).
     pub nsys_version: String,
+    /// Multi-source profiling: lista identyfikatorow kolektorow ktore peer
+    /// uznaje za uruchamialne (probe == Available albo NeedsElevation).
+    pub profiling_collectors_available: Vec<String>,
 }
 
 /// Broadcast z lista modeli zaladowanych/dostepnych na nodzie. Wysylany co
@@ -558,6 +566,7 @@ impl MeshPeerStore {
         tokens_per_sec: f32,
         nsys_available: bool,
         nsys_version: String,
+        profiling_collectors_available: Vec<String>,
     ) {
         let mut entry = self
             .peers
@@ -575,6 +584,7 @@ impl MeshPeerStore {
         entry.tokens_per_sec = tokens_per_sec;
         entry.nsys_available = nsys_available;
         entry.nsys_version = nsys_version;
+        entry.profiling_collectors_available = profiling_collectors_available;
         if !platform.is_empty() {
             entry.platform = platform;
         }
@@ -829,6 +839,7 @@ impl MeshPeerStore {
             tokens_per_sec: 0.0,
             nsys_available: false,
             nsys_version: String::new(),
+            profiling_collectors_available: Vec::new(),
         }
     }
 }
@@ -900,6 +911,10 @@ mod tests {
             tokens_per_sec: 42.0,
             nsys_available: true,
             nsys_version: "2024.5.1".to_string(),
+            profiling_collectors_available: vec![
+                "linux.proc.cpu_util".to_string(),
+                "nvidia.nsys.gpu".to_string(),
+            ],
         };
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&hb).expect("encode");
         let decoded =
@@ -908,5 +923,9 @@ mod tests {
         assert_eq!(decoded.nsys_version, "2024.5.1");
         assert_eq!(decoded.platform, "linux");
         assert_eq!(decoded.connected_peers, vec!["abc".to_string()]);
+        assert_eq!(decoded.profiling_collectors_available.len(), 2);
+        assert!(decoded
+            .profiling_collectors_available
+            .contains(&"nvidia.nsys.gpu".to_string()));
     }
 }

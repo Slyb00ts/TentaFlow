@@ -42,6 +42,13 @@ pub use profiling::{
     NsightSessionStatus, NsightSessionsRequest, NsightSessionsResponse, NsightStartRequest,
     NsightStartResponse, NsightStopRequest, NsightStopResponse, NsightPayload, ProfileKpi,
     ProfileMeta, ProfileReport, ProfileTopRow,
+    GpuTargets, GpuVendor, ProfileReportEnvelope, ProfileReportV2, ProfileScope,
+    ProfileSourceFlags, ProfileTarget, ProfilingActiveInfoRequest, ProfilingActiveInfoResponse,
+    ProfilingActiveSessionInfo, ProfilingDeleteRequest, ProfilingDeleteResponse,
+    ProfilingDownloadRequest, ProfilingDownloadResponse, ProfilingPayload, ProfilingReportRequest,
+    ProfilingReportResponse, ProfilingSessionEntry, ProfilingSessionsRequest,
+    ProfilingSessionsResponse, ProfilingSkippedCollector, ProfilingStartRequest,
+    ProfilingStartResponse, ProfilingStopRequest, ProfilingStopResponse,
 };
 pub use envelope::{
     message_kind, Envelope, EnvelopeFlags, Routing, SessionAuth, SignedSessionClaim,

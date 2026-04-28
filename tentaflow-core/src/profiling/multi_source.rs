@@ -399,6 +399,30 @@ impl MultiSourceSession {
         })
     }
 
+    /// Stop the currently active session by its public `session_id`. Used by
+    /// callers that hold the id but not the original `SessionHandle` (e.g. the
+    /// dispatch layer where the handle is process-local). Returns `StaleHandle`
+    /// when no session matches.
+    pub async fn stop_by_id(
+        self: Arc<Self>,
+        session_id: &str,
+    ) -> Result<ProfileReportV2, SessionError> {
+        let epoch = {
+            let guard = self.active.lock().await;
+            match guard.as_ref() {
+                Some(s) if s.session_id == session_id => s.epoch,
+                _ => return Err(SessionError::StaleHandle),
+            }
+        };
+        let handle = SessionHandle {
+            session_id: session_id.to_string(),
+            node_id: String::new(),
+            started_at_monotonic: Instant::now(),
+            epoch,
+        };
+        self.stop(handle).await
+    }
+
     /// Stop the active session, run parsers, merge timelines and persist the report.
     pub async fn stop(
         self: Arc<Self>,
