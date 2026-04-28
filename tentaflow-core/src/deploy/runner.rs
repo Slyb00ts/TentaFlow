@@ -380,19 +380,42 @@ async fn do_docker_deploy(
         .unwrap_or_else(|| service_name.clone());
     let host_port = config.port.unwrap_or(engine.default_port);
 
+    // Sidecar provisioning: generujemy (lub re-uzywamy z poprzedniego deployu)
+    // Ed25519 secret key dla iroh endpointa sidecara, oraz piszemy /data/config.toml
+    // ktory mountujemy do kontenera. Reuse klucza przy redeployu zachowuje stabilne
+    // EndpointId — bez tego ServiceManager dropowalby polaczenie po kazdym restarcie.
+    let sidecar = provision_docker_sidecar(
+        &service_name,
+        &engine.engine_id,
+        engine.default_port,
+        model_repo.as_deref(),
+    )
+    .context("przygotowanie sidecara (klucz iroh + config.toml)")?;
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        &format!(
+            "sidecar zainicjalizowany — endpoint_id={} (klucz w {})",
+            sidecar.endpoint_id_hex,
+            sidecar.dir.display()
+        ),
+    );
+
     let req = crate::deploy::docker::DeployRequest {
         // context_path z manifestu (np. "llm/docker/vllm") — docker::deploy
         // sklada to z prefixem "tentaflow-containers/" w sciezke do Dockerfile.
-        // Stary engine_id ("vllm") dawal "tentaflow-containers/vllm/Dockerfile"
-        // co lamie sie po reorganizacji do category-based layoutu.
         container: context_path.clone(),
         image_tag: Some(image_tag.to_string()),
         instance_name: Some(container_name.clone()),
-        ports: vec![(
-            host_port.to_string(),
-            format!("{}/tcp", engine.default_port),
-        )],
-        volumes: Vec::new(),
+        // Eksponujemy WYLACZNIE port sidecara (5000/udp). Wewnetrzny port silnika
+        // (np. 8000/tcp dla vLLM) jest niewidoczny z hosta — sidecar w kontenerze
+        // forwarduje do `127.0.0.1:<engine.default_port>` w tej samej sieci kontenera.
+        ports: vec![(host_port.to_string(), "5000/udp".to_string())],
+        // Mount klucza + config sidecara jako /data RO. Sidecar czyta /data/config.toml
+        // i /data/endpoint-key.bin (zgodnie z `tentaflow-sidecar`).
+        volumes: vec![(sidecar.dir.display().to_string(), "/data".to_string())],
         env: std::collections::HashMap::new(),
         gpu: config.gpu_select_mode.as_deref() == Some("all")
             || config
@@ -401,13 +424,6 @@ async fn do_docker_deploy(
                 .map(|v| !v.is_empty())
                 .unwrap_or(false),
     };
-    // deploy::docker::deploy zbuduje image od nowa — my już to zrobiliśmy. Użyjmy
-    // run_container bezpośrednio. Ale run_container jest private. Upublicznimy
-    // go dla runnera albo użyjemy bollard create_container inline.
-    //
-    // Prostsze: po naszym build idzie druga iteracja przez deploy::docker::deploy
-    // która wykryje istniejący image przez tag i pominie build (bollard build
-    // jest inkrementalny — no layers changed). Trochę nadmiarowe ale OK.
     let created_name = crate::deploy::docker::deploy(&req)
         .await
         .context("uruchomienie kontenera")?;
@@ -425,14 +441,20 @@ async fn do_docker_deploy(
     phase(db, deploy_id, tx, "registering", 96, "register service");
     let service_id = register_service(
         db,
-        service_manager,
         &service_name,
         &engine.engine_id,
         &engine.category,
         &created_name,
         host_port,
-        node_id,
     );
+    register_docker_quic_service(
+        service_manager,
+        &service_name,
+        &engine.category,
+        &sidecar.endpoint_id_hex,
+        host_port,
+    );
+    let _ = node_id;
     // Symetria z native LLM/STT/TTS/Embeddings: po register_service wpinamy
     // model do tabeli `models` i mappingu routera. Bez tego zakladka Models
     // jest pusta po docker deploy, a /v1/chat/completions z model="Qwen/..."
@@ -2282,13 +2304,11 @@ fn persist_source_hash(db: &DbPool, engine_id: &str, deploy_method: &str, servic
 
 fn register_service(
     db: &DbPool,
-    service_manager: &Arc<ServiceManager>,
     service_name: &str,
     engine_id: &str,
     category: &str,
     container_name: &str,
     host_port: u16,
-    node_id: &str,
 ) -> Option<i64> {
     // Wpis do tabeli services żeby startup restore_services mógł restaurować.
     let config_json = serde_json::json!({
@@ -2299,7 +2319,7 @@ fn register_service(
         "container_name": container_name,
     })
     .to_string();
-    let service_id = match crate::db::repository::create_service(
+    match crate::db::repository::create_service(
         db,
         service_name,
         service_type_from_category(category),
@@ -2312,20 +2332,134 @@ fn register_service(
             warn!("create_service '{}': {}", service_name, e);
             None
         }
-    };
-    let _ = node_id; // node_id docelowo do multi-node routing — dla single-node nie używane
+    }
+}
 
-    // ServiceManager: rejestracja zależna od category. Dla LLM → quic_llm.
+/// Rejestruje QUIC backend silnika w ServiceManager. Identyfikator iroh peera
+/// (`endpoint_id_hex`) pochodzi z klucza wygenerowanego przez `provision_docker_sidecar`,
+/// a `host_port` jest mapowanym portem UDP `5000/udp` w kontenerze. Direct addr
+/// `127.0.0.1:<host_port>` jest niezbedny — kontener Dockera nie jest discoverable
+/// przez LAN mDNS/DHT hosta.
+pub(crate) fn register_docker_quic_service(
+    service_manager: &Arc<ServiceManager>,
+    service_name: &str,
+    category: &str,
+    endpoint_id_hex: &str,
+    host_port: u16,
+) {
     let service_type = match category {
         "llm" => "llm",
         "stt" => "stt",
         "tts" => "tts",
         "embeddings" => "embedding",
-        _ => return service_id,
+        _ => return,
     };
-    let url = format!("http://127.0.0.1:{}", host_port);
-    service_manager.register_quic_service(service_name.to_string(), service_type, url, None, None);
-    service_id
+    service_manager.register_quic_service_with_addrs(
+        service_name.to_string(),
+        service_type,
+        endpoint_id_hex.to_string(),
+        None,
+        None,
+        vec![format!("127.0.0.1:{}", host_port)],
+    );
+}
+
+/// Wynik provisioning'u sidecara: katalog z kluczem + configiem (mountowany do
+/// `/data` w kontenerze) oraz hex `EndpointId` ktorym ServiceManager pingnie peera.
+pub(crate) struct SidecarProvision {
+    pub dir: std::path::PathBuf,
+    pub endpoint_id_hex: String,
+}
+
+/// Generuje (albo re-uzywa) Ed25519 secret key dla sidecara i zapisuje obok
+/// `config.toml` opisujacy role ReverseProxy do silnika. Reuse klucza miedzy
+/// redeployami jest istotny — zmiana `EndpointId` rozspojnia rejestracje w
+/// ServiceManager i wymusza pelny reconnect cycle.
+pub(crate) fn provision_docker_sidecar(
+    service_name: &str,
+    engine_id: &str,
+    engine_internal_port: u16,
+    model_repo: Option<&str>,
+) -> Result<SidecarProvision> {
+    let sidecar_dir = crate::paths::tentaflow_home()
+        .join("sidecar-keys")
+        .join(service_name);
+    std::fs::create_dir_all(&sidecar_dir)
+        .with_context(|| format!("mkdir sidecar dir {}", sidecar_dir.display()))?;
+
+    let key_path = sidecar_dir.join("endpoint-key.bin");
+    let secret = if key_path.exists() {
+        let bytes = std::fs::read(&key_path)
+            .with_context(|| format!("read sidecar key {}", key_path.display()))?;
+        if bytes.len() != 32 {
+            return Err(anyhow!(
+                "plik klucza {} ma {} bajtow, wymagane 32",
+                key_path.display(),
+                bytes.len()
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        iroh::SecretKey::from_bytes(&arr)
+    } else {
+        let s = iroh::SecretKey::generate();
+        std::fs::write(&key_path, s.to_bytes())
+            .with_context(|| format!("write sidecar key {}", key_path.display()))?;
+        s
+    };
+    let endpoint_id_hex = hex::encode(secret.public().as_bytes());
+
+    let upstream_api = match engine_id {
+        "llama-cpp" => "llama_cpp",
+        "sherpa-onnx" => "sherpa",
+        "vllm" | "sglang" | "xtts" | "voxcpm" | "parakeet" | "qwen-asr" | "comfyui"
+        | "whisper" | "ollama" => "open_ai",
+        _ => "raw_http",
+    };
+    // OpenAI-kompatybilne backendy maja prefix /v1, llama.cpp i sherpa wystawiaja
+    // wlasne sciezki na rooty - sidecar dba o tlumaczenie. Upstream dziala w tej
+    // samej network namespace co sidecar (loopback).
+    let upstream_url = if upstream_api == "open_ai" {
+        format!("http://127.0.0.1:{}/v1", engine_internal_port)
+    } else {
+        format!("http://127.0.0.1:{}", engine_internal_port)
+    };
+
+    let aliases_toml = match model_repo {
+        Some(repo) => format!("model_aliases = [\"{}\"]\n", repo.replace('"', "\\\"")),
+        None => "model_aliases = []\n".to_string(),
+    };
+    // enable_lan_discovery / enable_dht_discovery = false: kontener jest lokalny,
+    // ServiceManager dial'uje przez explicit direct_addrs (127.0.0.1:host_port),
+    // wiec mDNS/DHT ze srodka kontenera tylko marnuja CPU i mogliby reklamowac
+    // peera na zewnatrz hosta.
+    let config_toml = format!(
+        "service_name = \"{}\"\n\
+         {}\n\
+         [transport]\n\
+         port = 5000\n\
+         secret_key_path = \"/data/endpoint-key.bin\"\n\
+         enable_lan_discovery = false\n\
+         enable_dht_discovery = false\n\
+         \n\
+         [role]\n\
+         kind = \"reverse_proxy\"\n\
+         upstream_url = \"{}\"\n\
+         api = \"{}\"\n\
+         timeout_ms = 600000\n",
+        service_name.replace('"', "\\\""),
+        aliases_toml,
+        upstream_url,
+        upstream_api,
+    );
+    let config_path = sidecar_dir.join("config.toml");
+    std::fs::write(&config_path, config_toml)
+        .with_context(|| format!("write sidecar config {}", config_path.display()))?;
+
+    Ok(SidecarProvision {
+        dir: sidecar_dir,
+        endpoint_id_hex,
+    })
 }
 
 /// Rejestruje wpis `services` dla silnika ktory nie utrzymuje persistent
