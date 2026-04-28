@@ -7,6 +7,11 @@
 
 import { TfWindow } from '/js/components/tf-window.js';
 import { ProfilingLaunchModal } from '/js/modules/profiling-launch.js';
+import {
+  profilingSessions,
+  profilingDelete,
+  profilingDownload,
+} from '/js/protocol/profiling.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-searchbox.js';
 
@@ -123,6 +128,32 @@ function applyFilters(sessions, activeFilter, searchTerm) {
   });
 }
 
+// Maps a binary-protocol entry (camelCase, ProfilingSessionEntry) to the
+// snake_case shape used by the table renderer. Fixture JSON is already in
+// snake_case so we only normalize when fields are absent.
+function normalizeEntry(e) {
+  if (e == null) return e;
+  if ('session_id' in e) return e;
+  const startedMs = e.startedAt ? Date.parse(e.startedAt) : 0;
+  const startedNs = Number.isFinite(startedMs) && startedMs > 0
+    ? startedMs * 1_000_000
+    : 0;
+  return {
+    session_id: e.sessionId,
+    label: e.label,
+    status: 'completed',
+    started_at_unix_ns: startedNs,
+    duration_seconds: Number(e.durationNs || 0) / 1_000_000_000,
+    size_bytes: Number(e.sizeBytes || 0),
+    sources_used: Array.isArray(e.collectorsUsed)
+      ? e.collectorsUsed.map((id) => ({ id, label: id, status: 'ok' }))
+      : [],
+    has_flamegraph: false,
+    gpu_count: 0,
+    kind: e.kind,
+  };
+}
+
 async function fetchSessions(nodeId) {
   if (fixtureMode()) {
     const resp = await fetch('/js/modules/__fixtures__/profiling-sessions.json', { cache: 'no-store' });
@@ -132,11 +163,8 @@ async function fetchSessions(nodeId) {
     const deleted = readDeletedSet();
     return (data.sessions || []).filter((s) => !deleted.has(s.session_id));
   }
-  const url = `/api/profiling/sessions?node_id=${encodeURIComponent(nodeId)}`;
-  const resp = await fetch(url, { headers: { accept: 'application/json' } });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const data = await resp.json();
-  return data.sessions || [];
+  const data = await profilingSessions({ nodeId });
+  return (data.entries || []).map(normalizeEntry);
 }
 
 async function deleteSession(nodeId, sessionId) {
@@ -146,10 +174,7 @@ async function deleteSession(nodeId, sessionId) {
     writeDeletedSet(set);
     return;
   }
-  const resp = await fetch(`/api/profiling/sessions/${encodeURIComponent(sessionId)}?node_id=${encodeURIComponent(nodeId)}`, {
-    method: 'DELETE',
-  });
-  if (!resp.ok) throw new Error(`delete HTTP ${resp.status}`);
+  await profilingDelete({ nodeId, sessionId });
 }
 
 const DELETED_KEY = 'tf-profiling-fixture-deleted';
@@ -438,13 +463,30 @@ export class ProfilingSessionsView {
     location.hash = `#/profiling/report/${encodeURIComponent(sessionId)}`;
   }
 
-  _downloadSession(sessionId) {
+  async _downloadSession(sessionId) {
     if (fixtureMode()) {
       showToast('Fixture mode — download not supported', 'info');
       return;
     }
-    const url = `/api/profiling/sessions/${encodeURIComponent(sessionId)}/download?node_id=${encodeURIComponent(this.nodeId)}`;
-    window.open(url, '_blank', 'noopener');
+    try {
+      const resp = await profilingDownload({ nodeId: this.nodeId, sessionId });
+      const bytes = resp.tarballBytes instanceof Uint8Array
+        ? resp.tarballBytes
+        : new Uint8Array(resp.tarballBytes || []);
+      const filename = resp.filename || `profiling-${sessionId}.tar.gz`;
+      const blob = new Blob([bytes], { type: 'application/gzip' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      console.error('failed to download session', err);
+      showToast('Failed to download session', 'error');
+    }
   }
 
   async _confirmDelete(sessionId) {
