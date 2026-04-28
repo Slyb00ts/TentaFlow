@@ -880,6 +880,19 @@ fn persist_meeting_event(
                 event.meeting_key,
                 entries.len()
             );
+            // Per-entry trace — debug-level zeby zweryfikowac ze speaker_id
+            // i nazwa rzeczywiscie sa w payload (frontend filtrowal entries
+            // bez speakerId i nigdy nie pokazywal listy uczestnikow).
+            for e in entries.iter() {
+                tracing::debug!(
+                    "  roster entry: speaker_id={} name={:?} status={} has_video={} has_audio={}",
+                    e.speaker_id,
+                    e.speaker_name,
+                    e.status,
+                    e.has_video,
+                    e.has_audio
+                );
+            }
         }
         // BackendUpdate: persisted on meeting_sessions so a live view mounted
         // after the broadcast still sees the BACKEND panel populated. The same

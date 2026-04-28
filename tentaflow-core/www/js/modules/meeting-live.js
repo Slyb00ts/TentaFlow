@@ -37,6 +37,15 @@ const state = {
   // the bot is still setting up and we show a pending chip instead.
   lifecycleStage: 'idle',
   lifecycleDetails: '',
+  // Zbior flag oznaczajacych ktore sekcje wymagaja repaintu po zlapaniu
+  // batcha eventow. Pelny re-render robimy tylko gdy ktos doda 'all'
+  // (initial mount). Pozostale przypadki to surgical update DOM.
+  dirty: new Set(),
+  // Wtorny indeks atrybutow z ParticipantAttributes — kluczowany po
+  // participantId (DOM id z Teams) ORAZ po lowercase nazwie. Pozwala
+  // skleic emocje/wiek z roster entry nawet jezeli atrybuty przyszly
+  // przed RosterSnapshot albo nazwy nie matchuja sie 1:1.
+  participantAttrsByDomId: new Map(),
 };
 
 let unsubscribeLive = null;
@@ -53,6 +62,21 @@ function scheduleRender() {
     pendingRenderRaf = 0;
     renderAll();
   });
+}
+
+// Zaznacza wszystkie sekcje jako dirty — uzywane przy initial mount, kiedy
+// chcemy by renderAll wykonal pelny paint (renderBody przebuduje siatke).
+function markAllDirty() {
+  state.dirty.add('header');
+  state.dirty.add('lifecycle');
+  state.dirty.add('transcript');
+  state.dirty.add('participants');
+  state.dirty.add('actions');
+  state.dirty.add('summary');
+  state.dirty.add('backend');
+  // Marker pelnego rebudowy body — rozni sie od pojedynczych sekcji bo
+  // wymusza przejscie przez renderBody() zamiast surgical update.
+  state.dirty.add('full');
 }
 
 // --- Lifecycle --------------------------------------------------------------
@@ -80,6 +104,9 @@ const MeetingLiveScreen = {
     await loadInitialData();
     subscribeLive();
     startFooterTimer();
+    // Pierwszy render musi zbudowac calosc — markeryjemy wszystkie sekcje
+    // jako dirty, renderAll wykona pelny initial paint przez renderBody().
+    markAllDirty();
     renderAll();
   },
   unmount() {
@@ -99,6 +126,8 @@ const MeetingLiveScreen = {
     state.summaries = [];
     state.actionItems = [];
     state.latencyHistory = [];
+    state.dirty = new Set();
+    state.participantAttrsByDomId = new Map();
   },
 };
 
@@ -130,6 +159,8 @@ function resetState(meetingKey) {
   state.groupsCollapsed = { pending: false, done: true, cancelled: true };
   state.lifecycleStage = 'idle';
   state.lifecycleDetails = '';
+  state.dirty = new Set();
+  state.participantAttrsByDomId = new Map();
 }
 
 // Hydrates state.backend from a MeetingSessionDescriptor returned by the
@@ -293,10 +324,12 @@ function applyLiveEvent(timestampMs, type, data) {
         state.latencyHistory.push(entry.latencyMs);
         if (state.latencyHistory.length > 10) state.latencyHistory.shift();
       }
-      // Aktywny mowca — update participants map.
+      // Aktywny mowca — update participants map zachowujac wzbogacone
+      // pola (emocje, wiek, plec) z poprzedniego stanu.
       if (entry.speakerId) {
         const prev = state.participants.get(entry.speakerId) || {};
         state.participants.set(entry.speakerId, {
+          ...prev,
           speakerId: entry.speakerId,
           speakerName: entry.speakerName || prev.speakerName || entry.speakerId,
           isEnrolled: entry.isEnrolled || prev.isEnrolled || false,
@@ -304,17 +337,22 @@ function applyLiveEvent(timestampMs, type, data) {
           lastSpokenAt: timestampMs,
         });
       }
+      state.dirty.add('transcript');
+      state.dirty.add('participants');
+      state.dirty.add('header');
       break;
     }
     case 'RosterSnapshot': {
-      // Snapshot zastępuje cały roster — bot wysyła go raz na DOM scan.
-      // Brak entry = brak uczestnika (a nie "wyszedł" jako osobny event).
-      // Zachowujemy `isEnrolled` z poprzedniego stanu, bo to pole
-      // wzbogacane jest przez TranscriptEntry, nie przez snapshot.
+      // Snapshot zastepuje caly roster — bot wysyla go raz na DOM scan.
+      // Brak entry = brak uczestnika (a nie "wyszedl" jako osobny event).
+      // KRYTYCZNE: nie nadpisujemy emocji/wieku/plci, bo bot ich nie
+      // wysyla w roster — przyszly wczesniejszym ParticipantAttributes
+      // i muszą przezyc snapshot. Fallback na inne pola id zostawia bramke
+      // jezeli bot zmieni schemat w przyszlosci.
       const entries = Array.isArray(data.entries) ? data.entries : [];
       const next = new Map();
       for (const entry of entries) {
-        const id = String(entry.speakerId || '');
+        const id = String(entry.speakerId || entry.participantId || entry.id || '');
         if (!id) continue;
         const prev = state.participants.get(id) || {};
         next.set(id, {
@@ -325,9 +363,33 @@ function applyLiveEvent(timestampMs, type, data) {
           lastSpokenAt: entry.lastSpokenAgoSec != null
             ? timestampMs - Number(entry.lastSpokenAgoSec) * 1000
             : prev.lastSpokenAt || 0,
+          // Preserve atrybutow vision pipeline.
+          emotion: prev.emotion || null,
+          emotionConfidence: prev.emotionConfidence != null ? prev.emotionConfidence : null,
+          age: prev.age != null ? prev.age : null,
+          genderMaleProb: prev.genderMaleProb != null ? prev.genderMaleProb : null,
+          attributesUpdatedAt: prev.attributesUpdatedAt || 0,
+          hasVideo: entry.hasVideo != null ? Boolean(entry.hasVideo) : (prev.hasVideo || false),
+          hasAudio: entry.hasAudio != null ? Boolean(entry.hasAudio) : (prev.hasAudio || false),
         });
       }
+      // Sklejenie atrybutow z secondary index — moze byc tak ze
+      // ParticipantAttributes przyszlo zanim diarization wyprodukowalo
+      // speakerId; po snapshot nazwy juz pasuja, wiec dociagamy emocje.
+      for (const p of next.values()) {
+        const nameKey = String(p.speakerName || '').toLowerCase();
+        const cached = nameKey ? state.participantAttrsByDomId.get(nameKey) : null;
+        if (cached && (!p.attributesUpdatedAt || cached.timestamp > p.attributesUpdatedAt)) {
+          p.emotion = cached.emotion;
+          p.emotionConfidence = cached.emotionConfidence;
+          p.age = cached.age;
+          p.genderMaleProb = cached.genderMaleProb;
+          p.attributesUpdatedAt = cached.timestamp;
+        }
+      }
       state.participants = next;
+      state.dirty.add('participants');
+      state.dirty.add('header');
       break;
     }
     case 'SummaryUpdate': {
@@ -339,6 +401,8 @@ function applyLiveEvent(timestampMs, type, data) {
         summaryText: String(data.summaryText || ''),
         model: String(data.model || ''),
       });
+      state.dirty.add('summary');
+      state.dirty.add('header');
       break;
     }
     case 'ActionItemsUpdate': {
@@ -366,6 +430,8 @@ function applyLiveEvent(timestampMs, type, data) {
           });
         }
       }
+      state.dirty.add('actions');
+      state.dirty.add('header');
       break;
     }
     case 'BackendUpdate': {
@@ -384,55 +450,75 @@ function applyLiveEvent(timestampMs, type, data) {
           ? Number(data.totalParticipants)
           : state.backend.totalParticipants,
       };
+      state.dirty.add('backend');
       break;
     }
     case 'LifecycleUpdate': {
       state.lifecycleStage = String(data.stage || state.lifecycleStage);
       state.lifecycleDetails = data.details ? String(data.details) : '';
+      state.dirty.add('lifecycle');
+      state.dirty.add('header');
       break;
     }
     case 'ParticipantAttributes': {
-      // Pipeline rozpoznawania emocji + wieku + płci. `participantId` z DOM
-      // Teams (typowo = display name) — `state.participants` jest jednak
-      // kluczowane po `speakerId` z diarization, więc dopasowujemy po
-      // nazwie. Dla wieloosobowego rosteru dopasowanie po name jest
-      // wystarczające dopóki dwóch uczestników nie ma identycznego
-      // displayName (Teams sam ich rozróżnia "Jan Kowalski" vs "Jan
-      // Kowalski (Guest)").
-      const haystack = String(data.name || data.participantId || '').trim().toLowerCase();
-      if (!haystack) break;
-      let target = null;
-      for (const p of state.participants.values()) {
-        const candidate = String(p.speakerName || p.speakerId || '').trim().toLowerCase();
-        if (candidate && candidate === haystack) {
-          target = p;
-          break;
-        }
-      }
-      if (!target) {
-        // Brak dopasowania w roster — dorzucamy tymczasowy wpis pod
-        // participantId, żeby badge mógł się pokazać zanim TranscriptEntry
-        // założy realny rekord po speakerId. RosterSnapshot i tak go
-        // potem nadpisze — tracimy tylko atrybuty na <=1 cykl.
-        const id = String(data.participantId || haystack);
-        target = {
-          speakerId: id,
-          speakerName: data.name || id,
-          isEnrolled: false,
-          status: 'joined',
-          lastSpokenAt: 0,
-        };
-        state.participants.set(id, target);
-      }
-      target.emotion = data.emotion || null;
-      target.emotionConfidence = typeof data.emotionConfidence === 'number'
+      // Pipeline rozpoznawania emocji + wieku + plci. `participantId` z DOM
+      // Teams (typowo = display name) — `state.participants` kluczowane
+      // po `speakerId` z diarization. Dopasowanie:
+      //  1. case-insensitive equality (speakerName ↔ data.name),
+      //  2. case-insensitive substring (np. "Jan Kowalski" vs "Jan Kowalski (Guest)"),
+      //  3. brak targetu => tylko zapis do secondary index, snapshot
+      //     potem dociagnie atrybuty.
+      const nameLower = String(data.name || '').trim().toLowerCase();
+      const domId = String(data.participantId || '').trim();
+      const emotion = data.emotion || null;
+      const emotionConfidence = typeof data.emotionConfidence === 'number'
         ? data.emotionConfidence
         : null;
-      target.age = typeof data.age === 'number' ? data.age : null;
-      target.genderMaleProb = typeof data.genderMaleProb === 'number'
+      const age = typeof data.age === 'number' ? data.age : null;
+      const genderMaleProb = typeof data.genderMaleProb === 'number'
         ? data.genderMaleProb
         : null;
-      target.attributesUpdatedAt = timestampMs;
+
+      let target = null;
+      if (nameLower) {
+        for (const p of state.participants.values()) {
+          const candidates = [
+            String(p.speakerName || '').trim().toLowerCase(),
+            String(p.speakerId || '').trim().toLowerCase(),
+          ];
+          const match = candidates.some((c) => {
+            if (!c) return false;
+            if (c === nameLower) return true;
+            // Substring matching tylko dla rozsadnie dlugich nazw —
+            // chronimy przed false-positive na 1-2 znakowych prefixach.
+            if (c.length >= 3 && (c.includes(nameLower) || nameLower.includes(c))) return true;
+            return false;
+          });
+          if (match) { target = p; break; }
+        }
+      }
+
+      if (target) {
+        target.emotion = emotion;
+        target.emotionConfidence = emotionConfidence;
+        target.age = age;
+        target.genderMaleProb = genderMaleProb;
+        target.attributesUpdatedAt = timestampMs;
+      }
+
+      // Zapis do secondary index po wszystkich znanych kluczach. Roster
+      // snapshot pozniej skleci atrybuty z kazdym entry vbo nazwie.
+      const indexKeys = [domId, nameLower].filter(Boolean);
+      for (const key of indexKeys) {
+        state.participantAttrsByDomId.set(key.toLowerCase(), {
+          emotion,
+          emotionConfidence,
+          age,
+          genderMaleProb,
+          timestamp: timestampMs,
+        });
+      }
+      state.dirty.add('participants');
       break;
     }
     default:
@@ -475,11 +561,299 @@ function renderShell() {
 }
 
 function renderAll() {
-  renderBreadcrumb();
-  renderHeader();
-  renderBody();
+  // Partial-update pipeline: surgical updates per zmienionych sekcji.
+  // Pelny rebuild (renderBody) odpalamy tylko gdy initial mount oznaczyl
+  // 'full' albo gdy DOM body w ogole nie istnieje jeszcze.
+  const dirty = state.dirty;
+  if (dirty.size === 0) return;
+
+  // Breadcrumb zawsze trzymamy aktualny — to jeden DOM node, koszt zerowy.
+  if (!byId('meet-live-crumbs')?.firstChild) {
+    renderBreadcrumb();
+  }
+
+  const wantsFull = dirty.has('full') || !byId('meet-live-body')?.firstChild;
+  if (wantsFull) {
+    renderBreadcrumb();
+    renderHeader();
+    renderBody();
+    const footer = byId('meet-live-footer');
+    if (footer) footer.innerHTML = footerHtml();
+    state.dirty.clear();
+    return;
+  }
+
+  if (dirty.has('header') || dirty.has('lifecycle')) {
+    applyHeaderUpdate();
+  }
+  if (dirty.has('participants')) {
+    applyParticipantsUpdate();
+  }
+  if (dirty.has('transcript') && state.activeTab === 'transcript') {
+    applyTranscriptAppend();
+  }
+  if (dirty.has('actions')) {
+    applyActionsUpdate();
+  }
+  if (dirty.has('summary')) {
+    applySummaryUpdate();
+  }
+  if (dirty.has('backend')) {
+    applyBackendUpdate();
+  }
+  // Footer ma osobny ticker (1 Hz), ale zaraz po zmianie chcemy odswiezyc
+  // od razu zeby nie czekac do nastepnego tick'u.
   const footer = byId('meet-live-footer');
   if (footer) footer.innerHTML = footerHtml();
+
+  state.dirty.clear();
+}
+
+// --- Surgical updates -------------------------------------------------------
+
+// Aktualizuje header (subtitle z licznikami, lifecycle chip) bez burzenia
+// caleo node — szuka konkretnych spans i podmienia textContent. Fallback do
+// pelnego renderHeader jezeli root nie istnieje.
+function applyHeaderUpdate() {
+  const host = byId('meet-live-header');
+  if (!host || !host.firstChild) {
+    renderHeader();
+    return;
+  }
+  const sub = host.querySelector('.d-sub');
+  if (sub) {
+    const s = state.sessionDetail || {};
+    const participantsCount = state.participants.size;
+    const durationLabel = formatDuration(Date.now() - parseIsoMs(s.startedAt));
+    const platform = s.platform || '—';
+    sub.innerHTML = `${I18n.t('meeting.live.subtitle_participants', { n: participantsCount })} · ${durationLabel} · ${escapeHtml(platform)}`;
+  }
+  // Chip jest osobnym elementem w .d-name — najprosciej wymienic tylko go.
+  const dName = host.querySelector('.d-name');
+  if (dName) {
+    const chipNode = dName.querySelector('tf-chip');
+    const newChipHtml = renderLifecycleChip();
+    if (chipNode) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = newChipHtml;
+      const fresh = tmp.firstElementChild;
+      if (fresh) chipNode.replaceWith(fresh);
+    } else {
+      dName.insertAdjacentHTML('beforeend', newChipHtml);
+    }
+  }
+}
+
+// Surgical diff listy uczestnikow: dla kazdego speaker_id zachowuje istniejacy
+// row jezeli jest, aktualizuje tylko zmienione atrybuty, dodaje brakujace
+// i usuwa te ktorych juz nie ma w stanie.
+function applyParticipantsUpdate() {
+  const container = document.getElementById('meet-participants-list');
+  if (!container) {
+    // Fallback — sidebar jeszcze nie zmontowany, robimy pelny rebuild body.
+    renderBody();
+    return;
+  }
+  const list = Array.from(state.participants.values())
+    .sort((a, b) => (b.lastSpokenAt || 0) - (a.lastSpokenAt || 0));
+
+  // Aktualizacja licznika w naglowku karty (h3 .counter).
+  const card = container.closest('.tf-section-card');
+  const counter = card?.querySelector('h3 .counter');
+  if (counter) {
+    const count = list.length || state.backend.totalParticipants || 0;
+    counter.textContent = `(${count})`;
+  }
+
+  // Empty state ↔ rzeczywista lista. Jezeli prev byl empty, wymieniamy
+  // calosc. Jezeli prev byl listing — diff per row.
+  const hadEmpty = container.querySelector('.users-empty');
+  if (list.length === 0) {
+    if (!hadEmpty) {
+      container.innerHTML = `<div class="users-empty">${escapeHtml(I18n.t('meeting.live.no_participants'))}</div>`;
+    }
+    return;
+  }
+  if (hadEmpty) {
+    container.innerHTML = list.map(renderParticipantRow).join('');
+    return;
+  }
+
+  const existing = new Map();
+  container.querySelectorAll('[data-speaker-id]').forEach((el) => {
+    existing.set(el.dataset.speakerId, el);
+  });
+
+  const seen = new Set();
+  list.forEach((p, idx) => {
+    seen.add(p.speakerId);
+    let row = existing.get(p.speakerId);
+    if (!row) {
+      // Nowy uczestnik — buduje przez istniejacy renderParticipantRow.
+      const tmp = document.createElement('div');
+      tmp.innerHTML = renderParticipantRow(p);
+      row = tmp.firstElementChild;
+      if (row) container.appendChild(row);
+    } else {
+      updateParticipantRow(row, p);
+    }
+    if (row) row.style.order = String(idx);
+  });
+
+  // Usun rows nie obecne w aktualnym snapshot.
+  for (const [id, el] of existing) {
+    if (!seen.has(id)) el.remove();
+  }
+}
+
+// Aktualizuje pojedynczy row uczestnika na miejscu — tylko te atrybuty
+// ktore moga sie zmienic miedzy renderami (speaking flag, emocje, wiek,
+// czas ostatniej wypowiedzi).
+function updateParticipantRow(row, p) {
+  const speakingNow = p.status === 'active_now' && (Date.now() - (p.lastSpokenAt || 0) < 5000);
+  row.classList.toggle('speaking', speakingNow);
+
+  const nameEl = row.querySelector('.p-name');
+  if (nameEl) {
+    const nm = p.speakerName || p.speakerId || '?';
+    if (nameEl.textContent !== nm) nameEl.textContent = nm;
+  }
+
+  const subEl = row.querySelector('.p-sub');
+  if (subEl) {
+    const sub = speakingNow
+      ? `${p.isEnrolled ? 'Enrolled' : I18n.t('meeting.live.not_enrolled')} · ${I18n.t('meeting.live.participant_speaking_now')}`
+      : p.lastSpokenAt
+        ? `${p.isEnrolled ? 'Enrolled' : I18n.t('meeting.live.not_enrolled')} · ${I18n.t('meeting.live.participant_spoke_ago', { n: Math.max(1, Math.floor((Date.now() - p.lastSpokenAt) / 1000)) })}`
+        : (p.isEnrolled ? 'Enrolled' : I18n.t('meeting.live.not_enrolled'));
+    if (subEl.textContent !== sub) subEl.textContent = sub;
+  }
+
+  // Emotion badge — dodaj/podmien/usun w zaleznosci od stanu atrybutow.
+  const wrap = row.querySelector('.p-avatar-wrap');
+  let badge = wrap?.querySelector('.p-emotion-badge');
+  const stale = p.attributesUpdatedAt
+    ? (Date.now() - p.attributesUpdatedAt) > ATTRIBUTES_STALE_AFTER_MS
+    : false;
+  if (p.emotion && EMOTION_VISUAL[p.emotion] && wrap) {
+    const v = EMOTION_VISUAL[p.emotion];
+    const conf = typeof p.emotionConfidence === 'number'
+      ? `${(p.emotionConfidence * 100).toFixed(0)}%`
+      : '';
+    const title = `${p.emotion}${conf ? ' ' + conf : ''}`;
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'p-emotion-badge';
+      wrap.appendChild(badge);
+    }
+    if (badge.textContent !== v.emoji) badge.textContent = v.emoji;
+    badge.style.background = v.bg;
+    badge.title = title;
+    badge.classList.toggle('stale', stale);
+  } else if (badge) {
+    badge.remove();
+  }
+
+  // Wiek + plec — div .p-attrs pod nazwa.
+  const meta = row.querySelector('.p-meta');
+  let attrs = meta?.querySelector('.p-attrs');
+  if ((p.age != null || p.genderMaleProb != null) && meta) {
+    const parts = [];
+    if (typeof p.age === 'number') {
+      parts.push(`<span class="p-attr-age">~${Math.round(p.age)} ${escapeHtml(I18n.t('meeting.live.attr_years_short'))}</span>`);
+    }
+    if (typeof p.genderMaleProb === 'number') {
+      const symbol = p.genderMaleProb > 0.5 ? '♂' : '♀';
+      parts.push(`<span class="p-attr-gender">${symbol}</span>`);
+    }
+    if (!attrs) {
+      attrs = document.createElement('div');
+      attrs.className = 'p-attrs';
+      meta.appendChild(attrs);
+    }
+    attrs.innerHTML = parts.join('');
+    attrs.classList.toggle('stale', stale);
+  } else if (attrs) {
+    attrs.remove();
+  }
+}
+
+// Append najnowszego transcript entry zamiast rebudowy listy. Sprawdzamy
+// czy scroll jest "u dolu" — tylko wtedy auto-scrollujemy, zeby nie zbic
+// uzytkownikowi pozycji gdy przewinal sam do gory.
+function applyTranscriptAppend() {
+  const host = byId('meet-live-transcript-scroll');
+  if (!host) {
+    // Tab transcript zmontowany, ale scroller nie istnieje — np. byl
+    // wczesniej empty state. Pelny rebuild zakladki.
+    const body = byId('meet-live-tab-body');
+    if (body && state.activeTab === 'transcript') {
+      body.innerHTML = renderActiveTab();
+      scrollTranscriptToBottom();
+    }
+    return;
+  }
+  const last = state.transcript[state.transcript.length - 1];
+  if (!last) return;
+  const wasAtBottom = (host.scrollTop + host.clientHeight) >= (host.scrollHeight - 50);
+  // Append jednego node — taniej niz innerHTML +=.
+  const tmp = document.createElement('div');
+  tmp.innerHTML = renderTranscriptEntry(last);
+  const node = tmp.firstElementChild;
+  if (node) host.appendChild(node);
+  if (wasAtBottom) scrollTranscriptToBottom();
+
+  // Aktualizacja countera w tabsie.
+  const tabsEl = byId('meet-live-tabs');
+  const tabTranscript = tabsEl?.querySelector('tf-tab[id="transcript"]');
+  if (tabTranscript) tabTranscript.setAttribute('count', String(state.transcript.length));
+}
+
+function applyActionsUpdate() {
+  // Aktualizacja countera w tabsie zawsze.
+  const tabsEl = byId('meet-live-tabs');
+  const tabActions = tabsEl?.querySelector('tf-tab[id="actions"]');
+  if (tabActions) tabActions.setAttribute('count', String(state.actionItems.length));
+
+  // Sidebar AI summary card — odswiez liste pending action items.
+  const aside = document.querySelector('.meet-side');
+  if (aside) {
+    const cards = aside.querySelectorAll('.tf-section-card');
+    // Drugi card to AI summary (po participants). Zachowawczo zastepujemy
+    // tylko jego markup — dzieki zorzedowanej kolejnosci w renderBody.
+    if (cards[1]) cards[1].outerHTML = renderAiSummaryCard();
+  }
+
+  if (state.activeTab === 'actions') {
+    const body = byId('meet-live-tab-body');
+    if (body) {
+      body.innerHTML = renderActionsTab();
+      wireActiveTab();
+    }
+  }
+}
+
+function applySummaryUpdate() {
+  // Sidebar — ten sam card jak w applyActionsUpdate (AI summary zawiera
+  // decisions + action items). Pojedynczy outerHTML swap to najprostsza
+  // forma, koszt mikroskopijny bo card to ~30 linii markupu.
+  const aside = document.querySelector('.meet-side');
+  if (aside) {
+    const cards = aside.querySelectorAll('.tf-section-card');
+    if (cards[1]) cards[1].outerHTML = renderAiSummaryCard();
+  }
+  if (state.activeTab === 'summary') {
+    const body = byId('meet-live-tab-body');
+    if (body) body.innerHTML = renderActiveTab();
+  }
+}
+
+function applyBackendUpdate() {
+  const aside = document.querySelector('.meet-side');
+  if (!aside) return;
+  const cards = aside.querySelectorAll('.tf-section-card');
+  // Trzecia karta to backend (participants, ai-summary, backend).
+  if (cards[2]) cards[2].outerHTML = renderBackendCard();
 }
 
 function renderBreadcrumb() {
@@ -743,6 +1117,8 @@ async function setActionItemStatus(itemId, newStatus, _event) {
         createdAt: String(a.createdAt || ''),
         updatedAt: String(a.updatedAt || ''),
       }));
+      state.dirty.add('actions');
+      state.dirty.add('header');
       renderAll();
     } catch (e) {
       toast(e?.message || I18n.t('meeting.live.update_failed'), 'error');
@@ -758,6 +1134,7 @@ async function setActionItemStatus(itemId, newStatus, _event) {
       const item = state.actionItems.find((a) => a.id === itemId);
       if (item) item.status = newStatus;
       toast(I18n.t('meeting.live.update_ok'), 'success');
+      state.dirty.add('actions');
       renderAll();
     } else {
       throw new Error(I18n.t('meeting.live.update_failed'));
@@ -807,10 +1184,13 @@ function renderParticipantsCard() {
   const items = list.length
     ? list.map(renderParticipantRow).join('')
     : `<div class="users-empty">${escapeHtml(I18n.t('meeting.live.no_participants'))}</div>`;
+  // id="meet-participants-list" jest potrzebne dla applyParticipantsUpdate —
+  // to root surgical-diff. Poszczegolne row maja data-speaker-id by mozna
+  // bylo ich zlokalizowac bez query po DOM.
   return `
     <div class="tf-section-card">
       <h3>${escapeHtml(I18n.t('meeting.live.sidebar_participants'))} <span class="counter">(${count})</span></h3>
-      ${items}
+      <div id="meet-participants-list" class="meet-participants-list">${items}</div>
     </div>
   `;
 }
@@ -876,7 +1256,7 @@ function renderParticipantRow(p) {
   }
 
   return `
-    <div class="${rowClass}">
+    <div class="${rowClass}" data-speaker-id="${escapeAttr(p.speakerId || '')}">
       <div class="p-avatar-wrap">
         <div class="${avatarClass}">${escapeHtml(initials)}</div>
         ${emotionBadge}

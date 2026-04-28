@@ -131,6 +131,15 @@ pub fn maybe_spawn_inference(
         let result = run_inference(&pool, &participant_id, &jpeg).await;
         match result {
             Ok(Some(attrs)) => {
+                tracing::debug!(
+                    "ParticipantAttributes emit: participant_id={} name={:?} emotion={:?} conf={:?} age={:?} gender_male={:?}",
+                    participant_id,
+                    name,
+                    attrs.emotion,
+                    attrs.emotion_confidence,
+                    attrs.age,
+                    attrs.gender_male_prob,
+                );
                 let live_event = MeetingLiveEvent {
                     meeting_key,
                     timestamp_ms,
