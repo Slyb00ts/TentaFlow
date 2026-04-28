@@ -456,6 +456,7 @@ async fn do_docker_deploy(
         &engine.category,
         &created_name,
         host_port,
+        model_repo.as_deref(),
     );
     register_docker_quic_service(
         service_manager,
@@ -2328,16 +2329,26 @@ fn register_service(
     category: &str,
     container_name: &str,
     host_port: u16,
+    deployed_model: Option<&str>,
 ) -> Option<i64> {
     // Wpis do tabeli services żeby startup restore_services mógł restaurować.
-    let config_json = serde_json::json!({
+    // `deployed_model` jest KONIECZNE: ServiceManager::init_model_pool po
+    // restarcie czyta to pole z services.config_json zeby przywrocic mapping
+    // model_name -> service_name. Bez tego zakladka Models w GUI jest pusta
+    // i router nie potrafi wyrouter chat completion po nazwie modelu HF.
+    let mut cfg = serde_json::json!({
         "deploy_mode": "docker",
         "image": format!("tentaflow/{}:latest", engine_id),
         "manifest_engine_id": engine_id,
         "port": host_port,
         "container_name": container_name,
-    })
-    .to_string();
+    });
+    if let Some(m) = deployed_model {
+        if !m.is_empty() {
+            cfg["deployed_model"] = serde_json::Value::String(m.to_string());
+        }
+    }
+    let config_json = cfg.to_string();
     match crate::db::repository::create_service(
         db,
         service_name,
