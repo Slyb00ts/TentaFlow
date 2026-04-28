@@ -107,7 +107,7 @@ impl CollectorParser for MacosIostatDiskParser {
         &self,
         raw: RawCapture,
         ctx: &SessionCtx,
-        _names: &mut NameInterner,
+        names: &mut NameInterner,
         _frames: &mut FrameInterner,
     ) -> Result<Vec<TimelineEvent>, CollectorError> {
         let csv_path = match find_csv(&raw) {
@@ -118,6 +118,11 @@ impl CollectorParser for MacosIostatDiskParser {
             Ok(s) => s,
             Err(_) => return Ok(Vec::new()),
         };
+
+        // Cache device-name → interned id within this parse pass so identical
+        // labels across rows resolve in O(1) without re-hashing into the global
+        // interner per event.
+        let mut device_ids: HashMap<String, u32> = HashMap::new();
 
         let mut out: Vec<TimelineEvent> = Vec::new();
         for (idx, line) in body.lines().enumerate() {
@@ -130,12 +135,21 @@ impl CollectorParser for MacosIostatDiskParser {
             }
             let mut cols = trimmed.split(',');
             let ts: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let device: String = cols.next().unwrap_or("disk0").to_string();
+            let device_label: &str = cols.next().unwrap_or("disk0");
             let read_bps: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let write_bps: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let iops_r: u32 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let iops_w: u32 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
             let await_ms: f32 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+            let device_name_id = match device_ids.get(device_label) {
+                Some(id) => *id,
+                None => {
+                    let id = names.intern(device_label);
+                    device_ids.insert(device_label.to_string(), id);
+                    id
+                }
+            };
 
             let t_ns = ts.saturating_sub(ctx.t0_monotonic_ns);
             out.push(TimelineEvent {
@@ -145,7 +159,7 @@ impl CollectorParser for MacosIostatDiskParser {
                 category: EventCategory::DiskIoBurst,
                 lane_hint: 0,
                 payload: EventPayload::DiskIoBurst {
-                    device,
+                    device_name_id,
                     read_bps,
                     write_bps,
                     iops_r,
@@ -541,16 +555,17 @@ mod tests {
             .parse(raw, &ctx, &mut names, &mut frames)
             .unwrap();
         assert_eq!(events.len(), 2);
+        let names_vec = names.into_vec();
         match &events[0].payload {
             EventPayload::DiskIoBurst {
-                device,
+                device_name_id,
                 read_bps,
                 write_bps,
                 iops_r,
                 iops_w,
                 await_ms_p99,
             } => {
-                assert_eq!(device, "disk0");
+                assert_eq!(names_vec[*device_name_id as usize], "disk0");
                 assert_eq!(*read_bps, 720_000);
                 assert_eq!(*write_bps, 0);
                 assert_eq!(*iops_r, 45);

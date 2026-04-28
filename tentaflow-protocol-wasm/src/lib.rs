@@ -6621,7 +6621,7 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             set(&o, "writeBps", (*write_bps as f64).into());
         }
         P::DiskIoBurst {
-            device,
+            device_name_id,
             read_bps,
             write_bps,
             iops_r,
@@ -6629,7 +6629,9 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             await_ms_p99,
         } => {
             set(&o, "kind", "disk_io_burst".into());
-            set(&o, "device", device.clone().into());
+            // Device label is interned in `ProfileReportV2.names`; the GUI
+            // resolves the string via `names[deviceNameId]`.
+            set(&o, "deviceNameId", (*device_name_id as f64).into());
             set(&o, "readBps", (*read_bps as f64).into());
             set(&o, "writeBps", (*write_bps as f64).into());
             set(&o, "iopsR", (*iops_r as f64).into());
@@ -6710,14 +6712,15 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             set(&o, "color", (*color as f64).into());
         }
         P::NetworkSample {
-            iface,
+            iface_name_id,
             rx_bps,
             tx_bps,
             rx_pps,
             tx_pps,
         } => {
             set(&o, "kind", "network_sample".into());
-            set(&o, "iface", iface.clone().into());
+            // Interface label is interned in `ProfileReportV2.names`.
+            set(&o, "ifaceNameId", (*iface_name_id as f64).into());
             set(&o, "rxBps", (*rx_bps as f64).into());
             set(&o, "txBps", (*tx_bps as f64).into());
             set(&o, "rxPps", (*rx_pps as f64).into());

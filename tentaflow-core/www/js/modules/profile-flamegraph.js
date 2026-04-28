@@ -118,19 +118,22 @@ export class CpuFlamegraph {
   drillDown(frameId) {
     const node = this._findNodeInCurrentZoomByFrameId(frameId);
     if (!node) return;
-    // Walk from current root down to node, building zoomPath
-    const newPath = [];
-    let cursor = this._currentZoomRoot();
-    const stack = [{ node: cursor, path: [] }];
-    let found = null;
-    while (stack.length > 0 && !found) {
-      const { node: n, path } = stack.shift();
-      if (n === node) { found = path; break; }
+    // DFS from current root to node, building the path from frameIds. Using a
+    // stack with pop() avoids the O(n) shift() the previous BFS performed and
+    // also avoids spreading `path` into a fresh array per visited node.
+    const root = this._currentZoomRoot();
+    if (root === node) return;
+    const found = [];
+    const visit = (n) => {
+      if (n === node) return true;
       for (const child of n.children.values()) {
-        stack.push({ node: child, path: [...path, child.frameId] });
+        found.push(child.frameId);
+        if (visit(child)) return true;
+        found.pop();
       }
-    }
-    if (found) {
+      return false;
+    };
+    if (visit(root)) {
       this.zoomPath = [...this.zoomPath, ...found];
       this.selectedFrameId = null;
       this._renderAll();
@@ -193,15 +196,23 @@ export class CpuFlamegraph {
   }
 
   // Build aggregate count per stack id, optionally restricted to a time range.
+  // Fast path for the common (no-range) case caches the result so a search
+  // input change or minPercent slider tweak doesn't re-walk all samples; the
+  // cache is invalidated when differential mode toggles ranges via
+  // setDifferentialMode → _buildDifferentialTree which always passes a range.
   _aggregateStacks(rangeNs) {
+    if (!rangeNs && this._fullStacksCache) return this._fullStacksCache;
     const counts = new Map();
     if (!rangeNs) {
-      for (const s of this.cpuSamples) {
-        counts.set(s.stackId, (counts.get(s.stackId) || 0) + 1);
+      for (let i = 0; i < this.cpuSamples.length; i++) {
+        const id = this.cpuSamples[i].stackId;
+        counts.set(id, (counts.get(id) || 0) + 1);
       }
+      this._fullStacksCache = counts;
     } else {
       const { startNs, endNs } = rangeNs;
-      for (const s of this.cpuSamples) {
+      for (let i = 0; i < this.cpuSamples.length; i++) {
+        const s = this.cpuSamples[i];
         if (s.startNs >= startNs && s.startNs < endNs) {
           counts.set(s.stackId, (counts.get(s.stackId) || 0) + 1);
         }
