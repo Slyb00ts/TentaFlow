@@ -416,7 +416,17 @@ async fn do_docker_deploy(
         // Mount klucza + config sidecara jako /data RO. Sidecar czyta /data/config.toml
         // i /data/endpoint-key.bin (zgodnie z `tentaflow-sidecar`).
         volumes: vec![(sidecar.dir.display().to_string(), "/data".to_string())],
-        env: std::collections::HashMap::new(),
+        // Env dla silnika w kontenerze: entrypoint.sh dla LLM (vllm/sglang/...) i
+        // wielu STT/TTS oczekuje `MODEL` lub `MODEL_ID` z HF repo. Przekazujemy
+        // oba zeby pasowalo do roznych konwencji entrypointow.
+        env: {
+            let mut e = std::collections::HashMap::new();
+            if let Some(m) = model_repo.as_deref() {
+                e.insert("MODEL".to_string(), m.to_string());
+                e.insert("MODEL_ID".to_string(), m.to_string());
+            }
+            e
+        },
         gpu: config.gpu_select_mode.as_deref() == Some("all")
             || config
                 .gpu_ids
@@ -478,12 +488,13 @@ async fn do_docker_deploy(
             svc_id,
             &registry_config,
         );
-        // Router potrzebuje obu mappingow: model_name -> service_name (dla
-        // dispatch po HF repo) oraz service_name jako "local model" (dla
-        // dispatch po nazwie serwisu).
+        // Mapping HF repo -> service_name; QUIC LLM service jest juz zarejestrowany
+        // przez register_docker_quic_service(), wiec router znajdzie go po nazwie
+        // serwisu albo po nazwie modelu (model_aliases sidecar publikuje rowniez).
+        // NIE rejestrujemy `register_local_inference_model` — local inference
+        // jest dla embedded native (in-process MLX/llama.cpp); silnik w kontenerze
+        // jest osiagalny tylko przez QUIC sidecar.
         service_manager.register_model_mapping(model_name, &service_name);
-        service_manager.register_local_inference_model(model_name);
-        service_manager.register_local_inference_model(&service_name);
     }
     persist_source_hash(db, &engine.engine_id, "docker", &service_name);
     log_line(db, deploy_id, tx, "log", "serwis zarejestrowany w routerze");
