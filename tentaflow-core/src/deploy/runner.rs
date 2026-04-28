@@ -373,7 +373,11 @@ async fn do_docker_deploy(
     let host_port = config.port.unwrap_or(engine.default_port);
 
     let req = crate::deploy::docker::DeployRequest {
-        container: engine.engine_id.clone(),
+        // context_path z manifestu (np. "llm/docker/vllm") — docker::deploy
+        // sklada to z prefixem "tentaflow-containers/" w sciezke do Dockerfile.
+        // Stary engine_id ("vllm") dawal "tentaflow-containers/vllm/Dockerfile"
+        // co lamie sie po reorganizacji do category-based layoutu.
+        container: context_path.clone(),
         image_tag: Some(image_tag.to_string()),
         instance_name: Some(container_name.clone()),
         ports: vec![(

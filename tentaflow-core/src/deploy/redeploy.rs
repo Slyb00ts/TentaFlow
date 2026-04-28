@@ -356,7 +356,10 @@ async fn run_docker_redeploy(
     phase(db, deploy_id, tx, "running", 93, "start_new");
 
     let req = crate::deploy::docker::DeployRequest {
-        container: engine_id.to_string(),
+        // Pelny context_path z manifestu (np. "llm/docker/vllm") — patrz
+        // analogiczny komentarz w runner.rs. Stary engine_id daje zepsuta
+        // sciezke do Dockerfile po reorganizacji do category-based layoutu.
+        container: context_path.clone(),
         image_tag: Some(image_tag.clone()),
         instance_name: Some(container_name.clone()),
         ports: vec![(host_port.to_string(), format!("{}/tcp", default_port))],
