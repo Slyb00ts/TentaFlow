@@ -774,6 +774,10 @@ pub struct MeshNodeInfo {
     pub nsys_available: bool,
     /// Wykryta wersja `nsys` (np. "2024.5.1"); pusty string gdy niedostepny.
     pub nsys_version: String,
+    /// Multi-source profiling: lista identyfikatorow kolektorow (np.
+    /// `linux.proc.cpu_util`, `nvidia.nsys.gpu`) ktore peer moze uruchomic.
+    /// Pusta lista = peer nie obsluguje multi-source profiling V2.
+    pub profiling_collectors_available: Vec<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -3327,6 +3331,9 @@ pub enum MessageBody {
 
     // ---- Nsight profiling (single-variant, req+res w inner enum) ----
     // 10 par request/response w jednym slocie — rkyv 0.8 ma twardy limit 256.
+    // Nowe pary multi-source profiling (7 par) tez sa pakowane w NsightPayload
+    // (`NsightPayload::Profiling(ProfilingPayload)`) zeby nie zjadac kolejnych
+    // slotow — limit 256 wariantow MessageBody jest twardy.
     NsightBody(crate::profiling::NsightPayload),
 
     // ---- Vision inference (single-slot, req+res w inner enum) ----

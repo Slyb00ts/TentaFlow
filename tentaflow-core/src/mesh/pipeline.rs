@@ -495,6 +495,7 @@ fn upsert_local_peer(
         tokens_per_sec: 0.0,
         nsys_available: false,
         nsys_version: String::new(),
+        profiling_collectors_available: Vec::new(),
     });
 }
 
@@ -1368,6 +1369,7 @@ fn spawn_quic_event_handler(
                             metrics.tokens_per_sec,
                             metrics.nsys_available,
                             metrics.nsys_version,
+                            metrics.profiling_collectors_available,
                         );
 
                         // Aktualizuj topologie peera na podstawie jego connected_peers
@@ -1923,6 +1925,14 @@ fn spawn_heartbeat_sender(
                 // 2 Hz nie odpala kosztownego `which`/`--version` w kazdym ticku.
                 let nsys_cap = crate::profiling::detect_capability().await;
 
+                // Multi-source profiling capability — wynik discover() nie zmienia
+                // sie w czasie, ale probe() per kolektor moze, wiec robimy to co
+                // tick. Lista jest mala (≤ 16 elementow) i probe() jest tania.
+                let profiling_collectors_available =
+                    crate::profiling::collectors::CollectorRegistry::probe_available_ids(
+                        &crate::profiling::COLLECTOR_REGISTRY,
+                    );
+
                 let hb = HeartbeatMetrics {
                     cpu_usage_percent: m.cpu_usage_percent,
                     ram_used_mb: m.ram_used_mb,
@@ -1938,6 +1948,7 @@ fn spawn_heartbeat_sender(
                     tokens_per_sec,
                     nsys_available: nsys_cap.available,
                     nsys_version: nsys_cap.version,
+                    profiling_collectors_available,
                 };
 
                 // Aktualizuj metryki lokalnego noda w store (klonowanie z hb)
@@ -1956,6 +1967,7 @@ fn spawn_heartbeat_sender(
                     hb.tokens_per_sec,
                     hb.nsys_available,
                     hb.nsys_version.clone(),
+                    hb.profiling_collectors_available.clone(),
                 );
 
                 // Aktualizuj topologie lokalnego noda

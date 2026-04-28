@@ -5166,6 +5166,16 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     set(&obj, "nsysAvailable", n.nsys_available.into());
     set(&obj, "nsys_version", n.nsys_version.clone().into());
     set(&obj, "nsysVersion", n.nsys_version.into());
+    let collectors_arr = js_sys::Array::new();
+    for cid in &n.profiling_collectors_available {
+        collectors_arr.push(&js_sys::JsString::from(cid.as_str()).into());
+    }
+    set(
+        &obj,
+        "profiling_collectors_available",
+        collectors_arr.clone().into(),
+    );
+    set(&obj, "profilingCollectorsAvailable", collectors_arr.into());
     obj
 }
 
