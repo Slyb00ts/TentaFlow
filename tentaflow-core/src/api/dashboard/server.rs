@@ -5,8 +5,8 @@
 
 use super::{
     api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_fast_path, api_flows,
-    api_hub, api_models, api_pii_rules, api_prompts, api_registries, api_services, api_tts_rules,
-    auth, static_files,
+    api_hub, api_me_preferences, api_models, api_pii_rules, api_prompts, api_registries,
+    api_services, api_tts_rules, auth, static_files,
 };
 use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
@@ -1238,6 +1238,14 @@ fn route_api(
         (&Method::GET, "/api/auth/me") => handle_result(api_auth::handle_me(claims), 500),
         (&Method::POST, "/api/auth/change-password") => {
             handle_result(api_auth::handle_change_password(db, claims, body), 400)
+        }
+
+        // Preferencje uzytkownika (preferowany jezyk dla TTS itd.)
+        (&Method::GET, "/api/me/preferences") => {
+            handle_result(api_me_preferences::handle_get(db, claims), 500)
+        }
+        (&Method::PUT, "/api/me/preferences") => {
+            handle_result(api_me_preferences::handle_put(db, claims, body), 400)
         }
 
         // Dashboard

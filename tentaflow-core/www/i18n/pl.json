@@ -2584,6 +2584,7 @@
     "subtitle": "Twoje osobiste preferencje",
     "language_title": "Język",
     "language_hint": "Zmiany obowiązują natychmiast i są zapamiętywane na tym urządzeniu.",
+    "save_ok": "Zapisano wybór języka",
     "save_error": "Nie udało się zapisać ustawień"
   },
   "flows_user": {

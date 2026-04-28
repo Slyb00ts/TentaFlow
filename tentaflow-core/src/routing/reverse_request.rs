@@ -231,7 +231,7 @@ async fn handle_tts_stream(
     let request_id = request.request_id.clone();
 
     // Wyluskaj parametry TTS bez clone calego payloadu
-    let (model, input, voice, format, speed) = match request.payload {
+    let (model, input, voice, format, speed, language) = match request.payload {
         ModelPayload::Audio(p) => match p.operation {
             AudioOperation::TTS {
                 model,
@@ -239,7 +239,8 @@ async fn handle_tts_stream(
                 voice,
                 format,
                 speed,
-            } => (model, input, voice, format, speed),
+                language,
+            } => (model, input, voice, format, speed, language),
             _ => return,
         },
         _ => return,
@@ -254,6 +255,7 @@ async fn handle_tts_stream(
         // ale "pcm" zaoszczedzi pracy backendowi.
         response_format: Some("pcm".to_string()),
         speed,
+        language,
     };
     let _ = format; // honorujemy "pcm" niezaleznie od pola w request
 

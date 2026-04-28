@@ -2299,6 +2299,7 @@
     "subtitle": "Deine persönlichen Einstellungen",
     "language_title": "Sprache",
     "language_hint": "Änderungen gelten sofort und werden auf diesem Gerät gespeichert.",
+    "save_ok": "Spracheinstellung gespeichert",
     "save_error": "Einstellungen konnten nicht gespeichert werden"
   },
   "flows_user": {

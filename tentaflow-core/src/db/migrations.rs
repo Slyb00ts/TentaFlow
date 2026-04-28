@@ -1752,5 +1752,14 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             );
         ",
     ),
+    (
+        61,
+        "add_user_preferred_language",
+        "
+            -- Preferowany jezyk uzytkownika (ISO-639-1: en/pl/fr/es/de).
+            -- NULL = brak preferencji, handler TTS uzyje domyslnego \"en\".
+            ALTER TABLE users ADD COLUMN preferred_language TEXT;
+        ",
+    ),
 ]
 }

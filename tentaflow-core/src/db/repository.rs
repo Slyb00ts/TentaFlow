@@ -854,6 +854,49 @@ pub fn clear_must_change_password(pool: &DbPool, user_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Lista jezykow akceptowanych w `users.preferred_language` i w polu
+/// `language` requestu TTS. Trzymana w jednym miejscu, bo walidacja zapisu
+/// preferencji i walidacja body'ego endpointu musza wzajemnie sie zgadzac.
+pub const SUPPORTED_USER_LANGUAGES: &[&str] = &["pl", "en", "fr", "es", "de"];
+
+/// Zwraca preferowany jezyk uzytkownika lub None jesli brak preferencji.
+pub fn get_user_preferred_language(pool: &DbPool, user_id: i64) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    let result = conn
+        .query_row(
+            "SELECT preferred_language FROM users WHERE id = ?1",
+            rusqlite::params![user_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(result)
+}
+
+/// Ustawia preferowany jezyk uzytkownika. `lang = None` czysci preferencje.
+/// Zwraca blad gdy `lang` nie nalezy do `SUPPORTED_USER_LANGUAGES`.
+pub fn set_user_preferred_language(
+    pool: &DbPool,
+    user_id: i64,
+    lang: Option<&str>,
+) -> Result<()> {
+    if let Some(code) = lang {
+        if !SUPPORTED_USER_LANGUAGES.contains(&code) {
+            return Err(anyhow::anyhow!(
+                "Nieobslugiwany kod jezyka: '{}' (dozwolone: {:?})",
+                code,
+                SUPPORTED_USER_LANGUAGES
+            ));
+        }
+    }
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE users SET preferred_language = ?1 WHERE id = ?2",
+        rusqlite::params![lang, user_id],
+    )?;
+    Ok(())
+}
+
 // --- Prompts ---
 
 const PROMPT_COLS: &str = "id, prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority, is_active, version, language, is_system, created_at, updated_at";

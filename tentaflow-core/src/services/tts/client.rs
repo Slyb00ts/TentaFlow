@@ -160,6 +160,7 @@ impl TTSClient {
             voice: voice.to_string(),
             response_format: Some(format.to_string()),
             speed: Some(speed),
+            language: None,
         };
 
         // Wyslij POST request
