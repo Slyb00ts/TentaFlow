@@ -624,6 +624,49 @@ impl Router {
                     }
                     continue;
                 }
+                #[cfg(feature = "inference-sherpa")]
+                if engine_id == "sherpa-onnx" {
+                    // Restore embedded sherpa-onnx TTS po restarcie tentaflow.
+                    // Czytamy sciezke do bundle z config_json (zapisana przy
+                    // deployu) i ladujemy silnik do shared_tts_manager().
+                    let model_path_str = config["model_path"].as_str().unwrap_or("");
+                    let model_path = std::path::PathBuf::from(model_path_str);
+                    if model_path_str.is_empty() || !model_path.exists() {
+                        warn!(
+                            "sherpa-onnx restore '{}': brak sciezki '{}' — pomijam",
+                            svc.name, model_path_str
+                        );
+                        continue;
+                    }
+                    info!(
+                        "Przywracanie sherpa-onnx TTS '{}': model={}",
+                        svc.name,
+                        model_path.display()
+                    );
+                    let mut e = crate::tts::sherpa::SherpaTtsEngine::new();
+                    use crate::tts::TtsEngine;
+                    match e.load_model(&model_path) {
+                        Err(err) => {
+                            warn!("sherpa-onnx restore '{}': {}", svc.name, err);
+                        }
+                        Ok(info) => {
+                            let shared = crate::tts::shared_tts_manager();
+                            let mut mgr = shared.write().await;
+                            mgr.register(svc.name.clone(), Box::new(e));
+                            self.register_native_service_in_mesh(
+                                &svc.name,
+                                "tts",
+                                vec![config["deployed_model"]
+                                    .as_str()
+                                    .unwrap_or("sherpa-onnx")
+                                    .to_string()],
+                                Some("sherpa-onnx".to_string()),
+                                vec![info.sample_rate as u64 / 1000],
+                            );
+                        }
+                    }
+                    continue;
+                }
                 #[cfg(feature = "inference-mlx-kokoro")]
                 if engine_id == "kokoro" {
                     let model_path_str = config["model_path"].as_str().unwrap_or("");
