@@ -2752,14 +2752,19 @@ fn all_gpus_to_proto(gpus: &[StoreGpu]) -> Vec<tentaflow_protocol::MeshNodeGpuIn
     gpus.iter()
         .map(|g| {
             let name_lc = g.name.to_lowercase();
+            // Vendor zgodny z `GpuVendor` enum (Nvidia/Amd/Intel/Apple/Other) —
+            // frontend (mesh-detail-nsight.js) porownuje `g.vendor === 'Nvidia'`
+            // strict equality, wiec lowercase tu blokowal Profile button NIGDZIE.
             let vendor = if name_lc.contains("nvidia") {
-                "nvidia"
+                "Nvidia"
             } else if name_lc.contains("amd") || name_lc.contains("radeon") {
-                "amd"
+                "Amd"
             } else if name_lc.contains("intel") {
-                "intel"
+                "Intel"
+            } else if name_lc.contains("apple") {
+                "Apple"
             } else {
-                "unknown"
+                "Other"
             };
             tentaflow_protocol::MeshNodeGpuInfo {
                 vendor: vendor.to_string(),
