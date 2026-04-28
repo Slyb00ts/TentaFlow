@@ -651,6 +651,11 @@ fn emit_label(payload: &MeetingEventPayload) -> &'static str {
         MeetingEventPayload::ActionItemsUpdate { .. } => "action_items",
         MeetingEventPayload::BackendUpdate { .. } => "backend",
         MeetingEventPayload::VideoFrame { .. } => "video_frame",
+        // ParticipantAttributes (emocje + wiek + plec z vision pipeline)
+        // emituje router po inferencji na VideoFrame, NIE bot. Wariant
+        // wlasnie w match dla kompletnosci zeby protocol-only zmiany w
+        // enum nie wywalaly buildu teams-bota.
+        MeetingEventPayload::ParticipantAttributes { .. } => "participant_attributes",
     }
 }
 
