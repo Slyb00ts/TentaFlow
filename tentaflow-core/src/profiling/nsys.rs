@@ -60,6 +60,7 @@ pub struct ActiveSession {
 struct ActiveSlot {
     session: ActiveSession,
     child: Child,
+    auto_stop_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Error, Debug)]
@@ -180,24 +181,32 @@ impl NsysRunner {
             auto_stop_at,
         };
 
-        *slot = Some(ActiveSlot { session, child });
-        drop(slot);
-
         // Auto-stop background task — bez tego sesja z `duration_secs > 0`
         // leci w nieskonczonosc, bo nikt nie sprawdza `auto_stop_at`. Race
         // z manualnym stop jest OK: drugi stop dostanie NotFound i zignoruje
-        // (slot zostal juz wyczyszczony przez pierwsze wywolanie).
-        if duration_secs > 0 {
+        // (slot zostal juz wyczyszczony przez pierwsze wywolanie). Trzymamy
+        // JoinHandle w slocie zeby abortowac przy stop() — inaczej task spi
+        // pelne `duration_secs` (do 600s) trzymajac klon storage'u.
+        let auto_stop_handle = if duration_secs > 0 {
             let session_id_for_task = session_id.clone();
             let storage_for_task = storage.clone();
             let sleep_for = Duration::from_secs(duration_secs as u64);
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 tokio::time::sleep(sleep_for).await;
                 let _ = super::NSYS_RUNNER
                     .stop(&session_id_for_task, &storage_for_task)
                     .await;
-            });
-        }
+            }))
+        } else {
+            None
+        };
+
+        *slot = Some(ActiveSlot {
+            session,
+            child,
+            auto_stop_handle,
+        });
+        drop(slot);
 
         Ok((session_id, started_at_ms))
     }
@@ -221,17 +230,28 @@ impl NsysRunner {
         let ActiveSlot {
             session,
             mut child,
+            auto_stop_handle,
         } = slot;
         // Lock zwolniony przed dlugotrwalym parsowaniem — kolejny start moze
         // wystartowac jak tylko stop dolaczy proces dziecka.
         drop(slot_guard);
 
+        // Anuluj auto-stop task — niezaleznie czy to user-stop wyprzedzil
+        // timer, czy to wlasnie auto-stop sam sie wykonuje (abort na sobie
+        // jest no-op). Zwalnia klon storage'u i nie zostawia spiacego taska.
+        if let Some(handle) = auto_stop_handle {
+            handle.abort();
+        }
+
+        // PID bierzemy swiezo z `Child::id()` — defense-in-depth wzgledem
+        // cached `child_pid`. PID race i tak nie wystepuje (trzymamy `child`,
+        // OS nie zrecyklowal slotu), ale fresh id jest oczywisciej poprawny.
+        let kill_pid = child.id().unwrap_or(session.child_pid);
+
         // SIGTERM zamiast SIGKILL — nsys potrzebuje signala TERM zeby wywolac
         // teardown i flush'nac dane do `.nsys-rep`. SIGKILL zostawia plik
-        // czesciowy/uszkodzony. PID race nie wystepuje: wciaz trzymamy `child`
-        // (kill_on_drop=true), wiec OS nie zrecyklowal slotu PID przed
-        // bezposrednio nastepujacym `child.wait()`.
-        send_sigterm(session.child_pid);
+        // czesciowy/uszkodzony.
+        send_sigterm(kill_pid);
 
         // Krotki grace na flush — nsys 2025.x potrafi ignorowac SIGTERM albo
         // dlugo flush'owac. Po SIGTERM_GRACE wymuszamy SIGKILL, zeby nie
@@ -239,11 +259,15 @@ impl NsysRunner {
         // i tak parsuje sie do `Failed` przez krotszy POST_STOP_TIMEOUT.
         if tokio::time::timeout(SIGTERM_GRACE, child.wait()).await.is_err() {
             tracing::warn!(
-                pid = session.child_pid,
+                pid = kill_pid,
                 "nsys did not exit within grace period, sending SIGKILL"
             );
             let _ = child.kill().await;
-            let _ = child.wait().await;
+            // Drugi wait z timeoutem 2s — proces w stanie D (uninterruptible
+            // I/O do GPU) moglby zawiesic stop() na nieokreslony czas. Po
+            // timeoucie dropujemy `child` (kill_on_drop=true wczesniej zlecil
+            // SIGKILL) i lecimy dalej; resource cleanup zalatwi kernel.
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         }
 
         let result = tokio::time::timeout(POST_STOP_TIMEOUT, async {
