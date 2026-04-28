@@ -153,15 +153,30 @@ impl NsysRunner {
         }
 
         let (session_id, output_path) = storage.allocate(&label, &scope)?;
-        let args = build_nsys_args(&scope, &output_path);
+        let args = build_nsys_args(&scope, &output_path, duration_secs);
 
         let nsys_path = nsys_binary().ok_or(ProfilingError::NotAvailable)?;
-        let child = Command::new(nsys_path)
+        let mut child = Command::new(nsys_path)
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+
+        // Stderr nsys nie idzie nigdzie sensownego bez aktywnego readera —
+        // bez tego diagnoza bledow startu (np. brak uprawnien do gpu-metrics,
+        // konflikt z innym profilerem) jest niemozliwa. Spawn task czyta linie
+        // i loguje przez tracing; konczy sie naturalnie gdy nsys zamknie pipe.
+        if let Some(stderr) = child.stderr.take() {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::warn!(target: "nsys.profile", "{line}");
+                }
+            });
+        }
 
         let child_pid = child.id().unwrap_or(0);
         let started_at_ms = unix_ms_now();
@@ -290,10 +305,18 @@ impl NsysRunner {
 }
 
 /// Buduje argumenty `nsys profile` dla danego `NsightScope`. Output_path jest
-/// jedynym argumentem branym z zewnatrz — walidowany przez storage przed wywolaniem.
-fn build_nsys_args(scope: &NsightScope, output_path: &Path) -> Vec<String> {
+/// walidowany przez storage przed wywolaniem.
+///
+/// nsys 2025.x wymaga target-command na koncu — bez tego pierwsza flaga jest
+/// traktowana jako exe i sesja nie startuje ("Executable ' ' not found ...
+/// --sample=none: command not found"). Uzywamy `sleep` jako standardowy
+/// NVIDIA idiom dla system-wide profiling: proces nic nie robi, nsys zbiera
+/// metryki przez czas trwania sleepa. Manual-mode (`duration_secs == 0`)
+/// dostaje bardzo dlugi sleep — SIGTERM z `stop()` przerywa go i nsys
+/// wykonuje teardown z flushem `.nsys-rep`.
+fn build_nsys_args(scope: &NsightScope, output_path: &Path, duration_secs: u32) -> Vec<String> {
     let out = output_path.to_string_lossy().to_string();
-    match scope {
+    let mut args: Vec<String> = match scope {
         NsightScope::Cpu => vec![
             "profile".into(),
             "--sample=cpu".into(),
@@ -339,7 +362,16 @@ fn build_nsys_args(scope: &NsightScope, output_path: &Path) -> Vec<String> {
             out,
             "--force-overwrite=true".into(),
         ],
+    };
+    args.push("sleep".into());
+    if duration_secs > 0 {
+        args.push(duration_secs.to_string());
+    } else {
+        // Manual mode — bardzo dlugi sleep (24h), SIGTERM z stop() przerwie
+        // proces sleep, nsys propaguje teardown i flushuje raport.
+        args.push("86400".into());
     }
+    args
 }
 
 async fn finalize_session(
