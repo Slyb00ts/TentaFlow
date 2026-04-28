@@ -1,18 +1,19 @@
 # =============================================================================
 # Plik: python-bundles/vllm/bundle.toml
-# Opis: vLLM jako PyPI pinned (0.19.1, kwiecien 2026). Dla macOS Apple
+# Opis: vLLM jako PyPI pinned (0.20.0, kwiecien 2026). Dla macOS Apple
 #       Silicon uzywamy osobnego silnika `vllm-metal` (bundle
 #       ../vllm-metal/bundle.toml) — plugin MLX, inny flow instalacji.
 # =============================================================================
 
 [bundle]
 engine = "vllm"
-description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.19.1)"
+description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.20.0)"
 python_version = "3.12"
-# Pinned na 0.19.1 (kwiecien 2026 release, gRPC + Gemma 4). Switch z git HEAD
-# na PyPI dla reproducibility — git main moze rozjechac sie z innymi deps.
+# Pinned na 0.20.0 (2026-04-27): NVFP4 emulacja, Gemma 4 quantized MoE,
+# PyTorch 2.11 + CUDA 13.0 default. Switch z git HEAD na PyPI dla
+# reproducibility — git main moze rozjechac sie z innymi deps.
 source = "pypi"
-pypi_package = "vllm==0.19.1"
+pypi_package = "vllm==0.20.0"
 
 [launch]
 command = "python"
@@ -34,7 +35,7 @@ platforms = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
 
 [[install_variants]]
 backend = "cuda"
-extra_index = "https://download.pytorch.org/whl/cu124"
+extra_index = "https://download.pytorch.org/whl/cu130"
 extras = []
 
 [[install_variants]]

@@ -43,8 +43,14 @@ const MAX_DURATION_SECS: u32 = 600;
 const MAX_LABEL_CHARS: usize = 128;
 /// Cache TTL dla wyniku `nsys --version`.
 const CAPABILITY_CACHE_TTL: Duration = Duration::from_secs(5);
-/// Twardy timeout na `nsys stats` + `nsys export` w stop'ie.
-const POST_STOP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Twardy timeout na `nsys stats` + `nsys export` w stop'ie. 30s wystarcza
+/// na typowy raport; gdy parser/export wisi dluzej, lepiej zwrocic Failed
+/// niz blokowac UI uzytkownika kilka minut.
+const POST_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Czas na graceful shutdown nsys po SIGTERM zanim wymusimy SIGKILL. nsys
+/// uzywa SIGTERM do flush'a `.nsys-rep`; jezeli w 5s nie zareaguje, raport
+/// i tak bedzie niekompletny — wolimy odblokowac UI niz czekac dluzej.
+const SIGTERM_GRACE: Duration = Duration::from_secs(5);
 
 /// Wykryta dostepnosc Nsight Systems na lokalnej maszynie.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,6 +78,8 @@ struct ActiveSlot {
     /// process-wide nsys lock becomes available to the next caller (legacy or
     /// multi-source).
     _process_guard: OwnedMutexGuard<()>,
+    /// Auto-stop watchdog task (z main: hardening auto-stop fresh pid + wait timeout).
+    auto_stop_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Error, Debug)]
@@ -172,15 +180,30 @@ impl NsysRunner {
         };
 
         let (session_id, output_path) = storage.allocate(&label, &scope)?;
-        let args = build_nsys_args(&scope, &output_path);
+        let args = build_nsys_args(&scope, &output_path, duration_secs);
 
         let nsys_path = nsys_binary().ok_or(ProfilingError::NotAvailable)?;
-        let child = Command::new(nsys_path)
+        let mut child = Command::new(nsys_path)
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+
+        // Stderr nsys nie idzie nigdzie sensownego bez aktywnego readera —
+        // bez tego diagnoza bledow startu (np. brak uprawnien do gpu-metrics,
+        // konflikt z innym profilerem) jest niemozliwa. Spawn task czyta linie
+        // i loguje przez tracing; konczy sie naturalnie gdy nsys zamknie pipe.
+        if let Some(stderr) = child.stderr.take() {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::warn!(target: "nsys.profile", "{line}");
+                }
+            });
+        }
 
         let child_pid = child.id().unwrap_or(0);
         let started_at_ms = unix_ms_now();
@@ -200,11 +223,33 @@ impl NsysRunner {
             auto_stop_at,
         };
 
+        // Auto-stop background task (main: hardening) — bez tego sesja
+        // z `duration_secs > 0` leci w nieskonczonosc. Trzymamy JoinHandle
+        // w slocie zeby abortowac przy stop() — inaczej task spi pelne
+        // `duration_secs` (do 600s) trzymajac klon storage'u.
+        let auto_stop_handle = if duration_secs > 0 {
+            let session_id_for_task = session_id.clone();
+            let storage_for_task = storage.clone();
+            let sleep_for = Duration::from_secs(duration_secs as u64);
+            Some(tokio::spawn(async move {
+                tokio::time::sleep(sleep_for).await;
+                let _ = super::NSYS_RUNNER
+                    .stop(&session_id_for_task, &storage_for_task)
+                    .await;
+            }))
+        } else {
+            None
+        };
+
         *slot = Some(ActiveSlot {
             session,
             child,
+            // Foundation: process guard wspolny dla legacy + multi-source nsys.
             _process_guard: process_guard,
+            auto_stop_handle,
         });
+        drop(slot);
+
         Ok((session_id, started_at_ms))
     }
 
@@ -228,19 +273,45 @@ impl NsysRunner {
             session,
             mut child,
             _process_guard,
+            auto_stop_handle,
         } = slot;
         // Lock zwolniony przed dlugotrwalym parsowaniem — kolejny start moze
         // wystartowac jak tylko stop dolaczy proces dziecka.
         drop(slot_guard);
 
+        // Anuluj auto-stop task — niezaleznie czy to user-stop wyprzedzil
+        // timer, czy to wlasnie auto-stop sam sie wykonuje (abort na sobie
+        // jest no-op). Zwalnia klon storage'u i nie zostawia spiacego taska.
+        if let Some(handle) = auto_stop_handle {
+            handle.abort();
+        }
+
+        // PID bierzemy swiezo z `Child::id()` — defense-in-depth wzgledem
+        // cached `child_pid`. PID race i tak nie wystepuje (trzymamy `child`,
+        // OS nie zrecyklowal slotu), ale fresh id jest oczywisciej poprawny.
+        let kill_pid = child.id().unwrap_or(session.child_pid);
+
         // SIGTERM zamiast SIGKILL — nsys potrzebuje signala TERM zeby wywolac
         // teardown i flush'nac dane do `.nsys-rep`. SIGKILL zostawia plik
-        // czesciowy/uszkodzony. PID race nie wystepuje: wciaz trzymamy `child`
-        // (kill_on_drop=true), wiec OS nie zrecyklowal slotu PID przed
-        // bezposrednio nastepujacym `child.wait()`.
-        send_sigterm(session.child_pid);
+        // czesciowy/uszkodzony.
+        send_sigterm(kill_pid);
 
-        let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
+        // Krotki grace na flush — nsys 2025.x potrafi ignorowac SIGTERM albo
+        // dlugo flush'owac. Po SIGTERM_GRACE wymuszamy SIGKILL, zeby nie
+        // blokowac UI 30s+ gdy proces nie reaguje. Czesciowy `.nsys-rep`
+        // i tak parsuje sie do `Failed` przez krotszy POST_STOP_TIMEOUT.
+        if tokio::time::timeout(SIGTERM_GRACE, child.wait()).await.is_err() {
+            tracing::warn!(
+                pid = kill_pid,
+                "nsys did not exit within grace period, sending SIGKILL"
+            );
+            let _ = child.kill().await;
+            // Drugi wait z timeoutem 2s — proces w stanie D (uninterruptible
+            // I/O do GPU) moglby zawiesic stop() na nieokreslony czas. Po
+            // timeoucie dropujemy `child` (kill_on_drop=true wczesniej zlecil
+            // SIGKILL) i lecimy dalej; resource cleanup zalatwi kernel.
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
 
         let result = tokio::time::timeout(POST_STOP_TIMEOUT, async {
             finalize_session(&session, storage).await
@@ -262,10 +333,18 @@ impl NsysRunner {
 }
 
 /// Buduje argumenty `nsys profile` dla danego `NsightScope`. Output_path jest
-/// jedynym argumentem branym z zewnatrz — walidowany przez storage przed wywolaniem.
-pub(crate) fn build_nsys_args(scope: &NsightScope, output_path: &Path) -> Vec<String> {
+/// walidowany przez storage przed wywolaniem.
+///
+/// nsys 2025.x wymaga target-command na koncu — bez tego pierwsza flaga jest
+/// traktowana jako exe i sesja nie startuje ("Executable ' ' not found ...
+/// --sample=none: command not found"). Uzywamy `sleep` jako standardowy
+/// NVIDIA idiom dla system-wide profiling: proces nic nie robi, nsys zbiera
+/// metryki przez czas trwania sleepa. Manual-mode (`duration_secs == 0`)
+/// dostaje bardzo dlugi sleep — SIGTERM z `stop()` przerywa go i nsys
+/// wykonuje teardown z flushem `.nsys-rep`.
+pub(crate) fn build_nsys_args(scope: &NsightScope, output_path: &Path, duration_secs: u32) -> Vec<String> {
     let out = output_path.to_string_lossy().to_string();
-    match scope {
+    let mut args: Vec<String> = match scope {
         NsightScope::Cpu => vec![
             "profile".into(),
             "--sample=cpu".into(),
@@ -311,7 +390,16 @@ pub(crate) fn build_nsys_args(scope: &NsightScope, output_path: &Path) -> Vec<St
             out,
             "--force-overwrite=true".into(),
         ],
+    };
+    args.push("sleep".into());
+    if duration_secs > 0 {
+        args.push(duration_secs.to_string());
+    } else {
+        // Manual mode — bardzo dlugi sleep (24h), SIGTERM z stop() przerwie
+        // proces sleep, nsys propaguje teardown i flushuje raport.
+        args.push("86400".into());
     }
+    args
 }
 
 async fn finalize_session(
@@ -676,7 +764,7 @@ mod tests {
 
     #[test]
     fn validate_scope_cpu() {
-        let args = build_nsys_args(&NsightScope::Cpu, &dummy_path());
+        let args = build_nsys_args(&NsightScope::Cpu, &dummy_path(), 0);
         assert!(args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--gpu-metrics-device=none".to_string()));
         assert!(!args.iter().any(|a| a.starts_with("--trace=cuda")));
@@ -684,7 +772,7 @@ mod tests {
 
     #[test]
     fn validate_scope_gpu_index_3() {
-        let args = build_nsys_args(&NsightScope::GpuIndex(3), &dummy_path());
+        let args = build_nsys_args(&NsightScope::GpuIndex(3), &dummy_path(), 0);
         assert!(args.contains(&"--gpu-metrics-device=3".to_string()));
         assert!(!args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--sample=none".to_string()));
@@ -692,13 +780,13 @@ mod tests {
 
     #[test]
     fn validate_scope_gpu_all() {
-        let args = build_nsys_args(&NsightScope::GpuAll, &dummy_path());
+        let args = build_nsys_args(&NsightScope::GpuAll, &dummy_path(), 0);
         assert!(args.contains(&"--gpu-metrics-device=all".to_string()));
     }
 
     #[test]
     fn validate_scope_both_index_0() {
-        let args = build_nsys_args(&NsightScope::BothIndex(0), &dummy_path());
+        let args = build_nsys_args(&NsightScope::BothIndex(0), &dummy_path(), 0);
         assert!(args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--gpu-metrics-device=0".to_string()));
         assert!(args
@@ -708,7 +796,7 @@ mod tests {
 
     #[test]
     fn validate_scope_both_all() {
-        let args = build_nsys_args(&NsightScope::BothAll, &dummy_path());
+        let args = build_nsys_args(&NsightScope::BothAll, &dummy_path(), 0);
         assert!(args.contains(&"--sample=cpu".to_string()));
         assert!(args.contains(&"--gpu-metrics-device=all".to_string()));
     }

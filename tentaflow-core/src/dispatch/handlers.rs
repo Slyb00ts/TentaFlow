@@ -2292,6 +2292,23 @@ pub async fn service_stop(
         stop_warnings.push(format!("cleanup model_registry nieudany: {:#}", e));
     }
 
+    // Usun klucz Ed25519 + config sidecara — inaczej redeploy z ta sama nazwa
+    // wskrzesilby stary EndpointId (i zywego peera-zombie w discovery DHT/mDNS).
+    if deploy_mode == "docker" {
+        let sidecar_dir = crate::paths::tentaflow_home()
+            .join("sidecar-keys")
+            .join(&svc.name);
+        if sidecar_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&sidecar_dir) {
+                tracing::warn!(
+                    service = %svc.name, dir = %sidecar_dir.display(), error = %e,
+                    "cleanup sidecar-keys nieudany"
+                );
+                stop_warnings.push(format!("cleanup sidecar-keys nieudany: {:#}", e));
+            }
+        }
+    }
+
     repository::delete_service(&ctx.state.db, service_id).map_err(db_err)?;
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
