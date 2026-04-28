@@ -1,0 +1,737 @@
+// =============================================================================
+// Plik: modules/profiling-launch.js
+// Opis: Modal startu sesji multi-source profilingu. Otwiera tf-window z
+//       pelnym formularzem (label, duration, source-cards, elevation,
+//       target). Po submicie buduje ProfileScope JSON i wysyla do
+//       /api/profiling/start (lub fixture w trybie deweloperskim).
+// =============================================================================
+
+import { TfWindow } from '/js/components/tf-window.js';
+import '/js/components/tf-button.js';
+import '/js/components/tf-input.js';
+
+// ProfileSourceFlags bity (zgodnie z tentaflow-protocol/src/profiling.rs).
+const SOURCE_FLAGS = {
+  CPU_SAMPLING:  1 << 0,
+  CPU_COUNTERS:  1 << 1,
+  CPU_UTIL:      1 << 2,
+  RAM_USAGE:     1 << 3,
+  RAM_BANDWIDTH: 1 << 4,
+  DISK_IO:       1 << 5,
+  GPU:           1 << 6,
+  POWER:         1 << 7,
+  NETWORK:       1 << 8,
+};
+
+const MAX_LABEL_LEN = 128;
+const MAX_DURATION_SEC = 600;
+const MIN_DURATION_SEC = 10;
+
+// Mapa prefix -> kategoria. Sluzy do pogrupowania source-cards w siatce
+// modalu (CPU/RAM/Disk/GPU/Power/Network/Other).
+const CATEGORY_ORDER = ['CPU', 'RAM', 'Disk', 'GPU', 'Power', 'Network', 'Other'];
+
+function categorizeSource(source) {
+  const id = String(source.id || '').toLowerCase();
+  if (id.includes('cpu')) return 'CPU';
+  if (id.includes('ram') || id.includes('memory')) return 'RAM';
+  if (id.includes('disk') || id.includes('iostat')) return 'Disk';
+  if (id.includes('gpu') || id.includes('nsys') || id.includes('rocprof') || id.includes('vtune')) return 'GPU';
+  if (id.includes('power') || id.includes('rapl')) return 'Power';
+  if (id.includes('network') || id.includes('net.')) return 'Network';
+  return 'Other';
+}
+
+// Mapuje category -> dominujacy ProfileSourceFlags bit. Source moze nie miec
+// wlasnego mapowania jezeli backend uzywa wielu wewnetrznie — UI dziala na
+// poziomie agregowanym (CPU sampling vs CPU util sa osobnymi sources, ale
+// generuja te same flagi gdy zaznaczone).
+function sourceToFlag(source) {
+  const id = String(source.id || '').toLowerCase();
+  if (id.includes('sampling')) return SOURCE_FLAGS.CPU_SAMPLING;
+  if (id.includes('counter')) return SOURCE_FLAGS.CPU_COUNTERS;
+  if (id.includes('cpu_util') || id.endsWith('cpu')) return SOURCE_FLAGS.CPU_UTIL;
+  if (id.includes('ram_bandwidth') || id.includes('membw')) return SOURCE_FLAGS.RAM_BANDWIDTH;
+  if (id.includes('ram') || id.includes('memory')) return SOURCE_FLAGS.RAM_USAGE;
+  if (id.includes('disk') || id.includes('iostat')) return SOURCE_FLAGS.DISK_IO;
+  if (id.includes('gpu') || id.includes('nsys') || id.includes('rocprof') || id.includes('vtune')) return SOURCE_FLAGS.GPU;
+  if (id.includes('power') || id.includes('rapl')) return SOURCE_FLAGS.POWER;
+  if (id.includes('network') || id.includes('net.')) return SOURCE_FLAGS.NETWORK;
+  return 0;
+}
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeAttr(s) { return escapeHtml(s); }
+
+// Heuristic estymaty storage + overhead na podstawie wybranych sources.
+function estimateImpact(selectedSources, durationSec) {
+  // 50 MB per kolektor + 10 MB per s GPU sampling (gdy GPU obecny)
+  const baseBytesPerCollector = 50 * 1024 * 1024;
+  const hasGpu = selectedSources.some((s) => sourceToFlag(s) === SOURCE_FLAGS.GPU);
+  const gpuRateBytesPerSec = hasGpu ? 10 * 1024 * 1024 : 0;
+  const totalBytes = selectedSources.length * baseBytesPerCollector + gpuRateBytesPerSec * Math.max(1, durationSec);
+
+  let overheadPct = 0;
+  for (const src of selectedSources) {
+    const flag = sourceToFlag(src);
+    if (flag === SOURCE_FLAGS.CPU_SAMPLING || flag === SOURCE_FLAGS.CPU_COUNTERS || flag === SOURCE_FLAGS.CPU_UTIL) {
+      overheadPct += 1;
+    } else if (flag === SOURCE_FLAGS.GPU) {
+      overheadPct += 2;
+    }
+  }
+  return { bytes: totalBytes, overheadPct };
+}
+
+function formatBytes(b) {
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(0)} MB`;
+  return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+// Sprawdza czy label nie ma znakow kontrolnych (zgodnie z walidacja backendu).
+function hasControlChars(s) {
+  // eslint-disable-next-line no-control-regex
+  return /[\x00-\x1f\x7f]/.test(s);
+}
+
+function fixtureMode() {
+  return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
+}
+
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+async function startSession({ scope, nodeId, elevationPassword }) {
+  if (fixtureMode()) {
+    await sleep(300);
+    return { session_id: (crypto.randomUUID && crypto.randomUUID()) || `fix-${Date.now().toString(16)}` };
+  }
+  const body = { scope, node_id: nodeId };
+  if (elevationPassword) body.elevation_password = elevationPassword;
+  const resp = await fetch('/api/profiling/start', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`start failed: HTTP ${resp.status} ${txt}`);
+  }
+  return await resp.json();
+}
+
+async function testElevation(password) {
+  if (fixtureMode()) {
+    await sleep(220);
+    // fixture: any non-empty password is "valid"
+    return { ok: password.length >= 4 };
+  }
+  const resp = await fetch('/api/profiling/test-elevation', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password }),
+  });
+  if (!resp.ok) return { ok: false };
+  return await resp.json();
+}
+
+// =============================================================================
+// ProfilingLaunchModal — programowy controller dla tresci modalu.
+// =============================================================================
+
+export class ProfilingLaunchModal {
+  /**
+   * Otwiera modal. Zwraca Promise<{ launched: boolean, sessionId?: string }>.
+   * @param {object} opts
+   * @param {string} opts.nodeId
+   * @param {Array} opts.availableSources [{ id, label, description, status, vendor?, deviceIndex?, requiresElevation }]
+   * @param {Function=} opts.onLaunched callback wolany po sukcesie
+   */
+  static async open({ nodeId, availableSources, onLaunched }) {
+    if (!Array.isArray(availableSources) || availableSources.length === 0) {
+      throw new Error('availableSources must be a non-empty array');
+    }
+    const ctrl = new ProfilingLaunchModal(nodeId, availableSources, onLaunched);
+    return ctrl._run();
+  }
+
+  constructor(nodeId, availableSources, onLaunched) {
+    this.nodeId = nodeId;
+    this.sources = availableSources.slice();
+    this.onLaunched = typeof onLaunched === 'function' ? onLaunched : null;
+
+    // state
+    this.selected = new Set(); // ids
+    this.label = '';
+    this.durationSec = 60;
+    this.manualStop = false;
+    this.targetMode = 'system_wide';
+    this.targetPid = '';
+    this.elevationPassword = '';
+    this.elevationVisible = false;
+    this.elevationStatus = 'untested'; // 'untested' | 'ok' | 'bad' | 'testing'
+
+    // Domyslnie zaznacz wszystkie 'available' (bez 'unavailable').
+    for (const s of this.sources) {
+      if (s.status !== 'unavailable') this.selected.add(s.id);
+    }
+
+    this._winRef = null;
+    this._resolveOuter = null;
+  }
+
+  _run() {
+    return new Promise((resolve) => {
+      this._resolveOuter = resolve;
+      this._launchWindow();
+    });
+  }
+
+  _launchWindow() {
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'profiling-launch';
+
+    const footEl = document.createElement('div');
+    footEl.style.display = 'contents';
+
+    const winPromise = TfWindow.open({
+      title: 'Start profiling session',
+      icon: 'activity',
+      body: bodyEl,
+      footer: this._buildFooter(),
+      buttons: 'close',
+      modal: true,
+      draggable: true,
+      resizable: false,
+      minWidth: 560,
+      minHeight: 520,
+      width: 720,
+      closeOnAction: true,
+    });
+
+    // bodyEl ma dynamicznie aktualizowany content; renderujemy az do pierwszego paint
+    queueMicrotask(() => this._render(bodyEl));
+
+    // Find tf-window element (ostatni dodany do body) by wpiac sie w event 'action'
+    // przed zamknieciem. TfWindow.open nie eksponuje samego elementu, ale po
+    // queueMicrotask jest juz w DOM.
+    queueMicrotask(() => {
+      const wins = document.querySelectorAll('tf-window');
+      const win = wins[wins.length - 1];
+      this._winRef = win;
+      if (!win) return;
+
+      win.addEventListener('action', (ev) => {
+        const action = ev.detail?.action;
+        if (action === 'start') {
+          ev.preventDefault();
+          this._handleStart();
+        }
+        // 'cancel' / 'close' -> tf-window default closes
+      });
+      win.addEventListener('close-request', () => {
+        // jezeli zamykane bez sukcesu — odpowiedz z launched=false
+      });
+    });
+
+    winPromise.then(() => {
+      // Resolved gdy okno zamkniete; jezeli nie wystartowano sesji, odpowiedz negatywnie.
+      if (this._resolveOuter) {
+        if (!this._launchedOk) {
+          this._resolveOuter({ launched: false });
+        }
+        this._resolveOuter = null;
+      }
+    });
+  }
+
+  _buildFooter() {
+    const wrap = document.createElement('div');
+    wrap.style.display = 'flex';
+    wrap.style.alignItems = 'center';
+    wrap.style.gap = '10px';
+    wrap.style.width = '100%';
+
+    const est = document.createElement('div');
+    est.className = 'estimate-foot';
+    est.id = 'profiling-estimate-foot';
+    est.style.flex = '1';
+    est.textContent = 'Estimated storage: — · overhead: —';
+
+    const cancel = document.createElement('tf-button');
+    cancel.setAttribute('variant', 'ghost');
+    cancel.setAttribute('data-action', 'cancel');
+    cancel.textContent = 'Cancel';
+
+    const start = document.createElement('tf-button');
+    start.setAttribute('variant', 'primary');
+    start.setAttribute('data-action', 'start');
+    start.setAttribute('icon', 'record');
+    start.id = 'profiling-launch-start-btn';
+    start.textContent = 'Start Profiling';
+
+    wrap.appendChild(est);
+    wrap.appendChild(cancel);
+    wrap.appendChild(start);
+    return wrap;
+  }
+
+  _render(root) {
+    root.innerHTML = '';
+    root.appendChild(this._renderLabelField());
+    root.appendChild(this._renderDurationField());
+    root.appendChild(this._renderSourceGrid());
+    const elevation = this._renderElevation();
+    if (elevation) root.appendChild(elevation);
+    root.appendChild(this._renderTargetField());
+
+    this._attachListeners(root);
+    this._updateEstimate();
+  }
+
+  _renderLabelField() {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    wrap.innerHTML = `
+      <div class="field-label">
+        <span>Label</span>
+        <span class="counter" id="pl-label-counter">${this.label.length} / ${MAX_LABEL_LEN}</span>
+      </div>
+      <input class="field-input" id="pl-label-input" type="text"
+             maxlength="${MAX_LABEL_LEN}"
+             placeholder="qwen-7b inference benchmark"
+             value="${escapeAttr(this.label)}" />
+    `;
+    return wrap;
+  }
+
+  _renderDurationField() {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    const sliderDisabled = this.manualStop ? 'disabled' : '';
+    wrap.innerHTML = `
+      <div class="field-label"><span>Duration</span></div>
+      <div class="field-row">
+        <input type="range" class="tf-slider" id="pl-duration-slider"
+               min="${MIN_DURATION_SEC}" max="${MAX_DURATION_SEC}" step="5"
+               value="${this.durationSec}" ${sliderDisabled} />
+        <input type="number" class="field-input duration-num" id="pl-duration-num"
+               min="${MIN_DURATION_SEC}" max="${MAX_DURATION_SEC}" step="5"
+               value="${this.durationSec}" ${sliderDisabled} />
+        <label class="tf-check">
+          <input type="checkbox" id="pl-manual-stop" ${this.manualStop ? 'checked' : ''} />
+          <span>Manual stop</span>
+        </label>
+      </div>
+    `;
+    return wrap;
+  }
+
+  _renderSourceGrid() {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    wrap.innerHTML = `
+      <div class="field-label"><span>Sources</span></div>
+      <div class="source-grid" id="pl-source-grid"></div>
+    `;
+    const grid = wrap.querySelector('#pl-source-grid');
+
+    // Group by category, in stable order.
+    const byCat = new Map();
+    for (const src of this.sources) {
+      const cat = categorizeSource(src);
+      if (!byCat.has(cat)) byCat.set(cat, []);
+      byCat.get(cat).push(src);
+    }
+
+    for (const cat of CATEGORY_ORDER) {
+      const list = byCat.get(cat);
+      if (!list || list.length === 0) continue;
+      const label = document.createElement('div');
+      label.className = 'source-category-label';
+      label.textContent = cat;
+      grid.appendChild(label);
+      for (const src of list) {
+        grid.appendChild(this._renderSourceCard(src));
+      }
+    }
+    return wrap;
+  }
+
+  _renderSourceCard(src) {
+    const card = document.createElement('div');
+    const isDisabled = src.status === 'unavailable';
+    const isChecked = this.selected.has(src.id);
+    card.className = 'source-card';
+    card.setAttribute('data-source-id', src.id);
+    card.setAttribute('data-checked', String(isChecked));
+    card.setAttribute('data-disabled', String(isDisabled));
+    card.setAttribute('title', src.description || '');
+
+    const statusBadge = (() => {
+      if (src.status === 'available') return '<span class="src-status ok">ready</span>';
+      if (src.status === 'needs_sudo') return '<span class="src-status warn">sudo</span>';
+      if (src.status === 'needs_admin') return '<span class="src-status warn">admin</span>';
+      if (src.status === 'unavailable') return '<span class="src-status bad">n/a</span>';
+      return '';
+    })();
+
+    card.innerHTML = `
+      <label class="src-check">
+        <input type="checkbox"
+               ${isChecked ? 'checked' : ''}
+               ${isDisabled ? 'disabled' : ''}
+               data-source-checkbox="${escapeAttr(src.id)}" />
+      </label>
+      <div class="src-meta">
+        <div class="src-name">
+          <span>${escapeHtml(src.label || src.id)}</span>
+          ${statusBadge}
+        </div>
+        <div class="src-desc">${escapeHtml(src.description || '')}</div>
+      </div>
+    `;
+    return card;
+  }
+
+  _renderElevation() {
+    const needsElevation = Array.from(this.selected).some((id) => {
+      const src = this.sources.find((s) => s.id === id);
+      return src && (src.status === 'needs_sudo' || src.status === 'needs_admin');
+    });
+    if (!needsElevation) return null;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    wrap.id = 'pl-elevation-field';
+    const inputType = this.elevationVisible ? 'text' : 'password';
+    wrap.innerHTML = `
+      <div class="alert-box">
+        <div class="a-body">
+          <strong>Elevated permissions required.</strong>
+          Some selected sources need <code>sudo</code>/admin access. Provide your password and click <strong>Test</strong> to verify.
+        </div>
+      </div>
+      <div class="field-label"><span>Elevation password</span></div>
+      <div class="pw-input ${this.elevationStatus === 'ok' ? 'valid' : ''} ${this.elevationStatus === 'bad' ? 'invalid' : ''}">
+        <input type="${inputType}" id="pl-elevation-input"
+               autocomplete="current-password"
+               value="${escapeAttr(this.elevationPassword)}"
+               placeholder="••••••••" />
+        <button type="button" class="pw-eye" id="pl-elevation-eye"
+                title="Toggle visibility">${this.elevationVisible ? 'hide' : 'show'}</button>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+        <tf-button variant="outline" size="sm" id="pl-elevation-test">Test</tf-button>
+        <span class="pw-test-result ${this.elevationStatus === 'ok' ? 'ok' : ''} ${this.elevationStatus === 'bad' ? 'bad' : ''}"
+              id="pl-elevation-result">
+          ${this.elevationStatus === 'ok' ? '✓ Authenticated'
+            : this.elevationStatus === 'bad' ? '✗ Invalid password'
+            : this.elevationStatus === 'testing' ? 'Testing…'
+            : ''}
+        </span>
+      </div>
+    `;
+    return wrap;
+  }
+
+  _renderTargetField() {
+    const wrap = document.createElement('div');
+    wrap.className = 'field';
+    wrap.innerHTML = `
+      <div class="field-label"><span>Target</span></div>
+      <div class="radio-row">
+        <label class="tf-check">
+          <input type="radio" name="pl-target" value="system_wide"
+                 ${this.targetMode === 'system_wide' ? 'checked' : ''} />
+          <span>System-wide</span>
+        </label>
+        <label class="tf-check">
+          <input type="radio" name="pl-target" value="own_process"
+                 ${this.targetMode === 'own_process' ? 'checked' : ''} />
+          <span>TentaFlow process only</span>
+        </label>
+        <label class="tf-check">
+          <input type="radio" name="pl-target" value="specific_pid"
+                 ${this.targetMode === 'specific_pid' ? 'checked' : ''} />
+          <span>Specific PID</span>
+        </label>
+      </div>
+      <input type="number" class="field-input" id="pl-target-pid"
+             placeholder="PID" min="1" step="1"
+             value="${escapeAttr(this.targetPid)}"
+             style="${this.targetMode === 'specific_pid' ? '' : 'display:none;'}" />
+    `;
+    return wrap;
+  }
+
+  _attachListeners(root) {
+    // label
+    const labelInput = root.querySelector('#pl-label-input');
+    const labelCounter = root.querySelector('#pl-label-counter');
+    if (labelInput) {
+      labelInput.addEventListener('input', () => {
+        this.label = labelInput.value;
+        labelCounter.textContent = `${this.label.length} / ${MAX_LABEL_LEN}`;
+      });
+    }
+
+    // duration
+    const slider = root.querySelector('#pl-duration-slider');
+    const durNum = root.querySelector('#pl-duration-num');
+    const manualStop = root.querySelector('#pl-manual-stop');
+    if (slider) {
+      slider.addEventListener('input', () => {
+        this.durationSec = parseInt(slider.value, 10);
+        if (durNum) durNum.value = String(this.durationSec);
+        this._updateEstimate();
+      });
+    }
+    if (durNum) {
+      durNum.addEventListener('input', () => {
+        let v = parseInt(durNum.value, 10);
+        if (Number.isNaN(v)) v = MIN_DURATION_SEC;
+        v = Math.max(MIN_DURATION_SEC, Math.min(MAX_DURATION_SEC, v));
+        this.durationSec = v;
+        if (slider) slider.value = String(v);
+        this._updateEstimate();
+      });
+    }
+    if (manualStop) {
+      manualStop.addEventListener('change', () => {
+        this.manualStop = manualStop.checked;
+        if (slider) slider.disabled = this.manualStop;
+        if (durNum) durNum.disabled = this.manualStop;
+        this._updateEstimate();
+      });
+    }
+
+    // source cards
+    root.querySelectorAll('[data-source-checkbox]').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const id = cb.getAttribute('data-source-checkbox');
+        if (cb.checked) this.selected.add(id);
+        else this.selected.delete(id);
+        const card = cb.closest('.source-card');
+        if (card) card.setAttribute('data-checked', String(cb.checked));
+        // Re-render elevation block: appears/disappears depending on selection.
+        this._refreshElevation(root);
+        this._updateEstimate();
+      });
+    });
+
+    // elevation
+    this._attachElevationListeners(root);
+
+    // target
+    root.querySelectorAll('input[name="pl-target"]').forEach((rb) => {
+      rb.addEventListener('change', () => {
+        if (!rb.checked) return;
+        this.targetMode = rb.value;
+        const pidInput = root.querySelector('#pl-target-pid');
+        if (pidInput) pidInput.style.display = (this.targetMode === 'specific_pid') ? '' : 'none';
+      });
+    });
+    const pidInput = root.querySelector('#pl-target-pid');
+    if (pidInput) {
+      pidInput.addEventListener('input', () => {
+        this.targetPid = pidInput.value;
+      });
+    }
+  }
+
+  _attachElevationListeners(root) {
+    const pwInput = root.querySelector('#pl-elevation-input');
+    const eyeBtn = root.querySelector('#pl-elevation-eye');
+    const testBtn = root.querySelector('#pl-elevation-test');
+    const resultEl = root.querySelector('#pl-elevation-result');
+    if (pwInput) {
+      pwInput.addEventListener('input', () => {
+        this.elevationPassword = pwInput.value;
+        if (this.elevationStatus !== 'untested') {
+          this.elevationStatus = 'untested';
+          if (resultEl) {
+            resultEl.textContent = '';
+            resultEl.className = 'pw-test-result';
+          }
+          const pwWrap = pwInput.closest('.pw-input');
+          if (pwWrap) pwWrap.classList.remove('valid', 'invalid');
+        }
+      });
+    }
+    if (eyeBtn) {
+      eyeBtn.addEventListener('click', () => {
+        this.elevationVisible = !this.elevationVisible;
+        this._refreshElevation(root);
+      });
+    }
+    if (testBtn) {
+      testBtn.addEventListener('click', async () => {
+        if (!this.elevationPassword) return;
+        this.elevationStatus = 'testing';
+        if (resultEl) resultEl.textContent = 'Testing…';
+        try {
+          const res = await testElevation(this.elevationPassword);
+          this.elevationStatus = res.ok ? 'ok' : 'bad';
+        } catch (err) {
+          console.error('elevation test failed', err);
+          this.elevationStatus = 'bad';
+        }
+        this._refreshElevation(root);
+      });
+    }
+  }
+
+  _refreshElevation(root) {
+    const oldField = root.querySelector('#pl-elevation-field');
+    const newField = this._renderElevation();
+    if (oldField && newField) {
+      oldField.replaceWith(newField);
+      this._attachElevationListeners(root);
+    } else if (oldField && !newField) {
+      oldField.remove();
+    } else if (!oldField && newField) {
+      // wstaw przed target field (ostatnie .field)
+      const fields = root.querySelectorAll('.field');
+      const lastField = fields[fields.length - 1];
+      if (lastField) lastField.before(newField);
+      else root.appendChild(newField);
+      this._attachElevationListeners(root);
+    }
+  }
+
+  _updateEstimate() {
+    const selectedSources = this.sources.filter((s) => this.selected.has(s.id));
+    const dur = this.manualStop ? 60 : this.durationSec;
+    const { bytes, overheadPct } = estimateImpact(selectedSources, dur);
+    const foot = document.getElementById('profiling-estimate-foot');
+    if (foot) {
+      foot.textContent = `Estimated storage: ~${formatBytes(bytes)} · overhead: ~${overheadPct}% CPU`;
+    }
+  }
+
+  _validate() {
+    if (!this.label || !this.label.trim()) {
+      return 'Label is required.';
+    }
+    if (this.label.length > MAX_LABEL_LEN) {
+      return `Label too long (max ${MAX_LABEL_LEN}).`;
+    }
+    if (hasControlChars(this.label)) {
+      return 'Label contains control characters.';
+    }
+    if (this.selected.size === 0) {
+      return 'Select at least one source.';
+    }
+    if (!this.manualStop) {
+      if (this.durationSec < MIN_DURATION_SEC || this.durationSec > MAX_DURATION_SEC) {
+        return `Duration must be between ${MIN_DURATION_SEC}-${MAX_DURATION_SEC}s.`;
+      }
+    }
+    if (this.targetMode === 'specific_pid') {
+      const pid = parseInt(this.targetPid, 10);
+      if (!Number.isInteger(pid) || pid <= 0) return 'Specific PID must be a positive integer.';
+    }
+    // Elevation gating: jezeli ktorykolwiek source needs_sudo/needs_admin, password niepusty.
+    const needsElev = Array.from(this.selected).some((id) => {
+      const src = this.sources.find((s) => s.id === id);
+      return src && (src.status === 'needs_sudo' || src.status === 'needs_admin');
+    });
+    if (needsElev && !this.elevationPassword) {
+      return 'Elevation password is required for selected sources.';
+    }
+    return null;
+  }
+
+  _buildScope() {
+    // sources -> bitmask
+    let mask = 0;
+    const selectedSources = this.sources.filter((s) => this.selected.has(s.id));
+    for (const s of selectedSources) {
+      mask |= sourceToFlag(s);
+    }
+
+    // gpu_targets: jezeli ktorykolwiek wybrany ma deviceIndex, lista; w przeciwnym
+    // razie 'all' gdy GPU bit jest set, 'none' inaczej.
+    let gpuTargets;
+    const gpuSources = selectedSources.filter((s) => sourceToFlag(s) === SOURCE_FLAGS.GPU);
+    if (gpuSources.length === 0) {
+      gpuTargets = 'none';
+    } else {
+      const indices = gpuSources
+        .filter((s) => Number.isInteger(s.deviceIndex))
+        .map((s) => s.deviceIndex);
+      if (indices.length > 0) {
+        gpuTargets = { indices: Array.from(new Set(indices)).sort((a, b) => a - b) };
+      } else {
+        gpuTargets = 'all';
+      }
+    }
+
+    let target;
+    if (this.targetMode === 'system_wide') target = 'system_wide';
+    else if (this.targetMode === 'own_process') target = 'own_process';
+    else target = { pid: parseInt(this.targetPid, 10) };
+
+    return {
+      sources: mask >>> 0,
+      gpu_targets: gpuTargets,
+      cpu_sampling_hz: 99,
+      target,
+      duration_seconds: this.manualStop ? 0 : this.durationSec,
+      label: this.label.trim(),
+    };
+  }
+
+  async _handleStart() {
+    const err = this._validate();
+    const startBtn = document.getElementById('profiling-launch-start-btn');
+    if (err) {
+      this._showError(err);
+      return;
+    }
+    if (startBtn) startBtn.setAttribute('disabled', '');
+    try {
+      const scope = this._buildScope();
+      const elevationPassword = this.elevationPassword || undefined;
+      const resp = await startSession({ scope, nodeId: this.nodeId, elevationPassword });
+      const sessionId = resp.session_id;
+      this._launchedOk = true;
+      if (this.onLaunched && sessionId) {
+        try { this.onLaunched(sessionId); } catch (cbErr) { console.error('onLaunched callback error', cbErr); }
+      }
+      if (this._resolveOuter) {
+        this._resolveOuter({ launched: true, sessionId });
+        this._resolveOuter = null;
+      }
+      if (this._winRef) this._winRef.close(true);
+    } catch (sendErr) {
+      console.error('profiling start failed', sendErr);
+      this._showError(sendErr.message || 'Failed to start profiling.');
+      if (startBtn) startBtn.removeAttribute('disabled');
+    }
+  }
+
+  _showError(msg) {
+    const foot = document.getElementById('profiling-estimate-foot');
+    if (foot) {
+      foot.textContent = `⚠ ${msg}`;
+      foot.style.color = 'var(--tf-danger, #ef4444)';
+      setTimeout(() => {
+        foot.style.color = '';
+        this._updateEstimate();
+      }, 3500);
+    }
+  }
+}
