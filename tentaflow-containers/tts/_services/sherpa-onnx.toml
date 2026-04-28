@@ -26,10 +26,16 @@ platforms = ["linux", "macos", "windows"]
 runtime = "embedded"
 feature_flag = "inference-sherpa"
 
+# Wspierane sa dwa formaty repozytoriow HuggingFace:
+#   1. Sherpa-compatible bundle — w korzeniu `<voice>.onnx` + `tokens.txt`
+#      + `espeak-ng-data/`. Pobierany jeden-do-jeden (np. csukuangfj/*).
+#   2. Raw Piper voice — `<voice>.onnx` + `<voice>.onnx.json` (Piper config),
+#      bez `tokens.txt`. `prepare_model` automatycznie generuje `tokens.txt`
+#      z `phoneme_id_map` i doklada `espeak-ng-data/` ze shared cache.
 [[model_preset]]
 id = "vits-piper-en-amy-medium"
-display_name = "VITS Piper en (Amy, medium)"
-repo = "rhasspy/piper-voices/en/en_US/amy/medium"
+display_name = "VITS Piper en_US (Amy, medium)"
+repo = "csukuangfj/vits-piper-en_US-amy-medium"
 recommended = true
 
 [[model_preset]]
@@ -37,3 +43,9 @@ id = "vits-piper-pl_PL-jarvis_wg_glos-medium"
 display_name = "VITS Piper pl_PL (Jarvis, medium)"
 repo = "WitoldG/polish_piper_models"
 recommended = true
+
+[[model_preset]]
+id = "vits-piper-pl_PL-gosia-medium"
+display_name = "VITS Piper pl_PL (Gosia, medium)"
+repo = "csukuangfj/vits-piper-pl_PL-gosia-medium"
+recommended = false
