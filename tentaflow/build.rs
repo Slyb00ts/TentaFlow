@@ -246,6 +246,21 @@ fn build_meeting_bot() {
     println!("cargo:rerun-if-changed={}/src", bot_dir.display());
 
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    let target_dir = cargo_target_dir();
+    let bin_name = if cfg!(target_os = "windows") {
+        "tentaflow-meeting.exe"
+    } else {
+        "tentaflow-meeting"
+    };
+    let dest_bin = target_dir.join(bin_name);
+
+    // Wymus rerun gdy dest_bin znika (np. po `cargo clean` parent crate'u
+    // ale child target/ zostal). Bez tego cargo skipowal build.rs na podstawie
+    // rerun-if-changed na bot_dir/src — zmiany src nie bylo, wiec build.rs
+    // nie odpalal sie i tentaflow-meeting NIE byl kopiowany do
+    // tentaflow/target/release/. Skutek: "Failed to start bot: brak binarki
+    // tentaflow-meeting obok tentaflow ani w PATH".
+    println!("cargo:rerun-if-changed={}", dest_bin.display());
     let mut cmd = Command::new(env!("CARGO"));
     cmd.arg("build")
         .arg("--bin")
@@ -262,11 +277,6 @@ fn build_meeting_bot() {
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
 
     let status = cmd.status();
-    let bin_name = if cfg!(target_os = "windows") {
-        "tentaflow-meeting.exe"
-    } else {
-        "tentaflow-meeting"
-    };
     if !matches!(status, Ok(s) if s.success()) {
         println!(
             "cargo:warning=tentaflow: cargo build tentaflow-meeting nieudane — bot native nie bedzie dzialal"
@@ -283,9 +293,6 @@ fn build_meeting_bot() {
         );
         return;
     }
-
-    let target_dir = cargo_target_dir();
-    let dest_bin = target_dir.join(bin_name);
     if let Err(e) = std::fs::copy(&src_bin, &dest_bin) {
         println!(
             "cargo:warning=tentaflow: copy {} -> {} nieudane: {}",
