@@ -4797,6 +4797,54 @@ fn meeting_event_payload_to_js(
                 set(&data, "details", d.into());
             }
         }
+        // VideoFrame: surowe JPEG idzie do GUI tylko gdy jest subscriber
+        // wymagający podglądu (np. debug overlay). Standardowy live widok
+        // korzysta z `ParticipantAttributes` bo te są lekkie. JPEG eksponujemy
+        // jako Uint8Array żeby JS mogło zrobić `URL.createObjectURL` bez kopii.
+        EP::VideoFrame {
+            participant_id,
+            name,
+            ts_ms,
+            jpeg,
+        } => {
+            set(obj, "type", "VideoFrame".into());
+            set(&data, "participantId", participant_id.into());
+            if let Some(n) = name {
+                set(&data, "name", n.into());
+            }
+            set(&data, "tsMs", (ts_ms as f64).into());
+            let arr = js_sys::Uint8Array::new_with_length(jpeg.len() as u32);
+            arr.copy_from(&jpeg);
+            set(&data, "jpeg", arr.into());
+        }
+        EP::ParticipantAttributes {
+            participant_id,
+            name,
+            ts_ms,
+            emotion,
+            emotion_confidence,
+            age,
+            gender_male_prob,
+        } => {
+            set(obj, "type", "ParticipantAttributes".into());
+            set(&data, "participantId", participant_id.into());
+            if let Some(n) = name {
+                set(&data, "name", n.into());
+            }
+            set(&data, "tsMs", (ts_ms as f64).into());
+            if let Some(e) = emotion {
+                set(&data, "emotion", e.into());
+            }
+            if let Some(c) = emotion_confidence {
+                set(&data, "emotionConfidence", (c as f64).into());
+            }
+            if let Some(a) = age {
+                set(&data, "age", (a as f64).into());
+            }
+            if let Some(g) = gender_male_prob {
+                set(&data, "genderMaleProb", (g as f64).into());
+            }
+        }
     }
     set(obj, "data", data.into());
 }

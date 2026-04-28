@@ -23,6 +23,7 @@ pub mod streaming;
 pub mod stt;
 pub mod transcript_store;
 pub mod tts;
+pub mod video_pipeline;
 
 // Re-eksporty publicznych typow
 pub use middleware::{BackendHandle, ResolvedRoute, RouteMetadata, RouteResult};
