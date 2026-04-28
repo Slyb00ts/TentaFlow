@@ -14,7 +14,11 @@ use super::bundle;
 /// Konfiguracja deployu jednego kontenera.
 #[derive(Debug, Clone)]
 pub struct DeployRequest {
-    /// Nazwa kontenera w bundle (np. "llm-vllm")
+    /// Sciezka kontekstu wzgledem `tentaflow-containers/` w bundle, np.
+    /// "llm/docker/vllm" — `build_image` dokleja prefix i ladowa Dockerfile
+    /// z `tentaflow-containers/<container>/Dockerfile`. Historycznie pole
+    /// nazywalo sie "container" gdy struktura byla plaska (`llm-vllm/`),
+    /// po reorganizacji do category-based layoutu jest to context_path.
     pub container: String,
     /// Tag obrazu, domyslnie "tentaflow/<container>:latest"
     pub image_tag: Option<String>,

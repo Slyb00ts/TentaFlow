@@ -17,4 +17,4 @@ pub mod python_venv;
 pub mod redeploy;
 pub mod runner;
 
-pub use bundle::{extract_to, list_containers, ContainerInfo};
+pub use bundle::extract_to;
