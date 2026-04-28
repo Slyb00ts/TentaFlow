@@ -20,17 +20,20 @@ jobs = 8
 incremental = true
 
 # Sccache jako rustc wrapper — cache'uje skompilowane jednostki na dysku,
-# wspoldzielone miedzy clean buildami i miedzy projektami. Zainstaluj raz
-# `brew install sccache` (macOS) / `cargo install sccache` (linux) i ten
-# wpis zacznie dzialac. Bez sccache w PATH rustc po prostu padnie z
-# "sccache: command not found" — wtedy zakomentuj linijke ponizej.
+# wspoldzielone miedzy clean buildami i miedzy projektami.
+#
+# Aktywacja:
+#   * Zainstaluj raz: `brew install sccache` (macOS) / `cargo install sccache`
+#   * Wlacz przez ENV: `export RUSTC_WRAPPER=sccache` w ~/.zshrc / ~/.bashrc
+# Albo odkomentuj linijke ponizej (uwaga — zmusi WSZYSTKICH na repo do
+# instalacji sccache, bez tego `cargo build` padnie z "sccache: command
+# not found"). Domyslnie: opt-in przez ENV, nie commited.
 #
 # Pierwszy clean build per zmieniony crate jest tak samo wolny (cache miss).
 # DRUGI clean build (po `cargo clean`) odpala z cache i jest 5-10x szybszy.
 # Sccache pisze do ~/Library/Caches/Mozilla.sccache (domyslnie 10 GB cache).
-rustc-wrapper = "sccache"
-
-# Sprawdz statystyki cache hit rate kiedykolwiek przez `sccache --show-stats`.
+# Sprawdz statystyki kiedykolwiek przez `sccache --show-stats`.
+# rustc-wrapper = "sccache"
 
 [target.aarch64-apple-darwin]
 # Apple Silicon native. Domyslny ld64 (Apple) jest najszybszym linkerem
