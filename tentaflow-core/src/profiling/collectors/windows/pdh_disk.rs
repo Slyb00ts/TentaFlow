@@ -325,7 +325,7 @@ impl CollectorParser for WindowsPdhDiskParser {
         &self,
         raw: RawCapture,
         _ctx: &SessionCtx,
-        _names: &mut NameInterner,
+        names: &mut NameInterner,
         _frames: &mut FrameInterner,
     ) -> Result<Vec<TimelineEvent>, CollectorError> {
         let Some(csv_path) = raw.artifacts.first() else {
@@ -336,7 +336,8 @@ impl CollectorParser for WindowsPdhDiskParser {
             Err(_) => return Ok(Vec::new()),
         };
         let mut events = Vec::new();
-        let mut device_lane: HashMap<String, u16> = HashMap::new();
+        // (lane, interned name id) per unique device label.
+        let mut device_meta: HashMap<String, (u16, u32)> = HashMap::new();
         let mut next_lane: u16 = 0;
         for (idx, line) in content.lines().enumerate() {
             if idx == 0 || line.is_empty() {
@@ -349,7 +350,7 @@ impl CollectorParser for WindowsPdhDiskParser {
             let Ok(ts) = cols[0].parse::<u64>() else {
                 continue;
             };
-            let device = cols[1].to_string();
+            let device_label = cols[1];
             let Ok(read_bps) = cols[2].parse::<u64>() else {
                 continue;
             };
@@ -365,11 +366,16 @@ impl CollectorParser for WindowsPdhDiskParser {
             let Ok(await_ms_p99) = cols[6].parse::<f32>() else {
                 continue;
             };
-            let lane = *device_lane.entry(device.clone()).or_insert_with(|| {
-                let l = next_lane;
-                next_lane = next_lane.wrapping_add(1);
-                l
-            });
+            let (lane, device_name_id) = match device_meta.get(device_label) {
+                Some(v) => *v,
+                None => {
+                    let l = next_lane;
+                    next_lane = next_lane.wrapping_add(1);
+                    let id = names.intern(device_label);
+                    device_meta.insert(device_label.to_string(), (l, id));
+                    (l, id)
+                }
+            };
             events.push(TimelineEvent {
                 source_idx: 0,
                 t_start_ns: ts,
@@ -377,7 +383,7 @@ impl CollectorParser for WindowsPdhDiskParser {
                 category: EventCategory::DiskIoBurst,
                 lane_hint: lane,
                 payload: EventPayload::DiskIoBurst {
-                    device,
+                    device_name_id,
                     read_bps,
                     write_bps,
                     iops_r,
@@ -503,16 +509,17 @@ mod tests {
             .parse(raw, &ctx, &mut names, &mut frames)
             .unwrap();
         assert_eq!(evs.len(), 3);
+        let names_vec = names.into_vec();
         match &evs[0].payload {
             EventPayload::DiskIoBurst {
-                device,
+                device_name_id,
                 read_bps,
                 write_bps,
                 iops_r,
                 iops_w,
                 await_ms_p99,
             } => {
-                assert_eq!(device, "0 C:");
+                assert_eq!(names_vec[*device_name_id as usize], "0 C:");
                 assert_eq!(*read_bps, 1_048_576);
                 assert_eq!(*write_bps, 524_288);
                 assert_eq!(*iops_r, 12);

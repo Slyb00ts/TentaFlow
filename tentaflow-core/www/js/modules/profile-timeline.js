@@ -116,7 +116,7 @@ function buildLanes(events, names) {
     } else if (cat === 'RamBandwidth') {
       ramBw.push(idx);
     } else if (cat === 'DiskIoBurst') {
-      const dev = p.device || `disk${ev.lane_hint}`;
+      const dev = (p.deviceNameId !== undefined ? names[p.deviceNameId] : null) ?? `disk${ev.lane_hint}`;
       if (!diskByDev.has(dev)) diskByDev.set(dev, []);
       diskByDev.get(dev).push(idx);
     } else if (cat === 'GpuUtilSample') {
@@ -136,7 +136,7 @@ function buildLanes(events, names) {
       if (!nvtxByDev.has(dev)) nvtxByDev.set(dev, []);
       nvtxByDev.get(dev).push(idx);
     } else if (cat === 'NetworkSample') {
-      const iface = p.iface || `net${ev.lane_hint}`;
+      const iface = (p.ifaceNameId !== undefined ? names[p.ifaceNameId] : null) ?? `net${ev.lane_hint}`;
       if (!networkByIface.has(iface)) networkByIface.set(iface, []);
       networkByIface.get(iface).push(idx);
     }
@@ -368,7 +368,9 @@ export class UnifiedTimeline {
     this._dpr = window.devicePixelRatio || 1;
     this._renderQueued = false;
     this._needsHitTest = true;
-    this._hitMap = null;       // Uint32Array of event idx (+1) per pixel column×lane row
+    this._hitMap = null;       // Int32Array view of event idx (+1) per pixel column×lane row
+    this._hitBuffer = null;    // backing buffer reused across rebuilds to avoid 2MB+ alloc per frame
+    this._hitBufferLen = 0;
     this._hitW = 0;
     this._hitH = 0;
     this._rangeStartNs = null;
@@ -1074,7 +1076,16 @@ export class UnifiedTimeline {
     let totalH = 0;
     for (const l of visible) totalH += l.height;
     if (w <= 0 || totalH <= 0) { this._hitMap = null; return; }
-    const map = new Int32Array(w * totalH);
+    const need = w * totalH;
+    // Reuse backing buffer to avoid reallocating ~2MB on every viewport change.
+    // Grow with 1.5x slack so a few resize ticks don't re-grow.
+    if (!this._hitBuffer || this._hitBufferLen < need) {
+      const cap = Math.ceil(need * 1.5);
+      this._hitBuffer = new Int32Array(cap);
+      this._hitBufferLen = cap;
+    }
+    const map = this._hitBuffer.subarray(0, need);
+    map.fill(0);
     const vs = this.viewportStartNs;
     const ve = this.viewportEndNs;
     const span = ve - vs;
@@ -1154,8 +1165,14 @@ export class UnifiedTimeline {
     if (p.watts !== undefined) rows.push(`<div class="t-row"><b>W</b> ${p.watts.toFixed(1)}</div>`);
     if (p.compute_pct !== undefined) rows.push(`<div class="t-row"><b>SM%</b> ${p.compute_pct.toFixed(1)}</div>`);
     if (p.util_pct !== undefined) rows.push(`<div class="t-row"><b>util%</b> ${p.util_pct.toFixed(1)} core ${p.core ?? ev.lane_hint}</div>`);
-    if (p.iface) rows.push(`<div class="t-row"><b>${p.iface}</b> rx ${fmtBytes(p.rx_bps || 0)}/s · tx ${fmtBytes(p.tx_bps || 0)}/s</div>`);
-    if (p.device && p.read_bps !== undefined) rows.push(`<div class="t-row"><b>${p.device}</b> r ${fmtBytes(p.read_bps)}/s · w ${fmtBytes(p.write_bps)}/s</div>`);
+    if (p.ifaceNameId !== undefined) {
+      const ifaceLabel = this.names[p.ifaceNameId] || `iface_${p.ifaceNameId}`;
+      rows.push(`<div class="t-row"><b>${ifaceLabel}</b> rx ${fmtBytes(p.rx_bps || 0)}/s · tx ${fmtBytes(p.tx_bps || 0)}/s</div>`);
+    }
+    if (p.deviceNameId !== undefined && p.read_bps !== undefined) {
+      const devLabel = this.names[p.deviceNameId] || `disk_${p.deviceNameId}`;
+      rows.push(`<div class="t-row"><b>${devLabel}</b> r ${fmtBytes(p.read_bps)}/s · w ${fmtBytes(p.write_bps)}/s</div>`);
+    }
 
     this.tooltip.innerHTML = rows.join('');
     this.tooltip.style.display = 'block';
