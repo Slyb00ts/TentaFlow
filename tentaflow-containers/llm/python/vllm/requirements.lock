@@ -7,10 +7,16 @@
 # odbywa sie przez `pip install -e .` z klona repo. Ta lock sluzy do
 # pre-cache'owania wheels torch/xformers/flash-attn przed bootstrapem.
 
-# Core
-torch==2.5.1+cu124           # --extra-index-url https://download.pytorch.org/whl/cu124
-torchvision==0.20.1+cu124
-torchaudio==2.5.1+cu124
+# Core — bez sufixu `+cu124` zeby `--extra-index-url` z bundle.toml
+# install_variants zadecydowal ktora wariant wheela uv pobierze:
+#   * variant `cuda` + extra_index cu124 -> torch-2.5.1+cu124-cp3X-linux_x86_64.whl
+#   * variant `rocm` + extra_index rocm  -> torch-2.5.1+rocmX.Y-...
+#   * variant `cpu`  (brak extra_index)  -> torch-2.5.1-...-manylinux_x86_64 (CPU)
+# Pin `+cu124` zalamywal sie na aarch64 i innych platformach gdzie cu124
+# wheels nie istnieja — uv mowil "no wheels with a matching platform tag".
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
 
 # vLLM deps (pobierane z https://github.com/vllm-project/vllm/blob/main/requirements-cuda.txt)
 # Sidecar python_venv pobiera je wprost z requirements-cuda.txt HEAD;
