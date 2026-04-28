@@ -990,6 +990,80 @@ async fn do_embedded_native_deploy(
             finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
             Ok(())
         }
+        #[cfg(feature = "inference-sherpa")]
+        ("tts", "sherpa-onnx") => {
+            // Cross-platform embedded TTS przez sherpa-rs (sherpa-onnx + ORT).
+            // Pobieramy sherpa-onnx-compatible bundle z HF, ladujemy do
+            // shared_tts_manager() i rejestrujemy native service w mesh.
+            let model_repo = resolve_model_repo(engine, config)
+                .unwrap_or_else(|_| "csukuangfj/vits-piper-en_US-amy-medium".to_string());
+            let service_name = config
+                .container_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "sherpa-tts-native".to_string());
+
+            phase(db, deploy_id, tx, "building", 20, "download VITS Piper");
+            let model_dir = crate::tts::sherpa::prepare_model(&model_repo)
+                .await
+                .with_context(|| format!("prepare sherpa model '{}'", model_repo))?;
+
+            phase(db, deploy_id, tx, "running", 75, "load sherpa-onnx VITS");
+            let mut engine_impl = crate::tts::sherpa::SherpaTtsEngine::new();
+            let info = <crate::tts::sherpa::SherpaTtsEngine as crate::tts::TtsEngine>::load_model(
+                &mut engine_impl,
+                &model_dir,
+            )
+            .context("load sherpa-onnx VITS model")?;
+
+            {
+                let shared = crate::tts::shared_tts_manager();
+                let mut mgr = shared.write().await;
+                mgr.register(service_name.clone(), Box::new(engine_impl));
+            }
+
+            phase(db, deploy_id, tx, "registering", 92, "register service");
+            let config_json = serde_json::json!({
+                "deploy_mode": "native",
+                "engine": "sherpa-onnx",
+                "manifest_engine_id": engine.engine_id,
+                "deployed_model": model_repo,
+                "model_path": model_dir.to_string_lossy(),
+                "service_type": "tts",
+                "sample_rate": info.sample_rate,
+            })
+            .to_string();
+            let service_id = upsert_native_service(
+                db, node_id, &service_name, "tts", Some("tts"),
+                &config_json, "single",
+            )?;
+            ensure_model_registry_entry(
+                db,
+                &model_repo,
+                &format!("sherpa-onnx VITS ({})", model_repo),
+                "tts",
+                service_id,
+                &config_json,
+            );
+            router.register_native_service_in_mesh(
+                &service_name, "tts",
+                vec![model_repo.clone()],
+                Some("sherpa-onnx".to_string()),
+                vec![info.sample_rate as u64 / 1000],
+            );
+            auto_bind_teams_alias_if_empty(db, "teams-tts", &service_name, router);
+            persist_source_hash(db, &engine.engine_id, "native", &service_name);
+            log_line(
+                db,
+                deploy_id,
+                tx,
+                "log",
+                &format!("sherpa-onnx TTS gotowe: {}", service_name),
+            );
+            let _ = service_manager;
+            finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
+            Ok(())
+        }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         ("tts", "apple-tts") => {
             let service_name = config
@@ -1516,6 +1590,29 @@ async fn do_python_bundle_native_deploy(
         &config_json,
         "first_available",
     )?;
+
+    // Wpis w tabeli `models` zeby GUI -> Models pokazal silnik po deployu.
+    // Dotad robily to tylko embedded branche (whisper/kokoro/apple-tts/sherpa/
+    // vision) — python-bundle deploy zapisywal tylko `services` i model byl
+    // niewidoczny w GUI Models view mimo dzialajacego serwisu.
+    let registry_name = if model_repo.is_empty() {
+        service_name.clone()
+    } else {
+        model_repo.clone()
+    };
+    let registry_display = if model_repo.is_empty() {
+        format!("{} (native)", engine.engine_id)
+    } else {
+        format!("{} ({})", engine.engine_id, model_repo)
+    };
+    ensure_model_registry_entry(
+        db,
+        &registry_name,
+        &registry_display,
+        &engine.category,
+        service_id,
+        &config_json,
+    );
 
     // Natychmiastowa rejestracja w ServiceManager — router zacznie routowac
     // /v1/chat/completions (i inne OpenAI endpointy) do naszego vLLM-Metal
