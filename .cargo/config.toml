@@ -1,0 +1,63 @@
+# =============================================================================
+# Plik: .cargo/config.toml
+# Opis: Globalne ustawienia buildu dla calego projektu TentaFlow. Cargo szuka
+#       tego pliku idac w gore drzewa od CWD przy `cargo build` — jest brany
+#       pod uwage z kazdego sub-crate'u (tentaflow/, tentaflow-core/, itp.)
+#       BEZ workspace Cargo.toml. To jedyne wspoldzielone ustawienia
+#       buildowe miedzy wszystkimi crate'ami.
+# =============================================================================
+
+[build]
+# Cargo by default uzywa wszystkich logicznych CPU. Na M-series (8c hybrid:
+# 4P+4E) explicit jobs = num_cpus = 8 zapewnia ze rustc dostaje wszystkie
+# rdzenie nawet w shellach gdzie cargo gubilo tę detekcje (np. Docker exec).
+jobs = 8
+
+# Incremental compilation cache zostaje miedzy buildami. Domyslnie wlaczone
+# dla profile.dev, tu wymuszamy tez dla release zeby `cargo build --release`
+# po malej zmianie nie kompilowal calego drzewa od zera (~10 min -> ~30s
+# dla zmiany w pojedynczym .rs).
+incremental = true
+
+# rustc messages format: short = jedna linia per error/warning. Domyslny
+# "human" wypisuje pelne ramki ze strzaleczkami i kontekstem zrodla — w
+# pipeline cargo build daje koszmar przy 200+ warningach z third-party
+# crate'ow. "short" = kompaktowy log, latwiej zobaczyc co konkretnie sie
+# popsulo.
+# message-format = "short"   # opcjonalne, odkomentuj jak chcesz cisze
+
+# Linker — Apple ld jest wolny dla duzych binarek (sherpa + onnxruntime +
+# wgpu + iroh = 200+ MB unstripped). Lista alternatyw aktywnych przez
+# rustflags ponizej. ZA­DRY ustawia OS-specific linker.
+[target.aarch64-apple-darwin]
+# Apple Silicon native. lld dziala ale wymaga zewnetrznej instalacji
+# (brew install llvm). Bez lld zostawiamy domyslny ld64 — szybsze niz
+# linux/gnu_ld ale i tak najwolniejsza czesc buildu na release-fast.
+
+[target.x86_64-apple-darwin]
+# Intel Mac legacy.
+
+[target.x86_64-unknown-linux-gnu]
+# Linux x86_64. Mold jest 5-10x szybszy niz GNU ld dla duzych binarek.
+# Aktywuj jezeli masz zainstalowany:
+#   sudo apt install mold       # debian/ubuntu
+#   sudo dnf install mold       # fedora
+# A potem odkomentuj linijke ponizej.
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+# Linux ARM64 (Jetson, Graviton, Orin). Mold dziala identycznie.
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Wrapper rustc — sccache cache'uje skompilowane crate'y miedzy clean
+# buildami i miedzy projektami. ~70% szybsze drugie clean build'y po
+# `cargo clean`.
+# Aktywacja:
+#   brew install sccache    # macOS
+#   cargo install sccache   # cross-platform
+# A potem odkomentuj linijke ponizej. Bez sccache w PATH cargo tylko
+# warnuje i kontynuuje normalnie, ale ZALECANE ZAINSTALOWAC.
+# [build]
+# rustc-wrapper = "sccache"
