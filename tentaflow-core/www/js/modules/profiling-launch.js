@@ -7,6 +7,7 @@
 // =============================================================================
 
 import { TfWindow } from '/js/components/tf-window.js';
+import { profilingStart } from '/js/protocol/profiling.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
 
@@ -115,35 +116,26 @@ function sleep(ms) {
 async function startSession({ scope, nodeId, elevationPassword }) {
   if (fixtureMode()) {
     await sleep(300);
-    return { session_id: (crypto.randomUUID && crypto.randomUUID()) || `fix-${Date.now().toString(16)}` };
+    return { sessionId: (crypto.randomUUID && crypto.randomUUID()) || `fix-${Date.now().toString(16)}` };
   }
-  const body = { scope, node_id: nodeId };
-  if (elevationPassword) body.elevation_password = elevationPassword;
-  const resp = await fetch('/api/profiling/start', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+  return profilingStart({
+    nodeId,
+    scope,
+    label: scope.label,
+    elevationPassword: elevationPassword || null,
   });
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`start failed: HTTP ${resp.status} ${txt}`);
-  }
-  return await resp.json();
 }
 
+// Wasm-glue nie eksponuje osobnego `profilingTestElevation` (backend nie ma
+// dedykowanego endpointu w binary protocol). Walidujemy lokalnie — sukces
+// dopiero potwierdzi sie przy rzeczywistym `profilingStart` jezeli sudo
+// password byl bledny (collectorsSkipped przyjdzie z reason='sudo_failed').
 async function testElevation(password) {
   if (fixtureMode()) {
     await sleep(220);
-    // fixture: any non-empty password is "valid"
     return { ok: password.length >= 4 };
   }
-  const resp = await fetch('/api/profiling/test-elevation', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ password }),
-  });
-  if (!resp.ok) return { ok: false };
-  return await resp.json();
+  return { ok: typeof password === 'string' && password.length >= 4 };
 }
 
 // =============================================================================
@@ -686,10 +678,10 @@ export class ProfilingLaunchModal {
 
     return {
       sources: mask >>> 0,
-      gpu_targets: gpuTargets,
-      cpu_sampling_hz: 99,
+      gpuTargets,
+      cpuSamplingHz: 99,
       target,
-      duration_seconds: this.manualStop ? 0 : this.durationSec,
+      durationSeconds: this.manualStop ? 0 : this.durationSec,
       label: this.label.trim(),
     };
   }
@@ -706,7 +698,7 @@ export class ProfilingLaunchModal {
       const scope = this._buildScope();
       const elevationPassword = this.elevationPassword || undefined;
       const resp = await startSession({ scope, nodeId: this.nodeId, elevationPassword });
-      const sessionId = resp.session_id;
+      const sessionId = resp.sessionId || resp.session_id;
       this._launchedOk = true;
       if (this.onLaunched && sessionId) {
         try { this.onLaunched(sessionId); } catch (cbErr) { console.error('onLaunched callback error', cbErr); }
