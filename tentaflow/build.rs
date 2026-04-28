@@ -12,9 +12,26 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    set_linux_rpath();
     build_mlx_bridge();
     build_kokoro_bridge();
     build_meeting_bot();
+}
+
+// ----- Linux rpath = $ORIGIN -------------------------------------------------
+// sherpa-rs kopiuje libsherpa-onnx-c-api.so + libonnxruntime.so do
+// target/<profile>/ przy pierwszym buildzie. Bez ustawionego rpath binarka
+// szuka tych libsow tylko w systemowych sciezkach (/usr/lib, LD_LIBRARY_PATH)
+// i pada z "error while loading shared libraries". Rpath $ORIGIN mowi
+// linkerowi: szukaj obok exe. macOS uzywa @loader_path (ustawione w
+// build_mlx_bridge), wiec ta funkcja jest no-op dla macOS i tylko dotyczy
+// targetow ktore generuja .so (Linux primary).
+fn set_linux_rpath() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "linux" {
+        return;
+    }
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
 }
 
 // ----- MLX Swift bridge (macOS only) -----------------------------------------
