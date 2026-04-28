@@ -6,6 +6,10 @@
 // =============================================================================
 
 import '/js/components/tf-button.js';
+import {
+  profilingActiveInfo,
+  profilingStop,
+} from '/js/protocol/profiling.js';
 
 function fixtureMode() {
   return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
@@ -55,29 +59,40 @@ function fixtureActiveResponse() {
   };
 }
 
+// Normalizes the camelCase ProfilingActiveSessionInfo from wasm-glue into the
+// snake_case shape that the banner template consumes. `collectorsRunning` is a
+// flat string[] now; we wrap it back into {id,label} so the chip renderer
+// keeps a single code path.
+function normalizeActive(info) {
+  if (info == null) return null;
+  if ('session_id' in info) return info;
+  return {
+    session_id: info.sessionId,
+    label: info.label,
+    started_at_unix_ns: Number(info.startedAtUnixNs || 0),
+    planned_duration_ns: Number(info.plannedDurationNs || 0),
+    elapsed_ns: Number(info.elapsedNs || 0),
+    collectors_running: Array.isArray(info.collectorsRunning)
+      ? info.collectorsRunning.map((id) => ({ id, label: id }))
+      : [],
+  };
+}
+
 async function fetchActive(nodeId) {
   if (fixtureMode()) {
     return fixtureActiveResponse();
   }
-  const url = `/api/profiling/active?node_id=${encodeURIComponent(nodeId)}`;
-  const resp = await fetch(url, { headers: { accept: 'application/json' } });
-  if (resp.status === 404) return null;
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  return await resp.json();
+  const resp = await profilingActiveInfo({ nodeId });
+  return normalizeActive(resp ? resp.info : null);
 }
 
-async function stopActive(nodeId) {
+async function stopActive(nodeId, sessionId) {
   if (fixtureMode()) {
     fixtureSessionStopped = true;
     return { session_id: 'fixture-active-001', report_url: null };
   }
-  const resp = await fetch('/api/profiling/stop', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ node_id: nodeId }),
-  });
-  if (!resp.ok) throw new Error(`stop HTTP ${resp.status}`);
-  return await resp.json();
+  const resp = await profilingStop({ nodeId, sessionId });
+  return { session_id: resp.sessionId, report_url: null };
 }
 
 // =============================================================================
@@ -209,7 +224,7 @@ export class ProfilingActiveBanner {
     if (!this.session) return;
     const sid = this.session.session_id;
     try {
-      const res = await stopActive(this.nodeId);
+      const res = await stopActive(this.nodeId, sid);
       if (res && res.report_url) {
         location.assign(res.report_url);
         return;

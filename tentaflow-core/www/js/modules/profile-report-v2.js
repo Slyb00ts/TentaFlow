@@ -43,6 +43,11 @@ import {
   normalizeCollectorStatus,
   countUsedCollectors,
 } from '/js/modules/profile-report-helpers.js';
+import {
+  profilingReport,
+  profilingDelete,
+  profilingDownload,
+} from '/js/protocol/profiling.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-tabs.js';
@@ -64,11 +69,7 @@ async function loadReport({ nodeId, sessionId }) {
     if (!resp.ok) throw new Error(`fixture load failed: HTTP ${resp.status}`);
     return await resp.json();
   }
-  const resp = await fetch(`/api/profiling/sessions/${encodeURIComponent(sessionId)}/report?node_id=${encodeURIComponent(nodeId || '')}`, {
-    headers: { accept: 'application/json' },
-  });
-  if (!resp.ok) throw new Error(`load failed: HTTP ${resp.status}`);
-  return await resp.json();
+  return profilingReport({ nodeId: nodeId || '', sessionId });
 }
 
 // Fallback to the legacy V1 view when the report is V1Legacy.
@@ -101,13 +102,21 @@ export class ProfileReportV2View {
       return;
     }
 
-    // Envelope detection: legacy nsys reports have no schema_version field.
-    // The Rust envelope wraps as { V2: {...} } / { V1Legacy: {...} } when
-    // serialized via rkyv→serde; we tolerate both shapes.
+    // Envelope detection. Binary protocol returns { envelope: { kind, report }};
+    // fixture JSON may carry { V2: ... } / { V1Legacy: ... } / a bare V2.
     let report = raw;
     if (raw && typeof raw === 'object') {
-      if ('V2' in raw && raw.V2) report = raw.V2;
-      else if ('V1Legacy' in raw && raw.V1Legacy) {
+      if (raw.envelope && typeof raw.envelope === 'object') {
+        if (raw.envelope.kind === 'v1_legacy') {
+          await renderLegacyV1(container, { sessionId, nodeId });
+          return;
+        }
+        if (raw.envelope.kind === 'v2' && raw.envelope.report) {
+          report = raw.envelope.report;
+        }
+      } else if ('V2' in raw && raw.V2) {
+        report = raw.V2;
+      } else if ('V1Legacy' in raw && raw.V1Legacy) {
         await renderLegacyV1(container, { sessionId, nodeId });
         return;
       }
@@ -363,10 +372,16 @@ async function handleDownload(ctx) {
     return;
   }
   try {
-    const resp = await fetch(`/api/profiling/sessions/${encodeURIComponent(ctx.report.session_id)}/download`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const blob = await resp.blob();
-    triggerDownload(blob, `profile-${ctx.report.session_id}.bin`);
+    const resp = await profilingDownload({
+      nodeId: ctx.report.node_id || '',
+      sessionId: ctx.report.session_id,
+    });
+    const bytes = resp.tarballBytes instanceof Uint8Array
+      ? resp.tarballBytes
+      : new Uint8Array(resp.tarballBytes || []);
+    const filename = resp.filename || `profile-${ctx.report.session_id}.tar.gz`;
+    const blob = new Blob([bytes], { type: 'application/gzip' });
+    triggerDownload(blob, filename);
   } catch (err) {
     console.error('download failed', err);
   }
@@ -389,8 +404,10 @@ async function handleDelete(container, ctx) {
     return;
   }
   try {
-    const resp = await fetch(`/api/profiling/sessions/${encodeURIComponent(ctx.report.session_id)}`, { method: 'DELETE' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    await profilingDelete({
+      nodeId: ctx.report.node_id || '',
+      sessionId: ctx.report.session_id,
+    });
     navigateBack();
   } catch (err) {
     console.error('delete failed', err);
