@@ -471,11 +471,47 @@ fn detect_gpus_cached() -> Vec<PeerGpuInfo> {
 fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
     let mut gpus = get_wgpu_gpus().unwrap_or_default();
 
+    // Fallback build z nvidia-smi gdy wgpu pusto: typowe na headless Linux/WSL2
+    // bez Vulkan ICD — wgpu niczego nie widzi, mimo ze NVIDIA driver dziala.
+    // nvidia-smi to userspace tool driver-level i raportuje GPU bez Vulkan.
+    if gpus.is_empty() {
+        let entries = query_nvidia_smi();
+        if !entries.is_empty() {
+            let system_ram_mb = {
+                let sys = SYS.lock();
+                sys.total_memory() / (1024 * 1024)
+            };
+            gpus = entries
+                .into_iter()
+                .map(|e| {
+                    // Unified-memory NVIDIA (DGX Spark GB10) raportuje 0 dla VRAM —
+                    // wtedy uzywamy RAM systemowego jako pamieci wspoldzielonej.
+                    let vram_total = if e.vram_total == 0 {
+                        system_ram_mb
+                    } else {
+                        e.vram_total
+                    };
+                    PeerGpuInfo {
+                        name: e.name,
+                        vram_total_mb: vram_total,
+                        vram_used_mb: e.vram_used,
+                        usage_percent: e.usage,
+                        temperature_c: e.temp,
+                        power_draw_w: e.power_draw,
+                        power_limit_w: e.power_limit,
+                        vendor: crate::mesh::peer_store::GpuVendor::Nvidia,
+                    }
+                })
+                .collect();
+        }
+    }
+
     if gpus.is_empty() {
         return gpus;
     }
 
-    // NVIDIA — nvidia-smi (Linux, Windows)
+    // NVIDIA — nvidia-smi (Linux, Windows). Idempotentne: pomija GPU juz wzbogacone
+    // (np. zbudowane w fallbacku powyzej).
     enrich_nvidia_live(&mut gpus);
 
     // AMD — amd-smi / sysfs (Linux)
@@ -507,8 +543,48 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
     gpus
 }
 
-/// NVIDIA live metryki — nvidia-smi CLI. Wzbogaca istniejace GPU o VRAM, usage, temp.
-fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
+/// Sparsowany rekord z `nvidia-smi --query-gpu=...`. Pure-data: bez zaleznosci
+/// od PeerGpuInfo, zeby ten sam parser sluzyl i fallback-buildowi i enrichmentowi.
+#[derive(Debug, Clone)]
+pub(super) struct NvidiaEntry {
+    pub name: String,
+    pub vram_total: u64,
+    pub vram_used: u64,
+    pub usage: f32,
+    pub temp: u32,
+    pub power_draw: Option<f32>,
+    pub power_limit: Option<f32>,
+}
+
+/// Parser czystego stdoutu z `nvidia-smi --query-gpu=...,--format=csv,noheader,nounits`.
+/// Wydzielony zeby byl testowalny bez spawnowania procesu. Tolerujacy: wiersze 5/6/7 pol,
+/// wartosci `[N/A]` (typowe dla unified-memory GB10) traktowane jak 0.
+pub(super) fn parse_nvidia_smi_output(stdout: &str) -> Vec<NvidiaEntry> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            if parts.len() < 5 {
+                return None;
+            }
+            // Tolerancja [N/A] — `parse` zawiedzie, dostaniemy 0/None bez paniki.
+            Some(NvidiaEntry {
+                name: parts[0].to_string(),
+                vram_total: parts[1].parse().unwrap_or(0),
+                vram_used: parts[2].parse().unwrap_or(0),
+                usage: parts[3].parse().unwrap_or(0.0),
+                temp: parts[4].parse().unwrap_or(0),
+                power_draw: parts.get(5).and_then(|s| s.parse().ok()),
+                power_limit: parts.get(6).and_then(|s| s.parse().ok()),
+            })
+        })
+        .collect()
+}
+
+/// Wywoluje nvidia-smi i zwraca sparsowane rekordy. Pusty Vec gdy binarka brakuje
+/// lub status != 0. Pojedyncze zrodlo prawdy o nvidia-smi w calym module —
+/// uzywane zarowno w fallback build (gdy wgpu pusto) jak i w enrichmencie.
+pub(super) fn query_nvidia_smi() -> Vec<NvidiaEntry> {
     let output = match std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,power.limit",
@@ -517,49 +593,32 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return,
+        _ => return Vec::new(),
     };
-
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_nvidia_smi_output(&stdout)
+}
 
-    struct NvidiaEntry<'a> {
-        name: &'a str,
-        vram_total: u64,
-        vram_used: u64,
-        usage: f32,
-        temp: u32,
-        power_draw: Option<f32>,
-        power_limit: Option<f32>,
+/// NVIDIA live metryki — nvidia-smi CLI. Wzbogaca istniejace GPU o VRAM, usage, temp.
+/// Idempotentne: pomija GPU juz wzbogacone (vram_total_mb > 0), zeby kolejne wywolanie
+/// nie nadpisalo wartosci ustawionych przez fallback build z `query_nvidia_smi`.
+fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
+    let nvidia_entries = query_nvidia_smi();
+    if nvidia_entries.is_empty() {
+        return;
     }
 
-    let nvidia_entries: Vec<NvidiaEntry> = stdout
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-            if parts.len() >= 5 {
-                Some(NvidiaEntry {
-                    name: parts[0],
-                    vram_total: parts[1].parse().unwrap_or(0),
-                    vram_used: parts[2].parse().unwrap_or(0),
-                    usage: parts[3].parse().unwrap_or(0.0),
-                    temp: parts[4].parse().unwrap_or(0),
-                    power_draw: parts.get(5).and_then(|s| s.parse().ok()),
-                    power_limit: parts.get(6).and_then(|s| s.parse().ok()),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // RAM systemowy — potrzebny dla unified memory GPU (GB10, przyszle Blackwell)
     let system_ram_mb = {
         let sys = SYS.lock();
         sys.total_memory() / (1024 * 1024)
     };
 
-    // Dopasowanie po indeksie — nvidia-smi zwraca GPU w kolejności 0, 1, 2...
     for (i, gpu) in gpus.iter_mut().enumerate() {
+        if gpu.vram_total_mb > 0 {
+            // Juz wzbogacone (np. fallback build z query_nvidia_smi). Pomijamy,
+            // zeby nie zresetowac danych przy ponownym wywolaniu enrich.
+            continue;
+        }
         if let Some(nv) = nvidia_entries.get(i) {
             gpu.vram_total_mb = nv.vram_total;
             gpu.vram_used_mb = nv.vram_used;
@@ -568,8 +627,8 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
             gpu.power_draw_w = nv.power_draw;
             gpu.power_limit_w = nv.power_limit;
 
-            // Unified memory GPU (np. DGX Spark GB10) — nvidia-smi zwraca [N/A] dla VRAM
-            // Wtedy VRAM = RAM systemowy (wspoldzielona pamiec CPU/GPU)
+            // Unified memory GPU (np. DGX Spark GB10) — nvidia-smi zwraca [N/A] dla VRAM.
+            // Wtedy VRAM = RAM systemowy (wspoldzielona pamiec CPU/GPU).
             if gpu.vram_total_mb == 0 {
                 gpu.vram_total_mb = system_ram_mb;
             }
@@ -1604,5 +1663,72 @@ mod vendor_tests {
         assert_eq!(infer_vendor("Mali-G77"), GpuVendor::Other);
         assert_eq!(infer_vendor("Adreno 660"), GpuVendor::Other);
         assert_eq!(infer_vendor(""), GpuVendor::Other);
+    }
+}
+
+#[cfg(test)]
+mod nvidia_smi_tests {
+    use super::parse_nvidia_smi_output;
+
+    #[test]
+    fn parses_full_seven_field_line() {
+        // Pelna linia: name, vram_total, vram_used, usage, temp, power_draw, power_limit
+        let out = "NVIDIA GeForce RTX 4090, 24576, 1024, 35, 62, 250.5, 450.0\n";
+        let entries = parse_nvidia_smi_output(out);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.name, "NVIDIA GeForce RTX 4090");
+        assert_eq!(e.vram_total, 24576);
+        assert_eq!(e.vram_used, 1024);
+        assert!((e.usage - 35.0).abs() < f32::EPSILON);
+        assert_eq!(e.temp, 62);
+        assert_eq!(e.power_draw, Some(250.5));
+        assert_eq!(e.power_limit, Some(450.0));
+    }
+
+    #[test]
+    fn parses_n_a_vram_as_zero_for_unified_memory_gpu() {
+        // DGX Spark GB10: nvidia-smi zwraca [N/A] dla VRAM — fallback do RAM systemu
+        // robiony w wyzszej warstwie, parser ma tylko zwrocic 0.
+        let out = "NVIDIA GB10, [N/A], [N/A], 12, 55, [N/A], [N/A]\n";
+        let entries = parse_nvidia_smi_output(out);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.vram_total, 0);
+        assert_eq!(e.vram_used, 0);
+        assert!((e.usage - 12.0).abs() < f32::EPSILON);
+        assert_eq!(e.temp, 55);
+        assert_eq!(e.power_draw, None);
+        assert_eq!(e.power_limit, None);
+    }
+
+    #[test]
+    fn empty_output_returns_empty_vec() {
+        assert!(parse_nvidia_smi_output("").is_empty());
+        assert!(parse_nvidia_smi_output("\n\n").is_empty());
+    }
+
+    #[test]
+    fn mixed_field_counts_in_same_output() {
+        // Linia z 5 polami (stara wersja sterownika, brak power) + linia z 7.
+        let out = "\
+Tesla V100, 16384, 8192, 88, 72\n\
+NVIDIA H100 PCIe, 81920, 40960, 95, 70, 320.0, 400.0\n";
+        let entries = parse_nvidia_smi_output(out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "Tesla V100");
+        assert_eq!(entries[0].power_draw, None);
+        assert_eq!(entries[1].name, "NVIDIA H100 PCIe");
+        assert_eq!(entries[1].power_draw, Some(320.0));
+        assert_eq!(entries[1].power_limit, Some(400.0));
+    }
+
+    #[test]
+    fn skips_malformed_short_lines() {
+        // < 5 pol = nieparsowalna linia, nie wpisujemy do wynikow
+        let out = "incomplete, line\nNVIDIA RTX A6000, 49152, 2048, 22, 58\n";
+        let entries = parse_nvidia_smi_output(out);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "NVIDIA RTX A6000");
     }
 }

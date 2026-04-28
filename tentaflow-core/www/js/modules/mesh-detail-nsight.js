@@ -63,12 +63,35 @@ export async function loadSessions(nodeId) {
   return cachedSessions;
 }
 
-// Czy node wspiera profilowanie (heartbeat raportuje nsys_available).
+// Czy node ma jakikolwiek GPU NVIDIA (warunek wstepny — nsys ma sens tylko na NVIDIA).
+function hasNvidiaGpu(node) {
+  if (!node) return false;
+  const gpus = Array.isArray(node.gpus) ? node.gpus : [];
+  return gpus.some((g) => g && g.vendor === 'Nvidia');
+}
+
+// Czy node wspiera profilowanie (heartbeat raportuje nsys_available + jest NVIDIA).
 export function isNsightCapable(node) {
   if (!node) return false;
   if (node.nsys_available !== true) return false;
-  const gpus = Array.isArray(node.gpus) ? node.gpus : [];
-  return gpus.some((g) => g && g.vendor === 'Nvidia');
+  return hasNvidiaGpu(node);
+}
+
+// Wykrywa platforme docelowa do wyboru komendy instalacji. Preferuje `node.platform`
+// z heartbeatu (linux/macos/windows/android/ios). Dla local node fallback do
+// navigator.platform — heartbeat moze nie zdazyc dolecziec przy pierwszym renderze.
+function detectPlatformForInstall(node) {
+  const raw = String(node?.platform || '').toLowerCase();
+  if (raw === 'linux' || raw === 'macos' || raw === 'windows' || raw === 'android' || raw === 'ios') {
+    return raw;
+  }
+  if (typeof navigator !== 'undefined' && navigator.platform) {
+    const np = navigator.platform.toLowerCase();
+    if (np.includes('mac')) return 'macos';
+    if (np.includes('win')) return 'windows';
+    if (np.includes('linux')) return 'linux';
+  }
+  return 'linux';
 }
 
 // HTML do wstrzykniecia w `card-head` GPU. Pokazuje sie tylko dla NVIDIA + nsys.
@@ -108,8 +131,88 @@ export function topbarHtml(node) {
         <span>${escapeHtml(I18n.t('nsight.profile_node_btn'))}</span>
       </tf-button>
     `);
+  } else if (hasNvidiaGpu(node) && node.nsys_available === false) {
+    // NVIDIA jest, ale brak nsys w PATH — chip dziala jak link "scroll do install card".
+    parts.push(`
+      <tf-chip status="warn" data-action="nsight-scroll-install" title="${escapeAttr(I18n.t('nsight.error.not_available'))}">
+        ${escapeHtml(I18n.t('nsight.status.unavailable'))}
+      </tf-chip>
+    `);
+  } else if (!hasNvidiaGpu(node)) {
+    // Brak NVIDIA = nsys nigdy nie bedzie dostepny (Apple Silicon, AMD-only itp.).
+    // Chip informacyjny, disabled-look, zeby uzytkownik wiedzial dlaczego brak przycisku.
+    parts.push(`
+      <tf-chip status="muted" title="${escapeAttr(I18n.t('nsight.status.no_nvidia_tooltip'))}">
+        ${escapeHtml(I18n.t('nsight.status.no_nvidia'))}
+      </tf-chip>
+    `);
   }
   return parts.join('');
+}
+
+// Karta z instrukcja instalacji nsys gdy node ma NVIDIA ale nsys nie jest dostepny.
+// Renderowana w mesh-detail.js obok renderProfilingWrap. Pusta gdy nsys juz dziala
+// albo gdy nie ma NVIDIA (innych vendorow nsys nie wspiera).
+export function nsightInstallHintHtml(node) {
+  if (!node) return '';
+  if (node.nsys_available === true) return '';
+  if (!hasNvidiaGpu(node)) return '';
+
+  const platform = detectPlatformForInstall(node);
+  const docsUrl = 'https://developer.nvidia.com/nsight-systems';
+
+  // Per-platforma: na linux pokazujemy obie wersje (apt + dnf) bo heartbeat nie
+  // rozroznia distro. Wybor zostawiamy uzytkownikowi.
+  let cmds = '';
+  if (platform === 'linux' || platform === 'android') {
+    const aptCmd = 'sudo apt install nvidia-nsight-systems';
+    const dnfCmd = 'sudo dnf install cuda-nsight-systems-12-x';
+    cmds = `
+      ${installCmdRow(I18n.t('nsight.install.linux_apt_label'), aptCmd)}
+      ${installCmdRow(I18n.t('nsight.install.linux_dnf_label'), dnfCmd)}
+    `;
+  } else if (platform === 'windows') {
+    cmds = `
+      <div class="nsight-install-cmd-row">
+        <div class="nsight-install-cmd-label">${escapeHtml(I18n.t('nsight.install.windows_label'))}</div>
+        <div class="nsight-install-cmd-windows">
+          <a href="${escapeAttr(docsUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(docsUrl)}</a>
+        </div>
+      </div>
+    `;
+  } else if (platform === 'macos' || platform === 'ios') {
+    return `
+      <div class="nsight-install-card" data-nsight-install-card>
+        <h3 class="mesh-section-title">${escapeHtml(I18n.t('nsight.install.title'))}</h3>
+        <div class="nsight-install-warn">${escapeHtml(I18n.t('nsight.install.macos_unsupported'))}</div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="nsight-install-card" data-nsight-install-card>
+      <h3 class="mesh-section-title">${escapeHtml(I18n.t('nsight.install.title'))}</h3>
+      <p class="nsight-install-desc">${escapeHtml(I18n.t('nsight.install.description'))}</p>
+      ${cmds}
+      <div class="nsight-install-docs">
+        <a href="${escapeAttr(docsUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(I18n.t('nsight.install.docs_link'))}</a>
+      </div>
+    </div>
+  `;
+}
+
+function installCmdRow(label, cmd) {
+  return `
+    <div class="nsight-install-cmd-row">
+      <div class="nsight-install-cmd-label">${escapeHtml(label)}</div>
+      <div class="nsight-install-cmd">
+        <code>${escapeHtml(cmd)}</code>
+        <tf-button size="sm" variant="ghost" data-action="nsight-copy-cmd" data-cmd="${escapeAttr(cmd)}">
+          ${escapeHtml(I18n.t('nsight.install.copy_btn'))}
+        </tf-button>
+      </div>
+    </div>
+  `;
 }
 
 // HTML sekcji listy sesji (pod GPU). Ukryty gdy nsys niedostepny i brak historii.
@@ -191,6 +294,27 @@ export function bindNsightActions(root, node) {
 
     if (action === 'nsight-profile-node') {
       openStartModal(node, { defaultScope: 'both', defaultGpu: 'all' });
+      return;
+    }
+    if (action === 'nsight-copy-cmd') {
+      // Komenda osadzona w data-attribute — bez globalnego stanu, dziala
+      // niezaleznie od node id (przyklad ze strony jest zawsze ten sam tekst).
+      const cmd = btn.dataset.cmd || '';
+      if (!cmd) return;
+      try {
+        await navigator.clipboard.writeText(cmd);
+        const original = btn.textContent;
+        btn.textContent = I18n.t('nsight.install.copied');
+        setTimeout(() => { btn.textContent = original; }, 1500);
+      } catch (_err) {
+        toast(I18n.t('nsight.session.error'), 'error');
+      }
+      return;
+    }
+    if (action === 'nsight-scroll-install') {
+      // Chip "Nsight: niedostepny" w topbarze — przewija do instrukcji.
+      const card = root.querySelector('[data-nsight-install-card]');
+      if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
     }
     if (action === 'nsight-profile-card') {

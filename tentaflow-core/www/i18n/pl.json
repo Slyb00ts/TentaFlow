@@ -1555,6 +1555,22 @@
       "invalid_scope": "Niewłaściwy zakres profilowania",
       "session_not_found": "Sesja nie znaleziona"
     },
+    "status": {
+      "unavailable": "Nsight: niedostępny",
+      "no_nvidia": "Nsight: tylko NVIDIA",
+      "no_nvidia_tooltip": "Profilowanie wymaga NVIDIA GPU + Nsight Systems"
+    },
+    "install": {
+      "title": "Włącz profilowanie Nsight Systems",
+      "description": "Aby profilować GPU NVIDIA na tym nodzie, zainstaluj Nsight Systems. To część NVIDIA CUDA Toolkit lub osobny pakiet.",
+      "linux_apt_label": "Ubuntu / Debian",
+      "linux_dnf_label": "Fedora / RHEL / CUDA Toolkit",
+      "windows_label": "Windows — pobierz instalator",
+      "macos_unsupported": "Apple Silicon nie wspiera Nsight (brak NVIDIA GPU)",
+      "copy_btn": "Skopiuj",
+      "copied": "Skopiowano!",
+      "docs_link": "Pełna dokumentacja"
+    },
     "report": {
       "title": "Raport profilowania",
       "back": "Wróć",
@@ -2067,6 +2083,7 @@
       "participant_speaking_now": "mówi teraz",
       "participant_spoke_ago": "{n} s temu",
       "not_enrolled": "Nieenrollowany",
+      "attr_years_short": "l",
       "no_participants": "Brak uczestników",
       "no_action_items": "Brak pozycji",
       "backend_stt_label": "STT",

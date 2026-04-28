@@ -884,6 +884,31 @@ pub enum MeetingEventPayload {
         /// JPEG bytes (q≈0.6, max ~320px szerokości).
         jpeg: Vec<u8>,
     },
+    /// Atrybuty rozpoznane z klatki wideo uczestnika (emocje + wiek + płeć).
+    /// Router emituje ten wariant po inferencji vision modeli na klatce z
+    /// `VideoFrame` (throttle 1 inference / 2s per uczestnik). Nie persistujemy
+    /// do DB — broadcast wyłącznie live do dashboardu obok pozostałych
+    /// MeetingEventPayload.
+    ParticipantAttributes {
+        /// `data-tid` kafelka — taki sam jak w `VideoFrame.participant_id`.
+        participant_id: String,
+        /// Display name z `VideoFrame.name`. GUI używa go do dopasowania do
+        /// rosteru po nazwie, gdy `participant_id` z DOM Teams nie pokrywa
+        /// się ze `speaker_id` z diarization.
+        name: Option<String>,
+        ts_ms: u64,
+        /// Etykieta emocji z 8-klasowego AffectNet HSEmotion ("Happiness",
+        /// "Neutral", "Sadness", "Surprise", "Fear", "Anger", "Disgust",
+        /// "Contempt"). None gdy detector nie znalazł twarzy lub emotion
+        /// engine nie był podpięty — GUI traktuje to jako "wyczyść badge".
+        emotion: Option<String>,
+        /// Pewność emocji [0..1] po EWMA smoothing.
+        emotion_confidence: Option<f32>,
+        /// Wiek w latach (regresja MiVOLO).
+        age: Option<f32>,
+        /// Prawdopodobieństwo płci męskiej [0..1] z MiVOLO (>0.5 mężczyzna).
+        gender_male_prob: Option<f32>,
+    },
 }
 
 /// Etapy cyklu życia sesji meeting bota. Używane w
