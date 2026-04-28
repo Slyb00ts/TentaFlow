@@ -57,6 +57,10 @@ certs/
 # =============================================================================
 config.toml
 *.local.toml
+# Exception: .cargo/config.toml MUSI byc w repo zeby globalne build
+# settings (jobs, profile defaults, linker, sccache) zadzialaly dla
+# wszystkich. Nadpisuje regule `config.toml` powyzej.
+!.cargo/config.toml
 .env
 .env.*
 !.env.example
