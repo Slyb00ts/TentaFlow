@@ -9,9 +9,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use tentaflow_protocol::profiling::{ProfileKpi, ProfileTopRow};
-use tokio::process::Command;
-
-use super::nsys::ProfilingError;
+use super::nsys::{nsys_command, ProfilingError};
 
 /// Domyslny limit wierszy per tabela top — stat reports zwracaja czesto >1000
 /// linii a w GUI pokazujemy max ~50.
@@ -190,7 +188,7 @@ pub fn parse_stats_json_str(s: &str) -> Result<ParsedStats, ProfilingError> {
 /// Wywoluje `nsys stats --format json` na pliku `.nsys-rep` i parsuje wynik.
 /// Cienki wrapper na `parse_stats_json_str` — pure parsing siedzi tam.
 pub async fn parse_nsys_stats_json(rep_path: &Path) -> Result<ParsedStats, ProfilingError> {
-    let output = Command::new("nsys")
+    let output = nsys_command()?
         .args([
             "stats",
             "--report",
