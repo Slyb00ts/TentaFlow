@@ -114,8 +114,16 @@ function t(path, vars = null) {
 
 // Próbuje pobrać zapisaną w backendzie preferencję języka. Best-effort:
 // brak sesji (401) jest cichy, błędy sieciowe nie blokują startu UI.
+//
+// Pre-check JWT w localStorage zanim odpalimy fetch — wczesniej kazdy
+// niezalogowany user dostawal 401 w DevTools Network/Console (nie da
+// sie tego stlumic z poziomu fetch po stronie JS, bo browser zawsze
+// loguje 4xx). Skip = brak nawet requestu zanim user sie zaloguje.
 async function syncFromBackend() {
   try {
+    if (typeof localStorage !== 'undefined' && !localStorage.getItem('tentaflow_jwt')) {
+      return;
+    }
     const res = await fetch('/api/me/preferences', { credentials: 'include' });
     if (res.status === 401) return;
     if (!res.ok) {
