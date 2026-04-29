@@ -398,7 +398,10 @@ mod tests {
 
     #[test]
     fn test_stop_tokens() {
-        assert_eq!(ChatTemplate::ChatML.stop_tokens(), vec!["<|im_end|>"]);
+        assert_eq!(
+            ChatTemplate::ChatML.stop_tokens(),
+            vec!["<|im_end|>", "<|endoftext|>", "</s>"]
+        );
         assert_eq!(ChatTemplate::Llama3.stop_tokens(), vec!["<|eot_id|>"]);
         assert!(ChatTemplate::Plain.stop_tokens().is_empty());
     }

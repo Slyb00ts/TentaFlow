@@ -43,8 +43,9 @@ pub enum ValidationError {
     DockerRequiresSingleSource { engine_id: String },
 
     #[error(
-        "Engine '{engine_id}': deploy.native.runtime = embedded requires feature_flag \
-         and must not define binary_path or bundle_path"
+        "Engine '{engine_id}': deploy.native.runtime = embedded must not define \
+         binary_path or bundle_path (feature_flag is optional — silniki gated \
+         tylko przez target_os, jak apple-tts czy tract-onnx vision, mogą go pominąć)"
     )]
     EmbeddedRequiresFeatureFlag { engine_id: String },
 
@@ -113,10 +114,11 @@ pub fn validate_engine(
     if let Some(native) = &deploy.native {
         match native.runtime {
             NativeRuntime::Embedded => {
-                if native.feature_flag.is_none()
-                    || native.binary_path.is_some()
-                    || native.bundle_path.is_some()
-                {
+                // feature_flag is optional: silniki gated wyłącznie przez target_os
+                // (apple-tts via AVSpeechSynthesizer, vision/* via tract-onnx) nie
+                // mają Cargo feature do wskazania. binary_path / bundle_path nigdy
+                // nie pasują do embedded.
+                if native.binary_path.is_some() || native.bundle_path.is_some() {
                     errors.push(ValidationError::EmbeddedRequiresFeatureFlag {
                         engine_id: eid.clone(),
                     });
