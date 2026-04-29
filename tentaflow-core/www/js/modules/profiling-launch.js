@@ -8,6 +8,11 @@
 
 import { TfWindow } from '/js/components/tf-window.js';
 import { profilingStart } from '/js/protocol/profiling.js';
+import {
+  getSudoPassword,
+  setSudoPassword,
+  getDisabledSources,
+} from '/js/lib/profile-permissions-store.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
 
@@ -160,7 +165,11 @@ export class ProfilingLaunchModal {
 
   constructor(nodeId, availableSources, onLaunched) {
     this.nodeId = nodeId;
-    this.sources = availableSources.slice();
+    // Filter out sources globalnie wylaczone w Profile Permissions (per browser).
+    // Unavailable po stronie backendu zostawiamy zeby user widzial dlaczego cos
+    // nie dziala — disabled-by-user usuwamy z UI calkowicie.
+    const disabled = new Set(getDisabledSources());
+    this.sources = availableSources.filter((s) => !disabled.has(s.id));
     this.onLaunched = typeof onLaunched === 'function' ? onLaunched : null;
 
     // state
@@ -170,7 +179,8 @@ export class ProfilingLaunchModal {
     this.manualStop = false;
     this.targetMode = 'system_wide';
     this.targetPid = '';
-    this.elevationPassword = '';
+    // Pre-fill z permissions store (in-memory, per-tab).
+    this.elevationPassword = getSudoPassword() || '';
     this.elevationVisible = false;
     this.elevationStatus = 'untested'; // 'untested' | 'ok' | 'bad' | 'testing'
 
@@ -697,6 +707,9 @@ export class ProfilingLaunchModal {
     try {
       const scope = this._buildScope();
       const elevationPassword = this.elevationPassword || undefined;
+      // Zapisz do permissions store (in-memory, per-tab) — kolejna sesja
+      // uniknie pytania o haslo dopoki uzytkownik nie zamknie zakladki.
+      if (elevationPassword) setSudoPassword(elevationPassword);
       const resp = await startSession({ scope, nodeId: this.nodeId, elevationPassword });
       const sessionId = resp.sessionId || resp.session_id;
       this._launchedOk = true;

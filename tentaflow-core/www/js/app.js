@@ -43,6 +43,8 @@ import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
 import ProfileReportV2View from '/js/modules/profile-report-v2.js';
+import ProfileCompareView from '/js/modules/profile-compare.js';
+import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 
 // Adapter: V2 view eksponuje statyczne `render(container, params)`, podczas
 // gdy Router oczekuje `show(params)` lub `render()/mount()`. Owijamy V2 w
@@ -54,6 +56,24 @@ const ProfileReportScreen = {
     const main = document.getElementById('main');
     if (!main) return;
     await ProfileReportV2View.render(main, params);
+  },
+};
+
+const ProfileCompareScreen = {
+  title: 'Compare Profile Sessions',
+  async show(params = {}) {
+    const main = document.getElementById('main');
+    if (!main) return;
+    await ProfileCompareView.render(main, params);
+  },
+};
+
+const ProfilePermissionsScreen = {
+  title: 'Profile Permissions',
+  async show() {
+    const main = document.getElementById('main');
+    if (!main) return;
+    await ProfilePermissionsView.render(main);
   },
 };
 import { makeComingSoonScreen } from '/js/modules/coming-soon.js';
@@ -401,6 +421,8 @@ async function renderApp() {
   Router.register('translate',      TranslateScreen);
   Router.register('mesh-user',      makeComingSoonScreen('mesh_user', 'network'));
   Router.register('profile-report', ProfileReportScreen);
+  Router.register('profile-compare', ProfileCompareScreen);
+  Router.register('profile-permissions', ProfilePermissionsScreen);
 
   paint();
 
