@@ -210,6 +210,9 @@
     "col_endpoint": "Endpoint",
     "col_started": "Uruchomiono",
     "col_actions": "Akcje",
+    "col_transport": "Transport",
+    "col_models": "Modele",
+    "col_restart": "Restarty",
     "tooltip_pin_off": "Trzymaj zawsze w pamięci",
     "tooltip_pin_on": "Trzymany zawsze w pamięci — kliknij, aby wyłączyć",
     "tooltip_pause_off": "Zatrzymaj (zwolni pamięć, nie startuje z programem)",
@@ -291,6 +294,8 @@
       "running": "Działa",
       "starting": "Uruchamia się",
       "stopped": "Zatrzymany",
+      "degraded": "Pogorszony",
+      "failed": "Awaria",
       "error": "Błąd",
       "on_demand": "Na żądanie"
     },

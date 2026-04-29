@@ -9,7 +9,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, toast } from '/js/utils.js';
+import { byId, escapeHtml, toast, apiGet } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { measureItemHeight, getDefaultFont, getDefaultLineHeight } from '/js/lib/text-measure.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
@@ -359,13 +359,33 @@ const ChatScreen = {
     nextMsgId = maxId + 1;
 
     try {
-      const all = await ApiBinary.list('modelListRequest');
-      // Chat obsluguje tylko modele LLM. Bez filtru w dropdownie pojawialy sie
-      // serwisy STT/TTS (np. tentaflow-mlx-whisper-XXX) i klikniecie konczylo
-      // sie bledem "Model nie zostal znaleziony w konfiguracji".
-      modelOptions = (all || []).filter((m) => {
-        const cat = (m.category || m.service_type || '').toLowerCase();
-        return cat === '' || cat === 'llm';
+      // Phase 7: REST /api/models is the v2 surface fed by services_v2 +
+      // model_registry_v2. Chat only routes "chat" capable models; whisper /
+      // xtts rows would otherwise crash dispatch with "model not found in
+      // configuration".
+      const all = await apiGet('/api/models');
+      const list = Array.isArray(all) ? all : [];
+      const chatOnly = list.filter((m) => {
+        const caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+        return caps.length === 0 || caps.includes('chat');
+      });
+      // Disambiguate duplicate model_names served by multiple services
+      // (e.g. Qwen3.5 via vllm and llama-cpp) by appending engine_id to the
+      // label of every duplicated row. service_id stays as a dedupe key in
+      // case the future router lets us pin a specific instance.
+      const counts = new Map();
+      for (const m of chatOnly) {
+        counts.set(m.model_name, (counts.get(m.model_name) || 0) + 1);
+      }
+      modelOptions = chatOnly.map((m) => {
+        const baseLabel = m.display_name || m.model_name;
+        const dup = counts.get(m.model_name) > 1;
+        return {
+          id: m.model_name,
+          serviceId: m.service_id,
+          engineId: m.engine_id || '',
+          label: dup && m.engine_id ? `${baseLabel} (${m.engine_id})` : baseLabel,
+        };
       });
     } catch {
       modelOptions = [];
@@ -373,13 +393,12 @@ const ChatScreen = {
 
     const sel = byId('chat-model');
     const innerSelect = sel?.querySelector('select');
-    // value = service id (do dispatchu), label = display_name (HF repo, np.
-    // "Qwen/Qwen3.5-0.8B") gdy znany, fallback na id.
+    // value = model_name (router resolves alias chains server-side), label =
+    // display name (with engine_id suffix for ambiguous rows).
     const optionsHtml = modelOptions.length === 0
       ? `<option value="default">default</option>`
       : modelOptions.map((m) => {
-          const label = m.display_name || m.displayName || m.id;
-          return `<option value="${escapeHtml(m.id)}">${escapeHtml(label)}</option>`;
+          return `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`;
         }).join('');
     if (innerSelect) {
       innerSelect.innerHTML = optionsHtml;

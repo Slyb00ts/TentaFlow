@@ -1,31 +1,27 @@
 // =============================================================================
-// Plik: modules/services.js
-// Opis: Ekran Services — 3 zakladki (tf-tabs underline):
-//       1) Lista   — tabela deployowanych serwisow z auto-refresh 5s
-//       2) Aliasy  — CRUD aliasow modeli (binary: modelAlias*Request), edycja w tf-window
-//       3) Modele  — zbiorcza lista modeli ze wszystkich nodow mesh
-//      "Nowy serwis" otwiera Catalog (target picker → wizard). Edycja aliasu
-//      oraz potwierdzenia usuwania korzystaja z komponentu <tf-window>.
-//      Auto-refresh uzywa morphdom przez /js/lib/patch.js zeby nie migotac.
+// File: modules/services.js — Services screen with 3 tabs (tf-tabs underline)
+//   1) List     — deployed services table, REST /api/services, auto-refresh 5s
+//   2) Aliases  — model alias CRUD (binary modelAlias*Request), tf-window editor
+//   3) Models   — mesh-wide model aggregate (binary modelsUnifiedListRequest)
+//   "New service" opens Catalog (target picker → wizard). Aliases edit + delete
+//   confirmations use <tf-window>. Auto-refresh uses morphdom via /js/lib/patch.js
+//   so the table does not flicker.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, apiGet, apiDelete } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
-import { openUpdateModal } from '/js/modules/services/update-modal.js';
 
 let services = [];
 let aliases = [];
 let meshNodes = [];
 let unifiedModels = [];
-let quicStatusMap = {};
 let refresher = null;
-let quicRefresher = null;
 let currentTab = 'list';
 let lastQuery = '';
 
@@ -67,23 +63,14 @@ const ServicesScreen = {
       hiddenIntervalMs: 20000,
     });
     refresher.start();
-    quicRefresher = createRefresher({
-      run: loadQuicStatus,
-      intervalMs: 5000,
-      hiddenIntervalMs: 20000,
-    });
-    quicRefresher.start();
   },
   unmount() {
     if (refresher) refresher.dispose();
-    if (quicRefresher) quicRefresher.dispose();
     refresher = null;
-    quicRefresher = null;
     services = [];
     aliases = [];
     meshNodes = [];
     unifiedModels = [];
-    quicStatusMap = {};
   },
 };
 
@@ -92,13 +79,13 @@ const ServicesScreen = {
 async function loadAll() {
   try {
     const [svc, al, nodes, unified] = await Promise.all([
-      ApiBinary.list('serviceListRequest').catch(() => []),
+      apiGet('/api/services').catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
       ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
       ManifestStore.init().catch(() => false),
     ]);
-    services = svc || [];
+    services = Array.isArray(svc) ? svc : [];
     aliases = al || [];
     meshNodes = nodes || [];
     unifiedModels = Array.isArray(unified) ? unified : [];
@@ -108,7 +95,6 @@ async function loadAll() {
     renderTab();
     updateSubtitle();
     updateTabCounts();
-    await loadQuicStatus();
   } catch (err) {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
   }
@@ -117,7 +103,8 @@ async function loadAll() {
 async function loadForCurrentTab() {
   try {
     if (currentTab === 'list') {
-      services = await ApiBinary.list('serviceListRequest');
+      const svc = await apiGet('/api/services');
+      services = Array.isArray(svc) ? svc : [];
       patchListTab();
     } else if (currentTab === 'aliases') {
       aliases = await ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' });
@@ -139,20 +126,8 @@ async function loadForCurrentTab() {
   }
 }
 
-async function loadQuicStatus() {
-  try {
-    const resp = await ApiBinary.one('serviceQuicStatusRequest');
-    const next = {};
-    for (const item of resp.statuses ?? []) next[item.name] = item.status;
-    quicStatusMap = next;
-    if (currentTab === 'list') updateQuicDots();
-  } catch (err) {
-    console.warn('[services] quic status:', err.message);
-  }
-}
-
 function updateSubtitle() {
-  const running = services.filter((s) => ['running', 'active', 'ready'].includes((s.status || '').toLowerCase())).length;
+  const running = services.filter((s) => ['running'].includes((s.status || '').toLowerCase())).length;
   const total = services.length;
   const sub = byId('services-sub');
   if (!sub) return;
@@ -188,7 +163,6 @@ function renderTab() {
   else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
   else if (currentTab === 'models') body.innerHTML = renderModelsTab();
   bindTabEvents();
-  if (currentTab === 'list') updateQuicDots();
 }
 
 function patchListTab() {
@@ -197,7 +171,6 @@ function patchListTab() {
   if (!body) return;
   patchInner(body, renderListTab());
   bindTabEvents();
-  updateQuicDots();
 }
 
 function patchAliasesTab() {
@@ -225,37 +198,6 @@ function bindTabEvents() {
     b.onclick = (e) => {
       e.stopPropagation();
       stopService(b.dataset.svcDelete, b.dataset.svcName);
-    };
-  });
-  body.querySelectorAll('[data-svc-pin]').forEach((b) => {
-    b.onclick = async (e) => {
-      e.stopPropagation();
-      const newPin = b.dataset.pinned !== '1';
-      await toggleServiceFlag(b.dataset.svcPin, b.dataset.svcName, { pinned: newPin });
-    };
-  });
-  body.querySelectorAll('[data-svc-pause]').forEach((b) => {
-    b.onclick = async (e) => {
-      e.stopPropagation();
-      const newPause = b.dataset.paused !== '1';
-      await toggleServiceFlag(b.dataset.svcPause, b.dataset.svcName, { paused: newPause });
-    };
-  });
-  body.querySelectorAll('[data-svc-update]').forEach((b) => {
-    b.onclick = (e) => {
-      e.stopPropagation();
-      const svc = services.find((x) => String(x.id) === b.dataset.svcUpdate);
-      if (svc) {
-        openUpdateModal({
-          service: svc,
-          onUpdated: async () => {
-            services = await ApiBinary.list('serviceListRequest').catch(() => services);
-            patchListTab();
-            updateSubtitle();
-            updateTabCounts();
-          },
-        });
-      }
     };
   });
   body.querySelectorAll('[data-empty-cta]').forEach((b) => {
@@ -294,12 +236,13 @@ function renderListTab() {
     <table class="data-table">
       <thead>
         <tr>
-          <th>${escapeHtml(I18n.t('services.col_name'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_type'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_node'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_quic_address'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_quic_status'))}</th>
-          <th>${escapeHtml(I18n.t('services.col_created'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_engine'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_method'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_transport'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_status'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_endpoint'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_models'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_restart'))}</th>
           <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
         </tr>
       </thead>
@@ -310,69 +253,90 @@ function renderListTab() {
   `;
 }
 
+// Maps services_v2.status (running|degraded|failed|starting|stopped) onto the
+// tf-chip status palette. degraded → pending (yellow), failed → err (red).
+function mapStatusToChip(status) {
+  switch ((status || '').toLowerCase()) {
+    case 'running': return { variant: 'online', dot: true };
+    case 'degraded': return { variant: 'pending', dot: true };
+    case 'failed': return { variant: 'err', dot: true };
+    case 'starting': return { variant: 'info', dot: true };
+    case 'stopped': return { variant: 'offline', dot: false };
+    default: return { variant: 'info', dot: false };
+  }
+}
+
+// Translates the deploy_method db tag (docker|native_python_bundle|native_binary|
+// embedded|external) to a short human label. Falls back to raw value.
+function deployMethodLabel(method) {
+  const raw = (method || '').toLowerCase();
+  switch (raw) {
+    case 'docker': return I18n.t('wizard.method.docker') || 'Docker';
+    case 'native_python_bundle': return 'Native (Python)';
+    case 'native_binary': return 'Native (binary)';
+    case 'embedded': return I18n.t('wizard.method.embedded') || 'Embedded';
+    case 'external': return I18n.t('wizard.method.external') || 'External';
+    default: return raw || '—';
+  }
+}
+
+// Transport tag (http_direct | quic_sidecar | embedded_inproc) → short label.
+function transportLabel(transport) {
+  const raw = (transport || '').toLowerCase();
+  if (raw === 'http_direct') return 'HTTP';
+  if (raw === 'quic_sidecar') return 'QUIC';
+  if (raw === 'embedded_inproc') return 'inproc';
+  return raw || '—';
+}
+
 function renderRow(s) {
-  const cfg = parseConfig(s.configJson);
-  const quicAddr = extractQuicAddr(cfg);
-  const deployMode = extractDeployMode(cfg);
-  const nodeLabel = s.nodeHostname
-    || (s.nodeId ? `${s.nodeId.slice(0, 12)}…` : I18n.t('services.deploy_local'));
-  const updateInfo = evaluateUpdate(s, cfg);
-  const isOnDemand = String(s.status || '').toLowerCase() === 'on_demand' || !!cfg?.on_demand;
-  const onDemandLabel = I18n.t('services.status.on_demand');
-  const quicAddrCell = isOnDemand
-    ? `<span style="color:var(--text-3); font-style:italic;">${escapeHtml(onDemandLabel)}</span>`
-    : (quicAddr ? `<code style="font-size:11px;">${escapeHtml(quicAddr)}</code>` : '<span style="color:var(--text-3);">—</span>');
-  const quicStatusCell = isOnDemand
-    ? `<span class="tag-status pending">${escapeHtml(onDemandLabel)}</span>`
-    : `<span data-quic-status="${escapeAttr(s.name)}"><span class="tag-status offline">${escapeHtml(I18n.t('services.status.none'))}</span></span>`;
+  const statusInfo = mapStatusToChip(s.status);
+  const statusLabel = I18n.t(`services.status.${(s.status || '').toLowerCase()}`)
+    || s.status || '—';
+  const endpoint = s.endpoint_url
+    ? `<code style="font-size:11px;">${escapeHtml(s.endpoint_url)}</code>`
+    : '<span style="color:var(--text-3);">—</span>';
+  const models = Array.isArray(s.models) ? s.models : [];
+  const modelChips = models.length === 0
+    ? '<span style="color:var(--text-3);">—</span>'
+    : models
+        .map((m) => {
+          const label = m.display_name || m.model_name || '';
+          return `<tf-chip status="info">${escapeHtml(label)}</tf-chip>`;
+        })
+        .join(' ');
+  const restartCount = Number.isFinite(s.restart_count) ? s.restart_count : 0;
+  const restartCell = restartCount > 0
+    ? `<tf-chip status="warn">${restartCount}</tf-chip>`
+    : '<span style="color:var(--text-3);">0</span>';
+  const displayName = s.engine_id || '';
   return `
     <tr data-key="svc-${escapeAttr(s.id)}">
-      <td data-label="${escapeAttr(I18n.t('services.col_name'))}">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <strong style="color: var(--accent-2);">${escapeHtml(s.name)}</strong>
-          ${deployMode ? `<span class="scope-chip mesh-admin">${escapeHtml(deployMode)}</span>` : ''}
-          ${updateInfo.badge ? `<tf-chip status="${updateInfo.badge.variant}" dot>${escapeHtml(I18n.t(updateInfo.badge.labelKey))}</tf-chip>` : ''}
-        </div>
+      <td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
+        <strong style="color: var(--accent-2);">${escapeHtml(displayName)}</strong>
       </td>
-      <td data-label="${escapeAttr(I18n.t('services.col_type'))}"><span class="scope-chip ${typeChipClass(s.serviceType)}">${escapeHtml((s.serviceType || '').toUpperCase())}</span></td>
-      <td data-label="${escapeAttr(I18n.t('services.col_node'))}" style="font-size: 12px;">${escapeHtml(nodeLabel)}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_quic_address'))}">${quicAddrCell}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_quic_status'))}">${quicStatusCell}</td>
-      <td data-label="${escapeAttr(I18n.t('services.col_created'))}" style="font-size:11px;color:var(--text-3);">${s.createdAt ? escapeHtml(formatDateOnly(s.createdAt)) : '—'}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_method'))}">
+        <span class="scope-chip mesh-admin">${escapeHtml(deployMethodLabel(s.deploy_method))}</span>
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_transport'))}">
+        <span class="scope-chip mesh-read">${escapeHtml(transportLabel(s.transport))}</span>
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
+        <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_endpoint'))}">${endpoint}</td>
+      <td data-label="${escapeAttr(I18n.t('services.col_models'))}">
+        <div style="display:flex;flex-wrap:wrap;gap:4px;">${modelChips}</div>
+      </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_restart'))}">${restartCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
-        <tf-button variant="${s.pinned ? 'primary' : 'ghost'}" size="sm" icon="lock"
-          data-svc-pin="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
-          data-pinned="${s.pinned ? '1' : '0'}"
-          title="${escapeAttr(I18n.t(s.pinned ? 'services.tooltip_pin_on' : 'services.tooltip_pin_off'))}"></tf-button>
-        <tf-button variant="${s.paused ? 'warning' : 'ghost'}" size="sm" icon="${s.paused ? 'play' : 'pause'}"
-          data-svc-pause="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}"
-          data-paused="${s.paused ? '1' : '0'}"
-          title="${escapeAttr(I18n.t(s.paused ? 'services.tooltip_pause_on' : 'services.tooltip_pause_off'))}"></tf-button>
-        ${updateInfo.canRebuild ? (() => {
-          const labelKey = updateInfo.updateAvailable ? 'services.update_button' : 'services.rebuild_button';
-          const variant = updateInfo.updateAvailable ? 'primary' : 'ghost';
-          return `<tf-button variant="${variant}" size="sm" icon="refresh" data-svc-update="${escapeAttr(s.id)}" title="${escapeAttr(I18n.t(labelKey))}">${escapeHtml(I18n.t(labelKey))}</tf-button>`;
-        })() : ''}
-        <tf-button variant="danger" size="sm" icon="trash" data-svc-delete="${escapeAttr(s.id)}" data-svc-name="${escapeAttr(s.name)}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
+        <tf-button variant="danger" size="sm" icon="trash"
+          data-svc-delete="${escapeAttr(s.id)}"
+          data-svc-name="${escapeAttr(displayName)}"
+          title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
       </td>
     </tr>
   `;
-}
-
-function updateQuicDots() {
-  document.querySelectorAll('[data-quic-status]').forEach((el) => {
-    const name = el.dataset.quicStatus;
-    const raw = (quicStatusMap[name] || 'none').toLowerCase();
-    let cls = 'offline', labelKey = 'services.status.none';
-    if (raw === 'connected' || raw === 'ready') {
-      cls = 'online';
-      labelKey = raw === 'ready' ? 'services.status.ready' : 'services.status.connected';
-    } else if (raw === 'connecting') { cls = 'pending'; labelKey = 'services.status.connecting'; }
-    else if (raw === 'disconnected') { cls = 'offline'; labelKey = 'services.status.disconnected'; }
-    else if (raw === 'config_error') { cls = 'offline'; labelKey = 'services.status.config_error'; }
-    const target = `<span class="tag-status ${cls}">${escapeHtml(I18n.t(labelKey))}</span>`;
-    if (el.innerHTML !== target) el.innerHTML = target;
-  });
 }
 
 // ---- Aliases tab ----------------------------------------------------------
@@ -813,114 +777,18 @@ async function stopService(id, name) {
   });
   if (!ok) return;
   try {
-    const r = await ApiBinary.action('serviceStopRequest', { serviceId: id });
-    if (r.stopped) {
-      toast(I18n.t('services.delete_success', { name }), 'success');
-      services = await ApiBinary.list('serviceListRequest');
-      patchListTab();
-      updateSubtitle();
-      updateTabCounts();
-    } else {
-      toast(I18n.t('services.delete_not_found'), 'warning');
-    }
+    // REST DELETE /api/services/:id stops the runtime and removes the row,
+    // cascading to model_registry_v2 (services_v2 pipeline).
+    await apiDelete(`/api/services/${encodeURIComponent(id)}`);
+    toast(I18n.t('services.delete_success', { name }), 'success');
+    const fresh = await apiGet('/api/services').catch(() => services);
+    services = Array.isArray(fresh) ? fresh : [];
+    patchListTab();
+    updateSubtitle();
+    updateTabCounts();
   } catch (err) {
     toast(I18n.t('services.delete_error', { error: err.message }), 'error');
   }
-}
-
-/// MemoryGuard: ustawia pinned/paused. Jeśli paused=true — backend od razu
-/// zwolni VRAM (force_unload). Po sukcesie odświeżamy listę.
-async function toggleServiceFlag(id, name, { pinned, paused }) {
-  try {
-    const r = await ApiBinary.action('serviceFlagsUpdateRequest', {
-      serviceId: id,
-      pinned,
-      paused,
-    });
-    if (r.ok) {
-      let key;
-      if (pinned !== undefined) key = pinned ? 'services.toast_pinned' : 'services.toast_unpinned';
-      else key = paused ? 'services.toast_paused' : 'services.toast_resumed';
-      toast(I18n.t(key, { name }), 'success');
-      services = await ApiBinary.list('serviceListRequest');
-      patchListTab();
-    }
-  } catch (err) {
-    toast(I18n.t('services.toast_flag_error', { error: err.message }), 'error');
-  }
-}
-
-function parseConfig(json) {
-  if (!json) return {};
-  try { return JSON.parse(json); } catch { return {}; }
-}
-
-function extractQuicAddr(cfg) {
-  if (!cfg) return '';
-  if (cfg.quic_url) return String(cfg.quic_url).replace(/^quic:\/\//, '');
-  if (cfg.quic_port && cfg.agent_domain) return `${cfg.agent_domain}:${cfg.quic_port}`;
-  return '';
-}
-
-/// Determines whether the deployed instance is out of date vs. the manifest's
-/// current source hash. Returns:
-///   - showButton: render the "Update" action button
-///   - badge: { variant, labelKey } or null (chip rendered next to service name)
-/// External / embedded / unknown-method deployments never show the button
-/// because we have no source tree to rebuild from.
-function evaluateUpdate(service, cfg) {
-  // On-demand services like teams-bot register without engine_id in config_json,
-  // so fall back to service.name which equals the manifest engine.id for them.
-  const engineId = service.engineId || cfg?.engine_id || cfg?.engineId || service.name || '';
-  // Registrations in the wild use deploy_mode, deploy_method, camelCase, or
-  // snake_case interchangeably — accept any of them rather than forcing a
-  // migration of existing rows.
-  const rawMethod = (
-    service.deployMethod
-    || cfg?.deploy_method
-    || cfg?.deployMethod
-    || cfg?.deploy_mode
-    || cfg?.deployMode
-    || ''
-  ).toLowerCase();
-  if (!engineId || !ManifestStore.isLoaded()) {
-    return { canRebuild: false, badge: null };
-  }
-  if (rawMethod === 'external') {
-    return { canRebuild: false, badge: { variant: 'info', labelKey: 'services.update_managed_externally' } };
-  }
-  if (rawMethod !== 'docker' && rawMethod !== 'native') {
-    return { canRebuild: false, badge: null };
-  }
-  const manifest = ManifestStore.byId(engineId);
-  if (!manifest) {
-    return { canRebuild: false, badge: null };
-  }
-  const manifestHash = rawMethod === 'docker'
-    ? (manifest.docker_source_hash || '')
-    : (manifest.native_source_hash || '');
-  if (!manifestHash) {
-    // Source-less deploy kind (embedded feature-flag, or manifest predates the
-    // hash feature) — nothing to compare, nothing to update.
-    return { canRebuild: false, badge: null };
-  }
-  const deployedHash = service.deployedSourceHash || '';
-  const updateAvailable = deployedHash !== manifestHash;
-  return {
-    canRebuild: true,
-    updateAvailable,
-    badge: updateAvailable
-      ? { variant: 'warn', labelKey: 'services.update_available' }
-      : null,
-  };
-}
-
-function extractDeployMode(cfg) {
-  if (!cfg) return '';
-  const raw = String(cfg.deploy_mode || cfg.deployMode || cfg.deploy_method || cfg.deployMethod || '').toLowerCase();
-  if (!raw) return '';
-  const translated = I18n.t(`wizard.method.${raw}`);
-  return translated && translated !== `wizard.method.${raw}` ? translated : raw;
 }
 
 function typeChipClass(t) {
@@ -935,14 +803,6 @@ function typeChipClass(t) {
     case 'tool': return 'mesh-admin';
     default: return 'license';
   }
-}
-
-function formatDateOnly(s) {
-  try {
-    const d = new Date(s);
-    if (isNaN(d.getTime())) return s;
-    return d.toLocaleDateString(I18n.getLanguage(), { day: '2-digit', month: '2-digit', year: 'numeric' });
-  } catch { return s; }
 }
 
 export default ServicesScreen;
