@@ -51,7 +51,7 @@ export async function profilingStart({ nodeId, scope, label, elevationPassword }
  * Wczesniejsze zatrzymanie aktywnej sesji.
  *
  * @returns {Promise<{ sessionId: string, report: object }>} zwraca pelen
- *          zaparsowany ProfileReportV2 jezeli sesja zostala domkniecia.
+ *          zaparsowany ProfileReport jezeli sesja zostala domkniecia.
  */
 export async function profilingStop({ nodeId, sessionId }) {
   return ApiBinary.one('profilingStopRequest', { nodeId, sessionId });

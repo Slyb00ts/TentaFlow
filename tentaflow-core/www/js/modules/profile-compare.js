@@ -135,7 +135,7 @@ function renderShell(ctx) {
 
   return `
     <div class="profile-compare">
-      <nav class="pr2-breadcrumb" aria-label="Breadcrumb">
+      <nav class="pr-breadcrumb" aria-label="Breadcrumb">
         <a href="#" data-action="back-mesh">Mesh</a>
         <span class="sep">/</span>
         <span>Profiling</span>
@@ -162,7 +162,7 @@ function renderShell(ctx) {
         </div>
       </header>
 
-      <div class="pr2-tabs-wrap">
+      <div class="pr-tabs-wrap">
         <tf-tabs variant="underline" value="${escape(ctx.defaultTab)}" id="pc-tabs">
           <tf-tab id="overview">Overview</tf-tab>
           <tf-tab id="flame">CPU Flamegraph</tf-tab>
@@ -180,9 +180,9 @@ function renderShell(ctx) {
 function renderSkeleton() {
   return `
     <div class="profile-compare pc-loading">
-      <div class="pr2-skeleton" style="width:50%; height:24px;"></div>
-      <div class="pr2-skeleton" style="width:100%; height:120px; margin-top:14px;"></div>
-      <div class="pr2-skeleton" style="width:100%; height:300px; margin-top:14px;"></div>
+      <div class="pr-skeleton" style="width:50%; height:24px;"></div>
+      <div class="pr-skeleton" style="width:100%; height:120px; margin-top:14px;"></div>
+      <div class="pr-skeleton" style="width:100%; height:300px; margin-top:14px;"></div>
     </div>
   `;
 }

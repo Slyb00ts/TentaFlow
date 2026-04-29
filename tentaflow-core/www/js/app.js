@@ -47,7 +47,7 @@ import TranslateScreen from '/js/modules/translate.js';
 import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
-import ProfileReportV2View from '/js/modules/profile-report-v2.js';
+import ProfileReportView from '/js/modules/profile-report.js';
 import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
@@ -61,7 +61,7 @@ const ProfileReportScreen = {
   async show(params = {}) {
     const main = document.getElementById('main');
     if (!main) return;
-    await ProfileReportV2View.render(main, params);
+    await ProfileReportView.render(main, params);
   },
 };
 

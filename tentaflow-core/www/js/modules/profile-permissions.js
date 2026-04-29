@@ -122,7 +122,7 @@ function renderShell() {
 
   return `
     <div class="profile-permissions">
-      <nav class="pr2-breadcrumb" aria-label="Breadcrumb">
+      <nav class="pr-breadcrumb" aria-label="Breadcrumb">
         <a href="#" data-action="back-mesh">Mesh</a>
         <span class="sep">/</span>
         <span>Profiling</span>

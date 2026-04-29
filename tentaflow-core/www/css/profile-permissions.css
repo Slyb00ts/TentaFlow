@@ -20,14 +20,14 @@
   color: var(--pp-text);
 }
 
-.profile-permissions .pr2-breadcrumb {
+.profile-permissions .pr-breadcrumb {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--pp-text-2);
   margin-bottom: 12px;
 }
-.profile-permissions .pr2-breadcrumb a { color: var(--pp-text-2); text-decoration: none; }
-.profile-permissions .pr2-breadcrumb a:hover { color: var(--pp-text); }
-.profile-permissions .pr2-breadcrumb .sep { color: var(--pp-text-3); }
+.profile-permissions .pr-breadcrumb a { color: var(--pp-text-2); text-decoration: none; }
+.profile-permissions .pr-breadcrumb a:hover { color: var(--pp-text); }
+.profile-permissions .pr-breadcrumb .sep { color: var(--pp-text-3); }
 
 .pp-header {
   display: flex; align-items: flex-start; gap: 14px;
