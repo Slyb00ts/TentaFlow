@@ -1396,6 +1396,22 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     cmd.env("BUNDLE_DIR", &bundle_dir);
     cmd.env("VENV_DIR", venv);
 
+    // Prepend venv/bin to PATH tak, zeby procesy potomne (np. flashinfer
+    // JIT wolajacy `ninja` przez subprocess.run) znalazly binarki ktore pip
+    // zainstalowal w venv (ninja, cmake) zamiast szukac w systemowym PATH.
+    let venv_bin_dir = venv.join("bin");
+    let new_path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut p = std::ffi::OsString::from(&venv_bin_dir);
+            p.push(":");
+            p.push(existing);
+            p
+        }
+        None => std::ffi::OsString::from(&venv_bin_dir),
+    };
+    cmd.env("PATH", new_path);
+    cmd.env("VIRTUAL_ENV", venv);
+
     // Shared <tentaflow_home>/models/ — same root Docker uses, so a model
     // pulled by Docker vLLM lives in the same hub/models--*/ directory that
     // native Python vLLM (and every other engine on this host) sees.

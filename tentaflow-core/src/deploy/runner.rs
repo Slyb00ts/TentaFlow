@@ -1690,6 +1690,7 @@ async fn do_python_bundle_native_deploy(
     let mut last_log_offset: u64 = 0;
     let mut last_engine_activity_at = std::time::Instant::now();
     let mut last_heartbeat_at = std::time::Instant::now();
+    let mut fatal_in_log = false;
     for attempt in 0..max_attempts {
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
         // Najpierw: czy proces vllm zyje? Jesli padl (np. ImportError, OOM,
@@ -1700,6 +1701,15 @@ async fn do_python_bundle_native_deploy(
             crashed = true;
             break;
         }
+        // /proc/<pid>/status State: Z = zombie. kill(pid,0)==0 dla zombie az
+        // do reapa, wiec sam ten test nie wystarczy - sprawdzamy status zeby
+        // failowac szybko gdy proces juz nie zyje a tylko czeka na waitpid.
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+            if status.lines().any(|l| l.starts_with("State:") && l.contains('Z')) {
+                crashed = true;
+                break;
+            }
+        }
         if let Some(c) = client.as_ref() {
             if let Ok(resp) = c.get(&health_url).send().await {
                 if resp.status().is_success() {
@@ -1707,6 +1717,10 @@ async fn do_python_bundle_native_deploy(
                     break;
                 }
             }
+        }
+        if fatal_in_log {
+            crashed = true;
+            break;
         }
         // Tail engine.log od last_offset - wyslij nowe linie do GUI.
         // Robione co petla (3s) zeby user widzial dowloads/loading na biezaco.
@@ -1727,6 +1741,19 @@ async fn do_python_bundle_native_deploy(
                                         // odroznil log silnika od logow tentaflow.
                                         log_line(db, deploy_id, tx, "log",
                                             &format!("[engine] {}", trimmed));
+                                        // Fatal init errors: vLLM EngineCore /
+                                        // APIServer raisuje takie linie i potem
+                                        // proces utyka w czyszczeniu zasobow
+                                        // (NCCL destroy, atexit) zamiast od razu
+                                        // umierac. Bez tego czekamy 15min na
+                                        // /v1/models ktore nigdy nie odpowie.
+                                        if trimmed.contains("Engine core initialization failed")
+                                            || trimmed.contains("FileNotFoundError: [Errno 2] No such file or directory: 'ninja'")
+                                            || trimmed.contains("torch.OutOfMemoryError")
+                                            || trimmed.contains("CUDA out of memory")
+                                        {
+                                            fatal_in_log = true;
+                                        }
                                     }
                                 }
                                 last_log_offset += n as u64;
