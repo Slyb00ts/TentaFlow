@@ -77,6 +77,33 @@ function escapeHtml(s) {
 
 function escapeAttr(s) { return escapeHtml(s); }
 
+// Mapowanie GPU source -> vendor badge wedlug mockup (kolory akcentu).
+// nvidia.* -> NV (zielony NV), amd.*/rocm.*/rocprof.* -> A (czerwony AMD),
+// intel.* -> I (niebieski Intel), apple.*/macos.powermetrics.gpu -> M3.
+function sourceVendor(src) {
+  const id = String(src.id || '').toLowerCase();
+  if (id.includes('nvidia') || id.includes('nsys') || id.includes('nvsmi')) return { cls: 'nv', label: 'NV' };
+  if (id.includes('amd') || id.includes('rocm') || id.includes('rocprof') || id.includes('rocsmi')) return { cls: 'amd', label: 'A' };
+  if (id.includes('intel') || id.includes('xpu')) return { cls: 'intel', label: 'I' };
+  if (id.includes('apple') || id.includes('macos.powermetrics.gpu')) return { cls: 'apple', label: 'M3' };
+  return null;
+}
+
+// Niewielka ikonka SVG dla source bez vendor-badge. Wybor scieżki path zalezy
+// od kategorii (CPU=quad, RAM=stick, Disk=cylinder, Power=lightning,
+// Network=nodes, Other=lista).
+function sourceIconPath(src) {
+  const cat = categorizeSource(src);
+  switch (cat) {
+    case 'CPU': return 'M6 6h12v12H6z M3 9h3M3 12h3M3 15h3M18 9h3M18 12h3M18 15h3';
+    case 'RAM': return 'M3 6h18v12H3z M7 6V4M11 6V4M15 6V4M19 6V4';
+    case 'Disk': return 'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3v12c0 1.7-3.6 3-8 3s-8-1.3-8-3z';
+    case 'Power': return 'M12 2L4 7v10l8 5 8-5V7z';
+    case 'Network': return 'M12 9a3 3 0 0 1 3 3 3 3 0 0 1-3 3 3 3 0 0 1-3-3 3 3 0 0 1 3-3z';
+    default: return 'M3 6h18M3 12h18M3 18h18';
+  }
+}
+
 // Heuristic estymaty storage + overhead na podstawie wybranych sources.
 function estimateImpact(selectedSources, durationSec) {
   // 50 MB per kolektor + 10 MB per s GPU sampling (gdy GPU obecny)
@@ -343,66 +370,67 @@ export class ProfilingLaunchModal {
   _renderSourceGrid() {
     const wrap = document.createElement('div');
     wrap.className = 'field';
+    const total = this.sources.length;
+    const sel = this.sources.filter((s) => this.selected.has(s.id)).length;
     wrap.innerHTML = `
-      <div class="field-label"><span>Sources</span></div>
+      <div class="field-label">
+        <span>Data sources</span>
+        <span class="counter" id="pl-source-counter">${sel} of ${total} selected</span>
+      </div>
       <div class="source-grid" id="pl-source-grid"></div>
     `;
     const grid = wrap.querySelector('#pl-source-grid');
-
-    // Group by category, in stable order.
-    const byCat = new Map();
+    // Mockup #01 uzywa plaskiej 2-kolumnowej siatki bez nagłówków kategorii -
+    // user widzi pełną listę naraz, kategoryzacja przez prefix w nazwie ID
+    // jest wystarczająca jako wizualny grupator.
     for (const src of this.sources) {
-      const cat = categorizeSource(src);
-      if (!byCat.has(cat)) byCat.set(cat, []);
-      byCat.get(cat).push(src);
-    }
-
-    for (const cat of CATEGORY_ORDER) {
-      const list = byCat.get(cat);
-      if (!list || list.length === 0) continue;
-      const label = document.createElement('div');
-      label.className = 'source-category-label';
-      label.textContent = cat;
-      grid.appendChild(label);
-      for (const src of list) {
-        grid.appendChild(this._renderSourceCard(src));
-      }
+      grid.appendChild(this._renderSourceCard(src));
     }
     return wrap;
   }
 
   _renderSourceCard(src) {
-    const card = document.createElement('div');
+    const card = document.createElement('label');
     const isDisabled = src.status === 'unavailable';
     const isChecked = this.selected.has(src.id);
     card.className = 'source-card';
     card.setAttribute('data-source-id', src.id);
+    if (isChecked) card.setAttribute('checked', '');
     card.setAttribute('data-checked', String(isChecked));
     card.setAttribute('data-disabled', String(isDisabled));
     card.setAttribute('title', src.description || '');
 
+    // Status pill 1:1 wg mockupu: Available / Needs sudo / Limited / Unavailable.
     const statusBadge = (() => {
-      if (src.status === 'available') return '<span class="src-status ok">ready</span>';
-      if (src.status === 'needs_sudo') return '<span class="src-status warn">sudo</span>';
-      if (src.status === 'needs_admin') return '<span class="src-status warn">admin</span>';
-      if (src.status === 'unavailable') return '<span class="src-status bad">n/a</span>';
+      if (src.status === 'available') return '<span class="src-status ok">Available</span>';
+      if (src.status === 'needs_sudo') return '<span class="src-status warn">Needs sudo</span>';
+      if (src.status === 'needs_admin') return '<span class="src-status warn">Needs admin</span>';
+      if (src.status === 'limited') return '<span class="src-status lim">Limited</span>';
+      if (src.status === 'unavailable') return '<span class="src-status bad">Unavailable</span>';
       return '';
     })();
 
+    // Vendor-badge w ikonce kafelka (NV/A/I/M3) gdy źródło to GPU per-vendor.
+    const vendor = sourceVendor(src);
+    const iconHtml = vendor
+      ? `<span class="vendor-badge ${vendor.cls}">${vendor.label}</span>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="${sourceIconPath(src)}"/></svg>`;
+
     card.innerHTML = `
-      <label class="src-check">
+      <span class="src-check">
         <input type="checkbox"
                ${isChecked ? 'checked' : ''}
                ${isDisabled ? 'disabled' : ''}
                data-source-checkbox="${escapeAttr(src.id)}" />
-      </label>
-      <div class="src-meta">
-        <div class="src-name">
+      </span>
+      <span class="src-ico">${iconHtml}</span>
+      <span class="src-meta">
+        <span class="src-name">
           <span>${escapeHtml(src.label || src.id)}</span>
           ${statusBadge}
-        </div>
-        <div class="src-desc">${escapeHtml(src.description || '')}</div>
-      </div>
+        </span>
+        <span class="src-desc">${escapeHtml(src.description || '')}</span>
+      </span>
     `;
     return card;
   }
@@ -526,7 +554,16 @@ export class ProfilingLaunchModal {
         if (cb.checked) this.selected.add(id);
         else this.selected.delete(id);
         const card = cb.closest('.source-card');
-        if (card) card.setAttribute('data-checked', String(cb.checked));
+        if (card) {
+          card.setAttribute('data-checked', String(cb.checked));
+          if (cb.checked) card.setAttribute('checked', '');
+          else card.removeAttribute('checked');
+        }
+        // Live counter "N of M selected" w field-label.
+        const counterEl = root.querySelector('#pl-source-counter');
+        if (counterEl) {
+          counterEl.textContent = `${this.selected.size} of ${this.sources.length} selected`;
+        }
         // Re-render elevation block: appears/disappears depending on selection.
         this._refreshElevation(root);
         this._updateEstimate();
