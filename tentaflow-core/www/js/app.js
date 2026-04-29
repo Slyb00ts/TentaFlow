@@ -47,6 +47,7 @@ import TranslateScreen from '/js/modules/translate.js';
 import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
+import PoseScreen from '/js/modules/pose.js';
 import ProfileReportV2View from '/js/modules/profile-report-v2.js';
 import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
@@ -147,6 +148,7 @@ const USER_NAV = [
       { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
       { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
       { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
+      { id: 'pose', labelKey: 'nav.pose', icon: 'image' },
       { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
     ],
   },
@@ -425,6 +427,7 @@ async function renderApp() {
   Router.register('images',         makeComingSoonScreen('images',    'image'));
   Router.register('meeting', MeetingScreen);
   Router.register('meeting-live', MeetingLiveScreen);
+  Router.register('pose', PoseScreen);
   Router.register('translate',      TranslateScreen);
   Router.register('mesh-user',      makeComingSoonScreen('mesh_user', 'network'));
   Router.register('profile-report', ProfileReportScreen);
