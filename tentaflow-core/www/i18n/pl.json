@@ -29,6 +29,7 @@
     "addons": "Addons",
     "users": "Użytkownicy",
     "audit": "Dziennik audytu",
+    "profiling_sessions": "Profilowanie",
     "meeting": "Meeting Bot",
     "section_general": "Główne",
     "section_core": "Rdzeń",
