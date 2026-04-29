@@ -2265,7 +2265,13 @@ fn spawn_liveness_timer(
                     );
                     peer_store.set_quic_connected(&node_id, false);
                     peer_store.set_status(&node_id, "offline");
-                    peer_store.clear_heartbeat(&node_id);
+                    // NIE czyscimy heartbeat tutaj. clear_heartbeat zeruje
+                    // licznik age — jesli nowe polaczenie zestawi sie
+                    // szybciej niz nadejdzie pierwszy HB, nastepny tick
+                    // zobaczy age=0 i bedzie czekal pelne 45s. Pozwalamy
+                    // zeby clear_heartbeat zostal wywolany dopiero przez
+                    // handle_peer_disconnected gdy iroh faktycznie potwierdzi
+                    // smierc starego polaczenia.
                     crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
                         &node_id,
                         &peer.hostname,
