@@ -39,6 +39,7 @@ impl CollectorRegistry {
         r.register(Arc::new(super::linux::disk::LinuxIostatDiskCollector::new()));
         r.register(Arc::new(super::linux::rapl_power::LinuxRaplPowerCollector::new()));
         r.register(Arc::new(super::linux::nvsmi_gpu::LinuxNvsmiGpuCollector::new()));
+        r.register(Arc::new(super::linux::netdev::LinuxNetdevCollector::new()));
         // Linux GPU vendor collectors (AMD ROCm, Intel iGPU).
         r.register(Arc::new(super::linux_gpu::rocsmi_util::LinuxRocmSmiGpuCollector::new()));
         r.register(Arc::new(super::linux_gpu::rocprof_kernels::LinuxRocprofKernelsCollector::new()));

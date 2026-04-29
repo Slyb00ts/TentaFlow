@@ -7,6 +7,7 @@
 
 pub mod cpu_util;
 pub mod disk;
+pub mod netdev;
 pub mod nvsmi_gpu;
 pub mod perf_sampling;
 pub mod ram;
