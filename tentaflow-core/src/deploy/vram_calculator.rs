@@ -41,17 +41,12 @@ pub struct ModelSpec {
 
 impl ModelSpec {
     /// Liczba bajtow per parametr na podstawie dtype/quantization.
+    /// Quantization wartosci uwzgledniaja overhead skali/zero-pointow:
+    /// - 4-bit (awq/gptq/nvfp4/fp4/mxfp4/bnb_4bit/...): 0.5 + ~0.0625 = 0.5625
+    /// - 8-bit (int8/fp8/bnb_8bit): 1.0 + ~0.0625 = 1.0625
     pub fn bytes_per_param(&self) -> f64 {
         if let Some(q) = &self.quantization {
-            // Normalizuj - HF uzywa "auto-round" / "auto_round" / "AutoRound"
-            // dla AutoRound INT4 quantization. Plus AWQ/GPTQ/bnb-int4 = 0.5B.
-            let q_norm = q.to_lowercase().replace('-', "_");
-            return match q_norm.as_str() {
-                "int4" | "awq" | "gptq" | "int4_autoround" | "auto_round"
-                | "bnb_4bit" | "bitsandbytes_4bit" => 0.5,
-                "int8" | "fp8" | "bnb_8bit" | "bitsandbytes_8bit" => 1.0,
-                _ => self.bytes_per_dtype(),
-            };
+            return quant_label_to_bytes(q).unwrap_or_else(|| self.bytes_per_dtype());
         }
         self.bytes_per_dtype()
     }
@@ -105,6 +100,131 @@ impl ModelSpec {
             self.estimated_params()
         }
     }
+}
+
+/// Przeklada etykiete quantization (dowolny case, '-' lub '_') na bytes/param.
+/// Zwraca None gdy etykieta nieznana - caller fallbackuje do dtype.
+/// Wartosci dla 4/8-bit zawieraja overhead group-scales (~6.25%).
+pub fn quant_label_to_bytes(label: &str) -> Option<f64> {
+    let q = label.to_lowercase().replace('-', "_");
+    match q.as_str() {
+        // 4-bit: AWQ, GPTQ, AutoRound INT4, bnb-4bit, NVFP4, FP4, MXFP4, w4a16
+        "int4" | "awq" | "gptq" | "int4_autoround" | "auto_round"
+        | "bnb_4bit" | "bitsandbytes_4bit" | "load_in_4bit"
+        | "nvfp4" | "fp4" | "mxfp4" | "w4a16" | "compressed_tensors_4bit" => Some(0.5625),
+        // 8-bit: int8, fp8, bnb-8bit, w8a8, w8a16
+        "int8" | "fp8" | "fp8_e4m3" | "fp8_e5m2"
+        | "bnb_8bit" | "bitsandbytes_8bit" | "load_in_8bit"
+        | "w8a8" | "w8a16" | "modelopt_fp8" => Some(1.0625),
+        // 2-bit (rzadkie ale istnieje)
+        "int2" | "w2a16" => Some(0.3125),
+        // 16-bit warianty
+        "fp16" | "float16" | "bf16" | "bfloat16" | "f16" => Some(2.0),
+        "fp32" | "float32" | "f32" => Some(4.0),
+        _ => None,
+    }
+}
+
+/// Heurystyka: wykrywa kwantyzacje na podstawie nazwy repo HF
+/// (`User/Foo-NVFP4-turbo`, `Intel/x-int4-AutoRound`, `*-AWQ`, `*-GGUF-Q4_K_M` itd.).
+/// Zwraca etykiete nadajaca sie do `quant_label_to_bytes` lub None.
+pub fn detect_quant_from_name(repo: &str) -> Option<String> {
+    let lower = repo.to_lowercase();
+    // Kolejnosc wazna: bardziej specyficzne wzorce najpierw.
+    let patterns: &[(&[&str], &str)] = &[
+        (&["nvfp4"], "nvfp4"),
+        (&["mxfp4"], "mxfp4"),
+        (&["fp4"], "fp4"),
+        (&["awq"], "awq"),
+        (&["gptq"], "gptq"),
+        (&["autoround"], "auto_round"),
+        (&["w4a16"], "w4a16"),
+        (&["int4", "4bit", "4_bit", "q4_k", "q4_0", "q4_1", "gguf_q4", "gguf-q4"], "int4"),
+        (&["w8a8"], "w8a8"),
+        (&["w8a16"], "w8a16"),
+        (&["fp8"], "fp8"),
+        (&["int8", "8bit", "8_bit", "q8_0", "gguf_q8", "gguf-q8"], "int8"),
+    ];
+    for (needles, label) in patterns {
+        if needles.iter().any(|n| lower.contains(n)) {
+            return Some((*label).to_string());
+        }
+    }
+    None
+}
+
+/// Wyciaga etykiete quantization z pola `quantization_config` w HF config.json.
+/// Obsluguje:
+/// - `quant_method` (awq/gptq/bitsandbytes/fp8/compressed-tensors/modelopt/...)
+/// - `bits` (2/4/8) - decyduje o szerokosci dla bitsandbytes/compressed-tensors
+/// - `load_in_4bit` / `load_in_8bit` (bitsandbytes legacy fields)
+pub fn quant_label_from_config(qc: &serde_json::Value) -> Option<String> {
+    let obj = qc.as_object()?;
+    let method = obj
+        .get("quant_method")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase().replace('-', "_"))
+        .unwrap_or_default();
+    let bits = obj.get("bits").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // bnb legacy: `load_in_4bit` / `load_in_8bit` bool flags.
+    if obj.get("load_in_4bit").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Some("bnb_4bit".into());
+    }
+    if obj.get("load_in_8bit").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Some("bnb_8bit".into());
+    }
+
+    match method.as_str() {
+        "awq" => Some("awq".into()),
+        "gptq" => Some("gptq".into()),
+        "fp8" => Some("fp8".into()),
+        "bitsandbytes" => match bits {
+            8 => Some("bnb_8bit".into()),
+            _ => Some("bnb_4bit".into()),
+        },
+        "compressed_tensors" => match bits {
+            8 => Some("w8a16".into()),
+            _ => Some("compressed_tensors_4bit".into()),
+        },
+        "modelopt" => match bits {
+            8 => Some("modelopt_fp8".into()),
+            _ => Some("nvfp4".into()),
+        },
+        "nvfp4" | "fp4" | "mxfp4" => Some(method),
+        "" => None,
+        // Nieznany method - zwroc surowo, caller moze sparsowac przez bits.
+        other => match bits {
+            4 => Some("int4".into()),
+            8 => Some("int8".into()),
+            _ => Some(other.into()),
+        },
+    }
+}
+
+/// Konsolidowana detekcja: override (manual z UI) -> hf config -> nazwa repo.
+/// Zwraca etykiete kwantyzacji lub None gdy model jest pelnoprecyzyjny.
+pub fn detect_quantization(
+    repo: &str,
+    hf_config: &serde_json::Value,
+    override_label: Option<&str>,
+) -> Option<String> {
+    if let Some(o) = override_label {
+        let trimmed = o.trim();
+        if !trimmed.is_empty() {
+            // Specjalny token "none"/"auto" wylacza override.
+            let lower = trimmed.to_lowercase();
+            if lower != "none" && lower != "auto" && lower != "off" {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(qc) = hf_config.get("quantization_config") {
+        if let Some(label) = quant_label_from_config(qc) {
+            return Some(label);
+        }
+    }
+    detect_quant_from_name(repo)
 }
 
 /// Konfiguracja runtime do estymacji.
@@ -548,8 +668,18 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
     }
 
     // 3. Heurystyka domyslnych wartosci.
-    let default_ctx = model.max_position_embeddings.min(8192).max(2048);
-    let default_seqs: u64 = 16;
+    // Default policy gdy user nic nie lockuje: prefer maksymalny kontekst dla
+    // single-user dev setup (long system prompts, RAG, code analysis). Throughput
+    // (batchowanie wielu requestow) traktujemy jako wybor manualny - zeby zwiekszyc
+    // num_seqs user musi go ustawic explicit albo zlockowac.
+    let absolute_ctx_ceiling: u64 = 1_048_576;
+    let model_ctx_ceiling = if model.max_position_embeddings > 0 {
+        model.max_position_embeddings.min(absolute_ctx_ceiling)
+    } else {
+        absolute_ctx_ceiling
+    };
+    let default_seqs: u64 = 1;
+    let default_ctx = model_ctx_ceiling.max(2048);
 
     let req_ctx = req.requested_max_model_len.unwrap_or(default_ctx).max(512);
     let req_seqs = req.requested_max_num_seqs.unwrap_or(default_seqs).max(1);
@@ -607,25 +737,38 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             (capped, req_seqs)
         }
         (false, false) => {
-            // Brak lockow - balansuj proporcjonalnie do request, kapuj do budget.
-            let needed = kv_per_seq_token * req_ctx as f64 * req_seqs as f64;
-            if needed <= kv_budget_bytes {
-                (req_ctx, req_seqs)
-            } else {
-                // Skaluj oba sqrt(ratio) zeby zachowac mniej-wiecej proporcje.
-                let ratio = (kv_budget_bytes / needed).sqrt();
-                let new_ctx = ((req_ctx as f64) * ratio).floor() as u64;
-                let new_ctx = new_ctx.max(512);
-                let new_seqs = ((req_seqs as f64) * ratio).floor() as u64;
-                let new_seqs = new_seqs.max(1);
-                if new_ctx < req_ctx {
-                    auto_adjusted.push("max_model_len".into());
-                }
-                if new_seqs < req_seqs {
+            // Brak lockow. Polityka: trzymaj num_seqs jak najnizej (default 1)
+            // a max_model_len pcham do gornego limitu VRAM, capped przez
+            // model.max_position_embeddings i absolutny ceiling 1M.
+            //
+            // Gdy user explicit podal max_num_seqs (req.requested_max_num_seqs)
+            // bez locka - traktujemy to jako preferencje throughputu i probujemy
+            // zachowac, ale ctx i tak rozszerzamy do max ktory fits.
+            let target_seqs = req_seqs.max(1);
+            let mut new_seqs = target_seqs;
+            let kv_per_seq_full = kv_per_seq_token * req_ctx as f64;
+            // Jesli przy zadanym ctx + seqs nie fits - obnizamy seqs (nie ctx).
+            // Min 1 seq; jak nie fits przy 1 seq to dopiero kapujemy ctx.
+            if kv_per_seq_full * new_seqs as f64 > kv_budget_bytes {
+                let max_seqs_at_req_ctx =
+                    (kv_budget_bytes / kv_per_seq_full).floor() as u64;
+                new_seqs = max_seqs_at_req_ctx.max(1).min(target_seqs);
+                if new_seqs < target_seqs {
                     auto_adjusted.push("max_num_seqs".into());
                 }
-                (new_ctx, new_seqs)
             }
+            // Teraz wyznacz max ctx ktory fits przy ustalonym new_seqs. Bierzemy
+            // wieksze z dwojga: req_ctx (jak fits) lub max mozliwy z VRAM.
+            let max_ctx_from_vram =
+                (kv_budget_bytes / (kv_per_seq_token * new_seqs as f64)).floor() as u64;
+            let max_ctx_capped = max_ctx_from_vram.min(model_ctx_ceiling);
+            let final_ctx_unlocked = req_ctx.max(max_ctx_capped).min(max_ctx_from_vram).max(512);
+            // Round down do wielokrotnosci 1024 zeby konfiguracja wygladala czysto.
+            let final_ctx_unlocked = (final_ctx_unlocked / 1024).max(1) * 1024;
+            if final_ctx_unlocked < req_ctx {
+                auto_adjusted.push("max_model_len".into());
+            }
+            (final_ctx_unlocked, new_seqs)
         }
     };
 
@@ -737,6 +880,17 @@ pub fn parse_hf_config(
     config_json: &serde_json::Value,
     model_name: &str,
 ) -> Result<ModelSpec> {
+    parse_hf_config_with_override(config_json, model_name, None)
+}
+
+/// Wariant `parse_hf_config` z manualnym override quantization (z UI/API).
+/// Override ma najwyzszy priorytet; potem `quantization_config` w HF; potem
+/// heurystyka z nazwy repo.
+pub fn parse_hf_config_with_override(
+    config_json: &serde_json::Value,
+    model_name: &str,
+    quantization_override: Option<&str>,
+) -> Result<ModelSpec> {
     let cfg = config_json
         .as_object()
         .ok_or_else(|| anyhow!("config.json nie jest obiektem JSON"))?;
@@ -793,25 +947,8 @@ pub fn parse_hf_config(
         0
     };
 
-    // Quantization detection: config field or model name heuristic.
-    let quantization = cfg
-        .get("quantization_config")
-        .and_then(|q| q.as_object())
-        .and_then(|q| q.get("quant_method").and_then(|v| v.as_str()).map(String::from))
-        .or_else(|| {
-            let lower = model_name.to_lowercase();
-            if lower.contains("int4") || lower.contains("awq") || lower.contains("autoround") {
-                Some("int4".into())
-            } else if lower.contains("int8") {
-                Some("int8".into())
-            } else if lower.contains("fp8") {
-                Some("fp8".into())
-            } else if lower.contains("gptq") {
-                Some("gptq".into())
-            } else {
-                None
-            }
-        });
+    // Quantization detection: override -> HF quantization_config -> name heuristic.
+    let quantization = detect_quantization(model_name, config_json, quantization_override);
 
     let has_vision = cfg.contains_key("vision_config")
         || architectures
@@ -886,10 +1023,23 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
         match q_norm.as_str() {
             "awq" => { parts.push("--quantization".into()); parts.push("awq".into()); }
             "gptq" => { parts.push("--quantization".into()); parts.push("gptq".into()); }
-            "fp8" => { parts.push("--quantization".into()); parts.push("fp8".into()); }
+            "fp8" | "modelopt_fp8" => { parts.push("--quantization".into()); parts.push("fp8".into()); }
             "int4" | "int4_autoround" | "auto_round" => {
                 parts.push("--quantization".into());
                 parts.push("auto_round".into());
+            }
+            // NVIDIA Modelopt NVFP4/FP4/MXFP4 - vllm rozpoznaje "modelopt_fp4".
+            "nvfp4" | "fp4" | "mxfp4" => {
+                parts.push("--quantization".into());
+                parts.push("modelopt_fp4".into());
+            }
+            "compressed_tensors_4bit" | "w4a16" | "w8a8" | "w8a16" => {
+                parts.push("--quantization".into());
+                parts.push("compressed-tensors".into());
+            }
+            "bnb_4bit" | "bnb_8bit" | "bitsandbytes_4bit" | "bitsandbytes_8bit" => {
+                parts.push("--quantization".into());
+                parts.push("bitsandbytes".into());
             }
             _ => {}
         }
@@ -1147,7 +1297,10 @@ mod tests {
     fn parse_hf_config_detects_int4_from_name() {
         let json: serde_json::Value = serde_json::from_str(r#"{"hidden_size": 5376}"#).unwrap();
         let spec = parse_hf_config(&json, "Intel/gemma-4-31B-it-int4-AutoRound").unwrap();
-        assert_eq!(spec.quantization.as_deref(), Some("int4"));
+        // Wzorzec "AutoRound" wykrywany jako auto_round (canonical etykieta dla
+        // Intel AutoRound INT4); bytes_per_param i tak konczy na 0.5625.
+        assert_eq!(spec.quantization.as_deref(), Some("auto_round"));
+        assert!((spec.bytes_per_param() - 0.5625).abs() < 1e-9);
     }
 
     #[test]
@@ -1295,8 +1448,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_fit_no_locks_balances_ctx_and_seqs() {
-        // Gemma 27B na 2x 24GB (ciasno) bez lockow - powinno zmniejszyc oba.
+    fn auto_fit_no_locks_caps_seqs_to_fit() {
+        // Gemma 27B na 2x 24GB (ciasno) bez lockow. Polityka: num_seqs default 1,
+        // ctx pcham do max z VRAM. Tu i tak moze byc error (model za duzy na 2 GPU).
         let m = gemma2_27b_like();
         let fit = auto_fit_config(
             &m,
@@ -1314,11 +1468,281 @@ mod tests {
                 lock_tensor_parallel: false,
             },
         );
-        // Moze byc error (27B w bf16 = 54 GB, 2x 24 = 48 GB usable ~43GB, tight).
-        // Akceptujemy obie sciezki: jesli fits to applied < requested.
         if fit.error.is_none() {
             let est = estimate_vllm_vram(&m, &fit.applied);
             assert!(est.fits_per_gpu, "Po auto-fit musi fits: {est:?}");
         }
+    }
+
+    #[test]
+    fn auto_default_prefers_max_ctx_with_single_seq() {
+        // Gemma2 27B-like, 4x 24GB, brak request + brak lockow -> default policy.
+        // Oczekiwanie: max_num_seqs = 1, max_model_len = max mozliwy z VRAM
+        // (capped przez model.max_position_embeddings = 32768).
+        let m = gemma2_27b_like();
+        let fit = auto_fit_config(
+            &m,
+            &AutoFitRequest {
+                gpu_count: 4,
+                gpu_memory_gb_each: 24.0,
+                kv_cache_dtype: "auto".into(),
+                gpu_memory_utilization: 0.9,
+                requested_max_model_len: None,
+                requested_max_num_seqs: None,
+                requested_tensor_parallel: None,
+                requested_pipeline_parallel: None,
+                lock_max_model_len: false,
+                lock_max_num_seqs: false,
+                lock_tensor_parallel: false,
+            },
+        );
+        assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
+        assert_eq!(
+            fit.applied.max_num_seqs, 1,
+            "default num_seqs powinien byc 1, got {}",
+            fit.applied.max_num_seqs
+        );
+        // 27B BF16 na 4×24GB: ~13.5 GB weights/GPU + ~6.5 act = ~20 GB, KV budget
+        // ~1.7 GB/GPU dla 1 seq -> ~4-7k ctx. Test sprawdza ze ctx wynosi co najmniej
+        // 4k (default policy realnie wyciaga budget) i nie przekracza model maxa.
+        assert!(
+            fit.applied.max_model_len >= 4096,
+            "max_model_len powinien wykorzystac VRAM (>= 4k), got {}",
+            fit.applied.max_model_len
+        );
+        assert!(
+            fit.applied.max_model_len <= m.max_position_embeddings,
+            "max_model_len {} > model.max_position_embeddings {}",
+            fit.applied.max_model_len,
+            m.max_position_embeddings
+        );
+        let est = estimate_vllm_vram(&m, &fit.applied);
+        assert!(est.fits_per_gpu, "Per GPU musi fits: {est:?}");
+    }
+
+    #[test]
+    fn auto_default_caps_ctx_at_model_max_position() {
+        // Maly model (Qwen 0.5B, max_position 32768) na 1x24GB. KV budget olbrzymi
+        // wzgledem modelu - ctx ma byc capped przez model.max_position_embeddings,
+        // a nie absolutnym ceiling 1M.
+        let m = qwen_05b();
+        let fit = auto_fit_config(
+            &m,
+            &AutoFitRequest {
+                gpu_count: 1,
+                gpu_memory_gb_each: 24.0,
+                kv_cache_dtype: "auto".into(),
+                gpu_memory_utilization: 0.9,
+                requested_max_model_len: None,
+                requested_max_num_seqs: None,
+                requested_tensor_parallel: None,
+                requested_pipeline_parallel: None,
+                lock_max_model_len: false,
+                lock_max_num_seqs: false,
+                lock_tensor_parallel: false,
+            },
+        );
+        assert!(fit.error.is_none(), "Powinno fits: {:?}", fit.error);
+        assert_eq!(fit.applied.max_num_seqs, 1);
+        assert_eq!(
+            fit.applied.max_model_len, m.max_position_embeddings,
+            "Maly model: ctx == model.max_position_embeddings ({}), got {}",
+            m.max_position_embeddings, fit.applied.max_model_len
+        );
+    }
+
+    #[test]
+    fn quant_label_to_bytes_mapping() {
+        // 4-bit warianty -> 0.5625 (z overhead skali)
+        for q in &[
+            "nvfp4", "fp4", "mxfp4", "awq", "gptq", "int4", "auto-round",
+            "bnb_4bit", "load_in_4bit", "w4a16", "compressed-tensors-4bit",
+        ] {
+            assert_eq!(
+                quant_label_to_bytes(q),
+                Some(0.5625),
+                "4-bit '{}' powinno dac 0.5625",
+                q
+            );
+        }
+        // 8-bit -> 1.0625
+        for q in &["int8", "fp8", "fp8-e4m3", "bnb_8bit", "w8a8", "load_in_8bit"] {
+            assert_eq!(
+                quant_label_to_bytes(q),
+                Some(1.0625),
+                "8-bit '{}' powinno dac 1.0625",
+                q
+            );
+        }
+        // Pelne dtypes
+        assert_eq!(quant_label_to_bytes("fp16"), Some(2.0));
+        assert_eq!(quant_label_to_bytes("bf16"), Some(2.0));
+        assert_eq!(quant_label_to_bytes("fp32"), Some(4.0));
+        // Nieznane -> None (fallback do dtype)
+        assert_eq!(quant_label_to_bytes("definitely-not-a-quant"), None);
+    }
+
+    #[test]
+    fn quantization_detected_from_repo_name() {
+        assert_eq!(
+            detect_quant_from_name("LilaRest/gemma-4-31B-it-NVFP4-turbo").as_deref(),
+            Some("nvfp4")
+        );
+        // AutoRound pattern wygrywa nad surowym "int4" - i tak konczy na 4-bit.
+        assert_eq!(
+            detect_quant_from_name("Intel/foo-int4-AutoRound").as_deref(),
+            Some("auto_round")
+        );
+        assert_eq!(
+            detect_quant_from_name("user/Llama-3-8B-AWQ").as_deref(),
+            Some("awq")
+        );
+        assert_eq!(
+            detect_quant_from_name("user/Mixtral-8x7B-GPTQ").as_deref(),
+            Some("gptq")
+        );
+        assert_eq!(
+            detect_quant_from_name("nvidia/foo-FP8").as_deref(),
+            Some("fp8")
+        );
+        assert_eq!(
+            detect_quant_from_name("user/Foo-MXFP4-Instruct").as_deref(),
+            Some("mxfp4")
+        );
+        assert_eq!(
+            detect_quant_from_name("Qwen/Qwen2.5-7B-Instruct-GGUF-Q4_K_M").as_deref(),
+            Some("int4")
+        );
+        // Brak hinta -> None
+        assert!(detect_quant_from_name("meta-llama/Llama-3-70B-Instruct").is_none());
+    }
+
+    #[test]
+    fn quantization_detected_from_hf_config() {
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "quantization_config": {"quant_method": "awq", "bits": 4, "group_size": 128}
+        }"#).unwrap();
+        let q = detect_quantization("user/foo", &json, None);
+        assert_eq!(q.as_deref(), Some("awq"));
+
+        // bitsandbytes 4-bit przez load_in_4bit flag
+        let json2: serde_json::Value = serde_json::from_str(r#"{
+            "quantization_config": {"quant_method": "bitsandbytes", "load_in_4bit": true}
+        }"#).unwrap();
+        assert_eq!(
+            detect_quantization("user/foo", &json2, None).as_deref(),
+            Some("bnb_4bit")
+        );
+
+        // Modelopt NVFP4
+        let json3: serde_json::Value = serde_json::from_str(r#"{
+            "quantization_config": {"quant_method": "modelopt", "bits": 4}
+        }"#).unwrap();
+        assert_eq!(
+            detect_quantization("user/foo", &json3, None).as_deref(),
+            Some("nvfp4")
+        );
+
+        // compressed-tensors 8-bit
+        let json4: serde_json::Value = serde_json::from_str(r#"{
+            "quantization_config": {"quant_method": "compressed-tensors", "bits": 8}
+        }"#).unwrap();
+        assert_eq!(
+            detect_quantization("user/foo", &json4, None).as_deref(),
+            Some("w8a16")
+        );
+    }
+
+    #[test]
+    fn quantization_override_wins_over_config() {
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "quantization_config": {"quant_method": "awq", "bits": 4}
+        }"#).unwrap();
+        // User wymusza fp16 mimo ze config mowi awq.
+        assert_eq!(
+            detect_quantization("user/foo", &json, Some("fp16")).as_deref(),
+            Some("fp16")
+        );
+        // "none" / "auto" wylacza override -> wraca do config.
+        assert_eq!(
+            detect_quantization("user/foo", &json, Some("none")).as_deref(),
+            Some("awq")
+        );
+        assert_eq!(
+            detect_quantization("user/foo", &json, Some("auto")).as_deref(),
+            Some("awq")
+        );
+    }
+
+    #[test]
+    fn user_case_gemma_30b_nvfp4_fits_4x24gb() {
+        // LilaRest/gemma-4-31B-it-NVFP4-turbo: 30.6B params, NVFP4.
+        // Wagi: 30.6B × 0.5625 = 17.2 GB. Per GPU (TP=2/PP=2): ~4.3 GB.
+        // Cala konfiguracja z 32k ctx musi sie zmiescic luxurowo na 4×24GB.
+        let mut m = gemma4_31b();
+        m.num_parameters = 30_600_000_000;
+        m.quantization = Some("nvfp4".into());
+
+        let input = VramEstimateInput {
+            gpu_count: 4,
+            gpu_memory_gb_each: 24.0,
+            tensor_parallel: 2,
+            pipeline_parallel: 2,
+            max_model_len: 32768,
+            max_num_seqs: 1,
+            kv_cache_dtype: "auto".into(),
+            gpu_memory_utilization: 0.9,
+            activation_overhead_pct: 10.0,
+        };
+        let est = estimate_vllm_vram(&m, &input);
+        // Wagi powinny byc ~16-18 GB (vs 56.9 GB w bf16).
+        assert!(
+            est.model_weights_gb >= 14.0 && est.model_weights_gb <= 20.0,
+            "NVFP4 30.6B weights ~16 GB, got {}",
+            est.model_weights_gb
+        );
+        assert!(est.fits_per_gpu, "NVFP4 30.6B na 4×24GB musi fits: {est:?}");
+        // Per GPU << 24 GB - duzo zapasu.
+        assert!(
+            est.per_gpu_gb < 18.0,
+            "Per GPU powinien byc << 24 GB (komfortowo): got {}",
+            est.per_gpu_gb
+        );
+    }
+
+    #[test]
+    fn user_case_gemma_30b_nvfp4_auto_fit_max_ctx() {
+        let mut m = gemma4_31b();
+        m.num_parameters = 30_600_000_000;
+        m.quantization = Some("nvfp4".into());
+        let fit = auto_fit_config(
+            &m,
+            &AutoFitRequest {
+                gpu_count: 4,
+                gpu_memory_gb_each: 24.0,
+                kv_cache_dtype: "auto".into(),
+                gpu_memory_utilization: 0.9,
+                requested_max_model_len: None,
+                requested_max_num_seqs: None,
+                requested_tensor_parallel: None,
+                requested_pipeline_parallel: None,
+                lock_max_model_len: false,
+                lock_max_num_seqs: false,
+                lock_tensor_parallel: false,
+            },
+        );
+        assert!(fit.error.is_none(), "Powinno znalezc fit: {:?}", fit.error);
+        assert_eq!(fit.applied.max_num_seqs, 1, "default policy: 1 seq");
+        // Gemma4 31B ma 60 layers × 16 kv_heads × 256 head_dim → KV ~960 KB/token.
+        // Z budgetu ~12 GB/GPU dla 1 seq dostajemy ~12k tokenow ctx. NVFP4 oszczednosc
+        // dotyczy WAGS (~17 GB vs 56 GB) ale KV cache zostaje na bf16 i to on tu
+        // dominuje. Test wymaga zeby ctx byl realnie wyciagniety (>= 8k - vs PRZED
+        // poprawka, kiedy weights byly liczone jak bf16, model w ogole nie fit'owal).
+        assert!(
+            fit.applied.max_model_len >= 8192,
+            "Z malymi wagami (NVFP4) powinno dac sensowny ctx (>= 8k), got {}",
+            fit.applied.max_model_len
+        );
+        assert!(fit.applied.max_model_len <= m.max_position_embeddings);
     }
 }
