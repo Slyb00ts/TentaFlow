@@ -592,12 +592,31 @@ fn prepare_template_env(
     let template_id = template_identity(spec, variant, bundle_src)?;
     let template_dir = templates_root(cache)
         .join(&spec.bundle.engine)
-        .join(template_id)
+        .join(&template_id)
         .join("venv");
 
-    if template_dir.join("pyvenv.cfg").exists() {
-        log("template venv: reuse (pyvenv.cfg istnieje)");
+    // Marker pisany dopiero po SUKCESIE install_deps + copy_bundle_files.
+    // pyvenv.cfg powstaje na samym poczatku `python -m venv`, wiec gdy uv
+    // crashnie w trakcie pobierania wheels (np. broken pipe na nvidia-cublas),
+    // template ma pyvenv.cfg ale brakuje pakietow. Bez tego markera nastepny
+    // deploy "reuse" pomijal install i silnik padal z ModuleNotFoundError.
+    let install_complete_marker = template_dir.join(".tentaflow-install-complete");
+    if template_dir.join("pyvenv.cfg").exists() && install_complete_marker.exists() {
+        log("template venv: reuse (install complete)");
         return Ok(template_dir);
+    }
+
+    if template_dir.exists() {
+        log(&format!(
+            "template venv: niekompletny ({}), czyszcze przed ponowna instalacja",
+            template_dir.display()
+        ));
+        std::fs::remove_dir_all(&template_dir).with_context(|| {
+            format!(
+                "czyszczenie niekompletnego template venv {}",
+                template_dir.display()
+            )
+        })?;
     }
 
     std::fs::create_dir_all(template_dir.parent().unwrap()).ok();
@@ -622,6 +641,8 @@ fn prepare_template_env(
     }
     install_deps(&template_dir, uv, spec, variant, bundle_src, extra_env, log)?;
     copy_bundle_files(bundle_src, &template_dir)?;
+    std::fs::write(&install_complete_marker, template_id.as_bytes())
+        .context("zapis markera template install complete")?;
     Ok(template_dir)
 }
 
