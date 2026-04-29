@@ -1509,23 +1509,28 @@ function renderDiskTab(ctx) {
   }
   const cards = Array.from(byDevice.entries()).map(([device, samples]) => {
     const model = samples[0]?.p?.model || '';
-    const readPts = samples.map((s) => [s.t, s.p.read_bps / 1e6]);
-    const writePts = samples.map((s) => [s.t, s.p.write_bps / 1e6]);
+    const readBpsPts = samples.map((s) => [s.t, s.p.read_bps || 0]);
+    const writeBpsPts = samples.map((s) => [s.t, s.p.write_bps || 0]);
     const iopsPts = samples.map((s) => [s.t, (s.p.iops_r || 0) + (s.p.iops_w || 0)]);
     const latPts = samples.map((s) => [s.t, s.p.await_ms_p99 || 0]);
-    const peakRead = readPts.reduce((m, [, v]) => Math.max(m, v), 0);
-    const peakWrite = writePts.reduce((m, [, v]) => Math.max(m, v), 0);
+    const peakReadBps = readBpsPts.reduce((m, [, v]) => Math.max(m, v), 0);
+    const peakWriteBps = writeBpsPts.reduce((m, [, v]) => Math.max(m, v), 0);
     const peakIops = iopsPts.reduce((m, [, v]) => Math.max(m, v), 0);
     const p99 = latPts.reduce((m, [, v]) => Math.max(m, v), 0);
 
     return `
       <section class="pr2-card">
-        <h2 class="pr2-card-title">${escape(device)}${model ? ` — <span class="muted">${escape(model)}</span>` : ''}</h2>
+        <h2 class="pr2-card-title">
+          ${escape(device)}${model ? ` — <span class="muted">${escape(model)}</span>` : ''}
+          <span class="pr2-card-actions">
+            <span class="pr2-status-pill ok">Active</span>
+          </span>
+        </h2>
         <div class="pr2-charts-row">
           <div class="pr2-mini-chart">
-            <div class="mc-title"><span>Throughput MB/s</span><span class="v">R ${peakRead.toFixed(0)} · W ${peakWrite.toFixed(0)}</span></div>
+            <div class="mc-title"><span>Throughput</span><span class="v">R ${formatBytesPerSec(peakReadBps)} · W ${formatBytesPerSec(peakWriteBps)}</span></div>
             <svg viewBox="0 0 200 60" preserveAspectRatio="none" role="img" aria-label="Disk throughput">
-              ${twoLineSvg(readPts, writePts, '#22c55e', '#ef4444')}
+              ${twoLineSvg(readBpsPts, writeBpsPts, '#22c55e', '#ef4444')}
             </svg>
           </div>
           <div class="pr2-mini-chart">
