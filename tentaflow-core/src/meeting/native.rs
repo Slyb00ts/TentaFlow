@@ -36,6 +36,9 @@ pub struct SpawnRequest {
     pub response_mode: String,
     /// CSV slow aktywujacych ("jarvis,bot,...").
     pub wake_words: String,
+    /// Jezyk meetingu (ISO 639-1). `Some` → env `MEETING_LANGUAGE`; `None` →
+    /// env nie ustawiony, bot zostawi STT na auto-detect.
+    pub meeting_language: Option<String>,
 }
 
 /// Wynik spawn — PID subprocesu (do logowania) + nazwa "kontenera" zgodna
@@ -161,6 +164,9 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(false);
+    if let Some(lang) = req.meeting_language.as_deref() {
+        cmd.env("MEETING_LANGUAGE", lang);
+    }
 
     let child = cmd
         .spawn()

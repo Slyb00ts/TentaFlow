@@ -147,6 +147,12 @@ pub async fn meeting_session_start(
         return Err(bad_request("meeting_url za dlugi"));
     }
     let owner = current_user_id(ctx);
+    // Dziedzicz jezyk meetingu z `users.preferred_language` osoby ktora
+    // startuje sesje. Brak preferencji → None → bot zostawi STT na Whisper
+    // auto-detect (po cherry-picku fa9ab17 nie ma juz hardkoda 'pl').
+    let meeting_language = owner
+        .and_then(|uid| repository::get_user_preferred_language(&ctx.state.db, uid).ok())
+        .flatten();
     let start = StartSessionRequest {
         meeting_url: r.meeting_url.clone(),
         title: if r.title.is_empty() {
@@ -215,6 +221,7 @@ pub async fn meeting_session_start(
         // Dashboard moze nadpisac jezeli protocol zostanie rozszerzony.
         response_mode: None,
         wake_words: None,
+        meeting_language,
     };
     let desc = ctx
         .state

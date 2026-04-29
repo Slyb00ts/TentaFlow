@@ -154,10 +154,13 @@ pub struct MeetingConfig {
     #[serde(default = "default_summarization_min_entries")]
     pub summarization_min_entries: usize,
 
-    /// Jezyk prompta transcription_summarization (pl/en/de/es/fr). Dopasowany
-    /// do seeda w DB — patrz tentaflow-core/src/db/seed.rs.
-    #[serde(default = "default_meeting_language")]
-    pub meeting_language: String,
+    /// Jezyk meetingu (ISO 639-1: pl/en/de/es/fr). Dziedziczony przez hosta
+    /// z `users.preferred_language` osoby ktora startuje sesje. `None` =
+    /// brak preferencji → STT idzie do Whispera bez language → auto-detect;
+    /// fetch_prompt fallbackuje na `pl` (DB i tak ma pl-fallback po stronie
+    /// routera). Dopasowane do seeda w `tentaflow-core/src/db/seed.rs`.
+    #[serde(default)]
+    pub meeting_language: Option<String>,
 }
 
 fn default_transport_port() -> u16 {
@@ -237,10 +240,6 @@ fn default_transcript_buffer_minutes() -> u64 {
 
 fn default_summarization_min_entries() -> usize {
     3
-}
-
-fn default_meeting_language() -> String {
-    "pl".to_string()
 }
 
 /// Domyslna sciezka do modelu Silero VAD. Sprawdza po kolei:
@@ -389,8 +388,11 @@ impl MeetingConfig {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(10),
             summarization_min_entries: std::env::var("SUMMARIZATION_MIN_ENTRIES")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            // Pusty `MEETING_LANGUAGE` traktujemy jak brak (auto-detect),
+            // zeby caller nie musial rozrozniac "nie ustawiam" od "ustawiam pusto".
             meeting_language: std::env::var("MEETING_LANGUAGE")
-                .unwrap_or_else(|_| "pl".to_string()),
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         };
 
         tracing::info!("Konfiguracja zaladowana ze zmiennych srodowiskowych");
