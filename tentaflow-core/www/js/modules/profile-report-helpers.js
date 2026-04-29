@@ -23,8 +23,26 @@ function ti(key, vars, fallback) {
 // For real reports the API is expected to ship `events[]` directly; in that
 // case we just pass through.
 
+// Wasm-glue eksponuje event.category jako snake_case (np. "ram_sample"), ale
+// caly downstream code (profile-report.js, profile-timeline.js, profile-range)
+// porownuje przeciwko PascalCase ("RamSample"). Normalizujemy raz na wejsciu.
+function snakeToPascal(s) {
+  if (!s || typeof s !== 'string') return s;
+  if (/[A-Z]/.test(s)) return s; // juz PascalCase
+  return s.split('_').map((p) => p ? (p[0].toUpperCase() + p.slice(1)) : '').join('');
+}
+
+function normalizeEventCategories(events) {
+  if (!Array.isArray(events)) return events;
+  for (const e of events) {
+    if (e && typeof e.category === 'string') e.category = snakeToPascal(e.category);
+  }
+  return events;
+}
+
 export function expandCompactSeries(report) {
   if (Array.isArray(report.events) && report.events.length > 0) {
+    normalizeEventCategories(report.events);
     return report;
   }
   const cs = report._compact_series;
