@@ -14,7 +14,7 @@ use crate::deploy::python_venv::LogSink;
 
 /// Zwraca sciezke do dzialajacego Chromium. Najpierw probuje znalezc
 /// systemowa instalacje, potem cache, potem pobiera Chrome for Testing.
-pub fn ensure_chromium(log: &LogSink) -> Result<PathBuf> {
+pub async fn ensure_chromium(log: &LogSink) -> Result<PathBuf> {
     if let Some(path) = find_system_chromium() {
         log(&format!("chromium: znaleziony systemowy {}", path.display()));
         check_runtime_libs(&path, log);
@@ -30,7 +30,7 @@ pub fn ensure_chromium(log: &LogSink) -> Result<PathBuf> {
     }
 
     log("chromium: brak na hoscie i w cache — pobieram Chrome for Testing");
-    download_chrome_for_testing(&cache_dir, log)?;
+    download_chrome_for_testing(&cache_dir, log).await?;
     if !cached.is_file() {
         return Err(anyhow!(
             "chromium: pobranie zakonczone, ale binarka nie istnieje pod {}",
@@ -148,7 +148,7 @@ fn chrome_for_testing_platform() -> &'static str {
     }
 }
 
-fn download_chrome_for_testing(cache_dir: &Path, log: &LogSink) -> Result<()> {
+async fn download_chrome_for_testing(cache_dir: &Path, log: &LogSink) -> Result<()> {
     let platform = chrome_for_testing_platform();
     if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
         return Err(anyhow!(
@@ -162,20 +162,26 @@ fn download_chrome_for_testing(cache_dir: &Path, log: &LogSink) -> Result<()> {
         format!("tworzenie katalogu cache {}", cache_dir.display())
     })?;
 
+    // Async reqwest: synchroniczny `reqwest::blocking::Client` tworzyl wlasny
+    // tokio runtime i przy drop panikowal `Cannot drop a runtime in a context
+    // where blocking is not allowed`, bo provisioner jest wolany z async ctx
+    // (`runner.rs::do_binary_native_deploy`, `meeting/native.rs::spawn`).
     let versions_url =
         "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json";
     log(&format!("chromium: pobieram metadata {versions_url}"));
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .context("budowa klienta http")?;
     let meta: serde_json::Value = client
         .get(versions_url)
         .send()
+        .await
         .context("download versions json")?
         .error_for_status()
         .context("versions json status")?
         .json()
+        .await
         .context("parsowanie versions json")?;
 
     let downloads = meta
@@ -199,10 +205,12 @@ fn download_chrome_for_testing(cache_dir: &Path, log: &LogSink) -> Result<()> {
         .get(&url)
         .timeout(std::time::Duration::from_secs(600))
         .send()
+        .await
         .context("download chromium zip")?
         .error_for_status()
         .context("chromium zip status")?
         .bytes()
+        .await
         .context("read chromium zip body")?;
 
     log(&format!(
@@ -210,7 +218,14 @@ fn download_chrome_for_testing(cache_dir: &Path, log: &LogSink) -> Result<()> {
         zip_bytes.len(),
         cache_dir.display()
     ));
-    extract_zip(&zip_bytes, cache_dir)?;
+    // Zip extract to CPU + sync I/O — przenosimy do dedicated blocking threadu
+    // zeby nie blokowal reactora tokio na czas rozpakowywania ~200MB archiwum.
+    let dest = cache_dir.to_path_buf();
+    let bytes_vec = zip_bytes.to_vec();
+    tokio::task::spawn_blocking(move || extract_zip(&bytes_vec, &dest))
+        .await
+        .context("spawn_blocking extract_zip")?
+        .context("extract_zip")?;
 
     if cfg!(unix) {
         if let Some(bin) = cached_chromium_path(cache_dir).to_str() {

@@ -126,18 +126,30 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
     };
     let browser_config = builder
         .no_sandbox()
+        .launch_timeout(Duration::from_secs(60))
         .window_size(1920, 1080)
         .user_data_dir(user_data_dir)
         .arg("use-fake-ui-for-media-stream")
         .arg("autoplay-policy=no-user-gesture-required")
         .arg("enable-features=MediaStreamTrackGenerator")
+        // /dev/shm na hostach kontenerowych / niektorych deployach ma tylko
+        // 64 MB. Headless=new + user_data_dir z preferences potrafi tam
+        // alokowac wiecej, blokujac sie zanim Chrome zdazy wypisac DevTools
+        // URL na stderr — chromiumoxide trafia wtedy w `LaunchTimeout` z
+        // pustym BrowserStderr. `disable-dev-shm-usage` zmusza Chrome do
+        // uzywania /tmp zamiast /dev/shm.
+        .arg("disable-dev-shm-usage")
         // --disable-gpu tears down the WebRTC video pipeline: canvas
         // captureStream() reported the track as live but the encoder never
-        // got composited frames. swiftshader provides a software GL backend
-        // that's enough for canvas readbacks and WebRTC encoding inside the
-        // headless container.
-        .arg("use-gl=swiftshader")
-        .arg("enable-unsafe-swiftshader")
+        // got composited frames. SwANGLE (swiftshader-webgl przez ANGLE)
+        // jest software GL backendem ktory wystarcza dla canvas readbacks i
+        // WebRTC encoding w headless container. Chrome 130+ deprecated
+        // `--use-gl=swiftshader` na rzecz pary `use-gl=angle` +
+        // `use-angle=swiftshader-webgl` — bez tego Chrome 148 loguje
+        // `gl=none,angle=none not found in allowed implementations` i GPU
+        // process exit-uje.
+        .arg("use-gl=angle")
+        .arg("use-angle=swiftshader-webgl")
         .arg("disable-blink-features=AutomationControlled")
         .arg("ignore-certificate-errors")
         // Wymuszamy Linux Chromium UA zeby Teams nie serwowal wariantu
