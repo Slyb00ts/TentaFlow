@@ -29,6 +29,7 @@
     "addons": "Addons",
     "users": "Utilisateurs",
     "audit": "Journal d'audit",
+    "profiling_sessions": "Profilage",
     "meeting": "Bot de réunion",
     "section_general": "Général",
     "section_core": "Noyau",

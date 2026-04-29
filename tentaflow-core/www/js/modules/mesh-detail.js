@@ -338,9 +338,41 @@ function ensureActiveBanner(root, n) {
     bannerNodeId = null;
   }
   if (!activeBanner) {
-    activeBanner = new ProfilingActiveBanner({ nodeId: n.node_id });
+    const nodeId = n.node_id;
+    activeBanner = new ProfilingActiveBanner({
+      nodeId,
+      // Po zakonczeniu sesji (timeout / external stop) — toast z akcjami:
+      // "View report" otwiera profile-report; "View all sessions" otwiera
+      // globalny ekran profilingu zfiltrowany na ten nod. User nie zostaje
+      // bez sladu po zniknieciu bannera.
+      onSessionEnded: (sessionId) => {
+        const t = document.createElement('div');
+        t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--tf-bg-2,#0a0d24);color:var(--tf-text,#e8ebf5);border:1px solid var(--tf-border,#1f2548);border-radius:8px;padding:10px 14px;font-size:13px;z-index:9999;display:flex;gap:10px;align-items:center;box-shadow:0 12px 32px rgba(0,0,0,0.5);';
+        t.innerHTML = `<span>Profiling session finished</span>`;
+        const reportBtn = document.createElement('tf-button');
+        reportBtn.setAttribute('size', 'sm');
+        reportBtn.setAttribute('variant', 'primary');
+        reportBtn.textContent = 'View report';
+        reportBtn.addEventListener('click', () => {
+          if (window.Router) window.Router.navigate('profile-report', { nodeId, sessionId });
+          t.remove();
+        });
+        const listBtn = document.createElement('tf-button');
+        listBtn.setAttribute('size', 'sm');
+        listBtn.setAttribute('variant', 'ghost');
+        listBtn.textContent = 'All sessions';
+        listBtn.addEventListener('click', () => {
+          if (window.Router) window.Router.navigate('profiling-sessions', { nodeId, nodeName: bannerNodeId ? null : null });
+          t.remove();
+        });
+        t.appendChild(reportBtn);
+        t.appendChild(listBtn);
+        document.body.appendChild(t);
+        setTimeout(() => t.remove(), 12000);
+      },
+    });
     activeBanner.mount(host);
-    bannerNodeId = n.node_id;
+    bannerNodeId = nodeId;
   } else if (activeBanner.root && activeBanner.root.parentNode !== host) {
     // Po patchInner host moze byc nowym elementem DOM — przepnij banner.
     host.appendChild(activeBanner.root);

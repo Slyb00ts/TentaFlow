@@ -29,6 +29,7 @@
     "addons": "Addons",
     "users": "Benutzer",
     "audit": "Audit-Protokoll",
+    "profiling_sessions": "Profiling",
     "meeting": "Meeting-Bot",
     "section_general": "Allgemein",
     "section_core": "Kern",
