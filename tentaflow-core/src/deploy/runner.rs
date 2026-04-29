@@ -3003,7 +3003,18 @@ fn nvidia_smi_snapshot() -> Option<String> {
         .map(|l| {
             let cells: Vec<&str> = l.split(',').map(str::trim).collect();
             if cells.len() == 4 {
-                format!("GPU{}:{}%{}/{}MB", cells[0], cells[1], cells[2], cells[3])
+                // nvidia-smi zwraca '[N/A]' dla GPU bez dedykowanego VRAM
+                // (unified memory: GB10 / DGX Spark / Tegra). Wtedy memory.used /
+                // memory.total nie maja sensu - GPU dzieli LPDDR z CPU. Pokazujemy
+                // 'shared' zamiast '[N/A]/[N/A]MB' zeby user wiedzial ze to
+                // unified memory, nie blad odczytu.
+                let util = if cells[1] == "[N/A]" { "?" } else { cells[1] };
+                let mem = if cells[2] == "[N/A]" || cells[3] == "[N/A]" {
+                    "shared".to_string()
+                } else {
+                    format!("{}/{}MB", cells[2], cells[3])
+                };
+                format!("GPU{}:{}% {}", cells[0], util, mem)
             } else {
                 l.trim().to_string()
             }
