@@ -216,15 +216,20 @@ function buildContext(report) {
   const hasMemory = grouped.has('RamSample');
   const hasNetwork = grouped.has('NetworkSample');
 
+  // Mockup #04: 9-tab layout. CPU Detail (#07) wstawiony miedzy Flamegraph
+  // a GPU; widoczny zawsze gdy mamy CpuUtil events (a te zbiera kazdy
+  // backend cpu_util collector niezalezne od OS).
+  const hasCpuUtil = (grouped.get('CpuUtil') || []).length > 0;
   const tabs = [
-    { id: 'overview',  label: 'Overview',       icon: 'grid',     visible: true },
-    { id: 'timeline',  label: 'Unified Timeline', icon: 'timeline', visible: true },
-    { id: 'flame',     label: 'CPU Flamegraph', icon: 'bars',     visible: true },
-    { id: 'gpu',       label: 'GPU',            icon: 'cpu',      visible: hasGpu, count: devices.length || undefined },
-    { id: 'memory',    label: 'Memory',         icon: 'memory',   visible: hasMemory },
-    { id: 'disk',      label: 'Disk IO',        icon: 'disk',     visible: hasDisk },
-    { id: 'power',     label: 'Power',          icon: 'power',    visible: hasPower },
-    { id: 'sources',   label: 'Sources',        icon: 'list',     visible: true },
+    { id: 'overview',   label: 'Overview',         icon: 'grid',     visible: true },
+    { id: 'timeline',   label: 'Unified Timeline', icon: 'timeline', visible: true },
+    { id: 'flame',      label: 'CPU Flamegraph',   icon: 'bars',     visible: true },
+    { id: 'cpu_detail', label: 'CPU Detail',       icon: 'cpu',      visible: hasCpuUtil },
+    { id: 'gpu',        label: 'GPU',              icon: 'cpu',      visible: hasGpu, count: devices.length || undefined },
+    { id: 'memory',     label: 'Memory',           icon: 'memory',   visible: hasMemory },
+    { id: 'disk',       label: 'Disk IO',          icon: 'disk',     visible: hasDisk },
+    { id: 'power',      label: 'Power',            icon: 'power',    visible: hasPower },
+    { id: 'sources',    label: 'Sources',          icon: 'list',     visible: true },
   ].filter((t) => t.visible);
 
   // Single-pass aggregation across all events. Powers Overview + GPU tabs
@@ -488,12 +493,13 @@ function renderTab(container, ctx, tabId) {
   let html = ctx._tabHtml.get(tabId);
   if (html === undefined) {
     switch (tabId) {
-      case 'overview': html = renderOverviewTab(ctx); break;
-      case 'gpu':      html = renderGpuTab(ctx); break;
-      case 'memory':   html = renderMemoryTab(ctx); break;
-      case 'disk':     html = renderDiskTab(ctx); break;
-      case 'power':    html = renderPowerTab(ctx); break;
-      case 'sources':  html = renderSourcesTab(ctx); break;
+      case 'overview':   html = renderOverviewTab(ctx); break;
+      case 'cpu_detail': html = renderCpuDetailTab(ctx); break;
+      case 'gpu':        html = renderGpuTab(ctx); break;
+      case 'memory':     html = renderMemoryTab(ctx); break;
+      case 'disk':       html = renderDiskTab(ctx); break;
+      case 'power':      html = renderPowerTab(ctx); break;
+      case 'sources':    html = renderSourcesTab(ctx); break;
       default:         html = '';
     }
     ctx._tabHtml.set(tabId, html);
@@ -681,6 +687,183 @@ function renderOverviewTab(ctx) {
       </h2>
       <div class="pr2-timeline-preview">${renderRidgelinePreview(lanes, { width: 920, height: 140 })}</div>
     </section>
+  `;
+}
+
+// =============================================================================
+// Tab: CPU Detail (mockup #07) — per-core grid + PMU counters + top symbols
+// + hot threads. Source: linux.proc.cpu_util (CpuUtil events) — zawsze
+// dostepne. CpuSample / CpuCounter — opcjonalnie (perf record + perf stat),
+// banner-degraded gdy brak.
+// =============================================================================
+
+function renderCpuDetailTab(ctx) {
+  const { events, report } = ctx;
+  const utilEvents = eventsForCategory(events, 'CpuUtil');
+  const sampleEvents = eventsForCategory(events, 'CpuSample');
+  const counterEvents = eventsForCategory(events, 'CpuCounter');
+  const names = report.names || [];
+
+  if (utilEvents.length === 0) {
+    return noDataCard('No CPU utilization data collected for this session.');
+  }
+
+  // Group util events per-core, compute peak + sparkline. Mockup pokazuje
+  // 16 kafelkow; my pokazujemy ile cores faktycznie raportowalo - moze to byc
+  // 4, 8, 16, 32 zaleznie od hardware.
+  const perCore = new Map(); // core -> [{t,util}]
+  for (const e of utilEvents) {
+    const p = unwrapPayload(e.payload);
+    if (!p || typeof p.core !== 'number') continue;
+    const key = p.core;
+    if (!perCore.has(key)) perCore.set(key, []);
+    perCore.get(key).push({ t: e.t_start_ns, util: p.util_pct, freq: p.freq_mhz });
+  }
+  const cores = Array.from(perCore.keys()).sort((a, b) => a - b);
+  const coreCells = cores.map((core) => {
+    const points = perCore.get(core).sort((a, b) => a.t - b.t);
+    const peak = points.reduce((m, x) => Math.max(m, x.util), 0);
+    const last = points.length > 0 ? points[points.length - 1].util : 0;
+    // Mini sparkline: 100x28 viewBox, 12 sample points.
+    const xs = points.length;
+    const path = points.length === 0 ? 'M0 14 L100 14' : points
+      .filter((_, i) => i % Math.max(1, Math.ceil(xs / 24)) === 0)
+      .map((p, i, arr) => {
+        const x = (i / Math.max(1, arr.length - 1)) * 100;
+        const y = 28 - (p.util / 100) * 24 - 2;
+        return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+      })
+      .join(' ');
+    const color = peak > 80 ? '#ef4444' : peak > 60 ? '#f59e0b' : '#a78bfa';
+    return `
+      <div class="pr2-core-mini">
+        <div class="cm-head">
+          <span class="cm-name">CPU ${core}</span>
+          <span class="cm-val">${last.toFixed(0)}%</span>
+        </div>
+        <svg viewBox="0 0 100 28" preserveAspectRatio="none">
+          <path d="${path}" stroke="${color}" stroke-width="1.4" fill="none"/>
+        </svg>
+      </div>
+    `;
+  }).join('');
+
+  // PMU counters chart (line chart) gdy CpuCounter dostepne.
+  // Per kind (Cycles, Instructions, CacheMisses, BranchMisses) aggregated.
+  let pmuSection;
+  if (counterEvents.length > 0) {
+    // Sample-tick aggregation. Each event has payload { kind, value }.
+    const series = new Map(); // kind -> [{t,v}]
+    for (const e of counterEvents) {
+      const p = unwrapPayload(e.payload);
+      if (!p) continue;
+      const kind = String(p.kind);
+      if (!series.has(kind)) series.set(kind, []);
+      series.get(kind).push({ t: e.t_start_ns, v: p.value });
+    }
+    const colors = { Cycles: '#a78bfa', Instructions: '#60a5fa', CacheMisses: '#f59e0b', BranchMisses: '#22c55e' };
+    const lines = Array.from(series.entries()).map(([kind, pts]) => {
+      pts.sort((a, b) => a.t - b.t);
+      const max = Math.max(...pts.map((p) => p.v), 1);
+      const path = pts.map((p, i) => {
+        const x = (i / Math.max(1, pts.length - 1)) * 880 + 40;
+        const y = 160 - (p.v / max) * 140;
+        return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+      }).join(' ');
+      const color = colors[kind] || '#a0a8c8';
+      return `<path d="${path}" stroke="${color}" stroke-width="1.6" fill="none"/>`;
+    }).join('');
+    const legend = Array.from(series.keys()).map((k) => {
+      const c = colors[k] || '#a0a8c8';
+      return `<span style="display:inline-flex; align-items:center; gap:5px; margin-right:14px; font-size:11px; color:var(--tf-text-2);"><span style="width:10px; height:2px; background:${c};"></span>${escape(k)}</span>`;
+    }).join('');
+    pmuSection = `
+      <section class="pr2-card">
+        <h2 class="pr2-card-title">Hardware counters (PMU)</h2>
+        <div class="pr2-pmu-chart">
+          <svg viewBox="0 0 920 180" preserveAspectRatio="none" style="width:100%; height:180px;">
+            <line x1="40" y1="160" x2="920" y2="160" stroke="#1f2548"/>
+            <line x1="40" y1="20" x2="40" y2="160" stroke="#1f2548"/>
+            ${lines}
+          </svg>
+        </div>
+        <div style="margin-top:8px;">${legend}</div>
+      </section>
+    `;
+  } else {
+    pmuSection = `
+      <section class="pr2-card">
+        <h2 class="pr2-card-title">Hardware counters (PMU)</h2>
+        <div class="pr2-banner-degraded">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+          <div><strong>PMU counters not collected.</strong> Add <code>linux.perf.pmu_counters</code> source (perf stat -e cycles,instructions,cache-misses,branch-misses) to capture IPC, L3 miss rate i branch miss rate.</div>
+        </div>
+      </section>
+    `;
+  }
+
+  // Top symbols + Hot threads — both require CpuSample (perf record).
+  let symbolsSection;
+  if (sampleEvents.length > 0) {
+    // Group samples by stack -> root frame name. Self% per leaf.
+    const counts = new Map();
+    for (const e of sampleEvents) {
+      const p = unwrapPayload(e.payload);
+      if (!p) continue;
+      const stackId = p.stack_id;
+      const stack = (report.stacks || [])[stackId] || [];
+      if (stack.length === 0) continue;
+      const leaf = stack[0]; // leaf frame index
+      const frame = (report.frames || [])[leaf];
+      if (!frame) continue;
+      const sym = names[frame.symbol_id] || '?';
+      counts.set(sym, (counts.get(sym) || 0) + 1);
+    }
+    const total = sampleEvents.length;
+    const top = Array.from(counts.entries())
+      .map(([sym, n]) => ({ sym, pct: (n / total) * 100, n }))
+      .sort((a, b) => b.pct - a.pct)
+      .slice(0, 10);
+    const rows = top.map((r) => `
+      <tr>
+        <td style="font-family:'JetBrains Mono',monospace;">${escape(r.sym)}</td>
+        <td style="text-align:right; font-family:'JetBrains Mono',monospace;">${r.pct.toFixed(1)}%</td>
+        <td style="text-align:right; font-family:'JetBrains Mono',monospace;">${r.n}</td>
+      </tr>
+    `).join('');
+    symbolsSection = `
+      <section class="pr2-card">
+        <h2 class="pr2-card-title">Top symbols</h2>
+        <table class="pr2-table">
+          <thead><tr><th>Symbol</th><th style="text-align:right;">Self %</th><th style="text-align:right;">Samples</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </section>
+    `;
+  } else {
+    symbolsSection = `
+      <section class="pr2-card">
+        <h2 class="pr2-card-title">Top symbols</h2>
+        <div class="pr2-banner-degraded">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/></svg>
+          <div><strong>Stack samples not collected.</strong> Add <code>linux.perf.cpu_sampling</code> source (perf record -F 99 -g) to enable flamegraph and per-symbol hotspots.</div>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="pr2-card">
+      <h2 class="pr2-card-title">
+        Per-core utilization
+        <span class="pr2-card-actions"><span class="muted" style="font-size:11px;">${cores.length} core${cores.length === 1 ? '' : 's'} · ${utilEvents.length} samples</span></span>
+      </h2>
+      <div class="pr2-cores-grid">${coreCells}</div>
+    </section>
+
+    ${pmuSection}
+
+    ${symbolsSection}
   `;
 }
 
