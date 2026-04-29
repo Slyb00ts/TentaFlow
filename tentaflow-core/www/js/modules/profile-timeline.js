@@ -1276,14 +1276,21 @@ export class UnifiedTimeline {
           <div class="sp-item"><span class="sym">Disk write</span><span class="pct">${fmtBytes(diskWrite)}</span></div>
         </div>
       </div>
-      ${hasCpu ? `<div class="open-flame">
-        <tf-button variant="ghost" size="sm" data-act="open-flame">Open in flamegraph →</tf-button>
-      </div>` : ''}
+      <div class="open-flame">
+        <tf-button variant="ghost" size="sm" data-act="expand-range">Expand range →</tf-button>
+        ${hasCpu ? `<tf-button variant="ghost" size="sm" data-act="open-flame">Open in flamegraph →</tf-button>` : ''}
+      </div>
     `;
     const flameBtn = this.panel.querySelector('[data-act="open-flame"]');
     if (flameBtn) {
       flameBtn.addEventListener('click', () => {
         this._emit('openFlamegraph', { startNs: s, endNs: en });
+      });
+    }
+    const expandBtn = this.panel.querySelector('[data-act="expand-range"]');
+    if (expandBtn) {
+      expandBtn.addEventListener('click', () => {
+        this._emit('expandRange', { startNs: s, endNs: en });
       });
     }
   }
@@ -1295,5 +1302,82 @@ export class UnifiedTimeline {
     return mx || NS_PER_S;
   }
 }
+
+// =============================================================================
+// TimelineView — adapter wiring UnifiedTimeline into profile-report.
+// Profile report dispatcher (renderLazyTab) wymaga `render(host, ctx)`. Tu
+// hostujemy class UnifiedTimeline w kontenerze i przepinamy event
+// `openFlamegraph` na <tf-tabs> rodzica zeby panel "Open in flamegraph" dzialal.
+// =============================================================================
+
+export const TimelineView = {
+  render(host, ctx) {
+    if (!host) return;
+    const report = ctx?.report || {};
+    const events = ctx?.events || report.events || [];
+    if (!events.length) {
+      host.innerHTML = `
+        <div class="pr-card">
+          <div class="pr-banner-degraded">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+            <div><strong>No timeline data.</strong> This report contains zero events.</div>
+          </div>
+        </div>`;
+      return;
+    }
+
+    // Tear down previous instance jesli host byl juz uzywany — chroni przed
+    // wyciekiem ResizeObserver gdy uzytkownik przelacza taby tam i z powrotem.
+    if (host._timelineInstance && typeof host._timelineInstance.destroy === 'function') {
+      try { host._timelineInstance.destroy(); } catch (_) { /* noop */ }
+      host._timelineInstance = null;
+    }
+
+    host.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'pr-card pr-timeline-card';
+    host.appendChild(card);
+
+    const mount = document.createElement('div');
+    card.appendChild(mount);
+
+    const tl = new UnifiedTimeline(mount, {
+      events,
+      names: report.names || {},
+      frames: report.frames || [],
+      stacks: report.stacks || [],
+      collectors: report.collectors || [],
+      duration_ns: report.duration_ns || 0,
+    });
+
+    // Bridge "Open in flamegraph" → switch to flame tab via <tf-tabs>.
+    tl.on('openFlamegraph', () => {
+      const root = host.closest('[id]')?.ownerDocument || document;
+      const tabs = root.querySelector('#pr-tabs');
+      if (tabs && typeof tabs.setAttribute === 'function') {
+        tabs.setAttribute('value', 'flame');
+        tabs.dispatchEvent(new CustomEvent('change', { detail: { value: 'flame' } }));
+      }
+    });
+
+    // Bridge "Expand range" → open Range Detail modal (mockup #14).
+    // Module is loaded on demand to keep the timeline's initial cost low.
+    tl.on('expandRange', async ({ startNs, endNs }) => {
+      try {
+        const mod = await import('./profile-range-detail.js');
+        mod.openRangeDetailModal({
+          report,
+          range: { tStartNs: startNs, tEndNs: endNs },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[range-detail] failed to open:', err);
+      }
+    });
+
+    // Cleanup hook for future host re-renders.
+    host._timelineInstance = tl;
+  },
+};
 
 export default UnifiedTimeline;
