@@ -152,6 +152,10 @@ export class ProfilingActiveBanner {
       console.error('failed to fetch active profiling session', err);
       sess = null;
     }
+    // Banner moze zostac unmount'owany w trakcie fetchActive (route change,
+    // user przeszedl gdzie indziej). this.root => null po unmount, dalsze
+    // operacje na nim wywalaja TypeError. Sprawdz po await jeszcze raz.
+    if (!this.root) return;
     const previous = this.session;
     this.session = sess;
     if (!sess) {
