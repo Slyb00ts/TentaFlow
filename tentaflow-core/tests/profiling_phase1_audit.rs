@@ -29,7 +29,8 @@ async fn audit_real_session_3s() {
     // Wszystkie sources nie wymagajace sudo. RAM_BANDWIDTH (uncore IMC) i POWER
     // (RAPL) wymagaja sudo - pomijamy, bo test ma byc reproducible bez root.
     let sources = ProfileSourceFlags(
-        ProfileSourceFlags::CPU_UTIL
+        ProfileSourceFlags::CPU_SAMPLING
+            | ProfileSourceFlags::CPU_UTIL
             | ProfileSourceFlags::RAM_USAGE
             | ProfileSourceFlags::DISK_IO
             | ProfileSourceFlags::GPU
