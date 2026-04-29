@@ -517,9 +517,6 @@ pub enum MeshCommandType {
     // -- Cross-node service action forwarding (krok N3b). `service_id` is
     //    interpreted in the receiver's local SQLite namespace; the receiver
     //    runs the action against its own DB and returns the result.
-    ServiceStopRemote {
-        service_id: i64,
-    },
     ServiceStartRemote {
         service_id: i64,
     },
@@ -533,10 +530,6 @@ pub enum MeshCommandType {
     ServicePauseRemote {
         service_id: i64,
         paused: bool,
-    },
-    ServiceRenameRemote {
-        service_id: i64,
-        display_name: String,
     },
     /// Forwarded `ServiceManifestDeployRequest`. The receiver re-runs the same
     /// validation + tokio::spawn deploy that a local request would, and
@@ -744,10 +737,6 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("ProfilingActiveInfo")
                 .field("node_id", &req.node_id)
                 .finish(),
-            Self::ServiceStopRemote { service_id } => f
-                .debug_struct("ServiceStopRemote")
-                .field("service_id", service_id)
-                .finish(),
             Self::ServiceStartRemote { service_id } => f
                 .debug_struct("ServiceStartRemote")
                 .field("service_id", service_id)
@@ -765,14 +754,6 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("ServicePauseRemote")
                 .field("service_id", service_id)
                 .field("paused", paused)
-                .finish(),
-            Self::ServiceRenameRemote {
-                service_id,
-                display_name,
-            } => f
-                .debug_struct("ServiceRenameRemote")
-                .field("service_id", service_id)
-                .field("display_name", display_name)
                 .finish(),
             Self::ServiceDeployRemote {
                 engine_id,
