@@ -75,7 +75,7 @@ download_size_mb = 8500                    # OPTIONAL
 [deploy.native]
 platforms = ["linux", "macos", "windows"]  # REQUIRED
 runtime = "embedded"                       # REQUIRED: embedded | binary | python-bundle
-feature_flag = "inference-llamacpp"        # gdy runtime = embedded
+feature_flag = "inference-llamacpp"        # opcjonalne gdy runtime = embedded (gating przez Cargo feature)
 # binary_path = "tts/native/sherpa-onnx"   # gdy runtime = binary
 # bundle_path = "llm/python/vllm"          # gdy runtime = python-bundle
 
@@ -149,7 +149,7 @@ Dokładnie jedno z pól `context_path` albo `compose_path` musi być ustawione.
 |------|-----|----------|------|
 | `platforms` | array enum OS | tak | Systemy, na których działa wariant natywny. |
 | `runtime` | enum `embedded` / `binary` / `python-bundle` | tak | Sposób uruchomienia. |
-| `feature_flag` | string | warunkowo | Wymagane gdy `runtime = embedded`. Cargo feature aktywujący silnik w binarce `tentaflow-core`. |
+| `feature_flag` | string | nie | Dozwolone tylko przy `runtime = embedded`. Cargo feature aktywujący silnik w binarce `tentaflow-core`. Pomijaj gdy gating jest na innym poziomie (np. `target_os` dla `apple-tts`, stała zależność `tract-onnx` dla silników vision). |
 | `binary_path` | string | warunkowo | Wymagane gdy `runtime = binary`. Katalog pod `tentaflow-containers/` zawierający `build.sh`. |
 | `bundle_path` | string | warunkowo | Wymagane gdy `runtime = python-bundle`. Katalog z `bundle.toml` + `server.py`. |
 
@@ -196,7 +196,7 @@ z komunikatem wskazującym plik, sekcję i pole.
 |---|--------|
 | 1 | `engine.id` musi pasować do regex `^[a-z0-9][a-z0-9_-]{0,63}$` (chroni przed path-traversal/RCE). |
 | 2 | Manifest MUSI mieć przynajmniej jedną sekcję deploy (`[deploy.docker]`, `[deploy.native]` lub `[deploy.external]`). |
-| 3 | `deploy.native.runtime` musi być spójny z polami: `embedded` ⇒ `feature_flag` (i brak `binary_path`/`bundle_path`); `binary` ⇒ `binary_path` (i brak `feature_flag`/`bundle_path`); `python-bundle` ⇒ `bundle_path` (i brak `feature_flag`/`binary_path`). |
+| 3 | `deploy.native.runtime` musi być spójny z polami: `embedded` MOŻE mieć `feature_flag` (gating przez Cargo feature) ale nie musi (gdy gating jest przez `target_os` lub stałą zależność typu `tract-onnx`) — NIE MOŻE mieć `binary_path` ani `bundle_path`; `binary` ⇒ `binary_path` (i brak `feature_flag`/`bundle_path`); `python-bundle` ⇒ `bundle_path` (i brak `feature_flag`/`binary_path`). Tylko jedno z trzech pól. |
 | 4 | Ścieżki muszą istnieć na dysku — `deploy.docker.context_path`, `deploy.native.binary_path`, `deploy.native.bundle_path` (sprawdzane build-time, runtime nie ma dostępu do FS). |
 
 Dodatkowo build.rs egzekwuje **globalną unikalność `engine.id`** w obrębie całego repo.
