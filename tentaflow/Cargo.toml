@@ -50,6 +50,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+# panic=abort skraca binarke o tablice unwind i pozwala kompilatorowi pominac
+# landing pady — mniejszy rozmiar i nieco szybsze hot paths. Crash terminuje
+# proces zamiast unwindowac (akceptowalne dla server binary).
+panic = "abort"
 
 # release-fast: dev iteracje gdzie chcesz produkcyjny opt-level ale BEZ
 # wielominutowego LTO + single-codegen. Buduj przez `cargo build --profile

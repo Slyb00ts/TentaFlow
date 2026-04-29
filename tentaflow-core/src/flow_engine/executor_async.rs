@@ -20,6 +20,75 @@ use tracing::{debug, info, warn};
 const MAX_FLOW_NODES: usize = 256;
 const MAX_FLOW_EDGES: usize = 1024;
 
+/// Wstepnie sparsowany flow — wynik `serde_json::from_str` + topological_sort
+/// + budowa map adjacencji. Trzymamy w cache zeby chat completion nie placil
+/// tej pracy per-request (wczesniej O(N+E) na kazde wykonanie flow).
+pub struct ParsedFlow {
+    pub definition: Arc<FlowDefinition>,
+    /// Kolejnosc topologiczna jako indeksy do `definition.nodes`.
+    execution_order: Vec<usize>,
+    /// Pozycja node'a w `execution_order` po jego id (uzywane przy ewaluacji
+    /// blocked_edges — kodowanie krawedzi to from_pos*N + to_pos).
+    node_pos_by_id: HashMap<String, usize>,
+    /// Per-pozycja w execution_order: indeksy krawedzi wychodzacych z tego node'a
+    /// (indeksy do `definition.edges`).
+    outgoing_edges_per_pos: Vec<Vec<usize>>,
+    /// Per-pozycja w execution_order: indeksy krawedzi wchodzacych.
+    incoming_edges_per_pos: Vec<Vec<usize>>,
+}
+
+impl ParsedFlow {
+    /// Parsuje flow_json + waliduje + sortuje topologicznie + buduje mapy adjacencji.
+    pub fn parse(flow_json: &str) -> Result<Self> {
+        let definition = FlowExecutorAsync::parse_flow(flow_json)?;
+        let order_ids = FlowExecutorAsync::topological_sort(&definition)?;
+
+        // node_id -> indeks w `definition.nodes` (potrzebny do mapowania order_ids -> indeksow).
+        let node_idx_in_def: HashMap<&str, usize> = definition
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
+            .collect();
+
+        let execution_order: Vec<usize> = order_ids
+            .iter()
+            .map(|id| {
+                node_idx_in_def
+                    .get(id.as_str())
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("Wezel '{}' nie znaleziony w definition", id))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let node_pos_by_id: HashMap<String, usize> = order_ids
+            .iter()
+            .enumerate()
+            .map(|(pos, id)| (id.clone(), pos))
+            .collect();
+
+        let n = execution_order.len();
+        let mut outgoing_edges_per_pos: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut incoming_edges_per_pos: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (edge_idx, edge) in definition.edges.iter().enumerate() {
+            if let Some(&from_pos) = node_pos_by_id.get(edge.from.as_str()) {
+                outgoing_edges_per_pos[from_pos].push(edge_idx);
+            }
+            if let Some(&to_pos) = node_pos_by_id.get(edge.to.as_str()) {
+                incoming_edges_per_pos[to_pos].push(edge_idx);
+            }
+        }
+
+        Ok(Self {
+            definition: Arc::new(definition),
+            execution_order,
+            node_pos_by_id,
+            outgoing_edges_per_pos,
+            incoming_edges_per_pos,
+        })
+    }
+}
+
 /// Asynchroniczny executor flow DAG z prawdziwymi adapterami serwisow
 pub struct FlowExecutorAsync {
     db: DbPool,
@@ -32,7 +101,7 @@ impl FlowExecutorAsync {
     }
 
     /// Parsuje flow_json (string) na strukture FlowDefinition
-    fn parse_flow(flow_json: &str) -> Result<FlowDefinition> {
+    pub(super) fn parse_flow(flow_json: &str) -> Result<FlowDefinition> {
         let definition: FlowDefinition = serde_json::from_str(flow_json)?;
 
         if definition.nodes.is_empty() {
@@ -74,7 +143,7 @@ impl FlowExecutorAsync {
     }
 
     /// Sortowanie topologiczne wezlow DAG (algorytm Kahna)
-    fn topological_sort(definition: &FlowDefinition) -> Result<Vec<String>> {
+    pub(super) fn topological_sort(definition: &FlowDefinition) -> Result<Vec<String>> {
         let mut in_degree: HashMap<&str, usize> = HashMap::new();
         let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
 
@@ -125,12 +194,13 @@ impl FlowExecutorAsync {
         Ok(sorted)
     }
 
-    /// Wykonuje flow od poczatku do konca (async).
+    /// Wykonuje flow od poczatku do konca (async) na pre-sparsowanej strukturze.
     /// Tworzy rekord execution w DB, przetwarza wezly wg porzadku topologicznego
     /// delegujac serwisowe wezly do adapterow, aktualizuje rekord po zakonczeniu.
     pub async fn execute(
         &self,
         flow: &crate::db::models::DbFlow,
+        parsed: &ParsedFlow,
         context: &mut FlowContext,
     ) -> Result<FlowExecutionResult> {
         let start_time = std::time::Instant::now();
@@ -158,70 +228,41 @@ impl FlowExecutorAsync {
             "Rozpoczynam async wykonanie flow"
         );
 
-        let definition = Self::parse_flow(&flow.flow_json)?;
-        let execution_order = Self::topological_sort(&definition)?;
+        let definition: &FlowDefinition = &parsed.definition;
+        let nodes: &[FlowNode] = &definition.nodes;
+        let edges: &[FlowEdge] = &definition.edges;
+        let execution_order = &parsed.execution_order;
+        let n = execution_order.len();
 
-        let node_map: HashMap<&str, &FlowNode> = definition
-            .nodes
-            .iter()
-            .map(|n| (n.id.as_str(), n))
-            .collect();
-
-        let outgoing_edges: HashMap<&str, Vec<&FlowEdge>> = {
-            let mut map: HashMap<&str, Vec<&FlowEdge>> = HashMap::new();
-            for edge in &definition.edges {
-                map.entry(edge.from.as_str()).or_default().push(edge);
-            }
-            map
-        };
-
-        // Pre-computed mapa krawedzi wchodzacych (unika alokacji Vec w kazdej iteracji)
-        let incoming_edges: HashMap<&str, Vec<&FlowEdge>> = {
-            let mut map: HashMap<&str, Vec<&FlowEdge>> = HashMap::new();
-            for edge in &definition.edges {
-                map.entry(edge.to.as_str()).or_default().push(edge);
-            }
-            map
-        };
-
-        // Uzywamy indeksow do execution_order zamiast klonowania Stringow
         let mut blocked_edges: HashSet<usize> = HashSet::new();
-        // Mapa edge index: (from_idx, to_idx) w execution_order
-        let node_idx_map: HashMap<&str, usize> = execution_order
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str(), i))
-            .collect();
-        let mut executed_nodes: HashSet<usize> = HashSet::new();
+        let mut executed_positions: HashSet<usize> = HashSet::new();
         let mut final_output = serde_json::Value::Null;
         let mut total_prompt_tokens: i64 = 0;
         let mut total_completion_tokens: i64 = 0;
 
-        // Pre-compute indeksy krawedzi do blokowania (edge_index = from_idx * N + to_idx)
-        let n = execution_order.len();
+        for current_pos in 0..n {
+            let node_idx = execution_order[current_pos];
+            let node: &FlowNode = &nodes[node_idx];
+            let node_id: &str = node.id.as_str();
 
-        for (current_idx, node_id) in execution_order.iter().enumerate() {
             // Lazy evaluation: wezel wykonuje sie jesli CO NAJMNIEJ JEDNA krawedz wejsciowa jest aktywna
-            if let Some(incoming) = incoming_edges.get(node_id.as_str()) {
-                let has_active_input = incoming.iter().any(|e| {
-                    let from_idx = node_idx_map.get(e.from.as_str()).copied().unwrap_or(0);
-                    let to_idx = current_idx;
-                    !blocked_edges.contains(&(from_idx * n + to_idx))
-                        && executed_nodes.contains(&from_idx)
+            let incoming = &parsed.incoming_edges_per_pos[current_pos];
+            if !incoming.is_empty() {
+                let has_active_input = incoming.iter().any(|&edge_idx| {
+                    let edge = &edges[edge_idx];
+                    let from_pos = parsed
+                        .node_pos_by_id
+                        .get(edge.from.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    !blocked_edges.contains(&(from_pos * n + current_pos))
+                        && executed_positions.contains(&from_pos)
                 });
                 if !has_active_input {
                     debug!(node_id = %node_id, "Pomijam wezel (wszystkie wejscia zablokowane)");
                     continue;
                 }
             }
-
-            let node = match node_map.get(node_id.as_str()) {
-                Some(n) => *n,
-                None => {
-                    warn!(node_id = %node_id, "Wezel nie znaleziony w mapie");
-                    continue;
-                }
-            };
 
             let step_start = Utc::now().to_rfc3339();
             let mut step_status = "completed".to_string();
@@ -255,9 +296,9 @@ impl FlowExecutorAsync {
                     );
                     let is_condition = node.node_type == "condition" || node.node_type == "switch";
 
-                    context.node_results.insert(node_id.clone(), output);
+                    context.node_results.insert(node_id.to_string(), output);
 
-                    executed_nodes.insert(current_idx);
+                    executed_positions.insert(current_pos);
 
                     if is_final {
                         final_output = context
@@ -270,10 +311,10 @@ impl FlowExecutorAsync {
                     if is_condition {
                         let cond_result = context.node_results.get(node_id).unwrap();
                         Self::evaluate_condition_edges(
-                            node_id,
+                            current_pos,
                             cond_result,
-                            &outgoing_edges,
-                            &node_idx_map,
+                            parsed,
+                            edges,
                             n,
                             &mut blocked_edges,
                         );
@@ -290,7 +331,7 @@ impl FlowExecutorAsync {
                     );
 
                     context.execution_log.push(FlowStepLog {
-                        node_id: node_id.clone(),
+                        node_id: node_id.to_string(),
                         node_type: node.node_type.clone(),
                         started_at: step_start,
                         finished_at: Some(Utc::now().to_rfc3339()),
@@ -306,7 +347,7 @@ impl FlowExecutorAsync {
             }
 
             context.execution_log.push(FlowStepLog {
-                node_id: node_id.clone(),
+                node_id: node_id.to_string(),
                 node_type: node.node_type.clone(),
                 started_at: step_start,
                 finished_at: Some(Utc::now().to_rfc3339()),
@@ -369,10 +410,10 @@ impl FlowExecutorAsync {
     pub async fn execute_streaming_flow(
         &self,
         flow: &crate::db::models::DbFlow,
+        parsed: &ParsedFlow,
         context: &mut FlowContext,
     ) -> Result<AdapterChunkStream> {
-        let definition = Self::parse_flow(&flow.flow_json)?;
-        let execution_order = Self::topological_sort(&definition)?;
+        let definition: &FlowDefinition = &parsed.definition;
 
         let node_map: HashMap<&str, &FlowNode> = definition
             .nodes
@@ -440,21 +481,19 @@ impl FlowExecutorAsync {
 
         // Pre-fix: wykonuj nody w kolejnosci topologicznej az dojdziemy do producenta.
         // Producent sam sie NIE wykonuje blocking — wywolamy execute_streaming.
-        for node_id in &execution_order {
-            if node_id == &producer_id {
+        for &node_idx in &parsed.execution_order {
+            let node = &definition.nodes[node_idx];
+            let node_id = node.id.as_str();
+            if node_id == producer_id {
                 break;
             }
-            let node = match node_map.get(node_id.as_str()) {
-                Some(n) => *n,
-                None => continue,
-            };
             let step_start = Utc::now().to_rfc3339();
             let result = self.execute_node(node, context).await;
             match result {
                 Ok(output) => {
-                    context.node_results.insert(node_id.clone(), output);
+                    context.node_results.insert(node_id.to_string(), output);
                     context.execution_log.push(FlowStepLog {
-                        node_id: node_id.clone(),
+                        node_id: node_id.to_string(),
                         node_type: node.node_type.clone(),
                         started_at: step_start,
                         finished_at: Some(Utc::now().to_rfc3339()),
@@ -612,13 +651,14 @@ impl FlowExecutorAsync {
     }
 
     /// Ewaluuje warunki na krawedziach wychodzacych z wezla condition/switch.
-    /// blocked_edges uzywa zakodowanych indeksow (from_idx * n + to_idx) zamiast
-    /// alokacji String przy kazdym wstawieniu.
+    /// blocked_edges uzywa zakodowanych indeksow (from_pos * n + to_pos) zamiast
+    /// alokacji String przy kazdym wstawieniu — iteruje po `outgoing_edges_per_pos`
+    /// zamiast lookup po node_id.
     fn evaluate_condition_edges(
-        node_id: &str,
+        from_pos: usize,
         condition_result: &serde_json::Value,
-        outgoing_edges: &HashMap<&str, Vec<&FlowEdge>>,
-        node_idx_map: &HashMap<&str, usize>,
+        parsed: &ParsedFlow,
+        edges: &[FlowEdge],
         n: usize,
         blocked_edges: &mut HashSet<usize>,
     ) {
@@ -627,34 +667,34 @@ impl FlowExecutorAsync {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if let Some(edges) = outgoing_edges.get(node_id) {
-            let from_idx = node_idx_map.get(node_id).copied().unwrap_or(0);
+        let result_str: String = condition_result
+            .get("result")
+            .map(|v| v.to_string().trim_matches('"').to_string())
+            .unwrap_or_default();
 
-            // Oblicz raz przed petla - unika alokacji String w kazdej iteracji
-            let result_str: String = condition_result
-                .get("result")
-                .map(|v| v.to_string().trim_matches('"').to_string())
-                .unwrap_or_default();
-
-            for edge in edges {
-                let should_follow = match &edge.condition {
-                    Some(cond) => {
-                        let cond_lower = cond.to_lowercase();
-                        if cond_lower == "true" {
-                            result_bool
-                        } else if cond_lower == "false" {
-                            !result_bool
-                        } else {
-                            result_str == *cond
-                        }
+        for &edge_idx in &parsed.outgoing_edges_per_pos[from_pos] {
+            let edge = &edges[edge_idx];
+            let should_follow = match &edge.condition {
+                Some(cond) => {
+                    let cond_lower = cond.to_lowercase();
+                    if cond_lower == "true" {
+                        result_bool
+                    } else if cond_lower == "false" {
+                        !result_bool
+                    } else {
+                        result_str == *cond
                     }
-                    None => true,
-                };
-
-                if !should_follow {
-                    let to_idx = node_idx_map.get(edge.to.as_str()).copied().unwrap_or(0);
-                    blocked_edges.insert(from_idx * n + to_idx);
                 }
+                None => true,
+            };
+
+            if !should_follow {
+                let to_pos = parsed
+                    .node_pos_by_id
+                    .get(edge.to.as_str())
+                    .copied()
+                    .unwrap_or(0);
+                blocked_edges.insert(from_pos * n + to_pos);
             }
         }
     }
@@ -1018,7 +1058,8 @@ mod tests {
             "Cześć, jak sie masz?".to_string(),
         );
 
-        let result = executor.execute(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let result = executor.execute(&flow, &parsed, &mut ctx).await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
@@ -1063,7 +1104,8 @@ mod tests {
             "Testowy input".to_string(),
         );
 
-        let result = executor.execute(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let result = executor.execute(&flow, &parsed, &mut ctx).await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
@@ -1119,7 +1161,8 @@ mod tests {
             "Uzyj rag do odpowiedzi".to_string(),
         );
 
-        let result = executor.execute(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let result = executor.execute(&flow, &parsed, &mut ctx).await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
@@ -1184,7 +1227,8 @@ mod tests {
             "Zwykly chat bez specjalnych slow".to_string(),
         );
 
-        let result = executor.execute(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let result = executor.execute(&flow, &parsed, &mut ctx).await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
@@ -1238,7 +1282,8 @@ mod tests {
             serde_json::Value::String("pl".to_string()),
         );
 
-        let result = executor.execute(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let result = executor.execute(&flow, &parsed, &mut ctx).await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
@@ -1288,7 +1333,8 @@ mod tests {
             "test".to_string(),
         );
 
-        let result = executor.execute(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let result = executor.execute(&flow, &parsed, &mut ctx).await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
@@ -1351,7 +1397,8 @@ mod tests {
             "Pytanie".to_string(),
         );
 
-        let result = executor.execute(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let result = executor.execute(&flow, &parsed, &mut ctx).await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
@@ -1578,8 +1625,9 @@ mod tests {
             "Hej".to_string(),
         );
 
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
         let stream = executor
-            .execute_streaming_flow(&flow, &mut ctx)
+            .execute_streaming_flow(&flow, &parsed, &mut ctx)
             .await
             .expect("streaming flow should start");
 
@@ -1620,7 +1668,8 @@ mod tests {
         let flow = create_test_flow(flow_json);
         let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
 
-        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let res = executor.execute_streaming_flow(&flow, &parsed, &mut ctx).await;
         let msg = match res {
             Err(e) => e.to_string(),
             Ok(_) => panic!("flow bez stream edge powinien dac blad"),
@@ -1658,7 +1707,8 @@ mod tests {
         let flow = create_test_flow(flow_json);
         let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
 
-        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let res = executor.execute_streaming_flow(&flow, &parsed, &mut ctx).await;
         let msg = match res {
             Err(e) => e.to_string(),
             Ok(_) => panic!("powinno zwrocic blad"),
@@ -1694,7 +1744,8 @@ mod tests {
         let flow = create_test_flow(flow_json);
         let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
 
-        let res = executor.execute_streaming_flow(&flow, &mut ctx).await;
+        let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
+        let res = executor.execute_streaming_flow(&flow, &parsed, &mut ctx).await;
         let msg = match res {
             Err(e) => e.to_string(),
             Ok(_) => panic!("powinno zwrocic blad"),
