@@ -344,11 +344,26 @@ function renderSkeleton() {
 
 function renderError(err) {
   const msg = err?.message || String(err || 'Unknown error');
+  // Specific case: NotFound dla summary.bin -> session crashed/in-progress.
+  // Mowimy user'owi dokladnie co sie stalo, nie surowy error code.
+  const isMissingSummary = /NotFound.*summary\.bin/i.test(msg);
+  const friendlyHeader = isMissingSummary
+    ? 'Session report unavailable'
+    : 'Failed to load report';
+  const friendlyBody = isMissingSummary
+    ? `<p>Ta sesja nie ma zapisanego raportu na dysku. Mozliwe przyczyny:</p>
+       <ul style="margin:8px 0 8px 22px; line-height:1.6;">
+         <li>Sesja jest <strong>w trakcie zbierania</strong> (raport powstaje dopiero po Stop)</li>
+         <li>Proces tentaflow zostal <strong>zabity przed zakonczeniem</strong> (kill / OOM / restart)</li>
+         <li>Stop wywalil sie z bledem (sprawdz logi tentaflow)</li>
+       </ul>
+       <p style="font-size:12px; color:var(--tf-text-3, #6a7196);">Po pull i restart tentaflow ta sesja zostanie automatycznie schowana z listy (storage_v2 list_sessions filtruje po summary.bin).</p>`
+    : `<pre class="mono" style="white-space:pre-wrap; word-break:break-word;">${escape(msg)}</pre>`;
   return `
     <div class="profile-report-v2 pr2-error">
       <div class="pr2-error-card">
-        <h2>Failed to load report</h2>
-        <pre class="mono">${escape(msg)}</pre>
+        <h2>${escape(friendlyHeader)}</h2>
+        ${friendlyBody}
         <tf-button variant="ghost" size="sm" data-action="back-mesh">Back to Mesh</tf-button>
       </div>
     </div>

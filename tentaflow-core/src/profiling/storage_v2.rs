@@ -283,6 +283,15 @@ impl ProfileStorageV2 {
             if !mp.exists() {
                 continue;
             }
+            // Skip sessions bez summary.bin - to oznacza ze stop() nie ukonczyl
+            // zapisu (proces tentaflow zabity, panic, OOM itp.). Pokazywanie ich
+            // w liscie powoduje "Failed to load report: NotFound" gdy user kliknie.
+            // Active session jest pokazywana w banner'ze (osobny code path),
+            // nie przez list_sessions.
+            let sp = entry.path().join("summary.bin");
+            if !sp.exists() {
+                continue;
+            }
             match self.read_manifest(node_id, &name).await {
                 Ok(m) => out.push(SessionEntry {
                     session_id: m.session_id.clone(),
