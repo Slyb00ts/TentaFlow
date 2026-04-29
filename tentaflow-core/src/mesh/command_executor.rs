@@ -20,7 +20,7 @@ use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
 /// Resources required by cross-node service action handlers (krok N3b).
 /// Wired up after `MeshCommandExecutor::new` once the rest of `AppState` is
 /// constructed; absent in tests / when the supervisor never started, in
-/// which case ServiceStopRemote / ServiceDeleteRemote / ... return an error.
+/// which case ServiceDeleteRemote / ServicePinRemote / ... return an error.
 #[derive(Clone)]
 pub struct ServiceActionContext {
     pub db: DbPool,
@@ -64,7 +64,7 @@ pub struct MeshCommandExecutor {
     local_node_id: String,
     data_dir: PathBuf,
     /// Service-action context wired in after AppState initialisation. `None`
-    /// disables ServiceStopRemote / ServiceDeleteRemote / ... handlers.
+    /// disables ServiceDeleteRemote / ServicePinRemote / ... handlers.
     service_actions: AsyncRwLock<Option<ServiceActionContext>>,
 }
 
@@ -338,9 +338,6 @@ impl MeshCommandExecutor {
                 self.handle_profiling_active_info(req).await
             }
 
-            MeshCommandType::ServiceStopRemote { service_id } => {
-                self.handle_service_stop_remote(service_id).await
-            }
             MeshCommandType::ServiceStartRemote { service_id } => {
                 self.handle_service_start_remote(service_id).await
             }
@@ -352,13 +349,6 @@ impl MeshCommandExecutor {
             }
             MeshCommandType::ServicePauseRemote { service_id, paused } => {
                 self.handle_service_pause_remote(service_id, paused).await
-            }
-            MeshCommandType::ServiceRenameRemote {
-                service_id,
-                display_name,
-            } => {
-                self.handle_service_rename_remote(service_id, &display_name)
-                    .await
             }
             MeshCommandType::ServiceDeployRemote {
                 engine_id,
@@ -372,46 +362,6 @@ impl MeshCommandExecutor {
     }
 
     // ----- Cross-node service action handlers (krok N3b) -----
-
-    async fn handle_service_stop_remote(&self, service_id: i64) -> CommandResponse {
-        let actions = match self.service_action_ctx().await {
-            Some(c) => c,
-            None => return CommandResponse::fail("service action context not configured"),
-        };
-        let svc = {
-            let conn = match actions.db.lock() {
-                Ok(c) => c,
-                Err(_) => return CommandResponse::fail("db pool poisoned"),
-            };
-            match crate::services_repo::services::get(&conn, service_id) {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    return CommandResponse::fail(format!("service id={} not found", service_id))
-                }
-                Err(e) => return CommandResponse::fail(e.to_string()),
-            }
-        };
-        if let Err(e) = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await {
-            return CommandResponse::fail(e.to_string());
-        }
-        // Scoped lock: the MutexGuard must be dropped before any subsequent
-        // `.await`, otherwise the spawned future is `!Send`.
-        {
-            let conn = match actions.db.lock() {
-                Ok(c) => c,
-                Err(_) => return CommandResponse::fail("db pool poisoned"),
-            };
-            if let Err(e) = crate::services_repo::services::update_status(
-                &conn,
-                service_id,
-                crate::services_repo::services::ServiceStatus::Stopped,
-            ) {
-                return CommandResponse::fail(e.to_string());
-            }
-        }
-        push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
-        CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
-    }
 
     async fn handle_service_delete_remote(&self, service_id: i64) -> CommandResponse {
         let actions = match self.service_action_ctx().await {
@@ -637,34 +587,6 @@ impl MeshCommandExecutor {
 
         push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
         result
-    }
-
-    async fn handle_service_rename_remote(
-        &self,
-        service_id: i64,
-        display_name: &str,
-    ) -> CommandResponse {
-        let trimmed = display_name.trim();
-        if trimmed.is_empty() {
-            return CommandResponse::fail("display_name cannot be empty");
-        }
-        let actions = match self.service_action_ctx().await {
-            Some(c) => c,
-            None => return CommandResponse::fail("service action context not configured"),
-        };
-        {
-            let conn = match actions.db.lock() {
-                Ok(c) => c,
-                Err(_) => return CommandResponse::fail("db pool poisoned"),
-            };
-            if let Err(e) =
-                crate::services_repo::services::update_display_name(&conn, service_id, trimmed)
-            {
-                return CommandResponse::fail(e.to_string());
-            }
-        }
-        push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
-        CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
     }
 
     async fn handle_service_deploy_remote(

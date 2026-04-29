@@ -162,7 +162,7 @@ impl DashboardServer {
         // command executor is created by `start_mesh_pipeline` long before
         // AppState (db_pool + port_allocator + iroh) is fully assembled, so
         // we inject the action context here once everything exists. Without
-        // this the receiver of `ServiceStopRemote` / `ServiceDeleteRemote` /
+        // this the receiver of `ServiceDeleteRemote` / `ServicePinRemote` /
         // ... returns "service action context not configured".
         if let (Some(qm), Some(pa)) = (quic_mesh.clone(), port_allocator.clone()) {
             if let Some(executor) = qm.command_executor().await {
