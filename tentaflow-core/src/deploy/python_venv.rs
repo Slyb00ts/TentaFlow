@@ -1332,13 +1332,18 @@ fn copy_bundle_files(bundle_src: &Path, venv: &Path) -> Result<()> {
     Ok(())
 }
 
-fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Result<Child> {
-    let exe = venv_bin(venv, &spec.launch.command);
-    let bundle_dir = venv.join("app");
-
-    let mut cmd = Command::new(&exe);
+/// Wyodrebniona logika budowania listy args dla spawn_engine. Pozwala
+/// jednostkowo testowac VLLM_ARGS/SGLANG_ARGS passthrough bez spawn'owania
+/// realnego procesu.
+pub(crate) fn build_engine_args(
+    spec: &BundleSpec,
+    env: &HashMap<String, String>,
+    bundle_dir: &Path,
+    venv: &Path,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::with_capacity(spec.launch.args.len() + 8);
     for arg in &spec.launch.args {
-        cmd.arg(substitute_vars_full(arg, &req.env, &bundle_dir, venv));
+        args.push(substitute_vars_full(arg, env, bundle_dir, venv));
     }
     // VLLM_ARGS / SGLANG_ARGS / itd. z deploy wizard (Advanced section) -
     // appendowane PO arguments z bundle.toml. shlex split honoruje cudzyslowy
@@ -1348,7 +1353,7 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     // entrypoint.sh przez shell).
     let extra_args_env_keys = ["VLLM_ARGS", "SGLANG_ARGS", "TRTLLM_ARGS", "EXTRA_ARGS"];
     for key in extra_args_env_keys {
-        if let Some(extra) = req.env.get(key) {
+        if let Some(extra) = env.get(key) {
             let trimmed = extra.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1356,17 +1361,28 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
             match shlex::split(trimmed) {
                 Some(parts) => {
                     for part in parts {
-                        cmd.arg(substitute_vars_full(&part, &req.env, &bundle_dir, venv));
+                        args.push(substitute_vars_full(&part, env, bundle_dir, venv));
                     }
                 }
                 None => {
                     // Quotes mismatch - fallback do prostego whitespace split.
                     for part in trimmed.split_whitespace() {
-                        cmd.arg(substitute_vars_full(part, &req.env, &bundle_dir, venv));
+                        args.push(substitute_vars_full(part, env, bundle_dir, venv));
                     }
                 }
             }
         }
+    }
+    args
+}
+
+fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Result<Child> {
+    let exe = venv_bin(venv, &spec.launch.command);
+    let bundle_dir = venv.join("app");
+
+    let mut cmd = Command::new(&exe);
+    for arg in build_engine_args(spec, &req.env, &bundle_dir, venv) {
+        cmd.arg(arg);
     }
     for (k, v) in &req.env {
         cmd.env(k, v);
@@ -1528,6 +1544,113 @@ mod tests {
         let env = HashMap::new();
         let s = substitute_vars("--app-dir ${BUNDLE_DIR}", &env, Path::new("/tmp/b"));
         assert_eq!(s, "--app-dir /tmp/b");
+    }
+
+    fn vllm_bundle_spec() -> BundleSpec {
+        BundleSpec {
+            bundle: BundleMeta {
+                engine: "vllm".to_string(),
+                description: String::new(),
+                python_version: "3.12".to_string(),
+                source: "pypi".to_string(),
+                pypi_package: Some("vllm==0.20.0".to_string()),
+                git_repo: None,
+                git_ref: None,
+                install_subdir: None,
+                install_mode: None,
+                vllm_version: None,
+                vllm_metal_repo: None,
+            },
+            launch: LaunchSpec {
+                command: "python".to_string(),
+                args: vec![
+                    "-m".to_string(),
+                    "vllm.entrypoints.openai.api_server".to_string(),
+                    "--host".to_string(), "127.0.0.1".to_string(),
+                    "--port".to_string(), "${PORT:-8000}".to_string(),
+                    "--model".to_string(), "${MODEL}".to_string(),
+                ],
+                internal_port: 8000,
+                env: HashMap::new(),
+            },
+            requires: Requires::default(),
+            install_variants: vec![],
+        }
+    }
+
+    #[test]
+    fn build_engine_args_includes_vllm_args_from_env() {
+        let spec = vllm_bundle_spec();
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "Qwen/Qwen2.5-0.5B-Instruct".into());
+        env.insert("PORT".to_string(), "9001".into());
+        env.insert(
+            "VLLM_ARGS".to_string(),
+            "--tensor-parallel-size 4 --max-model-len 16384 --kv-cache-dtype fp8".into(),
+        );
+
+        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+
+        // Bundle defaults
+        assert!(args.iter().any(|a| a == "vllm.entrypoints.openai.api_server"));
+        assert!(args.contains(&"Qwen/Qwen2.5-0.5B-Instruct".to_string()));
+        assert!(args.contains(&"9001".to_string()));
+
+        // VLLM_ARGS appendowane PO bundle args
+        assert!(args.contains(&"--tensor-parallel-size".to_string()));
+        assert!(args.contains(&"4".to_string()));
+        assert!(args.contains(&"--max-model-len".to_string()));
+        assert!(args.contains(&"16384".to_string()));
+        assert!(args.contains(&"--kv-cache-dtype".to_string()));
+        assert!(args.contains(&"fp8".to_string()));
+    }
+
+    #[test]
+    fn build_engine_args_handles_quoted_vllm_args() {
+        let spec = vllm_bundle_spec();
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "test".into());
+        // Symuluje cudzyslowy w vllm_args (np. JSON config)
+        env.insert(
+            "VLLM_ARGS".to_string(),
+            r#"--tensor-parallel-size 2 --override-generation-config '{"max_tokens": 100}'"#.into(),
+        );
+        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        assert!(args.contains(&"--tensor-parallel-size".to_string()));
+        assert!(args.contains(&"2".to_string()));
+        assert!(args.contains(&"--override-generation-config".to_string()));
+        // shlex powinien zachowac JSON jako jeden token (bez surrounding ')
+        assert!(args.iter().any(|a| a == r#"{"max_tokens": 100}"#),
+            "args: {:?}", args);
+    }
+
+    #[test]
+    fn build_engine_args_skip_empty_vllm_args() {
+        let spec = vllm_bundle_spec();
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "test".into());
+        env.insert("VLLM_ARGS".to_string(), "   ".into()); // whitespace only
+        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        // Powinno byc tylko bundle defaults, BEZ trailing junk
+        let last = args.last().unwrap();
+        assert_ne!(last, " ");
+        assert_eq!(args.len(), spec.launch.args.len());
+    }
+
+    #[test]
+    fn build_engine_args_supports_sglang_args_too() {
+        let mut spec = vllm_bundle_spec();
+        spec.bundle.engine = "sglang".to_string();
+        let mut env = HashMap::new();
+        env.insert("MODEL".to_string(), "test".into());
+        env.insert(
+            "SGLANG_ARGS".to_string(),
+            "--mem-fraction-static 0.85 --tp 2".into(),
+        );
+        let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
+        assert!(args.contains(&"--mem-fraction-static".to_string()));
+        assert!(args.contains(&"0.85".to_string()));
+        assert!(args.contains(&"--tp".to_string()));
     }
 
     #[test]

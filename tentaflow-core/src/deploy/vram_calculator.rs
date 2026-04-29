@@ -43,9 +43,13 @@ impl ModelSpec {
     /// Liczba bajtow per parametr na podstawie dtype/quantization.
     pub fn bytes_per_param(&self) -> f64 {
         if let Some(q) = &self.quantization {
-            return match q.as_str() {
-                "int4" | "awq" | "gptq" | "int4_autoround" | "auto_round" => 0.5,
-                "int8" | "fp8" => 1.0,
+            // Normalizuj - HF uzywa "auto-round" / "auto_round" / "AutoRound"
+            // dla AutoRound INT4 quantization. Plus AWQ/GPTQ/bnb-int4 = 0.5B.
+            let q_norm = q.to_lowercase().replace('-', "_");
+            return match q_norm.as_str() {
+                "int4" | "awq" | "gptq" | "int4_autoround" | "auto_round"
+                | "bnb_4bit" | "bitsandbytes_4bit" => 0.5,
+                "int8" | "fp8" | "bnb_8bit" | "bitsandbytes_8bit" => 1.0,
                 _ => self.bytes_per_dtype(),
             };
         }
