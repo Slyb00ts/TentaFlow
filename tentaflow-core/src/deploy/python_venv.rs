@@ -1545,6 +1545,46 @@ fn build_engine_command(exe: &Path) -> Command {
     Command::new(exe)
 }
 
+/// Szuka instalacji CUDA toolkit na hoscie. Zwraca katalog, w ktorym
+/// `bin/nvcc` istnieje. Sprawdza w kolejnosci: `which nvcc` (PATH), potem
+/// znane lokacje systemowe. Wynik nie jest cache'owany — koszt to kilka
+/// stat() przy spawn engine'a.
+fn find_nvcc_root() -> Option<PathBuf> {
+    let nvcc_name = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+
+    if let Ok(output) = std::process::Command::new("which").arg(nvcc_name).output() {
+        if output.status.success() {
+            if let Ok(path) = std::str::from_utf8(&output.stdout) {
+                let nvcc_path = PathBuf::from(path.trim());
+                if nvcc_path.exists() {
+                    if let Some(bin_dir) = nvcc_path.parent() {
+                        if let Some(root) = bin_dir.parent() {
+                            return Some(root.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let candidates = [
+        "/usr/local/cuda",
+        "/opt/cuda",
+        "/usr/lib/cuda",
+        "/usr/local/cuda-13.0",
+        "/usr/local/cuda-12.8",
+        "/usr/local/cuda-12.4",
+        "/usr/local/cuda-12.1",
+    ];
+    for cand in &candidates {
+        let root = PathBuf::from(cand);
+        if root.join("bin").join(nvcc_name).exists() {
+            return Some(root);
+        }
+    }
+    None
+}
+
 fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Result<Child> {
     let exe = venv_bin(venv, &spec.launch.command);
     let bundle_dir = venv.join("app");
@@ -1596,6 +1636,39 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         if !req.env.contains_key(k) {
             cmd.env(k, &v);
         }
+    }
+
+    // CUDA_HOME / CUDA_PATH: flashinfer JIT odpala nvcc po sciezce
+    // <CUDA_HOME>/bin/nvcc. Gdy env wskazuje na nieistniejacy katalog
+    // (np. runai container `/workspace/cuda-13.0` na bare-metalu) lub gdy
+    // env nie jest ustawione a system ma nvcc tylko w PATH, JIT crashuje
+    // 5 minut po starcie z `nvcc: not found`. Wymuszamy realna sciezke
+    // wyszukana w runtime.
+    let env_cuda = req
+        .env
+        .get("CUDA_HOME")
+        .or_else(|| req.env.get("CUDA_PATH"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CUDA_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("CUDA_PATH").map(PathBuf::from));
+    let cuda_home_valid = env_cuda
+        .as_ref()
+        .map(|p| p.join("bin").join("nvcc").exists())
+        .unwrap_or(false);
+    let cuda_home = if cuda_home_valid {
+        env_cuda
+    } else {
+        find_nvcc_root()
+    };
+    if let Some(home) = &cuda_home {
+        cmd.env("CUDA_HOME", home);
+        cmd.env("CUDA_PATH", home);
+    } else {
+        eprintln!(
+            "WARN: nvcc nie znaleziony w PATH ani CUDA_HOME — flashinfer JIT \
+             bedzie crashowal przy pierwszym FP4/FP8 kernelu. Zainstaluj \
+             CUDA toolkit albo ustaw CUDA_HOME na poprawna sciezke."
+        );
     }
 
     // Cap rownoleglosci compile threads tak, zeby torch.compile / inductor /
