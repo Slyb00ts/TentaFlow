@@ -20,14 +20,14 @@
   color: var(--pp-text);
 }
 
-.profile-permissions .pr2-breadcrumb {
+.profile-permissions .pr-breadcrumb {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--pp-text-2);
   margin-bottom: 12px;
 }
-.profile-permissions .pr2-breadcrumb a { color: var(--pp-text-2); text-decoration: none; }
-.profile-permissions .pr2-breadcrumb a:hover { color: var(--pp-text); }
-.profile-permissions .pr2-breadcrumb .sep { color: var(--pp-text-3); }
+.profile-permissions .pr-breadcrumb a { color: var(--pp-text-2); text-decoration: none; }
+.profile-permissions .pr-breadcrumb a:hover { color: var(--pp-text); }
+.profile-permissions .pr-breadcrumb .sep { color: var(--pp-text-3); }
 
 .pp-header {
   display: flex; align-items: flex-start; gap: 14px;
@@ -53,7 +53,9 @@
   letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--pp-text-2);
   margin: 0 0 10px;
+  display: flex; align-items: center; gap: 8px;
 }
+.pp-h3 svg { stroke: var(--pp-text-2); flex: none; }
 
 .pp-alert {
   padding: 10px 12px;
@@ -180,7 +182,26 @@
 
 .pp-actions-row {
   display: flex; justify-content: flex-end; gap: 8px;
-  margin-top: 10px;
+  margin-top: 14px;
+}
+
+/* Storage-limit pole input — krotkie pole liczbowe / tekstowe po prawej stronie
+   wiersza settings, rownolegle do tf-toggle. Mockup uzywa szerokosci ~120px. */
+.pp-field-input {
+  background: var(--pp-bg-input);
+  border: 1px solid var(--pp-border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--pp-text);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  width: 120px;
+  text-align: right;
+}
+.pp-field-input:focus {
+  outline: none;
+  border-color: var(--accent-1, #6366f1);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.18);
 }
 
 /* Install hint per-distro - pokazuje sie pod row gdy collector ma N/A status. */

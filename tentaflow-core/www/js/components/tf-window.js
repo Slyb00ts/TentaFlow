@@ -36,7 +36,7 @@ let _zCounter = 1000;
 class TfWindow extends HTMLElement {
   static get observedAttributes() {
     return [
-      'title', 'icon', 'buttons', 'draggable', 'resizable', 'transparent',
+      'title', 'subtitle', 'icon', 'buttons', 'draggable', 'resizable', 'transparent',
       'min-width', 'min-height', 'initial-x', 'initial-y', 'width', 'height',
     ];
   }
@@ -132,10 +132,19 @@ class TfWindow extends HTMLElement {
     iconSvg.classList.add('tf-window-icon');
     const useEl = document.createElementNS('http://www.w3.org/2000/svg', 'use');
     iconSvg.appendChild(useEl);
+    // Tytuł umieszczamy w wewnętrznym wrapperze, żeby móc dołożyć drugą
+    // linię (subtitle) bez naruszania flex layoutu nagłówka.
+    const titleStack = document.createElement('div');
+    titleStack.className = 'tf-window-title-stack';
     const titleText = document.createElement('span');
     titleText.className = 'tf-window-title-text';
+    const subtitleText = document.createElement('span');
+    subtitleText.className = 'tf-window-subtitle-text';
+    subtitleText.style.display = 'none';
+    titleStack.appendChild(titleText);
+    titleStack.appendChild(subtitleText);
     titleEl.appendChild(iconSvg);
-    titleEl.appendChild(titleText);
+    titleEl.appendChild(titleStack);
 
     const actionsEl = document.createElement('div');
     actionsEl.className = 'tf-window-actions';
@@ -184,6 +193,7 @@ class TfWindow extends HTMLElement {
     this._win = win;
     this._header = header;
     this._titleEl = titleText;
+    this._subtitleEl = subtitleText;
     this._iconEl = useEl;
     this._iconSvg = iconSvg;
     this._controlsEl = controls;
@@ -209,6 +219,12 @@ class TfWindow extends HTMLElement {
       this._suppressTitleObserve = true;
       this.removeAttribute('title');
       this._suppressTitleObserve = false;
+    }
+
+    const subtitle = this.getAttribute('subtitle') || '';
+    if (this._subtitleEl) {
+      this._subtitleEl.textContent = subtitle;
+      this._subtitleEl.style.display = subtitle ? '' : 'none';
     }
 
     const icon = this.getAttribute('icon');
@@ -528,6 +544,7 @@ customElements.define('tf-window', TfWindow);
 TfWindow.open = function openWindow(opts = {}) {
   const {
     title = '',
+    subtitle = '',
     icon = null,
     body = '',
     footer = '',
@@ -555,6 +572,7 @@ TfWindow.open = function openWindow(opts = {}) {
 
     const win = document.createElement('tf-window');
     win.setAttribute('title', title);
+    if (subtitle) win.setAttribute('subtitle', subtitle);
     if (icon) win.setAttribute('icon', icon);
     win.setAttribute('buttons', buttons);
     if (draggable) win.setAttribute('draggable', '');

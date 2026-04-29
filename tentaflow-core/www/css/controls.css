@@ -160,6 +160,17 @@ tf-window [slot="footer"] {
   color: var(--tf-text);
 }
 
+.tf-btn.tf-btn-outline {
+  background: transparent;
+  color: var(--tf-text-2);
+  border-color: var(--tf-border);
+}
+.tf-btn.tf-btn-outline:hover {
+  background: var(--tf-bg-3);
+  color: var(--tf-text);
+  border-color: var(--tf-border-hover);
+}
+
 .tf-btn.tf-btn-danger {
   background: transparent;
   color: var(--tf-danger);
@@ -170,6 +181,17 @@ tf-window [slot="footer"] {
   border-color: var(--tf-danger);
   transform: translateY(-1px);
   box-shadow: 0 0 20px rgba(239, 68, 68, 0.3);
+}
+/* danger-outline: spojny z mockupem profiling-multi-source sekcja 02 — border
+   czerwony 0.4 alpha, transparent tlo, hover wypelnia ledwo widocznym czerwonym. */
+.tf-btn.tf-btn-danger-outline {
+  background: transparent;
+  color: var(--tf-danger);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.tf-btn.tf-btn-danger-outline:hover {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: var(--tf-danger);
 }
 .tf-btn.tf-btn-danger-solid {
   background: var(--tf-gradient-danger);
@@ -1272,7 +1294,8 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   text-overflow: ellipsis;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  min-width: 0;
 }
 .tf-window-title .tf-window-icon {
   width: 16px;
@@ -1283,6 +1306,31 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   stroke-linecap: round;
   stroke-linejoin: round;
   fill: none;
+  flex-shrink: 0;
+}
+/* Stack tytułu + opcjonalnego podtytułu w nagłówku okna. */
+.tf-window-title .tf-window-title-stack {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+.tf-window-title .tf-window-title-text {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--tf-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tf-window-title .tf-window-subtitle-text {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--tf-text-3);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tf-window-actions {

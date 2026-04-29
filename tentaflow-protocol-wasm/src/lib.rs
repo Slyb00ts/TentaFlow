@@ -4260,8 +4260,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 }
             }
         }
-        MessageBody::NsightBody(payload) => {
-            nsight_payload_to_js(&obj, payload);
+        MessageBody::ProfilingBody(payload) => {
+            profiling_payload_fill_obj(&obj, &payload);
         }
     }
     Ok(obj.into())
@@ -5937,346 +5937,8 @@ pub fn encode_network_config_update_request(
 }
 
 // =============================================================================
-// Nsight (NVIDIA Nsight Systems profiling) — encode/decode dla 5 par r/r.
-// Wszystkie pakowane w jeden wariant `MessageBody::NsightBody(NsightPayload)`,
-// zeby zaoszczedzic sloty w MessageBody (limit 256 wariantow rkyv).
-// =============================================================================
-
-/// Mapuje `NsightScope` z JsValue. Akceptuje:
-///   - string: "cpu" | "gpu_all" | "both_all"
-///   - object: { kind: "gpu_index" | "both_index", idx: u8 }
-fn nsight_scope_from_js(value: &JsValue) -> Result<tentaflow_protocol::NsightScope, JsError> {
-    use tentaflow_protocol::NsightScope;
-
-    if let Some(s) = value.as_string() {
-        return match s.as_str() {
-            "cpu" | "Cpu" => Ok(NsightScope::Cpu),
-            "gpu_all" | "GpuAll" => Ok(NsightScope::GpuAll),
-            "both_all" | "BothAll" => Ok(NsightScope::BothAll),
-            other => Err(JsError::new(&format!(
-                "nsight scope: nieznany string variant '{other}' (oczekiwany cpu|gpu_all|both_all albo obiekt z kind+idx)"
-            ))),
-        };
-    }
-
-    if value.is_object() {
-        let obj: &js_sys::Object = value.unchecked_ref();
-        let kind_js = js_sys::Reflect::get(obj, &"kind".into())
-            .map_err(|_| JsError::new("nsight scope: brak pola 'kind'"))?;
-        let kind = kind_js.as_string()
-            .ok_or_else(|| JsError::new("nsight scope: pole 'kind' musi byc stringiem"))?;
-        let idx_js = js_sys::Reflect::get(obj, &"idx".into())
-            .map_err(|_| JsError::new("nsight scope: brak pola 'idx'"))?;
-        let idx = idx_js.as_f64()
-            .ok_or_else(|| JsError::new("nsight scope: pole 'idx' musi byc liczba"))?;
-        if !(0.0..=255.0).contains(&idx) || idx.fract() != 0.0 {
-            return Err(JsError::new("nsight scope: 'idx' poza zakresem u8"));
-        }
-        let idx = idx as u8;
-        return match kind.as_str() {
-            "gpu_index" | "GpuIndex" => Ok(NsightScope::GpuIndex(idx)),
-            "both_index" | "BothIndex" => Ok(NsightScope::BothIndex(idx)),
-            other => Err(JsError::new(&format!(
-                "nsight scope: nieznany kind '{other}' (oczekiwany gpu_index|both_index)"
-            ))),
-        };
-    }
-
-    Err(JsError::new("nsight scope: oczekiwany string lub obiekt {kind, idx}"))
-}
-
-/// Mapuje `NsightScope` na JsValue w tagged formie:
-///   - unit: string "Cpu" | "GpuAll" | "BothAll"
-///   - tuple: { kind: "gpu_index", idx: u8 }
-fn nsight_scope_to_js(scope: &tentaflow_protocol::NsightScope) -> JsValue {
-    use tentaflow_protocol::NsightScope;
-    match scope {
-        NsightScope::Cpu => "Cpu".into(),
-        NsightScope::GpuAll => "GpuAll".into(),
-        NsightScope::BothAll => "BothAll".into(),
-        NsightScope::GpuIndex(idx) => {
-            let o = js_sys::Object::new();
-            set(&o, "kind", "gpu_index".into());
-            set(&o, "idx", (*idx as f64).into());
-            o.into()
-        }
-        NsightScope::BothIndex(idx) => {
-            let o = js_sys::Object::new();
-            set(&o, "kind", "both_index".into());
-            set(&o, "idx", (*idx as f64).into());
-            o.into()
-        }
-    }
-}
-
-/// Mapuje `NsightSessionStatus` na string (latwiejsze do switch w JS).
-fn nsight_status_to_js(status: &tentaflow_protocol::NsightSessionStatus) -> JsValue {
-    use tentaflow_protocol::NsightSessionStatus;
-    match status {
-        NsightSessionStatus::Running => "Running".into(),
-        NsightSessionStatus::Stopping => "Stopping".into(),
-        NsightSessionStatus::Done => "Done".into(),
-        NsightSessionStatus::Failed => "Failed".into(),
-    }
-}
-
-fn nsight_session_entry_to_js(entry: &tentaflow_protocol::NsightSessionEntry) -> js_sys::Object {
-    let o = js_sys::Object::new();
-    set(&o, "sessionId", entry.session_id.clone().into());
-    set(&o, "label", entry.label.clone().into());
-    set(&o, "scope", nsight_scope_to_js(&entry.scope));
-    set(&o, "status", nsight_status_to_js(&entry.status));
-    set(&o, "startedAtMs", (entry.started_at_ms as f64).into());
-    set(&o, "durationMs", (entry.duration_ms as f64).into());
-    set(&o, "sizeBytes", (entry.size_bytes as f64).into());
-    match &entry.error {
-        Some(e) => set(&o, "error", e.clone().into()),
-        None => set(&o, "error", JsValue::NULL),
-    }
-    o
-}
-
-fn nsight_top_row_to_js(row: &tentaflow_protocol::ProfileTopRow) -> js_sys::Object {
-    let o = js_sys::Object::new();
-    set(&o, "name", row.name.clone().into());
-    set(&o, "totalMs", row.total_ms.into());
-    set(&o, "calls", (row.calls as f64).into());
-    set(&o, "avgMs", row.avg_ms.into());
-    set(&o, "pct", (row.pct as f64).into());
-    o
-}
-
-fn nsight_gpu_target_to_js(t: &tentaflow_protocol::NsightGpuTarget) -> js_sys::Object {
-    let o = js_sys::Object::new();
-    set(&o, "idx", (t.idx as f64).into());
-    set(&o, "name", t.name.clone().into());
-    o
-}
-
-fn nsight_gpu_sample_to_js(s: &tentaflow_protocol::GpuUtilSample) -> js_sys::Object {
-    let o = js_sys::Object::new();
-    set(&o, "tMs", (s.t_ms as f64).into());
-    set(&o, "smPct", (s.sm_pct as f64).into());
-    set(&o, "memPct", (s.mem_pct as f64).into());
-    set(&o, "vramUsedMb", (s.vram_used_mb as f64).into());
-    set(&o, "powerW", (s.power_w as f64).into());
-    o
-}
-
-fn nsight_gpu_series_to_js(s: &tentaflow_protocol::GpuUtilSeries) -> js_sys::Object {
-    let o = js_sys::Object::new();
-    set(&o, "gpuIdx", (s.gpu_idx as f64).into());
-    set(&o, "powerLimitW", (s.power_limit_w as f64).into());
-    let arr = js_sys::Array::new();
-    for sample in &s.samples {
-        arr.push(&nsight_gpu_sample_to_js(sample).into());
-    }
-    set(&o, "samples", arr.into());
-    o
-}
-
-fn profile_report_to_js(r: &tentaflow_protocol::ProfileReport) -> js_sys::Object {
-    let o = js_sys::Object::new();
-
-    let meta = js_sys::Object::new();
-    set(&meta, "sessionId", r.meta.session_id.clone().into());
-    set(&meta, "label", r.meta.label.clone().into());
-    set(&meta, "scope", nsight_scope_to_js(&r.meta.scope));
-    set(&meta, "hostname", r.meta.hostname.clone().into());
-    set(&meta, "startedAtMs", (r.meta.started_at_ms as f64).into());
-    set(&meta, "durationMs", (r.meta.duration_ms as f64).into());
-    set(&meta, "nsysVersion", r.meta.nsys_version.clone().into());
-    let targets = js_sys::Array::new();
-    for t in &r.meta.gpu_targets {
-        targets.push(&nsight_gpu_target_to_js(t).into());
-    }
-    set(&meta, "gpuTargets", targets.into());
-    set(&o, "meta", meta.into());
-
-    let kpi = js_sys::Object::new();
-    set(&kpi, "totalGpuActiveMs", r.kpi.total_gpu_active_ms.into());
-    set(&kpi, "totalCpuActiveMs", r.kpi.total_cpu_active_ms.into());
-    set(&kpi, "kernelCount", (r.kpi.kernel_count as f64).into());
-    set(&kpi, "cudaApiCount", (r.kpi.cuda_api_count as f64).into());
-    set(&kpi, "peakVramMb", (r.kpi.peak_vram_mb as f64).into());
-    set(&kpi, "samplesCollected", (r.kpi.samples_collected as f64).into());
-    set(&o, "kpi", kpi.into());
-
-    let push_rows = |rows: &[tentaflow_protocol::ProfileTopRow]| -> JsValue {
-        let arr = js_sys::Array::new();
-        for row in rows {
-            arr.push(&nsight_top_row_to_js(row).into());
-        }
-        arr.into()
-    };
-    set(&o, "gpuKernelsTop", push_rows(&r.gpu_kernels_top));
-    set(&o, "cudaApiTop", push_rows(&r.cuda_api_top));
-    set(&o, "gpuMemOps", push_rows(&r.gpu_mem_ops));
-    set(&o, "cpuSamplesTop", push_rows(&r.cpu_samples_top));
-    set(&o, "nvtxRangesTop", push_rows(&r.nvtx_ranges_top));
-
-    let timeline = js_sys::Array::new();
-    for series in &r.gpu_util_timeline {
-        timeline.push(&nsight_gpu_series_to_js(series).into());
-    }
-    set(&o, "gpuUtilTimeline", timeline.into());
-
-    o
-}
-
-/// Wypelnia `obj` polami odpowiadajacymi pojedynczemu wariantowi `NsightPayload`.
-fn nsight_payload_to_js(obj: &js_sys::Object, payload: tentaflow_protocol::NsightPayload) {
-    use tentaflow_protocol::NsightPayload as NP;
-    match payload {
-        NP::StartRequest(r) => {
-            set(obj, "variant", "NsightStartRequest".into());
-            set(obj, "nodeId", r.node_id.into());
-            set(obj, "scope", nsight_scope_to_js(&r.scope));
-            set(obj, "durationSecs", (r.duration_secs as f64).into());
-            set(obj, "label", r.label.into());
-        }
-        NP::StartResponse(r) => {
-            set(obj, "variant", "NsightStartResponse".into());
-            set(obj, "sessionId", r.session_id.into());
-            set(obj, "startedAtMs", (r.started_at_ms as f64).into());
-        }
-        NP::StopRequest(r) => {
-            set(obj, "variant", "NsightStopRequest".into());
-            set(obj, "nodeId", r.node_id.into());
-            set(obj, "sessionId", r.session_id.into());
-        }
-        NP::StopResponse(r) => {
-            set(obj, "variant", "NsightStopResponse".into());
-            set(obj, "sessionId", r.session_id.into());
-            set(obj, "status", nsight_status_to_js(&r.status));
-        }
-        NP::SessionsRequest(r) => {
-            set(obj, "variant", "NsightSessionsRequest".into());
-            set(obj, "nodeId", r.node_id.into());
-        }
-        NP::SessionsResponse(r) => {
-            set(obj, "variant", "NsightSessionsResponse".into());
-            set(obj, "nodeId", r.node_id.into());
-            let arr = js_sys::Array::new();
-            for s in &r.sessions {
-                arr.push(&nsight_session_entry_to_js(s).into());
-            }
-            set(obj, "sessions", arr.into());
-        }
-        NP::ReportRequest(r) => {
-            set(obj, "variant", "NsightReportRequest".into());
-            set(obj, "nodeId", r.node_id.into());
-            set(obj, "sessionId", r.session_id.into());
-        }
-        NP::ReportResponse(r) => {
-            set(obj, "variant", "NsightReportResponse".into());
-            set(obj, "report", profile_report_to_js(&r.report).into());
-        }
-        NP::DeleteRequest(r) => {
-            set(obj, "variant", "NsightDeleteRequest".into());
-            set(obj, "nodeId", r.node_id.into());
-            set(obj, "sessionId", r.session_id.into());
-        }
-        NP::DeleteResponse(r) => {
-            set(obj, "variant", "NsightDeleteResponse".into());
-            set(obj, "sessionId", r.session_id.into());
-            set(obj, "ok", r.ok.into());
-        }
-        NP::DownloadRequest(r) => {
-            set(obj, "variant", "NsightDownloadRequest".into());
-            set(obj, "nodeId", r.node_id.into());
-            set(obj, "sessionId", r.session_id.into());
-        }
-        NP::DownloadResponse(r) => {
-            set(obj, "variant", "NsightDownloadResponse".into());
-            set(obj, "sessionId", r.session_id.into());
-            set(obj, "filename", r.filename.into());
-            set(
-                obj,
-                "bytes",
-                js_sys::Uint8Array::from(r.bytes.as_slice()).into(),
-            );
-        }
-        NP::Profiling(p) => profiling_payload_fill_obj(obj, &p),
-    }
-}
-
-fn encode_nsight(payload: tentaflow_protocol::NsightPayload) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NsightBody(payload)).map_err(|e| JsError::new(&e))
-}
-
-/// MessageBody::NsightBody(NsightPayload::StartRequest(..)).
-#[wasm_bindgen(js_name = encodeNsightStartRequest)]
-pub fn encode_nsight_start_request(
-    node_id: String,
-    scope: JsValue,
-    duration_secs: u32,
-    label: String,
-) -> Result<Vec<u8>, JsError> {
-    let scope = nsight_scope_from_js(&scope)?;
-    encode_nsight(tentaflow_protocol::NsightPayload::StartRequest(
-        tentaflow_protocol::NsightStartRequest {
-            node_id,
-            scope,
-            duration_secs,
-            label,
-        },
-    ))
-}
-
-/// MessageBody::NsightBody(NsightPayload::StopRequest(..)).
-#[wasm_bindgen(js_name = encodeNsightStopRequest)]
-pub fn encode_nsight_stop_request(node_id: String, session_id: String) -> Result<Vec<u8>, JsError> {
-    encode_nsight(tentaflow_protocol::NsightPayload::StopRequest(
-        tentaflow_protocol::NsightStopRequest { node_id, session_id },
-    ))
-}
-
-/// MessageBody::NsightBody(NsightPayload::SessionsRequest(..)).
-#[wasm_bindgen(js_name = encodeNsightSessionsRequest)]
-pub fn encode_nsight_sessions_request(node_id: String) -> Result<Vec<u8>, JsError> {
-    encode_nsight(tentaflow_protocol::NsightPayload::SessionsRequest(
-        tentaflow_protocol::NsightSessionsRequest { node_id },
-    ))
-}
-
-/// MessageBody::NsightBody(NsightPayload::ReportRequest(..)).
-#[wasm_bindgen(js_name = encodeNsightReportRequest)]
-pub fn encode_nsight_report_request(
-    node_id: String,
-    session_id: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_nsight(tentaflow_protocol::NsightPayload::ReportRequest(
-        tentaflow_protocol::NsightReportRequest { node_id, session_id },
-    ))
-}
-
-/// MessageBody::NsightBody(NsightPayload::DeleteRequest(..)).
-#[wasm_bindgen(js_name = encodeNsightDeleteRequest)]
-pub fn encode_nsight_delete_request(
-    node_id: String,
-    session_id: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_nsight(tentaflow_protocol::NsightPayload::DeleteRequest(
-        tentaflow_protocol::NsightDeleteRequest { node_id, session_id },
-    ))
-}
-
-/// MessageBody::NsightBody(NsightPayload::DownloadRequest(..)).
-#[wasm_bindgen(js_name = encodeNsightDownloadRequest)]
-pub fn encode_nsight_download_request(
-    node_id: String,
-    session_id: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_nsight(tentaflow_protocol::NsightPayload::DownloadRequest(
-        tentaflow_protocol::NsightDownloadRequest { node_id, session_id },
-    ))
-}
-
-// =============================================================================
 // Multi-source profiling (V2) — encode/decode dla 7 par r/r.
-// Pakowane w `MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload))`,
-// zeby nie konsumowac kolejnych slotow rkyv w MessageBody.
+// Pakowane w `MessageBody::ProfilingBody(ProfilingPayload)`.
 // =============================================================================
 
 fn gpu_vendor_to_js(v: &tentaflow_protocol::GpuVendor) -> JsValue {
@@ -6897,22 +6559,6 @@ fn profile_report_v2_to_js(r: &tentaflow_protocol::ProfileReportV2) -> JsValue {
     o.into()
 }
 
-fn profile_report_envelope_to_js(env: &tentaflow_protocol::ProfileReportEnvelope) -> JsValue {
-    use tentaflow_protocol::ProfileReportEnvelope as E;
-    let o = js_sys::Object::new();
-    match env {
-        E::V1Legacy(report) => {
-            set(&o, "kind", "v1_legacy".into());
-            set(&o, "report", profile_report_to_js(report).into());
-        }
-        E::V2(report) => {
-            set(&o, "kind", "v2".into());
-            set(&o, "report", profile_report_v2_to_js(report));
-        }
-    }
-    o.into()
-}
-
 fn profiling_skipped_collector_to_js(
     s: &tentaflow_protocol::ProfilingSkippedCollector,
 ) -> JsValue {
@@ -7018,7 +6664,7 @@ fn profiling_payload_fill_obj(obj: &js_sys::Object, payload: &tentaflow_protocol
         }
         P::ReportResponse(r) => {
             set(obj, "variant", "ProfilingReportResponse".into());
-            set(obj, "envelope", profile_report_envelope_to_js(&r.envelope));
+            set(obj, "report", profile_report_v2_to_js(&r.report));
         }
         P::DeleteRequest(r) => {
             set(obj, "variant", "ProfilingDeleteRequest".into());
@@ -7107,13 +6753,10 @@ fn profiling_collector_status_to_js(c: &tentaflow_protocol::ProfilingCollectorSt
 }
 
 fn encode_profiling(p: tentaflow_protocol::ProfilingPayload) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NsightBody(
-        tentaflow_protocol::NsightPayload::Profiling(p),
-    ))
-    .map_err(|e| JsError::new(&e))
+    encode_body_inner(&MessageBody::ProfilingBody(p)).map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::StartRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::StartRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingStartRequest)]
 pub fn encode_profiling_start_request(
     node_id: String,
@@ -7132,7 +6775,7 @@ pub fn encode_profiling_start_request(
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::StopRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::StopRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingStopRequest)]
 pub fn encode_profiling_stop_request(
     node_id: String,
@@ -7143,7 +6786,7 @@ pub fn encode_profiling_stop_request(
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::SessionsRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::SessionsRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingSessionsRequest)]
 pub fn encode_profiling_sessions_request(node_id: String) -> Result<Vec<u8>, JsError> {
     encode_profiling(tentaflow_protocol::ProfilingPayload::SessionsRequest(
@@ -7151,7 +6794,7 @@ pub fn encode_profiling_sessions_request(node_id: String) -> Result<Vec<u8>, JsE
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ReportRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::ReportRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingReportRequest)]
 pub fn encode_profiling_report_request(
     node_id: String,
@@ -7162,7 +6805,7 @@ pub fn encode_profiling_report_request(
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::DeleteRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::DeleteRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingDeleteRequest)]
 pub fn encode_profiling_delete_request(
     node_id: String,
@@ -7173,7 +6816,7 @@ pub fn encode_profiling_delete_request(
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::DownloadRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::DownloadRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingDownloadRequest)]
 pub fn encode_profiling_download_request(
     node_id: String,
@@ -7184,7 +6827,7 @@ pub fn encode_profiling_download_request(
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ActiveInfoRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::ActiveInfoRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingActiveInfoRequest)]
 pub fn encode_profiling_active_info_request(node_id: String) -> Result<Vec<u8>, JsError> {
     encode_profiling(tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(
@@ -7192,7 +6835,7 @@ pub fn encode_profiling_active_info_request(node_id: String) -> Result<Vec<u8>, 
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ValidateSudoRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::ValidateSudoRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingValidateSudoRequest)]
 pub fn encode_profiling_validate_sudo_request(
     node_id: String,
@@ -7203,7 +6846,7 @@ pub fn encode_profiling_validate_sudo_request(
     ))
 }
 
-/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::CollectorsStatusRequest(..))).
+/// MessageBody::ProfilingBody(ProfilingPayload::CollectorsStatusRequest(..)).
 #[wasm_bindgen(js_name = encodeProfilingCollectorsStatusRequest)]
 pub fn encode_profiling_collectors_status_request(node_id: String) -> Result<Vec<u8>, JsError> {
     encode_profiling(
@@ -7213,107 +6856,3 @@ pub fn encode_profiling_collectors_status_request(node_id: String) -> Result<Vec
     )
 }
 
-// =============================================================================
-// Testy nsight encode (host-side, bez wasm_bindgen)
-// =============================================================================
-
-#[cfg(test)]
-mod nsight_tests {
-    use super::*;
-    use tentaflow_protocol::{NsightPayload, NsightScope, NsightStartRequest};
-
-    #[test]
-    fn nsight_start_request_encode_round_trip() {
-        // encode_body_inner pomija wasm_bindgen — testowalne na host.
-        let payload = NsightPayload::StartRequest(NsightStartRequest {
-            node_id: "node-alpha".to_string(),
-            scope: NsightScope::BothIndex(2),
-            duration_secs: 30,
-            label: "vllm-cold".to_string(),
-        });
-        let body = MessageBody::NsightBody(payload.clone());
-        let bytes = encode_body_inner(&body).expect("encode");
-        let decoded = rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
-        match decoded {
-            MessageBody::NsightBody(p) => assert_eq!(p, payload),
-            _ => panic!("oczekiwany NsightBody"),
-        }
-    }
-
-    #[test]
-    fn nsight_all_payload_variants_round_trip() {
-        use tentaflow_protocol::{
-            NsightDeleteRequest, NsightDeleteResponse, NsightReportRequest, NsightReportResponse,
-            NsightSessionsRequest, NsightSessionsResponse, NsightStartResponse, NsightStopRequest,
-            NsightStopResponse, ProfileKpi, ProfileMeta, ProfileReport,
-        };
-        let payloads = vec![
-            NsightPayload::StartRequest(NsightStartRequest {
-                node_id: "n".into(),
-                scope: NsightScope::Cpu,
-                duration_secs: 10,
-                label: "x".into(),
-            }),
-            NsightPayload::StartResponse(NsightStartResponse {
-                session_id: "s1".into(),
-                started_at_ms: 1,
-            }),
-            NsightPayload::StopRequest(NsightStopRequest {
-                node_id: "n".into(),
-                session_id: "s1".into(),
-            }),
-            NsightPayload::StopResponse(NsightStopResponse {
-                session_id: "s1".into(),
-                status: tentaflow_protocol::NsightSessionStatus::Stopping,
-            }),
-            NsightPayload::SessionsRequest(NsightSessionsRequest { node_id: "n".into() }),
-            NsightPayload::SessionsResponse(NsightSessionsResponse {
-                node_id: "n".into(),
-                sessions: vec![],
-            }),
-            NsightPayload::ReportRequest(NsightReportRequest {
-                node_id: "n".into(),
-                session_id: "s1".into(),
-            }),
-            NsightPayload::ReportResponse(NsightReportResponse {
-                report: ProfileReport {
-                    meta: ProfileMeta {
-                        session_id: "s1".into(),
-                        label: "l".into(),
-                        scope: NsightScope::GpuAll,
-                        hostname: "h".into(),
-                        started_at_ms: 0,
-                        duration_ms: 0,
-                        nsys_version: "v".into(),
-                        gpu_targets: vec![],
-                    },
-                    kpi: ProfileKpi::default(),
-                    gpu_kernels_top: vec![],
-                    cuda_api_top: vec![],
-                    gpu_mem_ops: vec![],
-                    cpu_samples_top: vec![],
-                    nvtx_ranges_top: vec![],
-                    gpu_util_timeline: vec![],
-                },
-            }),
-            NsightPayload::DeleteRequest(NsightDeleteRequest {
-                node_id: "n".into(),
-                session_id: "s1".into(),
-            }),
-            NsightPayload::DeleteResponse(NsightDeleteResponse {
-                session_id: "s1".into(),
-                ok: true,
-            }),
-        ];
-        for p in payloads {
-            let body = MessageBody::NsightBody(p.clone());
-            let bytes = encode_body_inner(&body).expect("encode");
-            let decoded =
-                rkyv::from_bytes::<MessageBody, rkyv::rancor::Error>(&bytes).expect("decode");
-            match decoded {
-                MessageBody::NsightBody(decoded_p) => assert_eq!(decoded_p, p),
-                _ => panic!("oczekiwany NsightBody"),
-            }
-        }
-    }
-}
