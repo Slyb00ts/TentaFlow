@@ -33,7 +33,7 @@
     <key>NSLocalNetworkUsageDescription</key>
     <string>TentaFlow requires local network access for mesh networking and peer discovery.</string>
     <key>NSCameraUsageDescription</key>
-    <string>TentaFlow uses the camera to scan QR codes for pairing with other devices in your mesh.</string>
+    <string>TentaFlow uses the camera for QR pairing and local live vision features such as pose overlays.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>TentaFlow may use the microphone for voice interactions with local AI models.</string>
     <key>NSBonjourServices</key>
