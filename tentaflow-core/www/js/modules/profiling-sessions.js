@@ -552,8 +552,11 @@ export class ProfilingSessionsView {
       catch (err) { console.error('onOpenReport callback error', err); }
       return;
     }
-    // Default: route hash
-    location.hash = `#/profiling/report/${encodeURIComponent(sessionId)}`;
+    // Default: SPA Router (no hash routes in TentaFlow). Wymaga ze nodeId
+    // jest dostepne (konstruktor ustawia this.nodeId).
+    if (window.Router && typeof window.Router.navigate === 'function') {
+      window.Router.navigate('profile-report', { nodeId: this.nodeId, sessionId });
+    }
   }
 
   async _downloadSession(sessionId) {
