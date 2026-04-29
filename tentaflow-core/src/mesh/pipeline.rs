@@ -1968,7 +1968,7 @@ fn spawn_heartbeat_sender(
 
                 // Capability nsys propagujemy w kazdym heartbeacie: peerzy
                 // przy reconnect powinni miec aktualny stan. Detekcja jest
-                // cache'owana (~5s) wewnatrz NsysRunner, wiec wolanie z petli
+                // cache'owana (~5s) wewnatrz detect_capability, wiec wolanie z petli
                 // 2 Hz nie odpala kosztownego `which`/`--version` w kazdym ticku.
                 let nsys_cap = crate::profiling::detect_capability().await;
 

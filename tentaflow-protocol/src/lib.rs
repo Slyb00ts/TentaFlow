@@ -37,13 +37,8 @@ pub use vision::{
 };
 pub use profiling::{
     ClockSamples, CollectorRunInfo, CollectorStatus, CounterKind, DriftReport, EventCategory,
-    EventPayload, Frame, GpuTargets, GpuUtilSample, GpuUtilSeries, GpuVendor, NsightDeleteRequest,
-    NsightDeleteResponse, NsightDownloadRequest, NsightDownloadResponse, NsightGpuTarget,
-    NsightPayload, NsightReportRequest, NsightReportResponse, NsightScope, NsightSessionEntry,
-    NsightSessionStatus, NsightSessionsRequest, NsightSessionsResponse, NsightStartRequest,
-    NsightStartResponse, NsightStopRequest, NsightStopResponse, PowerDomain, ProfileKpi,
-    ProfileMeta, ProfileReport, ProfileReportEnvelope, ProfileReportV2, ProfileScope,
-    ProfileSourceFlags, ProfileTarget, ProfileTopRow, ProfilingActiveInfoRequest,
+    EventPayload, Frame, GpuTargets, GpuVendor, PowerDomain, ProfileReportV2, ProfileScope,
+    ProfileSourceFlags, ProfileTarget, ProfilingActiveInfoRequest,
     ProfilingActiveInfoResponse, ProfilingActiveSessionInfo, ProfilingDeleteRequest,
     ProfilingDeleteResponse, ProfilingDownloadRequest, ProfilingDownloadResponse, ProfilingPayload,
     ProfilingReportRequest, ProfilingReportResponse, ProfilingSessionEntry,
