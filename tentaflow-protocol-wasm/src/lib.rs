@@ -6983,7 +6983,54 @@ fn profiling_payload_fill_obj(obj: &js_sys::Object, payload: &tentaflow_protocol
                 None => set(obj, "info", JsValue::NULL),
             }
         }
+        P::ValidateSudoRequest(r) => {
+            set(obj, "variant", "ProfilingValidateSudoRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+        }
+        P::ValidateSudoResponse(r) => {
+            set(obj, "variant", "ProfilingValidateSudoResponse".into());
+            set(obj, "ok", r.ok.into());
+            set(obj, "message", r.message.clone().into());
+            set(obj, "reason", r.reason.clone().into());
+        }
+        P::CollectorsStatusRequest(r) => {
+            set(obj, "variant", "ProfilingCollectorsStatusRequest".into());
+            set(obj, "nodeId", r.node_id.clone().into());
+        }
+        P::CollectorsStatusResponse(r) => {
+            set(obj, "variant", "ProfilingCollectorsStatusResponse".into());
+            let arr = js_sys::Array::new();
+            for c in &r.collectors {
+                arr.push(&profiling_collector_status_to_js(c));
+            }
+            set(obj, "collectors", arr.into());
+            set(obj, "ageSeconds", (r.age_seconds as f64).into());
+        }
     }
+}
+
+fn profiling_collector_status_to_js(c: &tentaflow_protocol::ProfilingCollectorStatus) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "id", c.id.clone().into());
+    set(&o, "name", c.name.clone().into());
+    set(&o, "available", c.available.into());
+    set(
+        &o,
+        "version",
+        c.version.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    set(
+        &o,
+        "path",
+        c.path.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    set(&o, "needsSudo", c.needs_sudo.into());
+    set(
+        &o,
+        "note",
+        c.note.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    o.into()
 }
 
 fn encode_profiling(p: tentaflow_protocol::ProfilingPayload) -> Result<Vec<u8>, JsError> {
@@ -7070,6 +7117,27 @@ pub fn encode_profiling_active_info_request(node_id: String) -> Result<Vec<u8>, 
     encode_profiling(tentaflow_protocol::ProfilingPayload::ActiveInfoRequest(
         tentaflow_protocol::ProfilingActiveInfoRequest { node_id },
     ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ValidateSudoRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingValidateSudoRequest)]
+pub fn encode_profiling_validate_sudo_request(
+    node_id: String,
+    password: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_profiling(tentaflow_protocol::ProfilingPayload::ValidateSudoRequest(
+        tentaflow_protocol::ProfilingValidateSudoRequest { node_id, password },
+    ))
+}
+
+/// MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::CollectorsStatusRequest(..))).
+#[wasm_bindgen(js_name = encodeProfilingCollectorsStatusRequest)]
+pub fn encode_profiling_collectors_status_request(node_id: String) -> Result<Vec<u8>, JsError> {
+    encode_profiling(
+        tentaflow_protocol::ProfilingPayload::CollectorsStatusRequest(
+            tentaflow_protocol::ProfilingCollectorsStatusRequest { node_id },
+        ),
+    )
 }
 
 // =============================================================================

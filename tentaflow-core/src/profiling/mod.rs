@@ -9,6 +9,7 @@ pub mod elevation_runner;
 pub mod multi_source;
 pub mod nsys;
 pub mod parser;
+pub mod permissions;
 pub mod storage;
 pub mod storage_v2;
 pub mod timeline;

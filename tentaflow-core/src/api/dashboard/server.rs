@@ -1164,38 +1164,10 @@ pub async fn handle_request(
         return Ok(json_response_cors(200, body, cors_origin.as_deref()));
     }
 
-    // Profiling permissions API — sudo password validation + collector
-    // binary discovery. Both endpoints require admin; the password is
-    // validated in-memory and never persisted.
-    if path == "/api/profiling/validate-sudo" && method == Method::POST {
-        if let Some((s, b)) = require_admin(&claims, &db) {
-            return Ok(json_response_cors(s, b, cors_origin.as_deref()));
-        }
-        let (status, body) = super::api_profiling::handle_validate_sudo(
-            &db,
-            claims.user_id,
-            &body_bytes,
-            Some(remote_addr.as_str()),
-        )
-        .await;
-        return Ok(json_response_cors(
-            status,
-            body,
-            cors_origin.as_deref(),
-        ));
-    }
-
-    if path == "/api/profiling/collectors/status" && method == Method::GET {
-        if let Some((s, b)) = require_admin(&claims, &db) {
-            return Ok(json_response_cors(s, b, cors_origin.as_deref()));
-        }
-        let (status, body) = super::api_profiling::handle_collectors_status();
-        return Ok(json_response_cors(
-            status,
-            body,
-            cors_origin.as_deref(),
-        ));
-    }
+    // Profiling permissions: validate-sudo + collectors/status migrated to
+    // binary protocol (ProfilingPayload::ValidateSudoRequest /
+    // CollectorsStatusRequest). REST endpoints removed. GUI uses
+    // ApiBinary.one('profilingValidateSudoRequest', ...) etc.
 
     // Voice profiles API — bulletproof speaker recognition.
     // Wolane przez LLM po detekcji introducji ("Cześć, tu Jan") albo przez

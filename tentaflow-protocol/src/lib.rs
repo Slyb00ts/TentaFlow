@@ -49,6 +49,8 @@ pub use profiling::{
     ProfilingReportRequest, ProfilingReportResponse, ProfilingSessionEntry,
     ProfilingSessionsRequest, ProfilingSessionsResponse, ProfilingSkippedCollector,
     ProfilingStartRequest, ProfilingStartResponse, ProfilingStopRequest, ProfilingStopResponse,
+    ProfilingCollectorStatus, ProfilingCollectorsStatusRequest, ProfilingCollectorsStatusResponse,
+    ProfilingValidateSudoRequest, ProfilingValidateSudoResponse,
     TimelineEvent, TransferKind,
 };
 pub use envelope::{

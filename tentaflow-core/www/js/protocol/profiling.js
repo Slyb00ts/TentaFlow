@@ -105,3 +105,26 @@ export async function profilingDownload({ nodeId, sessionId }) {
 export async function profilingActiveInfo({ nodeId }) {
   return ApiBinary.one('profilingActiveInfoRequest', { nodeId });
 }
+
+/**
+ * Walidacja sudo password (bez utrwalania) przez binary protocol.
+ * Reason tags: ok | bad_password | no_sudo | timeout | empty | in_progress |
+ * spawn_error.
+ *
+ * @returns {Promise<{ ok: boolean, message: string, reason: string }>}
+ */
+export async function profilingValidateSudo({ nodeId, password }) {
+  return ApiBinary.one('profilingValidateSudoRequest', {
+    nodeId: nodeId ?? '',
+    password,
+  });
+}
+
+/**
+ * Status kolektorow + odkryte sciezki binarnek (cache 5s).
+ *
+ * @returns {Promise<{ collectors: Array<object>, ageSeconds: number }>}
+ */
+export async function profilingCollectorsStatus({ nodeId } = {}) {
+  return ApiBinary.one('profilingCollectorsStatusRequest', { nodeId: nodeId ?? '' });
+}
