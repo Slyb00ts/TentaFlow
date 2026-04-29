@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: modules/profile-report.js
-// Opis: Ekran raportu profilowania Nsight (multi-source). Renderuje raport
+// Opis: Ekran raportu profilowania (multi-source). Renderuje raport
 //       sesji z dynamicznymi zakladkami (Overview / Unified Timeline /
 //       CPU Flamegraph / GPU per-vendor / Memory / Disk / Power / Sources).
 //       Zakladki sa ukrywane gdy ich kategorii zdarzen nie ma w raporcie.

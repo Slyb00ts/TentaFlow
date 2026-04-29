@@ -180,17 +180,21 @@ export class ProfilingLaunchModal {
    * @param {object} opts
    * @param {string} opts.nodeId
    * @param {Array} opts.availableSources [{ id, label, description, status, vendor?, deviceIndex?, requiresElevation }]
+   * @param {object=} opts.preselectGpu { deviceIndex, vendor? } — gdy podane,
+   *        modal startuje z zaznaczonym tylko jednym source'em GPU (tym
+   *        dotyczacym `deviceIndex`). User moze nadal odznaczyc/zaznaczyc
+   *        cokolwiek przed startem.
    * @param {Function=} opts.onLaunched callback wolany po sukcesie
    */
-  static async open({ nodeId, availableSources, onLaunched }) {
+  static async open({ nodeId, availableSources, preselectGpu, onLaunched }) {
     if (!Array.isArray(availableSources) || availableSources.length === 0) {
       throw new Error('availableSources must be a non-empty array');
     }
-    const ctrl = new ProfilingLaunchModal(nodeId, availableSources, onLaunched);
+    const ctrl = new ProfilingLaunchModal(nodeId, availableSources, onLaunched, preselectGpu);
     return ctrl._run();
   }
 
-  constructor(nodeId, availableSources, onLaunched) {
+  constructor(nodeId, availableSources, onLaunched, preselectGpu = null) {
     this.nodeId = nodeId;
     // Filter out sources globalnie wylaczone w Profile Permissions (per browser).
     // Unavailable po stronie backendu zostawiamy zeby user widzial dlaczego cos
@@ -198,6 +202,9 @@ export class ProfilingLaunchModal {
     const disabled = new Set(getDisabledSources());
     this.sources = availableSources.filter((s) => !disabled.has(s.id));
     this.onLaunched = typeof onLaunched === 'function' ? onLaunched : null;
+    this.preselectGpu = preselectGpu && Number.isInteger(preselectGpu.deviceIndex)
+      ? preselectGpu
+      : null;
 
     // state
     this.selected = new Set(); // ids
@@ -212,9 +219,35 @@ export class ProfilingLaunchModal {
     this.elevationVisible = false;
     this.elevationStatus = 'untested'; // 'untested' | 'ok' | 'bad' | 'testing'
 
+    // GPU pre-select z per-card "Profile" buttona: pin device index na kazdym
+    // GPU source, zeby _buildScope() wybral konkretny indeks zamiast "all".
+    if (this.preselectGpu) {
+      for (const s of this.sources) {
+        if (sourceToFlag(s) === SOURCE_FLAGS.GPU) {
+          s.deviceIndex = this.preselectGpu.deviceIndex;
+        }
+      }
+    }
+
     // Domyslnie zaznacz wszystkie 'available' (bez 'unavailable').
+    // Wyjatek: gdy preselectGpu, GPU sources sa odznaczone poza tym pasujacym
+    // do device-indeksu — user moze i tak je domyslnie wlaczyc po reviewie.
     for (const s of this.sources) {
-      if (s.status !== 'unavailable') this.selected.add(s.id);
+      if (s.status === 'unavailable') continue;
+      if (this.preselectGpu && sourceToFlag(s) === SOURCE_FLAGS.GPU) {
+        // Wszystkie GPU sources maja juz ten sam deviceIndex, wiec rozroznienie
+        // po vendor: gdy preselectGpu.vendor podany, zaznacz tylko match.
+        if (this.preselectGpu.vendor) {
+          const v = sourceVendor(s);
+          if (v && String(this.preselectGpu.vendor).toLowerCase().startsWith(v.cls)) {
+            this.selected.add(s.id);
+          }
+        } else {
+          this.selected.add(s.id);
+        }
+        continue;
+      }
+      this.selected.add(s.id);
     }
 
     this._winRef = null;
