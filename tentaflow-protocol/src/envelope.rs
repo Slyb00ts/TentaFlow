@@ -23,11 +23,6 @@ use rkyv::{Archive, Deserialize, Serialize};
 ///   - Envelope.sequence u32 -> u64 (overflow bug fix)
 ///   - SessionAuth::UserSession adds `role: Option<String>` (RBAC)
 ///   - Resume tokens now bind to originating_user_id (P0 fix)
-/// v4 changes (2026-04-18):
-///   - ServiceSummary rozszerzony o name/service_type/strategy/config_json/
-///     node_id/node_hostname/created_at (migracja funkcjonalnosci starego dashboardu)
-///   - Nowe wiadomosci ServiceCreateRequest/Response, ServiceUpdateRequest/Response
-///   - Nowe wiadomosci ServiceQuicStatusRequest/Response do monitorowania QUIC
 /// v5 changes (2026-04-18): BREAKING — brak backward compat z nodami na v4
 ///   - Mesh transport zmieniony z quinn (custom TLS + ChaCha20-Poly1305 wrap +
 ///     epoch rotation + nonce counter + sliding window replay) na iroh

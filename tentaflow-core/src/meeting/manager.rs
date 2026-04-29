@@ -31,28 +31,27 @@ enum BotBackend {
 /// Brak wpisu = Docker (wstecznie kompatybilne — przed dodaniem native
 /// botow tabela `services` nie zawierala teams-bota wcale).
 fn detect_backend(db: &DbPool) -> BotBackend {
-    let services = match repository::list_services(db) {
+    use crate::services_repo::services::{self as services_repo, DeployMethod};
+
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("detect_backend: pool poisoned ({}), fallback Docker", e);
+            return BotBackend::Docker;
+        }
+    };
+    let services = match services_repo::list_alive(&conn) {
         Ok(s) => s,
         Err(e) => {
-            warn!(
-                "detect_backend: list_services blad ({}), fallback Docker",
-                e
-            );
+            warn!("detect_backend: list_alive blad ({}), fallback Docker", e);
             return BotBackend::Docker;
         }
     };
     for svc in &services {
-        let config: serde_json::Value =
-            serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
-        let engine = config["engine"]
-            .as_str()
-            .or(config["manifest_engine_id"].as_str());
-        if engine != Some("teams-bot") {
+        if svc.engine_id != "teams-bot" {
             continue;
         }
-        let deploy_mode = config["deploy_mode"].as_str().unwrap_or("");
-        let runtime = config["runtime"].as_str().unwrap_or("");
-        if deploy_mode == "native" && runtime == "binary" {
+        if matches!(svc.deploy_method, DeployMethod::NativeBinary) {
             return BotBackend::Native;
         }
     }

@@ -296,13 +296,6 @@ async fn run_server(args: Args) -> Result<()> {
     }
     router.start();
 
-    // Zaladuj serwisy QUIC z bazy danych (metoda w Core)
-    router.load_db_services();
-
-    // Native service restoration is deferred until mesh is attached below.
-    // Calling restore_native_services() here would silently skip mesh
-    // registration because Router.mesh_manager is still None.
-
     // Zainstaluj wbudowane addony
     if let Err(e) = tentaflow_core::addon::bundled::install_bundled_addons(&db) {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);
@@ -444,11 +437,6 @@ async fn run_server(args: Args) -> Result<()> {
         info!("Brak konfiguracji mesh");
         _mesh_handles = None;
     }
-
-    // Restore native services (in-process MLX/llama.cpp) from DB. Done after
-    // mesh attachment so register_native_service_in_mesh can publish them to
-    // the mesh service registry.
-    router.restore_native_services(&settings_cipher).await;
 
     // Inicjalizacja metryk
     let metrics = RouterMetrics::new();

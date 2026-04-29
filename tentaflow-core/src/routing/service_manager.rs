@@ -1983,30 +1983,6 @@ impl ServiceManager {
         self.load_balancing_strategies.get(service_name)
     }
 
-    /// Dynamicznie rejestruje HTTP backend (po deploy kontenera)
-    pub fn register_dynamic_http_backend(&self, service_name: &str, backend: Arc<BackendClient>) {
-        let strategy =
-            create_strategy("single", &[backend.clone()], vec![1]).unwrap_or_else(|_| {
-                create_strategy("round_robin", &[backend.clone()], vec![1]).unwrap()
-            });
-
-        let mut entry = self
-            .dynamic_backends
-            .entry(service_name.to_string())
-            .or_insert_with(|| (Vec::new(), strategy));
-        if !entry
-            .0
-            .iter()
-            .any(|b| std::ptr::eq(b.as_ref(), backend.as_ref()))
-        {
-            entry.0.push(backend);
-        }
-        info!(
-            "Zarejestrowano dynamiczny HTTP backend dla '{}'",
-            service_name
-        );
-    }
-
     /// Pobierz TTS client
     pub fn get_tts_client(&self, service_name: &str) -> Option<Arc<TTSClient>> {
         self.tts_clients.get(service_name).cloned()
@@ -2145,46 +2121,15 @@ impl ServiceManager {
     /// `dynamic_backends` keyed by every model name the entry hosts. SidecarQuic
     /// entries are owned by `register_quic_service` and are not touched here.
     pub fn hydrate_from_snapshot(&self) {
-        use crate::routing::transport_client::entry_to_backend_client;
         use crate::services::transport::Transport;
 
         let snap = self.current_snapshot();
         for entry in &snap.services {
-            match entry.transport {
-                Transport::Embedded => {
-                    for m in &entry.models {
-                        if !self.local_inference_models.contains_key(&m.model_name) {
-                            self.register_local_inference_model(&m.model_name);
-                        }
+            if matches!(entry.transport, Transport::Embedded) {
+                for m in &entry.models {
+                    if !self.local_inference_models.contains_key(&m.model_name) {
+                        self.register_local_inference_model(&m.model_name);
                     }
-                }
-                Transport::HttpDirect | Transport::ExternalHttp => {
-                    let client = match entry_to_backend_client(entry) {
-                        Ok(c) => Arc::new(c),
-                        Err(e) => {
-                            warn!(
-                                "hydrate: backend client init for svc-{} failed: {}",
-                                entry.id, e
-                            );
-                            continue;
-                        }
-                    };
-                    for m in &entry.models {
-                        if !self.dynamic_backends.contains_key(&m.model_name)
-                            && !self.service_backends.contains_key(&m.model_name)
-                        {
-                            self.register_dynamic_http_backend(&m.model_name, client.clone());
-                        }
-                    }
-                    if !entry.engine_id.is_empty()
-                        && !self.dynamic_backends.contains_key(&entry.engine_id)
-                        && !self.service_backends.contains_key(&entry.engine_id)
-                    {
-                        self.register_dynamic_http_backend(&entry.engine_id, client.clone());
-                    }
-                }
-                Transport::SidecarQuic => {
-                    // Owned by register_quic_service / spawn_connection_tasks.
                 }
             }
         }
@@ -2683,23 +2628,6 @@ impl ServiceManager {
     // MODEL POOL - mapowanie model_name -> serwisy
     // ========================================================================
 
-    /// Rejestruje mapowanie model -> serwis. Jesli model juz istnieje, dodaje serwis do puli.
-    pub fn register_model_mapping(&self, model_name: &str, service_name: &str) {
-        let mut entry = self
-            .model_pool
-            .entry(model_name.to_string())
-            .or_insert_with(ModelPoolEntry::new);
-        if !entry.service_names.iter().any(|s| s == service_name) {
-            entry.service_names.push(service_name.to_string());
-            info!(
-                "ModelPool: '{}' -> dodano serwis '{}' (lacznie: {})",
-                model_name,
-                service_name,
-                entry.service_names.len()
-            );
-        }
-    }
-
     /// Zwraca liste serwisow obslugujacych dany model
     pub fn resolve_model_services(&self, model_name: &str) -> Option<Vec<String>> {
         self.model_pool
@@ -2781,36 +2709,6 @@ impl ServiceManager {
                 )
             })
             .collect()
-    }
-
-    /// Inicjalizuje model_pool z bazy danych (skanuje serwisy po deployed_model w config_json)
-    pub fn init_model_pool(&self, db: &crate::db::DbPool) {
-        if let Ok(services) = crate::db::repository::list_services(db) {
-            for svc in &services {
-                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&svc.config_json) {
-                    if let Some(model_name) = config.get("deployed_model").and_then(|v| v.as_str())
-                    {
-                        if !model_name.is_empty() {
-                            self.register_model_mapping(model_name, &svc.name);
-                            if let Some(mut entry) = self.model_pool.get_mut(model_name) {
-                                entry.service_type = svc.service_type.clone();
-                            }
-                        }
-                    }
-                }
-                // Alias service_name -> service_name. GUI dispatchuje
-                // chat completion z model=service_name. Bez tego po restarcie
-                // tentaflow user dostaje 'Model X nie znaleziony w konfiguracji'.
-                self.register_model_mapping(&svc.name, &svc.name);
-                if let Some(mut entry) = self.model_pool.get_mut(&svc.name) {
-                    entry.service_type = svc.service_type.clone();
-                }
-            }
-        }
-        info!(
-            "ModelPool: Zaladowano {} modeli z DB",
-            self.model_pool.len()
-        );
     }
 }
 
@@ -3002,40 +2900,5 @@ mod snapshot_helpers_tests {
         assert!(!mgr.has_local_inference_service("qwen-mini"));
         mgr.hydrate_from_snapshot();
         assert!(mgr.has_local_inference_service("qwen-mini"));
-    }
-
-    #[test]
-    fn hydrate_from_snapshot_registers_dynamic_http_backend() {
-        let svc = fixture_entry(5, "vllm", Transport::HttpDirect, vec!["llama-y"]);
-        let mgr = make_manager_with_snapshot(build_snapshot(vec![svc]));
-
-        assert!(!mgr.has_http_backends("llama-y"));
-        mgr.hydrate_from_snapshot();
-        assert!(mgr.has_http_backends("llama-y"));
-        // Engine id is also registered so requests addressed by engine name route.
-        assert!(mgr.has_http_backends("vllm"));
-    }
-
-    #[test]
-    fn hydrate_from_snapshot_is_idempotent() {
-        let svc = fixture_entry(6, "vllm", Transport::HttpDirect, vec!["llama-z"]);
-        let mgr = make_manager_with_snapshot(build_snapshot(vec![svc]));
-
-        mgr.hydrate_from_snapshot();
-        let count_after_first = mgr
-            .dynamic_backends
-            .get("llama-z")
-            .map(|r| r.value().0.len())
-            .unwrap_or(0);
-        mgr.hydrate_from_snapshot();
-        let count_after_second = mgr
-            .dynamic_backends
-            .get("llama-z")
-            .map(|r| r.value().0.len())
-            .unwrap_or(0);
-        assert_eq!(
-            count_after_first, count_after_second,
-            "hydrate_from_snapshot should not duplicate backends across calls"
-        );
     }
 }
