@@ -109,6 +109,10 @@
   outline: none;
   cursor: pointer;
 }
+.profiling-launch .tf-slider:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .profiling-launch .tf-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 16px; height: 16px; border-radius: 50%;
@@ -170,7 +174,7 @@
 }
 
 .profiling-launch .radio-row {
-  display: flex; gap: 14px; flex-wrap: wrap;
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
 }
 
 /* SOURCE CARDS GRID */
@@ -297,7 +301,7 @@
   letter-spacing: 0; text-transform: none;
 }
 
-/* alert-box */
+/* alert-box (warning + info + danger + success warianty) */
 .alert-box {
   display: flex;
   gap: 10px;
@@ -310,6 +314,15 @@
 .alert-box.info { background: rgba(96, 165, 250, 0.08); border-color: rgba(96, 165, 250, 0.3); }
 .alert-box.danger { background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.3); }
 .alert-box.success { background: rgba(34, 197, 94, 0.08); border-color: rgba(34, 197, 94, 0.3); }
+.alert-box .a-ico { flex-shrink: 0; }
+.alert-box .a-ico svg {
+  width: 16px; height: 16px;
+  stroke: var(--tf-warning, #f59e0b);
+  fill: none; stroke-width: 2;
+}
+.alert-box.info .a-ico svg { stroke: var(--tf-info, #60a5fa); }
+.alert-box.danger .a-ico svg { stroke: var(--tf-danger, #ef4444); }
+.alert-box.success .a-ico svg { stroke: var(--tf-success, #22c55e); }
 .alert-box .a-body {
   flex: 1;
   font-size: 12.5px;
@@ -317,6 +330,18 @@
   line-height: 1.5;
 }
 .alert-box .a-body strong { color: var(--tf-text, #e8ebf5); font-weight: 700; }
+
+/* Info-tip (?) — inline icon obok nazwy źródła w source-card.
+   Renderowany gdy backend dostarczy src.tooltip. */
+.profiling-launch .source-card .src-name .info-tip {
+  color: var(--tf-text-3, #6a7196);
+  cursor: help;
+  display: inline-flex;
+}
+.profiling-launch .source-card .src-name .info-tip svg {
+  width: 12px; height: 12px;
+  stroke: currentColor; fill: none; stroke-width: 2;
+}
 
 /* password-input (no tf-password-input yet; will add component if reused 2+ places per #8) */
 .pw-input {
