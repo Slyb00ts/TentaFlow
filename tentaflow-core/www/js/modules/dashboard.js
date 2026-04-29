@@ -11,8 +11,9 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, formatDate } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { createRefresher } from '/js/lib/refresh.js';
 
-let metricsTimer = null;
+let metricsRefresher = null;
 let auditUnsubscribe = null;
 const recentEvents = [];
 const MAX_RECENT_EVENTS = 8;
@@ -163,7 +164,12 @@ const DashboardScreen = {
     }
 
     await refresh();
-    metricsTimer = setInterval(refresh, 5000);
+    metricsRefresher = createRefresher({
+      run: refresh,
+      intervalMs: 5000,
+      hiddenIntervalMs: 20000,
+    });
+    metricsRefresher.start();
 
     try {
       const client = await ApiBinary.client();
@@ -179,8 +185,8 @@ const DashboardScreen = {
     }
   },
   async unmount() {
-    if (metricsTimer) clearInterval(metricsTimer);
-    metricsTimer = null;
+    if (metricsRefresher) metricsRefresher.dispose();
+    metricsRefresher = null;
     if (auditUnsubscribe) auditUnsubscribe();
     auditUnsubscribe = null;
     recentEvents.length = 0;

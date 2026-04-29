@@ -11,6 +11,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
+import { createRefresher } from '/js/lib/refresh.js';
 
 // Stale modulu
 const PAGE_SIZE = 100;
@@ -28,7 +29,7 @@ let filters = {
   fromDate: '',
   toDate: '',
 };
-let refreshTimer = null;
+let refresher = null;
 let unsubscribePush = null;
 
 function sprite(id) {
@@ -97,7 +98,12 @@ const AuditScreen = {
     renderPagination();
     await loadEntries();
 
-    refreshTimer = setInterval(loadEntries, REFRESH_MS);
+    refresher = createRefresher({
+      run: loadEntries,
+      intervalMs: REFRESH_MS,
+      hiddenIntervalMs: REFRESH_MS * 4,
+    });
+    refresher.start();
 
     try {
       const client = await ApiBinary.client();
@@ -112,7 +118,7 @@ const AuditScreen = {
   },
 
   unmount() {
-    if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+    if (refresher) { refresher.dispose(); refresher = null; }
     if (unsubscribePush) { unsubscribePush(); unsubscribePush = null; }
     entries = [];
     totalCount = 0;
