@@ -23,12 +23,6 @@ DerivedData/
 tentaflow-core/www/js/generated/
 tentaflow-core/wwwroot/js/generated/
 
-# Wygenerowany wasm-bindgen glue dla protocol codec (build.rs produkuje)
-tentaflow-core/www/js/protocol/wasm_glue.js
-tentaflow-core/www/js/protocol/wasm_glue_bg.wasm
-tentaflow-core/wwwroot/js/protocol/wasm_glue.js
-tentaflow-core/wwwroot/js/protocol/wasm_glue_bg.wasm
-
 # Wygenerowany cbindgen header dla .NET P/Invoke
 tentaflow-client/native/include/
 
