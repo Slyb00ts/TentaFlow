@@ -95,35 +95,54 @@ export class ProfileReportV2View {
       return;
     }
 
-    // Envelope detection. Binary protocol returns { envelope: { kind, report }};
-    // fixture JSON may carry { V2: ... } / { V1Legacy: ... } / a bare V2.
+    // Envelope detection. Binary protocol returns rkyv enum jako
+    // { V1Legacy: {...} } / { V2: {...} } (rkyv variant naming). Fixture JSON
+    // moze tez zawierac { envelope: { kind, report } }. Wyciagamy 'report'
+    // i 'envelopeIsV2' flag.
     let report = raw;
+    let envelopeIsV2 = false;
+    let envelopeIsV1Legacy = false;
     if (raw && typeof raw === 'object') {
       if (raw.envelope && typeof raw.envelope === 'object') {
         if (raw.envelope.kind === 'v1_legacy') {
-          await renderLegacyV1(container, { sessionId, nodeId });
-          return;
-        }
-        if (raw.envelope.kind === 'v2' && raw.envelope.report) {
+          envelopeIsV1Legacy = true;
+        } else if (raw.envelope.kind === 'v2' && raw.envelope.report) {
+          envelopeIsV2 = true;
           report = raw.envelope.report;
         }
       } else if ('V2' in raw && raw.V2) {
+        envelopeIsV2 = true;
         report = raw.V2;
       } else if ('V1Legacy' in raw && raw.V1Legacy) {
-        await renderLegacyV1(container, { sessionId, nodeId });
-        return;
+        envelopeIsV1Legacy = true;
+      } else if (raw.envelope && Array.isArray(raw.envelope)) {
+        // Defensive: niektore deserializery moga zwrocic enum jako tagged tuple
+        const [tag, payload] = raw.envelope;
+        if (tag === 'V2' && payload) { envelopeIsV2 = true; report = payload; }
+        else if (tag === 'V1Legacy') { envelopeIsV1Legacy = true; }
       }
     }
-    if (!report || report.schema_version !== 2) {
-      // Attempt legacy fallback if not V2.
-      try {
-        await renderLegacyV1(container, { sessionId, nodeId });
-        return;
-      } catch (err) {
-        container.innerHTML = renderError(new Error('Unsupported report schema'));
-        bindBackHandler(container);
-        return;
-      }
+    // Tylko envelope=V1Legacy fallback do legacy V1 view. Inne sciezki (envelope
+    // V2 lub niezdefiniowana, nawet ze zlym schema_version) nie wracaja do legacy
+    // bo legacy backend zwroci 'to V2, otworz przez V2' -> circular loop -> user
+    // widzi blad w petli. Dla envelope V2 z innym schema_version pokazujemy
+    // explicit error 'Unknown V2 schema, dashboard wymaga upgrade'.
+    if (envelopeIsV1Legacy) {
+      await renderLegacyV1(container, { sessionId, nodeId });
+      return;
+    }
+    if (!report) {
+      container.innerHTML = renderError(new Error('Empty report received from backend'));
+      bindBackHandler(container);
+      return;
+    }
+    if (report.schema_version !== 2) {
+      const msg = envelopeIsV2
+        ? `Backend zwrocil V2 envelope ze schema_version=${report.schema_version} ktorego dashboard nie obsluguje. Zaktualizuj klienta WWW.`
+        : `Niepoznany format raportu (schema_version=${report.schema_version || 'brak'}). Sprawdz wersje tentaflow.`;
+      container.innerHTML = renderError(new Error(msg));
+      bindBackHandler(container);
+      return;
     }
 
     const expanded = expandCompactSeries(report);
