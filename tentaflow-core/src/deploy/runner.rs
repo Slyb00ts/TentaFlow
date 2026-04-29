@@ -842,6 +842,42 @@ async fn do_binary_native_deploy(
         &format!("Binarka znaleziona: {}", bin_path.display()),
     );
 
+    // Teams-bot wymaga Chromium do wszystkich operacji w meeting'u (Teams/
+    // Meet/Zoom). Provisioner sprawdza systemowy Chrome, potem cache, a w
+    // ostatecznosci pobiera Chrome for Testing. Robimy to przy deploy zeby
+    // problem byl widoczny od razu w logach deployu, nie przy pierwszym
+    // spawnie sesji meetingu (gdy user juz czeka na bota).
+    let chromium_path: Option<String> = if engine.engine_id == "teams-bot" {
+        let log_db = db.clone();
+        let log_deploy_id = deploy_id.to_string();
+        let log_tx = tx.clone();
+        let log_sink: crate::deploy::python_venv::LogSink =
+            std::sync::Arc::new(move |line: &str| {
+                log_line(&log_db, &log_deploy_id, &log_tx, "log", line);
+            });
+        phase(db, deploy_id, tx, "building", 50, "provisioning chromium");
+        match crate::deploy::chromium_provisioner::ensure_chromium(&log_sink) {
+            Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Err(e) => {
+                log_line(
+                    db,
+                    deploy_id,
+                    tx,
+                    "log",
+                    &format!(
+                        "chromium: provisioning nieudany ({}). Bot teams nie wystartuje \
+                         dopoki Chromium nie bedzie dostepny w PATH albo \
+                         TENTAFLOW_CHROMIUM_PATH.",
+                        e
+                    ),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let service_name = config
         .container_name
         .clone()
@@ -854,15 +890,18 @@ async fn do_binary_native_deploy(
     // engine.category z manifestu jest plural ('agents', 'tools') wiec mapujemy
     // przez service_type_from_category zanim trafi do DB.
     let svc_type = service_type_from_category(&engine.category);
-    let config_json = serde_json::json!({
+    let mut config_value = serde_json::json!({
         "deploy_mode": "native",
         "runtime": "binary",
         "engine": engine.engine_id,
         "manifest_engine_id": engine.engine_id,
         "service_type": svc_type,
         "binary_path": bin_path.to_string_lossy(),
-    })
-    .to_string();
+    });
+    if let Some(chrome) = &chromium_path {
+        config_value["chromium_path"] = serde_json::Value::String(chrome.clone());
+    }
+    let config_json = config_value.to_string();
 
     upsert_native_service(
         db,
