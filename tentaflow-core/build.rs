@@ -724,6 +724,20 @@ mod services_manifest_build {
         pub download_image: Option<String>,
         #[serde(default)]
         pub download_size_mb: Option<u64>,
+        /// Required as of Phase 6: declares whether TentaFlow wraps the
+        /// container's HTTP API in a QUIC sidecar (`sidecar-quic`) or speaks
+        /// HTTP directly to the host-mapped port (`direct-http`). Validated
+        /// with a dedicated rule below so the error message is actionable when
+        /// the field is missing.
+        #[serde(default)]
+        pub transport: Option<DockerTransport>,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum DockerTransport {
+        SidecarQuic,
+        DirectHttp,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -879,6 +893,20 @@ mod services_manifest_build {
             if has_context == has_compose {
                 errors.push(format!(
                     "engine '{}': deploy.docker must define exactly one of context_path or compose_path",
+                    eid
+                ));
+            }
+
+            // Reguła 5 (Faza 6): kazda sekcja [deploy.docker] musi miec pole
+            // `transport` ustawione na "sidecar-quic" lub "direct-http". Pole
+            // jest typowane przez serde; Option=None tutaj oznacza ze plik TOML
+            // pomijal klucz.
+            if docker.transport.is_none() {
+                errors.push(format!(
+                    "engine '{}': [deploy.docker] is missing required `transport` field — \
+                     set it to \"sidecar-quic\" (TentaFlow QUIC sidecar in front of the \
+                     engine HTTP API) or \"direct-http\" (TentaFlow speaks HTTP directly \
+                     to the host-mapped port).",
                     eid
                 ));
             }
