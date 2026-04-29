@@ -344,48 +344,37 @@ impl NsysRunner {
 /// wykonuje teardown z flushem `.nsys-rep`.
 pub(crate) fn build_nsys_args(scope: &NsightScope, output_path: &Path, duration_secs: u32) -> Vec<String> {
     let out = output_path.to_string_lossy().to_string();
+    // Uwaga: --gpu-metrics-device(s) zostalo usuniete, bo:
+    //   1) nsys 2025.6+ deprecated singular form -> --gpu-metrics-devices (plural).
+    //   2) Wymaga root + ustawionego /proc/sys/kernel/perf_event_paranoid<=1
+    //      ALBO modprobe nvidia NVreg_RestrictProfilingToAdminUsers=0.
+    //      Bez tego nsys odrzuca caly start z "ERR_NVGPUCTRPERM" -> 0 samples.
+    //   3) Util/mem/power dostarcza juz linux.nvsmi.gpu_util collector przez
+    //      `nvidia-smi --query-gpu=...` (nie wymaga root).
+    // nsys w naszym setupie traci GPU metrics ale zachowuje to co realnie potrzebne:
+    // CUDA kernel traces, CUDA API calls, NVTX ranges. Te dane sa fundamentem
+    // mockup #08 GPU tab "Top kernels" + "CUDA APIs" + mockup #05 NVTX lane.
     let mut args: Vec<String> = match scope {
         NsightScope::Cpu => vec![
             "profile".into(),
             "--sample=cpu".into(),
             "--trace=osrt".into(),
-            "--gpu-metrics-device=none".into(),
             "--output".into(),
             out,
             "--force-overwrite=true".into(),
         ],
-        NsightScope::GpuIndex(i) => vec![
+        NsightScope::GpuIndex(_) | NsightScope::GpuAll => vec![
             "profile".into(),
             "--sample=none".into(),
             "--trace=cuda,cudnn,cublas,nvtx".into(),
-            format!("--gpu-metrics-device={i}"),
             "--output".into(),
             out,
             "--force-overwrite=true".into(),
         ],
-        NsightScope::GpuAll => vec![
-            "profile".into(),
-            "--sample=none".into(),
-            "--trace=cuda,cudnn,cublas,nvtx".into(),
-            "--gpu-metrics-device=all".into(),
-            "--output".into(),
-            out,
-            "--force-overwrite=true".into(),
-        ],
-        NsightScope::BothIndex(i) => vec![
+        NsightScope::BothIndex(_) | NsightScope::BothAll => vec![
             "profile".into(),
             "--sample=cpu".into(),
             "--trace=cuda,cudnn,cublas,osrt,nvtx".into(),
-            format!("--gpu-metrics-device={i}"),
-            "--output".into(),
-            out,
-            "--force-overwrite=true".into(),
-        ],
-        NsightScope::BothAll => vec![
-            "profile".into(),
-            "--sample=cpu".into(),
-            "--trace=cuda,cudnn,cublas,osrt,nvtx".into(),
-            "--gpu-metrics-device=all".into(),
             "--output".into(),
             out,
             "--force-overwrite=true".into(),
