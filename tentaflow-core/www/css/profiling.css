@@ -329,17 +329,24 @@
 }
 .pw-input.invalid { border-color: var(--tf-danger, #ef4444); }
 .pw-input.valid { border-color: var(--tf-success, #22c55e); }
+.pw-input svg.lock-ico {
+  width: 14px; height: 14px;
+  margin-left: 11px;
+  stroke: var(--tf-text-3, #6a7196);
+  flex-shrink: 0;
+}
 .pw-input input {
   flex: 1;
   background: transparent;
   border: 0;
   outline: none;
-  padding: 9px 12px;
+  padding: 9px 10px;
   color: var(--tf-text, #e8ebf5);
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
   letter-spacing: 0.2em;
 }
+.pw-input .pw-eye svg { width: 14px; height: 14px; stroke: currentColor; }
 .pw-input .pw-eye {
   padding: 8px 10px;
   cursor: pointer;
