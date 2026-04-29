@@ -16,6 +16,7 @@ import {
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-searchbox.js';
+import '/js/components/tf-chip.js';
 
 // Krotki helper i18n z fallbackiem do angielskiego stringa.
 function t(key, vars, fallback) {
@@ -410,24 +411,26 @@ export class ProfilingSessionsView {
       </div>
     `;
 
-    // Render filter chips zgodnie z mockupem (.filter-chip[active]).
+    // Render filter chips zgodnie z mockupem przez komponent tf-chip
+    // (clickable + atrybut active). Globalny styl z addons.css obsluguje
+    // wizualny stan aktywny.
     const chipsWrap = this.root.querySelector('#ps-filter-chips');
     for (const f of getFilters()) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'filter-chip';
-      btn.textContent = f.label;
-      btn.setAttribute('data-filter-id', f.id);
-      if (this.activeFilter === f.id) btn.setAttribute('active', '');
-      btn.addEventListener('click', () => {
+      const chip = document.createElement('tf-chip');
+      chip.className = 'filter-chip';
+      chip.setAttribute('clickable', '');
+      chip.textContent = f.label;
+      chip.setAttribute('data-filter-id', f.id);
+      if (this.activeFilter === f.id) chip.setAttribute('active', '');
+      chip.addEventListener('click', () => {
         this.activeFilter = f.id;
-        chipsWrap.querySelectorAll('.filter-chip').forEach((c) => {
+        chipsWrap.querySelectorAll('tf-chip.filter-chip').forEach((c) => {
           if (c.getAttribute('data-filter-id') === this.activeFilter) c.setAttribute('active', '');
           else c.removeAttribute('active');
         });
         this._renderTable();
       });
-      chipsWrap.appendChild(btn);
+      chipsWrap.appendChild(chip);
     }
 
     const search = this.root.querySelector('#ps-search');
