@@ -231,6 +231,22 @@ pub fn list_alive(conn: &Connection) -> Result<Vec<ServiceRow>> {
     Ok(rows)
 }
 
+/// Lists services that the supervisor must keep watch over: any non-terminal
+/// state (running, degraded, starting). Terminal states (failed, stopped) are
+/// excluded — they require an explicit user action to come back online.
+pub fn list_supervised(conn: &Connection) -> Result<Vec<ServiceRow>> {
+    let sql = format!(
+        "SELECT {} FROM services_v2 WHERE status IN ('running','degraded','starting') \
+         ORDER BY id ASC",
+        SELECT_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], map_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Lists every service regardless of status (admin view).
 pub fn list_all(conn: &Connection) -> Result<Vec<ServiceRow>> {
     let sql = format!("SELECT {} FROM services_v2 ORDER BY id ASC", SELECT_COLUMNS);
