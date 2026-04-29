@@ -1645,6 +1645,13 @@ async fn do_python_bundle_native_deploy(
         .ok();
     let mut ready = false;
     let mut crashed = false;
+    // Tail engine.log: co kazda iteracje czytamy NOWE linie (od last_offset).
+    // Dzieki temu user widzi w GUI vllm download progress, model loading
+    // ('Loading checkpoint shards: 50%'), HF Hub download speed itp. zamiast
+    // patrzec na 'czekam na /v1/models (300s)' przez 10 minut bez sygnalu zycia.
+    // Bez tego wyglada jakby tentaflow stal w miejscu chociaz vllm pracuje.
+    let log_path = running.venv_dir.join("engine.log");
+    let mut last_log_offset: u64 = 0;
     for attempt in 0..max_attempts {
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
         // Najpierw: czy proces vllm zyje? Jesli padl (np. ImportError, OOM,
@@ -1660,6 +1667,34 @@ async fn do_python_bundle_native_deploy(
                 if resp.status().is_success() {
                     ready = true;
                     break;
+                }
+            }
+        }
+        // Tail engine.log od last_offset - wyslij nowe linie do GUI.
+        // Robione co petla (3s) zeby user widzial dowloads/loading na biezaco.
+        if let Ok(mut file) = std::fs::File::open(&log_path) {
+            use std::io::{Read, Seek, SeekFrom};
+            if let Ok(file_len) = file.seek(SeekFrom::End(0)) {
+                if file_len > last_log_offset {
+                    let to_read = (file_len - last_log_offset).min(64 * 1024);
+                    if file.seek(SeekFrom::Start(last_log_offset)).is_ok() {
+                        let mut buf = vec![0u8; to_read as usize];
+                        if let Ok(n) = file.read(&mut buf) {
+                            if n > 0 {
+                                let chunk = String::from_utf8_lossy(&buf[..n]);
+                                for line in chunk.lines() {
+                                    let trimmed = line.trim_end();
+                                    if !trimmed.is_empty() {
+                                        // Prefix [engine] zeby uzytkownik
+                                        // odroznil log silnika od logow tentaflow.
+                                        log_line(db, deploy_id, tx, "log",
+                                            &format!("[engine] {}", trimmed));
+                                    }
+                                }
+                                last_log_offset += n as u64;
+                            }
+                        }
+                    }
                 }
             }
         }
