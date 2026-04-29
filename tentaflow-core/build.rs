@@ -549,18 +549,24 @@ fn pack_container_contexts(out_dir: &Path) {
     let protocol_dir = workspace_root.join("tentaflow-protocol");
     let transport_dir = workspace_root.join("tentaflow-transport");
     let voice_dir = workspace_root.join("tentaflow-voice");
+    // vendor/ trzyma patched ed25519-dalek wymagany przez [patch.crates-io]
+    // w tentaflow-containers/sidecar/Cargo.toml. Bez tego docker build sidecara
+    // pada na "vendor: not found" przy pierwszym RUN cargo build.
+    let vendor_dir = workspace_root.join("vendor");
 
     if !containers_dir.exists()
         || !protocol_dir.exists()
         || !transport_dir.exists()
         || !voice_dir.exists()
+        || !vendor_dir.exists()
     {
         println!(
-            "cargo:warning=pack_container_contexts: brak jednego z wymaganych katalogow: {}, {}, {}, {} — embed pominiety",
+            "cargo:warning=pack_container_contexts: brak jednego z wymaganych katalogow: {}, {}, {}, {}, {} — embed pominiety",
             containers_dir.display(),
             protocol_dir.display(),
             transport_dir.display(),
-            voice_dir.display()
+            voice_dir.display(),
+            vendor_dir.display()
         );
         // Stworz pusty plik zeby include_bytes! nie padlo
         std::fs::write(out_dir.join("container_bundle.tar.gz"), b"").ok();
@@ -572,6 +578,7 @@ fn pack_container_contexts(out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", protocol_dir.display());
     println!("cargo:rerun-if-changed={}", transport_dir.display());
     println!("cargo:rerun-if-changed={}", voice_dir.display());
+    println!("cargo:rerun-if-changed={}", vendor_dir.display());
 
     let bundle_path = out_dir.join("container_bundle.tar.gz");
 
@@ -589,6 +596,7 @@ fn pack_container_contexts(out_dir: &Path) {
         .arg("tentaflow-protocol")
         .arg("tentaflow-transport")
         .arg("tentaflow-voice")
+        .arg("vendor")
         .status();
 
     match status {

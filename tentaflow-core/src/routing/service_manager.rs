@@ -2616,6 +2616,13 @@ impl ServiceManager {
                         }
                     }
                 }
+                // Alias service_name -> service_name. GUI dispatchuje
+                // chat completion z model=service_name. Bez tego po restarcie
+                // tentaflow user dostaje 'Model X nie znaleziony w konfiguracji'.
+                self.register_model_mapping(&svc.name, &svc.name);
+                if let Some(mut entry) = self.model_pool.get_mut(&svc.name) {
+                    entry.service_type = svc.service_type.clone();
+                }
             }
         }
         info!("ModelPool: Zaladowano {} modeli z DB", self.model_pool.len());
