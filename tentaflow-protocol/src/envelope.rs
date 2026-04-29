@@ -450,11 +450,7 @@ mod tests {
         // + [16] UserSession.user_id + [4] role_len + [4] "user" bytes
         assert_eq!(msg.len(), 16 + 8 + 32 + 1 + 16 + 4 + 4);
         assert_eq!(&msg[0..16], &[7u8; 16]);
-        assert_eq!(
-            &msg[16..24],
-            &1_700_000_000u64.to_le_bytes(),
-            "epoch LE"
-        );
+        assert_eq!(&msg[16..24], &1_700_000_000u64.to_le_bytes(), "epoch LE");
         assert_eq!(&msg[24..56], &[9u8; 32]);
         assert_eq!(msg[56], 2, "UserSession discriminant");
         assert_eq!(&msg[57..73], &[7u8; 16], "user_id");

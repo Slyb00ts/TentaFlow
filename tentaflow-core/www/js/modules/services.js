@@ -1,15 +1,16 @@
 // =============================================================================
 // File: modules/services.js — Services screen with 3 tabs (tf-tabs underline)
-//   1) List     — deployed services table, REST /api/services, auto-refresh 5s
+//   1) List     — deployed services table (binary serviceListRequest), 5s refresh
 //   2) Aliases  — model alias CRUD (binary modelAlias*Request), tf-window editor
 //   3) Models   — mesh-wide model aggregate (binary modelsUnifiedListRequest)
 //   "New service" opens Catalog (target picker → wizard). Aliases edit + delete
 //   confirmations use <tf-window>. Auto-refresh uses morphdom via /js/lib/patch.js
-//   so the table does not flicker.
+//   so the table does not flicker. Multi-node aggregation lands in Krok N5;
+//   today the list is local-only.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, apiGet, apiDelete } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
@@ -79,7 +80,7 @@ const ServicesScreen = {
 async function loadAll() {
   try {
     const [svc, al, nodes, unified] = await Promise.all([
-      apiGet('/api/services').catch(() => []),
+      ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
       ApiBinary.list('modelsUnifiedListRequest', { arrayKey: 'models' }).catch(() => []),
@@ -89,8 +90,9 @@ async function loadAll() {
     aliases = al || [];
     meshNodes = nodes || [];
     unifiedModels = Array.isArray(unified) ? unified : [];
-    // Lokalny service_registry jest swiezy — /api/mesh/nodes nie ma modeli
-    // lokalnego noda az heartbeat nie ustabilizuje sie. Mergujemy z modelsUnifiedListRequest.
+    // Local service_registry is fresh — /api/mesh/nodes does not surface this
+    // node's models until the first heartbeat lands. Merge the unified list so
+    // the Models tab paints something on first load.
     mergeUnifiedModelsIntoNodes();
     renderTab();
     updateSubtitle();
@@ -103,7 +105,7 @@ async function loadAll() {
 async function loadForCurrentTab() {
   try {
     if (currentTab === 'list') {
-      const svc = await apiGet('/api/services');
+      const svc = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
       services = Array.isArray(svc) ? svc : [];
       patchListTab();
     } else if (currentTab === 'aliases') {
@@ -777,11 +779,15 @@ async function stopService(id, name) {
   });
   if (!ok) return;
   try {
-    // REST DELETE /api/services/:id stops the runtime and removes the row,
+    // Binary RPC `ServiceDeleteRequest` stops the runtime AND removes the row,
     // cascading to model_registry via FK ON DELETE CASCADE.
-    await apiDelete(`/api/services/${encodeURIComponent(id)}`);
+    const resp = await ApiBinary.action('serviceDeleteRequest', { serviceId: id });
+    if (resp && resp.success === false) {
+      throw new Error(resp.error || 'Unknown error');
+    }
     toast(I18n.t('services.delete_success', { name }), 'success');
-    const fresh = await apiGet('/api/services').catch(() => services);
+    const fresh = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' })
+      .catch(() => services);
     services = Array.isArray(fresh) ? fresh : [];
     patchListTab();
     updateSubtitle();

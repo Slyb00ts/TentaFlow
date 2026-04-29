@@ -14,7 +14,9 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 /// Zakres zbierania danych profilera.
 /// Sterowane z GUI; mapuje sie na flagi `nsys profile --trace=...`.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub enum NsightScope {
     /// Tylko CPU (sampling + osapi).
     Cpu,
@@ -29,7 +31,9 @@ pub enum NsightScope {
 }
 
 /// Stan zycia sesji profilowania na nodzie.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub enum NsightSessionStatus {
     /// Trwa zbieranie danych (`nsys profile` w trakcie).
     Running,
@@ -46,7 +50,9 @@ pub enum NsightSessionStatus {
 // =============================================================================
 
 /// Pojedynczy GPU wybierany jako cel profilowania.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightGpuTarget {
     /// Indeks GPU widoczny dla CUDA / nvidia-smi.
     pub idx: u8,
@@ -55,7 +61,9 @@ pub struct NsightGpuTarget {
 }
 
 /// Rekord sesji w katalogu nodu.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct NsightSessionEntry {
     /// Identyfikator sesji (UUID lub timestamp-based slug).
     pub session_id: String,
@@ -80,7 +88,9 @@ pub struct NsightSessionEntry {
 // =============================================================================
 
 /// Start nowej sesji profilowania.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct NsightStartRequest {
     /// Nod docelowy.
     pub node_id: String,
@@ -93,68 +103,88 @@ pub struct NsightStartRequest {
 }
 
 /// Potwierdzenie startu z `session_id`.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightStartResponse {
     pub session_id: String,
     pub started_at_ms: u64,
 }
 
 /// Wczesniejsze zatrzymanie biezacej sesji.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightStopRequest {
     pub node_id: String,
     pub session_id: String,
 }
 
 /// Status sesji po wyslaniu stop.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightStopResponse {
     pub session_id: String,
     pub status: NsightSessionStatus,
 }
 
 /// Lista wszystkich sesji widocznych na nodzie.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightSessionsRequest {
     pub node_id: String,
 }
 
 /// Odpowiedz z lista sesji.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct NsightSessionsResponse {
     pub node_id: String,
     pub sessions: Vec<NsightSessionEntry>,
 }
 
 /// Pobranie sparsowanego raportu (`.nsys-rep` -> JSON via `nsys stats`).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightReportRequest {
     pub node_id: String,
     pub session_id: String,
 }
 
 /// Odpowiedz z pelnym raportem — meta + KPI + top tabele + timeline.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct NsightReportResponse {
     pub report: ProfileReport,
 }
 
 /// Usuniecie zapisanego raportu i metadanych sesji.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightDeleteRequest {
     pub node_id: String,
     pub session_id: String,
 }
 
 /// Potwierdzenie usuniecia.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightDeleteResponse {
     pub session_id: String,
     pub ok: bool,
 }
 
 /// Request pobrania surowego pliku `.nsys-rep` (do otwarcia w nsys-ui).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightDownloadRequest {
     pub node_id: String,
     pub session_id: String,
@@ -162,7 +192,9 @@ pub struct NsightDownloadRequest {
 
 /// Odpowiedz: cala zawartosc pliku `.nsys-rep` jako jeden binary blob.
 /// `bytes` ma rzad 1-50 MB; rkyv pakuje to w pojedynczy alloc dla Vec<u8>.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
+)]
 pub struct NsightDownloadResponse {
     pub session_id: String,
     /// Sugerowana nazwa pliku do zapisu po stronie klienta.
@@ -175,7 +207,9 @@ pub struct NsightDownloadResponse {
 // =============================================================================
 
 /// Metadane przebiegu — co, gdzie, kiedy, na czym.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct ProfileMeta {
     pub session_id: String,
     pub label: String,
@@ -191,7 +225,9 @@ pub struct ProfileMeta {
 
 /// Zagregowane wskazniki przebiegu — pokazywane jako kafelki na dashboardzie.
 /// Brak `Eq` przez floaty (NaN ≠ NaN).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct ProfileKpi {
     pub total_gpu_active_ms: f64,
     pub total_cpu_active_ms: f64,
@@ -216,7 +252,9 @@ impl Default for ProfileKpi {
 
 /// Wiersz tabeli top-N (kernel, CUDA API, mem op, CPU sample, NVTX range).
 /// Brak `Eq` przez f64/f32.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct ProfileTopRow {
     /// Nazwa elementu (mangled symbol, CUDA API, NVTX label, ...).
     pub name: String,
@@ -231,7 +269,9 @@ pub struct ProfileTopRow {
 }
 
 /// Pojedyncza probka utylizacji GPU w timeline (sampling co stala wartosc ms).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct GpuUtilSample {
     /// Czas od poczatku sesji w ms.
     pub t_ms: u32,
@@ -246,7 +286,9 @@ pub struct GpuUtilSample {
 }
 
 /// Timeline pojedynczego GPU — limit mocy + lista probek.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct GpuUtilSeries {
     pub gpu_idx: u8,
     pub power_limit_w: f32,
@@ -254,7 +296,9 @@ pub struct GpuUtilSeries {
 }
 
 /// Pelny raport sesji — agregat zwracany w `NsightReportResponse`.
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub struct ProfileReport {
     pub meta: ProfileMeta,
     pub kpi: ProfileKpi,
@@ -279,7 +323,9 @@ pub struct ProfileReport {
 /// Wszystkie request/response Nsight w jednym enumie. Trzymane jako jeden
 /// wariant `MessageBody::NsightBody(NsightPayload)`, zeby zaoszczedzic 9 slotow
 /// w MessageBody (rkyv ma twardy limit 256 wariantow w enumie).
-#[derive(Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
+#[derive(
+    Archive, Deserialize, Serialize, SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
+)]
 pub enum NsightPayload {
     StartRequest(NsightStartRequest),
     StartResponse(NsightStartResponse),

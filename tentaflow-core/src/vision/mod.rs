@@ -19,7 +19,9 @@ pub mod preprocessing;
 pub mod emonet;
 pub mod hsemotion;
 pub mod mivolo;
+pub mod movenet;
 pub mod scrfd;
+pub mod yolo_pose;
 pub mod yolov8_face;
 
 use std::collections::HashMap;
@@ -60,6 +62,22 @@ pub struct EmotionResult {
     pub arousal: Option<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PoseKeypoint {
+    pub id: u8,
+    pub name: &'static str,
+    pub x: f32,
+    pub y: f32,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoseDetection {
+    pub bbox: (f32, f32, f32, f32),
+    pub score: f32,
+    pub keypoints: Vec<PoseKeypoint>,
+}
+
 /// Detector twarzy — wspolny trait dla SCRFD, YOLOv8-face.
 pub trait FaceDetector: Send + Sync {
     /// `image_rgb` — pixele RGB w kolejnosci row-major (height * width * 3).
@@ -78,6 +96,10 @@ pub trait EmotionClassifier: Send + Sync {
     fn classify(&self, face_crop_rgb: &[u8], width: u32, height: u32) -> Result<EmotionResult>;
 }
 
+pub trait PoseEstimator: Send + Sync {
+    fn estimate(&self, image_rgb: &[u8], width: u32, height: u32) -> Result<Vec<PoseDetection>>;
+}
+
 /// Identyfikator silnika vision — odpowiada `engine.id` z manifestu TOML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionEngineKind {
@@ -86,6 +108,8 @@ pub enum VisionEngineKind {
     Mivolo,
     Hsemotion,
     Emonet,
+    Yolov8nPose,
+    MovenetLightning,
 }
 
 impl VisionEngineKind {
@@ -96,6 +120,8 @@ impl VisionEngineKind {
             "mivolo" => Some(Self::Mivolo),
             "hsemotion" => Some(Self::Hsemotion),
             "emonet" => Some(Self::Emonet),
+            "yolov8n-pose" | "yolov8-pose" => Some(Self::Yolov8nPose),
+            "movenet-lightning" => Some(Self::MovenetLightning),
             _ => None,
         }
     }
@@ -107,6 +133,21 @@ impl VisionEngineKind {
             Self::Mivolo => "mivolo",
             Self::Hsemotion => "hsemotion",
             Self::Emonet => "emonet",
+            Self::Yolov8nPose => "yolov8n-pose",
+            Self::MovenetLightning => "movenet-lightning",
+        }
+    }
+
+    pub fn from_service_or_model_id(id: &str) -> Option<Self> {
+        match id {
+            "yolov8n-face" => Some(Self::Yolov8Face),
+            "scrfd-2-5g-kps" => Some(Self::Scrfd),
+            "mivolo-v2-imdb" => Some(Self::Mivolo),
+            "hsemotion-enet-b0" => Some(Self::Hsemotion),
+            "emonet-8" => Some(Self::Emonet),
+            "yolov8n-pose-coco" => Some(Self::Yolov8nPose),
+            "movenet-lightning-singlepose" => Some(Self::MovenetLightning),
+            _ => Self::from_id(id),
         }
     }
 }
@@ -117,10 +158,23 @@ pub enum LoadedEngine {
     FaceDetector(Arc<dyn FaceDetector>),
     AgeGender(Arc<dyn AgeGenderEngine>),
     Emotion(Arc<dyn EmotionClassifier>),
+    Pose(Arc<dyn PoseEstimator>),
     /// Stub — load() przeszedl walidacje ONNX'a ale silnik nie ma jeszcze
     /// pelnej implementacji `detect/predict/classify`. Zwracany dla
     /// EmoNet (brak ONNX) jako placeholder.
     Stub,
+}
+
+impl Clone for LoadedEngine {
+    fn clone(&self) -> Self {
+        match self {
+            LoadedEngine::FaceDetector(e) => LoadedEngine::FaceDetector(Arc::clone(e)),
+            LoadedEngine::AgeGender(e) => LoadedEngine::AgeGender(Arc::clone(e)),
+            LoadedEngine::Emotion(e) => LoadedEngine::Emotion(Arc::clone(e)),
+            LoadedEngine::Pose(e) => LoadedEngine::Pose(Arc::clone(e)),
+            LoadedEngine::Stub => LoadedEngine::Stub,
+        }
+    }
 }
 
 /// Globalny registry zaladowanych silnikow — `OnceLock` lazy init, `RwLock`
@@ -171,6 +225,14 @@ pub fn get_emotion(service_name: &str) -> Option<Arc<dyn EmotionClassifier>> {
     }
 }
 
+pub fn get_pose_estimator(service_name: &str) -> Option<Arc<dyn PoseEstimator>> {
+    let guard = registry().read();
+    match guard.get(service_name)? {
+        LoadedEngine::Pose(e) => Some(Arc::clone(e)),
+        _ => None,
+    }
+}
+
 /// Otwiera ONNX z `vision_models::*_path()` i zwraca `LoadedEngine` zdatny
 /// do wpisania do registry. Wolany przez deploy handler runtime=embedded.
 pub fn load_engine(kind: VisionEngineKind, model_path: &Path) -> Result<LoadedEngine> {
@@ -197,6 +259,14 @@ pub fn load_engine(kind: VisionEngineKind, model_path: &Path) -> Result<LoadedEn
             let _ = emonet::load(model_path)?;
             Ok(LoadedEngine::Stub)
         }
+        VisionEngineKind::Yolov8nPose => {
+            let e = yolo_pose::load(model_path)?;
+            Ok(LoadedEngine::Pose(Arc::new(e)))
+        }
+        VisionEngineKind::MovenetLightning => {
+            let e = movenet::load(model_path)?;
+            Ok(LoadedEngine::Pose(Arc::new(e)))
+        }
     }
 }
 
@@ -209,6 +279,8 @@ pub fn model_path_for(kind: VisionEngineKind) -> Option<std::path::PathBuf> {
         VisionEngineKind::Mivolo => crate::vision_models::mivolo_age_path(),
         VisionEngineKind::Hsemotion => crate::vision_models::hsemotion_path(),
         VisionEngineKind::Emonet => crate::vision_models::emonet_path(),
+        VisionEngineKind::Yolov8nPose => crate::vision_models::yolov8n_pose_path(),
+        VisionEngineKind::MovenetLightning => crate::vision_models::movenet_lightning_path(),
     }
 }
 
@@ -217,6 +289,7 @@ pub fn model_path_for(kind: VisionEngineKind) -> Option<std::path::PathBuf> {
 #[derive(Debug, Clone)]
 pub enum InferOutput {
     Faces(Vec<FaceDetection>),
+    Poses(Vec<PoseDetection>),
     AgeGender(AgeGender),
     Emotion(EmotionResult),
 }
@@ -225,6 +298,15 @@ pub enum InferOutput {
 /// trait na obrazku RGB. Bezstanowe; wszystkie silniki sa Send+Sync wiec
 /// caller moze to wywolywac z dowolnego watka tokio bez extra synchronizacji.
 pub fn infer(service_name: &str, image_rgb: &[u8], width: u32, height: u32) -> Result<InferOutput> {
+    if !registry().read().contains_key(service_name) {
+        if let Some(kind) = VisionEngineKind::from_service_or_model_id(service_name) {
+            let model_path = model_path_for(kind)
+                .ok_or_else(|| anyhow!("vision: model '{}' is not available", kind.id()))?;
+            let engine = load_engine(kind, &model_path)?;
+            register_engine(service_name.to_string(), engine);
+        }
+    }
+
     let guard = registry().read();
     let engine = guard
         .get(service_name)
@@ -237,6 +319,7 @@ pub fn infer(service_name: &str, image_rgb: &[u8], width: u32, height: u32) -> R
             Ok(InferOutput::AgeGender(e.predict(image_rgb, width, height)?))
         }
         LoadedEngine::Emotion(e) => Ok(InferOutput::Emotion(e.classify(image_rgb, width, height)?)),
+        LoadedEngine::Pose(e) => Ok(InferOutput::Poses(e.estimate(image_rgb, width, height)?)),
         LoadedEngine::Stub => Err(anyhow!(
             "vision: silnik '{}' jest stubem (brak modelu lub niewpiety inference)",
             service_name
