@@ -43,6 +43,12 @@ struct DeployConfig {
     gpu_select_mode: Option<String>,
     #[serde(default)]
     gpu_ids: Option<Vec<String>>,
+    /// Zaawansowane VLLM_ARGS z deploy wizard (Advanced section). Gdy
+    /// ustawione, nadpisuja AUTO_PARALLEL i default VLLM_ARGS w entrypoint.sh.
+    /// Format: gotowy CLI args string, np. "--tensor-parallel-size 2
+    /// --pipeline-parallel-size 3 --max-model-len 16384 --kv-cache-dtype fp8"
+    #[serde(default)]
+    vllm_args: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,12 +424,20 @@ async fn do_docker_deploy(
         volumes: vec![(sidecar.dir.display().to_string(), "/data".to_string())],
         // Env dla silnika w kontenerze: entrypoint.sh dla LLM (vllm/sglang/...) i
         // wielu STT/TTS oczekuje `MODEL` lub `MODEL_ID` z HF repo. Przekazujemy
-        // oba zeby pasowalo do roznych konwencji entrypointow.
+        // oba zeby pasowalo do roznych konwencji entrypointow. Plus VLLM_ARGS
+        // gdy user ustawil zaawansowana konfiguracje w deploy wizard
+        // (Advanced section z kalkulatorem VRAM).
         env: {
             let mut e = std::collections::HashMap::new();
             if let Some(m) = model_repo.as_deref() {
                 e.insert("MODEL".to_string(), m.to_string());
                 e.insert("MODEL_ID".to_string(), m.to_string());
+            }
+            if let Some(args) = config.vllm_args.as_deref() {
+                let trimmed = args.trim();
+                if !trimmed.is_empty() {
+                    e.insert("VLLM_ARGS".to_string(), trimmed.to_string());
+                }
             }
             e
         },
@@ -1475,6 +1489,15 @@ async fn do_python_bundle_native_deploy(
     }
     if let Some(ids) = config.gpu_ids.as_ref().filter(|v| !v.is_empty()) {
         env.insert("GPU_IDS".to_string(), ids.join(","));
+    }
+
+    // VLLM_ARGS z deploy wizard Advanced (kalkulator VRAM) - dla bundle
+    // python jest podawane jako env do bundle.toml ${VLLM_ARGS:-...}.
+    if let Some(args) = config.vllm_args.as_deref() {
+        let trimmed = args.trim();
+        if !trimmed.is_empty() {
+            env.insert("VLLM_ARGS".to_string(), trimmed.to_string());
+        }
     }
 
     // Hugging Face token z zaszyfrowanego ustawienia `hf_token` w DB —
