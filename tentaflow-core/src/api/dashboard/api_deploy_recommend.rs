@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::deploy::vram_calculator::{
     analyze_gpu_compatibility, auto_fit_config, build_vllm_args_string, estimate_vllm_vram,
-    fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config,
-    AutoFitOutcome, AutoFitRequest, GpuCompatibilityReport, VramEstimate, VramEstimateInput,
+    fetch_hf_config, max_concurrent_seqs_for_budget, max_context_for_budget,
+    parse_hf_config_with_override, AutoFitOutcome, AutoFitRequest, GpuCompatibilityReport,
+    VramEstimate, VramEstimateInput,
 };
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +32,12 @@ pub struct RecommendRequest {
     pub max_num_seqs: Option<u64>,
     pub kv_cache_dtype: Option<String>,
     pub gpu_memory_utilization: Option<f64>,
+
+    /// Manualny override etykiety kwantyzacji (np. "nvfp4", "awq", "fp16").
+    /// Pomija auto-detekcje z `quantization_config` HF i nazwy repo. Przydatne
+    /// gdy backend zle wykrywa lub user wie ze model zostal przekonwertowany
+    /// po treningu. "none"/"auto" wylacza override.
+    pub quantization_override: Option<String>,
 
     // Lock flags - gdy true, backend traktuje odpowiadajacy parametr jako fixed
     // (uzytkownik wybral go swiadomie) i auto-zmniejsza POZOSTALE parametry zeby
@@ -148,8 +155,12 @@ pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
         }
     };
 
-    let spec = parse_hf_config(&config_json, &req.model)
-        .map_err(|e| anyhow::anyhow!("Parse HF config: {e}"))?;
+    let spec = parse_hf_config_with_override(
+        &config_json,
+        &req.model,
+        req.quantization_override.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("Parse HF config: {e}"))?;
 
     let gpu_count = req.gpus.len() as u32;
     let gpu_memory_gb = req.gpus.iter().map(|g| g.memory_gb).fold(f64::INFINITY, f64::min);
@@ -318,7 +329,7 @@ pub async fn handle_limits(query: &str) -> Result<(u16, String)> {
             ));
         }
     };
-    let spec = parse_hf_config(&config_json, &model)
+    let spec = parse_hf_config_with_override(&config_json, &model, None)
         .map_err(|e| anyhow::anyhow!("parse HF: {e}"))?;
 
     let gpu_count = gpus.len() as u32;

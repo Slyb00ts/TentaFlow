@@ -2833,8 +2833,7 @@ pub(crate) async fn build_auto_vllm_args(
     settings_cipher: &Arc<crate::crypto::SettingsCipher>,
 ) -> Result<Option<String>> {
     use crate::deploy::vram_calculator::{
-        build_vllm_args_string, estimate_vllm_vram, fetch_hf_config, max_concurrent_seqs_for_budget,
-        max_context_for_budget, parse_hf_config, recommend_parallelism, VramEstimateInput,
+        auto_fit_config, build_vllm_args_string, fetch_hf_config, parse_hf_config, AutoFitRequest,
     };
 
     // Wykryj GPU lokalne. detect_gpus_cached() jest cached 60s wiec nie
@@ -2890,54 +2889,36 @@ pub(crate) async fn build_auto_vllm_args(
     let cfg_json = fetch_hf_config(&client, model_repo, token_opt).await?;
     let spec = parse_hf_config(&cfg_json, model_repo)?;
 
-    let (tp, pp) = recommend_parallelism(&spec, gpu_count);
-
-    // Defaulty dla initial deploy: ctx 8192 (lub model max jesli mniej),
-    // batch 16, fp8 KV jesli model duzy (>20B param), gpu_mem_util 0.9.
-    let initial_ctx = spec
-        .max_position_embeddings
-        .min(8192)
-        .max(2048);
+    // Defaulty dla initial deploy delegujemy do auto_fit_config (zero lockow):
+    // num_seqs = 1, max_model_len = max mozliwy z VRAM, capped przez model.
+    // Spojne z polityka GUI / endpointu /api/services/recommend.
     let estimated_b = spec.estimated_params() as f64 / 1_000_000_000.0;
     let kv_dtype = if estimated_b > 20.0 { "fp8" } else { "auto" };
 
-    let mut input = VramEstimateInput {
-        gpu_count,
-        gpu_memory_gb_each,
-        tensor_parallel: tp,
-        pipeline_parallel: pp,
-        max_model_len: initial_ctx,
-        max_num_seqs: 16,
-        kv_cache_dtype: kv_dtype.into(),
-        gpu_memory_utilization: 0.9,
-        activation_overhead_pct: 10.0,
-    };
-
-    // Sprawdz czy fits. Jesli nie - obetnij ctx+seqs do max ktore fits.
-    let est = estimate_vllm_vram(&spec, &input);
-    if !est.fits_per_gpu {
-        // Spróbuj zmniejszyć batch do 4
-        input.max_num_seqs = 4;
-        let est2 = estimate_vllm_vram(&spec, &input);
-        if !est2.fits_per_gpu {
-            // Ogranicz ctx do max ktore fits
-            let max_ctx = max_context_for_budget(&spec, &input);
-            if max_ctx >= 1024 {
-                input.max_model_len = max_ctx;
-            } else {
-                // Nawet 1k ctx nie fits - return None, zostaw bundle defaults
-                return Ok(None);
-            }
-        }
+    let fit = auto_fit_config(
+        &spec,
+        &AutoFitRequest {
+            gpu_count,
+            gpu_memory_gb_each,
+            kv_cache_dtype: kv_dtype.into(),
+            gpu_memory_utilization: 0.9,
+            requested_max_model_len: None,
+            requested_max_num_seqs: None,
+            requested_tensor_parallel: None,
+            requested_pipeline_parallel: None,
+            lock_max_model_len: false,
+            lock_max_num_seqs: false,
+            lock_tensor_parallel: false,
+        },
+    );
+    if fit.error.is_some() {
+        return Ok(None);
+    }
+    if fit.applied.max_model_len < 1024 {
+        return Ok(None);
     }
 
-    // Final adjust: max_num_seqs do limitu fits (na wypadek gdy ctx zmalal).
-    let max_seqs = max_concurrent_seqs_for_budget(&spec, &input);
-    if max_seqs < input.max_num_seqs {
-        input.max_num_seqs = max_seqs.max(1);
-    }
-
-    Ok(Some(build_vllm_args_string(&spec, &input)))
+    Ok(Some(build_vllm_args_string(&spec, &fit.applied)))
 }
 
 /// Czyta /proc/<pid>/status -> VmRSS dla heartbeat. Linux only; macOS i
