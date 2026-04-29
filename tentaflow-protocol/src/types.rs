@@ -4012,4 +4012,60 @@ mod meeting_event_tests {
             _ => panic!("expected PromptFetched variant"),
         }
     }
+
+    // Regression: bajty zserializowanego `ModelResponse` NIE moga walidowac sie
+    // jako `ModelStreamChunk`. Ta kolizja byla zrodlem buga "subtree pointer
+    // overran range" w chat streaming path: sidecar dla `request.stream=false`
+    // zwracal `ModelResponse`, a klient po stronie routera czytal ramki jako
+    // `ModelStreamChunk`. `request_id: String` na poczatku obu typow przepuszczal
+    // parser az do enum discriminantu (Completion=1 vs TextDelta=1), gdzie rkyv
+    // probowal odczytac String z bledem bytes -> pointer overrun.
+    #[test]
+    fn model_response_bytes_dont_validate_as_stream_chunk() {
+        let response = ModelResponse {
+            request_id: "test-req-id".to_string(),
+            result: ModelResult::Completion(CompletionResult {
+                text: "Hello world from the LLM".to_string(),
+                reasoning_content: None,
+                model: "qwen3.5-0.8b".to_string(),
+                finish_reason: Some("stop".to_string()),
+                tool_calls: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+            }),
+            metrics: None,
+        };
+
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&response).expect("encode");
+
+        // Probujemy zwalidowac bajty ModelResponse jako ArchivedModelStreamChunk.
+        // To MUSI sie skonczyc bledem walidacji (a NIE panika ani sukcesem).
+        let result = rkyv::access::<ArchivedModelStreamChunk, rkyv::rancor::Error>(&bytes);
+        assert!(
+            result.is_err(),
+            "ModelResponse bytes nie powinny walidowac sie jako ModelStreamChunk \
+             (kolizja discriminantow ModelResult vs StreamChunkType)"
+        );
+    }
+
+    // Sanity: roundtrip ModelStreamChunk z TextDelta — kontrola pozytywna do
+    // testu wyzej.
+    #[test]
+    fn rkyv_roundtrip_stream_chunk_text_delta() {
+        let chunk = ModelStreamChunk {
+            request_id: "test-req-id".to_string(),
+            chunk: StreamChunkType::TextDelta("Hello world".to_string()),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&chunk).expect("encode");
+        let decoded: ModelStreamChunk =
+            rkyv::from_bytes::<ModelStreamChunk, rkyv::rancor::Error>(&bytes).expect("decode");
+        assert_eq!(decoded.request_id, "test-req-id");
+        match decoded.chunk {
+            StreamChunkType::TextDelta(s) => assert_eq!(s, "Hello world"),
+            _ => panic!("expected TextDelta"),
+        }
+    }
 }
