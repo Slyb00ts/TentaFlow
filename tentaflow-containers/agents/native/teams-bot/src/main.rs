@@ -551,15 +551,18 @@ async fn main() -> Result<()> {
             return None;
         };
 
+        // fetch_prompt nie umie auto-detect; gdy user nie ma preferencji
+        // jezyka, lecimy w pl (DB ma fallback i tak).
+        let prompt_lang = config.meeting_language.as_deref().unwrap_or("pl");
         let prompt_content = match client
-            .fetch_prompt("transcription_summarization", &config.meeting_language)
+            .fetch_prompt("transcription_summarization", prompt_lang)
             .await
         {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    lang = %config.meeting_language,
+                    lang = %prompt_lang,
                     "fetch_prompt nie powiodl sie — summarizer nie wystartuje w tej sesji"
                 );
                 return None;
@@ -916,7 +919,12 @@ async fn main() -> Result<()> {
                     let stt_started = std::time::Instant::now();
                     let stt_result = match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
-                        client.transcribe(&speech_buffer, stt_alias, None, extra_meta),
+                        client.transcribe(
+                            &speech_buffer,
+                            stt_alias,
+                            config.meeting_language.clone(),
+                            extra_meta,
+                        ),
                     ).await {
                         Ok(result) => result,
                         Err(_) => {
@@ -1049,7 +1057,7 @@ async fn main() -> Result<()> {
                                                 &sentence,
                                                 "",
                                                 &model_alias,
-                                                Some(lang.as_str()),
+                                                lang.as_deref(),
                                                 move |pcm| {
                                                     total_in.fetch_add(pcm.len(), Ordering::Relaxed);
                                                     ap_in.send(pcm).map_err(|e| {
@@ -1114,7 +1122,7 @@ async fn main() -> Result<()> {
                                                 &echo_text,
                                                 "",
                                                 &model_alias,
-                                                Some(lang.as_str()),
+                                                lang.as_deref(),
                                                 move |pcm| {
                                                     total_in.fetch_add(pcm.len(), Ordering::Relaxed);
                                                     ap_in.send(pcm).map_err(|e| {

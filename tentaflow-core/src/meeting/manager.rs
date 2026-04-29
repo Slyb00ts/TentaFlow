@@ -72,6 +72,10 @@ pub struct StartSessionRequest {
     pub response_mode: Option<String>,
     /// CSV slow aktywujacych. Pusta lista = zawsze aktywne (rownowazne always).
     pub wake_words: Option<String>,
+    /// Jezyk meetingu (ISO 639-1: pl/en/de/es/fr). Dziedziczony z
+    /// `users.preferred_language` osoby ktora startuje meeting; `None` = bot
+    /// wysle do STT bez language → Whisper auto-detect.
+    pub meeting_language: Option<String>,
 }
 
 /// Domyślne aliasy przekazywane do kontenera teams-bota, jeśli caller nie
@@ -270,6 +274,7 @@ impl MeetingManager {
                     respond_enabled,
                     response_mode: response_mode.clone(),
                     wake_words: wake_words.clone(),
+                    meeting_language: req.meeting_language.clone(),
                 };
 
                 match container::spawn(&spawn_req).await {
@@ -325,6 +330,7 @@ impl MeetingManager {
                     respond_enabled,
                     response_mode: response_mode.clone(),
                     wake_words: wake_words.clone(),
+                    meeting_language: req.meeting_language.clone(),
                 };
 
                 if let Err(e) = native::spawn(&spawn_req).await {
@@ -560,6 +566,7 @@ mod tests {
             respond_enabled: None,
             response_mode: None,
             wake_words: None,
+            meeting_language: None,
         }
     }
 

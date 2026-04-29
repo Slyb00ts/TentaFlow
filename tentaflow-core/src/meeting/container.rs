@@ -44,6 +44,9 @@ pub struct SpawnRequest {
     pub response_mode: String,
     /// CSV slow aktywujacych ("jarvis,bot,asystencie,...").
     pub wake_words: String,
+    /// Jezyk meetingu (ISO 639-1). `Some` → env `MEETING_LANGUAGE`; `None` →
+    /// env nie ustawiony, bot zostawi STT na auto-detect.
+    pub meeting_language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,7 +264,7 @@ pub async fn cleanup_stale_containers() -> Result<()> {
 }
 
 pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
-    vec![
+    let mut env = vec![
         format!("MEETING_URL={}", req.meeting_url),
         // Klucz sesji — bot kopiuje do każdego transkrypt eventu, router zapisuje
         // pod tym kluczem do meeting_sessions (get_or_create znajdzie naszą sesję).
@@ -273,7 +276,7 @@ pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
         format!("BOT_NAME={}", req.bot_name),
         "DISPLAY=:99".to_string(),
         "XDG_RUNTIME_DIR=/tmp/runtime".to_string(),
-        // Aliasy konsumowane przez teams-bota (tentaflow-containers/agents/docker/teams-bot/src/config.rs).
+        // Aliasy konsumowane przez teams-bota (tentaflow-containers/agents/native/teams-bot/src/config.rs).
         format!("STT_ALIAS={}", req.stt_alias),
         format!("SUMMARIZATION_ALIAS={}", req.summarization_alias),
         format!("TTS_ALIAS={}", req.tts_alias),
@@ -282,7 +285,11 @@ pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
         format!("RESPOND_ENABLED={}", if req.respond_enabled { "true" } else { "false" }),
         format!("RESPONSE_MODE={}", req.response_mode),
         format!("WAKE_WORDS={}", req.wake_words),
-    ]
+    ];
+    if let Some(lang) = req.meeting_language.as_deref() {
+        env.push(format!("MEETING_LANGUAGE={}", lang));
+    }
+    env
 }
 
 #[cfg(test)]
@@ -310,6 +317,7 @@ mod tests {
             respond_enabled: false,
             response_mode: "wake_word_intent".to_string(),
             wake_words: "jarvis,bot".to_string(),
+            meeting_language: None,
         }
     }
 
@@ -337,5 +345,20 @@ mod tests {
         assert!(!env.iter().any(|e| e.starts_with("STT_MODEL=")));
         assert!(!env.iter().any(|e| e.starts_with("TTS_MODEL=")));
         assert!(!env.iter().any(|e| e.starts_with("LLM_MODEL=")));
+    }
+
+    #[test]
+    fn build_env_omits_meeting_language_when_none() {
+        let req = sample("teams-stt", "teams-summarization", "teams-tts", "teams-flow");
+        let env = build_env(&req);
+        assert!(!env.iter().any(|e| e.starts_with("MEETING_LANGUAGE=")));
+    }
+
+    #[test]
+    fn build_env_emits_meeting_language_when_some() {
+        let mut req = sample("teams-stt", "teams-summarization", "teams-tts", "teams-flow");
+        req.meeting_language = Some("en".to_string());
+        let env = build_env(&req);
+        assert!(env.contains(&"MEETING_LANGUAGE=en".to_string()));
     }
 }
