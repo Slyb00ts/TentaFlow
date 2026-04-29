@@ -592,12 +592,31 @@ fn prepare_template_env(
     let template_id = template_identity(spec, variant, bundle_src)?;
     let template_dir = templates_root(cache)
         .join(&spec.bundle.engine)
-        .join(template_id)
+        .join(&template_id)
         .join("venv");
 
-    if template_dir.join("pyvenv.cfg").exists() {
-        log("template venv: reuse (pyvenv.cfg istnieje)");
+    // Marker pisany dopiero po SUKCESIE install_deps + copy_bundle_files.
+    // pyvenv.cfg powstaje na samym poczatku `python -m venv`, wiec gdy uv
+    // crashnie w trakcie pobierania wheels (np. broken pipe na nvidia-cublas),
+    // template ma pyvenv.cfg ale brakuje pakietow. Bez tego markera nastepny
+    // deploy "reuse" pomijal install i silnik padal z ModuleNotFoundError.
+    let install_complete_marker = template_dir.join(".tentaflow-install-complete");
+    if template_dir.join("pyvenv.cfg").exists() && install_complete_marker.exists() {
+        log("template venv: reuse (install complete)");
         return Ok(template_dir);
+    }
+
+    if template_dir.exists() {
+        log(&format!(
+            "template venv: niekompletny ({}), czyszcze przed ponowna instalacja",
+            template_dir.display()
+        ));
+        std::fs::remove_dir_all(&template_dir).with_context(|| {
+            format!(
+                "czyszczenie niekompletnego template venv {}",
+                template_dir.display()
+            )
+        })?;
     }
 
     std::fs::create_dir_all(template_dir.parent().unwrap()).ok();
@@ -622,6 +641,8 @@ fn prepare_template_env(
     }
     install_deps(&template_dir, uv, spec, variant, bundle_src, extra_env, log)?;
     copy_bundle_files(bundle_src, &template_dir)?;
+    std::fs::write(&install_complete_marker, template_id.as_bytes())
+        .context("zapis markera template install complete")?;
     Ok(template_dir)
 }
 
@@ -658,6 +679,15 @@ fn prepare_instance_env(
         })?;
     }
 
+    // Bundle/dependency update: zmiana template_id == rebuild venv. Globalne
+    // JIT compile cache (FlashInfer, Triton, torch_extensions) zapisuja
+    // absolutne sciezki do plikow zrodlowych z poprzedniego venv. Po jego
+    // usunieciu cache wskazuje na nieistniejace pliki i ninja crashuje
+    // (np. "missing and no known rule to make"). Czyscimy je defensywnie
+    // przy KAZDEJ aktualizacji bundla — to jest jedyny sposob zeby byc
+    // bulletproof na wszystkich platformach (Linux/Windows/macOS, CUDA/ROCm).
+    purge_global_jit_caches(log);
+
     log(&format!(
         "klonuje template venv do instance {}",
         instance_dir.display()
@@ -665,6 +695,36 @@ fn prepare_instance_env(
     copy_dir_recursive(template_venv, &instance_dir)?;
     std::fs::write(&marker, template_id)?;
     Ok(instance_dir)
+}
+
+/// Czysci globalne JIT cache'e (FlashInfer, Triton, torch_extensions, nvidia
+/// cuda_compile_cache) ktore zapisuja absolutne sciezki do plikow zrodlowych
+/// z konkretnej instancji venv. Po rebuild venv te cache zwracaja stale
+/// referencje i lamia kompilacje on-demand. Wywolujemy przy kazdej zmianie
+/// template_id (== zmiana bundle.toml / requirements.lock / Dockerfile).
+fn purge_global_jit_caches(log: &LogSink) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let candidates = [
+        home.join(".cache").join("flashinfer"),
+        home.join(".cache").join("torch_extensions"),
+        home.join(".triton").join("cache"),
+        home.join(".cache").join("nv").join("ComputeCache"),
+        home.join(".nv").join("ComputeCache"),
+    ];
+    for path in &candidates {
+        if path.exists() {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => log(&format!("purged stale JIT cache {}", path.display())),
+                Err(e) => log(&format!(
+                    "ostrzezenie: nie udalo sie wyczyscic {} ({})",
+                    path.display(),
+                    e
+                )),
+            }
+        }
+    }
 }
 
 fn template_identity(
@@ -854,11 +914,19 @@ fn install_deps(
 
     match spec.bundle.source.as_str() {
         "pypi" => {
-            let pkg = spec
-                .bundle
-                .pypi_package
-                .as_deref()
-                .unwrap_or(&spec.bundle.engine);
+            // Fallback do engine.id zostal usuniety: dawal mylacy blad
+            // "No versions of <engine_id>" gdy bundle.toml mial literowke
+            // (np. `package = "x"` zamiast `pypi_package = "x"`). Wymuszamy
+            // explicit pypi_package zeby walic z czytelnym bledem przy
+            // deploy zamiast 5 min po fakcie.
+            let pkg = spec.bundle.pypi_package.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "bundle.toml dla '{}': source=\"pypi\" wymaga pola \
+                     `pypi_package = \"<nazwa-na-pypi>\"`. Pole `package` \
+                     nie jest rozpoznawane (literowka).",
+                    spec.bundle.engine
+                )
+            })?;
             installer
                 .install_package(pkg)
                 .with_context(|| format!("install {}", pkg))?;
@@ -1223,6 +1291,11 @@ impl<'a> Installer<'a> {
         let mut c = if let Some(uv) = self.uv {
             let mut c = Command::new(uv);
             c.env("VIRTUAL_ENV", &self.venv);
+            // Duze wheels NVIDIA (cublas, cudnn, cudart) sa czesto > 500MB i
+            // przy slabszej sieci uv default timeout (30s) tnie polaczenie ze
+            // "stream closed because of a broken pipe". 600s pokrywa nawet
+            // 50KB/s edge case'y.
+            c.env("UV_HTTP_TIMEOUT", "600");
             c.arg("pip");
             c
         } else {
@@ -1236,6 +1309,34 @@ impl<'a> Installer<'a> {
             c.env(k, v);
         }
         c
+    }
+
+    /// Uruchamia komende instalacyjna z retry dla transient network errors
+    /// (broken pipe, connection reset). Trzy proby z exp backoff (2s, 4s).
+    /// Bledy nie-sieciowe (np. resolver conflict) nie sa retryowane —
+    /// drugi run da ten sam wynik. Heurystyka: retryujemy ZAWSZE przy
+    /// niezerowym exit code, bo `uv pip install` przy network failu zwraca 1
+    /// bez specjalnego kodu, a koszt retry'a po prawdziwym konflikcie to
+    /// kilka sekund — vs. utrata 5min pobrania torch+cu130.
+    fn run_install(&self, c: &mut Command) -> Result<()> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=3 {
+            match run_with_logs(c, &self.log) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt < 3 {
+                        let backoff_secs = 2u64.pow(attempt as u32);
+                        (self.log)(&format!(
+                            "pip install failed (attempt {}/3): {} — retry za {}s",
+                            attempt, e, backoff_secs
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap())
     }
     /// Dopisuje flagi do `pip install` (po subkomendzie). Osobno bo uv
     /// uzywa --index-strategy a pip nie zna tego flaga.
@@ -1260,7 +1361,7 @@ impl<'a> Installer<'a> {
             .arg("pip")
             .arg("wheel")
             .arg("setuptools>=77");
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     fn install_requirements(&self, path: &Path) -> Result<()> {
         (self.log)(&format!("pip: install -r {}", path.display()));
@@ -1269,7 +1370,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("-r").arg(path);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     fn install_package(&self, pkg: &str) -> Result<()> {
         (self.log)(&format!("pip: install {}", pkg));
@@ -1278,7 +1379,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg(pkg);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     fn install_editable(&self, path: &Path) -> Result<()> {
         (self.log)(&format!("pip: install -e {}", path.display()));
@@ -1287,7 +1388,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("-e").arg(path);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     /// Instalacja z wylaczona izolacja buildu (`--no-build-isolation`) —
     /// pakiet ma dostep do zainstalowanego torcha podczas budowy natywnych
@@ -1299,7 +1400,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("--no-build-isolation").arg(pkg);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     /// `pip install --force-reinstall --no-deps <pkg>` — nadpisuje wersje
     /// ktora resolver wybral, bez ruszania grafu zaleznosci. Uzywane do
@@ -1312,7 +1413,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("--force-reinstall").arg("--no-deps").arg(pkg);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
 }
 
@@ -1375,11 +1476,127 @@ pub(crate) fn build_engine_args(
     args
 }
 
+/// Buduje `Command` ktora opakowuje docelowa binarke w `nice` + `ionice`
+/// na Linuksie zeby silnik podczas startu (model load, torch.compile,
+/// flashinfer JIT) nie zabijal responsywnosci hosta. Wartosci nice/ionice
+/// mozna nadpisac przez TENTAFLOW_ENGINE_NICE / TENTAFLOW_ENGINE_IONICE_CLASS
+/// / TENTAFLOW_ENGINE_IONICE_LEVEL. Ustaw TENTAFLOW_ENGINE_NICE=0 zeby
+/// wylaczyc.
+#[cfg(target_os = "linux")]
+fn build_engine_command(exe: &Path) -> Command {
+    let nice_level = std::env::var("TENTAFLOW_ENGINE_NICE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(5);
+    let ionice_class = std::env::var("TENTAFLOW_ENGINE_IONICE_CLASS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(2);
+    let ionice_level = std::env::var("TENTAFLOW_ENGINE_IONICE_LEVEL")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(7);
+
+    if nice_level == 0 {
+        return Command::new(exe);
+    }
+
+    let nice_available = std::process::Command::new("nice")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !nice_available {
+        return Command::new(exe);
+    }
+
+    let ionice_available = std::process::Command::new("ionice")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let mut cmd = Command::new("nice");
+    cmd.arg("-n").arg(nice_level.to_string());
+    if ionice_available {
+        cmd.arg("ionice")
+            .arg("-c")
+            .arg(ionice_class.to_string())
+            .arg("-n")
+            .arg(ionice_level.to_string());
+    }
+    cmd.arg(exe);
+    cmd
+}
+
+#[cfg(target_os = "macos")]
+fn build_engine_command(exe: &Path) -> Command {
+    let nice_level = std::env::var("TENTAFLOW_ENGINE_NICE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(5);
+    if nice_level == 0 {
+        return Command::new(exe);
+    }
+    let mut cmd = Command::new("nice");
+    cmd.arg("-n").arg(nice_level.to_string()).arg(exe);
+    cmd
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn build_engine_command(exe: &Path) -> Command {
+    Command::new(exe)
+}
+
+/// Szuka instalacji CUDA toolkit na hoscie. Zwraca katalog, w ktorym
+/// `bin/nvcc` istnieje. Sprawdza w kolejnosci: `which nvcc` (PATH), potem
+/// znane lokacje systemowe. Wynik nie jest cache'owany — koszt to kilka
+/// stat() przy spawn engine'a.
+fn find_nvcc_root() -> Option<PathBuf> {
+    let nvcc_name = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+
+    if let Ok(output) = std::process::Command::new("which").arg(nvcc_name).output() {
+        if output.status.success() {
+            if let Ok(path) = std::str::from_utf8(&output.stdout) {
+                let nvcc_path = PathBuf::from(path.trim());
+                if nvcc_path.exists() {
+                    if let Some(bin_dir) = nvcc_path.parent() {
+                        if let Some(root) = bin_dir.parent() {
+                            return Some(root.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let candidates = [
+        "/usr/local/cuda",
+        "/opt/cuda",
+        "/usr/lib/cuda",
+        "/usr/local/cuda-13.0",
+        "/usr/local/cuda-12.8",
+        "/usr/local/cuda-12.4",
+        "/usr/local/cuda-12.1",
+    ];
+    for cand in &candidates {
+        let root = PathBuf::from(cand);
+        if root.join("bin").join(nvcc_name).exists() {
+            return Some(root);
+        }
+    }
+    None
+}
+
 fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Result<Child> {
     let exe = venv_bin(venv, &spec.launch.command);
     let bundle_dir = venv.join("app");
 
-    let mut cmd = Command::new(&exe);
+    let mut cmd = build_engine_command(&exe);
     for arg in build_engine_args(spec, &req.env, &bundle_dir, venv) {
         cmd.arg(arg);
     }
@@ -1394,6 +1611,22 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
     }
     cmd.env("BUNDLE_DIR", &bundle_dir);
     cmd.env("VENV_DIR", venv);
+
+    // Prepend venv/bin to PATH tak, zeby procesy potomne (np. flashinfer
+    // JIT wolajacy `ninja` przez subprocess.run) znalazly binarki ktore pip
+    // zainstalowal w venv (ninja, cmake) zamiast szukac w systemowym PATH.
+    let venv_bin_dir = venv.join("bin");
+    let new_path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut p = std::ffi::OsString::from(&venv_bin_dir);
+            p.push(":");
+            p.push(existing);
+            p
+        }
+        None => std::ffi::OsString::from(&venv_bin_dir),
+    };
+    cmd.env("PATH", new_path);
+    cmd.env("VIRTUAL_ENV", venv);
 
     // Shared <tentaflow_home>/models/ — same root Docker uses, so a model
     // pulled by Docker vLLM lives in the same hub/models--*/ directory that
@@ -1410,6 +1643,73 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         if !req.env.contains_key(k) {
             cmd.env(k, &v);
         }
+    }
+
+    // CUDA_HOME / CUDA_PATH: flashinfer JIT odpala nvcc po sciezce
+    // <CUDA_HOME>/bin/nvcc. Gdy env wskazuje na nieistniejacy katalog
+    // (np. runai container `/workspace/cuda-13.0` na bare-metalu) lub gdy
+    // env nie jest ustawione a system ma nvcc tylko w PATH, JIT crashuje
+    // 5 minut po starcie z `nvcc: not found`. Wymuszamy realna sciezke
+    // wyszukana w runtime.
+    let env_cuda = req
+        .env
+        .get("CUDA_HOME")
+        .or_else(|| req.env.get("CUDA_PATH"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CUDA_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("CUDA_PATH").map(PathBuf::from));
+    let cuda_home_valid = env_cuda
+        .as_ref()
+        .map(|p| p.join("bin").join("nvcc").exists())
+        .unwrap_or(false);
+    let cuda_home = if cuda_home_valid {
+        env_cuda
+    } else {
+        find_nvcc_root()
+    };
+    if let Some(home) = &cuda_home {
+        cmd.env("CUDA_HOME", home);
+        cmd.env("CUDA_PATH", home);
+    } else {
+        eprintln!(
+            "WARN: nvcc nie znaleziony w PATH ani CUDA_HOME — flashinfer JIT \
+             bedzie crashowal przy pierwszym FP4/FP8 kernelu. Zainstaluj \
+             CUDA toolkit albo ustaw CUDA_HOME na poprawna sciezke."
+        );
+    }
+
+    // Cap rownoleglosci compile threads tak, zeby torch.compile / inductor /
+    // flashinfer JIT nie odpalaly N watkow == liczba CPU (na 20-rdzeniowym
+    // node'ie to powoduje ze caly host wisi przez kilka minut przy starcie
+    // modelu). Polowa CPU domyslnie. Override przez TENTAFLOW_COMPILE_THREADS.
+    if !req.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
+        && !spec.launch.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
+    {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let compile_threads = std::env::var("TENTAFLOW_COMPILE_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| std::cmp::max(2, cpus / 2));
+        cmd.env(
+            "TORCHINDUCTOR_COMPILE_THREADS",
+            compile_threads.to_string(),
+        );
+        // MAX_JOBS jest honorowane przez setuptools/cmake (flashinfer JIT
+        // cz. nvcc fork-bomb) i ninja przy build_and_load.
+        cmd.env("MAX_JOBS", compile_threads.to_string());
+    }
+
+    // FlashInfer JIT cache musi byc per-instancja: build.ninja zapisuje
+    // absolutna sciezke do `<venv>/lib/python3.X/site-packages/flashinfer/data/csrc/*.cu`,
+    // a kazda instancja vLLM ma losowy katalog venv. Globalny cache w
+    // ~/.cache/flashinfer pamieta sciezke poprzedniej (juz usunietej)
+    // instancji i ninja crashuje z "missing and no known rule to make it".
+    let flashinfer_cache = venv.join(".flashinfer-cache");
+    let _ = std::fs::create_dir_all(&flashinfer_cache);
+    if !req.env.contains_key("FLASHINFER_WORKSPACE_BASE") {
+        cmd.env("FLASHINFER_WORKSPACE_BASE", &flashinfer_cache);
     }
 
     // Stdout/stderr -> <venv>/engine.log. `Stdio::piped()` bez aktywnego

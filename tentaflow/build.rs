@@ -13,6 +13,7 @@ use std::process::Command;
 
 fn main() {
     set_linux_rpath();
+    copy_versioned_shared_libs_linux();
     build_mlx_bridge();
     build_kokoro_bridge();
     build_meeting_bot();
@@ -42,6 +43,114 @@ fn set_linux_rpath() {
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
     println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
+}
+
+// llama-cpp-sys-2 build.rs:124 ma glob "*.so" ktory matchuje tylko symlinki bez
+// wersji (libllama.so), ale binarka kompiluje sie z SONAME libllama.so.0 i tego
+// szuka w runtime. Dociagamy wersjonowane pliki sami, dopoki upstream nie
+// naprawi tego globa. Dotyczy buildow z `dynamic-link` (np. gpu-cuda na CUDA 13,
+// gdzie statyczne cublas_static.a nie istnieje).
+//
+// Cargo nie gwarantuje ze llama-cpp-sys-2 cmake build skonczy sie przed naszym
+// build.rs (build skrypty roznych krat moga sie nakladac z ich kompilacjami),
+// wiec pollujemy az versioned libe sie pojawia. `cargo:rerun-if-changed` na
+// out/lib zapewnia ze cargo invaliduje nasz cache gdy llama sie przebuduje.
+fn copy_versioned_shared_libs_linux() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "linux" {
+        return;
+    }
+    let out_dir = match std::env::var("OUT_DIR") {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => return,
+    };
+    let target_dir = match out_dir.ancestors().nth(3) {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+    let build_dir = target_dir.join("build");
+    println!("cargo:rerun-if-changed={}", build_dir.display());
+
+    let lib_dirs = find_llama_lib_dirs(&build_dir);
+    if lib_dirs.is_empty() {
+        return;
+    }
+    for lib_dir in &lib_dirs {
+        println!("cargo:rerun-if-changed={}", lib_dir.display());
+        // Safety net: dorzuc out/lib jako rpath linker arg. Gdy polling
+        // ponizej nie zdazy (cmake build llama+CUDA potrafi trwac 13+ min),
+        // binarka i tak znajdzie versioned .so bezposrednio w build dir.
+        // Sciezka jest absolutna i hash-zalezna, wiec nie nadaje sie do
+        // deploymentu — tylko fallback dla local dev workflow.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    }
+
+    // Polling do 20 min (cmake llama+CUDA build moze trwac ~13 min na NGC).
+    // Build.rs i tak musi czekac az llama-cpp-sys-2 dostarczy symbole, wiec
+    // ten wait nie blokuje zadnej rownoleglej pracy cargo.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1200);
+    let mut copied = 0usize;
+    loop {
+        copied = 0;
+        for lib_dir in &lib_dirs {
+            copied += copy_versioned_from(lib_dir, &target_dir);
+        }
+        if copied > 0 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    if copied == 0 {
+        println!(
+            "cargo:warning=tentaflow: nie skopiowano versioned .so w 20 min — fallback rpath \
+             na out/lib aktywny, ale binarka przeniesiona w inne miejsce nie zadziala."
+        );
+    }
+}
+
+fn find_llama_lib_dirs(build_dir: &std::path::Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(build_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut result = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("llama-cpp-sys-2-") {
+            continue;
+        }
+        result.push(entry.path().join("out").join("lib"));
+    }
+    result
+}
+
+fn copy_versioned_from(lib_dir: &std::path::Path, target_dir: &std::path::Path) -> usize {
+    let entries = match std::fs::read_dir(lib_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let lib_name = entry.file_name();
+        if !lib_name.to_string_lossy().contains(".so.") {
+            continue;
+        }
+        let dst = target_dir.join(&lib_name);
+        let src = entry.path();
+        let _ = std::fs::remove_file(&dst);
+        if std::fs::hard_link(&src, &dst).is_err() && std::fs::copy(&src, &dst).is_err() {
+            continue;
+        }
+        // Bez RPATH na samych .so loader szuka ich tranzytywnych zaleznosci
+        // (libllama → libggml.so.0) w systemowych sciezkach i pada. Ustawiamy
+        // $ORIGIN zeby kazdy .so szukal swoich deps obok siebie.
+        let _ = Command::new("patchelf")
+            .args(["--set-rpath", "$ORIGIN"])
+            .arg(&dst)
+            .status();
+        count += 1;
+    }
+    count
 }
 
 // ----- MLX Swift bridge (macOS only) -----------------------------------------

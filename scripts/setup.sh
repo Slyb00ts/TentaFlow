@@ -173,10 +173,16 @@ install_base() {
                 openssl
                 vulkan-icd-loader
                 sqlite
+                # Profiling: perf zbiera CPU samples + PMU counters + uncore IMC.
+                # which jest potrzebne dla collectors/permissions auto-discovery.
+                perf
+                which
+                # iostat dla disk IO collector (/usr/bin/iostat).
+                sysstat
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged pacman -S --needed --noconfirm "${pkgs[@]}"
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "vulkan-loader" "sqlite")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -191,10 +197,18 @@ install_base() {
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
+                # Profiling: linux-tools dostarcza perf, sysstat dostarcza iostat.
+                # linux-tools-generic to meta-package ktory dociaga linux-tools-<kernel>
+                # pasujace do biezacego kernela (Ubuntu 24.04+).
+                linux-tools-common
+                linux-tools-generic
+                sysstat
+                libclang-dev
+                patchelf
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libvulkan1" "sqlite3-dev")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -208,10 +222,14 @@ install_base() {
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
+                # Profiling: perf jest w pakiecie 'perf' na Fedora 38+.
+                # sysstat dostarcza iostat dla linux.iostat.disk collector.
+                perf
+                sysstat
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "vulkan-loader" "sqlite-devel")
+            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -875,9 +893,21 @@ download_vision_models() {
     )
     local _ok=0
     local _miss=0
+    # stat ma rozne flagi per OS:
+    #   GNU (Linux):  stat -c %s <file>      (--format=%s)
+    #   BSD (macOS):  stat -f %z <file>      (--format wbudowane w -f)
+    # Mieszanie ich daje smieci - na Linuxie 'stat -f %z' to '--file-system'
+    # i wypluwa multi-line output z lokalizowanym 'Plik:' / 'File:' /etc.
+    # ktore set -u wykrywa jako undefined variable.
+    local _stat_size
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        _stat_size() { stat -f %z "$1" 2>/dev/null || echo 0; }
+    else
+        _stat_size() { stat -c %s "$1" 2>/dev/null || echo 0; }
+    fi
     for f in "${_expected[@]}"; do
         local p="${vision_dir}/${f}"
-        if [[ -f "$p" ]] && [[ $(stat -f %z "$p" 2>/dev/null || stat -c %s "$p" 2>/dev/null || echo 0) -gt 100000 ]]; then
+        if [[ -f "$p" ]] && [[ $(_stat_size "$p") -gt 100000 ]]; then
             _ok=$((_ok + 1))
         else
             log_warn "BRAK po pobieraniu: $p"

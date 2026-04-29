@@ -543,21 +543,23 @@ function renderStepAdvanced() {
   const isLoading = !rec;
   const hasError = rec && rec.error;
 
-  // Sekcja: podsumowanie z poprzednich kroków
+  const tk = (k, params) => I18n.t(`catalog.deploy_wizard.advanced.${k}`, params);
+
+  // Summary of selections from previous steps.
   const summaryCard = `
     <div class="adv-section">
       <div class="adv-sec-title">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3 8-8"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-        Wybór z poprzednich kroków
+        ${escapeHtml(tk('summary_title'))}
       </div>
       <div class="adv-summary-grid">
         <div class="adv-summary-cell">
-          <div class="adv-cell-label">Model</div>
+          <div class="adv-cell-label">${escapeHtml(tk('summary_model'))}</div>
           <div class="adv-cell-value"><code>${escapeHtml(model)}</code></div>
           ${rec && rec.model_spec ? `<div class="adv-cell-sub">${(rec.model_spec.estimated_params_billions || 0).toFixed(1)}B params · ${escapeHtml(rec.model_spec.dtype || '?')} · max ctx ${(rec.model_spec.max_position_embeddings || 0).toLocaleString()}</div>` : ''}
         </div>
         <div class="adv-summary-cell">
-          <div class="adv-cell-label">GPU</div>
+          <div class="adv-cell-label">${escapeHtml(tk('summary_gpu'))}</div>
           <div class="adv-cell-value">${escapeHtml(gpuLabel)}</div>
           <div class="adv-cell-sub">${gpus.map((g) => `GPU ${g.index}`).join(' · ') || '—'}</div>
         </div>
@@ -565,28 +567,27 @@ function renderStepAdvanced() {
     </div>
   `;
 
-  // Sekcja: kalkulator VRAM
+  // VRAM calculator section.
   const vramCard = isLoading
-    ? `<div class="adv-section"><div class="adv-loading">Pobieram <code>config.json</code> modelu z HuggingFace i kalkuluję VRAM…</div></div>`
+    ? `<div class="adv-section"><div class="adv-loading">${escapeHtml(tk('loading_config'))}</div></div>`
     : hasError
       ? `<div class="adv-section"><div class="adv-error">${escapeHtml(rec.error)}</div></div>`
       : renderVramCard(rec, totalVramGb, gpus.length);
 
-  // Sekcja: tryb auto/manual + reset locka (tylko w manual gdy cos jest locked)
+  // Mode card with auto/manual toggle and lock reset (only in manual when locked).
   const showReset = adv.mode === 'manual' && adv.lockedParam;
   const resetBtn = showReset
-    ? `<button type="button" class="adv-reset-lock" id="edw-adv-reset-lock" title="Odblokuj wszystkie parametry — niech backend dobierze auto-fit">🔄 Reset to auto</button>`
+    ? `<button type="button" class="adv-reset-lock" id="edw-adv-reset-lock" title="${escapeAttr(tk('reset_lock_title'))}">🔄 ${escapeHtml(tk('reset_lock'))}</button>`
     : '';
-  // Error box: backend zwrocil 409 (np. dwa parametry zalockowane jednoczesnie
-  // i ich kombinacja przekracza VRAM). Pokazujemy podpowiedz: kliknij Reset
-  // albo zmniejsz wartosc.
+  // Error box: backend returned 409 (e.g. two locked parameters whose combo
+  // exceeds VRAM). Suggest Reset or lower the locked parameter.
   let errorBox = '';
   if (hasError && adv.mode === 'manual') {
     errorBox = `
       <div class="adv-error-box">
-        <strong>Konfiguracja nie miesci sie w VRAM.</strong>
+        <strong>${escapeHtml(tk('error_no_fit'))}</strong>
         ${escapeHtml(rec.error)}
-        <div class="adv-error-hint">Klik <strong>🔄 Reset to auto</strong> albo zmniejsz zafiksowany parametr.</div>
+        <div class="adv-error-hint">${escapeHtml(tk('error_hint'))}</div>
       </div>
     `;
   }
@@ -595,12 +596,12 @@ function renderStepAdvanced() {
     <div class="adv-section">
       <div class="adv-sec-title">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/></svg>
-        Tryb konfiguracji
+        ${escapeHtml(tk('mode_title'))}
         <div class="adv-sec-actions">${resetBtn}</div>
       </div>
       <tf-segmented id="edw-adv-mode" value="${escapeAttr(adv.mode)}" size="sm">
-        <option value="auto" variant="neutral">Auto-tuned</option>
-        <option value="manual" variant="neutral">Ręczna</option>
+        <option value="auto" variant="neutral">${escapeHtml(tk('mode_auto'))}</option>
+        <option value="manual" variant="neutral">${escapeHtml(tk('mode_manual'))}</option>
       </tf-segmented>
       ${errorBox}
       ${adv.mode === 'auto'
@@ -610,13 +611,15 @@ function renderStepAdvanced() {
   `;
 
   return `
-    <h4 class="wizard-step-title">Konfiguracja zaawansowana</h4>
-    <p class="form-hint" style="margin-bottom:14px;">Inteligentny kalkulator VRAM dobiera tensor parallel, kontekst i KV cache pod twoje GPU. Możesz zostawić auto-tuned albo przełączyć na ręczne.</p>
+    <h4 class="wizard-step-title">${escapeHtml(tk('title'))}</h4>
+    <p class="form-hint" style="margin-bottom:14px;">${escapeHtml(tk('subtitle'))}</p>
     ${summaryCard}
     ${vramCard}
     ${modeCard}
   `;
 }
+
+function tAdv(k, params) { return I18n.t(`catalog.deploy_wizard.advanced.${k}`, params); }
 
 function renderVramCard(rec, totalVramGb, gpuCount) {
   const v = rec.vram_estimate || {};
@@ -634,17 +637,17 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   // parametry, fits, ale dalej recznie nie ma sie gdzie ruszyc).
   const backendAtLimit = rec && rec.at_limit === true;
   let pillCls = 'adv-pill ok';
-  let pillTxt = backendAtLimit ? `${pctUsed}% — AT LIMIT` : 'FITS';
+  let pillTxt = backendAtLimit ? tAdv('pill_at_limit', { p: pctUsed }) : tAdv('pill_fits');
   let barCls = 'ok';
   let kvCls = '';
   let leftCls = 'success';
   let totalCls = 'accent';
   if (pctUsed > 95) {
-    pillCls = 'adv-pill danger'; pillTxt = `${pctUsed}% — OUT OF VRAM`;
+    pillCls = 'adv-pill danger'; pillTxt = tAdv('pill_oom', { p: pctUsed });
     barCls = 'danger'; kvCls = 'danger'; leftCls = 'danger'; totalCls = 'danger';
   } else if (pctUsed > 80 || backendAtLimit) {
     pillCls = 'adv-pill warn';
-    if (!backendAtLimit) pillTxt = `${pctUsed}% — uważaj`;
+    if (!backendAtLimit) pillTxt = tAdv('pill_warn', { p: pctUsed });
     barCls = 'warn'; kvCls = 'warn'; leftCls = 'warn';
   }
   // Pulse 1x na przejsciu na "at limit" zeby user zauwazyl. Klasa
@@ -669,26 +672,26 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
     <div class="adv-section">
       <div class="adv-sec-title">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h20v18H2z"/><path d="M2 9h20"/></svg>
-        Kalkulator VRAM
+        ${escapeHtml(tAdv('vram_calc_title'))}
         <div class="adv-sec-actions"><span class="${pillCls}">${escapeHtml(pillTxt)}</span></div>
       </div>
       <div class="adv-kpi-grid" id="edw-adv-kpi">
-        <div class="adv-kpi"><div class="k-label">Wagi modelu</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
-        <div class="adv-kpi ${kvCls}"><div class="k-label">KV cache</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${(r.max_model_len || 0).toLocaleString()} ctx · ${escapeHtml(r.kv_cache_dtype || 'auto')}</div></div>
-        <div class="adv-kpi"><div class="k-label">Aktywacje</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">workspace</div></div>
-        <div class="adv-kpi ${leftCls}"><div class="k-label">Zostaje</div><div class="k-value">${headroomGb >= 0 ? headroomGb.toFixed(1) : '−' + Math.abs(headroomGb).toFixed(1)} GB</div><div class="k-sub">${Math.max(0, 100 - pctUsed)}% headroom</div></div>
-        <div class="adv-kpi ${totalCls}"><div class="k-label">Total / Avail</div><div class="k-value">${totalUsed.toFixed(1)} GB / ${totalVramGb.toFixed(0)} GB</div><div class="k-sub">${pctUsed}% z ${gpuCount} GPU</div></div>
+        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
+        <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(tAdv('kpi_kv_cache'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_kv_sub', { ctx: (r.max_model_len || 0).toLocaleString(), dtype: r.kv_cache_dtype || 'auto' }))}</div></div>
+        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_activations'))}</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_activations_sub'))}</div></div>
+        <div class="adv-kpi ${leftCls}"><div class="k-label">${escapeHtml(tAdv('kpi_headroom'))}</div><div class="k-value">${headroomGb >= 0 ? headroomGb.toFixed(1) : '−' + Math.abs(headroomGb).toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_headroom_sub', { p: Math.max(0, 100 - pctUsed) }))}</div></div>
+        <div class="adv-kpi ${totalCls}"><div class="k-label">${escapeHtml(tAdv('kpi_total_avail'))}</div><div class="k-value">${totalUsed.toFixed(1)} GB / ${totalVramGb.toFixed(0)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_total_sub', { p: pctUsed, n: gpuCount }))}</div></div>
       </div>
       <div class="adv-vram-bar-wrap">
-        <div class="adv-vram-head"><span>Wykorzystanie VRAM</span><span class="pct">${pctUsed}%</span></div>
+        <div class="adv-vram-head"><span>${escapeHtml(tAdv('vram_usage'))}</span><span class="pct">${pctUsed}%</span></div>
         <div class="adv-vram-bar"><div class="fill ${barCls}" style="width:${Math.min(100, pctUsed)}%"></div></div>
         <div class="adv-vram-legend">
-          <span class="lg-w">Wagi ${w(weightsGb).toFixed(0)}%</span>
-          <span class="lg-kv">KV ${w(kvGb).toFixed(0)}%</span>
-          <span class="lg-act">Aktywacje ${w(actGb).toFixed(0)}%</span>
+          <span class="lg-w">${escapeHtml(tAdv('legend_weights', { p: w(weightsGb).toFixed(0) }))}</span>
+          <span class="lg-kv">${escapeHtml(tAdv('legend_kv', { p: w(kvGb).toFixed(0) }))}</span>
+          <span class="lg-act">${escapeHtml(tAdv('legend_activations', { p: w(actGb).toFixed(0) }))}</span>
           ${overflow
-            ? `<span class="lg-free danger">Brakuje ${Math.abs(headroomGb).toFixed(1)} GB</span>`
-            : `<span class="lg-free">Wolne ${w(freeGb).toFixed(0)}%</span>`}
+            ? `<span class="lg-free danger">${escapeHtml(tAdv('legend_short', { gb: Math.abs(headroomGb).toFixed(1) }))}</span>`
+            : `<span class="lg-free">${escapeHtml(tAdv('legend_free', { p: w(freeGb).toFixed(0) }))}</span>`}
         </div>
       </div>
     </div>
@@ -697,30 +700,30 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
 
 function renderAutoAlert(rec) {
   if (!rec || rec.error) {
-    return `<div class="form-hint" style="margin-top:10px;">Auto-tuned użyje domyślnej konfiguracji vLLM po pobraniu rekomendacji.</div>`;
+    return `<div class="form-hint" style="margin-top:10px;">${escapeHtml(tAdv('auto_default_hint'))}</div>`;
   }
   const r = rec.recommended || {};
   const args = rec.recommended_vllm_args || '';
   const warnings = rec.warnings || [];
-  // GPU compatibility: jezeli liczba wybranych GPU nie pasuje do architektury
-  // modelu (TP musi dzielic num_attention_heads, PP musi dzielic
-  // num_hidden_layers), pokazujemy duzy warning chip + liste lepszych counts.
+  // GPU compatibility: when the chosen GPU count doesn't fit the model
+  // architecture (TP must divide num_attention_heads, PP must divide
+  // num_hidden_layers), surface a warning chip with better-fitting counts.
   const compat = rec.gpu_compatibility;
   let compatChip = '';
   if (compat && !compat.clean_partition) {
-    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' lub ');
+    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' / ');
     compatChip = `
       <div style="margin-top:10px; padding:10px; background:#fff4e0; border:1px solid #ffb84d; border-radius:6px; font-size:12px; color:#663d00;">
-        ⚠️ <strong>Liczba GPU nieoptymalna dla tego modelu.</strong>
+        ⚠️ <strong>${escapeHtml(tAdv('compat_warn_title'))}</strong>
         ${escapeHtml(compat.warning || '')}<br>
-        <em>Wroc do kroku GPU i wybierz: ${better || '—'}</em>
+        <em>${escapeHtml(tAdv('compat_better', { options: '' }))} ${better || '—'}</em>
       </div>
     `;
   } else if (compat && !compat.uses_all_gpus) {
-    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' lub ');
+    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' / ');
     compatChip = `
       <div style="margin-top:10px; padding:8px; background:#fffbe5; border:1px solid #f5d76e; border-radius:6px; font-size:12px; color:#5c4500;">
-        ℹ️ TP=${compat.used_tp} × PP=${compat.used_pp} = ${compat.used_tp * compat.used_pp} GPU uzywanych. Pozostale bezczynne. Lepiej uzyc: ${better}.
+        ℹ️ ${escapeHtml(tAdv('compat_idle', { tp: compat.used_tp, pp: compat.used_pp, used: compat.used_tp * compat.used_pp, options: '' }))} ${better}
       </div>
     `;
   }
@@ -728,10 +731,15 @@ function renderAutoAlert(rec) {
     <div class="adv-alert info">
       <div class="adv-alert-ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></div>
       <div class="adv-alert-body">
-        <strong>Rekomendacja na podstawie hardware'u:</strong>
-        TP=${r.tensor_parallel || 1} × PP=${r.pipeline_parallel || 1}, kontekst <strong>${(r.max_model_len || 0).toLocaleString()}</strong>,
-        KV cache <strong>${escapeHtml(r.kv_cache_dtype || 'auto')}</strong>, max_num_seqs=${r.max_num_seqs || 0},
-        gpu_memory_utilization=${(r.gpu_memory_utilization || 0.9).toFixed(2)}.
+        <strong>${escapeHtml(tAdv('rec_intro'))}</strong>
+        ${escapeHtml(tAdv('rec_summary', {
+          tp: r.tensor_parallel || 1,
+          pp: r.pipeline_parallel || 1,
+          ctx: (r.max_model_len || 0).toLocaleString(),
+          dtype: r.kv_cache_dtype || 'auto',
+          seqs: r.max_num_seqs || 0,
+          mu: (r.gpu_memory_utilization || 0.9).toFixed(2),
+        }))}
         ${args ? `<div class="adv-alert-args">${escapeHtml(args)}</div>` : ''}
         ${compatChip}
         ${warnings.length > 0 ? `<ul class="adv-alert-warn">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
@@ -787,20 +795,21 @@ function renderAdvancedManualControls(adv, rec) {
   const memUtil = valueFor('gpu_memory_utilization', 0.9);
   const totalGpus = (getAdvancedGpus() || []).length || 1;
 
-  // Helper: render hintu auto-adjust pod sliderem.
+  // Helper: render the auto-adjust hint shown below a slider.
   const adjustHint = (key, prevVal, newVal) => {
-    if (lockedParam === key) return ''; // locked = wartosc usera, nic nie autotunujemy
+    if (lockedParam === key) return ''; // locked = user value, never auto-tune
     if (!autoAdjusted.has(key)) return '';
     const fmt = (v) => typeof v === 'number' ? (v >= 1 ? v.toLocaleString() : v.toFixed(2)) : String(v ?? '?');
-    return `<div class="adv-hint adjust-warn">⚙ Auto-zmniejszono z ${fmt(prevVal)} do ${fmt(newVal)} (limit VRAM)</div>`;
+    return `<div class="adv-hint adjust-warn">⚙ ${escapeHtml(tAdv('auto_adjusted', { prev: fmt(prevVal), new: fmt(newVal) }))}</div>`;
   };
 
-  // Helper: marker locka obok labelki slidera.
+  // Helper: lock marker rendered next to the slider label.
   const lockMark = (key) => lockedParam === key
-    ? `<span class="adv-lock-tag" title="Ten parametr jest zablokowany — pozostale slidery dostosowuja sie automatycznie">🔒 locked</span>`
+    ? `<span class="adv-lock-tag" title="${escapeAttr(tAdv('lock_title'))}">🔒 ${escapeHtml(tAdv('lock_tag'))}</span>`
     : '';
 
-  // Live JS estimator KV — natychmiastowy podglad VRAM (przed backendem).
+  // Live client-side KV estimator — instant VRAM preview before the backend
+  // round-trip resolves with the authoritative number.
   let liveKvHint = '';
   if (cachedModelSpec) {
     const liveGb = estimateKvGb({
@@ -810,18 +819,20 @@ function renderAdvancedManualControls(adv, rec) {
       kv_dtype_bytes: kvDtypeBytes(kv),
     });
     if (liveGb != null) {
-      liveKvHint = `<div class="adv-hint">Estymowany KV cache (live): <strong>${liveGb.toFixed(1)} GB</strong> · backend potwierdzi za chwile…</div>`;
+      liveKvHint = `<div class="adv-hint">${escapeHtml(tAdv('live_kv_estimate', { gb: liveGb.toFixed(1) }))}</div>`;
     }
   }
 
-  // Chipy presetów — disabled gdy przekraczają max modelu.
+  // Preset chips — disabled when they exceed the model's max context.
   const chips = CTX_PRESETS.map((p) => {
     const exceeds = p.value > maxCtx;
     const active = !exceeds && Math.abs(p.value - ctx) < 1024;
     const cls = ['adv-ctx-chip'];
     if (active) cls.push('active');
     if (exceeds) cls.push('exceeds');
-    const title = exceeds ? `Przekracza max modelu (${maxCtx.toLocaleString()})` : `Ustaw ${p.label}`;
+    const title = exceeds
+      ? tAdv('ctx_chip_exceeds', { max: maxCtx.toLocaleString() })
+      : tAdv('ctx_chip_set', { label: p.label });
     return `<button type="button" class="${cls.join(' ')}" data-ctx="${p.value}" title="${escapeAttr(title)}" ${exceeds ? 'disabled' : ''}>${escapeHtml(p.label)}</button>`;
   }).join('');
 
@@ -834,43 +845,47 @@ function renderAdvancedManualControls(adv, rec) {
   const tpAdjust = adjustHint('tensor_parallel', recCfg.tensor_parallel, applied.tensor_parallel);
   const memAdjust = adjustHint('gpu_memory_utilization', recCfg.gpu_memory_utilization, applied.gpu_memory_utilization);
 
+  const ctxHint = vramMaxCtx
+    ? tAdv('ctx_hint_max_with_vram', { model: modelMaxCtx ? modelMaxCtx.toLocaleString() : '?', vram: vramMaxCtx.toLocaleString() })
+    : tAdv('ctx_hint_max', { model: modelMaxCtx ? modelMaxCtx.toLocaleString() : '?' });
+
   return `
     <div class="adv-form-row">
       <label>
-        <span>Długość kontekstu (max_model_len) ${lockMark('max_model_len')}</span>
+        <span>${escapeHtml(tAdv('ctx_label'))} ${lockMark('max_model_len')}</span>
         <span class="v" id="edw-adv-ctx-val">${ctx.toLocaleString()}</span>
       </label>
       <input type="range" class="adv-range" id="edw-adv-ctx" min="512" max="${maxCtx}" step="512" value="${ctx}">
       <div class="adv-ctx-presets">${chips}</div>
-      <div class="adv-hint">Max z konfiguracji modelu: <strong>${modelMaxCtx ? modelMaxCtx.toLocaleString() : '?'}</strong>${vramMaxCtx ? ` · z VRAM: <strong>${vramMaxCtx.toLocaleString()}</strong>` : ''}.</div>
+      <div class="adv-hint">${escapeHtml(ctxHint)}</div>
       ${ctxAdjust}
     </div>
 
     <div class="adv-row-2">
       <div class="adv-form-row">
-        <label><span>Tensor Parallel ${lockMark('tensor_parallel')}</span><span class="v">${tp}</span></label>
+        <label><span>${escapeHtml(tAdv('tp_label'))} ${lockMark('tensor_parallel')}</span><span class="v">${tp}</span></label>
         <tf-input type="number" id="edw-adv-tp" min="1" max="${totalGpus}" value="${tp}"></tf-input>
-        <div class="adv-hint">Musi dzielić num_attention_heads. Limit ${totalGpus} GPU.</div>
+        <div class="adv-hint">${escapeHtml(tAdv('tp_hint', { n: totalGpus }))}</div>
         ${tpAdjust}
       </div>
       <div class="adv-form-row">
-        <label><span>Pipeline Parallel</span><span class="v">${pp}</span></label>
+        <label><span>${escapeHtml(tAdv('pp_label'))}</span><span class="v">${pp}</span></label>
         <tf-input type="number" id="edw-adv-pp" min="1" max="${totalGpus}" value="${pp}"></tf-input>
-        <div class="adv-hint">TP × PP ≤ ${totalGpus}. PP dzieli num_hidden_layers.</div>
+        <div class="adv-hint">${escapeHtml(tAdv('pp_hint', { n: totalGpus }))}</div>
       </div>
     </div>
 
     <div class="adv-row-2">
       <div class="adv-form-row">
-        <label><span>Max num seqs ${lockMark('max_num_seqs')}</span><span class="v" id="edw-adv-seqs-val">${seqs}</span></label>
+        <label><span>${escapeHtml(tAdv('seqs_label'))} ${lockMark('max_num_seqs')}</span><span class="v" id="edw-adv-seqs-val">${seqs}</span></label>
         <input type="range" class="adv-range" id="edw-adv-seqs" min="1" max="${maxSeqs}" step="1" value="${seqs}">
-        <div class="adv-hint">Liczba równoległych zapytań w batch (max ${maxSeqs}).</div>
+        <div class="adv-hint">${escapeHtml(tAdv('seqs_hint', { n: maxSeqs }))}</div>
         ${seqsAdjust}
       </div>
       <div class="adv-form-row">
-        <label><span>GPU memory utilization ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
+        <label><span>${escapeHtml(tAdv('mem_label'))} ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
         <input type="range" class="adv-range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}">
-        <div class="adv-hint">Procent VRAM dla vLLM, reszta na CUDA workspace.</div>
+        <div class="adv-hint">${escapeHtml(tAdv('mem_hint'))}</div>
         ${memAdjust}
       </div>
     </div>
@@ -878,24 +893,24 @@ function renderAdvancedManualControls(adv, rec) {
     ${liveKvHint}
 
     <div class="adv-form-row">
-      <label>KV Cache dtype</label>
+      <label>${escapeHtml(tAdv('kv_label'))}</label>
       <tf-select id="edw-adv-kv" value="${escapeAttr(kv)}">
-        <option value="auto">auto (fp16 default)</option>
-        <option value="fp16">fp16 (2 B/elem)</option>
-        <option value="bfloat16">bfloat16 (2 B/elem)</option>
-        <option value="fp8">fp8 (1 B/elem · 2× kontekst)</option>
+        <option value="auto">${escapeHtml(tAdv('kv_opt_auto'))}</option>
+        <option value="fp16">${escapeHtml(tAdv('kv_opt_fp16'))}</option>
+        <option value="bfloat16">${escapeHtml(tAdv('kv_opt_bf16'))}</option>
+        <option value="fp8">${escapeHtml(tAdv('kv_opt_fp8'))}</option>
       </tf-select>
-      <div class="adv-hint">fp8 jest dwa razy tańszy w VRAM przy zachowanej jakości.</div>
+      <div class="adv-hint">${escapeHtml(tAdv('kv_hint'))}</div>
     </div>
 
     <div class="adv-hint" style="margin-top:10px;">
-      Wartości są zapisywane jako VLLM_ARGS w deploy. Suwaki nie wymuszają hard-limitów — możesz spróbować ekstremalnych ustawień, ale kalkulator powyżej pokaże gdy konfiguracja nie zmieści się w VRAM.
+      ${escapeHtml(tAdv('vllm_args_note'))}
     </div>
   `;
 }
 
 function bindAdvancedHandlers() {
-  // Tryb auto/manual — tf-segmented emituje "change" z detail.value.
+  // Auto/manual mode — tf-segmented emits "change" with detail.value.
   const modeSeg = document.getElementById('edw-adv-mode');
   if (modeSeg) {
     modeSeg.addEventListener('change', (e) => {

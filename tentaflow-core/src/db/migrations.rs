@@ -1912,5 +1912,40 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             CREATE UNIQUE INDEX idx_deployments_slug ON deployments(slug);
         ",
     ),
+    (
+        65,
+        "peer_persisted_and_hints",
+        "
+            -- Single source of truth for peer state owned by PeerRegistry.
+            -- One row per peer; state fields are written by PersistenceWriter
+            -- in batched, debounced transactions guarded by persisted_ver
+            -- (out-of-order writes are dropped via ON CONFLICT WHERE clause).
+            CREATE TABLE IF NOT EXISTS peer_persisted (
+                node_id        BLOB PRIMARY KEY,
+                pubkey         BLOB NOT NULL,
+                trust_state    INTEGER NOT NULL DEFAULT 0,
+                hostname       TEXT,
+                platform       TEXT,
+                role           INTEGER NOT NULL DEFAULT 0,
+                last_seen_ms   INTEGER NOT NULL DEFAULT 0,
+                persisted_ver  INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms  INTEGER NOT NULL
+            );
+
+            -- Transport hints discovered for a peer (direct addrs, relay URLs,
+            -- DNS hostnames). Many-to-one with peer_persisted; cascade-deleted.
+            CREATE TABLE IF NOT EXISTS peer_hints (
+                node_id     BLOB NOT NULL,
+                hint_kind   INTEGER NOT NULL,
+                payload     TEXT NOT NULL,
+                last_ok_ms  INTEGER,
+                fail_count  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (node_id, hint_kind, payload),
+                FOREIGN KEY (node_id) REFERENCES peer_persisted(node_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_peer_hints_node ON peer_hints(node_id);
+        ",
+    ),
 ]
 }

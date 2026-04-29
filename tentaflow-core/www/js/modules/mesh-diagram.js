@@ -8,6 +8,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
 
 let listenerBound = null;
 let resetListener = null;
@@ -357,7 +358,5 @@ export function destroyDiagram() {
 }
 
 function isOnline(node) {
-  const s = String(node.status || '').toLowerCase();
-  if (node.is_local) return true;
-  return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
+  return isOnlineHelper(node);
 }

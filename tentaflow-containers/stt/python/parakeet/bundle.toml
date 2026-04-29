@@ -1,10 +1,13 @@
 [bundle]
 engine = "parakeet"
-description = "NVIDIA NeMo Parakeet-TDT-0.6B-v3 (STT, git HEAD)"
+description = "NVIDIA NeMo Parakeet-TDT-0.6B-v3 (STT)"
 python_version = "3.12"
 source = "git"
 git_repo = "https://github.com/NVIDIA/NeMo.git"
-git_ref = "main"
+# Tag musi byc spojny z `nemo_toolkit[asr]==2.6.2` w install_variants.extras —
+# inaczej git checkout (HEAD) wciaga lhotse z PyPI transitive deps, ktora
+# nie ma symboli wymaganych przez nowszy NeMo (ImportError: Compress).
+git_ref = "v2.6.2"
 
 [launch]
 command = "uvicorn"

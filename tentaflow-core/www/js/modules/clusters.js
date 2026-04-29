@@ -18,6 +18,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
+import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
 import ClusterDetailScreen from '/js/modules/cluster-detail.js';
 import ClusterWizard from '/js/modules/cluster-wizard.js';
 import '/js/components/tf-button.js';
@@ -226,10 +227,7 @@ function clusterStatus(cluster) {
 }
 
 function isOnline(node) {
-  if (!node) return false;
-  if (node.is_local) return true;
-  const s = String(node.status || '').toLowerCase();
-  return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
+  return isOnlineHelper(node);
 }
 
 function renderStatusChip(status) {
