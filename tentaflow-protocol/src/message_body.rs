@@ -132,25 +132,12 @@ pub struct ServiceListResponse {
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceStopRequest {
+pub struct ServiceDeleteRequest {
     pub service_id: i64,
     /// Target mesh node. `None` (or local node id) = run locally; otherwise
     /// the dispatcher forwards the action to the named peer over mesh and
     /// waits for the response. `service_id` always lives in the target node's
     /// SQLite namespace.
-    pub node_id: Option<String>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceStopResponse {
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceDeleteRequest {
-    pub service_id: i64,
-    /// See `ServiceStopRequest::node_id`.
     pub node_id: Option<String>,
 }
 
@@ -164,7 +151,7 @@ pub struct ServiceDeleteResponse {
 pub struct ServicePinRequest {
     pub service_id: i64,
     pub pinned: bool,
-    /// See `ServiceStopRequest::node_id`.
+    /// See `ServiceDeleteRequest::node_id`.
     pub node_id: Option<String>,
 }
 
@@ -177,7 +164,7 @@ pub struct ServicePinResponse {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceStartRequest {
     pub service_id: i64,
-    /// See `ServiceStopRequest::node_id`.
+    /// See `ServiceDeleteRequest::node_id`.
     pub node_id: Option<String>,
 }
 
@@ -191,26 +178,12 @@ pub struct ServiceStartResponse {
 pub struct ServicePauseRequest {
     pub service_id: i64,
     pub paused: bool,
-    /// See `ServiceStopRequest::node_id`.
+    /// See `ServiceDeleteRequest::node_id`.
     pub node_id: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServicePauseResponse {
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceRenameRequest {
-    pub service_id: i64,
-    pub display_name: String,
-    /// See `ServiceStopRequest::node_id`.
-    pub node_id: Option<String>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceRenameResponse {
     pub success: bool,
     pub error: Option<String>,
 }
@@ -221,8 +194,6 @@ pub struct ServiceRenameResponse {
 pub enum ServicePayload {
     ReqList(ServiceListRequest),
     ResList(ServiceListResponse),
-    ReqStop(ServiceStopRequest),
-    ResStop(ServiceStopResponse),
     ReqDelete(ServiceDeleteRequest),
     ResDelete(ServiceDeleteResponse),
     ReqPin(ServicePinRequest),
@@ -231,8 +202,6 @@ pub enum ServicePayload {
     ResPause(ServicePauseResponse),
     ReqStart(ServiceStartRequest),
     ResStart(ServiceStartResponse),
-    ReqRename(ServiceRenameRequest),
-    ResRename(ServiceRenameResponse),
 }
 
 // =============================================================================

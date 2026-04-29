@@ -396,18 +396,6 @@ pub fn set_paused(conn: &Connection, id: i64, paused: bool) -> Result<()> {
     Ok(())
 }
 
-/// Renames the user-facing display name.
-pub fn update_display_name(conn: &Connection, id: i64, name: &str) -> Result<()> {
-    let n = conn.execute(
-        "UPDATE services SET display_name = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-        params![id, name],
-    )?;
-    if n == 0 {
-        return Err(anyhow!("update_display_name: service id={} not found", id));
-    }
-    Ok(())
-}
-
 /// Deletes a service. Cascades to `model_registry` via FK ON DELETE CASCADE.
 pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("DELETE FROM services WHERE id = ?1", params![id])?;
@@ -485,16 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn pin_pause_and_rename_round_trip() {
+    fn pin_pause_round_trip() {
         let conn = open_test_db();
         let id = insert(&conn, &sample_new("vllm")).unwrap();
         set_pinned(&conn, id, true).unwrap();
         set_paused(&conn, id, true).unwrap();
-        update_display_name(&conn, id, "Production vLLM").unwrap();
         let row = get(&conn, id).unwrap().unwrap();
         assert!(row.pinned);
         assert!(row.paused);
-        assert_eq!(row.display_name, "Production vLLM");
 
         let pinned = list_pinned(&conn).unwrap();
         assert_eq!(pinned.len(), 1);

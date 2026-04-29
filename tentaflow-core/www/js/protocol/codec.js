@@ -835,18 +835,6 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ServiceStopRequest { serviceId, nodeId? } */
-  serviceStopRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceStopRequest(serviceId, nodeId ?? undefined);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
   /** MessageBody::ServiceFlagsUpdateRequest { serviceId, pinned?, paused? }
    *  pinned/paused: undefined/null = nie zmieniaj, true/false = ustaw. */
   serviceFlagsUpdateRequest(correlationId, { serviceId, pinned, paused }, sequence = 1) {
@@ -2386,18 +2374,6 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ServiceBody(ServicePayload::ReqStop). */
-  serviceStopRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceStopRequest(Number(serviceId), nodeId ?? undefined);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
   /** MessageBody::ServiceBody(ServicePayload::ReqDelete). */
   serviceDeleteRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
     assertReady();
@@ -2454,21 +2430,6 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ServiceBody(ServicePayload::ReqRename). */
-  serviceRenameRequest(correlationId, { serviceId, displayName, nodeId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceRenameRequest(
-      Number(serviceId),
-      String(displayName),
-      nodeId ?? undefined,
-    );
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
 };
 
 // =============================================================================

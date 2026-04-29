@@ -1429,23 +1429,6 @@ pub fn encode_service_list_request(
     .map_err(|e| JsError::new(&e))
 }
 
-/// MessageBody::ServiceBody(ServicePayload::ReqStop) — stops the runtime but
-/// keeps the row.
-#[wasm_bindgen(js_name = encodeServiceStopRequest)]
-pub fn encode_service_stop_request(
-    service_id: f64,
-    node_id: Option<String>,
-) -> Result<Vec<u8>, JsError> {
-    use tentaflow_protocol::{ServicePayload, ServiceStopRequest};
-    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqStop(
-        ServiceStopRequest {
-            service_id: service_id as i64,
-            node_id,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
 /// MessageBody::ServiceBody(ServicePayload::ReqDelete) — stop + delete the row
 /// (cascades to `model_registry`).
 #[wasm_bindgen(js_name = encodeServiceDeleteRequest)]
@@ -1512,24 +1495,6 @@ pub fn encode_service_pause_request(
         ServicePauseRequest {
             service_id: service_id as i64,
             paused,
-            node_id,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// MessageBody::ServiceBody(ServicePayload::ReqRename) — sets `display_name`.
-#[wasm_bindgen(js_name = encodeServiceRenameRequest)]
-pub fn encode_service_rename_request(
-    service_id: f64,
-    display_name: String,
-    node_id: Option<String>,
-) -> Result<Vec<u8>, JsError> {
-    use tentaflow_protocol::{ServicePayload, ServiceRenameRequest};
-    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqRename(
-        ServiceRenameRequest {
-            service_id: service_id as i64,
-            display_name,
             node_id,
         },
     )))
@@ -2004,18 +1969,6 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
             }
             set(obj, "services", arr.into());
         }
-        SP::ReqStop(r) => {
-            set(obj, "variant", "ServiceStopRequest".into());
-            set(obj, "serviceId", (r.service_id as f64).into());
-            set(obj, "service_id", (r.service_id as f64).into());
-        }
-        SP::ResStop(r) => {
-            set(obj, "variant", "ServiceStopResponse".into());
-            set(obj, "success", r.success.into());
-            if let Some(e) = r.error {
-                set(obj, "error", e.into());
-            }
-        }
         SP::ReqDelete(r) => {
             set(obj, "variant", "ServiceDeleteRequest".into());
             set(obj, "serviceId", (r.service_id as f64).into());
@@ -2061,20 +2014,6 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         }
         SP::ResStart(r) => {
             set(obj, "variant", "ServiceStartResponse".into());
-            set(obj, "success", r.success.into());
-            if let Some(e) = r.error {
-                set(obj, "error", e.into());
-            }
-        }
-        SP::ReqRename(r) => {
-            set(obj, "variant", "ServiceRenameRequest".into());
-            set(obj, "serviceId", (r.service_id as f64).into());
-            set(obj, "service_id", (r.service_id as f64).into());
-            set(obj, "displayName", r.display_name.clone().into());
-            set(obj, "display_name", r.display_name.into());
-        }
-        SP::ResRename(r) => {
-            set(obj, "variant", "ServiceRenameResponse".into());
             set(obj, "success", r.success.into());
             if let Some(e) = r.error {
                 set(obj, "error", e.into());

@@ -1116,7 +1116,7 @@ pub fn prune_orphaned_quic_models(pool: &DbPool) -> Result<u32> {
 }
 
 /// Usuwa wszystkie wpisy model_registry powiazane z danym serwisem.
-/// Wolane przy service_stop — bez tego stare modele MLX/llama.cpp zostaja
+/// Wolane przy service_delete — bez tego stare modele MLX/llama.cpp zostaja
 /// w GUI jako "Załadowane" mimo ze ich serwis juz nie istnieje.
 pub fn delete_model_entries_by_service(pool: &DbPool, service_id: i64) -> Result<usize> {
     let conn = acquire(pool)?;
