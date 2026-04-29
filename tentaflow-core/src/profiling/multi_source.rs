@@ -1,7 +1,7 @@
 // =============================================================================
 // File: multi_source.rs — Orchestrator that runs multiple ProfileCollectors in
 // parallel, merges their TimelineEvents into a single ProfileReportV2, and
-// persists via ProfileStorageV2.
+// persists via ProfileStorage.
 // =============================================================================
 
 use std::collections::HashMap;
@@ -24,8 +24,8 @@ use crate::profiling::collectors::{
     CollectorParser, CollectorRegistry, ElevationKind, ElevationToken, FrameInterner, FrameKey,
     NameInterner, ProbeResult, ProfileCollector, RunningCollector, SessionCtx,
 };
-use crate::profiling::storage_v2::{
-    ProfileStorageV2, SessionKind, SessionManifest, SkippedCollector, StorageError,
+use crate::profiling::storage::{
+    ProfileStorage, SessionKind, SessionManifest, SkippedCollector, StorageError,
 };
 
 // -----------------------------------------------------------------------------
@@ -173,14 +173,14 @@ struct ActiveSessionState {
 // -----------------------------------------------------------------------------
 
 pub struct MultiSourceSession {
-    storage: Arc<ProfileStorageV2>,
+    storage: Arc<ProfileStorage>,
     registry: Arc<CollectorRegistry>,
     active: Mutex<Option<ActiveSessionState>>,
     epoch_counter: AtomicU64,
 }
 
 impl MultiSourceSession {
-    pub fn new(storage: Arc<ProfileStorageV2>, registry: Arc<CollectorRegistry>) -> Arc<Self> {
+    pub fn new(storage: Arc<ProfileStorage>, registry: Arc<CollectorRegistry>) -> Arc<Self> {
         Arc::new(Self {
             storage,
             registry,
@@ -1191,7 +1191,7 @@ mod tests {
         Arc<ParserRegistry>,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let registry = Arc::new(CollectorRegistry::new());
         let parsers = Arc::new(ParserRegistry::new());
         let orch = MultiSourceSession::new(storage, Arc::clone(&registry));
@@ -1259,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn start_already_active_returns_already_active() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_cpu("mock.cpu"));
         let registry = Arc::new(reg);
@@ -1313,7 +1313,7 @@ mod tests {
     #[tokio::test]
     async fn start_filters_unavailable_collectors_to_none_available() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(
             MockCollector::new_cpu("mock.cpu").with_probe(ProbeResult::Unavailable {
@@ -1341,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn start_skips_needs_elevation_when_no_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_cpu("mock.cpu_a"));
         reg.register(MockCollector::new_cpu("mock.cpu_b").with_probe(
@@ -1374,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn start_uses_elevation_when_token_provided() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(
             MockCollector::new_cpu("mock.cpu").with_probe(ProbeResult::NeedsElevation {
@@ -1406,7 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn start_all_collectors_fail_returns_all_failed() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         let failing = Arc::new(
             (*MockCollector::new_cpu("mock.cpu_fail"))
@@ -1456,7 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn stop_returns_assembled_report_with_merged_events() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu_a"));
         reg.register(MockCollector::new_gpu("mock.gpu_b"));
@@ -1513,7 +1513,7 @@ mod tests {
     #[tokio::test]
     async fn stop_persists_via_storage() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1547,7 +1547,7 @@ mod tests {
     #[tokio::test]
     async fn abort_removes_session_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1575,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn stale_handle_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1607,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn watchdog_auto_stops_after_duration() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1685,7 +1685,7 @@ mod tests {
     #[tokio::test]
     async fn merge_dedupes_names_and_remaps_event_ids() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.a"));
         reg.register(MockCollector::new_gpu("mock.b"));
@@ -1741,7 +1741,7 @@ mod tests {
     #[tokio::test]
     async fn merge_preserves_event_categories() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
@@ -1784,7 +1784,7 @@ mod tests {
     #[tokio::test]
     async fn is_active_and_info_during_session() {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(ProfileStorageV2::new(tmp.path()));
+        let storage = Arc::new(ProfileStorage::new(tmp.path()));
         let mut reg = CollectorRegistry::new();
         reg.register(MockCollector::new_gpu("mock.gpu"));
         let registry = Arc::new(reg);
