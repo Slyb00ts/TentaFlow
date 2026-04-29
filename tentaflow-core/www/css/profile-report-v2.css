@@ -46,23 +46,6 @@
 .profile-report-v2 .muted { color: var(--pr2-text-3); }
 .profile-report-v2 .num { text-align: right; font-variant-numeric: tabular-nums; }
 
-/* ---- Breadcrumb ---- */
-.pr2-breadcrumb {
-  font-size: 12px;
-  color: var(--pr2-text-3);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.pr2-breadcrumb a {
-  color: var(--pr2-text-2);
-  text-decoration: none;
-  transition: color 0.12s;
-}
-.pr2-breadcrumb a:hover { color: var(--pr2-text); }
-.pr2-breadcrumb .sep { color: var(--pr2-text-3); }
-
 /* ---- Header ---- */
 .pr2-header {
   display: flex;
@@ -83,16 +66,11 @@
   color: var(--pr2-text);
 }
 .pr2-meta {
-  margin-top: 6px;
+  margin-top: 4px;
   font-size: 12px;
   color: var(--pr2-text-3);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
 }
-.pr2-meta .sep { color: var(--pr2-border-h); }
 .pr2-header-actions {
   display: inline-flex;
   align-items: center;
@@ -202,7 +180,7 @@
 .pr2-kpi-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
 }
 .pr2-kpi-ico {
   width: 22px; height: 22px;

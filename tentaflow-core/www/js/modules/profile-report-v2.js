@@ -38,7 +38,6 @@ import {
 } from '/js/modules/profile-report-helpers.js';
 import {
   profilingReport,
-  profilingDelete,
   profilingDownload,
 } from '/js/protocol/profiling.js';
 import '/js/components/tf-button.js';
@@ -220,16 +219,18 @@ function buildContext(report) {
   // a GPU; widoczny zawsze gdy mamy CpuUtil events (a te zbiera kazdy
   // backend cpu_util collector niezalezne od OS).
   const hasCpuUtil = (grouped.get('CpuUtil') || []).length > 0;
+  // Sub-tab icons match mockup #04 (linie 1107-1115). Komplet symboli zywie
+  // w www/index.html jako <symbol id="i-...">.
   const tabs = [
-    { id: 'overview',   label: 'Overview',         icon: 'grid',     visible: true },
-    { id: 'timeline',   label: 'Unified Timeline', icon: 'timeline', visible: true },
-    { id: 'flame',      label: 'CPU Flamegraph',   icon: 'bars',     visible: true },
-    { id: 'cpu_detail', label: 'CPU Detail',       icon: 'cpu',      visible: hasCpuUtil },
-    { id: 'gpu',        label: 'GPU',              icon: 'cpu',      visible: hasGpu, count: devices.length || undefined },
-    { id: 'memory',     label: 'Memory',           icon: 'memory',   visible: hasMemory },
-    { id: 'disk',       label: 'Disk IO',          icon: 'disk',     visible: hasDisk },
-    { id: 'power',      label: 'Power',            icon: 'power',    visible: hasPower },
-    { id: 'sources',    label: 'Sources',          icon: 'list',     visible: true },
+    { id: 'overview',   label: 'Overview',         icon: 'grid-2x2',   visible: true },
+    { id: 'timeline',   label: 'Unified Timeline', icon: 'line-chart', visible: true },
+    { id: 'flame',      label: 'CPU Flamegraph',   icon: 'bar-chart',  visible: true },
+    { id: 'cpu_detail', label: 'CPU Detail',       icon: 'cpu',        visible: hasCpuUtil },
+    { id: 'gpu',        label: 'GPU',              icon: 'globe-grid', visible: hasGpu, count: devices.length || undefined },
+    { id: 'memory',     label: 'Memory',           icon: 'ram',        visible: hasMemory },
+    { id: 'disk',       label: 'Disk IO',          icon: 'cylinder',   visible: hasDisk },
+    { id: 'power',      label: 'Power',            icon: 'shield',     visible: hasPower },
+    { id: 'sources',    label: 'Sources',          icon: 'list',       visible: true },
   ].filter((t) => t.visible);
 
   // Single-pass aggregation across all events. Powers Overview + GPU tabs
@@ -259,7 +260,6 @@ function buildContext(report) {
 function renderShell(ctx) {
   const { report, counts } = ctx;
   const startedAt = formatDateTime(report.t0_wallclock_unix_ns);
-  const rel = relativeTime(report.t0_wallclock_unix_ns);
   const dur = formatDurationNs(report.duration_ns);
   const scopeLabel = escape(report.scope?.label || '—');
   const sessionShort = escape((report.session_id || '').slice(0, 8));
@@ -267,20 +267,8 @@ function renderShell(ctx) {
   const sourcesPill = `${counts.used}/${counts.total} sources used`;
   const sourcesPillCls = counts.skipped > 0 || counts.failed > 0 ? 'warn' : 'ok';
 
-  const breadcrumb = `
-    <nav class="pr2-breadcrumb" aria-label="Breadcrumb">
-      <a href="#" data-action="back-mesh">Mesh</a>
-      <span class="sep">/</span>
-      <a href="#" data-action="back-mesh">Nodes</a>
-      <span class="sep">/</span>
-      <a href="#" data-action="back-mesh">${node}</a>
-      <span class="sep">/</span>
-      <span>Profiling</span>
-      <span class="sep">/</span>
-      <span class="mono">${sessionShort}</span>
-    </nav>
-  `;
-
+  // Mockup #04: jedna linia mono z czterema segmentami. Bez relative time
+  // (redundantny z absolute) i bez prefixu "started" — sam timestamp wystarcza.
   const headerActions = `
     <span class="pr2-status-pill ${sourcesPillCls}" role="status">
       ${counts.skipped > 0 || counts.failed > 0
@@ -288,32 +276,23 @@ function renderShell(ctx) {
         : `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>`}
       ${escape(sourcesPill)}
     </span>
-    <tf-button variant="ghost" size="sm" data-action="refresh" aria-label="Refresh report">Refresh</tf-button>
     <tf-button variant="ghost" size="sm" data-action="download" aria-label="Download report">Download</tf-button>
-    <tf-button variant="danger" size="sm" data-action="delete" aria-label="Delete report">Delete</tf-button>
+    <tf-button variant="ghost" size="sm" data-action="compare" aria-label="Compare with another session">Compare</tf-button>
   `;
 
   const tabsHtml = ctx.tabs.map((t) => {
     const countAttr = t.count ? ` count="${t.count}"` : '';
-    return `<tf-tab id="${escape(t.id)}"${countAttr}>${escape(t.label)}</tf-tab>`;
+    const iconAttr = t.icon ? ` icon="${escape(t.icon)}"` : '';
+    return `<tf-tab id="${escape(t.id)}"${iconAttr}${countAttr}>${escape(t.label)}</tf-tab>`;
   }).join('');
 
   return `
     <div class="profile-report-v2">
-      ${breadcrumb}
-
       <header class="pr2-header">
         <div class="pr2-header-main">
           <h1 class="pr2-title">${scopeLabel}</h1>
-          <div class="pr2-meta">
-            <span class="mono">session ${sessionShort}</span>
-            <span class="sep">·</span>
-            <span>${escape(startedAt)}</span>
-            ${rel ? `<span class="sep">·</span><span class="muted">${escape(rel)}</span>` : ''}
-            <span class="sep">·</span>
-            <span>${escape(dur)}</span>
-            <span class="sep">·</span>
-            <span class="mono">${node}</span>
+          <div class="pr2-meta mono">
+            session ${sessionShort} · ${escape(startedAt)} · ${escape(dur)} duration · ${node}
           </div>
         </div>
         <div class="pr2-header-actions">
@@ -379,15 +358,10 @@ function bindShell(container, ctx) {
     if (action === 'back-mesh') {
       e.preventDefault();
       navigateBack();
-    } else if (action === 'refresh') {
-      ProfileReportV2View.render(container, {
-        sessionId: ctx.report.session_id,
-        nodeId: ctx.report.node_id,
-      });
     } else if (action === 'download') {
       handleDownload(ctx);
-    } else if (action === 'delete') {
-      handleDelete(container, ctx);
+    } else if (action === 'compare') {
+      handleCompare(ctx);
     } else if (action === 'open-timeline') {
       const tabs = container.querySelector('#pr2-tabs');
       if (tabs) tabs.value = 'timeline';
@@ -457,19 +431,14 @@ function triggerDownload(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function handleDelete(container, ctx) {
-  if (fixtureMode()) {
-    navigateBack();
-    return;
-  }
-  try {
-    await profilingDelete({
-      nodeId: ctx.report.node_id || '',
-      sessionId: ctx.report.session_id,
+// Compare ouverture: Router pokazuje modal wyboru drugiej sesji i po
+// potwierdzeniu nawiguje na osobny widok diff. Tu tylko delegujemy.
+function handleCompare(ctx) {
+  if (window.Router && typeof window.Router.navigate === 'function') {
+    window.Router.navigate('profile-compare', {
+      nodeId: ctx.report.node_id,
+      sessionA: ctx.report.session_id,
     });
-    navigateBack();
-  } catch (err) {
-    console.error('delete failed', err);
   }
 }
 
@@ -570,10 +539,12 @@ function renderOverviewTab(ctx) {
   const net = kpis.net;
   const gpuKpiOf = (id) => kpis.gpu.get(id) || { peakCompute: 0, peakMem: 0, memUsedBytes: 0, topKernel: null, topPct: 0, avgW: 0, peakW: 0, kernels: [], apis: [] };
 
-  const gpuTiles = devices.slice(0, 3).map((d) => {
+  // Mockup #04: max 4 GPU w grid 4x2. NVIDIA pokazuje "Peak SM · Top kernel ...",
+  // AMD "Peak compute · Top ...", Intel/Apple bez detali kernel ("No kernel detail")
+  // bo nie ma per-kernel sourcing z ich runtime'ow w aktualnej generacji.
+  const gpuTiles = devices.slice(0, 4).map((d) => {
     const k = gpuKpiOf(d.device_id);
     const badge = vendorBadge(d.vendor);
-    const topKernel = k.topKernel ? `${escape(k.topKernel)} ${formatPct(k.topPct)}` : '<span class="muted">no kernel data</span>';
     return `
       <div class="pr2-kpi-tile ${badge.cls}">
         <div class="pr2-kpi-head">
@@ -581,7 +552,7 @@ function renderOverviewTab(ctx) {
           <span class="pr2-kpi-label">GPU ${d.device_id} — ${escape(d.name)}</span>
         </div>
         <div class="pr2-kpi-value">${formatPct(k.peakCompute, 0)}</div>
-        <div class="pr2-kpi-sub">Peak compute · Top: <strong>${topKernel}</strong></div>
+        <div class="pr2-kpi-sub">${vendorPeakLabel(badge.cls, k)}</div>
       </div>
     `;
   }).join('');
@@ -621,24 +592,9 @@ function renderOverviewTab(ctx) {
       <div class="pr2-kpi-sub">Peak in · Peak out <strong>${formatBytesPerSec(net.peakTxBps)}</strong></div>
     </div>
   ` : '';
-  const wallTile = `
-    <div class="pr2-kpi-tile">
-      <div class="pr2-kpi-head"><span class="pr2-kpi-ico">${iconClock()}</span><span class="pr2-kpi-label">Wallclock</span></div>
-      <div class="pr2-kpi-value">${formatDurationNs(report.duration_ns)}</div>
-      <div class="pr2-kpi-sub">Sources <strong>${ctx.counts.used} of ${ctx.counts.total}</strong></div>
-    </div>
-  `;
-
-  // CPU counters tile only when CpuCounter events exist (not in fixture).
-  const counterEvents = eventsForCategory(events, 'CpuCounter');
-  const counterTile = counterEvents.length > 0 ? `
-    <div class="pr2-kpi-tile">
-      <div class="pr2-kpi-head"><span class="pr2-kpi-ico">${iconCpu()}</span><span class="pr2-kpi-label">CPU Counters</span></div>
-      <div class="pr2-kpi-value">${counterEvents.length}</div>
-      <div class="pr2-kpi-sub">PMU samples</div>
-    </div>
-  ` : '';
-
+  // Mockup #04 trzyma siatke 4x2 w stalej kolejnosci: CPU + (do 4 GPU) + RAM
+  // + Disk + Power + Network. Wallclock i CPU Counters byly extras V2 i
+  // wypadly z headline metrics (zostaja w innych zakladkach).
   const findings = buildQuickFindings(events, devices, report.duration_ns, names);
   const findingsHtml = findings.length === 0 ? `<div class="muted">No notable findings.</div>` : findings.map((f) => `
     <div class="pr2-finding-card ${escape(f.kind)}">
@@ -684,9 +640,7 @@ function renderOverviewTab(ctx) {
         ${ramTile}
         ${diskTile}
         ${powerTile}
-        ${counterTile}
         ${netTile}
-        ${wallTile}
       </div>
     </section>
 
@@ -1559,10 +1513,29 @@ function iconRam()    { return `<svg viewBox="0 0 24 24" aria-hidden="true"><rec
 function iconDisk()   { return `<svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/></svg>`; }
 function iconPower()  { return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2L4 7v10l8 5 8-5V7l-8-5z"/></svg>`; }
 function iconNet()    { return `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="4" r="1.5"/><circle cx="20" cy="4" r="1.5"/><circle cx="4" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/></svg>`; }
-function iconClock()  { return `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>`; }
 function iconFinding(kind) {
   if (kind === 'info') return `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>`;
   if (kind === 'bad')  return `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 9v4M12 17h.01"/></svg>`;
   if (kind === 'ok')   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>`;
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.86l-8.06 14a2 2 0 0 0 1.7 3h16.12a2 2 0 0 0 1.7-3l-8.06-14a2 2 0 0 0-3.4 0z"/></svg>`;
+}
+
+// Mockup #04: NVIDIA pokazuje "Peak SM" + nazwe konkretnego kernela; AMD
+// "Peak compute" + ostatnia gorna funkcja rocBLAS; Intel/Apple "No kernel
+// detail" bo zaden runtime nie strumieniuje per-kernel telemetrii do
+// collectorow w aktualnej generacji.
+function vendorPeakLabel(vendorCls, k) {
+  const hasKernel = k && k.topKernel;
+  if (vendorCls === 'nv') {
+    return hasKernel
+      ? `Peak SM · Top kernel <strong>${escape(k.topKernel)} ${formatPct(k.topPct)}</strong>`
+      : `Peak SM · <strong>No kernel detail</strong>`;
+  }
+  if (vendorCls === 'amd') {
+    return hasKernel
+      ? `Peak compute · Top <strong>${escape(k.topKernel)} ${formatPct(k.topPct)}</strong>`
+      : `Peak compute · <strong>No kernel detail</strong>`;
+  }
+  // Intel + Apple: brak kernel-level sourcing.
+  return `Peak compute · <strong>No kernel detail</strong>`;
 }
