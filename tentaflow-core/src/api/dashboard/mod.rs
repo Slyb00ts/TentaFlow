@@ -20,6 +20,7 @@ pub mod api_prompts;
 pub mod api_registries;
 pub mod api_services;
 pub mod api_services_manifest;
+pub mod api_deploy_recommend;
 pub mod api_tts_rules;
 pub mod auth;
 pub mod auto_register;
