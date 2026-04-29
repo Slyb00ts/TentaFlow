@@ -306,99 +306,6 @@ pub struct FlowExecutionSummary {
 }
 
 // =============================================================================
-// Services — runtime engine deployments (migration-map #295-#303)
-// =============================================================================
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceSummary {
-    pub id: String,
-    /// Nazwa serwisu nadana przez uzytkownika (np. `embeddings-bge`).
-    pub name: String,
-    /// Typ: "llm" | "embedding" | "stt" | "tts" | "rag" | "tools" | "memory" | "reranker".
-    pub service_type: String,
-    /// Strategia routingu (np. `single`).
-    pub strategy: String,
-    /// "active" | "inactive" | "running" | "starting" | "stopped" | "error".
-    pub status: String,
-    /// Serializowany JSON konfiguracji (quic_url, sni_domain, cluster_id).
-    pub config_json: String,
-    /// `None` gdy lokalny, hex enkodowany node_id mesh w innym wypadku.
-    pub node_id: Option<String>,
-    /// Czytelna nazwa wezla mesh (hostname) dla kolumny tabeli.
-    pub node_hostname: Option<String>,
-    /// ISO-8601 timestamp utworzenia.
-    pub created_at: String,
-    /// Metoda wdrozenia gdy serwis pochodzi z katalogu silnikow: "docker" | "native" | "external".
-    pub deploy_method: Option<String>,
-    /// Zewnetrzny URL endpointu silnika (jesli znany).
-    pub endpoint_url: Option<String>,
-    /// Unix epoch uruchomienia silnika.
-    pub started_at_epoch: Option<u64>,
-    /// Identyfikator silnika z katalogu (jesli wdrozony z katalogu).
-    pub engine_id: Option<String>,
-    /// Identyfikator modelu (jesli serwis obsluguje konkretny model).
-    pub model_id: Option<String>,
-    /// MemoryGuard pinning — true = zawsze warm, nie evict.
-    pub pinned: bool,
-    /// MemoryGuard pause — true = nie startuje autostart, request odrzucany.
-    pub paused: bool,
-    /// Source-tree hash captured at last deploy. `None` for instances created
-    /// before the update-detection feature. GUI compares this with the
-    /// manifest's current `docker_source_hash`/`native_source_hash` to decide
-    /// whether an update is available.
-    pub deployed_source_hash: Option<String>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceCreateRequest {
-    pub name: String,
-    pub service_type: String,
-    pub strategy: String,
-    pub config_json: String,
-    /// Hex-enkodowany 32-bajtowy node_id lub `None` dla lokalnego.
-    pub node_id: Option<String>,
-    /// Id klastra do ktorego serwis nalezy.
-    pub cluster_id: Option<String>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceUpdateRequest {
-    pub id: String,
-    pub name: String,
-    pub service_type: String,
-    pub strategy: String,
-    pub status: String,
-    pub config_json: String,
-    pub node_id: Option<String>,
-    pub cluster_id: Option<String>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceQuicStatus {
-    pub name: String,
-    /// "connected" | "connecting" | "disconnected" | "ready" | "config_error" | "none".
-    pub status: String,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceDeployRequest {
-    pub engine_id: String,
-    pub model_id: String,
-    /// "docker" | "native" | "external".
-    pub deploy_method: String,
-    pub node_id: [u8; 32],
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceDeployProgress {
-    pub deploy_id: String,
-    /// "pulling" | "building" | "starting" | "ready" | "failed".
-    pub stage: String,
-    pub progress_percent: u8,
-    pub message: String,
-}
-
-// =============================================================================
 // Prompts — prompt templates (migration-map #265-#269)
 // =============================================================================
 
@@ -2364,68 +2271,6 @@ pub enum DeploymentPayload {
     ReqLogStream(DeploymentLogStreamRequest),
     StreamChunk(DeploymentStreamChunk),
     StreamEnd(DeploymentStreamEnd),
-    /// Redeploy an already-deployed service from a refreshed source tree.
-    /// Caller obtains the streaming deploy_id in `ResRedeploy` and then
-    /// subscribes through the existing `ReqLogStream` flow.
-    ReqRedeploy(ServiceRedeployRequest),
-    ResRedeploy(ServiceRedeployResponse),
-}
-
-/// Possible `status` values returned in `ServiceRedeployResponse`. Kept as
-/// constants so dispatch handler and GUI share one source of truth.
-pub const REDEPLOY_STATUS_STARTED: &str = "started";
-pub const REDEPLOY_STATUS_ACTIVE_SESSIONS: &str = "active_sessions";
-pub const REDEPLOY_STATUS_NO_SOURCE: &str = "no_source";
-pub const REDEPLOY_STATUS_UNSUPPORTED: &str = "unsupported";
-pub const REDEPLOY_STATUS_NOT_FOUND: &str = "not_found";
-pub const REDEPLOY_STATUS_FAILED: &str = "failed";
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceRedeployRequest {
-    pub service_id: i64,
-    /// For agents (teams-bot): when `false` and the engine has live meeting
-    /// sessions, handler returns `active_sessions` without stopping anything.
-    /// GUI is expected to ask the user first; backend does not re-prompt.
-    pub force_if_active_sessions: bool,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceRedeployResponse {
-    /// One of the `REDEPLOY_STATUS_*` constants.
-    pub status: String,
-    /// Streaming id — subscribe via `DeploymentLogStreamRequest{deploy_id}`.
-    /// Empty unless `status == "started"`.
-    pub deploy_id: String,
-    /// New manifest source hash once rebuild succeeds. Empty while the job
-    /// runs — the GUI reads the final value from the `services` row after
-    /// the stream ends.
-    pub new_hash: String,
-    /// Human-readable detail for non-success statuses.
-    pub error: String,
-    /// Populated when `status == "active_sessions"`; zero otherwise.
-    pub active_session_count: u32,
-}
-
-/// MemoryGuard flagi (pinned/paused) — wrapper req/res.
-/// Pola w `ServiceFlagsUpdateRequest` opcjonalne: `None` = nie zmieniaj.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub enum ServiceFlagsPayload {
-    Req(ServiceFlagsUpdateRequest),
-    Res(ServiceFlagsUpdateResponse),
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceFlagsUpdateRequest {
-    pub service_id: String,
-    pub pinned: Option<bool>,
-    pub paused: Option<bool>,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct ServiceFlagsUpdateResponse {
-    pub ok: bool,
-    pub pinned: bool,
-    pub paused: bool,
 }
 
 // =============================================================================
@@ -3056,24 +2901,6 @@ pub enum MessageBody {
     MeshNodeCommandResponseBody(MeshNodeCommandResponse),
     MeshNodeNetworkConfigRequestBody(MeshNodeNetworkConfigRequest),
     MeshNodeNetworkConfigResponseBody(MeshNodeNetworkConfigResponse),
-
-    // ---- Services (R-LIST + W-ACTION + R-STREAM dla deploy progress) ----
-    ServiceListRequest,
-    ServiceListResponse { services: Vec<ServiceSummary> },
-    ServiceCreateRequestBody(ServiceCreateRequest),
-    ServiceCreateResponse { id: String },
-    ServiceUpdateRequestBody(ServiceUpdateRequest),
-    ServiceUpdateResponse { updated: bool },
-    ServiceDeployRequestBody(ServiceDeployRequest),
-    ServiceDeployAccepted { deploy_id: String },
-    ServiceDeployProgressBody(ServiceDeployProgress),
-    ServiceStopRequest { service_id: String },
-    ServiceStopResponse { stopped: bool },
-    /// MemoryGuard pin/pause toggle. Wrapper na sub-enum, zeby zaoszczedzic
-    /// slot w 256-variant limicie rkyv (Req + Res = 1 wariant zamiast 2).
-    ServiceFlagsBody(ServiceFlagsPayload),
-    ServiceQuicStatusRequest,
-    ServiceQuicStatusResponse { statuses: Vec<ServiceQuicStatus> },
 
     // ---- Prompts (R-LIST + R-ONE) ----
     PromptListRequest,
