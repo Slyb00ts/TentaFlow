@@ -13,8 +13,15 @@ import {
   profilingDownload,
   profilingStop,
 } from '/js/protocol/profiling.js';
+import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-searchbox.js';
+
+// Krotki helper i18n z fallbackiem do angielskiego stringa.
+function t(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
 
 function fixtureMode() {
   return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
@@ -48,10 +55,10 @@ function formatRelative(unixNs) {
   if (!Number.isFinite(unixNs) || unixNs <= 0) return '—';
   const ms = Math.floor(unixNs / 1_000_000);
   const diff = Date.now() - ms;
-  if (diff < 60_000) return 'just now';
-  if (diff < 3600_000) return `${Math.floor(diff / 60_000)} min ago`;
-  if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} hours ago`;
-  if (diff < 7 * 86400_000) return `${Math.floor(diff / 86400_000)} days ago`;
+  if (diff < 60_000) return t('profiling.sessions.rel_just_now', null, 'just now');
+  if (diff < 3600_000) return t('profiling.sessions.rel_min_ago', { n: Math.floor(diff / 60_000) }, `${Math.floor(diff / 60_000)} min ago`);
+  if (diff < 86400_000) return t('profiling.sessions.rel_hours_ago', { n: Math.floor(diff / 3600_000) }, `${Math.floor(diff / 3600_000)} hours ago`);
+  if (diff < 7 * 86400_000) return t('profiling.sessions.rel_days_ago', { n: Math.floor(diff / 86400_000) }, `${Math.floor(diff / 86400_000)} days ago`);
   return new Date(ms).toLocaleDateString();
 }
 
@@ -81,10 +88,10 @@ function formatStarted(unixNs) {
   if (ms >= startOfYesterday) {
     const hh = String(date.getHours()).padStart(2, '0');
     const mm = String(date.getMinutes()).padStart(2, '0');
-    return `Yesterday ${hh}:${mm}`;
+    return t('profiling.sessions.rel_yesterday', { time: `${hh}:${mm}` }, `Yesterday ${hh}:${mm}`);
   }
   const daysAgo = Math.floor((startOfToday - ms) / 86400_000) + 1;
-  if (daysAgo < 7) return `${daysAgo} days ago`;
+  if (daysAgo < 7) return t('profiling.sessions.rel_days_ago', { n: daysAgo }, `${daysAgo} days ago`);
   return date.toLocaleDateString();
 }
 
@@ -110,23 +117,21 @@ function elapsedSeconds(unixNs) {
 
 function statusIcon(status) {
   if (status === 'running') {
-    // Mockup: mala kropka r=3, kolor danger, pulsujaca animacja.
-    return `<span class="row-status-ico run" title="Running">
+    return `<span class="row-status-ico run" title="${escapeHtml(t('profiling.sessions.status_running', null, 'Running'))}">
       <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></svg>
     </span>`;
   }
   if (status === 'failed') {
-    return `<span class="row-status-ico fail" title="Failed">
+    return `<span class="row-status-ico fail" title="${escapeHtml(t('profiling.sessions.status_failed', null, 'Failed'))}">
       <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
     </span>`;
   }
   if (status === 'partial') {
-    // Mockup: trojkat ostrzegawczy (warn).
-    return `<span class="row-status-ico warn" title="Partial">
+    return `<span class="row-status-ico warn" title="${escapeHtml(t('profiling.sessions.status_partial', null, 'Partial'))}">
       <svg viewBox="0 0 24 24"><path d="M12 2L2 22h20L12 2z"/><path d="M12 9v6M12 18h.01"/></svg>
     </span>`;
   }
-  return `<span class="row-status-ico ok" title="Completed">
+  return `<span class="row-status-ico ok" title="${escapeHtml(t('profiling.sessions.status_completed', null, 'Completed'))}">
     <svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg>
   </span>`;
 }
@@ -144,21 +149,23 @@ function srcChips(sourcesUsed) {
     let label = s.label || s.id;
     // Dla skipped sources doklej "(skipped)" zgodnie z mockupem, jezeli backend
     // jeszcze nie dolozyl tego do labela.
-    if (isSkipped && !/skipped/i.test(label)) label = `${label} (skipped)`;
+    if (isSkipped && !/skipped/i.test(label)) label = `${label} (${t('profiling.sessions.skipped_suffix', null, 'skipped')})`;
     return `<span class="src-chip-mini ${cls}">${escapeHtml(label)}</span>`;
   }).join('');
-  const more = rest > 0 ? `<span class="src-chip-more">+${rest} more</span>` : '';
+  const more = rest > 0 ? `<span class="src-chip-more">${escapeHtml(t('profiling.sessions.more_count', { n: rest }, `+${rest} more`))}</span>` : '';
   return chips + more;
 }
 
-const FILTERS = [
-  { id: 'all', label: 'All' },
-  { id: 'last_24h', label: 'Last 24h' },
-  { id: 'this_week', label: 'This week' },
-  { id: 'has_flamegraph', label: 'Has flamegraph' },
-  { id: 'multi_gpu', label: 'Multi-GPU' },
-  { id: 'failed', label: 'Failed' },
-];
+function getFilters() {
+  return [
+    { id: 'all', label: t('profiling.sessions.filter_all', null, 'All') },
+    { id: 'last_24h', label: t('profiling.sessions.filter_last_24h', null, 'Last 24h') },
+    { id: 'this_week', label: t('profiling.sessions.filter_this_week', null, 'This week') },
+    { id: 'has_flamegraph', label: t('profiling.sessions.filter_has_flamegraph', null, 'Has flamegraph') },
+    { id: 'multi_gpu', label: t('profiling.sessions.filter_multi_gpu', null, 'Multi-GPU') },
+    { id: 'failed', label: t('profiling.sessions.filter_failed', null, 'Failed') },
+  ];
+}
 
 function applyFilters(sessions, activeFilter, searchTerm) {
   const term = (searchTerm || '').toLowerCase().trim();
@@ -378,22 +385,25 @@ export class ProfilingSessionsView {
     // Layout 1:1 z mockup #03 (sekcja 03 SESSIONS LIST).
     // Toolbar: search | tf-filter-group (chipy) | (margin-auto) Refresh | New
     // session | Export. Brak breadcrumb/page-title — sa czescia parent screen.
+    const searchPh = escapeHtml(t('profiling.sessions.search_placeholder', null, 'Search by label, session id…'));
+    const compareCount = escapeHtml(t('profiling.sessions.compare_count', { n: 0 }, '0/2 selected'));
+    const compareHint = escapeHtml(t('profiling.sessions.compare_hint', null, 'Pick two completed sessions to compare side-by-side.'));
     this.root.innerHTML = `
       <div class="tf-section-card">
         <div class="toolbar">
-          <tf-searchbox id="ps-search" placeholder="Search by label, session id…"></tf-searchbox>
+          <tf-searchbox id="ps-search" placeholder="${searchPh}"></tf-searchbox>
           <div class="tf-filter-group" id="ps-filter-chips"></div>
-          <tf-button variant="ghost" size="sm" icon="refresh" id="ps-refresh" style="margin-left:auto;">Refresh</tf-button>
-          <tf-button variant="primary" size="sm" icon="plus" id="ps-new">New session</tf-button>
-          <tf-button variant="outline" size="sm" icon="download" id="ps-export">Export</tf-button>
+          <tf-button variant="ghost" size="sm" icon="refresh" id="ps-refresh" style="margin-left:auto;">${escapeHtml(t('profiling.sessions.btn_refresh', null, 'Refresh'))}</tf-button>
+          <tf-button variant="primary" size="sm" icon="plus" id="ps-new">${escapeHtml(t('profiling.sessions.btn_new', null, 'New session'))}</tf-button>
+          <tf-button variant="outline" size="sm" icon="download" id="ps-export">${escapeHtml(t('profiling.sessions.btn_export', null, 'Export'))}</tf-button>
         </div>
 
         <div id="ps-compare-bar" class="ps-compare-bar hidden">
-          <span class="count">0/2 selected</span>
-          <span style="color: var(--text-2, #a0a8c8);">Pick two completed sessions to compare side-by-side.</span>
+          <span class="count">${compareCount}</span>
+          <span style="color: var(--text-2, #a0a8c8);">${compareHint}</span>
           <span style="flex:1"></span>
-          <tf-button variant="ghost" size="sm" id="ps-compare-clear">Clear</tf-button>
-          <tf-button variant="primary" size="sm" id="ps-compare-go" disabled>Compare selected</tf-button>
+          <tf-button variant="ghost" size="sm" id="ps-compare-clear">${escapeHtml(t('profiling.sessions.compare_clear', null, 'Clear'))}</tf-button>
+          <tf-button variant="primary" size="sm" id="ps-compare-go" disabled>${escapeHtml(t('profiling.sessions.compare_go', null, 'Compare selected'))}</tf-button>
         </div>
 
         <div id="ps-table-wrap"></div>
@@ -402,7 +412,7 @@ export class ProfilingSessionsView {
 
     // Render filter chips zgodnie z mockupem (.filter-chip[active]).
     const chipsWrap = this.root.querySelector('#ps-filter-chips');
-    for (const f of FILTERS) {
+    for (const f of getFilters()) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'filter-chip';
@@ -458,7 +468,7 @@ export class ProfilingSessionsView {
     }
     bar.classList.remove('hidden');
     const countEl = bar.querySelector('.count');
-    if (countEl) countEl.textContent = `${n}/2 selected`;
+    if (countEl) countEl.textContent = t('profiling.sessions.compare_count', { n }, `${n}/2 selected`);
     const goBtn = bar.querySelector('#ps-compare-go');
     if (goBtn) {
       if (n === 2) goBtn.removeAttribute('disabled');
@@ -502,9 +512,9 @@ export class ProfilingSessionsView {
               <path d="M3 3v18h18"/><path d="M7 14l3-4 4 5 7-9"/>
             </svg>
           </div>
-          <div class="es-title">No profiling sessions yet</div>
-          <div class="es-sub">Launch your first multi-source profiling session to inspect CPU, GPU, memory and power together.</div>
-          <tf-button variant="primary" icon="record" id="ps-empty-launch">Launch first profiling</tf-button>
+          <div class="es-title">${escapeHtml(t('profiling.sessions.empty_title', null, 'No profiling sessions yet'))}</div>
+          <div class="es-sub">${escapeHtml(t('profiling.sessions.empty_sub', null, 'Launch your first multi-source profiling session to inspect CPU, GPU, memory and power together.'))}</div>
+          <tf-button variant="primary" icon="record" id="ps-empty-launch">${escapeHtml(t('profiling.sessions.empty_btn', null, 'Launch first profiling'))}</tf-button>
         </div>
       `;
       const btn = wrap.querySelector('#ps-empty-launch');
@@ -515,25 +525,23 @@ export class ProfilingSessionsView {
     if (filtered.length === 0) {
       wrap.innerHTML = `
         <div class="empty-state">
-          <div class="es-title">No sessions match current filters</div>
-          <div class="es-sub">Try clearing the search or filter chips.</div>
+          <div class="es-title">${escapeHtml(t('profiling.sessions.empty_filtered_title', null, 'No sessions match current filters'))}</div>
+          <div class="es-sub">${escapeHtml(t('profiling.sessions.empty_filtered_sub', null, 'Try clearing the search or filter chips.'))}</div>
         </div>
       `;
       return;
     }
 
     const rows = filtered.map((s) => this._renderRow(s)).join('');
-    // Layout 1:1 z mockup #03: status-ico | Label/sources | Duration·Size |
-    // Started | Actions.
     wrap.innerHTML = `
       <table class="tf-table">
         <thead>
           <tr>
             <th style="width: 40px"></th>
-            <th>Label / sources</th>
-            <th style="width: 14%">Duration · Size</th>
-            <th style="width: 14%">Started</th>
-            <th class="actions-col" style="width: 16%">Actions</th>
+            <th>${escapeHtml(t('profiling.sessions.col_label_sources', null, 'Label / sources'))}</th>
+            <th style="width: 14%">${escapeHtml(t('profiling.sessions.col_duration_size', null, 'Duration · Size'))}</th>
+            <th style="width: 14%">${escapeHtml(t('profiling.sessions.col_started', null, 'Started'))}</th>
+            <th class="actions-col" style="width: 16%">${escapeHtml(t('profiling.sessions.col_actions', null, 'Actions'))}</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
@@ -546,7 +554,7 @@ export class ProfilingSessionsView {
   _renderRow(s) {
     const sid = escapeHtml(s.session_id);
     const ico = statusIcon(s.status);
-    const labelName = escapeHtml(s.label || '(no label)');
+    const labelName = escapeHtml(s.label || t('profiling.sessions.no_label', null, '(no label)'));
     const size = formatBytes(s.size_bytes);
     const startedTop = formatStarted(s.started_at_unix_ns);
     const startedSub = formatStartedSub(s.started_at_unix_ns);
@@ -561,11 +569,11 @@ export class ProfilingSessionsView {
     // Status pill widoczny przy nazwie (REC / FAILED / PARTIAL).
     let statusPill = '';
     if (isRunning) {
-      statusPill = '<span class="status-pill danger" style="margin-left:4px;">REC</span>';
+      statusPill = `<span class="status-pill danger" style="margin-left:4px;">${escapeHtml(t('profiling.sessions.pill_rec', null, 'REC'))}</span>`;
     } else if (isFailed) {
-      statusPill = '<span class="status-pill danger" style="margin-left:4px;">FAILED</span>';
+      statusPill = `<span class="status-pill danger" style="margin-left:4px;">${escapeHtml(t('profiling.sessions.pill_failed', null, 'FAILED'))}</span>`;
     } else if (isPartial) {
-      statusPill = '<span class="status-pill warn" style="margin-left:4px;">PARTIAL</span>';
+      statusPill = `<span class="status-pill warn" style="margin-left:4px;">${escapeHtml(t('profiling.sessions.pill_partial', null, 'PARTIAL'))}</span>`;
     }
 
     // Duration · Size cell (mockup):
@@ -595,7 +603,7 @@ export class ProfilingSessionsView {
         const failedSrc = s.sources_used.find((x) => x.status === 'failed' || x.status === 'bad');
         if (failedSrc) errMsg = `${failedSrc.id || failedSrc.label}: ${failedSrc.message || 'failed'}`;
       }
-      if (!errMsg) errMsg = 'session failed';
+      if (!errMsg) errMsg = t('profiling.sessions.session_failed', null, 'session failed');
       labelDetail = `<div class="lc-sub lc-err">${escapeHtml(errMsg)}</div>`;
     } else {
       const chips = srcChips(s.sources_used);
@@ -607,35 +615,43 @@ export class ProfilingSessionsView {
     //  Completed -> Open + Compare + Download + Delete
     //  Partial   -> Open + Re-run with sudo
     //  Failed    -> View logs + Delete
+    const aWatch = escapeHtml(t('profiling.sessions.action_watch', null, 'Watch live'));
+    const aStop = escapeHtml(t('profiling.sessions.action_stop', null, 'Stop'));
+    const aLogs = escapeHtml(t('profiling.sessions.action_logs', null, 'View logs'));
+    const aDelete = escapeHtml(t('profiling.sessions.action_delete', null, 'Delete'));
+    const aOpen = escapeHtml(t('profiling.sessions.action_open', null, 'Open report'));
+    const aCompare = escapeHtml(t('profiling.sessions.action_compare', null, 'Compare'));
+    const aCompareSel = escapeHtml(t('profiling.sessions.action_compare_selected', null, 'Selected for compare'));
+    const aDownload = escapeHtml(t('profiling.sessions.action_download', null, 'Download'));
+    const aRerunSudo = escapeHtml(t('profiling.sessions.action_rerun_sudo', null, 'Re-run with sudo'));
     let actions = '';
     if (isRunning) {
       actions = `
-        <tf-button variant="ghost" size="sm" icon="eye" data-action="watch" data-sid="${sid}" title="Watch live"></tf-button>
-        <tf-button variant="ghost" size="sm" icon="stop" data-action="stop" data-sid="${sid}" title="Stop"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="eye" data-action="watch" data-sid="${sid}" title="${aWatch}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="stop" data-action="stop" data-sid="${sid}" title="${aStop}"></tf-button>
       `;
     } else if (isFailed) {
       actions = `
-        <tf-button variant="ghost" size="sm" icon="file-text" data-action="logs" data-sid="${sid}" title="View logs"></tf-button>
-        <tf-button variant="ghost" size="sm" icon="trash" data-action="delete" data-sid="${sid}" title="Delete"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="file-text" data-action="logs" data-sid="${sid}" title="${aLogs}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="trash" data-action="delete" data-sid="${sid}" title="${aDelete}"></tf-button>
       `;
     } else if (isPartial) {
       actions = `
-        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="Open report"></tf-button>
-        <tf-button variant="ghost" size="sm" icon="refresh" data-action="rerun-sudo" data-sid="${sid}" title="Re-run with sudo"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="${aOpen}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="refresh" data-action="rerun-sudo" data-sid="${sid}" title="${aRerunSudo}"></tf-button>
       `;
     } else {
       const cmpClass = isSelected ? 'primary' : 'ghost';
       actions = `
-        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="Open report"></tf-button>
-        <tf-button variant="${cmpClass}" size="sm" icon="copy" data-action="compare-toggle" data-sid="${sid}" title="${isSelected ? 'Selected for compare' : 'Compare'}"></tf-button>
-        <tf-button variant="ghost" size="sm" icon="download" data-action="download" data-sid="${sid}" title="Download"></tf-button>
-        <tf-button variant="ghost" size="sm" icon="trash" data-action="delete" data-sid="${sid}" title="Delete"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="${aOpen}"></tf-button>
+        <tf-button variant="${cmpClass}" size="sm" icon="copy" data-action="compare-toggle" data-sid="${sid}" title="${isSelected ? aCompareSel : aCompare}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="download" data-action="download" data-sid="${sid}" title="${aDownload}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="trash" data-action="delete" data-sid="${sid}" title="${aDelete}"></tf-button>
       `;
     }
     if (!canCompare && !isRunning && !isFailed) {
-      // safety net: pokazujemy chociaz Open
       actions = `
-        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="Open report"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="${aOpen}"></tf-button>
       `;
     }
 
@@ -708,7 +724,7 @@ export class ProfilingSessionsView {
 
   async _downloadSession(sessionId) {
     if (fixtureMode()) {
-      showToast('Fixture mode — download not supported', 'info');
+      showToast(t('profiling.sessions.toast_fixture_download', null, 'Fixture mode — download not supported'), 'info');
       return;
     }
     try {
@@ -728,42 +744,42 @@ export class ProfilingSessionsView {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err) {
       console.error('failed to download session', err);
-      showToast('Failed to download session', 'error');
+      showToast(t('profiling.sessions.toast_download_failed', null, 'Failed to download session'), 'error');
     }
   }
 
   async _stopRunning(sessionId) {
     if (fixtureMode()) {
-      showToast('Fixture mode — stop not supported', 'info');
+      showToast(t('profiling.sessions.toast_fixture_stop', null, 'Fixture mode — stop not supported'), 'info');
       return;
     }
     try {
       await profilingStop({ nodeId: this.nodeId, sessionId });
-      showToast('Session stopped', 'success');
+      showToast(t('profiling.sessions.toast_session_stopped', null, 'Session stopped'), 'success');
       await this.refresh();
     } catch (err) {
       console.error('failed to stop session', err);
-      showToast('Failed to stop session', 'error');
+      showToast(t('profiling.sessions.toast_stop_failed', null, 'Failed to stop session'), 'error');
     }
   }
 
   async _confirmDelete(sessionId) {
     const confirmed = await TfWindow.confirm({
-      title: 'Delete profiling session?',
-      message: `Session ${sessionId} will be removed permanently.`,
-      description: 'This cannot be undone.',
-      confirmLabel: 'Delete',
-      cancelLabel: 'Cancel',
+      title: t('profiling.sessions.delete_confirm_title', null, 'Delete profiling session?'),
+      message: t('profiling.sessions.delete_confirm_msg', { sid: sessionId }, `Session ${sessionId} will be removed permanently.`),
+      description: t('profiling.sessions.delete_confirm_desc', null, 'This cannot be undone.'),
+      confirmLabel: t('profiling.sessions.delete_confirm_ok', null, 'Delete'),
+      cancelLabel: t('profiling.sessions.delete_confirm_cancel', null, 'Cancel'),
       danger: true,
     });
     if (!confirmed) return;
     try {
       await deleteSession(this.nodeId, sessionId);
-      showToast('Session deleted', 'success');
+      showToast(t('profiling.sessions.toast_session_deleted', null, 'Session deleted'), 'success');
       await this.refresh();
     } catch (err) {
       console.error('failed to delete session', err);
-      showToast('Failed to delete session', 'error');
+      showToast(t('profiling.sessions.toast_delete_failed', null, 'Failed to delete session'), 'error');
     }
   }
 
@@ -772,15 +788,15 @@ export class ProfilingSessionsView {
   // pojedyncze download'y leca przez juz dziala'jacy profilingDownload.
   async _exportAll() {
     if (fixtureMode()) {
-      showToast('Fixture mode — export not supported', 'info');
+      showToast(t('profiling.sessions.toast_fixture_export', null, 'Fixture mode — export not supported'), 'info');
       return;
     }
     const eligible = this.sessions.filter((s) => s.status === 'completed' || s.status === 'partial');
     if (eligible.length === 0) {
-      showToast('No completed sessions to export', 'info');
+      showToast(t('profiling.sessions.toast_no_completed', null, 'No completed sessions to export'), 'info');
       return;
     }
-    showToast(`Exporting ${eligible.length} session(s)…`, 'info');
+    showToast(t('profiling.sessions.toast_exporting', { n: eligible.length }, `Exporting ${eligible.length} session(s)…`), 'info');
     let ok = 0;
     for (const s of eligible) {
       try {
@@ -790,12 +806,12 @@ export class ProfilingSessionsView {
         console.error('export: failed for session', s.session_id, err);
       }
     }
-    showToast(`Exported ${ok}/${eligible.length} sessions`, ok === eligible.length ? 'success' : 'error');
+    showToast(t('profiling.sessions.toast_exported', { ok, total: eligible.length }, `Exported ${ok}/${eligible.length} sessions`), ok === eligible.length ? 'success' : 'error');
   }
 
   async _openLaunch() {
     if (this.availableSources.length === 0) {
-      showToast('No profiling sources available on this node', 'error');
+      showToast(t('profiling.sessions.toast_no_sources', null, 'No profiling sources available on this node'), 'error');
       return;
     }
     try {
@@ -805,12 +821,12 @@ export class ProfilingSessionsView {
         onLaunched: () => { /* refresh handled below */ },
       });
       if (result.launched) {
-        showToast('Profiling session started', 'success');
+        showToast(t('profiling.sessions.toast_session_started', null, 'Profiling session started'), 'success');
         await this.refresh();
       }
     } catch (err) {
       console.error('launch modal failed', err);
-      showToast(err.message || 'Failed to launch profiling', 'error');
+      showToast(err.message || t('profiling.sessions.toast_launch_failed', null, 'Failed to launch profiling'), 'error');
     }
   }
 }
