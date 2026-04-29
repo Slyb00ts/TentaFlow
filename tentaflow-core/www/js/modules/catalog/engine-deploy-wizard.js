@@ -620,6 +620,28 @@ function renderAutoAlert(rec) {
   const r = rec.recommended || {};
   const args = rec.recommended_vllm_args || '';
   const warnings = rec.warnings || [];
+  // GPU compatibility: jezeli liczba wybranych GPU nie pasuje do architektury
+  // modelu (TP musi dzielic num_attention_heads, PP musi dzielic
+  // num_hidden_layers), pokazujemy duzy warning chip + liste lepszych counts.
+  const compat = rec.gpu_compatibility;
+  let compatChip = '';
+  if (compat && !compat.clean_partition) {
+    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' lub ');
+    compatChip = `
+      <div style="margin-top:10px; padding:10px; background:#fff4e0; border:1px solid #ffb84d; border-radius:6px; font-size:12px; color:#663d00;">
+        ⚠️ <strong>Liczba GPU nieoptymalna dla tego modelu.</strong>
+        ${escapeHtml(compat.warning || '')}<br>
+        <em>Wroc do kroku GPU i wybierz: ${better || '—'}</em>
+      </div>
+    `;
+  } else if (compat && !compat.uses_all_gpus) {
+    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' lub ');
+    compatChip = `
+      <div style="margin-top:10px; padding:8px; background:#fffbe5; border:1px solid #f5d76e; border-radius:6px; font-size:12px; color:#5c4500;">
+        ℹ️ TP=${compat.used_tp} × PP=${compat.used_pp} = ${compat.used_tp * compat.used_pp} GPU uzywanych. Pozostale bezczynne. Lepiej uzyc: ${better}.
+      </div>
+    `;
+  }
   return `
     <div class="adv-alert info">
       <div class="adv-alert-ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></div>
@@ -629,6 +651,7 @@ function renderAutoAlert(rec) {
         KV cache <strong>${escapeHtml(r.kv_cache_dtype || 'auto')}</strong>, max_num_seqs=${r.max_num_seqs || 0},
         gpu_memory_utilization=${(r.gpu_memory_utilization || 0.9).toFixed(2)}.
         ${args ? `<div class="adv-alert-args">${escapeHtml(args)}</div>` : ''}
+        ${compatChip}
         ${warnings.length > 0 ? `<ul class="adv-alert-warn">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
       </div>
     </div>
