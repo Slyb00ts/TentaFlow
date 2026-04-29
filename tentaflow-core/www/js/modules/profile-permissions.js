@@ -2,8 +2,8 @@
 // File: modules/profile-permissions.js
 // Purpose: Profile Permissions Settings (mockup section 15). Globalny ekran
 //          ustawien profiling permissions: cache hasla sudo (in-memory only),
-//          override sciezek kolektorow, wylaczone sources, oraz lista
-//          status-detektorow (Available / Needs sudo / Limited / Disabled).
+//          auto-elevate toggle, override sciezek kolektorow, limity storage
+//          (lokalne), oraz lista source-toggle dla launch modal.
 // =============================================================================
 
 import {
@@ -22,6 +22,32 @@ import { profilingCollectorsStatus } from '/js/protocol/profiling.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-input.js';
+
+// Klucze localStorage dla per-browser preferencji nieobslugiwanych przez backend.
+const KEY_REMEMBER_SUDO = 'tf-profile-permissions-remember-sudo';
+const KEY_AUTO_ELEVATE  = 'tf-profile-permissions-auto-elevate';
+const KEY_STORAGE_LIMITS = 'tf-profile-permissions-storage-limits';
+
+function readBoolLocal(key, fallback) {
+  try { const v = localStorage.getItem(key); return v == null ? fallback : v === '1'; }
+  catch (_e) { return fallback; }
+}
+function writeBoolLocal(key, value) {
+  try { localStorage.setItem(key, value ? '1' : '0'); } catch (_e) {}
+}
+function readJsonLocal(key, fallback) {
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
+  catch (_e) { return fallback; }
+}
+function writeJsonLocal(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (_e) {}
+}
+
+const DEFAULT_STORAGE_LIMITS = {
+  capPerSession: '1 GB',
+  fifoSize: 20,
+  autoDeleteDays: '7 days',
+};
 
 // Domyślne kolektory pokazywane w UI (auto-discovery będzie wskazywać
 // "FOUND/N/A" tylko jak backend dostarczy odpowiedź; bez backendu pokazujemy
@@ -89,6 +115,9 @@ function renderShell() {
   const validated = isSudoValidated();
   const disabled = new Set(getDisabledSources());
   const overrides = getCollectorPaths();
+  const rememberSudo = readBoolLocal(KEY_REMEMBER_SUDO, true);
+  const autoElevate  = readBoolLocal(KEY_AUTO_ELEVATE, false);
+  const limits = { ...DEFAULT_STORAGE_LIMITS, ...(readJsonLocal(KEY_STORAGE_LIMITS, {}) || {}) };
 
   const collectorsHtml = DEFAULT_COLLECTORS.map((c) => {
     const cur = overrides[c.id] || c.defaultPath;
@@ -137,11 +166,29 @@ function renderShell() {
       </header>
 
       <section class="pp-card">
-        <h3 class="pp-h3">Privilege caching</h3>
+        <h3 class="pp-h3">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+          Privilege caching
+        </h3>
+
+        <div class="pp-row">
+          <div class="pp-row-meta">
+            <div class="pp-row-name">Remember sudo for current session</div>
+            <div class="pp-row-desc">Cache password in memory (never on disk) until tentaflow process exits. Convenient for back-to-back captures.</div>
+          </div>
+          <tf-toggle data-pref-toggle="remember-sudo" ${rememberSudo ? 'checked' : ''}></tf-toggle>
+        </div>
+
+        <div class="pp-row">
+          <div class="pp-row-meta">
+            <div class="pp-row-name">Auto-elevate when profiling started</div>
+            <div class="pp-row-desc">Automatically prompt for sudo when starting any profile session that requires it.</div>
+          </div>
+          <tf-toggle data-pref-toggle="auto-elevate" ${autoElevate ? 'checked' : ''}></tf-toggle>
+        </div>
+
         <div class="pp-alert danger">
-          <strong>Security:</strong> sudo password is held in JavaScript memory only.
-          It is never written to disk, never sent to the server unless you start a
-          session, and is wiped when this browser tab closes.
+          <strong>Security warning:</strong> caching sudo credentials grants the tentaflow process the ability to spawn privileged collectors without re-authentication. Disable this toggle on shared workstations.
         </div>
 
         <div class="pp-row">
@@ -160,8 +207,11 @@ function renderShell() {
       </section>
 
       <section class="pp-card">
-        <h3 class="pp-h3">Collector binary paths</h3>
-        <div class="pp-sub">Override defaults if collectors are installed in non-standard locations. Paths are stored locally per-browser.</div>
+        <h3 class="pp-h3">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+          Collector binary paths
+        </h3>
+        <div class="pp-sub">Auto-discovered from PATH. Override if you have a non-standard installation. Paths are stored locally per-browser.</div>
         ${collectorsHtml}
         <div class="pp-actions-row">
           <tf-button variant="ghost" size="sm" data-action="paths-reset">Reset to defaults</tf-button>
@@ -175,15 +225,18 @@ function renderShell() {
       </section>
 
       <section class="pp-card">
-        <h3 class="pp-h3">Storage limits</h3>
-        <div class="pp-sub">Mockup #15 — limity zapisu sesji. Wartosci sa lokalne (per browser); zmiana realnej polityki backend wymaga settings.toml.</div>
+        <h3 class="pp-h3">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+          Storage limits
+        </h3>
+        <div class="pp-sub">Backend nie wystawia jeszcze API zarzadzania limitami; ustawienia trzymane sa per-browser. Backend ma na sztywno: FIFO 20 sesji per nod, max 600s duration, label ≤ 128 znakow.</div>
 
         <div class="pp-row">
           <div class="pp-row-meta">
             <div class="pp-row-name">Storage cap per session</div>
             <div class="pp-row-desc">Maksymalny rozmiar pojedynczej sesji. Sesje przekraczajace cap sa zatrzymane i oznaczone jako truncated.</div>
           </div>
-          <input class="pp-path-input" id="pp-cap-session" type="text" value="1 GB" style="width:120px;" />
+          <input class="pp-field-input" id="pp-cap-session" type="text" value="${escapeHtml(String(limits.capPerSession))}" />
         </div>
 
         <div class="pp-row">
@@ -191,7 +244,7 @@ function renderShell() {
             <div class="pp-row-name">FIFO size (sessions per node)</div>
             <div class="pp-row-desc">Liczba sesji trzymanych na dysku. Najstarsza jest rotowana gdy limit osiagniety.</div>
           </div>
-          <input class="pp-path-input" id="pp-fifo-size" type="number" value="20" style="width:120px;" />
+          <input class="pp-field-input" id="pp-fifo-size" type="number" min="5" max="50" value="${escapeHtml(String(limits.fifoSize))}" />
         </div>
 
         <div class="pp-row">
@@ -199,7 +252,12 @@ function renderShell() {
             <div class="pp-row-name">Auto-delete failed sessions after</div>
             <div class="pp-row-desc">Sesje zakonczone bledem sa usuwane po tylu dniach.</div>
           </div>
-          <input class="pp-path-input" id="pp-autodelete-days" type="text" value="7 days" style="width:120px;" />
+          <input class="pp-field-input" id="pp-autodelete-days" type="text" value="${escapeHtml(String(limits.autoDeleteDays))}" />
+        </div>
+
+        <div class="pp-actions-row">
+          <tf-button variant="ghost" size="sm" data-action="limits-reset">Reset defaults</tf-button>
+          <tf-button variant="primary" size="sm" data-action="limits-save">Save settings</tf-button>
         </div>
       </section>
     </div>
@@ -331,6 +389,42 @@ function bind(container) {
       });
       return;
     }
+    if (action === 'limits-reset') {
+      writeJsonLocal(KEY_STORAGE_LIMITS, {});
+      const cap = container.querySelector('#pp-cap-session');
+      const fifo = container.querySelector('#pp-fifo-size');
+      const autodel = container.querySelector('#pp-autodelete-days');
+      if (cap) cap.value = DEFAULT_STORAGE_LIMITS.capPerSession;
+      if (fifo) fifo.value = String(DEFAULT_STORAGE_LIMITS.fifoSize);
+      if (autodel) autodel.value = DEFAULT_STORAGE_LIMITS.autoDeleteDays;
+      return;
+    }
+    if (action === 'limits-save') {
+      const next = {
+        capPerSession: container.querySelector('#pp-cap-session')?.value || DEFAULT_STORAGE_LIMITS.capPerSession,
+        fifoSize: Number(container.querySelector('#pp-fifo-size')?.value) || DEFAULT_STORAGE_LIMITS.fifoSize,
+        autoDeleteDays: container.querySelector('#pp-autodelete-days')?.value || DEFAULT_STORAGE_LIMITS.autoDeleteDays,
+      };
+      writeJsonLocal(KEY_STORAGE_LIMITS, next);
+      const fb = container.querySelector('#pp-sudo-feedback');
+      if (fb) {
+        fb.hidden = false;
+        fb.className = 'pp-feedback warn';
+        fb.textContent = 'Storage limits saved locally. Backend nie udostepnia jeszcze API do zmiany realnej polityki — limity sa hintem dla GUI (FIFO 20, duration 600s sa w backendzie hardcoded).';
+      }
+      return;
+    }
+  });
+
+  // Privilege caching toggles — per-browser preference (backend nie ma jeszcze
+  // API kontroli polityki sudo, wiec to lokalne hinty dla launch-modal logiki).
+  container.querySelectorAll('[data-pref-toggle]').forEach((tog) => {
+    const id = tog.getAttribute('data-pref-toggle');
+    tog.addEventListener('change', (ev) => {
+      const checked = !!(ev.detail?.checked ?? tog.checked);
+      if (id === 'remember-sudo') writeBoolLocal(KEY_REMEMBER_SUDO, checked);
+      else if (id === 'auto-elevate') writeBoolLocal(KEY_AUTO_ELEVATE, checked);
+    });
   });
 
   // Sudo input — sync na blur.
