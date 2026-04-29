@@ -29,6 +29,7 @@
     "addons": "Addons",
     "users": "Usuarios",
     "audit": "Registro de auditoría",
+    "profiling_sessions": "Perfilado",
     "meeting": "Bot de reuniones",
     "section_general": "General",
     "section_core": "Núcleo",

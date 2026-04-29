@@ -172,6 +172,10 @@ export function topbarHtml(node) {
         <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-record"/></svg>
         <span>${escapeHtml(I18n.t('nsight.profile_node_btn'))}</span>
       </tf-button>
+      <tf-button size="sm" variant="ghost" data-action="nsight-view-sessions" title="View profiling sessions for this node">
+        <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-trend"/></svg>
+        <span>Sessions</span>
+      </tf-button>
     `);
   } else if (hasNvidiaGpu(node) && node.nsys_available === false) {
     // NVIDIA jest, ale brak nsys w PATH — chip dziala jak link "scroll do install card".
@@ -372,6 +376,14 @@ export function bindNsightActions(root, node) {
     }
     if (action === 'nsight-stop-session') {
       await stopActiveSession();
+      return;
+    }
+    if (action === 'nsight-view-sessions') {
+      const { Router } = await import('/js/router.js');
+      Router.navigate('profiling-sessions', {
+        nodeId: node.node_id,
+        nodeName: node.hostname || node.node_id,
+      });
       return;
     }
     if (action === 'nsight-open-report') {
