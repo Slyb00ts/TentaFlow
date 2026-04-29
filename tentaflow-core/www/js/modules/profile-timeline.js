@@ -1276,14 +1276,21 @@ export class UnifiedTimeline {
           <div class="sp-item"><span class="sym">Disk write</span><span class="pct">${fmtBytes(diskWrite)}</span></div>
         </div>
       </div>
-      ${hasCpu ? `<div class="open-flame">
-        <tf-button variant="ghost" size="sm" data-act="open-flame">Open in flamegraph →</tf-button>
-      </div>` : ''}
+      <div class="open-flame">
+        <tf-button variant="ghost" size="sm" data-act="expand-range">Expand range →</tf-button>
+        ${hasCpu ? `<tf-button variant="ghost" size="sm" data-act="open-flame">Open in flamegraph →</tf-button>` : ''}
+      </div>
     `;
     const flameBtn = this.panel.querySelector('[data-act="open-flame"]');
     if (flameBtn) {
       flameBtn.addEventListener('click', () => {
         this._emit('openFlamegraph', { startNs: s, endNs: en });
+      });
+    }
+    const expandBtn = this.panel.querySelector('[data-act="expand-range"]');
+    if (expandBtn) {
+      expandBtn.addEventListener('click', () => {
+        this._emit('expandRange', { startNs: s, endNs: en });
       });
     }
   }
@@ -1350,6 +1357,21 @@ export const TimelineView = {
       if (tabs && typeof tabs.setAttribute === 'function') {
         tabs.setAttribute('value', 'flame');
         tabs.dispatchEvent(new CustomEvent('change', { detail: { value: 'flame' } }));
+      }
+    });
+
+    // Bridge "Expand range" → open Range Detail modal (mockup #14).
+    // Module is loaded on demand to keep the timeline's initial cost low.
+    tl.on('expandRange', async ({ startNs, endNs }) => {
+      try {
+        const mod = await import('./profile-range-detail.js');
+        mod.openRangeDetailModal({
+          report,
+          range: { tStartNs: startNs, tEndNs: endNs },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[range-detail] failed to open:', err);
       }
     });
 
