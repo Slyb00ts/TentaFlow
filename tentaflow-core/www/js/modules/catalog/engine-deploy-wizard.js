@@ -583,7 +583,14 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   const weightsGb = v.model_weights_gb || 0;
   const kvGb = v.kv_cache_gb || 0;
   const actGb = v.activations_gb || 0;
-  const w = (n) => totalVramGb > 0 ? Math.min(100, (n / totalVramGb) * 100) : 0;
+  // Legend percentages must sum to <=100. When totalUsed > totalVramGb each
+  // segment would clamp at 100%, producing nonsense like "59 + 100 + 56 = 215%".
+  // Normalize against max(totalVramGb, totalUsed) so segments stay proportional
+  // and free shows real headroom (or is omitted when negative).
+  const legendBase = Math.max(totalVramGb, totalUsed);
+  const w = (n) => legendBase > 0 ? (n / legendBase) * 100 : 0;
+  const overflow = totalUsed > totalVramGb;
+  const freeGb = Math.max(0, totalVramGb - totalUsed);
 
   return `
     <div class="adv-section">
@@ -597,7 +604,7 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
         <div class="adv-kpi ${kvCls}"><div class="k-label">KV cache</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${(r.max_model_len || 0).toLocaleString()} ctx · ${escapeHtml(r.kv_cache_dtype || 'auto')}</div></div>
         <div class="adv-kpi"><div class="k-label">Aktywacje</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">workspace</div></div>
         <div class="adv-kpi ${leftCls}"><div class="k-label">Zostaje</div><div class="k-value">${headroomGb >= 0 ? headroomGb.toFixed(1) : '−' + Math.abs(headroomGb).toFixed(1)} GB</div><div class="k-sub">${Math.max(0, 100 - pctUsed)}% headroom</div></div>
-        <div class="adv-kpi ${totalCls}"><div class="k-label">Total / Avail</div><div class="k-value">${totalUsed.toFixed(1)} / ${totalVramGb.toFixed(0)}</div><div class="k-sub">${pctUsed}% z ${gpuCount} GPU</div></div>
+        <div class="adv-kpi ${totalCls}"><div class="k-label">Total / Avail</div><div class="k-value">${totalUsed.toFixed(1)} GB / ${totalVramGb.toFixed(0)} GB</div><div class="k-sub">${pctUsed}% z ${gpuCount} GPU</div></div>
       </div>
       <div class="adv-vram-bar-wrap">
         <div class="adv-vram-head"><span>Wykorzystanie VRAM</span><span class="pct">${pctUsed}%</span></div>
@@ -606,7 +613,9 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
           <span class="lg-w">Wagi ${w(weightsGb).toFixed(0)}%</span>
           <span class="lg-kv">KV ${w(kvGb).toFixed(0)}%</span>
           <span class="lg-act">Aktywacje ${w(actGb).toFixed(0)}%</span>
-          <span class="lg-free">Wolne ${Math.max(0, 100 - pctUsed)}%</span>
+          ${overflow
+            ? `<span class="lg-free danger">Brakuje ${Math.abs(headroomGb).toFixed(1)} GB</span>`
+            : `<span class="lg-free">Wolne ${w(freeGb).toFixed(0)}%</span>`}
         </div>
       </div>
     </div>

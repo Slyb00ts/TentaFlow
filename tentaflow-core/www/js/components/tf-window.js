@@ -104,7 +104,9 @@ class TfWindow extends HTMLElement {
     }
   }
 
-  attributeChangedCallback() {
+  attributeChangedCallback(name) {
+    // Skip the synthetic 'title' removal we trigger inside _applyAttrs.
+    if (name === 'title' && this._suppressTitleObserve) return;
     if (this._win) this._applyAttrs();
   }
 
@@ -200,6 +202,14 @@ class TfWindow extends HTMLElement {
   _applyAttrs() {
     const title = this.getAttribute('title') || '';
     this._titleEl.textContent = title;
+    // Suppress browser native tooltip on host element: the value lives in the
+    // header span, so the host's `title` attribute would only render as a stray
+    // hover bubble over the body. We strip it after consuming the value.
+    if (this.hasAttribute('title')) {
+      this._suppressTitleObserve = true;
+      this.removeAttribute('title');
+      this._suppressTitleObserve = false;
+    }
 
     const icon = this.getAttribute('icon');
     if (icon) {
