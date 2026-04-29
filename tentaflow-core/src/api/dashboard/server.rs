@@ -1069,13 +1069,14 @@ pub async fn handle_request(
                 cors_origin.as_deref(),
             ));
         }
-        let (status, response_body) = match api_deploy_recommend::handle_recommend(&body_bytes).await {
-            Ok(p) => p,
-            Err(e) => (
-                500,
-                format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'")),
-            ),
-        };
+        let (status, response_body) =
+            match api_deploy_recommend::handle_recommend(&body_bytes).await {
+                Ok(p) => p,
+                Err(e) => (
+                    500,
+                    format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'")),
+                ),
+            };
         return Ok(json_response_cors(
             status,
             response_body,
@@ -1178,11 +1179,7 @@ pub async fn handle_request(
             Some(remote_addr.as_str()),
         )
         .await;
-        return Ok(json_response_cors(
-            status,
-            body,
-            cors_origin.as_deref(),
-        ));
+        return Ok(json_response_cors(status, body, cors_origin.as_deref()));
     }
 
     if path == "/api/profiling/collectors/status" && method == Method::GET {
@@ -1190,11 +1187,7 @@ pub async fn handle_request(
             return Ok(json_response_cors(s, b, cors_origin.as_deref()));
         }
         let (status, body) = super::api_profiling::handle_collectors_status();
-        return Ok(json_response_cors(
-            status,
-            body,
-            cors_origin.as_deref(),
-        ));
+        return Ok(json_response_cors(status, body, cors_origin.as_deref()));
     }
 
     // Voice profiles API — bulletproof speaker recognition.
@@ -1296,7 +1289,6 @@ fn route_api(
             }
             handle_result(api_services::handle_create(db, body), 400)
         }
-
 
         // API Keys
         (&Method::GET, "/api/apikeys") => handle_result(api_apikeys::handle_list(db), 500),

@@ -127,14 +127,17 @@ pub struct RecommendedConfig {
 
 /// Handler endpointa. Body: JSON `RecommendRequest`. Response: `RecommendResponse`.
 pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
-    let req: RecommendRequest = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {e}"))?;
+    let req: RecommendRequest =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("Niepoprawny JSON: {e}"))?;
 
     if req.model.trim().is_empty() {
         return Ok((400, r#"{"error":"model wymagany"}"#.to_string()));
     }
     if req.gpus.is_empty() {
-        return Ok((400, r#"{"error":"co najmniej jeden GPU wymagany"}"#.to_string()));
+        return Ok((
+            400,
+            r#"{"error":"co najmniej jeden GPU wymagany"}"#.to_string(),
+        ));
     }
 
     let client = reqwest::Client::builder()
@@ -163,7 +166,11 @@ pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
     .map_err(|e| anyhow::anyhow!("Parse HF config: {e}"))?;
 
     let gpu_count = req.gpus.len() as u32;
-    let gpu_memory_gb = req.gpus.iter().map(|g| g.memory_gb).fold(f64::INFINITY, f64::min);
+    let gpu_memory_gb = req
+        .gpus
+        .iter()
+        .map(|g| g.memory_gb)
+        .fold(f64::INFINITY, f64::min);
 
     let kv_dtype = req
         .kv_cache_dtype
@@ -293,10 +300,7 @@ pub struct LimitsResponse {
 pub async fn handle_limits(query: &str) -> Result<(u16, String)> {
     let params = parse_query(query);
 
-    let model = params
-        .get("model")
-        .cloned()
-        .unwrap_or_default();
+    let model = params.get("model").cloned().unwrap_or_default();
     if model.trim().is_empty() {
         return Ok((400, r#"{"error":"model wymagany"}"#.to_string()));
     }
@@ -347,9 +351,7 @@ pub async fn handle_limits(query: &str) -> Result<(u16, String)> {
     let lock_tp = parse_bool(params.get("lock_tensor_parallel"));
     let req_ctx = params.get("max_model_len").and_then(|s| s.parse().ok());
     let req_seqs = params.get("max_num_seqs").and_then(|s| s.parse().ok());
-    let req_tp = params
-        .get("tensor_parallel")
-        .and_then(|s| s.parse().ok());
+    let req_tp = params.get("tensor_parallel").and_then(|s| s.parse().ok());
 
     let fit = auto_fit_config(
         &spec,
@@ -378,8 +380,8 @@ pub async fn handle_limits(query: &str) -> Result<(u16, String)> {
 
     // KV budget: capacity*util - weights/parallel - activations
     let parallel = (applied.tensor_parallel * applied.pipeline_parallel).max(1) as f64;
-    let weights_gb = (spec.estimated_params() as f64 * spec.bytes_per_param())
-        / (1024.0 * 1024.0 * 1024.0);
+    let weights_gb =
+        (spec.estimated_params() as f64 * spec.bytes_per_param()) / (1024.0 * 1024.0 * 1024.0);
     let weights_per_gpu = weights_gb / parallel;
     let activations_per_gpu = 5.0 + weights_per_gpu * 0.10;
     let usable_per_gpu = applied.gpu_memory_gb_each * applied.gpu_memory_utilization;

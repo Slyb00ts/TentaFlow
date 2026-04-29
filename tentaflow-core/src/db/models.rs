@@ -498,7 +498,9 @@ pub struct UserAccount {
     pub role: String,
 }
 
-fn default_role() -> String { "user".to_string() }
+fn default_role() -> String {
+    "user".to_string()
+}
 
 /// Grupa uzytkownikow
 #[derive(Debug, Clone, Serialize, Deserialize)]

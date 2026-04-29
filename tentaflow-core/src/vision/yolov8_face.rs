@@ -68,9 +68,7 @@ impl FaceDetector for Yolov8FaceEngine {
             .ok_or_else(|| anyhow!("YOLO: brak output tensorow"))?;
 
         let shape = out.shape().to_vec();
-        let data = out
-            .as_slice::<f32>()
-            .context("YOLO: output nie jest f32")?;
+        let data = out.as_slice::<f32>().context("YOLO: output nie jest f32")?;
 
         // YOLOv8/v11-face zwraca (1, attrs, anchors) lub (1, anchors, attrs).
         // attrs = 4 (bbox) + 1 (score) + 5*3 (kps) = 20. anchors = 8400 dla 640.

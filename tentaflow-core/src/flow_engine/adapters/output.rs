@@ -67,9 +67,11 @@ impl NodeAdapter for OutputNodeAdapter {
             .iter()
             .rev()
             .find_map(|step| {
-                ctx.node_results
-                    .get(&step.node_id)
-                    .and_then(|r| r.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                ctx.node_results.get(&step.node_id).and_then(|r| {
+                    r.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
             })
             .unwrap_or_else(|| ctx.input.clone());
 

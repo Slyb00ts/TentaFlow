@@ -123,10 +123,12 @@ pub fn handle_update(pool: &DbPool, id: i64, body: &[u8]) -> Result<(u16, String
         ));
     }
 
-    let language = req
-        .language
-        .as_deref()
-        .unwrap_or(existing.as_ref().map(|p| p.language.as_str()).unwrap_or("pl"));
+    let language = req.language.as_deref().unwrap_or(
+        existing
+            .as_ref()
+            .map(|p| p.language.as_str())
+            .unwrap_or("pl"),
+    );
     let params = UpdatePrompt {
         id,
         name: &req.name,

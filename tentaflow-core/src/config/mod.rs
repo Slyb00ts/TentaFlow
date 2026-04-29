@@ -76,6 +76,63 @@ pub struct NodeConfig {
     /// Konfiguracja lokalnej inferencji (opcjonalna)
     #[serde(default)]
     pub inference: Option<InferenceConfig>,
+
+    /// Runtime services subsystem (port range, supervisor cadence, restart policy).
+    /// Used by the unified services refactor (services_repo + services::deploy/supervisor).
+    #[serde(default)]
+    pub services_runtime: ServicesRuntimeConfig,
+}
+
+// =============================================================================
+// Konfiguracja runtime serwisow (additive — wariant B refactor unifikacji)
+// =============================================================================
+
+/// Konfiguracja podsystemu runtime'u serwisow zarzadzanych przez `services_repo`
+/// i `services::deploy/supervisor`. Sekcja TOML: `[services_runtime]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServicesRuntimeConfig {
+    /// Inclusive zakres portow ktore allocator moze rozdawac dla deploymentow.
+    #[serde(default = "default_services_port_range")]
+    pub port_range: (u16, u16),
+
+    /// Interwal probek health-check w milisekundach.
+    #[serde(default = "default_services_health_interval_ms")]
+    pub health_check_interval_ms: u64,
+
+    /// Maksymalna liczba prob restartow zanim supervisor oznaczy serwis jako Failed.
+    #[serde(default = "default_services_max_restart_attempts")]
+    pub max_restart_attempts: u32,
+
+    /// Gorny limit (cap) dla exponential backoff miedzy restartami, w milisekundach.
+    #[serde(default = "default_services_restart_backoff_max_ms")]
+    pub restart_backoff_max_ms: u64,
+}
+
+impl Default for ServicesRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            port_range: default_services_port_range(),
+            health_check_interval_ms: default_services_health_interval_ms(),
+            max_restart_attempts: default_services_max_restart_attempts(),
+            restart_backoff_max_ms: default_services_restart_backoff_max_ms(),
+        }
+    }
+}
+
+fn default_services_port_range() -> (u16, u16) {
+    (5000, 6000)
+}
+
+fn default_services_health_interval_ms() -> u64 {
+    2_000
+}
+
+fn default_services_max_restart_attempts() -> u32 {
+    5
+}
+
+fn default_services_restart_backoff_max_ms() -> u64 {
+    60_000
 }
 
 // =============================================================================
@@ -990,6 +1047,7 @@ impl Default for NodeConfig {
                 iroh_relay_url: default_iroh_relay_url(),
             }),
             inference: None,
+            services_runtime: ServicesRuntimeConfig::default(),
         }
     }
 }

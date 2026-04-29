@@ -7,9 +7,9 @@
 
 use std::path::Path;
 
+use super::nsys::{nsys_command, ProfilingError};
 use serde::Deserialize;
 use tentaflow_protocol::profiling::{ProfileKpi, ProfileTopRow};
-use super::nsys::{nsys_command, ProfilingError};
 
 /// Domyslny limit wierszy per tabela top — stat reports zwracaja czesto >1000
 /// linii a w GUI pokazujemy max ~50.
@@ -30,7 +30,12 @@ pub struct ParsedStats {
 /// wiec wszystkie pola sa Option i probujemy kilku wariantow nazewnictwa.
 #[derive(Debug, Deserialize, Default)]
 struct RawRow {
-    #[serde(default, alias = "Time(ns)", alias = "Total Time (ns)", alias = "Total Time")]
+    #[serde(
+        default,
+        alias = "Time(ns)",
+        alias = "Total Time (ns)",
+        alias = "Total Time"
+    )]
     time_ns: Option<f64>,
     #[serde(default, alias = "Total Time (ms)")]
     time_ms: Option<f64>,
@@ -40,7 +45,13 @@ struct RawRow {
     avg_ns: Option<f64>,
     #[serde(default, alias = "Avg(ms)", alias = "Avg (ms)")]
     avg_ms: Option<f64>,
-    #[serde(default, alias = "Name", alias = "Operation", alias = "Range", alias = "Symbol")]
+    #[serde(
+        default,
+        alias = "Name",
+        alias = "Operation",
+        alias = "Range",
+        alias = "Symbol"
+    )]
     name: Option<String>,
 }
 

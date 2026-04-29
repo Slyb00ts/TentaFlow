@@ -199,9 +199,8 @@ pub fn list_wake_words(pool: &DbPool) -> Result<Vec<WakeWord>> {
 /// Lista samych wlaczonych slow w postaci CSV — uzywane przy spawn bota.
 pub fn enabled_wake_words_csv(pool: &DbPool) -> Result<String> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT word FROM teams_bot_wake_words WHERE enabled = 1 ORDER BY word",
-    )?;
+    let mut stmt = conn
+        .prepare_cached("SELECT word FROM teams_bot_wake_words WHERE enabled = 1 ORDER BY word")?;
     let words: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -659,8 +658,9 @@ pub fn verify_api_key(pool: &DbPool, key_hash: &str) -> Result<Option<DbApiKey>>
 
 pub fn list_aliases(pool: &DbPool) -> Result<Vec<DbServiceAlias>> {
     let conn = acquire(pool)?;
-    let mut stmt =
-        conn.prepare_cached("SELECT id, alias, target_service_id FROM service_aliases ORDER BY alias")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, alias, target_service_id FROM service_aliases ORDER BY alias",
+    )?;
     let aliases = stmt
         .query_map([], |row| {
             Ok(DbServiceAlias {
@@ -758,7 +758,8 @@ pub fn delete_setting(pool: &DbPool, key: &str) -> Result<()> {
 
 pub fn list_settings(pool: &DbPool) -> Result<Vec<DbSetting>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached("SELECT key, value, updated_at FROM settings ORDER BY key")?;
+    let mut stmt =
+        conn.prepare_cached("SELECT key, value, updated_at FROM settings ORDER BY key")?;
     let settings = stmt
         .query_map([], |row| {
             Ok(DbSetting {
@@ -875,11 +876,7 @@ pub fn get_user_preferred_language(pool: &DbPool, user_id: i64) -> Result<Option
 
 /// Ustawia preferowany jezyk uzytkownika. `lang = None` czysci preferencje.
 /// Zwraca blad gdy `lang` nie nalezy do `SUPPORTED_USER_LANGUAGES`.
-pub fn set_user_preferred_language(
-    pool: &DbPool,
-    user_id: i64,
-    lang: Option<&str>,
-) -> Result<()> {
+pub fn set_user_preferred_language(pool: &DbPool, user_id: i64, lang: Option<&str>) -> Result<()> {
     if let Some(code) = lang {
         if !SUPPORTED_USER_LANGUAGES.contains(&code) {
             return Err(anyhow::anyhow!(
@@ -940,11 +937,7 @@ pub fn get_prompt_by_prompt_id(pool: &DbPool, prompt_id: &str) -> Result<Option<
 /// Runtime lookup z fallbackiem na `pl`. Uzywane przez bota gdy chcemy wariant
 /// per-jezyk, ale baza domyslnie ma polski seed wiec ten sam prompt zadziala
 /// gdy lokal nie jest przetlumaczony.
-pub fn find_prompt(
-    pool: &DbPool,
-    prompt_id: &str,
-    language: &str,
-) -> Result<Option<DbPrompt>> {
+pub fn find_prompt(pool: &DbPool, prompt_id: &str, language: &str) -> Result<Option<DbPrompt>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts WHERE prompt_id = ?1 AND language = ?2",
@@ -1514,7 +1507,8 @@ pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>>
 
 pub fn get_flow(pool: &DbPool, id: i64) -> Result<Option<DbFlow>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(&format!("SELECT {} FROM flows WHERE id = ?1", FLOW_COLS))?;
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {} FROM flows WHERE id = ?1", FLOW_COLS))?;
     let result = stmt
         .query_row(rusqlite::params![id], row_to_flow)
         .optional()?;
@@ -2388,7 +2382,9 @@ fn row_to_user_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserAccount>
         last_login_at: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
-        role: row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "user".to_string()),
+        role: row
+            .get::<_, Option<String>>(13)?
+            .unwrap_or_else(|| "user".to_string()),
     })
 }
 
@@ -2549,8 +2545,8 @@ pub fn create_group(pool: &DbPool, name: &str, description: &str) -> Result<i64>
 /// Lista wszystkich grup uzytkownikow.
 pub fn list_groups(pool: &DbPool) -> Result<Vec<UserGroup>> {
     let conn = acquire(pool)?;
-    let mut stmt =
-        conn.prepare_cached("SELECT id, name, description, created_at FROM user_groups ORDER BY id")?;
+    let mut stmt = conn
+        .prepare_cached("SELECT id, name, description, created_at FROM user_groups ORDER BY id")?;
     let rows = stmt
         .query_map([], |row| {
             Ok(UserGroup {
@@ -3984,7 +3980,8 @@ pub fn remove_revoked_node(pool: &DbPool, node_id: &str) -> Result<()> {
 /// Lista wszystkich revoked nodow
 pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<String>> {
     let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached("SELECT node_id FROM revoked_nodes ORDER BY revoked_at DESC")?;
+    let mut stmt =
+        conn.prepare_cached("SELECT node_id FROM revoked_nodes ORDER BY revoked_at DESC")?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4488,10 +4485,7 @@ pub mod transcripts {
     /// Read-only lookup session_id po meeting_key. `Ok(None)` gdy brak sesji.
     /// Uzywane przez handlery (summaries/action-items/export), ktore nie moga
     /// tworzyc sesji — w odroznieniu od `get_or_create_session`.
-    pub fn session_id_by_meeting_key(
-        pool: &DbPool,
-        meeting_key: &str,
-    ) -> Result<Option<i64>> {
+    pub fn session_id_by_meeting_key(pool: &DbPool, meeting_key: &str) -> Result<Option<i64>> {
         let conn = pool.lock().unwrap();
         let id: rusqlite::Result<i64> = conn.query_row(
             "SELECT id FROM meeting_sessions WHERE meeting_key = ?1",
@@ -4505,10 +4499,7 @@ pub mod transcripts {
         }
     }
 
-    pub fn owner_of_meeting_key(
-        pool: &DbPool,
-        meeting_key: &str,
-    ) -> Result<Option<Option<i64>>> {
+    pub fn owner_of_meeting_key(pool: &DbPool, meeting_key: &str) -> Result<Option<Option<i64>>> {
         let conn = pool.lock().unwrap();
         let row: rusqlite::Result<Option<i64>> = conn.query_row(
             "SELECT owner_user_id FROM meeting_sessions WHERE meeting_key = ?1",
@@ -4824,7 +4815,8 @@ pub mod transcripts {
 
     pub fn list_reserved_ports(pool: &DbPool, kind: &str) -> Result<Vec<u16>> {
         let conn = pool.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT port FROM meeting_port_allocations WHERE kind = ?1")?;
+        let mut stmt =
+            conn.prepare_cached("SELECT port FROM meeting_port_allocations WHERE kind = ?1")?;
         let rows = stmt.query_map(rusqlite::params![kind], |row| {
             let p: i64 = row.get(0)?;
             Ok(p as u16)
@@ -8751,7 +8743,13 @@ pub mod resource_permissions {
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(resource_type, resource_id, subject_type, subject_id)
              DO UPDATE SET access_level = excluded.access_level",
-            rusqlite::params![resource_type, resource_id, subject_type, subject_id, access_level],
+            rusqlite::params![
+                resource_type,
+                resource_id,
+                subject_type,
+                subject_id,
+                access_level
+            ],
         )?;
         Ok(())
     }
@@ -8874,9 +8872,10 @@ pub mod resource_permissions {
                AND rp.subject_type = 'group' AND gm.user_id = ?3",
         )?;
         let levels: Vec<String> = stmt
-            .query_map(rusqlite::params![resource_type, resource_id, user_id], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(
+                rusqlite::params![resource_type, resource_id, user_id],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if levels.iter().any(|l| l == "deny") {
             return Ok(false);
@@ -9133,14 +9132,9 @@ mod meeting_summary_action_items_tests {
             upsert_meeting_action_item(&db, sid, "Alice", "prepare report", Some("2026-05-01"))
                 .unwrap();
         // Ten sam owner+task — dedup przez content_hash, to samo id.
-        let id2 = upsert_meeting_action_item(
-            &db,
-            sid,
-            "  alice ",
-            "Prepare Report",
-            Some("2026-05-02"),
-        )
-        .unwrap();
+        let id2 =
+            upsert_meeting_action_item(&db, sid, "  alice ", "Prepare Report", Some("2026-05-02"))
+                .unwrap();
         assert_eq!(id1, id2);
         let rows = list_action_items_for_meeting(&db, sid, None).unwrap();
         assert_eq!(rows.len(), 1);
@@ -9205,8 +9199,11 @@ mod meeting_summary_action_items_tests {
             // SQLite wymaga wlaczonego PRAGMA foreign_keys per-connection — init
             // to robi globalnie przez set_pragmas, ale sprawdzamy tu eksplicytnie.
             conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
-            conn.execute("DELETE FROM meeting_sessions WHERE id = ?1", rusqlite::params![sid])
-                .unwrap();
+            conn.execute(
+                "DELETE FROM meeting_sessions WHERE id = ?1",
+                rusqlite::params![sid],
+            )
+            .unwrap();
         }
         let summaries = list_summaries_for_meeting(&db, sid, 10).unwrap();
         let items = list_action_items_for_meeting(&db, sid, None).unwrap();
@@ -9230,15 +9227,9 @@ mod delete_service_cascade_tests {
         // DELETE w `delete_service` modele zostawalyby sierotami widocznymi w GUI.
         let db = setup_db();
 
-        let service_id = create_service(
-            &db,
-            "test-tts-service",
-            "tts",
-            "single",
-            Some("tts"),
-            "{}",
-        )
-        .expect("create_service failed");
+        let service_id =
+            create_service(&db, "test-tts-service", "tts", "single", Some("tts"), "{}")
+                .expect("create_service failed");
 
         let model_id = create_model_entry(
             &db,
@@ -9313,15 +9304,9 @@ mod delete_service_cascade_tests {
         )
         .expect("create orphan failed");
 
-        let new_service = create_service(
-            &db,
-            "apple-tts-native",
-            "tts",
-            "single",
-            Some("tts"),
-            "{}",
-        )
-        .expect("create_service failed");
+        let new_service =
+            create_service(&db, "apple-tts-native", "tts", "single", Some("tts"), "{}")
+                .expect("create_service failed");
 
         let updated = relink_model_entry_to_service(
             &db,
@@ -9333,10 +9318,19 @@ mod delete_service_cascade_tests {
         .expect("relink failed");
         assert_eq!(updated, 1, "powinien byc dokladnie jeden UPDATE");
 
-        let entry = get_model_entry(&db, orphan_id).unwrap().expect("entry znika");
-        assert_eq!(entry.service_id, Some(new_service), "service_id nie przepiety");
+        let entry = get_model_entry(&db, orphan_id)
+            .unwrap()
+            .expect("entry znika");
+        assert_eq!(
+            entry.service_id,
+            Some(new_service),
+            "service_id nie przepiety"
+        );
         assert_eq!(entry.is_active, true, "is_active powinno byc true");
-        assert!(entry.config_json.contains("native"), "config_json nie zaktualizowany");
+        assert!(
+            entry.config_json.contains("native"),
+            "config_json nie zaktualizowany"
+        );
 
         // Idempotencja: drugi call nadal updateuje 1 wiersz, ale stan ten sam.
         let again = relink_model_entry_to_service(
@@ -9424,8 +9418,14 @@ mod delete_service_cascade_tests {
         assert_eq!(removed, 2, "powinny zniknac tylko quic+local sieroty");
 
         // openai global i live model przezyly.
-        assert!(get_model_entry(&db, openai_id).unwrap().is_some(), "openai global skasowany!");
-        assert!(get_model_entry(&db, live_id).unwrap().is_some(), "live model skasowany!");
+        assert!(
+            get_model_entry(&db, openai_id).unwrap().is_some(),
+            "openai global skasowany!"
+        );
+        assert!(
+            get_model_entry(&db, live_id).unwrap().is_some(),
+            "live model skasowany!"
+        );
 
         // Drugi call to no-op.
         let again = prune_orphaned_quic_models(&db).unwrap();

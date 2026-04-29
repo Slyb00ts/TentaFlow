@@ -355,7 +355,12 @@ async fn deploy_bundled_container(
     // z legacy silnikami spoza Service Manifest registry.
     let context_path = crate::services::manifest::registry()
         .by_id(&config.engine)
-        .and_then(|e| e.deploy.docker.as_ref().and_then(|d| d.context_path.clone()))
+        .and_then(|e| {
+            e.deploy
+                .docker
+                .as_ref()
+                .and_then(|d| d.context_path.clone())
+        })
         .unwrap_or_else(|| bundle_name.to_string());
 
     let deploy_req = crate::deploy::docker::DeployRequest {

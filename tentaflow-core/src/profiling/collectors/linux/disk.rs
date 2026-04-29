@@ -27,8 +27,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "linux.iostat.disk";
@@ -242,7 +242,10 @@ fn polling_loop(
             Err(_) => continue,
         };
         let now_at = Instant::now();
-        let dt = now_at.saturating_duration_since(prev_at).as_secs_f64().max(1e-3);
+        let dt = now_at
+            .saturating_duration_since(prev_at)
+            .as_secs_f64()
+            .max(1e-3);
         prev_at = now_at;
 
         let ts_ns = started_at.elapsed().as_nanos() as u64;
@@ -380,7 +383,8 @@ impl CollectorParser for LinuxIostatDiskParser {
         device_names.sort();
         // Intern each unique device name once; per-event payloads carry only
         // the resulting u32 id (zero String allocs in the hot loop below).
-        let mut lane_index: HashMap<String, (u16, u32)> = HashMap::with_capacity(device_names.len());
+        let mut lane_index: HashMap<String, (u16, u32)> =
+            HashMap::with_capacity(device_names.len());
         for (i, n) in device_names.iter().enumerate() {
             let lane = i.min(u16::MAX as usize) as u16;
             let name_id = names.intern(n);

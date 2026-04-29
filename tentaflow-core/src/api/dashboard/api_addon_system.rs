@@ -2080,7 +2080,6 @@ pub fn handle_invoke_addon_tool(
             .get(service_name)
             .map(|r| r.value().clone());
         if let Some(handle) = handle {
-
             // Async → sync bridge (ten handler jest wolany z sync kontekstu)
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {

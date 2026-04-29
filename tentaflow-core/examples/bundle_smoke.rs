@@ -25,8 +25,8 @@ use anyhow::{anyhow, Result};
 use tentaflow_core::deploy::python_venv::{deploy_with_logs, NativeDeployRequest};
 
 const HEALTH_TIMEOUT_SECS: u64 = 600; // 10 min na ladowanie modelu
-// sglang/vllm/trtllm robia JIT compile triton kerneli przy pierwszym chat
-// request — moze trwac kilka min. Drugi request bedzie szybki (cached).
+                                      // sglang/vllm/trtllm robia JIT compile triton kerneli przy pierwszym chat
+                                      // request — moze trwac kilka min. Drugi request bedzie szybki (cached).
 const SMOKE_REQUEST_TIMEOUT_SECS: u64 = 600;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -38,9 +38,19 @@ async fn main() -> Result<()> {
     let model = args.next();
 
     eprintln!("=== bundle_smoke: {} ===", engine);
-    eprintln!("cache_root = {:?}", std::env::var("TENTAFLOW_CACHE_DIR").ok());
+    eprintln!(
+        "cache_root = {:?}",
+        std::env::var("TENTAFLOW_CACHE_DIR").ok()
+    );
     eprintln!("hf_home    = {:?}", std::env::var("HF_HOME").ok());
-    eprintln!("hf_token   = {}", if std::env::var("HF_TOKEN").is_ok() { "present" } else { "MISSING" });
+    eprintln!(
+        "hf_token   = {}",
+        if std::env::var("HF_TOKEN").is_ok() {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
     eprintln!("model      = {:?}", model);
     eprintln!();
 
@@ -72,7 +82,10 @@ async fn main() -> Result<()> {
     // RTX 4090 nie testujemy.
     if engine == "tensorrt-llm" {
         env.insert("UCX_TLS".to_string(), "tcp".to_string());
-        env.insert("OMPI_MCA_opal_cuda_support".to_string(), "false".to_string());
+        env.insert(
+            "OMPI_MCA_opal_cuda_support".to_string(),
+            "false".to_string(),
+        );
         // Wymus loopback tylko — bez tego trtllm/MPI prubuje dialowac na docker
         // bridge (172.17.0.1) i ginie z "Connection timed out" na port 1027.
         env.insert("OMPI_MCA_btl_tcp_if_include".to_string(), "lo".to_string());
@@ -109,13 +122,20 @@ async fn main() -> Result<()> {
     // wewnetrznych blocking runtime'ow.
     let req_for_deploy = req.clone();
     let log_sink_clone = log_sink.clone();
-    let deploy_handle = tokio::task::spawn_blocking(move || {
-        deploy_with_logs(&req_for_deploy, &log_sink_clone)
-    });
-    let mut running = match deploy_handle.await.unwrap_or_else(|e| Err(anyhow!("join error: {e}"))) {
+    let deploy_handle =
+        tokio::task::spawn_blocking(move || deploy_with_logs(&req_for_deploy, &log_sink_clone));
+    let mut running = match deploy_handle
+        .await
+        .unwrap_or_else(|e| Err(anyhow!("join error: {e}")))
+    {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("\n!!! DEPLOY FAILED for {} after {:.1}s: {:#}", engine, started_at.elapsed().as_secs_f32(), e);
+            eprintln!(
+                "\n!!! DEPLOY FAILED for {} after {:.1}s: {:#}",
+                engine,
+                started_at.elapsed().as_secs_f32(),
+                e
+            );
             std::process::exit(2);
         }
     };
@@ -152,7 +172,11 @@ async fn main() -> Result<()> {
 
     let healthy = match wait_for_health(&base_url, HEALTH_TIMEOUT_SECS).await {
         Ok(probe) => {
-            eprintln!("+++ health OK po {:.1}s — probe '{}' zwrocil 200", started_at.elapsed().as_secs_f32(), probe);
+            eprintln!(
+                "+++ health OK po {:.1}s — probe '{}' zwrocil 200",
+                started_at.elapsed().as_secs_f32(),
+                probe
+            );
             true
         }
         Err(e) => {
@@ -186,7 +210,10 @@ async fn main() -> Result<()> {
 
     eprintln!(
         "\n=== SUMMARY {}: deploy_ok=true health_ok={} smoke_ok={} elapsed={:.1}s ===",
-        engine, healthy, smoke_ok, started_at.elapsed().as_secs_f32()
+        engine,
+        healthy,
+        smoke_ok,
+        started_at.elapsed().as_secs_f32()
     );
 
     if !healthy || !smoke_ok {
@@ -237,7 +264,9 @@ async fn run_smoke(base_url: &str, engine: &str) -> bool {
     match category {
         "llm" => smoke_llm(&client, base_url).await,
         "stt" | "tts" => {
-            eprintln!("(category={category}: smoke ograniczony do health check, skip request body)");
+            eprintln!(
+                "(category={category}: smoke ograniczony do health check, skip request body)"
+            );
             true
         }
         _ => {
@@ -268,12 +297,19 @@ async fn smoke_llm(client: &reqwest::Client, base_url: &str) -> bool {
     };
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    eprintln!("--> HTTP {} in {:.2}s", status, started.elapsed().as_secs_f32());
+    eprintln!(
+        "--> HTTP {} in {:.2}s",
+        status,
+        started.elapsed().as_secs_f32()
+    );
     if !status.is_success() {
         eprintln!("body: {}", &body.chars().take(500).collect::<String>());
         return false;
     }
-    eprintln!("body (first 400 chars): {}", &body.chars().take(400).collect::<String>());
+    eprintln!(
+        "body (first 400 chars): {}",
+        &body.chars().take(400).collect::<String>()
+    );
     true
 }
 

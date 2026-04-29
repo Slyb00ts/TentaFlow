@@ -873,7 +873,10 @@ fn install_deps(
             let clone_dir = venv.join("src").join(&spec.bundle.engine);
             if !clone_dir.exists() {
                 std::fs::create_dir_all(clone_dir.parent().unwrap()).ok();
-                log(&format!("git clone --depth 1 --branch {} {}", refname, repo));
+                log(&format!(
+                    "git clone --depth 1 --branch {} {}",
+                    refname, repo
+                ));
                 run_with_logs(
                     Command::new("git")
                         .arg("clone")
@@ -1031,11 +1034,7 @@ fn install_vllm_metal(installer: &Installer<'_>, meta: &BundleMeta, log: &LogSin
     cmd.env("CXXFLAGS", "-Wno-parentheses");
     cmd.arg("install");
     installer.add_install_flags(&mut cmd);
-    cmd.arg(
-        vllm_src
-            .to_str()
-            .context("nie-UTF8 sciezka do vllm src")?,
-    );
+    cmd.arg(vllm_src.to_str().context("nie-UTF8 sciezka do vllm src")?);
     run_with_logs(&mut cmd, log).context("kompilacja vllm ze zrodla")?;
 
     let wheel_dir = tempfile::tempdir().context("tmpdir dla wheel vllm-metal")?;
@@ -1486,9 +1485,7 @@ fn venv_bin(venv: &Path, bin: &str) -> PathBuf {
 fn run_with_logs(cmd: &mut Command, log_cb: &LogSink) -> Result<()> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let program = format!("{:?}", cmd.get_program());
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn {}", program))?;
+    let mut child = cmd.spawn().with_context(|| format!("spawn {}", program))?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -1509,9 +1506,7 @@ fn run_with_logs(cmd: &mut Command, log_cb: &LogSink) -> Result<()> {
         }
     });
 
-    let status = child
-        .wait()
-        .with_context(|| format!("wait {}", program))?;
+    let status = child.wait().with_context(|| format!("wait {}", program))?;
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
     if !status.success() {
@@ -1566,9 +1561,12 @@ mod tests {
                 args: vec![
                     "-m".to_string(),
                     "vllm.entrypoints.openai.api_server".to_string(),
-                    "--host".to_string(), "127.0.0.1".to_string(),
-                    "--port".to_string(), "${PORT:-8000}".to_string(),
-                    "--model".to_string(), "${MODEL}".to_string(),
+                    "--host".to_string(),
+                    "127.0.0.1".to_string(),
+                    "--port".to_string(),
+                    "${PORT:-8000}".to_string(),
+                    "--model".to_string(),
+                    "${MODEL}".to_string(),
                 ],
                 internal_port: 8000,
                 env: HashMap::new(),
@@ -1592,7 +1590,9 @@ mod tests {
         let args = build_engine_args(&spec, &env, Path::new("/tmp/b"), Path::new("/tmp/v"));
 
         // Bundle defaults
-        assert!(args.iter().any(|a| a == "vllm.entrypoints.openai.api_server"));
+        assert!(args
+            .iter()
+            .any(|a| a == "vllm.entrypoints.openai.api_server"));
         assert!(args.contains(&"Qwen/Qwen2.5-0.5B-Instruct".to_string()));
         assert!(args.contains(&"9001".to_string()));
 
@@ -1620,8 +1620,11 @@ mod tests {
         assert!(args.contains(&"2".to_string()));
         assert!(args.contains(&"--override-generation-config".to_string()));
         // shlex powinien zachowac JSON jako jeden token (bez surrounding ')
-        assert!(args.iter().any(|a| a == r#"{"max_tokens": 100}"#),
-            "args: {:?}", args);
+        assert!(
+            args.iter().any(|a| a == r#"{"max_tokens": 100}"#),
+            "args: {:?}",
+            args
+        );
     }
 
     #[test]

@@ -85,11 +85,10 @@ impl LoadableEngine for PythonBundleEngine {
             instance_name: Some(self.instance_name.clone()),
             env: self.env.clone(),
         };
-        let running = tokio::task::spawn_blocking(move || {
-            crate::deploy::python_venv::relaunch(&req)
-        })
-        .await
-        .map_err(|e| anyhow!("spawn_blocking relaunch: {}", e))??;
+        let running =
+            tokio::task::spawn_blocking(move || crate::deploy::python_venv::relaunch(&req))
+                .await
+                .map_err(|e| anyhow!("spawn_blocking relaunch: {}", e))??;
 
         let new_pid = running.child.id();
         std::mem::forget(running.child);
@@ -107,12 +106,11 @@ impl LoadableEngine for PythonBundleEngine {
             return Ok(());
         }
         let pid_owned = p;
-        let killed = tokio::task::spawn_blocking(move || {
-            crate::deploy::process_ctl::terminate(pid_owned)
-        })
-        .await
-        .map_err(|e| anyhow!("spawn_blocking terminate: {}", e))?
-        .with_context(|| format!("terminate pid {}", p))?;
+        let killed =
+            tokio::task::spawn_blocking(move || crate::deploy::process_ctl::terminate(pid_owned))
+                .await
+                .map_err(|e| anyhow!("spawn_blocking terminate: {}", e))?
+                .with_context(|| format!("terminate pid {}", p))?;
         self.pid.store(0, Ordering::Release);
         info!(
             service = %self.service_name, pid = p, killed,

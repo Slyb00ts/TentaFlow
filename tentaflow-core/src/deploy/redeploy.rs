@@ -188,11 +188,9 @@ pub async fn start_redeploy(
 
         match outcome {
             Ok((image_tag, container_name)) => {
-                if let Err(e) = repository::set_deployed_source_hash(
-                    &db_task,
-                    service_id_task,
-                    &new_hash_task,
-                ) {
+                if let Err(e) =
+                    repository::set_deployed_source_hash(&db_task, service_id_task, &new_hash_task)
+                {
                     warn!("set_deployed_source_hash: {}", e);
                 }
                 finish_success(
@@ -225,7 +223,9 @@ fn engine_id_for_service(service: &crate::db::models::DbService) -> String {
         manifest_engine_id: Option<String>,
     }
     let parsed: Cfg = serde_json::from_str(&service.config_json).unwrap_or_default();
-    parsed.manifest_engine_id.unwrap_or_else(|| service.name.clone())
+    parsed
+        .manifest_engine_id
+        .unwrap_or_else(|| service.name.clone())
 }
 
 /// When config_json has no explicit `deploy_mode`, infer one from the

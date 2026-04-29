@@ -36,7 +36,8 @@ pub struct AppState {
     /// Active VNC tunnels for same-node websockify bridging. Keyed by server-
     /// generated tunnel_id (UUID). Instantiated per WS connection so tunnels
     /// die with the socket that spawned them.
-    pub vnc_tunnels: Arc<dashmap::DashMap<String, crate::api::dashboard::vnc_tunnel::VncTunnelEntry>>,
+    pub vnc_tunnels:
+        Arc<dashmap::DashMap<String, crate::api::dashboard::vnc_tunnel::VncTunnelEntry>>,
     /// Snapshot zdrowia relay iroh + faktyczny adres bind. Aktualizowany w tle
     /// przez `mesh::relay_health::spawn_relay_health_monitor`. Czytany przez
     /// handler `NetworkRelayStatusRequest`. `None` gdy mesh w ogole nie wystartowal

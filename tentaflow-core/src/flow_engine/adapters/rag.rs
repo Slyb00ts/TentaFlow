@@ -134,11 +134,11 @@ impl NodeAdapter for RagNodeAdapter {
             .get(&engine_name)
             .map(|r| r.value().clone())
             .ok_or_else(|| {
-            anyhow::anyhow!(
-                "RAG adapter: serwis '{}' nie jest skonfigurowany",
-                engine_name
-            )
-        })?;
+                anyhow::anyhow!(
+                    "RAG adapter: serwis '{}' nie jest skonfigurowany",
+                    engine_name
+                )
+            })?;
 
         let rag_client = rag_handle.get_client().await.ok_or_else(|| {
             anyhow::anyhow!("RAG adapter: serwis '{}' nie jest polaczony", engine_name)

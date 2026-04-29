@@ -40,9 +40,8 @@ pub static NSYS_RUNNER: LazyLock<Arc<NsysRunner>> = LazyLock::new(|| Arc::new(Ns
 /// Global storage V2, anchored at `tentaflow_home()`. Multi-source profiling
 /// state lives here. One instance per process — directory is shared across
 /// nodes thanks to per-node sub-directories.
-pub static PROFILE_STORAGE_V2: LazyLock<Arc<ProfileStorageV2>> = LazyLock::new(|| {
-    Arc::new(ProfileStorageV2::new(crate::paths::tentaflow_home()))
-});
+pub static PROFILE_STORAGE_V2: LazyLock<Arc<ProfileStorageV2>> =
+    LazyLock::new(|| Arc::new(ProfileStorageV2::new(crate::paths::tentaflow_home())));
 
 /// Global collector registry — discovered once. `discover()` is cheap (no probes).
 pub static COLLECTOR_REGISTRY: LazyLock<Arc<CollectorRegistry>> =
