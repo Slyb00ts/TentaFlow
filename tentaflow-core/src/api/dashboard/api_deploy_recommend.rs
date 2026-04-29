@@ -10,9 +10,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::deploy::vram_calculator::{
-    build_vllm_args_string, estimate_vllm_vram, fetch_hf_config, max_concurrent_seqs_for_budget,
-    max_context_for_budget, parse_hf_config, recommend_parallelism, ModelSpec, VramEstimate,
-    VramEstimateInput,
+    analyze_gpu_compatibility, build_vllm_args_string, estimate_vllm_vram, fetch_hf_config,
+    max_concurrent_seqs_for_budget, max_context_for_budget, parse_hf_config,
+    recommend_parallelism, GpuCompatibilityReport, ModelSpec, VramEstimate, VramEstimateInput,
 };
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +56,9 @@ pub struct RecommendResponse {
     pub recommended_vllm_args: String,
     /// Warnings (TP nie dzieli heads, model multimodal, OOM etc.)
     pub warnings: Vec<String>,
+    /// Analiza zgodnosci liczby GPU z modelem - lepsze wartosci do wyboru
+    /// gdy aktualny setup jest nieoptymalny (np. 5 GPU dla Gemma -> rekomendacja 4 lub 6).
+    pub gpu_compatibility: GpuCompatibilityReport,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,7 +181,11 @@ pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
         bytes_per_param,
     };
 
-    let warnings = estimate.warnings.clone();
+    let mut warnings = estimate.warnings.clone();
+    let gpu_compat = analyze_gpu_compatibility(&spec, gpu_count);
+    if let Some(w) = &gpu_compat.warning {
+        warnings.push(w.clone());
+    }
 
     let response = RecommendResponse {
         model_spec: summary,
@@ -195,6 +202,7 @@ pub async fn handle_recommend(body: &[u8]) -> Result<(u16, String)> {
         max_supported_num_seqs,
         recommended_vllm_args,
         warnings,
+        gpu_compatibility: gpu_compat,
     };
 
     Ok((200, serde_json::to_string(&response)?))
