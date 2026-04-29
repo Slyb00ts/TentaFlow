@@ -8,6 +8,7 @@
 pub mod binary;
 pub mod docker;
 pub mod embedded;
+pub mod external;
 pub mod python_bundle;
 
 use std::collections::HashMap;
@@ -225,17 +226,11 @@ pub async fn deploy(
             ports.clone(),
             sink.clone(),
         )),
-        DeployMethod::External => {
-            mark_finished(
-                db,
-                deployment_id,
-                DeploymentStatus::Failed,
-                Some("external method has no deploy step"),
-            );
-            return Err(DeployError::Manifest(
-                "External deploy method is not handled by services::deploy::deploy".to_string(),
-            ));
-        }
+        DeployMethod::External => Box::new(external::ExternalDeploy::new(
+            manifest.clone(),
+            user_config.clone(),
+            sink.clone(),
+        )),
     };
 
     // 3. PREPARE.

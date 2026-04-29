@@ -19,6 +19,9 @@ use tentaflow_protocol::*;
 /// Adapter wezla RAG - wyszukiwanie kontekstu w bazie wiedzy
 pub struct RagNodeAdapter {
     service_manager: Arc<ServiceManager>,
+    /// Trzymany dla zachowania sygnatury konstruktora (callerzy migruja
+    /// w kroku N7.3); aliasy modeli pochodza z DB, nie z config.toml.
+    #[allow(dead_code)]
     config: Arc<RouterConfig>,
 }
 
@@ -30,13 +33,10 @@ impl RagNodeAdapter {
         }
     }
 
-    /// Rozwiazuje alias modelu na nazwe kanoniczna
+    /// Rozwiazuje alias modelu na nazwe kanoniczna. Config-driven aliasy
+    /// zostaly skasowane (krok N7.1a); DB `service_aliases` jest rozwiazywany
+    /// przez middleware route resolver przed wejsciem do flow.
     fn resolve_model_alias(&self, model: &str) -> String {
-        for alias in &self.config.service_aliases {
-            if alias.alias == model {
-                return alias.target.clone();
-            }
-        }
         model.to_string()
     }
 

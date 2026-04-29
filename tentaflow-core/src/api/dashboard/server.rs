@@ -510,6 +510,7 @@ pub async fn handle_request(
             mesh_relay_health: mesh_relay_health.clone(),
             port_allocator: port_allocator.clone(),
             mesh_services_registry: mesh_services_registry.clone(),
+            live_handles: service_manager.live_handles.clone(),
         });
 
         let upgrade = hyper::upgrade::on(&mut req);

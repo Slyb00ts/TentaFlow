@@ -222,21 +222,11 @@ async fn run_server(args: Args) -> Result<()> {
         info!(node_id = %local_node_id_str, "Local node seeded in peer_store");
     }
 
-    // === Phase 4: services supervisor over services_v2 ===
-    // Runs alongside legacy router restore paths until Phase 5 swaps call sites.
-    // Phase 5: `snapshot_rx` is wired into the router below so resolve_model
-    // can consult the supervisor's view as a fallback.
-    let (services_snapshot_rx_for_router, services_port_allocator): (
-        Option<
-            tokio::sync::watch::Receiver<
-                Arc<tentaflow_core::services::supervisor::ServicesSnapshot>,
-            >,
-        >,
-        Option<Arc<tentaflow_core::services::ports::PortAllocator>>,
-    ) = {
+    // === Phase 4: port allocator (services supervisor instantiated after the
+    // router so it can share the same `LiveHandlesCache` instance). ===
+    let services_port_allocator: Option<Arc<tentaflow_core::services::ports::PortAllocator>> = {
         use std::collections::HashSet;
         use tentaflow_core::services::ports::PortAllocator;
-        use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
         use tentaflow_core::services_repo::services as services_v2_repo;
 
         let services_runtime_cfg = config.services_runtime.clone();
@@ -258,38 +248,14 @@ async fn run_server(args: Args) -> Result<()> {
         }
 
         match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
-            Ok(allocator) => {
-                let port_allocator = Arc::new(allocator);
-                // Phase 5: AlwaysOkEmbeddedProbe is a placeholder until the
-                // local inference manager exposes a per-engine health hook.
-                let (supervisor, snapshot_rx) =
-                    Supervisor::new(&services_runtime_cfg, db.clone(), port_allocator.clone());
-                let supervisor = supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
-
-                // First tick is synchronous so the initial snapshot is non-empty
-                // before the router goes online. Failures are logged but not fatal.
-                if let Err(e) = supervisor.run_first_tick().await {
-                    tracing::warn!("services supervisor: first_tick failed: {}", e);
-                }
-
-                let supervisor_handle = supervisor.spawn();
-                info!(
-                    "Services supervisor started (interval={}ms, port_range={:?})",
-                    services_runtime_cfg.health_check_interval_ms, services_runtime_cfg.port_range
-                );
-                // Keep the supervisor task alive for the lifetime of the
-                // process; the port allocator escapes the block so deploy
-                // handlers can share the same instance.
-                let _supervisor_handle = supervisor_handle;
-                (Some(snapshot_rx), Some(port_allocator))
-            }
+            Ok(allocator) => Some(Arc::new(allocator)),
             Err(e) => {
                 tracing::warn!(
                     "Services supervisor disabled: invalid port_range {:?}: {}",
                     services_runtime_cfg.port_range,
                     e
                 );
-                (None, None)
+                None
             }
         }
     };
@@ -297,9 +263,71 @@ async fn run_server(args: Args) -> Result<()> {
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
     let router: Arc<Router> = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
+
+    // === Phase 4 (cont.): wire the supervisor against the router's
+    // `LiveHandlesCache` so reconcile() updates the same cache the routing
+    // call sites read. Order matters: router first, supervisor second. ===
+    let services_snapshot_rx_for_router: Option<
+        tokio::sync::watch::Receiver<Arc<tentaflow_core::services::supervisor::ServicesSnapshot>>,
+    > = if let Some(port_allocator) = services_port_allocator.clone() {
+        use tentaflow_core::services::supervisor::{AlwaysOkEmbeddedProbe, Supervisor};
+        let services_runtime_cfg = config.services_runtime.clone();
+        let live_handles = router.service_manager().live_handles.clone();
+        let (supervisor, snapshot_rx) = Supervisor::new(
+            &services_runtime_cfg,
+            db.clone(),
+            port_allocator,
+            local_node_id_str.clone(),
+            mesh_services_registry.clone(),
+            live_handles,
+        );
+        let supervisor = supervisor.with_embedded_probe(Arc::new(AlwaysOkEmbeddedProbe));
+
+        // First tick is synchronous so the initial snapshot is non-empty
+        // before the router goes online. Failures are logged but not fatal.
+        if let Err(e) = supervisor.run_first_tick().await {
+            tracing::warn!("services supervisor: first_tick failed: {}", e);
+        }
+
+        let supervisor_handle = supervisor.spawn();
+        info!(
+            "Services supervisor started (interval={}ms, port_range={:?})",
+            services_runtime_cfg.health_check_interval_ms, services_runtime_cfg.port_range
+        );
+        // Keep the supervisor task alive for the lifetime of the process.
+        let _supervisor_handle = supervisor_handle;
+        Some(snapshot_rx)
+    } else {
+        None
+    };
+
     if let Some(rx) = services_snapshot_rx_for_router {
         router.set_services_snapshot_rx(rx);
     }
+
+    // Best-effort discovery of user-managed external daemons (Ollama). Runs in
+    // the background so a slow probe does not block the rest of startup; any
+    // failure is logged and ignored — auto-detect is a convenience, not a
+    // requirement.
+    if let Some(port_allocator) = services_port_allocator.clone() {
+        let db_for_detect = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tentaflow_core::services::auto_detect::auto_register_ollama(
+                &db_for_detect,
+                port_allocator,
+            )
+            .await
+            {
+                tracing::warn!("auto_detect ollama failed: {}", e);
+            }
+        });
+    }
+    // Wire the shared V2 mesh registry into the service manager so the routing
+    // path can call `find_live_handle_for_model` to resolve handles across
+    // local + remote nodes (krok N7.3).
+    router
+        .service_manager()
+        .set_mesh_services_registry(mesh_services_registry.clone());
     router.start();
 
     // Zainstaluj wbudowane addony
@@ -358,9 +386,6 @@ async fn run_server(args: Args) -> Result<()> {
                     // zwraca ten sam hex — nie ma potrzeby podmieniac peer_store entry.
                     if let Some(ref mesh_mgr) = handles.quic_mesh {
                         router.set_mesh_manager(mesh_mgr.clone());
-                        router
-                            .service_manager()
-                            .set_mesh_registry(mesh_mgr.service_registry().clone());
 
                         // Ustaw forward handler — zdalny node uzywa routera do obslugi forwardowanych requestow
                         let router_for_forward = router.clone();
@@ -619,7 +644,7 @@ fn apply_cli_overrides(config: &mut NodeConfig, args: &Args) {
 // =============================================================================
 
 fn log_config_summary(config: &NodeConfig, db_path: &PathBuf) {
-    info!("   - Serwisy: {}", config.services.len());
+    info!("   - Serwisy: snapshot-driven (DB + mesh registry)");
     info!(
         "   - OpenAI API: {} ({})",
         if config.protocols.openai_api.enabled {

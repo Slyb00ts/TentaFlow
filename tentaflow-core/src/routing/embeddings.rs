@@ -65,20 +65,16 @@ impl Router {
                 async move {
                     match &handle {
                         BackendHandle::QuicEmbedding(name) => {
-                            let quic_handle = this
+                            let quic_client = this
                                 .service_manager
-                                .quic_embedding_services
-                                .get(name)
-                                .map(|r| r.value().clone())
+                                .find_quic_client_for_model(name)
+                                .await
                                 .ok_or_else(|| {
                                     anyhow::anyhow!(
-                                        "QUIC embedding serwis '{}' nie znaleziony",
+                                        "QUIC embedding service '{}' not found or not connected",
                                         name
                                     )
                                 })?;
-                            let quic_client = quic_handle.get_client().await.ok_or_else(|| {
-                                anyhow::anyhow!("QUIC embedding serwis '{}' nie polaczony", name)
-                            })?;
                             debug!("Routing embeddings przez QUIC: {}", name);
                             this.route_embeddings_quic(quic_client, req, name.clone())
                                 .await
@@ -104,20 +100,16 @@ impl Router {
                                 service = %svc,
                                 "MeshForward embeddings do zdalnej uslugi"
                             );
-                            let quic_handle = this
+                            let quic_client = this
                                 .service_manager
-                                .quic_embedding_services
-                                .get(svc)
-                                .map(|r| r.value().clone())
+                                .find_quic_client_for_model(svc)
+                                .await
                                 .ok_or_else(|| {
                                     anyhow::anyhow!(
-                                        "Mesh embedding serwis '{}' na nodzie {} nie zarejestrowany lokalnie",
+                                        "Mesh embedding service '{}' on node {} not found or not connected",
                                         svc, node_id
                                     )
                                 })?;
-                            let quic_client = quic_handle.get_client().await.ok_or_else(|| {
-                                anyhow::anyhow!("Mesh embedding serwis '{}' nie polaczony", svc)
-                            })?;
                             this.route_embeddings_quic(quic_client, req, svc.clone())
                                 .await
                         }
@@ -241,22 +233,13 @@ impl Router {
             texts.len()
         );
 
-        let quic_handle = self
+        let quic_client = self
             .service_manager
-            .quic_embedding_services
-            .get(&model_name)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| CoreError::ModelNotFound {
+            .find_quic_client_for_model(&model_name)
+            .await
+            .ok_or_else(|| CoreError::AllBackendsUnavailable {
                 model_name: model_name.clone(),
             })?;
-
-        let quic_client =
-            quic_handle
-                .get_client()
-                .await
-                .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                    model_name: model_name.clone(),
-                })?;
 
         // Mapuj nazwe serwisu Router -> nazwe modelu w Embeddings Engine
         let embeddings_model_name = model_name
@@ -294,24 +277,13 @@ impl Router {
 
         let model_name = self.resolve_model_alias(&payload.model);
 
-        let rerank_quic_handle = self
+        let quic_client = self
             .service_manager
-            .quic_embedding_services
-            .get(&model_name)
-            .map(|r| r.value().clone());
-        let quic_client = if let Some(quic_handle) = rerank_quic_handle {
-            quic_handle
-                .get_client()
-                .await
-                .ok_or_else(|| CoreError::AllBackendsUnavailable {
-                    model_name: model_name.clone(),
-                })?
-        } else {
-            return Err(CoreError::ModelNotFound {
+            .find_quic_client_for_model(&model_name)
+            .await
+            .ok_or_else(|| CoreError::AllBackendsUnavailable {
                 model_name: model_name.clone(),
-            }
-            .into());
-        };
+            })?;
 
         let request_id = uuid::Uuid::new_v4().to_string();
 

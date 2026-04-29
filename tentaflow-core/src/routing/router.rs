@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tentaflow_protocol::*;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Router zarzadzajacy routing requestow do backendow.
 ///
@@ -353,18 +353,12 @@ impl Router {
         info!("Router: Starting callback handler...");
         self.spawn_callback_handler();
         info!("Router: Callback handler started");
-
-        // Ustaw router dla odwrotnych requestow od kontenerow — MUSI byc przed
-        // spawn_connection_tasks, inaczej petle serwisow dostana None zamiast routera
-        // i reverse listener dla meeting-bot nie bedzie uruchomiony.
-        info!("Router: Registering reverse router for container requests...");
+        // QUIC service connection tasks are owned by the supervisor (krok N7.2):
+        // it spawns reconnect loops directly per `BackendHandle::Quic` planted
+        // into `live_handles`. The reverse router for incoming container streams
+        // is wired the same way through `Router::set_mesh_manager` and the
+        // dispatcher's `MeshForward` path.
         self.service_manager.set_reverse_router(self.clone());
-        info!("Router: Reverse router registered");
-
-        // Dopiero teraz spawnujemy tasks polaczen QUIC — reverse_router jest juz ustawiony
-        info!("Router: Spawning QUIC connection tasks...");
-        self.service_manager.spawn_connection_tasks();
-        info!("Router: QUIC connection tasks spawned");
     }
 
     /// Wysyla sygnal shutdown do wszystkich komponentow routera.
@@ -374,80 +368,18 @@ impl Router {
         info!("Shutdown signal sent to all components");
     }
 
-    /// Rejestruje natywny serwis in-process w mesh registry,
-    /// zeby inne nody widzialy go i mogly forwardowac requesty.
-    pub fn register_native_service_in_mesh(
-        &self,
-        service_name: &str,
-        service_type: &str,
-        models: Vec<String>,
-        engine_id: Option<String>,
-        model_sizes_mb: Vec<u64>,
-    ) {
-        let mesh_guard = self.mesh_manager.read();
-        let mesh = match mesh_guard.as_ref() {
-            Some(m) => m,
-            None => return,
-        };
-
-        let node_id = mesh.node_id().to_string();
-        let quic_port = self.config.mesh.as_ref().map(|m| m.port).unwrap_or(8090);
-
-        let service_info = tentaflow_protocol::MeshServiceInfo {
-            service_id: format!("native-{}-{}", service_type, service_name),
-            service_name: service_name.to_string(),
-            service_type: service_type.to_string(),
-            node_id,
-            quic_port,
-            quic_url: format!("quic://0.0.0.0:{}", quic_port),
-            status: "running".to_string(),
-            models,
-            load_percent: 0,
-            engine_id,
-            model_sizes_mb,
-        };
-
-        mesh.service_registry().register_local(service_info);
-        info!(
-            "Zarejestrowano natywny serwis '{}' ({}) w mesh",
-            service_name, service_type
-        );
-    }
-
-    /// Wyrejestrowuje natywny serwis z mesh registry.
-    pub fn unregister_native_service_from_mesh(&self, service_id: &str) {
-        let mesh_guard = self.mesh_manager.read();
-        if let Some(mesh) = mesh_guard.as_ref() {
-            mesh.service_registry().unregister_local(service_id);
-            info!("Wyrejestrowano natywny serwis '{}' z mesh", service_id);
-        }
-    }
-
-    /// Wybiera backend HTTP (statyczny lub dynamiczny) i wykonuje na nim operacje.
-    /// Obsluguje oba typy rejestrow transparentnie.
+    /// Resolves an HTTP backend client for `service_name` (the model name) via
+    /// the V2 snapshot pipeline: `find_http_backend_for_model` consults the live
+    /// handles cache; on miss `resolve_http_backends_via_snapshot` materialises
+    /// a fresh client straight from the snapshot.
     pub(crate) fn select_http_backend(&self, service_name: &str) -> Option<Arc<BackendClient>> {
-        // Statyczny rejestr
-        if let Some(backends) = self.service_manager.get_service_backends(service_name) {
-            if !backends.is_empty() {
-                if let Some(strategy) = self.service_manager.get_strategy(service_name) {
-                    if let Ok(idx) = strategy.select_backend(backends) {
-                        return Some(backends[idx].clone());
-                    }
-                }
-                return Some(backends[0].clone());
-            }
-        }
-        // Dynamiczny rejestr
-        if let Some(entry) = self.service_manager.dynamic_backends.get(service_name) {
-            let (backends, strategy) = entry.value();
-            if !backends.is_empty() {
-                if let Ok(idx) = strategy.select_backend(backends) {
-                    return Some(backends[idx].clone());
-                }
-                return Some(backends[0].clone());
-            }
-        }
-        None
+        self.service_manager
+            .find_http_backend_for_model(service_name)
+            .or_else(|| {
+                self.service_manager
+                    .resolve_http_backends_via_snapshot(service_name)
+                    .and_then(|v| v.into_iter().next())
+            })
     }
 
     /// Pobierz RAG client (async - sprawdza czy polaczony)
@@ -516,11 +448,10 @@ impl Router {
         self.service_manager.set_snapshot_rx(rx.clone());
         *self.services_snapshot_rx.write() = Some(rx.clone());
 
-        // Hydrate legacy DashMap stores once on every snapshot update so that
-        // chat.rs / adapter callers that still consult `service_backends`
-        // observe newly-deployed services without waiting for the next request
-        // cycle. Skipped when no Tokio runtime is available (unit tests wiring
-        // a snapshot directly through `set_snapshot_rx`).
+        // Hydrate `local_inference_models` from the snapshot so embedded
+        // engines become routable on the first deploy without waiting for the
+        // next request cycle. Skipped when no Tokio runtime is available (unit
+        // tests wiring a snapshot directly through `set_snapshot_rx`).
         if tokio::runtime::Handle::try_current().is_ok() {
             let manager = self.service_manager.clone();
             let mut rx = rx;
@@ -560,14 +491,10 @@ impl Router {
     // ALIAS RETENTAFLOWN
     // ========================================================================
 
-    /// Rozwiazuje alias modelu na canonical name (config.toml aliasy).
+    /// Rozwiazuje alias modelu na canonical name. Aliasy nie pochodza juz z
+    /// config.toml — DB `service_aliases` (uzywane przez middleware route
+    /// resolver) jest jedynym zrodlem, wiec tutaj zwracamy nazwe bez zmian.
     pub(crate) fn resolve_model_alias(&self, model: &str) -> String {
-        for alias in &self.config.service_aliases {
-            if alias.alias == model {
-                debug!("Alias resolved: {} -> {}", model, alias.target);
-                return alias.target.clone();
-            }
-        }
         model.to_string()
     }
 
@@ -575,49 +502,37 @@ impl Router {
     // HEALTH & MONITORING METHODS
     // ========================================================================
 
-    /// Sprawdza czy jest dostepny przynajmniej jeden zdrowy backend
+    /// Whether the V2 snapshot exposes at least one routable service. Used by
+    /// health probes; does not consider per-backend liveness.
     pub fn has_healthy_backends(&self) -> bool {
-        self.service_manager.has_service_backends() || self.service_manager.has_rag_services()
+        let snap = self.service_manager.current_snapshot();
+        !snap.services.is_empty()
     }
 
-    /// Zwraca liste wszystkich dostepnych modeli (model pools + RAG engines + aliasy)
+    /// Distinct model names exposed by the V2 services snapshot.
     pub fn list_available_models(&self) -> Vec<String> {
-        let mut models = Vec::new();
-
-        for model_name in self.service_manager.service_backend_names().into_iter() {
-            models.push(model_name.clone());
-        }
-
-        for rag_name in self.service_manager.rag_service_names().into_iter() {
-            models.push(rag_name.clone());
-        }
-
-        for alias in &self.config.service_aliases {
-            models.push(alias.alias.clone());
-        }
-
+        let snap = self.service_manager.current_snapshot();
+        let mut models: Vec<String> = snap.models_by_name.keys().cloned().collect();
         models.sort();
         models.dedup();
         models
     }
 
-    // TODO: zaimplementowac rzeczywiste metryki (aktualnie zwraca hardcoded zera)
+    /// Returns one healthy entry per model name from the V2 snapshot. The
+    /// per-backend health info is best-effort (treated as healthy when the
+    /// snapshot lists the service); active-request counters are not tracked.
     pub fn get_metrics(&self) -> RouterMetrics {
-        let mut backend_metrics = HashMap::new();
-
-        for (model_name, backends) in &self.service_manager.service_backends {
-            let mut model_backend_metrics = Vec::new();
-
-            for _backend in backends {
-                model_backend_metrics.push(BackendMetric {
+        let snap = self.service_manager.current_snapshot();
+        let mut backend_metrics: HashMap<String, Vec<BackendMetric>> = HashMap::new();
+        for (model_name, _service_id) in &snap.models_by_name {
+            backend_metrics
+                .entry(model_name.clone())
+                .or_default()
+                .push(BackendMetric {
                     is_healthy: true,
                     active_requests: 0,
                 });
-            }
-
-            backend_metrics.insert(model_name.clone(), model_backend_metrics);
         }
-
         RouterMetrics {
             backends: backend_metrics,
             total_requests: 0,

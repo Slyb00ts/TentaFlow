@@ -18,6 +18,9 @@ use tentaflow_protocol::*;
 /// Adapter wezla STT - transkrypcja audio na tekst
 pub struct SttNodeAdapter {
     service_manager: Arc<ServiceManager>,
+    /// Trzymany dla zachowania sygnatury konstruktora (callerzy migruja
+    /// w kroku N7.3); aliasy modeli pochodza z DB, nie z config.toml.
+    #[allow(dead_code)]
     config: Arc<RouterConfig>,
 }
 
@@ -29,13 +32,10 @@ impl SttNodeAdapter {
         }
     }
 
-    /// Rozwiazuje alias modelu na nazwe kanoniczna
+    /// Rozwiazuje alias modelu na nazwe kanoniczna. Config-driven aliasy
+    /// zostaly skasowane (krok N7.1a); DB `service_aliases` jest rozwiazywany
+    /// przez middleware route resolver przed wejsciem do flow.
     fn resolve_model_alias(&self, model: &str) -> String {
-        for alias in &self.config.service_aliases {
-            if alias.alias == model {
-                return alias.target.clone();
-            }
-        }
         model.to_string()
     }
 }
@@ -149,17 +149,15 @@ impl NodeAdapter for SttNodeAdapter {
                     }
                 }
 
-                // HTTP backend (snapshot-first; legacy fallback removed in FAZA-8c).
                 // STT-over-HTTP path itself is not yet implemented — this branch
                 // only logs that a backend was discoverable so an operator can
                 // see the routing decision.
                 let backend_opt = self
                     .service_manager
-                    .resolve_http_backends_via_snapshot(&model_name)
-                    .and_then(|v| v.into_iter().next())
+                    .find_http_backend_for_model(&model_name)
                     .or_else(|| {
                         self.service_manager
-                            .get_service_backends_cloned(&model_name)
+                            .resolve_http_backends_via_snapshot(&model_name)
                             .and_then(|v| v.into_iter().next())
                     });
                 if let Some(backend) = backend_opt {

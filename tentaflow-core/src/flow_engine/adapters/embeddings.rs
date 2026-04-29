@@ -18,6 +18,9 @@ use tentaflow_protocol::*;
 /// Adapter wezla Embeddings - generowanie wektorow embedding
 pub struct EmbeddingsNodeAdapter {
     service_manager: Arc<ServiceManager>,
+    /// Trzymany dla zachowania sygnatury konstruktora (callerzy migruja
+    /// w kroku N7.3); aliasy modeli pochodza z DB, nie z config.toml.
+    #[allow(dead_code)]
     config: Arc<RouterConfig>,
 }
 
@@ -29,13 +32,10 @@ impl EmbeddingsNodeAdapter {
         }
     }
 
-    /// Rozwiazuje alias modelu na nazwe kanoniczna
+    /// Rozwiazuje alias modelu na nazwe kanoniczna. Config-driven aliasy
+    /// zostaly skasowane (krok N7.1a); DB `service_aliases` jest rozwiazywany
+    /// przez middleware route resolver przed wejsciem do flow.
     fn resolve_model_alias(&self, model: &str) -> String {
-        for alias in &self.config.service_aliases {
-            if alias.alias == model {
-                return alias.target.clone();
-            }
-        }
         model.to_string()
     }
 
@@ -93,14 +93,12 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             }));
         }
 
-        // Sprawdz QUIC embedding client
-        let quic_handle = self
+        let resolved_quic_client = self
             .service_manager
-            .quic_embedding_services
-            .get(&model_name)
-            .map(|r| r.value().clone());
-        if let Some(quic_handle) = quic_handle {
-            if let Some(quic_client) = quic_handle.get_client().await {
+            .find_quic_client_for_model(&model_name)
+            .await;
+        if let Some(quic_client) = resolved_quic_client {
+            {
                 debug!("Embeddings adapter: uzywam QUIC backend: {}", model_name);
 
                 let embeddings_model_name = model_name
@@ -157,22 +155,15 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
                         );
                     }
                 }
-            } else {
-                warn!(
-                    "Embeddings adapter: QUIC serwis '{}' nie jest polaczony",
-                    model_name
-                );
             }
         }
 
-        // HTTP backend (snapshot-first; legacy fallback removed in FAZA-8c).
         let backend_opt = self
             .service_manager
-            .resolve_http_backends_via_snapshot(&model_name)
-            .and_then(|v| v.into_iter().next())
+            .find_http_backend_for_model(&model_name)
             .or_else(|| {
                 self.service_manager
-                    .get_service_backends_cloned(&model_name)
+                    .resolve_http_backends_via_snapshot(&model_name)
                     .and_then(|v| v.into_iter().next())
             });
 

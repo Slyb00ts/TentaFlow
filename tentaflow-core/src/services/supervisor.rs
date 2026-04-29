@@ -13,10 +13,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::db::DbPool;
 use crate::services::deploy::{self, RuntimeHandle};
+use crate::services::handles_cache::{
+    build_handle, spawn_quic_reconnect_loop, BackendHandle, LiveHandlesCache,
+};
+use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::ports::PortAllocator;
+use crate::services::snapshot_builder;
 use crate::services::transport::Transport;
 use crate::services_repo::services::{self as services_repo, ServiceRow, ServiceStatus};
 
@@ -193,6 +199,22 @@ pub struct Supervisor {
     restart_state: Arc<Mutex<HashMap<i64, RestartState>>>,
     embedded_probe: Option<Arc<dyn EmbeddedHealthProbe>>,
     health_timeout: Duration,
+    /// Local node id stamped on `ServiceInfo` records published into the mesh
+    /// services registry. Set via `Supervisor::new`.
+    local_node_id: String,
+    /// In-memory registry of services advertised by every reachable node
+    /// (local + remote). The supervisor owns the local entry and republishes
+    /// it on every tick from `snapshot_builder::build_local_snapshot`.
+    mesh_registry: Arc<MeshServicesRegistry>,
+    /// Lock-free cache of live runtime handles (HTTP / QUIC / Embedded). The
+    /// supervisor diffs DB state against this map every tick: new rows get a
+    /// fresh `BackendHandle` (and a QUIC reconnect task when applicable),
+    /// vanished rows have their handle shut down and dropped.
+    live_handles: Arc<LiveHandlesCache>,
+    /// Per-handle reconnect tasks spawned for `Transport::SidecarQuic`. Keyed
+    /// by `(node_id, service_id)` so the supervisor can abort the right task
+    /// when a row is removed from the snapshot. Sole producer.
+    reconnect_tasks: Arc<Mutex<HashMap<(String, i64), JoinHandle<()>>>>,
 }
 
 impl Supervisor {
@@ -204,6 +226,9 @@ impl Supervisor {
         config: &crate::config::ServicesRuntimeConfig,
         db: DbPool,
         ports: Arc<PortAllocator>,
+        local_node_id: String,
+        mesh_registry: Arc<MeshServicesRegistry>,
+        live_handles: Arc<LiveHandlesCache>,
     ) -> (Self, watch::Receiver<Arc<ServicesSnapshot>>) {
         let (tx, rx) = watch::channel(Arc::new(ServicesSnapshot::default()));
         let initial = Duration::from_secs(1);
@@ -218,6 +243,10 @@ impl Supervisor {
             restart_state: Arc::new(Mutex::new(HashMap::new())),
             embedded_probe: None,
             health_timeout: Duration::from_secs(3),
+            local_node_id,
+            mesh_registry,
+            live_handles,
+            reconnect_tasks: Arc::new(Mutex::new(HashMap::new())),
         };
         (supervisor, rx)
     }
@@ -275,6 +304,11 @@ impl Supervisor {
         if let Err(e) = self.auto_start_pinned().await {
             tracing::warn!("supervisor: auto_start_pinned failed: {}", e);
         }
+
+        // Mesh registry + live handles reconcile before the V2 snapshot so
+        // call sites that pull handles via `live_handles.get_for_model` see a
+        // populated cache as soon as the watcher fires.
+        self.reconcile_handles().await;
 
         let snapshot = self.build_snapshot().await?;
         let _ = self.snapshot_tx.send(Arc::new(snapshot));
@@ -386,6 +420,7 @@ impl Supervisor {
 
             // pinned-respawn handled by Krok N4 — list_pinned() is already
             // available in services_repo for the consumer there.
+            self.reconcile_handles().await;
             match self.build_snapshot().await {
                 Ok(snap) => {
                     let _ = self.snapshot_tx.send(Arc::new(snap));
@@ -538,6 +573,121 @@ impl Supervisor {
         })
         .await
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
+    }
+
+    // ---- Mesh registry + live handles reconcile ---------------------------
+
+    /// Refresh the local entry of the mesh services registry from SQLite, then
+    /// reconcile the live-handles cache against the union of local and remote
+    /// snapshots. New `(node_id, service_id)` keys get a freshly-built
+    /// `BackendHandle`; keys that disappeared have their handle shut down and
+    /// dropped. QUIC handles get a per-handle reconnect task spawned on insert
+    /// and aborted on remove.
+    async fn reconcile_handles(&self) {
+        // (1) Republish local snapshot.
+        let local_services =
+            match snapshot_builder::build_local_snapshot(&self.db, &self.local_node_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("supervisor: build_local_snapshot failed: {}", e);
+                    return;
+                }
+            };
+        self.mesh_registry
+            .replace_local(self.local_node_id.clone(), local_services);
+
+        // (2) Compute the desired set of (node_id, service_id) pairs from the
+        // registry (local + remote), keyed for diffing.
+        //
+        // For remote nodes we only build a handle when the transport is
+        // network-reachable from this node — i.e. SidecarQuic or ExternalHttp.
+        // Embedded engines run in-process on the owning node and HttpDirect
+        // typically binds to 127.0.0.1, so neither has a usable network path
+        // from a peer. Such remote rows are still observable through the
+        // registry (GUI shows them) but they will never appear in the live
+        // handles cache, and any chat / embedding / stt / tts / memory call
+        // routed to that model must be forwarded across mesh by the dispatch
+        // layer.
+        let local_id = self.local_node_id.as_str();
+        let desired: HashMap<(String, i64), tentaflow_protocol::ServiceInfo> = self
+            .mesh_registry
+            .visible_services()
+            .into_iter()
+            .filter(|svc| {
+                if svc.node_id == local_id {
+                    return true;
+                }
+                matches!(svc.transport.as_str(), "sidecar_quic" | "external_http")
+            })
+            .map(|svc| ((svc.node_id.clone(), svc.id), svc))
+            .collect();
+
+        // (3) Drop handles that are no longer in `desired`.
+        let mut to_remove: Vec<(String, i64)> = Vec::new();
+        for (node_id, service_id) in self.live_handles.keys() {
+            if !desired.contains_key(&(node_id.clone(), service_id)) {
+                to_remove.push((node_id, service_id));
+            }
+        }
+        for (node_id, service_id) in to_remove {
+            if let Some(handle) = self.live_handles.remove(&node_id, service_id) {
+                handle.shutdown();
+            }
+            // Abort the reconnect task if any (QUIC) so it does not linger
+            // after the handle's shutdown signal is processed.
+            let mut tasks = self.reconnect_tasks.lock().await;
+            if let Some(task) = tasks.remove(&(node_id.clone(), service_id)) {
+                task.abort();
+            }
+        }
+
+        // (4) Insert handles for new pairs.
+        for ((node_id, service_id), svc) in desired.into_iter() {
+            if self.live_handles.get(&node_id, service_id).is_some() {
+                continue;
+            }
+            let handle = match build_handle(&svc) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        "supervisor: build_handle failed for ({}, {}): {}",
+                        node_id,
+                        service_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+            // Grab a clone of the inner `Arc<QuicServiceHandle>` BEFORE the
+            // outer enum is moved into the cache, so the spawned reconnect
+            // task can keep its own ref without going through the cache.
+            let quic_inner = match &handle {
+                BackendHandle::Quic(h) => Some(h.clone()),
+                _ => None,
+            };
+            self.live_handles
+                .insert(node_id.clone(), service_id, handle);
+            if let Some(qh) = quic_inner {
+                let task = spawn_quic_reconnect_loop(qh);
+                let mut tasks = self.reconnect_tasks.lock().await;
+                tasks.insert((node_id, service_id), task);
+            }
+        }
+    }
+
+    /// Drain every live handle and abort every reconnect task. Called on
+    /// process shutdown to release sockets cleanly. After this returns the
+    /// supervisor is unusable; do not call any other method on it.
+    pub async fn shutdown(&self) {
+        for (node_id, service_id) in self.live_handles.keys() {
+            if let Some(handle) = self.live_handles.remove(&node_id, service_id) {
+                handle.shutdown();
+            }
+        }
+        let mut tasks = self.reconnect_tasks.lock().await;
+        for (_, task) in tasks.drain() {
+            task.abort();
+        }
     }
 
     // ---- Health-check dispatch --------------------------------------------
@@ -870,7 +1020,14 @@ mod tests {
         let db = open_db();
         let ports = ports_for_test(50_500, 50_510);
         let conf = cfg(1_000, 2, 60_000);
-        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports,
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
 
         // Insert a row that will never come back: an http_direct entry pointed
         // at a closed port, so respawn() will also fail because the manifest
@@ -929,7 +1086,14 @@ mod tests {
         let db = open_db();
         let ports = ports_for_test(50_600, 50_610);
         let conf = cfg(1_000, 5, 60_000);
-        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports,
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
 
         let (alive, stopped) = {
             let conn = db.lock().unwrap();
@@ -972,7 +1136,14 @@ mod tests {
         let db = open_db();
         let ports = ports_for_test(50_700, 50_710);
         let conf = cfg(1_000, 5, 60_000);
-        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports,
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
 
         let id = {
             let conn = db.lock().unwrap();
@@ -1080,7 +1251,14 @@ mod tests {
         let db = open_db();
         let ports = ports_for_test(50_800, 50_810);
         let conf = cfg(1_000, 5, 60_000);
-        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports,
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
 
         let svc_id = {
             let conn = db.lock().unwrap();
@@ -1137,7 +1315,14 @@ mod tests {
         let db = open_db();
         let ports = ports_for_test(50_900, 50_910);
         let conf = cfg(60_000, 1, 60_000);
-        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports,
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
 
         // Insert a pinned, stopped service with an engine_id absent from the
         // global manifest registry. respawn() will fail, but auto_start_pinned
@@ -1184,7 +1369,14 @@ mod tests {
         let db = open_db();
         let ports = ports_for_test(50_920, 50_930);
         let conf = cfg(60_000, 1, 60_000);
-        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports,
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
 
         let id = {
             let conn = db.lock().unwrap();
@@ -1225,7 +1417,14 @@ mod tests {
         let db = open_db();
         let ports = ports_for_test(50_940, 50_950);
         let conf = cfg(60_000, 1, 60_000);
-        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db.clone(),
+            ports,
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
 
         let id = {
             let conn = db.lock().unwrap();
@@ -1258,5 +1457,149 @@ mod tests {
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Running);
+    }
+
+    // ---- N7.2: live-handles reconcile ----------------------------------------
+
+    fn build_supervisor_with_registry(
+        db: DbPool,
+    ) -> (Supervisor, Arc<MeshServicesRegistry>, Arc<LiveHandlesCache>) {
+        let ports = ports_for_test(51_000, 51_010);
+        let conf = cfg(60_000, 1, 60_000);
+        let registry = Arc::new(MeshServicesRegistry::new());
+        let cache = Arc::new(LiveHandlesCache::new());
+        let (sup, _rx) = Supervisor::new(
+            &conf,
+            db,
+            ports,
+            "local-node".to_string(),
+            registry.clone(),
+            cache.clone(),
+        );
+        (sup, registry, cache)
+    }
+
+    #[tokio::test]
+    async fn reconcile_inserts_handle_for_new_local_service() {
+        let db = open_db();
+        let (sup, registry, cache) = build_supervisor_with_registry(db.clone());
+
+        let svc_id = {
+            let conn = db.lock().unwrap();
+            services_repo::insert(
+                &conn,
+                &NewService {
+                    engine_id: "llama-cpp".into(),
+                    category: "llm".into(),
+                    display_name: "llama-local".into(),
+                    deploy_method: DeployMethod::NativeEmbedded,
+                    transport: Transport::Embedded,
+                    status: ServiceStatus::Running,
+                    pinned: false,
+                    paused: false,
+                    runtime_pid: None,
+                    runtime_port: None,
+                    sidecar_quic_port: None,
+                    endpoint_url: None,
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap()
+        };
+
+        sup.reconcile_handles().await;
+
+        // Local snapshot was republished.
+        assert_eq!(registry.local().services.len(), 1);
+        // Handle was built and inserted under the local node id.
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("local-node", svc_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_handle_for_removed_service() {
+        let db = open_db();
+        let (sup, _registry, cache) = build_supervisor_with_registry(db.clone());
+
+        let svc_id = {
+            let conn = db.lock().unwrap();
+            services_repo::insert(
+                &conn,
+                &NewService {
+                    engine_id: "llama-cpp".into(),
+                    category: "llm".into(),
+                    display_name: "llama-local".into(),
+                    deploy_method: DeployMethod::NativeEmbedded,
+                    transport: Transport::Embedded,
+                    status: ServiceStatus::Running,
+                    pinned: false,
+                    paused: false,
+                    runtime_pid: None,
+                    runtime_port: None,
+                    sidecar_quic_port: None,
+                    endpoint_url: None,
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap()
+        };
+
+        sup.reconcile_handles().await;
+        assert_eq!(cache.len(), 1);
+
+        // Delete the row and reconcile again — handle must be dropped.
+        {
+            let conn = db.lock().unwrap();
+            services_repo::delete(&conn, svc_id).unwrap();
+        }
+        sup.reconcile_handles().await;
+
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get("local-node", svc_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_inserts_handle_for_remote_service_in_registry() {
+        let db = open_db();
+        let (sup, registry, cache) = build_supervisor_with_registry(db.clone());
+
+        // Inject a remote node's snapshot directly — the supervisor must pick
+        // it up from the registry and build a handle on next reconcile. The
+        // transport must be `sidecar_quic` (or `external_http`) for a remote
+        // row: embedded / http_direct are local-only and the reconcile filter
+        // skips them on remote nodes.
+        let remote_svc = tentaflow_protocol::ServiceInfo {
+            id: 42,
+            node_id: "peerB".to_string(),
+            engine_id: "vllm".to_string(),
+            category: "llm".to_string(),
+            display_name: "peer-vllm".to_string(),
+            deploy_method: "native_python_bundle".to_string(),
+            transport: "sidecar_quic".to_string(),
+            status: "running".to_string(),
+            pinned: false,
+            paused: false,
+            runtime_pid: None,
+            runtime_port: Some(9100),
+            sidecar_quic_port: Some(9101),
+            endpoint_url: None,
+            restart_count: 0,
+            health_last_err: None,
+            models: vec![tentaflow_protocol::ServiceModelEntry {
+                model_name: "qwen-tiny".into(),
+                display_name: None,
+                capabilities: Vec::new(),
+                context_length: None,
+                quantization: None,
+                is_default: true,
+            }],
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+        };
+        registry.replace_node("peerB".into(), vec![remote_svc]);
+
+        sup.reconcile_handles().await;
+
+        assert!(cache.get("peerB", 42).is_some());
     }
 }

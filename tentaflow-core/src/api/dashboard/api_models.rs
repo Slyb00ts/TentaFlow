@@ -10,8 +10,28 @@ use std::sync::Arc;
 use crate::db::models::DbModelAlias;
 use crate::db::{self, DbPool};
 use crate::mesh::iroh_manager::IrohMeshManager;
-use crate::mesh::service_registry::UnifiedModelInfo;
+use crate::services::mesh_registry::MeshServicesRegistry;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+/// Aggregated unified-model view: single `model_name` × `service_type` row with
+/// every node instance hosting it. Built from `MeshServicesRegistry` snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifiedModelInfo {
+    pub model_name: String,
+    pub service_type: String,
+    pub instances: Vec<ModelInstance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInstance {
+    pub node_id: String,
+    pub node_name: String,
+    pub service_id: String,
+    pub status: String,
+    pub backend: Option<String>,
+    pub size_mb: Option<u64>,
+}
 
 // =============================================================================
 // Alias domain logic (called from binary handlers in `dispatch::handlers`).
@@ -75,13 +95,36 @@ pub fn delete_alias(pool: &DbPool, id: i64) -> Result<bool> {
     Ok(true)
 }
 
-/// Distinct models reported by mesh peers via service registry. Empty when
-/// the mesh manager is not initialized (no QUIC mesh on this node).
-pub fn collect_unified(quic_mesh: &Option<Arc<IrohMeshManager>>) -> Vec<UnifiedModelInfo> {
-    match quic_mesh {
-        Some(qm) => qm.service_registry().unique_models(),
-        None => Vec::new(),
+/// Distinct models advertised across the mesh, grouped by `(model_name,
+/// category)` with one `ModelInstance` per advertising node. Sourced from the
+/// V2 `MeshServicesRegistry` aggregator (local + remote snapshots).
+pub fn collect_unified(registry: &MeshServicesRegistry) -> Vec<UnifiedModelInfo> {
+    use std::collections::HashMap;
+
+    let mut by_key: HashMap<(String, String), Vec<ModelInstance>> = HashMap::new();
+    for svc in registry.visible_services() {
+        let loaded_status = svc.status.clone();
+        for model in &svc.models {
+            let key = (model.model_name.clone(), svc.category.clone());
+            by_key.entry(key).or_default().push(ModelInstance {
+                node_id: svc.node_id.clone(),
+                node_name: svc.display_name.clone(),
+                service_id: svc.id.to_string(),
+                status: loaded_status.clone(),
+                backend: Some(svc.engine_id.clone()),
+                size_mb: None,
+            });
+        }
     }
+
+    by_key
+        .into_iter()
+        .map(|((model_name, service_type), instances)| UnifiedModelInfo {
+            model_name,
+            service_type,
+            instances,
+        })
+        .collect()
 }
 
 /// Reload local router alias cache and broadcast the latest alias snapshot to

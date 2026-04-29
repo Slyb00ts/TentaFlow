@@ -24,4 +24,3 @@ pub mod pipeline;
 pub mod rdma_probe;
 pub mod relay_health;
 pub mod security;
-pub mod service_registry;
