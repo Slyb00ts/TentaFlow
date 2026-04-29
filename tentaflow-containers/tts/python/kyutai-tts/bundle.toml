@@ -3,8 +3,7 @@ engine = "kyutai-tts"
 description = "Kyutai Pocket TTS — 100M params, CPU, 6x realtime"
 python_version = "3.12"
 source = "pypi"
-package = "pocket-tts"
-package_version = "2.0.0"
+pypi_package = "pocket-tts==2.0.0"
 
 [launch]
 command = "uvicorn"
