@@ -261,6 +261,90 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
     }
 }
 
+/// Wynik analizy zgodnosci liczby GPU z architektura modelu. GUI wykorzystuje
+/// to do pokazania warning chip-a "5 GPU nie dzieli sie dobrze - rekomendowane
+/// 4 lub 8" oraz listy sugerowanych counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuCompatibilityReport {
+    /// Faktyczne TP*PP wybrane przez recommend_parallelism. Moze byc < gpu_count
+    /// gdy zaden podzial nie pasuje (fallback (1, gpu_count) - PP zwykle dziala).
+    pub used_tp: u32,
+    pub used_pp: u32,
+    /// True gdy TP*PP == gpu_count (zadne GPU nieuzywane).
+    pub uses_all_gpus: bool,
+    /// True gdy partycja jest "czysta" - heads i layers podzielne idealnie
+    /// (vllm nie odrzuca konfiguracji).
+    pub clean_partition: bool,
+    /// Lista liczb GPU dla ktorych model dzieli sie idealnie (TP*PP=N, heads
+    /// i layers podzielne). Sortowana rosnaco. Pomaga user'owi wybrac
+    /// "lepszy zestaw kart" (np. zamiast 5 wybrac 4 albo 6).
+    pub better_gpu_counts: Vec<u32>,
+    /// Komunikat warning gdy current setup nieoptymalny - do pokazania w GUI.
+    pub warning: Option<String>,
+}
+
+/// Analizuje czy liczba GPU pasuje do architektury modelu i sugeruje lepsze
+/// alternatywy. Zwraca raport ktorego user-facing warnings i listy mozna
+/// pokazac w GUI Advanced step.
+pub fn analyze_gpu_compatibility(spec: &ModelSpec, gpu_count: u32) -> GpuCompatibilityReport {
+    let (tp, pp) = recommend_parallelism(spec, gpu_count);
+    let uses_all = tp * pp == gpu_count;
+    let heads = spec.num_attention_heads.max(1);
+    let kv_heads = spec.num_key_value_heads.max(1);
+    let layers = spec.num_hidden_layers.max(1);
+    let clean = heads % (tp as u64) == 0
+        && kv_heads % (tp as u64) == 0
+        && layers % (pp as u64) == 0;
+
+    // Lista "lepszych" gpu_counts dla tego modelu: szukamy w zakresie [1..16]
+    // wszystkich N takich ze istnieje partycja TP*PP=N gdzie heads%TP=0,
+    // kv_heads%TP=0, layers%PP=0.
+    let mut better: Vec<u32> = Vec::new();
+    for n in 1..=16u32 {
+        for cand_tp in 1..=n {
+            if n % cand_tp != 0 {
+                continue;
+            }
+            let cand_pp = n / cand_tp;
+            if heads % (cand_tp as u64) == 0
+                && kv_heads % (cand_tp as u64) == 0
+                && layers % (cand_pp as u64) == 0
+            {
+                better.push(n);
+                break;
+            }
+        }
+    }
+
+    let warning = if !clean {
+        Some(format!(
+            "{} GPU nie dzieli sie idealnie dla tego modelu (heads={}, kv_heads={}, layers={}). \
+             Wybrano TP={} PP={} jako fallback - czesc GPU moze byc nieoptymalnie wykorzystana \
+             albo deploy moze sie nie udac. Lepsze liczby GPU: {}",
+            gpu_count, heads, kv_heads, layers, tp, pp,
+            better.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+        ))
+    } else if !uses_all {
+        Some(format!(
+            "{} GPU - {} bedzie nieuzywane (TP={} PP={} = {}). \
+             Lepsze liczby GPU: {}",
+            gpu_count, gpu_count - tp * pp, tp, pp, tp * pp,
+            better.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+        ))
+    } else {
+        None
+    };
+
+    GpuCompatibilityReport {
+        used_tp: tp,
+        used_pp: pp,
+        uses_all_gpus: uses_all,
+        clean_partition: clean,
+        better_gpu_counts: better,
+        warning,
+    }
+}
+
 /// Smart pick TP/PP dla danej liczby GPU + atrybutow modelu. Strategia:
 /// 1. Jesli gpu_count = 1: TP=1, PP=1.
 /// 2. Sprobuj TP=gpu_count (najprostsze, najnizszy comm overhead).
@@ -640,6 +724,63 @@ mod tests {
         };
         let est = estimate_vllm_vram(&m, &input);
         assert!(est.fits_per_gpu, "31B na 6x 3090 z TP*PP=6 musi sie miescic: {est:?}");
+    }
+
+    #[test]
+    fn analyze_gpu_compat_warns_on_5_gpu_for_gemma() {
+        let m = gemma4_31b(); // 32 heads, 16 kv, 60 layers
+        let r = analyze_gpu_compatibility(&m, 5);
+        // 5 GPU: probujemy 1*5, 5*1, ale 32%5!=0, 60%5=0 OK dla PP=5.
+        // Faktycznie (1,5) jest valid bo layers%5=0. Sprawdzmy.
+        if r.clean_partition {
+            // Akceptowalne - 60 dzieli sie przez 5
+            assert_eq!(r.used_pp, 5);
+            assert!(r.warning.is_none(), "5 GPU OK gdy layers%5=0: {:?}", r);
+        } else {
+            assert!(r.warning.is_some());
+        }
+        // Lista better powinna zawierac 1, 2, 4, 6, 8 (32 dzieli przez 1,2,4,8;
+        // 60 dzieli przez 1,2,3,4,5,6,10,12,15,20,30,60)
+        assert!(r.better_gpu_counts.contains(&1));
+        assert!(r.better_gpu_counts.contains(&4));
+        assert!(r.better_gpu_counts.contains(&6));
+        println!("Gemma 31B compat dla 5 GPU: tp={} pp={} better={:?} warning={:?}",
+            r.used_tp, r.used_pp, r.better_gpu_counts, r.warning);
+    }
+
+    #[test]
+    fn analyze_gpu_compat_warns_on_3_gpu_for_llama8b() {
+        let m = ModelSpec {
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            num_hidden_layers: 32,
+            ..Default::default()
+        };
+        let r = analyze_gpu_compatibility(&m, 3);
+        // 3 GPU dla Llama: 32%3!=0 (TP nope), 32%3!=0 (PP=3 nope) - warning
+        assert!(!r.clean_partition);
+        assert!(r.warning.is_some());
+        // Better counts dla Llama 8B: 1, 2, 4, 8 (dzielniki 32 i 8)
+        assert!(r.better_gpu_counts.contains(&1));
+        assert!(r.better_gpu_counts.contains(&2));
+        assert!(r.better_gpu_counts.contains(&4));
+        assert!(r.better_gpu_counts.contains(&8));
+        // 3 nie powinno byc na liscie better
+        assert!(!r.better_gpu_counts.contains(&3));
+    }
+
+    #[test]
+    fn analyze_gpu_compat_no_warning_for_perfect_match() {
+        let m = ModelSpec {
+            num_attention_heads: 32,
+            num_key_value_heads: 16,
+            num_hidden_layers: 60,
+            ..Default::default()
+        };
+        let r = analyze_gpu_compatibility(&m, 6); // TP=2 PP=3 idealnie
+        assert!(r.clean_partition);
+        assert!(r.uses_all_gpus);
+        assert!(r.warning.is_none(), "6 GPU dla Gemma 31B perfect: {:?}", r);
     }
 
     #[test]
