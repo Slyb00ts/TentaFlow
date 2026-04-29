@@ -1188,6 +1188,11 @@ fn spawn_quic_event_handler(
                     // Deduplikuj — iroh czesto generuje wiele PeerConnected dla tego
                     // samego peera (direct + relay path). Toast/event emitujemy tylko
                     // na prawdziwa transitioned offline→online.
+                    // Make the peer visible to GUI as Discovered before any trust
+                    // gating runs: even untrusted incoming connections must surface
+                    // as pairing candidates. Frames from them are still rejected by
+                    // the mesh gate.
+                    peer_store.ensure_in_registry(&node_id);
                     let was_connected = peer_store.is_quic_connected(&node_id);
                     peer_store.set_quic_connected(&node_id, true);
                     peer_store.set_status(&node_id, "connected");
