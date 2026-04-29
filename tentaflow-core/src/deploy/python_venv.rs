@@ -1263,6 +1263,11 @@ impl<'a> Installer<'a> {
         let mut c = if let Some(uv) = self.uv {
             let mut c = Command::new(uv);
             c.env("VIRTUAL_ENV", &self.venv);
+            // Duze wheels NVIDIA (cublas, cudnn, cudart) sa czesto > 500MB i
+            // przy slabszej sieci uv default timeout (30s) tnie polaczenie ze
+            // "stream closed because of a broken pipe". 600s pokrywa nawet
+            // 50KB/s edge case'y.
+            c.env("UV_HTTP_TIMEOUT", "600");
             c.arg("pip");
             c
         } else {
@@ -1276,6 +1281,34 @@ impl<'a> Installer<'a> {
             c.env(k, v);
         }
         c
+    }
+
+    /// Uruchamia komende instalacyjna z retry dla transient network errors
+    /// (broken pipe, connection reset). Trzy proby z exp backoff (2s, 4s).
+    /// Bledy nie-sieciowe (np. resolver conflict) nie sa retryowane —
+    /// drugi run da ten sam wynik. Heurystyka: retryujemy ZAWSZE przy
+    /// niezerowym exit code, bo `uv pip install` przy network failu zwraca 1
+    /// bez specjalnego kodu, a koszt retry'a po prawdziwym konflikcie to
+    /// kilka sekund — vs. utrata 5min pobrania torch+cu130.
+    fn run_install(&self, c: &mut Command) -> Result<()> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=3 {
+            match run_with_logs(c, &self.log) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt < 3 {
+                        let backoff_secs = 2u64.pow(attempt as u32);
+                        (self.log)(&format!(
+                            "pip install failed (attempt {}/3): {} — retry za {}s",
+                            attempt, e, backoff_secs
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap())
     }
     /// Dopisuje flagi do `pip install` (po subkomendzie). Osobno bo uv
     /// uzywa --index-strategy a pip nie zna tego flaga.
@@ -1300,7 +1333,7 @@ impl<'a> Installer<'a> {
             .arg("pip")
             .arg("wheel")
             .arg("setuptools>=77");
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     fn install_requirements(&self, path: &Path) -> Result<()> {
         (self.log)(&format!("pip: install -r {}", path.display()));
@@ -1309,7 +1342,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("-r").arg(path);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     fn install_package(&self, pkg: &str) -> Result<()> {
         (self.log)(&format!("pip: install {}", pkg));
@@ -1318,7 +1351,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg(pkg);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     fn install_editable(&self, path: &Path) -> Result<()> {
         (self.log)(&format!("pip: install -e {}", path.display()));
@@ -1327,7 +1360,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("-e").arg(path);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     /// Instalacja z wylaczona izolacja buildu (`--no-build-isolation`) —
     /// pakiet ma dostep do zainstalowanego torcha podczas budowy natywnych
@@ -1339,7 +1372,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("--no-build-isolation").arg(pkg);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
     /// `pip install --force-reinstall --no-deps <pkg>` — nadpisuje wersje
     /// ktora resolver wybral, bez ruszania grafu zaleznosci. Uzywane do
@@ -1352,7 +1385,7 @@ impl<'a> Installer<'a> {
         self.add_index(&mut c);
         self.add_install_flags(&mut c);
         c.arg("--force-reinstall").arg("--no-deps").arg(pkg);
-        run_with_logs(&mut c, &self.log)
+        self.run_install(&mut c)
     }
 }
 
