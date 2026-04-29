@@ -107,24 +107,19 @@ export class ProfileReportView {
       return;
     }
 
-    // Wyodrebnienie raportu z rkyv envelope. Binary protocol zwraca enum
-    // jako { V2: {...} }; fixture JSON moze nosic { envelope: { kind, report } }.
-    // Legacy V1 nie jest juz wspierany — zwracamy explicit error zamiast renderowac.
+    // Wyodrebnienie raportu. Binary protocol po cleanupie nsight zwraca prosto
+    // `{ variant: 'ProfilingReportResponse', report: ProfileReportV2 }`. Fixture
+    // JSON moze nosic stary `{ envelope: { kind: 'v2', report } }` ksztalt.
     let report = raw;
-    let envelopeIsV2 = false;
+    let envelopeIsV2 = true;
     if (raw && typeof raw === 'object') {
-      if (raw.envelope && typeof raw.envelope === 'object') {
-        if (raw.envelope.kind === 'v2' && raw.envelope.report) {
-          envelopeIsV2 = true;
-          report = raw.envelope.report;
-        }
+      if (raw.report && typeof raw.report === 'object') {
+        report = raw.report;
+      } else if (raw.envelope && typeof raw.envelope === 'object'
+                 && raw.envelope.kind === 'v2' && raw.envelope.report) {
+        report = raw.envelope.report;
       } else if ('V2' in raw && raw.V2) {
-        envelopeIsV2 = true;
         report = raw.V2;
-      } else if (raw.envelope && Array.isArray(raw.envelope)) {
-        // Niektore deserializery zwracaja enum jako tagged tuple [tag, payload].
-        const [tag, payload] = raw.envelope;
-        if (tag === 'V2' && payload) { envelopeIsV2 = true; report = payload; }
       }
     }
     if (!report) {
