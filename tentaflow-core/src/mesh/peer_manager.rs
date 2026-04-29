@@ -292,7 +292,7 @@ impl PeerManager {
     }
 
     /// Zwraca kopie version vector CRDT (do delta sync)
-    pub fn version_vector(&self) -> HashMap<String, u64> {
+    pub fn version_vector(&self) -> HashMap<u64, u64> {
         let state = self.crdt_state.read();
         state.version_vector.clone()
     }

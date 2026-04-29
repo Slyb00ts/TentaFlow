@@ -21,10 +21,10 @@ use crate::flow_engine::adapters::trigger::TriggerNodeAdapter;
 use crate::flow_engine::adapters::tts::TtsNodeAdapter;
 use crate::flow_engine::adapters::tts_clean::TtsCleanNodeAdapter;
 use crate::flow_engine::adapters::{AdapterChunkStream, AdapterRegistry};
-use crate::flow_engine::cache::FlowCache;
-use crate::flow_engine::executor_async::FlowExecutorAsync;
+use crate::flow_engine::cache::{CachedFlow, FlowCache};
+use crate::flow_engine::executor_async::{FlowExecutorAsync, ParsedFlow};
 use crate::flow_engine::resolver;
-use crate::flow_engine::types::{FlowContext, FlowDefinition, FlowExecutionResult};
+use crate::flow_engine::types::{FlowContext, FlowExecutionResult};
 use crate::routing::service_manager::ServiceManager;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +96,47 @@ impl FlowDispatcher {
         &self.registry
     }
 
+    /// Resolwuje flow z cache albo z DB. Przy cache miss parsuje flow_json
+    /// raz i zapisuje gotowy `Arc<CachedFlow>` — chat completion nie placi
+    /// re-parse + topological_sort per-request.
+    async fn resolve_cached(
+        &self,
+        cache_key: &str,
+        model_name: &str,
+        service_type: &str,
+    ) -> Result<Option<Arc<CachedFlow>>> {
+        if let Some(opt) = self.cache.get(cache_key) {
+            return Ok(opt);
+        }
+        let db_clone = self.db.clone();
+        let model_owned = model_name.to_string();
+        let svc_owned = service_type.to_string();
+        let resolved = tokio::task::spawn_blocking(move || {
+            resolver::resolve_flow(&db_clone, &model_owned, &svc_owned)
+        })
+        .await??;
+        match resolved {
+            Some(flow) => {
+                let parsed = match ParsedFlow::parse(&flow.flow_json) {
+                    Ok(p) => Arc::new(p),
+                    Err(e) => {
+                        warn!(flow_id = flow.id, "Niepoprawny flow_json: {}", e);
+                        // Negatywny cache — niepoprawny flow nie ma sensu re-parsowac.
+                        self.cache.set(cache_key, None);
+                        return Ok(None);
+                    }
+                };
+                let cached = Arc::new(CachedFlow { flow, parsed });
+                self.cache.set(cache_key, Some(cached.clone()));
+                Ok(Some(cached))
+            }
+            None => {
+                self.cache.set(cache_key, None);
+                Ok(None)
+            }
+        }
+    }
+
     /// Sprawdza czy flow engine jest wlaczony (setting w DB, cache na 5s)
     async fn is_enabled(&self) -> bool {
         let should_refresh = {
@@ -150,31 +191,12 @@ impl FlowDispatcher {
 
         let cache_key = format!("{}:{}", model_name, service_type);
 
-        let flow = match self.cache.get(&cache_key) {
-            Some(Some(cached_flow)) => cached_flow,
-            Some(None) => return Ok(None),
-            None => {
-                let db_clone = self.db.clone();
-                let model_owned = model_name.to_string();
-                let svc_owned = service_type.to_string();
-                let resolved = tokio::task::spawn_blocking(move || {
-                    resolver::resolve_flow(&db_clone, &model_owned, &svc_owned)
-                })
-                .await??;
-                match resolved {
-                    Some(f) => {
-                        self.cache.set(&cache_key, Some(f.clone()));
-                        f
-                    }
-                    None => {
-                        self.cache.set(&cache_key, None);
-                        return Ok(None);
-                    }
-                }
-            }
+        let cached = match self.resolve_cached(&cache_key, model_name, service_type).await? {
+            Some(c) => c,
+            None => return Ok(None),
         };
 
-        let flow_id = flow.id;
+        let flow_id = cached.flow.id;
 
         // ACL — flow ma resource_type='flow', resource_id=flow.id (string).
         // Skipujemy gdy ctx nie ma user_id (internal caller).
@@ -197,7 +219,7 @@ impl FlowDispatcher {
         let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
         match timeout(
             Duration::from_secs(FLOW_TIMEOUT_SECS),
-            executor.execute(&flow, &mut ctx),
+            executor.execute(&cached.flow, &cached.parsed, &mut ctx),
         )
         .await
         {
@@ -235,44 +257,25 @@ impl FlowDispatcher {
 
         let cache_key = format!("{}:{}", model_name, service_type);
 
-        let flow = match self.cache.get(&cache_key) {
-            Some(Some(cached_flow)) => cached_flow,
-            Some(None) => return Ok(None),
-            None => {
-                let db_clone = self.db.clone();
-                let model_owned = model_name.to_string();
-                let svc_owned = service_type.to_string();
-                let resolved = tokio::task::spawn_blocking(move || {
-                    resolver::resolve_flow(&db_clone, &model_owned, &svc_owned)
-                })
-                .await??;
-                match resolved {
-                    Some(f) => {
-                        self.cache.set(&cache_key, Some(f.clone()));
-                        f
-                    }
-                    None => {
-                        self.cache.set(&cache_key, None);
-                        return Ok(None);
-                    }
-                }
-            }
+        let cached = match self.resolve_cached(&cache_key, model_name, service_type).await? {
+            Some(c) => c,
+            None => return Ok(None),
         };
 
         // Szybka inspekcja: czy flow zawiera edge from_port="stream"? Jesli nie —
         // blocking path zrobi robote i nie ma po co budowac streaming executor'a.
-        let has_stream_edge = match serde_json::from_str::<FlowDefinition>(&flow.flow_json) {
-            Ok(def) => def.edges.iter().any(|e| e.from_port == "stream"),
-            Err(e) => {
-                warn!("Niepoprawny flow_json przy sprawdzaniu portow: {}", e);
-                return Ok(None);
-            }
-        };
+        // Inspekcja po pre-parsed strukturze unika ponownej deserializacji JSON.
+        let has_stream_edge = cached
+            .parsed
+            .definition
+            .edges
+            .iter()
+            .any(|e| e.from_port == "stream");
         if !has_stream_edge {
             return Ok(None);
         }
 
-        let flow_id = flow.id;
+        let flow_id = cached.flow.id;
 
         if let Some(uid) = ctx.user_id {
             let role = ctx.user_role.clone().unwrap_or_else(|| "user".to_string());
@@ -293,7 +296,10 @@ impl FlowDispatcher {
         }
 
         let executor = FlowExecutorAsync::new(self.db.clone(), self.registry.clone());
-        match executor.execute_streaming_flow(&flow, &mut ctx).await {
+        match executor
+            .execute_streaming_flow(&cached.flow, &cached.parsed, &mut ctx)
+            .await
+        {
             Ok(stream) => Ok(Some(stream)),
             Err(e) => {
                 warn!(

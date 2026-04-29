@@ -5,9 +5,18 @@
 // =============================================================================
 
 use crate::db::models::DbFlow;
+use crate::flow_engine::executor_async::ParsedFlow;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+
+/// Wpis cache z gotowym do wykonania flow — DB metadata + sparsowane mapy
+/// adjacencji. Trzymamy w `Arc` zeby chat completion nie placil parsowania
+/// JSON i topological_sort per-request.
+pub struct CachedFlow {
+    pub flow: DbFlow,
+    pub parsed: Arc<ParsedFlow>,
+}
 
 /// Cache resolucji flow z automatycznym TTL
 pub struct FlowCache {
@@ -18,7 +27,7 @@ pub struct FlowCache {
 /// Pojedynczy wpis cache z timestampem wstawienia
 struct CacheEntry {
     /// None = brak flow (tez cache'ujemy negatywny wynik)
-    flow: Option<DbFlow>,
+    flow: Option<Arc<CachedFlow>>,
     inserted_at: Instant,
 }
 
@@ -32,10 +41,10 @@ impl FlowCache {
 
     /// Pobiera wpis z cache.
     /// Zwraca:
-    /// - Some(Some(DbFlow)) - flow znaleziony w cache
+    /// - Some(Some(Arc<CachedFlow>)) - flow znaleziony w cache
     /// - Some(None) - cache mowi ze flow nie istnieje (negatywny cache)
     /// - None - nie ma w cache (trzeba odpytac DB)
-    pub fn get(&self, key: &str) -> Option<Option<DbFlow>> {
+    pub fn get(&self, key: &str) -> Option<Option<Arc<CachedFlow>>> {
         let entries = self.entries.read().ok()?;
         let entry = entries.get(key)?;
 
@@ -47,7 +56,7 @@ impl FlowCache {
     }
 
     /// Ustawia wpis w cache
-    pub fn set(&self, key: &str, value: Option<DbFlow>) {
+    pub fn set(&self, key: &str, value: Option<Arc<CachedFlow>>) {
         if let Ok(mut entries) = self.entries.write() {
             let entry = CacheEntry {
                 flow: value,
@@ -76,19 +85,28 @@ impl FlowCache {
 mod tests {
     use super::*;
 
-    fn test_flow(id: i64, json: &str) -> DbFlow {
-        DbFlow {
+    fn test_flow(id: i64, json: &str) -> Arc<CachedFlow> {
+        // Stary kontrakt testow pozwalal na placeholder JSON (`{}`, `{"nodes":[]}`).
+        // Po wprowadzeniu pre-parsing'u w ParsedFlow musimy podac minimalny
+        // poprawny DAG — `_` w nazwie zmiennej jasno oznacza ze argument jest
+        // ignorowany w nowej semantyce.
+        let _ = json;
+        let valid_json =
+            r#"{"nodes":[{"id":"a","type":"trigger","config":{}}],"edges":[]}"#;
+        let flow = DbFlow {
             id,
             name: format!("test-flow-{}", id),
             description: None,
             version: 1,
             is_default: false,
             service_type: None,
-            flow_json: json.to_string(),
+            flow_json: valid_json.to_string(),
             status: "active".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
-        }
+        };
+        let parsed = Arc::new(ParsedFlow::parse(valid_json).expect("valid test flow"));
+        Arc::new(CachedFlow { flow, parsed })
     }
 
     #[test]
@@ -100,14 +118,15 @@ mod tests {
     #[test]
     fn test_cache_hit_positive() {
         let cache = FlowCache::new(60);
-        cache.set("model:chat", Some(test_flow(42, r#"{"nodes":[]}"#)));
+        cache.set("model:chat", Some(test_flow(42, "")));
         let result = cache.get("model:chat");
         assert!(result.is_some());
         let inner = result.unwrap();
         assert!(inner.is_some());
-        let flow = inner.unwrap();
-        assert_eq!(flow.id, 42);
-        assert_eq!(flow.flow_json, r#"{"nodes":[]}"#);
+        let cached = inner.unwrap();
+        assert_eq!(cached.flow.id, 42);
+        // ParsedFlow musi byc gotowy do uzycia bezposrednio z cache.
+        assert!(!cached.parsed.definition.nodes.is_empty());
     }
 
     #[test]
@@ -170,8 +189,8 @@ mod tests {
                 let key = format!("model-{}:chat", i);
                 let result = cache_clone.get(&key);
                 assert!(result.is_some(), "Klucz {} powinien byc w cache", key);
-                let flow = result.unwrap().unwrap();
-                assert_eq!(flow.id, i as i64);
+                let cached = result.unwrap().unwrap();
+                assert_eq!(cached.flow.id, i as i64);
             });
             read_handles.push(handle);
         }
