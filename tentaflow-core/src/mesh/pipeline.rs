@@ -1412,24 +1412,7 @@ fn spawn_quic_event_handler(
                     if let Ok(metrics) =
                         rkyv::from_bytes::<HeartbeatMetrics, rkyv::rancor::Error>(&heartbeat)
                     {
-                        peer_store.update_metrics(
-                            &node_id,
-                            metrics.cpu_usage_percent,
-                            metrics.ram_used_mb,
-                            metrics.gpus,
-                            metrics.containers,
-                            metrics.networks,
-                            metrics.platform,
-                            metrics.cpu_temperature_c,
-                            metrics.swap_total_mb,
-                            metrics.swap_used_mb,
-                            metrics.active_requests,
-                            metrics.tokens_per_sec,
-                            metrics.nsys_available,
-                            metrics.nsys_version,
-                            metrics.profiling_collectors_available,
-                        );
-
+                        peer_store.update_metrics(&node_id, &metrics);
                         // Aktualizuj topologie peera na podstawie jego connected_peers
                         peer_store.update_topology(&node_id, metrics.connected_peers);
                     }
@@ -2033,24 +2016,9 @@ fn spawn_heartbeat_sender(
                     profiling_collectors_available,
                 };
 
-                // Aktualizuj metryki lokalnego noda w store (klonowanie z hb)
-                peer_store.update_metrics(
-                    &local_node_id,
-                    hb.cpu_usage_percent,
-                    hb.ram_used_mb,
-                    hb.gpus.clone(),
-                    hb.containers.clone(),
-                    hb.networks.clone(),
-                    hb.platform.clone(),
-                    hb.cpu_temperature_c,
-                    hb.swap_total_mb,
-                    hb.swap_used_mb,
-                    hb.active_requests,
-                    hb.tokens_per_sec,
-                    hb.nsys_available,
-                    hb.nsys_version.clone(),
-                    hb.profiling_collectors_available.clone(),
-                );
+                // Aktualizuj metryki lokalnego noda w store — pojedyncze klonowanie
+                // wewnatrz update_metrics zamiast czterokrotnego u callera.
+                peer_store.update_metrics(&local_node_id, &hb);
 
                 // Aktualizuj topologie lokalnego noda
                 peer_store.update_topology(&local_node_id, connected_peers.clone());
@@ -2145,11 +2113,20 @@ fn spawn_heartbeat_sender(
                     };
                     if let Ok(bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&payload) {
                         let bv = bytes.to_vec();
-                        for peer_id in &connected_peers {
-                            if let Err(e) = quic_mesh.send_topology_announce(peer_id, &bv).await {
-                                debug!(peer = %peer_id, "Blad wysylania TopologyAnnounce: {}", e);
+                        // Rownolegly broadcast — kazdy send_topology_announce blokuje
+                        // sie na write do strumienia QUIC danego peera, sekwencyjne
+                        // czekanie kumuluje sie liniowo z liczba peerow.
+                        let sends = connected_peers.iter().map(|peer_id| {
+                            let qm = quic_mesh.clone();
+                            let pid = peer_id.clone();
+                            let bv_ref = &bv;
+                            async move {
+                                if let Err(e) = qm.send_topology_announce(&pid, bv_ref).await {
+                                    debug!(peer = %pid, "Blad wysylania TopologyAnnounce: {}", e);
+                                }
                             }
-                        }
+                        });
+                        futures::future::join_all(sends).await;
                     }
                 }
             }
