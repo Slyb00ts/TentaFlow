@@ -658,6 +658,15 @@ fn prepare_instance_env(
         })?;
     }
 
+    // Bundle/dependency update: zmiana template_id == rebuild venv. Globalne
+    // JIT compile cache (FlashInfer, Triton, torch_extensions) zapisuja
+    // absolutne sciezki do plikow zrodlowych z poprzedniego venv. Po jego
+    // usunieciu cache wskazuje na nieistniejace pliki i ninja crashuje
+    // (np. "missing and no known rule to make"). Czyscimy je defensywnie
+    // przy KAZDEJ aktualizacji bundla — to jest jedyny sposob zeby byc
+    // bulletproof na wszystkich platformach (Linux/Windows/macOS, CUDA/ROCm).
+    purge_global_jit_caches(log);
+
     log(&format!(
         "klonuje template venv do instance {}",
         instance_dir.display()
@@ -665,6 +674,36 @@ fn prepare_instance_env(
     copy_dir_recursive(template_venv, &instance_dir)?;
     std::fs::write(&marker, template_id)?;
     Ok(instance_dir)
+}
+
+/// Czysci globalne JIT cache'e (FlashInfer, Triton, torch_extensions, nvidia
+/// cuda_compile_cache) ktore zapisuja absolutne sciezki do plikow zrodlowych
+/// z konkretnej instancji venv. Po rebuild venv te cache zwracaja stale
+/// referencje i lamia kompilacje on-demand. Wywolujemy przy kazdej zmianie
+/// template_id (== zmiana bundle.toml / requirements.lock / Dockerfile).
+fn purge_global_jit_caches(log: &LogSink) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let candidates = [
+        home.join(".cache").join("flashinfer"),
+        home.join(".cache").join("torch_extensions"),
+        home.join(".triton").join("cache"),
+        home.join(".cache").join("nv").join("ComputeCache"),
+        home.join(".nv").join("ComputeCache"),
+    ];
+    for path in &candidates {
+        if path.exists() {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => log(&format!("purged stale JIT cache {}", path.display())),
+                Err(e) => log(&format!(
+                    "ostrzezenie: nie udalo sie wyczyscic {} ({})",
+                    path.display(),
+                    e
+                )),
+            }
+        }
+    }
 }
 
 fn template_identity(
@@ -1427,6 +1466,17 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         if !req.env.contains_key(k) {
             cmd.env(k, &v);
         }
+    }
+
+    // FlashInfer JIT cache musi byc per-instancja: build.ninja zapisuje
+    // absolutna sciezke do `<venv>/lib/python3.X/site-packages/flashinfer/data/csrc/*.cu`,
+    // a kazda instancja vLLM ma losowy katalog venv. Globalny cache w
+    // ~/.cache/flashinfer pamieta sciezke poprzedniej (juz usunietej)
+    // instancji i ninja crashuje z "missing and no known rule to make it".
+    let flashinfer_cache = venv.join(".flashinfer-cache");
+    let _ = std::fs::create_dir_all(&flashinfer_cache);
+    if !req.env.contains_key("FLASHINFER_WORKSPACE_BASE") {
+        cmd.env("FLASHINFER_WORKSPACE_BASE", &flashinfer_cache);
     }
 
     // Stdout/stderr -> <venv>/engine.log. `Stdio::piped()` bez aktywnego
