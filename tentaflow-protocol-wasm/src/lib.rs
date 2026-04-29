@@ -6470,6 +6470,8 @@ fn event_category_to_js(c: tentaflow_protocol::EventCategory) -> JsValue {
         E::PowerSample => "power_sample",
         E::NvtxRange => "nvtx_range",
         E::NetworkSample => "network_sample",
+        E::ProcessRssSample => "process_rss_sample",
+        E::ProcessIoSample => "process_io_sample",
         E::Custom => "custom",
     }
     .into()
@@ -6730,6 +6732,30 @@ fn event_payload_to_js(p: &tentaflow_protocol::EventPayload) -> JsValue {
             set(&o, "kind", "custom".into());
             set(&o, "nameId", (*name_id as f64).into());
             set(&o, "value", (*value).into());
+        }
+        P::ProcessRssSample {
+            pid,
+            comm_name_id,
+            rss_bytes,
+            vsz_bytes,
+        } => {
+            set(&o, "kind", "process_rss_sample".into());
+            set(&o, "pid", (*pid as f64).into());
+            set(&o, "commNameId", (*comm_name_id as f64).into());
+            set(&o, "rssBytes", (*rss_bytes as f64).into());
+            set(&o, "vszBytes", (*vsz_bytes as f64).into());
+        }
+        P::ProcessIoSample {
+            pid,
+            comm_name_id,
+            read_bytes,
+            write_bytes,
+        } => {
+            set(&o, "kind", "process_io_sample".into());
+            set(&o, "pid", (*pid as f64).into());
+            set(&o, "commNameId", (*comm_name_id as f64).into());
+            set(&o, "readBytes", (*read_bytes as f64).into());
+            set(&o, "writeBytes", (*write_bytes as f64).into());
         }
     }
     o.into()

@@ -384,6 +384,8 @@ pub enum EventCategory {
     PowerSample,
     NvtxRange,
     NetworkSample,
+    ProcessRssSample,
+    ProcessIoSample,
     Custom,
 }
 
@@ -858,6 +860,22 @@ pub enum EventPayload {
     Custom {
         name_id: u32,
         value: f64,
+    },
+    /// Per-process RSS sample - mockup #09 "Top processes by RSS".
+    /// `comm_name_id` indexes `ProfileReportV2.names` (process name interned).
+    ProcessRssSample {
+        pid: u32,
+        comm_name_id: u32,
+        rss_bytes: u64,
+        vsz_bytes: u64,
+    },
+    /// Per-process IO sample - mockup #10 "Top processes by IO". Bytes
+    /// kumulatywne od momentu poczatku procesu; GUI obliczy delta.
+    ProcessIoSample {
+        pid: u32,
+        comm_name_id: u32,
+        read_bytes: u64,
+        write_bytes: u64,
     },
 }
 

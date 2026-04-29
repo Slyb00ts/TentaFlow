@@ -41,6 +41,7 @@ impl CollectorRegistry {
         r.register(Arc::new(super::linux::rapl_power::LinuxRaplPowerCollector::new()));
         r.register(Arc::new(super::linux::nvsmi_gpu::LinuxNvsmiGpuCollector::new()));
         r.register(Arc::new(super::linux::netdev::LinuxNetdevCollector::new()));
+        r.register(Arc::new(super::linux::top_processes::LinuxTopProcessesCollector::new()));
         // Linux GPU vendor collectors (AMD ROCm, Intel iGPU).
         r.register(Arc::new(super::linux_gpu::rocsmi_util::LinuxRocmSmiGpuCollector::new()));
         r.register(Arc::new(super::linux_gpu::rocprof_kernels::LinuxRocprofKernelsCollector::new()));
@@ -151,6 +152,10 @@ fn category_matches_source(cat: EventCategory, sources: u32) -> bool {
         | EventCategory::NvtxRange => ProfileSourceFlags::GPU,
         EventCategory::PowerSample => ProfileSourceFlags::POWER,
         EventCategory::NetworkSample => ProfileSourceFlags::NETWORK,
+        // Process-level sample - mapped pod RAM_USAGE i DISK_IO bo to są
+        // workflow user'a wybierajacego "pamiec" lub "dysk" do trace.
+        EventCategory::ProcessRssSample => ProfileSourceFlags::RAM_USAGE,
+        EventCategory::ProcessIoSample => ProfileSourceFlags::DISK_IO,
         // `Custom` is admitted by any non-empty request so that user-defined
         // sources can attach to a session without a dedicated flag.
         EventCategory::Custom => return sources != 0,

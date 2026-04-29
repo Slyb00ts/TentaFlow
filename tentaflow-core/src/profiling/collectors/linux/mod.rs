@@ -13,3 +13,4 @@ pub mod perf_counters;
 pub mod perf_sampling;
 pub mod ram;
 pub mod rapl_power;
+pub mod top_processes;

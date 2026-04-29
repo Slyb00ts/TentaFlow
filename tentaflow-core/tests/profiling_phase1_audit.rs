@@ -107,6 +107,8 @@ async fn audit_real_session_3s() {
             EventPayload::PowerSample { .. } => "PowerSample",
             EventPayload::NvtxRange { .. } => "NvtxRange",
             EventPayload::NetworkSample { .. } => "NetworkSample",
+            EventPayload::ProcessRssSample { .. } => "ProcessRssSample",
+            EventPayload::ProcessIoSample { .. } => "ProcessIoSample",
             EventPayload::Custom { .. } => "Custom",
         };
         *counts.entry(key).or_insert(0) += 1;
