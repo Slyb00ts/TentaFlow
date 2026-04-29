@@ -1296,4 +1296,66 @@ export class UnifiedTimeline {
   }
 }
 
+// =============================================================================
+// TimelineView — adapter wiring UnifiedTimeline into profile-report-v2.
+// Profile report dispatcher (renderLazyTab) wymaga `render(host, ctx)`. Tu
+// hostujemy class UnifiedTimeline w kontenerze i przepinamy event
+// `openFlamegraph` na <tf-tabs> rodzica zeby panel "Open in flamegraph" dzialal.
+// =============================================================================
+
+export const TimelineView = {
+  render(host, ctx) {
+    if (!host) return;
+    const report = ctx?.report || {};
+    const events = ctx?.events || report.events || [];
+    if (!events.length) {
+      host.innerHTML = `
+        <div class="pr2-card">
+          <div class="pr2-banner-degraded">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+            <div><strong>No timeline data.</strong> This report contains zero events.</div>
+          </div>
+        </div>`;
+      return;
+    }
+
+    // Tear down previous instance jesli host byl juz uzywany — chroni przed
+    // wyciekiem ResizeObserver gdy uzytkownik przelacza taby tam i z powrotem.
+    if (host._timelineInstance && typeof host._timelineInstance.destroy === 'function') {
+      try { host._timelineInstance.destroy(); } catch (_) { /* noop */ }
+      host._timelineInstance = null;
+    }
+
+    host.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'pr2-card pr2-timeline-card';
+    host.appendChild(card);
+
+    const mount = document.createElement('div');
+    card.appendChild(mount);
+
+    const tl = new UnifiedTimeline(mount, {
+      events,
+      names: report.names || {},
+      frames: report.frames || [],
+      stacks: report.stacks || [],
+      collectors: report.collectors || [],
+      duration_ns: report.duration_ns || 0,
+    });
+
+    // Bridge "Open in flamegraph" → switch to flame tab via <tf-tabs>.
+    tl.on('openFlamegraph', () => {
+      const root = host.closest('[id]')?.ownerDocument || document;
+      const tabs = root.querySelector('#pr2-tabs');
+      if (tabs && typeof tabs.setAttribute === 'function') {
+        tabs.setAttribute('value', 'flame');
+        tabs.dispatchEvent(new CustomEvent('change', { detail: { value: 'flame' } }));
+      }
+    });
+
+    // Cleanup hook for future host re-renders.
+    host._timelineInstance = tl;
+  },
+};
+
 export default UnifiedTimeline;
