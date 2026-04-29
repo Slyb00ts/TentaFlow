@@ -4,9 +4,9 @@
 // =============================================================================
 
 use super::{
-    api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_fast_path, api_flows,
-    api_hub, api_me_preferences, api_models, api_pii_rules, api_prompts, api_registries,
-    api_services, api_tts_rules, auth, static_files,
+    api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_deploy_recommend,
+    api_fast_path, api_flows, api_hub, api_me_preferences, api_models, api_pii_rules, api_prompts,
+    api_registries, api_services, api_tts_rules, auth, static_files,
 };
 use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
@@ -1031,6 +1031,32 @@ pub async fn handle_request(
         }
     }
 
+    // Deploy: vLLM VRAM calculator + smart config recommend.
+    // Body: {model, gpus[], hf_token?, optional overrides}.
+    // Wolane przez engine-deploy-wizard dla live recompute przy zmianie
+    // modelu lub suwakow advanced settings. Endpoint async bo robi HF fetch.
+    if method == Method::POST && path == "/api/deploy/vllm/recommend" {
+        if require_admin(&claims, &db).is_some() {
+            return Ok(json_error_cors(
+                403,
+                "Brak uprawnien administratora",
+                cors_origin.as_deref(),
+            ));
+        }
+        let (status, response_body) = match api_deploy_recommend::handle_recommend(&body_bytes).await {
+            Ok(p) => p,
+            Err(e) => (
+                500,
+                format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'")),
+            ),
+        };
+        return Ok(json_response_cors(
+            status,
+            response_body,
+            cors_origin.as_deref(),
+        ));
+    }
+
     // Hub API — silniki, wyszukiwanie modeli HF, lokalne modele
     if path.starts_with("/api/hub/") {
         let (status, response_body) = route_hub_api(
@@ -1244,6 +1270,7 @@ fn route_api(
             }
             handle_result(api_services::handle_create(db, body), 400)
         }
+
 
         // API Keys
         (&Method::GET, "/api/apikeys") => handle_result(api_apikeys::handle_list(db), 500),
