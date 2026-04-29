@@ -9,7 +9,7 @@
 //   Submit → POST /api/services/deploy.
 // =============================================================================
 
-import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast, apiPost } from '/js/utils.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
@@ -482,17 +482,7 @@ async function fetchVllmRecommendation(overrides = {}) {
     ...overrides,
   };
   try {
-    const resp = await fetch('/api/deploy/vllm/recommend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const errBody = await resp.text();
-      return { error: `HTTP ${resp.status}: ${errBody}` };
-    }
-    return await resp.json();
+    return await apiPost('/api/deploy/vllm/recommend', body);
   } catch (err) {
     return { error: err.message || String(err) };
   }
