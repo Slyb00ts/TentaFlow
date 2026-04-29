@@ -21,6 +21,7 @@ import { renderDiagram, bindDiagramEvents, destroyDiagram } from '/js/modules/me
 import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import { runPairProgress } from '/js/lib/pair-progress.js';
 import { patchInner } from '/js/lib/patch.js';
+import { createRefresher } from '/js/lib/refresh.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
@@ -31,7 +32,7 @@ let nodes = [];
 let pending = [];
 let unifiedModels = [];
 let relayHealth = null;
-let refreshInterval = null;
+let refresher = null;
 let refreshTickCount = 0;
 let activeTab = 'list';
 
@@ -84,21 +85,26 @@ const MeshScreen = {
     await loadRelayHealth();
     renderActiveTab();
     refreshTickCount = 0;
-    refreshInterval = setInterval(async () => {
-      refreshTickCount += 1;
-      await loadData();
-      // Relay status probujemy co ~30 s (co 6. tick z 5 s loop) — backend i tak
-      // cache'uje wynik probe co 30 s, czesciej nic nie da.
-      if (refreshTickCount % 6 === 0) {
-        await loadRelayHealth();
-      }
-      renderActiveTab();
-    }, 5000);
+    refresher = createRefresher({
+      run: async () => {
+        refreshTickCount += 1;
+        await loadData();
+        // Relay status probujemy co ~30 s (co 6. tick z 5 s loop) — backend i tak
+        // cache'uje wynik probe co 30 s, czesciej nic nie da.
+        if (refreshTickCount % 6 === 0) {
+          await loadRelayHealth();
+        }
+        renderActiveTab();
+      },
+      intervalMs: 5000,
+      hiddenIntervalMs: 15000,
+    });
+    refresher.start();
   },
   unmount() {
-    if (refreshInterval) {
-      clearInterval(refreshInterval);
-      refreshInterval = null;
+    if (refresher) {
+      refresher.dispose();
+      refresher = null;
     }
     destroyDiagram();
     nodes = [];

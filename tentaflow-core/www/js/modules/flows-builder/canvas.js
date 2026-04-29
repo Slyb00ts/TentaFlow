@@ -364,9 +364,11 @@ export class FlowCanvas {
   }
 
   _pushHistory() {
-    // Odcinamy redo-branche po nowej operacji
+    // Odcinamy redo-branche po nowej operacji. structuredClone zamiast
+    // JSON round-trip — szybszy binary copy + zachowuje typy Date/Map jesli
+    // kiedys trafia do node.config (JSON.stringify gubi wszystko nieprymitywne).
     this.history = this.history.slice(0, this.historyIndex + 1);
-    this.history.push(JSON.stringify({ nodes: this.nodes, edges: this.edges }));
+    this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges }));
     if (this.history.length > MAX_HISTORY) this.history.shift();
     this.historyIndex = this.history.length - 1;
   }
@@ -374,7 +376,7 @@ export class FlowCanvas {
   undo() {
     if (this.historyIndex <= 0) return;
     this.historyIndex -= 1;
-    const snap = JSON.parse(this.history[this.historyIndex]);
+    const snap = structuredClone(this.history[this.historyIndex]);
     this.nodes = snap.nodes;
     this.edges = snap.edges;
     this.selectedIds.clear();
@@ -386,7 +388,7 @@ export class FlowCanvas {
   redo() {
     if (this.historyIndex >= this.history.length - 1) return;
     this.historyIndex += 1;
-    const snap = JSON.parse(this.history[this.historyIndex]);
+    const snap = structuredClone(this.history[this.historyIndex]);
     this.nodes = snap.nodes;
     this.edges = snap.edges;
     this.render();

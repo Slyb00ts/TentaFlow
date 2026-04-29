@@ -217,7 +217,7 @@ Manifest ma do trzech sekcji deploy (każda renderuje przycisk w wizardzie):
 
 - **`[deploy.docker]`** — obraz Docker budowany lokalnie z `context_path`. Opcjonalny `download_image` (Pro feature, prebuilt OCI).
 - **`[deploy.native]`** — natywne uruchomienie. Pole `runtime` decyduje:
-  - `embedded` — wkompilowane w binarkę `tentaflow` przez Cargo `feature_flag` (np. llama.cpp, MLX).
+  - `embedded` — wkompilowane w binarkę `tentaflow`. Gating opcjonalnie przez Cargo `feature_flag` (np. llama.cpp, MLX) albo przez `target_os` / stałą zależność (np. `apple-tts`, vision/* przez `tract-onnx`) — wtedy `feature_flag` pomijamy.
   - `binary` — natywna binarka budowana skryptem `binary_path/build.sh` (np. sherpa-onnx, stable-diffusion-cpp).
   - `python-bundle` — bundle Pythona w `bundle_path` (np. vllm, xtts, comfyui).
 - **`[deploy.external]`** — wykrycie zewnętrznego daemona w `PATH` z health-checkiem (np. ollama).
@@ -238,7 +238,7 @@ Build.rs sprawdza 4 reguły semantyczne przy każdym `cargo build`:
 
 1. `engine.id` pasuje do regex `^[a-z0-9][a-z0-9_-]{0,63}$` (chroni przed path-traversal).
 2. Manifest ma przynajmniej jedną sekcję deploy (`docker`, `native` lub `external`).
-3. `deploy.native.runtime` spójny z polami: `embedded` ⇒ `feature_flag`; `binary` ⇒ `binary_path`; `python-bundle` ⇒ `bundle_path` (i tylko jedno z trzech).
+3. `deploy.native.runtime` spójny z polami: `embedded` MOŻE mieć `feature_flag` (gdy gating przez Cargo feature) ale nie musi (gdy gating przez `target_os` lub stałą zależność, np. `apple-tts`, vision/* przez `tract-onnx`); `embedded` NIE MOŻE mieć `binary_path` ani `bundle_path`. `binary` ⇒ `binary_path`. `python-bundle` ⇒ `bundle_path`. Tylko jedno z trzech.
 4. Ścieżki `context_path` / `binary_path` / `bundle_path` istnieją na dysku.
 
 Globalna unikalność `engine.id` jest egzekwowana cross-file.

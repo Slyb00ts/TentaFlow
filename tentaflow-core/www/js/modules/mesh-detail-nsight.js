@@ -32,6 +32,8 @@ let lastSessionsNodeId = null;  // dla ktorego noda cachedSessions zostalo pobra
 
 let pendingActionsTarget = null; // tf-menu: ktora sesja aktualnie pokazana
 let onChangeCallback = null;     // wywolanie do mesh-detail.js po start/stop/delete
+let boundActionsRoot = null;     // root na ktorym wisi nasz click listener
+let boundActionsHandler = null;  // referencja handlera do removeEventListener
 
 // ---- Public API ------------------------------------------------------------
 
@@ -42,6 +44,11 @@ export function initNsight({ onChange } = {}) {
 export function cleanupNsight() {
   if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
   if (pollSessionsInterval) { clearInterval(pollSessionsInterval); pollSessionsInterval = null; }
+  if (boundActionsRoot && boundActionsHandler) {
+    boundActionsRoot.removeEventListener('click', boundActionsHandler);
+  }
+  boundActionsRoot = null;
+  boundActionsHandler = null;
   activeSession = null;
   activeNodeId = null;
   cachedSessions = [];
@@ -123,6 +130,16 @@ export function gpuProfileButtonHtml(node, gpu, idx) {
   `;
 }
 
+// Tylko etykieta countdown/elapsed dla aktywnej sesji REC. Pozwala mesh-detail
+// odswiezyc tekst chipa (1Hz) bez pelnego rerender'u widoku.
+export function activeRecLabel(node) {
+  if (!activeSession || !node || activeNodeId !== node.node_id) return null;
+  const elapsed = Math.max(0, Math.floor((Date.now() - activeSession.startedAtMs) / 1000));
+  return activeSession.durationSecs > 0
+    ? formatCountdown(Math.max(0, activeSession.durationSecs - elapsed))
+    : formatElapsed(elapsed);
+}
+
 // HTML do wstrzykniecia w `mesh-detail-actions`. Profile node + badge gdy aktywna sesja.
 export function topbarHtml(node) {
   const parts = [];
@@ -134,7 +151,7 @@ export function topbarHtml(node) {
       : formatElapsed(elapsed);
     parts.push(`
       <span class="nsight-rec-wrap">
-        <tf-chip status="recording" dot>REC ${escapeHtml(label)}</tf-chip>
+        <tf-chip status="recording" dot data-nsight-rec-chip>REC ${escapeHtml(label)}</tf-chip>
         <tf-button size="sm" variant="danger" data-action="nsight-stop-session">
           <svg width="12" height="12" fill="currentColor" aria-hidden="true"><use href="#i-stop"/></svg>
           <span>${escapeHtml(I18n.t('nsight.stop'))}</span>
@@ -302,9 +319,15 @@ function sessionRowHtml(s) {
 
 export function bindNsightActions(root, node) {
   if (!root || !node) return;
-  if (root.__nsightBound) return;
-  root.__nsightBound = true;
-  root.addEventListener('click', async (e) => {
+  // Idempotentnie po stronie (root, ekran). Cleanup() w mesh-detail wola
+  // cleanupNsight ktory zdejmuje listener — tu wystarczy sprawdzic czy juz
+  // mamy aktywny handler na tym wlasnie root'cie.
+  if (boundActionsRoot === root && boundActionsHandler) return;
+  if (boundActionsRoot && boundActionsHandler) {
+    boundActionsRoot.removeEventListener('click', boundActionsHandler);
+  }
+  boundActionsRoot = root;
+  boundActionsHandler = async (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     const action = btn.dataset.action;
@@ -398,7 +421,8 @@ export function bindNsightActions(root, node) {
       }
       return;
     }
-  });
+  };
+  root.addEventListener('click', boundActionsHandler);
 }
 
 // ---- Modal start ----------------------------------------------------------
