@@ -64,16 +64,54 @@ pub struct ServicesSnapshot {
     pub generated_at_unix_ms: u128,
 }
 
+impl ServicesSnapshot {
+    /// Returns the first service hosting `model_name`. Snapshot is rebuilt by
+    /// the supervisor on every health-tick; callers should re-borrow the
+    /// `watch::Receiver` per request to pick up restarts/redeploys.
+    pub fn find_service_for_model(&self, model_name: &str) -> Option<&ServiceEntry> {
+        let service_id = self.models_by_name.get(model_name)?;
+        let idx = *self.services_by_id.get(service_id)?;
+        self.services.get(idx)
+    }
+
+    /// Returns every service hosting `model_name`. Used by the load balancer
+    /// to weighted-pick across replicas of the same model.
+    pub fn find_services_for_model(&self, model_name: &str) -> Vec<&ServiceEntry> {
+        self.services
+            .iter()
+            .filter(|s| {
+                s.models
+                    .iter()
+                    .any(|m| m.model_name == model_name || s.engine_id == model_name)
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceEntry {
     pub id: i64,
     pub engine_id: String,
+    pub deploy_method: crate::services_repo::services::DeployMethod,
     pub transport: Transport,
     pub status: ServiceStatus,
     pub endpoint_url: Option<String>,
+    pub runtime_pid: Option<i32>,
     pub runtime_port: Option<u16>,
     pub sidecar_quic_port: Option<u16>,
     pub models: Vec<ModelEntry>,
+    /// Backend timeout for this service (defaults to 30000 if `config_json`
+    /// does not specify it). Materialised from `services_v2.config_json` at
+    /// snapshot build time so the routing path never re-parses TOML.
+    pub timeout_ms: u64,
+    /// Maximum concurrent requests the load balancer will dispatch to this
+    /// service. Default 16.
+    pub max_concurrent: u32,
+    /// Weight for weighted random load balancing across replicas. Default 100.
+    pub weight: u32,
+    /// Optional alias the engine prefers for this model (e.g. ollama maps
+    /// `llama3.1` → `llama3.1:8b-instruct-q4_0`).
+    pub model_name_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -360,17 +398,25 @@ impl Supervisor {
                         }
                     })
                     .collect();
+                let (timeout_ms, max_concurrent, weight, model_name_override) =
+                    parse_backend_meta(&row.config_json);
                 let idx = services.len();
                 services_by_id.insert(row.id, idx);
                 services.push(ServiceEntry {
                     id: row.id,
                     engine_id: row.engine_id,
+                    deploy_method: row.deploy_method,
                     transport: row.transport,
                     status: row.status,
                     endpoint_url: row.endpoint_url,
+                    runtime_pid: row.runtime_pid.map(|p| p as i32),
                     runtime_port: row.runtime_port,
                     sidecar_quic_port: row.sidecar_quic_port,
                     models: model_entries,
+                    timeout_ms,
+                    max_concurrent,
+                    weight,
+                    model_name_override,
                 });
             }
 
@@ -561,6 +607,37 @@ async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
         Err(e) if e.is_connect() => HealthStatus::Failed(format!("connect: {}", e)),
         Err(e) => HealthStatus::Failed(format!("http error: {}", e)),
     }
+}
+
+// ----- config_json materialisation ------------------------------------------
+
+/// Parses optional `timeout_ms` / `max_concurrent` / `weight` /
+/// `model_name_override` from `services_v2.config_json` (a JSON object).
+/// Missing or malformed fields fall back to documented defaults so the
+/// routing path can rely on these values being populated unconditionally.
+fn parse_backend_meta(config_json: &str) -> (u64, u32, u32, Option<String>) {
+    let parsed: serde_json::Value =
+        serde_json::from_str(config_json).unwrap_or(serde_json::Value::Null);
+    let obj = parsed.as_object();
+    let timeout_ms = obj
+        .and_then(|m| m.get("timeout_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30_000);
+    let max_concurrent = obj
+        .and_then(|m| m.get("max_concurrent"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(u32::MAX as u64) as u32)
+        .unwrap_or(16);
+    let weight = obj
+        .and_then(|m| m.get("weight"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(u32::MAX as u64) as u32)
+        .unwrap_or(100);
+    let model_name_override = obj
+        .and_then(|m| m.get("model_name_override"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (timeout_ms, max_concurrent, weight, model_name_override)
 }
 
 // ----- Tests ----------------------------------------------------------------
@@ -781,5 +858,84 @@ mod tests {
         sup.apply_health(&svc, HealthStatus::Ok, true).await;
         let g = sup.restart_state.lock().await;
         assert!(!g.contains_key(&id), "state must be cleared after recovery");
+    }
+
+    #[test]
+    fn parse_backend_meta_returns_defaults_for_empty_object() {
+        let (timeout, max_conc, weight, alias) = parse_backend_meta("{}");
+        assert_eq!(timeout, 30_000);
+        assert_eq!(max_conc, 16);
+        assert_eq!(weight, 100);
+        assert!(alias.is_none());
+    }
+
+    #[test]
+    fn parse_backend_meta_reads_overrides() {
+        let json = r#"{"timeout_ms":60000,"max_concurrent":4,"weight":50,"model_name_override":"alias-x"}"#;
+        let (timeout, max_conc, weight, alias) = parse_backend_meta(json);
+        assert_eq!(timeout, 60_000);
+        assert_eq!(max_conc, 4);
+        assert_eq!(weight, 50);
+        assert_eq!(alias.as_deref(), Some("alias-x"));
+    }
+
+    #[test]
+    fn parse_backend_meta_tolerates_invalid_json() {
+        let (timeout, max_conc, weight, alias) = parse_backend_meta("not-json");
+        assert_eq!(timeout, 30_000);
+        assert_eq!(max_conc, 16);
+        assert_eq!(weight, 100);
+        assert!(alias.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_find_service_for_model_resolves_via_models_index() {
+        let db = open_db();
+        let ports = ports_for_test(50_800, 50_810);
+        let conf = cfg(1_000, 5, 60_000);
+        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+
+        let svc_id = {
+            let conn = db.lock().unwrap();
+            let id = services_repo::insert(
+                &conn,
+                &NewService {
+                    engine_id: "llama-cpp".into(),
+                    deploy_method: DeployMethod::NativeEmbedded,
+                    transport: Transport::Embedded,
+                    status: ServiceStatus::Running,
+                    runtime_pid: None,
+                    runtime_port: None,
+                    sidecar_quic_port: None,
+                    endpoint_url: None,
+                    config_json: r#"{"timeout_ms":45000,"weight":75}"#.into(),
+                },
+            )
+            .unwrap();
+            crate::services_repo::models::insert(
+                &conn,
+                &crate::services_repo::models::NewModel {
+                    service_id: id,
+                    model_name: "qwen3-0_8b".into(),
+                    display_name: Some("Qwen 3 0.8B".into()),
+                    capabilities: "[]".into(),
+                    context_length: None,
+                    quantization: None,
+                    is_default: true,
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        let snap = sup.build_snapshot().await.unwrap();
+        let entry = snap
+            .find_service_for_model("qwen3-0_8b")
+            .expect("snapshot must resolve known model");
+        assert_eq!(entry.id, svc_id);
+        assert_eq!(entry.timeout_ms, 45_000);
+        assert_eq!(entry.weight, 75);
+        assert_eq!(entry.max_concurrent, 16);
+        assert!(snap.find_service_for_model("nope").is_none());
     }
 }
