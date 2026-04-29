@@ -181,7 +181,7 @@ export class ProfilingActiveBanner {
     const elapsedSec = Math.max(0, (Date.now() - startedMs) / 1000);
     if (plannedSec > 0) {
       const remaining = Math.max(0, plannedSec - elapsedSec);
-      return `${formatMS(remaining)} <span class="of">/ ${formatMS(plannedSec)} remaining</span>`;
+      return `${formatMS(remaining)} <span class="of">/ ${formatMS(plannedSec)}</span>`;
     }
     return `${formatMS(elapsedSec)} <span class="of">elapsed (manual stop)</span>`;
   }
@@ -193,17 +193,25 @@ export class ProfilingActiveBanner {
     const chips = collectors.map((c) => `
       <span class="col-chip"><span class="dot"></span>${escapeHtml(c.label || c.id)}</span>
     `).join('');
+    // Meta wg mockupu: "session a3f9c2e1b8d4 · started 02:01:18 · 9 collectors"
+    const sidShort = String(sess.session_id || '').slice(0, 12);
+    const startedMs = sess.started_at_unix_ns / 1_000_000;
+    const startedHHMMSS = startedMs > 0
+      ? new Date(startedMs).toLocaleTimeString('en-GB', { hour12: false })
+      : '—';
+    const colCount = collectors.length;
+    const meta = `session ${sidShort} · started ${startedHHMMSS} · ${colCount} collector${colCount === 1 ? '' : 's'}`;
 
     this.root.innerHTML = `
       <span class="rec">REC</span>
       <div class="session-title">
         <div class="s-label">${escapeHtml(sess.label || 'profiling session')}</div>
-        <div class="s-meta">id ${escapeHtml(sess.session_id)}</div>
+        <div class="s-meta">${escapeHtml(meta)}</div>
       </div>
       <div class="countdown">${this._countdownHtml()}</div>
       <div class="banner-actions">
+        <tf-button variant="outline" size="sm" icon="external-link" data-action="open-when-done" disabled>Open report when done</tf-button>
         <tf-button variant="danger" size="sm" icon="stop" data-action="stop">Stop now</tf-button>
-        <tf-button variant="outline" size="sm" icon="external-link" data-action="open-when-done">Open report when done</tf-button>
       </div>
       <div class="collectors">${chips}</div>
     `;
