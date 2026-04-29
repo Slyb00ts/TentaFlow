@@ -354,10 +354,7 @@ fn compute_collectors_status() -> Vec<CollectorStatus> {
             if !supports_platform {
                 available = false;
                 version = None;
-                note = Some(format!(
-                    "Niewspierane na tym systemie: {}",
-                    cap.description
-                ));
+                note = Some(format!("Niewspierane na tym systemie: {}", cap.description));
             } else {
                 match c.probe() {
                     ProbeResult::Available { version: v } => {
@@ -388,7 +385,8 @@ fn compute_collectors_status() -> Vec<CollectorStatus> {
             // Best-effort binary path / version refinement using a small
             // lookup table keyed off the collector id namespace.
             let binary = binary_for_collector(&id);
-            let path = binary.and_then(|name| which::which(name).ok().map(|p| p.display().to_string()));
+            let path =
+                binary.and_then(|name| which::which(name).ok().map(|p| p.display().to_string()));
             if version.is_none() {
                 if let Some(name) = binary {
                     if let Some(v) = quick_version(name) {
@@ -471,8 +469,7 @@ fn quick_version(bin: &str) -> Option<String> {
 // =============================================================================
 
 fn json_response<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}"))
+    serde_json::to_string(value).unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}"))
 }
 
 fn json_error(msg: &str) -> String {
@@ -495,10 +492,7 @@ mod tests {
         let body = handle_collectors_status();
         assert_eq!(body.0, 200);
         let parsed: CollectorsStatusResponse = serde_json::from_str(&body.1).unwrap();
-        assert!(parsed
-            .collectors
-            .iter()
-            .any(|c| c.id == "nvidia.nsys.gpu"));
+        assert!(parsed.collectors.iter().any(|c| c.id == "nvidia.nsys.gpu"));
     }
 
     #[test]

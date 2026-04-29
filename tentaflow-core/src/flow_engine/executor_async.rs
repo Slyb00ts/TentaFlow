@@ -698,7 +698,6 @@ impl FlowExecutorAsync {
             }
         }
     }
-
 }
 
 /// Czy dany typ node'a jest pass-through na stream path — executor w S4b
@@ -1634,11 +1633,17 @@ mod tests {
         let collected: Vec<_> = stream.collect().await;
         assert_eq!(collected.len(), 3);
         assert_eq!(
-            collected[0].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            collected[0].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
             Some("Hel")
         );
         assert_eq!(
-            collected[2].as_ref().unwrap().choices[0].delta.content.as_deref(),
+            collected[2].as_ref().unwrap().choices[0]
+                .delta
+                .content
+                .as_deref(),
             Some("!")
         );
     }
@@ -1669,7 +1674,9 @@ mod tests {
         let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
 
         let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
-        let res = executor.execute_streaming_flow(&flow, &parsed, &mut ctx).await;
+        let res = executor
+            .execute_streaming_flow(&flow, &parsed, &mut ctx)
+            .await;
         let msg = match res {
             Err(e) => e.to_string(),
             Ok(_) => panic!("flow bez stream edge powinien dac blad"),
@@ -1708,7 +1715,9 @@ mod tests {
         let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
 
         let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
-        let res = executor.execute_streaming_flow(&flow, &parsed, &mut ctx).await;
+        let res = executor
+            .execute_streaming_flow(&flow, &parsed, &mut ctx)
+            .await;
         let msg = match res {
             Err(e) => e.to_string(),
             Ok(_) => panic!("powinno zwrocic blad"),
@@ -1745,7 +1754,9 @@ mod tests {
         let mut ctx = FlowContext::new("r".to_string(), "m".to_string(), "i".to_string());
 
         let parsed = ParsedFlow::parse(&flow.flow_json).unwrap();
-        let res = executor.execute_streaming_flow(&flow, &parsed, &mut ctx).await;
+        let res = executor
+            .execute_streaming_flow(&flow, &parsed, &mut ctx)
+            .await;
         let msg = match res {
             Err(e) => e.to_string(),
             Ok(_) => panic!("powinno zwrocic blad"),

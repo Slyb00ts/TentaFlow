@@ -98,7 +98,9 @@ pub struct TtsManager {
 
 impl TtsManager {
     pub fn new() -> Self {
-        Self { engines: std::collections::HashMap::new() }
+        Self {
+            engines: std::collections::HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, name: impl Into<String>, engine: Box<dyn TtsEngine>) {
@@ -120,7 +122,11 @@ impl TtsManager {
     /// Wybiera silnik po `engine_id` i wykonuje synteze. Jezeli silnik nie
     /// jest zarejestrowany, zwraca blad — caller (router) moze wtedy
     /// fallbackowac na zewnetrzny QUIC TTS sidecar.
-    pub fn synthesize(&self, engine_id: &str, params: SynthesizeParams) -> anyhow::Result<SynthesizeResult> {
+    pub fn synthesize(
+        &self,
+        engine_id: &str,
+        params: SynthesizeParams,
+    ) -> anyhow::Result<SynthesizeResult> {
         let engine = self
             .engines
             .get(engine_id)
@@ -129,10 +135,14 @@ impl TtsManager {
     }
 
     pub fn model_info(&self, engine_id: &str) -> Option<TtsModelInfo> {
-        self.engines.get(engine_id).and_then(|e| e.model_info().cloned())
+        self.engines
+            .get(engine_id)
+            .and_then(|e| e.model_info().cloned())
     }
 }
 
 impl Default for TtsManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

@@ -79,10 +79,7 @@ pub fn allocate_for_session(pool: &DbPool, session_id: i64) -> Result<AllocatedP
 }
 
 /// Alokuje porty native: QUIC (UDP) + bridge WS (TCP). Brak VNC/noVNC.
-pub fn allocate_for_native_session(
-    pool: &DbPool,
-    session_id: i64,
-) -> Result<NativeAllocatedPorts> {
+pub fn allocate_for_native_session(pool: &DbPool, session_id: i64) -> Result<NativeAllocatedPorts> {
     let quic = match reserve_one(pool, session_id, KIND_QUIC, QUIC_RANGE, PortKind::Udp) {
         Ok(p) => p,
         Err(e) => {

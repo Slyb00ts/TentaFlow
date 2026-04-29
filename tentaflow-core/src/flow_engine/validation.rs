@@ -19,10 +19,7 @@ pub enum FlowValidationError {
         node_id: String,
     },
     /// Typ wezla nie jest zarejestrowany w AdapterRegistry.
-    UnknownAdapter {
-        node_id: String,
-        node_type: String,
-    },
+    UnknownAdapter { node_id: String, node_type: String },
     /// Edge.from_port nie istnieje na liscie portow wyjsciowych adaptera.
     InvalidOutputPort {
         node_id: String,
@@ -98,13 +95,12 @@ pub fn validate_flow(
                 node_id: edge.from.clone(),
             })?;
 
-        let from_adapter =
-            registry
-                .get(&from_node.node_type)
-                .ok_or_else(|| FlowValidationError::UnknownAdapter {
-                    node_id: from_node.id.clone(),
-                    node_type: from_node.node_type.clone(),
-                })?;
+        let from_adapter = registry.get(&from_node.node_type).ok_or_else(|| {
+            FlowValidationError::UnknownAdapter {
+                node_id: from_node.id.clone(),
+                node_type: from_node.node_type.clone(),
+            }
+        })?;
 
         let out_ports = from_adapter.supported_output_ports();
         if !out_ports.contains(&edge.from_port.as_str()) {
@@ -116,22 +112,19 @@ pub fn validate_flow(
             });
         }
 
-        let to_node = flow
-            .nodes
-            .iter()
-            .find(|n| n.id == edge.to)
-            .ok_or_else(|| FlowValidationError::UnknownNode {
+        let to_node = flow.nodes.iter().find(|n| n.id == edge.to).ok_or_else(|| {
+            FlowValidationError::UnknownNode {
                 edge_endpoint: "to".to_string(),
                 node_id: edge.to.clone(),
-            })?;
+            }
+        })?;
 
-        let to_adapter =
-            registry
-                .get(&to_node.node_type)
-                .ok_or_else(|| FlowValidationError::UnknownAdapter {
-                    node_id: to_node.id.clone(),
-                    node_type: to_node.node_type.clone(),
-                })?;
+        let to_adapter = registry.get(&to_node.node_type).ok_or_else(|| {
+            FlowValidationError::UnknownAdapter {
+                node_id: to_node.id.clone(),
+                node_type: to_node.node_type.clone(),
+            }
+        })?;
 
         let in_ports = to_adapter.supported_input_ports();
         if !in_ports.contains(&edge.to_port.as_str()) {
@@ -240,9 +233,7 @@ mod tests {
         };
         let err = validate_flow(&flow, &sample_registry()).unwrap_err();
         match err {
-            FlowValidationError::InvalidOutputPort {
-                port, node_id, ..
-            } => {
+            FlowValidationError::InvalidOutputPort { port, node_id, .. } => {
                 assert_eq!(port, "stream");
                 assert_eq!(node_id, "a");
             }

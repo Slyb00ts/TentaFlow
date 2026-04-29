@@ -91,7 +91,13 @@ mod tests {
         let mut rx1 = subscribe();
         let mut rx2 = subscribe();
         publish(sample_event("multi-both"));
-        assert_eq!(recv_with_key(&mut rx1, "multi-both").await.meeting_key, "multi-both");
-        assert_eq!(recv_with_key(&mut rx2, "multi-both").await.meeting_key, "multi-both");
+        assert_eq!(
+            recv_with_key(&mut rx1, "multi-both").await.meeting_key,
+            "multi-both"
+        );
+        assert_eq!(
+            recv_with_key(&mut rx2, "multi-both").await.meeting_key,
+            "multi-both"
+        );
     }
 }

@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::nsys::{nsys_command, ProfilingError};
 use rusqlite::Connection;
 use tentaflow_protocol::profiling::{GpuUtilSample, GpuUtilSeries, NsightGpuTarget};
-use super::nsys::{nsys_command, ProfilingError};
 
 /// Surowa probka odczytana z SQLite — 1 wiersz `GPU_METRICS`.
 #[derive(Debug, Clone)]
@@ -142,7 +142,11 @@ fn bin_samples_100ms(raw: Vec<RawGpuSample>) -> Vec<GpuUtilSample> {
             sm_pct: sm_avg.clamp(0.0, 100.0) as u8,
             mem_pct: dram_avg.clamp(0.0, 100.0) as u8,
             vram_used_mb: vram_max,
-            power_w: if power_max.is_finite() { power_max } else { 0.0 },
+            power_w: if power_max.is_finite() {
+                power_max
+            } else {
+                0.0
+            },
         });
     }
     out

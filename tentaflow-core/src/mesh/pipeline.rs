@@ -19,13 +19,13 @@ use crate::mesh::peer_store::{HeartbeatMetrics, MeshPeerInfo, MeshPeerStore, Nod
 use crate::mesh::relay_health::{spawn_relay_health_monitor, RelayHealth};
 use crate::mesh::security::MeshSecurity;
 use crate::net::iroh::load_relay_url;
-use parking_lot::RwLock as PlRwLock;
-use tokio_util::sync::CancellationToken;
 use crate::net::iroh::pairing::{
     load_trusted_contact_hints, merge_contact_hints, store_trusted_contact_hints,
     PairingContactHints,
 };
 use crate::routing::live_metrics;
+use parking_lot::RwLock as PlRwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Snapshot live-metrics routera — zwracany do heartbeat.
 fn routing_metrics_snapshot() -> (u32, f32) {
@@ -233,7 +233,8 @@ pub async fn start_mesh_pipeline(
                         let nid = node.node_id.clone();
                         let sec = sec.clone();
                         tokio::spawn(async move {
-                            if let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &nid) {
+                            if let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &nid)
+                            {
                                 if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
                                     debug!(peer_id = %nid, "Reconnect via trusted hints: {}", e);
                                 }
@@ -325,7 +326,8 @@ pub async fn start_mesh_pipeline(
                         }
                         if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
                             for node in trusted {
-                                if node.node_id == self_id || store.is_quic_connected(&node.node_id) {
+                                if node.node_id == self_id || store.is_quic_connected(&node.node_id)
+                                {
                                     failure_counts.remove(&node.node_id);
                                     continue;
                                 }
@@ -511,7 +513,11 @@ fn upsert_local_peer(
         Some(db) => {
             let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
             let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
-            crate::mesh::network_interfaces::filter_advertise_ips(&raw_addresses, &filters, &kind_map)
+            crate::mesh::network_interfaces::filter_advertise_ips(
+                &raw_addresses,
+                &filters,
+                &kind_map,
+            )
         }
         None => raw_addresses
             .into_iter()
@@ -561,7 +567,9 @@ fn trusted_contact_hints_for_peer(
     security: &MeshSecurity,
     node_id: &str,
 ) -> Option<PairingContactHints> {
-    load_trusted_contact_hints(&security.db, node_id).ok().flatten()
+    load_trusted_contact_hints(&security.db, node_id)
+        .ok()
+        .flatten()
 }
 
 fn prefer_address_first(addresses: &mut Vec<String>, preferred: Option<&str>) {
@@ -672,8 +680,7 @@ async fn handle_peer_connected(
                     if let Ok(sync_data) =
                         rkyv::to_bytes::<rkyv::rancor::Error>(&payload).map(|v| v.to_vec())
                     {
-                        if let Err(e) =
-                            qm_events.send_trusted_keys_sync(&node_id, &sync_data).await
+                        if let Err(e) = qm_events.send_trusted_keys_sync(&node_id, &sync_data).await
                         {
                             warn!("Blad wysylania TrustedKeysSync do {}: {}", node_id, e);
                         }
@@ -727,55 +734,55 @@ async fn handle_peer_connected(
                             "contact_snapshot: wszystkie adresy odrzucone przez advertise filters — pomijam persist"
                         );
                     } else {
-                    let mut direct_addresses: Vec<String> = filtered_ips
-                        .iter()
-                        .map(|ip| format!("{}:{}", ip, port))
-                        .collect();
-                    let snapshot = qm_events.connection_snapshot(&node_id);
-                    let selected_address = snapshot.as_ref().and_then(|c| c.address.as_deref());
-                    let selected_is_direct = snapshot
-                        .as_ref()
-                        .map(|c| c.transport.as_str() == "p2p")
-                        .unwrap_or(false);
-                    if selected_is_direct {
-                        prefer_address_first(&mut direct_addresses, selected_address);
-                    }
-                    // Gdy user wlaczyl prefer_same_subnet, po filtrze przestawiamy
-                    // adres z tej samej /24 co peer na poczatek listy.
-                    if crate::mesh::network_interfaces::load_prefer_same_subnet(&sec.db) {
-                        crate::mesh::network_interfaces::sort_prefer_same_subnet(
-                            &mut direct_addresses,
-                            selected_address,
+                        let mut direct_addresses: Vec<String> = filtered_ips
+                            .iter()
+                            .map(|ip| format!("{}:{}", ip, port))
+                            .collect();
+                        let snapshot = qm_events.connection_snapshot(&node_id);
+                        let selected_address = snapshot.as_ref().and_then(|c| c.address.as_deref());
+                        let selected_is_direct = snapshot
+                            .as_ref()
+                            .map(|c| c.transport.as_str() == "p2p")
+                            .unwrap_or(false);
+                        if selected_is_direct {
+                            prefer_address_first(&mut direct_addresses, selected_address);
+                        }
+                        // Gdy user wlaczyl prefer_same_subnet, po filtrze przestawiamy
+                        // adres z tej samej /24 co peer na poczatek listy.
+                        if crate::mesh::network_interfaces::load_prefer_same_subnet(&sec.db) {
+                            crate::mesh::network_interfaces::sort_prefer_same_subnet(
+                                &mut direct_addresses,
+                                selected_address,
+                            );
+                        }
+                        let addr_str = direct_addresses.join(",");
+                        tracing::info!(
+                            peer = %node_id,
+                            raw_count = addresses.len(),
+                            filtered_count = direct_addresses.len(),
+                            advertised = %addr_str,
+                            "advertise to peer: addresses po filtrach"
                         );
-                    }
-                    let addr_str = direct_addresses.join(",");
-                    tracing::info!(
-                        peer = %node_id,
-                        raw_count = addresses.len(),
-                        filtered_count = direct_addresses.len(),
-                        advertised = %addr_str,
-                        "advertise to peer: addresses po filtrach"
-                    );
-                    let _ = crate::db::repository::update_trusted_node_addresses(
-                        &sec.db, &node_id, &addr_str,
-                    );
-                    let relay_url = snapshot
-                        .as_ref()
-                        .and_then(|c| c.relay_url.clone())
-                        .or_else(|| qm_events.relay_url().map(|url| url.to_string()))
-                        .unwrap_or_default();
-                    let current = load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
-                    let hints = merge_contact_hints(
-                        current,
-                        PairingContactHints {
-                            node_id: node_id.clone(),
-                            public_key_hex: String::new(),
-                            hostname,
-                            addresses: direct_addresses,
-                            relay_url,
-                        },
-                    );
-                    let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
+                        let _ = crate::db::repository::update_trusted_node_addresses(
+                            &sec.db, &node_id, &addr_str,
+                        );
+                        let relay_url = snapshot
+                            .as_ref()
+                            .and_then(|c| c.relay_url.clone())
+                            .or_else(|| qm_events.relay_url().map(|url| url.to_string()))
+                            .unwrap_or_default();
+                        let current = load_trusted_contact_hints(&sec.db, &node_id).ok().flatten();
+                        let hints = merge_contact_hints(
+                            current,
+                            PairingContactHints {
+                                node_id: node_id.clone(),
+                                public_key_hex: String::new(),
+                                hostname,
+                                addresses: direct_addresses,
+                                relay_url,
+                            },
+                        );
+                        let _ = store_trusted_contact_hints(&sec.db, &node_id, &hints);
                     }
                 }
             }
@@ -1213,15 +1220,13 @@ fn spawn_quic_event_handler(
                             let recent = last_dial_at
                                 .get(&entry.node_id)
                                 .map(|t| {
-                                    t.elapsed()
-                                        < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
+                                    t.elapsed() < std::time::Duration::from_secs(DIAL_COOLDOWN_SECS)
                                 })
                                 .unwrap_or(false);
                             if recent {
                                 continue;
                             }
-                            last_dial_at
-                                .insert(entry.node_id.clone(), std::time::Instant::now());
+                            last_dial_at.insert(entry.node_id.clone(), std::time::Instant::now());
                             let target = entry.node_id.clone();
                             let qm = qm_events.clone();
                             let hints = merge_contact_hints(
@@ -2181,8 +2186,7 @@ fn spawn_slow_refresh(
                 // chcemy zeby stary set adresow wrocil do peer_store.
                 let addresses = match db_for_task.as_ref() {
                     Some(db) => {
-                        let filters =
-                            crate::mesh::network_interfaces::load_advertise_filters(db);
+                        let filters = crate::mesh::network_interfaces::load_advertise_filters(db);
                         let kind_map = crate::mesh::network_interfaces::ipv4_kind_map();
                         crate::mesh::network_interfaces::filter_advertise_ips(
                             &raw, &filters, &kind_map,
@@ -2283,9 +2287,8 @@ fn spawn_liveness_timer(
                         // mDNS tick albo DHT lookup. Dla cross-network pairingu
                         // jedyna sciezka to relay i hints ja niosa.
                         if let Some(pool) = db_for_reconnect {
-                            match crate::net::iroh::pairing::load_trusted_contact_hints(
-                                &pool, &nid,
-                            ) {
+                            match crate::net::iroh::pairing::load_trusted_contact_hints(&pool, &nid)
+                            {
                                 Ok(Some(hints)) => {
                                     if let Err(e) = qm.connect_to_peer_with_hints(&hints).await {
                                         warn!(

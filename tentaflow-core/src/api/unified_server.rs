@@ -165,8 +165,8 @@ pub fn start_unified_server_with_permissions(
     let mut shutdown_rx = service_manager.shutdown_rx.clone();
 
     // Subskrypcja eventow cyklu zycia (iOS resume po suspend). Na wake
-     // wymuszamy rebind listenera, bo iOS przy suspendzie moze uniewaznic
-     // socket loopback (errno 9 EBADF / errno 57 ENOTCONN przy accept).
+    // wymuszamy rebind listenera, bo iOS przy suspendzie moze uniewaznic
+    // socket loopback (errno 9 EBADF / errno 57 ENOTCONN przy accept).
     let mut lifecycle_rx = crate::lifecycle_signal::subscribe();
 
     tokio::spawn(async move {
@@ -228,10 +228,7 @@ pub fn start_unified_server_with_permissions(
                         // zapelni albo 200ms timeout, co blokuje LLM streaming
                         // do widocznych "tokenow co 30s". Loopback też dotyczy.
                         if let Err(e) = conn.0.set_nodelay(true) {
-                            tracing::warn!(
-                                "set_nodelay failed dla {}: {}",
-                                conn.1, e
-                            );
+                            tracing::warn!("set_nodelay failed dla {}: {}", conn.1, e);
                         }
                         conn
                     }
@@ -256,153 +253,164 @@ pub fn start_unified_server_with_permissions(
                     }
                 };
 
-            let tls_acceptor = tls_acceptor.clone();
-            let router = router.clone();
-            let db = db.clone();
-            let metrics = metrics.clone();
-            let cipher = cipher.clone();
-            let sc = settings_cipher.clone();
-            let sm = service_manager.clone();
-            let mps = mesh_peer_store.clone();
-            let qm = quic_mesh.clone();
-            let lni = local_node_id.clone();
-            let msec = mesh_security.clone();
-            let pc = permission_checker.clone();
-            let mrh = mesh_relay_health.clone();
-            let license: Arc<dyn crate::license::LicenseChecker> =
-                Arc::new(crate::license::StaticLicenseChecker::free());
+                let tls_acceptor = tls_acceptor.clone();
+                let router = router.clone();
+                let db = db.clone();
+                let metrics = metrics.clone();
+                let cipher = cipher.clone();
+                let sc = settings_cipher.clone();
+                let sm = service_manager.clone();
+                let mps = mesh_peer_store.clone();
+                let qm = quic_mesh.clone();
+                let lni = local_node_id.clone();
+                let msec = mesh_security.clone();
+                let pc = permission_checker.clone();
+                let mrh = mesh_relay_health.clone();
+                let license: Arc<dyn crate::license::LicenseChecker> =
+                    Arc::new(crate::license::StaticLicenseChecker::free());
 
-            tokio::spawn(async move {
-                // TLS handshake
-                let tls_stream = match tls_acceptor.accept(stream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // Klient probowal HTTP bez TLS lub przerwano handshake
-                        debug!("TLS handshake nieudany od {}: {}", remote_addr, e);
-                        return;
-                    }
-                };
-                let io = TokioIo::new(tls_stream);
+                tokio::spawn(async move {
+                    // TLS handshake
+                    let tls_stream = match tls_acceptor.accept(stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // Klient probowal HTTP bez TLS lub przerwano handshake
+                            debug!("TLS handshake nieudany od {}: {}", remote_addr, e);
+                            return;
+                        }
+                    };
+                    let io = TokioIo::new(tls_stream);
 
-                // VULN-035: Przekaz remote_addr do handle_request
-                let remote_addr_str = remote_addr.to_string();
-                let service = service_fn(move |req: Request<Incoming>| {
-                    let router = router.clone();
-                    let db = db.clone();
-                    let metrics = metrics.clone();
-                    let cipher = cipher.clone();
-                    let sc = sc.clone();
-                    let sm = sm.clone();
-                    let mps = mps.clone();
-                    let qm = qm.clone();
-                    let lni = lni.clone();
-                    let msec = msec.clone();
-                    let pc = pc.clone();
-                    let mrh = mrh.clone();
-                    let lic = license.clone();
-                    let ra = remote_addr_str.clone();
-                    async move {
-                        let path = req.uri().path().to_string();
+                    // VULN-035: Przekaz remote_addr do handle_request
+                    let remote_addr_str = remote_addr.to_string();
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let router = router.clone();
+                        let db = db.clone();
+                        let metrics = metrics.clone();
+                        let cipher = cipher.clone();
+                        let sc = sc.clone();
+                        let sm = sm.clone();
+                        let mps = mps.clone();
+                        let qm = qm.clone();
+                        let lni = lni.clone();
+                        let msec = msec.clone();
+                        let pc = pc.clone();
+                        let mrh = mrh.clone();
+                        let lic = license.clone();
+                        let ra = remote_addr_str.clone();
+                        async move {
+                            let path = req.uri().path().to_string();
 
-                        if is_openai_path(&path) {
-                            let mut owner_user_ctx: Option<crate::routing::acl::UserContext> = None;
-                            // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
-                            if path != "/health" && path != "/ready" {
-                                let api_key = req
-                                    .headers()
-                                    .get("authorization")
-                                    .and_then(|v| v.to_str().ok())
-                                    .and_then(|v| v.strip_prefix("Bearer "))
-                                    .or_else(|| {
-                                        req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
-                                    });
+                            if is_openai_path(&path) {
+                                let mut owner_user_ctx: Option<crate::routing::acl::UserContext> =
+                                    None;
+                                // VULN-001: Sprawdz API key dla sciezek OpenAI (oprocz /health i /ready)
+                                if path != "/health" && path != "/ready" {
+                                    let api_key = req
+                                        .headers()
+                                        .get("authorization")
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|v| v.strip_prefix("Bearer "))
+                                        .or_else(|| {
+                                            req.headers()
+                                                .get("x-api-key")
+                                                .and_then(|v| v.to_str().ok())
+                                        });
 
-                                let auth_error_msg = match api_key {
-                                    Some(key) => {
-                                        let key_hash =
-                                            crate::api::dashboard::auth::hash_api_key(key);
-                                        match crate::db::repository::verify_api_key(&db, &key_hash) {
-                                            Ok(Some(api_key_row)) => {
-                                                if let Some(uid) = api_key_row.owner_user_id {
-                                                    let role = crate::db::repository::get_user_account_by_id(&db, uid)
+                                    let auth_error_msg = match api_key {
+                                        Some(key) => {
+                                            let key_hash =
+                                                crate::api::dashboard::auth::hash_api_key(key);
+                                            match crate::db::repository::verify_api_key(
+                                                &db, &key_hash,
+                                            ) {
+                                                Ok(Some(api_key_row)) => {
+                                                    if let Some(uid) = api_key_row.owner_user_id {
+                                                        let role = crate::db::repository::get_user_account_by_id(&db, uid)
                                                         .ok()
                                                         .flatten()
                                                         .map(|u| u.role)
                                                         .unwrap_or_else(|| "user".to_string());
-                                                    owner_user_ctx = Some(
-                                                        crate::routing::acl::UserContext::new(uid, role)
-                                                    );
+                                                        owner_user_ctx = Some(
+                                                            crate::routing::acl::UserContext::new(
+                                                                uid, role,
+                                                            ),
+                                                        );
+                                                    }
+                                                    None
                                                 }
-                                                None
+                                                _ => Some(
+                                                    r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
+                                                ),
                                             }
-                                            _ => Some(
-                                                r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
-                                            ),
                                         }
+                                        None => Some(
+                                            r#"{"error":{"type":"authentication_error","message":"Brak API key. Uzyj naglowka Authorization: Bearer <key> lub x-api-key","code":"missing_api_key"}}"#,
+                                        ),
+                                    };
+
+                                    if let Some(err_body) = auth_error_msg {
+                                        let full = http_body_util::Full::new(
+                                            hyper::body::Bytes::from(err_body),
+                                        );
+                                        let resp = hyper::Response::builder()
+                                            .status(401)
+                                            .header("Content-Type", "application/json")
+                                            .body(UnsyncBoxBody::new(full.map_err(
+                                                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                                    match e {}
+                                                },
+                                            )))
+                                            .unwrap();
+                                        return Ok(resp);
                                     }
-                                    None => Some(
-                                        r#"{"error":{"type":"authentication_error","message":"Brak API key. Uzyj naglowka Authorization: Bearer <key> lub x-api-key","code":"missing_api_key"}}"#,
-                                    ),
-                                };
-
-                                if let Some(err_body) = auth_error_msg {
-                                    let full = http_body_util::Full::new(hyper::body::Bytes::from(
-                                        err_body,
-                                    ));
-                                    let resp = hyper::Response::builder()
-                                        .status(401)
-                                        .header("Content-Type", "application/json")
-                                        .body(UnsyncBoxBody::new(full.map_err(
-                                            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                                                match e {}
-                                            },
-                                        )))
-                                        .unwrap();
-                                    return Ok(resp);
                                 }
-                            }
 
-                            // Wstrzykuje UserContext do request extensions zeby
-                            // openai::server::handle_request mogl uzyc go w
-                            // route_*_for_user wariantach.
-                            let mut req = req;
-                            if let Some(uc) = owner_user_ctx {
-                                req.extensions_mut().insert(uc);
+                                // Wstrzykuje UserContext do request extensions zeby
+                                // openai::server::handle_request mogl uzyc go w
+                                // route_*_for_user wariantach.
+                                let mut req = req;
+                                if let Some(uc) = owner_user_ctx {
+                                    req.extensions_mut().insert(uc);
+                                }
+                                let resp =
+                                    crate::api::openai::server::handle_request(req, router).await?;
+                                let resp = resp.map(|body| {
+                                    UnsyncBoxBody::new(body.map_err(
+                                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                            Box::new(e)
+                                        },
+                                    ))
+                                });
+                                Ok::<_, hyper::Error>(resp)
+                            } else {
+                                let resp = crate::api::dashboard::server::handle_request(
+                                    req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec,
+                                    pc, lic, mrh, ra,
+                                )
+                                .await?;
+                                let resp = resp.map(|body| {
+                                    UnsyncBoxBody::new(body.map_err(
+                                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                            e.into()
+                                        },
+                                    ))
+                                });
+                                Ok::<_, hyper::Error>(resp)
                             }
-                            let resp =
-                                crate::api::openai::server::handle_request(req, router).await?;
-                            let resp = resp.map(|body| {
-                                UnsyncBoxBody::new(body.map_err(
-                                    |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
-                                ))
-                            });
-                            Ok::<_, hyper::Error>(resp)
-                        } else {
-                            let resp = crate::api::dashboard::server::handle_request(
-                                req, db, metrics, cipher, sc, sm, router, mps, qm, lni, msec, pc,
-                                lic, mrh, ra,
-                            )
-                            .await?;
-                            let resp = resp.map(|body| {
-                                UnsyncBoxBody::new(body.map_err(
-                                    |e| -> Box<dyn std::error::Error + Send + Sync> { e.into() },
-                                ))
-                            });
-                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+
+                    let conn = http1::Builder::new()
+                        .serve_connection(io, service)
+                        .with_upgrades();
+                    if let Err(e) = conn.await {
+                        let msg = e.to_string();
+                        if !msg.contains("connection closed") && !msg.contains("incomplete") {
+                            error!("Blad obslugi polaczenia od {}: {}", remote_addr, e);
                         }
                     }
                 });
-
-                let conn = http1::Builder::new()
-                    .serve_connection(io, service)
-                    .with_upgrades();
-                if let Err(e) = conn.await {
-                    let msg = e.to_string();
-                    if !msg.contains("connection closed") && !msg.contains("incomplete") {
-                        error!("Blad obslugi polaczenia od {}: {}", remote_addr, e);
-                    }
-                }
-            });
             } // koniec wewnetrznej petli accept
         } // koniec 'rebind loop
     });

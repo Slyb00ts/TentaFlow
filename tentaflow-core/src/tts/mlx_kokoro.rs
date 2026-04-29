@@ -89,11 +89,16 @@ fn open_bridge() -> Result<Bridge> {
         Symbol<'static, FreeBufferFn>,
     ) = unsafe {
         (
-            lib.get(b"Kokoro_getContext\0").context("Brak Kokoro_getContext")?,
-            lib.get(b"Kokoro_loadModel\0").context("Brak Kokoro_loadModel")?,
-            lib.get(b"Kokoro_unloadModel\0").context("Brak Kokoro_unloadModel")?,
-            lib.get(b"Kokoro_synthesize\0").context("Brak Kokoro_synthesize")?,
-            lib.get(b"Kokoro_freeBuffer\0").context("Brak Kokoro_freeBuffer")?,
+            lib.get(b"Kokoro_getContext\0")
+                .context("Brak Kokoro_getContext")?,
+            lib.get(b"Kokoro_loadModel\0")
+                .context("Brak Kokoro_loadModel")?,
+            lib.get(b"Kokoro_unloadModel\0")
+                .context("Brak Kokoro_unloadModel")?,
+            lib.get(b"Kokoro_synthesize\0")
+                .context("Brak Kokoro_synthesize")?,
+            lib.get(b"Kokoro_freeBuffer\0")
+                .context("Brak Kokoro_freeBuffer")?,
         )
     };
     let context = unsafe { get_ctx() };
@@ -142,7 +147,10 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
         && target.join("config.json").exists()
         && target.join("voices/af_heart.safetensors").exists();
     if already {
-        info!("[mlx-kokoro] uzywam istniejacego cache: {}", target.display());
+        info!(
+            "[mlx-kokoro] uzywam istniejacego cache: {}",
+            target.display()
+        );
         return Ok(target);
     }
 
@@ -164,9 +172,18 @@ pub async fn prepare_model(repo_id: &str) -> Result<PathBuf> {
         // Standardowy zestaw voices: 6 zenskich US + 4 meskich US + 2 GB.
         // Po ~1 MB kazdy = 12 MB. Caller moze sie pobrac wiecej.
         let voices = [
-            "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_nova",
-            "am_adam", "am_michael", "am_echo", "am_fenrir",
-            "bf_alice", "bm_george",
+            "af_heart",
+            "af_alloy",
+            "af_aoede",
+            "af_bella",
+            "af_jessica",
+            "af_nova",
+            "am_adam",
+            "am_michael",
+            "am_echo",
+            "am_fenrir",
+            "bf_alice",
+            "bm_george",
         ];
         for v in voices {
             let fname = format!("voices/{}.safetensors", v);
@@ -224,7 +241,9 @@ impl MlxKokoroEngine {
 }
 
 impl TtsEngine for MlxKokoroEngine {
-    fn backend_name(&self) -> &str { "mlx-kokoro" }
+    fn backend_name(&self) -> &str {
+        "mlx-kokoro"
+    }
 
     fn load_model(&mut self, model_dir: &Path) -> Result<TtsModelInfo> {
         self.ensure_bridge()?;
@@ -250,7 +269,7 @@ impl TtsEngine for MlxKokoroEngine {
                 .to_string(),
             backend: "mlx-kokoro".to_string(),
             sample_rate: 24_000,
-            speakers: 0,  // dynamiczne, voices listowane przez Kokoro_listVoices
+            speakers: 0, // dynamiczne, voices listowane przez Kokoro_listVoices
         };
         *self.info.lock().unwrap() = Some(info.clone());
         info!("[mlx-kokoro] model zaladowany: {}", path_str);
@@ -294,5 +313,7 @@ impl TtsEngine for MlxKokoroEngine {
         })
     }
 
-    fn model_info(&self) -> Option<&TtsModelInfo> { None }
+    fn model_info(&self) -> Option<&TtsModelInfo> {
+        None
+    }
 }

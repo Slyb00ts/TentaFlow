@@ -8,9 +8,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 fn bench_noop(c: &mut Criterion) {
     c.bench_function("noop", |b| {
-        b.iter(|| {
-            std::hint::black_box(1u64.wrapping_add(2))
-        });
+        b.iter(|| std::hint::black_box(1u64.wrapping_add(2)));
     });
 }
 

@@ -295,7 +295,9 @@ async fn handle_tts_stream(
     let final_chunk = match synth_task.await {
         Ok(Ok(())) => ModelStreamChunk {
             request_id: request_id.clone(),
-            chunk: StreamChunkType::Done { final_metrics: None },
+            chunk: StreamChunkType::Done {
+                final_metrics: None,
+            },
         },
         Ok(Err(e)) => ModelStreamChunk {
             request_id: request_id.clone(),
@@ -397,7 +399,9 @@ async fn handle_completion_stream(
                                 request_id: request_id.clone(),
                                 chunk: StreamChunkType::TextDelta(text),
                             };
-                            if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &frame).await {
+                            if let Err(e) =
+                                tentaflow_transport::framing::write_frame(&mut send, &frame).await
+                            {
                                 warn!("Completion stream: blad wysylki TextDelta: {:?}", e);
                                 errored = true;
                                 break;
@@ -425,7 +429,9 @@ async fn handle_completion_stream(
     if !errored {
         let done = ModelStreamChunk {
             request_id: request_id.clone(),
-            chunk: StreamChunkType::Done { final_metrics: None },
+            chunk: StreamChunkType::Done {
+                final_metrics: None,
+            },
         };
         if let Err(e) = tentaflow_transport::framing::write_frame(&mut send, &done).await {
             warn!("Completion stream: blad wysylki Done: {:?}", e);
@@ -600,24 +606,17 @@ pub async fn dispatch_reverse_request(
             // Kontener (np. meeting-bot) pobiera treść promptu z DB routera —
             // jedno źródło prawdy zamiast kopiowania seed-a po stronie obrazu.
             let Some(ref pool) = router.db else {
-                return make_error_response(
-                    request_id,
-                    "PromptFetch: router bez DB",
-                );
+                return make_error_response(request_id, "PromptFetch: router bez DB");
             };
             handle_prompt_fetch(pool, request_id, req)
         }
-
 
         ModelPayload::MeetingEvent(event) => {
             // Bot meetingowy otwiera reverse stream i pcha eventy summary/action
             // items. Router resolvuje meeting_key -> session_id przez get_or_create
             // (bot moze miec inny widok sesji niz DB, np. przy restarcie routera).
             let Some(ref pool) = router.db else {
-                return make_error_response(
-                    request_id,
-                    "MeetingEvent persist: router bez DB",
-                );
+                return make_error_response(request_id, "MeetingEvent persist: router bez DB");
             };
 
             // Zachowujemy kopie do live broadcastu przed move do persist.
@@ -765,10 +764,7 @@ fn handle_prompt_fetch(
                 req.prompt_id, req.language
             ),
         ),
-        Err(e) => make_error_response(
-            request_id,
-            &format!("PromptFetch: blad DB: {}", e),
-        ),
+        Err(e) => make_error_response(request_id, &format!("PromptFetch: blad DB: {}", e)),
     }
 }
 
@@ -784,13 +780,14 @@ fn resolve_session_id_cached(
     if let Some(cached) = meeting_session_cache().get(meeting_key) {
         return Ok(*cached);
     }
-    let id = crate::db::repository::transcripts::get_or_create_session(
-        pool,
-        meeting_key,
-        None,
-        None,
-    )
-    .map_err(|e| format!("MeetingEvent: resolve session '{}' failed: {}", meeting_key, e))?;
+    let id =
+        crate::db::repository::transcripts::get_or_create_session(pool, meeting_key, None, None)
+            .map_err(|e| {
+                format!(
+                    "MeetingEvent: resolve session '{}' failed: {}",
+                    meeting_key, e
+                )
+            })?;
     meeting_session_cache().insert(meeting_key.to_string(), id);
     Ok(id)
 }
@@ -1173,8 +1170,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let rows = crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10)
-            .unwrap();
+        let rows =
+            crate::db::repository::transcripts::list_summaries_for_meeting(&db, sid, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].decisions_text, "D1");
         assert_eq!(rows[0].summary_text, "S1");
@@ -1226,11 +1223,20 @@ mod tests {
             None,
         )
         .unwrap();
-        let rows = crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
-            .unwrap();
-        assert_eq!(rows.len(), 2, "dwa unikalne action items (dedup drugiego Alice)");
+        let rows =
+            crate::db::repository::transcripts::list_action_items_for_meeting(&db, sid, None)
+                .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "dwa unikalne action items (dedup drugiego Alice)"
+        );
         let alice = rows.iter().find(|r| r.owner == "Alice").unwrap();
-        assert_eq!(alice.deadline.as_deref(), Some("2026-05-10"), "deadline odswiezony");
+        assert_eq!(
+            alice.deadline.as_deref(),
+            Some("2026-05-10"),
+            "deadline odswiezony"
+        );
     }
 
     // =========================================================================
@@ -1274,7 +1280,10 @@ mod tests {
         );
         match resp.result {
             ModelResult::PromptFetched(p) => {
-                assert_eq!(p.resolved_language, "pl", "fallback na pl gdy brak wariantu");
+                assert_eq!(
+                    p.resolved_language, "pl",
+                    "fallback na pl gdy brak wariantu"
+                );
                 assert!(!p.content.is_empty());
             }
             _ => panic!("expected PromptFetched"),
@@ -1433,7 +1442,10 @@ mod tests {
 
         // Cache musi mieć teraz wpis.
         let cached = meeting_session_cache().get(key).map(|v| *v);
-        assert!(cached.is_some(), "cache nie został zapełniony po pierwszym evencie");
+        assert!(
+            cached.is_some(),
+            "cache nie został zapełniony po pierwszym evencie"
+        );
         let real_sid = cached.unwrap();
 
         // Kasujemy sesję bezpośrednio z DB (cascade FK usunie summary). Cache

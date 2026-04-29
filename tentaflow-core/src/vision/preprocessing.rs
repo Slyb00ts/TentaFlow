@@ -52,17 +52,16 @@ pub fn letterbox(src: &RgbImage, target: u32, fill: [u8; 3]) -> (RgbImage, Lette
 /// `(x, y)` w pikselach `target x target` → `(x', y')` w pikselach src.
 #[inline]
 pub fn unletterbox_xy(x: f32, y: f32, meta: &LetterboxMeta) -> (f32, f32) {
-    ((x - meta.pad_x as f32) / meta.scale, (y - meta.pad_y as f32) / meta.scale)
+    (
+        (x - meta.pad_x as f32) / meta.scale,
+        (y - meta.pad_y as f32) / meta.scale,
+    )
 }
 
 /// `RgbImage` → NCHW f32 z normalizacja `(pixel - mean) / std`. Buf to
 /// `Vec<f32>` o rozmiarze `1 * 3 * H * W`. Czytamy CHW: najpierw cały
 /// kanał R, potem G, potem B (tak ONNX przyjmuje w 99% case'ow).
-pub fn rgb_to_nchw_normalized(
-    img: &RgbImage,
-    mean: [f32; 3],
-    std: [f32; 3],
-) -> Vec<f32> {
+pub fn rgb_to_nchw_normalized(img: &RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
     let (w, h) = img.dimensions();
     let plane = (w * h) as usize;
     let mut buf = vec![0f32; plane * 3];

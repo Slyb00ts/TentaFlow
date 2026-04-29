@@ -8,6 +8,7 @@
 // i w kodzie samego tentaflow-core (handlerom).
 extern crate self as tentaflow_core;
 
+pub mod audio_models;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -23,9 +24,9 @@ pub mod net;
 pub mod prompt_registry;
 pub mod routing;
 pub mod services;
+pub mod services_repo;
 pub mod stt;
 pub mod tts;
-pub mod audio_models;
 pub mod vision;
 pub mod vision_models;
 

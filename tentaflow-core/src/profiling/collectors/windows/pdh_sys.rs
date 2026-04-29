@@ -32,7 +32,10 @@ impl std::error::Error for PdhError {}
 /// Encode a Rust string as a NUL-terminated UTF-16 buffer suitable for the
 /// `*W` PDH entry points.
 pub fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Owned PDH query handle. Calls `PdhCloseQuery` on drop.

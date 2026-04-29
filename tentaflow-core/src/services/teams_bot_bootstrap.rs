@@ -13,12 +13,7 @@ use crate::db::{repository, DbPool};
 /// że user powinien przypisać konkretny model w UI. `teams-llm` jest LLM
 /// generujacy odpowiedzi bota w real-time, oddzielny od `teams-summarization`
 /// ktory robi okresowe podsumowania.
-const TEAMS_ALIASES: &[&str] = &[
-    "teams-stt",
-    "teams-summarization",
-    "teams-tts",
-    "teams-llm",
-];
+const TEAMS_ALIASES: &[&str] = &["teams-stt", "teams-summarization", "teams-tts", "teams-llm"];
 
 /// Nazwa domyślnego flow dla teams-bota.
 const TEAMS_FLOW_NAME: &str = "teams-flow";
@@ -26,13 +21,7 @@ const TEAMS_FLOW_NAME: &str = "teams-flow";
 /// Domyslne wake-words dodawane przy pierwszym deploy teams-bota.
 /// Edytowalne przez UI/API; po edycji tabela jest "user-managed" — nie
 /// nadpisujemy. Ten seed dotyka tylko pustej tabeli.
-const DEFAULT_WAKE_WORDS: &[&str] = &[
-    "jarvis",
-    "tentaflow",
-    "asystencie",
-    "asystent",
-    "bot",
-];
+const DEFAULT_WAKE_WORDS: &[&str] = &["jarvis", "tentaflow", "asystencie", "asystent", "bot"];
 
 /// Tworzy (jeśli brak) domyślne aliasy i flow dla teams-bota. Bezpieczna do
 /// wywołania wielokrotnie — istniejące wpisy nie są modyfikowane, żeby nie
@@ -110,9 +99,7 @@ fn ensure_teams_flow(pool: &DbPool) -> Result<()> {
 
     let params = FlowParams {
         name: TEAMS_FLOW_NAME,
-        description: Some(
-            "Domyslny flow dla teams-bot: trigger -> llm -> pii_filter -> output.",
-        ),
+        description: Some("Domyslny flow dla teams-bot: trigger -> llm -> pii_filter -> output."),
         is_default: false,
         service_type: Some("agents"),
         flow_json: &flow_json,
@@ -183,10 +170,7 @@ mod tests {
         assert_eq!(edges.len(), 3);
 
         // Kolejność węzłów i krawędzi: trigger -> llm -> pii_filter -> output.
-        let node_types: Vec<&str> = nodes
-            .iter()
-            .map(|n| n["type"].as_str().unwrap())
-            .collect();
+        let node_types: Vec<&str> = nodes.iter().map(|n| n["type"].as_str().unwrap()).collect();
         assert_eq!(node_types, vec!["trigger", "llm", "pii_filter", "output"]);
 
         // LLM musi mieć alias do routingu summaryzacji.

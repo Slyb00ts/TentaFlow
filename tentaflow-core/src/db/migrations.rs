@@ -1761,5 +1761,60 @@ fn get_migrations() -> &'static [(i64, &'static str, &'static str)] {
             ALTER TABLE users ADD COLUMN preferred_language TEXT;
         ",
     ),
+    (
+        62,
+        "services_unification_v2_tables",
+        "
+            -- Additive migration for services unification refactor (Phase 1).
+            -- New tables live alongside legacy `services` / `model_registry` /
+            -- `deployments`. Phase 8 cleanup will drop legacy tables and
+            -- rename these to bare names.
+            CREATE TABLE IF NOT EXISTS services_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                engine_id TEXT NOT NULL,
+                deploy_method TEXT NOT NULL CHECK(deploy_method IN ('docker','native_embedded','native_binary','native_python_bundle','external')),
+                transport TEXT NOT NULL CHECK(transport IN ('embedded','http_direct','sidecar_quic','external_http')),
+                status TEXT NOT NULL CHECK(status IN ('starting','running','degraded','failed','stopped')) DEFAULT 'starting',
+                runtime_pid INTEGER,
+                runtime_port INTEGER,
+                sidecar_quic_port INTEGER,
+                endpoint_url TEXT,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                health_last_ok TIMESTAMP,
+                health_last_err TEXT,
+                restart_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_services_v2_status ON services_v2(status);
+            CREATE INDEX IF NOT EXISTS idx_services_v2_engine ON services_v2(engine_id);
+
+            CREATE TABLE IF NOT EXISTS model_registry_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id INTEGER NOT NULL REFERENCES services_v2(id) ON DELETE CASCADE,
+                model_name TEXT NOT NULL,
+                display_name TEXT,
+                capabilities TEXT NOT NULL DEFAULT '[]',
+                context_length INTEGER,
+                quantization TEXT,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(service_id, model_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_models_v2_service ON model_registry_v2(service_id);
+            CREATE INDEX IF NOT EXISTS idx_models_v2_name ON model_registry_v2(model_name);
+
+            CREATE TABLE IF NOT EXISTS deployments_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                engine_id TEXT NOT NULL,
+                deploy_method TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending','running','success','failed')),
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                error_text TEXT,
+                config_json TEXT
+            );
+        ",
+    ),
 ]
 }

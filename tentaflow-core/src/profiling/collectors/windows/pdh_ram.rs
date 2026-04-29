@@ -19,8 +19,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "windows.pdh.ram";
@@ -165,9 +165,7 @@ mod windows_impl {
         Ok(())
     }
 
-    pub fn start_session(
-        ctx: SessionCtx,
-    ) -> Result<Box<dyn RunningCollector>, CollectorError> {
+    pub fn start_session(ctx: SessionCtx) -> Result<Box<dyn RunningCollector>, CollectorError> {
         fs::create_dir_all(&ctx.output_dir)?;
         let csv_path = ctx.output_dir.join(CSV_FILENAME);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -209,8 +207,8 @@ mod windows_impl {
             "timestamp_ns,used_bytes,available_bytes,page_faults_per_s"
         )?;
 
-        let query = PdhQuery::open()
-            .map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
+        let query =
+            PdhQuery::open().map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
 
         let avail = query
             .add_counter("\\Memory\\Available Bytes")
@@ -369,7 +367,11 @@ mod tests {
     fn ram_parser_handles_empty_csv() {
         let dir = TempDir::new().unwrap();
         let csv = dir.path().join("ram.csv");
-        fs::write(&csv, "timestamp_ns,used_bytes,available_bytes,page_faults_per_s\n").unwrap();
+        fs::write(
+            &csv,
+            "timestamp_ns,used_bytes,available_bytes,page_faults_per_s\n",
+        )
+        .unwrap();
         let raw = RawCapture {
             artifacts: vec![csv],
             metadata: HashMap::new(),

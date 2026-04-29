@@ -258,16 +258,18 @@ text, with no explanations, quotes, preface or meta-commentary.",
         translated_text.chars().count(),
     );
 
-    Ok(MessageBody::TranslateBody(tentaflow_protocol::TranslatePayload::Res(TranslateResponse {
-        translated_text,
-        // Auto-detection of the source language is not surfaced by current
-        // LLM backends; leaving None until a detector is wired in.
-        detected_source_lang: None,
-        model_used: if response.model.is_empty() {
-            model_id
-        } else {
-            response.model
-        },
-        tokens_used,
-    })))
+    Ok(MessageBody::TranslateBody(
+        tentaflow_protocol::TranslatePayload::Res(TranslateResponse {
+            translated_text,
+            // Auto-detection of the source language is not surfaced by current
+            // LLM backends; leaving None until a detector is wired in.
+            detected_source_lang: None,
+            model_used: if response.model.is_empty() {
+                model_id
+            } else {
+                response.model
+            },
+            tokens_used,
+        }),
+    ))
 }

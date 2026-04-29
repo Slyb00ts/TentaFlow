@@ -131,9 +131,7 @@ impl MeshCommandExecutor {
                 })
                 .await;
                 match result {
-                    Ok(Ok(output)) => {
-                        CommandResponse::ok(MeshCommandResponsePayload::Text(output))
-                    }
+                    Ok(Ok(output)) => CommandResponse::ok(MeshCommandResponsePayload::Text(output)),
                     Ok(Err(e)) => CommandResponse::fail(e.to_string()),
                     Err(e) => CommandResponse::fail(format!("Blad watku: {}", e)),
                 }
@@ -148,9 +146,7 @@ impl MeshCommandExecutor {
             MeshCommandType::ContainerRestart { container_id } => {
                 self.handle_container_restart(&container_id).await
             }
-            MeshCommandType::SystemPrune { volumes } => {
-                self.handle_system_prune(volumes).await
-            }
+            MeshCommandType::SystemPrune { volumes } => self.handle_system_prune(volumes).await,
 
             MeshCommandType::BandwidthProbe {
                 target_ip,
@@ -220,10 +216,12 @@ impl MeshCommandExecutor {
                         }
 
                         // Zwroc OBA porty — klient sprobuje RDMA, jesli fail uzyje TCP
-                        CommandResponse::ok(MeshCommandResponsePayload::BandwidthProbeServerStarted {
-                            tcp_port,
-                            rdma_port: server_rdma_port,
-                        })
+                        CommandResponse::ok(
+                            MeshCommandResponsePayload::BandwidthProbeServerStarted {
+                                tcp_port,
+                                rdma_port: server_rdma_port,
+                            },
+                        )
                     }
                     "client" => {
                         // Probuj RDMA jesli serwer zwrocil rdma_port > 0
@@ -441,14 +439,14 @@ impl MeshCommandExecutor {
             .start(req.scope, req.duration_secs, req.label, &storage)
             .await
         {
-            Ok((session_id, started_at_ms)) => CommandResponse::ok(
-                MeshCommandResponsePayload::NsightStart(
+            Ok((session_id, started_at_ms)) => {
+                CommandResponse::ok(MeshCommandResponsePayload::NsightStart(
                     tentaflow_protocol::profiling::NsightStartResponse {
                         session_id,
                         started_at_ms,
                     },
-                ),
-            ),
+                ))
+            }
             Err(e) => CommandResponse::fail(format!("nsight start: {}", e)),
         }
     }
@@ -596,9 +594,7 @@ impl MeshCommandExecutor {
         &self,
         req: tentaflow_protocol::ProfilingStartRequest,
     ) -> CommandResponse {
-        use crate::profiling::{
-            ElevationToken, MULTI_SOURCE, PROFILE_PARSERS,
-        };
+        use crate::profiling::{ElevationToken, MULTI_SOURCE, PROFILE_PARSERS};
         use std::time::{SystemTime, UNIX_EPOCH};
         let elevation = if req.elevation_password.is_empty() {
             None
@@ -669,7 +665,10 @@ impl MeshCommandExecutor {
         use crate::profiling::PROFILE_STORAGE_V2;
         match PROFILE_STORAGE_V2.list_sessions(&self.local_node_id).await {
             Ok(entries) => {
-                let entries = entries.into_iter().map(Self::map_session_entry_v2).collect();
+                let entries = entries
+                    .into_iter()
+                    .map(Self::map_session_entry_v2)
+                    .collect();
                 CommandResponse::ok(MeshCommandResponsePayload::ProfilingSessions(
                     tentaflow_protocol::ProfilingSessionsResponse {
                         node_id: req.node_id,
@@ -923,11 +922,7 @@ impl MeshCommandExecutor {
                 .map(|v| v.len())
                 .unwrap_or(0);
             let containers_bytes = containers.space_reclaimed.unwrap_or(0);
-            let images_count = images
-                .images_deleted
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let images_count = images.images_deleted.as_ref().map(|v| v.len()).unwrap_or(0);
             let images_bytes = images.space_reclaimed.unwrap_or(0);
             let (volumes_count, volumes_bytes) = match volumes_resp {
                 Some(v) => (
@@ -1029,10 +1024,7 @@ mod tests {
             label: String::new(),
         };
         let resp = executor
-            .execute(
-                "untrusted-peer",
-                MeshCommandType::NsightStart(req),
-            )
+            .execute("untrusted-peer", MeshCommandType::NsightStart(req))
             .await;
         assert!(!resp.ok);
         let err = resp.error.unwrap_or_default();

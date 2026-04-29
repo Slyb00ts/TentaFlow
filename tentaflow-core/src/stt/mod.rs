@@ -4,10 +4,10 @@
 // =============================================================================
 
 pub mod audio;
-#[cfg(feature = "inference-whisper")]
-pub mod whisper;
 #[cfg(feature = "inference-mlx-whisper")]
 pub mod mlx_whisper;
+#[cfg(feature = "inference-whisper")]
+pub mod whisper;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

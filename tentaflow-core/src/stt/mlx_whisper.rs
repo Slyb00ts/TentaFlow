@@ -166,8 +166,9 @@ pub async fn prepare_model(mlx_repo_id: &str) -> Result<PathBuf> {
                 Err(_) => continue,
             };
             let dst = target_clone.join(f);
-            std::fs::copy(&src, &dst)
-                .with_context(|| format!("copy tokenizer {} -> {}", src.display(), dst.display()))?;
+            std::fs::copy(&src, &dst).with_context(|| {
+                format!("copy tokenizer {} -> {}", src.display(), dst.display())
+            })?;
         }
         Ok(())
     })
@@ -182,7 +183,9 @@ pub async fn prepare_model(mlx_repo_id: &str) -> Result<PathBuf> {
 // Helpery `locate_dylib` + `ensure_metallib_next_to` zostaly przeniesione do
 // `crate::macos_ffi` zeby mogly z nich korzystac inne moduly Apple-specific
 // (apple_tts, mlx_kokoro). Lokalne fn ponizej deleguja do wspoldzielonego.
-fn locate_dylib() -> Option<PathBuf> { crate::macos_ffi::locate_mlx_bridge_dylib() }
+fn locate_dylib() -> Option<PathBuf> {
+    crate::macos_ffi::locate_mlx_bridge_dylib()
+}
 fn ensure_metallib_next_to(dylib: &std::path::Path) {
     crate::macos_ffi::ensure_mlx_metallib_next_to(dylib)
 }
@@ -268,11 +271,7 @@ impl SttEngine for MlxWhisperEngine {
         vec!["wav".to_string(), "pcm".to_string()]
     }
 
-    async fn load_model(
-        &self,
-        model_path: &Path,
-        _device: Option<&str>,
-    ) -> Result<SttModelInfo> {
+    async fn load_model(&self, model_path: &Path, _device: Option<&str>) -> Result<SttModelInfo> {
         self.ensure_bridge()?;
         // Akceptujemy dwa formaty `model_path`:
         //   1. Lokalna scieżka istniejaca na dysku — uzywamy bezposrednio.
@@ -464,6 +463,5 @@ fn walk_size(dir: &Path) -> Option<u64> {
 /// teams-bot dostawal "Nie-WAV input" bo wysyla raw PCM bez RIFF headera
 /// (oszczedzajac na 44 B per chunk audio).
 fn decode_wav_to_f32(audio: &[u8]) -> Result<Vec<f32>> {
-    crate::stt::audio::decode_to_pcm_f32(audio)
-        .map_err(|e| anyhow::anyhow!("decode audio: {}", e))
+    crate::stt::audio::decode_to_pcm_f32(audio).map_err(|e| anyhow::anyhow!("decode audio: {}", e))
 }

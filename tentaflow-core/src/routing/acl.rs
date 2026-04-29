@@ -21,7 +21,10 @@ pub struct UserContext {
 
 impl UserContext {
     pub fn new(user_id: i64, role: impl Into<String>) -> Self {
-        Self { user_id, role: role.into() }
+        Self {
+            user_id,
+            role: role.into(),
+        }
     }
 
     pub fn is_admin(&self) -> bool {

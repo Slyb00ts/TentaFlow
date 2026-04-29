@@ -8,8 +8,8 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -344,10 +344,7 @@ impl IrohMeshManager {
     /// ma sie wyemitowac, false — stlumic.
     fn should_log_discovery(&self, peer_hex: &str) -> bool {
         const COOLDOWN: Duration = Duration::from_secs(60);
-        let mut entry = self
-            .peer_log_state
-            .entry(peer_hex.to_string())
-            .or_default();
+        let mut entry = self.peer_log_state.entry(peer_hex.to_string()).or_default();
         let now = Instant::now();
         let emit = match entry.last_discovery_log {
             Some(prev) => now.duration_since(prev) >= COOLDOWN,
@@ -362,10 +359,7 @@ impl IrohMeshManager {
     /// Liczy kolejne nieudane dial-y. Zwraca nowa wartosc licznika; 1 = pierwszy
     /// fail w serii, >1 = kolejny z rzedu bez sukcesu.
     fn note_dial_failure(&self, peer_hex: &str) -> u32 {
-        let mut entry = self
-            .peer_log_state
-            .entry(peer_hex.to_string())
-            .or_default();
+        let mut entry = self.peer_log_state.entry(peer_hex.to_string()).or_default();
         entry.consecutive_dial_failures = entry.consecutive_dial_failures.saturating_add(1);
         entry.consecutive_dial_failures
     }
@@ -389,10 +383,7 @@ impl IrohMeshManager {
         } else {
             Duration::from_secs(30)
         };
-        let mut entry = self
-            .peer_log_state
-            .entry(peer_hex.to_string())
-            .or_default();
+        let mut entry = self.peer_log_state.entry(peer_hex.to_string()).or_default();
         let now = Instant::now();
         if let Some(prev) = entry.last_dial_attempt {
             if now.duration_since(prev) < cooldown {
@@ -1791,7 +1782,9 @@ fn hostname() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_addr_from_target, is_private_socket_addr, transport_kind, transport_scope};
+    use super::{
+        endpoint_addr_from_target, is_private_socket_addr, transport_kind, transport_scope,
+    };
     use iroh::TransportAddr;
 
     #[test]
@@ -1804,9 +1797,7 @@ mod tests {
         let ips: Vec<_> = addr.ip_addrs().copied().collect();
         assert_eq!(
             ips,
-            vec!["192.168.1.10:7777"
-                .parse::<std::net::SocketAddr>()
-                .unwrap()]
+            vec!["192.168.1.10:7777".parse::<std::net::SocketAddr>().unwrap()]
         );
     }
 
@@ -1987,8 +1978,7 @@ mod tie_break_tests {
             manager.register_connection(peer_hex.clone(), out, ConnectionDirection::Outgoing),
         )
         .await
-        .expect("register timeout")
-        ;
+        .expect("register timeout");
         assert!(result.is_some(), "outgoing powinno wygrac");
         assert!(manager.is_connected(&peer_hex).await);
     }
@@ -2040,7 +2030,11 @@ mod tie_break_tests {
         // pustej mapy.
         let first = tokio::time::timeout(
             Duration::from_secs(10),
-            manager.register_connection(peer_hex.clone(), inc_a.clone(), ConnectionDirection::Incoming),
+            manager.register_connection(
+                peer_hex.clone(),
+                inc_a.clone(),
+                ConnectionDirection::Incoming,
+            ),
         )
         .await
         .expect("register incoming timeout");
@@ -2080,19 +2074,30 @@ mod tie_break_tests {
 
         // Najpierw zwyciezca.
         let first = manager
-            .register_connection(peer_hex.clone(), out_a.clone(), ConnectionDirection::Outgoing)
+            .register_connection(
+                peer_hex.clone(),
+                out_a.clone(),
+                ConnectionDirection::Outgoing,
+            )
             .await;
         let winner_id = first.expect("outgoing wygrywa");
 
         // Potem przychodzi przegrany.
         let second = manager
-            .register_connection(peer_hex.clone(), inc_a.clone(), ConnectionDirection::Incoming)
+            .register_connection(
+                peer_hex.clone(),
+                inc_a.clone(),
+                ConnectionDirection::Incoming,
+            )
             .await;
         assert!(second.is_none(), "przegrany incoming nie dostaje id");
 
         // Mapa dalej trzyma ten sam connection_id.
         {
-            let active = manager.connections.get(&peer_hex).expect("entry still present");
+            let active = manager
+                .connections
+                .get(&peer_hex)
+                .expect("entry still present");
             assert_eq!(active.id, winner_id, "zwyciezca w mapie niezmienny");
             assert_eq!(active.direction, ConnectionDirection::Outgoing);
         }
@@ -2124,17 +2129,28 @@ mod tie_break_tests {
         let (out_second, _inc2) = single_link(&manager, &peer).await;
 
         let first = manager
-            .register_connection(peer_hex.clone(), out_first.clone(), ConnectionDirection::Outgoing)
+            .register_connection(
+                peer_hex.clone(),
+                out_first.clone(),
+                ConnectionDirection::Outgoing,
+            )
             .await
             .expect("pierwszy outgoing");
 
         let second = manager
-            .register_connection(peer_hex.clone(), out_second.clone(), ConnectionDirection::Outgoing)
+            .register_connection(
+                peer_hex.clone(),
+                out_second.clone(),
+                ConnectionDirection::Outgoing,
+            )
             .await;
         assert!(second.is_none(), "duplikat kierunku → no-op");
 
         {
-            let active = manager.connections.get(&peer_hex).expect("entry still present");
+            let active = manager
+                .connections
+                .get(&peer_hex)
+                .expect("entry still present");
             assert_eq!(active.id, first);
         }
 
@@ -2143,10 +2159,7 @@ mod tie_break_tests {
             out_second.close_reason().is_some(),
             "duplikat musi byc zamkniety"
         );
-        assert!(
-            out_first.close_reason().is_none(),
-            "pierwszy dalej otwarty"
-        );
+        assert!(out_first.close_reason().is_none(), "pierwszy dalej otwarty");
     }
 
     /// `dial_locks` musi zwracac ten sam `Arc<Mutex>` dla tego samego peera.

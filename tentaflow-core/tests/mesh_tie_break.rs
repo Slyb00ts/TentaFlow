@@ -98,11 +98,7 @@ async fn starts_without_internet_with_relay_none() {
         .expect("bind timeout — relay_url=None nie powinno blokowac na DNS");
 
     let node_id = result.node_id();
-    assert_eq!(
-        node_id.len(),
-        64,
-        "node_id powinien byc 32B = 64 hex znaki"
-    );
+    assert_eq!(node_id.len(), 64, "node_id powinien byc 32B = 64 hex znaki");
     assert!(
         !result.endpoint().bound_sockets().is_empty(),
         "endpoint powinien miec co najmniej jeden bind socket"
@@ -164,12 +160,20 @@ async fn simultaneous_dial_converges_to_single_connection() {
     // Test ze connection zostalo "zywe": kazda strona moze otworzyc uni stream
     // i wyslac heartbeat. Przed tie-break'iem jedna ze stron dostawala
     // "superseded (code 0)" przy open_uni.
-    a.send_to_peer(&b_hex, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, b"ping-a")
-        .await
-        .expect("A → B open_uni musi sie udac po tie-break");
-    b.send_to_peer(&a_hex, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, b"ping-b")
-        .await
-        .expect("B → A open_uni musi sie udac po tie-break");
+    a.send_to_peer(
+        &b_hex,
+        tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
+        b"ping-a",
+    )
+    .await
+    .expect("A → B open_uni musi sie udac po tie-break");
+    b.send_to_peer(
+        &a_hex,
+        tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
+        b"ping-b",
+    )
+    .await
+    .expect("B → A open_uni musi sie udac po tie-break");
 
     a.shutdown().await;
     b.shutdown().await;
@@ -272,9 +276,13 @@ async fn heartbeats_flow_both_directions_after_simultaneous_dial() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // A wysyla heartbeat, B powinno dostac event HeartbeatReceived.
-    a.send_to_peer(&b_hex, tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT, b"hb-from-a")
-        .await
-        .expect("A heartbeat send");
+    a.send_to_peer(
+        &b_hex,
+        tentaflow_protocol::mesh::MESH_MSG_HEARTBEAT,
+        b"hb-from-a",
+    )
+    .await
+    .expect("A heartbeat send");
 
     let received = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

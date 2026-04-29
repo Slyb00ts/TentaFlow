@@ -82,7 +82,9 @@ pub struct MeshPeerInfo {
 
 /// Producent GPU — wykrywany po nazwie / PCI; uzywany do gating profilowania
 /// (np. NVIDIA Nsight Systems wymaga `vendor == Nvidia`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
+)]
 pub enum GpuVendor {
     Nvidia,
     Amd,
@@ -459,8 +461,7 @@ impl MeshPeerStore {
     }
 
     fn rebuild_cache(&self) {
-        let list: Vec<MeshPeerInfo> =
-            self.peers.iter().map(|e| e.value().clone()).collect();
+        let list: Vec<MeshPeerInfo> = self.peers.iter().map(|e| e.value().clone()).collect();
         self.list_cache.store(Arc::new(list));
         self.dirty.store(false, Ordering::Release);
     }
@@ -509,10 +510,7 @@ impl MeshPeerStore {
 
     /// Snapshot hostname + addresses + port — dla persystencji trusted contact
     /// hints. Omija klonowanie pozostalych ~20 pol MeshPeerInfo.
-    pub fn contact_snapshot(
-        &self,
-        node_id: &str,
-    ) -> Option<(String, Vec<std::net::IpAddr>, u16)> {
+    pub fn contact_snapshot(&self, node_id: &str) -> Option<(String, Vec<std::net::IpAddr>, u16)> {
         self.peers
             .get(node_id)
             .map(|p| (p.hostname.clone(), p.addresses.clone(), p.port))
@@ -852,8 +850,7 @@ mod tests {
         };
 
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&gpu).expect("encode");
-        let decoded =
-            rkyv::from_bytes::<PeerGpuInfo, rkyv::rancor::Error>(&bytes).expect("decode");
+        let decoded = rkyv::from_bytes::<PeerGpuInfo, rkyv::rancor::Error>(&bytes).expect("decode");
 
         assert_eq!(decoded.name, gpu.name);
         assert_eq!(decoded.vram_total_mb, gpu.vram_total_mb);

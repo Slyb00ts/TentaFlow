@@ -31,12 +31,12 @@ where
     match value {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::Array(arr)) if arr.len() == 2 => {
-            let x = arr[0].as_f64().ok_or_else(|| {
-                serde::de::Error::custom("position[0] nie jest liczba")
-            })?;
-            let y = arr[1].as_f64().ok_or_else(|| {
-                serde::de::Error::custom("position[1] nie jest liczba")
-            })?;
+            let x = arr[0]
+                .as_f64()
+                .ok_or_else(|| serde::de::Error::custom("position[0] nie jest liczba"))?;
+            let y = arr[1]
+                .as_f64()
+                .ok_or_else(|| serde::de::Error::custom("position[1] nie jest liczba"))?;
             Ok(Some((x, y)))
         }
         Some(serde_json::Value::Object(map)) => {
@@ -74,11 +74,17 @@ pub struct FlowEdge {
     /// stream-aware adaptery (LLM, TTS) eksponuja tez port "stream".
     /// skip_serializing_if chroni stare flow_json — edges bez jawnych portow
     /// round-trippuja byte-identycznie.
-    #[serde(default = "default_port_full", skip_serializing_if = "is_default_port_full")]
+    #[serde(
+        default = "default_port_full",
+        skip_serializing_if = "is_default_port_full"
+    )]
     pub from_port: String,
 
     /// Port wejsciowy docelowego node'a. Default "in".
-    #[serde(default = "default_port_in", skip_serializing_if = "is_default_port_in")]
+    #[serde(
+        default = "default_port_in",
+        skip_serializing_if = "is_default_port_in"
+    )]
     pub to_port: String,
 }
 

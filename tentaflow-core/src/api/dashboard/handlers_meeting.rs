@@ -10,9 +10,8 @@ use tentaflow_protocol::{
     MeetingActionItemItem, MeetingActionItemStatusUpdateResponse, MeetingActionItemsListResponse,
     MeetingActiveSessionResponse, MeetingPayload, MeetingSessionDescriptor,
     MeetingSessionDetailResponse, MeetingSessionLeaveResponse, MeetingSessionListResponse,
-    MeetingSessionStartResponse, MeetingSettingKv,
-    MeetingSettingsGetResponse, MeetingSettingsUpdateResponse,
-    MeetingSummariesListResponse, MeetingSummaryItem,
+    MeetingSessionStartResponse, MeetingSettingKv, MeetingSettingsGetResponse,
+    MeetingSettingsUpdateResponse, MeetingSummariesListResponse, MeetingSummaryItem,
     MeetingTranscriptEntry, MeetingTranscriptExportResponse, MeetingTranscriptsListResponse,
     MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
 };
@@ -200,14 +199,12 @@ pub async fn meeting_session_start(
         // Bez tego respond_enabled=false → bot tylko transkrybuje + summary.
         respond_enabled: {
             let has_explicit = !r.llm_alias.is_empty();
-            let has_default_alias = crate::db::repository::resolve_model_alias(
-                &ctx.state.db,
-                "teams-llm",
-            )
-            .ok()
-            .flatten()
-            .map(|a| !a.target_model.trim().is_empty())
-            .unwrap_or(false);
+            let has_default_alias =
+                crate::db::repository::resolve_model_alias(&ctx.state.db, "teams-llm")
+                    .ok()
+                    .flatten()
+                    .map(|a| !a.target_model.trim().is_empty())
+                    .unwrap_or(false);
             Some(has_explicit || has_default_alias)
         },
         // Default: pasywny tryb wake_word_intent (bot odpowiada tylko gdy
@@ -471,13 +468,12 @@ pub fn meeting_settings_update(
 
 /// Weryfikuje ownership sesji i zwraca session_id. Admin widzi wszystko.
 /// Sesje bez ownera (legacy) — tylko admin.
-fn resolve_owned_session_id(
-    ctx: &HandlerContext,
-    meeting_key: &str,
-) -> Result<i64, ProtocolError> {
+fn resolve_owned_session_id(ctx: &HandlerContext, meeting_key: &str) -> Result<i64, ProtocolError> {
     let session_id = repository::transcripts::session_id_by_meeting_key(&ctx.state.db, meeting_key)
         .map_err(internal)?
-        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "meeting session not found"))?;
+        .ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorCode::NotFound, "meeting session not found")
+        })?;
     if is_admin(ctx) {
         return Ok(session_id);
     }
@@ -509,8 +505,9 @@ pub fn meeting_summaries_list(
     };
     let session_id = resolve_owned_session_id(ctx, &r.meeting_key)?;
     let limit = r.limit.unwrap_or(20).max(1);
-    let rows = repository::transcripts::list_summaries_for_meeting(&ctx.state.db, session_id, limit)
-        .map_err(internal)?;
+    let rows =
+        repository::transcripts::list_summaries_for_meeting(&ctx.state.db, session_id, limit)
+            .map_err(internal)?;
     let items = rows
         .into_iter()
         .map(|s| MeetingSummaryItem {
@@ -568,9 +565,9 @@ pub fn meeting_action_items_list(
             updated_at: a.updated_at,
         })
         .collect();
-    Ok(MessageBody::MeetingBody(MeetingPayload::ResActionItemsList(
-        MeetingActionItemsListResponse { items },
-    )))
+    Ok(MessageBody::MeetingBody(
+        MeetingPayload::ResActionItemsList(MeetingActionItemsListResponse { items }),
+    ))
 }
 
 // =============================================================================
@@ -618,8 +615,9 @@ pub fn meeting_action_item_status_update(
     // Ta sama sciezka ACL co przy list/export — admin albo owner sesji.
     resolve_owned_session_id(ctx, &meeting_key)?;
 
-    let ok = repository::transcripts::update_action_item_status(&ctx.state.db, r.item_id, &r.status)
-        .map_err(internal)?;
+    let ok =
+        repository::transcripts::update_action_item_status(&ctx.state.db, r.item_id, &r.status)
+            .map_err(internal)?;
     Ok(MessageBody::MeetingBody(
         MeetingPayload::ResActionItemStatusUpdate(MeetingActionItemStatusUpdateResponse {
             success: ok,
@@ -636,8 +634,8 @@ fn format_ts_ms(ms: i64) -> String {
     // transkrypt jest artefaktem sesji, nie wiadomoscia wyslana o tej godzinie
     // do usera; dodawanie TZ mylaco.
     let secs = ms / 1000;
-    let naive = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let naive =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_else(chrono::Utc::now);
     naive.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
@@ -657,8 +655,8 @@ pub fn meeting_transcript_export(
     let session = repository::transcripts::get_session(&ctx.state.db, session_id)
         .map_err(internal)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "session not found"))?;
-    let entries = repository::transcripts::list_transcripts(&ctx.state.db, session_id)
-        .map_err(internal)?;
+    let entries =
+        repository::transcripts::list_transcripts(&ctx.state.db, session_id).map_err(internal)?;
 
     // Naglowek: tytul (fallback na meeting_key), start, unikalni uczestnicy.
     let title = session
@@ -692,9 +690,9 @@ pub fn meeting_transcript_export(
         ));
     }
 
-    Ok(MessageBody::MeetingBody(MeetingPayload::ResTranscriptExport(
-        MeetingTranscriptExportResponse { content: out },
-    )))
+    Ok(MessageBody::MeetingBody(
+        MeetingPayload::ResTranscriptExport(MeetingTranscriptExportResponse { content: out }),
+    ))
 }
 
 // =============================================================================
@@ -715,8 +713,8 @@ pub fn meeting_wake_word(
     let MeetingPayload::ReqWakeWord(r) = payload else {
         return Err(bad_request("expected ReqWakeWord"));
     };
-    use tentaflow_protocol::WakeWordOp;
     use crate::db::repository;
+    use tentaflow_protocol::WakeWordOp;
     match &r.op {
         WakeWordOp::List => {}
         WakeWordOp::Create { word } => {
@@ -730,8 +728,7 @@ pub fn meeting_wake_word(
             repository::add_wake_word(&ctx.state.db, trimmed).map_err(internal)?;
         }
         WakeWordOp::Toggle { id, enabled } => {
-            repository::set_wake_word_enabled(&ctx.state.db, *id, *enabled)
-                .map_err(internal)?;
+            repository::set_wake_word_enabled(&ctx.state.db, *id, *enabled).map_err(internal)?;
         }
         WakeWordOp::Delete { id } => {
             repository::delete_wake_word(&ctx.state.db, *id).map_err(internal)?;
@@ -748,9 +745,7 @@ pub fn meeting_wake_word(
         })
         .collect();
     Ok(MessageBody::MeetingBody(MeetingPayload::ResWakeWord(
-        tentaflow_protocol::MeetingWakeWordResponse {
-            words: proto_words,
-        },
+        tentaflow_protocol::MeetingWakeWordResponse { words: proto_words },
     )))
 }
 
@@ -804,9 +799,11 @@ mod tests {
     fn summaries_list_returns_owner_records_desc() {
         let state = AppState::for_test();
         let sid = make_owned_session(&state, "m-sum", 7);
-        repository::transcripts::insert_meeting_summary(&state.db, sid, "D1", "S1", "qwen").unwrap();
+        repository::transcripts::insert_meeting_summary(&state.db, sid, "D1", "S1", "qwen")
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        repository::transcripts::insert_meeting_summary(&state.db, sid, "D2", "S2", "qwen").unwrap();
+        repository::transcripts::insert_meeting_summary(&state.db, sid, "D2", "S2", "qwen")
+            .unwrap();
 
         let ctx = user_ctx(state.clone(), 7, false);
         let req = MessageBody::MeetingBody(MeetingPayload::ReqSummariesList(
@@ -878,9 +875,12 @@ mod tests {
     fn action_items_list_filters_by_status() {
         let state = AppState::for_test();
         let sid = make_owned_session(&state, "m-ai", 3);
-        let a = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "Alice", "task A", None)
+        let a = repository::transcripts::upsert_meeting_action_item(
+            &state.db, sid, "Alice", "task A", None,
+        )
+        .unwrap();
+        repository::transcripts::upsert_meeting_action_item(&state.db, sid, "Bob", "task B", None)
             .unwrap();
-        repository::transcripts::upsert_meeting_action_item(&state.db, sid, "Bob", "task B", None).unwrap();
         repository::transcripts::update_action_item_status(&state.db, a, "done").unwrap();
 
         let ctx = user_ctx(state.clone(), 3, false);
@@ -917,7 +917,8 @@ mod tests {
     fn action_items_list_admin_can_see_other_user_session() {
         let state = AppState::for_test();
         let sid = make_owned_session(&state, "m-ai-adm", 99);
-        repository::transcripts::upsert_meeting_action_item(&state.db, sid, "X", "t", None).unwrap();
+        repository::transcripts::upsert_meeting_action_item(&state.db, sid, "X", "t", None)
+            .unwrap();
         let ctx = user_ctx(state.clone(), 1, true);
         let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemsList(
             MeetingActionItemsListRequest {
@@ -938,7 +939,9 @@ mod tests {
     fn action_item_status_update_transitions_pending_to_done() {
         let state = AppState::for_test();
         let sid = make_owned_session(&state, "m-upd", 5);
-        let id = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None).unwrap();
+        let id =
+            repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None)
+                .unwrap();
 
         let ctx = user_ctx(state.clone(), 5, false);
         let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
@@ -954,7 +957,8 @@ mod tests {
         assert!(r.success);
 
         let rows =
-            repository::transcripts::list_action_items_for_meeting(&state.db, sid, Some("done")).unwrap();
+            repository::transcripts::list_action_items_for_meeting(&state.db, sid, Some("done"))
+                .unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -962,7 +966,9 @@ mod tests {
     fn action_item_status_update_invalid_status_rejected() {
         let state = AppState::for_test();
         let sid = make_owned_session(&state, "m-upd-bad", 5);
-        let id = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None).unwrap();
+        let id =
+            repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None)
+                .unwrap();
 
         let ctx = user_ctx(state.clone(), 5, false);
         let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
@@ -979,7 +985,9 @@ mod tests {
     fn action_item_status_update_forbidden_for_non_owner() {
         let state = AppState::for_test();
         let sid = make_owned_session(&state, "m-upd-priv", 5);
-        let id = repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None).unwrap();
+        let id =
+            repository::transcripts::upsert_meeting_action_item(&state.db, sid, "A", "t", None)
+                .unwrap();
 
         let ctx = user_ctx(state.clone(), 999, false);
         let req = MessageBody::MeetingBody(MeetingPayload::ReqActionItemStatusUpdate(
@@ -1047,7 +1055,9 @@ mod tests {
         let MessageBody::MeetingBody(MeetingPayload::ResTranscriptExport(r)) = res else {
             panic!()
         };
-        assert!(r.content.starts_with("Transkrypt spotkania: Stand-up 22.04\n"));
+        assert!(r
+            .content
+            .starts_with("Transkrypt spotkania: Stand-up 22.04\n"));
         assert!(r.content.contains("Rozpoczęcie: 2024-04-23 14:22:00"));
         assert!(r.content.contains("Uczestnicy: Maja K., Tomek P."));
         assert!(r.content.contains("================================"));

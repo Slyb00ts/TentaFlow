@@ -778,7 +778,10 @@ impl BackendClient {
 
         debug!(
             "audio_speech POST {} (model={}, input_len={}, voice={})",
-            url, request.model, request.input.len(), request.voice
+            url,
+            request.model,
+            request.input.len(),
+            request.voice
         );
 
         let response = self

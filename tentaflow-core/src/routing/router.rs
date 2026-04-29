@@ -630,9 +630,14 @@ impl Router {
                         let mut mgr = shared.write().await;
                         mgr.register(svc.name.clone(), Box::new(e));
                         self.register_native_service_in_mesh(
-                            &svc.name, "tts",
-                            vec![config["deployed_model"].as_str().unwrap_or("zosia-pl").to_string()],
-                            Some("apple-tts".to_string()), vec![0],
+                            &svc.name,
+                            "tts",
+                            vec![config["deployed_model"]
+                                .as_str()
+                                .unwrap_or("zosia-pl")
+                                .to_string()],
+                            Some("apple-tts".to_string()),
+                            vec![0],
                         );
                     }
                     continue;
@@ -685,10 +690,18 @@ impl Router {
                     let model_path_str = config["model_path"].as_str().unwrap_or("");
                     let model_path = std::path::PathBuf::from(model_path_str);
                     if !model_path.exists() {
-                        warn!("Kokoro restore '{}': brak sciezki {}", svc.name, model_path.display());
+                        warn!(
+                            "Kokoro restore '{}': brak sciezki {}",
+                            svc.name,
+                            model_path.display()
+                        );
                         continue;
                     }
-                    info!("Przywracanie Kokoro TTS '{}': model={}", svc.name, model_path.display());
+                    info!(
+                        "Przywracanie Kokoro TTS '{}': model={}",
+                        svc.name,
+                        model_path.display()
+                    );
                     let mut e = crate::tts::mlx_kokoro::MlxKokoroEngine::new();
                     use crate::tts::TtsEngine;
                     if let Err(err) = e.load_model(&model_path) {
@@ -698,9 +711,14 @@ impl Router {
                         let mut mgr = shared.write().await;
                         mgr.register(svc.name.clone(), Box::new(e));
                         self.register_native_service_in_mesh(
-                            &svc.name, "tts",
-                            vec![config["deployed_model"].as_str().unwrap_or("kokoro").to_string()],
-                            Some("kokoro".to_string()), vec![0],
+                            &svc.name,
+                            "tts",
+                            vec![config["deployed_model"]
+                                .as_str()
+                                .unwrap_or("kokoro")
+                                .to_string()],
+                            Some("kokoro".to_string()),
+                            vec![0],
                         );
                     }
                     continue;
@@ -858,14 +876,16 @@ impl Router {
                 "python-bundle: PID martwy, relaunchuje z cache venv"
             );
 
-            let hf_token = crate::db::repository::get_setting_secure(db, "hf_token", settings_cipher)
-                .unwrap_or_default()
-                .unwrap_or_default();
+            let hf_token =
+                crate::db::repository::get_setting_secure(db, "hf_token", settings_cipher)
+                    .unwrap_or_default()
+                    .unwrap_or_default();
             let _ = crate::paths::ensure_models_dirs();
             let hf_home = crate::paths::hf_home();
             let torch_home = crate::paths::torch_home();
 
-            let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut env: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             env.insert("PORT".to_string(), host_port.to_string());
             if let Some(model) = config["deployed_model"].as_str() {
                 if !model.is_empty() {
@@ -876,7 +896,10 @@ impl Router {
                 env.insert("HF_TOKEN".to_string(), hf_token.clone());
                 env.insert("HUGGING_FACE_HUB_TOKEN".to_string(), hf_token);
             }
-            env.insert("HF_HOME".to_string(), hf_home.to_string_lossy().into_owned());
+            env.insert(
+                "HF_HOME".to_string(),
+                hf_home.to_string_lossy().into_owned(),
+            );
             env.insert(
                 "HUGGINGFACE_HUB_CACHE".to_string(),
                 hf_home.to_string_lossy().into_owned(),
@@ -895,11 +918,10 @@ impl Router {
                 instance_name: Some(instance_name.clone()),
                 env,
             };
-            let running = tokio::task::spawn_blocking(move || {
-                crate::deploy::python_venv::relaunch(&req)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking relaunch: {}", e))??;
+            let running =
+                tokio::task::spawn_blocking(move || crate::deploy::python_venv::relaunch(&req))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("spawn_blocking relaunch: {}", e))??;
 
             let new_pid = running.child.id();
             std::mem::forget(running.child);
@@ -982,7 +1004,10 @@ impl Router {
             env.insert("HF_TOKEN".to_string(), hf_token.clone());
             env.insert("HUGGING_FACE_HUB_TOKEN".to_string(), hf_token);
         }
-        env.insert("HF_HOME".to_string(), hf_home.to_string_lossy().into_owned());
+        env.insert(
+            "HF_HOME".to_string(),
+            hf_home.to_string_lossy().into_owned(),
+        );
         env.insert(
             "HUGGINGFACE_HUB_CACHE".to_string(),
             hf_home.to_string_lossy().into_owned(),

@@ -279,7 +279,10 @@ pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
         format!("TTS_ALIAS={}", req.tts_alias),
         format!("FLOW_ALIAS={}", req.flow_alias),
         format!("LLM_ALIAS={}", req.llm_alias),
-        format!("RESPOND_ENABLED={}", if req.respond_enabled { "true" } else { "false" }),
+        format!(
+            "RESPOND_ENABLED={}",
+            if req.respond_enabled { "true" } else { "false" }
+        ),
         format!("RESPONSE_MODE={}", req.response_mode),
         format!("WAKE_WORDS={}", req.wake_words),
     ]
@@ -315,7 +318,12 @@ mod tests {
 
     #[test]
     fn build_env_emits_alias_keys_expected_by_bot() {
-        let req = sample("teams-stt", "teams-summarization", "teams-tts", "teams-flow");
+        let req = sample(
+            "teams-stt",
+            "teams-summarization",
+            "teams-tts",
+            "teams-flow",
+        );
         let env = build_env(&req);
         assert!(env.contains(&"STT_ALIAS=teams-stt".to_string()));
         assert!(env.contains(&"SUMMARIZATION_ALIAS=teams-summarization".to_string()));

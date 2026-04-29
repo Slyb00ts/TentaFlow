@@ -298,7 +298,10 @@ impl MeshSecurity {
 
         self.pin_attempts.remove(remote_node_id);
 
-        let pin = if !pin_hint.is_empty() && pin_hint.len() == 6 && pin_hint.chars().all(|c| c.is_ascii_digit()) {
+        let pin = if !pin_hint.is_empty()
+            && pin_hint.len() == 6
+            && pin_hint.chars().all(|c| c.is_ascii_digit())
+        {
             pin_hint.to_string()
         } else {
             Self::generate_pin()

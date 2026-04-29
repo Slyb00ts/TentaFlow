@@ -815,7 +815,10 @@ fn registry_non_empty_categories_only_used() {
 fn loaded_manifest_has_engines() {
     let reg = super::registry::registry();
     let count = reg.engines().len();
-    assert!(count > 0, "REGISTRY pusty — build.rs nie wygenerowal manifestow?");
+    assert!(
+        count > 0,
+        "REGISTRY pusty — build.rs nie wygenerowal manifestow?"
+    );
 }
 
 /// E2: Wszystkie zaladowane manifesty przechodza walidacje semantyczna

@@ -26,9 +26,7 @@ pub fn validate_engine_id(id: &str) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    #[error(
-        "Engine id = '{id}' must match '^[a-z0-9][a-z0-9_-]{{0,63}}$'"
-    )]
+    #[error("Engine id = '{id}' must match '^[a-z0-9][a-z0-9_-]{{0,63}}$'")]
     InvalidEngineId { id: String },
 
     #[error(

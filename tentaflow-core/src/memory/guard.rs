@@ -177,9 +177,12 @@ impl MemoryGuard {
     /// Glowna metoda: wywolywana przed kazdym dispatch. Gdy service zaladowany
     /// — touch last_used + return. Gdy nie — load z eviction jesli trzeba.
     pub async fn ensure_loaded(&self, service_name: &str) -> Result<()> {
-        let entry = self
-            .get_entry(service_name)
-            .ok_or_else(|| anyhow!("service '{}' nie zarejestrowany w MemoryGuard", service_name))?;
+        let entry = self.get_entry(service_name).ok_or_else(|| {
+            anyhow!(
+                "service '{}' nie zarejestrowany w MemoryGuard",
+                service_name
+            )
+        })?;
 
         // Paused — odrzucamy z jasnym bledem, nie ladujemy.
         if entry.state.read().paused {
@@ -228,8 +231,7 @@ impl MemoryGuard {
 
             // Per karta: sprawdz needed_per_gpu vs free_per_gpu. Jesli ktorakolwiek
             // karta z affinity nie miesci, eviction tylko z tej karty.
-            let needed_per_gpu =
-                needed_total / target_indices.len().max(1) as u64;
+            let needed_per_gpu = needed_total / target_indices.len().max(1) as u64;
 
             for &idx in &target_indices {
                 let snapshot = match snapshots.get(idx) {
@@ -246,8 +248,7 @@ impl MemoryGuard {
 
                 if conservative_used + needed_per_gpu > limit {
                     let _eviction = self.eviction_lock.lock().await;
-                    let to_free =
-                        (conservative_used + needed_per_gpu).saturating_sub(limit);
+                    let to_free = (conservative_used + needed_per_gpu).saturating_sub(limit);
                     tracing::info!(
                         service = %service_name, gpu = idx,
                         needed_mb = needed_per_gpu, used_mb = conservative_used,
@@ -384,8 +385,12 @@ impl MemoryGuard {
 
         if freed < needed_mb {
             warn!(
-                requested_mb = needed_mb, freed_mb = freed, gpu = gpu_idx, requesting,
-                "MemoryGuard: nie udalo sie zwolnic wystarczajaco na GPU {}", gpu_idx
+                requested_mb = needed_mb,
+                freed_mb = freed,
+                gpu = gpu_idx,
+                requesting,
+                "MemoryGuard: nie udalo sie zwolnic wystarczajaco na GPU {}",
+                gpu_idx
             );
         }
         Ok(freed)
@@ -410,7 +415,12 @@ impl MemoryGuard {
                 if s.pinned || s.paused || !s.is_loaded() || name == requesting {
                     None
                 } else {
-                    Some((name.clone(), s.last_used, s.vram_estimated_mb, entry.clone()))
+                    Some((
+                        name.clone(),
+                        s.last_used,
+                        s.vram_estimated_mb,
+                        entry.clone(),
+                    ))
                 }
             })
             .collect();
@@ -448,7 +458,9 @@ impl MemoryGuard {
 
         if freed < needed_mb {
             warn!(
-                requested_mb = needed_mb, freed_mb = freed, requesting,
+                requested_mb = needed_mb,
+                freed_mb = freed,
+                requesting,
                 "MemoryGuard: nie udalo sie zwolnic wystarczajaco — moze brakowac VRAM"
             );
         }

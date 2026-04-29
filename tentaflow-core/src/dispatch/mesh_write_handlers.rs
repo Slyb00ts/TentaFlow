@@ -549,9 +549,7 @@ pub async fn mesh_node_network_config(
                 Some(ctx.state.local_node_id.as_ref()),
             );
             Ok(MessageBody::MeshNodeNetworkConfigResponseBody(
-                MeshNodeNetworkConfigResponse {
-                    ok: response.ok,
-                },
+                MeshNodeNetworkConfigResponse { ok: response.ok },
             ))
         }
         Err(e) => Err(ProtocolError::new(
@@ -574,18 +572,15 @@ fn profiling_err_to_proto(e: crate::profiling::ProfilingError) -> ProtocolError 
             ProtocolErrorCode::NotAvailable,
             "nsys not available on this node",
         ),
-        PE::Busy => ProtocolError::new(
-            ProtocolErrorCode::Conflict,
-            "profiling already in progress",
-        ),
+        PE::Busy => {
+            ProtocolError::new(ProtocolErrorCode::Conflict, "profiling already in progress")
+        }
         PE::NotFound(s) => ProtocolError::not_found(format!("session not found: {}", s)),
         PE::InvalidSessionId => ProtocolError::bad_request("invalid session id format"),
         PE::InvalidLabel(reason) => {
             ProtocolError::bad_request(format!("invalid label: {}", reason))
         }
-        PE::InvalidDuration(d) => {
-            ProtocolError::bad_request(format!("invalid duration: {}s", d))
-        }
+        PE::InvalidDuration(d) => ProtocolError::bad_request(format!("invalid duration: {}s", d)),
         other => ProtocolError::internal(format!("profiling: {}", other)),
     }
 }
@@ -656,8 +651,8 @@ async fn handle_nsight_local(
 ) -> Result<NsightPayload, ProtocolError> {
     use crate::profiling::NSYS_RUNNER;
     use tentaflow_protocol::profiling::{
-        NsightDeleteResponse, NsightDownloadResponse, NsightReportResponse,
-        NsightSessionsResponse, NsightStartResponse, NsightStopResponse,
+        NsightDeleteResponse, NsightDownloadResponse, NsightReportResponse, NsightSessionsResponse,
+        NsightStartResponse, NsightStopResponse,
     };
 
     match payload {
@@ -731,7 +726,9 @@ async fn handle_nsight_local(
             let storage = local_profile_storage(ctx);
             match storage.read_summary(&req.session_id) {
                 Ok(report) => {
-                    return Ok(NsightPayload::ReportResponse(NsightReportResponse { report }));
+                    return Ok(NsightPayload::ReportResponse(NsightReportResponse {
+                        report,
+                    }));
                 }
                 Err(crate::profiling::ProfilingError::NotFound(_)) => {
                     // v1 nie ma - sprobuj v2.
@@ -741,12 +738,17 @@ async fn handle_nsight_local(
             // Fallback v2: multi-source sesje zyja w <home>/profiling/<node>/<session>/
             let storage_v2 = std::sync::Arc::clone(&crate::profiling::PROFILE_STORAGE_V2);
             let local_node_id = ctx.state.local_node_id.as_ref().to_string();
-            match storage_v2.read_report(&local_node_id, &req.session_id).await {
+            match storage_v2
+                .read_report(&local_node_id, &req.session_id)
+                .await
+            {
                 Ok(envelope) => {
                     use tentaflow_protocol::profiling::ProfileReportEnvelope;
                     match envelope {
                         ProfileReportEnvelope::V1Legacy(report) => {
-                            Ok(NsightPayload::ReportResponse(NsightReportResponse { report }))
+                            Ok(NsightPayload::ReportResponse(NsightReportResponse {
+                                report,
+                            }))
                         }
                         ProfileReportEnvelope::V2(_v2_report) => {
                             // V2 ma inne pola (multi-source timeline, frames, stacks
@@ -921,9 +923,7 @@ fn profiling_v2_err_to_proto(e: crate::profiling::SessionError) -> ProtocolError
             "no collectors available for the requested scope",
         ),
         SE::AllCollectorsFailed => ProtocolError::internal("all collectors failed to start"),
-        SE::InvalidScope(reason) => {
-            ProtocolError::bad_request(format!("invalid scope: {reason}"))
-        }
+        SE::InvalidScope(reason) => ProtocolError::bad_request(format!("invalid scope: {reason}")),
         SE::Storage(s) => ProtocolError::internal(format!("storage: {s}")),
         SE::CollectorStartFailure { id, error } => {
             ProtocolError::internal(format!("collector {id} start failure: {error}"))
@@ -937,17 +937,13 @@ fn profiling_v2_err_to_proto(e: crate::profiling::SessionError) -> ProtocolError
 fn storage_err_to_proto(e: crate::profiling::StorageError) -> ProtocolError {
     use crate::profiling::StorageError as SE;
     match e {
-        SE::InvalidSessionId(s) => {
-            ProtocolError::bad_request(format!("invalid session id: {s}"))
-        }
+        SE::InvalidSessionId(s) => ProtocolError::bad_request(format!("invalid session id: {s}")),
         SE::InvalidNodeId(s) => ProtocolError::bad_request(format!("invalid node id: {s}")),
         SE::InvalidCollectorId(s) => {
             ProtocolError::bad_request(format!("invalid collector id: {s}"))
         }
         SE::NotFound(s) => ProtocolError::not_found(s),
-        SE::PathTraversal(s) => {
-            ProtocolError::bad_request(format!("path traversal rejected: {s}"))
-        }
+        SE::PathTraversal(s) => ProtocolError::bad_request(format!("path traversal rejected: {s}")),
         SE::SizeCapExceeded { actual, cap } => {
             ProtocolError::internal(format!("size cap exceeded: {actual} > {cap}"))
         }
@@ -1090,9 +1086,7 @@ async fn handle_profiling_local(
     ctx: &HandlerContext,
     payload: tentaflow_protocol::ProfilingPayload,
 ) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
-    use crate::profiling::{
-        ElevationToken, MULTI_SOURCE, PROFILE_PARSERS, PROFILE_STORAGE_V2,
-    };
+    use crate::profiling::{ElevationToken, MULTI_SOURCE, PROFILE_PARSERS, PROFILE_STORAGE_V2};
     use tentaflow_protocol::ProfilingPayload as PP;
     use tentaflow_protocol::{
         ProfilingActiveInfoResponse, ProfilingActiveSessionInfo, ProfilingDeleteResponse,
@@ -1231,8 +1225,10 @@ async fn handle_profiling_local(
             }))
         }
         PP::ActiveInfoRequest(_req) => {
-            let info = orchestrator.active_info().await.map(|i| {
-                ProfilingActiveSessionInfo {
+            let info = orchestrator
+                .active_info()
+                .await
+                .map(|i| ProfilingActiveSessionInfo {
                     session_id: i.session_id,
                     node_id: i.node_id,
                     label: i.label,
@@ -1241,8 +1237,7 @@ async fn handle_profiling_local(
                     elapsed_ns: i.elapsed_ns,
                     collectors_running: i.collectors_running,
                     collectors_skipped: map_storage_skipped(i.collectors_skipped),
-                }
-            });
+                });
             Ok(PP::ActiveInfoResponse(ProfilingActiveInfoResponse { info }))
         }
         // Response variants must not arrive as requests.
@@ -1333,8 +1328,14 @@ macro_rules! register_profiling_variant {
     };
 }
 
-register_profiling_variant!("ProfilingStartRequest", "tentaflow_ws_handler_profiling_start");
-register_profiling_variant!("ProfilingStopRequest", "tentaflow_ws_handler_profiling_stop");
+register_profiling_variant!(
+    "ProfilingStartRequest",
+    "tentaflow_ws_handler_profiling_start"
+);
+register_profiling_variant!(
+    "ProfilingStopRequest",
+    "tentaflow_ws_handler_profiling_stop"
+);
 register_profiling_variant!(
     "ProfilingSessionsRequest",
     "tentaflow_ws_handler_profiling_sessions"
@@ -1591,8 +1592,7 @@ mod nsight_tests {
         // forwardera (bo `quic_mesh = None` dalby inny komunikat o mesh managerze).
         match res {
             Err(e) => assert!(
-                e.message.contains("nsys not available")
-                    || e.message.contains("nsys"),
+                e.message.contains("nsys not available") || e.message.contains("nsys"),
                 "oczekiwano komunikatu o braku nsys, dostalem: {}",
                 e.message
             ),
@@ -1717,9 +1717,9 @@ mod nsight_tests {
         // tentaflow_home jest cache'owane przez OnceLock, wiec ten test moze
         // dostac wczesniej zainicjalizowana wartosc — w takim razie list() nadal
         // zwroci Ok, bo node_dir nie istnieje (storage::list zwraca pusty Vec).
-        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(
-            NsightSessionsRequest { node_id: local },
-        ));
+        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(NsightSessionsRequest {
+            node_id: local,
+        }));
         let res = nsight_dispatch(&body, &ctx).await;
         match res {
             Ok(MessageBody::NsightBody(NsightPayload::SessionsResponse(r))) => {
@@ -1765,11 +1765,9 @@ mod nsight_tests {
     #[tokio::test]
     async fn nsight_remote_node_without_mesh_manager_fails() {
         let ctx = admin_ctx();
-        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(
-            NsightSessionsRequest {
-                node_id: "some-other-peer-node".into(),
-            },
-        ));
+        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(NsightSessionsRequest {
+            node_id: "some-other-peer-node".into(),
+        }));
         let res = nsight_dispatch(&body, &ctx).await;
         match res {
             Err(e) => {

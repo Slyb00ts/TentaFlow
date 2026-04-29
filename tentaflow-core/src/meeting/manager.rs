@@ -34,14 +34,19 @@ fn detect_backend(db: &DbPool) -> BotBackend {
     let services = match repository::list_services(db) {
         Ok(s) => s,
         Err(e) => {
-            warn!("detect_backend: list_services blad ({}), fallback Docker", e);
+            warn!(
+                "detect_backend: list_services blad ({}), fallback Docker",
+                e
+            );
             return BotBackend::Docker;
         }
     };
     for svc in &services {
         let config: serde_json::Value =
             serde_json::from_str(&svc.config_json).unwrap_or(serde_json::Value::Null);
-        let engine = config["engine"].as_str().or(config["manifest_engine_id"].as_str());
+        let engine = config["engine"]
+            .as_str()
+            .or(config["manifest_engine_id"].as_str());
         if engine != Some("teams-bot") {
             continue;
         }
@@ -199,7 +204,11 @@ impl MeetingManager {
         }
 
         let backend = detect_backend(&self.db);
-        info!(session = session_id, ?backend, "Meeting session — wybrany backend");
+        info!(
+            session = session_id,
+            ?backend,
+            "Meeting session — wybrany backend"
+        );
 
         // Generuj secret key bota — iroh::SecretKey ma endpoint_id (public key) wbudowany.
         let secret = SecretKey::generate();
