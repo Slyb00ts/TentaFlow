@@ -1,8 +1,9 @@
 // =============================================================================
 // File: modules/profile-compare.js
-// Purpose: Compare Sessions view (mockup section 13). Side-by-side widok dwoch
-//          raportow profilingu z deltami KPI i differential flamegraph
-//          (dwa flamegraphy obok siebie + tablica delt funkcji).
+// Purpose: Compare Sessions view (mockup section 13). Single-page diff:
+//          two summary cards (Baseline vs Compared) z deltami KPI oraz
+//          differential flamegraph (czerwony=wolniej w B, zielony=szybciej w B,
+//          żółty/neutralny=bez zmian) plus tabela meta z opisem źródeł.
 // =============================================================================
 
 import {
@@ -10,26 +11,29 @@ import {
   computeAllKpis,
   formatBytes,
   formatPower,
-  formatPct,
   formatDateTime,
   formatDurationNs,
   escape,
 } from '/js/modules/profile-report-helpers.js';
 import { profilingReport } from '/js/protocol/profiling.js';
-import { CpuFlamegraph } from '/js/modules/profile-flamegraph.js';
 import '/js/components/tf-button.js';
-import '/js/components/tf-tabs.js';
 import '/js/components/tf-chip.js';
 
 const FIXTURE_PATH = '/js/modules/__fixtures__/profile-report.json';
+
+// Próg powyżej którego frame uznajemy za realnie szybszy/wolniejszy w B.
+// Liczone jako (sampleShareB - sampleShareA) / max(A,B). Dwa progi:
+// - DELTA_FRAME — barwienie diff-flamegraph
+// - DELTA_KPI   — barwienie pigułek delty w KPI grid
+const DELTA_FRAME = 0.10; // 10%
+const DELTA_KPI = 0.05;   // 5%
 
 function fixtureMode() {
   return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
 }
 
-// Rownolegle pobranie dwoch raportow. Compare = czysty client-side diff,
-// backend nie ma osobnego endpointu — uzywamy istniejacego profilingReport
-// dwa razy.
+// Równoległe pobranie dwóch raportów. Compare = client-side diff,
+// backend nie ma dedykowanego endpointu — używamy istniejącego profilingReport.
 async function loadTwoReports({ nodeId, sessionA, sessionB }) {
   const fetchOne = async (sid) => {
     if (fixtureMode()) {
@@ -43,14 +47,10 @@ async function loadTwoReports({ nodeId, sessionA, sessionB }) {
   return { a, b };
 }
 
-// Rozpakowuje envelope z profilingReport (raw może być { V2: ... } /
-// { envelope: { kind:'v2', report } } / bare V2). Zwraca null gdy V1 lub
-// nieobsługiwane.
+// Rozpakowuje envelope z profilingReport (raw może być { V2: ... } albo
+// surowy V2). Po cleanup #11 nie wspieramy V1 ani envelope.kind.
 function unpackReport(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  if (raw.envelope && raw.envelope.kind === 'v2' && raw.envelope.report) {
-    return raw.envelope.report;
-  }
   if ('V2' in raw && raw.V2) return raw.V2;
   if (raw.schema_version === 2) return raw;
   return null;
@@ -90,24 +90,14 @@ export class ProfileCompareView {
     const repA = unpackReport(raw.a);
     const repB = unpackReport(raw.b);
     if (!repA || !repB) {
-      container.innerHTML = renderError(new Error('Compare requires both reports in V2 schema (legacy V1 not supported).'));
+      container.innerHTML = renderError(new Error('Compare requires both reports in V2 schema.'));
       bindBack(container);
       return;
     }
 
-    const ctxA = buildOne(repA);
-    const ctxB = buildOne(repB);
-    const ctx = {
-      a: ctxA,
-      b: ctxB,
-      defaultTab: 'overview',
-      // Lazy cache rendered HTML per tab (re-mount flamegraph instances on demand).
-      _tabHtml: new Map(),
-    };
-
+    const ctx = { a: buildOne(repA), b: buildOne(repB) };
     container.innerHTML = renderShell(ctx);
-    bindShell(container, ctx);
-    renderTab(container, ctx, ctx.defaultTab);
+    bindShell(container);
   }
 }
 
@@ -120,22 +110,13 @@ function buildOne(report) {
 }
 
 // =============================================================================
-// Shell.
+// Shell rendering.
 // =============================================================================
 
 function renderShell(ctx) {
-  const a = ctx.a.report;
-  const b = ctx.b.report;
-  const labelA = escape(a.scope?.label || a.session_id?.slice(0, 8) || 'A');
-  const labelB = escape(b.scope?.label || b.session_id?.slice(0, 8) || 'B');
-  const sidA = escape((a.session_id || '').slice(0, 8));
-  const sidB = escape((b.session_id || '').slice(0, 8));
-  const dateA = escape(formatDateTime(a.t0_wallclock_unix_ns));
-  const dateB = escape(formatDateTime(b.t0_wallclock_unix_ns));
-
   return `
-    <div class="profile-compare">
-      <nav class="pr2-breadcrumb" aria-label="Breadcrumb">
+    <div class="profile-compare compare-screen">
+      <nav class="pr-breadcrumb" aria-label="Breadcrumb">
         <a href="#" data-action="back-mesh">Mesh</a>
         <span class="sep">/</span>
         <span>Profiling</span>
@@ -143,36 +124,10 @@ function renderShell(ctx) {
         <span>Compare</span>
       </nav>
 
-      <header class="pc-header">
-        <div class="pc-title-block">
-          <h1 class="pc-title">Compare sessions</h1>
-          <div class="pc-sub">
-            <span class="pc-chip pc-chip-a">A · ${labelA}</span>
-            <span class="pc-vs">vs</span>
-            <span class="pc-chip pc-chip-b">B · ${labelB}</span>
-          </div>
-          <div class="pc-meta">
-            <span class="mono">${sidA}</span> @ <span>${dateA}</span>
-            <span class="sep">·</span>
-            <span class="mono">${sidB}</span> @ <span>${dateB}</span>
-          </div>
-        </div>
-        <div class="pc-actions">
-          <tf-button variant="ghost" size="sm" data-action="back-mesh">Back</tf-button>
-        </div>
-      </header>
-
-      <div class="pr2-tabs-wrap">
-        <tf-tabs variant="underline" value="${escape(ctx.defaultTab)}" id="pc-tabs">
-          <tf-tab id="overview">Overview</tf-tab>
-          <tf-tab id="flame">CPU Flamegraph</tf-tab>
-          <tf-tab id="gpu">GPU</tf-tab>
-          <tf-tab id="memory">Memory</tf-tab>
-          <tf-tab id="power">Power</tf-tab>
-        </tf-tabs>
-      </div>
-
-      <main class="pc-body" id="pc-body" role="region" aria-label="Compare body"></main>
+      ${renderHeader(ctx)}
+      ${renderSummaryGrid(ctx)}
+      ${renderDifferentialFlamegraph(ctx)}
+      ${renderMetaTable(ctx)}
     </div>
   `;
 }
@@ -180,9 +135,9 @@ function renderShell(ctx) {
 function renderSkeleton() {
   return `
     <div class="profile-compare pc-loading">
-      <div class="pr2-skeleton" style="width:50%; height:24px;"></div>
-      <div class="pr2-skeleton" style="width:100%; height:120px; margin-top:14px;"></div>
-      <div class="pr2-skeleton" style="width:100%; height:300px; margin-top:14px;"></div>
+      <div class="pr-skeleton" style="width:50%; height:24px;"></div>
+      <div class="pr-skeleton" style="width:100%; height:120px; margin-top:14px;"></div>
+      <div class="pr-skeleton" style="width:100%; height:300px; margin-top:14px;"></div>
     </div>
   `;
 }
@@ -209,7 +164,7 @@ function bindBack(container) {
   });
 }
 
-function bindShell(container, ctx) {
+function bindShell(container) {
   container.addEventListener('click', (e) => {
     const t = e.target.closest('[data-action]');
     if (!t) return;
@@ -218,379 +173,412 @@ function bindShell(container, ctx) {
       navigateBack();
     }
   });
-
-  const tabsEl = container.querySelector('#pc-tabs');
-  if (tabsEl) {
-    tabsEl.addEventListener('change', (e) => {
-      const id = e.detail?.value;
-      if (id) renderTab(container, ctx, id);
-    });
-  }
 }
 
 // =============================================================================
-// Tab dispatch + per-tab content.
+// Header — tytuł + akcja Back.
 // =============================================================================
 
-function renderTab(container, ctx, tabId) {
-  const body = container.querySelector('#pc-body');
-  if (!body) return;
-  // Flamegraph tab nie cache'ujemy bo wymaga remount instances.
-  if (tabId === 'flame') {
-    body.innerHTML = '';
-    renderFlameTab(body, ctx);
-    return;
-  }
-  if (ctx._tabHtml.has(tabId)) {
-    body.innerHTML = ctx._tabHtml.get(tabId);
-    return;
-  }
-  let html = '';
-  switch (tabId) {
-    case 'overview': html = renderOverviewTab(ctx); break;
-    case 'gpu':      html = renderGpuTab(ctx);      break;
-    case 'memory':   html = renderMemoryTab(ctx);   break;
-    case 'power':    html = renderPowerTab(ctx);    break;
-    default:         html = `<div class="pc-empty">Unknown tab: ${escape(tabId)}</div>`;
-  }
-  ctx._tabHtml.set(tabId, html);
-  body.innerHTML = html;
-}
-
-// ---- Delta helpers ----------------------------------------------------------
-
-const DELTA_THRESHOLD = 0.05; // ±5% — scoring "better/worse/unchanged"
-
-function pctDelta(a, b) {
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  if (a === 0) return b === 0 ? 0 : Infinity;
-  return (b - a) / Math.abs(a);
-}
-
-function renderDeltaPill(rawA, rawB, opts = {}) {
-  const { unit = '', formatter = (x) => String(x), lowerIsBetter = true } = opts;
-  if (!Number.isFinite(rawA) || !Number.isFinite(rawB)) {
-    return `<span class="pc-delta neutral">—</span>`;
-  }
-  const diff = rawB - rawA;
-  const pct = pctDelta(rawA, rawB);
-  const absPct = Math.abs(pct ?? 0);
-  let cls = 'neutral';
-  if (absPct >= DELTA_THRESHOLD) {
-    const worse = (diff > 0) === lowerIsBetter;
-    cls = worse ? 'worse' : 'better';
-  }
-  const sign = diff > 0 ? '+' : '';
-  const valueStr = `${sign}${formatter(diff)}${unit}`;
-  return `<span class="pc-delta ${cls}">${escape(valueStr)}</span>`;
-}
-
-// ---- Overview ---------------------------------------------------------------
-
-function renderOverviewTab(ctx) {
-  const ka = ctx.a.kpis;
-  const kb = ctx.b.kpis;
+function renderHeader(ctx) {
   const a = ctx.a.report;
   const b = ctx.b.report;
+  const labelA = escape(sessionLabel(a));
+  const labelB = escape(sessionLabel(b));
+  return `
+    <header class="compare-header">
+      <div class="compare-title-block">
+        <h1 class="compare-title">Compare sessions</h1>
+        <div class="compare-sub">
+          <span class="status-pill local">Baseline</span>
+          <strong>${labelA}</strong>
+          <span class="compare-vs">vs</span>
+          <span class="status-pill sso">Compared</span>
+          <strong>${labelB}</strong>
+        </div>
+      </div>
+      <div class="compare-actions">
+        <tf-button variant="ghost" size="sm" data-action="back-mesh">Back</tf-button>
+      </div>
+    </header>
+  `;
+}
 
-  const rows = [
-    {
-      label: 'CPU avg',
-      a: ka.cpu.avgUtil, b: kb.cpu.avgUtil,
-      fmt: (x) => x.toFixed(1) + '%',
-      delta: renderDeltaPill(ka.cpu.avgUtil, kb.cpu.avgUtil, { unit: 'pp', formatter: (d) => d.toFixed(1) }),
-    },
-    {
-      label: 'CPU peak',
-      a: ka.cpu.peakUtil, b: kb.cpu.peakUtil,
-      fmt: (x) => x.toFixed(1) + '%',
-      delta: renderDeltaPill(ka.cpu.peakUtil, kb.cpu.peakUtil, { unit: 'pp', formatter: (d) => d.toFixed(1) }),
-    },
-    {
-      label: 'RAM peak',
-      a: ka.ram.peakUsedBytes, b: kb.ram.peakUsedBytes,
-      fmt: (x) => formatBytes(x),
-      delta: renderDeltaPill(ka.ram.peakUsedBytes, kb.ram.peakUsedBytes, { formatter: (d) => formatBytes(Math.abs(d)) }),
-    },
-    {
-      label: 'Power avg',
-      a: ka.power.avgW, b: kb.power.avgW,
-      fmt: (x) => formatPower(x),
-      delta: renderDeltaPill(ka.power.avgW, kb.power.avgW, { unit: ' W', formatter: (d) => d.toFixed(1) }),
-    },
-    {
-      label: 'Power peak',
-      a: ka.power.peakW, b: kb.power.peakW,
-      fmt: (x) => formatPower(x),
-      delta: renderDeltaPill(ka.power.peakW, kb.power.peakW, { unit: ' W', formatter: (d) => d.toFixed(1) }),
-    },
-    {
-      label: 'Total time',
-      a: a.duration_ns, b: b.duration_ns,
-      fmt: (x) => formatDurationNs(x),
-      delta: renderDeltaPill(a.duration_ns, b.duration_ns, { formatter: (d) => formatDurationNs(Math.abs(d)) }),
-    },
-  ];
+function sessionLabel(report) {
+  if (report.scope?.label) return report.scope.label;
+  if (report.session_id) return report.session_id.slice(0, 8);
+  return 'session';
+}
 
-  // GPU0 peak compute (jeżeli oba mają)
-  const gpu0A = ka.gpu.get(0);
-  const gpu0B = kb.gpu.get(0);
-  if (gpu0A && gpu0B) {
-    rows.push({
-      label: 'GPU0 SM peak',
-      a: gpu0A.peakCompute, b: gpu0B.peakCompute,
-      fmt: (x) => x.toFixed(1) + '%',
-      delta: renderDeltaPill(gpu0A.peakCompute, gpu0B.peakCompute, { unit: 'pp', formatter: (d) => d.toFixed(1), lowerIsBetter: false }),
-    });
-  }
+// =============================================================================
+// Summary grid — dwie karty side-by-side z KPI i deltami (mockup s13).
+// =============================================================================
 
-  const rowsHtml = rows.map((r) => `
-    <div class="pc-kpi-row">
-      <div class="pc-kpi-name">${escape(r.label)}</div>
-      <div class="pc-kpi-a">${escape(r.fmt(r.a))}</div>
-      <div class="pc-kpi-b">${escape(r.fmt(r.b))}</div>
-      <div class="pc-kpi-delta">${r.delta}</div>
+function renderSummaryGrid(ctx) {
+  return `
+    <section class="tf-section-card compare-section">
+      <h3 class="compare-section-h3">Side-by-side</h3>
+      <div class="compare-grid">
+        ${renderSummaryCard(ctx.a, ctx.b, 'baseline')}
+        ${renderSummaryCard(ctx.b, ctx.a, 'compared')}
+      </div>
+    </section>
+  `;
+}
+
+// side: 'baseline' | 'compared'. Dla baseline nie pokazujemy delt; dla compared
+// liczymy deltę względem baseline.
+function renderSummaryCard(self, other, side) {
+  const isCompared = side === 'compared';
+  const pillClass = isCompared ? 'sso' : 'local';
+  const pillText = isCompared ? 'Compared' : 'Baseline';
+  const sourcesCount = countSources(self.report);
+  const dur = formatDurationShort(self.report.duration_ns || 0);
+  const label = escape(sessionLabel(self.report));
+  const date = escape(formatDateTime(self.report.t0_wallclock_unix_ns));
+
+  const tiles = buildSummaryTiles(self.kpis, isCompared ? other.kpis : null, self.report, isCompared ? other.report : null);
+  const tilesHtml = tiles.map((t) => `
+    <div class="kpi-tile">
+      <div class="kpi-label">${escape(t.label)}${t.deltaHtml ? ' ' + t.deltaHtml : ''}</div>
+      <div class="kpi-value">${escape(t.value)}</div>
     </div>
   `).join('');
 
   return `
-    <section class="pc-section">
-      <h3 class="pc-h3">Side-by-side KPIs</h3>
-      <div class="pc-kpi-table">
-        <div class="pc-kpi-head">
-          <div></div>
-          <div class="pc-col-a">A · baseline</div>
-          <div class="pc-col-b">B · compared</div>
-          <div class="pc-col-d">Δ (B − A)</div>
-        </div>
-        ${rowsHtml}
+    <div class="compare-card">
+      <div class="compare-card-head">
+        <span class="status-pill ${pillClass}">${pillText}</span>
+        <strong class="compare-card-title">${label}</strong>
+        <span class="compare-card-meta">${dur} · ${sourcesCount} sources · ${date}</span>
       </div>
-      <div class="pc-legend">
-        <span><span class="sw better"></span>better in B (≥5%)</span>
-        <span><span class="sw worse"></span>worse in B (≥5%)</span>
-        <span><span class="sw neutral"></span>~unchanged</span>
+      <div class="kpi-grid kpi-grid-2">
+        ${tilesHtml}
       </div>
-    </section>
+    </div>
   `;
 }
 
-// ---- CPU Flamegraph (side-by-side + top function deltas) -------------------
+function buildSummaryTiles(self, other, repSelf, repOther) {
+  const cpuVal = self.cpu.avgUtil;
+  const gpu0 = self.gpu.get(0);
+  const pwrVal = self.power.avgW;
+  const totalNs = repSelf.duration_ns || 0;
 
-function renderFlameTab(body, ctx) {
-  body.innerHTML = `
-    <section class="pc-section">
-      <h3 class="pc-h3">CPU Flamegraph — side-by-side</h3>
-      <div class="pc-flame-grid">
-        <div class="pc-flame-pane">
-          <div class="pc-pane-head"><span class="pc-chip pc-chip-a">A · baseline</span></div>
-          <div id="pc-flame-a" class="pc-flame-host"></div>
-        </div>
-        <div class="pc-flame-pane">
-          <div class="pc-pane-head"><span class="pc-chip pc-chip-b">B · compared</span></div>
-          <div id="pc-flame-b" class="pc-flame-host"></div>
-        </div>
-      </div>
-      <div id="pc-flame-deltas" class="pc-flame-deltas"></div>
-    </section>
-  `;
-
-  const hostA = body.querySelector('#pc-flame-a');
-  const hostB = body.querySelector('#pc-flame-b');
-
-  const dataA = {
-    events: ctx.a.report.events || [],
-    frames: ctx.a.report.frames || [],
-    stacks: ctx.a.report.stacks || [],
-    names: ctx.a.report.names || [],
-    totalDurationNs: ctx.a.report.duration_ns || 0,
-    source: 'A',
-  };
-  const dataB = {
-    events: ctx.b.report.events || [],
-    frames: ctx.b.report.frames || [],
-    stacks: ctx.b.report.stacks || [],
-    names: ctx.b.report.names || [],
-    totalDurationNs: ctx.b.report.duration_ns || 0,
-    source: 'B',
-  };
-
-  // Każda strona = osobna instancja flamegrapha (full mode). Differential mode
-  // wbudowany w CpuFlamegraph operuje na zakresach czasu w obrębie jednego
-  // raportu, więc nie da się go bezpośrednio zastosować cross-report.
-  try {
-    new CpuFlamegraph(hostA, dataA);
-  } catch (err) {
-    hostA.innerHTML = `<div class="pc-empty">Flamegraph A unavailable: ${escape(err?.message || err)}</div>`;
+  const tiles = [];
+  // CPU avg
+  tiles.push({
+    label: 'CPU avg',
+    value: Number.isFinite(cpuVal) ? `${cpuVal.toFixed(0)}%` : '—',
+    deltaHtml: other ? deltaPctPill(other.cpu.avgUtil, cpuVal, { suffix: 'pp', lowerIsBetter: true }) : '',
+  });
+  // GPU0 SM peak
+  if (gpu0) {
+    const otherGpu0 = other ? other.gpu.get(0) : null;
+    tiles.push({
+      label: 'GPU0 SM peak',
+      value: Number.isFinite(gpu0.peakCompute) ? `${gpu0.peakCompute.toFixed(0)}%` : '—',
+      deltaHtml: otherGpu0 ? deltaPctPill(otherGpu0.peakCompute, gpu0.peakCompute, { suffix: 'pp', lowerIsBetter: false }) : '',
+    });
+  } else {
+    tiles.push({ label: 'GPU0 SM peak', value: '—', deltaHtml: '' });
   }
-  try {
-    new CpuFlamegraph(hostB, dataB);
-  } catch (err) {
-    hostB.innerHTML = `<div class="pc-empty">Flamegraph B unavailable: ${escape(err?.message || err)}</div>`;
-  }
-
-  // Tablica delt funkcji CPU — top symbole z każdej strony, scal po nazwie.
-  const deltasHost = body.querySelector('#pc-flame-deltas');
-  deltasHost.innerHTML = renderTopSymbolDeltas(ctx);
+  // Power avg
+  tiles.push({
+    label: 'Power avg',
+    value: Number.isFinite(pwrVal) ? formatPower(pwrVal) : '—',
+    deltaHtml: other ? deltaAbsPill(other.power.avgW, pwrVal, ' W', 0, true) : '',
+  });
+  // Total time
+  const otherNs = repOther ? (repOther.duration_ns || 0) : 0;
+  tiles.push({
+    label: 'Total time',
+    value: formatDurationShort(totalNs),
+    deltaHtml: other ? deltaTimePill(otherNs, totalNs) : '',
+  });
+  return tiles;
 }
 
-function topCpuSymbols(report) {
-  // Agregacja CpuSample.pct po name_id (compatibility: fixture nie ma stacks).
-  const names = report.names || [];
-  const byName = new Map();
+// Pigułka delty w stylu mockupu (.delta-down zielone = lepiej dla B,
+// .delta-up czerwone = gorzej dla B, .delta-flat = bez zmian).
+// otherVal = baseline (A), selfVal = aktualna (B).
+function deltaPctPill(baseline, current, { suffix = '%', lowerIsBetter = true } = {}) {
+  if (!Number.isFinite(baseline) || !Number.isFinite(current)) return '';
+  const diff = current - baseline;
+  if (Math.abs(diff) < 0.05) {
+    return `<span class="compare-delta same delta-flat">~0${suffix}</span>`;
+  }
+  const sign = diff > 0 ? '+' : '';
+  const isBetter = lowerIsBetter ? diff < 0 : diff > 0;
+  const cls = isBetter ? 'delta-down compare-delta down' : 'delta-up compare-delta up';
+  return `<span class="${cls}">${sign}${diff.toFixed(0)}${suffix}</span>`;
+}
+
+function deltaAbsPill(baseline, current, unit, decimals, lowerIsBetter) {
+  if (!Number.isFinite(baseline) || !Number.isFinite(current)) return '';
+  const diff = current - baseline;
+  if (Math.abs(diff) < 0.5) {
+    return `<span class="compare-delta same delta-flat">~0${unit}</span>`;
+  }
+  const sign = diff > 0 ? '+' : '';
+  const isBetter = lowerIsBetter ? diff < 0 : diff > 0;
+  const cls = isBetter ? 'delta-down compare-delta down' : 'delta-up compare-delta up';
+  return `<span class="${cls}">${sign}${diff.toFixed(decimals)}${unit}</span>`;
+}
+
+function deltaTimePill(baselineNs, currentNs) {
+  if (!Number.isFinite(baselineNs) || !Number.isFinite(currentNs)) return '';
+  const diff = currentNs - baselineNs;
+  const absSec = Math.abs(diff) / 1e9;
+  if (absSec < 0.05) {
+    return `<span class="compare-delta same delta-flat">~0s</span>`;
+  }
+  const sign = diff > 0 ? '+' : '-';
+  const cls = diff < 0 ? 'delta-down compare-delta down' : 'delta-up compare-delta up';
+  return `<span class="${cls}">${sign}${absSec.toFixed(1)}s</span>`;
+}
+
+function formatDurationShort(ns) {
+  if (!Number.isFinite(ns) || ns <= 0) return '0:00';
+  const sec = ns / 1e9;
+  const m = Math.floor(sec / 60);
+  const s = sec - m * 60;
+  return `${m}:${s.toFixed(1).padStart(4, '0')}`;
+}
+
+function countSources(report) {
+  // Heurystyka: liczba unikalnych kategorii zdarzeń + GPU count.
+  const cats = new Set();
   for (const ev of report.events || []) {
-    if (ev.category !== 'CpuSample') continue;
-    const p = ev.payload && (ev.payload.CpuSample || ev.payload);
-    if (!p) continue;
-    const nm = (typeof p.name_id === 'number' && names[p.name_id]) || '—';
-    const cur = byName.get(nm) || 0;
-    byName.set(nm, cur + (Number(p.pct) || 0));
+    if (ev.category) cats.add(String(ev.category));
   }
-  return byName;
+  return cats.size || 0;
 }
 
-function renderTopSymbolDeltas(ctx) {
-  const mapA = topCpuSymbols(ctx.a.report);
-  const mapB = topCpuSymbols(ctx.b.report);
-  const all = new Set([...mapA.keys(), ...mapB.keys()]);
-  const rows = [];
-  for (const nm of all) {
-    const va = mapA.get(nm) || 0;
-    const vb = mapB.get(nm) || 0;
-    rows.push({ name: nm, a: va, b: vb, diff: vb - va });
-  }
-  rows.sort((x, y) => Math.abs(y.diff) - Math.abs(x.diff));
-  const top = rows.slice(0, 12);
-  if (top.length === 0) {
-    return `<div class="pc-empty">No CPU sample data to compare.</div>`;
+// =============================================================================
+// Differential flamegraph — własny SVG renderer.
+// =============================================================================
+
+function renderDifferentialFlamegraph(ctx) {
+  const layout = computeFlameDiffLayout(ctx.a.report, ctx.b.report);
+  if (!layout || layout.rects.length === 0) {
+    return `
+      <section class="tf-section-card compare-section">
+        <h3 class="compare-section-h3">Differential flamegraph</h3>
+        <div class="pc-empty diff-flamegraph-empty">No CPU sample data available in either session.</div>
+      </section>
+    `;
   }
 
-  const body = top.map((r) => {
-    const sign = r.diff > 0 ? '+' : '';
-    let cls = 'neutral';
-    if (Math.abs(r.diff) >= 0.5) cls = r.diff > 0 ? 'worse' : 'better';
+  const W = 920;
+  const ROW_H = 22;
+  const H = layout.depth * ROW_H + ROW_H + 4;
+  const rects = layout.rects.map((r) => {
+    const cls = colorClass(r.deltaShare);
+    const labelText = formatRectLabel(r);
+    const showText = r.w >= 60;
     return `
-      <tr>
-        <td class="mono">${escape(r.name)}</td>
-        <td class="num">${r.a.toFixed(2)}%</td>
-        <td class="num">${r.b.toFixed(2)}%</td>
-        <td class="num"><span class="pc-delta ${cls}">${sign}${r.diff.toFixed(2)}%</span></td>
-      </tr>
+      <g>
+        <rect class="diff-rect ${cls}" x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${r.w.toFixed(1)}" height="${ROW_H - 1}"/>
+        ${showText ? `<text x="${(r.x + 6).toFixed(1)}" y="${(r.y + 15).toFixed(1)}">${escape(labelText)}</text>` : ''}
+      </g>
     `;
   }).join('');
 
   return `
-    <h3 class="pc-h3">Top function deltas</h3>
-    <table class="pc-table">
-      <thead><tr><th>Symbol</th><th class="num">A %</th><th class="num">B %</th><th class="num">Δ</th></tr></thead>
-      <tbody>${body}</tbody>
-    </table>
-  `;
-}
-
-// ---- GPU --------------------------------------------------------------------
-
-function renderGpuTab(ctx) {
-  const ga = ctx.a.kpis.gpu;
-  const gb = ctx.b.kpis.gpu;
-  const ids = new Set([...ga.keys(), ...gb.keys()]);
-  if (ids.size === 0) {
-    return `<section class="pc-section"><div class="pc-empty">No GPU data in either session.</div></section>`;
-  }
-  const blocks = [];
-  for (const id of Array.from(ids).sort((x, y) => x - y)) {
-    const a = ga.get(id);
-    const b = gb.get(id);
-    const peakA = a?.peakCompute ?? NaN;
-    const peakB = b?.peakCompute ?? NaN;
-    const memA = a?.memUsedBytes ?? NaN;
-    const memB = b?.memUsedBytes ?? NaN;
-    const pwrA = a?.peakW ?? NaN;
-    const pwrB = b?.peakW ?? NaN;
-
-    blocks.push(`
-      <div class="pc-card">
-        <div class="pc-card-head">GPU ${id}</div>
-        <div class="pc-kpi-row"><div class="pc-kpi-name">SM peak</div>
-          <div class="pc-kpi-a">${Number.isFinite(peakA) ? peakA.toFixed(1) + '%' : '—'}</div>
-          <div class="pc-kpi-b">${Number.isFinite(peakB) ? peakB.toFixed(1) + '%' : '—'}</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(peakA, peakB, { unit: 'pp', formatter: (d) => d.toFixed(1), lowerIsBetter: false })}</div>
-        </div>
-        <div class="pc-kpi-row"><div class="pc-kpi-name">Mem used</div>
-          <div class="pc-kpi-a">${Number.isFinite(memA) ? formatBytes(memA) : '—'}</div>
-          <div class="pc-kpi-b">${Number.isFinite(memB) ? formatBytes(memB) : '—'}</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(memA, memB, { formatter: (d) => formatBytes(Math.abs(d)) })}</div>
-        </div>
-        <div class="pc-kpi-row"><div class="pc-kpi-name">Power peak</div>
-          <div class="pc-kpi-a">${Number.isFinite(pwrA) ? formatPower(pwrA) : '—'}</div>
-          <div class="pc-kpi-b">${Number.isFinite(pwrB) ? formatPower(pwrB) : '—'}</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(pwrA, pwrB, { unit: ' W', formatter: (d) => d.toFixed(1) })}</div>
-        </div>
+    <section class="tf-section-card compare-section">
+      <h3 class="compare-section-h3">Differential flamegraph</h3>
+      <div class="flame-wrap diff-flamegraph">
+        <svg class="flame-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+          <g font-family="JetBrains Mono, ui-monospace, monospace" font-size="9">
+            ${rects}
+          </g>
+        </svg>
       </div>
-    `);
-  }
-  return `<section class="pc-section"><h3 class="pc-h3">GPU per-device comparison</h3>${blocks.join('')}</section>`;
-}
-
-// ---- Memory -----------------------------------------------------------------
-
-function renderMemoryTab(ctx) {
-  const ka = ctx.a.kpis.ram;
-  const kb = ctx.b.kpis.ram;
-  return `
-    <section class="pc-section">
-      <h3 class="pc-h3">Memory comparison</h3>
-      <div class="pc-kpi-table">
-        <div class="pc-kpi-head">
-          <div></div><div class="pc-col-a">A</div><div class="pc-col-b">B</div><div class="pc-col-d">Δ</div>
-        </div>
-        <div class="pc-kpi-row">
-          <div class="pc-kpi-name">Peak used</div>
-          <div class="pc-kpi-a">${escape(formatBytes(ka.peakUsedBytes))}</div>
-          <div class="pc-kpi-b">${escape(formatBytes(kb.peakUsedBytes))}</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(ka.peakUsedBytes, kb.peakUsedBytes, { formatter: (d) => formatBytes(Math.abs(d)) })}</div>
-        </div>
-        <div class="pc-kpi-row">
-          <div class="pc-kpi-name">Peak BW</div>
-          <div class="pc-kpi-a">${escape(formatBytes(ka.peakBwBps))}/s</div>
-          <div class="pc-kpi-b">${escape(formatBytes(kb.peakBwBps))}/s</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(ka.peakBwBps, kb.peakBwBps, { formatter: (d) => formatBytes(Math.abs(d)) + '/s' })}</div>
-        </div>
+      <div class="diff-legend">
+        <span><span class="sw slower-red"></span>slower in compared (≥${(DELTA_FRAME * 100).toFixed(0)}%)</span>
+        <span><span class="sw faster-green"></span>faster in compared (≥${(DELTA_FRAME * 100).toFixed(0)}%)</span>
+        <span><span class="sw unchanged"></span>~unchanged</span>
       </div>
     </section>
   `;
 }
 
-// ---- Power ------------------------------------------------------------------
+// Klasa CSS dla diff-rect. deltaShare ∈ [-1, +1].
+function colorClass(deltaShare) {
+  if (!Number.isFinite(deltaShare)) return 'unchanged';
+  if (deltaShare >= DELTA_FRAME) return 'slower-red';
+  if (deltaShare <= -DELTA_FRAME) return 'faster-green';
+  return 'unchanged';
+}
 
-function renderPowerTab(ctx) {
-  const pa = ctx.a.kpis.power;
-  const pb = ctx.b.kpis.power;
+function formatRectLabel(r) {
+  if (Math.abs(r.deltaShare) < 0.005) return r.name;
+  const sign = r.deltaShare > 0 ? '+' : '';
+  return `${r.name} ${sign}${(r.deltaShare * 100).toFixed(1)}%`;
+}
+
+// Buduje layout differential flamegraph poprzez agregację CPU sampli z A i B
+// per (depth, frame_name). Wynik to lista prostokątów z pozycją, szerokością
+// proporcjonalną do max(shareA, shareB) i wartością deltaShare = (shareB-shareA)
+// / max(shareA, shareB).
+function computeFlameDiffLayout(repA, repB) {
+  const aggA = aggregateSamples(repA);
+  const aggB = aggregateSamples(repB);
+  if (aggA.totalSamples === 0 && aggB.totalSamples === 0) return null;
+
+  // Zbiór wszystkich (depth, name) z obu stron.
+  const keys = new Set([...aggA.byKey.keys(), ...aggB.byKey.keys()]);
+  const merged = [];
+  for (const key of keys) {
+    const [depthStr, name] = key.split('', 2);
+    const depth = Number(depthStr);
+    const a = aggA.byKey.get(key) || { samples: 0 };
+    const b = aggB.byKey.get(key) || { samples: 0 };
+    const shareA = aggA.totalSamples > 0 ? a.samples / aggA.totalSamples : 0;
+    const shareB = aggB.totalSamples > 0 ? b.samples / aggB.totalSamples : 0;
+    const maxShare = Math.max(shareA, shareB);
+    if (maxShare < 0.005) continue; // odrzuć bardzo małe ramki
+    const denom = Math.max(shareA, shareB);
+    const deltaShare = denom > 0 ? (shareB - shareA) / denom : 0;
+    merged.push({ depth, name, shareA, shareB, maxShare, deltaShare });
+  }
+
+  // Grupuj po głębokości; w każdej warstwie sortuj malejąco po maxShare
+  // i layoutuj kolejno od x=0; szerokość proporcjonalna do maxShare względem
+  // sumy maxShare w warstwie.
+  const W = 920;
+  const ROW_H = 22;
+  const layers = new Map();
+  for (const f of merged) {
+    if (!layers.has(f.depth)) layers.set(f.depth, []);
+    layers.get(f.depth).push(f);
+  }
+
+  let maxDepth = 0;
+  for (const d of layers.keys()) if (d > maxDepth) maxDepth = d;
+  const finalDepth = maxDepth + 1;
+
+  const rects = [];
+  for (const [depth, frames] of layers) {
+    frames.sort((x, y) => y.maxShare - x.maxShare);
+    const sumShare = frames.reduce((s, f) => s + f.maxShare, 0);
+    if (sumShare <= 0) continue;
+    // depth=0 (root) ląduje na dole; głębsze ramki nad nim.
+    const y = (finalDepth - 1 - depth) * ROW_H;
+    let cx = 0;
+    for (const f of frames) {
+      const w = (f.maxShare / sumShare) * W;
+      rects.push({ x: cx, y, w, name: f.name, deltaShare: f.deltaShare });
+      cx += w;
+    }
+  }
+
+  return { rects, depth: finalDepth };
+}
+
+// Agreguje CPU sample według (depth, frame_name) korzystając z tabeli stacks
+// + frames + names. Każdy sample rozkłada swoje "samples" (lub pct, jeśli brak
+// liczby sampli) na każdą ramkę swojego stacka.
+function aggregateSamples(report) {
+  const events = report.events || [];
+  const stacks = report.stacks || [];
+  const frames = report.frames || [];
+  const names = report.names || [];
+  const byKey = new Map();
+  let totalSamples = 0;
+
+  for (const ev of events) {
+    const cat = ev.category;
+    if (cat !== 'CpuSample' && cat !== 0) continue;
+    const payload = ev.payload && (ev.payload.CpuSample || ev.payload);
+    if (!payload) continue;
+    const stackId = Number(payload.stack_id);
+    if (!Number.isFinite(stackId)) continue;
+    const samples = Number(payload.samples) > 0 ? Number(payload.samples) : (Number(payload.pct) || 1);
+    totalSamples += samples;
+    const stack = stacks[stackId];
+    if (!stack || !Array.isArray(stack)) continue;
+    // stack = leaf-first. depth=0 to root (ostatni element).
+    for (let i = 0; i < stack.length; i++) {
+      const frameId = stack[i];
+      const fr = frames[frameId];
+      if (!fr) continue;
+      const nameId = typeof fr === 'object' ? fr.name_id : fr;
+      const name = (typeof nameId === 'number' ? names[nameId] : null) || '—';
+      const depth = stack.length - 1 - i; // root ma depth 0
+      const key = `${depth}${name}`;
+      const cur = byKey.get(key) || { samples: 0 };
+      cur.samples += samples;
+      byKey.set(key, cur);
+    }
+  }
+
+  // Fallback: bez stacks/frames używamy płaskiej agregacji po name_id na depth=0.
+  if (byKey.size === 0) {
+    for (const ev of events) {
+      const cat = ev.category;
+      if (cat !== 'CpuSample' && cat !== 0) continue;
+      const payload = ev.payload && (ev.payload.CpuSample || ev.payload);
+      if (!payload) continue;
+      const nm = (typeof payload.name_id === 'number' ? names[payload.name_id] : null) || '—';
+      const samples = Number(payload.pct) || 1;
+      totalSamples += samples;
+      const key = `0${nm}`;
+      const cur = byKey.get(key) || { samples: 0 };
+      cur.samples += samples;
+      byKey.set(key, cur);
+    }
+  }
+  return { byKey, totalSamples };
+}
+
+// =============================================================================
+// Meta-table — informacje o obu sesjach (sources, durations, timestamps).
+// =============================================================================
+
+function renderMetaTable(ctx) {
+  const a = ctx.a.report;
+  const b = ctx.b.report;
+  const rows = [
+    { label: 'Session ID', a: (a.session_id || '').slice(0, 16) || '—', b: (b.session_id || '').slice(0, 16) || '—', mono: true },
+    { label: 'Started at', a: formatDateTime(a.t0_wallclock_unix_ns), b: formatDateTime(b.t0_wallclock_unix_ns) },
+    { label: 'Duration', a: formatDurationNs(a.duration_ns), b: formatDurationNs(b.duration_ns) },
+    { label: 'Source kinds', a: String(countSources(a)), b: String(countSources(b)) },
+    { label: 'CPU samples', a: countSamples(a).toLocaleString('en-US'), b: countSamples(b).toLocaleString('en-US') },
+    { label: 'GPU devices', a: String(ctx.a.kpis.gpu.size), b: String(ctx.b.kpis.gpu.size) },
+    { label: 'RAM peak', a: formatBytes(ctx.a.kpis.ram.peakUsedBytes), b: formatBytes(ctx.b.kpis.ram.peakUsedBytes) },
+    { label: 'Power avg', a: formatPower(ctx.a.kpis.power.avgW), b: formatPower(ctx.b.kpis.power.avgW) },
+  ];
+
+  const body = rows.map((r) => `
+    <tr>
+      <td class="meta-label">${escape(r.label)}</td>
+      <td class="${r.mono ? 'mono' : ''}">${escape(r.a)}</td>
+      <td class="${r.mono ? 'mono' : ''}">${escape(r.b)}</td>
+    </tr>
+  `).join('');
+
   return `
-    <section class="pc-section">
-      <h3 class="pc-h3">Power comparison</h3>
-      <div class="pc-kpi-table">
-        <div class="pc-kpi-head">
-          <div></div><div class="pc-col-a">A</div><div class="pc-col-b">B</div><div class="pc-col-d">Δ</div>
-        </div>
-        <div class="pc-kpi-row">
-          <div class="pc-kpi-name">Avg watts</div>
-          <div class="pc-kpi-a">${escape(formatPower(pa.avgW))}</div>
-          <div class="pc-kpi-b">${escape(formatPower(pb.avgW))}</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(pa.avgW, pb.avgW, { unit: ' W', formatter: (d) => d.toFixed(1) })}</div>
-        </div>
-        <div class="pc-kpi-row">
-          <div class="pc-kpi-name">Peak watts</div>
-          <div class="pc-kpi-a">${escape(formatPower(pa.peakW))}</div>
-          <div class="pc-kpi-b">${escape(formatPower(pb.peakW))}</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(pa.peakW, pb.peakW, { unit: ' W', formatter: (d) => d.toFixed(1) })}</div>
-        </div>
-        <div class="pc-kpi-row">
-          <div class="pc-kpi-name">Total energy</div>
-          <div class="pc-kpi-a">${(pa.totalKj || 0).toFixed(2)} kJ</div>
-          <div class="pc-kpi-b">${(pb.totalKj || 0).toFixed(2)} kJ</div>
-          <div class="pc-kpi-delta">${renderDeltaPill(pa.totalKj, pb.totalKj, { unit: ' kJ', formatter: (d) => d.toFixed(2) })}</div>
-        </div>
-      </div>
+    <section class="tf-section-card compare-section">
+      <h3 class="compare-section-h3">Sessions metadata</h3>
+      <table class="compare-meta-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th><span class="status-pill local">Baseline</span> A</th>
+            <th><span class="status-pill sso">Compared</span> B</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
     </section>
   `;
+}
+
+function countSamples(report) {
+  let n = 0;
+  for (const ev of report.events || []) {
+    if (ev.category === 'CpuSample' || ev.category === 0) n++;
+  }
+  return n;
 }

@@ -214,8 +214,8 @@ export class ProfilingActiveBanner {
       </div>
       <div class="countdown">${this._countdownHtml()}</div>
       <div class="banner-actions">
-        <tf-button variant="outline" size="sm" icon="external-link" data-action="open-when-done" disabled>Open report when done</tf-button>
-        <tf-button variant="danger" size="sm" icon="stop" data-action="stop">Stop now</tf-button>
+        <tf-button variant="outline" size="sm" icon="chart-line" data-action="open-when-done" disabled>Open report when done</tf-button>
+        <tf-button variant="danger-outline" size="sm" icon="stop" data-action="stop">Stop now</tf-button>
       </div>
       <div class="collectors">${chips}</div>
     `;

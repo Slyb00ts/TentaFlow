@@ -2,7 +2,7 @@
 // Plik: modules/profile-flamegraph.js
 // Opis: Interaktywny CPU flamegraph z drill-down, search highlight, reverse
 //       (icicle), differential mode i side panel "Selected frame". Zywi sie
-//       eventami CpuSample + side-tablicami frames/stacks/names z ProfileReportV2.
+//       eventami CpuSample + side-tablicami frames/stacks/names z ProfileReport.
 //       Renderowanie SVG z clip-renderingiem (tylko ramki >= MIN_PX_WIDTH).
 //       UI komponenty tf-*: tf-button, tf-toggle, tf-searchbox, tf-chip.
 // =============================================================================
@@ -562,6 +562,12 @@ export class CpuFlamegraph {
           </div>`;
         }).join('');
 
+    // Mockup #06 ma przycisk "Open source (file:line)" — pokazujemy tylko gdy
+    // mamy realną ścieżkę pliku, zeby nie zaśmiecać UI dla framów bez debug info.
+    const openSrcBtn = node.file
+      ? `<tf-button variant="outline" size="sm" data-action="open-source" style="margin-top:6px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>Open source (${escapeText(node.file)}${node.line ? ':' + node.line : ''})</tf-button>`
+      : '';
+
     panel.innerHTML = `
       <div class="fp-head">Selected frame</div>
       <div class="fp-symbol">${escapeText(node.name)}</div>
@@ -575,6 +581,7 @@ export class CpuFlamegraph {
         <div class="fp-section-title">Top children</div>
         <div class="fp-children">${childrenHtml}</div>
       </div>
+      ${openSrcBtn}
     `;
 
     panel.querySelectorAll('.fp-child').forEach((el) => {
@@ -589,6 +596,13 @@ export class CpuFlamegraph {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fire(); }
       });
     });
+
+    const openBtn = panel.querySelector('[data-action="open-source"]');
+    if (openBtn) {
+      openBtn.addEventListener('click', () => {
+        this._emit('openSource', { file: node.file, line: node.line, frameId: node.frameId, name: node.name });
+      });
+    }
   }
 
   // ------------------------- Rendering: flame SVG --------------------------
@@ -984,5 +998,71 @@ function escapeText(s) {
     }
   });
 }
+
+// =============================================================================
+// FlamegraphView — adapter for profile-report dispatcher.
+// Dispatcher (renderLazyTab) wymaga `render(host, ctx)`. Tutaj montujemy
+// CpuFlamegraph w hostowym kontenerze i mapujemy ksztalt `ctx.report` (kompat
+// z TimelineView) na argumenty konstruktora. names moze byc obiektem (rkyv)
+// albo tablica (fixtures) — flatten do tablicy zeby data lookup dzialal.
+// =============================================================================
+
+function namesToArray(names) {
+  if (Array.isArray(names)) return names;
+  if (names && typeof names === 'object') {
+    const out = [];
+    for (const [k, v] of Object.entries(names)) {
+      const idx = Number(k);
+      if (Number.isFinite(idx)) out[idx] = v;
+    }
+    return out;
+  }
+  return [];
+}
+
+export const FlamegraphView = {
+  render(host, ctx) {
+    if (!host) return;
+    const report = ctx?.report || {};
+    const events = ctx?.events || report.events || [];
+    if (!events.length) {
+      host.innerHTML = `
+        <div class="pr-card">
+          <div class="pr-banner-degraded">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+            <div><strong>No CPU samples.</strong> This report contains no events for flamegraph aggregation.</div>
+          </div>
+        </div>`;
+      return;
+    }
+
+    // Tear down poprzednia instancja zeby nie wyciekal singleton tooltipa
+    // ani listenery na <tf-tabs> przy przelaczaniu zakladek.
+    if (host._flamegraphInstance && typeof host._flamegraphInstance.destroy === 'function') {
+      try { host._flamegraphInstance.destroy(); } catch (_) { /* noop */ }
+      host._flamegraphInstance = null;
+    }
+
+    host.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'pr-card';
+    host.appendChild(card);
+
+    const mount = document.createElement('div');
+    card.appendChild(mount);
+
+    const fg = new CpuFlamegraph(mount, {
+      events,
+      frames: Array.isArray(report.frames) ? report.frames : [],
+      stacks: Array.isArray(report.stacks) ? report.stacks : [],
+      names: namesToArray(report.names),
+      totalDurationNs: Number(report.duration_ns) || 0,
+      source: report.cpu_source || 'linux.perf.cpu_sampling',
+      sampleHzApprox: Number(report.cpu_hz) || 0,
+    });
+
+    host._flamegraphInstance = fg;
+  },
+};
 
 export default CpuFlamegraph;
