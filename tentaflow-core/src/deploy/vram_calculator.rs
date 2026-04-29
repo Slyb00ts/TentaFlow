@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Konfiguracja modelu pobrana z HF config.json. Pola opcjonalne bo
 /// config moze byc zagniezdzony (text_config dla multimodal) albo uzywac
 /// alternatywnych nazw.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub model_type: String,
     pub architectures: Vec<String>,
