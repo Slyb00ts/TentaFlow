@@ -1134,11 +1134,49 @@ function renderMemoryTab(ctx) {
     ${bwBlock}
     <section class="pr2-card">
       <h2 class="pr2-card-title">Top processes by RSS</h2>
+      ${renderTopRssTable(events, report.names || [])}
+    </section>
+  `;
+}
+
+// Mockup #09 - top procs po RSS. Iteruje ProcessRssSample events, agreguje
+// peak RSS per pid, renderuje table 10 najwiekszych. Banner-degraded gdy brak.
+function renderTopRssTable(events, names) {
+  const rss = eventsForCategory(events, 'ProcessRssSample');
+  if (rss.length === 0) {
+    return `
       <div class="pr2-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div><strong>Per-process RSS not available.</strong> Requires eBPF or psutil sampling — pending feature M5.</div>
+        <div><strong>Per-process RSS not collected.</strong> Add <code>linux.proc.top_processes</code> source.</div>
       </div>
-    </section>
+    `;
+  }
+  const byPid = new Map();
+  for (const e of rss) {
+    const p = unwrapPayload(e.payload);
+    if (!p) continue;
+    const cur = byPid.get(p.pid);
+    const comm = names[p.comm_name_id] || `pid_${p.pid}`;
+    if (!cur || cur.peakRss < p.rss_bytes) {
+      byPid.set(p.pid, { pid: p.pid, comm, peakRss: p.rss_bytes, peakVsz: p.vsz_bytes });
+    }
+  }
+  const top = Array.from(byPid.values()).sort((a, b) => b.peakRss - a.peakRss).slice(0, 10);
+  const totalRss = top.reduce((s, p) => s + p.peakRss, 0) || 1;
+  const rows = top.map((p) => `
+    <tr>
+      <td class="mono">${formatInt(p.pid)}</td>
+      <td>${escape(p.comm)}</td>
+      <td class="num mono">${formatBytes(p.peakRss)}</td>
+      <td class="num mono">${formatBytes(p.peakVsz)}</td>
+      <td class="num mono">${formatPct((p.peakRss / totalRss) * 100, 1)}</td>
+    </tr>
+  `).join('');
+  return `
+    <table class="pr2-table">
+      <thead><tr><th>PID</th><th>Process</th><th class="num">Peak RSS</th><th class="num">Peak VSZ</th><th class="num">% of top10</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
   `;
 }
 
@@ -1221,11 +1259,77 @@ function renderDiskTab(ctx) {
     ${cards}
     <section class="pr2-card">
       <h2 class="pr2-card-title">Top processes by IO</h2>
+      ${renderTopIoTable(events, report.names || [])}
+    </section>
+  `;
+}
+
+// Mockup #10 - top procs po sumie read+write bytes. Bytes sa kumulatywne
+// w /proc/[pid]/io, wiec last - first sample = delta during session.
+function renderTopIoTable(events, names) {
+  const io = eventsForCategory(events, 'ProcessIoSample');
+  if (io.length === 0) {
+    return `
       <div class="pr2-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div><strong>Per-process IO not available.</strong> Requires eBPF (cap_bpf) — pending feature M5.</div>
+        <div><strong>Per-process IO not collected.</strong> Add <code>linux.proc.top_processes</code> source (parses /proc/[pid]/io).</div>
       </div>
-    </section>
+    `;
+  }
+  // Agreguj per pid: (first read, first write, last read, last write).
+  const byPid = new Map();
+  for (const e of io) {
+    const p = unwrapPayload(e.payload);
+    if (!p) continue;
+    const cur = byPid.get(p.pid) || {
+      pid: p.pid,
+      comm: names[p.comm_name_id] || `pid_${p.pid}`,
+      firstRead: p.read_bytes,
+      firstWrite: p.write_bytes,
+      lastRead: p.read_bytes,
+      lastWrite: p.write_bytes,
+      tFirst: e.t_start_ns,
+      tLast: e.t_start_ns,
+    };
+    if (e.t_start_ns < cur.tFirst) {
+      cur.tFirst = e.t_start_ns;
+      cur.firstRead = p.read_bytes;
+      cur.firstWrite = p.write_bytes;
+    }
+    if (e.t_start_ns > cur.tLast) {
+      cur.tLast = e.t_start_ns;
+      cur.lastRead = p.read_bytes;
+      cur.lastWrite = p.write_bytes;
+    }
+    byPid.set(p.pid, cur);
+  }
+  const top = Array.from(byPid.values())
+    .map((p) => ({
+      pid: p.pid,
+      comm: p.comm,
+      readDelta: Math.max(0, p.lastRead - p.firstRead),
+      writeDelta: Math.max(0, p.lastWrite - p.firstWrite),
+    }))
+    .filter((p) => p.readDelta + p.writeDelta > 0)
+    .sort((a, b) => (b.readDelta + b.writeDelta) - (a.readDelta + a.writeDelta))
+    .slice(0, 10);
+  if (top.length === 0) {
+    return `<div class="pr2-banner-degraded"><div>No process IO during this session window.</div></div>`;
+  }
+  const rows = top.map((p) => `
+    <tr>
+      <td class="mono">${formatInt(p.pid)}</td>
+      <td>${escape(p.comm)}</td>
+      <td class="num mono">${formatBytes(p.readDelta)}</td>
+      <td class="num mono">${formatBytes(p.writeDelta)}</td>
+      <td class="num mono">${formatBytes(p.readDelta + p.writeDelta)}</td>
+    </tr>
+  `).join('');
+  return `
+    <table class="pr2-table">
+      <thead><tr><th>PID</th><th>Process</th><th class="num">Read</th><th class="num">Write</th><th class="num">Total</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
   `;
 }
 
