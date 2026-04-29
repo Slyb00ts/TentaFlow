@@ -1191,20 +1191,27 @@ function renderGpuDeviceCard(ctx, d) {
         <tbody>${kernels.slice(0, 30).map((r) => `<tr><td class="mono">${escape(r.name)}</td><td class="num mono">${formatInt(r.count)}</td><td class="num mono">${(r.totalNs / 1e6).toFixed(1)}</td><td class="num mono">${(r.avgNs / 1e3).toFixed(1)}</td><td class="num mono">${formatPct(r.pct)}</td></tr>`).join('')}</tbody>
       </table>`;
 
-  // API calls table — precomputed.
+  // API calls table — precomputed. Apple shows a placeholder row in the same
+  // table layout to keep the unified design intact.
   const apis = k.apis;
   const apiHeader = d.vendor === 'amd' ? 'HIP APIs' : d.vendor === 'intel' ? 'Level Zero APIs' : d.vendor === 'apple' ? 'Metal calls' : 'CUDA APIs';
   const apiTable = apis.length === 0
-    ? `<div class="pr2-banner-degraded inline"><div>${d.vendor === 'apple' ? 'Use Xcode Instruments for Metal API tracing.' : 'No API call data captured.'}</div></div>`
+    ? (d.vendor === 'apple'
+        ? `<table class="pr2-table">
+            <thead><tr><th>API</th><th class="num">Calls</th><th class="num">Total ms</th></tr></thead>
+            <tbody><tr><td class="mono muted">— Metal calls available only with Xcode Instruments trace</td><td></td><td></td></tr></tbody>
+          </table>`
+        : `<div class="pr2-banner-degraded inline"><div>${d.vendor === 'intel' ? 'Per-API timings require Intel GPA / Level Zero tracer.' : 'No API call data captured.'}</div></div>`)
     : `<table class="pr2-table">
         <thead><tr><th>API</th><th class="num">Calls</th><th class="num">Total ms</th></tr></thead>
         <tbody>${apis.slice(0, 30).map((r) => `<tr><td class="mono">${escape(r.name)}</td><td class="num mono">${formatInt(r.count)}</td><td class="num mono">${r.totalNs == null ? '<span class="muted">limited</span>' : (r.totalNs / 1e6).toFixed(1)}</td></tr>`).join('')}</tbody>
       </table>`;
 
-  // Memory transfer chart / banner.
+  // Memory transfer chart / banner. Apple Silicon has no explicit H2D/D2H —
+  // unified memory means transfers are CPU loads/stores, surfaced in RAM tab.
   const transferBlock = d.vendor === 'apple'
-    ? `<div class="pr2-banner-degraded"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/></svg><div><strong>Unified memory architecture</strong> — no explicit host/device transfers on Apple Silicon.</div></div>`
-    : renderTransferChart(d, color);
+    ? `<div class="pr2-banner-degraded"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18"/><circle cx="12" cy="12" r="10"/></svg><div><strong>Unified memory architecture</strong> — no explicit host/device transfers on Apple Silicon. See RAM tab for combined memory pressure.</div></div>`
+    : renderTransferChart(events, d, color);
 
   return `
     <article class="pr2-gpu-device-card ${badge.cls}">
@@ -1244,21 +1251,91 @@ function buildPowerSeriesForGpu(events, deviceId) {
   return out;
 }
 
-function renderTransferChart(d, color) {
+// Mockup #08: trzy linie czasowe H2D / D2H / D2D w jednym SVG (solid + dwa
+// wzory dasharray). Jezeli mamy GpuMemTransfer events, agregujemy bajty/s
+// w 60-bucketowym histogramie i rysujemy realne serie. Bez eventow padamy
+// na bary z peakow (skompresowany manifest).
+function renderTransferChart(events, d, color) {
+  const transferEvents = [];
+  for (const e of eventsForCategory(events, 'GpuMemTransfer')) {
+    const p = unwrapPayload(e.payload) || e.payload;
+    if (!p || p.device_id !== d.device_id) continue;
+    transferEvents.push({ t: e.t_start_ns, kind: p.kind, bytes: Number(p.bytes) || 0, dur: Math.max(1, Number(e.dur_ns) || 1) });
+  }
+
+  if (transferEvents.length > 0) {
+    return renderTransferTimeSeries(transferEvents, d, color);
+  }
+
   if (!d.transfers) {
     return `<div class="pr2-banner-degraded inline"><div>Transfer telemetry not collected for this device.</div></div>`;
   }
   const { h2d_bytes_per_s_peak, d2h_bytes_per_s_peak, d2d_bytes_per_s_peak } = d.transfers;
   const peak = Math.max(h2d_bytes_per_s_peak || 0, d2h_bytes_per_s_peak || 0, d2d_bytes_per_s_peak || 0);
-  // We synthesize a small bar-style chart from the three peak values since
-  // per-tick transfer events are not in the fixture.
+  if (peak === 0) {
+    return `<div class="pr2-banner-degraded inline"><div>No host-device transfers observed during this window.</div></div>`;
+  }
   const w = 600; const h = 60;
   const bars = ['H2D', 'D2H', 'D2D'].map((label, i) => {
     const v = [h2d_bytes_per_s_peak, d2h_bytes_per_s_peak, d2d_bytes_per_s_peak][i] || 0;
     const barW = (v / peak) * (w - 80);
     return `<g><text x="0" y="${18 + i * 18}" font-family="JetBrains Mono" font-size="10" fill="#a0a8c8">${label}</text><rect x="40" y="${10 + i * 18}" width="${barW.toFixed(0)}" height="10" fill="${color}" opacity="${0.9 - i * 0.2}"/><text x="${44 + barW}" y="${18 + i * 18}" font-family="JetBrains Mono" font-size="9" fill="#e8ebf5">${formatBytesPerSec(v)}</text></g>`;
   }).join('');
-  return `<div class="pr2-mini-chart"><div class="mc-title"><span>Peak rates</span><span class="v">peak ${formatBytesPerSec(peak)}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="GPU transfer peaks">${bars}</svg></div>`;
+  return `<div class="pr2-mini-chart"><div class="mc-title"><span>MB/s — H2D · D2H · D2D</span><span class="v">peak ${formatBytesPerSec(peak)}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="GPU transfer peaks">${bars}</svg></div>`;
+}
+
+function renderTransferTimeSeries(transferEvents, d, color) {
+  const BUCKETS = 60;
+  const ts = transferEvents.map((e) => e.t).sort((a, b) => a - b);
+  const tMin = ts[0];
+  const tMax = ts[ts.length - 1] + 1;
+  const span = Math.max(1, tMax - tMin);
+  const bucketNs = span / BUCKETS;
+
+  const series = { H2D: new Float64Array(BUCKETS), D2H: new Float64Array(BUCKETS), D2D: new Float64Array(BUCKETS) };
+  for (const ev of transferEvents) {
+    if (!series[ev.kind]) continue; // UnifiedAccess etc. ignored for this chart
+    const idx = Math.min(BUCKETS - 1, Math.floor((ev.t - tMin) / bucketNs));
+    // bytes/s rate for this event: bytes / dur_ns * 1e9.
+    const rate = (ev.bytes * 1e9) / ev.dur;
+    if (rate > series[ev.kind][idx]) series[ev.kind][idx] = rate;
+  }
+
+  let peak = 0;
+  for (const arr of Object.values(series)) {
+    for (const v of arr) if (v > peak) peak = v;
+  }
+  if (peak === 0) {
+    return `<div class="pr2-banner-degraded inline"><div>No host-device transfers observed during this window.</div></div>`;
+  }
+
+  const w = 600; const h = 60;
+  const baseColors = vendorTransferColors(d.vendor, color);
+  const path = (arr) => {
+    let s = `M0 ${h - (arr[0] / peak) * (h - 6) - 3}`;
+    for (let i = 1; i < BUCKETS; i++) {
+      const x = (i / (BUCKETS - 1)) * w;
+      const y = h - (arr[i] / peak) * (h - 6) - 3;
+      s += ` L${x.toFixed(1)} ${y.toFixed(1)}`;
+    }
+    return s;
+  };
+
+  const lines = [
+    `<path d="${path(series.H2D)}" stroke="${baseColors.h2d}" stroke-width="1.4" fill="none"/>`,
+    `<path d="${path(series.D2H)}" stroke="${baseColors.d2h}" stroke-width="1.4" fill="none" stroke-dasharray="3 2"/>`,
+    `<path d="${path(series.D2D)}" stroke="${baseColors.d2d}" stroke-width="1.2" fill="none" stroke-dasharray="2 3"/>`,
+  ].join('');
+
+  return `<div class="pr2-mini-chart"><div class="mc-title"><span>MB/s — H2D · D2H · D2D</span><span class="v">peak ${formatBytesPerSec(peak)}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="GPU transfer time-series H2D D2H D2D">${lines}</svg></div>`;
+}
+
+// Stroke palette per vendor, matching mockup #08 (NV greens, AMD reds, Intel blues).
+function vendorTransferColors(vendor, fallback) {
+  if (vendor === 'amd')   return { h2d: '#ed1c24', d2h: '#ff6b6b', d2d: '#fbbf24' };
+  if (vendor === 'intel') return { h2d: '#0071c5', d2h: '#4ba3e0', d2d: '#7dd3fc' };
+  if (vendor === 'nvidia' || vendor === 'nv') return { h2d: '#76b900', d2h: '#b9d300', d2d: '#4ade80' };
+  return { h2d: fallback, d2h: fallback, d2d: fallback };
 }
 
 // =============================================================================
