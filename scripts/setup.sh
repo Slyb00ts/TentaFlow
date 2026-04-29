@@ -173,10 +173,16 @@ install_base() {
                 openssl
                 vulkan-icd-loader
                 sqlite
+                # Profiling: perf zbiera CPU samples + PMU counters + uncore IMC.
+                # which jest potrzebne dla collectors/permissions auto-discovery.
+                perf
+                which
+                # iostat dla disk IO collector (/usr/bin/iostat).
+                sysstat
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged pacman -S --needed --noconfirm "${pkgs[@]}"
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "vulkan-loader" "sqlite")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -191,10 +197,16 @@ install_base() {
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
+                # Profiling: linux-tools dostarcza perf, sysstat dostarcza iostat.
+                # linux-tools-generic to meta-package ktory dociaga linux-tools-<kernel>
+                # pasujace do biezacego kernela (Ubuntu 24.04+).
+                linux-tools-common
+                linux-tools-generic
+                sysstat
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libvulkan1" "sqlite3-dev")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "libvulkan1" "sqlite3-dev" "perf" "sysstat")
             ;;
         fedora)
             local pkgs=(
@@ -208,10 +220,14 @@ install_base() {
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
+                # Profiling: perf jest w pakiecie 'perf' na Fedora 38+.
+                # sysstat dostarcza iostat dla linux.iostat.disk collector.
+                perf
+                sysstat
             )
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged dnf install -y "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "vulkan-loader" "sqlite-devel")
+            INSTALLED+=("gcc/g++" "cmake" "clang" "lld" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then

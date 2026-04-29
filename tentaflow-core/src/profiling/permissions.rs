@@ -234,7 +234,17 @@ fn compute_collectors_status() -> Vec<ProfilingCollectorStatus> {
                     ProbeResult::Unavailable { reason } => {
                         available = false;
                         version = None;
-                        note = Some(reason);
+                        // Dolacz konkretne polecenie instalacji dla wykrytej dystrybucji.
+                        // Bez tego user widzi 'perf not in PATH' ale nie wie co
+                        // dokladnie wpisac - 'install perf' to za malo bo paczka
+                        // jest inaczej nazwana per system (Ubuntu: linux-tools-generic,
+                        // Fedora: perf, Arch: perf, macOS: brak).
+                        let hint = install_hint_for_collector(&id);
+                        note = Some(if hint.is_empty() {
+                            reason
+                        } else {
+                            format!("{reason}\n\nInstall: {hint}")
+                        });
                     }
                 }
             }
@@ -285,6 +295,186 @@ fn binary_for_collector(id: &str) -> Option<&'static str> {
     }
 }
 
+// =============================================================================
+// Distro detection + per-collector install hints (mockup #15: konkretna komenda
+// dla user'owej dystrybucji, nie generic 'apt or dnf or pacman or brew').
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedDistro {
+    /// Arch / Manjaro / EndeavourOS / CachyOS / Garuda — pacman.
+    Arch,
+    /// Ubuntu / Debian / Pop!_OS / Mint / Elementary — apt.
+    Debian,
+    /// Fedora / RHEL / CentOS / Rocky / Alma — dnf.
+    Fedora,
+    /// SUSE / openSUSE — zypper.
+    Suse,
+    /// Alpine — apk.
+    Alpine,
+    /// macOS — brew (lub pre-installed).
+    MacOs,
+    /// Windows — winget / scoop.
+    Windows,
+    /// Linux ale nieznana dystrybucja.
+    LinuxUnknown,
+}
+
+fn detect_distro() -> DetectedDistro {
+    if cfg!(target_os = "macos") {
+        return DetectedDistro::MacOs;
+    }
+    if cfg!(target_os = "windows") {
+        return DetectedDistro::Windows;
+    }
+    // Linux: parsuj /etc/os-release ID + ID_LIKE.
+    let os_release = match std::fs::read_to_string("/etc/os-release") {
+        Ok(s) => s,
+        Err(_) => return DetectedDistro::LinuxUnknown,
+    };
+    let mut id = String::new();
+    let mut id_like = String::new();
+    for line in os_release.lines() {
+        if let Some(v) = line.strip_prefix("ID=") {
+            id = v.trim_matches('"').to_lowercase();
+        } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
+            id_like = v.trim_matches('"').to_lowercase();
+        }
+    }
+    let combined = format!("{id} {id_like}");
+    if combined.contains("arch")
+        || combined.contains("manjaro")
+        || combined.contains("cachyos")
+        || combined.contains("endeavouros")
+        || combined.contains("garuda")
+    {
+        DetectedDistro::Arch
+    } else if combined.contains("ubuntu")
+        || combined.contains("debian")
+        || combined.contains("mint")
+        || combined.contains("pop")
+        || combined.contains("elementary")
+        || combined.contains("zorin")
+    {
+        DetectedDistro::Debian
+    } else if combined.contains("fedora")
+        || combined.contains("rhel")
+        || combined.contains("centos")
+        || combined.contains("rocky")
+        || combined.contains("alma")
+    {
+        DetectedDistro::Fedora
+    } else if combined.contains("suse") || combined.contains("opensuse") {
+        DetectedDistro::Suse
+    } else if combined.contains("alpine") {
+        DetectedDistro::Alpine
+    } else {
+        DetectedDistro::LinuxUnknown
+    }
+}
+
+/// Returns concrete install command for the missing tooling backing this
+/// collector, tailored to the detected distro. Empty string when no command
+/// applies (collector is /proc-only or already system-included).
+fn install_hint_for_collector(id: &str) -> String {
+    let distro = detect_distro();
+    // Mapowanie collector_id -> jakiego pakietu uzywa.
+    let pkg_kind = match id {
+        // perf: cpu_sampling, perf_counters, uncore.imc.
+        "linux.perf.cpu_sampling" | "linux.perf.pmu_counters" | "linux.uncore.imc" => "perf",
+        // iostat: linux.iostat.disk + macos.iostat.disk.
+        "linux.iostat.disk" | "macos.iostat.disk" => "iostat",
+        // nsys: NVIDIA Nsight Systems (CUDA Toolkit).
+        "nvidia.nsys.gpu" => "nsys",
+        // nvidia-smi.
+        "linux.nvsmi.gpu_util" => "nvidia-smi",
+        // ROCm tooling.
+        "linux.rocsmi.gpu_util" => "rocm-smi",
+        "linux.rocprof.gpu_kernels" => "rocprof",
+        // Intel iGPU tooling.
+        "linux.intel_gpu_top.gpu" => "intel_gpu_top",
+        // /proc-only collectors - no install needed.
+        _ => return String::new(),
+    };
+    install_command(pkg_kind, distro)
+}
+
+fn install_command(pkg: &str, distro: DetectedDistro) -> String {
+    match (pkg, distro) {
+        // perf - linux performance tools.
+        ("perf", DetectedDistro::Arch) => "sudo pacman -S perf".into(),
+        ("perf", DetectedDistro::Debian) => {
+            "sudo apt install linux-tools-common linux-tools-generic".into()
+        }
+        ("perf", DetectedDistro::Fedora) => "sudo dnf install perf".into(),
+        ("perf", DetectedDistro::Suse) => "sudo zypper install perf".into(),
+        ("perf", DetectedDistro::Alpine) => "sudo apk add perf".into(),
+        ("perf", DetectedDistro::MacOs) => "macOS uses Instruments instead of perf".into(),
+        ("perf", DetectedDistro::Windows) => "Windows: use Windows Performance Recorder (WPR)".into(),
+        ("perf", _) => "Install Linux perf tools (linux-tools / perf package)".into(),
+
+        // iostat - sysstat package.
+        ("iostat", DetectedDistro::Arch) => "sudo pacman -S sysstat".into(),
+        ("iostat", DetectedDistro::Debian) => "sudo apt install sysstat".into(),
+        ("iostat", DetectedDistro::Fedora) => "sudo dnf install sysstat".into(),
+        ("iostat", DetectedDistro::Suse) => "sudo zypper install sysstat".into(),
+        ("iostat", DetectedDistro::Alpine) => "sudo apk add sysstat".into(),
+        ("iostat", DetectedDistro::MacOs) => "iostat is built into macOS".into(),
+        ("iostat", _) => "Install sysstat package (provides iostat)".into(),
+
+        // NVIDIA Nsight Systems - CUDA Toolkit.
+        ("nsys", DetectedDistro::Fedora) => {
+            "Install CUDA Toolkit: https://developer.nvidia.com/cuda-downloads (Fedora repo) or 'sudo dnf install cuda-toolkit'".into()
+        }
+        ("nsys", DetectedDistro::Debian) => {
+            "Install CUDA Toolkit: https://developer.nvidia.com/cuda-downloads (Debian/Ubuntu repo) - includes nsys".into()
+        }
+        ("nsys", DetectedDistro::Arch) => {
+            "sudo pacman -S cuda  (includes Nsight Systems)".into()
+        }
+        ("nsys", DetectedDistro::MacOs) => {
+            "macOS: nsys is not supported - use Xcode Instruments for GPU profiling".into()
+        }
+        ("nsys", DetectedDistro::Windows) => {
+            "Install CUDA Toolkit for Windows: https://developer.nvidia.com/cuda-downloads".into()
+        }
+        ("nsys", _) => {
+            "Install NVIDIA CUDA Toolkit (includes Nsight Systems): https://developer.nvidia.com/cuda-downloads".into()
+        }
+
+        // nvidia-smi - NVIDIA driver.
+        ("nvidia-smi", _) => {
+            "Install NVIDIA proprietary driver (includes nvidia-smi)".into()
+        }
+
+        // ROCm tooling.
+        ("rocm-smi" | "rocprof", DetectedDistro::Arch) => {
+            "yay -S rocm-hip-runtime  (AUR; rocm-smi i rocprof w pakietach rocm-*)".into()
+        }
+        ("rocm-smi" | "rocprof", DetectedDistro::Debian) => {
+            "Install ROCm: https://rocm.docs.amd.com/projects/install-on-linux/en/latest/  (sudo apt install rocm-smi rocprofiler)".into()
+        }
+        ("rocm-smi" | "rocprof", DetectedDistro::Fedora) => {
+            "Install ROCm via Negativo17 repo or AMD official installer; pakiety: rocm-smi rocprofiler".into()
+        }
+        ("rocm-smi" | "rocprof", DetectedDistro::MacOs | DetectedDistro::Windows) => {
+            "AMD ROCm tooling is Linux-only".into()
+        }
+        ("rocm-smi" | "rocprof", _) => {
+            "Install AMD ROCm (https://rocm.docs.amd.com/) - provides rocm-smi and rocprof".into()
+        }
+
+        // Intel GPU top.
+        ("intel_gpu_top", DetectedDistro::Arch) => "sudo pacman -S intel-gpu-tools".into(),
+        ("intel_gpu_top", DetectedDistro::Debian) => "sudo apt install intel-gpu-tools".into(),
+        ("intel_gpu_top", DetectedDistro::Fedora) => "sudo dnf install intel-gpu-tools".into(),
+        ("intel_gpu_top", DetectedDistro::Suse) => "sudo zypper install intel-gpu-tools".into(),
+        ("intel_gpu_top", _) => "Install intel-gpu-tools (provides intel_gpu_top)".into(),
+
+        _ => String::new(),
+    }
+}
+
 fn quick_version(bin: &str) -> Option<String> {
     let path = which::which(bin).ok()?;
     let out = std::process::Command::new(path)
@@ -301,4 +491,49 @@ fn quick_version(bin: &str) -> Option<String> {
         .map(|l| l.trim())
         .find(|l| !l.is_empty())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_command_perf_per_distro() {
+        assert_eq!(install_command("perf", DetectedDistro::Arch), "sudo pacman -S perf");
+        assert_eq!(
+            install_command("perf", DetectedDistro::Debian),
+            "sudo apt install linux-tools-common linux-tools-generic"
+        );
+        assert_eq!(install_command("perf", DetectedDistro::Fedora), "sudo dnf install perf");
+        assert!(install_command("perf", DetectedDistro::MacOs).contains("Instruments"));
+    }
+
+    #[test]
+    fn install_command_iostat_per_distro() {
+        assert_eq!(install_command("iostat", DetectedDistro::Debian), "sudo apt install sysstat");
+        assert_eq!(install_command("iostat", DetectedDistro::Fedora), "sudo dnf install sysstat");
+        assert!(install_command("iostat", DetectedDistro::MacOs).contains("built into"));
+    }
+
+    #[test]
+    fn install_hint_for_perf_collectors() {
+        // perf-based collectors share install hint.
+        for id in &[
+            "linux.perf.cpu_sampling",
+            "linux.perf.pmu_counters",
+            "linux.uncore.imc",
+        ] {
+            let hint = install_hint_for_collector(id);
+            assert!(!hint.is_empty(), "{id} powinno miec hint");
+        }
+    }
+
+    #[test]
+    fn install_hint_proc_only_collectors_empty() {
+        // Pure /proc collectors nie wymagaja zewn instalacji.
+        assert_eq!(install_hint_for_collector("linux.proc.cpu_util"), "");
+        assert_eq!(install_hint_for_collector("linux.proc.ram"), "");
+        assert_eq!(install_hint_for_collector("linux.proc.top_processes"), "");
+        assert_eq!(install_hint_for_collector("linux.netdev"), "");
+    }
 }
