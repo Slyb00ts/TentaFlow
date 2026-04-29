@@ -1469,11 +1469,87 @@ pub(crate) fn build_engine_args(
     args
 }
 
+/// Buduje `Command` ktora opakowuje docelowa binarke w `nice` + `ionice`
+/// na Linuksie zeby silnik podczas startu (model load, torch.compile,
+/// flashinfer JIT) nie zabijal responsywnosci hosta. Wartosci nice/ionice
+/// mozna nadpisac przez TENTAFLOW_ENGINE_NICE / TENTAFLOW_ENGINE_IONICE_CLASS
+/// / TENTAFLOW_ENGINE_IONICE_LEVEL. Ustaw TENTAFLOW_ENGINE_NICE=0 zeby
+/// wylaczyc.
+#[cfg(target_os = "linux")]
+fn build_engine_command(exe: &Path) -> Command {
+    let nice_level = std::env::var("TENTAFLOW_ENGINE_NICE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(5);
+    let ionice_class = std::env::var("TENTAFLOW_ENGINE_IONICE_CLASS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(2);
+    let ionice_level = std::env::var("TENTAFLOW_ENGINE_IONICE_LEVEL")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(7);
+
+    if nice_level == 0 {
+        return Command::new(exe);
+    }
+
+    let nice_available = std::process::Command::new("nice")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !nice_available {
+        return Command::new(exe);
+    }
+
+    let ionice_available = std::process::Command::new("ionice")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let mut cmd = Command::new("nice");
+    cmd.arg("-n").arg(nice_level.to_string());
+    if ionice_available {
+        cmd.arg("ionice")
+            .arg("-c")
+            .arg(ionice_class.to_string())
+            .arg("-n")
+            .arg(ionice_level.to_string());
+    }
+    cmd.arg(exe);
+    cmd
+}
+
+#[cfg(target_os = "macos")]
+fn build_engine_command(exe: &Path) -> Command {
+    let nice_level = std::env::var("TENTAFLOW_ENGINE_NICE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(5);
+    if nice_level == 0 {
+        return Command::new(exe);
+    }
+    let mut cmd = Command::new("nice");
+    cmd.arg("-n").arg(nice_level.to_string()).arg(exe);
+    cmd
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn build_engine_command(exe: &Path) -> Command {
+    Command::new(exe)
+}
+
 fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Result<Child> {
     let exe = venv_bin(venv, &spec.launch.command);
     let bundle_dir = venv.join("app");
 
-    let mut cmd = Command::new(&exe);
+    let mut cmd = build_engine_command(&exe);
     for arg in build_engine_args(spec, &req.env, &bundle_dir, venv) {
         cmd.arg(arg);
     }
@@ -1520,6 +1596,29 @@ fn spawn_engine(venv: &Path, spec: &BundleSpec, req: &NativeDeployRequest) -> Re
         if !req.env.contains_key(k) {
             cmd.env(k, &v);
         }
+    }
+
+    // Cap rownoleglosci compile threads tak, zeby torch.compile / inductor /
+    // flashinfer JIT nie odpalaly N watkow == liczba CPU (na 20-rdzeniowym
+    // node'ie to powoduje ze caly host wisi przez kilka minut przy starcie
+    // modelu). Polowa CPU domyslnie. Override przez TENTAFLOW_COMPILE_THREADS.
+    if !req.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
+        && !spec.launch.env.contains_key("TORCHINDUCTOR_COMPILE_THREADS")
+    {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let compile_threads = std::env::var("TENTAFLOW_COMPILE_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| std::cmp::max(2, cpus / 2));
+        cmd.env(
+            "TORCHINDUCTOR_COMPILE_THREADS",
+            compile_threads.to_string(),
+        );
+        // MAX_JOBS jest honorowane przez setuptools/cmake (flashinfer JIT
+        // cz. nvcc fork-bomb) i ninja przy build_and_load.
+        cmd.env("MAX_JOBS", compile_threads.to_string());
     }
 
     // FlashInfer JIT cache musi byc per-instancja: build.ninja zapisuje
