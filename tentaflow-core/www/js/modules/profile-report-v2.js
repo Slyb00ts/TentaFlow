@@ -1343,7 +1343,7 @@ function vendorTransferColors(vendor, fallback) {
 // =============================================================================
 
 function renderMemoryTab(ctx) {
-  const { events } = ctx;
+  const { events, report } = ctx;
   if (eventsForCategory(events, 'RamSample').length === 0) {
     return noDataCard('No memory samples collected for this session.');
   }
@@ -1355,6 +1355,16 @@ function renderMemoryTab(ctx) {
   const usedPeak = used.reduce((m, [, v]) => Math.max(m, v), 0);
   const availMin = avail.reduce((m, [, v]) => Math.min(m, v), Infinity);
   const faultsPeak = faults.reduce((m, [, v]) => Math.max(m, v), 0);
+  // Total fizyczny RAM aproksymujemy jako max(used+available) — w typowym Linux
+  // sumie tej dwojki nie zmienia sie istotnie (pamiec klasyfikowana inaczej).
+  const totalGbApprox = (() => {
+    let max = 0;
+    for (let i = 0; i < used.length && i < avail.length; i += 1) {
+      const sum = used[i][1] + avail[i][1];
+      if (sum > max) max = sum;
+    }
+    return max;
+  })();
 
   const bwEvents = eventsForCategory(events, 'RamBandwidth');
   const hasBw = bwEvents.length > 0;
@@ -1378,11 +1388,13 @@ function renderMemoryTab(ctx) {
     </div>
   `;
 
+  const readPeak = readSeries.reduce((m, [, v]) => Math.max(m, v), 0);
+  const writePeak = writeSeries.reduce((m, [, v]) => Math.max(m, v), 0);
   const bwBlock = hasBw ? `
     <section class="pr2-card">
       <h2 class="pr2-card-title">RAM bandwidth (uncore counters)</h2>
-      <div class="pr2-mini-chart" style="background:var(--bg-input);">
-        <div class="mc-title"><span>Read · Write GB/s</span><span class="v">read peak ${readSeries.reduce((m, [, v]) => Math.max(m, v), 0).toFixed(1)} GB/s · write peak ${writeSeries.reduce((m, [, v]) => Math.max(m, v), 0).toFixed(1)} GB/s</span></div>
+      <div class="pr2-mini-chart">
+        <div class="mc-title"><span>Read · Write GB/s</span><span class="v">read peak ${readPeak.toFixed(1)} · write peak ${writePeak.toFixed(1)} GB/s</span></div>
         <svg viewBox="0 0 920 80" preserveAspectRatio="none" role="img" aria-label="RAM bandwidth">
           ${ramBandwidthSvg(readSeries, writeSeries)}
         </svg>
@@ -1405,14 +1417,15 @@ function renderMemoryTab(ctx) {
     ${bwBlock}
     <section class="pr2-card">
       <h2 class="pr2-card-title">Top processes by RSS</h2>
-      ${renderTopRssTable(events, report.names || [])}
+      ${renderTopRssTable(events, report.names || [], totalGbApprox)}
     </section>
   `;
 }
 
 // Mockup #09 - top procs po RSS. Iteruje ProcessRssSample events, agreguje
-// peak RSS per pid, renderuje table 10 najwiekszych. Banner-degraded gdy brak.
-function renderTopRssTable(events, names) {
+// peak RSS per pid, renderuje table 10 najwiekszych. % of total liczony
+// wzgledem fizycznego RAM (przyblizenie z RamSample); fallback na sume top10.
+function renderTopRssTable(events, names, totalGb) {
   const rss = eventsForCategory(events, 'ProcessRssSample');
   if (rss.length === 0) {
     return `
@@ -1433,19 +1446,21 @@ function renderTopRssTable(events, names) {
     }
   }
   const top = Array.from(byPid.values()).sort((a, b) => b.peakRss - a.peakRss).slice(0, 10);
-  const totalRss = top.reduce((s, p) => s + p.peakRss, 0) || 1;
+  const totalBytes = (totalGb && totalGb > 0)
+    ? totalGb * 1024 * 1024 * 1024
+    : (top.reduce((s, p) => s + p.peakRss, 0) || 1);
   const rows = top.map((p) => `
     <tr>
       <td class="mono">${formatInt(p.pid)}</td>
       <td>${escape(p.comm)}</td>
       <td class="num mono">${formatBytes(p.peakRss)}</td>
       <td class="num mono">${formatBytes(p.peakVsz)}</td>
-      <td class="num mono">${formatPct((p.peakRss / totalRss) * 100, 1)}</td>
+      <td class="num mono">${formatPct((p.peakRss / totalBytes) * 100, 1)}</td>
     </tr>
   `).join('');
   return `
     <table class="pr2-table">
-      <thead><tr><th>PID</th><th>Process</th><th class="num">Peak RSS</th><th class="num">Peak VSZ</th><th class="num">% of top10</th></tr></thead>
+      <thead><tr><th>PID</th><th>Process</th><th class="num">RSS</th><th class="num">VSZ</th><th class="num">% of total</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   `;
