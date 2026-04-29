@@ -149,15 +149,24 @@ impl NodeAdapter for SttNodeAdapter {
                     }
                 }
 
-                // HTTP backend jako fallback
-                let backends = self
+                // HTTP backend (snapshot-first; legacy fallback removed in FAZA-8c).
+                // STT-over-HTTP path itself is not yet implemented — this branch
+                // only logs that a backend was discoverable so an operator can
+                // see the routing decision.
+                let backend_opt = self
                     .service_manager
-                    .get_service_backends_cloned(&model_name);
-                if let Some(ref backends) = backends {
-                    if !backends.is_empty() {
-                        debug!("STT adapter: uzywam HTTP backend (fallback)");
-                        // TODO: Implementacja HTTP STT - wymaga TranscriptionRequest
-                    }
+                    .resolve_http_backends_via_snapshot(&model_name)
+                    .and_then(|v| v.into_iter().next())
+                    .or_else(|| {
+                        self.service_manager
+                            .get_service_backends_cloned(&model_name)
+                            .and_then(|v| v.into_iter().next())
+                    });
+                if let Some(backend) = backend_opt {
+                    debug!(
+                        "STT adapter: HTTP backend dostepny ({}), HTTP transcription path not implemented yet",
+                        backend.url()
+                    );
                 }
 
                 bail!(

@@ -348,14 +348,18 @@ impl NodeAdapter for LlmNodeAdapter {
             }
         }
 
-        // HTTP backend
-        let backend = self
+        // HTTP backend (snapshot-first; legacy fallback removed in FAZA-8c).
+        let backend_opt = self
             .service_manager
-            .get_service_backends_cloned(&model_name);
-        match backend {
-            Some(backends) if !backends.is_empty() => {
-                let backend = &backends[0];
-
+            .resolve_http_backends_via_snapshot(&model_name)
+            .and_then(|v| v.into_iter().next())
+            .or_else(|| {
+                self.service_manager
+                    .get_service_backends_cloned(&model_name)
+                    .and_then(|v| v.into_iter().next())
+            });
+        match backend_opt {
+            Some(backend) => {
                 debug!("LLM adapter: HTTP backend {}", backend.url(),);
 
                 let response = backend.chat_completion(request).await?;
@@ -486,19 +490,25 @@ impl NodeAdapter for LlmNodeAdapter {
             }
         }
 
-        let backends = self
+        // Snapshot-first; legacy fallback removed in FAZA-8c.
+        let backend_opt = self
             .service_manager
-            .get_service_backends_cloned(&model_name);
-        match backends {
-            Some(backends) if !backends.is_empty() => {
-                let backend = backends[0].clone();
+            .resolve_http_backends_via_snapshot(&model_name)
+            .and_then(|v| v.into_iter().next())
+            .or_else(|| {
+                self.service_manager
+                    .get_service_backends_cloned(&model_name)
+                    .and_then(|v| v.into_iter().next())
+            });
+        match backend_opt {
+            Some(backend) => {
                 debug!("LLM adapter streaming: HTTP backend {}", backend.url());
                 match backend.chat_completion_stream(request).await {
                     Ok(stream) => Some(Ok(stream)),
                     Err(e) => Some(Err(e)),
                 }
             }
-            _ => Some(Err(anyhow!(
+            None => Some(Err(anyhow!(
                 "LLM adapter (stream): brak backendu dla modelu '{}'",
                 model_name
             ))),

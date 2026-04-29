@@ -13,6 +13,7 @@ use crate::config::RouterConfig;
 use crate::error::{CoreError, Result};
 use crate::flow_engine::converter;
 use crate::flow_engine::types::FlowExecutionResult;
+use crate::routing::backend::BackendClient;
 use crate::routing::router::{
     DiarizedSpeaker, RequestMetrics, Router, SpeakerIdentifyResult, SttWithDiarization, VoiceInfo,
 };
@@ -1067,79 +1068,63 @@ impl Router {
                     }
                 }
 
-                let backends = match service_manager.service_backends.get(&model) {
-                    Some(b) => b,
-                    None => {
+                // Snapshot-first: build BackendClients from supervisor snapshot.
+                // When the snapshot resolves the model we skip the strategy map
+                // entirely — newly-deployed services never have config-defined
+                // strategies, FirstAvailable is the right default. Legacy path
+                // (config.toml `service_backends`) is the only remaining fallback
+                // and disappears in FAZA-8c.
+                let snapshot_backends = service_manager.resolve_http_backends_via_snapshot(&model);
+                let backend = if let Some(b) =
+                    snapshot_backends.as_ref().and_then(|v| v.first().cloned())
+                {
+                    debug!(
+                        "Embedding callback: snapshot resolved model '{}' to HTTP backend",
+                        model
+                    );
+                    b
+                } else if let Some(legacy) = service_manager.service_backends.get(&model) {
+                    if legacy.is_empty() {
                         return ModelResponse {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::ModelNotFound,
-                                message: format!("Model embedding '{}' nie znaleziony w konfiguracji (ani QUIC ani HTTP)", model),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                if backends.is_empty() {
-                    return ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::ModelNotFound,
-                            message: format!("Brak dostepnych backendow dla modelu '{}'", model),
-                            details: None,
-                        }),
-                        metrics: None,
-                    };
-                }
-
-                let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                    Some(s) => s,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
                                 message: format!(
-                                    "Brak strategii load balancing dla modelu '{}'",
+                                    "Brak dostepnych backendow dla modelu '{}'",
                                     model
                                 ),
                                 details: None,
                             }),
                             metrics: None,
-                        }
+                        };
                     }
+                    let backends_slice: &[Arc<BackendClient>] = legacy.as_slice();
+                    match service_manager
+                        .load_balancing_strategies
+                        .get(&model)
+                        .map(|s| s.select_backend(backends_slice))
+                    {
+                        Some(Ok(idx)) => backends_slice[idx].clone(),
+                        _ => backends_slice[0].clone(),
+                    }
+                } else {
+                    return ModelResponse {
+                        request_id,
+                        result: ModelResult::Error(ErrorInfo {
+                            error_type: ErrorType::ModelNotFound,
+                            message: format!("Model embedding '{}' nie znaleziony w konfiguracji (ani QUIC ani HTTP)", model),
+                            details: None,
+                        }),
+                        metrics: None,
+                    };
                 };
 
-                let backend_idx = match strategy.select_backend(backends) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Blad wyboru backendu: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend = &backends[backend_idx];
-
-                debug!(
-                    "Wybrany backend ({}): {} [{}]",
-                    strategy.name(),
-                    backend.url(),
-                    backend_idx
-                );
+                debug!("Embedding callback: backend url={}", backend.url());
 
                 match backend.embedding(input).await {
                     Ok(embeddings) => {
                         debug!("Embedding callback sukces: {} wektorow", embeddings.len());
-                        ModelResponse {
+                        return ModelResponse {
                             request_id,
                             result: ModelResult::Embeddings(EmbeddingsResult {
                                 embeddings,
@@ -1147,11 +1132,11 @@ impl Router {
                                 model,
                             }),
                             metrics: None,
-                        }
+                        };
                     }
                     Err(e) => {
                         error!("Embedding callback error: {}", e);
-                        ModelResponse {
+                        return ModelResponse {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
                                 error_type: ErrorType::InternalError,
@@ -1159,7 +1144,7 @@ impl Router {
                                 details: Some(e.to_string()),
                             }),
                             metrics: None,
-                        }
+                        };
                     }
                 }
             }
@@ -1237,9 +1222,37 @@ impl Router {
                     }
                 }
 
-                let backends = match service_manager.service_backends.get(&model) {
-                    Some(b) => b,
-                    None => {
+                // Snapshot-first: see Embedding case above. Same pattern.
+                let snapshot_backends = service_manager.resolve_http_backends_via_snapshot(&model);
+                let backend =
+                    if let Some(b) = snapshot_backends.as_ref().and_then(|v| v.first().cloned()) {
+                        debug!(
+                            "Completion callback: snapshot resolved model '{}' to HTTP backend",
+                            model
+                        );
+                        b
+                    } else if let Some(legacy) = service_manager.service_backends.get(&model) {
+                        if legacy.is_empty() {
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::ModelNotFound,
+                                    message: format!("No backends available for model: {}", model),
+                                    details: None,
+                                }),
+                                metrics: None,
+                            };
+                        }
+                        let backends_slice: &[Arc<BackendClient>] = legacy.as_slice();
+                        match service_manager
+                            .load_balancing_strategies
+                            .get(&model)
+                            .map(|s| s.select_backend(backends_slice))
+                        {
+                            Some(Ok(idx)) => backends_slice[idx].clone(),
+                            _ => backends_slice[0].clone(),
+                        }
+                    } else {
                         return ModelResponse {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
@@ -1251,63 +1264,10 @@ impl Router {
                                 details: None,
                             }),
                             metrics: None,
-                        }
-                    }
-                };
-
-                if backends.is_empty() {
-                    return ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::ModelNotFound,
-                            message: format!("No backends available for model: {}", model),
-                            details: None,
-                        }),
-                        metrics: None,
+                        };
                     };
-                }
 
-                let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                    Some(s) => s,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!(
-                                    "Brak strategii load balancing dla modelu '{}'",
-                                    model
-                                ),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend_idx = match strategy.select_backend(backends) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Blad wyboru backendu: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend = &backends[backend_idx];
-
-                debug!(
-                    "Callback ChatCompletion - wybrany backend ({}): {} [{}]",
-                    strategy.name(),
-                    backend.url(),
-                    backend_idx
-                );
+                debug!("Completion callback: backend url={}", backend.url());
 
                 let openai_messages: Vec<Message> = messages
                     .iter()
@@ -1425,67 +1385,49 @@ impl Router {
                             audio_data.len()
                         );
 
-                        let backends = match service_manager.service_backends.get(&model) {
-                            Some(b) => b,
-                            None => {
+                        // Snapshot-first; legacy fallback removed in FAZA-8c.
+                        let snapshot_backends =
+                            service_manager.resolve_http_backends_via_snapshot(&model);
+                        let backend = if let Some(b) =
+                            snapshot_backends.as_ref().and_then(|v| v.first().cloned())
+                        {
+                            debug!("AudioSTT callback: snapshot resolved model '{}'", model);
+                            b
+                        } else if let Some(legacy) = service_manager.service_backends.get(&model) {
+                            if legacy.is_empty() {
                                 return ModelResponse {
                                     request_id,
                                     result: ModelResult::Error(ErrorInfo {
                                         error_type: ErrorType::ModelNotFound,
-                                        message: format!("Model not found: {}", model),
-                                        details: None,
-                                    }),
-                                    metrics: None,
-                                }
-                            }
-                        };
-
-                        if backends.is_empty() {
-                            return ModelResponse {
-                                request_id,
-                                result: ModelResult::Error(ErrorInfo {
-                                    error_type: ErrorType::ModelNotFound,
-                                    message: format!("No backends available for model: {}", model),
-                                    details: None,
-                                }),
-                                metrics: None,
-                            };
-                        }
-
-                        let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                            Some(s) => s,
-                            None => {
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
                                         message: format!(
-                                            "Brak strategii load balancing dla modelu '{}'",
+                                            "No backends available for model: {}",
                                             model
                                         ),
                                         details: None,
                                     }),
                                     metrics: None,
-                                }
+                                };
                             }
-                        };
-
-                        let backend_idx = match strategy.select_backend(backends) {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                return ModelResponse {
-                                    request_id,
-                                    result: ModelResult::Error(ErrorInfo {
-                                        error_type: ErrorType::InternalError,
-                                        message: format!("Blad wyboru backendu: {}", e),
-                                        details: Some(e.to_string()),
-                                    }),
-                                    metrics: None,
-                                }
+                            let backends_slice: &[Arc<BackendClient>] = legacy.as_slice();
+                            match service_manager
+                                .load_balancing_strategies
+                                .get(&model)
+                                .map(|s| s.select_backend(backends_slice))
+                            {
+                                Some(Ok(idx)) => backends_slice[idx].clone(),
+                                _ => backends_slice[0].clone(),
                             }
+                        } else {
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::ModelNotFound,
+                                    message: format!("Model not found: {}", model),
+                                    details: None,
+                                }),
+                                metrics: None,
+                            };
                         };
-
-                        let backend = &backends[backend_idx];
 
                         let filename = format!("audio_{}.mp3", uuid::Uuid::new_v4());
 
@@ -1631,9 +1573,34 @@ impl Router {
                     messages.len()
                 );
 
-                let backends = match service_manager.service_backends.get(&model) {
-                    Some(b) => b,
-                    None => {
+                // Snapshot-first; legacy fallback removed in FAZA-8c.
+                let snapshot_backends = service_manager.resolve_http_backends_via_snapshot(&model);
+                let backend =
+                    if let Some(b) = snapshot_backends.as_ref().and_then(|v| v.first().cloned()) {
+                        debug!("Vision callback: snapshot resolved model '{}'", model);
+                        b
+                    } else if let Some(legacy) = service_manager.service_backends.get(&model) {
+                        if legacy.is_empty() {
+                            return ModelResponse {
+                                request_id,
+                                result: ModelResult::Error(ErrorInfo {
+                                    error_type: ErrorType::ModelNotFound,
+                                    message: format!("No backends available for model: {}", model),
+                                    details: None,
+                                }),
+                                metrics: None,
+                            };
+                        }
+                        let backends_slice: &[Arc<BackendClient>] = legacy.as_slice();
+                        match service_manager
+                            .load_balancing_strategies
+                            .get(&model)
+                            .map(|s| s.select_backend(backends_slice))
+                        {
+                            Some(Ok(idx)) => backends_slice[idx].clone(),
+                            _ => backends_slice[0].clone(),
+                        }
+                    } else {
                         return ModelResponse {
                             request_id,
                             result: ModelResult::Error(ErrorInfo {
@@ -1642,56 +1609,8 @@ impl Router {
                                 details: None,
                             }),
                             metrics: None,
-                        }
-                    }
-                };
-
-                if backends.is_empty() {
-                    return ModelResponse {
-                        request_id,
-                        result: ModelResult::Error(ErrorInfo {
-                            error_type: ErrorType::ModelNotFound,
-                            message: format!("No backends available for model: {}", model),
-                            details: None,
-                        }),
-                        metrics: None,
+                        };
                     };
-                }
-
-                let strategy = match service_manager.load_balancing_strategies.get(&model) {
-                    Some(s) => s,
-                    None => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!(
-                                    "Brak strategii load balancing dla modelu '{}'",
-                                    model
-                                ),
-                                details: None,
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend_idx = match strategy.select_backend(backends) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        return ModelResponse {
-                            request_id,
-                            result: ModelResult::Error(ErrorInfo {
-                                error_type: ErrorType::InternalError,
-                                message: format!("Blad wyboru backendu: {}", e),
-                                details: Some(e.to_string()),
-                            }),
-                            metrics: None,
-                        }
-                    }
-                };
-
-                let backend = &backends[backend_idx];
 
                 match backend
                     .vision(model.clone(), messages.clone(), max_tokens)
