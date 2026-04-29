@@ -104,25 +104,73 @@ impl ParserRegistry {
         // NVIDIA Nsight Systems SQLite parser.
         r.register("nvidia.nsys.gpu".to_string(), Arc::new(c::NvidiaNsysParser));
         // Linux no-priv parsers.
-        r.register("linux.proc.cpu_util".to_string(), Arc::new(c::linux::cpu_util::LinuxProcCpuUtilParser));
-        r.register("linux.proc.ram".to_string(), Arc::new(c::linux::ram::LinuxProcRamParser));
-        r.register("linux.iostat.disk".to_string(), Arc::new(c::linux::disk::LinuxIostatDiskParser));
-        r.register("linux.rapl.power".to_string(), Arc::new(c::linux::rapl_power::LinuxRaplPowerParser));
-        r.register("linux.nvsmi.gpu_util".to_string(), Arc::new(c::linux::nvsmi_gpu::LinuxNvsmiGpuParser));
+        r.register(
+            "linux.proc.cpu_util".to_string(),
+            Arc::new(c::linux::cpu_util::LinuxProcCpuUtilParser),
+        );
+        r.register(
+            "linux.proc.ram".to_string(),
+            Arc::new(c::linux::ram::LinuxProcRamParser),
+        );
+        r.register(
+            "linux.iostat.disk".to_string(),
+            Arc::new(c::linux::disk::LinuxIostatDiskParser),
+        );
+        r.register(
+            "linux.rapl.power".to_string(),
+            Arc::new(c::linux::rapl_power::LinuxRaplPowerParser),
+        );
+        r.register(
+            "linux.nvsmi.gpu_util".to_string(),
+            Arc::new(c::linux::nvsmi_gpu::LinuxNvsmiGpuParser),
+        );
         // Linux GPU vendor parsers.
-        r.register("linux.rocsmi.gpu_util".to_string(), Arc::new(c::linux_gpu::rocsmi_util::LinuxRocmSmiGpuParser));
-        r.register("linux.rocprof.gpu_kernels".to_string(), Arc::new(c::linux_gpu::rocprof_kernels::LinuxRocprofKernelsParser));
-        r.register("linux.intel_gpu_top.gpu".to_string(), Arc::new(c::linux_gpu::intel_gpu_top::LinuxIntelGpuTopParser));
+        r.register(
+            "linux.rocsmi.gpu_util".to_string(),
+            Arc::new(c::linux_gpu::rocsmi_util::LinuxRocmSmiGpuParser),
+        );
+        r.register(
+            "linux.rocprof.gpu_kernels".to_string(),
+            Arc::new(c::linux_gpu::rocprof_kernels::LinuxRocprofKernelsParser),
+        );
+        r.register(
+            "linux.intel_gpu_top.gpu".to_string(),
+            Arc::new(c::linux_gpu::intel_gpu_top::LinuxIntelGpuTopParser),
+        );
         // macOS parsers.
-        r.register("macos.vm_stat.ram".to_string(), Arc::new(c::macos::vm_stat_ram::MacosVmStatRamParser));
-        r.register("macos.iostat.disk".to_string(), Arc::new(c::macos::iostat_disk::MacosIostatDiskParser));
-        r.register("macos.powermetrics.power".to_string(), Arc::new(c::macos::powermetrics_power::MacosPowermetricsPowerParser));
-        r.register("macos.powermetrics.gpu".to_string(), Arc::new(c::macos::powermetrics_gpu::MacosPowermetricsGpuParser));
+        r.register(
+            "macos.vm_stat.ram".to_string(),
+            Arc::new(c::macos::vm_stat_ram::MacosVmStatRamParser),
+        );
+        r.register(
+            "macos.iostat.disk".to_string(),
+            Arc::new(c::macos::iostat_disk::MacosIostatDiskParser),
+        );
+        r.register(
+            "macos.powermetrics.power".to_string(),
+            Arc::new(c::macos::powermetrics_power::MacosPowermetricsPowerParser),
+        );
+        r.register(
+            "macos.powermetrics.gpu".to_string(),
+            Arc::new(c::macos::powermetrics_gpu::MacosPowermetricsGpuParser),
+        );
         // Windows PDH parsers.
-        r.register("windows.pdh.cpu_util".to_string(), Arc::new(c::windows::pdh_cpu_util::WindowsPdhCpuUtilParser));
-        r.register("windows.pdh.ram".to_string(), Arc::new(c::windows::pdh_ram::WindowsPdhRamParser));
-        r.register("windows.pdh.disk".to_string(), Arc::new(c::windows::pdh_disk::WindowsPdhDiskParser));
-        r.register("windows.pdh.gpu".to_string(), Arc::new(c::windows::pdh_gpu::WindowsPdhGpuParser));
+        r.register(
+            "windows.pdh.cpu_util".to_string(),
+            Arc::new(c::windows::pdh_cpu_util::WindowsPdhCpuUtilParser),
+        );
+        r.register(
+            "windows.pdh.ram".to_string(),
+            Arc::new(c::windows::pdh_ram::WindowsPdhRamParser),
+        );
+        r.register(
+            "windows.pdh.disk".to_string(),
+            Arc::new(c::windows::pdh_disk::WindowsPdhDiskParser),
+        );
+        r.register(
+            "windows.pdh.gpu".to_string(),
+            Arc::new(c::windows::pdh_gpu::WindowsPdhGpuParser),
+        );
         r
     }
 }
@@ -460,8 +508,10 @@ impl MultiSourceSession {
         // Phase 1: stop every collector concurrently on the blocking pool.
         // For 17 collectors with 50–500 ms shutdown cost each this turns a
         // sequential ~8 s tail into the time of the slowest single stop.
-        let mut stop_set: JoinSet<(String, Result<crate::profiling::collectors::RawCapture, String>)> =
-            JoinSet::new();
+        let mut stop_set: JoinSet<(
+            String,
+            Result<crate::profiling::collectors::RawCapture, String>,
+        )> = JoinSet::new();
         for (id, handle) in state.running {
             stop_set.spawn_blocking(move || {
                 let res = match handle.stop() {
@@ -678,10 +728,8 @@ impl MultiSourceSession {
                         local_stacks,
                     } = fragment;
 
-                    let name_remap: Vec<u32> = local_names
-                        .iter()
-                        .map(|s| final_names.intern(s))
-                        .collect();
+                    let name_remap: Vec<u32> =
+                        local_names.iter().map(|s| final_names.intern(s)).collect();
                     let frame_remap: Vec<u32> = local_frames
                         .into_iter()
                         .map(|f| final_frames.intern_frame(FrameKey::from(f)))
@@ -689,10 +737,8 @@ impl MultiSourceSession {
                     let stack_remap: Vec<u32> = local_stacks
                         .into_iter()
                         .map(|s| {
-                            let translated: Vec<u32> = s
-                                .into_iter()
-                                .map(|fid| frame_remap[fid as usize])
-                                .collect();
+                            let translated: Vec<u32> =
+                                s.into_iter().map(|fid| frame_remap[fid as usize]).collect();
                             final_frames.intern_stack(translated)
                         })
                         .collect();

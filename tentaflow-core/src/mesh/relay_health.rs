@@ -93,10 +93,7 @@ pub fn spawn_relay_health_monitor(
     *state.write() = RelayHealth::initial_pending(url_str.clone(), bind_addr_actual.clone());
 
     let probe_target = probe_url(&url_str);
-    let client = match reqwest::Client::builder()
-        .timeout(PING_TIMEOUT)
-        .build()
-    {
+    let client = match reqwest::Client::builder().timeout(PING_TIMEOUT).build() {
         Ok(c) => c,
         Err(err) => {
             tracing::error!(error = %err, "relay health monitor: nie udalo sie zbudowac reqwest client");
@@ -207,7 +204,13 @@ mod tests {
     #[test]
     fn probe_url_normalizes_trailing_slash() {
         assert_eq!(probe_url("https://relay.example"), "https://relay.example/");
-        assert_eq!(probe_url("https://relay.example/"), "https://relay.example/");
-        assert_eq!(probe_url("https://relay.example///"), "https://relay.example/");
+        assert_eq!(
+            probe_url("https://relay.example/"),
+            "https://relay.example/"
+        );
+        assert_eq!(
+            probe_url("https://relay.example///"),
+            "https://relay.example/"
+        );
     }
 }

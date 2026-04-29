@@ -39,16 +39,29 @@ impl Router {
         user: Option<crate::routing::acl::UserContext>,
     ) -> Result<
         crate::routing::RouteResult<
-            std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::api::openai::types::ChatCompletionChunk>> + Send>>,
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<crate::api::openai::types::ChatCompletionChunk>,
+                        > + Send,
+                >,
+            >,
         >,
     > {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                if !crate::routing::acl::check_access_safe(
+                    db,
+                    "model",
+                    &request.model,
+                    u.user_id,
+                    &u.role,
+                ) {
                     tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied model access (stream)");
                     return Err(crate::error::CoreError::AllBackendsUnavailable {
                         model_name: request.model.clone(),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -69,12 +82,16 @@ impl Router {
         // route_chat_completion ktorego potem wywolujemy z model-level ACL).
         if let Some(ref u) = user {
             if let Some(ref dispatcher) = self.flow_dispatcher {
-                let ctx = crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
-                if let Ok(Some(result)) = dispatcher.try_dispatch(&request.model, "chat", ctx).await {
+                let ctx =
+                    crate::routing::build_flow_context_for_user(&request, false, Some(u.clone()));
+                if let Ok(Some(result)) = dispatcher.try_dispatch(&request.model, "chat", ctx).await
+                {
                     use crate::routing::chat::flow_result_to_chat_response;
                     let response = flow_result_to_chat_response(result, &request.model);
                     let metadata = crate::routing::RouteMetadata {
-                        served_by_node: hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "unknown".to_string()),
+                        served_by_node: hostname::get()
+                            .map(|h| h.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "unknown".to_string()),
                         backend_type: "flow_engine".to_string(),
                         strategy_used: "direct".to_string(),
                         fallbacks_tried: 0,
@@ -647,10 +664,14 @@ impl Router {
     ) -> Result<ChatCompletionResponse> {
         debug!("Routing to RAG engine: {}", rag_engine_name);
 
-        let rag_handle = self.service_manager.rag_services.get(&rag_engine_name).map(|r| r.value().clone())
-        .ok_or_else(|| CoreError::ModelNotFound {
-            model_name: rag_engine_name.clone(),
-        })?;
+        let rag_handle = self
+            .service_manager
+            .rag_services
+            .get(&rag_engine_name)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| CoreError::ModelNotFound {
+                model_name: rag_engine_name.clone(),
+            })?;
 
         let rag_client =
             rag_handle
@@ -1004,7 +1025,10 @@ impl Router {
                     input.len()
                 );
 
-                let emb_handle = service_manager.quic_embedding_services.get(&model).map(|r| r.value().clone());
+                let emb_handle = service_manager
+                    .quic_embedding_services
+                    .get(&model)
+                    .map(|r| r.value().clone());
                 if let Some(quic_handle) = emb_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla embeddingow: {}", model);
@@ -1156,7 +1180,10 @@ impl Router {
                     prompt.as_ref().map(|p| p.len())
                 );
 
-                let llm_handle = service_manager.quic_llm_services.get(&model).map(|r| r.value().clone());
+                let llm_handle = service_manager
+                    .quic_llm_services
+                    .get(&model)
+                    .map(|r| r.value().clone());
                 if let Some(quic_handle) = llm_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla LLM: {}", model);
@@ -1714,7 +1741,10 @@ impl Router {
                     rerank_payload.documents.len()
                 );
 
-                let rerank_handle = service_manager.quic_embedding_services.get(&model).map(|r| r.value().clone());
+                let rerank_handle = service_manager
+                    .quic_embedding_services
+                    .get(&model)
+                    .map(|r| r.value().clone());
                 if let Some(quic_handle) = rerank_handle {
                     if let Some(quic_client) = quic_handle.get_client().await {
                         debug!("Uzywam QUIC client dla rerankingu: {}", model);
@@ -1803,8 +1833,7 @@ impl Router {
                         error_type: ErrorType::InvalidRequest,
                         message: "MeetingEvent is not valid in chat callbacks".to_string(),
                         details: Some(
-                            "MeetingEvent is handled by dispatch_reverse_request only"
-                                .to_string(),
+                            "MeetingEvent is handled by dispatch_reverse_request only".to_string(),
                         ),
                     }),
                     metrics: None,
@@ -1821,8 +1850,7 @@ impl Router {
                         error_type: ErrorType::InvalidRequest,
                         message: "PromptFetch is not valid in chat callbacks".to_string(),
                         details: Some(
-                            "PromptFetch is handled by dispatch_reverse_request only"
-                                .to_string(),
+                            "PromptFetch is handled by dispatch_reverse_request only".to_string(),
                         ),
                     }),
                     metrics: None,
@@ -2156,7 +2184,10 @@ impl Router {
             let mut client = None;
             let memory_handles: Vec<_> = self
                 .service_manager
-                .quic_memory_services.iter().map(|r| r.value().clone()).collect();
+                .quic_memory_services
+                .iter()
+                .map(|r| r.value().clone())
+                .collect();
             for handle in memory_handles {
                 if let Some(c) = handle.get_client().await {
                     client = Some(c);

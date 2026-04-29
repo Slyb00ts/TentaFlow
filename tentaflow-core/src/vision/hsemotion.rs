@@ -23,7 +23,14 @@ const INPUT_SIZE: u32 = 224;
 /// Kolejnosc klas — alfabetyczna AffectNet8 (zgodna z `enet_b0_8_best_afew`).
 /// Patrz: HSE-asavchenko/face-emotion-recognition/src/affectnet_emotions.py.
 pub const EMOTION_LABELS: [&str; 8] = [
-    "Anger", "Contempt", "Disgust", "Fear", "Happiness", "Neutral", "Sadness", "Surprise",
+    "Anger",
+    "Contempt",
+    "Disgust",
+    "Fear",
+    "Happiness",
+    "Neutral",
+    "Sadness",
+    "Surprise",
 ];
 
 type Runnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
@@ -33,12 +40,7 @@ pub struct HsemotionEngine {
 }
 
 impl EmotionClassifier for HsemotionEngine {
-    fn classify(
-        &self,
-        face_crop_rgb: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<EmotionResult> {
+    fn classify(&self, face_crop_rgb: &[u8], width: u32, height: u32) -> Result<EmotionResult> {
         let img = rgb_buf_to_image(face_crop_rgb, width, height)
             .ok_or_else(|| anyhow!("HSEmotion: invalid RGB buffer"))?;
         let resized = image::imageops::resize(&img, INPUT_SIZE, INPUT_SIZE, FilterType::Triangle);
@@ -86,7 +88,11 @@ impl EmotionClassifier for HsemotionEngine {
         let (best_idx, _best_prob) = probs
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.1 .1
+                    .partial_cmp(&b.1 .1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|(i, p)| (i, p.1))
             .unwrap_or((0, 0.0));
 

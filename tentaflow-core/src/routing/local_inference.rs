@@ -104,7 +104,6 @@ impl LocalInferenceHandler {
         Ok(chunk_rx)
     }
 
-
     /// Obsluga /v1/embeddings przez lokalne modele.
     pub async fn handle_embeddings(
         &self,
@@ -400,5 +399,4 @@ impl LocalInferenceHandler {
             }
         }
     }
-
 }

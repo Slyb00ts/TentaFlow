@@ -20,8 +20,8 @@ pub mod node_info_collector;
 pub mod peer_manager;
 pub mod peer_store;
 pub mod pipeline;
-pub mod relay_health;
 #[cfg(any(feature = "rdma-probe", target_os = "macos"))]
 pub mod rdma_probe;
+pub mod relay_health;
 pub mod security;
 pub mod service_registry;

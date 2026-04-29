@@ -125,9 +125,7 @@ pub async fn handle_initiate_pairing(
                         );
                     } else {
                         let local_info = node_info_collector::collect_node_info(local_node_id);
-                        if let Ok(info_bytes) =
-                            rkyv::to_bytes::<rkyv::rancor::Error>(&local_info)
-                        {
+                        if let Ok(info_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&local_info) {
                             if let Err(e) =
                                 qm.send_node_info(&remote_hints.node_id, &info_bytes).await
                             {
@@ -171,7 +169,8 @@ pub async fn handle_initiate_pairing(
                 Ok(PairingAttemptOutcome::Pending) => {
                     if !pin_hint.is_empty() {
                         let _ = delete_pending_contact_hints(&security.db, remote_node_id);
-                        let _ = db::repository::delete_pending_pairing(&security.db, remote_node_id);
+                        let _ =
+                            db::repository::delete_pending_pairing(&security.db, remote_node_id);
                         return Ok((
                             409,
                             json_error(
@@ -187,7 +186,9 @@ pub async fn handle_initiate_pairing(
                     let _ = db::repository::delete_pending_pairing(&security.db, remote_node_id);
                     return Ok((
                         502,
-                        json_error("Nie udało się wysłać PairingRequest — node może nie być osiągalny"),
+                        json_error(
+                            "Nie udało się wysłać PairingRequest — node może nie być osiągalny",
+                        ),
                     ));
                 }
             }
@@ -436,7 +437,10 @@ fn local_contact_hints(
         public_key_hex: String::new(),
         hostname,
         addresses,
-        relay_url: qm.relay_url().map(|url| url.to_string()).unwrap_or_default(),
+        relay_url: qm
+            .relay_url()
+            .map(|url| url.to_string())
+            .unwrap_or_default(),
     }
 }
 

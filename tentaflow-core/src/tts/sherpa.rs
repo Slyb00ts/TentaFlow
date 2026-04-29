@@ -95,9 +95,7 @@ fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
 
     let api = Api::new().context("hf-hub Api::new")?;
     let r = api.model(repo.to_string());
-    let info_repo = r
-        .info()
-        .with_context(|| format!("hf-hub info({})", repo))?;
+    let info_repo = r.info().with_context(|| format!("hf-hub info({})", repo))?;
     let files: Vec<String> = info_repo
         .siblings
         .into_iter()
@@ -112,9 +110,9 @@ fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
         .filter(|f| f.ends_with(".onnx") && !f.starts_with('.'))
         .collect();
     onnx_candidates.sort();
-    let onnx_path = onnx_candidates.first().ok_or_else(|| {
-        anyhow!("repo {} nie zawiera zadnego pliku .onnx", repo)
-    })?;
+    let onnx_path = onnx_candidates
+        .first()
+        .ok_or_else(|| anyhow!("repo {} nie zawiera zadnego pliku .onnx", repo))?;
     let voice_subdir: String = match onnx_path.rfind('/') {
         Some(idx) => onnx_path[..=idx].to_string(),
         None => String::new(),
@@ -201,7 +199,10 @@ fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
             );
         }
         let onnx_json = find_file_with_ext(target, ".onnx.json").ok_or_else(|| {
-            anyhow!("oczekiwano <voice>.onnx.json w {} po pobraniu", target.display())
+            anyhow!(
+                "oczekiwano <voice>.onnx.json w {} po pobraniu",
+                target.display()
+            )
         })?;
         info!(
             "[sherpa-onnx] generuje tokens.txt z {}",
@@ -237,8 +238,8 @@ fn download_and_prepare(repo: &str, target: &Path) -> Result<()> {
 /// parsuje tokens.txt po `split(' ')` i nie ma sposobu zakodowac tokena
 /// "spacja" jednoznacznie.
 fn generate_tokens_from_piper_json(json_path: &Path, out_path: &Path) -> Result<()> {
-    let bytes = std::fs::read(json_path)
-        .with_context(|| format!("read {}", json_path.display()))?;
+    let bytes =
+        std::fs::read(json_path).with_context(|| format!("read {}", json_path.display()))?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse json {}", json_path.display()))?;
     let map = v
@@ -273,8 +274,7 @@ fn generate_tokens_from_piper_json(json_path: &Path, out_path: &Path) -> Result<
         out.push_str(&id.to_string());
         out.push('\n');
     }
-    std::fs::write(out_path, out)
-        .with_context(|| format!("write {}", out_path.display()))?;
+    std::fs::write(out_path, out).with_context(|| format!("write {}", out_path.display()))?;
     Ok(())
 }
 
@@ -341,11 +341,8 @@ fn ensure_shared_espeak_data() -> Result<PathBuf> {
 /// `espeak-ng-data/` (~kilka tysiecy malych plikow). Symlinki nie dzialaja
 /// na Windows bez admin'a, wiec robimy fizyczna kopie.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .with_context(|| format!("create dir {}", dst.display()))?;
-    for entry in std::fs::read_dir(src)
-        .with_context(|| format!("read dir {}", src.display()))?
-    {
+    std::fs::create_dir_all(dst).with_context(|| format!("create dir {}", dst.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read dir {}", src.display()))? {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());

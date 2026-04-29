@@ -21,7 +21,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::crypto::SettingsCipher;
-use crate::db::repository as repository;
+use crate::db::repository;
 use crate::db::repository::deployments as deployments_repo;
 use crate::db::DbPool;
 use crate::deploy::log_bus::{self, BusMessage};
@@ -165,7 +165,12 @@ fn load_engine_meta(engine_id: &str) -> Result<EngineMeta> {
         .ok_or_else(|| anyhow!("engine '{}' nie istnieje w manifeście", engine_id))?;
 
     let context_path = entry.deploy.docker.as_ref().map(|d| d.context_path.clone());
-    let compose_path = entry.deploy.docker.as_ref().map(|d| d.compose_path.clone()).flatten();
+    let compose_path = entry
+        .deploy
+        .docker
+        .as_ref()
+        .map(|d| d.compose_path.clone())
+        .flatten();
     let native_runtime = entry
         .deploy
         .native
@@ -196,15 +201,7 @@ async fn do_docker_deploy(
     start_ms: i64,
 ) -> Result<()> {
     if engine.compose_path.is_some() {
-        return do_docker_compose_deploy(
-            db,
-            deploy_id,
-            tx,
-            engine,
-            config,
-            start_ms,
-        )
-        .await;
+        return do_docker_compose_deploy(db, deploy_id, tx, engine, config, start_ms).await;
     }
 
     let context_path = engine.context_path.as_ref().ok_or_else(|| {
@@ -248,7 +245,13 @@ async fn do_docker_deploy(
     // biblioteki), wywołujemy systemowe `docker build` z DOCKER_BUILDKIT=1 env —
     // to ta sama komenda którą user odpalilby ręcznie. Streaming stdout linia-po-
     // linii do log_bus + parsing `Step N/M` (legacy) i `#N [step]` (BuildKit).
-    log_line(db, deploy_id, tx, "log", "uruchamiam `docker build` (BuildKit)...");
+    log_line(
+        db,
+        deploy_id,
+        tx,
+        "log",
+        "uruchamiam `docker build` (BuildKit)...",
+    );
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
 
@@ -323,10 +326,7 @@ async fn do_docker_deploy(
         log_line(db, deploy_id, tx, "log", l.trim_end());
     }
 
-    let status = child
-        .wait()
-        .await
-        .context("docker build wait")?;
+    let status = child.wait().await.context("docker build wait")?;
     if !status.success() {
         return Err(anyhow!(
             "docker build zwrocil exit code {:?}",
@@ -349,7 +349,9 @@ async fn do_docker_deploy(
     // ze silnik jest zainstalowany i gotowy na spawn per-zadanie.
     if matches!(engine.category.as_str(), "agents" | "tools") {
         if engine.engine_id == "teams-bot" {
-            if let Err(e) = crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults(db).await {
+            if let Err(e) =
+                crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults(db).await
+            {
                 warn!("ensure_teams_bot_defaults nie powiodło się: {}", e);
             } else {
                 info!("domyślne aliasy i flow dla teams-bota zainicjalizowane");
@@ -357,7 +359,13 @@ async fn do_docker_deploy(
         }
         register_on_demand_service(db, &engine.engine_id, &engine.category, &image_tag);
         persist_source_hash(db, &engine.engine_id, "docker", &engine.engine_id);
-        log_line(db, deploy_id, tx, "log", "serwis zarejestrowany (on_demand)");
+        log_line(
+            db,
+            deploy_id,
+            tx,
+            "log",
+            "serwis zarejestrowany (on_demand)",
+        );
         finish_success(
             db,
             deploy_id,
@@ -485,7 +493,12 @@ async fn do_docker_deploy(
     // streamowane do deploy_log z prefixem [docker]. Bez tego user widzi tylko
     // 'kontener uruchomiony' i potem cisze az QUIC peer się polaczy. Dla 31B
     // multimodal vllm load + warmup zajmuje 3-5min - bez logow wyglada jak hang.
-    spawn_docker_log_tailer(db.clone(), deploy_id.to_string(), tx.clone(), created_name.clone());
+    spawn_docker_log_tailer(
+        db.clone(),
+        deploy_id.to_string(),
+        tx.clone(),
+        created_name.clone(),
+    );
     // Symetria z native LLM/STT/TTS/Embeddings: po register_service wpinamy
     // model do tabeli `models` i mappingu routera. Bez tego zakladka Models
     // jest pusta po docker deploy, a /v1/chat/completions z model="Qwen/..."
@@ -686,15 +699,7 @@ async fn do_docker_compose_deploy(
         &format!("compose stack deployed: {}", project_name),
     );
 
-    finish_success(
-        db,
-        deploy_id,
-        tx,
-        start_ms,
-        String::new(),
-        project_name,
-    )
-    .await;
+    finish_success(db, deploy_id, tx, start_ms, String::new(), project_name).await;
     Ok(())
 }
 
@@ -756,16 +761,7 @@ async fn do_native_deploy(
             .await
         }
         "binary" => {
-            do_binary_native_deploy(
-                db,
-                deploy_id,
-                tx,
-                engine,
-                node_id,
-                config,
-                start_ms,
-            )
-            .await
+            do_binary_native_deploy(db, deploy_id, tx, engine, node_id, config, start_ms).await
         }
         "python-bundle" => {
             do_python_bundle_native_deploy(
@@ -818,7 +814,14 @@ async fn do_binary_native_deploy(
         }
     };
 
-    phase(db, deploy_id, tx, "building", 30, "weryfikacja binarki natywnej");
+    phase(
+        db,
+        deploy_id,
+        tx,
+        "building",
+        30,
+        "weryfikacja binarki natywnej",
+    );
 
     let exe = std::env::current_exe()
         .context("nie udalo sie ustalic sciezki biezacej binarki tentaflow")?;
@@ -848,7 +851,14 @@ async fn do_binary_native_deploy(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("{}-native", slugify_name(&engine.engine_id)));
 
-    phase(db, deploy_id, tx, "registering", 92, "rejestracja serwisu native");
+    phase(
+        db,
+        deploy_id,
+        tx,
+        "registering",
+        92,
+        "rejestracja serwisu native",
+    );
 
     // services.service_type ma CHECK constraint na lp ('agent', 'tool', ...).
     // engine.category z manifestu jest plural ('agents', 'tools') wiec mapujemy
@@ -1007,7 +1017,8 @@ async fn do_embedded_native_deploy(
             // Rejestruj w mesh — bez tego router widzi serwis w DB ale nie
             // wie ze jest live na tym nodzie (Mesh STT serwis nie polaczony).
             router.register_native_service_in_mesh(
-                &service_name, "stt",
+                &service_name,
+                "stt",
                 vec!["whisper-large-v3-turbo".to_string()],
                 Some("whisper".to_string()),
                 vec![stt_info.size_bytes / (1024 * 1024)],
@@ -1044,11 +1055,12 @@ async fn do_embedded_native_deploy(
 
             phase(db, deploy_id, tx, "running", 75, "load kokoro");
             let mut engine_impl = crate::tts::mlx_kokoro::MlxKokoroEngine::new();
-            let info = <crate::tts::mlx_kokoro::MlxKokoroEngine as crate::tts::TtsEngine>::load_model(
-                &mut engine_impl,
-                &resolved,
-            )
-            .context("load kokoro w Swift bridge")?;
+            let info =
+                <crate::tts::mlx_kokoro::MlxKokoroEngine as crate::tts::TtsEngine>::load_model(
+                    &mut engine_impl,
+                    &resolved,
+                )
+                .context("load kokoro w Swift bridge")?;
 
             {
                 let shared = crate::tts::shared_tts_manager();
@@ -1068,8 +1080,13 @@ async fn do_embedded_native_deploy(
             })
             .to_string();
             let service_id = upsert_native_service(
-                db, node_id, &service_name, "tts", Some("tts"),
-                &config_json, "single",
+                db,
+                node_id,
+                &service_name,
+                "tts",
+                Some("tts"),
+                &config_json,
+                "single",
             )?;
             ensure_model_registry_entry(
                 db,
@@ -1080,14 +1097,21 @@ async fn do_embedded_native_deploy(
                 &config_json,
             );
             router.register_native_service_in_mesh(
-                &service_name, "tts",
+                &service_name,
+                "tts",
                 vec![model_repo.clone()],
                 Some("kokoro".to_string()),
-                vec![info.sample_rate as u64 / 1000],  // placeholder
+                vec![info.sample_rate as u64 / 1000], // placeholder
             );
             auto_bind_teams_alias_if_empty(db, "teams-tts", &service_name, router);
             persist_source_hash(db, &engine.engine_id, "native", &service_name);
-            log_line(db, deploy_id, tx, "log", &format!("Kokoro TTS gotowe: {}", service_name));
+            log_line(
+                db,
+                deploy_id,
+                tx,
+                "log",
+                &format!("Kokoro TTS gotowe: {}", service_name),
+            );
             let _ = service_manager;
             finish_success(db, deploy_id, tx, start_ms, String::new(), service_name).await;
             Ok(())
@@ -1136,8 +1160,13 @@ async fn do_embedded_native_deploy(
             })
             .to_string();
             let service_id = upsert_native_service(
-                db, node_id, &service_name, "tts", Some("tts"),
-                &config_json, "single",
+                db,
+                node_id,
+                &service_name,
+                "tts",
+                Some("tts"),
+                &config_json,
+                "single",
             )?;
             ensure_model_registry_entry(
                 db,
@@ -1148,7 +1177,8 @@ async fn do_embedded_native_deploy(
                 &config_json,
             );
             router.register_native_service_in_mesh(
-                &service_name, "tts",
+                &service_name,
+                "tts",
                 vec![model_repo.clone()],
                 Some("sherpa-onnx".to_string()),
                 vec![info.sample_rate as u64 / 1000],
@@ -1177,16 +1207,17 @@ async fn do_embedded_native_deploy(
             // Apple nie pobiera modelu z dysku (uzywa głosów systemowych macOS) —
             // przekazujemy stalą "apple-tts" jako logiczny identyfikator silnika;
             // placeholder "system" powodowal mylące target=system w logach routera i w GUI.
-            let voice_id = resolve_model_repo(engine, config)
-                .unwrap_or_else(|_| "zosia-pl".to_string());
+            let voice_id =
+                resolve_model_repo(engine, config).unwrap_or_else(|_| "zosia-pl".to_string());
 
             phase(db, deploy_id, tx, "running", 75, "init apple tts");
             let mut engine_impl = crate::tts::apple_tts::AppleTtsEngine::new();
-            let info = <crate::tts::apple_tts::AppleTtsEngine as crate::tts::TtsEngine>::load_model(
-                &mut engine_impl,
-                std::path::Path::new("apple-tts"),
-            )
-            .context("init apple-tts (brak libMLXBridge.dylib?)")?;
+            let info =
+                <crate::tts::apple_tts::AppleTtsEngine as crate::tts::TtsEngine>::load_model(
+                    &mut engine_impl,
+                    std::path::Path::new("apple-tts"),
+                )
+                .context("init apple-tts (brak libMLXBridge.dylib?)")?;
             // Rejestracja w globalnym TtsManager pod kluczem service_name —
             // router znajduje silnik po nazwie serwisu albo po backend_name.
             {
@@ -1224,7 +1255,8 @@ async fn do_embedded_native_deploy(
                 &config_json,
             );
             router.register_native_service_in_mesh(
-                &service_name, "tts",
+                &service_name,
+                "tts",
                 vec![voice_id.clone()],
                 Some("apple-tts".to_string()),
                 vec![0],
@@ -1303,7 +1335,8 @@ async fn do_embedded_native_deploy(
             // polaczony". Wczesniej tylko `restore_native_services` przy
             // starcie tentaflow to robil; po deployu trzeba wprost.
             router.register_native_service_in_mesh(
-                &service_name, "stt",
+                &service_name,
+                "stt",
                 vec![model_repo.clone()],
                 Some("mlx-whisper".to_string()),
                 vec![stt_info.size_bytes / (1024 * 1024)],
@@ -1383,7 +1416,9 @@ async fn do_embedded_native_deploy(
                 "vision",
                 vec![engine_id.to_string()],
                 Some("tract-onnx".to_string()),
-                vec![std::fs::metadata(&model_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0)],
+                vec![std::fs::metadata(&model_path)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0)],
             );
 
             // Auto-wiązanie aliasów teams-vision-* — pipeline meeting bota
@@ -1443,7 +1478,9 @@ async fn do_embedded_native_deploy(
 
 fn random_suffix() -> String {
     use rand::distr::{Alphanumeric, SampleString};
-    Alphanumeric.sample_string(&mut rand::rng(), 5).to_lowercase()
+    Alphanumeric
+        .sample_string(&mut rand::rng(), 5)
+        .to_lowercase()
 }
 
 /// Deploy native runtime=python-bundle: wywoluje `deploy::python_venv::deploy_with_logs`
@@ -1514,7 +1551,9 @@ async fn do_python_bundle_native_deploy(
     // model + GPU = 'all' i dostaje OOM (np. 31B na 1 GPU bez TP) lub
     // multimodal crash (--max-num-batched-tokens default 2048).
     if !vllm_args_explicit && engine.engine_id == "vllm" && !model_repo.is_empty() {
-        match build_auto_vllm_args(&model_repo, config.gpu_ids.as_deref(), db, settings_cipher).await {
+        match build_auto_vllm_args(&model_repo, config.gpu_ids.as_deref(), db, settings_cipher)
+            .await
+        {
             Ok(Some(auto_args)) => {
                 log_line(
                     db,
@@ -1530,8 +1569,13 @@ async fn do_python_bundle_native_deploy(
                     "auto-tune skip: brak GPU lub HF config niedostepny - uzywam default args z bundle.toml");
             }
             Err(e) => {
-                log_line(db, deploy_id, tx, "log",
-                    &format!("auto-tune fail: {} - uzywam default args z bundle.toml", e));
+                log_line(
+                    db,
+                    deploy_id,
+                    tx,
+                    "log",
+                    &format!("auto-tune fail: {} - uzywam default args z bundle.toml", e),
+                );
             }
         }
     }
@@ -1553,7 +1597,10 @@ async fn do_python_bundle_native_deploy(
     let _ = crate::paths::ensure_models_dirs();
     let hf_home = crate::paths::hf_home();
     let torch_home = crate::paths::torch_home();
-    env.insert("HF_HOME".to_string(), hf_home.to_string_lossy().into_owned());
+    env.insert(
+        "HF_HOME".to_string(),
+        hf_home.to_string_lossy().into_owned(),
+    );
     env.insert(
         "HUGGINGFACE_HUB_CACHE".to_string(),
         hf_home.to_string_lossy().into_owned(),
@@ -1632,10 +1679,7 @@ async fn do_python_bundle_native_deploy(
     let tx_c = tx.clone();
     std::thread::spawn(move || {
         if let Some(o) = stdout_handle {
-            for line in std::io::BufReader::new(o)
-                .lines()
-                .map_while(Result::ok)
-            {
+            for line in std::io::BufReader::new(o).lines().map_while(Result::ok) {
                 log_line(&db_c, &dep_c, &tx_c, "log", &line);
             }
         }
@@ -1645,10 +1689,7 @@ async fn do_python_bundle_native_deploy(
     let tx_c = tx.clone();
     std::thread::spawn(move || {
         if let Some(e) = stderr_handle {
-            for line in std::io::BufReader::new(e)
-                .lines()
-                .map_while(Result::ok)
-            {
+            for line in std::io::BufReader::new(e).lines().map_while(Result::ok) {
                 log_line(&db_c, &dep_c, &tx_c, "log", &line);
             }
         }
@@ -1725,8 +1766,13 @@ async fn do_python_bundle_native_deploy(
                                     if !trimmed.is_empty() {
                                         // Prefix [engine] zeby uzytkownik
                                         // odroznil log silnika od logow tentaflow.
-                                        log_line(db, deploy_id, tx, "log",
-                                            &format!("[engine] {}", trimmed));
+                                        log_line(
+                                            db,
+                                            deploy_id,
+                                            tx,
+                                            "log",
+                                            &format!("[engine] {}", trimmed),
+                                        );
                                     }
                                 }
                                 last_log_offset += n as u64;
@@ -1801,7 +1847,10 @@ async fn do_python_bundle_native_deploy(
             })
             .unwrap_or_else(|| format!("(brak {})", log_path.display()));
         let reason = if crashed {
-            format!("Engine zcrashowal (PID {} nie zyje). Ostatnie 80 linii engine.log:\n{}", pid, last_log)
+            format!(
+                "Engine zcrashowal (PID {} nie zyje). Ostatnie 80 linii engine.log:\n{}",
+                pid, last_log
+            )
         } else {
             format!(
                 "Bundle nie odpowiedzial na {} po {}s. Ostatnie 80 linii engine.log:\n{}",
@@ -2314,7 +2363,11 @@ fn ensure_model_registry_entry(
     match crate::db::repository::get_model_by_name(db, model_name) {
         Ok(Some(_)) => {
             if let Err(e) = crate::db::repository::relink_model_entry_to_service(
-                db, model_name, service_id, service_type, config_json,
+                db,
+                model_name,
+                service_id,
+                service_type,
+                config_json,
             ) {
                 tracing::warn!(
                     "ensure_model_registry_entry({}): relink failed: {}",
@@ -2345,11 +2398,7 @@ fn ensure_model_registry_entry(
         config_json,
     };
     if let Err(e) = crate::db::repository::create_model_entry(db, &params) {
-        tracing::warn!(
-            "ensure_model_registry_entry({}): {}",
-            model_name,
-            e
-        );
+        tracing::warn!("ensure_model_registry_entry({}): {}", model_name, e);
     }
 }
 
@@ -2375,8 +2424,8 @@ fn register_native_http_backend(
 
     // Idempotencja: jesli ten sam service_id juz ma backend z tym samym URL,
     // pomin insert (zdarza sie po ponownym deploy tej samej instancji).
-    let existing = crate::db::repository::list_backends_for_service(db, service_id)
-        .unwrap_or_default();
+    let existing =
+        crate::db::repository::list_backends_for_service(db, service_id).unwrap_or_default();
     let already = existing.iter().any(|b| b.config_json.contains(&base_url));
 
     if !already {
@@ -2416,7 +2465,8 @@ fn register_native_http_backend(
         health_check_path: Some("/v1/models".to_string()),
     };
 
-    let client = BackendClient::new(sb, None).context("BackendClient::new for native python-bundle")?;
+    let client =
+        BackendClient::new(sb, None).context("BackendClient::new for native python-bundle")?;
     service_manager.register_dynamic_http_backend(service_name, Arc::new(client));
     Ok(())
 }
@@ -2587,8 +2637,8 @@ pub(crate) fn provision_docker_sidecar(
     let upstream_api = match engine_id {
         "llama-cpp" => "llama_cpp",
         "sherpa-onnx" => "sherpa",
-        "vllm" | "sglang" | "xtts" | "voxcpm" | "parakeet" | "qwen-asr" | "comfyui"
-        | "whisper" | "ollama" => "open_ai",
+        "vllm" | "sglang" | "xtts" | "voxcpm" | "parakeet" | "qwen-asr" | "comfyui" | "whisper"
+        | "ollama" => "open_ai",
         _ => "raw_http",
     };
     // OpenAI-kompatybilne backendy maja prefix /v1, llama.cpp i sherpa wystawiaja
@@ -2839,10 +2889,8 @@ pub(crate) async fn build_auto_vllm_args(
     // Wykryj GPU lokalne. detect_gpus_cached() jest cached 60s wiec nie
     // robi nvidia-smi przy kazdym deploy.
     let all_gpus = crate::mesh::node_info_collector::detect_gpus_cached();
-    let nvidia: Vec<&crate::mesh::peer_store::PeerGpuInfo> = all_gpus
-        .iter()
-        .filter(|g| g.vram_total_mb > 0)
-        .collect();
+    let nvidia: Vec<&crate::mesh::peer_store::PeerGpuInfo> =
+        all_gpus.iter().filter(|g| g.vram_total_mb > 0).collect();
     if nvidia.is_empty() {
         return Ok(None);
     }
@@ -2850,11 +2898,11 @@ pub(crate) async fn build_auto_vllm_args(
     // Filter po wybranych GPU_IDS gdy user wybral konkretne (gpu_select_mode=specific).
     let selected: Vec<&crate::mesh::peer_store::PeerGpuInfo> = match gpu_ids_filter {
         Some(ids) if !ids.is_empty() => {
-            let id_set: std::collections::HashSet<u32> = ids
+            let id_set: std::collections::HashSet<u32> =
+                ids.iter().filter_map(|s| s.parse::<u32>().ok()).collect();
+            nvidia
                 .iter()
-                .filter_map(|s| s.parse::<u32>().ok())
-                .collect();
-            nvidia.iter().enumerate()
+                .enumerate()
                 .filter(|(idx, _)| id_set.contains(&(*idx as u32)))
                 .map(|(_, g)| *g)
                 .collect()
@@ -2875,7 +2923,11 @@ pub(crate) async fn build_auto_vllm_args(
     let hf_token = repository::get_setting_secure(db, "hf_token", settings_cipher)
         .unwrap_or_default()
         .unwrap_or_default();
-    let token_opt = if hf_token.is_empty() { None } else { Some(hf_token.as_str()) };
+    let token_opt = if hf_token.is_empty() {
+        None
+    } else {
+        Some(hf_token.as_str())
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -2950,9 +3002,10 @@ fn read_proc_metrics(pid: u32) -> Option<String> {
 /// (macOS, AMD-only).
 fn nvidia_smi_snapshot() -> Option<String> {
     use std::process::Command;
-    use std::time::{Duration, Instant};
     use std::sync::Mutex;
-    static CACHE: std::sync::OnceLock<Mutex<(Instant, Option<String>)>> = std::sync::OnceLock::new();
+    use std::time::{Duration, Instant};
+    static CACHE: std::sync::OnceLock<Mutex<(Instant, Option<String>)>> =
+        std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(60), None)));
     {
         let guard = cache.lock().ok()?;
@@ -2982,7 +3035,11 @@ fn nvidia_smi_snapshot() -> Option<String> {
             }
         })
         .collect();
-    let snap = if parts.is_empty() { None } else { Some(parts.join(" ")) };
+    let snap = if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    };
     if let Ok(mut guard) = cache.lock() {
         *guard = (Instant::now(), snap.clone());
     }
@@ -3014,8 +3071,13 @@ fn spawn_docker_log_tailer(
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                log_line(&db, &deploy_id, &tx, "log",
-                    &format!("[docker-log] spawn fail: {e}"));
+                log_line(
+                    &db,
+                    &deploy_id,
+                    &tx,
+                    "log",
+                    &format!("[docker-log] spawn fail: {e}"),
+                );
                 return;
             }
         };
@@ -3030,8 +3092,13 @@ fn spawn_docker_log_tailer(
                 while let Ok(Some(line)) = lines.next_line().await {
                     let trimmed = line.trim_end();
                     if !trimmed.is_empty() {
-                        log_line(&db_o, &dep_o, &tx_o, "log",
-                            &format!("[docker] {}", trimmed));
+                        log_line(
+                            &db_o,
+                            &dep_o,
+                            &tx_o,
+                            "log",
+                            &format!("[docker] {}", trimmed),
+                        );
                     }
                 }
             }
@@ -3042,12 +3109,19 @@ fn spawn_docker_log_tailer(
                 while let Ok(Some(line)) = lines.next_line().await {
                     let trimmed = line.trim_end();
                     if !trimmed.is_empty() {
-                        log_line(&db, &deploy_id, &tx, "log",
-                            &format!("[docker] {}", trimmed));
+                        log_line(
+                            &db,
+                            &deploy_id,
+                            &tx,
+                            "log",
+                            &format!("[docker] {}", trimmed),
+                        );
                     }
                 }
             }
         });
-        let _ = tokio::join!(stdout_task, stderr_task, async { let _ = child.wait().await; });
+        let _ = tokio::join!(stdout_task, stderr_task, async {
+            let _ = child.wait().await;
+        });
     });
 }

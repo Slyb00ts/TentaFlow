@@ -240,9 +240,7 @@ impl ProfileStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tentaflow_protocol::profiling::{
-        NsightScope, ProfileKpi, ProfileMeta, ProfileReport,
-    };
+    use tentaflow_protocol::profiling::{NsightScope, ProfileKpi, ProfileMeta, ProfileReport};
 
     fn dummy_report(session_id: &str, started_at_ms: u64) -> ProfileReport {
         ProfileReport {
@@ -335,7 +333,10 @@ mod tests {
         st.rotate().unwrap();
 
         let new_dir = tmp.path().join("nsight").join("node-test").join(&sid_new);
-        assert!(!old_dir.exists(), "stary osierocony katalog powinien byc usuniety");
+        assert!(
+            !old_dir.exists(),
+            "stary osierocony katalog powinien byc usuniety"
+        );
         assert!(new_dir.exists(), "swiezy osierocony katalog ma pozostac");
     }
 

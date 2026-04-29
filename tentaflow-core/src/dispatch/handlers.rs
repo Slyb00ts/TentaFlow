@@ -11,8 +11,8 @@ use tentaflow_protocol::{
     ApiKeyCreateResponse, ApiKeySummary, AuditEvent, AuthLoginResponse, AuthMeResponse,
     DashboardSnapshot, FlowDetail, FlowExecutionSummary, FlowSummary, HubEngineSummary,
     MeshPairInitResponse, MeshPeerSummary, MessageBody, ModelDetail, ModelSummary, PromptDetail,
-    PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary,
-    ServiceQuicStatus, ServiceSummary, SessionAuth, SettingEntry, TtsRule,
+    PromptSummary, ProtocolError, ProtocolErrorCode, RegistrySummary, ServiceQuicStatus,
+    ServiceSummary, SessionAuth, SettingEntry, TtsRule,
 };
 
 use super::HandlerContext;
@@ -410,7 +410,11 @@ pub fn model_list_request(
             // service'u (typu "tentaflow-vllm-metal-2izlb"). Fallback: nazwa.
             let display_name = serde_json::from_str::<serde_json::Value>(&s.config_json)
                 .ok()
-                .and_then(|v| v.get("deployed_model").and_then(|m| m.as_str()).map(String::from))
+                .and_then(|v| {
+                    v.get("deployed_model")
+                        .and_then(|m| m.as_str())
+                        .map(String::from)
+                })
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| s.name.clone());
             // engine_id: takze z config_json (vllm-metal/mlx/llama-cpp), nie
@@ -504,7 +508,11 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     // Cascade — usun wpisy w `model_registry` powiazane z tym serwisem,
     // inaczej zostaja jako sierota w panelu Modele po deleted serwisu.
     if let Err(e) = repository::delete_model_entries_by_service(&ctx.state.db, svc.id) {
-        tracing::warn!(service_id = svc.id, "delete_model_entries_by_service: {}", e);
+        tracing::warn!(
+            service_id = svc.id,
+            "delete_model_entries_by_service: {}",
+            e
+        );
     }
     // Wyrejestruj z mesh registry, inaczej router dalej forwarduje requesty
     // na nieistniejacy serwis ("Mesh STT serwis nie polaczony").
@@ -856,13 +864,22 @@ pub fn flow_node_templates_list(
     let templates: Vec<tentaflow_protocol::FlowNodeTemplate> = rows
         .into_iter()
         .map(|t| {
-            let (input_ports, output_ports) = match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
-                Some(adapter) => (
-                    adapter.supported_input_ports().iter().map(|s| s.to_string()).collect(),
-                    adapter.supported_output_ports().iter().map(|s| s.to_string()).collect(),
-                ),
-                None => (Vec::new(), Vec::new()),
-            };
+            let (input_ports, output_ports) =
+                match dispatcher.and_then(|d| d.registry().get(&t.node_type)) {
+                    Some(adapter) => (
+                        adapter
+                            .supported_input_ports()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        adapter
+                            .supported_output_ports()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
             tentaflow_protocol::FlowNodeTemplate {
                 id: t.id,
                 node_type: t.node_type,
@@ -2315,7 +2332,11 @@ pub async fn service_stop(
     let audit_detail = if stop_warnings.is_empty() {
         format!("service:{}", service_id)
     } else {
-        format!("service:{} warnings=[{}]", service_id, stop_warnings.join("; "))
+        format!(
+            "service:{} warnings=[{}]",
+            service_id,
+            stop_warnings.join("; ")
+        )
     };
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -2624,7 +2645,6 @@ pub fn tts_rule_delete(
     Ok(MessageBody::TtsRuleDeleteResponse { deleted: true })
 }
 
-
 #[handler(variant = "PiiRuleListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -2661,7 +2681,11 @@ pub fn vision_infer(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::VisionBody(tentaflow_protocol::VisionInferPayload::InferRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected VisionBody/InferRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected VisionBody/InferRequest",
+            ))
+        }
     };
 
     let started = std::time::Instant::now();
@@ -2688,28 +2712,28 @@ pub fn vision_infer(
         .map_err(|e| ProtocolError::internal(&format!("vision::infer: {e}")))?;
 
     let result = match out {
-        crate::vision::InferOutput::Faces(faces) => {
-            tentaflow_protocol::VisionInferResult::Faces(
-                faces
-                    .into_iter()
-                    .map(|f| tentaflow_protocol::VisionFaceDet {
-                        x1: f.bbox.0,
-                        y1: f.bbox.1,
-                        x2: f.bbox.2,
-                        y2: f.bbox.3,
-                        score: f.score,
-                        keypoints: f
-                            .keypoints
-                            .map(|k| k.iter().map(|p| (p.0, p.1)).collect())
-                            .unwrap_or_default(),
-                    })
-                    .collect(),
-            )
+        crate::vision::InferOutput::Faces(faces) => tentaflow_protocol::VisionInferResult::Faces(
+            faces
+                .into_iter()
+                .map(|f| tentaflow_protocol::VisionFaceDet {
+                    x1: f.bbox.0,
+                    y1: f.bbox.1,
+                    x2: f.bbox.2,
+                    y2: f.bbox.3,
+                    score: f.score,
+                    keypoints: f
+                        .keypoints
+                        .map(|k| k.iter().map(|p| (p.0, p.1)).collect())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        ),
+        crate::vision::InferOutput::AgeGender(ag) => {
+            tentaflow_protocol::VisionInferResult::AgeGender {
+                age_years: ag.age_years,
+                gender_male_prob: ag.gender_male_prob,
+            }
         }
-        crate::vision::InferOutput::AgeGender(ag) => tentaflow_protocol::VisionInferResult::AgeGender {
-            age_years: ag.age_years,
-            gender_male_prob: ag.gender_male_prob,
-        },
         crate::vision::InferOutput::Emotion(em) => tentaflow_protocol::VisionInferResult::Emotion {
             label: em.label,
             probabilities: em.probabilities,
@@ -4031,8 +4055,7 @@ pub async fn service_redeploy(
                 status: tentaflow_protocol::REDEPLOY_STATUS_NO_SOURCE.to_string(),
                 deploy_id: String::new(),
                 new_hash: String::new(),
-                error: "manifest exposes no source_hash for this engine/deploy_mode"
-                    .to_string(),
+                error: "manifest exposes no source_hash for this engine/deploy_mode".to_string(),
                 active_session_count: 0,
             }
         }
@@ -4712,7 +4735,9 @@ fn bool_to_setting(v: bool) -> &'static str {
     }
 }
 
-fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::NetworkConfig, ProtocolError> {
+fn load_network_config(
+    ctx: &HandlerContext,
+) -> Result<tentaflow_protocol::NetworkConfig, ProtocolError> {
     use network_config_keys::*;
     let pool = &ctx.state.db;
 
@@ -4722,8 +4747,10 @@ fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::Netwo
     let bind_ipv4 = repository::get_setting(pool, BIND_IPV4)
         .map_err(db_err)?
         .unwrap_or_default();
-    let hide_docker =
-        parse_bool_setting(&repository::get_setting(pool, HIDE_DOCKER).map_err(db_err)?, true);
+    let hide_docker = parse_bool_setting(
+        &repository::get_setting(pool, HIDE_DOCKER).map_err(db_err)?,
+        true,
+    );
     let hide_link_local = parse_bool_setting(
         &repository::get_setting(pool, HIDE_LINK_LOCAL).map_err(db_err)?,
         true,
@@ -4740,9 +4767,10 @@ fn load_network_config(ctx: &HandlerContext) -> Result<tentaflow_protocol::Netwo
         &repository::get_setting(pool, PREFER_SAME_SUBNET).map_err(db_err)?,
         true,
     );
-    let iroh_relay_url = repository::get_setting(pool, crate::net::iroh::relay::RELAY_URL_SETTING_KEY)
-        .map_err(db_err)?
-        .unwrap_or_else(|| crate::net::iroh::relay::DEFAULT_RELAY_URL.to_string());
+    let iroh_relay_url =
+        repository::get_setting(pool, crate::net::iroh::relay::RELAY_URL_SETTING_KEY)
+            .map_err(db_err)?
+            .unwrap_or_else(|| crate::net::iroh::relay::DEFAULT_RELAY_URL.to_string());
 
     Ok(tentaflow_protocol::NetworkConfig {
         bind_mode,

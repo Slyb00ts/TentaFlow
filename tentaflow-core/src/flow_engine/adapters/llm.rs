@@ -486,7 +486,9 @@ impl NodeAdapter for LlmNodeAdapter {
             }
         }
 
-        let backends = self.service_manager.get_service_backends_cloned(&model_name);
+        let backends = self
+            .service_manager
+            .get_service_backends_cloned(&model_name);
         match backends {
             Some(backends) if !backends.is_empty() => {
                 let backend = backends[0].clone();

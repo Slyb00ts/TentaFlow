@@ -28,11 +28,18 @@ impl Router {
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
-                if !crate::routing::acl::check_access_safe(db, "model", &request.model, u.user_id, &u.role) {
+                if !crate::routing::acl::check_access_safe(
+                    db,
+                    "model",
+                    &request.model,
+                    u.user_id,
+                    &u.role,
+                ) {
                     tracing::warn!(user_id = u.user_id, model = %request.model, "ACL denied embedding model");
                     return Err(crate::error::CoreError::AllBackendsUnavailable {
                         model_name: request.model.clone(),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -234,10 +241,14 @@ impl Router {
             texts.len()
         );
 
-        let quic_handle = self.service_manager.quic_embedding_services.get(&model_name).map(|r| r.value().clone())
-        .ok_or_else(|| CoreError::ModelNotFound {
-            model_name: model_name.clone(),
-        })?;
+        let quic_handle = self
+            .service_manager
+            .quic_embedding_services
+            .get(&model_name)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| CoreError::ModelNotFound {
+                model_name: model_name.clone(),
+            })?;
 
         let quic_client =
             quic_handle
@@ -283,7 +294,11 @@ impl Router {
 
         let model_name = self.resolve_model_alias(&payload.model);
 
-        let rerank_quic_handle = self.service_manager.quic_embedding_services.get(&model_name).map(|r| r.value().clone());
+        let rerank_quic_handle = self
+            .service_manager
+            .quic_embedding_services
+            .get(&model_name)
+            .map(|r| r.value().clone());
         let quic_client = if let Some(quic_handle) = rerank_quic_handle {
             quic_handle
                 .get_client()

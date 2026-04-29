@@ -91,8 +91,7 @@ mod tests {
         // poprawny DAG — `_` w nazwie zmiennej jasno oznacza ze argument jest
         // ignorowany w nowej semantyce.
         let _ = json;
-        let valid_json =
-            r#"{"nodes":[{"id":"a","type":"trigger","config":{}}],"edges":[]}"#;
+        let valid_json = r#"{"nodes":[{"id":"a","type":"trigger","config":{}}],"edges":[]}"#;
         let flow = DbFlow {
             id,
             name: format!("test-flow-{}", id),

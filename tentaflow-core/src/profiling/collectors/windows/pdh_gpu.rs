@@ -20,8 +20,8 @@ use tentaflow_protocol::profiling::{
 };
 
 use crate::profiling::collectors::{
-    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner,
-    PlatformSet, ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
+    CollectorCapability, CollectorError, CollectorParser, FrameInterner, NameInterner, PlatformSet,
+    ProbeResult, ProfileCollector, RawCapture, RunningCollector, SessionCtx,
 };
 
 const COLLECTOR_ID: &str = "windows.pdh.gpu";
@@ -120,7 +120,10 @@ impl RunningCollector for WindowsPdhGpuRunning {
         }
 
         let mut metadata: HashMap<String, String> = HashMap::new();
-        metadata.insert("source".into(), "PDH \\GPU Engine(*) + \\GPU Process Memory(*)".into());
+        metadata.insert(
+            "source".into(),
+            "PDH \\GPU Engine(*) + \\GPU Process Memory(*)".into(),
+        );
         metadata.insert("sample_period_ms".into(), "1000".into());
         metadata.insert("power".into(), "not available via PDH".into());
 
@@ -182,9 +185,7 @@ mod windows_impl {
         Some(tail[..end].to_string())
     }
 
-    pub fn start_session(
-        ctx: SessionCtx,
-    ) -> Result<Box<dyn RunningCollector>, CollectorError> {
+    pub fn start_session(ctx: SessionCtx) -> Result<Box<dyn RunningCollector>, CollectorError> {
         fs::create_dir_all(&ctx.output_dir)?;
         let csv_path = ctx.output_dir.join(CSV_FILENAME);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -226,8 +227,8 @@ mod windows_impl {
             "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes"
         )?;
 
-        let query = PdhQuery::open()
-            .map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
+        let query =
+            PdhQuery::open().map_err(|e| CollectorError::Custom(format!("PdhOpenQueryW: {e}")))?;
 
         // Engine util counters (one per engine instance), grouped by LUID.
         let engine_instances = enum_instances("GPU Engine").unwrap_or_default();
@@ -343,10 +344,7 @@ mod windows_impl {
         #[test]
         fn extract_luid_parses_typical_instance() {
             let inst = "pid_1234_luid_0x00000000_0x0000C0FE_phys_0_eng_0_engtype_3D";
-            assert_eq!(
-                extract_luid(inst).as_deref(),
-                Some("0x00000000_0x0000C0FE")
-            );
+            assert_eq!(extract_luid(inst).as_deref(), Some("0x00000000_0x0000C0FE"));
         }
 
         #[test]
@@ -499,7 +497,11 @@ mod tests {
     fn gpu_parser_handles_empty_csv() {
         let dir = TempDir::new().unwrap();
         let csv = dir.path().join("gpu.csv");
-        fs::write(&csv, "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes\n").unwrap();
+        fs::write(
+            &csv,
+            "timestamp_ns,device_id,compute_pct,mem_pct,mem_used_bytes\n",
+        )
+        .unwrap();
         let raw = RawCapture {
             artifacts: vec![csv],
             metadata: HashMap::new(),

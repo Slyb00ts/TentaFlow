@@ -16,11 +16,11 @@
 pub mod nms;
 pub mod preprocessing;
 
+pub mod emonet;
+pub mod hsemotion;
+pub mod mivolo;
 pub mod scrfd;
 pub mod yolov8_face;
-pub mod mivolo;
-pub mod hsemotion;
-pub mod emonet;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -230,8 +230,12 @@ pub fn infer(service_name: &str, image_rgb: &[u8], width: u32, height: u32) -> R
         .get(service_name)
         .ok_or_else(|| anyhow!("vision: brak zaladowanego silnika '{}'", service_name))?;
     match engine {
-        LoadedEngine::FaceDetector(d) => Ok(InferOutput::Faces(d.detect(image_rgb, width, height)?)),
-        LoadedEngine::AgeGender(e) => Ok(InferOutput::AgeGender(e.predict(image_rgb, width, height)?)),
+        LoadedEngine::FaceDetector(d) => {
+            Ok(InferOutput::Faces(d.detect(image_rgb, width, height)?))
+        }
+        LoadedEngine::AgeGender(e) => {
+            Ok(InferOutput::AgeGender(e.predict(image_rgb, width, height)?))
+        }
         LoadedEngine::Emotion(e) => Ok(InferOutput::Emotion(e.classify(image_rgb, width, height)?)),
         LoadedEngine::Stub => Err(anyhow!(
             "vision: silnik '{}' jest stubem (brak modelu lub niewpiety inference)",

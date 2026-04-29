@@ -300,7 +300,10 @@ impl NsysRunner {
         // dlugo flush'owac. Po SIGTERM_GRACE wymuszamy SIGKILL, zeby nie
         // blokowac UI 30s+ gdy proces nie reaguje. Czesciowy `.nsys-rep`
         // i tak parsuje sie do `Failed` przez krotszy POST_STOP_TIMEOUT.
-        if tokio::time::timeout(SIGTERM_GRACE, child.wait()).await.is_err() {
+        if tokio::time::timeout(SIGTERM_GRACE, child.wait())
+            .await
+            .is_err()
+        {
             tracing::warn!(
                 pid = kill_pid,
                 "nsys did not exit within grace period, sending SIGKILL"
@@ -342,7 +345,11 @@ impl NsysRunner {
 /// metryki przez czas trwania sleepa. Manual-mode (`duration_secs == 0`)
 /// dostaje bardzo dlugi sleep — SIGTERM z `stop()` przerywa go i nsys
 /// wykonuje teardown z flushem `.nsys-rep`.
-pub(crate) fn build_nsys_args(scope: &NsightScope, output_path: &Path, duration_secs: u32) -> Vec<String> {
+pub(crate) fn build_nsys_args(
+    scope: &NsightScope,
+    output_path: &Path,
+    duration_secs: u32,
+) -> Vec<String> {
     let out = output_path.to_string_lossy().to_string();
     let mut args: Vec<String> = match scope {
         NsightScope::Cpu => vec![

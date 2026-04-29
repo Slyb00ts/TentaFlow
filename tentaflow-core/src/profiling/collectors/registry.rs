@@ -33,25 +33,53 @@ impl CollectorRegistry {
         // NVIDIA Nsight Systems (kernels, API calls, NVTX, GPU metrics).
         r.register(Arc::new(super::NvidiaNsysCollector::new()));
         // Linux no-priv collectors (CPU/RAM/Disk/Power/GPU util via vendor CLIs).
-        r.register(Arc::new(super::linux::cpu_util::LinuxProcCpuUtilCollector::new()));
+        r.register(Arc::new(
+            super::linux::cpu_util::LinuxProcCpuUtilCollector::new(),
+        ));
         r.register(Arc::new(super::linux::ram::LinuxProcRamCollector::new()));
         r.register(Arc::new(super::linux::disk::LinuxIostatDiskCollector::new()));
-        r.register(Arc::new(super::linux::rapl_power::LinuxRaplPowerCollector::new()));
-        r.register(Arc::new(super::linux::nvsmi_gpu::LinuxNvsmiGpuCollector::new()));
+        r.register(Arc::new(
+            super::linux::rapl_power::LinuxRaplPowerCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::linux::nvsmi_gpu::LinuxNvsmiGpuCollector::new(),
+        ));
         // Linux GPU vendor collectors (AMD ROCm, Intel iGPU).
-        r.register(Arc::new(super::linux_gpu::rocsmi_util::LinuxRocmSmiGpuCollector::new()));
-        r.register(Arc::new(super::linux_gpu::rocprof_kernels::LinuxRocprofKernelsCollector::new()));
-        r.register(Arc::new(super::linux_gpu::intel_gpu_top::LinuxIntelGpuTopCollector::new()));
+        r.register(Arc::new(
+            super::linux_gpu::rocsmi_util::LinuxRocmSmiGpuCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::linux_gpu::rocprof_kernels::LinuxRocprofKernelsCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::linux_gpu::intel_gpu_top::LinuxIntelGpuTopCollector::new(),
+        ));
         // macOS collectors (vm_stat, iostat, powermetrics power+gpu).
-        r.register(Arc::new(super::macos::vm_stat_ram::MacosVmStatRamCollector::new()));
-        r.register(Arc::new(super::macos::iostat_disk::MacosIostatDiskCollector::new()));
-        r.register(Arc::new(super::macos::powermetrics_power::MacosPowermetricsPowerCollector::new()));
-        r.register(Arc::new(super::macos::powermetrics_gpu::MacosPowermetricsGpuCollector::new()));
+        r.register(Arc::new(
+            super::macos::vm_stat_ram::MacosVmStatRamCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::macos::iostat_disk::MacosIostatDiskCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::macos::powermetrics_power::MacosPowermetricsPowerCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::macos::powermetrics_gpu::MacosPowermetricsGpuCollector::new(),
+        ));
         // Windows PDH no-Admin collectors (CPU/RAM/Disk/GPU).
-        r.register(Arc::new(super::windows::pdh_cpu_util::WindowsPdhCpuUtilCollector::new()));
-        r.register(Arc::new(super::windows::pdh_ram::WindowsPdhRamCollector::new()));
-        r.register(Arc::new(super::windows::pdh_disk::WindowsPdhDiskCollector::new()));
-        r.register(Arc::new(super::windows::pdh_gpu::WindowsPdhGpuCollector::new()));
+        r.register(Arc::new(
+            super::windows::pdh_cpu_util::WindowsPdhCpuUtilCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::windows::pdh_ram::WindowsPdhRamCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::windows::pdh_disk::WindowsPdhDiskCollector::new(),
+        ));
+        r.register(Arc::new(
+            super::windows::pdh_gpu::WindowsPdhGpuCollector::new(),
+        ));
         r
     }
 
