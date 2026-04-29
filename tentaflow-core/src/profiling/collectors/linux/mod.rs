@@ -8,5 +8,6 @@
 pub mod cpu_util;
 pub mod disk;
 pub mod nvsmi_gpu;
+pub mod perf_sampling;
 pub mod ram;
 pub mod rapl_power;

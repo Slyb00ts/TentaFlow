@@ -34,6 +34,7 @@ impl CollectorRegistry {
         r.register(Arc::new(super::NvidiaNsysCollector::new()));
         // Linux no-priv collectors (CPU/RAM/Disk/Power/GPU util via vendor CLIs).
         r.register(Arc::new(super::linux::cpu_util::LinuxProcCpuUtilCollector::new()));
+        r.register(Arc::new(super::linux::perf_sampling::LinuxPerfSamplingCollector::new()));
         r.register(Arc::new(super::linux::ram::LinuxProcRamCollector::new()));
         r.register(Arc::new(super::linux::disk::LinuxIostatDiskCollector::new()));
         r.register(Arc::new(super::linux::rapl_power::LinuxRaplPowerCollector::new()));
