@@ -238,6 +238,9 @@ export class ProfilingSessionsView {
     this.searchTerm = '';
     this.refreshTimer = null;
     this.root = null;
+    // Set<sessionId> wybranych do porownania (Compare). Max 2 — przy 3.
+    // wybraniu pierwszy zostaje zdjety.
+    this.compareSelected = new Set();
   }
 
   async mount(parent) {
@@ -298,8 +301,17 @@ export class ProfilingSessionsView {
       <div class="toolbar">
         <tf-searchbox id="ps-search" placeholder="Filter by label..."></tf-searchbox>
         <div id="ps-filter-chips"></div>
+        <tf-button variant="ghost" size="sm" icon="settings" id="ps-permissions">Permissions</tf-button>
         <tf-button variant="ghost" size="sm" icon="refresh" id="ps-refresh">Refresh</tf-button>
         <tf-button variant="primary" size="sm" icon="plus" id="ps-new">New session</tf-button>
+      </div>
+
+      <div id="ps-compare-bar" class="ps-compare-bar hidden">
+        <span class="count">0/2 selected</span>
+        <span style="color: var(--tf-text-2, #a0a8c8);">Pick two completed sessions to compare side-by-side.</span>
+        <span style="flex:1"></span>
+        <tf-button variant="ghost" size="sm" id="ps-compare-clear">Clear</tf-button>
+        <tf-button variant="primary" size="sm" id="ps-compare-go" disabled>Compare selected</tf-button>
       </div>
 
       <div id="ps-table-wrap"></div>
@@ -342,6 +354,65 @@ export class ProfilingSessionsView {
     if (refreshBtn) refreshBtn.addEventListener('click', () => { this.refresh(); });
     const newBtn = this.root.querySelector('#ps-new');
     if (newBtn) newBtn.addEventListener('click', () => this._openLaunch());
+
+    const permsBtn = this.root.querySelector('#ps-permissions');
+    if (permsBtn) {
+      permsBtn.addEventListener('click', () => {
+        if (window.Router && typeof window.Router.navigate === 'function') {
+          window.Router.navigate('profile-permissions');
+        }
+      });
+    }
+
+    const cmpClear = this.root.querySelector('#ps-compare-clear');
+    if (cmpClear) cmpClear.addEventListener('click', () => {
+      this.compareSelected.clear();
+      this._renderTable();
+      this._updateCompareBar();
+    });
+    const cmpGo = this.root.querySelector('#ps-compare-go');
+    if (cmpGo) cmpGo.addEventListener('click', () => this._launchCompare());
+  }
+
+  _updateCompareBar() {
+    const bar = this.root?.querySelector('#ps-compare-bar');
+    if (!bar) return;
+    const n = this.compareSelected.size;
+    if (n === 0) {
+      bar.classList.add('hidden');
+      return;
+    }
+    bar.classList.remove('hidden');
+    const countEl = bar.querySelector('.count');
+    if (countEl) countEl.textContent = `${n}/2 selected`;
+    const goBtn = bar.querySelector('#ps-compare-go');
+    if (goBtn) {
+      if (n === 2) goBtn.removeAttribute('disabled');
+      else goBtn.setAttribute('disabled', '');
+    }
+  }
+
+  _toggleCompare(sessionId) {
+    if (this.compareSelected.has(sessionId)) {
+      this.compareSelected.delete(sessionId);
+    } else {
+      // Max 2 — gdy juz dwa, zdejmij najstarszy.
+      if (this.compareSelected.size >= 2) {
+        const first = this.compareSelected.values().next().value;
+        this.compareSelected.delete(first);
+      }
+      this.compareSelected.add(sessionId);
+    }
+    this._renderTable();
+    this._updateCompareBar();
+  }
+
+  _launchCompare() {
+    if (this.compareSelected.size !== 2) return;
+    const [sessionA, sessionB] = Array.from(this.compareSelected);
+    if (window.Router && typeof window.Router.navigate === 'function') {
+      window.Router.navigate('profile-compare', { nodeId: this.nodeId, sessionA, sessionB });
+    }
   }
 
   _renderTable() {
@@ -382,8 +453,9 @@ export class ProfilingSessionsView {
       <table class="tf-table-native">
         <thead>
           <tr>
-            <th style="width: 32%">Status / Label</th>
-            <th style="width: 28%">Sources</th>
+            <th class="ps-select-cell" title="Select for compare"></th>
+            <th style="width: 30%">Status / Label</th>
+            <th style="width: 26%">Sources</th>
             <th style="width: 14%">Duration · Size</th>
             <th style="width: 14%">Started</th>
             <th class="actions-col" style="width: 12%">Actions</th>
@@ -393,6 +465,7 @@ export class ProfilingSessionsView {
       </table>
     `;
     this._attachRowListeners(wrap);
+    this._updateCompareBar();
   }
 
   _renderRow(s) {
@@ -406,8 +479,16 @@ export class ProfilingSessionsView {
     const rel = formatRelative(s.started_at_unix_ns);
     const abs = formatAbsolute(s.started_at_unix_ns);
 
+    const isSelected = this.compareSelected.has(s.session_id);
+    // Tylko ukonczone sesje moga byc porownane (running/failed maja niepelne raporty).
+    const canCompare = s.status === 'completed' || s.status === 'partial';
+    const checkbox = canCompare
+      ? `<input type="checkbox" data-action="compare-toggle" data-sid="${sid}" ${isSelected ? 'checked' : ''} aria-label="Select for compare" />`
+      : `<input type="checkbox" disabled aria-label="Compare unavailable for this status" />`;
+
     return `
-      <tr data-session-id="${sid}">
+      <tr data-session-id="${sid}" class="${isSelected ? 'selected' : ''}">
+        <td class="ps-select-cell">${checkbox}</td>
         <td>
           <div class="label-cell">
             ${ico}
@@ -434,22 +515,34 @@ export class ProfilingSessionsView {
   _attachRowListeners(wrap) {
     wrap.querySelectorAll('tr[data-session-id]').forEach((tr) => {
       tr.addEventListener('click', (ev) => {
-        // Ignore clicks on action buttons (handled separately)
+        // Ignore clicks on action buttons / checkboxes.
         if (ev.target.closest('[data-action]')) return;
+        if (ev.target.tagName === 'INPUT') return;
         const sid = tr.getAttribute('data-session-id');
         this._openReport(sid);
       });
     });
     wrap.querySelectorAll('[data-action]').forEach((btn) => {
-      btn.addEventListener('click', (ev) => {
+      const handler = (ev) => {
         ev.stopPropagation();
         const action = btn.getAttribute('data-action');
         const sid = btn.getAttribute('data-sid');
         if (!sid) return;
+        if (action === 'compare-toggle') {
+          this._toggleCompare(sid);
+          return;
+        }
         if (action === 'open') this._openReport(sid);
         else if (action === 'download') this._downloadSession(sid);
         else if (action === 'delete') this._confirmDelete(sid);
-      });
+      };
+      // Checkboxy reaguja na 'change' (tez na klawiature); buttons na 'click'.
+      if (btn.tagName === 'INPUT') {
+        btn.addEventListener('change', handler);
+        btn.addEventListener('click', (ev) => ev.stopPropagation());
+      } else {
+        btn.addEventListener('click', handler);
+      }
     });
   }
 

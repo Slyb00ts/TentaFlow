@@ -10,11 +10,10 @@
 import { escapeHtml, escapeAttr, toast, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
-import { nsightStart, nsightStop, nsightSessions, nsightDelete, nsightDownload } from '/js/protocol/nsight.js';
+import { nsightStop, nsightSessions, nsightDelete, nsightDownload } from '/js/protocol/nsight.js';
+import { ProfilingLaunchModal } from '/js/modules/profiling-launch.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
-import '/js/components/tf-select.js';
-import '/js/components/tf-input.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-menu.js';
 import '/js/components/tf-window.js';
@@ -30,15 +29,21 @@ let pollSessionsInterval = null; // setInterval do polling listy sesji po auto-s
 let cachedSessions = [];        // ostatnio pobrana lista sesji (snapshot)
 let lastSessionsNodeId = null;  // dla ktorego noda cachedSessions zostalo pobrane
 
-let pendingActionsTarget = null; // tf-menu: ktora sesja aktualnie pokazana
 let onChangeCallback = null;     // wywolanie do mesh-detail.js po start/stop/delete
 let boundActionsRoot = null;     // root na ktorym wisi nasz click listener
 let boundActionsHandler = null;  // referencja handlera do removeEventListener
+// Hook ustawiany przez mesh-detail.js — wolany po sukcesie launchu by banner
+// aktywnej sesji od razu zrobil poll zamiast czekac na swoj 1s tick.
+let activeBannerPokeHook = null;
 
 // ---- Public API ------------------------------------------------------------
 
 export function initNsight({ onChange } = {}) {
   onChangeCallback = typeof onChange === 'function' ? onChange : null;
+}
+
+export function setActiveBannerPokeHook(fn) {
+  activeBannerPokeHook = typeof fn === 'function' ? fn : null;
 }
 
 export function cleanupNsight() {
@@ -53,6 +58,7 @@ export function cleanupNsight() {
   activeNodeId = null;
   cachedSessions = [];
   lastSessionsNodeId = null;
+  activeBannerPokeHook = null;
 }
 
 // Pobiera liste sesji z backendu i cache'uje. Wolane z mesh-detail przy loadNode.
@@ -335,7 +341,7 @@ export function bindNsightActions(root, node) {
     if (btn.hasAttribute('disabled')) return;
 
     if (action === 'nsight-profile-node') {
-      openStartModal(node, { defaultScope: 'both', defaultGpu: 'all' });
+      await openProfilingLaunch(node);
       return;
     }
     if (action === 'nsight-copy-cmd') {
@@ -361,8 +367,7 @@ export function bindNsightActions(root, node) {
     }
     if (action === 'nsight-profile-card') {
       const idx = parseInt(btn.dataset.gpuIdx, 10);
-      const idxStr = Number.isFinite(idx) ? String(idx) : 'all';
-      openStartModal(node, { defaultScope: 'gpu', defaultGpu: idxStr });
+      await openProfilingLaunch(node, { gpuCardIndex: Number.isFinite(idx) ? idx : null });
       return;
     }
     if (action === 'nsight-stop-session') {
@@ -426,139 +431,61 @@ export function bindNsightActions(root, node) {
 }
 
 // ---- Modal start ----------------------------------------------------------
+//
+// Multi-source profiling V2: heartbeat broadcasts a flat list of collector
+// ids (`profiling_collectors_available`). The launch modal needs richer
+// objects (`{ id, label, status, ... }`), so we lift each id into a minimal
+// `available` source and pre-tick the GPU collector when the user clicked a
+// per-card "Profile" button.
 
-function openStartModal(node, { defaultScope = 'both', defaultGpu = 'all' } = {}) {
+function buildLaunchSources(node) {
+  const ids = Array.isArray(node?.profiling_collectors_available)
+    ? node.profiling_collectors_available
+    : [];
+  return ids.map((id) => ({
+    id: String(id),
+    label: String(id),
+    description: '',
+    status: 'available',
+  }));
+}
+
+async function openProfilingLaunch(node, { gpuCardIndex = null } = {}) {
   if (activeSession) {
     toast(I18n.t('nsight.error.busy'), 'warn');
     return;
   }
-  const gpus = Array.isArray(node.gpus) ? node.gpus.filter((g) => g && String(g.vendor || '').toLowerCase() === 'nvidia') : [];
-  const gpuOptions = ['<option value="all">' + escapeHtml(I18n.t('nsight.gpu.all')) + '</option>']
-    .concat(gpus.map((g, idx) => {
-      const realIdx = Array.isArray(node.gpus) ? node.gpus.indexOf(g) : idx;
-      const label = `GPU ${realIdx}: ${g.name || ''}`.trim();
-      return `<option value="${realIdx}">${escapeHtml(label)}</option>`;
-    }))
-    .join('');
-
-  const bodyHtml = `
-    <div class="nsight-form">
-      <div class="field">
-        <label class="field-label">${escapeHtml(I18n.t('nsight.scope.label'))}</label>
-        <tf-select id="nsight-scope" value="${escapeAttr(defaultScope)}">
-          <option value="cpu">${escapeHtml(I18n.t('nsight.scope.cpu'))}</option>
-          <option value="gpu">${escapeHtml(I18n.t('nsight.scope.gpu'))}</option>
-          <option value="both">${escapeHtml(I18n.t('nsight.scope.both'))}</option>
-        </tf-select>
-      </div>
-      <div class="field" id="nsight-gpu-field">
-        <label class="field-label">${escapeHtml(I18n.t('nsight.gpu.label'))}</label>
-        <tf-select id="nsight-gpu" value="${escapeAttr(defaultGpu)}">${gpuOptions}</tf-select>
-      </div>
-      <div class="field">
-        <label class="field-label">${escapeHtml(I18n.t('nsight.duration.label'))}</label>
-        <tf-select id="nsight-duration" value="60">
-          <option value="30">${escapeHtml(I18n.t('nsight.duration.30s'))}</option>
-          <option value="60">${escapeHtml(I18n.t('nsight.duration.60s'))}</option>
-          <option value="120">${escapeHtml(I18n.t('nsight.duration.120s'))}</option>
-          <option value="0">${escapeHtml(I18n.t('nsight.duration.manual'))}</option>
-        </tf-select>
-      </div>
-      <tf-input id="nsight-label" label="${escapeAttr(I18n.t('nsight.label.label'))}" placeholder="${escapeAttr(I18n.t('nsight.label.placeholder'))}"></tf-input>
-      <div class="form-error" hidden></div>
-    </div>
-  `;
-  const footerHtml = `
-    <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('nsight.cancel'))}</tf-button>
-    <tf-button variant="primary" icon="play" data-action="start">${escapeHtml(I18n.t('nsight.start'))}</tf-button>
-  `;
-
-  const win = document.createElement('tf-window');
-  win.setAttribute('title', I18n.t('nsight.modal.title'));
-  win.setAttribute('icon', 'record');
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('width', '480');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  win.setAttribute('draggable', '');
-  const bodyWrap = document.createElement('div');
-  bodyWrap.slot = 'body';
-  bodyWrap.innerHTML = bodyHtml;
-  win.appendChild(bodyWrap);
-  const footWrap = document.createElement('div');
-  footWrap.slot = 'footer';
-  footWrap.innerHTML = footerHtml;
-  win.appendChild(footWrap);
-  const backdrop = document.createElement('div');
-  backdrop.className = 'tf-window-backdrop';
-  document.body.append(backdrop, win);
-
-  const cleanup = () => {
-    if (win.isConnected) win.remove();
-    if (backdrop.isConnected) backdrop.remove();
-  };
-
-  // Pokazywanie/ukrywanie pola GPU zaleznie od scope (cpu nie potrzebuje wyboru).
-  const scopeSel = bodyWrap.querySelector('#nsight-scope');
-  const gpuField = bodyWrap.querySelector('#nsight-gpu-field');
-  const syncGpuVisibility = () => {
-    const scope = scopeSel?.value || 'both';
-    if (scope === 'cpu') gpuField.classList.add('hidden');
-    else gpuField.classList.remove('hidden');
-  };
-  scopeSel?.addEventListener('change', syncGpuVisibility);
-  // Inicjalizacja po mount (tf-select buduje sie w connectedCallback).
-  setTimeout(syncGpuVisibility, 0);
-
-  win.addEventListener('action', async (e) => {
-    const a = e.detail?.action;
-    if (a === 'cancel') return cleanup();
-    if (a !== 'start') return;
-    e.preventDefault();
-    const errEl = bodyWrap.querySelector('.form-error');
-    errEl.hidden = true;
-
-    const scopeVal = scopeSel?.value || 'both';
-    const gpuVal = bodyWrap.querySelector('#nsight-gpu')?.value || 'all';
-    const durationVal = parseInt(bodyWrap.querySelector('#nsight-duration')?.value || '60', 10);
-    const labelInput = bodyWrap.querySelector('#nsight-label');
-    const labelVal = (labelInput?.value || '').trim() || `profile-${Date.now()}`;
-
-    const scope = mapScopeToProtocol(scopeVal, gpuVal);
-    if (!scope) {
-      errEl.hidden = false;
-      errEl.textContent = I18n.t('nsight.error.invalid_scope');
-      return;
+  const sources = buildLaunchSources(node);
+  if (sources.length === 0) {
+    toast(I18n.t('nsight.error.not_available'), 'error');
+    return;
+  }
+  // When invoked from a specific GPU card, hint device index on every GPU
+  // source so the launch modal can scope to that device.
+  if (Number.isInteger(gpuCardIndex)) {
+    for (const s of sources) {
+      if (/gpu|nsys|rocprof|vtune/i.test(s.id)) {
+        s.deviceIndex = gpuCardIndex;
+      }
     }
-
-    try {
-      const resp = await nsightStart({
-        nodeId: node.node_id,
-        scope,
-        durationSecs: Math.max(0, durationVal | 0),
-        label: labelVal,
-      });
-      activeSession = {
-        sessionId: resp.sessionId,
-        startedAtMs: resp.startedAtMs || Date.now(),
-        scope,
-        scopeKey: scopeVal,
-        gpuKey: gpuVal,
-        label: labelVal,
-        durationSecs: Math.max(0, durationVal | 0),
-      };
-      activeNodeId = node.node_id;
-      startCountdown();
+  }
+  try {
+    const result = await ProfilingLaunchModal.open({
+      nodeId: node.node_id,
+      availableSources: sources,
+    });
+    if (result && result.launched) {
       toast(I18n.t('nsight.session.started'), 'success');
-      cleanup();
-      // Odswiez liste sesji + zmusza rerender mesh-detail.
       await loadSessions(node.node_id);
       notifyChange();
-    } catch (err) {
-      errEl.hidden = false;
-      errEl.textContent = `${I18n.t('nsight.session.error')}: ${err.message || err}`;
+      // Banner sam polluje 1Hz; ten poke pokazuje go natychmiast.
+      if (activeBannerPokeHook) {
+        try { activeBannerPokeHook(); } catch (_e) { /* ignore */ }
+      }
     }
-  });
+  } catch (err) {
+    toast(`${I18n.t('nsight.session.error')}: ${err.message || err}`, 'error');
+  }
 }
 
 // ---- Stop / lifecycle -----------------------------------------------------
@@ -574,26 +501,6 @@ async function stopActiveSession() {
   } catch (err) {
     toast(`${I18n.t('nsight.session.error')}: ${err.message}`, 'error');
   }
-}
-
-function startCountdown() {
-  if (countdownInterval) clearInterval(countdownInterval);
-  countdownInterval = setInterval(() => {
-    if (!activeSession) {
-      clearInterval(countdownInterval);
-      countdownInterval = null;
-      return;
-    }
-    const elapsed = Math.floor((Date.now() - activeSession.startedAtMs) / 1000);
-    // Auto-stop osiagniety — przejdz na polling i czekaj az backend zamknie sesje.
-    if (activeSession.durationSecs > 0 && elapsed >= activeSession.durationSecs) {
-      clearInterval(countdownInterval);
-      countdownInterval = null;
-      startSessionsPolling(activeNodeId, activeSession.sessionId);
-      return;
-    }
-    notifyChange();
-  }, 1000);
 }
 
 function startSessionsPolling(nodeId, sessionId) {
@@ -631,24 +538,6 @@ function notifyChange() {
 }
 
 // ---- Helpers --------------------------------------------------------------
-
-// Mapuje wybor z UI na enum protokolu (kompatybilny z codec.js — lowercase strings).
-function mapScopeToProtocol(scopeKey, gpuKey) {
-  if (scopeKey === 'cpu') return 'cpu';
-  if (scopeKey === 'gpu') {
-    if (gpuKey === 'all') return 'gpu_all';
-    const idx = parseInt(gpuKey, 10);
-    if (!Number.isFinite(idx) || idx < 0 || idx > 255) return null;
-    return { kind: 'gpu_index', idx };
-  }
-  if (scopeKey === 'both') {
-    if (gpuKey === 'all') return 'both_all';
-    const idx = parseInt(gpuKey, 10);
-    if (!Number.isFinite(idx) || idx < 0 || idx > 255) return null;
-    return { kind: 'both_index', idx };
-  }
-  return null;
-}
 
 // scope w odpowiedzi przychodzi w formie CamelCase tagged enum (patrz wasm glue).
 function formatScopeForDisplay(scope) {
