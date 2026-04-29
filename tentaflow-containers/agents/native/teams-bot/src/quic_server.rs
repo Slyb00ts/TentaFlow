@@ -372,6 +372,7 @@ impl RouterClient {
                     voice: voice.to_string(),
                     format: Some("pcm".to_string()),
                     speed: None,
+                    language: None,
                 },
             }),
             stream: true,
