@@ -9,6 +9,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -267,12 +268,16 @@ impl MeshPeerStore {
         self.dirty.store(true, Ordering::Release);
     }
 
-    fn normalize_hostname(hostname: &str) -> String {
-        hostname
-            .trim()
-            .trim_end_matches(" (local)")
-            .trim()
-            .to_string()
+    /// Zwraca `Cow::Borrowed` gdy hostname juz jest znormalizowany — wiekszosc
+    /// heartbeatow trafia na ten path bez alokacji.
+    fn normalize_hostname(hostname: &str) -> Cow<'_, str> {
+        let trimmed = hostname.trim();
+        let stripped = trimmed.trim_end_matches(" (local)").trim_end();
+        if stripped.len() == hostname.len() {
+            Cow::Borrowed(hostname)
+        } else {
+            Cow::Borrowed(stripped)
+        }
     }
 
     /// Zbiera id-ki disconnected peerow z pasujacym hostname+port (rozne od
@@ -400,7 +405,7 @@ impl MeshPeerStore {
                 .peers
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
-            entry.hostname = hostname.clone();
+            entry.hostname = hostname.as_ref().to_string();
             entry.port
         };
         Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
@@ -523,7 +528,7 @@ impl MeshPeerStore {
             return;
         }
         let port = if let Some(mut p) = self.peers.get_mut(node_id) {
-            p.hostname = hostname.clone();
+            p.hostname = hostname.as_ref().to_string();
             p.port
         } else {
             return;
@@ -538,7 +543,7 @@ impl MeshPeerStore {
                 .peers
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
-            entry.hostname = Self::normalize_hostname(&info.hostname);
+            entry.hostname = Self::normalize_hostname(&info.hostname).into_owned();
             entry.os_info = info.os_info.clone();
             entry.cpu_count = info.cpu_count;
             entry.ram_total_mb = info.ram_total_mb;
@@ -549,44 +554,29 @@ impl MeshPeerStore {
         self.mark_dirty();
     }
 
-    /// Aktualizuje biezace metryki peera (z heartbeatu)
-    pub fn update_metrics(
-        &self,
-        node_id: &str,
-        cpu_usage: f32,
-        ram_used: u64,
-        gpus: Vec<PeerGpuInfo>,
-        containers: Vec<PeerContainerInfo>,
-        networks: Vec<PeerNetworkInfo>,
-        platform: String,
-        cpu_temperature_c: Option<f32>,
-        swap_total_mb: u64,
-        swap_used_mb: u64,
-        active_requests: u32,
-        tokens_per_sec: f32,
-        nsys_available: bool,
-        nsys_version: String,
-        profiling_collectors_available: Vec<String>,
-    ) {
+    /// Aktualizuje biezace metryki peera (z heartbeatu).
+    /// Bierze `&HeartbeatMetrics` zeby caller (pipeline broadcast) mogl uzyc tej
+    /// samej referencji do serializacji rkyv bez podwojnego klonowania Vec.
+    pub fn update_metrics(&self, node_id: &str, hb: &HeartbeatMetrics) {
         let mut entry = self
             .peers
             .entry(node_id.to_string())
             .or_insert_with(|| Self::empty_peer(node_id));
-        entry.cpu_usage_percent = cpu_usage;
-        entry.ram_used_mb = ram_used;
-        entry.gpu_info = gpus;
-        entry.containers = containers;
-        entry.networks = networks;
-        entry.cpu_temperature_c = cpu_temperature_c;
-        entry.swap_total_mb = swap_total_mb;
-        entry.swap_used_mb = swap_used_mb;
-        entry.active_requests = active_requests;
-        entry.tokens_per_sec = tokens_per_sec;
-        entry.nsys_available = nsys_available;
-        entry.nsys_version = nsys_version;
-        entry.profiling_collectors_available = profiling_collectors_available;
-        if !platform.is_empty() {
-            entry.platform = platform;
+        entry.cpu_usage_percent = hb.cpu_usage_percent;
+        entry.ram_used_mb = hb.ram_used_mb;
+        entry.gpu_info = hb.gpus.clone();
+        entry.containers = hb.containers.clone();
+        entry.networks = hb.networks.clone();
+        entry.cpu_temperature_c = hb.cpu_temperature_c;
+        entry.swap_total_mb = hb.swap_total_mb;
+        entry.swap_used_mb = hb.swap_used_mb;
+        entry.active_requests = hb.active_requests;
+        entry.tokens_per_sec = hb.tokens_per_sec;
+        entry.nsys_available = hb.nsys_available;
+        entry.nsys_version = hb.nsys_version.clone();
+        entry.profiling_collectors_available = hb.profiling_collectors_available.clone();
+        if !hb.platform.is_empty() {
+            entry.platform = hb.platform.clone();
         }
         drop(entry);
         self.mark_dirty();
@@ -613,7 +603,7 @@ impl MeshPeerStore {
                 .peers
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
-            entry.hostname = Self::normalize_hostname(&hostname);
+            entry.hostname = Self::normalize_hostname(&hostname).into_owned();
             entry.os_info = os_info;
             entry.platform = platform;
             entry.cpu_count = cpu_count;
@@ -786,7 +776,7 @@ impl MeshPeerStore {
                 .entry(node_id.to_string())
                 .or_insert_with(|| Self::empty_peer(node_id));
             if !hostname.is_empty() && entry.hostname.is_empty() {
-                entry.hostname = hostname.clone();
+                entry.hostname = hostname.as_ref().to_string();
             }
             if !platform.is_empty() && entry.platform.is_empty() {
                 entry.platform = platform.to_string();
