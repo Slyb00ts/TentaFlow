@@ -3812,7 +3812,7 @@ pub fn service_manifest_deploy(
         },
     )?;
 
-    let deploy_id = uuid::Uuid::new_v4().to_string();
+    let slug = uuid::Uuid::new_v4().to_string();
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     audit(
@@ -3826,66 +3826,121 @@ pub fn service_manifest_deploy(
         )),
     );
 
-    // Record deployment row in DB + spawn background runner. Runner streams
-    // log lines to the subscription associated with deploy_id through the
-    // deployment log bus (see deploy/runner.rs + deploy/log_bus.rs).
-    let user_id_i64 = user_id;
-    let config_json = if payload.config_json.is_empty() {
-        "{}".to_string()
-    } else {
-        payload.config_json.clone()
-    };
-    if let Err(e) = repository::deployments::create(
-        &ctx.state.db,
-        &deploy_id,
-        &payload.engine_id,
-        &payload.deploy_method,
-        &payload.node_id,
-        &config_json,
-        user_id_i64,
-    ) {
-        return Err(ProtocolError::internal(format!(
-            "failed to persist deployment: {}",
-            e
-        )));
-    }
+    // Resolve the deploy method tag from the wire ("docker"/"native"/"external")
+    // into the internal `DeployMethod` enum used by the unified pipeline.
+    let manifest = crate::services::manifest::registry()
+        .by_id(&payload.engine_id)
+        .cloned()
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!(
+                "Silnik '{}' nie istnieje w manifescie",
+                payload.engine_id
+            ))
+        })?;
 
+    let deploy_method = resolve_deploy_method(&manifest, &payload.deploy_method)
+        .map_err(ProtocolError::bad_request)?;
+
+    let user_config: serde_json::Value = if payload.config_json.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&payload.config_json)
+            .map_err(|e| ProtocolError::bad_request(format!("invalid config_json: {}", e)))?
+    };
+
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    let log_sender = crate::deploy::log_bus::sender_for(&slug);
     let db_clone = ctx.state.db.clone();
-    let service_manager = ctx.state.service_manager.clone();
-    let settings_cipher = ctx.state.settings_cipher.clone();
-    let deploy_id_task = deploy_id.clone();
-    let engine_id_task = payload.engine_id.clone();
-    let method_task = payload.deploy_method.clone();
-    let node_id_task = payload.node_id.clone();
-    let config_json_task = config_json.clone();
-    let router_task = ctx.state.router.clone();
+    let slug_task = slug.clone();
+    let manifest_task = manifest.clone();
+    let user_config_task = user_config.clone();
+    let log_sender_task = log_sender.clone();
+
     tokio::spawn(async move {
-        crate::deploy::runner::run_deployment(
-            db_clone,
-            service_manager,
-            settings_cipher,
-            router_task,
-            deploy_id_task,
-            engine_id_task,
-            method_task,
-            node_id_task,
-            config_json_task,
+        let start_ms = crate::deploy::log_bus::now_ms();
+        let result = crate::services::deploy::deploy(
+            deploy_method,
+            &manifest_task,
+            &user_config_task,
+            &port_allocator,
+            &db_clone,
+            Some(log_sender_task.clone()),
+            Some(slug_task.clone()),
         )
         .await;
+        match result {
+            Ok(outcome) => {
+                let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
+                    deploy_id: slug_task.clone(),
+                    final_status: "success".to_string(),
+                    image_tag: String::new(),
+                    container_name: format!("service-id-{}", outcome.endpoint.handle.id),
+                    error_message: String::new(),
+                    duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                crate::deploy::log_bus::close(&slug_task);
+            }
+            Err(err) => {
+                let _ = log_sender_task.send(crate::deploy::log_bus::BusMessage::End {
+                    deploy_id: slug_task.clone(),
+                    final_status: "failure".to_string(),
+                    image_tag: String::new(),
+                    container_name: String::new(),
+                    error_message: err.to_string(),
+                    duration_ms: crate::deploy::log_bus::now_ms() - start_ms,
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                crate::deploy::log_bus::close(&slug_task);
+            }
+        }
     });
 
     Ok(MessageBody::DeploymentBody(
         tentaflow_protocol::DeploymentPayload::ResStart(
             tentaflow_protocol::ServiceManifestDeployResponse {
                 status: "started".to_string(),
-                deploy_id: deploy_id.clone(),
+                deploy_id: slug.clone(),
                 engine_id: payload.engine_id.clone(),
                 deploy_method: payload.deploy_method.clone(),
                 node_id: payload.node_id.clone(),
-                websocket_url: String::new(),
+                websocket_url: format!("/ws/deploy?id={}", slug),
             },
         ),
     ))
+}
+
+/// Maps the wire deploy method string ("docker"/"native"/"external") to the
+/// internal `DeployMethod` variant by inspecting which sections the manifest
+/// declares. "native" picks the runtime declared by `[deploy.native].runtime`.
+fn resolve_deploy_method(
+    manifest: &crate::services::manifest::ServiceManifest,
+    method: &str,
+) -> std::result::Result<crate::services_repo::services::DeployMethod, String> {
+    use crate::services::manifest::NativeRuntime;
+    use crate::services_repo::services::DeployMethod;
+    match method {
+        "docker" => Ok(DeployMethod::Docker),
+        "external" => Ok(DeployMethod::External),
+        "native" => {
+            let native =
+                manifest.deploy.native.as_ref().ok_or_else(|| {
+                    format!("engine '{}' has no [deploy.native]", manifest.engine.id)
+                })?;
+            Ok(match native.runtime {
+                NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
+                NativeRuntime::Binary => DeployMethod::NativeBinary,
+                NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
+            })
+        }
+        other => Err(format!(
+            "unknown deploy method '{}': expected docker/native/external",
+            other
+        )),
+    }
 }
 
 // =============================================================================
