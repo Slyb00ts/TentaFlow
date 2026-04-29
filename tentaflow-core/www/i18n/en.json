@@ -1492,7 +1492,17 @@
     "qr_scan_denied": "Camera access denied. Check browser site permissions.",
     "qr_scan_no_camera": "No camera found on this device.",
     "qr_scan_busy": "Camera is in use by another application.",
-    "qr_scan_insecure": "Scanning requires HTTPS. Open the app over https://"
+    "qr_scan_insecure": "Scanning requires HTTPS. Open the app over https://",
+    "profile_node_btn": "Profile node",
+    "profile_gpu_btn": "Profile this GPU",
+    "profile_view_sessions": "Sessions",
+    "profile_started": "Profiling session started",
+    "profile_unavailable": "Profiling is not available on this node.",
+    "profile_error": "Profiling error",
+    "profile_rec_badge": "REC",
+    "profile_rec_session_label": "Session: {label}",
+    "profile_rec_stop": "Stop",
+    "profile_rec_view_report": "Open report"
   },
   "nsight": {
     "profile_btn": "Profile",
@@ -1628,6 +1638,67 @@
         "delete": "Failed to delete session",
         "download": "Failed to download file"
       }
+    }
+  },
+  "profiling": {
+    "launch": {
+      "title": "Start profiling session",
+      "label_field": "Label",
+      "label_placeholder": "qwen-7b inference benchmark",
+      "duration": "Duration",
+      "manual_stop": "Manual stop",
+      "data_sources": "Data sources",
+      "sources_selected": "{sel} of {total} selected",
+      "estimated_storage": "Estimated storage: {size} · overhead: {overhead}",
+      "estimated_unknown": "Estimated storage: — · overhead: —",
+      "start_button": "Start Profiling",
+      "cancel_button": "Cancel",
+      "test_button": "Test",
+      "sudo_password_label": "Sudo password",
+      "sudo_used_once": "used once · not stored",
+      "sudo_placeholder": "••••••••",
+      "elevation_count": "{count} source requires elevation",
+      "elevation_count_plural": "{count} sources require elevation",
+      "elevation_explain": "Provide your sudo password once. It is used to spawn collectors and is {strong_never_stored}.",
+      "elevation_never_stored": "never stored on disk or in DB",
+      "elevation_authenticated": "✓ Authenticated",
+      "elevation_invalid": "✗ Invalid password",
+      "elevation_testing": "Testing…",
+      "toggle_password_visibility": "Toggle visibility",
+      "target_field": "Profile target",
+      "target_system_wide": "System-wide",
+      "target_own_process": "Own process (tentaflow)",
+      "target_specific_pid": "Specific PID",
+      "target_pid_placeholder": "e.g. 14872",
+      "status_available": "Available",
+      "status_needs_sudo": "Needs sudo",
+      "status_needs_admin": "Needs admin",
+      "status_limited": "Limited",
+      "status_unavailable": "Unavailable"
+    },
+    "banner": {
+      "rec": "REC",
+      "stop_now": "Stop now",
+      "open_report_when_done": "Open report when done",
+      "session_label": "session {sid} · started {time} · {count} collector",
+      "session_label_plural": "session {sid} · started {time} · {count} collectors",
+      "elapsed_manual": "{elapsed} elapsed (manual stop)",
+      "default_label": "profiling session",
+      "stop_error": "Failed to stop profiling session",
+      "session_finished": "Profiling session finished",
+      "view_report": "View report",
+      "all_sessions": "All sessions"
+    },
+    "sessions": {
+      "title": "Profiling sessions",
+      "empty_no_sessions": "No sessions",
+      "empty_launch_first": "Launch your first session to see results here.",
+      "no_sessions_match": "No sessions match the filters"
+    },
+    "errors": {
+      "active_busy": "Another profiling session is already active",
+      "session_not_found": "Session not found",
+      "invalid_request": "Invalid request"
     }
   },
   "clusters": {
