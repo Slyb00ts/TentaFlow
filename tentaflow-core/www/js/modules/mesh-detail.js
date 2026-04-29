@@ -22,6 +22,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
+import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import {
@@ -161,9 +162,7 @@ function gaugeLevel(pct) {
 }
 
 function isOnline(n) {
-  const s = String(n.status || '').toLowerCase();
-  if (n.is_local) return true;
-  return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
+  return isOnlineHelper(n);
 }
 
 function shortId(id) {

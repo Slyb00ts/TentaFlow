@@ -897,18 +897,7 @@ pub async fn handle_request(
         ));
     }
 
-    // Mesh API — pozostale write paths (pairing/trust/connect/command/network-config).
-    // Read paths przeniesione do binarnego protokolu (FAZA 1a).
-    if path.starts_with("/api/mesh/") {
-        let (status, response_body) = route_mesh_api().await;
-        return Ok(json_response_cors(
-            status,
-            response_body,
-            cors_origin.as_deref(),
-        ));
-    }
-
-    // Clusters API — CRUD clusterow i czlonkostwa
+// Clusters API — CRUD clusterow i czlonkostwa
     if path.starts_with("/api/clusters") {
         let (status, response_body) =
             route_clusters_api(&method, &path, &db, &body_bytes, &claims, &quic_mesh).await;
@@ -2056,18 +2045,6 @@ fn extract_ws_user_session(
         });
 
     Some((claims.user_id, role))
-}
-
-/// Routing endpointow mesh — peers, parowanie, zaufanie, nody, serwisy, komendy
-/// VULN-031: Mutujace endpointy (pair, trust) wymagaja uprawnien administratora
-async fn route_mesh_api() -> (u16, String) {
-    // All /api/mesh/* paths are served by the binary protocol dispatcher
-    // (see dispatch/mesh_write_handlers.rs). REST hits here only for legacy
-    // URLs and returns 404.
-    (
-        404,
-        serde_json::json!({"error": "Nieznany endpoint mesh"}).to_string(),
-    )
 }
 
 /// Routing endpointow clusters — CRUD clusterow, czlonkostwa nodow, probing

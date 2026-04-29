@@ -131,6 +131,8 @@ serde_yaml = "0.9.33"
 parking_lot = "0.12.5"
 dashmap = "6.1.0"
 arc-swap = "1.7.1"
+smallvec = "1.13"
+rustc-hash = "2"
 
 # Utils
 uuid = { version = "1.23.1", features = ["v4"] }
@@ -198,6 +200,7 @@ hf-hub = "0.5.0"
 urlencoding = "2"
 url = "2"
 dirs = "6.0.0"
+subtle = "2"
 
 # Enumeracja interfejsow sieciowych (IPv4-only advertise/bind dla iroh mesh)
 netdev = "0.31"

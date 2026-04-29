@@ -185,7 +185,34 @@ async fn run_server(args: Args) -> Result<()> {
     );
 
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
-    let mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
+    let mut mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
+    // PR2: parallel peer registry — receives shadow writes from every
+    // peer_store mutator so PR3 can flip reads onto it without missing state.
+    let peer_registry = tentaflow_core::mesh::peer_registry::PeerRegistry::new(4096);
+    mesh_peer_store.set_registry(peer_registry.clone());
+
+    // PR5: hydrate registry from peer_persisted + peer_hints (single source of
+    // truth). The startup migration in db::init copies legacy trusted_nodes /
+    // settings.trusted_contact:* rows into the new tables, so this call alone
+    // restores trust state, hostname, platform AND transport hints for every
+    // peer the user previously paired with.
+    match peer_registry.hydrate_from_db(&db) {
+        Ok(n) => info!("PeerRegistry hydrated {} peers from peer_persisted", n),
+        Err(e) => tracing::warn!("PeerRegistry hydrate failed: {}", e),
+    }
+
+    // Install PersistenceWriter — mutators in the registry now schedule
+    // debounced batched writes through this channel. Must be set AFTER hydrate
+    // so the hydrate path itself does not re-emit writes.
+    {
+        use tentaflow_core::mesh::peer_registry::persistence::{
+            DbSink, PersistenceWriter, CHANNEL_CAPACITY,
+        };
+        let sink = std::sync::Arc::new(DbSink::new(db.clone()));
+        let (writer, persist_tx) = PersistenceWriter::new(sink, CHANNEL_CAPACITY);
+        peer_registry.set_persistence(persist_tx);
+        let _writer_handle = writer.spawn();
+    }
 
     // Seed lokalnego noda w peer_store — synchronicznie, przed startupem mesh.
     // Dzieki temu catalog/services/mesh GUI zawsze ma target "local" do dyspozycji.
