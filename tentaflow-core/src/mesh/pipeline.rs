@@ -453,6 +453,7 @@ pub async fn start_mesh_pipeline(
                 local_node_id.clone(),
                 docker_cache,
                 db_pool.clone(),
+                mesh_services_registry.clone(),
             );
             spawn_slow_refresh(
                 mesh_peer_store.clone(),
@@ -1156,34 +1157,10 @@ fn spawn_quic_event_handler(
                                 .collect();
                             peer_store.update_models(&entry.node_id, models);
                         }
-                        // Uslugi — wpisujemy do service_registry jako remote
-                        // (pozwala GUI mesh-service browserowi pokazac spark-002 uslugi).
-                        if !entry.services.is_empty() {
-                            let services: Vec<tentaflow_protocol::mesh::MeshServiceInfo> = entry
-                                .services
-                                .iter()
-                                .map(|s| tentaflow_protocol::mesh::MeshServiceInfo {
-                                    service_id: format!("{}-{}", entry.node_id, s.name),
-                                    service_name: s.name.clone(),
-                                    service_type: s.service_type.clone(),
-                                    node_id: entry.node_id.clone(),
-                                    quic_port: entry.port,
-                                    quic_url: String::new(),
-                                    status: if s.ready {
-                                        "ready".to_string()
-                                    } else {
-                                        "stopped".to_string()
-                                    },
-                                    models: Vec::new(),
-                                    load_percent: 0,
-                                    engine_id: None,
-                                    model_sizes_mb: Vec::new(),
-                                })
-                                .collect();
-                            qm_events
-                                .service_registry()
-                                .update_remote(&entry.node_id, services);
-                        }
+                        // Cross-node service inventory now flows over the V2
+                        // `MeshServicesAnnounce/Update` protocol (discriminants
+                        // 0x40-0x43) into `mesh_services_registry`. The legacy
+                        // `service_registry().update_remote` path is gone.
                         // Persystuj snapshot do DB — bootstrap po restarcie.
                         // Serializujemy bezposrednio Vec<ServiceSummary>/<ModelSummary>
                         // (derive SerdeSerialize) — omija intermediate serde_json::Value tree.
@@ -2112,6 +2089,7 @@ fn spawn_heartbeat_sender(
     local_node_id: String,
     docker_cache: Arc<tokio::sync::RwLock<Vec<crate::mesh::peer_store::PeerContainerInfo>>>,
     db_pool: Option<crate::db::DbPool>,
+    mesh_services_registry: Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -2242,7 +2220,7 @@ fn spawn_heartbeat_sender(
                 // ModelsSync broadcast co 60 heartbeatow (~30s). Serwer-side
                 // scrape z service_registry zwraca aktualne aliasy + stan zaladowania.
                 if heartbeat_count % 60 == 0 {
-                    let models = collect_local_models(&quic_mesh);
+                    let models = collect_local_models(&mesh_services_registry);
                     peer_store.update_models(&local_node_id, models.clone());
                     let sync = crate::mesh::peer_store::ModelsSync { models };
                     if let Ok(data) = rkyv::to_bytes::<rkyv::rancor::Error>(&sync) {
@@ -2254,18 +2232,19 @@ fn spawn_heartbeat_sender(
                 // Kazdy node anonsuje SIEBIE: hostname + platform + bezposredni sasiedzi
                 // + modele + uslugi. Flooding z dedupem (origin, epoch) dociera az do 5 hopow.
                 if heartbeat_count % 60 == 30 {
-                    let services: Vec<tentaflow_protocol::mesh::ServiceSummary> = quic_mesh
-                        .service_registry()
-                        .local_services()
-                        .into_iter()
-                        .map(|s| tentaflow_protocol::mesh::ServiceSummary {
-                            name: s.service_name,
-                            service_type: s.service_type,
-                            ready: matches!(s.status.as_str(), "running" | "ready"),
-                        })
-                        .collect();
+                    let services: Vec<tentaflow_protocol::mesh::ServiceSummary> =
+                        mesh_services_registry
+                            .local()
+                            .services
+                            .iter()
+                            .map(|s| tentaflow_protocol::mesh::ServiceSummary {
+                                name: s.display_name.clone(),
+                                service_type: s.category.clone(),
+                                ready: matches!(s.status.as_str(), "running" | "ready"),
+                            })
+                            .collect();
                     let models_summary: Vec<tentaflow_protocol::mesh::ModelSummary> =
-                        collect_local_models(&quic_mesh)
+                        collect_local_models(&mesh_services_registry)
                             .into_iter()
                             .map(|m| tentaflow_protocol::mesh::ModelSummary {
                                 alias: m.alias,
@@ -2337,30 +2316,29 @@ fn spawn_heartbeat_sender(
     });
 }
 
-/// Buduje liste `PeerModelInfo` z lokalnego service_registry. Tylko LOKALNE
-/// serwisy (te na biezacym nodzie) — modele z peerow przychodza przez
-/// ModelsSync od ich wlascicieli.
+/// Builds `PeerModelInfo` list from the local snapshot of the V2 mesh services
+/// registry. Only LOCAL services — peers' models arrive via `ModelsSync` from
+/// their owners.
 fn collect_local_models(
-    quic_mesh: &Arc<IrohMeshManager>,
+    mesh_services_registry: &Arc<crate::services::mesh_registry::MeshServicesRegistry>,
 ) -> Vec<crate::mesh::peer_store::PeerModelInfo> {
-    let registry = quic_mesh.service_registry();
-    registry
-        .local_services()
-        .into_iter()
+    let local = mesh_services_registry.local();
+    local
+        .services
+        .iter()
         .flat_map(|svc| {
-            let kind = svc.service_type.clone();
-            let backend = svc.engine_id.clone().unwrap_or_default();
-            let sizes = svc.model_sizes_mb.clone();
+            let kind = svc.category.clone();
+            let backend = svc.engine_id.clone();
             let loaded = matches!(svc.status.as_str(), "running" | "ready");
-            svc.models.into_iter().enumerate().map(move |(idx, alias)| {
-                crate::mesh::peer_store::PeerModelInfo {
-                    alias,
+            svc.models
+                .iter()
+                .map(move |m| crate::mesh::peer_store::PeerModelInfo {
+                    alias: m.model_name.clone(),
                     kind: kind.clone(),
                     backend: backend.clone(),
-                    size_mb: sizes.get(idx).copied().unwrap_or(0),
+                    size_mb: 0,
                     loaded,
-                }
-            })
+                })
         })
         .collect()
 }

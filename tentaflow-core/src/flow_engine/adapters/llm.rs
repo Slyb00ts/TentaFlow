@@ -21,6 +21,9 @@ use crate::routing::stream_helpers::quic_stream_to_openai_chunks;
 /// Trzyma Arc do ServiceManager i konfiguracji routera.
 pub struct LlmNodeAdapter {
     service_manager: Arc<ServiceManager>,
+    /// Trzymany dla zachowania sygnatury konstruktora (callerzy migruja
+    /// w kroku N7.3); aliasy modeli pochodza z DB, nie z config.toml.
+    #[allow(dead_code)]
     config: Arc<RouterConfig>,
 }
 
@@ -32,13 +35,10 @@ impl LlmNodeAdapter {
         }
     }
 
-    /// Rozwiazuje alias modelu na nazwe kanoniczna
+    /// Rozwiazuje alias modelu na nazwe kanoniczna. Config-driven aliasy
+    /// zostaly skasowane (krok N7.1a); DB `service_aliases` jest rozwiazywany
+    /// przez middleware route resolver przed wejsciem do flow.
     fn resolve_model_alias(&self, model: &str) -> String {
-        for alias in &self.config.service_aliases {
-            if alias.alias == model {
-                return alias.target.clone();
-            }
-        }
         model.to_string()
     }
 
@@ -246,17 +246,14 @@ impl NodeAdapter for LlmNodeAdapter {
             "LLM adapter: wywolanie serwisu"
         );
 
-        // Sprawdz czy to QUIC LLM
-        if self.service_manager.has_quic_llm_service(&model_name) {
-            let quic_handle = self
-                .service_manager
-                .quic_llm_services
-                .get(&model_name)
-                .map(|r| r.value().clone());
-            if let Some(quic_handle) = quic_handle {
-                if let Some(quic_client) = quic_handle.get_client().await {
-                    debug!("LLM adapter: uzywam QUIC backend: {}", model_name);
-
+        let resolved_quic_client = self
+            .service_manager
+            .find_quic_client_for_model(&model_name)
+            .await;
+        if let Some(quic_client) = resolved_quic_client {
+            // Inline the original "QUIC available" arm.
+            {
+                {
                     let request_id = uuid::Uuid::new_v4().to_string();
 
                     // Konwertuj messages do formatu protocol
@@ -348,14 +345,12 @@ impl NodeAdapter for LlmNodeAdapter {
             }
         }
 
-        // HTTP backend (snapshot-first; legacy fallback removed in FAZA-8c).
         let backend_opt = self
             .service_manager
-            .resolve_http_backends_via_snapshot(&model_name)
-            .and_then(|v| v.into_iter().next())
+            .find_http_backend_for_model(&model_name)
             .or_else(|| {
                 self.service_manager
-                    .get_service_backends_cloned(&model_name)
+                    .resolve_http_backends_via_snapshot(&model_name)
                     .and_then(|v| v.into_iter().next())
             });
         match backend_opt {
@@ -428,14 +423,13 @@ impl NodeAdapter for LlmNodeAdapter {
             "LLM adapter: streaming"
         );
 
-        if self.service_manager.has_quic_llm_service(&model_name) {
-            let quic_handle = self
-                .service_manager
-                .quic_llm_services
-                .get(&model_name)
-                .map(|r| r.value().clone());
-            if let Some(quic_handle) = quic_handle {
-                if let Some(quic_client) = quic_handle.get_client().await {
+        let resolved_quic_client = self
+            .service_manager
+            .find_quic_client_for_model(&model_name)
+            .await;
+        if let Some(quic_client) = resolved_quic_client {
+            {
+                {
                     let protocol_messages: Vec<tentaflow_protocol::Message> = request
                         .messages
                         .iter()
@@ -490,14 +484,12 @@ impl NodeAdapter for LlmNodeAdapter {
             }
         }
 
-        // Snapshot-first; legacy fallback removed in FAZA-8c.
         let backend_opt = self
             .service_manager
-            .resolve_http_backends_via_snapshot(&model_name)
-            .and_then(|v| v.into_iter().next())
+            .find_http_backend_for_model(&model_name)
             .or_else(|| {
                 self.service_manager
-                    .get_service_backends_cloned(&model_name)
+                    .resolve_http_backends_via_snapshot(&model_name)
                     .and_then(|v| v.into_iter().next())
             });
         match backend_opt {

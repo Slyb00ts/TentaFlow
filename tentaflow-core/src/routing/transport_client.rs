@@ -7,11 +7,14 @@
 // `pick_service` directly.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rand::RngExt;
 
 use crate::config::{ConnectionType, ServiceBackend};
+use crate::net::quic::QuicClient;
 use crate::routing::backend::client::BackendClient;
+use crate::services::handles_cache::BackendHandle;
 use crate::services::supervisor::ServiceEntry;
 use crate::services::transport::Transport;
 
@@ -25,6 +28,88 @@ pub enum TransportClientError {
     UnsupportedTransport(String),
     #[error("backend client init failed: {0}")]
     BackendInit(String),
+    #[error("QUIC handle not connected for {0}")]
+    QuicNotConnected(String),
+    #[error("embedded engine cross-node dispatch is not supported (node {0})")]
+    EmbeddedRemote(String),
+}
+
+/// Materialised view returned by `resolve_quic_client`. Contains the connected
+/// `QuicClient` ready to issue `send_request` / `send_request_stream`. The
+/// caller decides which payload variant to wrap (chat / embeddings / stt /
+/// tts / memory) — the helper is transport-agnostic.
+pub struct ResolvedQuic {
+    pub client: Arc<QuicClient>,
+}
+
+/// Materialised view returned by `resolve_http_client`. The caller picks one
+/// of the `BackendClient::*` methods (`chat_completion`, `embedding`,
+/// `audio_transcription`, `audio_speech`, `embeddings_request`, etc.) based on
+/// the request kind.
+pub struct ResolvedHttp {
+    pub client: Arc<BackendClient>,
+}
+
+/// Resolves a `BackendHandle` to a concrete QUIC client when the handle is the
+/// `Quic` variant and the underlying connection is currently connected.
+/// Returns `Err(QuicNotConnected)` while the reconnect loop is still trying;
+/// caller must decide whether to wait, retry, or fall back to HTTP.
+pub async fn resolve_quic_client(
+    handle: &BackendHandle,
+    label: &str,
+) -> Result<ResolvedQuic, TransportClientError> {
+    match handle {
+        BackendHandle::Quic(qh) => match qh.get_client().await {
+            Some(client) => Ok(ResolvedQuic { client }),
+            None => Err(TransportClientError::QuicNotConnected(label.to_string())),
+        },
+        _ => Err(TransportClientError::UnsupportedTransport(format!(
+            "expected Quic, got non-quic handle for {}",
+            label
+        ))),
+    }
+}
+
+/// Resolves a `BackendHandle` to a HTTP `BackendClient`. Returns
+/// `Err(UnsupportedTransport)` for non-HTTP variants.
+pub fn resolve_http_client(
+    handle: &BackendHandle,
+    label: &str,
+) -> Result<ResolvedHttp, TransportClientError> {
+    match handle {
+        BackendHandle::Http(client) => Ok(ResolvedHttp {
+            client: client.clone(),
+        }),
+        _ => Err(TransportClientError::UnsupportedTransport(format!(
+            "expected Http, got non-http handle for {}",
+            label
+        ))),
+    }
+}
+
+/// Validates that an `Embedded` handle belongs to `local_node_id`. Cross-node
+/// embedded dispatch is rejected because embedded engines only run in-process
+/// — the request must be forwarded to the owning node before reaching the
+/// dispatch helper.
+pub fn ensure_local_embedded(
+    handle: &BackendHandle,
+    local_node_id: &str,
+) -> Result<String, TransportClientError> {
+    match handle {
+        BackendHandle::Embedded {
+            model_name,
+            node_id,
+        } => {
+            if node_id == local_node_id {
+                Ok(model_name.clone())
+            } else {
+                Err(TransportClientError::EmbeddedRemote(node_id.clone()))
+            }
+        }
+        _ => Err(TransportClientError::UnsupportedTransport(
+            "expected Embedded handle".into(),
+        )),
+    }
 }
 
 /// Builds a `ServiceBackend` (legacy config struct) from a snapshot
@@ -82,7 +167,7 @@ pub fn entry_to_service_backend(
 /// Resolves an API key from the snapshot's `extra_config`. Direct `api_key`
 /// always wins; otherwise the named env var is consulted. Returns `None` when
 /// neither is present (anonymous backend, e.g. local ollama).
-#[allow(dead_code)] // FAZA-8b-2: consumed by chat.rs / middleware.rs migration
+#[allow(dead_code)]
 fn resolve_api_key(cfg: &HashMap<String, String>) -> Option<String> {
     if let Some(direct) = cfg.get("api_key") {
         return Some(direct.clone());
@@ -157,7 +242,7 @@ pub fn pick_service<'a>(candidates: &[&'a ServiceEntry]) -> Option<&'a ServiceEn
 /// `Err(BackendInit)` because `BackendClient` only speaks OpenAI-compatible
 /// HTTP — the QUIC sidecar path is owned by `quic_*_services` in
 /// `ServiceManager`.
-#[allow(dead_code)] // FAZA-8b-2: consumed by chat.rs / middleware.rs migration
+#[allow(dead_code)]
 pub fn entry_to_backend_client(svc: &ServiceEntry) -> Result<BackendClient, TransportClientError> {
     let cfg = entry_to_service_backend(svc)?;
     BackendClient::new(cfg, None).map_err(|e| TransportClientError::BackendInit(e.to_string()))
@@ -362,5 +447,103 @@ mod tests {
             count_a,
             count_b
         );
+    }
+
+    // ---- N7.3 dispatch helpers ----------------------------------------------
+
+    #[test]
+    fn ensure_local_embedded_accepts_local_node() {
+        let h = BackendHandle::Embedded {
+            model_name: "qwen-tiny".into(),
+            node_id: "local".into(),
+        };
+        let model = ensure_local_embedded(&h, "local").unwrap();
+        assert_eq!(model, "qwen-tiny");
+    }
+
+    #[test]
+    fn ensure_local_embedded_rejects_remote_node() {
+        let h = BackendHandle::Embedded {
+            model_name: "qwen-tiny".into(),
+            node_id: "peerB".into(),
+        };
+        let err = ensure_local_embedded(&h, "local").unwrap_err();
+        assert!(matches!(err, TransportClientError::EmbeddedRemote(ref n) if n == "peerB"));
+    }
+
+    #[test]
+    fn ensure_local_embedded_rejects_non_embedded() {
+        let svc = fixture_entry(Transport::HttpDirect, 100);
+        let backend = entry_to_service_backend(&svc).unwrap();
+        let client = BackendClient::new(backend, None).expect("client");
+        let h = BackendHandle::Http(Arc::new(client));
+        let err = ensure_local_embedded(&h, "local").unwrap_err();
+        assert!(matches!(err, TransportClientError::UnsupportedTransport(_)));
+    }
+
+    #[test]
+    fn resolve_http_client_returns_arc_for_http_handle() {
+        let svc = fixture_entry(Transport::HttpDirect, 100);
+        let backend = entry_to_service_backend(&svc).unwrap();
+        let client = BackendClient::new(backend, None).expect("client");
+        let h = BackendHandle::Http(Arc::new(client));
+        let resolved = resolve_http_client(&h, "test-model").unwrap();
+        // The Arc strong-count is at least 2 here (the original + the resolved
+        // clone), proving the helper handed back a usable reference.
+        assert!(Arc::strong_count(&resolved.client) >= 2);
+    }
+
+    #[test]
+    fn resolve_http_client_rejects_quic_handle() {
+        let qcfg = crate::net::quic::QuicConfig {
+            name: "test".into(),
+            url: "iroh://aaaa".into(),
+            tls_ca: None,
+            server_name: None,
+            alpn: "tentaflow-service/v1".into(),
+            timeout_ms: 1_000,
+            auto_reconnect: false,
+            reconnect_interval_ms: 500,
+            keepalive_interval_ms: 5_000,
+            skip_tls_verify: true,
+            direct_addrs: Vec::new(),
+        };
+        let qh = Arc::new(crate::routing::service_manager::QuicServiceHandle::new(
+            qcfg,
+        ));
+        let h = BackendHandle::Quic(qh);
+        match resolve_http_client(&h, "test") {
+            Err(TransportClientError::UnsupportedTransport(_)) => {}
+            Err(other) => panic!("expected UnsupportedTransport, got {:?}", other),
+            Ok(_) => panic!("expected error for QUIC handle on HTTP path"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_quic_client_reports_not_connected_when_loop_idle() {
+        // Build a QUIC handle with no reconnect loop attached — `get_client()`
+        // returns None, so the helper must produce `QuicNotConnected`.
+        let qcfg = crate::net::quic::QuicConfig {
+            name: "test".into(),
+            url: "iroh://aaaa".into(),
+            tls_ca: None,
+            server_name: None,
+            alpn: "tentaflow-service/v1".into(),
+            timeout_ms: 1_000,
+            auto_reconnect: false,
+            reconnect_interval_ms: 500,
+            keepalive_interval_ms: 5_000,
+            skip_tls_verify: true,
+            direct_addrs: Vec::new(),
+        };
+        let qh = Arc::new(crate::routing::service_manager::QuicServiceHandle::new(
+            qcfg,
+        ));
+        let h = BackendHandle::Quic(qh);
+        match resolve_quic_client(&h, "test-model").await {
+            Err(TransportClientError::QuicNotConnected(ref m)) if m == "test-model" => {}
+            Err(other) => panic!("expected QuicNotConnected(\"test-model\"), got {:?}", other),
+            Ok(_) => panic!("expected error when reconnect loop idle"),
+        }
     }
 }

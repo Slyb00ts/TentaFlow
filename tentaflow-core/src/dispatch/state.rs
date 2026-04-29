@@ -17,6 +17,7 @@ use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
 use crate::routing::router::Router;
 use crate::routing::service_manager::ServiceManager;
+use crate::services::handles_cache::LiveHandlesCache;
 use crate::services::mesh_registry::MeshServicesRegistry;
 use crate::services::ports::PortAllocator;
 
@@ -54,6 +55,10 @@ pub struct AppState {
     /// table; remote snapshots arrive via `MeshServicesGet`/`Announce`/`Update`
     /// messages handled in `mesh::pipeline`.
     pub mesh_services_registry: Arc<MeshServicesRegistry>,
+    /// Lock-free cache of live runtime handles (HTTP / QUIC / Embedded) keyed
+    /// by `(node_id, service_id)`. Populated by the supervisor (krok N7.2);
+    /// consumed by routing call sites (krok N7.3). Empty in N7.1.
+    pub live_handles: Arc<LiveHandlesCache>,
 }
 
 impl AppState {
@@ -78,6 +83,7 @@ impl AppState {
         let config = RouterConfig::default();
         let router = Arc::new(Router::new(config, Some(db.clone())).expect("test router"));
         let service_manager = router.service_manager().clone();
+        let live_handles = service_manager.live_handles.clone();
         let mesh_peer_store = MeshPeerStore::new();
 
         let meeting_manager =
@@ -100,6 +106,7 @@ impl AppState {
             mesh_relay_health: None,
             port_allocator: None,
             mesh_services_registry: Arc::new(MeshServicesRegistry::new()),
+            live_handles,
         })
     }
 }

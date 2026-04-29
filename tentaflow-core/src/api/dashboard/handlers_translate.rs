@@ -77,7 +77,8 @@ fn first_choice_text(resp: &crate::api::openai::types::ChatCompletionResponse) -
 // Selects an LLM identifier. Prefers the first unified LLM from mesh registry;
 // falls back to the generic "default" that local_inference resolves at runtime.
 fn pick_llm_model(ctx: &HandlerContext) -> String {
-    let unified = crate::api::dashboard::api_models::collect_unified(&ctx.state.quic_mesh);
+    let unified =
+        crate::api::dashboard::api_models::collect_unified(&ctx.state.mesh_services_registry);
     unified
         .into_iter()
         .find(|m| m.service_type.eq_ignore_ascii_case("llm"))

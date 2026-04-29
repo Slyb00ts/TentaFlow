@@ -2073,46 +2073,33 @@ pub fn handle_invoke_addon_tool(
             session_id: None,
         };
 
-        // Znajdz QUIC handle i wyslij
-        let handle = router
-            .service_manager
-            .quic_llm_services
-            .get(service_name)
-            .map(|r| r.value().clone());
-        if let Some(handle) = handle {
-            // Async → sync bridge (ten handler jest wolany z sync kontekstu)
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let client = handle.get_client().await;
-                    match client {
-                        Some(c) => c.send_request(request).await.map_err(|e| format!("{}", e)),
-                        None => Err("Klient QUIC nie polaczony".to_string()),
-                    }
-                })
-            });
-
-            match result {
-                Ok(response) => match response.result {
-                    tentaflow_protocol::ModelResult::Completion(c) => Ok((
-                        200,
-                        serde_json::json!({
-                            "ok": true,
-                            "result": c.text,
-                        })
-                        .to_string(),
-                    )),
-                    tentaflow_protocol::ModelResult::Error(e) => Ok((500, json_error(&e.message))),
-                    _ => Ok((200, serde_json::json!({"ok": true}).to_string())),
-                },
-                Err(e) => Ok((503, json_error(&format!("Kontener niedostepny: {}", e)))),
-            }
-        } else {
-            Ok((
-                503,
-                json_error(
-                    "Serwis meeting-bot nie jest polaczony. Zdeplojuj kontener z Service Catalog.",
-                ),
-            ))
+        // Resolve QUIC client through the V2 live handles cache.
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                match router
+                    .service_manager
+                    .find_quic_client_for_model(service_name)
+                    .await
+                {
+                    Some(c) => c.send_request(request).await.map_err(|e| format!("{}", e)),
+                    None => Err("Klient QUIC nie polaczony".to_string()),
+                }
+            })
+        });
+        match result {
+            Ok(response) => match response.result {
+                tentaflow_protocol::ModelResult::Completion(c) => Ok((
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "result": c.text,
+                    })
+                    .to_string(),
+                )),
+                tentaflow_protocol::ModelResult::Error(e) => Ok((500, json_error(&e.message))),
+                _ => Ok((200, serde_json::json!({"ok": true}).to_string())),
+            },
+            Err(e) => Ok((503, json_error(&format!("Kontener niedostepny: {}", e)))),
         }
     } else {
         Ok((
