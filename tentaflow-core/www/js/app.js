@@ -42,7 +42,20 @@ import TranslateScreen from '/js/modules/translate.js';
 import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
-import ProfileReportScreen from '/js/modules/profile-report.js';
+import ProfileReportV2View from '/js/modules/profile-report-v2.js';
+
+// Adapter: V2 view eksponuje statyczne `render(container, params)`, podczas
+// gdy Router oczekuje `show(params)` lub `render()/mount()`. Owijamy V2 w
+// minimalny screen object zeby Router.navigate('profile-report', ...) z
+// mesh-detail-nsight trafial w nowy multi-source widok.
+const ProfileReportScreen = {
+  title: 'Profile Report',
+  async show(params = {}) {
+    const main = document.getElementById('main');
+    if (!main) return;
+    await ProfileReportV2View.render(main, params);
+  },
+};
 import { makeComingSoonScreen } from '/js/modules/coming-soon.js';
 
 // Helper: SVG <use> reference do inline sprite.
