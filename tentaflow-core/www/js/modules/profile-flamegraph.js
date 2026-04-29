@@ -39,7 +39,7 @@ export class CpuFlamegraph {
       stacks: Array.isArray(data?.stacks) ? data.stacks : [],
       names: Array.isArray(data?.names) ? data.names : [],
       totalDurationNs: Number(data?.totalDurationNs) || 0,
-      source: data?.source || 'linux.perf.cpu_sampling',
+      source: data?.source || '—',
       sampleHzApprox: Number(data?.sampleHzApprox) || 0,
     };
 
@@ -1061,13 +1061,19 @@ export const FlamegraphView = {
     const mount = document.createElement('div');
     card.appendChild(mount);
 
+    // Aktywny CPU source = pierwszy kolektor z `primary_category === 'cpu_sample'`,
+    // jezeli zaden nie zostal uzyty pokazujemy "—" zamiast hardcodowanego linux.perf.
+    const cpuCollector = (Array.isArray(report.collectors) ? report.collectors : [])
+      .find((c) => (c.primary_category === 'cpu_sample' || c.primaryCategory === 'cpu_sample'));
+    const cpuSource = cpuCollector ? (cpuCollector.id || '—') : '—';
+
     const fg = new CpuFlamegraph(mount, {
       events,
       frames: Array.isArray(report.frames) ? report.frames : [],
       stacks: Array.isArray(report.stacks) ? report.stacks : [],
       names: namesToArray(report.names),
       totalDurationNs: Number(report.duration_ns) || 0,
-      source: report.cpu_source || 'linux.perf.cpu_sampling',
+      source: cpuSource,
       sampleHzApprox: Number(report.cpu_hz) || 0,
     });
 

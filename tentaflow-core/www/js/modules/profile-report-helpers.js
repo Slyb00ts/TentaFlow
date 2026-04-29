@@ -1024,20 +1024,31 @@ export function vendorBadge(vendor) {
 
 // ---- Collector status helpers -----------------------------------------------
 
-// Status enum is rkyv-tagged. We normalize to { kind, reason }.
+// Wasm-glue emituje status jako `{ kind: 'used'|'skipped_requires_elevation'|
+// 'skipped_unavailable'|'failed', reason?: string }`. Backward-compat:
+// dopuszczamy tez stary PascalCase rkyv-tagged kszt­alt `{ Used: ... }`.
 export function normalizeCollectorStatus(status) {
   if (!status) return { kind: 'unknown', reason: '' };
   if (typeof status === 'string') return { kind: status.toLowerCase(), reason: '' };
-  if (typeof status === 'object') {
-    const keys = Object.keys(status);
-    if (keys.length === 0) return { kind: 'unknown', reason: '' };
-    const k = keys[0];
-    const v = status[k];
-    if (k === 'Used') return { kind: 'used', reason: '' };
-    if (k === 'SkippedUnavailable') return { kind: 'skipped', reason: typeof v === 'string' ? v : 'unavailable' };
-    if (k === 'SkippedRequiresElevation') return { kind: 'skipped', reason: 'requires elevation' };
-    if (k === 'Failed') return { kind: 'failed', reason: typeof v === 'string' ? v : 'failed' };
+  if (typeof status !== 'object') return { kind: 'unknown', reason: '' };
+  // Nowy ksztalt z wasm-glue.
+  if (typeof status.kind === 'string') {
+    const k = status.kind.toLowerCase();
+    if (k === 'used') return { kind: 'used', reason: '' };
+    if (k === 'skipped_requires_elevation') return { kind: 'skipped', reason: 'requires elevation' };
+    if (k === 'skipped_unavailable') return { kind: 'skipped', reason: status.reason || 'unavailable' };
+    if (k === 'failed') return { kind: 'failed', reason: status.reason || 'failed' };
+    return { kind: k, reason: status.reason || '' };
   }
+  // Legacy PascalCase fallback.
+  const keys = Object.keys(status);
+  if (keys.length === 0) return { kind: 'unknown', reason: '' };
+  const k = keys[0];
+  const v = status[k];
+  if (k === 'Used') return { kind: 'used', reason: '' };
+  if (k === 'SkippedUnavailable') return { kind: 'skipped', reason: typeof v === 'string' ? v : 'unavailable' };
+  if (k === 'SkippedRequiresElevation') return { kind: 'skipped', reason: 'requires elevation' };
+  if (k === 'Failed') return { kind: 'failed', reason: typeof v === 'string' ? v : 'failed' };
   return { kind: 'unknown', reason: '' };
 }
 
