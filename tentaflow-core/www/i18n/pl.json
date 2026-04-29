@@ -31,6 +31,7 @@
     "audit": "Dziennik audytu",
     "profiling_sessions": "Profilowanie",
     "meeting": "Meeting Bot",
+    "pose": "Pozy",
     "section_general": "Główne",
     "section_core": "Rdzeń",
     "section_workflows": "Przepływy",
@@ -213,6 +214,24 @@
     "col_transport": "Transport",
     "col_models": "Modele",
     "col_restart": "Restarty",
+    "col_category": "Kategoria",
+    "col_display_name": "Serwis",
+    "col_pin": "Pin",
+    "btn_play": "Uruchom",
+    "btn_pause": "Zatrzymaj",
+    "btn_pin": "Przypnij",
+    "btn_delete": "Usuń",
+    "node_local_badge": "lokalny",
+    "confirm_delete_title": "Usuń serwis",
+    "confirm_delete_body": "Usunąć \"{name}\" z {node}?",
+    "status": {
+      "running": "Uruchomiony",
+      "starting": "Startuje",
+      "degraded": "Pogorszony",
+      "failed": "Błąd",
+      "stopped": "Zatrzymany",
+      "paused": "Wstrzymany"
+    },
     "tooltip_pin_off": "Trzymaj zawsze w pamięci",
     "tooltip_pin_on": "Trzymany zawsze w pamięci — kliknij, aby wyłączyć",
     "tooltip_pause_off": "Zatrzymaj (zwolni pamięć, nie startuje z programem)",
@@ -1930,6 +1949,28 @@
     "accept_license": "Zaakceptuj licencję NVIDIA",
     "retry": "Ponów Deploy"
   },
+  "pose": {
+    "title": "Pozy",
+    "subtitle": "Podgląd kamery z lokalnym szkieletem sylwetki",
+    "live_chip": "Live",
+    "model_label": "Model pozy",
+    "camera_label": "Kamera",
+    "camera_front": "Przednia",
+    "camera_back": "Tylna",
+    "fps_label": "Częstotliwość",
+    "start": "Start",
+    "stop": "Stop",
+    "status": "Status",
+    "status_idle": "Gotowe",
+    "status_running": "Analiza na żywo",
+    "latency": "Latencja",
+    "poses": "Sylwetki",
+    "no_model_title": "Brak wdrożonego modelu pozy",
+    "no_model_desc": "Wdróż MoveNet Lightning albo YOLOv8n Pose z katalogu serwisów. Model pobierze się automatycznie podczas deploya.",
+    "camera_error": "Nie udało się uruchomić kamery",
+    "inference_error": "Nie udało się policzyć pozy",
+    "models_error": "Nie udało się pobrać listy modeli"
+  },
   "meeting": {
     "title": "Meeting Bot",
     "url_label": "URL spotkania Teams",
@@ -2542,6 +2583,10 @@
     "meeting": {
       "name": "Meeting Bot",
       "desc": "Nagrywanie i streszczenia spotkań"
+    },
+    "pose": {
+      "name": "Pozy",
+      "desc": "Podgląd kamery ze szkieletem sylwetki"
     },
     "flows": {
       "name": "Przepływy",
