@@ -106,6 +106,7 @@ impl ParserRegistry {
         // Linux no-priv parsers.
         r.register("linux.proc.cpu_util".to_string(), Arc::new(c::linux::cpu_util::LinuxProcCpuUtilParser));
         r.register("linux.perf.cpu_sampling".to_string(), Arc::new(c::linux::perf_sampling::LinuxPerfSamplingParser));
+        r.register("linux.perf.pmu_counters".to_string(), Arc::new(c::linux::perf_counters::LinuxPerfCountersParser));
         r.register("linux.proc.ram".to_string(), Arc::new(c::linux::ram::LinuxProcRamParser));
         r.register("linux.iostat.disk".to_string(), Arc::new(c::linux::disk::LinuxIostatDiskParser));
         r.register("linux.rapl.power".to_string(), Arc::new(c::linux::rapl_power::LinuxRaplPowerParser));
