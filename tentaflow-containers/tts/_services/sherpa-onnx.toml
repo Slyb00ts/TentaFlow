@@ -16,6 +16,7 @@ version = "1.12.40"
 [deploy.docker]
 context_path = "tts/docker/sherpa-onnx"
 platforms = ["linux", "windows"]
+transport = "sidecar-quic"
 
 [deploy.native]
 platforms = ["linux", "macos", "windows"]

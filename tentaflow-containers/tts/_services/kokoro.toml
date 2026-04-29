@@ -19,6 +19,7 @@ version = "1.0.0"
 [deploy.docker]
 context_path = "tts/docker/kokoro"
 platforms = ["linux", "windows"]
+transport = "sidecar-quic"
 
 [deploy.native]
 platforms = ["macos", "ios"]

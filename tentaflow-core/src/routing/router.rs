@@ -71,6 +71,15 @@ pub struct Router {
 
     /// Globalny counter do round-robin w middleware routing
     pub(crate) route_counter: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Phase 5 plumbing: read-only handle to the supervisor's services
+    /// snapshot. Currently consulted as a fallback after legacy resolution
+    /// misses; Phase 8 cleanup will make it the only source of truth.
+    pub(crate) services_snapshot_rx: Arc<
+        parking_lot::RwLock<
+            Option<tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>>,
+        >,
+    >,
 }
 
 /// Wynik identyfikacji mowcy z poziomem pewnosci.
@@ -320,6 +329,7 @@ impl Router {
             mesh_manager: Arc::new(parking_lot::RwLock::new(None)),
             alias_cache,
             route_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            services_snapshot_rx: Arc::new(parking_lot::RwLock::new(None)),
         };
 
         router.reload_alias_cache();
@@ -1210,6 +1220,38 @@ impl Router {
     /// Ustawia mesh manager (wywolane po inicjalizacji mesh pipeline)
     pub fn set_mesh_manager(&self, manager: Arc<crate::mesh::iroh_manager::IrohMeshManager>) {
         *self.mesh_manager.write() = Some(manager);
+    }
+
+    /// Wires the supervisor's services snapshot into the router. Called once
+    /// from `main.rs` after `Supervisor::new` returns. The router consults the
+    /// snapshot as a fallback when legacy resolution misses a model — Phase 8
+    /// cleanup will make it the only resolution path.
+    pub fn set_services_snapshot_rx(
+        &self,
+        rx: tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>,
+    ) {
+        *self.services_snapshot_rx.write() = Some(rx);
+    }
+
+    /// Returns the current services snapshot, or `None` if `main.rs` hasn't
+    /// wired it yet (legacy startup paths, tests with `Router::default`).
+    pub fn services_snapshot(&self) -> Option<Arc<crate::services::supervisor::ServicesSnapshot>> {
+        self.services_snapshot_rx
+            .read()
+            .as_ref()
+            .map(|rx| rx.borrow().clone())
+    }
+
+    /// Resolves `model_name` against the V2 services snapshot. Returns
+    /// `(service_id, engine_id)` of the first running/degraded service that
+    /// hosts the model. Used by routers/handlers as a fallback after the
+    /// legacy `model_pool` lookup misses.
+    pub fn resolve_model_via_snapshot(&self, model_name: &str) -> Option<(i64, String)> {
+        let snap = self.services_snapshot()?;
+        let service_id = *snap.models_by_name.get(model_name)?;
+        let idx = *snap.services_by_id.get(&service_id)?;
+        let entry = snap.services.get(idx)?;
+        Some((entry.id, entry.engine_id.clone()))
     }
 
     /// Przekieruj request do zdalnego noda przez mesh.

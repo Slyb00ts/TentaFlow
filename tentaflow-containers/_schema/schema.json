@@ -69,6 +69,9 @@
         "homepage": { "type": "string", "format": "uri" },
         "license": { "type": "string", "minLength": 1 },
         "icon": { "type": "string" },
+        "resource_kind": { "type": "string", "enum": ["ai", "infra"] },
+        "requires_model": { "type": "boolean" },
+        "gpu_supported": { "type": "boolean" },
         "default_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "api": { "$ref": "#/$defs/api" },
         "version": { "type": "string", "minLength": 1 }
@@ -86,14 +89,24 @@
     },
     "deploy_docker": {
       "type": "object",
-      "required": ["context_path", "platforms"],
+      "required": ["platforms", "transport"],
       "additionalProperties": false,
       "properties": {
         "context_path": { "type": "string", "minLength": 1 },
+        "compose_path": { "type": "string", "minLength": 1 },
         "platforms": { "$ref": "#/$defs/platforms" },
         "download_image": { "type": "string", "minLength": 1 },
-        "download_size_mb": { "type": "integer", "minimum": 0 }
-      }
+        "download_size_mb": { "type": "integer", "minimum": 0 },
+        "transport": {
+          "type": "string",
+          "enum": ["sidecar-quic", "direct-http"],
+          "description": "Required. sidecar-quic: TentaFlow sidecar wraps the engine HTTP API into QUIC for mesh-routed clients. direct-http: TentaFlow speaks HTTP directly to the host-mapped port."
+        }
+      },
+      "oneOf": [
+        { "required": ["context_path"] },
+        { "required": ["compose_path"] }
+      ]
     },
     "deploy_native": {
       "type": "object",
@@ -113,7 +126,6 @@
         {
           "if": { "properties": { "runtime": { "const": "embedded" } } },
           "then": {
-            "required": ["feature_flag"],
             "not": { "anyOf": [
               { "required": ["binary_path"] },
               { "required": ["bundle_path"] }

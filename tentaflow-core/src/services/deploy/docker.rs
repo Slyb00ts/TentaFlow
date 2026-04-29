@@ -18,7 +18,7 @@ use super::{
     build_new_service, models_from_manifest, transport_hint, DeployError, DeployResult,
     DeployStrategy, PreparedDeploy, RuntimeHandle,
 };
-use crate::services::manifest::ServiceManifest;
+use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
@@ -44,12 +44,28 @@ impl DockerDeploy {
         }
     }
 
-    /// Selects the transport based on user_config hint. `sidecar_quic` is
-    /// the default; `direct_http` bypasses the sidecar.
+    /// Resolves the runtime transport for this docker deploy.
+    ///
+    /// Source of truth (Phase 6): the manifest's `[deploy.docker].transport`
+    /// field — `sidecar-quic` or `direct-http`. The legacy `transport_explicit`
+    /// hint in `user_config` is honoured as an override only when set, which
+    /// keeps existing wizard requests working until the GUI stops sending it.
     fn pick_transport(&self) -> Transport {
-        match transport_hint(&self.user_config).as_deref() {
-            Some("direct_http") => Transport::HttpDirect,
-            _ => Transport::SidecarQuic,
+        if let Some(hint) = transport_hint(&self.user_config) {
+            return match hint.as_str() {
+                "direct_http" | "direct-http" => Transport::HttpDirect,
+                _ => Transport::SidecarQuic,
+            };
+        }
+        match self
+            .manifest
+            .deploy
+            .docker
+            .as_ref()
+            .and_then(|d| d.transport)
+        {
+            Some(DockerTransport::DirectHttp) => Transport::HttpDirect,
+            Some(DockerTransport::SidecarQuic) | None => Transport::SidecarQuic,
         }
     }
 }
@@ -361,7 +377,8 @@ mod tests {
 
     fn skeleton_manifest(id: &str) -> ServiceManifest {
         use crate::services::manifest::{
-            ApiKind, Category, DeploySection, DockerDeploy as DockerSec, Engine, TargetOs,
+            ApiKind, Category, DeploySection, DockerDeploy as DockerSec, DockerTransport, Engine,
+            TargetOs,
         };
         ServiceManifest {
             engine: Engine {
@@ -387,6 +404,7 @@ mod tests {
                     platforms: vec![TargetOs::Linux, TargetOs::Macos, TargetOs::Windows],
                     download_image: None,
                     download_size_mb: None,
+                    transport: Some(DockerTransport::SidecarQuic),
                 }),
                 native: None,
                 external: None,
