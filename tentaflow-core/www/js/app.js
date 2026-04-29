@@ -52,10 +52,9 @@ import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
 
-// Adapter: V2 view eksponuje statyczne `render(container, params)`, podczas
-// gdy Router oczekuje `show(params)` lub `render()/mount()`. Owijamy V2 w
-// minimalny screen object zeby Router.navigate('profile-report', ...) z
-// mesh-detail-nsight trafial w nowy multi-source widok.
+// Adapter: profile-report eksponuje statyczne `render(container, params)`,
+// podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
+// object zeby Router.navigate('profile-report', ...) zadzialalo.
 const ProfileReportScreen = {
   title: 'Profile Report',
   async show(params = {}) {
