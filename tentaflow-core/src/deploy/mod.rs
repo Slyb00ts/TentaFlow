@@ -11,6 +11,7 @@
 pub mod docker;
 
 pub mod bundle;
+pub mod chromium_provisioner;
 pub mod log_bus;
 pub mod process_ctl;
 pub mod python_venv;
