@@ -1486,18 +1486,32 @@ impl IrohMeshManagerRef {
                 }
             });
         }
-        let is_current = self
-            .connections
-            .get(&remote_hex)
-            .map(|active| active.id == connection_id)
-            .unwrap_or(false);
-        if is_current {
-            self.connections.remove(&remote_hex);
-            let reason = close_reason.as_deref().unwrap_or("stream closed");
+        // Connection wymarl. Mapowanie usuwamy WYLACZNIE jesli nadal
+        // wskazuje na nasz connection_id — gdy nowsze polaczenie
+        // (tie-break / reconnect) juz przebilo nasz wpis, zostawiamy
+        // jego stan w spokoju. Nie wysylamy wtedy PeerDisconnected, zeby
+        // pipeline nie zerowal heartbeat livenessu zywego polaczenia.
+        let was_current = match self.connections.get(&remote_hex) {
+            Some(active) if active.id == connection_id => {
+                drop(active);
+                self.connections.remove(&remote_hex);
+                true
+            }
+            _ => false,
+        };
+        let reason = close_reason.as_deref().unwrap_or("stream closed");
+        if was_current {
             info!(peer = %remote_hex, reason, "iroh_mesh: polaczenie zamkniete");
             let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
                 node_id: remote_hex,
             });
+        } else {
+            debug!(
+                peer = %remote_hex,
+                reason,
+                connection_id,
+                "iroh_mesh: stary handler zakonczony — aktywne jest nowsze polaczenie, PeerDisconnected pominiety"
+            );
         }
     }
 
