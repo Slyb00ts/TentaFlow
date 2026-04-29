@@ -11,6 +11,12 @@ import '/js/components/tf-button.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-chip.js';
+import { I18n } from '/js/i18n.js';
+
+function ti(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
 
 const ROW_H = 22;
 const MIN_PX_WIDTH = 1.0;
@@ -320,60 +326,63 @@ export class CpuFlamegraph {
     this.container.innerHTML = '';
     const root = document.createElement('div');
     root.className = 'flamegraph-root';
+    const phSearch = ti('profiling.flame.ph_search', null, 'Search frame…');
+    const startPh = ti('profiling.flame.diff_start_ph', null, 'start');
+    const endPh = ti('profiling.flame.diff_end_ph', null, 'end');
     root.innerHTML = `
       <div class="flamegraph-toolbar">
-        <tf-searchbox placeholder="Search frame…" debounce="120" data-ref="searchbox"></tf-searchbox>
+        <tf-searchbox placeholder="${phSearch}" debounce="120" data-ref="searchbox"></tf-searchbox>
         <span class="ftb-group">
-          <tf-toggle data-ref="reverseToggle" aria-label="Reverse (icicle)"></tf-toggle>
-          Reverse (icicle)
+          <tf-toggle data-ref="reverseToggle" aria-label="${ti('profiling.flame.aria_reverse', null, 'Reverse (icicle)')}"></tf-toggle>
+          ${ti('profiling.flame.label_reverse', null, 'Reverse (icicle)')}
         </span>
         <span class="ftb-group">
-          <tf-toggle data-ref="diffToggle" aria-label="Differential mode"></tf-toggle>
-          Differential
+          <tf-toggle data-ref="diffToggle" aria-label="${ti('profiling.flame.aria_diff', null, 'Differential mode')}"></tf-toggle>
+          ${ti('profiling.flame.label_diff', null, 'Differential')}
         </span>
         <span class="ftb-group">
-          <tf-toggle data-ref="moduleColorToggle" aria-label="Color by module"></tf-toggle>
-          Color by module
+          <tf-toggle data-ref="moduleColorToggle" aria-label="${ti('profiling.flame.aria_module_color', null, 'Color by module')}"></tf-toggle>
+          ${ti('profiling.flame.label_module_color', null, 'Color by module')}
         </span>
         <span class="ftb-group">
-          Min %
-          <input type="range" class="ftb-slider" min="0" max="5" step="0.1" value="1.0" data-ref="minPctSlider" aria-label="Minimum frame percent" />
+          ${ti('profiling.flame.label_min_pct', null, 'Min %')}
+          <input type="range" class="ftb-slider" min="0" max="5" step="0.1" value="1.0" data-ref="minPctSlider" aria-label="${ti('profiling.flame.aria_min_pct', null, 'Minimum frame percent')}" />
           <span class="ftb-slider-val" data-ref="minPctVal">1.0%</span>
         </span>
-        <tf-button variant="ghost" size="sm" data-ref="resetBtn">Reset</tf-button>
+        <tf-button variant="ghost" size="sm" data-ref="resetBtn">${ti('profiling.flame.btn_reset', null, 'Reset')}</tf-button>
       </div>
 
       <div class="flamegraph-diff-bar" data-ref="diffBar" hidden>
         <div class="flamegraph-diff-range">
-          <div class="fdr-label">Range A (ms)</div>
+          <div class="fdr-label">${ti('profiling.flame.diff_a_label', null, 'Range A (ms)')}</div>
           <div class="fdr-inputs">
-            <input type="number" min="0" step="10" data-ref="diffAStart" placeholder="start" />
+            <input type="number" min="0" step="10" data-ref="diffAStart" placeholder="${startPh}" />
             <span class="fdr-unit">→</span>
-            <input type="number" min="0" step="10" data-ref="diffAEnd" placeholder="end" />
+            <input type="number" min="0" step="10" data-ref="diffAEnd" placeholder="${endPh}" />
           </div>
         </div>
         <div class="flamegraph-diff-range">
-          <div class="fdr-label">Range B (ms)</div>
+          <div class="fdr-label">${ti('profiling.flame.diff_b_label', null, 'Range B (ms)')}</div>
           <div class="fdr-inputs">
-            <input type="number" min="0" step="10" data-ref="diffBStart" placeholder="start" />
+            <input type="number" min="0" step="10" data-ref="diffBStart" placeholder="${startPh}" />
             <span class="fdr-unit">→</span>
-            <input type="number" min="0" step="10" data-ref="diffBEnd" placeholder="end" />
+            <input type="number" min="0" step="10" data-ref="diffBEnd" placeholder="${endPh}" />
           </div>
         </div>
       </div>
 
       <div class="flamegraph-diff-legend" data-ref="diffLegend" hidden>
-        <span class="fdl-end">B faster</span>
+        <span class="fdl-end">${ti('profiling.flame.diff_b_faster', null, 'B faster')}</span>
         <span class="fdl-bar" aria-hidden="true"></span>
-        <span class="fdl-end">B slower</span>
-        <span style="margin-left:auto;color:var(--fg-text-3);">color = (B − A) / max</span>
+        <span class="fdl-end">${ti('profiling.flame.diff_b_slower', null, 'B slower')}</span>
+        <span style="margin-left:auto;color:var(--fg-text-3);">${ti('profiling.flame.diff_caption', null, 'color = (B − A) / max')}</span>
       </div>
 
       <div class="flamegraph-breadcrumb" data-ref="breadcrumb"></div>
 
       <div class="flamegraph-layout">
         <div>
-          <div class="flamegraph-wrap" data-ref="wrap" tabindex="0" role="application" aria-label="CPU flamegraph">
+          <div class="flamegraph-wrap" data-ref="wrap" tabindex="0" role="application" aria-label="${ti('profiling.flame.aria_chart', null, 'CPU flamegraph')}">
             <svg class="flamegraph-svg" data-ref="svg" preserveAspectRatio="none" xmlns="${SVG_NS}"></svg>
           </div>
           <div class="flamegraph-foot" data-ref="foot"></div>
@@ -473,7 +482,7 @@ export class CpuFlamegraph {
     bc.innerHTML = '';
     const allItem = document.createElement('span');
     allItem.className = 'fbc-item' + (this.zoomPath.length === 0 ? ' current' : '');
-    allItem.textContent = '[all]';
+    allItem.textContent = ti('profiling.flame.all_root', null, '[all]');
     if (this.zoomPath.length > 0) {
       allItem.addEventListener('click', () => {
         this.zoomPath = [];
@@ -511,8 +520,8 @@ export class CpuFlamegraph {
   _renderFoot() {
     const samples = this.totalSamples.toLocaleString('en-US');
     const stacks = this.uniqueStackCount.toLocaleString('en-US');
-    const hz = this.data.sampleHzApprox > 0 ? `${this.data.sampleHzApprox} Hz · ` : '';
-    this._refs.foot.textContent = `Source: ${this.data.source} · ${hz}${samples} samples · ${stacks} unique stacks`;
+    const hz = this.data.sampleHzApprox > 0 ? ti('profiling.flame.foot_hz', { hz: this.data.sampleHzApprox }, `${this.data.sampleHzApprox} Hz · `) : '';
+    this._refs.foot.textContent = ti('profiling.flame.foot', { source: this.data.source, hz, samples, stacks }, `Source: ${this.data.source} · ${hz}${samples} samples · ${stacks} unique stacks`);
   }
 
   _renderPanel() {
@@ -520,14 +529,14 @@ export class CpuFlamegraph {
     panel.innerHTML = '';
     if (this.selectedFrameId === null || this.selectedFrameId === undefined) {
       panel.innerHTML = `
-        <div class="fp-head">Selected frame</div>
-        <div class="fp-empty">Click a frame to inspect.<br>Enter to drill down · Esc to reset</div>
+        <div class="fp-head">${ti('profiling.flame.panel_head', null, 'Selected frame')}</div>
+        <div class="fp-empty">${ti('profiling.flame.panel_empty', null, 'Click a frame to inspect.<br>Enter to drill down · Esc to reset')}</div>
       `;
       return;
     }
     const node = this._findNodeInCurrentZoomByFrameId(this.selectedFrameId);
     if (!node) {
-      panel.innerHTML = `<div class="fp-head">Selected frame</div><div class="fp-empty">Frame not in current zoom.</div>`;
+      panel.innerHTML = `<div class="fp-head">${ti('profiling.flame.panel_head', null, 'Selected frame')}</div><div class="fp-empty">${ti('profiling.flame.panel_not_in_zoom', null, 'Frame not in current zoom.')}</div>`;
       return;
     }
     const rootTotal = this.tree.totalCount || 1;
@@ -544,16 +553,16 @@ export class CpuFlamegraph {
       const cls = delta > 0.5 ? 'tt-delta-up' : delta < -0.5 ? 'tt-delta-down' : '';
       const sign = delta > 0 ? '+' : '';
       diffRow = `
-        <div class="fp-row"><span class="l">A %</span><span class="r">${aPct.toFixed(2)}%</span></div>
-        <div class="fp-row"><span class="l">B %</span><span class="r">${bPct.toFixed(2)}%</span></div>
-        <div class="fp-row"><span class="l">Δ (B−A)</span><span class="r ${cls}">${sign}${delta.toFixed(2)}%</span></div>
+        <div class="fp-row"><span class="l">${ti('profiling.flame.panel_a_pct', null, 'A %')}</span><span class="r">${aPct.toFixed(2)}%</span></div>
+        <div class="fp-row"><span class="l">${ti('profiling.flame.panel_b_pct', null, 'B %')}</span><span class="r">${bPct.toFixed(2)}%</span></div>
+        <div class="fp-row"><span class="l">${ti('profiling.flame.panel_delta', null, 'Δ (B−A)')}</span><span class="r ${cls}">${sign}${delta.toFixed(2)}%</span></div>
       `;
     }
 
     // Top 5 children by totalCount
     const children = [...node.children.values()].sort((a, b) => b.totalCount - a.totalCount).slice(0, 5);
     const childrenHtml = children.length === 0
-      ? `<div class="fp-empty" style="padding:8px 0;">No children (leaf)</div>`
+      ? `<div class="fp-empty" style="padding:8px 0;">${ti('profiling.flame.panel_no_children', null, 'No children (leaf)')}</div>`
       : children.map((c) => {
           const pct = (c.totalCount / rootTotal) * 100;
           return `<div class="fp-child" data-frame="${c.frameId}" tabindex="0" role="button">
@@ -564,21 +573,22 @@ export class CpuFlamegraph {
 
     // Mockup #06 ma przycisk "Open source (file:line)" — pokazujemy tylko gdy
     // mamy realną ścieżkę pliku, zeby nie zaśmiecać UI dla framów bez debug info.
+    const openSrcPath = `${escapeText(node.file)}${node.line ? ':' + node.line : ''}`;
     const openSrcBtn = node.file
-      ? `<tf-button variant="outline" size="sm" data-action="open-source" style="margin-top:6px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>Open source (${escapeText(node.file)}${node.line ? ':' + node.line : ''})</tf-button>`
+      ? `<tf-button variant="outline" size="sm" data-action="open-source" style="margin-top:6px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>${ti('profiling.flame.panel_open_source', { path: openSrcPath }, `Open source (${openSrcPath})`)}</tf-button>`
       : '';
 
     panel.innerHTML = `
-      <div class="fp-head">Selected frame</div>
+      <div class="fp-head">${ti('profiling.flame.panel_head', null, 'Selected frame')}</div>
       <div class="fp-symbol">${escapeText(node.name)}</div>
-      <div class="fp-row"><span class="l">Module</span><span class="r">${escapeText(node.module || '—')}</span></div>
-      <div class="fp-row"><span class="l">File</span><span class="r">${file}</span></div>
-      <div class="fp-row"><span class="l">Self %</span><span class="r">${selfPct.toFixed(2)}%</span></div>
-      <div class="fp-row"><span class="l">Total %</span><span class="r">${totalPct.toFixed(2)}%</span></div>
-      <div class="fp-row"><span class="l">Samples</span><span class="r">${node.totalCount.toLocaleString('en-US')}</span></div>
+      <div class="fp-row"><span class="l">${ti('profiling.flame.panel_module', null, 'Module')}</span><span class="r">${escapeText(node.module || '—')}</span></div>
+      <div class="fp-row"><span class="l">${ti('profiling.flame.panel_file', null, 'File')}</span><span class="r">${file}</span></div>
+      <div class="fp-row"><span class="l">${ti('profiling.flame.panel_self_pct', null, 'Self %')}</span><span class="r">${selfPct.toFixed(2)}%</span></div>
+      <div class="fp-row"><span class="l">${ti('profiling.flame.panel_total_pct', null, 'Total %')}</span><span class="r">${totalPct.toFixed(2)}%</span></div>
+      <div class="fp-row"><span class="l">${ti('profiling.flame.panel_samples', null, 'Samples')}</span><span class="r">${node.totalCount.toLocaleString('en-US')}</span></div>
       ${diffRow}
       <div class="fp-section">
-        <div class="fp-section-title">Top children</div>
+        <div class="fp-section-title">${ti('profiling.flame.panel_top_children', null, 'Top children')}</div>
         <div class="fp-children">${childrenHtml}</div>
       </div>
       ${openSrcBtn}
@@ -623,7 +633,7 @@ export class CpuFlamegraph {
       t.setAttribute('fill', '#6a7196');
       t.setAttribute('font-family', 'JetBrains Mono, monospace');
       t.setAttribute('font-size', '12');
-      t.textContent = 'No CPU samples in this range.';
+      t.textContent = ti('profiling.flame.no_samples_in_range', null, 'No CPU samples in this range.');
       svg.appendChild(t);
       return;
     }
@@ -707,7 +717,7 @@ export class CpuFlamegraph {
       label.setAttribute('y', (y + ROW_H / 2).toFixed(2));
       const pct = ((node.totalCount / (zoomTotal || 1)) * 100);
       const text = node.frameId === -1
-        ? `[all] ${pct.toFixed(0)}% — ${node.totalCount.toLocaleString('en-US')} samples`
+        ? ti('profiling.flame.all_label', { pct: pct.toFixed(0), samples: node.totalCount.toLocaleString('en-US') }, `[all] ${pct.toFixed(0)}% — ${node.totalCount.toLocaleString('en-US')} samples`)
         : this._truncateLabel(node.name, width, pct);
       label.textContent = text;
       svg.appendChild(label);
@@ -1030,7 +1040,7 @@ export const FlamegraphView = {
         <div class="pr-card">
           <div class="pr-banner-degraded">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-            <div><strong>No CPU samples.</strong> This report contains no events for flamegraph aggregation.</div>
+            <div>${ti('profiling.report.no_cpu_samples_flame', null, '<strong>No CPU samples.</strong> This report contains no events for flamegraph aggregation.')}</div>
           </div>
         </div>`;
       return;

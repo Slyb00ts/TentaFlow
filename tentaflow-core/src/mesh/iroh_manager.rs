@@ -304,6 +304,13 @@ impl IrohMeshManager {
             .map_err(|e: IrohEndpointError| anyhow::anyhow!("iroh endpoint bind: {e:?}"))?;
 
         let local_id_hex = hex::encode(endpoint.id().as_bytes());
+        info!(
+            target: "mesh::identity",
+            iroh_node_id = %endpoint.id().to_string(),
+            iroh_node_id_bytes_hex = %local_id_hex,
+            ed25519_hex = %security.ed25519_public_key_hex(),
+            "local iroh identity"
+        );
         // Duzy buffer — przy discovery burst (nowa siec, wiele peerow na raz)
         // subscriber pipeline moze chwilowo byc wolniejszy niz producent
         // eventow. 1024 bylo za malo, przy 100+ peerach Lagged sie zdarzal.
@@ -1547,9 +1554,15 @@ impl IrohMeshManagerRef {
         // frames. Every other mesh frame is dropped before any application
         // state (peer_store, registry, command executor, ...) is touched.
         let frame_type = disc[0];
-        if !crate::mesh::frame_policy::is_pre_trust_frame(frame_type)
-            && !self.security.is_trusted(&remote_hex)
-        {
+        let trusted_now = self.security.is_trusted(&remote_hex);
+        tracing::debug!(
+            target: "mesh::gate",
+            remote_hex = %remote_hex,
+            frame_type = format!("0x{:02X}", frame_type),
+            is_trusted = trusted_now,
+            "frame received, gate check"
+        );
+        if !crate::mesh::frame_policy::is_pre_trust_frame(frame_type) && !trusted_now {
             warn!(
                 peer = %remote_hex,
                 frame_type = format!("0x{:02X}", frame_type),

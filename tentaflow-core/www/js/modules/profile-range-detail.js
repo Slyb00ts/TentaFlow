@@ -7,6 +7,12 @@
 // =============================================================================
 
 import { unwrapPayload, detectVendor, escape } from './profile-report-helpers.js';
+import { I18n } from '/js/i18n.js';
+
+function ti(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
 
 const NS_PER_S = 1_000_000_000;
 
@@ -258,7 +264,7 @@ function renderMiniTimeline(report, s, en) {
         <rect class="range-overlay" x="${x0.toFixed(1)}" y="0"
               width="${Math.max(2, x1 - x0).toFixed(1)}" height="${H - 15}"/>
         <text class="range-label" x="${labelX.toFixed(1)}" y="${H - 4}" text-anchor="middle">
-          selection ${escape(fmtTime(dur))}
+          ${escape(ti('profiling.range.selection_label', { dur: fmtTime(dur) }, `selection ${fmtTime(dur)}`))}
         </text>
       </svg>
     </div>`;
@@ -268,8 +274,8 @@ function renderCpuSection(stats) {
   if (!stats.cpuRows.length) {
     return `
       <div class="range-section">
-        <h3>Top CPU symbols</h3>
-        <div class="range-empty">No CPU samples in this range.</div>
+        <h3>${escape(ti('profiling.range.cpu_h', null, 'Top CPU symbols'))}</h3>
+        <div class="range-empty">${escape(ti('profiling.range.cpu_no_data', null, 'No CPU samples in this range.'))}</div>
       </div>`;
   }
   const rows = stats.cpuRows.map((r) => `
@@ -279,18 +285,18 @@ function renderCpuSection(stats) {
     </div>`).join('');
   return `
     <div class="range-section">
-      <h3>Top CPU symbols</h3>
+      <h3>${escape(ti('profiling.range.cpu_h', null, 'Top CPU symbols'))}</h3>
       <div class="range-list">${rows}</div>
     </div>`;
 }
 
 function renderIoSection(stats) {
   const items = [
-    ['Disk read', fmtBytes(stats.diskRead)],
-    ['Disk write', fmtBytes(stats.diskWrite)],
-    ['Avg IOPS', stats.avgIops ? Math.round(stats.avgIops).toLocaleString() : '—'],
-    ['Net in', fmtBytes(stats.netIn)],
-    ['Net out', fmtBytes(stats.netOut)],
+    [ti('profiling.range.io_disk_read', null, 'Disk read'), fmtBytes(stats.diskRead)],
+    [ti('profiling.range.io_disk_write', null, 'Disk write'), fmtBytes(stats.diskWrite)],
+    [ti('profiling.range.io_avg_iops', null, 'Avg IOPS'), stats.avgIops ? Math.round(stats.avgIops).toLocaleString() : '—'],
+    [ti('profiling.range.io_net_in', null, 'Net in'), fmtBytes(stats.netIn)],
+    [ti('profiling.range.io_net_out', null, 'Net out'), fmtBytes(stats.netOut)],
   ];
   const rows = items.map(([k, v]) => `
     <div class="range-io-row">
@@ -299,7 +305,7 @@ function renderIoSection(stats) {
     </div>`).join('');
   return `
     <div class="range-section">
-      <h3>IO summary</h3>
+      <h3>${escape(ti('profiling.range.io_h', null, 'IO summary'))}</h3>
       <div class="range-list">${rows}</div>
     </div>`;
 }
@@ -317,7 +323,7 @@ function renderPowerLine(powerLine, s, en) {
   });
   return `
     <div class="range-power-mini">
-      <div class="range-power-mini-title">Power timeline (range)</div>
+      <div class="range-power-mini-title">${escape(ti('profiling.range.power_mini_title', null, 'Power timeline (range)'))}</div>
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
         <path d="M ${points.join(' L ')}"/>
       </svg>
@@ -326,13 +332,13 @@ function renderPowerLine(powerLine, s, en) {
 
 function renderPowerSection(stats, s, en) {
   const rows = [
-    ['Avg total', `${stats.avgTotalW.toFixed(0)} W`],
-    ['Peak total', `${stats.peakTotalW.toFixed(0)} W`],
-    ['Total energy', `${stats.totalKj.toFixed(2)} kJ`],
+    [ti('profiling.range.power_avg_total', null, 'Avg total'), `${stats.avgTotalW.toFixed(0)} W`],
+    [ti('profiling.range.power_peak_total', null, 'Peak total'), `${stats.peakTotalW.toFixed(0)} W`],
+    [ti('profiling.range.power_total_energy', null, 'Total energy'), `${stats.totalKj.toFixed(2)} kJ`],
     ...stats.perDomain.slice(0, 4).map((d) => {
       let label = d.key;
-      if (d.key === 'cpu') label = 'CPU pkg';
-      else if (d.key.startsWith('gpu:')) label = `GPU ${d.key.slice(4)}`;
+      if (d.key === 'cpu') label = ti('profiling.range.power_cpu_pkg', null, 'CPU pkg');
+      else if (d.key.startsWith('gpu:')) label = ti('profiling.range.power_gpu', { id: d.key.slice(4) }, `GPU ${d.key.slice(4)}`);
       return [label, `${d.avgW.toFixed(0)} W`];
     }),
   ];
@@ -343,7 +349,7 @@ function renderPowerSection(stats, s, en) {
     </div>`).join('');
   return `
     <div class="range-section range-power-summary">
-      <h3>Power summary</h3>
+      <h3>${escape(ti('profiling.range.power_h', null, 'Power summary'))}</h3>
       <div class="range-list">${items}</div>
       ${renderPowerLine(stats.powerLine, s, en)}
     </div>`;
@@ -363,7 +369,7 @@ function renderVendorColumn(vendor, group) {
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>
           </svg>
-          <div>No kernel data in this range.</div>
+          <div>${escape(ti('profiling.range.kernels_no_data', null, 'No kernel data in this range.'))}</div>
         </div>
       </div>`;
   }
@@ -371,7 +377,7 @@ function renderVendorColumn(vendor, group) {
     <div class="range-kernel-row">
       <span class="sym">${escape(k.name)}</span>
       <span class="pct">${k.pct.toFixed(0)}%</span>
-    </div>`).join('') || '<div class="range-empty">no kernels</div>';
+    </div>`).join('') || `<div class="range-empty">${escape(ti('profiling.range.kernels_no_kernels', null, 'no kernels'))}</div>`;
   return `
     <div>
       <div class="range-vendor-name ${vendor}">
@@ -406,18 +412,18 @@ function renderKernelsAndNvtx(stats, report) {
           <td class="num">${escape(fmtTime(r.startNs))}</td>
           <td class="num">${escape(fmtTime(r.durNs))}</td>
         </tr>`).join('')
-    : `<tr><td colspan="4" class="range-empty">No NVTX ranges intersect this selection.</td></tr>`;
+    : `<tr><td colspan="4" class="range-empty">${escape(ti('profiling.range.nvtx_no_intersect', null, 'No NVTX ranges intersect this selection.'))}</td></tr>`;
 
   return `
     <div class="range-section">
-      <h3>Top GPU kernels per vendor</h3>
+      <h3>${escape(ti('profiling.range.kernels_h', null, 'Top GPU kernels per vendor'))}</h3>
       <div class="range-vendor-grid">${cols}</div>
-      <h3 style="margin-top:14px;">NVTX ranges in selection</h3>
+      <h3 style="margin-top:14px;">${escape(ti('profiling.range.nvtx_h', null, 'NVTX ranges in selection'))}</h3>
       <table class="range-nvtx-table">
         <thead>
           <tr>
-            <th>Range</th><th>Vendor</th>
-            <th class="num">Start</th><th class="num">Duration</th>
+            <th>${escape(ti('profiling.range.nvtx_col_range', null, 'Range'))}</th><th>${escape(ti('profiling.range.nvtx_col_vendor', null, 'Vendor'))}</th>
+            <th class="num">${escape(ti('profiling.range.nvtx_col_start', null, 'Start'))}</th><th class="num">${escape(ti('profiling.range.nvtx_col_duration', null, 'Duration'))}</th>
           </tr>
         </thead>
         <tbody>${nvtxRows}</tbody>
@@ -435,7 +441,7 @@ export class ProfileRangeDetailView {
     const s = range.tStartNs;
     const en = range.tEndNs;
     if (s == null || en == null || en <= s) {
-      host.innerHTML = `<div class="range-empty">Invalid time range.</div>`;
+      host.innerHTML = `<div class="range-empty">${escape(ti('profiling.range.invalid', null, 'Invalid time range.'))}</div>`;
       return;
     }
     const stats = aggregateRange(report, s, en);
@@ -443,7 +449,7 @@ export class ProfileRangeDetailView {
     host.classList.add('profile-range');
     host.innerHTML = `
       <div class="range-header">
-        <span class="status-pill warn">Range</span>
+        <span class="status-pill warn">${escape(ti('profiling.range.pill', null, 'Range'))}</span>
         <span class="range-time">${escape(fmtTime(s))} → ${escape(fmtTime(en))}</span>
         <span class="range-duration">${escape(fmtTime(en - s))}</span>
         <div class="range-actions"></div>
@@ -486,7 +492,7 @@ export function openRangeDetailModal({ report, range }) {
     return Promise.resolve({ action: 'fallback' });
   }
   return TfWindow.open({
-    title: 'Range Select — cross-source detail',
+    title: ti('profiling.range.modal_title', null, 'Range Select — cross-source detail'),
     subtitle: `${fmtTime(range.tStartNs)} → ${fmtTime(range.tEndNs)} · ${fmtTime(range.tEndNs - range.tStartNs)}`,
     icon: 'i-grid-rows',
     body: host,

@@ -39,11 +39,18 @@ import {
   profilingReport,
   profilingDownload,
 } from '/js/protocol/profiling.js';
+import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-window.js';
+
+// Krotki helper i18n z fallbackiem.
+function t(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
 
 const FIXTURE_PATH = '/js/modules/__fixtures__/profile-report.json';
 
@@ -121,15 +128,16 @@ export class ProfileReportView {
       }
     }
     if (!report) {
-      container.innerHTML = renderError(new Error('Empty report received from backend'));
+      container.innerHTML = renderError(new Error(t('profiling.report.err_empty_report', null, 'Empty report received from backend')));
       bindBackHandler(container);
       return;
     }
     report = deepSnakeKeys(report);
     if (report.schema_version !== 2) {
+      const ver = report.schema_version || 'brak';
       const msg = envelopeIsV2
-        ? `Backend zwrocil V2 envelope ze schema_version=${report.schema_version} ktorego dashboard nie obsluguje. Zaktualizuj klienta WWW.`
-        : `Niepoznany format raportu (schema_version=${report.schema_version || 'brak'}). Sprawdz wersje tentaflow.`;
+        ? t('profiling.report.err_unknown_schema_v2', { ver }, `Backend returned a V2 envelope with schema_version=${ver} which the dashboard does not understand. Update the web client.`)
+        : t('profiling.report.err_unknown_schema', { ver }, `Unknown report format (schema_version=${ver}). Check tentaflow versions.`);
       container.innerHTML = renderError(new Error(msg));
       bindBackHandler(container);
       return;
@@ -194,16 +202,16 @@ function buildContext(report) {
   // Sub-tab icons match mockup #04 (linie 1107-1115). Komplet symboli zywie
   // w www/index.html jako <symbol id="i-...">.
   const tabs = [
-    { id: 'overview',   label: 'Overview',         icon: 'grid-2x2',   visible: true },
-    { id: 'timeline',   label: 'Unified Timeline', icon: 'line-chart', visible: true },
-    { id: 'flame',      label: 'CPU Flamegraph',   icon: 'bar-chart',  visible: true },
-    { id: 'cpu_detail', label: 'CPU Detail',       icon: 'cpu',        visible: hasCpuUtil },
-    { id: 'gpu',        label: 'GPU',              icon: 'globe-grid', visible: hasGpu, count: devices.length || undefined },
-    { id: 'memory',     label: 'Memory',           icon: 'ram',        visible: hasMemory },
-    { id: 'disk',       label: 'Disk IO',          icon: 'cylinder',   visible: hasDisk },
-    { id: 'power',      label: 'Power',            icon: 'shield',     visible: hasPower },
-    { id: 'sources',    label: 'Sources',          icon: 'list',       visible: true },
-  ].filter((t) => t.visible);
+    { id: 'overview',   label: t('profiling.report.tab_overview', null, 'Overview'),                 icon: 'grid-2x2',   visible: true },
+    { id: 'timeline',   label: t('profiling.report.tab_timeline', null, 'Unified Timeline'),         icon: 'line-chart', visible: true },
+    { id: 'flame',      label: t('profiling.report.tab_flame', null, 'CPU Flamegraph'),              icon: 'bar-chart',  visible: true },
+    { id: 'cpu_detail', label: t('profiling.report.tab_cpu_detail', null, 'CPU Detail'),             icon: 'cpu',        visible: hasCpuUtil },
+    { id: 'gpu',        label: t('profiling.report.tab_gpu', null, 'GPU'),                            icon: 'globe-grid', visible: hasGpu, count: devices.length || undefined },
+    { id: 'memory',     label: t('profiling.report.tab_memory', null, 'Memory'),                      icon: 'ram',        visible: hasMemory },
+    { id: 'disk',       label: t('profiling.report.tab_disk', null, 'Disk IO'),                       icon: 'cylinder',   visible: hasDisk },
+    { id: 'power',      label: t('profiling.report.tab_power', null, 'Power'),                        icon: 'shield',     visible: hasPower },
+    { id: 'sources',    label: t('profiling.report.tab_sources', null, 'Sources'),                    icon: 'list',       visible: true },
+  ].filter((tt) => tt.visible);
 
   // Single-pass aggregation across all events. Powers Overview + GPU tabs
   // without re-walking events for each KPI.
@@ -236,7 +244,7 @@ function renderShell(ctx) {
   const scopeLabel = escape(report.scope?.label || '—');
   const sessionShort = escape((report.session_id || '').slice(0, 8));
   const node = escape(report.node_id || '—');
-  const sourcesPill = `${counts.used}/${counts.total} sources used`;
+  const sourcesPill = t('profiling.report.header_sources_used', { used: counts.used, total: counts.total }, `${counts.used}/${counts.total} sources used`);
   const sourcesPillCls = counts.skipped > 0 || counts.failed > 0 ? 'warn' : 'ok';
 
   // Mockup #04: jedna linia mono z czterema segmentami. Bez relative time
@@ -248,8 +256,8 @@ function renderShell(ctx) {
         : `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>`}
       ${escape(sourcesPill)}
     </span>
-    <tf-button variant="ghost" size="sm" data-action="download" aria-label="Download report">Download</tf-button>
-    <tf-button variant="ghost" size="sm" data-action="compare" aria-label="Compare with another session">Compare</tf-button>
+    <tf-button variant="ghost" size="sm" data-action="download" aria-label="${escape(t('profiling.report.header_aria_download', null, 'Download report'))}">${escape(t('profiling.report.header_action_download', null, 'Download'))}</tf-button>
+    <tf-button variant="ghost" size="sm" data-action="compare" aria-label="${escape(t('profiling.report.header_aria_compare', null, 'Compare with another session'))}">${escape(t('profiling.report.header_action_compare', null, 'Compare'))}</tf-button>
   `;
 
   const tabsHtml = ctx.tabs.map((t) => {
@@ -264,7 +272,7 @@ function renderShell(ctx) {
         <div class="pr-header-main">
           <h1 class="pr-title">${scopeLabel}</h1>
           <div class="pr-meta mono">
-            session ${sessionShort} · ${escape(startedAt)} · ${escape(dur)} duration · ${node}
+            ${escape(t('profiling.report.header_meta', { sid: sessionShort, started: startedAt, dur, node }, `session ${sessionShort} · ${startedAt} · ${dur} duration · ${node}`))}
           </div>
         </div>
         <div class="pr-header-actions">
@@ -278,7 +286,7 @@ function renderShell(ctx) {
         </tf-tabs>
       </div>
 
-      <main class="pr-body" id="pr-body" role="region" aria-label="Report body"></main>
+      <main class="pr-body" id="pr-body" role="region" aria-label="${escape(t('profiling.report.header_aria_body', null, 'Report body'))}"></main>
     </div>
   `;
 }
@@ -299,23 +307,23 @@ function renderError(err) {
   // Mowimy user'owi dokladnie co sie stalo, nie surowy error code.
   const isMissingSummary = /NotFound.*summary\.bin/i.test(msg);
   const friendlyHeader = isMissingSummary
-    ? 'Session report unavailable'
-    : 'Failed to load report';
+    ? t('profiling.report.err_unavailable_title', null, 'Session report unavailable')
+    : t('profiling.report.err_failed_title', null, 'Failed to load report');
   const friendlyBody = isMissingSummary
-    ? `<p>Ta sesja nie ma zapisanego raportu na dysku. Mozliwe przyczyny:</p>
+    ? `<p>${escape(t('profiling.report.err_missing_summary_intro', null, 'This session has no report saved on disk. Possible reasons:'))}</p>
        <ul style="margin:8px 0 8px 22px; line-height:1.6;">
-         <li>Sesja jest <strong>w trakcie zbierania</strong> (raport powstaje dopiero po Stop)</li>
-         <li>Proces tentaflow zostal <strong>zabity przed zakonczeniem</strong> (kill / OOM / restart)</li>
-         <li>Stop wywalil sie z bledem (sprawdz logi tentaflow)</li>
+         <li>${t('profiling.report.err_missing_summary_in_progress', null, 'Session is <strong>still being collected</strong> (the report is created only after Stop)')}</li>
+         <li>${t('profiling.report.err_missing_summary_killed', null, 'Tentaflow process was <strong>killed before completion</strong> (kill / OOM / restart)')}</li>
+         <li>${t('profiling.report.err_missing_summary_stop_failed', null, 'Stop failed with an error (check tentaflow logs)')}</li>
        </ul>
-       <p style="font-size:12px; color:var(--tf-text-3, #6a7196);">Po pull i restart tentaflow ta sesja zostanie automatycznie schowana z listy (storage_v2 list_sessions filtruje po summary.bin).</p>`
+       <p style="font-size:12px; color:var(--tf-text-3, #6a7196);">${escape(t('profiling.report.err_missing_summary_hidden', null, 'After pull and restart, this session will be automatically hidden from the list (storage_v2 list_sessions filters by summary.bin).'))}</p>`
     : `<pre class="mono" style="white-space:pre-wrap; word-break:break-word;">${escape(msg)}</pre>`;
   return `
     <div class="profile-report pr-error">
       <div class="pr-error-card">
         <h2>${escape(friendlyHeader)}</h2>
         ${friendlyBody}
-        <tf-button variant="ghost" size="sm" data-action="back-mesh">Back to Mesh</tf-button>
+        <tf-button variant="ghost" size="sm" data-action="back-mesh">${escape(t('profiling.report.err_back_btn', null, 'Back to Mesh'))}</tf-button>
       </div>
     </div>
   `;
@@ -477,9 +485,9 @@ async function renderLazyTab(host, modulePath, ctx, exportName) {
       await ViewClass.render(host, ctx);
       return;
     }
-    host.innerHTML = pendingModuleBanner(modulePath, 'export missing');
+    host.innerHTML = pendingModuleBanner(modulePath, t('profiling.report.tab_pending_export_missing', null, 'export missing'));
   } catch (err) {
-    host.innerHTML = pendingModuleBanner(modulePath, err?.message || 'module unavailable');
+    host.innerHTML = pendingModuleBanner(modulePath, err?.message || t('profiling.report.tab_pending_module_unavailable', null, 'module unavailable'));
   }
 }
 
@@ -489,9 +497,8 @@ function pendingModuleBanner(modulePath, reason) {
       <div class="pr-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
         <div>
-          <strong>Tab not yet available.</strong>
-          The module <code class="mono">${escape(modulePath)}</code> is being implemented separately
-          (${escape(reason)}). Other tabs of this report are fully functional.
+          <strong>${escape(t('profiling.report.tab_pending', null, 'Tab not yet available.'))}</strong>
+          ${t('profiling.report.tab_pending_body', { path: escape(modulePath), reason: escape(reason) }, `The module <code class="mono">${escape(modulePath)}</code> is being implemented separately (${escape(reason)}). Other tabs of this report are fully functional.`)}
         </div>
       </div>
     </div>
@@ -522,7 +529,7 @@ function renderOverviewTab(ctx) {
       <div class="pr-kpi-tile ${badge.cls}">
         <div class="pr-kpi-head">
           <span class="pr-kpi-ico"><span class="pr-vendor-badge ${badge.cls}">${escape(badge.label)}</span></span>
-          <span class="pr-kpi-label">GPU ${d.device_id} — ${escape(d.name)}</span>
+          <span class="pr-kpi-label">${escape(t('profiling.report.kpi_gpu_label', { id: d.device_id, name: d.name }, `GPU ${d.device_id} — ${d.name}`))}</span>
         </div>
         <div class="pr-kpi-value">${formatPct(k.peakCompute, 0)}</div>
         <div class="pr-kpi-sub">${vendorPeakLabel(badge.cls, k)}</div>
@@ -532,44 +539,44 @@ function renderOverviewTab(ctx) {
 
   const cpuTile = `
     <div class="pr-kpi-tile">
-      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconCpu()}</span><span class="pr-kpi-label">CPU</span></div>
+      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconCpu()}</span><span class="pr-kpi-label">${escape(t('profiling.report.kpi_cpu', null, 'CPU'))}</span></div>
       <div class="pr-kpi-value">${formatPct(cpu.avgUtil, 0)}</div>
-      <div class="pr-kpi-sub">Avg util · Peak <strong>${formatPct(cpu.peakUtil, 0)}</strong> · Top: <strong>${escape(cpu.topSymbol)}</strong></div>
+      <div class="pr-kpi-sub">${t('profiling.report.kpi_avg_util', { peak: formatPct(cpu.peakUtil, 0), top: escape(cpu.topSymbol) }, `Avg util · Peak <strong>${formatPct(cpu.peakUtil, 0)}</strong> · Top: <strong>${escape(cpu.topSymbol)}</strong>`)}</div>
     </div>
   `;
   const ramTile = hasMemory ? `
     <div class="pr-kpi-tile">
-      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconRam()}</span><span class="pr-kpi-label">RAM</span></div>
+      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconRam()}</span><span class="pr-kpi-label">${escape(t('profiling.report.kpi_ram', null, 'RAM'))}</span></div>
       <div class="pr-kpi-value">${formatBytes(ram.peakUsedBytes)}</div>
-      <div class="pr-kpi-sub">Peak used · BW peak <strong>${formatBytesPerSec(ram.peakBwBps)}</strong></div>
+      <div class="pr-kpi-sub">${t('profiling.report.kpi_ram_sub', { bw: formatBytesPerSec(ram.peakBwBps) }, `Peak used · BW peak <strong>${formatBytesPerSec(ram.peakBwBps)}</strong>`)}</div>
     </div>
   ` : '';
   const diskTile = hasDisk ? `
     <div class="pr-kpi-tile">
-      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconDisk()}</span><span class="pr-kpi-label">Disk</span></div>
+      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconDisk()}</span><span class="pr-kpi-label">${escape(t('profiling.report.kpi_disk', null, 'Disk'))}</span></div>
       <div class="pr-kpi-value">${formatBytesPerSec(disk.peakReadBps)}</div>
-      <div class="pr-kpi-sub">Peak R · W <strong>${formatBytesPerSec(disk.peakWriteBps)}</strong> · p99 await <strong>${disk.p99AwaitMs.toFixed(1)} ms</strong></div>
+      <div class="pr-kpi-sub">${t('profiling.report.kpi_disk_sub', { w: formatBytesPerSec(disk.peakWriteBps), p99: disk.p99AwaitMs.toFixed(1) }, `Peak R · W <strong>${formatBytesPerSec(disk.peakWriteBps)}</strong> · p99 await <strong>${disk.p99AwaitMs.toFixed(1)} ms</strong>`)}</div>
     </div>
   ` : '';
   const powerTile = hasPower ? `
     <div class="pr-kpi-tile">
-      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconPower()}</span><span class="pr-kpi-label">Power</span></div>
+      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconPower()}</span><span class="pr-kpi-label">${escape(t('profiling.report.kpi_power', null, 'Power'))}</span></div>
       <div class="pr-kpi-value">${formatPower(power.avgW)}</div>
-      <div class="pr-kpi-sub">Avg · Peak <strong>${formatPower(power.peakW)}</strong> · Total <strong>${power.totalKj.toFixed(1)} kJ</strong></div>
+      <div class="pr-kpi-sub">${t('profiling.report.kpi_power_sub', { peak: formatPower(power.peakW), total: power.totalKj.toFixed(1) }, `Avg · Peak <strong>${formatPower(power.peakW)}</strong> · Total <strong>${power.totalKj.toFixed(1)} kJ</strong>`)}</div>
     </div>
   ` : '';
   const netTile = hasNetwork ? `
     <div class="pr-kpi-tile">
-      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconNet()}</span><span class="pr-kpi-label">Network</span></div>
+      <div class="pr-kpi-head"><span class="pr-kpi-ico">${iconNet()}</span><span class="pr-kpi-label">${escape(t('profiling.report.kpi_network', null, 'Network'))}</span></div>
       <div class="pr-kpi-value">${formatBytesPerSec(net.peakRxBps)}</div>
-      <div class="pr-kpi-sub">Peak in · Peak out <strong>${formatBytesPerSec(net.peakTxBps)}</strong></div>
+      <div class="pr-kpi-sub">${t('profiling.report.kpi_net_sub', { tx: formatBytesPerSec(net.peakTxBps) }, `Peak in · Peak out <strong>${formatBytesPerSec(net.peakTxBps)}</strong>`)}</div>
     </div>
   ` : '';
   // Mockup #04 trzyma siatke 4x2 w stalej kolejnosci: CPU + (do 4 GPU) + RAM
   // + Disk + Power + Network. Wallclock i CPU Counters byly extras V2 i
   // wypadly z headline metrics (zostaja w innych zakladkach).
   const findings = buildQuickFindings(events, devices, report.duration_ns, names);
-  const findingsHtml = findings.length === 0 ? `<div class="muted">No notable findings.</div>` : findings.map((f) => `
+  const findingsHtml = findings.length === 0 ? `<div class="muted">${escape(t('profiling.report.no_findings', null, 'No notable findings.'))}</div>` : findings.map((f) => `
     <div class="pr-finding-card ${escape(f.kind)}">
       <span class="f-ico">${iconFinding(f.kind)}</span>
       <div class="f-body">
@@ -579,34 +586,32 @@ function renderOverviewTab(ctx) {
     </div>
   `).join('');
 
-  // Mini timeline preview: 4 lanes (CPU util, GPU0..2 compute, total power).
   const lanes = [];
-  lanes.push({ label: 'CPU', color: '#a78bfa', bg: 'rgba(167,139,250,0.05)', points: buildTimeSeries(events, 'CpuUtil', null, 'util_pct') });
+  lanes.push({ label: t('profiling.report.lane_cpu', null, 'CPU'), color: '#a78bfa', bg: 'rgba(167,139,250,0.05)', points: buildTimeSeries(events, 'CpuUtil', null, 'util_pct') });
   for (const d of devices) {
     const badge = vendorBadge(d.vendor);
     const colors = { nv: '#76b900', amd: '#ed1c24', intel: '#0071c5', apple: '#d4d4d8' };
     lanes.push({
-      label: `GPU${d.device_id}`,
+      label: t('profiling.report.lane_gpu', { id: d.device_id }, `GPU${d.device_id}`),
       color: colors[badge.cls] || '#a78bfa',
       bg: 'rgba(255,255,255,0.02)',
       points: buildTimeSeries(events, 'GpuUtilSample', d.device_id, 'compute_pct'),
     });
   }
   if (hasPower) {
-    // Sum tick-wise across all PowerSample events for the preview lane.
     const totals = new Map();
     for (const e of eventsForCategory(events, 'PowerSample')) {
       const p = unwrapPayload(e.payload);
       if (!p) continue;
       totals.set(e.t_start_ns, (totals.get(e.t_start_ns) || 0) + p.watts);
     }
-    const arr = Array.from(totals.entries()).map(([t, v]) => [t, v]).sort((a, b) => a[0] - b[0]);
-    lanes.push({ label: 'PWR', color: '#f59e0b', bg: 'rgba(245,158,11,0.04)', points: arr });
+    const arr = Array.from(totals.entries()).map(([tt, v]) => [tt, v]).sort((a, b) => a[0] - b[0]);
+    lanes.push({ label: t('profiling.report.lane_pwr', null, 'PWR'), color: '#f59e0b', bg: 'rgba(245,158,11,0.04)', points: arr });
   }
 
   return `
     <section class="pr-card">
-      <h2 class="pr-card-title">Headline metrics</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.section_headline', null, 'Headline metrics'))}</h2>
       <div class="pr-kpi-grid">
         ${cpuTile}
         ${gpuTiles}
@@ -618,14 +623,14 @@ function renderOverviewTab(ctx) {
     </section>
 
     <section class="pr-card">
-      <h2 class="pr-card-title">Quick findings</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.section_findings', null, 'Quick findings'))}</h2>
       <div class="pr-findings-stack">${findingsHtml}</div>
     </section>
 
     <section class="pr-card">
       <h2 class="pr-card-title">
-        Timeline preview
-        <span class="pr-card-actions"><tf-button variant="ghost" size="sm" data-action="open-timeline">Open Unified Timeline →</tf-button></span>
+        ${escape(t('profiling.report.section_timeline_preview', null, 'Timeline preview'))}
+        <span class="pr-card-actions"><tf-button variant="ghost" size="sm" data-action="open-timeline">${escape(t('profiling.report.open_unified_timeline', null, 'Open Unified Timeline →'))}</tf-button></span>
       </h2>
       <div class="pr-timeline-preview">${renderRidgelinePreview(lanes, { width: 920, height: 140 })}</div>
     </section>
@@ -649,7 +654,7 @@ function renderCpuDetailTab(ctx) {
   const stacks = report.stacks || [];
 
   if (utilEvents.length === 0) {
-    return noDataCard('No CPU utilization data collected for this session.');
+    return noDataCard(t('profiling.report.cpu_no_data', null, 'No CPU utilization data collected for this session.'));
   }
 
   // -- Per-core grid ----------------------------------------------------------
@@ -665,7 +670,7 @@ function renderCpuDetailTab(ctx) {
   }
   const cores = Array.from(perCore.keys()).sort((a, b) => a - b);
   const totalThreadsHint = cores.length > 0
-    ? `${cores.length} core${cores.length === 1 ? '' : 's'} · ${utilEvents.length.toLocaleString()} samples`
+    ? t('profiling.report.cpu_cores_hint', { cores: cores.length, samples: utilEvents.length.toLocaleString() }, `${cores.length} core${cores.length === 1 ? '' : 's'} · ${utilEvents.length.toLocaleString()} samples`)
     : `${utilEvents.length} samples`;
 
   const coreCells = cores.map((core) => {
@@ -731,8 +736,8 @@ function renderCpuDetailTab(ctx) {
     ctxSwitchSection = `
       <section class="pr-card">
         <h2 class="pr-card-title">
-          Context switches /s
-          <span class="pr-card-actions"><span class="muted" style="font-size:11px;">avg ${Math.round(avg).toLocaleString()} · peak ${Math.round(max).toLocaleString()}</span></span>
+          ${escape(t('profiling.report.cpu_ctx_switch_title', null, 'Context switches /s'))}
+          <span class="pr-card-actions"><span class="muted" style="font-size:11px;">${escape(t('profiling.report.cpu_ctx_switch_meta', { avg: Math.round(avg).toLocaleString(), peak: Math.round(max).toLocaleString() }, `avg ${Math.round(avg).toLocaleString()} · peak ${Math.round(max).toLocaleString()}`))}</span></span>
         </h2>
         <div class="pr-pmu-chart">
           <svg viewBox="0 0 920 60" preserveAspectRatio="none" style="width:100%; height:60px;">
@@ -822,7 +827,7 @@ function renderCpuDetailTab(ctx) {
 
     pmuSection = `
       <section class="pr-card">
-        <h2 class="pr-card-title">Hardware counters (PMU)</h2>
+        <h2 class="pr-card-title">${escape(t('profiling.report.cpu_pmu_title', null, 'Hardware counters (PMU)'))}</h2>
         <div class="pr-pmu-chart">
           <svg viewBox="0 0 920 180" preserveAspectRatio="none" style="width:100%; height:180px;">
             <line x1="40" y1="160" x2="920" y2="160" stroke="#1f2548"/>
@@ -834,11 +839,11 @@ function renderCpuDetailTab(ctx) {
         <table class="pr-table" style="margin-top:10px;">
           <thead>
             <tr>
-              <th>Counter</th>
-              <th class="num">Total</th>
-              <th class="num">Avg/sample</th>
-              <th class="num">Last</th>
-              <th class="num">Per-instr</th>
+              <th>${escape(t('profiling.report.col_counter', null, 'Counter'))}</th>
+              <th class="num">${escape(t('profiling.report.col_total', null, 'Total'))}</th>
+              <th class="num">${escape(t('profiling.report.col_avg_per_sample', null, 'Avg/sample'))}</th>
+              <th class="num">${escape(t('profiling.report.col_last', null, 'Last'))}</th>
+              <th class="num">${escape(t('profiling.report.col_per_instr', null, 'Per-instr'))}</th>
             </tr>
           </thead>
           <tbody>${counterRows}</tbody>
@@ -848,10 +853,10 @@ function renderCpuDetailTab(ctx) {
   } else {
     pmuSection = `
       <section class="pr-card">
-        <h2 class="pr-card-title">Hardware counters (PMU)</h2>
+        <h2 class="pr-card-title">${escape(t('profiling.report.cpu_pmu_title', null, 'Hardware counters (PMU)'))}</h2>
         <div class="pr-banner-degraded">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-          <div><strong>PMU counters require perf stat.</strong> Add <code>linux.perf.pmu_counters</code> source (perf stat -e cycles,instructions,cache-misses,branch-misses) to capture IPC, L3 miss rate and branch miss rate.</div>
+          <div>${t('profiling.report.cpu_pmu_no_data', null, '<strong>PMU counters require perf stat.</strong> Add <code>linux.perf.pmu_counters</code> source (perf stat -e cycles,instructions,cache-misses,branch-misses) to capture IPC, L3 miss rate and branch miss rate.')}</div>
         </div>
       </section>
     `;
@@ -931,12 +936,12 @@ function renderCpuDetailTab(ctx) {
     symbolsSection = `
       <section class="pr-card">
         <h2 class="pr-card-title">
-          Top symbols
-          <span class="pr-card-actions"><tf-button variant="ghost" size="sm" data-action="open-flame">Open flamegraph →</tf-button></span>
+          ${escape(t('profiling.report.cpu_top_symbols_title', null, 'Top symbols'))}
+          <span class="pr-card-actions"><tf-button variant="ghost" size="sm" data-action="open-flame">${escape(t('profiling.report.cpu_open_flame_btn', null, 'Open flamegraph →'))}</tf-button></span>
         </h2>
         <table class="pr-table">
           <thead>
-            <tr><th>Symbol</th><th>Module</th><th class="num">Self %</th><th class="num">Total %</th></tr>
+            <tr><th>${escape(t('profiling.report.col_symbol', null, 'Symbol'))}</th><th>${escape(t('profiling.report.col_module', null, 'Module'))}</th><th class="num">${escape(t('profiling.report.col_self_pct', null, 'Self %'))}</th><th class="num">${escape(t('profiling.report.col_total_pct', null, 'Total %'))}</th></tr>
           </thead>
           <tbody>${symbolRows}</tbody>
         </table>
@@ -959,10 +964,10 @@ function renderCpuDetailTab(ctx) {
     }).join('');
     threadsSection = `
       <section class="pr-card">
-        <h2 class="pr-card-title">Hot threads</h2>
+        <h2 class="pr-card-title">${escape(t('profiling.report.cpu_hot_threads_title', null, 'Hot threads'))}</h2>
         <table class="pr-table">
           <thead>
-            <tr><th>TID</th><th>Name</th><th class="num">CPU %</th><th class="num">Samples</th></tr>
+            <tr><th>${escape(t('profiling.report.col_tid', null, 'TID'))}</th><th>${escape(t('profiling.report.col_name', null, 'Name'))}</th><th class="num">${escape(t('profiling.report.col_cpu_pct', null, 'CPU %'))}</th><th class="num">${escape(t('profiling.report.col_samples', null, 'Samples'))}</th></tr>
           </thead>
           <tbody>${threadRows}</tbody>
         </table>
@@ -979,19 +984,19 @@ function renderCpuDetailTab(ctx) {
       </section>
     `;
     symbolsSection = banner(
-      'Top symbols',
-      '<strong>Top symbols require perf record.</strong> Add <code>linux.perf.cpu_sampling</code> source (perf record -F 99 -g) to enable per-symbol hotspots and the flamegraph view.',
+      escape(t('profiling.report.cpu_top_symbols_title', null, 'Top symbols')),
+      t('profiling.report.cpu_top_symbols_no_data', null, '<strong>Top symbols require perf record.</strong> Add <code>linux.perf.cpu_sampling</code> source (perf record -F 99 -g) to enable per-symbol hotspots and the flamegraph view.'),
     );
     threadsSection = banner(
-      'Hot threads',
-      '<strong>Hot threads require perf record.</strong> Per-thread CPU breakdown is reconstructed from CPU sampling events.',
+      escape(t('profiling.report.cpu_hot_threads_title', null, 'Hot threads')),
+      t('profiling.report.cpu_hot_threads_no_data', null, '<strong>Hot threads require perf record.</strong> Per-thread CPU breakdown is reconstructed from CPU sampling events.'),
     );
   }
 
   return `
     <section class="pr-card">
       <h2 class="pr-card-title">
-        Per-core utilization
+        ${escape(t('profiling.report.cpu_per_core_title', null, 'Per-core utilization'))}
         <span class="pr-card-actions"><span class="muted" style="font-size:11px;">${escape(totalThreadsHint)}</span></span>
       </h2>
       <div class="pr-cores-grid">${coreCells}</div>
@@ -1040,15 +1045,14 @@ function bindCpuDetailTab(host) {
 function renderGpuTab(ctx) {
   const { devices } = ctx;
   if (devices.length === 0) {
-    return noDataCard('No GPU data collected for this session.');
+    return noDataCard(t('profiling.report.gpu_no_data', null, 'No GPU data collected for this session.'));
   }
-  // Vendor sub-tabs (chips). First device active by default.
   const subTabs = devices.map((d, idx) => {
     const badge = vendorBadge(d.vendor);
     return `
       <button type="button" class="pr-vendor-tab" data-gpu-tab="${d.device_id}" ${idx === 0 ? 'data-active="true"' : ''} role="tab" aria-selected="${idx === 0 ? 'true' : 'false'}">
         <span class="pr-vendor-badge ${badge.cls}">${escape(badge.label)}</span>
-        <span>GPU ${d.device_id} — ${escape(d.name)}</span>
+        <span>${escape(t('profiling.report.kpi_gpu_label', { id: d.device_id, name: d.name }, `GPU ${d.device_id} — ${d.name}`))}</span>
       </button>
     `;
   }).join('');
@@ -1061,7 +1065,7 @@ function renderGpuTab(ctx) {
 
   return `
     <section class="pr-card">
-      <div class="pr-vendor-tabs" role="tablist" aria-label="GPU device">${subTabs}</div>
+      <div class="pr-vendor-tabs" role="tablist" aria-label="${escape(t('profiling.report.gpu_aria_device', null, 'GPU device'))}">${subTabs}</div>
       ${cards}
     </section>
   `;
@@ -1090,8 +1094,8 @@ function renderGpuDeviceCard(ctx, d) {
   const badge = vendorBadge(d.vendor);
 
   const collectorStatus = d.limited
-    ? `<span class="pr-status-pill warn">Limited (${escape(d.collector || 'unknown')})</span>`
-    : `<span class="pr-status-pill ok">${escape(d.collector || 'collector')}</span>`;
+    ? `<span class="pr-status-pill warn">${escape(t('profiling.report.gpu_status_limited', { coll: d.collector || t('profiling.report.gpu_collector_unknown', null, 'unknown') }, `Limited (${d.collector || 'unknown'})`))}</span>`
+    : `<span class="pr-status-pill ok">${escape(d.collector || t('profiling.report.gpu_collector_default', null, 'collector'))}</span>`;
 
   const computeSeries = buildTimeSeries(events, 'GpuUtilSample', d.device_id, 'compute_pct');
   const memSeries = buildTimeSeries(events, 'GpuUtilSample', d.device_id, 'mem_pct');
@@ -1102,19 +1106,19 @@ function renderGpuDeviceCard(ctx, d) {
 
   // Memory chart: Apple Silicon → unified memory banner; otherwise mem%.
   const memChart = d.vendor === 'apple'
-    ? `<div class="pr-mini-chart"><div class="mc-title"><span>Memory %</span><span class="v">unified</span></div><div class="pr-banner-degraded inline"><div>Unified memory — see RAM tab for combined pressure.</div></div></div>`
-    : `<div class="pr-mini-chart"><div class="mc-title"><span>Memory %</span><span class="v">${formatPct(k.peakMem, 0)} max</span></div>${renderLineChart(memSeries, { color, height: 60, ariaLabel: 'GPU memory utilization' })}</div>`;
+    ? `<div class="pr-mini-chart"><div class="mc-title"><span>${escape(t('profiling.report.gpu_memory_pct', null, 'Memory %'))}</span><span class="v">${escape(t('profiling.report.kpi_unified_mem', null, 'unified'))}</span></div><div class="pr-banner-degraded inline"><div>${escape(t('profiling.report.gpu_unified_mem_banner', null, 'Unified memory — see RAM tab for combined pressure.'))}</div></div></div>`
+    : `<div class="pr-mini-chart"><div class="mc-title"><span>${escape(t('profiling.report.gpu_memory_pct', null, 'Memory %'))}</span><span class="v">${escape(t('profiling.report.gpu_max_suffix', { val: formatPct(k.peakMem, 0) }, `${formatPct(k.peakMem, 0)} max`))}</span></div>${renderLineChart(memSeries, { color, height: 60, ariaLabel: t('profiling.report.gpu_aria_memory', null, 'GPU memory utilization') })}</div>`;
 
   const charts = `
     <div class="pr-charts-row">
       <div class="pr-mini-chart">
-        <div class="mc-title"><span>Compute %</span><span class="v">${formatPct(k.peakCompute, 0)} max</span></div>
-        ${renderLineChart(computeSeries, { color, height: 60, ariaLabel: 'GPU compute utilization' })}
+        <div class="mc-title"><span>${escape(t('profiling.report.gpu_compute_pct', null, 'Compute %'))}</span><span class="v">${escape(t('profiling.report.gpu_max_suffix', { val: formatPct(k.peakCompute, 0) }, `${formatPct(k.peakCompute, 0)} max`))}</span></div>
+        ${renderLineChart(computeSeries, { color, height: 60, ariaLabel: t('profiling.report.gpu_aria_compute', null, 'GPU compute utilization') })}
       </div>
       ${memChart}
       <div class="pr-mini-chart">
-        <div class="mc-title"><span>Power W</span><span class="v">${formatPower(k.peakW)} max</span></div>
-        ${renderLineChart(powerSeries, { color: '#f59e0b', height: 60, ariaLabel: 'GPU power' })}
+        <div class="mc-title"><span>${escape(t('profiling.report.gpu_power_w', null, 'Power W'))}</span><span class="v">${escape(t('profiling.report.gpu_max_suffix', { val: formatPower(k.peakW) }, `${formatPower(k.peakW)} max`))}</span></div>
+        ${renderLineChart(powerSeries, { color: '#f59e0b', height: 60, ariaLabel: t('profiling.report.gpu_aria_power', null, 'GPU power') })}
       </div>
     </div>
   `;
@@ -1124,13 +1128,13 @@ function renderGpuDeviceCard(ctx, d) {
     if (d.vendor === 'intel') {
       return `<div class="pr-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div><strong>Kernel-level metrics not available on this platform.</strong> Engine utilization captured via <code class="mono">intel_gpu_top</code>. Install <code class="mono">Intel GPA</code> or <code class="mono">VTune Profiler</code> for kernel traces.</div>
+        <div>${t('profiling.report.gpu_intel_kernel_banner', null, '<strong>Kernel-level metrics not available on this platform.</strong> Engine utilization captured via <code class=\"mono\">intel_gpu_top</code>. Install <code class=\"mono\">Intel GPA</code> or <code class=\"mono\">VTune Profiler</code> for kernel traces.')}</div>
       </div>`;
     }
     if (d.vendor === 'apple') {
       return `<div class="pr-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div><strong>Apple Silicon — utilization and power only.</strong> For kernel-level insight, capture a Metal trace via <code class="mono">Xcode Instruments</code>.</div>
+        <div>${t('profiling.report.gpu_apple_kernel_banner', null, '<strong>Apple Silicon — utilization and power only.</strong> For kernel-level insight, capture a Metal trace via <code class=\"mono\">Xcode Instruments</code>.')}</div>
       </div>`;
     }
     return '';
@@ -1138,58 +1142,65 @@ function renderGpuDeviceCard(ctx, d) {
 
   // KPI row.
   const memKpi = d.vendor === 'apple'
-    ? `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">Peak mem</span></div><div class="pr-kpi-value pr-kpi-text-sm">unified</div><div class="pr-kpi-sub">shared with CPU</div></div>`
-    : `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">Peak mem</span></div><div class="pr-kpi-value">${formatPct(k.peakMem, 0)}</div><div class="pr-kpi-sub">VRAM ${formatBytes(k.memUsedBytes)}${d.memTotalBytes ? ' / ' + formatBytes(d.memTotalBytes) : ''}</div></div>`;
+    ? `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.kpi_peak_mem', null, 'Peak mem'))}</span></div><div class="pr-kpi-value pr-kpi-text-sm">${escape(t('profiling.report.kpi_unified_mem', null, 'unified'))}</div><div class="pr-kpi-sub">${escape(t('profiling.report.kpi_unified_mem_sub', null, 'shared with CPU'))}</div></div>`
+    : `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.kpi_peak_mem', null, 'Peak mem'))}</span></div><div class="pr-kpi-value">${formatPct(k.peakMem, 0)}</div><div class="pr-kpi-sub">VRAM ${formatBytes(k.memUsedBytes)}${d.memTotalBytes ? ' / ' + formatBytes(d.memTotalBytes) : ''}</div></div>`;
 
   const topKernelKpi = k.topKernel
-    ? `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">Top kernel</span></div><div class="pr-kpi-value pr-kpi-text-sm">${escape(k.topKernel)}</div><div class="pr-kpi-sub"><strong>${formatPct(k.topPct)}</strong> total time</div></div>`
-    : `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">Top kernel</span></div><div class="pr-kpi-value pr-kpi-text-sm muted">no kernel data</div><div class="pr-kpi-sub">${d.vendor === 'intel' ? 'use Intel GPA' : 'use Metal trace'}</div></div>`;
+    ? `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.kpi_top_kernel', null, 'Top kernel'))}</span></div><div class="pr-kpi-value pr-kpi-text-sm">${escape(k.topKernel)}</div><div class="pr-kpi-sub">${t('profiling.report.kpi_top_pct', { pct: formatPct(k.topPct) }, `<strong>${formatPct(k.topPct)}</strong> total time`)}</div></div>`
+    : `<div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.kpi_top_kernel', null, 'Top kernel'))}</span></div><div class="pr-kpi-value pr-kpi-text-sm muted">${escape(t('profiling.report.kpi_no_kernel_data', null, 'no kernel data'))}</div><div class="pr-kpi-sub">${escape(d.vendor === 'intel' ? t('profiling.report.kpi_use_intel_gpa', null, 'use Intel GPA') : t('profiling.report.kpi_use_metal_trace', null, 'use Metal trace'))}</div></div>`;
 
+  const computeSubLabel = d.vendor === 'amd' ? t('profiling.report.kpi_cu_util', null, 'CU utilization')
+    : d.vendor === 'intel' ? t('profiling.report.kpi_render_compute', null, 'render+compute')
+    : t('profiling.report.kpi_sm_util', null, 'SM utilization');
   const kpiRow = `
     <div class="pr-gpu-kpi-row">
-      <div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">Peak compute</span></div><div class="pr-kpi-value">${formatPct(k.peakCompute, 0)}</div><div class="pr-kpi-sub">${escape(d.vendor === 'amd' ? 'CU utilization' : d.vendor === 'intel' ? 'render+compute' : 'SM utilization')}</div></div>
+      <div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.kpi_peak_compute', null, 'Peak compute'))}</span></div><div class="pr-kpi-value">${formatPct(k.peakCompute, 0)}</div><div class="pr-kpi-sub">${escape(computeSubLabel)}</div></div>
       ${memKpi}
       ${topKernelKpi}
-      <div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">Power avg</span></div><div class="pr-kpi-value">${formatPower(k.avgW)}</div><div class="pr-kpi-sub">Peak <strong>${formatPower(k.peakW)}</strong></div></div>
+      <div class="pr-kpi-tile ${badge.cls}"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.kpi_power_avg', null, 'Power avg'))}</span></div><div class="pr-kpi-value">${formatPower(k.avgW)}</div><div class="pr-kpi-sub">${t('profiling.report.power_peak_strong', { val: formatPower(k.peakW) }, `Peak <strong>${formatPower(k.peakW)}</strong>`)}</div></div>
     </div>
   `;
 
   // Kernels table — precomputed in single-pass aggregation.
   const kernels = k.kernels;
+  const kernelNoCapture = d.vendor === 'apple' ? t('profiling.report.gpu_apple_kernel_table_note', null, 'Per-kernel timings require Metal capture (Xcode Instruments).')
+    : d.vendor === 'intel' ? t('profiling.report.gpu_intel_kernel_table_note', null, 'Per-kernel timings require Intel GPA / Level Zero tracer.')
+    : t('profiling.report.gpu_no_kernel_capture', null, 'No kernel data captured.');
   const kernelTable = kernels.length === 0
-    ? `<div class="pr-banner-degraded inline"><div>${d.vendor === 'apple' ? 'Per-kernel timings require Metal capture (Xcode Instruments).' : d.vendor === 'intel' ? 'Per-kernel timings require Intel GPA / Level Zero tracer.' : 'No kernel data captured.'}</div></div>`
+    ? `<div class="pr-banner-degraded inline"><div>${escape(kernelNoCapture)}</div></div>`
     : `<table class="pr-table">
-        <thead><tr><th>Kernel</th><th class="num">Count</th><th class="num">Total ms</th><th class="num">Avg µs</th><th class="num">%</th></tr></thead>
+        <thead><tr><th>${escape(t('profiling.report.col_kernel', null, 'Kernel'))}</th><th class="num">${escape(t('profiling.report.col_count', null, 'Count'))}</th><th class="num">${escape(t('profiling.report.col_total_ms', null, 'Total ms'))}</th><th class="num">${escape(t('profiling.report.col_avg_us', null, 'Avg µs'))}</th><th class="num">${escape(t('profiling.report.col_pct', null, '%'))}</th></tr></thead>
         <tbody>${kernels.slice(0, 30).map((r) => `<tr><td class="mono">${escape(r.name)}</td><td class="num mono">${formatInt(r.count)}</td><td class="num mono">${(r.totalNs / 1e6).toFixed(1)}</td><td class="num mono">${(r.avgNs / 1e3).toFixed(1)}</td><td class="num mono">${formatPct(r.pct)}</td></tr>`).join('')}</tbody>
       </table>`;
 
-  // API calls table — precomputed. Apple shows a placeholder row in the same
-  // table layout to keep the unified design intact.
   const apis = k.apis;
-  const apiHeader = d.vendor === 'amd' ? 'HIP APIs' : d.vendor === 'intel' ? 'Level Zero APIs' : d.vendor === 'apple' ? 'Metal calls' : 'CUDA APIs';
+  const apiHeader = d.vendor === 'amd' ? t('profiling.report.gpu_apis_hip', null, 'HIP APIs')
+    : d.vendor === 'intel' ? t('profiling.report.gpu_apis_levelzero', null, 'Level Zero APIs')
+    : d.vendor === 'apple' ? t('profiling.report.gpu_apis_metal', null, 'Metal calls')
+    : t('profiling.report.gpu_apis_cuda', null, 'CUDA APIs');
+  const apiNoCapture = d.vendor === 'intel' ? t('profiling.report.gpu_intel_api_note', null, 'Per-API timings require Intel GPA / Level Zero tracer.')
+    : t('profiling.report.gpu_no_api_capture', null, 'No API call data captured.');
   const apiTable = apis.length === 0
     ? (d.vendor === 'apple'
         ? `<table class="pr-table">
-            <thead><tr><th>API</th><th class="num">Calls</th><th class="num">Total ms</th></tr></thead>
-            <tbody><tr><td class="mono muted">— Metal calls available only with Xcode Instruments trace</td><td></td><td></td></tr></tbody>
+            <thead><tr><th>${escape(t('profiling.report.col_api', null, 'API'))}</th><th class="num">${escape(t('profiling.report.col_calls', null, 'Calls'))}</th><th class="num">${escape(t('profiling.report.col_total_ms', null, 'Total ms'))}</th></tr></thead>
+            <tbody><tr><td class="mono muted">${escape(t('profiling.report.gpu_apple_api_placeholder', null, '— Metal calls available only with Xcode Instruments trace'))}</td><td></td><td></td></tr></tbody>
           </table>`
-        : `<div class="pr-banner-degraded inline"><div>${d.vendor === 'intel' ? 'Per-API timings require Intel GPA / Level Zero tracer.' : 'No API call data captured.'}</div></div>`)
+        : `<div class="pr-banner-degraded inline"><div>${escape(apiNoCapture)}</div></div>`)
     : `<table class="pr-table">
-        <thead><tr><th>API</th><th class="num">Calls</th><th class="num">Total ms</th></tr></thead>
-        <tbody>${apis.slice(0, 30).map((r) => `<tr><td class="mono">${escape(r.name)}</td><td class="num mono">${formatInt(r.count)}</td><td class="num mono">${r.totalNs == null ? '<span class="muted">limited</span>' : (r.totalNs / 1e6).toFixed(1)}</td></tr>`).join('')}</tbody>
+        <thead><tr><th>${escape(t('profiling.report.col_api', null, 'API'))}</th><th class="num">${escape(t('profiling.report.col_calls', null, 'Calls'))}</th><th class="num">${escape(t('profiling.report.col_total_ms', null, 'Total ms'))}</th></tr></thead>
+        <tbody>${apis.slice(0, 30).map((r) => `<tr><td class="mono">${escape(r.name)}</td><td class="num mono">${formatInt(r.count)}</td><td class="num mono">${r.totalNs == null ? `<span class="muted">${escape(t('profiling.report.gpu_limited_pill', null, 'limited'))}</span>` : (r.totalNs / 1e6).toFixed(1)}</td></tr>`).join('')}</tbody>
       </table>`;
 
-  // Memory transfer chart / banner. Apple Silicon has no explicit H2D/D2H —
-  // unified memory means transfers are CPU loads/stores, surfaced in RAM tab.
   const transferBlock = d.vendor === 'apple'
-    ? `<div class="pr-banner-degraded"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18"/><circle cx="12" cy="12" r="10"/></svg><div><strong>Unified memory architecture</strong> — no explicit host/device transfers on Apple Silicon. See RAM tab for combined memory pressure.</div></div>`
+    ? `<div class="pr-banner-degraded"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18"/><circle cx="12" cy="12" r="10"/></svg><div>${t('profiling.report.gpu_transfer_apple', null, '<strong>Unified memory architecture</strong> — no explicit host/device transfers on Apple Silicon. See RAM tab for combined memory pressure.')}</div></div>`
     : renderTransferChart(events, d, color);
 
   return `
     <article class="pr-gpu-device-card ${badge.cls}">
       <header class="gd-head">
         <span class="pr-vendor-badge ${badge.cls}">${escape(badge.label)}</span>
-        <div class="gd-name">GPU ${d.device_id} — ${escape(d.name)}</div>
+        <div class="gd-name">${escape(t('profiling.report.kpi_gpu_label', { id: d.device_id, name: d.name }, `GPU ${d.device_id} — ${d.name}`))}</div>
         ${d.version ? `<span class="gd-id mono">${escape(d.version)}</span>` : ''}
         <span class="gd-status">${collectorStatus}</span>
       </header>
@@ -1198,13 +1209,13 @@ function renderGpuDeviceCard(ctx, d) {
       ${kpiRow}
       ${charts}
 
-      <h3 class="pr-subhead">Top kernels</h3>
+      <h3 class="pr-subhead">${escape(t('profiling.report.gpu_top_kernels_h', null, 'Top kernels'))}</h3>
       ${kernelTable}
 
       <h3 class="pr-subhead">${escape(apiHeader)}</h3>
       ${apiTable}
 
-      <h3 class="pr-subhead">Memory transfer (D2H / H2D / D2D)</h3>
+      <h3 class="pr-subhead">${escape(t('profiling.report.gpu_transfer_h', null, 'Memory transfer (D2H / H2D / D2D)'))}</h3>
       ${transferBlock}
     </article>
   `;
@@ -1240,12 +1251,12 @@ function renderTransferChart(events, d, color) {
   }
 
   if (!d.transfers) {
-    return `<div class="pr-banner-degraded inline"><div>Transfer telemetry not collected for this device.</div></div>`;
+    return `<div class="pr-banner-degraded inline"><div>${escape(t('profiling.report.gpu_transfer_no_telemetry', null, 'Transfer telemetry not collected for this device.'))}</div></div>`;
   }
   const { h2d_bytes_per_s_peak, d2h_bytes_per_s_peak, d2d_bytes_per_s_peak } = d.transfers;
   const peak = Math.max(h2d_bytes_per_s_peak || 0, d2h_bytes_per_s_peak || 0, d2d_bytes_per_s_peak || 0);
   if (peak === 0) {
-    return `<div class="pr-banner-degraded inline"><div>No host-device transfers observed during this window.</div></div>`;
+    return `<div class="pr-banner-degraded inline"><div>${escape(t('profiling.report.gpu_transfer_no_window', null, 'No host-device transfers observed during this window.'))}</div></div>`;
   }
   const w = 600; const h = 60;
   const bars = ['H2D', 'D2H', 'D2D'].map((label, i) => {
@@ -1253,7 +1264,7 @@ function renderTransferChart(events, d, color) {
     const barW = (v / peak) * (w - 80);
     return `<g><text x="0" y="${18 + i * 18}" font-family="JetBrains Mono" font-size="10" fill="#a0a8c8">${label}</text><rect x="40" y="${10 + i * 18}" width="${barW.toFixed(0)}" height="10" fill="${color}" opacity="${0.9 - i * 0.2}"/><text x="${44 + barW}" y="${18 + i * 18}" font-family="JetBrains Mono" font-size="9" fill="#e8ebf5">${formatBytesPerSec(v)}</text></g>`;
   }).join('');
-  return `<div class="pr-mini-chart"><div class="mc-title"><span>MB/s — H2D · D2H · D2D</span><span class="v">peak ${formatBytesPerSec(peak)}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="GPU transfer peaks">${bars}</svg></div>`;
+  return `<div class="pr-mini-chart"><div class="mc-title"><span>${escape(t('profiling.report.gpu_transfer_legend', null, 'MB/s — H2D · D2H · D2D'))}</span><span class="v">${escape(t('profiling.report.gpu_transfer_peak', { val: formatBytesPerSec(peak) }, `peak ${formatBytesPerSec(peak)}`))}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="${escape(t('profiling.report.gpu_aria_transfer_peaks', null, 'GPU transfer peaks'))}">${bars}</svg></div>`;
 }
 
 function renderTransferTimeSeries(transferEvents, d, color) {
@@ -1278,7 +1289,7 @@ function renderTransferTimeSeries(transferEvents, d, color) {
     for (const v of arr) if (v > peak) peak = v;
   }
   if (peak === 0) {
-    return `<div class="pr-banner-degraded inline"><div>No host-device transfers observed during this window.</div></div>`;
+    return `<div class="pr-banner-degraded inline"><div>${escape(t('profiling.report.gpu_transfer_no_window', null, 'No host-device transfers observed during this window.'))}</div></div>`;
   }
 
   const w = 600; const h = 60;
@@ -1299,7 +1310,7 @@ function renderTransferTimeSeries(transferEvents, d, color) {
     `<path d="${path(series.D2D)}" stroke="${baseColors.d2d}" stroke-width="1.2" fill="none" stroke-dasharray="2 3"/>`,
   ].join('');
 
-  return `<div class="pr-mini-chart"><div class="mc-title"><span>MB/s — H2D · D2H · D2D</span><span class="v">peak ${formatBytesPerSec(peak)}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="GPU transfer time-series H2D D2H D2D">${lines}</svg></div>`;
+  return `<div class="pr-mini-chart"><div class="mc-title"><span>${escape(t('profiling.report.gpu_transfer_legend', null, 'MB/s — H2D · D2H · D2D'))}</span><span class="v">${escape(t('profiling.report.gpu_transfer_peak', { val: formatBytesPerSec(peak) }, `peak ${formatBytesPerSec(peak)}`))}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="${escape(t('profiling.report.gpu_aria_transfer_ts', null, 'GPU transfer time-series H2D D2H D2D'))}">${lines}</svg></div>`;
 }
 
 // Stroke palette per vendor, matching mockup #08 (NV greens, AMD reds, Intel blues).
@@ -1317,7 +1328,7 @@ function vendorTransferColors(vendor, fallback) {
 function renderMemoryTab(ctx) {
   const { events, report } = ctx;
   if (eventsForCategory(events, 'RamSample').length === 0) {
-    return noDataCard('No memory samples collected for this session.');
+    return noDataCard(t('profiling.report.memory_no_data', null, 'No memory samples collected for this session.'));
   }
 
   const used = buildTimeSeries(events, 'RamSample', null, 'used_bytes').map(([t, v]) => [t, v / 1024 / 1024 / 1024]);
@@ -1346,15 +1357,15 @@ function renderMemoryTab(ctx) {
   const charts = `
     <div class="pr-charts-row">
       <div class="pr-mini-chart">
-        <div class="mc-title"><span>Used GB</span><span class="v">${usedPeak.toFixed(1)} peak</span></div>
+        <div class="mc-title"><span>${escape(t('profiling.report.memory_used_gb', null, 'Used GB'))}</span><span class="v">${escape(t('profiling.report.memory_used_peak', { val: usedPeak.toFixed(1) }, `${usedPeak.toFixed(1)} peak`))}</span></div>
         ${renderAreaChart(used, { color: '#a78bfa', fill: 'rgba(167,139,250,0.25)', height: 60 })}
       </div>
       <div class="pr-mini-chart">
-        <div class="mc-title"><span>Available GB</span><span class="v">${availMin === Infinity ? '—' : availMin.toFixed(1) + ' min'}</span></div>
+        <div class="mc-title"><span>${escape(t('profiling.report.memory_avail_gb', null, 'Available GB'))}</span><span class="v">${availMin === Infinity ? '—' : escape(t('profiling.report.memory_avail_min', { val: availMin.toFixed(1) }, `${availMin.toFixed(1)} min`))}</span></div>
         ${renderLineChart(avail, { color: '#22c55e', height: 60 })}
       </div>
       <div class="pr-mini-chart">
-        <div class="mc-title"><span>Page faults / s</span><span class="v">${formatInt(faultsPeak)} peak</span></div>
+        <div class="mc-title"><span>${escape(t('profiling.report.memory_page_faults', null, 'Page faults / s'))}</span><span class="v">${escape(t('profiling.report.memory_faults_peak', { val: formatInt(faultsPeak) }, `${formatInt(faultsPeak)} peak`))}</span></div>
         ${renderLineChart(faults, { color: '#f59e0b', height: 60 })}
       </div>
     </div>
@@ -1364,10 +1375,10 @@ function renderMemoryTab(ctx) {
   const writePeak = writeSeries.reduce((m, [, v]) => Math.max(m, v), 0);
   const bwBlock = hasBw ? `
     <section class="pr-card">
-      <h2 class="pr-card-title">RAM bandwidth (uncore counters)</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.memory_bw_h', null, 'RAM bandwidth (uncore counters)'))}</h2>
       <div class="pr-mini-chart">
-        <div class="mc-title"><span>Read · Write GB/s</span><span class="v">read peak ${readPeak.toFixed(1)} · write peak ${writePeak.toFixed(1)} GB/s</span></div>
-        <svg viewBox="0 0 920 80" preserveAspectRatio="none" role="img" aria-label="RAM bandwidth">
+        <div class="mc-title"><span>${escape(t('profiling.report.memory_bw_legend', null, 'Read · Write GB/s'))}</span><span class="v">${escape(t('profiling.report.memory_bw_peaks', { r: readPeak.toFixed(1), w: writePeak.toFixed(1) }, `read peak ${readPeak.toFixed(1)} · write peak ${writePeak.toFixed(1)} GB/s`))}</span></div>
+        <svg viewBox="0 0 920 80" preserveAspectRatio="none" role="img" aria-label="${escape(t('profiling.report.memory_bw_aria', null, 'RAM bandwidth'))}">
           ${ramBandwidthSvg(readSeries, writeSeries)}
         </svg>
       </div>
@@ -1376,19 +1387,19 @@ function renderMemoryTab(ctx) {
     <section class="pr-card">
       <div class="pr-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div><strong>RAM bandwidth not collected.</strong> Requires uncore counters (sudo + cap_perfmon) on x86, or Apple Silicon performance counters.</div>
+        <div>${t('profiling.report.memory_bw_no_data', null, '<strong>RAM bandwidth not collected.</strong> Requires uncore counters (sudo + cap_perfmon) on x86, or Apple Silicon performance counters.')}</div>
       </div>
     </section>
   `;
 
   return `
     <section class="pr-card">
-      <h2 class="pr-card-title">Memory pressure</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.memory_pressure_h', null, 'Memory pressure'))}</h2>
       ${charts}
     </section>
     ${bwBlock}
     <section class="pr-card">
-      <h2 class="pr-card-title">Top processes by RSS</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.memory_top_rss_h', null, 'Top processes by RSS'))}</h2>
       ${renderTopRssTable(events, report.names || [], totalGbApprox)}
     </section>
   `;
@@ -1403,7 +1414,7 @@ function renderTopRssTable(events, names, totalGb) {
     return `
       <div class="pr-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div><strong>Per-process RSS not collected.</strong> Add <code>linux.proc.top_processes</code> source.</div>
+        <div>${t('profiling.report.memory_rss_no_data', null, '<strong>Per-process RSS not collected.</strong> Add <code>linux.proc.top_processes</code> source.')}</div>
       </div>
     `;
   }
@@ -1432,7 +1443,7 @@ function renderTopRssTable(events, names, totalGb) {
   `).join('');
   return `
     <table class="pr-table">
-      <thead><tr><th>PID</th><th>Process</th><th class="num">RSS</th><th class="num">VSZ</th><th class="num">% of total</th></tr></thead>
+      <thead><tr><th>${escape(t('profiling.report.col_pid', null, 'PID'))}</th><th>${escape(t('profiling.report.col_process', null, 'Process'))}</th><th class="num">${escape(t('profiling.report.col_rss', null, 'RSS'))}</th><th class="num">${escape(t('profiling.report.col_vsz', null, 'VSZ'))}</th><th class="num">${escape(t('profiling.report.col_pct_of_total', null, '% of total'))}</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   `;
@@ -1470,7 +1481,7 @@ function renderDiskTab(ctx) {
   const resolveDevice = (p) => (p && p.deviceNameId !== undefined ? names[p.deviceNameId] : null) || `disk_${p?.deviceNameId ?? '?'}`;
   const all = eventsForCategory(events, 'DiskIoBurst').map((e) => ({ t: e.t_start_ns, p: unwrapPayload(e.payload) })).filter((s) => s.p);
   if (all.length === 0) {
-    return noDataCard('No disk IO samples collected.');
+    return noDataCard(t('profiling.report.disk_no_data', null, 'No disk IO samples collected.'));
   }
   const byDevice = new Map();
   for (const s of all) {
@@ -1495,22 +1506,22 @@ function renderDiskTab(ctx) {
         <h2 class="pr-card-title">
           ${escape(device)}${model ? ` — <span class="muted">${escape(model)}</span>` : ''}
           <span class="pr-card-actions">
-            <span class="pr-status-pill ok">Active</span>
+            <span class="pr-status-pill ok">${escape(t('profiling.report.disk_active_pill', null, 'Active'))}</span>
           </span>
         </h2>
         <div class="pr-charts-row">
           <div class="pr-mini-chart">
-            <div class="mc-title"><span>Throughput</span><span class="v">R ${formatBytesPerSec(peakReadBps)} · W ${formatBytesPerSec(peakWriteBps)}</span></div>
-            <svg viewBox="0 0 200 60" preserveAspectRatio="none" role="img" aria-label="Disk throughput">
+            <div class="mc-title"><span>${escape(t('profiling.report.disk_throughput', null, 'Throughput'))}</span><span class="v">${escape(t('profiling.report.disk_throughput_rw', { r: formatBytesPerSec(peakReadBps), w: formatBytesPerSec(peakWriteBps) }, `R ${formatBytesPerSec(peakReadBps)} · W ${formatBytesPerSec(peakWriteBps)}`))}</span></div>
+            <svg viewBox="0 0 200 60" preserveAspectRatio="none" role="img" aria-label="${escape(t('profiling.report.disk_aria_throughput', null, 'Disk throughput'))}">
               ${twoLineSvg(readBpsPts, writeBpsPts, '#22c55e', '#ef4444')}
             </svg>
           </div>
           <div class="pr-mini-chart">
-            <div class="mc-title"><span>IOPS (R+W)</span><span class="v">peak ${formatInt(peakIops)}</span></div>
+            <div class="mc-title"><span>${escape(t('profiling.report.disk_iops', null, 'IOPS (R+W)'))}</span><span class="v">${escape(t('profiling.report.disk_iops_peak', { val: formatInt(peakIops) }, `peak ${formatInt(peakIops)}`))}</span></div>
             ${renderLineChart(iopsPts, { color: '#a78bfa', height: 60 })}
           </div>
           <div class="pr-mini-chart">
-            <div class="mc-title"><span>Latency p99 ms</span><span class="v">${p99.toFixed(1)} ms</span></div>
+            <div class="mc-title"><span>${escape(t('profiling.report.disk_latency_p99', null, 'Latency p99 ms'))}</span><span class="v">${escape(t('profiling.report.disk_latency_val', { val: p99.toFixed(1) }, `${p99.toFixed(1)} ms`))}</span></div>
             ${renderLineChart(latPts, { color: '#ef4444', height: 60 })}
           </div>
         </div>
@@ -1521,7 +1532,7 @@ function renderDiskTab(ctx) {
   return `
     ${cards}
     <section class="pr-card">
-      <h2 class="pr-card-title">Top processes by IO</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.disk_top_io_h', null, 'Top processes by IO'))}</h2>
       ${renderTopIoTable(events, report.names || [])}
     </section>
   `;
@@ -1535,7 +1546,7 @@ function renderTopIoTable(events, names) {
     return `
       <div class="pr-banner-degraded">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-        <div><strong>Per-process IO not collected.</strong> Add <code>linux.proc.top_processes</code> source (parses /proc/[pid]/io).</div>
+        <div>${t('profiling.report.disk_io_no_data', null, '<strong>Per-process IO not collected.</strong> Add <code>linux.proc.top_processes</code> source (parses /proc/[pid]/io).')}</div>
       </div>
     `;
   }
@@ -1577,7 +1588,7 @@ function renderTopIoTable(events, names) {
     .sort((a, b) => (b.readDelta + b.writeDelta) - (a.readDelta + a.writeDelta))
     .slice(0, 10);
   if (top.length === 0) {
-    return `<div class="pr-banner-degraded"><div>No process IO during this session window.</div></div>`;
+    return `<div class="pr-banner-degraded"><div>${escape(t('profiling.report.disk_io_no_window', null, 'No process IO during this session window.'))}</div></div>`;
   }
   const rows = top.map((p) => `
     <tr>
@@ -1590,7 +1601,7 @@ function renderTopIoTable(events, names) {
   `).join('');
   return `
     <table class="pr-table">
-      <thead><tr><th>PID</th><th>Process</th><th class="num">Read</th><th class="num">Write</th><th class="num">Total</th></tr></thead>
+      <thead><tr><th>${escape(t('profiling.report.col_pid', null, 'PID'))}</th><th>${escape(t('profiling.report.col_process', null, 'Process'))}</th><th class="num">${escape(t('profiling.report.col_read', null, 'Read'))}</th><th class="num">${escape(t('profiling.report.col_write', null, 'Write'))}</th><th class="num">${escape(t('profiling.report.col_total', null, 'Total'))}</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   `;
@@ -1620,17 +1631,11 @@ function renderPowerTab(ctx) {
   const { events, report } = ctx;
   const samples = eventsForCategory(events, 'PowerSample');
   if (samples.length === 0) {
-    // Pełen brak PowerSample — żaden kolektor nie zwrócił danych.
     return `
       <section class="pr-card">
         <div class="pr-banner-degraded">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-          <div>
-            <strong>No power samples collected.</strong>
-            Power telemetry requires <code class="mono">RAPL</code> (sudo / CAP_SYS_RAWIO on Linux),
-            <code class="mono">nvidia-smi</code>, <code class="mono">rocm-smi</code>,
-            or <code class="mono">powermetrics</code> (macOS, sudo). Re-run the session with elevated privileges.
-          </div>
+          <div>${t('profiling.report.power_no_samples', null, '<strong>No power samples collected.</strong> Power telemetry requires <code class=\"mono\">RAPL</code> (sudo / CAP_SYS_RAWIO on Linux), <code class=\"mono\">nvidia-smi</code>, <code class=\"mono\">rocm-smi</code>, or <code class=\"mono\">powermetrics</code> (macOS, sudo). Re-run the session with elevated privileges.')}</div>
         </div>
       </section>
     `;
@@ -1687,30 +1692,27 @@ function renderPowerTab(ctx) {
   const kWh = power.totalKj / 3600;
   const cost = kWh * 0.15;
 
-  // Legenda w formacie mockupu: "CPU pkg (84W avg)".
   const legend = labels.map((l, i) =>
-    `<span class="lg"><span class="sw" style="background:${colors[i]};"></span>${escape(l)} (${avgs[i].toFixed(0)}W avg)</span>`
+    `<span class="lg"><span class="sw" style="background:${colors[i]};"></span>${escape(t('profiling.report.power_legend_avg', { label: l, avg: avgs[i].toFixed(0) }, `${l} (${avgs[i].toFixed(0)}W avg)`))}</span>`
   ).join('') +
-    `<span class="lg"><span class="sw" style="background:#f59e0b;height:2px;"></span>Total (peak ${formatPower(power.peakW)})</span>`;
+    `<span class="lg"><span class="sw" style="background:#f59e0b;height:2px;"></span>${escape(t('profiling.report.power_legend_total', { peak: formatPower(power.peakW) }, `Total (peak ${formatPower(power.peakW)})`))}</span>`;
 
-  // Mockup wymaga osobnego kafelka ANE; jeśli brak danych — placeholder.
   const hasAne = byDomain.has('Ane');
   const anePlaceholder = !hasAne ? `
     <div class="pr-mini-chart">
-      <div class="mc-title"><span>ANE W</span><span class="v">— not detected</span></div>
-      <svg viewBox="0 0 200 60" preserveAspectRatio="none" aria-label="ANE not detected">
+      <div class="mc-title"><span>${escape(t('profiling.report.power_ane_not_detected', null, 'ANE W'))}</span><span class="v">${escape(t('profiling.report.power_ane_not_detected_v', null, '— not detected'))}</span></div>
+      <svg viewBox="0 0 200 60" preserveAspectRatio="none" aria-label="${escape(t('profiling.report.power_ane_aria', null, 'ANE not detected'))}">
         <path d="M0 56 L200 56" stroke="#71717a" stroke-width="1" stroke-dasharray="2 3" fill="none"/>
       </svg>
     </div>
   ` : '';
 
-  // Per-domain mini charts.
   const miniCharts = labels.map((l, i) => {
     const pts = seriesList[i];
     const peak = pts.reduce((m, [, v]) => Math.max(m, v), 0);
     return `
       <div class="pr-mini-chart">
-        <div class="mc-title"><span>${escape(l)} W</span><span class="v">${peak.toFixed(0)} max</span></div>
+        <div class="mc-title"><span>${escape(t('profiling.report.power_domain_w', { label: l }, `${l} W`))}</span><span class="v">${escape(t('profiling.report.power_domain_max', { val: peak.toFixed(0) }, `${peak.toFixed(0)} max`))}</span></div>
         ${renderLineChart(pts, { color: colors[i], height: 60 })}
       </div>
     `;
@@ -1726,13 +1728,13 @@ function renderPowerTab(ctx) {
   const partialBanner = (raplSkipped && !byDomain.has('CpuPkg') && !byDomain.has('Dram')) ? `
     <div class="pr-banner-degraded inline" style="margin-bottom:10px;">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-      <div><strong>RAPL unavailable</strong> — CPU pkg / DRAM power missing. Showing GPU-only domains. Re-run with sudo for full breakdown.</div>
+      <div>${t('profiling.report.power_rapl_unavailable', null, '<strong>RAPL unavailable</strong> — CPU pkg / DRAM power missing. Showing GPU-only domains. Re-run with sudo for full breakdown.')}</div>
     </div>
   ` : '';
 
   return `
     <section class="pr-card">
-      <h2 class="pr-card-title">Total power broken down per domain</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.power_total_h', null, 'Total power broken down per domain'))}</h2>
       ${partialBanner}
       <div class="pr-stacked-chart-wrap">
         ${renderStackedArea(seriesList, { width: 920, height: 220, colors })}
@@ -1741,17 +1743,17 @@ function renderPowerTab(ctx) {
     </section>
 
     <section class="pr-card">
-      <h2 class="pr-card-title">Energy budget</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.power_energy_h', null, 'Energy budget'))}</h2>
       <div class="pr-kpi-grid">
-        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">Total energy</span></div><div class="pr-kpi-value">${power.totalKj.toFixed(1)} kJ</div><div class="pr-kpi-sub">over ${formatDurationNs(report.duration_ns)}</div></div>
-        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">Energy</span></div><div class="pr-kpi-value">${(kWh * 1000).toFixed(1)} Wh</div><div class="pr-kpi-sub">= ${kWh.toFixed(3)} kWh</div></div>
-        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">Estimated cost</span></div><div class="pr-kpi-value">$${cost.toFixed(4)}</div><div class="pr-kpi-sub">@ $0.15 / kWh</div></div>
-        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">Avg / Peak</span></div><div class="pr-kpi-value">${formatPower(power.avgW)}</div><div class="pr-kpi-sub">peak <strong>${formatPower(power.peakW)}</strong></div></div>
+        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.power_total_energy', null, 'Total energy'))}</span></div><div class="pr-kpi-value">${power.totalKj.toFixed(1)} kJ</div><div class="pr-kpi-sub">${escape(t('profiling.report.power_total_energy_sub', { dur: formatDurationNs(report.duration_ns) }, `over ${formatDurationNs(report.duration_ns)}`))}</div></div>
+        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.power_energy_label', null, 'Energy'))}</span></div><div class="pr-kpi-value">${(kWh * 1000).toFixed(1)} Wh</div><div class="pr-kpi-sub">${escape(t('profiling.report.power_energy_sub', { val: kWh.toFixed(3) }, `= ${kWh.toFixed(3)} kWh`))}</div></div>
+        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.power_estimated_cost', null, 'Estimated cost'))}</span></div><div class="pr-kpi-value">$${cost.toFixed(4)}</div><div class="pr-kpi-sub">${escape(t('profiling.report.power_cost_sub', null, '@ $0.15 / kWh'))}</div></div>
+        <div class="pr-kpi-tile"><div class="pr-kpi-head"><span class="pr-kpi-label">${escape(t('profiling.report.power_avg_peak', null, 'Avg / Peak'))}</span></div><div class="pr-kpi-value">${formatPower(power.avgW)}</div><div class="pr-kpi-sub">${t('profiling.report.power_peak_strong', { val: formatPower(power.peakW) }, `peak <strong>${formatPower(power.peakW)}</strong>`)}</div></div>
       </div>
     </section>
 
     <section class="pr-card">
-      <h2 class="pr-card-title">Per-domain mini charts</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.power_per_domain_h', null, 'Per-domain mini charts'))}</h2>
       <div class="pr-charts-row pr-charts-row-flexible">${miniCharts}</div>
     </section>
   `;
@@ -1800,7 +1802,7 @@ function renderSourcesTab(ctx) {
     if (!reason && s.kind === 'used') {
       const cat = String(c.primary_category || '').toLowerCase();
       if (elevationHintCategories.has(cat) || elevationHintIdPatterns.test(c.id || '')) {
-        reason = 'sudo provided';
+        reason = t('profiling.report.sources_sudo_provided', null, 'sudo provided');
       }
     }
     return `<tr${dim}>
@@ -1849,12 +1851,12 @@ function renderSourcesTab(ctx) {
   });
 
   const capPerfmonCls = skippedElevation > 0 ? 'warn' : 'muted';
-  const capPerfmonText = skippedElevation > 0 ? 'not set' : 'unknown';
+  const capPerfmonText = skippedElevation > 0 ? t('profiling.report.sources_cap_not_set', null, 'not set') : t('profiling.report.sources_cap_unknown', null, 'unknown');
   const capBpfCls = skippedElevation > 0 ? 'warn' : 'muted';
-  const capBpfText = skippedElevation > 0 ? 'not set' : 'unknown';
+  const capBpfText = capPerfmonText;
 
   const rerunBtn = totalSkipped > 0 || failed > 0
-    ? `<tf-button variant="ghost" size="sm" icon="refresh" data-action="rerun" aria-label="Re-run with elevation">Re-run with elevated permissions</tf-button>`
+    ? `<tf-button variant="ghost" size="sm" icon="refresh" data-action="rerun" aria-label="${escape(t('profiling.report.sources_rerun_aria', null, 'Re-run with elevation'))}">${escape(t('profiling.report.sources_rerun_btn', null, 'Re-run with elevated permissions'))}</tf-button>`
     : '';
 
   // Drift summary alert: kontener .pr-alert ma teraz strukture .pr-alert-icon
@@ -1864,37 +1866,37 @@ function renderSourcesTab(ctx) {
     ? `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>`
     : `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>`;
   const alertBody = driftOk
-    ? `<strong>Within tolerance</strong> — cross-source correlation reliable.`
-    : `<strong>Exceeded tolerance</strong> — cross-source correlation unreliable; re-collect with NTP-synced clocks.`;
+    ? t('profiling.report.sources_drift_ok', null, '<strong>Within tolerance</strong> — cross-source correlation reliable.')
+    : t('profiling.report.sources_drift_bad', null, '<strong>Exceeded tolerance</strong> — cross-source correlation unreliable; re-collect with NTP-synced clocks.');
 
   return `
     <section class="pr-card">
-      <h2 class="pr-card-title">Collectors used</h2>
+      <h2 class="pr-card-title">${escape(t('profiling.report.sources_collectors_h', null, 'Collectors used'))}</h2>
       <table class="pr-table">
-        <thead><tr><th>ID</th><th>Category</th><th>Status</th><th>Reason</th><th class="num">Samples</th><th class="num">Raw size</th></tr></thead>
+        <thead><tr><th>${escape(t('profiling.report.col_id', null, 'ID'))}</th><th>${escape(t('profiling.report.col_category', null, 'Category'))}</th><th>${escape(t('profiling.report.col_status', null, 'Status'))}</th><th>${escape(t('profiling.report.col_reason', null, 'Reason'))}</th><th class="num">${escape(t('profiling.report.col_samples', null, 'Samples'))}</th><th class="num">${escape(t('profiling.report.col_raw_size', null, 'Raw size'))}</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </section>
 
     <div class="pr-two-col">
       <section class="pr-card">
-        <h2 class="pr-card-title">Privilege summary</h2>
+        <h2 class="pr-card-title">${escape(t('profiling.report.sources_privilege_h', null, 'Privilege summary'))}</h2>
         <div class="pr-sp-list">
-          <div class="sp-item"><span class="sym">Sudo provided</span><span class="pct ${sudoUsed ? 'ok' : 'warn'}">${sudoUsed ? 'yes (test passed)' : 'no / not tested'}</span></div>
-          <div class="sp-item"><span class="sym">Admin (Windows)</span><span class="pct muted">n/a</span></div>
-          <div class="sp-item"><span class="sym">cap_perfmon</span><span class="pct ${capPerfmonCls}">${capPerfmonText}</span></div>
-          <div class="sp-item"><span class="sym">cap_bpf</span><span class="pct ${capBpfCls}">${capBpfText}</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_sudo_label', null, 'Sudo provided'))}</span><span class="pct ${sudoUsed ? 'ok' : 'warn'}">${escape(sudoUsed ? t('profiling.report.sources_sudo_yes', null, 'yes (test passed)') : t('profiling.report.sources_sudo_no', null, 'no / not tested'))}</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_admin_label', null, 'Admin (Windows)'))}</span><span class="pct muted">${escape(t('profiling.report.sources_admin_na', null, 'n/a'))}</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_cap_perfmon', null, 'cap_perfmon'))}</span><span class="pct ${capPerfmonCls}">${escape(capPerfmonText)}</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_cap_bpf', null, 'cap_bpf'))}</span><span class="pct ${capBpfCls}">${escape(capBpfText)}</span></div>
         </div>
         ${rerunBtn}
       </section>
 
       <section class="pr-card">
-        <h2 class="pr-card-title">Drift report</h2>
+        <h2 class="pr-card-title">${escape(t('profiling.report.sources_drift_h', null, 'Drift report'))}</h2>
         <div class="pr-sp-list">
-          <div class="sp-item"><span class="sym">Max clock drift</span><span class="pct">${driftMs.toFixed(2)} ms</span></div>
-          <div class="sp-item"><span class="sym">Tolerance</span><span class="pct">${tolMs.toFixed(1)} ms</span></div>
-          <div class="sp-item"><span class="sym">Reference</span><span class="pct">CLOCK_MONOTONIC_RAW</span></div>
-          <div class="sp-item"><span class="sym">NTP-synced</span><span class="pct ${ntpKnownOk ? 'ok' : 'muted'}">${ntpKnownOk ? 'yes' : 'unknown'}</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_max_drift', null, 'Max clock drift'))}</span><span class="pct">${driftMs.toFixed(2)} ms</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_tolerance', null, 'Tolerance'))}</span><span class="pct">${tolMs.toFixed(1)} ms</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_reference', null, 'Reference'))}</span><span class="pct">CLOCK_MONOTONIC_RAW</span></div>
+          <div class="sp-item"><span class="sym">${escape(t('profiling.report.sources_ntp_synced', null, 'NTP-synced'))}</span><span class="pct ${ntpKnownOk ? 'ok' : 'muted'}">${escape(ntpKnownOk ? t('profiling.report.sources_ntp_yes', null, 'yes') : t('profiling.report.sources_ntp_unknown', null, 'unknown'))}</span></div>
         </div>
         <div class="pr-alert ${alertCls}">
           <span class="pr-alert-icon">${alertIcon}</span>
@@ -1935,14 +1937,13 @@ function vendorPeakLabel(vendorCls, k) {
   const hasKernel = k && k.topKernel;
   if (vendorCls === 'nv') {
     return hasKernel
-      ? `Peak SM · Top kernel <strong>${escape(k.topKernel)} ${formatPct(k.topPct)}</strong>`
-      : `Peak SM · <strong>No kernel detail</strong>`;
+      ? t('profiling.report.kpi_peak_gpu_sub_nv', { kernel: escape(k.topKernel), pct: formatPct(k.topPct) }, `Peak SM · Top kernel <strong>${escape(k.topKernel)} ${formatPct(k.topPct)}</strong>`)
+      : t('profiling.report.kpi_peak_gpu_sub_nv_no', null, 'Peak SM · <strong>No kernel detail</strong>');
   }
   if (vendorCls === 'amd') {
     return hasKernel
-      ? `Peak compute · Top <strong>${escape(k.topKernel)} ${formatPct(k.topPct)}</strong>`
-      : `Peak compute · <strong>No kernel detail</strong>`;
+      ? t('profiling.report.kpi_peak_gpu_sub_amd', { kernel: escape(k.topKernel), pct: formatPct(k.topPct) }, `Peak compute · Top <strong>${escape(k.topKernel)} ${formatPct(k.topPct)}</strong>`)
+      : t('profiling.report.kpi_peak_gpu_sub_amd_no', null, 'Peak compute · <strong>No kernel detail</strong>');
   }
-  // Intel + Apple: brak kernel-level sourcing.
-  return `Peak compute · <strong>No kernel detail</strong>`;
+  return t('profiling.report.kpi_peak_gpu_sub_other', null, 'Peak compute · <strong>No kernel detail</strong>');
 }

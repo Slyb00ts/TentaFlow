@@ -16,8 +16,14 @@ import {
   escape,
 } from '/js/modules/profile-report-helpers.js';
 import { profilingReport } from '/js/protocol/profiling.js';
+import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
+
+function ti(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
 
 const FIXTURE_PATH = '/js/modules/__fixtures__/profile-report.json';
 
@@ -72,7 +78,7 @@ export class ProfileCompareView {
   static async render(container, { nodeId, sessionA, sessionB } = {}) {
     if (!container) throw new Error('container is required');
     if (!sessionA || !sessionB) {
-      container.innerHTML = renderError(new Error('Two session IDs are required for comparison'));
+      container.innerHTML = renderError(new Error(ti('profiling.report.err_compare_two_required', null, 'Two session IDs are required for comparison')));
       bindBack(container);
       return;
     }
@@ -90,7 +96,7 @@ export class ProfileCompareView {
     const repA = unpackReport(raw.a);
     const repB = unpackReport(raw.b);
     if (!repA || !repB) {
-      container.innerHTML = renderError(new Error('Compare requires both reports in V2 schema.'));
+      container.innerHTML = renderError(new Error(ti('profiling.report.err_compare_v2_required', null, 'Compare requires both reports in V2 schema.')));
       bindBack(container);
       return;
     }
@@ -117,11 +123,11 @@ function renderShell(ctx) {
   return `
     <div class="profile-compare compare-screen">
       <nav class="pr-breadcrumb" aria-label="Breadcrumb">
-        <a href="#" data-action="back-mesh">Mesh</a>
+        <a href="#" data-action="back-mesh">${escape(ti('profiling.compare.breadcrumb_mesh', null, 'Mesh'))}</a>
         <span class="sep">/</span>
-        <span>Profiling</span>
+        <span>${escape(ti('profiling.compare.breadcrumb_profiling', null, 'Profiling'))}</span>
         <span class="sep">/</span>
-        <span>Compare</span>
+        <span>${escape(ti('profiling.compare.breadcrumb_compare', null, 'Compare'))}</span>
       </nav>
 
       ${renderHeader(ctx)}
@@ -143,13 +149,13 @@ function renderSkeleton() {
 }
 
 function renderError(err) {
-  const msg = err?.message || String(err || 'Unknown error');
+  const msg = err?.message || String(err || ti('profiling.compare.fail_unknown', null, 'Unknown error'));
   return `
     <div class="profile-compare pc-error">
       <div class="pc-error-card">
-        <h2>Compare failed</h2>
+        <h2>${escape(ti('profiling.compare.fail_title', null, 'Compare failed'))}</h2>
         <pre class="mono">${escape(msg)}</pre>
-        <tf-button variant="ghost" size="sm" data-action="back-mesh">Back</tf-button>
+        <tf-button variant="ghost" size="sm" data-action="back-mesh">${escape(ti('profiling.compare.back', null, 'Back'))}</tf-button>
       </div>
     </div>
   `;
@@ -187,17 +193,17 @@ function renderHeader(ctx) {
   return `
     <header class="compare-header">
       <div class="compare-title-block">
-        <h1 class="compare-title">Compare sessions</h1>
+        <h1 class="compare-title">${escape(ti('profiling.compare.title', null, 'Compare sessions'))}</h1>
         <div class="compare-sub">
-          <span class="status-pill local">Baseline</span>
+          <span class="status-pill local">${escape(ti('profiling.compare.baseline', null, 'Baseline'))}</span>
           <strong>${labelA}</strong>
-          <span class="compare-vs">vs</span>
-          <span class="status-pill sso">Compared</span>
+          <span class="compare-vs">${escape(ti('profiling.compare.vs', null, 'vs'))}</span>
+          <span class="status-pill sso">${escape(ti('profiling.compare.compared', null, 'Compared'))}</span>
           <strong>${labelB}</strong>
         </div>
       </div>
       <div class="compare-actions">
-        <tf-button variant="ghost" size="sm" data-action="back-mesh">Back</tf-button>
+        <tf-button variant="ghost" size="sm" data-action="back-mesh">${escape(ti('profiling.compare.back', null, 'Back'))}</tf-button>
       </div>
     </header>
   `;
@@ -206,7 +212,7 @@ function renderHeader(ctx) {
 function sessionLabel(report) {
   if (report.scope?.label) return report.scope.label;
   if (report.session_id) return report.session_id.slice(0, 8);
-  return 'session';
+  return ti('profiling.compare.session_default', null, 'session');
 }
 
 // =============================================================================
@@ -216,7 +222,7 @@ function sessionLabel(report) {
 function renderSummaryGrid(ctx) {
   return `
     <section class="tf-section-card compare-section">
-      <h3 class="compare-section-h3">Side-by-side</h3>
+      <h3 class="compare-section-h3">${escape(ti('profiling.compare.side_by_side', null, 'Side-by-side'))}</h3>
       <div class="compare-grid">
         ${renderSummaryCard(ctx.a, ctx.b, 'baseline')}
         ${renderSummaryCard(ctx.b, ctx.a, 'compared')}
@@ -230,7 +236,7 @@ function renderSummaryGrid(ctx) {
 function renderSummaryCard(self, other, side) {
   const isCompared = side === 'compared';
   const pillClass = isCompared ? 'sso' : 'local';
-  const pillText = isCompared ? 'Compared' : 'Baseline';
+  const pillText = isCompared ? ti('profiling.compare.compared', null, 'Compared') : ti('profiling.compare.baseline', null, 'Baseline');
   const sourcesCount = countSources(self.report);
   const dur = formatDurationShort(self.report.duration_ns || 0);
   const label = escape(sessionLabel(self.report));
@@ -247,9 +253,9 @@ function renderSummaryCard(self, other, side) {
   return `
     <div class="compare-card">
       <div class="compare-card-head">
-        <span class="status-pill ${pillClass}">${pillText}</span>
+        <span class="status-pill ${pillClass}">${escape(pillText)}</span>
         <strong class="compare-card-title">${label}</strong>
-        <span class="compare-card-meta">${dur} · ${sourcesCount} sources · ${date}</span>
+        <span class="compare-card-meta">${dur} · ${escape(ti('profiling.compare.sources_count', { n: sourcesCount }, `${sourcesCount} sources`))} · ${date}</span>
       </div>
       <div class="kpi-grid kpi-grid-2">
         ${tilesHtml}
@@ -265,33 +271,29 @@ function buildSummaryTiles(self, other, repSelf, repOther) {
   const totalNs = repSelf.duration_ns || 0;
 
   const tiles = [];
-  // CPU avg
   tiles.push({
-    label: 'CPU avg',
+    label: ti('profiling.compare.kpi_cpu_avg', null, 'CPU avg'),
     value: Number.isFinite(cpuVal) ? `${cpuVal.toFixed(0)}%` : '—',
     deltaHtml: other ? deltaPctPill(other.cpu.avgUtil, cpuVal, { suffix: 'pp', lowerIsBetter: true }) : '',
   });
-  // GPU0 SM peak
   if (gpu0) {
     const otherGpu0 = other ? other.gpu.get(0) : null;
     tiles.push({
-      label: 'GPU0 SM peak',
+      label: ti('profiling.compare.kpi_gpu0_sm_peak', null, 'GPU0 SM peak'),
       value: Number.isFinite(gpu0.peakCompute) ? `${gpu0.peakCompute.toFixed(0)}%` : '—',
       deltaHtml: otherGpu0 ? deltaPctPill(otherGpu0.peakCompute, gpu0.peakCompute, { suffix: 'pp', lowerIsBetter: false }) : '',
     });
   } else {
-    tiles.push({ label: 'GPU0 SM peak', value: '—', deltaHtml: '' });
+    tiles.push({ label: ti('profiling.compare.kpi_gpu0_sm_peak', null, 'GPU0 SM peak'), value: '—', deltaHtml: '' });
   }
-  // Power avg
   tiles.push({
-    label: 'Power avg',
+    label: ti('profiling.compare.kpi_power_avg', null, 'Power avg'),
     value: Number.isFinite(pwrVal) ? formatPower(pwrVal) : '—',
     deltaHtml: other ? deltaAbsPill(other.power.avgW, pwrVal, ' W', 0, true) : '',
   });
-  // Total time
   const otherNs = repOther ? (repOther.duration_ns || 0) : 0;
   tiles.push({
-    label: 'Total time',
+    label: ti('profiling.compare.kpi_total_time', null, 'Total time'),
     value: formatDurationShort(totalNs),
     deltaHtml: other ? deltaTimePill(otherNs, totalNs) : '',
   });
@@ -363,8 +365,8 @@ function renderDifferentialFlamegraph(ctx) {
   if (!layout || layout.rects.length === 0) {
     return `
       <section class="tf-section-card compare-section">
-        <h3 class="compare-section-h3">Differential flamegraph</h3>
-        <div class="pc-empty diff-flamegraph-empty">No CPU sample data available in either session.</div>
+        <h3 class="compare-section-h3">${escape(ti('profiling.compare.diff_h', null, 'Differential flamegraph'))}</h3>
+        <div class="pc-empty diff-flamegraph-empty">${escape(ti('profiling.compare.diff_no_data', null, 'No CPU sample data available in either session.'))}</div>
       </section>
     `;
   }
@@ -384,9 +386,10 @@ function renderDifferentialFlamegraph(ctx) {
     `;
   }).join('');
 
+  const pct = (DELTA_FRAME * 100).toFixed(0);
   return `
     <section class="tf-section-card compare-section">
-      <h3 class="compare-section-h3">Differential flamegraph</h3>
+      <h3 class="compare-section-h3">${escape(ti('profiling.compare.diff_h', null, 'Differential flamegraph'))}</h3>
       <div class="flame-wrap diff-flamegraph">
         <svg class="flame-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
           <g font-family="JetBrains Mono, ui-monospace, monospace" font-size="9">
@@ -395,9 +398,9 @@ function renderDifferentialFlamegraph(ctx) {
         </svg>
       </div>
       <div class="diff-legend">
-        <span><span class="sw slower-red"></span>slower in compared (≥${(DELTA_FRAME * 100).toFixed(0)}%)</span>
-        <span><span class="sw faster-green"></span>faster in compared (≥${(DELTA_FRAME * 100).toFixed(0)}%)</span>
-        <span><span class="sw unchanged"></span>~unchanged</span>
+        <span><span class="sw slower-red"></span>${escape(ti('profiling.compare.diff_legend_slower', { pct }, `slower in compared (≥${pct}%)`))}</span>
+        <span><span class="sw faster-green"></span>${escape(ti('profiling.compare.diff_legend_faster', { pct }, `faster in compared (≥${pct}%)`))}</span>
+        <span><span class="sw unchanged"></span>${escape(ti('profiling.compare.diff_legend_unchanged', null, '~unchanged'))}</span>
       </div>
     </section>
   `;
@@ -540,14 +543,14 @@ function renderMetaTable(ctx) {
   const a = ctx.a.report;
   const b = ctx.b.report;
   const rows = [
-    { label: 'Session ID', a: (a.session_id || '').slice(0, 16) || '—', b: (b.session_id || '').slice(0, 16) || '—', mono: true },
-    { label: 'Started at', a: formatDateTime(a.t0_wallclock_unix_ns), b: formatDateTime(b.t0_wallclock_unix_ns) },
-    { label: 'Duration', a: formatDurationNs(a.duration_ns), b: formatDurationNs(b.duration_ns) },
-    { label: 'Source kinds', a: String(countSources(a)), b: String(countSources(b)) },
-    { label: 'CPU samples', a: countSamples(a).toLocaleString('en-US'), b: countSamples(b).toLocaleString('en-US') },
-    { label: 'GPU devices', a: String(ctx.a.kpis.gpu.size), b: String(ctx.b.kpis.gpu.size) },
-    { label: 'RAM peak', a: formatBytes(ctx.a.kpis.ram.peakUsedBytes), b: formatBytes(ctx.b.kpis.ram.peakUsedBytes) },
-    { label: 'Power avg', a: formatPower(ctx.a.kpis.power.avgW), b: formatPower(ctx.b.kpis.power.avgW) },
+    { label: ti('profiling.compare.meta_session_id', null, 'Session ID'), a: (a.session_id || '').slice(0, 16) || '—', b: (b.session_id || '').slice(0, 16) || '—', mono: true },
+    { label: ti('profiling.compare.meta_started', null, 'Started at'), a: formatDateTime(a.t0_wallclock_unix_ns), b: formatDateTime(b.t0_wallclock_unix_ns) },
+    { label: ti('profiling.compare.meta_duration', null, 'Duration'), a: formatDurationNs(a.duration_ns), b: formatDurationNs(b.duration_ns) },
+    { label: ti('profiling.compare.meta_source_kinds', null, 'Source kinds'), a: String(countSources(a)), b: String(countSources(b)) },
+    { label: ti('profiling.compare.meta_cpu_samples', null, 'CPU samples'), a: countSamples(a).toLocaleString('en-US'), b: countSamples(b).toLocaleString('en-US') },
+    { label: ti('profiling.compare.meta_gpu_devices', null, 'GPU devices'), a: String(ctx.a.kpis.gpu.size), b: String(ctx.b.kpis.gpu.size) },
+    { label: ti('profiling.compare.meta_ram_peak', null, 'RAM peak'), a: formatBytes(ctx.a.kpis.ram.peakUsedBytes), b: formatBytes(ctx.b.kpis.ram.peakUsedBytes) },
+    { label: ti('profiling.compare.meta_power_avg', null, 'Power avg'), a: formatPower(ctx.a.kpis.power.avgW), b: formatPower(ctx.b.kpis.power.avgW) },
   ];
 
   const body = rows.map((r) => `
@@ -560,13 +563,13 @@ function renderMetaTable(ctx) {
 
   return `
     <section class="tf-section-card compare-section">
-      <h3 class="compare-section-h3">Sessions metadata</h3>
+      <h3 class="compare-section-h3">${escape(ti('profiling.compare.meta_h', null, 'Sessions metadata'))}</h3>
       <table class="compare-meta-table">
         <thead>
           <tr>
             <th></th>
-            <th><span class="status-pill local">Baseline</span> A</th>
-            <th><span class="status-pill sso">Compared</span> B</th>
+            <th><span class="status-pill local">${escape(ti('profiling.compare.baseline', null, 'Baseline'))}</span> A</th>
+            <th><span class="status-pill sso">${escape(ti('profiling.compare.compared', null, 'Compared'))}</span> B</th>
           </tr>
         </thead>
         <tbody>${body}</tbody>

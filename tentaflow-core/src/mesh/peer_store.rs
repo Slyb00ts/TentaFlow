@@ -396,14 +396,36 @@ impl MeshPeerStore {
                 ConnectionStateTag::Degraded | ConnectionStateTag::Reconnecting
             )
         {
-            tracing::warn!(
-                target: "mesh::shadow",
-                node_id = %node_id,
-                site = %where_,
-                store_connected,
-                reg_state = ?detail.summary.conn_tag,
-                "peer_store ↔ peer_registry rozjazd: connection flag",
-            );
+            // store says the QUIC connection is up but the registry has fallen
+            // into Offline / Disconnected. Force a Discovered trigger so the
+            // registry leaves Offline and reconnect logic schedules a fresh
+            // dial — that path will populate Connected with real conn_id+path.
+            // Faking DialOk here with synthetic data would corrupt the
+            // registry's path tracking.
+            if store_connected
+                && matches!(
+                    detail.summary.conn_tag,
+                    ConnectionStateTag::Offline | ConnectionStateTag::Disconnected
+                )
+            {
+                reg.upsert_discovered(id, TransportHints::default());
+                tracing::info!(
+                    target: "mesh::shadow",
+                    node_id = %node_id,
+                    site = %where_,
+                    reg_state = ?detail.summary.conn_tag,
+                    "peer_store ↔ peer_registry rozjazd: forced Discovered to nudge registry out of Offline",
+                );
+            } else {
+                tracing::warn!(
+                    target: "mesh::shadow",
+                    node_id = %node_id,
+                    site = %where_,
+                    store_connected,
+                    reg_state = ?detail.summary.conn_tag,
+                    "peer_store ↔ peer_registry rozjazd: connection flag",
+                );
+            }
         }
         if !store.hostname.is_empty()
             && !detail.summary.hostname.is_empty()
@@ -920,6 +942,11 @@ impl MeshPeerStore {
             (self.peer_registry.as_ref(), Self::parse_node_id(node_id))
         {
             r.upsert_discovered(id, TransportHints::default());
+            // Defense-in-depth: receiving metrics means the peer is alive; force
+            // the registry to record a heartbeat so liveness state matches the
+            // physical reality even if the HEARTBEAT frame path missed for any
+            // reason (gate decision, deserialization race, ...).
+            r.record_heartbeat(&id, std::time::Instant::now());
             if !hb.platform.is_empty() {
                 r.set_platform(&id, Arc::<str>::from(hb.platform.as_str()));
             }
