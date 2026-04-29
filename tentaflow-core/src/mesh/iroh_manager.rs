@@ -360,6 +360,14 @@ impl IrohMeshManager {
         *self.command_executor.write().await = Some(executor);
     }
 
+    /// Aktualnie wpiety executor — uzywany przez wyzsze warstwy do wstrzykiwania
+    /// `ServiceActionContext` (krok N3b) po pelnej inicjalizacji AppState.
+    pub async fn command_executor(
+        &self,
+    ) -> Option<Arc<crate::mesh::command_executor::MeshCommandExecutor>> {
+        self.command_executor.read().await.clone()
+    }
+
     /// Discovery spamuje na kazdy mDNS tick — logujemy pierwsze odkrycie peera
     /// i potem co najmniej co `DISCOVERY_LOG_COOLDOWN`. Zwraca true gdy log
     /// ma sie wyemitowac, false — stlumic.

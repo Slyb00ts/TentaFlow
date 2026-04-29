@@ -835,10 +835,10 @@ export const encode = {
     );
   },
 
-  /** MessageBody::ServiceStopRequest { serviceId } */
-  serviceStopRequest(correlationId, { serviceId }, sequence = 1) {
+  /** MessageBody::ServiceStopRequest { serviceId, nodeId? } */
+  serviceStopRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceStopRequest(serviceId);
+    const body = _wasm.encodeServiceStopRequest(serviceId, nodeId ?? undefined);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2387,9 +2387,9 @@ export const encode = {
   },
 
   /** MessageBody::ServiceBody(ServicePayload::ReqStop). */
-  serviceStopRequest(correlationId, { serviceId }, sequence = 1) {
+  serviceStopRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceStopRequest(Number(serviceId));
+    const body = _wasm.encodeServiceStopRequest(Number(serviceId), nodeId ?? undefined);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2399,9 +2399,9 @@ export const encode = {
   },
 
   /** MessageBody::ServiceBody(ServicePayload::ReqDelete). */
-  serviceDeleteRequest(correlationId, { serviceId }, sequence = 1) {
+  serviceDeleteRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceDeleteRequest(Number(serviceId));
+    const body = _wasm.encodeServiceDeleteRequest(Number(serviceId), nodeId ?? undefined);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2411,9 +2411,13 @@ export const encode = {
   },
 
   /** MessageBody::ServiceBody(ServicePayload::ReqPin). */
-  servicePinRequest(correlationId, { serviceId, pinned }, sequence = 1) {
+  servicePinRequest(correlationId, { serviceId, pinned, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServicePinRequest(Number(serviceId), Boolean(pinned));
+    const body = _wasm.encodeServicePinRequest(
+      Number(serviceId),
+      Boolean(pinned),
+      nodeId ?? undefined,
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2423,9 +2427,13 @@ export const encode = {
   },
 
   /** MessageBody::ServiceBody(ServicePayload::ReqPause). */
-  servicePauseRequest(correlationId, { serviceId, paused }, sequence = 1) {
+  servicePauseRequest(correlationId, { serviceId, paused, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServicePauseRequest(Number(serviceId), Boolean(paused));
+    const body = _wasm.encodeServicePauseRequest(
+      Number(serviceId),
+      Boolean(paused),
+      nodeId ?? undefined,
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2435,9 +2443,13 @@ export const encode = {
   },
 
   /** MessageBody::ServiceBody(ServicePayload::ReqRename). */
-  serviceRenameRequest(correlationId, { serviceId, displayName }, sequence = 1) {
+  serviceRenameRequest(correlationId, { serviceId, displayName, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceRenameRequest(Number(serviceId), String(displayName));
+    const body = _wasm.encodeServiceRenameRequest(
+      Number(serviceId),
+      String(displayName),
+      nodeId ?? undefined,
+    );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

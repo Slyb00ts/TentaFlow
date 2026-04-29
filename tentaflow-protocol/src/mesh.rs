@@ -503,6 +503,25 @@ pub enum MeshCommandType {
     ProfilingDownload(ProfilingDownloadRequest),
     /// Profiling V2: snapshot aktywnej sesji (Some) albo None.
     ProfilingActiveInfo(ProfilingActiveInfoRequest),
+
+    // -- Cross-node service action forwarding (krok N3b). `service_id` is
+    //    interpreted in the receiver's local SQLite namespace; the receiver
+    //    runs the action against its own DB and returns the result.
+    ServiceStopRemote { service_id: i64 },
+    ServiceDeleteRemote { service_id: i64 },
+    ServicePinRemote { service_id: i64, pinned: bool },
+    ServicePauseRemote { service_id: i64, paused: bool },
+    ServiceRenameRemote { service_id: i64, display_name: String },
+    /// Forwarded `ServiceManifestDeployRequest`. The receiver re-runs the same
+    /// validation + tokio::spawn deploy that a local request would, and
+    /// returns the synchronously generated `deploy_id` (slug). Logs continue
+    /// to flow on the receiver's local websocket bus — cross-node log
+    /// streaming is intentionally not part of N3b.
+    ServiceDeployRemote {
+        engine_id: String,
+        deploy_method: String,
+        config_json: String,
+    },
 }
 
 // =============================================================================
@@ -562,6 +581,18 @@ pub enum MeshCommandResponsePayload {
     ProfilingDownload(ProfilingDownloadResponse),
     /// Profiling V2: snapshot aktywnej sesji.
     ProfilingActiveInfo(ProfilingActiveInfoResponse),
+
+    /// Cross-node service action result (stop/delete/pin/pause/rename) — the
+    /// generic ok/error already lives in the outer `MeshCommandResponse`, so
+    /// the payload is `Empty` for all five.
+    ServiceActionResult,
+    /// Cross-node deploy result — carries the slug allocated by the receiver
+    /// so the initiator can wire the deploy log websocket back to that node.
+    ServiceDeployResult {
+        deploy_id: String,
+        engine_id: String,
+        deploy_method: String,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -686,6 +717,41 @@ impl std::fmt::Debug for MeshCommandType {
             Self::ProfilingActiveInfo(req) => f
                 .debug_struct("ProfilingActiveInfo")
                 .field("node_id", &req.node_id)
+                .finish(),
+            Self::ServiceStopRemote { service_id } => f
+                .debug_struct("ServiceStopRemote")
+                .field("service_id", service_id)
+                .finish(),
+            Self::ServiceDeleteRemote { service_id } => f
+                .debug_struct("ServiceDeleteRemote")
+                .field("service_id", service_id)
+                .finish(),
+            Self::ServicePinRemote { service_id, pinned } => f
+                .debug_struct("ServicePinRemote")
+                .field("service_id", service_id)
+                .field("pinned", pinned)
+                .finish(),
+            Self::ServicePauseRemote { service_id, paused } => f
+                .debug_struct("ServicePauseRemote")
+                .field("service_id", service_id)
+                .field("paused", paused)
+                .finish(),
+            Self::ServiceRenameRemote {
+                service_id,
+                display_name,
+            } => f
+                .debug_struct("ServiceRenameRemote")
+                .field("service_id", service_id)
+                .field("display_name", display_name)
+                .finish(),
+            Self::ServiceDeployRemote {
+                engine_id,
+                deploy_method,
+                ..
+            } => f
+                .debug_struct("ServiceDeployRemote")
+                .field("engine_id", engine_id)
+                .field("deploy_method", deploy_method)
                 .finish(),
         }
     }

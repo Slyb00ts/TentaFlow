@@ -36,6 +36,10 @@ pub struct ModelSummary {
     pub engine_id: String,
     /// `services.id` — disambiguates the same `model_name` across instances.
     pub service_id: i64,
+    /// Owning mesh node — endpoint-id hex of the node that hosts this model's
+    /// service. Equal to the local node when the model is hosted here; for
+    /// rows aggregated from `MeshServicesRegistry` carries the remote node id.
+    pub node_id: String,
     /// Mirrors `services.status` ("running" / "degraded" / ...).
     pub availability: String,
     /// `services.transport` (embedded / http_direct / sidecar_quic /
@@ -130,6 +134,11 @@ pub struct ServiceListResponse {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceStopRequest {
     pub service_id: i64,
+    /// Target mesh node. `None` (or local node id) = run locally; otherwise
+    /// the dispatcher forwards the action to the named peer over mesh and
+    /// waits for the response. `service_id` always lives in the target node's
+    /// SQLite namespace.
+    pub node_id: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -141,6 +150,8 @@ pub struct ServiceStopResponse {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServiceDeleteRequest {
     pub service_id: i64,
+    /// See `ServiceStopRequest::node_id`.
+    pub node_id: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -153,6 +164,8 @@ pub struct ServiceDeleteResponse {
 pub struct ServicePinRequest {
     pub service_id: i64,
     pub pinned: bool,
+    /// See `ServiceStopRequest::node_id`.
+    pub node_id: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -165,6 +178,8 @@ pub struct ServicePinResponse {
 pub struct ServicePauseRequest {
     pub service_id: i64,
     pub paused: bool,
+    /// See `ServiceStopRequest::node_id`.
+    pub node_id: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -177,6 +192,8 @@ pub struct ServicePauseResponse {
 pub struct ServiceRenameRequest {
     pub service_id: i64,
     pub display_name: String,
+    /// See `ServiceStopRequest::node_id`.
+    pub node_id: Option<String>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -3496,6 +3513,7 @@ mod tests {
             category: "llm".to_string(),
             engine_id: "llama-cpp".to_string(),
             service_id: 1,
+            node_id: "test-local-node".to_string(),
             availability: "ready".to_string(),
             transport: "http_direct".to_string(),
             endpoint_url: Some("http://127.0.0.1:8080".to_string()),

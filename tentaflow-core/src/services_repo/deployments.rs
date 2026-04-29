@@ -192,10 +192,7 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<DeploymentRow>> {
 }
 
 pub fn list_recent(conn: &Connection, limit: i64) -> Result<Vec<DeploymentRow>> {
-    let sql = format!(
-        "SELECT {} FROM deployments ORDER BY id DESC LIMIT ?1",
-        COLS
-    );
+    let sql = format!("SELECT {} FROM deployments ORDER BY id DESC LIMIT ?1", COLS);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![limit], map_row)?
