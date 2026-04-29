@@ -451,6 +451,13 @@ pub struct ServiceManager {
 
     /// EventBus addonow — ustawiany po konstrukcji AddonManager (jak reverse_router)
     pub(crate) event_bus: parking_lot::RwLock<Option<Arc<crate::addon::event_bus::EventBus>>>,
+
+    /// Snapshot receiver wired in by `Router::set_services_snapshot_rx`. Read
+    /// path consults `current_snapshot()` which falls back to an empty
+    /// `ServicesSnapshot::default()` when unwired (legacy startup, tests).
+    snapshot_rx: parking_lot::RwLock<
+        Option<tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>>,
+    >,
 }
 
 impl ServiceManager {
@@ -952,7 +959,30 @@ impl ServiceManager {
             mesh_registry: parking_lot::RwLock::new(None),
             reverse_router: parking_lot::RwLock::new(None),
             event_bus: parking_lot::RwLock::new(None),
+            snapshot_rx: parking_lot::RwLock::new(None),
         })
+    }
+
+    /// Wires the supervisor's services snapshot receiver. Called by
+    /// `Router::set_services_snapshot_rx` so the manager can resolve models
+    /// against the V2 snapshot without re-borrowing through the router.
+    pub fn set_snapshot_rx(
+        &self,
+        rx: tokio::sync::watch::Receiver<Arc<crate::services::supervisor::ServicesSnapshot>>,
+    ) {
+        *self.snapshot_rx.write() = Some(rx);
+    }
+
+    /// Returns the current snapshot. When the receiver has not been wired
+    /// (legacy startup paths, unit tests using `Router::default`-style setup)
+    /// returns an empty snapshot rather than `None` — callers should treat an
+    /// empty snapshot as "no services known".
+    pub fn current_snapshot(&self) -> Arc<crate::services::supervisor::ServicesSnapshot> {
+        self.snapshot_rx
+            .read()
+            .as_ref()
+            .map(|rx| rx.borrow().clone())
+            .unwrap_or_else(|| Arc::new(crate::services::supervisor::ServicesSnapshot::default()))
     }
 
     /// Uruchamia wszystkie background taski dla polaczen QUIC.
