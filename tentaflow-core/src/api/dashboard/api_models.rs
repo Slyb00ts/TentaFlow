@@ -40,9 +40,65 @@ pub struct UpdateModelEntryRequest {
     pub config_json: Option<String>,
 }
 
-/// GET /api/models - lista wpisow rejestru modeli z paginacja
+/// GET /api/models - alive models served by services_v2 (running or degraded).
+/// Phase 5 flip: legacy `model_registry` is no longer queried here. Pagination
+/// kept for compatibility — applied client-side to the JOIN result.
 pub fn handle_list_entries(pool: &DbPool, offset: i64, limit: i64) -> Result<(u16, String)> {
-    let items = db::repository::list_model_entries(pool, offset, limit)?;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Item {
+        id: i64,
+        service_id: i64,
+        model_name: String,
+        display_name: Option<String>,
+        capabilities: serde_json::Value,
+        context_length: Option<i64>,
+        quantization: Option<String>,
+        is_default: bool,
+        engine_id: String,
+        status: String,
+        transport: String,
+        deploy_method: String,
+        endpoint_url: Option<String>,
+    }
+
+    let conn = pool
+        .lock()
+        .map_err(|e| anyhow::anyhow!("pool lock poisoned: {}", e))?;
+    let rows = crate::services_repo::models::list_alive(&conn)?;
+    drop(conn);
+
+    let start = offset.max(0) as usize;
+    let take = if limit <= 0 {
+        rows.len()
+    } else {
+        limit as usize
+    };
+    let items: Vec<Item> = rows
+        .into_iter()
+        .skip(start)
+        .take(take)
+        .map(|m| {
+            let caps = serde_json::from_str::<serde_json::Value>(&m.capabilities)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+            Item {
+                id: m.id,
+                service_id: m.service_id,
+                model_name: m.model_name,
+                display_name: m.display_name,
+                capabilities: caps,
+                context_length: m.context_length,
+                quantization: m.quantization,
+                is_default: m.is_default,
+                engine_id: m.engine_id,
+                status: m.status,
+                transport: m.transport,
+                deploy_method: m.deploy_method,
+                endpoint_url: m.endpoint_url,
+            }
+        })
+        .collect();
     Ok((200, serde_json::to_string(&items)?))
 }
 
@@ -219,5 +275,65 @@ pub fn broadcast_alias_mutation(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_v2_endpoint {
+    use super::*;
+    use crate::services::transport::Transport;
+    use crate::services_repo::models::{insert as model_insert, NewModel};
+    use crate::services_repo::services::{
+        insert as service_insert, update_status, DeployMethod, NewService, ServiceStatus,
+    };
+
+    fn open_db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        std::sync::Arc::new(std::sync::Mutex::new(conn))
+    }
+
+    fn seed(db: &DbPool, engine: &str, status: ServiceStatus) -> i64 {
+        let conn = db.lock().unwrap();
+        let mut new = NewService::minimal(engine, DeployMethod::Docker, Transport::HttpDirect);
+        new.status = status;
+        let id = service_insert(&conn, &new).unwrap();
+        update_status(&conn, id, status).unwrap();
+        model_insert(
+            &conn,
+            &NewModel {
+                service_id: id,
+                model_name: format!("{}-m", engine),
+                display_name: None,
+                capabilities: r#"["chat"]"#.into(),
+                context_length: None,
+                quantization: None,
+                is_default: true,
+            },
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn v2_endpoint_returns_only_alive() {
+        let db = open_db();
+        seed(&db, "running-engine", ServiceStatus::Running);
+        seed(&db, "starting-engine", ServiceStatus::Starting);
+        seed(&db, "failed-engine", ServiceStatus::Failed);
+        seed(&db, "degraded-engine", ServiceStatus::Degraded);
+
+        let (status, body) = handle_list_entries(&db, 0, 100).unwrap();
+        assert_eq!(status, 200);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let engines: Vec<&str> = parsed
+            .iter()
+            .map(|v| v["engine_id"].as_str().unwrap())
+            .collect();
+        assert!(engines.contains(&"running-engine"));
+        assert!(engines.contains(&"degraded-engine"));
+        assert!(!engines.contains(&"starting-engine"));
+        assert!(!engines.contains(&"failed-engine"));
     }
 }

@@ -12,11 +12,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::Transaction;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::{
     build_new_service, host_os_supported, http_health_wait, models_from_manifest,
-    standard_engine_env, DeployError, DeployResult, DeployStrategy, PreparedDeploy, RuntimeHandle,
+    standard_engine_env, DeployError, DeployResult, DeployStrategy, LogSink, PreparedDeploy,
+    RuntimeHandle,
 };
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
 use crate::services::ports::PortAllocator;
@@ -27,6 +29,7 @@ pub struct PythonBundleDeploy {
     manifest: ServiceManifest,
     user_config: serde_json::Value,
     ports: Arc<PortAllocator>,
+    log_sink: Option<LogSink>,
     child: std::sync::Mutex<Option<Child>>,
 }
 
@@ -35,11 +38,13 @@ impl PythonBundleDeploy {
         manifest: ServiceManifest,
         user_config: serde_json::Value,
         ports: Arc<PortAllocator>,
+        log_sink: Option<LogSink>,
     ) -> Self {
         Self {
             manifest,
             user_config,
             ports,
+            log_sink,
             child: std::sync::Mutex::new(None),
         }
     }
@@ -270,10 +275,41 @@ impl DeployStrategy for PythonBundleDeploy {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd
+        if let Some(s) = &self.log_sink {
+            s.info(&format!(
+                "[python-bundle] spawn {} {} (PORT={})",
+                venv_python.display(),
+                entry.display(),
+                port
+            ));
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| DeployError::Spawn(format!("spawn python: {}", e)))?;
         let pid = child.id().map(|v| v as i64);
+
+        // Pipe stdout / stderr line-by-line to the log sink while the child runs.
+        if let Some(sink) = self.log_sink.clone() {
+            if let Some(stdout) = child.stdout.take() {
+                let s = sink.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        s.emit("log", &line);
+                    }
+                });
+            }
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        sink.emit("log", &line);
+                    }
+                });
+            }
+        }
+
         if let Ok(mut slot) = self.child.lock() {
             *slot = Some(child);
         }
@@ -450,7 +486,7 @@ mod tests {
             native_source_hash: String::new(),
         };
         let ports = Arc::new(PortAllocator::new((48_000, 48_010), HashSet::new()).unwrap());
-        let mut s = PythonBundleDeploy::new(manifest, serde_json::json!({}), ports);
+        let mut s = PythonBundleDeploy::new(manifest, serde_json::json!({}), ports, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Manifest(_)));
     }

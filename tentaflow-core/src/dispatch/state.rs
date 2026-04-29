@@ -17,6 +17,7 @@ use crate::mesh::peer_store::MeshPeerStore;
 use crate::metrics::RouterMetrics;
 use crate::routing::router::Router;
 use crate::routing::service_manager::ServiceManager;
+use crate::services::ports::PortAllocator;
 
 /// Wszystkie shared resources serwera. Handlery uzywaja przez `ctx.state`.
 pub struct AppState {
@@ -43,6 +44,10 @@ pub struct AppState {
     /// handler `NetworkRelayStatusRequest`. `None` gdy mesh w ogole nie wystartowal
     /// (np. przy testach lub `mesh.enabled=false`).
     pub mesh_relay_health: Option<Arc<parking_lot::RwLock<crate::mesh::relay_health::RelayHealth>>>,
+    /// Shared port allocator owned by the supervisor and consumed by the
+    /// unified service deploy pipeline (`services::deploy::deploy`). `None`
+    /// only in tests / when the supervisor failed to initialise.
+    pub port_allocator: Option<Arc<PortAllocator>>,
 }
 
 impl AppState {
@@ -87,6 +92,7 @@ impl AppState {
             meeting_manager,
             vnc_tunnels: Arc::new(dashmap::DashMap::new()),
             mesh_relay_health: None,
+            port_allocator: None,
         })
     }
 }
