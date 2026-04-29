@@ -268,23 +268,57 @@ pub async fn start_mesh_pipeline(
                     let mut ticker = tokio::time::interval(Duration::from_secs(15));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+                    // Counter consecutive failures per peer. Po N failures
+                    // przelaczamy z hint-based dial na pure DHT lookup -
+                    // hints z parowania moga byc stale (peer dostal nowy
+                    // IP po restarcie), iroh.connect() z addresses sprobuje
+                    // tylko ich i nie zrobi address-lookup. connect_to_peer
+                    // (no addresses) wymusza pkarr/mDNS lookup.
+                    let failure_counts: Arc<dashmap::DashMap<String, u32>> =
+                        Arc::new(dashmap::DashMap::new());
+                    const FAILURE_THRESHOLD: u32 = 2;
+
                     let run_iteration = |trigger: &str| {
                         let peers = store.list();
                         let mut redialed = 0usize;
                         for p in peers.iter() {
                             if p.node_id == self_id || p.quic_connected {
+                                // Reset counter po success connection.
+                                failure_counts.remove(&p.node_id);
                                 continue;
                             }
                             let qm2 = qm.clone();
                             let nid = p.node_id.clone();
                             let hints = trusted_contact_hints_for_peer(sec.as_ref(), &nid);
+                            let counts = failure_counts.clone();
+                            let fail_count = counts.get(&nid).map(|v| *v).unwrap_or(0);
                             tokio::spawn(async move {
-                                if let Some(hints) = hints {
-                                    if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
-                                        debug!(peer_id = %nid, "Reconnect loop via trusted hints: {}", e);
+                                let result = if fail_count >= FAILURE_THRESHOLD {
+                                    // Force pure DHT lookup - peer mogl dostac nowy IP
+                                    if fail_count == FAILURE_THRESHOLD {
+                                        info!(
+                                            peer_id = %nid,
+                                            "reconnect: hints stale (>={} failures), fallback do pure DHT lookup",
+                                            FAILURE_THRESHOLD
+                                        );
                                     }
-                                } else if let Err(e) = qm2.connect_to_peer(&nid, dummy).await {
-                                    debug!(peer_id = %nid, "Reconnect loop: {}", e);
+                                    qm2.connect_to_peer(&nid, dummy).await
+                                } else if let Some(hints) = hints {
+                                    qm2.connect_to_peer_with_hints(&hints).await
+                                } else {
+                                    qm2.connect_to_peer(&nid, dummy).await
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        counts.remove(&nid);
+                                    }
+                                    Err(e) => {
+                                        counts
+                                            .entry(nid.clone())
+                                            .and_modify(|v| *v = v.saturating_add(1))
+                                            .or_insert(1);
+                                        debug!(peer_id = %nid, fail_count = ?counts.get(&nid).map(|v| *v), "Reconnect loop fail: {}", e);
+                                    }
                                 }
                             });
                             redialed += 1;
@@ -292,19 +326,43 @@ pub async fn start_mesh_pipeline(
                         if let Ok(trusted) = crate::db::repository::list_trusted_nodes(&sec.db) {
                             for node in trusted {
                                 if node.node_id == self_id || store.is_quic_connected(&node.node_id) {
+                                    failure_counts.remove(&node.node_id);
                                     continue;
                                 }
                                 if peers.iter().any(|p| p.node_id == node.node_id) {
                                     continue;
                                 }
-                                let Some(hints) = trusted_contact_hints_for_peer(sec.as_ref(), &node.node_id) else {
-                                    continue;
-                                };
                                 let qm2 = qm.clone();
                                 let nid = node.node_id.clone();
+                                let counts = failure_counts.clone();
+                                let fail_count = counts.get(&nid).map(|v| *v).unwrap_or(0);
+                                let hints = trusted_contact_hints_for_peer(sec.as_ref(), &nid);
                                 tokio::spawn(async move {
-                                    if let Err(e) = qm2.connect_to_peer_with_hints(&hints).await {
-                                        debug!(peer_id = %nid, "Reconnect loop via trusted-only hints: {}", e);
+                                    let result = if fail_count >= FAILURE_THRESHOLD {
+                                        if fail_count == FAILURE_THRESHOLD {
+                                            info!(
+                                                peer_id = %nid,
+                                                "reconnect: hints stale (>={} failures), fallback do pure DHT lookup",
+                                                FAILURE_THRESHOLD
+                                            );
+                                        }
+                                        qm2.connect_to_peer(&nid, dummy).await
+                                    } else if let Some(hints) = hints {
+                                        qm2.connect_to_peer_with_hints(&hints).await
+                                    } else {
+                                        qm2.connect_to_peer(&nid, dummy).await
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            counts.remove(&nid);
+                                        }
+                                        Err(e) => {
+                                            counts
+                                                .entry(nid.clone())
+                                                .and_modify(|v| *v = v.saturating_add(1))
+                                                .or_insert(1);
+                                            debug!(peer_id = %nid, "Reconnect loop trusted-only fail: {}", e);
+                                        }
                                     }
                                 });
                                 redialed += 1;
