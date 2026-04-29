@@ -10,12 +10,14 @@
 import { Sfx } from '/js/lib/sfx.js';
 
 const VARIANT_CLASS = {
-  primary:       'tf-btn-primary',
-  secondary:     'tf-btn-secondary',
-  ghost:         'tf-btn-ghost',
-  danger:        'tf-btn-danger',
+  primary:        'tf-btn-primary',
+  secondary:      'tf-btn-secondary',
+  ghost:          'tf-btn-ghost',
+  outline:        'tf-btn-outline',
+  danger:         'tf-btn-danger',
   'danger-solid': 'tf-btn-danger-solid',
-  success:       'tf-btn-success',
+  'danger-outline': 'tf-btn-danger-outline',
+  success:        'tf-btn-success',
 };
 
 class TfButton extends HTMLElement {
@@ -64,7 +66,7 @@ class TfButton extends HTMLElement {
         return;
       }
       const variant = this.getAttribute('variant') || 'primary';
-      if (variant === 'primary' || variant === 'secondary' || variant === 'danger' || variant === 'danger-solid' || variant === 'success') {
+      if (variant === 'primary' || variant === 'secondary' || variant === 'danger' || variant === 'danger-solid' || variant === 'danger-outline' || variant === 'success') {
         Sfx.play('ui-click');
       }
     });
