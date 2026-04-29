@@ -216,6 +216,66 @@ async fn run_server(args: Args) -> Result<()> {
         info!(node_id = %local_node_id_str, "Local node seeded in peer_store");
     }
 
+    // === Phase 4: services supervisor over services_v2 ===
+    // Runs alongside legacy router restore paths until Phase 5 swaps call sites.
+    {
+        use std::collections::HashSet;
+        use tentaflow_core::services::ports::PortAllocator;
+        use tentaflow_core::services::supervisor::Supervisor;
+        use tentaflow_core::services_repo::services as services_v2_repo;
+
+        let services_runtime_cfg = config.services_runtime.clone();
+
+        // Reserve ports already owned by alive services_v2 rows so the allocator
+        // never hands them to a parallel deploy.
+        let mut excluded: HashSet<u16> = HashSet::new();
+        if let Ok(conn) = db.lock() {
+            if let Ok(rows) = services_v2_repo::list_supervised(&conn) {
+                for row in rows {
+                    if let Some(p) = row.runtime_port {
+                        excluded.insert(p);
+                    }
+                    if let Some(p) = row.sidecar_quic_port {
+                        excluded.insert(p);
+                    }
+                }
+            }
+        }
+
+        match PortAllocator::new(services_runtime_cfg.port_range, excluded) {
+            Ok(allocator) => {
+                let port_allocator = Arc::new(allocator);
+                let (supervisor, snapshot_rx) =
+                    Supervisor::new(&services_runtime_cfg, db.clone(), port_allocator.clone());
+
+                // First tick is synchronous so the initial snapshot is non-empty
+                // before the router goes online. Failures are logged but not fatal.
+                if let Err(e) = supervisor.run_first_tick().await {
+                    tracing::warn!("services supervisor: first_tick failed: {}", e);
+                }
+
+                let supervisor_handle = supervisor.spawn();
+                info!(
+                    "Services supervisor started (interval={}ms, port_range={:?})",
+                    services_runtime_cfg.health_check_interval_ms,
+                    services_runtime_cfg.port_range
+                );
+                // The receiver / handle are not yet consumed by anyone; Phase 5
+                // will plumb the snapshot into the router. Keep them alive.
+                let _supervisor_snapshot_rx = snapshot_rx;
+                let _supervisor_handle = supervisor_handle;
+                let _supervisor_port_allocator = port_allocator;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Services supervisor disabled: invalid port_range {:?}: {}",
+                    services_runtime_cfg.port_range,
+                    e
+                );
+            }
+        }
+    }
+
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
     let router: Arc<Router> = Arc::new(Router::new(config.clone(), Some(db.clone()))?);

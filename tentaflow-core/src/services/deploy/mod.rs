@@ -250,6 +250,66 @@ pub async fn deploy(
     })
 }
 
+/// Re-spawns the runtime side of an existing service (process / container)
+/// without touching `services_v2`. Used by the supervisor's restart loop —
+/// the caller is expected to update `runtime_pid/port/...` on the existing row
+/// after this returns.
+///
+/// Conceptually this drives `DeployStrategy::prepare()` only; the `commit`
+/// half is skipped because the DB row is already there.
+pub async fn respawn(
+    engine_id: &str,
+    deploy_method: DeployMethod,
+    config_json: &str,
+    ports: Arc<PortAllocator>,
+) -> DeployResult<RuntimeHandle> {
+    let manifest = crate::services::manifest::registry()
+        .by_id(engine_id)
+        .cloned()
+        .ok_or_else(|| {
+            DeployError::Manifest(format!(
+                "respawn: manifest '{}' not found in registry",
+                engine_id
+            ))
+        })?;
+
+    let user_config: serde_json::Value = if config_json.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(config_json)
+            .map_err(|e| DeployError::Other(format!("respawn: parse config_json: {}", e)))?
+    };
+
+    let mut strategy: Box<dyn DeployStrategy> = match deploy_method {
+        DeployMethod::NativeEmbedded => {
+            Box::new(embedded::EmbeddedDeploy::new(manifest, user_config))
+        }
+        DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new(
+            manifest,
+            user_config,
+            ports.clone(),
+        )),
+        DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
+            manifest,
+            user_config,
+            ports.clone(),
+        )),
+        DeployMethod::Docker => Box::new(docker::DockerDeploy::new(
+            manifest,
+            user_config,
+            ports.clone(),
+        )),
+        DeployMethod::External => {
+            return Err(DeployError::Manifest(
+                "respawn: external services are not respawnable".to_string(),
+            ));
+        }
+    };
+
+    let prepared = strategy.prepare().await?;
+    Ok(prepared.runtime)
+}
+
 // ----- DB helpers -----------------------------------------------------------
 
 /// Runs a closure inside a single SQLite transaction held under the pool's
@@ -482,6 +542,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn respawn_does_not_insert_to_db() {
+        // First, create a real service row via deploy() to act as the
+        // "existing" service row.
+        let db = open_db();
+        let ports = Arc::new(PortAllocator::new((46_500, 46_599), Default::default()).unwrap());
+        let manifest = dummy_manifest("respawn-emb", NativeRuntime::Embedded);
+        let cfg = serde_json::json!({});
+        let outcome = deploy(
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            ports.clone(),
+            db.clone(),
+        )
+        .await
+        .expect("seed deploy succeeds");
+
+        let count_before: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM services_v2", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // respawn: should produce a RuntimeHandle without inserting anywhere.
+        // Since the embedded manifest needs to be in the global manifest registry
+        // for respawn() to find it, this branch is exercised only for engines
+        // that exist in the registry. Use a manifest id that we know is missing
+        // and assert the expected error path — proving the function never
+        // touches the DB even on the unhappy path.
+        let err = respawn(
+            "respawn-not-in-registry",
+            DeployMethod::NativeEmbedded,
+            "{}",
+            ports.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DeployError::Manifest(_)));
+
+        let count_after: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM services_v2", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count_before, count_after, "respawn must not touch the DB");
+        // Sanity: the seed deploy did create exactly one row.
+        assert_eq!(count_after, 1);
+        let _ = outcome;
     }
 
     #[tokio::test]
