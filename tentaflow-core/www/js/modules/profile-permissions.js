@@ -236,14 +236,41 @@ async function refreshCollectorStatus(container) {
         badge.textContent = `FOUND${status.version ? ' · ' + status.version.split('\n')[0].slice(0, 24) : ''}`;
         badge.style.background = 'rgba(34,197,94,0.14)';
         badge.style.color = 'var(--tf-success, #22c55e)';
+        badge.removeAttribute('title');
       } else {
         badge.textContent = 'N/A';
         badge.style.background = 'rgba(245,158,11,0.14)';
         badge.style.color = 'var(--tf-warning, #f59e0b)';
+        // Backend wbudowuje konkretna komende instalacji per-distro w note
+        // (linia po '\n\nInstall: '). Pokaz w tooltipie + pod inputem.
+        if (status.note) {
+          badge.title = status.note;
+          badge.style.cursor = 'help';
+        }
       }
     }
+    // Pod inputem - jezeli backend zwrocil sciezke binarki, pokaz jako placeholder.
+    // Jezeli brak - pokaz install hint pod row.
     if (input && status.path && !input.value) {
       input.placeholder = status.path;
+    }
+    // Render install hint inline pod row gdy collector niedostepny.
+    if (!status.available && status.note) {
+      const row = badge?.closest('.pp-path-row');
+      if (row) {
+        // Sprawdz czy hint juz istnieje, jak nie - dodaj.
+        let hintEl = row.querySelector('.pp-install-hint');
+        if (!hintEl) {
+          hintEl = document.createElement('div');
+          hintEl.className = 'pp-install-hint';
+          row.insertAdjacentElement('afterend', hintEl);
+        }
+        // Wyciagnij linie 'Install: <command>' z note.
+        const m = String(status.note).match(/Install:\s*(.+)$/);
+        if (m) {
+          hintEl.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px; margin-right:6px;"><path d="M12 2L2 22h20L12 2z"/><path d="M12 9v6M12 18h.01"/></svg>Install on this system: <code>${m[1].replace(/</g, '&lt;')}</code>`;
+        }
+      }
     }
   }
 }
