@@ -453,6 +453,61 @@ pub fn parse_hf_config(
     })
 }
 
+/// Buduje string `--key val --key val ...` do wpisania w VLLM_ARGS env.
+/// Zalacza tylko parametry rozne od vllm defaults zeby nie zasmiecac.
+/// Wspoldzielone miedzy api_deploy_recommend (endpoint dla GUI) i runner.rs
+/// (auto-defaults dla bundle native gdy user nie ustawil Advanced).
+pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    parts.push("--dtype".into());
+    parts.push("auto".into());
+    parts.push("--gpu-memory-utilization".into());
+    parts.push(format!("{:.2}", input.gpu_memory_utilization));
+    parts.push("--max-model-len".into());
+    parts.push(input.max_model_len.to_string());
+    parts.push("--max-num-seqs".into());
+    parts.push(input.max_num_seqs.to_string());
+    parts.push("--max-num-batched-tokens".into());
+    parts.push(input.max_model_len.max(8192).to_string());
+
+    // chunked prefill TYLKO dla nie-multimodal: vllm dla VL modeli (Gemma 4,
+    // Qwen 2.5 VL itp.) Forcuje --disable_chunked_mm_input wewnetrznie i
+    // chunked-prefill staje sie no-op. Brak flagi nie szkodzi text-only.
+    if !spec.has_vision && !spec.has_audio {
+        parts.push("--enable-chunked-prefill".into());
+    }
+
+    if input.tensor_parallel > 1 {
+        parts.push("--tensor-parallel-size".into());
+        parts.push(input.tensor_parallel.to_string());
+    }
+    if input.pipeline_parallel > 1 {
+        parts.push("--pipeline-parallel-size".into());
+        parts.push(input.pipeline_parallel.to_string());
+    }
+    if input.kv_cache_dtype != "auto" {
+        parts.push("--kv-cache-dtype".into());
+        parts.push(input.kv_cache_dtype.clone());
+    }
+
+    if let Some(q) = &spec.quantization {
+        let q_norm = q.to_lowercase().replace('-', "_");
+        match q_norm.as_str() {
+            "awq" => { parts.push("--quantization".into()); parts.push("awq".into()); }
+            "gptq" => { parts.push("--quantization".into()); parts.push("gptq".into()); }
+            "fp8" => { parts.push("--quantization".into()); parts.push("fp8".into()); }
+            "int4" | "int4_autoround" | "auto_round" => {
+                parts.push("--quantization".into());
+                parts.push("auto_round".into());
+            }
+            _ => {}
+        }
+    }
+
+    parts.join(" ")
+}
+
 /// Pobierz HF config.json przez HTTP. Wymaga internet + ewentualnie HF token
 /// dla gated repo (przekazany jako Bearer).
 pub async fn fetch_hf_config(
