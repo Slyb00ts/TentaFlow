@@ -48,21 +48,20 @@ import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
 import PoseScreen from '/js/modules/pose.js';
-import ProfileReportV2View from '/js/modules/profile-report-v2.js';
+import ProfileReportView from '/js/modules/profile-report.js';
 import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
 import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
 
-// Adapter: V2 view eksponuje statyczne `render(container, params)`, podczas
-// gdy Router oczekuje `show(params)` lub `render()/mount()`. Owijamy V2 w
-// minimalny screen object zeby Router.navigate('profile-report', ...) z
-// mesh-detail-nsight trafial w nowy multi-source widok.
+// Adapter: profile-report eksponuje statyczne `render(container, params)`,
+// podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
+// object zeby Router.navigate('profile-report', ...) zadzialalo.
 const ProfileReportScreen = {
   title: 'Profile Report',
   async show(params = {}) {
     const main = document.getElementById('main');
     if (!main) return;
-    await ProfileReportV2View.render(main, params);
+    await ProfileReportView.render(main, params);
   },
 };
 

@@ -11,6 +11,12 @@
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-searchbox.js';
+import { I18n } from '/js/i18n.js';
+
+function ti(key, vars, fallback) {
+  const v = I18n.t(key, vars || null);
+  return v === key && fallback != null ? fallback : v;
+}
 
 // ----- helpers ---------------------------------------------------------------
 
@@ -441,18 +447,18 @@ export class UnifiedTimeline {
     const toolbar = document.createElement('div');
     toolbar.className = 'tf-timeline-toolbar';
     toolbar.innerHTML = `
-      <tf-button variant="ghost" size="sm" data-act="zoom-in">Zoom in</tf-button>
-      <tf-button variant="ghost" size="sm" data-act="zoom-out">Zoom out</tf-button>
-      <tf-button variant="ghost" size="sm" data-act="fit">Fit</tf-button>
-      <div class="tl-pps" role="group" aria-label="time scale">
-        <button data-pps="1000">1 s/px</button>
-        <button data-pps="100" class="active">100 ms/px</button>
-        <button data-pps="10">10 ms/px</button>
+      <tf-button variant="ghost" size="sm" data-act="zoom-in">${ti('profiling.timeline.btn_zoom_in', null, 'Zoom in')}</tf-button>
+      <tf-button variant="ghost" size="sm" data-act="zoom-out">${ti('profiling.timeline.btn_zoom_out', null, 'Zoom out')}</tf-button>
+      <tf-button variant="ghost" size="sm" data-act="fit">${ti('profiling.timeline.btn_fit', null, 'Fit')}</tf-button>
+      <div class="tl-pps" role="group" aria-label="${ti('profiling.timeline.scale_aria', null, 'time scale')}">
+        <button data-pps="1000">${ti('profiling.timeline.scale_1s', null, '1 s/px')}</button>
+        <button data-pps="100" class="active">${ti('profiling.timeline.scale_100ms', null, '100 ms/px')}</button>
+        <button data-pps="10">${ti('profiling.timeline.scale_10ms', null, '10 ms/px')}</button>
       </div>
-      <tf-button variant="ghost" size="sm" data-act="lanes">Lanes ▾</tf-button>
-      <tf-searchbox placeholder="Search symbol or kernel…" debounce="200"></tf-searchbox>
+      <tf-button variant="ghost" size="sm" data-act="lanes">${ti('profiling.timeline.btn_lanes', null, 'Lanes ▾')}</tf-button>
+      <tf-searchbox placeholder="${ti('profiling.timeline.search_ph', null, 'Search symbol or kernel…')}" debounce="200"></tf-searchbox>
       <span class="tl-spacer"></span>
-      <tf-chip clickable status="info" data-act="range-mode">Range select</tf-chip>
+      <tf-chip clickable status="info" data-act="range-mode">${ti('profiling.timeline.range_chip', null, 'Range select')}</tf-chip>
     `;
     this.container.appendChild(toolbar);
     this.toolbar = toolbar;
@@ -488,10 +494,10 @@ export class UnifiedTimeline {
     const hint = document.createElement('div');
     hint.className = 'tf-timeline-hint';
     hint.innerHTML = `
-      <span><span class="kbd">Drag</span> pan</span>
-      <span><span class="kbd">Scroll</span> zoom</span>
-      <span><span class="kbd">Shift</span>+drag select range</span>
-      <span><span class="kbd">F</span> fit · <span class="kbd">←/→</span> pan · <span class="kbd">+/-</span> zoom · <span class="kbd">Esc</span> clear</span>
+      <span><span class="kbd">${ti('profiling.timeline.hint_drag_word', null, 'Drag')}</span> ${ti('profiling.timeline.hint_drag', null, 'pan')}</span>
+      <span><span class="kbd">${ti('profiling.timeline.hint_scroll_word', null, 'Scroll')}</span> ${ti('profiling.timeline.hint_scroll', null, 'zoom')}</span>
+      <span><span class="kbd">${ti('profiling.timeline.hint_shift_word', null, 'Shift')}</span>${ti('profiling.timeline.hint_shift_drag', null, '+drag select range')}</span>
+      <span>${ti('profiling.timeline.hint_keys', null, 'F fit · ←/→ pan · +/- zoom · Esc clear')}</span>
     `;
     left.appendChild(hint);
 
@@ -1157,21 +1163,21 @@ export class UnifiedTimeline {
     const nm = (p.name_id !== undefined && this.names[p.name_id]) || ev.category;
     const rows = [];
     rows.push(`<div class="t-title">${nm}</div>`);
-    rows.push(`<div class="t-row"><b>cat</b> ${ev.category}</div>`);
-    rows.push(`<div class="t-row"><b>t</b> ${fmtTime(ev.t_start_ns)} → ${fmtTime(ev.t_end_ns)}</div>`);
-    rows.push(`<div class="t-row"><b>dur</b> ${dur > 0 ? fmtTime(dur) : 'point'}</div>`);
-    if (p.device_id !== undefined) rows.push(`<div class="t-row"><b>dev</b> ${p.device_id}</div>`);
-    if (p.bytes !== undefined) rows.push(`<div class="t-row"><b>bytes</b> ${fmtBytes(p.bytes)}</div>`);
-    if (p.watts !== undefined) rows.push(`<div class="t-row"><b>W</b> ${p.watts.toFixed(1)}</div>`);
-    if (p.compute_pct !== undefined) rows.push(`<div class="t-row"><b>SM%</b> ${p.compute_pct.toFixed(1)}</div>`);
-    if (p.util_pct !== undefined) rows.push(`<div class="t-row"><b>util%</b> ${p.util_pct.toFixed(1)} core ${p.core ?? ev.lane_hint}</div>`);
+    rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_cat', null, 'cat')}</b> ${ev.category}</div>`);
+    rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_t', null, 't')}</b> ${fmtTime(ev.t_start_ns)} → ${fmtTime(ev.t_end_ns)}</div>`);
+    rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_dur', null, 'dur')}</b> ${dur > 0 ? fmtTime(dur) : ti('profiling.timeline.tt_dur_point', null, 'point')}</div>`);
+    if (p.device_id !== undefined) rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_dev', null, 'dev')}</b> ${p.device_id}</div>`);
+    if (p.bytes !== undefined) rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_bytes', null, 'bytes')}</b> ${fmtBytes(p.bytes)}</div>`);
+    if (p.watts !== undefined) rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_w', null, 'W')}</b> ${p.watts.toFixed(1)}</div>`);
+    if (p.compute_pct !== undefined) rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_sm', null, 'SM%')}</b> ${p.compute_pct.toFixed(1)}</div>`);
+    if (p.util_pct !== undefined) rows.push(`<div class="t-row"><b>${ti('profiling.timeline.tt_util', null, 'util%')}</b> ${p.util_pct.toFixed(1)} ${ti('profiling.timeline.tt_core', null, 'core')} ${p.core ?? ev.lane_hint}</div>`);
     if (p.ifaceNameId !== undefined) {
       const ifaceLabel = this.names[p.ifaceNameId] || `iface_${p.ifaceNameId}`;
-      rows.push(`<div class="t-row"><b>${ifaceLabel}</b> rx ${fmtBytes(p.rx_bps || 0)}/s · tx ${fmtBytes(p.tx_bps || 0)}/s</div>`);
+      rows.push(`<div class="t-row"><b>${ifaceLabel}</b> ${ti('profiling.timeline.tt_iface_rx_tx', { rx: fmtBytes(p.rx_bps || 0), tx: fmtBytes(p.tx_bps || 0) }, `rx ${fmtBytes(p.rx_bps || 0)}/s · tx ${fmtBytes(p.tx_bps || 0)}/s`)}</div>`);
     }
     if (p.deviceNameId !== undefined && p.read_bps !== undefined) {
       const devLabel = this.names[p.deviceNameId] || `disk_${p.deviceNameId}`;
-      rows.push(`<div class="t-row"><b>${devLabel}</b> r ${fmtBytes(p.read_bps)}/s · w ${fmtBytes(p.write_bps)}/s</div>`);
+      rows.push(`<div class="t-row"><b>${devLabel}</b> ${ti('profiling.timeline.tt_disk_rw', { r: fmtBytes(p.read_bps), w: fmtBytes(p.write_bps) }, `r ${fmtBytes(p.read_bps)}/s · w ${fmtBytes(p.write_bps)}/s`)}</div>`);
     }
 
     this.tooltip.innerHTML = rows.join('');
@@ -1185,7 +1191,7 @@ export class UnifiedTimeline {
   // ---- selection panel (stats from current range) ----
   _renderSelectionPanel() {
     if (this._rangeStartNs === null || this._rangeEndNs === null) {
-      this.panel.innerHTML = `<div class="sp-empty">Drag with <b>Shift</b> to select a range — cross-source stats will appear here.</div>`;
+      this.panel.innerHTML = `<div class="sp-empty">${ti('profiling.timeline.selection_empty', null, 'Drag with <b>Shift</b> to select a range — cross-source stats will appear here.')}</div>`;
       return;
     }
     const s = this._rangeStartNs;
@@ -1246,7 +1252,7 @@ export class UnifiedTimeline {
       vendorBlocks.push(`
         <div class="v-col">
           <div class="v-name" style="color:${pal.stroke}">${label}</div>
-          ${top.map(([nm, d]) => `<div class="v-row">${nm} ${(d / total * 100).toFixed(0)}%</div>`).join('') || '<div class="v-row" style="color:var(--text-3); font-style:italic">no data</div>'}
+          ${top.map(([nm, d]) => `<div class="v-row">${nm} ${(d / total * 100).toFixed(0)}%</div>`).join('') || `<div class="v-row" style="color:var(--text-3); font-style:italic">${ti('profiling.timeline.selection_no_data', null, 'no data')}</div>`}
         </div>`);
     }
 
@@ -1260,30 +1266,37 @@ export class UnifiedTimeline {
         <span class="duration-pill">${fmtTime(dur)}</span>
       </div>
       ${hasCpu ? `<div class="sp-block">
-        <div class="sp-title">Top CPU symbols</div>
+        <div class="sp-title">${ti('profiling.timeline.selection_top_cpu', null, 'Top CPU symbols')}</div>
         <div class="sp-list">${cpuRows}</div>
       </div>` : ''}
       ${vendorBlocks.length ? `<div class="sp-block">
-        <div class="sp-title">Top GPU kernels</div>
+        <div class="sp-title">${ti('profiling.timeline.selection_top_gpu', null, 'Top GPU kernels')}</div>
         <div class="sp-vendor-grid">${vendorBlocks.join('')}</div>
       </div>` : ''}
       <div class="sp-block">
-        <div class="sp-title">Power & IO</div>
+        <div class="sp-title">${ti('profiling.timeline.selection_power_io', null, 'Power & IO')}</div>
         <div class="sp-list">
-          <div class="sp-item"><span class="sym">Avg power</span><span class="pct">${avgPower.toFixed(0)} W</span></div>
-          <div class="sp-item"><span class="sym">Total energy</span><span class="pct">${(totalEnergy / 1000).toFixed(2)} kJ</span></div>
-          <div class="sp-item"><span class="sym">Disk read</span><span class="pct">${fmtBytes(diskRead)}</span></div>
-          <div class="sp-item"><span class="sym">Disk write</span><span class="pct">${fmtBytes(diskWrite)}</span></div>
+          <div class="sp-item"><span class="sym">${ti('profiling.timeline.selection_avg_power', null, 'Avg power')}</span><span class="pct">${avgPower.toFixed(0)} W</span></div>
+          <div class="sp-item"><span class="sym">${ti('profiling.timeline.selection_total_energy', null, 'Total energy')}</span><span class="pct">${(totalEnergy / 1000).toFixed(2)} kJ</span></div>
+          <div class="sp-item"><span class="sym">${ti('profiling.timeline.selection_disk_read', null, 'Disk read')}</span><span class="pct">${fmtBytes(diskRead)}</span></div>
+          <div class="sp-item"><span class="sym">${ti('profiling.timeline.selection_disk_write', null, 'Disk write')}</span><span class="pct">${fmtBytes(diskWrite)}</span></div>
         </div>
       </div>
-      ${hasCpu ? `<div class="open-flame">
-        <tf-button variant="ghost" size="sm" data-act="open-flame">Open in flamegraph →</tf-button>
-      </div>` : ''}
+      <div class="open-flame">
+        <tf-button variant="ghost" size="sm" data-act="expand-range">${ti('profiling.timeline.selection_expand_range', null, 'Expand range →')}</tf-button>
+        ${hasCpu ? `<tf-button variant="ghost" size="sm" data-act="open-flame">${ti('profiling.timeline.selection_open_flame', null, 'Open in flamegraph →')}</tf-button>` : ''}
+      </div>
     `;
     const flameBtn = this.panel.querySelector('[data-act="open-flame"]');
     if (flameBtn) {
       flameBtn.addEventListener('click', () => {
         this._emit('openFlamegraph', { startNs: s, endNs: en });
+      });
+    }
+    const expandBtn = this.panel.querySelector('[data-act="expand-range"]');
+    if (expandBtn) {
+      expandBtn.addEventListener('click', () => {
+        this._emit('expandRange', { startNs: s, endNs: en });
       });
     }
   }
@@ -1295,5 +1308,82 @@ export class UnifiedTimeline {
     return mx || NS_PER_S;
   }
 }
+
+// =============================================================================
+// TimelineView — adapter wiring UnifiedTimeline into profile-report.
+// Profile report dispatcher (renderLazyTab) wymaga `render(host, ctx)`. Tu
+// hostujemy class UnifiedTimeline w kontenerze i przepinamy event
+// `openFlamegraph` na <tf-tabs> rodzica zeby panel "Open in flamegraph" dzialal.
+// =============================================================================
+
+export const TimelineView = {
+  render(host, ctx) {
+    if (!host) return;
+    const report = ctx?.report || {};
+    const events = ctx?.events || report.events || [];
+    if (!events.length) {
+      host.innerHTML = `
+        <div class="pr-card">
+          <div class="pr-banner-degraded">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+            <div>${ti('profiling.report.no_timeline_data', null, '<strong>No timeline data.</strong> This report contains zero events.')}</div>
+          </div>
+        </div>`;
+      return;
+    }
+
+    // Tear down previous instance jesli host byl juz uzywany — chroni przed
+    // wyciekiem ResizeObserver gdy uzytkownik przelacza taby tam i z powrotem.
+    if (host._timelineInstance && typeof host._timelineInstance.destroy === 'function') {
+      try { host._timelineInstance.destroy(); } catch (_) { /* noop */ }
+      host._timelineInstance = null;
+    }
+
+    host.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'pr-card pr-timeline-card';
+    host.appendChild(card);
+
+    const mount = document.createElement('div');
+    card.appendChild(mount);
+
+    const tl = new UnifiedTimeline(mount, {
+      events,
+      names: report.names || {},
+      frames: report.frames || [],
+      stacks: report.stacks || [],
+      collectors: report.collectors || [],
+      duration_ns: report.duration_ns || 0,
+    });
+
+    // Bridge "Open in flamegraph" → switch to flame tab via <tf-tabs>.
+    tl.on('openFlamegraph', () => {
+      const root = host.closest('[id]')?.ownerDocument || document;
+      const tabs = root.querySelector('#pr-tabs');
+      if (tabs && typeof tabs.setAttribute === 'function') {
+        tabs.setAttribute('value', 'flame');
+        tabs.dispatchEvent(new CustomEvent('change', { detail: { value: 'flame' } }));
+      }
+    });
+
+    // Bridge "Expand range" → open Range Detail modal (mockup #14).
+    // Module is loaded on demand to keep the timeline's initial cost low.
+    tl.on('expandRange', async ({ startNs, endNs }) => {
+      try {
+        const mod = await import('./profile-range-detail.js');
+        mod.openRangeDetailModal({
+          report,
+          range: { tStartNs: startNs, tEndNs: endNs },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[range-detail] failed to open:', err);
+      }
+    });
+
+    // Cleanup hook for future host re-renders.
+    host._timelineInstance = tl;
+  },
+};
 
 export default UnifiedTimeline;

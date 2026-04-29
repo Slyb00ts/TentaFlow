@@ -12,6 +12,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, formatDate } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { createRefresher } from '/js/lib/refresh.js';
+import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
 
 let metricsRefresher = null;
 let auditUnsubscribe = null;
@@ -241,7 +242,7 @@ function updateMetrics(m) {
 
 function updateMeshStat(nodes) {
   const total = nodes.length;
-  const online = nodes.filter((n) => n.status === 'online' || n.isSelf).length;
+  const online = nodes.filter((n) => isOnlineHelper(n) || n.isSelf).length;
   setText('stat-mesh-value', I18n.t('home.stat_mesh_value', { online }));
   const offline = total - online;
   setText('stat-mesh-sub', offline > 0

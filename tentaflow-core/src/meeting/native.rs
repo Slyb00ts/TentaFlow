@@ -84,6 +84,29 @@ fn locate_meeting_binary() -> Result<std::path::PathBuf> {
     ))
 }
 
+/// Provisioning safety net: gdy deploy nie utrwalil sciezki do Chromium
+/// (np. teams-bot byl deployed ze starego buildu, albo Chromium zostal
+/// odinstalowany od deployu), wolamy provisioner przed spawnem. Blad jest
+/// logowany ale nie blokuje spawn — bot wtedy sam zwroci czytelny error
+/// 'Nie znaleziono Chromium/Chrome'.
+async fn ensure_chromium_for_spawn() -> Option<String> {
+    use std::sync::Arc;
+    let log: crate::deploy::python_venv::LogSink = Arc::new(|line: &str| {
+        info!(target = "chromium", "{}", line);
+    });
+    match crate::deploy::chromium_provisioner::ensure_chromium(&log).await {
+        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        Err(e) => {
+            warn!(
+                "chromium provisioner spawn-time fallback nieudany: {}. \
+                 Bot uzyje wlasnego find_chromium_executable.",
+                e
+            );
+            None
+        }
+    }
+}
+
 fn which_in_path(name: &str) -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -102,11 +125,20 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
     let bin = locate_meeting_binary()?;
     let name = container_name(req.session_id);
 
+    // Last-resort safety net: jesli deploy chromium_provisioner z jakiegos
+    // powodu nie zostawil systemowego/cached Chrome, wykryjmy to TUTAJ i
+    // pobierzmy go zanim spawnujemy bota — meeting nie wystartuje bez
+    // przegladarki, a bot nie potrafi pobierac sam.
+    let chromium_env = ensure_chromium_for_spawn().await;
+
     // Bez `--config` — bot uzyje default `meeting.toml` ktory nie istnieje w
     // cwd subprocesu, wiec zalanduje w `from_env()`. Wszystkie potrzebne
     // wartosci podajemy jako env (kontrakt 1:1 z Dockerem, gdzie tez nie ma
     // pliku konfig — env-only).
     let mut cmd = Command::new(&bin);
+    if let Some(chrome) = chromium_env {
+        cmd.env("TENTAFLOW_CHROMIUM_PATH", chrome);
+    }
     cmd.env("MEETING_URL", &req.meeting_url)
         .env("MEETING_ID", &req.meeting_key)
         .env("BOT_SECRET_KEY_HEX", &req.secret_key_hex)

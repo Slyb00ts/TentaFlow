@@ -43,10 +43,14 @@ impl LocalSttHandler {
         request: &TranscriptionRequest,
     ) -> anyhow::Result<TranscriptionResponse> {
         // Zbuduj TranscribeParams z TranscriptionRequest.
-        // Domyslny jezyk: polski (jesli request.language nie jest ustawiony)
+        // Brak language => Whisper auto-detection. Resolver w api/openai/server.rs
+        // probuje user preference przed wpadnieciem tutaj — wiec None na tym
+        // poziomie oznacza ze user faktycznie nie ma zadnej preferencji i
+        // chcemy auto-detect zamiast hardkodowanego "pl" (powodowal cross-lang
+        // hallucination dla krotkich nagran w innym jezyku niz polski).
         let params = TranscribeParams {
             audio_data: std::sync::Arc::clone(&request.file),
-            language: request.language.clone().or_else(|| Some("pl".to_string())),
+            language: request.language.clone(),
             translate: false,
             word_timestamps: request
                 .timestamp_granularities

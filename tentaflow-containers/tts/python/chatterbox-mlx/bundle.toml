@@ -3,8 +3,7 @@ engine = "chatterbox-mlx"
 description = "Chatterbox MLX (mlx-audio) dla Apple Silicon"
 python_version = "3.12"
 source = "pypi"
-package = "mlx-audio"
-package_version = "0.4.2"
+pypi_package = "mlx-audio==0.4.2"
 
 [launch]
 command = "uvicorn"

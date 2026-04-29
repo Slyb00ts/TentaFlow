@@ -109,6 +109,10 @@
   outline: none;
   cursor: pointer;
 }
+.profiling-launch .tf-slider:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .profiling-launch .tf-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 16px; height: 16px; border-radius: 50%;
@@ -170,7 +174,7 @@
 }
 
 .profiling-launch .radio-row {
-  display: flex; gap: 14px; flex-wrap: wrap;
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
 }
 
 /* SOURCE CARDS GRID */
@@ -269,8 +273,35 @@
 .src-status.ok { background: rgba(34, 197, 94, 0.14); color: var(--tf-success, #22c55e); }
 .src-status.warn { background: rgba(245, 158, 11, 0.14); color: var(--tf-warning, #f59e0b); }
 .src-status.bad { background: rgba(239, 68, 68, 0.14); color: var(--tf-danger, #ef4444); }
+.src-status.lim { background: rgba(96, 165, 250, 0.14); color: var(--tf-info, #60a5fa); }
 
-/* alert-box */
+/* Vendor-badge w source-card icon (NV/A/I/M3) - kolory akcentu wg vendor */
+.profiling-launch .src-ico {
+  width: 26px; height: 26px; border-radius: 6px;
+  background: var(--tf-bg-input, #0b0e22);
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.profiling-launch .src-ico svg { width: 14px; height: 14px; stroke: var(--tf-accent-2, #a78bfa); fill: none; stroke-width: 2; }
+.profiling-launch .vendor-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 800; color: white;
+}
+.profiling-launch .vendor-badge.nv { background: #76b900; color: #000; }
+.profiling-launch .vendor-badge.amd { background: #ed1c24; }
+.profiling-launch .vendor-badge.intel { background: #0071c5; }
+.profiling-launch .vendor-badge.apple { background: #d4d4d8; color: #000; }
+.profiling-launch .source-card[checked] {
+  border-color: rgba(167, 139, 250, 0.4);
+  background: rgba(99, 102, 241, 0.06);
+}
+.profiling-launch .field-label .counter {
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  color: var(--tf-text-3, #6a7196); font-weight: 600;
+  letter-spacing: 0; text-transform: none;
+}
+
+/* alert-box (warning + info + danger + success warianty) */
 .alert-box {
   display: flex;
   gap: 10px;
@@ -283,6 +314,15 @@
 .alert-box.info { background: rgba(96, 165, 250, 0.08); border-color: rgba(96, 165, 250, 0.3); }
 .alert-box.danger { background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.3); }
 .alert-box.success { background: rgba(34, 197, 94, 0.08); border-color: rgba(34, 197, 94, 0.3); }
+.alert-box .a-ico { flex-shrink: 0; }
+.alert-box .a-ico svg {
+  width: 16px; height: 16px;
+  stroke: var(--tf-warning, #f59e0b);
+  fill: none; stroke-width: 2;
+}
+.alert-box.info .a-ico svg { stroke: var(--tf-info, #60a5fa); }
+.alert-box.danger .a-ico svg { stroke: var(--tf-danger, #ef4444); }
+.alert-box.success .a-ico svg { stroke: var(--tf-success, #22c55e); }
 .alert-box .a-body {
   flex: 1;
   font-size: 12.5px;
@@ -290,6 +330,18 @@
   line-height: 1.5;
 }
 .alert-box .a-body strong { color: var(--tf-text, #e8ebf5); font-weight: 700; }
+
+/* Info-tip (?) — inline icon obok nazwy źródła w source-card.
+   Renderowany gdy backend dostarczy src.tooltip. */
+.profiling-launch .source-card .src-name .info-tip {
+  color: var(--tf-text-3, #6a7196);
+  cursor: help;
+  display: inline-flex;
+}
+.profiling-launch .source-card .src-name .info-tip svg {
+  width: 12px; height: 12px;
+  stroke: currentColor; fill: none; stroke-width: 2;
+}
 
 /* password-input (no tf-password-input yet; will add component if reused 2+ places per #8) */
 .pw-input {
@@ -302,17 +354,24 @@
 }
 .pw-input.invalid { border-color: var(--tf-danger, #ef4444); }
 .pw-input.valid { border-color: var(--tf-success, #22c55e); }
+.pw-input svg.lock-ico {
+  width: 14px; height: 14px;
+  margin-left: 11px;
+  stroke: var(--tf-text-3, #6a7196);
+  flex-shrink: 0;
+}
 .pw-input input {
   flex: 1;
   background: transparent;
   border: 0;
   outline: none;
-  padding: 9px 12px;
+  padding: 9px 10px;
   color: var(--tf-text, #e8ebf5);
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
   letter-spacing: 0.2em;
 }
+.pw-input .pw-eye svg { width: 14px; height: 14px; stroke: currentColor; }
 .pw-input .pw-eye {
   padding: 8px 10px;
   cursor: pointer;
@@ -351,6 +410,55 @@
 }
 .nd-active-banner-host:empty {
   display: none;
+}
+
+/* Kompaktowa pigulka REC w topbarze mesh-detail. Sticky widocznosc
+   niezaleznie od scrolla. Pulsujaca kropka, label, countdown, Stop button. */
+.profile-rec-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 6px;
+  background: rgba(239, 68, 68, 0.10);
+  border: 1px solid rgba(239, 68, 68, 0.55);
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--tf-text, #e8ebf5);
+}
+.profile-rec-pill .rp-rec {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #ef4444;
+}
+.profile-rec-pill .rp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6);
+  animation: tf-rec-pulse 1.4s ease-in-out infinite;
+}
+@keyframes tf-rec-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+  70%  { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+.profile-rec-pill .rp-label {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+.profile-rec-pill .rp-countdown {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--tf-text, #e8ebf5);
+  padding: 0 4px;
 }
 
 .session-banner {
@@ -456,24 +564,14 @@
   max-width: 1480px;
   margin: 0 auto;
 }
-.profiling-sessions .breadcrumb {
-  font-size: 12px;
-  color: var(--tf-text-3, #6a7196);
-  margin-bottom: 10px;
-}
-.profiling-sessions .breadcrumb a {
-  color: var(--tf-text-2, #a0a8c8);
-  text-decoration: none;
-}
-.profiling-sessions .breadcrumb a:hover { color: var(--tf-text, #e8ebf5); }
-.profiling-sessions .breadcrumb .sep { margin: 0 6px; color: var(--tf-text-3, #6a7196); }
 
-.profiling-sessions .page-title {
-  font-size: 20px;
-  font-weight: 800;
-  letter-spacing: -0.01em;
+/* Section card kontener (mockup #03: <div class="tf-section-card">). */
+.profiling-sessions .tf-section-card {
+  background: var(--tf-bg-2, #0a0d24);
+  border: 1px solid var(--tf-border, #1f2548);
+  border-radius: 10px;
+  padding: 18px 20px;
   margin-bottom: 14px;
-  color: var(--tf-text, #e8ebf5);
 }
 
 .profiling-sessions .toolbar {
@@ -482,6 +580,11 @@
   align-items: center;
   flex-wrap: wrap;
   margin-bottom: 12px;
+}
+.profiling-sessions .tf-filter-group {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 .profiling-sessions .filter-chip {
   display: inline-flex;
@@ -503,13 +606,35 @@
   background: var(--tf-bg-card-hover, #1a1f45);
   color: var(--tf-text, #e8ebf5);
 }
-.profiling-sessions .filter-chip[data-active="true"] {
+.profiling-sessions .filter-chip[active] {
   background: var(--tf-accent-glow, rgba(99,102,241,0.22));
   border-color: rgba(167, 139, 250, 0.3);
   color: var(--tf-accent-2, #a78bfa);
 }
 
-.profiling-sessions table.tf-table-native {
+/* status-pill — wariant local dla rzedow tabeli (REC / FAILED / PARTIAL) */
+.profiling-sessions .status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.profiling-sessions .status-pill.danger {
+  background: rgba(239, 68, 68, 0.14);
+  color: var(--tf-danger, #ef4444);
+}
+.profiling-sessions .status-pill.warn {
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--tf-warning, #f59e0b);
+}
+
+.profiling-sessions table.tf-table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
@@ -518,15 +643,15 @@
   border-radius: 10px;
   overflow: hidden;
 }
-.profiling-sessions .tf-table-native th,
-.profiling-sessions .tf-table-native td {
+.profiling-sessions .tf-table th,
+.profiling-sessions .tf-table td {
   padding: 10px 12px;
   font-size: 12px;
   text-align: left;
   border-bottom: 1px solid var(--tf-border, #1f2548);
   vertical-align: middle;
 }
-.profiling-sessions .tf-table-native th {
+.profiling-sessions .tf-table th {
   background: var(--tf-bg-3, #111535);
   color: var(--tf-text-2, #a0a8c8);
   font-weight: 700;
@@ -534,15 +659,64 @@
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
-.profiling-sessions .tf-table-native tbody tr {
+.profiling-sessions .tf-table tbody tr {
   cursor: pointer;
   transition: background 0.12s;
 }
-.profiling-sessions .tf-table-native tbody tr:hover td {
+.profiling-sessions .tf-table tbody tr:hover td {
   background: var(--tf-bg-3, #111535);
 }
-.profiling-sessions .tf-table-native tbody tr:last-child td {
+.profiling-sessions .tf-table tbody tr:last-child td {
   border-bottom: 0;
+}
+
+/* Started column — gorny "absolute" timestamp (HH:MM:SS / Yesterday HH:MM /
+   N days ago) jest monospace w kolorze --text. */
+.profiling-sessions .started-top {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--tf-text, #e8ebf5);
+  font-size: 12px;
+}
+
+/* Duration · Size cell — gorna linia monospace */
+.profiling-sessions .ds-duration {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--tf-text, #e8ebf5);
+}
+
+/* Failed session — czerwona wiadomosc bledu zamiast chip-ow zrodel */
+.profiling-sessions .label-cell .lc-err {
+  color: var(--tf-danger, #ef4444);
+  font-family: 'Manrope', system-ui, sans-serif;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+/* Compare bar — pojawia sie tylko gdy >=1 sesji jest zaznaczona do compare. */
+.profiling-sessions .ps-compare-bar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--tf-bg-3, #111535);
+  border: 1px solid var(--tf-border, #1f2548);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--tf-text-2, #a0a8c8);
+}
+.profiling-sessions .ps-compare-bar.hidden { display: none; }
+.profiling-sessions .ps-compare-bar .count {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  color: var(--tf-text, #e8ebf5);
+}
+
+/* Selected row state dla compare */
+.profiling-sessions .tf-table tbody tr.selected td {
+  background: var(--tf-accent-glow, rgba(99,102,241,0.18));
 }
 .profiling-sessions .actions-col {
   text-align: right;
@@ -572,6 +746,10 @@
   background: rgba(239, 68, 68, 0.14);
   color: var(--tf-danger, #ef4444);
   animation: profiling-pulse-rec 1.6s infinite;
+}
+/* Mockup: mala wypelniona kropka REC zamiast stroked circle */
+.profiling-sessions .row-status-ico.run svg circle {
+  fill: currentColor;
 }
 .profiling-sessions .label-cell {
   display: flex;

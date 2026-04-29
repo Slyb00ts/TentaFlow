@@ -2385,19 +2385,9 @@ async fn store_peer_to_proto(
     local_node_id: &str,
     is_trusted: bool,
     route: Option<tentaflow_protocol::MeshNodeRoute>,
-    connection: Option<crate::mesh::iroh_manager::ConnectionSnapshot>,
+    connection: Option<tentaflow_protocol::MeshConnectionInfo>,
 ) -> tentaflow_protocol::MeshNodeInfo {
     let is_local = p.node_id == local_node_id;
-    let effective_status = if is_local {
-        p.status.clone()
-    } else if p.quic_connected {
-        p.status.clone()
-    } else {
-        match p.status.as_str() {
-            "connected" | "online" | "active" | "ready" | "degraded" => "offline".to_string(),
-            other => other.to_string(),
-        }
-    };
     let source = if is_local {
         "local"
     } else if is_trusted {
@@ -2505,7 +2495,6 @@ async fn store_peer_to_proto(
         node_id: p.node_id.clone(),
         hostname: p.hostname.clone(),
         ip: first_non_loopback_ip_str(&p.addresses),
-        status: effective_status,
         source: source.to_string(),
         is_local,
         uptime_secs: None,
@@ -2523,22 +2512,7 @@ async fn store_peer_to_proto(
         last_seen_epoch: Some(parse_ts(&p.discovered_at) as i64),
         route,
         platform: p.platform.clone(),
-        connection: connection.map(|c| tentaflow_protocol::MeshConnectionInfo {
-            transport: c.transport,
-            scope: c.scope,
-            address: c.address,
-            relay_url: c.relay_url,
-            paths: c
-                .paths
-                .into_iter()
-                .map(|p| tentaflow_protocol::MeshConnectionPathInfo {
-                    transport: p.transport,
-                    address: p.address,
-                    selected: p.selected,
-                    closed: p.closed,
-                })
-                .collect(),
-        }),
+        connection,
         nsys_available,
         nsys_version,
         profiling_collectors_available,
@@ -2571,31 +2545,75 @@ pub async fn mesh_node_list(
         .as_ref()
         .map(|qm| qm.connection_snapshots())
         .unwrap_or_default();
-    let trusted_db = repository::list_trusted_nodes(&ctx.state.db).map_err(db_err)?;
-    let trusted_ids: std::collections::HashSet<String> =
-        trusted_db.iter().map(|t| t.node_id.clone()).collect();
 
-    let mut nodes: Vec<tentaflow_protocol::MeshNodeInfo> = Vec::new();
-    for p in peers
+    // Registry is the authoritative source for "which nodes do we know about
+    // and what is their current connection state" — including trusted peers
+    // that are currently offline (no peer_store row). peer_store still owns
+    // the rich device data (CPU, RAM, GPU, models, containers).
+    let registry = store.registry().cloned();
+    let summaries = registry
+        .as_ref()
+        .map(|r| r.snapshot_summary())
+        .unwrap_or_default();
+    let now_ms = crate::mesh::proto_conv::now_unix_ms();
+
+    let store_by_id: std::collections::HashMap<String, &StorePeerInfo> = peers
         .iter()
         .filter(|p| p.node_id == local_node_id || !is_loopback_or_local_dup(p, local_node_id))
-    {
-        let is_local = p.node_id == local_node_id;
-        let is_trusted = is_local
-            || trusted_ids.contains(&p.node_id)
-            || ctx
-                .state
-                .mesh_security
-                .as_ref()
-                .map_or(false, |s| s.is_trusted(&p.node_id));
-        let route = if is_local {
-            Some(tentaflow_protocol::MeshNodeRoute {
-                hops: 0,
-                direct: true,
-                next_hop: None,
-            })
-        } else {
-            store
+        .map(|p| (p.node_id.clone(), p))
+        .collect();
+
+    let mut nodes: Vec<tentaflow_protocol::MeshNodeInfo> = Vec::new();
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Local node first (always present in peer_store via seed_local).
+    if let Some(local) = store_by_id.get(local_node_id) {
+        let route = Some(tentaflow_protocol::MeshNodeRoute {
+            hops: 0,
+            direct: true,
+            next_hop: None,
+        });
+        let connection = registry.as_ref().and_then(|r| {
+            let id_bytes = parse_node_id_hex(&local.node_id)?;
+            let summary = r
+                .snapshot_summary()
+                .into_iter()
+                .find(|s| s.node_id == id_bytes)?;
+            Some(crate::mesh::proto_conv::build_conn_info(
+                &summary,
+                connection_map.get(&local.node_id),
+                now_ms,
+            ))
+        });
+        nodes.push(
+            store_peer_to_proto(local, local_node_id, true, route, connection).await,
+        );
+        emitted.insert(local.node_id.clone());
+    }
+
+    // All other registry-known peers — drives both online and trusted-offline.
+    for summary in &summaries {
+        let node_id_hex = hex::encode(summary.node_id);
+        if emitted.contains(&node_id_hex) {
+            continue;
+        }
+        let is_trusted = matches!(
+            summary.trust,
+            crate::mesh::peer_registry::TrustStateTag::Trusted
+        ) || ctx
+            .state
+            .mesh_security
+            .as_ref()
+            .map_or(false, |s| s.is_trusted(&node_id_hex));
+
+        let connection = Some(crate::mesh::proto_conv::build_conn_info(
+            summary,
+            connection_map.get(&node_id_hex),
+            now_ms,
+        ));
+
+        if let Some(p) = store_by_id.get(&node_id_hex) {
+            let route = store
                 .get_route(&p.node_id)
                 .map(|r| tentaflow_protocol::MeshNodeRoute {
                     hops: r.hops as u32,
@@ -2605,62 +2623,79 @@ pub async fn mesh_node_list(
                     } else {
                         Some(r.next_hop.clone())
                     },
-                })
-        };
-        nodes.push(
-            store_peer_to_proto(
-                p,
-                local_node_id,
-                is_trusted,
-                route,
-                connection_map.get(&p.node_id).cloned(),
-            )
-            .await,
-        );
+                });
+            nodes.push(
+                store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await,
+            );
+        } else {
+            // No peer_store entry — trusted node offline (or freshly seeded).
+            // Render with whatever the registry knows; rich device fields stay
+            // empty until the peer comes online and pushes node info.
+            nodes.push(tentaflow_protocol::MeshNodeInfo {
+                node_id: node_id_hex.clone(),
+                hostname: summary.hostname.to_string(),
+                ip: None,
+                source: if is_trusted { "trusted" } else { "discovered" }.to_string(),
+                is_local: false,
+                uptime_secs: None,
+                gpus: Vec::new(),
+                network_interfaces: Vec::new(),
+                cpu_count: None,
+                cpu_usage_percent: None,
+                ram_total_mb: None,
+                ram_used_mb: None,
+                vram_total_mb: None,
+                vram_used_mb: None,
+                gpu_load_percent: None,
+                models: Vec::new(),
+                containers: Vec::new(),
+                last_seen_epoch: None,
+                route: None,
+                platform: summary.platform.to_string(),
+                connection,
+                nsys_available: false,
+                nsys_version: String::new(),
+                profiling_collectors_available: Vec::new(),
+            });
+        }
+        emitted.insert(node_id_hex);
     }
 
-    let peer_ids: std::collections::HashSet<String> =
-        peers.iter().map(|p| p.node_id.clone()).collect();
-    for t in &trusted_db {
-        if t.node_id == local_node_id
-            || t.hostname == "127.0.0.1"
-            || t.hostname == "::1"
-            || peer_ids.contains(&t.node_id)
-        {
+    // Backfill: any peer_store entry not present in the registry yet (e.g. a
+    // legacy mDNS row before the shadow caught up). Treat as offline.
+    for p in store_by_id.values() {
+        if emitted.contains(&p.node_id) {
             continue;
         }
-        nodes.push(tentaflow_protocol::MeshNodeInfo {
-            node_id: t.node_id.clone(),
-            hostname: t.hostname.clone(),
-            ip: None,
-            status: if t.is_active { "offline" } else { "inactive" }.to_string(),
-            source: "trusted".to_string(),
-            is_local: false,
-            uptime_secs: None,
-            gpus: Vec::new(),
-            network_interfaces: Vec::new(),
-            cpu_count: None,
-            cpu_usage_percent: None,
-            ram_total_mb: None,
-            ram_used_mb: None,
-            vram_total_mb: None,
-            vram_used_mb: None,
-            gpu_load_percent: None,
-            models: Vec::new(),
-            containers: Vec::new(),
-            last_seen_epoch: None,
-            route: None,
-            platform: String::new(),
-            connection: None,
-            nsys_available: false,
-            nsys_version: String::new(),
-            profiling_collectors_available: Vec::new(),
-        });
+        let is_trusted = ctx
+            .state
+            .mesh_security
+            .as_ref()
+            .map_or(false, |s| s.is_trusted(&p.node_id));
+        let route = store
+            .get_route(&p.node_id)
+            .map(|r| tentaflow_protocol::MeshNodeRoute {
+                hops: r.hops as u32,
+                direct: r.direct,
+                next_hop: if r.direct {
+                    None
+                } else {
+                    Some(r.next_hop.clone())
+                },
+            });
+        nodes.push(
+            store_peer_to_proto(p, local_node_id, is_trusted, route, None).await,
+        );
     }
 
     Ok(MessageBody::MeshNodeListResponseBody(
         tentaflow_protocol::MeshNodeListResponse { nodes },
     ))
+}
+
+fn parse_node_id_hex(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s, &mut out).ok().map(|()| out)
 }
 
 #[handler(variant = "MeshNodeDetailRequest", since = (1, 0))]
@@ -2685,9 +2720,17 @@ pub async fn mesh_node_detail(
         ProtocolError::not_found(format!("node '{}' nie znaleziony", payload.node_id))
     })?;
     let is_local = peer.node_id == local_node_id;
-    let trusted = repository::list_trusted_nodes(&ctx.state.db).map_err(db_err)?;
+    let registry = store.registry().cloned();
+    let summary = registry
+        .as_ref()
+        .and_then(|r| parse_node_id_hex(&peer.node_id).and_then(|id| {
+            r.snapshot_summary().into_iter().find(|s| s.node_id == id)
+        }));
     let is_trusted = is_local
-        || trusted.iter().any(|t| t.node_id == peer.node_id)
+        || summary
+            .as_ref()
+            .map(|s| matches!(s.trust, crate::mesh::peer_registry::TrustStateTag::Trusted))
+            .unwrap_or(false)
         || ctx
             .state
             .mesh_security
@@ -2712,11 +2755,15 @@ pub async fn mesh_node_detail(
                 },
             })
     };
-    let connection = ctx
+    let iroh_snapshot = ctx
         .state
         .quic_mesh
         .as_ref()
         .and_then(|qm| qm.connection_snapshot(&payload.node_id));
+    let now_ms = crate::mesh::proto_conv::now_unix_ms();
+    let connection = summary.as_ref().map(|s| {
+        crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms)
+    });
     let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection).await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
@@ -2855,19 +2902,33 @@ pub fn mesh_trusted_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let trusted = repository::list_trusted_nodes(&ctx.state.db).map_err(db_err)?;
-    let nodes: Vec<tentaflow_protocol::MeshTrustedNode> = trusted
-        .into_iter()
-        .map(|t| tentaflow_protocol::MeshTrustedNode {
-            node_id: t.node_id,
-            hostname: if t.hostname.is_empty() {
-                None
-            } else {
-                Some(t.hostname)
-            },
-            trusted_since_epoch: parse_ts(&t.approved_at) as i64,
+    use crate::mesh::peer_registry::TrustStateTag;
+    // Source of truth: in-memory PeerRegistry (hydrated from peer_persisted
+    // at startup). When no registry is wired (test stubs) the response is
+    // simply empty — there is no legacy fallback.
+    let nodes: Vec<tentaflow_protocol::MeshTrustedNode> = ctx
+        .state
+        .mesh_peer_store
+        .registry()
+        .map(|reg| {
+            reg.snapshot_summary()
+                .into_iter()
+                .filter(|s| matches!(s.trust, TrustStateTag::Trusted))
+                .map(|s| tentaflow_protocol::MeshTrustedNode {
+                    node_id: hex::encode(s.node_id),
+                    hostname: if s.hostname.is_empty() {
+                        None
+                    } else {
+                        Some((*s.hostname).to_string())
+                    },
+                    // PeerSummary does not carry an explicit "trusted since"
+                    // timestamp; expose 0 ("unknown") rather than fabricating
+                    // one. GUI tolerates 0.
+                    trusted_since_epoch: 0,
+                })
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .unwrap_or_default();
     Ok(MessageBody::MeshTrustedListResponseBody(
         tentaflow_protocol::MeshTrustedListResponse { trusted: nodes },
     ))

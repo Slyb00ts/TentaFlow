@@ -1398,100 +1398,14 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
-  // Nsight (NVIDIA Nsight Systems profiling) — start/stop/sessions/report/delete
-  // -------------------------------------------------------------------------
-
-  /**
-   * MessageBody::NsightBody(NsightPayload::StartRequest).
-   * `scope` przyjmuje przyjazna dla UI forme:
-   *   - 'cpu' | 'gpu_all' | 'both_all'
-   *   - { kind: 'gpu_index', idx: 3 } | { kind: 'both_index', idx: 1 }
-   */
-  nsightStartRequest(correlationId, { nodeId, scope, durationSecs, label }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNsightStartRequest(
-      String(nodeId),
-      scope,
-      Number(durationSecs) >>> 0,
-      String(label ?? ''),
-    );
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** MessageBody::NsightBody(NsightPayload::StopRequest). */
-  nsightStopRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNsightStopRequest(String(nodeId), String(sessionId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** MessageBody::NsightBody(NsightPayload::SessionsRequest). */
-  nsightSessionsRequest(correlationId, { nodeId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNsightSessionsRequest(String(nodeId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** MessageBody::NsightBody(NsightPayload::ReportRequest). */
-  nsightReportRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNsightReportRequest(String(nodeId), String(sessionId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** MessageBody::NsightBody(NsightPayload::DeleteRequest). */
-  nsightDeleteRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNsightDeleteRequest(String(nodeId), String(sessionId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** MessageBody::NsightBody(NsightPayload::DownloadRequest). */
-  nsightDownloadRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNsightDownloadRequest(String(nodeId), String(sessionId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  // -------------------------------------------------------------------------
-  // Multi-source profiling (V2) — ProfilingPayload pakowany w NsightBody.
+  // Multi-source profiling — ProfilingPayload w MessageBody::ProfilingBody.
   // `scope` musi byc obiektem zgodnym z ProfileScope:
   //   { sources: u32, gpuTargets: 'all'|'none'|{indices:[..]}|{byVendor:'nvidia'},
   //     cpuSamplingHz: u32, target: 'system_wide'|'own_process'|{pid:u32},
   //     durationSeconds: u32, label: string }
   // -------------------------------------------------------------------------
 
-  /** MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::StartRequest)). */
+  /** MessageBody::ProfilingBody(ProfilingPayload::StartRequest). */
   profilingStartRequest(
     correlationId,
     { nodeId, scope, label, elevationPassword },
@@ -1512,7 +1426,7 @@ export const encode = {
     );
   },
 
-  /** MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::StopRequest)). */
+  /** MessageBody::ProfilingBody(ProfilingPayload::StopRequest). */
   profilingStopRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeProfilingStopRequest(String(nodeId), String(sessionId));
@@ -1524,7 +1438,7 @@ export const encode = {
     );
   },
 
-  /** MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::SessionsRequest)). */
+  /** MessageBody::ProfilingBody(ProfilingPayload::SessionsRequest). */
   profilingSessionsRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeProfilingSessionsRequest(String(nodeId));
@@ -1536,7 +1450,7 @@ export const encode = {
     );
   },
 
-  /** MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ReportRequest)). */
+  /** MessageBody::ProfilingBody(ProfilingPayload::ReportRequest). */
   profilingReportRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeProfilingReportRequest(String(nodeId), String(sessionId));
@@ -1548,7 +1462,7 @@ export const encode = {
     );
   },
 
-  /** MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::DeleteRequest)). */
+  /** MessageBody::ProfilingBody(ProfilingPayload::DeleteRequest). */
   profilingDeleteRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeProfilingDeleteRequest(String(nodeId), String(sessionId));
@@ -1560,7 +1474,7 @@ export const encode = {
     );
   },
 
-  /** MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::DownloadRequest)). */
+  /** MessageBody::ProfilingBody(ProfilingPayload::DownloadRequest). */
   profilingDownloadRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeProfilingDownloadRequest(String(nodeId), String(sessionId));
@@ -1572,10 +1486,37 @@ export const encode = {
     );
   },
 
-  /** MessageBody::NsightBody(NsightPayload::Profiling(ProfilingPayload::ActiveInfoRequest)). */
+  /** MessageBody::ProfilingBody(ProfilingPayload::ActiveInfoRequest). */
   profilingActiveInfoRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeProfilingActiveInfoRequest(String(nodeId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** ProfilingPayload::ValidateSudoRequest — sudo password (used once, never logged). */
+  profilingValidateSudoRequest(correlationId, { nodeId, password }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProfilingValidateSudoRequest(
+      String(nodeId ?? ''),
+      String(password ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** ProfilingPayload::CollectorsStatusRequest — list collectors + binary paths. */
+  profilingCollectorsStatusRequest(correlationId, { nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProfilingCollectorsStatusRequest(String(nodeId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

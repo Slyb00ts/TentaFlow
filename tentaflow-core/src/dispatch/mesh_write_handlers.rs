@@ -1,8 +1,9 @@
 // =============================================================================
 // Plik: dispatch/mesh_write_handlers.rs
 // Opis: Async handlery operacji zapisu mesh: pairing/trust/connect/command/
-//       network-config oraz Nsight profiling dispatch. Reuzywaja domenowe
-//       helpery z api/dashboard/api_mesh.rs i mapuja rezultaty na MessageBody.
+//       network-config oraz multi-source profiling dispatch. Domena pairing/trust
+//       zyje w mesh::admin_ops; tu robimy tylko walidacje wariantu i mapowanie
+//       AdminError -> ProtocolError.
 // =============================================================================
 
 use std::net::{IpAddr, SocketAddr};
@@ -15,13 +16,13 @@ use tentaflow_protocol::{
     MeshPairingConfirmResponse, MeshPairingRejectRequest, MeshPairingRejectResponse,
     MeshPairingStartRequest, MeshPairingStartResponse, MeshTrustRetrustRequest,
     MeshTrustRetrustResponse, MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody,
-    NsightPayload, ProtocolError, ProtocolErrorCode,
+    ProtocolError, ProtocolErrorCode,
 };
 use tracing::warn;
 
 use super::HandlerContext;
-use crate::api::dashboard::api_mesh;
 use crate::db::repository;
+use crate::mesh::admin_ops::{self, AdminError, AdminErrorKind};
 use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::mesh::security::MeshSecurity;
 
@@ -43,27 +44,28 @@ fn require_mesh_security(ctx: &HandlerContext) -> Result<Arc<MeshSecurity>, Prot
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::Internal, "MeshSecurity niedostepny"))
 }
 
-/// Mapuje HTTP-style status code z api_mesh::handle_* na ProtocolError.
-fn http_status_to_proto_err(status: u16, json_body: &str) -> ProtocolError {
-    // Wyekstrahuj "error" pole jesli to JSON object.
-    let msg = serde_json::from_str::<serde_json::Value>(json_body)
-        .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| json_body.to_string());
-
-    let code = match status {
-        400 => ProtocolErrorCode::BadRequest,
-        403 => ProtocolErrorCode::PolicyDenied,
-        404 => ProtocolErrorCode::NotFound,
-        413 | 429 => ProtocolErrorCode::BadRequest,
-        502 | 503 => ProtocolErrorCode::Internal,
-        _ => ProtocolErrorCode::Internal,
-    };
-    ProtocolError::new(code, msg)
+impl From<AdminError> for ProtocolError {
+    fn from(e: AdminError) -> Self {
+        let code = match e.kind {
+            AdminErrorKind::BadRequest => ProtocolErrorCode::BadRequest,
+            AdminErrorKind::AlreadyPending => ProtocolErrorCode::Conflict,
+            AdminErrorKind::RateLimited => ProtocolErrorCode::RateLimited,
+            AdminErrorKind::BadPin => ProtocolErrorCode::AuthRequired,
+            AdminErrorKind::DeliveryFailed => ProtocolErrorCode::NodeUnreachable,
+            AdminErrorKind::MeshUnavailable => ProtocolErrorCode::NotAvailable,
+            AdminErrorKind::Internal => ProtocolErrorCode::Internal,
+        };
+        // CR-004: never let raw internal error text reach the wire — caller
+        // already logged details via tracing::error! at the AdminError site.
+        let message = match e.kind {
+            AdminErrorKind::Internal => {
+                tracing::error!("AdminError::Internal: {}", e.message);
+                "internal mesh error".to_string()
+            }
+            _ => e.message,
+        };
+        ProtocolError::new(code, message)
+    }
 }
 
 // =============================================================================
@@ -99,7 +101,7 @@ pub async fn mesh_pairing_start(
     // Uwaga: REST handler uzywal "remote_address" jako node_id (legacy shape).
     // Zachowujemy te sama semantyke — dla binary protocol to jest faktycznie
     // identyfikator zdalnego noda (lub jego publicznego aliasu).
-    let (status, json_body) = api_mesh::handle_initiate_pairing(
+    let outcome = admin_ops::initiate_pairing(
         &ctx.state.db,
         &security,
         remote_address,
@@ -112,34 +114,13 @@ pub async fn mesh_pairing_start(
         &ctx.state.mesh_peer_store,
         pin_hint,
     )
-    .await
-    .map_err(|e| ProtocolError::internal(format!("pairing start failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
-
-    // JSON body: {"pin": ..., "node_id": ..., "expires_in_seconds": ...}
-    let parsed: serde_json::Value = serde_json::from_str(&json_body)
-        .map_err(|e| ProtocolError::internal(format!("pairing response parse: {}", e)))?;
-    let pin = parsed
-        .get("pin")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let completed = parsed
-        .get("completed")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    // Pair_id = node_id (mapowanie proste — pairing jednoznaczny per node).
-    let pair_id = remote_address.clone();
+    .await?;
 
     Ok(MessageBody::MeshPairingStartResponseBody(
         MeshPairingStartResponse {
-            pair_id,
-            pin,
-            completed,
+            pair_id: remote_address.clone(),
+            pin: outcome.pin,
+            completed: outcome.completed,
         },
     ))
 }
@@ -168,29 +149,19 @@ pub async fn mesh_pairing_confirm(
     let security = require_mesh_security(ctx)?;
 
     // pair_id mapuje na node_id (patrz mesh_pairing_start).
-    let body_json = serde_json::json!({
-        "pin": pin,
-        "hostname": "",
-    })
-    .to_string();
-
-    let (status, json_body) = api_mesh::handle_confirm_pairing(
+    let outcome = admin_ops::confirm_pairing(
         &security,
         pair_id,
-        body_json.as_bytes(),
+        Some(pin.as_str()),
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
-    )
-    .map_err(|e| ProtocolError::internal(format!("pairing confirm failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+        &ctx.state.mesh_peer_store,
+    )?;
 
     Ok(MessageBody::MeshPairingConfirmResponseBody(
         MeshPairingConfirmResponse {
             ok: true,
-            trusted_node_id: pair_id.clone(),
+            trusted_node_id: outcome.trusted_node_id,
         },
     ))
 }
@@ -218,17 +189,7 @@ pub async fn mesh_pairing_reject(
 
     let security = require_mesh_security(ctx)?;
 
-    let (status, json_body) = api_mesh::handle_reject_pairing(
-        &security,
-        pair_id,
-        &ctx.state.quic_mesh,
-        ctx.state.local_node_id.as_ref(),
-    )
-    .map_err(|e| ProtocolError::internal(format!("pairing reject failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+    admin_ops::reject_pairing(&security, pair_id, &ctx.state.quic_mesh)?;
 
     Ok(MessageBody::MeshPairingRejectResponseBody(
         MeshPairingRejectResponse { ok: true },
@@ -258,17 +219,12 @@ pub async fn mesh_trust_revoke(
 
     let security = require_mesh_security(ctx)?;
 
-    let (status, json_body) = api_mesh::handle_revoke_trust(
+    admin_ops::revoke_trust(
         &security,
         node_id,
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
-    )
-    .map_err(|e| ProtocolError::internal(format!("trust revoke failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+    )?;
 
     Ok(MessageBody::MeshTrustRevokeResponseBody(
         MeshTrustRevokeResponse { ok: true },
@@ -298,12 +254,7 @@ pub async fn mesh_trust_retrust(
 
     let security = require_mesh_security(ctx)?;
 
-    let (status, json_body) = api_mesh::handle_retrust(&security, node_id)
-        .map_err(|e| ProtocolError::internal(format!("retrust failed: {}", e)))?;
-
-    if status != 200 {
-        return Err(http_status_to_proto_err(status, &json_body));
-    }
+    admin_ops::retrust(&security, node_id)?;
 
     Ok(MessageBody::MeshTrustRetrustResponseBody(
         MeshTrustRetrustResponse { ok: true },
@@ -560,354 +511,7 @@ pub async fn mesh_node_network_config(
 }
 
 // =============================================================================
-// 9. NsightBody — start/stop/sessions/report/delete sesji profilowania.
-// =============================================================================
-
-/// Mapuje `ProfilingError` na `ProtocolError` z deterministycznymi kodami,
-/// zeby GUI moglo rozroznic stany bez parsowania komunikatow.
-fn profiling_err_to_proto(e: crate::profiling::ProfilingError) -> ProtocolError {
-    use crate::profiling::ProfilingError as PE;
-    match e {
-        PE::NotAvailable => ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "nsys not available on this node",
-        ),
-        PE::Busy => {
-            ProtocolError::new(ProtocolErrorCode::Conflict, "profiling already in progress")
-        }
-        PE::NotFound(s) => ProtocolError::not_found(format!("session not found: {}", s)),
-        PE::InvalidSessionId => ProtocolError::bad_request("invalid session id format"),
-        PE::InvalidLabel(reason) => {
-            ProtocolError::bad_request(format!("invalid label: {}", reason))
-        }
-        PE::InvalidDuration(d) => ProtocolError::bad_request(format!("invalid duration: {}s", d)),
-        other => ProtocolError::internal(format!("profiling: {}", other)),
-    }
-}
-
-/// Buduje `ProfileStorage` dla lokalnego noda. Storage rozdziela katalogi per
-/// node_id, wiec uzywamy `state.local_node_id`.
-fn local_profile_storage(ctx: &HandlerContext) -> crate::profiling::ProfileStorage {
-    crate::profiling::ProfileStorage::new(
-        crate::paths::tentaflow_home(),
-        ctx.state.local_node_id.as_ref(),
-    )
-}
-
-/// Wykonuje `MeshCommandType::Nsight*` na zdalnym nodzie i odpakowuje typed
-/// `MeshCommandResponsePayload::Nsight*` w `NsightPayload::*Response`.
-async fn forward_nsight_to_peer(
-    ctx: &HandlerContext,
-    target_node_id: &str,
-    cmd: tentaflow_protocol::mesh::MeshCommandType,
-) -> Result<NsightPayload, ProtocolError> {
-    use tentaflow_protocol::mesh::MeshCommandResponsePayload as RP;
-
-    let qm = require_quic_mesh(ctx)?;
-    let is_trusted = ctx
-        .state
-        .mesh_security
-        .as_ref()
-        .map_or(false, |s| s.is_trusted(target_node_id));
-    if !is_trusted {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "Node nie jest zaufany — nie mozna wyslac komendy",
-        ));
-    }
-
-    let response = qm.send_command(target_node_id, cmd).await.map_err(|e| {
-        ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            format!("mesh nsight forward: {}", e),
-        )
-    })?;
-
-    if !response.ok {
-        let msg = response
-            .error
-            .unwrap_or_else(|| "remote node refused command".to_string());
-        return Err(ProtocolError::new(ProtocolErrorCode::Internal, msg));
-    }
-
-    match response.payload {
-        RP::NsightStart(r) => Ok(NsightPayload::StartResponse(r)),
-        RP::NsightStop(r) => Ok(NsightPayload::StopResponse(r)),
-        RP::NsightSessions(r) => Ok(NsightPayload::SessionsResponse(r)),
-        RP::NsightReport(r) => Ok(NsightPayload::ReportResponse(r)),
-        RP::NsightDelete(r) => Ok(NsightPayload::DeleteResponse(r)),
-        RP::NsightDownload(r) => Ok(NsightPayload::DownloadResponse(r)),
-        _ => Err(ProtocolError::internal(
-            "remote node returned unexpected payload variant",
-        )),
-    }
-}
-
-/// Lokalna obsluga sub-akcji NsightPayload — wywolywana gdy `req.node_id`
-/// odpowiada lokalnemu nodowi. Reuzywa `NSYS_RUNNER` i `ProfileStorage`.
-async fn handle_nsight_local(
-    ctx: &HandlerContext,
-    payload: NsightPayload,
-) -> Result<NsightPayload, ProtocolError> {
-    use crate::profiling::NSYS_RUNNER;
-    use tentaflow_protocol::profiling::{
-        NsightDeleteResponse, NsightDownloadResponse, NsightReportResponse, NsightSessionsResponse,
-        NsightStartResponse, NsightStopResponse,
-    };
-
-    match payload {
-        NsightPayload::StartRequest(req) => {
-            let storage = local_profile_storage(ctx);
-            let scope_str = format!("{:?}", req.scope);
-            let label_for_audit = req.label.clone();
-            let duration_for_audit = req.duration_secs;
-            let (session_id, started_at_ms) = NSYS_RUNNER
-                .start(req.scope, req.duration_secs, req.label, &storage)
-                .await
-                .map_err(profiling_err_to_proto)?;
-            let details = serde_json::json!({
-                "session_id": session_id,
-                "scope": scope_str,
-                "label": label_for_audit,
-                "duration_secs": duration_for_audit,
-            })
-            .to_string();
-            let _ = repository::log_audit(
-                &ctx.state.db,
-                None,
-                None,
-                "nsight.start",
-                Some(&format!("session:{}", session_id)),
-                Some(&details),
-                None,
-                Some(ctx.state.local_node_id.as_ref()),
-            );
-            Ok(NsightPayload::StartResponse(NsightStartResponse {
-                session_id,
-                started_at_ms,
-            }))
-        }
-        NsightPayload::StopRequest(req) => {
-            let storage = local_profile_storage(ctx);
-            let status = NSYS_RUNNER
-                .stop(&req.session_id, &storage)
-                .await
-                .map_err(profiling_err_to_proto)?;
-            let _ = repository::log_audit(
-                &ctx.state.db,
-                None,
-                None,
-                "nsight.stop",
-                Some(&format!("session:{}", req.session_id)),
-                Some(&format!("{:?}", status)),
-                None,
-                Some(ctx.state.local_node_id.as_ref()),
-            );
-            Ok(NsightPayload::StopResponse(NsightStopResponse {
-                session_id: req.session_id,
-                status,
-            }))
-        }
-        NsightPayload::SessionsRequest(req) => {
-            let storage = local_profile_storage(ctx);
-            let sessions = storage.list().map_err(profiling_err_to_proto)?;
-            Ok(NsightPayload::SessionsResponse(NsightSessionsResponse {
-                node_id: req.node_id,
-                sessions,
-            }))
-        }
-        NsightPayload::ReportRequest(req) => {
-            // Najpierw v1 storage (legacy nsys-only). Jesli sesja w v1 brak,
-            // fallback do storage_v2 (multi-source). Multi-source sesje zapisuja
-            // ProfileReportEnvelope::V1Legacy(ProfileReport) gdy collectorzy
-            // wygenerowali metryki kompatybilne z legacy view (nsys path), albo
-            // V2 gdy nowy format - w drugim przypadku zwracamy konkretny error
-            // zeby GUI wiedzialo zeby uzyc V2 view.
-            let storage = local_profile_storage(ctx);
-            match storage.read_summary(&req.session_id) {
-                Ok(report) => {
-                    return Ok(NsightPayload::ReportResponse(NsightReportResponse {
-                        report,
-                    }));
-                }
-                Err(crate::profiling::ProfilingError::NotFound(_)) => {
-                    // v1 nie ma - sprobuj v2.
-                }
-                Err(e) => return Err(profiling_err_to_proto(e)),
-            }
-            // Fallback v2: multi-source sesje zyja w <home>/profiling/<node>/<session>/
-            let storage_v2 = std::sync::Arc::clone(&crate::profiling::PROFILE_STORAGE_V2);
-            let local_node_id = ctx.state.local_node_id.as_ref().to_string();
-            match storage_v2
-                .read_report(&local_node_id, &req.session_id)
-                .await
-            {
-                Ok(envelope) => {
-                    use tentaflow_protocol::profiling::ProfileReportEnvelope;
-                    match envelope {
-                        ProfileReportEnvelope::V1Legacy(report) => {
-                            Ok(NsightPayload::ReportResponse(NsightReportResponse {
-                                report,
-                            }))
-                        }
-                        ProfileReportEnvelope::V2(_v2_report) => {
-                            // V2 ma inne pola (multi-source timeline, frames, stacks
-                            // itp.) ktorych legacy NsightReport view nie potrafi
-                            // wyrenderowac. Zwracamy bad-request zeby GUI uzyl V2 view.
-                            Err(ProtocolError::bad_request(format!(
-                                "sesja {} to multi-source profilowanie (V2). \
-                                 Otwórz przez Profile Report V2 (mesh detail -> Sessions -> ten przycisk).",
-                                req.session_id
-                            )))
-                        }
-                    }
-                }
-                Err(_e) => Err(ProtocolError::not_found(format!(
-                    "session {} not found in either v1 nsight nor v2 profiling storage",
-                    req.session_id
-                ))),
-            }
-        }
-        NsightPayload::DeleteRequest(req) => {
-            let storage = local_profile_storage(ctx);
-            storage
-                .delete(&req.session_id)
-                .map_err(profiling_err_to_proto)?;
-            Ok(NsightPayload::DeleteResponse(NsightDeleteResponse {
-                session_id: req.session_id,
-                ok: true,
-            }))
-        }
-        NsightPayload::DownloadRequest(req) => {
-            let storage = local_profile_storage(ctx);
-            let path = storage
-                .raw_report_path(&req.session_id)
-                .map_err(profiling_err_to_proto)?;
-            let bytes = tokio::fs::read(&path).await.map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ProtocolError::not_found(format!("session not found: {}", req.session_id))
-                } else {
-                    ProtocolError::internal(format!("nsight download: {}", e))
-                }
-            })?;
-            let filename = format!("nsight-{}.nsys-rep", req.session_id);
-            Ok(NsightPayload::DownloadResponse(NsightDownloadResponse {
-                session_id: req.session_id,
-                filename,
-                bytes,
-            }))
-        }
-        // Response warianty nie powinny przyjsc jako request — zwracaj BadRequest.
-        NsightPayload::StartResponse(_)
-        | NsightPayload::StopResponse(_)
-        | NsightPayload::SessionsResponse(_)
-        | NsightPayload::ReportResponse(_)
-        | NsightPayload::DeleteResponse(_)
-        | NsightPayload::DownloadResponse(_) => Err(ProtocolError::bad_request(
-            "expected NsightPayload request variant",
-        )),
-        // Profiling V2 jest obslugiwany przez `profiling_dispatch` — jesli tu trafil,
-        // ktos wywolal nsight handler ze zlym wariantem.
-        NsightPayload::Profiling(_) => Err(ProtocolError::bad_request(
-            "Profiling sub-payload must use profiling_dispatch, not nsight",
-        )),
-    }
-}
-
-/// Wybiera lokalna albo mesh-forward sciezke po `req.node_id`.
-async fn nsight_route(
-    ctx: &HandlerContext,
-    payload: NsightPayload,
-) -> Result<NsightPayload, ProtocolError> {
-    use tentaflow_protocol::mesh::MeshCommandType as MC;
-
-    let local = ctx.state.local_node_id.as_ref();
-    let target: String = match &payload {
-        NsightPayload::StartRequest(r) => r.node_id.clone(),
-        NsightPayload::StopRequest(r) => r.node_id.clone(),
-        NsightPayload::SessionsRequest(r) => r.node_id.clone(),
-        NsightPayload::ReportRequest(r) => r.node_id.clone(),
-        NsightPayload::DeleteRequest(r) => r.node_id.clone(),
-        NsightPayload::DownloadRequest(r) => r.node_id.clone(),
-        _ => {
-            return Err(ProtocolError::bad_request(
-                "expected NsightPayload request variant",
-            ))
-        }
-    };
-
-    if target.is_empty() || target.as_str() == local {
-        return handle_nsight_local(ctx, payload).await;
-    }
-
-    let cmd = match payload {
-        NsightPayload::StartRequest(r) => MC::NsightStart(r),
-        NsightPayload::StopRequest(r) => MC::NsightStop(r),
-        NsightPayload::SessionsRequest(r) => MC::NsightSessions(r),
-        NsightPayload::ReportRequest(r) => MC::NsightReport(r),
-        NsightPayload::DeleteRequest(r) => MC::NsightDelete(r),
-        NsightPayload::DownloadRequest(r) => MC::NsightDownload(r),
-        _ => unreachable!("filtered above"),
-    };
-    forward_nsight_to_peer(ctx, &target, cmd).await
-}
-
-/// Jeden handler dla calego `MessageBody::NsightBody` — wewnatrz match po
-/// wariantach `NsightPayload`. Zarejestrowany pod 5 nazwami request-side przez
-/// `register_nsight_variant!` macro (variant_name_of zwraca pojedyncze nazwy
-/// jak "NsightStartRequest").
-#[handler(variant = "NsightBody", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub async fn nsight_dispatch(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::NsightBody(p) => p.clone(),
-        _ => return Err(ProtocolError::bad_request("expected NsightBody")),
-    };
-    let res = nsight_route(ctx, payload).await?;
-    Ok(MessageBody::NsightBody(res))
-}
-
-// variant_name_of() zwraca nazwy inner payloadu (np. "NsightStartRequest"),
-// wiec rejestrujemy `nsight_dispatch` pod kazdym z 5 nazw request-side.
-// Wzorzec analogiczny do `register_iam_variant!` w handlers.rs — wrapper
-// `__tentaflow_dispatch_nsight_dispatch` jest file-private, dlatego submit!
-// musi byc w tym samym pliku.
-macro_rules! register_nsight_variant {
-    ($variant:literal, $metric:literal) => {
-        ::inventory::submit! {
-            crate::dispatch::HandlerMeta {
-                variant_name: $variant,
-                since_major: 1,
-                since_minor: 0,
-                required_auth: crate::dispatch::SessionAuthKind::Admin,
-                metric_name: $metric,
-                dispatch_fn: __tentaflow_dispatch_nsight_dispatch,
-            }
-        }
-    };
-}
-
-register_nsight_variant!("NsightStartRequest", "tentaflow_ws_handler_nsight_start");
-register_nsight_variant!("NsightStopRequest", "tentaflow_ws_handler_nsight_stop");
-register_nsight_variant!(
-    "NsightSessionsRequest",
-    "tentaflow_ws_handler_nsight_sessions"
-);
-register_nsight_variant!("NsightReportRequest", "tentaflow_ws_handler_nsight_report");
-register_nsight_variant!("NsightDeleteRequest", "tentaflow_ws_handler_nsight_delete");
-register_nsight_variant!(
-    "NsightDownloadRequest",
-    "tentaflow_ws_handler_nsight_download"
-);
-
-// =============================================================================
-// 10. ProfilingPayload — multi-source profiling V2 (start/stop/sessions/...).
-// Pakowane wewnatrz `NsightPayload::Profiling(...)` zeby nie zjadac slotow
-// MessageBody (rkyv 256 limit).
+// 9. ProfilingBody — multi-source profiling (start/stop/sessions/report/...).
 // =============================================================================
 
 /// Mapuje `SessionError` na `ProtocolError` z deterministycznymi kodami.
@@ -967,7 +571,6 @@ fn map_storage_skipped(
 fn session_kind_to_str(k: &crate::profiling::SessionKind) -> String {
     match k {
         crate::profiling::SessionKind::MultiSource => "multi_source".to_string(),
-        crate::profiling::SessionKind::LegacyNsight => "legacy_nsight".to_string(),
     }
 }
 
@@ -1054,7 +657,7 @@ async fn forward_profiling_to_peer(
 
 /// Pakuje sciezke zdarzen + manifest + raw/ do tar.gz w pamieci.
 fn build_session_tarball(
-    storage: &crate::profiling::ProfileStorageV2,
+    storage: &crate::profiling::ProfileStorage,
     node_id: &str,
     session_id: &str,
 ) -> Result<Vec<u8>, ProtocolError> {
@@ -1086,7 +689,7 @@ async fn handle_profiling_local(
     ctx: &HandlerContext,
     payload: tentaflow_protocol::ProfilingPayload,
 ) -> Result<tentaflow_protocol::ProfilingPayload, ProtocolError> {
-    use crate::profiling::{ElevationToken, MULTI_SOURCE, PROFILE_PARSERS, PROFILE_STORAGE_V2};
+    use crate::profiling::{ElevationToken, MULTI_SOURCE, PROFILE_PARSERS, PROFILE_STORAGE};
     use tentaflow_protocol::ProfilingPayload as PP;
     use tentaflow_protocol::{
         ProfilingActiveInfoResponse, ProfilingActiveSessionInfo, ProfilingDeleteResponse,
@@ -1094,7 +697,7 @@ async fn handle_profiling_local(
         ProfilingStartResponse, ProfilingStopResponse,
     };
 
-    let storage = std::sync::Arc::clone(&PROFILE_STORAGE_V2);
+    let storage = std::sync::Arc::clone(&PROFILE_STORAGE);
     let parsers = std::sync::Arc::clone(&PROFILE_PARSERS);
     let orchestrator = std::sync::Arc::clone(&MULTI_SOURCE);
     let local_node_id = ctx.state.local_node_id.as_ref().to_string();
@@ -1192,11 +795,11 @@ async fn handle_profiling_local(
             }))
         }
         PP::ReportRequest(req) => {
-            let envelope = storage
+            let report = storage
                 .read_report(&local_node_id, &req.session_id)
                 .await
                 .map_err(storage_err_to_proto)?;
-            Ok(PP::ReportResponse(ProfilingReportResponse { envelope }))
+            Ok(PP::ReportResponse(ProfilingReportResponse { report }))
         }
         PP::DeleteRequest(req) => {
             storage
@@ -1240,6 +843,33 @@ async fn handle_profiling_local(
                 });
             Ok(PP::ActiveInfoResponse(ProfilingActiveInfoResponse { info }))
         }
+        PP::ValidateSudoRequest(req) => {
+            let response = crate::profiling::permissions::validate_sudo(req.password).await;
+            let _ = repository::log_audit(
+                &ctx.state.db,
+                None,
+                None,
+                "profiling.validate_sudo",
+                None,
+                Some(&format!(
+                    "success={}, reason={}",
+                    response.ok, response.reason
+                )),
+                None,
+                Some(ctx.state.local_node_id.as_ref()),
+            );
+            Ok(PP::ValidateSudoResponse(response))
+        }
+        PP::CollectorsStatusRequest(_req) => {
+            let (collectors, age_seconds) =
+                crate::profiling::permissions::collectors_status_snapshot();
+            Ok(PP::CollectorsStatusResponse(
+                tentaflow_protocol::ProfilingCollectorsStatusResponse {
+                    collectors,
+                    age_seconds,
+                },
+            ))
+        }
         // Response variants must not arrive as requests.
         PP::StartResponse(_)
         | PP::StopResponse(_)
@@ -1247,7 +877,9 @@ async fn handle_profiling_local(
         | PP::ReportResponse(_)
         | PP::DeleteResponse(_)
         | PP::DownloadResponse(_)
-        | PP::ActiveInfoResponse(_) => Err(ProtocolError::bad_request(
+        | PP::ActiveInfoResponse(_)
+        | PP::ValidateSudoResponse(_)
+        | PP::CollectorsStatusResponse(_) => Err(ProtocolError::bad_request(
             "expected ProfilingPayload request variant",
         )),
     }
@@ -1269,6 +901,12 @@ async fn profiling_route(
         PP::DeleteRequest(r) => r.node_id.clone(),
         PP::DownloadRequest(r) => r.node_id.clone(),
         PP::ActiveInfoRequest(r) => r.node_id.clone(),
+        // ValidateSudo i CollectorsStatus to per-process state — sudo dziala
+        // tylko w kontekscie tego procesu, kolektory probowane lokalnie.
+        // Nie forward'ujemy do peera - obsluga wprost lokalna.
+        PP::ValidateSudoRequest(_) | PP::CollectorsStatusRequest(_) => {
+            return handle_profiling_local(ctx, payload).await;
+        }
         _ => {
             return Err(ProtocolError::bad_request(
                 "expected ProfilingPayload request variant",
@@ -1300,17 +938,14 @@ pub async fn profiling_dispatch(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    use tentaflow_protocol::NsightPayload;
     let payload = match req {
-        MessageBody::NsightBody(NsightPayload::Profiling(p)) => p.clone(),
+        MessageBody::ProfilingBody(p) => p.clone(),
         _ => {
-            return Err(ProtocolError::bad_request(
-                "expected NsightBody(Profiling(_))",
-            ))
+            return Err(ProtocolError::bad_request("expected ProfilingBody"))
         }
     };
     let res = profiling_route(ctx, payload).await?;
-    Ok(MessageBody::NsightBody(NsightPayload::Profiling(res)))
+    Ok(MessageBody::ProfilingBody(res))
 }
 
 macro_rules! register_profiling_variant {
@@ -1356,13 +991,21 @@ register_profiling_variant!(
     "ProfilingActiveInfoRequest",
     "tentaflow_ws_handler_profiling_active_info"
 );
+register_profiling_variant!(
+    "ProfilingValidateSudoRequest",
+    "tentaflow_ws_handler_profiling_validate_sudo"
+);
+register_profiling_variant!(
+    "ProfilingCollectorsStatusRequest",
+    "tentaflow_ws_handler_profiling_collectors_status"
+);
 
 #[cfg(test)]
 mod profiling_tests {
     use super::*;
     use crate::dispatch::state::AppState;
     use tentaflow_protocol::{
-        NsightPayload, ProfileScope, ProfileSourceFlags, ProfileTarget, ProfilingActiveInfoRequest,
+        ProfileScope, ProfileSourceFlags, ProfileTarget, ProfilingActiveInfoRequest,
         ProfilingDeleteRequest, ProfilingDownloadRequest, ProfilingReportRequest,
         ProfilingSessionsRequest, ProfilingStartRequest, ProfilingStopRequest, SessionAuth,
     };
@@ -1391,7 +1034,7 @@ mod profiling_tests {
     }
 
     fn wrap(p: tentaflow_protocol::ProfilingPayload) -> MessageBody {
-        MessageBody::NsightBody(NsightPayload::Profiling(p))
+        MessageBody::ProfilingBody(p)
     }
 
     #[tokio::test]
@@ -1403,9 +1046,9 @@ mod profiling_tests {
         ));
         let res = profiling_dispatch(&body, &ctx).await;
         match res {
-            Ok(MessageBody::NsightBody(NsightPayload::Profiling(
+            Ok(MessageBody::ProfilingBody(
                 tentaflow_protocol::ProfilingPayload::ActiveInfoResponse(r),
-            ))) => {
+            )) => {
                 // Może być Some(...) jeżeli inny test left the orchestrator active —
                 // wówczas nie crashujemy, akceptujemy oba stany.
                 let _ = r.info;
@@ -1426,10 +1069,10 @@ mod profiling_tests {
         ));
         let res = profiling_dispatch(&body, &ctx).await;
         match res {
-            Ok(MessageBody::NsightBody(NsightPayload::Profiling(
+            Ok(MessageBody::ProfilingBody(
                 tentaflow_protocol::ProfilingPayload::SessionsResponse(r),
-            ))) => {
-                // PROFILE_STORAGE_V2 jest LazyLock i mogla byc juz zainicjowana
+            )) => {
+                // PROFILE_STORAGE jest LazyLock i mogla byc juz zainicjowana
                 // wczesniej z innym TENTAFLOW_HOME — wiec wynik moze nie byc pusty.
                 let _ = r.entries;
             }
@@ -1553,228 +1196,3 @@ mod profiling_tests {
     }
 }
 
-#[cfg(test)]
-mod nsight_tests {
-    use super::*;
-    use crate::dispatch::state::AppState;
-    use tentaflow_protocol::profiling::{
-        NsightDeleteRequest, NsightDownloadRequest, NsightReportRequest, NsightScope,
-        NsightSessionsRequest, NsightStartRequest, NsightStopRequest,
-    };
-    use tentaflow_protocol::SessionAuth;
-
-    fn admin_ctx() -> HandlerContext {
-        HandlerContext {
-            session: SessionAuth::UserSession {
-                user_id: [0u8; 16],
-                role: Some("admin".to_string()),
-            },
-            correlation_id: 1,
-            resume_secret: None,
-            state: AppState::for_test(),
-        }
-    }
-
-    /// `req.node_id` ustawiony na lokalny node musi isc lokalna sciezka. Bez nsys
-    /// w PATH dostaniemy `NotAvailable` z `profiling_err_to_proto`.
-    #[tokio::test]
-    async fn nsight_start_local_node_routes_locally() {
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        let body = MessageBody::NsightBody(NsightPayload::StartRequest(NsightStartRequest {
-            node_id: local,
-            scope: NsightScope::Cpu,
-            duration_secs: 10,
-            label: "test".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        // Bez nsys w PATH dostajemy NotAvailable. Wazne ze nie poszlo do mesh
-        // forwardera (bo `quic_mesh = None` dalby inny komunikat o mesh managerze).
-        match res {
-            Err(e) => assert!(
-                e.message.contains("nsys not available") || e.message.contains("nsys"),
-                "oczekiwano komunikatu o braku nsys, dostalem: {}",
-                e.message
-            ),
-            Ok(_) => {} // jesli host ma nsys to test po prostu przechodzi.
-        }
-    }
-
-    #[tokio::test]
-    async fn nsight_start_invalid_duration_601_is_bad_request() {
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        let body = MessageBody::NsightBody(NsightPayload::StartRequest(NsightStartRequest {
-            node_id: local,
-            scope: NsightScope::Cpu,
-            duration_secs: 601,
-            label: "test".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        match res {
-            Err(e) => {
-                // NotAvailable wygrywa nad InvalidDuration tylko wtedy gdy capability
-                // jest sprawdzane przed walidacja — sprawdzmy w nsys.rs:
-                // start() najpierw waliduje duration, dopiero potem capability.
-                // Wiec na hostach bez nsys i tak dostajemy BadRequest.
-                if e.code != ProtocolErrorCode::BadRequest {
-                    // Toleruj Internal jesli to capability check przyspieszyl.
-                    assert!(
-                        e.message.contains("invalid duration") || e.message.contains("nsys"),
-                        "spodziewane invalid duration albo nsys, dostalem: {:?}",
-                        e
-                    );
-                } else {
-                    assert!(e.message.contains("invalid duration"));
-                }
-            }
-            Ok(_) => panic!("oczekiwano bledu walidacji"),
-        }
-    }
-
-    #[tokio::test]
-    async fn nsight_stop_invalid_session_id_is_bad_request() {
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        let body = MessageBody::NsightBody(NsightPayload::StopRequest(NsightStopRequest {
-            node_id: local,
-            session_id: "../etc/passwd".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        match res {
-            Err(e) => {
-                // NSYS_RUNNER.stop() zwraca NotFound dla nieaktywnej sesji ZANIM
-                // walidacja session_id sprawdzi format. Akceptujemy oba scenariusze
-                // (NotFound i BadRequest) — wazne ze handler nie crashuje i nie
-                // probuje czegos wykonac z bledna sciezka.
-                assert!(
-                    matches!(
-                        e.code,
-                        ProtocolErrorCode::BadRequest | ProtocolErrorCode::NotFound
-                    ),
-                    "spodziewano BadRequest/NotFound, dostalem: {:?}",
-                    e
-                );
-            }
-            Ok(_) => panic!("oczekiwano bledu"),
-        }
-    }
-
-    #[tokio::test]
-    async fn nsight_download_invalid_session_id_is_bad_request() {
-        // Walidacja regexem `^[0-9a-f]{32}$` w `session_dir` chroni przed
-        // path-traversal — proba odczytu `../etc/passwd` musi konczyc sie
-        // BadRequest, bez dotykania filesystemu.
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        let body = MessageBody::NsightBody(NsightPayload::DownloadRequest(NsightDownloadRequest {
-            node_id: local,
-            session_id: "../etc/passwd".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        match res {
-            Err(e) => assert_eq!(
-                e.code,
-                ProtocolErrorCode::BadRequest,
-                "spodziewano BadRequest, dostalem: {:?}",
-                e
-            ),
-            Ok(_) => panic!("oczekiwano bledu walidacji"),
-        }
-    }
-
-    #[tokio::test]
-    async fn nsight_download_unknown_session_is_not_found() {
-        // Poprawny format session_id ale plik `.nsys-rep` nie istnieje.
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("TENTAFLOW_HOME", tmp.path());
-        let body = MessageBody::NsightBody(NsightPayload::DownloadRequest(NsightDownloadRequest {
-            node_id: local,
-            session_id: "0123456789abcdef0123456789abcdef".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        std::env::remove_var("TENTAFLOW_HOME");
-        match res {
-            Err(e) => assert_eq!(
-                e.code,
-                ProtocolErrorCode::NotFound,
-                "spodziewano NotFound, dostalem: {:?}",
-                e
-            ),
-            Ok(_) => panic!("oczekiwano bledu"),
-        }
-    }
-
-    #[tokio::test]
-    async fn nsight_sessions_local_empty_returns_empty_list() {
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        // Wymus pusty katalog: ustaw TENTAFLOW_HOME na tempdir.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("TENTAFLOW_HOME", tmp.path());
-        // tentaflow_home jest cache'owane przez OnceLock, wiec ten test moze
-        // dostac wczesniej zainicjalizowana wartosc — w takim razie list() nadal
-        // zwroci Ok, bo node_dir nie istnieje (storage::list zwraca pusty Vec).
-        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(NsightSessionsRequest {
-            node_id: local,
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        match res {
-            Ok(MessageBody::NsightBody(NsightPayload::SessionsResponse(r))) => {
-                assert!(r.sessions.is_empty(), "oczekiwano pustej listy sesji");
-            }
-            Ok(other) => panic!("nieoczekiwany wariant: {:?}", other),
-            Err(e) => panic!("nieoczekiwany blad: {:?}", e),
-        }
-    }
-
-    #[tokio::test]
-    async fn nsight_delete_invalid_session_id_is_bad_request() {
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        let body = MessageBody::NsightBody(NsightPayload::DeleteRequest(NsightDeleteRequest {
-            node_id: local,
-            session_id: "ZZZZZ".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        match res {
-            Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest),
-            Ok(_) => panic!("oczekiwano BadRequest"),
-        }
-    }
-
-    #[tokio::test]
-    async fn nsight_report_invalid_session_id_is_bad_request() {
-        let ctx = admin_ctx();
-        let local = ctx.state.local_node_id.as_ref().to_string();
-        let body = MessageBody::NsightBody(NsightPayload::ReportRequest(NsightReportRequest {
-            node_id: local,
-            session_id: "../passwd".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        match res {
-            Err(e) => assert_eq!(e.code, ProtocolErrorCode::BadRequest),
-            Ok(_) => panic!("oczekiwano BadRequest"),
-        }
-    }
-
-    /// Bez `quic_mesh` w AppState forward do remote noda zwraca Internal —
-    /// nie ma fallback'u na lokalne wykonanie.
-    #[tokio::test]
-    async fn nsight_remote_node_without_mesh_manager_fails() {
-        let ctx = admin_ctx();
-        let body = MessageBody::NsightBody(NsightPayload::SessionsRequest(NsightSessionsRequest {
-            node_id: "some-other-peer-node".into(),
-        }));
-        let res = nsight_dispatch(&body, &ctx).await;
-        match res {
-            Err(e) => {
-                assert_eq!(e.code, ProtocolErrorCode::Internal);
-                assert!(e.message.contains("Mesh manager niedostepny"));
-            }
-            Ok(_) => panic!("oczekiwano bledu — brak quic_mesh"),
-        }
-    }
-}

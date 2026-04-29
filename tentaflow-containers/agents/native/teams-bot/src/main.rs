@@ -1026,6 +1026,7 @@ async fn main() -> Result<()> {
                             let tts_queue = crate::tts_queue::TtsQueue::spawn();
 
                             let tts_alias_owned = tts_alias.to_string();
+                            let meeting_language_owned = config.meeting_language.clone();
                             let mk_tts_job = {
                                 let tts_queue = Arc::clone(&tts_queue);
                                 let client = Arc::clone(&client);
@@ -1038,6 +1039,7 @@ async fn main() -> Result<()> {
                                     let ap = Arc::clone(&audio_playback);
                                     let total = Arc::clone(&total_bytes);
                                     let model_alias = tts_alias_owned.clone();
+                                    let lang = meeting_language_owned.clone();
                                     tts_queue.enqueue(async move {
                                         let total_in = Arc::clone(&total);
                                         let ap_in = Arc::clone(&ap);
@@ -1047,6 +1049,7 @@ async fn main() -> Result<()> {
                                                 &sentence,
                                                 "",
                                                 &model_alias,
+                                                Some(lang.as_str()),
                                                 move |pcm| {
                                                     total_in.fetch_add(pcm.len(), Ordering::Relaxed);
                                                     ap_in.send(pcm).map_err(|e| {
@@ -1101,6 +1104,7 @@ async fn main() -> Result<()> {
                                     let total = Arc::clone(&total_bytes);
                                     is_bot_speaking.store(true, Ordering::Relaxed);
                                     let echo_text = reply.clone();
+                                    let lang = config.meeting_language.clone();
                                     q.enqueue(async move {
                                         let total_in = Arc::clone(&total);
                                         let ap_in = Arc::clone(&ap);
@@ -1110,6 +1114,7 @@ async fn main() -> Result<()> {
                                                 &echo_text,
                                                 "",
                                                 &model_alias,
+                                                Some(lang.as_str()),
                                                 move |pcm| {
                                                     total_in.fetch_add(pcm.len(), Ordering::Relaxed);
                                                     ap_in.send(pcm).map_err(|e| {

@@ -701,6 +701,20 @@ async fn handle_audio_transcriptions(
         }
     };
 
+    // Rozwiazanie pola `language`: form klienta -> preferencja uzytkownika -> brak.
+    // Whisper ma w sobie language detection, wiec gdy nikt nie poda zostawiamy
+    // None i silnik sam wykryje. Prefer user setting przed auto-detection
+    // bo eliminuje cross-language hallucination przy krotkich nagraniach.
+    if language.is_none() {
+        if let (Some(ref ctx), Some(ref db)) = (user_ctx.as_ref(), router.db.as_ref()) {
+            if let Ok(Some(lang)) =
+                crate::db::repository::get_user_preferred_language(db, ctx.user_id)
+            {
+                language = Some(lang);
+            }
+        }
+    }
+
     let fname = filename.unwrap_or_else(|| "audio.mp3".to_string());
 
     debug!(

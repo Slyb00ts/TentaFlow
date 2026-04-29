@@ -9021,6 +9021,377 @@ pub mod mesh_topology {
 }
 
 // =============================================================================
+// peer_persisted + peer_hints — single source of truth for PeerRegistry state.
+// Writes go through PersistenceWriter (mesh::peer_registry::persistence). Reads
+// happen once at startup via PeerRegistry::hydrate_from_db.
+// =============================================================================
+
+/// Hint discriminator stored as INTEGER in peer_hints.hint_kind. Kept in sync
+/// with mesh::peer_registry::HintKind via from_u8 / to_u8.
+pub const HINT_KIND_DIRECT_ADDR: i64 = 0;
+pub const HINT_KIND_RELAY_URL: i64 = 1;
+pub const HINT_KIND_HOSTNAME: i64 = 2;
+
+/// Trust state encoding for peer_persisted.trust_state.
+pub const TRUST_DISCOVERED: i64 = 0;
+pub const TRUST_PENDING_PAIRING: i64 = 1;
+pub const TRUST_TRUSTED: i64 = 2;
+
+/// Role encoding for peer_persisted.role.
+pub const ROLE_NODE: i64 = 0;
+pub const ROLE_EDGE: i64 = 1;
+pub const ROLE_RELAY: i64 = 2;
+
+#[derive(Debug, Clone)]
+pub struct PeerPersistedRow {
+    pub node_id: [u8; 32],
+    pub pubkey: Vec<u8>,
+    pub trust_state: i64,
+    pub hostname: Option<String>,
+    pub platform: Option<String>,
+    pub role: i64,
+    pub last_seen_ms: i64,
+    pub persisted_ver: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerHintRow {
+    pub node_id: [u8; 32],
+    pub hint_kind: i64,
+    pub payload: String,
+    pub last_ok_ms: Option<i64>,
+    pub fail_count: i64,
+}
+
+fn node_id_from_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
+    if blob.len() != 32 {
+        anyhow::bail!("peer_persisted.node_id: expected 32 bytes, got {}", blob.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&blob);
+    Ok(out)
+}
+
+/// Load every row from peer_persisted. Used once by PeerRegistry::hydrate_from_db
+/// at startup; afterwards the registry is the source of truth.
+pub fn load_peer_persisted_all(pool: &DbPool) -> Result<Vec<PeerPersistedRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, pubkey, trust_state, hostname, platform, role, \
+                last_seen_ms, persisted_ver, updated_at_ms \
+         FROM peer_persisted",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            let node_id = match node_id_from_blob(blob) {
+                Ok(id) => id,
+                Err(_) => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(PeerPersistedRow {
+                node_id,
+                pubkey: row.get(1)?,
+                trust_state: row.get(2)?,
+                hostname: row.get(3)?,
+                platform: row.get(4)?,
+                role: row.get(5)?,
+                last_seen_ms: row.get(6)?,
+                persisted_ver: row.get(7)?,
+                updated_at_ms: row.get(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Load every hint row, grouped by node_id. Skips rows whose node_id is not
+/// 32 bytes (defensive: should be impossible thanks to FK + schema).
+pub fn load_peer_hints_all(
+    pool: &DbPool,
+) -> Result<std::collections::HashMap<[u8; 32], Vec<PeerHintRow>>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, hint_kind, payload, last_ok_ms, fail_count FROM peer_hints",
+    )?;
+    let mut out: std::collections::HashMap<[u8; 32], Vec<PeerHintRow>> = Default::default();
+    let rows = stmt.query_map([], |row| {
+        let blob: Vec<u8> = row.get(0)?;
+        let node_id = match node_id_from_blob(blob) {
+            Ok(id) => id,
+            Err(_) => return Err(rusqlite::Error::InvalidQuery),
+        };
+        Ok(PeerHintRow {
+            node_id,
+            hint_kind: row.get(1)?,
+            payload: row.get(2)?,
+            last_ok_ms: row.get(3)?,
+            fail_count: row.get(4)?,
+        })
+    })?;
+    for row in rows {
+        let row = row?;
+        out.entry(row.node_id).or_default().push(row);
+    }
+    Ok(out)
+}
+
+/// Idempotent batched upsert of peer state rows. The WHERE clause on the
+/// conflict path drops out-of-order writes (lower persisted_ver loses).
+pub fn upsert_peer_persisted_batch(pool: &DbPool, rows: &[PeerPersistedRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO peer_persisted \
+                (node_id, pubkey, trust_state, hostname, platform, role, \
+                 last_seen_ms, persisted_ver, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(node_id) DO UPDATE SET \
+                pubkey = excluded.pubkey, \
+                trust_state = excluded.trust_state, \
+                hostname = excluded.hostname, \
+                platform = excluded.platform, \
+                role = excluded.role, \
+                last_seen_ms = excluded.last_seen_ms, \
+                persisted_ver = excluded.persisted_ver, \
+                updated_at_ms = excluded.updated_at_ms \
+             WHERE excluded.persisted_ver > peer_persisted.persisted_ver",
+        )?;
+        for r in rows {
+            stmt.execute(rusqlite::params![
+                r.node_id.as_slice(),
+                r.pubkey,
+                r.trust_state,
+                r.hostname,
+                r.platform,
+                r.role,
+                r.last_seen_ms,
+                r.persisted_ver,
+                r.updated_at_ms,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Replace the hint set for a node atomically. Hints are union-merged in
+/// memory by the writer before this call, so a single call carries the
+/// authoritative current set.
+pub fn replace_peer_hints(
+    pool: &DbPool,
+    node_id: &[u8; 32],
+    hints: &[PeerHintRow],
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM peer_hints WHERE node_id = ?1",
+        rusqlite::params![node_id.as_slice()],
+    )?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO peer_hints \
+                (node_id, hint_kind, payload, last_ok_ms, fail_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for h in hints {
+            stmt.execute(rusqlite::params![
+                h.node_id.as_slice(),
+                h.hint_kind,
+                h.payload,
+                h.last_ok_ms,
+                h.fail_count,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn delete_peer_persisted(pool: &DbPool, node_id: &[u8; 32]) -> Result<()> {
+    let conn = acquire(pool)?;
+    // peer_hints cascade-delete via FK.
+    conn.execute(
+        "DELETE FROM peer_persisted WHERE node_id = ?1",
+        rusqlite::params![node_id.as_slice()],
+    )?;
+    Ok(())
+}
+
+/// One-shot upgrade path: copy `trusted_nodes` rows + decode `settings` keys
+/// `trusted_contact:<hex>` (JSON value) into peer_persisted + peer_hints.
+/// After the copy, settings rows for `trusted_contact:%` and `pending_contact:%`
+/// are deleted. Returns the number of peer_persisted rows produced.
+///
+/// Idempotent: if peer_persisted already has a row for a given node_id, the
+/// trusted_nodes copy is skipped via INSERT OR IGNORE; settings rows are
+/// always purged at the end.
+pub fn migrate_settings_trusted_contacts_to_peer_hints(pool: &DbPool) -> Result<usize> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+
+    let now_ms: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    // Step 1: pull trusted_nodes rows. Tolerate absence of last_addresses.
+    let mut trusted_rows: Vec<(String, String, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT node_id, public_key, hostname FROM trusted_nodes WHERE is_active = 1",
+        )?;
+        let it = stmt.query_map([], |row| {
+            let nid: String = row.get(0)?;
+            let pk: String = row.get(1)?;
+            let host: String = row.get(2).unwrap_or_default();
+            Ok((nid, pk, host))
+        })?;
+        for r in it {
+            trusted_rows.push(r?);
+        }
+    }
+
+    let mut created = 0usize;
+    {
+        let mut ins_peer = tx.prepare_cached(
+            "INSERT OR IGNORE INTO peer_persisted \
+                (node_id, pubkey, trust_state, hostname, platform, role, \
+                 last_seen_ms, persisted_ver, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, 0, ?6)",
+        )?;
+
+        for (node_hex, pk_hex, hostname) in &trusted_rows {
+            let mut node_id = [0u8; 32];
+            if hex::decode_to_slice(node_hex.as_str(), &mut node_id).is_err() {
+                continue;
+            }
+            // pubkey may be 64 hex (Ed25519) or 128 hex (Ed25519+X25519).
+            let pubkey = match hex::decode(pk_hex.as_str()) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let host_opt: Option<&str> = if hostname.is_empty() { None } else { Some(hostname) };
+            let n = ins_peer.execute(rusqlite::params![
+                node_id.as_slice(),
+                pubkey,
+                TRUST_TRUSTED,
+                host_opt,
+                ROLE_NODE,
+                now_ms,
+            ])?;
+            if n > 0 {
+                created += 1;
+            }
+        }
+    }
+
+    // Step 2: parse settings `trusted_contact:<hex>` rows (JSON
+    // PairingContactHints) and emit peer_hints rows. Same JSON shape used by
+    // pairing.rs / sanitize_trusted_contacts.
+    let mut settings_rows: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT key, value FROM settings WHERE key LIKE 'trusted_contact:%' ESCAPE '\\'",
+        )?;
+        let it = stmt.query_map([], |row| {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            Ok((key, value))
+        })?;
+        for r in it {
+            settings_rows.push(r?);
+        }
+    }
+
+    {
+        // Ensure a peer_persisted row exists before inserting hints (FK).
+        let mut ensure_peer = tx.prepare_cached(
+            "INSERT OR IGNORE INTO peer_persisted \
+                (node_id, pubkey, trust_state, hostname, platform, role, \
+                 last_seen_ms, persisted_ver, updated_at_ms) \
+             VALUES (?1, X'', ?2, NULL, NULL, ?3, 0, 0, ?4)",
+        )?;
+        let mut ins_hint = tx.prepare_cached(
+            "INSERT OR IGNORE INTO peer_hints (node_id, hint_kind, payload, last_ok_ms, fail_count) \
+             VALUES (?1, ?2, ?3, NULL, 0)",
+        )?;
+
+        for (key, value) in &settings_rows {
+            let hex_part = match key.strip_prefix("trusted_contact:") {
+                Some(s) => s,
+                None => continue,
+            };
+            let mut node_id = [0u8; 32];
+            if hex::decode_to_slice(hex_part, &mut node_id).is_err() {
+                continue;
+            }
+            let parsed: serde_json::Value = match serde_json::from_str(value) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            ensure_peer.execute(rusqlite::params![
+                node_id.as_slice(),
+                TRUST_TRUSTED,
+                ROLE_NODE,
+                now_ms,
+            ])?;
+
+            if let Some(addrs) = parsed.get("addresses").and_then(|v| v.as_array()) {
+                for a in addrs {
+                    if let Some(s) = a.as_str() {
+                        if !s.is_empty() {
+                            ins_hint.execute(rusqlite::params![
+                                node_id.as_slice(),
+                                HINT_KIND_DIRECT_ADDR,
+                                s,
+                            ])?;
+                        }
+                    }
+                }
+            }
+            if let Some(relay) = parsed.get("relay_url").and_then(|v| v.as_str()) {
+                if !relay.is_empty() {
+                    ins_hint.execute(rusqlite::params![
+                        node_id.as_slice(),
+                        HINT_KIND_RELAY_URL,
+                        relay,
+                    ])?;
+                }
+            }
+            if let Some(host) = parsed.get("hostname").and_then(|v| v.as_str()) {
+                if !host.is_empty() {
+                    ins_hint.execute(rusqlite::params![
+                        node_id.as_slice(),
+                        HINT_KIND_HOSTNAME,
+                        host,
+                    ])?;
+                }
+            }
+        }
+    }
+
+    // Step 3: purge settings rows that have been migrated. pending_contact:* is
+    // an ephemeral pairing artifact; not migrated, just dropped.
+    tx.execute(
+        "DELETE FROM settings WHERE key LIKE 'trusted_contact:%' ESCAPE '\\'",
+        [],
+    )?;
+    tx.execute(
+        "DELETE FROM settings WHERE key LIKE 'pending_contact:%' ESCAPE '\\'",
+        [],
+    )?;
+
+    tx.commit()?;
+    Ok(created)
+}
+
+// =============================================================================
 // Tests: meeting_summaries + meeting_action_items (migracja 53)
 // =============================================================================
 
@@ -9439,5 +9810,87 @@ mod delete_service_cascade_tests {
         // Drugi call to no-op.
         let again = prune_orphaned_quic_models(&db).unwrap();
         assert_eq!(again, 0, "drugi prune nic nie znajduje");
+    }
+}
+
+// =============================================================================
+// Tests: settings → peer_persisted/peer_hints upgrade migration (PR5)
+// =============================================================================
+
+#[cfg(test)]
+mod settings_to_peer_hints_migration_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("init test DB")
+    }
+
+    #[test]
+    fn migration_settings_trusted_contacts_to_peer_hints_idempotent() {
+        let db = fresh_db();
+
+        // db::init runs the migration once on a clean schema; expect zero
+        // peer rows at this point.
+        let n0: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM peer_persisted", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(n0, 0, "fresh DB should not contain peer_persisted rows yet");
+
+        // Seed a legacy settings row with the JSON shape that pairing.rs
+        // historically wrote under `trusted_contact:<hex>`. node_id is 64 hex
+        // = 32 raw bytes.
+        let node_hex = "abcd1234".repeat(8);
+        let value = r#"{"node_id":"abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234","public_key_hex":"","hostname":"foo","addresses":["127.0.0.1:7777"],"relay_url":"https://relay.example.com"}"#;
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("trusted_contact:{}", node_hex), value],
+            )
+            .unwrap();
+        }
+
+        // First explicit run after seeding.
+        let created = migrate_settings_trusted_contacts_to_peer_hints(&db).unwrap();
+        // The migration may have produced 0 from the trusted_nodes branch
+        // (table empty) but ensure_peer in the settings branch creates the
+        // peer_persisted row via INSERT OR IGNORE.
+        let _ = created;
+
+        let conn = db.lock().unwrap();
+        let persisted_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peer_persisted", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(persisted_count, 1, "expected 1 peer_persisted row after migration");
+
+        let hints_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peer_hints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hints_count, 3, "expected 3 hint rows (1 addr + 1 relay + 1 hostname)");
+
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key LIKE 'trusted_contact:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "settings rows should be purged after migration");
+        drop(conn);
+
+        // Idempotency: a second run must not duplicate rows.
+        let _ = migrate_settings_trusted_contacts_to_peer_hints(&db).unwrap();
+        let conn = db.lock().unwrap();
+        let persisted_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peer_persisted", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(persisted_after, 1, "second run must not create duplicates");
+        let hints_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peer_hints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hints_after, 3, "second run must not create duplicate hints");
     }
 }

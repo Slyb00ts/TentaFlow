@@ -1,11 +1,15 @@
 // =============================================================================
 // File: modules/chat.js — User-facing Chat app.
-// Layout (matches wireframes-20260417 #chat-app):
-//   [conversations sidebar 280px] | [model chip + status | virtualized body | composer]
-// Virtualization: VirtualList + pretext text-measure. Handles 10k+ messages.
-// Streaming: incremental tail-only height updates (O(1) per chunk).
+// Layout (matches design chat-redesign-20260430):
+//   [conversations sidebar 296px] | [model picker + title + actions |
+//    centered max-800px virtualized body | composer pill]
+// Virtualization: VirtualList mounted directly on .chat-body. The centered
+// 800px column is achieved via `padding-inline: max(24px, calc((100% - 800px)/2))`
+// on .chat-body so the vlist host stays full-width and the scrollbar sits at
+// the viewport edge. Streaming uses incremental tail-only height updates (O(1)
+// per chunk).
 // Conversations: persisted locally (localStorage) — server history API is
-// a future addition; until then every user has a real, persistent local list.
+// a future addition.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -13,10 +17,18 @@ import { byId, escapeHtml, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { measureItemHeight, getDefaultFont, getDefaultLineHeight } from '/js/lib/text-measure.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
+import { renderMarkdown, extractPlainText } from '/js/lib/md-lite.js';
 
-const MAX_BUBBLE_WIDTH = 0.85;
 const STORAGE_KEY = 'tentaflow_chat_conversations_v1';
-const BUBBLE_CHROME_PX = 16 + 30 + 12; // bubble padding (20) + avatar gutter (30+12)
+const MAX_INPUT_CHARS = 4096;
+// Bubble chrome (avatar 36 + gap 12 + bubble padding 16+16). User messages do
+// not span the full inner column; assistant messages do. Heuristic — overscan
+// in VirtualList absorbs small drift from <think>/code blocks.
+const AVATAR_AND_GAP_PX = 36 + 12;
+const BUBBLE_PADDING_PX = 16 + 16;
+const USER_BUBBLE_MAX = 680;
+const FENCE_HEADER_PX = 30;
+const THINK_COLLAPSED_PX = 40;
 
 let unsubscribe = null;
 let modelOptions = [];
@@ -35,8 +47,7 @@ function loadConversations() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed;
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
@@ -59,7 +70,7 @@ function newConversation(title) {
     title: title || I18n.t('chat.new_conversation') || 'Nowa rozmowa',
     createdAt: Date.now(),
     updatedAt: Date.now(),
-    messages: [], // { id, role, text, ts }
+    messages: [],
   };
 }
 
@@ -67,7 +78,7 @@ function activeConv() {
   return conversations.find((c) => c.id === activeConvId) || null;
 }
 
-// ---- Rendering helpers ---------------------------------------------------
+// ---- Sidebar rendering ---------------------------------------------------
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
@@ -85,17 +96,37 @@ function lastMessagePreview(conv) {
   const last = conv.messages[conv.messages.length - 1];
   if (!last) return '';
   const prefix = last.role === 'user' ? 'User: ' : last.role === 'assistant' ? 'AI: ' : '';
-  const text = last.text.replace(/\s+/g, ' ').trim();
+  const text = extractPlainText(last.text || '');
   return prefix + (text.length > 60 ? `${text.slice(0, 60)}…` : text);
+}
+
+// Group conversations into Today / Yesterday / Earlier buckets for sidebar.
+function groupByDay(items) {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = startOfToday - 86_400_000;
+  const today = [];
+  const yesterday = [];
+  const earlier = [];
+  for (const c of items) {
+    if (c.updatedAt >= startOfToday) today.push(c);
+    else if (c.updatedAt >= startOfYesterday) yesterday.push(c);
+    else earlier.push(c);
+  }
+  const groups = [];
+  if (today.length) groups.push({ label: I18n.t('chat.day_today') || 'Dziś', items: today });
+  if (yesterday.length) groups.push({ label: I18n.t('chat.day_yesterday') || 'Wczoraj', items: yesterday });
+  if (earlier.length) groups.push({ label: I18n.t('chat.day_earlier') || 'Wcześniej', items: earlier });
+  return groups;
 }
 
 function renderConvItem(conv) {
   const cls = `conv-item${conv.id === activeConvId ? ' active' : ''}`;
   return `
     <div class="${cls}" data-conv-id="${escapeHtml(conv.id)}">
-      <div class="conv-time">${escapeHtml(formatTime(conv.updatedAt))}</div>
-      <div class="conv-title">${escapeHtml(conv.title)}</div>
-      <div class="conv-snippet">${escapeHtml(lastMessagePreview(conv))}</div>
+      <span class="conv-title">${escapeHtml(conv.title)}</span>
+      <span class="conv-time">${escapeHtml(formatTime(conv.updatedAt))}</span>
+      <span class="conv-snippet">${escapeHtml(lastMessagePreview(conv))}</span>
     </div>
   `;
 }
@@ -114,56 +145,142 @@ function renderConvList() {
     host.innerHTML = `<div class="conv-empty">${escapeHtml(I18n.t('chat.no_conversations') || 'Brak rozmów')}</div>`;
     return;
   }
-  host.innerHTML = filtered.map(renderConvItem).join('');
+  const groups = groupByDay(filtered);
+  host.innerHTML = groups
+    .map((g) => `<div class="conv-day">${escapeHtml(g.label)}</div>${g.items.map(renderConvItem).join('')}`)
+    .join('');
   host.querySelectorAll('.conv-item').forEach((el) => {
     el.addEventListener('click', () => {
       const id = el.dataset.convId;
-      if (id && id !== activeConvId) {
-        selectConversation(id);
-      }
+      if (id && id !== activeConvId) selectConversation(id);
+      // Close drawer on mobile pick.
+      document.querySelector('.chat-shell')?.classList.remove('drawer-open');
     });
   });
 }
 
+// ---- Bubble rendering ----------------------------------------------------
+
 function renderBubble(msg) {
-  const cls = msg.role === 'user' ? 'user' : (msg.role === 'system' ? 'system' : 'assistant');
+  const isUser = msg.role === 'user';
+  const isSystem = msg.role === 'system';
+  const cls = isUser ? 'user' : (isSystem ? 'system' : 'assistant');
   const isStreaming = msg.streaming === true;
-  const avatar = msg.role === 'user'
-    ? '<div class="avatar-mini">U</div>'
-    : msg.role === 'assistant'
-      ? '<div class="avatar-mini"><img src="/tentaflow.png" alt=""></div>'
-      : '';
-  const bubbleCls = isStreaming ? 'chat-bubble streaming' : 'chat-bubble';
+
+  const bubbleHtml = isUser
+    ? escapeHtml(msg.text || '').replaceAll('\n', '<br>')
+    : renderMarkdown(msg.text || '', { streaming: isStreaming });
+  const streamCaret = isStreaming && !isUser ? '<span class="streaming-caret"></span>' : '';
+
+  const avatar = isUser
+    ? '<div class="avatar user">U</div>'
+    : isSystem
+      ? ''
+      : `<div class="avatar assistant">${sprite('model')}</div>`;
+
+  const timeStr = formatBubbleTime(msg.ts);
+  const meta = isUser
+    ? `<div class="bubble-meta"><span>${timeStr}</span><span class="who">${escapeHtml(I18n.t('chat.you') || 'Ty')}</span></div>`
+    : `<div class="bubble-meta"><span class="who">${escapeHtml(msg.modelLabel || I18n.t('chat.assistant') || 'Asystent')}</span><span>·</span><span>${timeStr}</span></div>`;
+
+  const actions = isUser ? renderUserActions() : renderAssistantActions();
+
   return `
-    <div class="chat-msg chat-msg-${cls}">
-      ${avatar}
-      <div class="${bubbleCls}">${formatText(msg.text || '')}</div>
+    <div class="msg-row ${cls}" data-msg-id="${msg.id}">
+      ${isUser ? `
+        <div class="bubble-wrap">
+          ${meta}
+          <div class="bubble">${bubbleHtml}${streamCaret}</div>
+          ${actions}
+        </div>
+        ${avatar}
+      ` : `
+        ${avatar}
+        <div class="bubble-wrap">
+          ${meta}
+          <div class="bubble">${bubbleHtml}${streamCaret}</div>
+          ${actions}
+        </div>
+      `}
     </div>
   `;
 }
 
-function formatText(text) {
-  return escapeHtml(text).replaceAll('\n', '<br>');
+function formatBubbleTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function itemHeight(msg) {
-  // Bubble width: 85% of list width minus padding + avatar gutter.
-  const maxBubbleWidth = Math.floor(listWidth * MAX_BUBBLE_WIDTH) - BUBBLE_CHROME_PX;
-  const txtHeight = measureItemHeight(msg.text || ' ', {
+function renderUserActions() {
+  return `
+    <div class="msg-actions">
+      <button type="button" class="msg-act" data-act="copy" title="${escapeHtml(I18n.t('chat.copy') || 'Kopiuj')}">${sprite('copy')}</button>
+      <button type="button" class="msg-act" data-act="edit" title="${escapeHtml(I18n.t('chat.edit') || 'Edytuj')}">${sprite('edit')}</button>
+    </div>
+  `;
+}
+
+function renderAssistantActions() {
+  return `
+    <div class="msg-actions">
+      <button type="button" class="msg-act" data-act="copy" title="${escapeHtml(I18n.t('chat.copy') || 'Kopiuj')}">${sprite('copy')}</button>
+      <button type="button" class="msg-act" data-act="regenerate" title="${escapeHtml(I18n.t('chat.regenerate') || 'Regeneruj')}">${sprite('refresh')}</button>
+    </div>
+  `;
+}
+
+// ---- Height heuristics ---------------------------------------------------
+
+function measureBubbleHeight(text, maxWidth) {
+  const txtHeight = measureItemHeight(text || ' ', {
     font: getDefaultFont(),
-    maxWidth: Math.max(80, maxBubbleWidth),
+    maxWidth: Math.max(80, maxWidth),
     lineHeight: getDefaultLineHeight(),
   });
-  // + bubble padding (20) + msg margin (16) + avatar alignment slack
-  return Math.max(46, txtHeight + 36);
+  return txtHeight;
+}
+
+// itemHeight is a heuristic (overscan absorbs the drift). For assistant
+// messages with code fences / <think> blocks, add fixed-cost extras instead
+// of doing per-segment monospace measurement — good enough for the virtualizer.
+function itemHeight(msg) {
+  const innerWidth = listWidth || 800;
+  const isUser = msg.role === 'user';
+  const bubbleMax = isUser
+    ? Math.min(USER_BUBBLE_MAX, innerWidth) - BUBBLE_PADDING_PX
+    : (innerWidth - AVATAR_AND_GAP_PX - BUBBLE_PADDING_PX);
+  const text = msg.text || '';
+
+  let extra = 0;
+  if (!isUser) {
+    const fenceMatches = text.match(/```/g) || [];
+    extra += Math.floor(fenceMatches.length / 2) * FENCE_HEADER_PX;
+    const thinkMatches = text.match(/<think(?:ing)?>/gi) || [];
+    extra += thinkMatches.length * THINK_COLLAPSED_PX;
+  }
+
+  const txtHeight = measureBubbleHeight(text, bubbleMax);
+  // Bubble padding (24) + meta row (18) + row gap (20) + actions (28).
+  return Math.max(60, txtHeight + extra + 90);
 }
 
 // ---- Virtual list mounting -----------------------------------------------
 
+// Inner column width (used by itemHeight) = host clientWidth minus left+right
+// computed padding. Centered 800px column comes from `.chat-body` padding-inline.
+function computeInnerWidth(host) {
+  const cs = window.getComputedStyle(host);
+  const pl = parseFloat(cs.paddingLeft) || 0;
+  const pr = parseFloat(cs.paddingRight) || 0;
+  return Math.max(80, host.clientWidth - pl - pr);
+}
+
 function mountVList() {
   const host = byId('chat-body');
   if (!host) return;
-  listWidth = host.clientWidth;
+  listWidth = computeInnerWidth(host);
   const conv = activeConv();
   const messages = conv ? conv.messages : [];
   if (vlist) { vlist.destroy(); vlist = null; }
@@ -184,7 +301,7 @@ function mountVList() {
 function remountIfWidthChanged() {
   const host = byId('chat-body');
   if (!host) return;
-  const w = host.clientWidth;
+  const w = computeInnerWidth(host);
   if (Math.abs(w - listWidth) > 1) {
     listWidth = w;
     vlist?.refresh();
@@ -203,9 +320,15 @@ function selectConversation(id) {
 
 function updateHeaderTitle() {
   const titleEl = byId('chat-head-title');
-  if (!titleEl) return;
+  const metaEl = byId('chat-head-meta');
   const conv = activeConv();
-  titleEl.textContent = conv ? conv.title : '';
+  if (titleEl) titleEl.textContent = conv ? conv.title : '';
+  if (metaEl) {
+    const count = conv ? conv.messages.length : 0;
+    const label = I18n.t('chat.connected') || 'Połączony';
+    const msgsLabel = I18n.t('chat.messages_count') || 'wiadomości';
+    metaEl.textContent = conv ? `${label} · ${count} ${msgsLabel}` : '';
+  }
 }
 
 // ---- Send / receive ------------------------------------------------------
@@ -222,26 +345,35 @@ function ensureActiveConv() {
   return conv;
 }
 
+function currentInputValue() {
+  const inputEl = byId('chat-input');
+  return inputEl?.value || '';
+}
+
+function setInputValue(value) {
+  const inputEl = byId('chat-input');
+  if (inputEl) inputEl.value = value;
+}
+
 function sendMessage() {
   const modelSel = byId('chat-model');
   const modelId = modelSel?.value || (modelOptions[0]?.id ?? 'default');
-  const inputEl = byId('chat-input');
-  const userMessage = (inputEl?.value || '').trim();
+  const userMessage = currentInputValue().trim();
   if (!userMessage) return;
 
   const conv = ensureActiveConv();
-
-  inputEl.value = '';
+  setInputValue('');
+  updateInputCounter();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
-  // If conversation is still untitled, derive title from first user message.
   if (!conv.messages.length && (conv.title === 'Nowa rozmowa' || conv.title === (I18n.t('chat.new_conversation') || 'Nowa rozmowa'))) {
     conv.title = userMessage.slice(0, 40) + (userMessage.length > 40 ? '…' : '');
   }
 
   pushMessage(conv, { id: nextMsgId++, role: 'user', text: userMessage, ts: Date.now() });
 
-  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true };
+  const modelLabel = currentModelLabel();
+  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel };
   pushMessage(conv, assistantMsg);
 
   ApiBinary.subscribe(
@@ -265,6 +397,7 @@ function sendMessage() {
         saveConversations();
         onStreamTick();
         renderConvList();
+        updateHeaderTitle();
       },
       onError: (err) => {
         assistantMsg.streaming = false;
@@ -282,11 +415,16 @@ function sendMessage() {
   });
 }
 
+function currentModelLabel() {
+  const sel = byId('chat-model');
+  const id = sel?.value;
+  const m = modelOptions.find((m) => m.id === id);
+  return m?.display_name || m?.displayName || id || 'Model';
+}
+
 function pushMessage(conv, msg) {
-  // vlist.append pushuje element do items — a items to ta sama referencja co
-  // conv.messages (przekazywana przez `items: messages` w mountVList).
-  // Osobny `conv.messages.push(msg)` zdublowalby wpis. Fallback push tylko
-  // gdy vlist nie jest jeszcze zainicjalizowany.
+  // vlist.append shares the items reference with conv.messages (passed via
+  // mountVList items: messages). A separate conv.messages.push would dupe.
   if (vlist) {
     vlist.append(msg);
   } else {
@@ -296,22 +434,166 @@ function pushMessage(conv, msg) {
   saveConversations();
 }
 
-// Wywolywane po kazdym chunk ze streama. updateTail patchuje TYLKO innerHTML
-// ostatniego .vlist-item (incremental), wiec ~1ms per chunk — taniej niz
-// requestAnimationFrame ktory w background tab moze byc throttlowany do
-// <1Hz przez Chrome (powod "tokeny po 30s" gdy uzytkownik przelaczyl karte).
-// Bezposrednie wywolanie zapewnia stabilny render niezaleznie od visibility.
+// Direct call (no rAF) — background tabs throttle rAF to <1Hz in Chrome,
+// which would stall token rendering when the user switches away.
 function onStreamTick() {
   if (!vlist) return;
   const wasPinned = vlist.pinned;
   vlist.updateTail();
   const pill = byId('chat-new-pill');
   if (!pill) return;
-  if (!wasPinned) {
-    pill.classList.add('visible');
-  } else {
-    pill.classList.remove('visible');
+  if (!wasPinned) pill.classList.add('visible');
+  else pill.classList.remove('visible');
+}
+
+// ---- Composer hints ------------------------------------------------------
+
+function updateInputCounter() {
+  const counter = byId('chat-input-counter');
+  if (!counter) return;
+  const len = currentInputValue().length;
+  counter.textContent = `${len} / ${MAX_INPUT_CHARS} znaków`;
+  counter.classList.toggle('warn', len > MAX_INPUT_CHARS * 0.75);
+}
+
+// ---- Click delegation for in-bubble actions ------------------------------
+
+function onBodyClick(e) {
+  const copyBtn = e.target.closest('.copy-btn');
+  if (copyBtn) {
+    const encoded = copyBtn.dataset.code || '';
+    let plain = '';
+    try { plain = decodeURIComponent(escape(atob(encoded))); } catch { plain = ''; }
+    if (plain) {
+      navigator.clipboard?.writeText(plain).then(
+        () => toast(I18n.t('chat.copied') || 'Skopiowano', 'info'),
+        () => toast(I18n.t('chat.copy_failed') || 'Nie udało się skopiować', 'error'),
+      );
+    }
+    return;
   }
+  const act = e.target.closest('.msg-act');
+  if (act) {
+    const action = act.dataset.act;
+    const row = act.closest('.msg-row');
+    const msgId = Number(row?.dataset.msgId);
+    if (action === 'copy') {
+      const conv = activeConv();
+      const msg = conv?.messages.find((m) => m.id === msgId);
+      if (msg) {
+        navigator.clipboard?.writeText(msg.text || '');
+        toast(I18n.t('chat.copied') || 'Skopiowano', 'info');
+      }
+    } else {
+      toast(I18n.t('chat.coming_soon') || 'Wkrótce', 'info');
+    }
+  }
+}
+
+// ---- Header actions ------------------------------------------------------
+
+function exportActiveConversation() {
+  const conv = activeConv();
+  if (!conv) { toast(I18n.t('chat.no_conversations'), 'info'); return; }
+  const payload = {
+    id: conv.id,
+    title: conv.title,
+    createdAt: conv.createdAt,
+    updatedAt: conv.updatedAt,
+    messages: conv.messages.map((m) => ({ role: m.role, text: m.text, ts: m.ts })),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const dt = new Date();
+  const yyyy = dt.getFullYear();
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `tentaflow-chat-${conv.id}-${yyyy}-${mm}-${dd}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // setTimeout so the download dialog has the URL when it pops, then revoke.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(I18n.t('chat.export_done'), 'info');
+}
+
+function conversationToMarkdown(conv) {
+  const lines = [`# ${conv.title}`, ''];
+  const youLabel = I18n.t('chat.you');
+  const asstLabel = I18n.t('chat.assistant');
+  for (const m of conv.messages) {
+    const who = m.role === 'user' ? youLabel : (m.modelLabel || asstLabel);
+    lines.push(`**${who}:**`, '', m.text || '', '');
+  }
+  return lines.join('\n');
+}
+
+async function shareActiveConversation() {
+  const conv = activeConv();
+  if (!conv) { toast(I18n.t('chat.no_conversations'), 'info'); return; }
+  const md = conversationToMarkdown(conv);
+  // navigator.share is gated to secure contexts on mobile and accepts only
+  // a plain text payload here; clipboard is the desktop fallback.
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: conv.title, text: md });
+      return;
+    } catch (err) {
+      // User cancelled or unsupported MIME — fall through to clipboard.
+      if (err && err.name === 'AbortError') return;
+    }
+  }
+  try {
+    await navigator.clipboard.writeText(md);
+    toast(I18n.t('chat.share_done'), 'info');
+  } catch {
+    toast(I18n.t('chat.share_failed'), 'error');
+  }
+}
+
+function renameActiveConversation() {
+  const conv = activeConv();
+  if (!conv) return;
+  // eslint-disable-next-line no-alert
+  const next = window.prompt(I18n.t('chat.rename_prompt'), conv.title);
+  if (next == null) return;
+  const trimmed = next.trim();
+  if (!trimmed || trimmed === conv.title) return;
+  conv.title = trimmed.slice(0, 200);
+  conv.updatedAt = Date.now();
+  saveConversations();
+  renderConvList();
+  updateHeaderTitle();
+}
+
+function clearActiveConversation() {
+  const conv = activeConv();
+  if (!conv) return;
+  // eslint-disable-next-line no-alert
+  if (!window.confirm(I18n.t('chat.confirm_clear'))) return;
+  conv.messages = [];
+  conv.updatedAt = Date.now();
+  saveConversations();
+  mountVList();
+  renderConvList();
+  updateHeaderTitle();
+  toast(I18n.t('chat.clear_done'), 'info');
+}
+
+function deleteActiveConversation() {
+  const conv = activeConv();
+  if (!conv) return;
+  // eslint-disable-next-line no-alert
+  if (!window.confirm(I18n.t('chat.confirm_delete'))) return;
+  conversations = conversations.filter((c) => c.id !== conv.id);
+  activeConvId = conversations[0]?.id || null;
+  saveConversations();
+  renderConvList();
+  updateHeaderTitle();
+  mountVList();
+  toast(I18n.t('chat.delete_done'), 'info');
 }
 
 // ---- Screen --------------------------------------------------------------
@@ -323,27 +605,57 @@ const ChatScreen = {
     return `
       <div class="chat-shell">
         <aside class="chat-sidebar">
-          <tf-searchbox id="chat-search" placeholder="${escapeHtml(I18n.t('chat.search_placeholder') || 'Szukaj rozmów...')}" debounce="200"></tf-searchbox>
-          <div class="chat-new-btn">
-            <tf-button variant="primary" icon="plus" id="chat-new">${escapeHtml(I18n.t('chat.new_conversation') || 'Nowa rozmowa')}</tf-button>
+          <div class="sidebar-head">
+            <tf-searchbox id="chat-search" placeholder="${escapeHtml(I18n.t('chat.search_placeholder') || 'Szukaj rozmów...')}" debounce="200"></tf-searchbox>
+            <div class="chat-new-btn">
+              <tf-button variant="primary" icon="plus" id="chat-new">${escapeHtml(I18n.t('chat.new_conversation') || 'Nowa rozmowa')}</tf-button>
+            </div>
           </div>
           <div class="conv-list" id="chat-conv-list"></div>
         </aside>
+        <div class="chat-scrim" id="chat-scrim"></div>
         <section class="chat-main">
           <div class="chat-head">
-            <tf-select class="chat-model-select" id="chat-model"></tf-select>
-            <div class="status" id="chat-status">
-              <span class="dot"></span>
-              <span id="chat-head-title"></span>
+            <div class="chat-head-left">
+              <tf-button variant="ghost" icon="management" id="chat-burger" class="head-burger" aria-label="Menu"></tf-button>
+              <tf-select class="chat-model-select" id="chat-model"></tf-select>
+            </div>
+            <div class="head-title">
+              <span class="title" id="chat-head-title"></span>
+              <span class="meta">
+                <span class="dot-status"></span>
+                <span id="chat-head-meta"></span>
+              </span>
+            </div>
+            <div class="head-actions">
+              <tf-button variant="ghost" icon="download" id="chat-export" aria-label="${escapeHtml(I18n.t('chat.export'))}" title="${escapeHtml(I18n.t('chat.export'))}"></tf-button>
+              <tf-button variant="ghost" icon="share" id="chat-share" aria-label="${escapeHtml(I18n.t('chat.share'))}" title="${escapeHtml(I18n.t('chat.share'))}"></tf-button>
+              <div class="chat-more-wrap">
+                <tf-button variant="ghost" icon="management" id="chat-more" aria-label="${escapeHtml(I18n.t('chat.more'))}" title="${escapeHtml(I18n.t('chat.more'))}"></tf-button>
+                <tf-menu id="chat-more-menu" placement="bottom-end">
+                  <tf-menu-item action="rename" icon="edit">${escapeHtml(I18n.t('chat.menu_rename'))}</tf-menu-item>
+                  <tf-menu-item action="clear" icon="refresh">${escapeHtml(I18n.t('chat.menu_clear'))}</tf-menu-item>
+                  <tf-menu-divider></tf-menu-divider>
+                  <tf-menu-item action="delete" icon="trash" danger>${escapeHtml(I18n.t('chat.menu_delete'))}</tf-menu-item>
+                </tf-menu>
+              </div>
             </div>
           </div>
           <div class="chat-body" id="chat-body"></div>
-          <div class="chat-new-pill" id="chat-new-pill">${sprite('chevron-down')}${escapeHtml(I18n.t('chat.new_messages') || 'Nowe wiadomości')}</div>
-          <div class="chat-input-row">
-            <tf-textarea id="chat-input" autogrow rows="2"
-              placeholder="${escapeHtml(I18n.t('chat.placeholder'))}"></tf-textarea>
-            <tf-button variant="secondary" icon="paperclip" id="chat-attach" aria-label="${escapeHtml(I18n.t('chat.attach') || 'Załącz')}"></tf-button>
-            <tf-button variant="primary" icon="send" id="chat-send">${escapeHtml(I18n.t('chat.send') || 'Wyślij')}</tf-button>
+          <div class="chat-new-pill" id="chat-new-pill">${sprite('chevron-down')}<span>${escapeHtml(I18n.t('chat.new_messages') || 'Nowe wiadomości')}</span></div>
+          <div class="composer-wrap">
+            <div class="composer">
+              <tf-button variant="ghost" icon="paperclip" id="chat-attach" class="composer-attach" aria-label="${escapeHtml(I18n.t('chat.attach') || 'Załącz')}"></tf-button>
+              <tf-textarea id="chat-input" autogrow rows="1"
+                placeholder="${escapeHtml(I18n.t('chat.placeholder'))}"></tf-textarea>
+              <tf-button variant="primary" icon="send" id="chat-send" class="composer-send" aria-label="${escapeHtml(I18n.t('chat.send') || 'Wyślij')}"></tf-button>
+            </div>
+            <div class="composer-hints">
+              <span class="kbd"><kbd>Enter</kbd> ${escapeHtml(I18n.t('chat.hint_send') || 'wyślij')}</span>
+              <span class="kbd"><kbd>Shift</kbd>+<kbd>Enter</kbd> ${escapeHtml(I18n.t('chat.hint_newline') || 'nowa linia')}</span>
+              <span class="spacer"></span>
+              <span class="counter" id="chat-input-counter">0 / ${MAX_INPUT_CHARS} znaków</span>
+            </div>
           </div>
         </section>
       </div>
@@ -353,7 +665,6 @@ const ChatScreen = {
   async mount() {
     conversations = loadConversations();
     activeConvId = conversations.length ? conversations.sort((a, b) => b.updatedAt - a.updatedAt)[0].id : null;
-    // Keep nextMsgId ahead of any persisted id.
     let maxId = 0;
     for (const c of conversations) for (const m of c.messages) if (m.id > maxId) maxId = m.id;
     nextMsgId = maxId + 1;
@@ -369,10 +680,6 @@ const ChatScreen = {
         const caps = Array.isArray(m.capabilities) ? m.capabilities : [];
         return caps.length === 0 || caps.includes('chat');
       });
-      // Disambiguate duplicate model_names served by multiple services
-      // (e.g. Qwen3.5 via vllm and llama-cpp) by appending engine_id to the
-      // label of every duplicated row. service_id stays as a dedupe key in
-      // case the future router lets us pin a specific instance.
       const counts = new Map();
       for (const m of chatOnly) {
         counts.set(m.model_name, (counts.get(m.model_name) || 0) + 1);
@@ -393,8 +700,6 @@ const ChatScreen = {
 
     const sel = byId('chat-model');
     const innerSelect = sel?.querySelector('select');
-    // value = model_name (router resolves alias chains server-side), label =
-    // display name (with engine_id suffix for ambiguous rows).
     const optionsHtml = modelOptions.length === 0
       ? `<option value="default">default</option>`
       : modelOptions.map((m) => {
@@ -408,14 +713,13 @@ const ChatScreen = {
     renderConvList();
     updateHeaderTitle();
     mountVList();
+    updateInputCounter();
 
-    // Search
     byId('chat-search')?.addEventListener('search', (e) => {
       searchFilter = e.detail.value || '';
       renderConvList();
     });
 
-    // New conversation
     byId('chat-new')?.addEventListener('click', () => {
       const conv = newConversation();
       conversations.push(conv);
@@ -425,30 +729,60 @@ const ChatScreen = {
       updateHeaderTitle();
       mountVList();
       byId('chat-input')?.focus();
+      document.querySelector('.chat-shell')?.classList.remove('drawer-open');
     });
 
-    // New-messages pill — click to scroll to bottom.
     byId('chat-new-pill')?.addEventListener('click', () => {
       vlist?.scrollToBottom();
       byId('chat-new-pill')?.classList.remove('visible');
     });
 
-    // Send button
     byId('chat-send')?.addEventListener('click', sendMessage);
 
-    // Attach — not wired yet (no backend endpoint). Honest toast instead of stub.
     byId('chat-attach')?.addEventListener('click', () => {
       toast(I18n.t('chat.attach_unavailable') || 'Załączniki wkrótce', 'info');
     });
 
-    // Ctrl/Cmd+Enter submits; bare Enter inserts newline (multi-line composer).
-    byId('chat-input')?.addEventListener('tf-keydown', (e) => {
-      const { key, ctrlKey, metaKey } = e.detail;
-      if (key === 'Enter' && (ctrlKey || metaKey)) {
-        e.detail.original.preventDefault();
-        sendMessage();
-      }
+    byId('chat-export')?.addEventListener('click', exportActiveConversation);
+    byId('chat-share')?.addEventListener('click', shareActiveConversation);
+
+    // More button toggles a tf-menu sibling; the menu handles outside-click
+    // dismissal itself, so we only need the toggle and the action router.
+    byId('chat-more')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      byId('chat-more-menu')?.toggle();
     });
+    byId('chat-more-menu')?.addEventListener('action', (e) => {
+      const action = e.detail?.action;
+      if (action === 'rename') renameActiveConversation();
+      else if (action === 'clear') clearActiveConversation();
+      else if (action === 'delete') deleteActiveConversation();
+    });
+
+    byId('chat-burger')?.addEventListener('click', () => {
+      document.querySelector('.chat-shell')?.classList.toggle('drawer-open');
+    });
+    byId('chat-scrim')?.addEventListener('click', () => {
+      document.querySelector('.chat-shell')?.classList.remove('drawer-open');
+    });
+
+    // Composer keymap: bare Enter sends, Shift/Alt+Enter inserts newline,
+    // Cmd/Ctrl+Enter is kept as a power-user alias. IME composition passes
+    // through untouched so CJK input does not trigger a send mid-compose.
+    byId('chat-input')?.addEventListener('tf-keydown', (e) => {
+      const { key, ctrlKey, metaKey, shiftKey, altKey, original } = e.detail;
+      if (original?.isComposing) return;
+      if (key !== 'Enter') return;
+      if (shiftKey || altKey) return; // newline
+      original?.preventDefault();
+      sendMessage();
+      // Cmd/Ctrl+Enter falls through here too — fine, also sends.
+      void ctrlKey; void metaKey;
+    });
+
+    byId('chat-input')?.addEventListener('input', updateInputCounter);
+
+    byId('chat-body')?.addEventListener('click', onBodyClick);
 
     resizeListener = () => remountIfWidthChanged();
     window.addEventListener('resize', resizeListener);

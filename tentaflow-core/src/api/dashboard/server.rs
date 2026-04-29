@@ -885,18 +885,7 @@ pub async fn handle_request(
         ));
     }
 
-    // Mesh API — pozostale write paths (pairing/trust/connect/command/network-config).
-    // Read paths przeniesione do binarnego protokolu (FAZA 1a).
-    if path.starts_with("/api/mesh/") {
-        let (status, response_body) = route_mesh_api().await;
-        return Ok(json_response_cors(
-            status,
-            response_body,
-            cors_origin.as_deref(),
-        ));
-    }
-
-    // Clusters API — CRUD clusterow i czlonkostwa
+// Clusters API — CRUD clusterow i czlonkostwa
     if path.starts_with("/api/clusters") {
         let (status, response_body) =
             route_clusters_api(&method, &path, &db, &body_bytes, &claims, &quic_mesh).await;
@@ -1153,30 +1142,10 @@ pub async fn handle_request(
         return Ok(json_response_cors(200, body, cors_origin.as_deref()));
     }
 
-    // Profiling permissions API — sudo password validation + collector
-    // binary discovery. Both endpoints require admin; the password is
-    // validated in-memory and never persisted.
-    if path == "/api/profiling/validate-sudo" && method == Method::POST {
-        if let Some((s, b)) = require_admin(&claims, &db) {
-            return Ok(json_response_cors(s, b, cors_origin.as_deref()));
-        }
-        let (status, body) = super::api_profiling::handle_validate_sudo(
-            &db,
-            claims.user_id,
-            &body_bytes,
-            Some(remote_addr.as_str()),
-        )
-        .await;
-        return Ok(json_response_cors(status, body, cors_origin.as_deref()));
-    }
-
-    if path == "/api/profiling/collectors/status" && method == Method::GET {
-        if let Some((s, b)) = require_admin(&claims, &db) {
-            return Ok(json_response_cors(s, b, cors_origin.as_deref()));
-        }
-        let (status, body) = super::api_profiling::handle_collectors_status();
-        return Ok(json_response_cors(status, body, cors_origin.as_deref()));
-    }
+    // Profiling permissions: validate-sudo + collectors/status migrated to
+    // binary protocol (ProfilingPayload::ValidateSudoRequest /
+    // CollectorsStatusRequest). REST endpoints removed. GUI uses
+    // ApiBinary.one('profilingValidateSudoRequest', ...) etc.
 
     // Voice profiles API — bulletproof speaker recognition.
     // Wolane przez LLM po detekcji introducji ("Cześć, tu Jan") albo przez
@@ -1991,18 +1960,6 @@ fn extract_ws_user_session(
         });
 
     Some((claims.user_id, role))
-}
-
-/// Routing endpointow mesh — peers, parowanie, zaufanie, nody, serwisy, komendy
-/// VULN-031: Mutujace endpointy (pair, trust) wymagaja uprawnien administratora
-async fn route_mesh_api() -> (u16, String) {
-    // All /api/mesh/* paths are served by the binary protocol dispatcher
-    // (see dispatch/mesh_write_handlers.rs). REST hits here only for legacy
-    // URLs and returns 404.
-    (
-        404,
-        serde_json::json!({"error": "Nieznany endpoint mesh"}).to_string(),
-    )
 }
 
 /// Routing endpointow clusters — CRUD clusterow, czlonkostwa nodow, probing

@@ -77,6 +77,17 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     let pool = Arc::new(Mutex::new(conn));
     set_global_pool(pool.clone());
 
+    // Upgrade path for PR5: copy `trusted_nodes` rows + parse legacy
+    // `settings.trusted_contact:*` JSON entries into peer_persisted /
+    // peer_hints. Idempotent (INSERT OR IGNORE), so a second startup is a
+    // no-op once both source sets are empty.
+    match repository::migrate_settings_trusted_contacts_to_peer_hints(&pool) {
+        Ok(n) if n > 0 => info!("Migrated {} trusted peer rows into peer_persisted", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("peer_persisted migration failed: {}", e),
+    }
+
+
     info!("Baza danych zainicjalizowana pomyslnie");
 
     Ok(pool)

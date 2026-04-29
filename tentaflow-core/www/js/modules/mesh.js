@@ -22,6 +22,7 @@ import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import { runPairProgress } from '/js/lib/pair-progress.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
+import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
@@ -734,9 +735,7 @@ function buildOfflineMeta(node) {
 // ---- Helpers --------------------------------------------------------------
 
 function isOnline(node) {
-  const s = String(node.status || '').toLowerCase();
-  if (node.is_local) return true;
-  return s === 'connected' || s === 'online' || s === 'active' || s === 'ready';
+  return isOnlineHelper(node);
 }
 
 function connectionTransportLabel(value) {

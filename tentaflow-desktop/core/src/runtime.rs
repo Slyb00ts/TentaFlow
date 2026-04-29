@@ -127,7 +127,28 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     }
 
     // Store peerow mesh — wspoldzielony miedzy mDNS, QUIC, dashboard i UI sync
-    let mesh_peer_store = MeshPeerStore::new();
+    let mut mesh_peer_store = MeshPeerStore::new();
+    // PR2: shadow registry receives every peer_store mutation so PR3 can
+    // switch reads onto it without state loss.
+    let peer_registry = tentaflow_core::mesh::peer_registry::PeerRegistry::new(4096);
+    mesh_peer_store.set_registry(peer_registry.clone());
+
+    // PR5: hydrate from peer_persisted + peer_hints, then install the
+    // PersistenceWriter so subsequent mutations land in SQLite via batched
+    // debounced writes.
+    match peer_registry.hydrate_from_db(&db) {
+        Ok(n) => tracing::info!("PeerRegistry hydrated {} peers from peer_persisted", n),
+        Err(e) => tracing::warn!("PeerRegistry hydrate failed: {}", e),
+    }
+    {
+        use tentaflow_core::mesh::peer_registry::persistence::{
+            DbSink, PersistenceWriter, CHANNEL_CAPACITY,
+        };
+        let sink = std::sync::Arc::new(DbSink::new(db.clone()));
+        let (writer, persist_tx) = PersistenceWriter::new(sink, CHANNEL_CAPACITY);
+        peer_registry.set_persistence(persist_tx);
+        let _writer_handle = writer.spawn();
+    }
 
     // Mesh networking — mDNS discovery + QUIC mesh (wspoldzielony pipeline z Core)
     // PRZED Dashboard server, zeby Dashboard mial dostep do quic_mesh
