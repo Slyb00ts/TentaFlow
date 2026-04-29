@@ -552,11 +552,20 @@
   margin-top: 10px;
   padding: 10px 12px;
   border-radius: var(--pr-radius-sm);
-  font-size: 12px;
+  font-size: 12.5px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  line-height: 1.5;
 }
 .pr-alert.ok  { background: rgba(34, 197, 94, 0.08); border: 1px solid rgba(34, 197, 94, 0.3); color: var(--pr-text-2); }
 .pr-alert.bad { background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.3); color: var(--pr-text-2); }
 .pr-alert strong { color: var(--pr-text); font-weight: 700; }
+.pr-alert .pr-alert-icon { flex-shrink: 0; display: inline-flex; }
+.pr-alert .pr-alert-icon svg { width: 16px; height: 16px; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.pr-alert.ok  .pr-alert-icon svg { stroke: var(--pr-success); }
+.pr-alert.bad .pr-alert-icon svg { stroke: var(--pr-danger); }
+.pr-alert .pr-alert-body { flex: 1; }
 
 /* ---- Loading / error ---- */
 .pr-loading-card, .pr-error-card {
