@@ -145,10 +145,25 @@ impl ReverseProxyHandler {
             body["top_p"] = tp.into();
         }
 
+        // Bidi handler (serve_model_requests) zaklada framing strumieniowy:
+        // klient po stronie routera czyta read_frame::<ModelStreamChunk>. Jesli
+        // tu zwrocimy ModelOutcome::Unary(ModelResponse), klient probuje
+        // zdeserializowac bajty ModelResponse jako ModelStreamChunk i konczy
+        // sie "subtree pointer overran range" (discriminanty enumow ModelResult
+        // i StreamChunkType collide-uja). Dlatego niezaleznie od request.stream
+        // zawsze zwracamy strumien — dla stream=false to pojedynczy
+        // TextDelta + Done zbudowany z unary upstreamu.
         if request.stream {
+            // body["stream"] juz jest true.
             self.stream_chat_sse(&url, body, request.request_id.clone()).await
         } else {
-            self.unary_chat(&url, body, request.request_id.clone()).await
+            // Wymus stream=false po stronie upstreamu (chcemy zwykla odpowiedz JSON),
+            // ale klientowi i tak oddamy strumien.
+            body["stream"] = serde_json::Value::Bool(false);
+            let outcome = self
+                .unary_chat(&url, body, request.request_id.clone())
+                .await?;
+            Ok(wrap_unary_as_stream(outcome))
         }
     }
 
@@ -563,6 +578,62 @@ impl ModelHandler for ReverseProxyHandler {
             ))),
         }
     }
+}
+
+/// Pakuje `ModelOutcome::Unary(ModelResponse)` w jednochunkowy strumien tak,
+/// zeby bidi handler zawsze mowil tym samym jezykiem (sekwencja
+/// `ModelStreamChunk`). Dla `Completion` wysylamy `TextDelta(text)` + `Done`,
+/// dla `Error` wysylamy `Error(...)` + `Done`. Inne warianty (Embeddings,
+/// Audio, ...) sa przenoszone w `Done.final_metrics=None` po wczesniejszym
+/// best-effort tekstowym opisie — w praktyce ten path jest uzywany tylko dla
+/// chat completion, ale fallback jest defensywny.
+fn wrap_unary_as_stream(outcome: ModelOutcome) -> ModelOutcome {
+    let response = match outcome {
+        ModelOutcome::Stream(rx) => return ModelOutcome::Stream(rx),
+        ModelOutcome::Unary(r) => r,
+    };
+
+    let request_id = response.request_id.clone();
+    let metrics = response.metrics.clone();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<ModelStreamChunk>(2);
+
+    tokio::spawn(async move {
+        match response.result {
+            ModelResult::Completion(c) => {
+                if !c.text.is_empty() {
+                    let _ = tx
+                        .send(ModelStreamChunk {
+                            request_id: request_id.clone(),
+                            chunk: StreamChunkType::TextDelta(c.text),
+                        })
+                        .await;
+                }
+            }
+            ModelResult::Error(err) => {
+                let _ = tx
+                    .send(ModelStreamChunk {
+                        request_id: request_id.clone(),
+                        chunk: StreamChunkType::Error(err),
+                    })
+                    .await;
+            }
+            _ => {
+                // Inne warianty nie powinny tu trafic dla chat path; zostawiamy
+                // tylko Done zeby klient nie zostal w "stream finished early".
+            }
+        }
+        let _ = tx
+            .send(ModelStreamChunk {
+                request_id,
+                chunk: StreamChunkType::Done {
+                    final_metrics: metrics,
+                },
+            })
+            .await;
+    });
+
+    ModelOutcome::Stream(rx)
 }
 
 fn error_response(request_id: &str, message: &str) -> ModelResponse {
