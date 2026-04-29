@@ -2,7 +2,7 @@
 // Plik: modules/profile-flamegraph.js
 // Opis: Interaktywny CPU flamegraph z drill-down, search highlight, reverse
 //       (icicle), differential mode i side panel "Selected frame". Zywi sie
-//       eventami CpuSample + side-tablicami frames/stacks/names z ProfileReportV2.
+//       eventami CpuSample + side-tablicami frames/stacks/names z ProfileReport.
 //       Renderowanie SVG z clip-renderingiem (tylko ramki >= MIN_PX_WIDTH).
 //       UI komponenty tf-*: tf-button, tf-toggle, tf-searchbox, tf-chip.
 // =============================================================================
@@ -1000,7 +1000,7 @@ function escapeText(s) {
 }
 
 // =============================================================================
-// FlamegraphView — adapter for profile-report-v2 dispatcher.
+// FlamegraphView — adapter for profile-report dispatcher.
 // Dispatcher (renderLazyTab) wymaga `render(host, ctx)`. Tutaj montujemy
 // CpuFlamegraph w hostowym kontenerze i mapujemy ksztalt `ctx.report` (kompat
 // z TimelineView) na argumenty konstruktora. names moze byc obiektem (rkyv)
@@ -1027,8 +1027,8 @@ export const FlamegraphView = {
     const events = ctx?.events || report.events || [];
     if (!events.length) {
       host.innerHTML = `
-        <div class="pr2-card">
-          <div class="pr2-banner-degraded">
+        <div class="pr-card">
+          <div class="pr-banner-degraded">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
             <div><strong>No CPU samples.</strong> This report contains no events for flamegraph aggregation.</div>
           </div>
@@ -1045,7 +1045,7 @@ export const FlamegraphView = {
 
     host.innerHTML = '';
     const card = document.createElement('div');
-    card.className = 'pr2-card';
+    card.className = 'pr-card';
     host.appendChild(card);
 
     const mount = document.createElement('div');

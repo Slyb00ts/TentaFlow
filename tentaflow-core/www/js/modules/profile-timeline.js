@@ -1297,7 +1297,7 @@ export class UnifiedTimeline {
 }
 
 // =============================================================================
-// TimelineView — adapter wiring UnifiedTimeline into profile-report-v2.
+// TimelineView — adapter wiring UnifiedTimeline into profile-report.
 // Profile report dispatcher (renderLazyTab) wymaga `render(host, ctx)`. Tu
 // hostujemy class UnifiedTimeline w kontenerze i przepinamy event
 // `openFlamegraph` na <tf-tabs> rodzica zeby panel "Open in flamegraph" dzialal.
@@ -1310,8 +1310,8 @@ export const TimelineView = {
     const events = ctx?.events || report.events || [];
     if (!events.length) {
       host.innerHTML = `
-        <div class="pr2-card">
-          <div class="pr2-banner-degraded">
+        <div class="pr-card">
+          <div class="pr-banner-degraded">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
             <div><strong>No timeline data.</strong> This report contains zero events.</div>
           </div>
@@ -1328,7 +1328,7 @@ export const TimelineView = {
 
     host.innerHTML = '';
     const card = document.createElement('div');
-    card.className = 'pr2-card pr2-timeline-card';
+    card.className = 'pr-card pr-timeline-card';
     host.appendChild(card);
 
     const mount = document.createElement('div');
@@ -1346,7 +1346,7 @@ export const TimelineView = {
     // Bridge "Open in flamegraph" → switch to flame tab via <tf-tabs>.
     tl.on('openFlamegraph', () => {
       const root = host.closest('[id]')?.ownerDocument || document;
-      const tabs = root.querySelector('#pr2-tabs');
+      const tabs = root.querySelector('#pr-tabs');
       if (tabs && typeof tabs.setAttribute === 'function') {
         tabs.setAttribute('value', 'flame');
         tabs.dispatchEvent(new CustomEvent('change', { detail: { value: 'flame' } }));
