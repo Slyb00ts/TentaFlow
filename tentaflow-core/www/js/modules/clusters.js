@@ -17,6 +17,7 @@ import {
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { patchInner } from '/js/lib/patch.js';
+import { createRefresher } from '/js/lib/refresh.js';
 import ClusterDetailScreen from '/js/modules/cluster-detail.js';
 import ClusterWizard from '/js/modules/cluster-wizard.js';
 import '/js/components/tf-button.js';
@@ -25,7 +26,7 @@ import '/js/components/tf-window.js';
 
 let clusters = [];
 let nodesById = new Map();
-let refreshInterval = null;
+let refresher = null;
 
 const ClustersScreen = {
   title: 'Clusters',
@@ -57,14 +58,19 @@ const ClustersScreen = {
     await loadAll();
     renderList();
 
-    refreshInterval = setInterval(async () => {
-      if (!document.querySelector('.clusters-shell')) {
-        stopRefresh();
-        return;
-      }
-      await loadAll();
-      renderList();
-    }, 5000);
+    refresher = createRefresher({
+      run: async () => {
+        if (!document.querySelector('.clusters-shell')) {
+          stopRefresh();
+          return;
+        }
+        await loadAll();
+        renderList();
+      },
+      intervalMs: 5000,
+      hiddenIntervalMs: 20000,
+    });
+    refresher.start();
   },
   unmount() {
     stopRefresh();
@@ -76,9 +82,9 @@ const ClustersScreen = {
 };
 
 function stopRefresh() {
-  if (refreshInterval) {
-    clearInterval(refreshInterval);
-    refreshInterval = null;
+  if (refresher) {
+    refresher.dispose();
+    refresher = null;
   }
 }
 

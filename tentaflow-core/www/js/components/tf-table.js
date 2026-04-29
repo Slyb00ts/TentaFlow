@@ -85,10 +85,14 @@ class TfTable extends HTMLElement {
     this._tbody = tbody;
   }
 
-  _render() {
-    if (!this._thead) return;
-    const cols = this.columns;
-    const sortableTable = this.hasAttribute('sortable');
+  // Sygnatura kolumn — sluzy do detekcji "kolumny sie nie zmienily" zeby
+  // unikac rebuildu thead przy kazdym set rows / sort. thead trzymamy
+  // wylacznie dla ARIA i sortowania, nie zalezy od liczby wierszy.
+  _columnsSignature(cols) {
+    return cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}`).join('');
+  }
+
+  _renderThead(cols, sortableTable) {
     const tr = document.createElement('tr');
     cols.forEach((col) => {
       const th = document.createElement('th');
@@ -97,44 +101,119 @@ class TfTable extends HTMLElement {
       if (sortableTable && col.sortable) {
         th.classList.add('sortable');
         th.dataset.key = col.key;
-        if (this._sortKey === col.key) {
-          th.classList.add(this._sortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
-        }
       }
       tr.appendChild(th);
     });
-    // jesli sa akcje — dodatkowa kolumna (renderer="actions")
-    this._thead.innerHTML = '';
-    this._thead.appendChild(tr);
+    this._thead.replaceChildren(tr);
+  }
+
+  _updateSortIndicators() {
+    const ths = this._thead.querySelectorAll('th.sortable');
+    ths.forEach((th) => {
+      th.classList.remove('sorted-asc', 'sorted-desc');
+      if (th.dataset.key === this._sortKey) {
+        th.classList.add(this._sortDir === 'asc' ? 'sorted-asc' : 'sorted-desc');
+      }
+    });
+  }
+
+  // Recyklinguje wiersze: aktualizuje istniejace `<tr>`/`<td>` zamiast je
+  // burzyc. Eliminuje pelen rebuild tbody przy kazdym set rows / sort i
+  // pozwala browserowi zachowac focus/selection w komorkach.
+  _renderTbody(cols, rows) {
+    const tbody = this._tbody;
+    const existingRows = tbody.children;
+    const target = rows.length;
+
+    // 1) Update istniejacych tr w miejscu
+    const reuseCount = Math.min(existingRows.length, target);
+    for (let i = 0; i < reuseCount; i += 1) {
+      const tr = existingRows[i];
+      tr.dataset.idx = String(i);
+      this._updateRowCells(tr, cols, rows[i]);
+    }
+
+    // 2) Dodaj brakujace
+    if (target > existingRows.length) {
+      const frag = document.createDocumentFragment();
+      for (let i = existingRows.length; i < target; i += 1) {
+        frag.appendChild(this._buildRow(cols, rows[i], i));
+      }
+      tbody.appendChild(frag);
+    }
+
+    // 3) Usun nadmiarowe od konca (szybsze niz removeChild w petli z poczatku)
+    while (tbody.children.length > target) {
+      tbody.removeChild(tbody.lastChild);
+    }
+  }
+
+  _buildRow(cols, row, idx) {
+    const rtr = document.createElement('tr');
+    rtr.dataset.idx = String(idx);
+    cols.forEach((col) => {
+      const td = document.createElement('td');
+      td.dataset.label = col.label;
+      if (col.renderer === 'num' || col.align === 'num') td.classList.add('num');
+      this._writeCell(td, col, row[col.key]);
+      rtr.appendChild(td);
+    });
+    return rtr;
+  }
+
+  _updateRowCells(tr, cols, row) {
+    const tds = tr.children;
+    for (let i = 0; i < cols.length; i += 1) {
+      const td = tds[i];
+      if (!td) {
+        // Brakujaca kolumna (zmiana liczby kolumn) — odbuduj caly wiersz.
+        // Rzadki przypadek; szybka sciezka i tak zwykle dziala.
+        tr.replaceChildren();
+        cols.forEach((col) => {
+          const fresh = document.createElement('td');
+          fresh.dataset.label = col.label;
+          if (col.renderer === 'num' || col.align === 'num') fresh.classList.add('num');
+          this._writeCell(fresh, col, row[col.key]);
+          tr.appendChild(fresh);
+        });
+        return;
+      }
+      this._writeCell(td, cols[i], row[cols[i].key]);
+    }
+  }
+
+  _writeCell(td, col, value) {
+    if (col.renderer === 'chip') {
+      const chip = typeof value === 'object' && value
+        ? value
+        : { status: 'info', label: String(value ?? '') };
+      td.innerHTML = `<span class="tf-chip ${chip.status || 'info'}">${chip.dot ? '<span class="tf-chip-dot"></span>' : ''}${chip.label ?? ''}</span>`;
+    } else if (col.renderer === 'html') {
+      const next = value ?? '';
+      // Skip jesli identyczne — eliminuje koszt parsowania HTML komorki gdy
+      // wiersz przyszedl niezmieniony z API (najczestsze w 2-sekundowym refreshu).
+      if (td.innerHTML !== next) td.innerHTML = next;
+    } else {
+      const next = value ?? '';
+      const txt = typeof next === 'string' ? next : String(next);
+      if (td.textContent !== txt) td.textContent = txt;
+    }
+  }
+
+  _render() {
+    if (!this._thead) return;
+    const cols = this.columns;
+    const sortableTable = this.hasAttribute('sortable');
+    const sig = this._columnsSignature(cols);
+
+    if (sig !== this._lastColsSig) {
+      this._renderThead(cols, sortableTable);
+      this._lastColsSig = sig;
+    }
+    this._updateSortIndicators();
 
     const rows = this._sortedRows();
-    const frag = document.createDocumentFragment();
-    rows.forEach((row, idx) => {
-      const rtr = document.createElement('tr');
-      rtr.dataset.idx = String(idx);
-      cols.forEach((col) => {
-        const td = document.createElement('td');
-        td.dataset.label = col.label;
-        const value = row[col.key];
-        if (col.renderer === 'chip') {
-          const chip = typeof value === 'object' && value
-            ? value
-            : { status: 'info', label: String(value ?? '') };
-          td.innerHTML = `<span class="tf-chip ${chip.status || 'info'}">${chip.dot ? '<span class="tf-chip-dot"></span>' : ''}${chip.label ?? ''}</span>`;
-        } else if (col.renderer === 'num' || col.align === 'num') {
-          td.classList.add('num');
-          td.textContent = value ?? '';
-        } else if (col.renderer === 'html') {
-          td.innerHTML = value ?? '';
-        } else {
-          td.textContent = value ?? '';
-        }
-        rtr.appendChild(td);
-      });
-      frag.appendChild(rtr);
-    });
-    this._tbody.innerHTML = '';
-    this._tbody.appendChild(frag);
+    this._renderTbody(cols, rows);
   }
 
   _sortedRows() {
