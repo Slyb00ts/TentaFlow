@@ -577,6 +577,20 @@ function renderStepAdvanced() {
   const resetBtn = showReset
     ? `<button type="button" class="adv-reset-lock" id="edw-adv-reset-lock" title="Odblokuj wszystkie parametry — niech backend dobierze auto-fit">🔄 Reset to auto</button>`
     : '';
+  // Error box: backend zwrocil 409 (np. dwa parametry zalockowane jednoczesnie
+  // i ich kombinacja przekracza VRAM). Pokazujemy podpowiedz: kliknij Reset
+  // albo zmniejsz wartosc.
+  let errorBox = '';
+  if (hasError && adv.mode === 'manual') {
+    errorBox = `
+      <div class="adv-error-box">
+        <strong>Konfiguracja nie miesci sie w VRAM.</strong>
+        ${escapeHtml(rec.error)}
+        <div class="adv-error-hint">Klik <strong>🔄 Reset to auto</strong> albo zmniejsz zafiksowany parametr.</div>
+      </div>
+    `;
+  }
+
   const modeCard = `
     <div class="adv-section">
       <div class="adv-sec-title">
@@ -588,6 +602,7 @@ function renderStepAdvanced() {
         <option value="auto" variant="neutral">Auto-tuned</option>
         <option value="manual" variant="neutral">Ręczna</option>
       </tf-segmented>
+      ${errorBox}
       ${adv.mode === 'auto'
         ? renderAutoAlert(rec)
         : `<div class="adv-manual">${renderAdvancedManualControls(adv, rec)}</div>`}
@@ -907,6 +922,10 @@ function bindAdvancedHandlers() {
 
   const buildOverrides = () => {
     const a = selection.advanced;
+    // `lock_<param>: true` informuje backend ze user zafiksowal ten parametr —
+    // pozostale (auto-fit) zostana zmniejszone zeby zmiescic sie w VRAM. Bez
+    // locka backend traktuje overrides jako sugestie i moze je obnizyc.
+    const lock = a.lockedParam;
     return {
       tensor_parallel: a.tensor_parallel || undefined,
       pipeline_parallel: a.pipeline_parallel || undefined,
@@ -914,26 +933,60 @@ function bindAdvancedHandlers() {
       max_num_seqs: a.max_num_seqs || undefined,
       kv_cache_dtype: a.kv_cache_dtype !== 'auto' ? a.kv_cache_dtype : undefined,
       gpu_memory_utilization: a.gpu_memory_utilization || undefined,
+      lock_max_model_len: lock === 'max_model_len' || undefined,
+      lock_max_num_seqs: lock === 'max_num_seqs' || undefined,
+      lock_tensor_parallel: lock === 'tensor_parallel' || undefined,
     };
   };
 
-  const bindRange = (id, valSpanId, key, transform, displayFn) => {
+  // Live update KPI tile "KV cache" — natychmiastowy feedback przed backendem.
+  // Klasa `.estimating` przelacza tile na szary kolor (kalkulowane lokalnie),
+  // backend potem nadpisze przy odpowiedzi /recommend.
+  const updateLiveKvTile = () => {
+    if (!cachedModelSpec) return;
+    const a = selection.advanced;
+    const ctx = a.max_model_len ?? advancedRecommendation?.applied?.max_model_len ?? advancedRecommendation?.recommended?.max_model_len;
+    const seqs = a.max_num_seqs ?? advancedRecommendation?.applied?.max_num_seqs ?? advancedRecommendation?.recommended?.max_num_seqs;
+    const kv = a.kv_cache_dtype || advancedRecommendation?.applied?.kv_cache_dtype || 'auto';
+    const liveGb = estimateKvGb({
+      ...cachedModelSpec,
+      max_model_len: ctx,
+      max_num_seqs: seqs,
+      kv_dtype_bytes: kvDtypeBytes(kv),
+    });
+    if (liveGb == null) return;
+    const tiles = document.querySelectorAll('#edw-adv-kpi .adv-kpi');
+    // KV cache jest drugim tile w gridzie (Wagi, KV, Aktywacje, Zostaje, Total).
+    const kvTile = tiles[1];
+    if (!kvTile) return;
+    const valEl = kvTile.querySelector('.k-value');
+    if (valEl) valEl.textContent = `${liveGb.toFixed(1)} GB`;
+    kvTile.classList.add('estimating');
+    setTimeout(() => kvTile.classList.remove('estimating'), 300);
+  };
+
+  const bindRange = (id, valSpanId, key, transform, displayFn, lockable) => {
     const el = document.getElementById(id);
     const valSpan = document.getElementById(valSpanId);
     if (!el) return;
     el.addEventListener('input', () => {
       const v = transform(el.value);
       selection.advanced[key] = v;
+      if (lockable) selection.advanced.lockedParam = lockable;
       if (valSpan) valSpan.textContent = displayFn ? displayFn(v) : v.toLocaleString();
+      updateLiveKvTile();
       debounceRecompute(buildOverrides());
     });
   };
 
-  bindRange('edw-adv-ctx', 'edw-adv-ctx-val', 'max_model_len', (v) => parseInt(v, 10), (v) => v.toLocaleString());
-  bindRange('edw-adv-seqs', 'edw-adv-seqs-val', 'max_num_seqs', (v) => parseInt(v, 10), (v) => String(v));
+  bindRange('edw-adv-ctx', 'edw-adv-ctx-val', 'max_model_len', (v) => parseInt(v, 10), (v) => v.toLocaleString(), 'max_model_len');
+  bindRange('edw-adv-seqs', 'edw-adv-seqs-val', 'max_num_seqs', (v) => parseInt(v, 10), (v) => String(v), 'max_num_seqs');
+  // gpu_memory_utilization nie ma osobnego locka w backendzie — jest stale
+  // wejscie do auto-fit, nie parametr do dopasowania. Lockable=null.
   bindRange('edw-adv-mem', 'edw-adv-mem-val', 'gpu_memory_utilization',
     (v) => parseFloat(v),
-    (v) => `${(v * 100).toFixed(0)}%`);
+    (v) => `${(v * 100).toFixed(0)}%`,
+    null);
 
   // Chipy presetów kontekstu — klik ustawia suwak i wyzwala recompute.
   document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((chip) => {
@@ -942,12 +995,14 @@ function bindAdvancedHandlers() {
       const v = parseInt(chip.dataset.ctx, 10);
       if (!Number.isFinite(v)) return;
       selection.advanced.max_model_len = v;
+      selection.advanced.lockedParam = 'max_model_len';
       const slider = document.getElementById('edw-adv-ctx');
       if (slider) slider.value = String(v);
       const valSpan = document.getElementById('edw-adv-ctx-val');
       if (valSpan) valSpan.textContent = v.toLocaleString();
       document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
+      updateLiveKvTile();
       debounceRecompute(buildOverrides());
     });
   });
@@ -962,18 +1017,40 @@ function bindAdvancedHandlers() {
       const v = parseInt(raw, 10);
       if (Number.isFinite(v)) {
         selection.advanced[key] = v;
+        // TP locka — backend dostaje lock_tensor_parallel:true zeby auto-fit
+        // dopasowal ctx/seqs do wybranego TP. PP nie ma osobnego locka.
+        if (key === 'tensor_parallel') selection.advanced.lockedParam = 'tensor_parallel';
         debounceRecompute(buildOverrides());
       }
     });
   });
 
-  // tf-select dla KV dtype.
+  // tf-select dla KV dtype. Nie ma osobnego locka — backend traktuje kv_cache_dtype
+  // jako stale wejscie, nie jako parametr auto-fit.
   const kvSelect = document.getElementById('edw-adv-kv');
   if (kvSelect) {
     kvSelect.addEventListener('change', (e) => {
       const v = e.detail?.value ?? kvSelect.value;
       selection.advanced.kv_cache_dtype = v;
+      updateLiveKvTile();
       debounceRecompute(buildOverrides());
+    });
+  }
+
+  // "Reset to auto" — czysci wszystkie locki + manualne wartosci, backend
+  // dostaje czysty /recommend (bez overrides) i zwraca pelne auto-tuning.
+  const resetBtn = document.getElementById('edw-adv-reset-lock');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      const a = selection.advanced;
+      a.lockedParam = null;
+      a.tensor_parallel = null;
+      a.pipeline_parallel = null;
+      a.max_model_len = null;
+      a.max_num_seqs = null;
+      a.gpu_memory_utilization = 0.9;
+      a.kv_cache_dtype = 'auto';
+      debounceRecompute({});
     });
   }
 
