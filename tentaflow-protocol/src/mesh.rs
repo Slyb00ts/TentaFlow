@@ -737,6 +737,14 @@ pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
 pub const MESH_MSG_RELAY_FRAME: u8 = 0x37;
 pub const MESH_MSG_FORWARD_STREAM_REQ: u8 = 0x38;
 pub const MESH_MSG_ALIAS_SYNC: u8 = 0x39;
+/// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
+pub const MESH_MSG_SERVICES_GET: u8 = 0x40;
+/// Odpowiedz na `MESH_MSG_SERVICES_GET` — pelen snapshot lokalnego nodu.
+pub const MESH_MSG_SERVICES_GET_RESPONSE: u8 = 0x41;
+/// Periodyczny anti-drift broadcast pelnego stanu serwisow (co ~5min).
+pub const MESH_MSG_SERVICES_ANNOUNCE: u8 = 0x42;
+/// Push delta — pojedyncza zmiana (deploy/stop/pin/pause/rename/delete).
+pub const MESH_MSG_SERVICES_UPDATE: u8 = 0x43;
 
 // =============================================================================
 // Struktury wire format dla nowych wiadomosci mesh (rkyv zero-copy)
@@ -869,6 +877,48 @@ pub struct MeshRelayFrame {
     pub ttl: u8,
     pub discriminant: u8,
     pub payload: Vec<u8>,
+}
+
+// =============================================================================
+// Mesh services registry — wire payloads (krok N3a)
+// =============================================================================
+//
+// Cross-node services sync flows over four discriminants 0x40..0x43. The full
+// `ServiceInfo` struct lives in `message_body` (it is also returned by the
+// local `ServiceListRequest`); we re-use it here so receivers can drop a
+// snapshot straight into the in-memory `MeshServicesRegistry`.
+
+/// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesGetPayload {
+    pub from_node_id: String,
+}
+
+/// Odpowiedz na `MeshServicesGetPayload` — pelen snapshot lokalnego nodu.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesGetResponsePayload {
+    pub from_node_id: String,
+    pub services: Vec<crate::message_body::ServiceInfo>,
+}
+
+/// Periodyczny anti-drift broadcast (co ~5 min). Pelen stan zastepuje to co
+/// odbiorca trzyma w `MeshServicesRegistry` dla danego nodu.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesAnnouncePayload {
+    pub from_node_id: String,
+    pub services: Vec<crate::message_body::ServiceInfo>,
+}
+
+/// Push delta — wysylane natychmiast po lokalnej mutacji (deploy/stop/pin/
+/// pause/rename/delete). Odbiorca aplikuje `change` na swoim widoku nodu.
+#[derive(Debug, Clone, Archive, Deserialize, Serialize)]
+#[rkyv(derive(Debug))]
+pub struct MeshServicesUpdatePayload {
+    pub from_node_id: String,
+    pub change: crate::message_body::ServiceChange,
 }
 
 // =============================================================================
