@@ -84,6 +84,41 @@ export class BinaryWsClient {
   }
 
   /**
+   * Wariant `addUnsolicitedListener` z coalescingiem przez requestAnimationFrame.
+   * Heartbeat / metric frames potrafia leciec szybciej niz UI je przerysuje
+   * (np. 60Hz heartbeat -> setInterval refresh ekranu nie nadazy). Zamiast
+   * wolac listenera dla kazdego frame'u, zachowujemy ostatni i wolamy raz
+   * per animation frame z najnowsza wartoscia.
+   *
+   * @param {(frame: {envelope: object, body: object}) => boolean} predicate
+   *        Filtr — zwroc true dla frame'ow ktore maja byc przekazane do `fn`.
+   *        Niefiltrowane frame'y zostaja przepuszczone do innych listenerow
+   *        (predicate nie konsumuje).
+   * @param {(latest: {envelope, body}) => void} fn
+   * @returns {() => void} unsubscribe
+   */
+  subscribeCoalesced(predicate, fn) {
+    let pending = null;
+    let scheduled = false;
+    const flush = () => {
+      scheduled = false;
+      const frame = pending;
+      pending = null;
+      if (!frame) return;
+      try { fn(frame); } catch (err) { console.error('[ws] coalesced listener threw:', err); }
+    };
+    const wrapper = (frame) => {
+      if (!predicate(frame)) return;
+      pending = frame; // zachowaj ostatni — UI nie czyta posrednich wartosci
+      if (!scheduled) {
+        scheduled = true;
+        requestAnimationFrame(flush);
+      }
+    };
+    return this.addUnsolicitedListener(wrapper);
+  }
+
+  /**
    * Backward compat: ustawia jedyny listener (zachowuje stary onUnsolicited semantyke).
    * Lepiej uzywac addUnsolicitedListener dla composition.
    */

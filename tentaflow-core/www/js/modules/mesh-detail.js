@@ -6,7 +6,9 @@
 //       tytulami w accent-2. Sekcje: System info, Resource usage (CPU+RAM),
 //       GPUs, Profiling sessions (nsight), Network interfaces (tabela + mobile
 //       cards), Loaded models, Containers. Zero zakladek — wszystko w jednym
-//       scrollu. Auto-refresh 2s/5s. Pelna responsywnosc do 320px.
+//       scrollu. Auto-refresh przez `createRefresher` (pauza w tle, swiezy
+//       paint po visibility return). Render uzywa `patchInner` (morphdom),
+//       wiec rerender co 2s nie powoduje pelnego reflow ani utraty fokusu.
 // =============================================================================
 
 import {
@@ -18,6 +20,8 @@ import {
 } from '/js/utils.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
+import { patchInner } from '/js/lib/patch.js';
+import { createRefresher } from '/js/lib/refresh.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import {
@@ -29,14 +33,21 @@ import {
   sessionsSectionHtml as nsightSessionsSectionHtml,
   nsightInstallHintHtml,
   bindNsightActions,
+  activeRecLabel,
 } from '/js/modules/mesh-detail-nsight.js';
 
 let currentNodeId = null;
 let nodeData = null;
-let refreshInterval = null;
-let visibilityListener = null;
+let refresher = null;
 let wasDisconnected = false;
 let lastFetchAt = null;
+let backHandler = null;
+let containerHandler = null;
+
+// Inline SVG przez <use href="#i-..."> — sprite definiuje symbole raz w
+// index.html. Nie parsujemy zadnego SVG przy kazdym renderDetail.
+const ico = (id, extraClass = '') =>
+  `<svg viewBox="0 0 24 24"${extraClass ? ` class="${extraClass}"` : ''} fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#${id}"/></svg>`;
 
 const MeshDetailScreen = {
   title: 'Node',
@@ -52,25 +63,36 @@ const MeshDetailScreen = {
     content.innerHTML = renderSkeleton();
     bindBack(content);
 
-    initNsight({ onChange: () => renderDetail() });
+    // Callback z nsight — countdown 1Hz nie powinien rebuildowac calego widoku;
+    // updateRecBadge dotyka tylko jednego elementu chipa.
+    initNsight({ onChange: () => updateRecBadge() });
 
     await loadNode();
     renderDetail();
 
-    setupRefresh();
-    visibilityListener = () => setupRefresh();
-    document.addEventListener('visibilitychange', visibilityListener);
+    refresher = createRefresher({
+      run: async () => {
+        if (!currentNodeId) { MeshDetailScreen.cleanup(); return; }
+        if (!document.querySelector('.nd-shell')) { MeshDetailScreen.cleanup(); return; }
+        await loadNode();
+        if (currentNodeId && document.querySelector('.nd-shell')) renderDetail();
+      },
+      intervalMs: 2000,
+      hiddenIntervalMs: 5000,
+    });
+    refresher.start();
   },
   cleanup() {
-    if (refreshInterval) {
-      clearInterval(refreshInterval);
-      refreshInterval = null;
-    }
-    if (visibilityListener) {
-      document.removeEventListener('visibilitychange', visibilityListener);
-      visibilityListener = null;
-    }
+    if (refresher) { refresher.dispose(); refresher = null; }
     cleanupNsight();
+    const root = document.getElementById('main');
+    if (root) {
+      if (backHandler) root.removeEventListener('click', backHandler);
+      if (containerHandler) root.removeEventListener('click', containerHandler);
+      delete root.__nsightBound;
+    }
+    backHandler = null;
+    containerHandler = null;
     currentNodeId = null;
     nodeData = null;
   },
@@ -96,36 +118,22 @@ async function loadNode() {
   }
 }
 
-function setupRefresh() {
-  if (refreshInterval) clearInterval(refreshInterval);
-  if (!currentNodeId) return;
-  const interval = document.hidden ? 5000 : 2000;
-  refreshInterval = setInterval(async () => {
-    if (!currentNodeId) {
-      MeshDetailScreen.cleanup();
-      return;
-    }
-    if (!document.querySelector('.nd-shell')) {
-      MeshDetailScreen.cleanup();
-      return;
-    }
-    await loadNode();
-    if (currentNodeId && document.querySelector('.nd-shell')) {
-      renderDetail();
-    }
-  }, interval);
-}
-
 // ---- Helpers -------------------------------------------------------------
 
 function bindBack(root) {
-  root.addEventListener('click', (e) => {
+  // Idempotentne — listener jest dodawany raz na cykl zycia ekranu.
+  // Trzymamy referencje do handlera w module zeby cleanup() mogl go usunac
+  // (root #main jest wspoldzielony miedzy ekranami — bez removeEventListener
+  // listenery z poprzednich wizyt by sie nakladaly).
+  if (backHandler) return;
+  backHandler = (e) => {
     const back = e.target.closest('#btn-back-mesh, .nd-back-crumb');
     if (back) {
       MeshDetailScreen.cleanup();
       import('/js/router.js').then(({ Router }) => Router.navigate('mesh'));
     }
-  });
+  };
+  root.addEventListener('click', backHandler);
 }
 
 function gaugeLevel(pct) {
@@ -177,20 +185,14 @@ function ifaceRoleLabel(iface) {
 
 function ifaceIconSvg(iface) {
   const cls = ifaceRoleClass(iface);
-  switch (cls) {
-    case 'tb':
-      return '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
-    case 'wifi':
-      return '<svg viewBox="0 0 24 24"><path d="M5 13a10 10 0 0 1 14 0M8.5 16.5a5 5 0 0 1 7 0M12 20h.01M2 8.82a15 15 0 0 1 20 0"/></svg>';
-    case 'vpn':
-      return '<svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
-    case 'virt':
-      return '<svg viewBox="0 0 24 24"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg>';
-    case 'loop':
-      return '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/></svg>';
-    default:
-      return '<svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4M9 19v2M15 19v2"/></svg>';
-  }
+  const map = {
+    tb: 'i-iface-tb',
+    wifi: 'i-iface-wifi',
+    vpn: 'i-iface-vpn',
+    virt: 'i-iface-virt',
+    loop: 'i-iface-loop',
+  };
+  return ico(map[cls] || 'i-iface-lan');
 }
 
 function speedLabel(mbps) {
@@ -221,13 +223,13 @@ function renderSkeleton() {
         <div class="nd-head__crumbs">
           <div class="nd-breadcrumb">
             <span class="crumb nd-back-crumb">Mesh</span>
-            <span class="sep"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></span>
+            <span class="sep">${ico('i-chevron-right')}</span>
             <span class="crumb current">…</span>
           </div>
         </div>
         <div class="nd-head__header">
           <div class="nd-detail-header">
-            <div class="big-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="M3 13h18M8 21h8M12 17v4"/></svg></div>
+            <div class="big-ico">${ico('i-host')}</div>
             <div class="d-meta">
               <div class="d-name"><span class="skeleton" style="display:inline-block;width:200px;height:24px;"></span></div>
             </div>
@@ -239,6 +241,21 @@ function renderSkeleton() {
 }
 
 // ---- Render --------------------------------------------------------------
+
+// Tylko zmiana tekstu chipa REC — nsight countdown 1Hz nie moze rebuildowac
+// pelnego widoku, bo wraca to do `innerHTML = ...` na kilkukilobajtowym
+// stringu. F2 fix.
+function updateRecBadge() {
+  const root = document.getElementById('main');
+  if (!root || !nodeData) return;
+  const chip = root.querySelector('[data-nsight-rec-chip]');
+  if (!chip) return;
+  const label = activeRecLabel(nodeData);
+  if (label == null) return;
+  // Chip renderuje children jako label — slot/text. Bezpiecznie podmieniamy
+  // textContent zachowujac dot.
+  chip.textContent = `REC ${label}`;
+}
 
 function renderDetail() {
   const content = document.getElementById('main');
@@ -267,7 +284,7 @@ function renderDetail() {
   const hostname = n.hostname || shortId(n.node_id) || I18n.t('mesh.unknown_host');
   const online = isOnline(n);
 
-  content.innerHTML = `
+  const html = `
     <div class="nd-shell${freshnessClass()}">
       ${renderHead(n, hostname, online)}
       <div class="nd-body">
@@ -281,7 +298,10 @@ function renderDetail() {
       </div>
     </div>
   `;
-  bindBack(content);
+  // Diff zamiast full innerHTML — zachowuje fokus, animacje meterów
+  // i scroll w zagniezdzonych kontenerach. Custom elements (`tf-*`) nie
+  // sa rekurencyjnie morphowane (patrz lib/patch.js).
+  patchInner(content, html);
   bindContainerActions(content);
   bindNsightActions(content, n);
 }
@@ -294,14 +314,14 @@ function renderHead(n, hostname, online) {
 
   const subParts = [];
   if (n.os_info) {
-    subParts.push(`<span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>${escapeHtml(n.os_info)}</span>`);
+    subParts.push(`<span>${ico('i-os')}${escapeHtml(n.os_info)}</span>`);
   }
   if (n.docker_version) {
-    subParts.push(`<span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg>Docker ${escapeHtml(n.docker_version)}</span>`);
+    subParts.push(`<span>${ico('i-docker')}Docker ${escapeHtml(n.docker_version)}</span>`);
   }
   if (transport) {
     const txt = [transport, scope].filter(Boolean).join(' · ');
-    subParts.push(`<span class="nd-conn-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>${escapeHtml(txt)}${addr ? ` · <span class="addr">${escapeHtml(addr)}</span>` : ''}</span>`);
+    subParts.push(`<span class="nd-conn-badge">${ico('i-arrow')}${escapeHtml(txt)}${addr ? ` · <span class="addr">${escapeHtml(addr)}</span>` : ''}</span>`);
   }
 
   const badges = [];
@@ -321,16 +341,14 @@ function renderHead(n, hostname, online) {
       <nav class="nd-head__crumbs">
         <div class="nd-breadcrumb">
           <span class="crumb nd-back-crumb">${escapeHtml(I18n.t('mesh.title') || 'Mesh')}</span>
-          <span class="sep"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></span>
+          <span class="sep">${ico('i-chevron-right')}</span>
           <span class="crumb current">${escapeHtml(hostname)}</span>
         </div>
       </nav>
       <div class="nd-head__header">
         <div class="nd-detail-header">
           <div class="big-ico">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="3" width="18" height="14" rx="2"/><path d="M3 13h18M8 21h8M12 17v4"/>
-            </svg>
+            ${ico('i-host')}
             <span class="live-dot${online ? '' : ' off'}"></span>
           </div>
           <div class="d-meta">
@@ -359,28 +377,28 @@ function renderSystemInfo(n) {
   if (n.cpu_model || n.cpu_count) {
     stats.push({
       label: 'CPU',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/><path d="M3 9h3M3 12h3M3 15h3M18 9h3M18 12h3M18 15h3M9 3v3M12 3v3M15 3v3M9 18v3M12 18v3M15 18v3"/></svg>',
+      icon: ico('i-cpu'),
       value: n.cpu_model || `${n.cpu_count} ${I18n.t('mesh.cpu_cores')}`,
     });
   }
   if (n.cpu_count) {
     stats.push({
       label: I18n.t('mesh.cores') || 'Cores',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z"/><path d="M3 9h18M3 15h18"/></svg>',
+      icon: ico('i-grid-rows'),
       value: `${n.cpu_count} ${I18n.t('mesh.cpu_cores')}`,
     });
   }
   if (n.ram_total_mb) {
     stats.push({
       label: I18n.t('mesh.memory') || 'RAM',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><path d="M7 6V4M11 6V4M15 6V4M19 6V4"/></svg>',
+      icon: ico('i-ram'),
       value: formatMb(n.ram_total_mb),
     });
   }
   if (n.os_info) {
     stats.push({
       label: 'OS',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M3 12h18"/></svg>',
+      icon: ico('i-os'),
       value: n.os_info,
       mono: true,
     });
@@ -388,7 +406,7 @@ function renderSystemInfo(n) {
   if (n.docker_version) {
     stats.push({
       label: 'Docker',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/></svg>',
+      icon: ico('i-docker'),
       value: n.docker_version,
       mono: true,
     });
@@ -399,7 +417,7 @@ function renderSystemInfo(n) {
   if (gpuSummary) {
     stats.push({
       label: 'GPU',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><circle cx="9" cy="12" r="2"/></svg>',
+      icon: ico('i-gpu'),
       value: gpuSummary,
     });
   }
@@ -416,7 +434,7 @@ function renderSystemInfo(n) {
   return `
     <div class="nd-section">
       <h3>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 2"/></svg>
+        ${ico('i-clock-glance')}
         ${escapeHtml(I18n.t('mesh.info') || 'System info')}
         <span class="h-actions">${escapeHtml(I18n.t('mesh.last_fetch') || 'Ostatnia aktualizacja')}: <strong style="color:var(--text-2);">${ageSec} s</strong></span>
       </h3>
@@ -455,7 +473,7 @@ function renderResources(n) {
     <div class="nd-rcard">
       <div class="rc-head">
         <div class="title">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/><path d="M3 9h3M3 12h3M3 15h3M18 9h3M18 12h3M18 15h3M9 3v3M12 3v3M15 3v3M9 18v3M12 18v3M15 18v3"/></svg>
+          ${ico('i-cpu')}
           ${escapeHtml(I18n.t('mesh.cpu'))}
         </div>
         <div class="big">${escapeHtml(cpuBig)}</div>
@@ -472,7 +490,7 @@ function renderResources(n) {
     <div class="nd-rcard">
       <div class="rc-head">
         <div class="title">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><path d="M7 6V4M11 6V4M15 6V4M19 6V4"/></svg>
+          ${ico('i-ram')}
           ${escapeHtml(I18n.t('mesh.ram') || 'RAM')}
         </div>
         <div class="big">${escapeHtml(ramBig)}</div>
@@ -493,7 +511,7 @@ function renderResources(n) {
   return `
     <div class="nd-section">
       <h3>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 4 5-5"/></svg>
+        ${ico('i-trend')}
         ${escapeHtml(I18n.t('mesh.resources') || 'Resource usage')}
         <span class="h-actions"><span class="nd-stat-pill ok dot live">live</span></span>
       </h3>
@@ -526,7 +544,7 @@ function renderGpus(n) {
       .filter(Boolean).join(' · ');
 
     return `
-      <div class="nd-gpu">
+      <div class="nd-gpu" data-key="gpu-${idx}">
         <div class="gc-head">
           <div class="gc-title-wrap">
             <span class="gc-idx">${idx}</span>
@@ -555,12 +573,12 @@ function renderGpus(n) {
   }).join('');
 
   // Auto-dense gdy >= 6 GPU (typowe rigi 8x). Mniejsze karty bez 'driver/CUDA'
-  // line, ciasniejsze odstepy. Manual toggle via przycisk w headerze.
+  // line, ciasniejsze odstepy.
   const dense = gpus.length >= 6;
   return `
     <div class="nd-section">
       <h3>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><circle cx="9" cy="12" r="2"/><circle cx="16" cy="12" r="1.2"/></svg>
+        ${ico('i-gpu')}
         GPU
         <span class="count-pill">${gpus.length}</span>
         ${summary ? `<span class="h-actions">${summary}</span>` : ''}
@@ -573,8 +591,6 @@ function renderGpus(n) {
 function renderProfilingWrap(n) {
   const sessionsHtml = nsightSessionsSectionHtml(n);
   const installHtml = nsightInstallHintHtml(n);
-  // Sessions widoczne tylko gdy nsys dziala. Install hint widoczny tylko gdy
-  // jest NVIDIA + brak nsys. Nigdy nie pokazemy obu naraz.
   if (!sessionsHtml && !installHtml) return '';
   return `<div class="nd-section">${sessionsHtml}${installHtml}</div>`;
 }
@@ -583,7 +599,7 @@ function renderNetwork(n) {
   const ifaces = Array.isArray(n.network_interfaces) ? n.network_interfaces : [];
   if (ifaces.length === 0) return '';
 
-  const rows = ifaces.map(i => {
+  const rows = ifaces.map((i, idx) => {
     const up = i.link_up;
     const speed = speedLabel(i.speed_mbps);
     const ipv4 = i.ipv4_address || (up ? '—' : (I18n.t('mesh.network_no_link') || '—'));
@@ -604,7 +620,7 @@ function renderNetwork(n) {
       : '<span class="nd-stat-pill off">DOWN</span>';
 
     return `
-      <tr>
+      <tr data-key="iface-${escapeAttr(i.name || idx)}">
         <td>
           <div class="nd-acell">
             <div class="nd-aicon">${ifaceIconSvg(i)}</div>
@@ -627,7 +643,7 @@ function renderNetwork(n) {
     `;
   }).join('');
 
-  const mobileCards = ifaces.map(i => {
+  const mobileCards = ifaces.map((i, idx) => {
     const up = i.link_up;
     const speed = speedLabel(i.speed_mbps);
     const ipv4 = i.ipv4_address || '—';
@@ -635,7 +651,7 @@ function renderNetwork(n) {
     const tx = i.tx_bytes_per_sec || 0;
     const statusPill = up ? '<span class="nd-stat-pill ok dot">UP</span>' : '<span class="nd-stat-pill off">DOWN</span>';
     return `
-      <div class="nd-net-card-m">
+      <div class="nd-net-card-m" data-key="iface-card-${escapeAttr(i.name || idx)}">
         <div class="nh">
           <div class="nd-aicon">${ifaceIconSvg(i)}</div>
           <div class="nh-meta">
@@ -657,7 +673,7 @@ function renderNetwork(n) {
   return `
     <div class="nd-section flush">
       <h3>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="8" rx="1"/><path d="M7 11V7h10v4"/></svg>
+        ${ico('i-iface-lan')}
         ${escapeHtml(I18n.t('mesh.network_section') || 'Network')}
         <span class="count-pill">${ifaces.length}</span>
       </h3>
@@ -686,13 +702,13 @@ function renderModels(n) {
   const models = Array.isArray(n.models) ? n.models : [];
   if (models.length === 0) return '';
 
-  const rows = models.map(m => {
+  const rows = models.map((m, idx) => {
     const loaded = !!m.loaded;
     const statusPill = loaded
       ? `<span class="nd-stat-pill ok dot">${escapeHtml(I18n.t('mesh.loaded') || 'loaded')}</span>`
       : `<span class="nd-stat-pill off">${escapeHtml(I18n.t('mesh.unloaded') || 'unloaded')}</span>`;
     return `
-      <div class="nd-model">
+      <div class="nd-model" data-key="model-${escapeAttr(m.alias || idx)}">
         <span class="kind">${escapeHtml(m.kind || '—')}</span>
         <span class="alias" title="${escapeAttr(m.alias || '')}">${escapeHtml(m.alias || '—')}</span>
         <span class="backend">${escapeHtml(m.backend || '—')}</span>
@@ -705,7 +721,7 @@ function renderModels(n) {
   return `
     <div class="nd-section">
       <h3>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        ${ico('i-models')}
         ${escapeHtml(I18n.t('mesh.models_section') || 'Models')}
         <span class="count-pill">${models.length}</span>
       </h3>
@@ -738,10 +754,10 @@ function renderContainers(n) {
       : `<tf-button variant="primary" size="sm" data-container-action="start" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.start'))}</tf-button>`;
 
     return `
-      <tr>
+      <tr data-key="ct-${escapeAttr(c.name || '')}">
         <td>
           <div class="nd-cname">
-            <span class="nd-aicon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg></span>
+            <span class="nd-aicon">${ico('i-docker')}</span>
             ${escapeHtml(c.name || '—')}
           </div>
         </td>
@@ -757,7 +773,7 @@ function renderContainers(n) {
   return `
     <div class="nd-section flush">
       <h3>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="9" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/><rect x="15" y="9" width="4" height="4"/><path d="M3 17h18c0 2-2 3-4 3H7c-2 0-4-1-4-3z"/></svg>
+        ${ico('i-docker')}
         ${escapeHtml(I18n.t('mesh.containers'))}
         <span class="count-pill">${containers.length}</span>
       </h3>
@@ -781,7 +797,9 @@ function renderContainers(n) {
 }
 
 function bindContainerActions(root) {
-  root.addEventListener('click', async (e) => {
+  // Patrz komentarz w bindBack — handler trzymany w module dla cleanup().
+  if (containerHandler) return;
+  containerHandler = async (e) => {
     const btn = e.target.closest('[data-container-action]');
     if (!btn) return;
     const action = btn.dataset.containerAction;
@@ -799,7 +817,8 @@ function bindContainerActions(root) {
     } catch (err) {
       toast(`${action} ${name}: ${err.message}`, 'error');
     }
-  });
+  };
+  root.addEventListener('click', containerHandler);
 }
 
 export default MeshDetailScreen;

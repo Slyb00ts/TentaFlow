@@ -14,6 +14,7 @@ import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
+import { createRefresher } from '/js/lib/refresh.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openUpdateModal } from '/js/modules/services/update-modal.js';
@@ -23,8 +24,8 @@ let aliases = [];
 let meshNodes = [];
 let unifiedModels = [];
 let quicStatusMap = {};
-let refreshTimer = null;
-let quicTimer = null;
+let refresher = null;
+let quicRefresher = null;
 let currentTab = 'list';
 let lastQuery = '';
 
@@ -60,16 +61,24 @@ const ServicesScreen = {
     byId('svc-tabs')?.addEventListener('change', handleTabChange);
 
     await loadAll();
-    refreshTimer = setInterval(() => {
-      loadForCurrentTab();
-    }, 5000);
-    quicTimer = setInterval(loadQuicStatus, 5000);
+    refresher = createRefresher({
+      run: () => loadForCurrentTab(),
+      intervalMs: 5000,
+      hiddenIntervalMs: 20000,
+    });
+    refresher.start();
+    quicRefresher = createRefresher({
+      run: loadQuicStatus,
+      intervalMs: 5000,
+      hiddenIntervalMs: 20000,
+    });
+    quicRefresher.start();
   },
   unmount() {
-    if (refreshTimer) clearInterval(refreshTimer);
-    if (quicTimer) clearInterval(quicTimer);
-    refreshTimer = null;
-    quicTimer = null;
+    if (refresher) refresher.dispose();
+    if (quicRefresher) quicRefresher.dispose();
+    refresher = null;
+    quicRefresher = null;
     services = [];
     aliases = [];
     meshNodes = [];
