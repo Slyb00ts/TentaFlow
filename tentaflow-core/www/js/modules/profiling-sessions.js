@@ -11,6 +11,7 @@ import {
   profilingSessions,
   profilingDelete,
   profilingDownload,
+  profilingStop,
 } from '/js/protocol/profiling.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-searchbox.js';
@@ -449,16 +450,18 @@ export class ProfilingSessionsView {
     }
 
     const rows = filtered.map((s) => this._renderRow(s)).join('');
+    // Layout 1:1 z mockup #03: status-ico | Label/sources (with src-chip-mini
+    // pod nazwa) | Duration·Size | Started | Actions. Dropped select-checkbox
+    // column - compare bar nadal dziala (selecty inline w nazwie)
     wrap.innerHTML = `
       <table class="tf-table-native">
         <thead>
           <tr>
-            <th class="ps-select-cell" title="Select for compare"></th>
-            <th style="width: 30%">Status / Label</th>
-            <th style="width: 26%">Sources</th>
+            <th style="width: 40px"></th>
+            <th>Label / sources</th>
             <th style="width: 14%">Duration · Size</th>
             <th style="width: 14%">Started</th>
-            <th class="actions-col" style="width: 12%">Actions</th>
+            <th class="actions-col" style="width: 16%">Actions</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
@@ -472,7 +475,6 @@ export class ProfilingSessionsView {
     const sid = escapeHtml(s.session_id);
     const ico = statusIcon(s.status);
     const labelName = escapeHtml(s.label || '(no label)');
-    const labelSub = `${escapeHtml(s.session_id.slice(0, 12))} · ${escapeHtml(s.status)}`;
     const sources = srcChips(s.sources_used);
     const duration = formatDuration(s.duration_seconds);
     const size = formatBytes(s.size_bytes);
@@ -480,34 +482,70 @@ export class ProfilingSessionsView {
     const abs = formatAbsolute(s.started_at_unix_ns);
 
     const isSelected = this.compareSelected.has(s.session_id);
-    // Tylko ukonczone sesje moga byc porownane (running/failed maja niepelne raporty).
     const canCompare = s.status === 'completed' || s.status === 'partial';
-    const checkbox = canCompare
-      ? `<input type="checkbox" data-action="compare-toggle" data-sid="${sid}" ${isSelected ? 'checked' : ''} aria-label="Select for compare" />`
-      : `<input type="checkbox" disabled aria-label="Compare unavailable for this status" />`;
+    const isRunning = s.status === 'running';
+    const isFailed = s.status === 'failed';
+    const isPartial = s.status === 'partial';
+
+    // Status pill widoczny przy nazwie (REC / FAILED / PARTIAL).
+    let statusPill = '';
+    if (isRunning) {
+      statusPill = '<span class="status-pill danger" style="margin-left:6px;">REC</span>';
+    } else if (isFailed) {
+      statusPill = '<span class="status-pill danger" style="margin-left:6px;">FAILED</span>';
+    } else if (isPartial) {
+      statusPill = '<span class="status-pill warn" style="margin-left:6px;">PARTIAL</span>';
+    }
+
+    // Akcje per status (mockup #03):
+    //  Running   -> Watch live + Stop
+    //  Completed -> Open + Compare + Download + Delete
+    //  Partial   -> Open + Re-run with sudo
+    //  Failed    -> View logs + Delete
+    let actions = '';
+    if (isRunning) {
+      actions = `
+        <tf-button variant="ghost" size="sm" icon="eye" data-action="watch" data-sid="${sid}" title="Watch live"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="stop" data-action="stop" data-sid="${sid}" title="Stop"></tf-button>
+      `;
+    } else if (isFailed) {
+      actions = `
+        <tf-button variant="ghost" size="sm" icon="file-text" data-action="logs" data-sid="${sid}" title="View logs"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="trash" data-action="delete" data-sid="${sid}" title="Delete"></tf-button>
+      `;
+    } else if (isPartial) {
+      actions = `
+        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="Open report"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="refresh" data-action="rerun-sudo" data-sid="${sid}" title="Re-run with sudo"></tf-button>
+      `;
+    } else {
+      const cmpClass = isSelected ? 'primary' : 'ghost';
+      actions = `
+        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="Open report"></tf-button>
+        <tf-button variant="${cmpClass}" size="sm" icon="copy" data-action="compare-toggle" data-sid="${sid}" title="${isSelected ? 'Selected for compare' : 'Compare'}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="download" data-action="download" data-sid="${sid}" title="Download"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="trash" data-action="delete" data-sid="${sid}" title="Delete"></tf-button>
+      `;
+    }
+    if (!canCompare && !isRunning && !isFailed) {
+      // safety net: pokazujemy chociaz Open
+      actions = `
+        <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="Open report"></tf-button>
+      `;
+    }
 
     return `
       <tr data-session-id="${sid}" class="${isSelected ? 'selected' : ''}">
-        <td class="ps-select-cell">${checkbox}</td>
+        <td>${ico}</td>
         <td>
-          <div class="label-cell">
-            ${ico}
-            <div>
-              <div class="lc-name">${labelName}</div>
-              <div class="lc-sub">${labelSub}</div>
-            </div>
-          </div>
+          <div class="label-cell"><div>
+            <div class="lc-name">${labelName}${statusPill}</div>
+            <div class="src-chips" style="margin-top:5px;">${sources}</div>
+          </div></div>
         </td>
-        <td>${sources}</td>
-        <td><span style="font-family:'JetBrains Mono',monospace;">${duration} · ${size}</span></td>
+        <td><span style="font-family:'JetBrains Mono',monospace;">${duration}</span><div class="lc-sub">${size}</div></td>
         <td title="${escapeHtml(abs)}"><span style="font-family:'JetBrains Mono',monospace; color:var(--tf-text-2,#a0a8c8);">${rel}</span></td>
-        <td class="actions-col">
-          <span class="row-actions">
-            <tf-button variant="ghost" size="sm" icon="external-link" data-action="open" data-sid="${sid}" title="Open report"></tf-button>
-            <tf-button variant="ghost" size="sm" icon="download" data-action="download" data-sid="${sid}" title="Download"></tf-button>
-            <tf-button variant="ghost" size="sm" icon="trash" data-action="delete" data-sid="${sid}" title="Delete"></tf-button>
-          </span>
-        </td>
+        <td class="actions-col"><span class="row-actions">${actions}</span></td>
       </tr>
     `;
   }
@@ -535,6 +573,10 @@ export class ProfilingSessionsView {
         if (action === 'open') this._openReport(sid);
         else if (action === 'download') this._downloadSession(sid);
         else if (action === 'delete') this._confirmDelete(sid);
+        else if (action === 'watch') this._openReport(sid);
+        else if (action === 'stop') this._stopRunning(sid);
+        else if (action === 'logs') this._openReport(sid);
+        else if (action === 'rerun-sudo') this._openLaunch();
       };
       // Checkboxy reaguja na 'change' (tez na klawiature); buttons na 'click'.
       if (btn.tagName === 'INPUT') {
@@ -582,6 +624,21 @@ export class ProfilingSessionsView {
     } catch (err) {
       console.error('failed to download session', err);
       showToast('Failed to download session', 'error');
+    }
+  }
+
+  async _stopRunning(sessionId) {
+    if (fixtureMode()) {
+      showToast('Fixture mode — stop not supported', 'info');
+      return;
+    }
+    try {
+      await profilingStop({ nodeId: this.nodeId, sessionId });
+      showToast('Session stopped', 'success');
+      await this.refresh();
+    } catch (err) {
+      console.error('failed to stop session', err);
+      showToast('Failed to stop session', 'error');
     }
   }
 
