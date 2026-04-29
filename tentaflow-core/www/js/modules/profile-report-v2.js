@@ -490,6 +490,7 @@ function renderTab(container, ctx, tabId) {
   }
   body.innerHTML = html;
   if (tabId === 'gpu') bindGpuTab(body, ctx);
+  if (tabId === 'cpu_detail') bindCpuDetailTab(body);
 }
 
 // Lazy-load tabs (Timeline + Flamegraph) implemented by sibling agents. While
@@ -672,80 +673,181 @@ function renderCpuDetailTab(ctx) {
   const sampleEvents = eventsForCategory(events, 'CpuSample');
   const counterEvents = eventsForCategory(events, 'CpuCounter');
   const names = report.names || [];
+  const frames = report.frames || [];
+  const stacks = report.stacks || [];
 
   if (utilEvents.length === 0) {
     return noDataCard('No CPU utilization data collected for this session.');
   }
 
-  // Group util events per-core, compute peak + sparkline. Mockup pokazuje
-  // 16 kafelkow; my pokazujemy ile cores faktycznie raportowalo - moze to byc
-  // 4, 8, 16, 32 zaleznie od hardware.
-  const perCore = new Map(); // core -> [{t,util}]
+  // -- Per-core grid ----------------------------------------------------------
+  // Mockup pokazuje 16 kafelkow; my renderujemy ile cores faktycznie
+  // raportowalo (4/8/16/32+). Klik kafla emituje CustomEvent
+  // 'pr2:cpu-filter-by-core' (nasluchiwacze podswietlaja core w timeline).
+  const perCore = new Map();
   for (const e of utilEvents) {
     const p = unwrapPayload(e.payload);
     if (!p || typeof p.core !== 'number') continue;
-    const key = p.core;
-    if (!perCore.has(key)) perCore.set(key, []);
-    perCore.get(key).push({ t: e.t_start_ns, util: p.util_pct, freq: p.freq_mhz });
+    if (!perCore.has(p.core)) perCore.set(p.core, []);
+    perCore.get(p.core).push({ t: e.t_start_ns, util: p.util_pct, freq: p.freq_mhz });
   }
   const cores = Array.from(perCore.keys()).sort((a, b) => a - b);
+  const totalThreadsHint = cores.length > 0
+    ? `${cores.length} core${cores.length === 1 ? '' : 's'} · ${utilEvents.length.toLocaleString()} samples`
+    : `${utilEvents.length} samples`;
+
   const coreCells = cores.map((core) => {
     const points = perCore.get(core).sort((a, b) => a.t - b.t);
     const peak = points.reduce((m, x) => Math.max(m, x.util), 0);
     const last = points.length > 0 ? points[points.length - 1].util : 0;
-    // Mini sparkline: 100x28 viewBox, 12 sample points.
     const xs = points.length;
-    const path = points.length === 0 ? 'M0 14 L100 14' : points
-      .filter((_, i) => i % Math.max(1, Math.ceil(xs / 24)) === 0)
+    const sampled = xs <= 24 ? points : points.filter((_, i) => i % Math.max(1, Math.ceil(xs / 24)) === 0);
+    const path = sampled.length === 0 ? 'M0 14 L100 14' : sampled
       .map((p, i, arr) => {
         const x = (i / Math.max(1, arr.length - 1)) * 100;
         const y = 28 - (p.util / 100) * 24 - 2;
         return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
       })
       .join(' ');
+    // Kolor wedlug peak (mockup: red >80, amber >60, violet baseline).
     const color = peak > 80 ? '#ef4444' : peak > 60 ? '#f59e0b' : '#a78bfa';
     return `
-      <div class="pr2-core-mini">
+      <button type="button" class="pr2-core-mini" data-core="${core}" aria-label="Filter timeline by CPU ${core}">
         <div class="cm-head">
           <span class="cm-name">CPU ${core}</span>
           <span class="cm-val">${last.toFixed(0)}%</span>
         </div>
-        <svg viewBox="0 0 100 28" preserveAspectRatio="none">
+        <svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true">
           <path d="${path}" stroke="${color}" stroke-width="1.4" fill="none"/>
         </svg>
-      </div>
+      </button>
     `;
   }).join('');
 
-  // PMU counters chart (line chart) gdy CpuCounter dostepne.
-  // Per kind (Cycles, Instructions, CacheMisses, BranchMisses) aggregated.
+  // -- PMU counters -----------------------------------------------------------
+  // Kazde CpuCounter event ma { kind, value }. kind to enum rkyv: unit warianty
+  // (Ipc/CacheMissL3/BranchMiss/ContextSwitches/...) serializuja sie jako string;
+  // Custom(...) jako { Custom: "..." }.
+  const counterKindLabel = (k) => {
+    if (typeof k === 'string') return k;
+    if (k && typeof k === 'object' && 'Custom' in k) return String(k.Custom);
+    return '?';
+  };
+
+  const counterSeries = new Map(); // label -> [{t, v}]
+  for (const e of counterEvents) {
+    const p = unwrapPayload(e.payload) || e.payload;
+    if (!p || typeof p !== 'object') continue;
+    const kind = counterKindLabel(p.kind);
+    if (typeof p.value !== 'number') continue;
+    if (!counterSeries.has(kind)) counterSeries.set(kind, []);
+    counterSeries.get(kind).push({ t: e.t_start_ns, v: p.value });
+  }
+
+  // -- Context switches (osobna karta z trendu CounterKind=ContextSwitches) ---
+  const ctxSwitchPts = (counterSeries.get('ContextSwitches') || []).slice().sort((a, b) => a.t - b.t);
+  const ctxSwitchTotal = ctxSwitchPts.reduce((s, x) => s + x.v, 0);
+  let ctxSwitchSection;
+  if (ctxSwitchPts.length > 0) {
+    const max = Math.max(...ctxSwitchPts.map((p) => p.v), 1);
+    const path = ctxSwitchPts.map((p, i, arr) => {
+      const x = (i / Math.max(1, arr.length - 1)) * 920;
+      const y = 60 - (p.v / max) * 50 - 4;
+      return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    }).join(' ');
+    const avg = ctxSwitchTotal / ctxSwitchPts.length;
+    ctxSwitchSection = `
+      <section class="pr2-card">
+        <h2 class="pr2-card-title">
+          Context switches /s
+          <span class="pr2-card-actions"><span class="muted" style="font-size:11px;">avg ${Math.round(avg).toLocaleString()} · peak ${Math.round(max).toLocaleString()}</span></span>
+        </h2>
+        <div class="pr2-pmu-chart">
+          <svg viewBox="0 0 920 60" preserveAspectRatio="none" style="width:100%; height:60px;">
+            <path d="${path}" stroke="#60a5fa" stroke-width="1.4" fill="none"/>
+          </svg>
+        </div>
+      </section>
+    `;
+  } else {
+    ctxSwitchSection = '';
+  }
+
+  // -- PMU table + line chart -------------------------------------------------
   let pmuSection;
-  if (counterEvents.length > 0) {
-    // Sample-tick aggregation. Each event has payload { kind, value }.
-    const series = new Map(); // kind -> [{t,v}]
-    for (const e of counterEvents) {
-      const p = unwrapPayload(e.payload);
-      if (!p) continue;
-      const kind = String(p.kind);
-      if (!series.has(kind)) series.set(kind, []);
-      series.get(kind).push({ t: e.t_start_ns, v: p.value });
+  if (counterSeries.size > 0) {
+    // Lookup totalow do liczenia "Per-instr": instructions jako baseline.
+    const totals = new Map();
+    for (const [kind, pts] of counterSeries) {
+      const sum = pts.reduce((s, p) => s + p.v, 0);
+      totals.set(kind, sum);
     }
-    const colors = { Cycles: '#a78bfa', Instructions: '#60a5fa', CacheMisses: '#f59e0b', BranchMisses: '#22c55e' };
-    const lines = Array.from(series.entries()).map(([kind, pts]) => {
-      pts.sort((a, b) => a.t - b.t);
+    const instructionsTotal = totals.get('Instructions') || totals.get('Ipc');
+
+    // KPI tabela (Counter | Total | Per-instr | Trend).
+    const formatNumber = (n) => {
+      if (!Number.isFinite(n)) return '—';
+      if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(2) + 'T';
+      if (Math.abs(n) >= 1e9)  return (n / 1e9).toFixed(2) + 'G';
+      if (Math.abs(n) >= 1e6)  return (n / 1e6).toFixed(2) + 'M';
+      if (Math.abs(n) >= 1e3)  return (n / 1e3).toFixed(2) + 'k';
+      return n.toFixed(2);
+    };
+    const perInstr = (kind, sum) => {
+      if (kind === 'Ipc' || kind === 'Instructions' || !instructionsTotal) return '—';
+      const r = sum / instructionsTotal;
+      if (r >= 1) return r.toFixed(3);
+      if (r >= 0.001) return (r * 100).toFixed(2) + '%';
+      return (r * 1000).toFixed(2) + '/k';
+    };
+
+    // Stabilna kolejnosc kluczowych counterow (jesli istnieja).
+    const orderHints = ['Ipc', 'Instructions', 'CacheMissL1', 'CacheMissL2', 'CacheMissL3', 'BranchMiss', 'ContextSwitches', 'PageFaults', 'TlbMiss'];
+    const ordered = [
+      ...orderHints.filter((k) => counterSeries.has(k)),
+      ...Array.from(counterSeries.keys()).filter((k) => !orderHints.includes(k)),
+    ];
+
+    const counterRows = ordered.map((kind) => {
+      const pts = counterSeries.get(kind);
+      const sum = totals.get(kind);
+      const avg = sum / pts.length;
+      const last = pts[pts.length - 1].v;
+      return `
+        <tr>
+          <td class="mono">${escape(kind)}</td>
+          <td class="num mono">${formatNumber(sum)}</td>
+          <td class="num mono">${formatNumber(avg)}</td>
+          <td class="num mono">${formatNumber(last)}</td>
+          <td class="num mono">${escape(perInstr(kind, sum))}</td>
+        </tr>
+      `;
+    }).join('');
+
+    // Linie chart (max 4 najwazniejsze: Ipc/CacheMissL3/BranchMiss/Instructions).
+    const chartKinds = ordered.filter((k) => k !== 'ContextSwitches').slice(0, 4);
+    const colors = {
+      Ipc: '#a78bfa', Instructions: '#60a5fa',
+      CacheMissL1: '#fb923c', CacheMissL2: '#f59e0b', CacheMissL3: '#f59e0b',
+      BranchMiss: '#22c55e', PageFaults: '#f472b6', TlbMiss: '#ef4444',
+    };
+    const lines = chartKinds.map((kind) => {
+      const pts = counterSeries.get(kind).slice().sort((a, b) => a.t - b.t);
       const max = Math.max(...pts.map((p) => p.v), 1);
-      const path = pts.map((p, i) => {
-        const x = (i / Math.max(1, pts.length - 1)) * 880 + 40;
+      const path = pts.map((p, i, arr) => {
+        const x = (i / Math.max(1, arr.length - 1)) * 880 + 40;
         const y = 160 - (p.v / max) * 140;
         return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
       }).join(' ');
-      const color = colors[kind] || '#a0a8c8';
-      return `<path d="${path}" stroke="${color}" stroke-width="1.6" fill="none"/>`;
+      const c = colors[kind] || '#a0a8c8';
+      const dash = kind.startsWith('CacheMiss') ? ' stroke-dasharray="4 2"' : kind === 'BranchMiss' ? ' stroke-dasharray="2 3"' : '';
+      return `<path d="${path}" stroke="${c}" stroke-width="1.6" fill="none"${dash}/>`;
     }).join('');
-    const legend = Array.from(series.keys()).map((k) => {
+    const legend = chartKinds.map((k) => {
       const c = colors[k] || '#a0a8c8';
-      return `<span style="display:inline-flex; align-items:center; gap:5px; margin-right:14px; font-size:11px; color:var(--tf-text-2);"><span style="width:10px; height:2px; background:${c};"></span>${escape(k)}</span>`;
+      return `<span class="pr2-pmu-legend-item"><span class="sw" style="background:${c};"></span>${escape(k)}</span>`;
     }).join('');
+
     pmuSection = `
       <section class="pr2-card">
         <h2 class="pr2-card-title">Hardware counters (PMU)</h2>
@@ -756,7 +858,19 @@ function renderCpuDetailTab(ctx) {
             ${lines}
           </svg>
         </div>
-        <div style="margin-top:8px;">${legend}</div>
+        <div class="pr2-pmu-legend">${legend}</div>
+        <table class="pr2-table" style="margin-top:10px;">
+          <thead>
+            <tr>
+              <th>Counter</th>
+              <th class="num">Total</th>
+              <th class="num">Avg/sample</th>
+              <th class="num">Last</th>
+              <th class="num">Per-instr</th>
+            </tr>
+          </thead>
+          <tbody>${counterRows}</tbody>
+        </table>
       </section>
     `;
   } else {
@@ -765,75 +879,186 @@ function renderCpuDetailTab(ctx) {
         <h2 class="pr2-card-title">Hardware counters (PMU)</h2>
         <div class="pr2-banner-degraded">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-          <div><strong>PMU counters not collected.</strong> Add <code>linux.perf.pmu_counters</code> source (perf stat -e cycles,instructions,cache-misses,branch-misses) to capture IPC, L3 miss rate i branch miss rate.</div>
+          <div><strong>PMU counters require perf stat.</strong> Add <code>linux.perf.pmu_counters</code> source (perf stat -e cycles,instructions,cache-misses,branch-misses) to capture IPC, L3 miss rate and branch miss rate.</div>
         </div>
       </section>
     `;
   }
 
-  // Top symbols + Hot threads — both require CpuSample (perf record).
+  // -- Top symbols + Hot threads (CpuSample required) ------------------------
   let symbolsSection;
+  let threadsSection;
   if (sampleEvents.length > 0) {
-    // Group samples by stack -> root frame name. Self% per leaf.
-    const counts = new Map();
+    // Self% = sample landed na leaf frame. Total% = symbol pojawia sie gdziekolwiek
+    // w stacku (any frame). `module` jest na rekordzie Frame.
+    const selfCounts = new Map();    // symbol -> { module, n }
+    const totalCounts = new Map();   // symbol -> n (per-stack-occurrence)
+    const threadCounts = new Map();  // tid -> { tid, samples, cmdHint }
+
     for (const e of sampleEvents) {
-      const p = unwrapPayload(e.payload);
+      const p = unwrapPayload(e.payload) || e.payload;
       if (!p) continue;
       const stackId = p.stack_id;
-      const stack = (report.stacks || [])[stackId] || [];
-      if (stack.length === 0) continue;
-      const leaf = stack[0]; // leaf frame index
-      const frame = (report.frames || [])[leaf];
-      if (!frame) continue;
-      const sym = names[frame.symbol_id] || '?';
-      counts.set(sym, (counts.get(sym) || 0) + 1);
+      const stack = stacks[stackId] || [];
+      if (stack.length > 0) {
+        const leafIdx = stack[0];
+        const leaf = frames[leafIdx];
+        if (leaf) {
+          const sym = leaf.symbol || `frame_${leafIdx}`;
+          const mod = leaf.module || '';
+          if (!selfCounts.has(sym)) selfCounts.set(sym, { module: mod, n: 0 });
+          selfCounts.get(sym).n += 1;
+        }
+        // Total: dedup w obrebie pojedynczego stacka.
+        const seenInStack = new Set();
+        for (const fIdx of stack) {
+          const fr = frames[fIdx];
+          if (!fr) continue;
+          const s = fr.symbol || `frame_${fIdx}`;
+          if (seenInStack.has(s)) continue;
+          seenInStack.add(s);
+          totalCounts.set(s, (totalCounts.get(s) || 0) + 1);
+        }
+      }
+      // Hot threads (TID heuristic — cmd resolution: brak dedykowanego pola,
+      // probujemy pierwszy frame stacku jako hint).
+      if (typeof p.tid === 'number') {
+        if (!threadCounts.has(p.tid)) {
+          let cmdHint = '';
+          if (stack.length > 0) {
+            const root = frames[stack[stack.length - 1]];
+            if (root && root.module) cmdHint = root.module.replace(/\.[^.]+$/, '');
+          }
+          threadCounts.set(p.tid, { tid: p.tid, samples: 0, cmdHint });
+        }
+        threadCounts.get(p.tid).samples += 1;
+      }
     }
-    const total = sampleEvents.length;
-    const top = Array.from(counts.entries())
-      .map(([sym, n]) => ({ sym, pct: (n / total) * 100, n }))
-      .sort((a, b) => b.pct - a.pct)
-      .slice(0, 10);
-    const rows = top.map((r) => `
-      <tr>
-        <td style="font-family:'JetBrains Mono',monospace;">${escape(r.sym)}</td>
-        <td style="text-align:right; font-family:'JetBrains Mono',monospace;">${r.pct.toFixed(1)}%</td>
-        <td style="text-align:right; font-family:'JetBrains Mono',monospace;">${r.n}</td>
+
+    const totalSamples = sampleEvents.length;
+    const top = Array.from(selfCounts.entries())
+      .map(([sym, info]) => ({
+        sym,
+        module: info.module,
+        selfPct: (info.n / totalSamples) * 100,
+        totalPct: ((totalCounts.get(sym) || info.n) / totalSamples) * 100,
+        n: info.n,
+      }))
+      .sort((a, b) => b.selfPct - a.selfPct)
+      .slice(0, 12);
+
+    const symbolRows = top.map((r) => `
+      <tr data-symbol="${escape(r.sym)}">
+        <td class="mono">${escape(r.sym)}</td>
+        <td class="mono dim">${escape(r.module || '—')}</td>
+        <td class="num mono">${r.selfPct.toFixed(1)}%</td>
+        <td class="num mono">${r.totalPct.toFixed(1)}%</td>
       </tr>
     `).join('');
+
     symbolsSection = `
       <section class="pr2-card">
-        <h2 class="pr2-card-title">Top symbols</h2>
+        <h2 class="pr2-card-title">
+          Top symbols
+          <span class="pr2-card-actions"><tf-button variant="ghost" size="sm" data-action="open-flame">Open flamegraph →</tf-button></span>
+        </h2>
         <table class="pr2-table">
-          <thead><tr><th>Symbol</th><th style="text-align:right;">Self %</th><th style="text-align:right;">Samples</th></tr></thead>
-          <tbody>${rows}</tbody>
+          <thead>
+            <tr><th>Symbol</th><th>Module</th><th class="num">Self %</th><th class="num">Total %</th></tr>
+          </thead>
+          <tbody>${symbolRows}</tbody>
+        </table>
+      </section>
+    `;
+
+    const hotThreads = Array.from(threadCounts.values())
+      .sort((a, b) => b.samples - a.samples)
+      .slice(0, 10);
+    const threadRows = hotThreads.map((t) => {
+      const cpuPct = (t.samples / totalSamples) * 100;
+      return `
+        <tr>
+          <td class="mono accent">${t.tid}</td>
+          <td class="mono">${escape(t.cmdHint || '—')}</td>
+          <td class="num mono">${cpuPct.toFixed(1)}%</td>
+          <td class="num mono">${t.samples.toLocaleString()}</td>
+        </tr>
+      `;
+    }).join('');
+    threadsSection = `
+      <section class="pr2-card">
+        <h2 class="pr2-card-title">Hot threads</h2>
+        <table class="pr2-table">
+          <thead>
+            <tr><th>TID</th><th>Name</th><th class="num">CPU %</th><th class="num">Samples</th></tr>
+          </thead>
+          <tbody>${threadRows}</tbody>
         </table>
       </section>
     `;
   } else {
-    symbolsSection = `
+    const banner = (title, msg) => `
       <section class="pr2-card">
-        <h2 class="pr2-card-title">Top symbols</h2>
+        <h2 class="pr2-card-title">${title}</h2>
         <div class="pr2-banner-degraded">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/></svg>
-          <div><strong>Stack samples not collected.</strong> Add <code>linux.perf.cpu_sampling</code> source (perf record -F 99 -g) to enable flamegraph and per-symbol hotspots.</div>
+          <div>${msg}</div>
         </div>
       </section>
     `;
+    symbolsSection = banner(
+      'Top symbols',
+      '<strong>Top symbols require perf record.</strong> Add <code>linux.perf.cpu_sampling</code> source (perf record -F 99 -g) to enable per-symbol hotspots and the flamegraph view.',
+    );
+    threadsSection = banner(
+      'Hot threads',
+      '<strong>Hot threads require perf record.</strong> Per-thread CPU breakdown is reconstructed from CPU sampling events.',
+    );
   }
 
   return `
     <section class="pr2-card">
       <h2 class="pr2-card-title">
         Per-core utilization
-        <span class="pr2-card-actions"><span class="muted" style="font-size:11px;">${cores.length} core${cores.length === 1 ? '' : 's'} · ${utilEvents.length} samples</span></span>
+        <span class="pr2-card-actions"><span class="muted" style="font-size:11px;">${escape(totalThreadsHint)}</span></span>
       </h2>
       <div class="pr2-cores-grid">${coreCells}</div>
     </section>
 
     ${pmuSection}
 
-    ${symbolsSection}
+    <div class="pr2-cpu-detail-row">
+      ${symbolsSection}
+      ${threadsSection}
+    </div>
+
+    ${ctxSwitchSection}
   `;
+}
+
+// Klik kafla per-core: emit event do timeline highlight.
+// Klik symbolu: switch flamegraph tab z preselected symbol.
+function bindCpuDetailTab(host) {
+  host.addEventListener('click', (e) => {
+    const coreBtn = e.target.closest('[data-core]');
+    if (coreBtn) {
+      const core = Number(coreBtn.dataset.core);
+      host.dispatchEvent(new CustomEvent('pr2:cpu-filter-by-core', { detail: { core }, bubbles: true }));
+      host.querySelectorAll('[data-core]').forEach((b) => b.removeAttribute('data-active'));
+      coreBtn.setAttribute('data-active', 'true');
+      return;
+    }
+    const flameBtn = e.target.closest('[data-action="open-flame"]');
+    if (flameBtn) {
+      host.dispatchEvent(new CustomEvent('pr2:open-tab', { detail: { tab: 'flame' }, bubbles: true }));
+      return;
+    }
+    const symRow = e.target.closest('[data-symbol]');
+    if (symRow) {
+      const symbol = symRow.dataset.symbol;
+      host.dispatchEvent(new CustomEvent('pr2:open-tab', { detail: { tab: 'flame', symbol }, bubbles: true }));
+    }
+  });
 }
 
 // =============================================================================

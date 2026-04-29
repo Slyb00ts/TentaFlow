@@ -618,6 +618,23 @@
   border-radius: 6px;
   padding: 10px 12px;
   display: flex; flex-direction: column; gap: 6px;
+  /* Klikalna - chcemy efekt button z reset stylow. */
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease, transform 120ms ease;
+}
+.pr2-core-mini:hover {
+  border-color: var(--tf-accent-2, #a78bfa);
+  background: var(--tf-bg-2, #161b3a);
+}
+.pr2-core-mini[data-active="true"] {
+  border-color: var(--tf-accent, #60a5fa);
+  background: rgba(96, 165, 250, 0.08);
+}
+.pr2-core-mini:focus-visible {
+  outline: 2px solid var(--tf-accent, #60a5fa);
+  outline-offset: 2px;
 }
 .pr2-core-mini .cm-head {
   display: flex; justify-content: space-between; align-items: baseline;
@@ -656,3 +673,26 @@
   font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
   color: var(--tf-accent-2, #a78bfa);
 }
+
+/* CPU Detail: PMU legend + 2-col layout (Top symbols / Hot threads) */
+.pr2-pmu-legend {
+  display: flex; flex-wrap: wrap; gap: 14px;
+  margin-top: 8px;
+  font-size: 11px; color: var(--tf-text-2, #a0a8c8);
+}
+.pr2-pmu-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.pr2-pmu-legend-item .sw {
+  display: inline-block; width: 12px; height: 2px; border-radius: 1px;
+}
+
+.pr2-cpu-detail-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+@media (max-width: 1100px) {
+  .pr2-cpu-detail-row { grid-template-columns: 1fr; }
+}
+
+/* Drobne dodatki do pr2-table dla CPU Detail (TID akcent, dim module) */
+.pr2-table td.accent { color: var(--tf-accent-2, #a78bfa); }
