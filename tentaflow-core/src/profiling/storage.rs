@@ -93,10 +93,34 @@ impl ProfileStorage {
         Ok(())
     }
 
-    /// Odczyt raportu rkyv z `<session>/summary.bin`.
+    /// Odczyt raportu rkyv z `<session>/summary.bin`. Gdy plik nie istnieje
+    /// (sesja na liscie, ale parser .nsys-rep -> summary.bin nie zakonczyl
+    /// sie sukcesem, albo sesja zostala czesciowo skasowana po rotacji),
+    /// zwracamy NotFound z konkretna informacja jaki plik brakuje, zamiast
+    /// generycznego IO error 2 ktore w GUI widac jako 'Internal' bez kontekstu.
     pub fn read_summary(&self, session_id: &str) -> Result<ProfileReport, ProfilingError> {
         let dir = self.session_dir(session_id)?;
-        let bytes = fs::read(dir.join("summary.bin"))?;
+        let summary_path = dir.join("summary.bin");
+        if !summary_path.exists() {
+            // Sprawdz czy mamy raw .nsys-rep — to znaczy ze nagranie sie udalo
+            // ale parser/eksport padl. Daj user'owi konkretny feedback.
+            let raw_path = dir.join("report.nsys-rep");
+            let hint = if raw_path.exists() {
+                format!(
+                    "sesja {} ma raw report.nsys-rep ale brak summary.bin - parser nsys export prawdopodobnie padl. \
+                     Pobierz raw przez NsightDownload (przycisk 'Pobierz' w GUI) i otworz lokalnie w Nsight Systems",
+                    session_id
+                )
+            } else {
+                format!(
+                    "sesja {} nie ma summary.bin ani report.nsys-rep - prawdopodobnie skasowana przez rotacje (FIFO 20 sesji per nod) \
+                     albo sesja byla przerwana przed write. Odswiez liste sesji.",
+                    session_id
+                )
+            };
+            return Err(ProfilingError::NotFound(hint));
+        }
+        let bytes = fs::read(&summary_path)?;
         rkyv::from_bytes::<ProfileReport, rkyv::rancor::Error>(&bytes)
             .map_err(|e| ProfilingError::Parse(format!("rkyv decode: {e}")))
     }
