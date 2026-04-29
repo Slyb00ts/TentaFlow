@@ -102,18 +102,11 @@ pub struct MeshServiceInfo {
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshMessage {
     // -- Gossip --
-
     /// Ping do sprawdzenia czy nod zyje
-    Ping {
-        from: String,
-        incarnation: u64,
-    },
+    Ping { from: String, incarnation: u64 },
 
     /// Odpowiedz na ping
-    PingAck {
-        from: String,
-        incarnation: u64,
-    },
+    PingAck { from: String, incarnation: u64 },
 
     /// Posredni ping przez inny nod (protocol SWIM)
     IndirectPing {
@@ -123,7 +116,6 @@ pub enum MeshMessage {
     },
 
     // -- Membership --
-
     /// Dolaczenie noda do mesh
     Join {
         node_id: String,
@@ -133,12 +125,9 @@ pub enum MeshMessage {
     },
 
     /// Opuszczenie mesh przez nod
-    Leave {
-        node_id: String,
-    },
+    Leave { node_id: String },
 
     // -- CRDT sync --
-
     /// Synchronizacja stanu CRDT - lista operacji do zaaplikowania
     StateSync {
         from: String,
@@ -146,13 +135,9 @@ pub enum MeshMessage {
     },
 
     /// Zadanie synchronizacji stanu od podanego czasu
-    StateSyncRequest {
-        from: String,
-        since_time: u64,
-    },
+    StateSyncRequest { from: String, since_time: u64 },
 
     // -- Service discovery --
-
     /// Ogloszenie dostepnych serwisow na nodzie
     ServiceAnnounce {
         node_id: String,
@@ -160,10 +145,7 @@ pub enum MeshMessage {
     },
 
     /// Zapytanie o serwisy danego typu
-    ServiceQuery {
-        service_type: String,
-        from: String,
-    },
+    ServiceQuery { service_type: String, from: String },
 
     /// Odpowiedz z lista serwisow
     ServiceResponse {
@@ -172,7 +154,6 @@ pub enum MeshMessage {
     },
 
     // -- Forwarding --
-
     /// Przekazanie requestu do innego noda
     ForwardRequest {
         request_id: String,
@@ -187,7 +168,6 @@ pub enum MeshMessage {
     },
 
     // -- Stale polaczenia QUIC --
-
     /// Heartbeat wysylany co 500ms na stalym polaczeniu
     Heartbeat(MeshHeartbeat),
 
@@ -214,12 +194,8 @@ pub enum MeshMessage {
     },
 
     // -- Parowanie mesh (bezpieczenstwo) --
-
     /// Zadanie parowania — wysylane do noda po mDNS discovery
-    PairingRequest {
-        from_node_id: String,
-        pin: String,
-    },
+    PairingRequest { from_node_id: String, pin: String },
 
     /// Potwierdzenie parowania — wymiana kluczy publicznych
     PairingConfirm {
@@ -228,19 +204,13 @@ pub enum MeshMessage {
     },
 
     /// Odrzucenie parowania
-    PairingReject {
-        from_node_id: String,
-    },
+    PairingReject { from_node_id: String },
 
     /// Cofniecie zaufania — node nie jest juz zaufany
-    TrustRevoked {
-        node_id: String,
-    },
+    TrustRevoked { node_id: String },
 
     /// Synchronizacja kluczy zaufanych nodow po zatwierdzeniu parowania
-    TrustedKeysSync {
-        keys: Vec<(String, Vec<u8>)>,
-    },
+    TrustedKeysSync { keys: Vec<(String, Vec<u8>)> },
 
     /// Rotacja klucza szyfrowania — wymiana ephemeral X25519 public key
     KeyRotation {
@@ -255,12 +225,9 @@ pub enum MeshMessage {
     },
 
     /// Graceful leave — node opuszcza mesh (nie revoke, chwilowe odlaczenie)
-    NodeLeaving {
-        node_id: String,
-    },
+    NodeLeaving { node_id: String },
 
     // -- Komendy zarzadzania --
-
     /// Komenda zarzadzania wyslana do sparowanego noda
     MeshCommand {
         command_id: String,
@@ -298,7 +265,6 @@ pub enum MeshMessage {
     },
 
     // -- Cluster --
-
     /// Informacja o clusterze nodow
     ClusterInfo {
         cluster_id: String,
@@ -308,7 +274,6 @@ pub enum MeshMessage {
     },
 
     // -- Service discovery rozszerzony --
-
     /// Zapytanie o wszystkie widoczne serwisy w mesh
     ServiceQueryAll {
         from_node_id: String,
@@ -557,10 +522,7 @@ pub enum MeshCommandResponsePayload {
     /// Lista obrazow zwracana przez `ListImages`.
     ImageList(Vec<String>),
     /// Wynik probing przepustowosci (server side: porty otwarte do polaczenia).
-    BandwidthProbeServerStarted {
-        tcp_port: u16,
-        rdma_port: u16,
-    },
+    BandwidthProbeServerStarted { tcp_port: u16, rdma_port: u16 },
     /// Wynik probing przepustowosci (client side: zmierzone metryki).
     BandwidthProbeClientResult {
         bandwidth_mbps: f64,
@@ -605,56 +567,61 @@ pub enum MeshCommandResponsePayload {
 impl std::fmt::Debug for MeshCommandType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ContainerStart { container_id } => {
-                f.debug_struct("ContainerStart")
-                    .field("container_id", container_id)
-                    .finish()
-            }
-            Self::ContainerStop { container_id } => {
-                f.debug_struct("ContainerStop")
-                    .field("container_id", container_id)
-                    .finish()
-            }
-            Self::ContainerRestart { container_id } => {
-                f.debug_struct("ContainerRestart")
-                    .field("container_id", container_id)
-                    .finish()
-            }
+            Self::ContainerStart { container_id } => f
+                .debug_struct("ContainerStart")
+                .field("container_id", container_id)
+                .finish(),
+            Self::ContainerStop { container_id } => f
+                .debug_struct("ContainerStop")
+                .field("container_id", container_id)
+                .finish(),
+            Self::ContainerRestart { container_id } => f
+                .debug_struct("ContainerRestart")
+                .field("container_id", container_id)
+                .finish(),
             Self::ListContainers => write!(f, "ListContainers"),
             Self::ListImages => write!(f, "ListImages"),
-            Self::SystemPrune { volumes } => {
-                f.debug_struct("SystemPrune")
-                    .field("volumes", volumes)
-                    .finish()
-            }
-            Self::ProvisionCerts { cert_pem: _, key_pem: _, target_dir } => {
-                f.debug_struct("ProvisionCerts")
-                    .field("cert_pem", &"[CERT]")
-                    .field("key_pem", &"***")
-                    .field("target_dir", target_dir)
-                    .finish()
-            }
-            Self::AddService { service_config } => {
-                f.debug_struct("AddService")
-                    .field("service_config", service_config)
-                    .finish()
-            }
-            Self::NetworkConfig { interface, ipv4, netmask, gateway, dhcp, sudo_password: _ } => {
-                f.debug_struct("NetworkConfig")
-                    .field("interface", interface)
-                    .field("ipv4", ipv4)
-                    .field("netmask", netmask)
-                    .field("gateway", gateway)
-                    .field("dhcp", dhcp)
-                    .field("sudo_password", &"***")
-                    .finish()
-            }
-            Self::BandwidthProbe { target_ip, mode, .. } => {
-                f.debug_struct("BandwidthProbe")
-                    .field("target_ip", target_ip)
-                    .field("mode", mode)
-                    .finish()
-            }
+            Self::SystemPrune { volumes } => f
+                .debug_struct("SystemPrune")
+                .field("volumes", volumes)
+                .finish(),
+            Self::ProvisionCerts {
+                cert_pem: _,
+                key_pem: _,
+                target_dir,
+            } => f
+                .debug_struct("ProvisionCerts")
+                .field("cert_pem", &"[CERT]")
+                .field("key_pem", &"***")
+                .field("target_dir", target_dir)
+                .finish(),
+            Self::AddService { service_config } => f
+                .debug_struct("AddService")
+                .field("service_config", service_config)
+                .finish(),
+            Self::NetworkConfig {
+                interface,
+                ipv4,
+                netmask,
+                gateway,
+                dhcp,
+                sudo_password: _,
+            } => f
+                .debug_struct("NetworkConfig")
+                .field("interface", interface)
+                .field("ipv4", ipv4)
+                .field("netmask", netmask)
+                .field("gateway", gateway)
+                .field("dhcp", dhcp)
+                .field("sudo_password", &"***")
+                .finish(),
+            Self::BandwidthProbe {
+                target_ip, mode, ..
+            } => f
+                .debug_struct("BandwidthProbe")
+                .field("target_ip", target_ip)
+                .field("mode", mode)
+                .finish(),
             Self::BandwidthProbeCancel => write!(f, "BandwidthProbeCancel"),
             Self::NsightStart(req) => f
                 .debug_struct("NsightStart")
@@ -994,9 +961,11 @@ mod tests {
             incarnation: 42,
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja ping powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja ping powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja ping powinna sie udac");
+        let archived =
+            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja ping powinna sie udac");
 
         match archived {
             ArchivedMeshMessage::Ping { from, incarnation } => {
@@ -1016,13 +985,18 @@ mod tests {
             capabilities: vec!["llm".to_string(), "embedding".to_string()],
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja join powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja join powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja join powinna sie udac");
+        let archived =
+            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja join powinna sie udac");
 
         match archived {
             ArchivedMeshMessage::Join {
-                node_id, addr, role, capabilities,
+                node_id,
+                addr,
+                role,
+                capabilities,
             } => {
                 assert_eq!(node_id.as_str(), "node-2");
                 assert_eq!(addr.as_str(), "192.168.1.10:4433");
@@ -1055,7 +1029,9 @@ mod tests {
             operations: ops,
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja state sync powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja state sync powinna sie udac");
         let archived = MeshMessage::deserialize_rkyv(&bytes)
             .expect("Deserializacja state sync powinna sie udac");
 
@@ -1087,7 +1063,9 @@ mod tests {
             }],
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja service announce powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja service announce powinna sie udac");
         let archived = MeshMessage::deserialize_rkyv(&bytes)
             .expect("Deserializacja service announce powinna sie udac");
 
@@ -1112,13 +1090,17 @@ mod tests {
             payload: payload.clone(),
         };
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja forward powinna sie udac");
-        let archived = MeshMessage::deserialize_rkyv(&bytes)
-            .expect("Deserializacja forward powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja forward powinna sie udac");
+        let archived =
+            MeshMessage::deserialize_rkyv(&bytes).expect("Deserializacja forward powinna sie udac");
 
         match archived {
             ArchivedMeshMessage::ForwardRequest {
-                request_id, target_node, payload: archived_payload,
+                request_id,
+                target_node,
+                payload: archived_payload,
             } => {
                 assert_eq!(request_id.as_str(), "req-001");
                 assert_eq!(target_node.as_str(), "node-5");
@@ -1207,7 +1189,10 @@ mod tests {
 
         match archived {
             ArchivedMeetingControl::Join { meeting_url } => {
-                assert_eq!(meeting_url.as_str(), "https://teams.microsoft.com/l/meetup-join/abc");
+                assert_eq!(
+                    meeting_url.as_str(),
+                    "https://teams.microsoft.com/l/meetup-join/abc"
+                );
             }
             _ => panic!("Oczekiwano wariantu Join"),
         }
@@ -1243,7 +1228,9 @@ mod tests {
 
     #[test]
     fn test_meeting_control_state_changed_joining() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::Joining };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Joining,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1259,7 +1246,9 @@ mod tests {
 
     #[test]
     fn test_meeting_control_state_changed_connected() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::Connected };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Connected,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1275,7 +1264,9 @@ mod tests {
 
     #[test]
     fn test_meeting_control_state_changed_reconnecting() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::Reconnecting };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::Reconnecting,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1292,7 +1283,9 @@ mod tests {
     #[test]
     fn test_meeting_control_state_changed_ended() {
         let ctrl = MeetingControl::StateChanged {
-            state: MeetingState::Ended { reason: "host ended".to_string() },
+            state: MeetingState::Ended {
+                reason: "host ended".to_string(),
+            },
         };
 
         let bytes = rkyv_serialize!(&ctrl);
@@ -1300,21 +1293,21 @@ mod tests {
             .expect("Dostep do archived powinna sie udac");
 
         match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                match state {
-                    ArchivedMeetingState::Ended { reason } => {
-                        assert_eq!(reason.as_str(), "host ended");
-                    }
-                    _ => panic!("Oczekiwano MeetingState::Ended"),
+            ArchivedMeetingControl::StateChanged { state } => match state {
+                ArchivedMeetingState::Ended { reason } => {
+                    assert_eq!(reason.as_str(), "host ended");
                 }
-            }
+                _ => panic!("Oczekiwano MeetingState::Ended"),
+            },
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
     }
 
     #[test]
     fn test_meeting_control_state_changed_auth_expired() {
-        let ctrl = MeetingControl::StateChanged { state: MeetingState::AuthExpired };
+        let ctrl = MeetingControl::StateChanged {
+            state: MeetingState::AuthExpired,
+        };
 
         let bytes = rkyv_serialize!(&ctrl);
         let archived = rkyv::access::<ArchivedMeetingControl, rkyv::rancor::Error>(&bytes)
@@ -1331,7 +1324,9 @@ mod tests {
     #[test]
     fn test_meeting_control_state_changed_kicked() {
         let ctrl = MeetingControl::StateChanged {
-            state: MeetingState::Kicked { reason: "disruption".to_string() },
+            state: MeetingState::Kicked {
+                reason: "disruption".to_string(),
+            },
         };
 
         let bytes = rkyv_serialize!(&ctrl);
@@ -1339,14 +1334,12 @@ mod tests {
             .expect("Dostep do archived powinna sie udac");
 
         match archived {
-            ArchivedMeetingControl::StateChanged { state } => {
-                match state {
-                    ArchivedMeetingState::Kicked { reason } => {
-                        assert_eq!(reason.as_str(), "disruption");
-                    }
-                    _ => panic!("Oczekiwano MeetingState::Kicked"),
+            ArchivedMeetingControl::StateChanged { state } => match state {
+                ArchivedMeetingState::Kicked { reason } => {
+                    assert_eq!(reason.as_str(), "disruption");
                 }
-            }
+                _ => panic!("Oczekiwano MeetingState::Kicked"),
+            },
             _ => panic!("Oczekiwano wariantu StateChanged"),
         }
     }
@@ -1427,10 +1420,15 @@ mod tests {
     fn test_meeting_control_serde_json_roundtrip() {
         // JSON roundtrip dla kazdego wariantu MeetingControl
         let controls = vec![
-            MeetingControl::Join { meeting_url: "https://test".to_string() },
+            MeetingControl::Join {
+                meeting_url: "https://test".to_string(),
+            },
             MeetingControl::Leave,
             MeetingControl::Mute { muted: true },
-            MeetingControl::SidecarHealth { healthy: false, uptime_s: 0 },
+            MeetingControl::SidecarHealth {
+                healthy: false,
+                uptime_s: 0,
+            },
         ];
 
         for ctrl in &controls {
@@ -1496,7 +1494,9 @@ mod tests {
             docker_running: true,
         });
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja heartbeat powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja heartbeat powinna sie udac");
         let archived = MeshMessage::deserialize_rkyv(&bytes)
             .expect("Deserializacja heartbeat powinna sie udac");
 
@@ -1564,7 +1564,9 @@ mod tests {
             cluster_id: Some("gpu-farm".to_string()),
         });
 
-        let bytes = msg.serialize_rkyv().expect("Serializacja full state powinna sie udac");
+        let bytes = msg
+            .serialize_rkyv()
+            .expect("Serializacja full state powinna sie udac");
         let archived = MeshMessage::deserialize_rkyv(&bytes)
             .expect("Deserializacja full state powinna sie udac");
 
@@ -1692,7 +1694,7 @@ mod tests {
 
     #[test]
     fn mesh_command_response_payload_variants_round_trip() {
-        use crate::profiling::{NsightStartResponse, NsightStopResponse, NsightSessionStatus};
+        use crate::profiling::{NsightSessionStatus, NsightStartResponse, NsightStopResponse};
 
         let payloads = vec![
             MeshCommandResponsePayload::Empty,

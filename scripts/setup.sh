@@ -842,7 +842,16 @@ download_vision_models() {
         "https://github.com/HSE-asavchenko/face-emotion-recognition/raw/main/models/affectnet_emotions/onnx/enet_b0_8_best_afew.onnx" \
         "${vision_dir}/hsemotion.onnx"
 
-    # 5. EmoNet (face-analysis/emonet) nie ma publicznego ONNX. Ich oryginalny
+    # 5. Body pose models. Deploy can download these on-device, but setup.sh
+    #    prefetches them so release builds can embed the bytes immediately.
+    _vfetch "yolov8n-pose.onnx (17 COCO keypoints)" \
+        "https://huggingface.co/Xenova/yolov8n-pose/resolve/main/onnx/model.onnx" \
+        "${vision_dir}/yolov8n-pose.onnx"
+    _vfetch "movenet-lightning.onnx (single-person pose)" \
+        "https://huggingface.co/Xenova/movenet-singlepose-lightning/resolve/main/onnx/model.onnx" \
+        "${vision_dir}/movenet-lightning.onnx"
+
+    # 6. EmoNet (face-analysis/emonet) nie ma publicznego ONNX. Ich oryginalny
     #    checkpoint jest tylko PyTorch. Wymagany manualny eksport; po nim:
     #      cp emonet_8.onnx ${vision_dir}/emonet.onnx
     #    Bez tego silnik EmoNet zostanie wylaczony przy deploy (ten sam
@@ -861,6 +870,8 @@ download_vision_models() {
         "mivolo_age.onnx"
         "mivolo_gender.onnx"
         "hsemotion.onnx"
+        "yolov8n-pose.onnx"
+        "movenet-lightning.onnx"
     )
     local _ok=0
     local _miss=0

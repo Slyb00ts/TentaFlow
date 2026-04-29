@@ -1536,7 +1536,7 @@ pub const WESPEAKER_EMBEDDING_ONNX: &[u8] = include_bytes!(r"{embedding}");
 }
 
 // =============================================================================
-// embed_vision_models — czyta 6 plikow ONNX z `tentaflow-core/models/vision/`
+// embed_vision_models — czyta pliki ONNX z `tentaflow-core/models/vision/`
 // (pobranych wczesniej przez `scripts/setup.sh::download_vision_models`),
 // generuje vision_models_embed.rs z `include_bytes!` na kazdym. Brak pliku
 // → empty placeholder, runtime extractor zwraca None.
@@ -1548,6 +1548,8 @@ pub const WESPEAKER_EMBEDDING_ONNX: &[u8] = include_bytes!(r"{embedding}");
 //   - MIVOLO_GENDER_ONNX         — mivolo_gender.onnx (placeholder GoogLeNet)
 //   - HSEMOTION_ONNX             — hsemotion.onnx
 //   - EMONET_ONNX                — emonet.onnx (placeholder, brak public ONNX)
+//   - YOLOV8N_POSE_ONNX          — yolov8n-pose.onnx
+//   - MOVENET_LIGHTNING_ONNX     — movenet-lightning.onnx
 // =============================================================================
 
 fn embed_vision_models(out_dir: &Path) {
@@ -1565,6 +1567,8 @@ fn embed_vision_models(out_dir: &Path) {
         ("MIVOLO_GENDER_ONNX", "mivolo_gender.onnx"),
         ("HSEMOTION_ONNX", "hsemotion.onnx"),
         ("EMONET_ONNX", "emonet.onnx"),
+        ("YOLOV8N_POSE_ONNX", "yolov8n-pose.onnx"),
+        ("MOVENET_LIGHTNING_ONNX", "movenet-lightning.onnx"),
     ];
 
     let dest_dir = out_dir.join("vision_models");

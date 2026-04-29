@@ -5,8 +5,8 @@
 
 use super::{
     api_addon_system, api_apikeys, api_auth, api_clusters, api_dashboard, api_deploy_recommend,
-    api_fast_path, api_flows, api_hub, api_me_preferences, api_models, api_pii_rules, api_prompts,
-    api_registries, api_services, api_tts_rules, auth, static_files,
+    api_fast_path, api_flows, api_hub, api_me_preferences, api_pii_rules, api_prompts,
+    api_registries, api_tts_rules, auth, static_files,
 };
 use crate::db::{self, DbPool};
 use crate::license::{LicenseChecker, StaticLicenseChecker};
@@ -1228,7 +1228,10 @@ async fn route_api(
     db: &DbPool,
     claims: &auth::Claims,
     body: &[u8],
-    port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
+    // Reserved for REST handlers that mutate runtime services. After Krok N2
+    // every such mutation goes through binary RPC; kept on the signature so
+    // the call site (HTTP frame dispatcher) stays stable.
+    _port_allocator: Option<Arc<crate::services::ports::PortAllocator>>,
 ) -> (u16, String) {
     match (method, path) {
         // Auth
@@ -1248,10 +1251,10 @@ async fn route_api(
         // Dashboard
         (&Method::GET, "/api/dashboard") => handle_result(api_dashboard::handle_overview(db), 500),
 
-        // Services — REST GET serves the unified services view. Mutations
-        // (deploy / pin / pause / delete) go through binary RPC; the only
-        // REST mutation kept is DELETE /api/services/:id below.
-        (&Method::GET, "/api/services") => handle_result(api_services::handle_list(db), 500),
+        // Services — REST surface removed in Krok N2; Services tab and chat
+        // model picker run on binary RPC (`ServiceListRequest` /
+        // `ModelListRequest`). The deploy wizard catalog comes from the
+        // embedded `services-manifest.js` module, not from a REST endpoint.
 
         // API Keys
         (&Method::GET, "/api/apikeys") => handle_result(api_apikeys::handle_list(db), 500),
@@ -1275,18 +1278,9 @@ async fn route_api(
             handle_result(api_prompts::handle_create(db, body), 400)
         }
 
-        // Models
-        (&Method::GET, "/api/models") => {
-            let offset = parse_query_param(query, "offset", 0);
-            let limit = parse_query_param(query, "limit", 50);
-            handle_result(api_models::handle_list_entries(db, offset, limit), 500)
-        }
-        (&Method::POST, "/api/models") => {
-            if let Some(err) = require_admin(claims, db) {
-                return err;
-            }
-            handle_result(api_models::handle_create_entry(db, body), 400)
-        }
+        // Models — REST surface removed in Krok N2. Chat model picker now
+        // talks to `ModelListRequest` over binary WS. Aliases CRUD already
+        // moved to binary RPC in FAZA 2 (see `api_models::*_alias`).
 
         // Flows — migracja do binary WS (FAZA 3). REST usuniety:
         // - GET  /api/flows                       → FlowListRequest
@@ -1372,19 +1366,8 @@ async fn route_api(
                 )
             };
 
-            // /api/services/:id — DELETE stops the runtime and removes the row.
-            // POST/PUT/stats/backends went away with the legacy services table.
-            if let Some(id) = extract_id_from_path(path, "/api/services/") {
-                if *method == Method::DELETE {
-                    if require_admin(claims, db).is_some() {
-                        return admin_err();
-                    }
-                    let res =
-                        api_services::handle_delete(db, port_allocator.clone(), id).await;
-                    return handle_result(res, 500);
-                }
-                return (405, r#"{"error":"Method not allowed"}"#.to_string());
-            }
+            // /api/services/:id — REST removed in Krok N2; binary RPC
+            // `ServiceDeleteRequest` is the single source of truth.
 
             if let Some(id) = extract_id_from_path(path, "/api/apikeys/") {
                 if *method == Method::DELETE {
@@ -1415,25 +1398,8 @@ async fn route_api(
                 };
             }
 
-            // Models /:id
-            if let Some(id) = extract_id_from_path(path, "/api/models/") {
-                return match *method {
-                    Method::GET => handle_result(api_models::handle_get_entry(db, id), 500),
-                    Method::PUT => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_models::handle_update_entry(db, id, body), 400)
-                    }
-                    Method::DELETE => {
-                        if require_admin(claims, db).is_some() {
-                            return admin_err();
-                        }
-                        handle_result(api_models::handle_delete_entry(db, id), 500)
-                    }
-                    _ => (405, r#"{"error":"Method not allowed"}"#.to_string()),
-                };
-            }
+            // Models /:id — REST removed in Krok N2 (binary RPC owns the
+            // surface; alias CRUD already lives on binary in FAZA 2).
 
             // Flow Versions + Flows /:id — zmigrowane do binary WS (FAZA 3).
             // GET/POST /api/flows/:id/versions[/:vid[/restore]] → FlowVersion{List,Get,Restore}Request
