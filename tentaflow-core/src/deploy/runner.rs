@@ -1616,8 +1616,17 @@ async fn do_python_bundle_native_deploy(
         .build()
         .ok();
     let mut ready = false;
+    let mut crashed = false;
     for attempt in 0..max_attempts {
         tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+        // Najpierw: czy proces vllm zyje? Jesli padl (np. ImportError, OOM,
+        // multimodal config bug), nie ma sensu czekac 15min - failuj natychmiast.
+        // libc::kill(pid, 0) zwraca 0 gdy proces zyje, -1 gdy zombie/dead.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        if !alive {
+            crashed = true;
+            break;
+        }
         if let Some(c) = client.as_ref() {
             if let Ok(resp) = c.get(&health_url).send().await {
                 if resp.status().is_success() {
@@ -1652,28 +1661,33 @@ async fn do_python_bundle_native_deploy(
             &format!("silnik odpowiedzial na {} — gotowy", health_url),
         );
     } else {
-        // BLAD: silnik nie odpowiedzial w timeoucie. Nie rejestrujemy HTTP backendu
-        // bo router bedzie strzelal w martwy port (ECONNREFUSED) i wszystkie
-        // requesty bedą padaly. User musi zobaczyc deploy=failed z czytelnym
-        // komunikatem, sprawdzic logi engine.log w venv_dir i naprawic.
+        // BLAD: silnik nie odpowiedzial w timeoucie ALBO zcrashowal. Nie rejestrujemy
+        // HTTP backendu bo router bedzie strzelal w martwy port (ECONNREFUSED) i
+        // wszystkie requesty bedą padaly. User musi zobaczyc deploy=failed z
+        // czytelnym komunikatem - 80 linii engine.log z konca (multimodal init
+        // / OOM / brak modelu wymaga pelnego stack trace).
         let log_path = running.venv_dir.join("engine.log");
         let last_log = std::fs::read_to_string(&log_path)
             .ok()
             .map(|s| {
-                let lines: Vec<&str> = s.lines().rev().take(20).collect();
+                let lines: Vec<&str> = s.lines().rev().take(80).collect();
                 lines.into_iter().rev().collect::<Vec<_>>().join("\n")
             })
             .unwrap_or_else(|| format!("(brak {})", log_path.display()));
-        let err = format!(
-            "Bundle nie odpowiedzial na {} po {}s. Ostatnie 20 linii engine.log:\n{}",
-            health_url, health_timeout_secs, last_log
-        );
-        log_line(db, deploy_id, tx, "log", &err);
-        // Zabij proces zeby nie zostawic zombie zajmujacego port
+        let reason = if crashed {
+            format!("Engine zcrashowal (PID {} nie zyje). Ostatnie 80 linii engine.log:\n{}", pid, last_log)
+        } else {
+            format!(
+                "Bundle nie odpowiedzial na {} po {}s. Ostatnie 80 linii engine.log:\n{}",
+                health_url, health_timeout_secs, last_log
+            )
+        };
+        log_line(db, deploy_id, tx, "log", &reason);
+        // Zabij proces zeby nie zostawic zombie zajmujacego port (no-op gdy juz dead)
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
-        return Err(anyhow!(err));
+        return Err(anyhow!(reason));
     }
 
     phase(
