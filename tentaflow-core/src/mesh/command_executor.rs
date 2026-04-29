@@ -341,6 +341,9 @@ impl MeshCommandExecutor {
             MeshCommandType::ServiceStopRemote { service_id } => {
                 self.handle_service_stop_remote(service_id).await
             }
+            MeshCommandType::ServiceStartRemote { service_id } => {
+                self.handle_service_start_remote(service_id).await
+            }
             MeshCommandType::ServiceDeleteRemote { service_id } => {
                 self.handle_service_delete_remote(service_id).await
             }
@@ -454,9 +457,7 @@ impl MeshCommandExecutor {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
-            if let Err(e) =
-                crate::services_repo::services::set_pinned(&conn, service_id, pinned)
-            {
+            if let Err(e) = crate::services_repo::services::set_pinned(&conn, service_id, pinned) {
                 return CommandResponse::fail(e.to_string());
             }
         }
@@ -469,19 +470,173 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
+
+        // When pausing, mirror the local handler: actively stop the runtime
+        // and clear runtime metadata so health checks don't keep flapping.
+        if paused {
+            let svc = {
+                let conn = match actions.db.lock() {
+                    Ok(c) => c,
+                    Err(_) => return CommandResponse::fail("db pool poisoned"),
+                };
+                match crate::services_repo::services::get(&conn, service_id) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        return CommandResponse::fail(format!(
+                            "service id={} not found",
+                            service_id
+                        ))
+                    }
+                    Err(e) => return CommandResponse::fail(e.to_string()),
+                }
+            };
+            if matches!(
+                svc.status,
+                crate::services_repo::services::ServiceStatus::Running
+                    | crate::services_repo::services::ServiceStatus::Degraded
+                    | crate::services_repo::services::ServiceStatus::Starting
+            ) {
+                if let Err(e) =
+                    crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await
+                {
+                    return CommandResponse::fail(e.to_string());
+                }
+                let conn = match actions.db.lock() {
+                    Ok(c) => c,
+                    Err(_) => return CommandResponse::fail("db pool poisoned"),
+                };
+                if let Err(e) = crate::services_repo::services::update_status(
+                    &conn,
+                    service_id,
+                    crate::services_repo::services::ServiceStatus::Stopped,
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+                if let Err(e) = crate::services_repo::services::update_runtime(
+                    &conn, service_id, None, None, None, None,
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+            }
+        }
+
         {
             let conn = match actions.db.lock() {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
-            if let Err(e) =
-                crate::services_repo::services::set_paused(&conn, service_id, paused)
-            {
+            if let Err(e) = crate::services_repo::services::set_paused(&conn, service_id, paused) {
                 return CommandResponse::fail(e.to_string());
             }
         }
         push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
         CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+    }
+
+    async fn handle_service_start_remote(&self, service_id: i64) -> CommandResponse {
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+        let svc = {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            match crate::services_repo::services::get(&conn, service_id) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return CommandResponse::fail(format!("service id={} not found", service_id))
+                }
+                Err(e) => return CommandResponse::fail(e.to_string()),
+            }
+        };
+
+        // Idempotent for already-running services.
+        if matches!(
+            svc.status,
+            crate::services_repo::services::ServiceStatus::Running
+                | crate::services_repo::services::ServiceStatus::Degraded
+        ) && !svc.paused
+        {
+            return CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult);
+        }
+
+        // Clear pause + flip to Starting before respawn.
+        {
+            let conn = match actions.db.lock() {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::fail("db pool poisoned"),
+            };
+            if svc.paused {
+                if let Err(e) = crate::services_repo::services::set_paused(&conn, service_id, false)
+                {
+                    return CommandResponse::fail(e.to_string());
+                }
+            }
+            if let Err(e) = crate::services_repo::services::update_status(
+                &conn,
+                service_id,
+                crate::services_repo::services::ServiceStatus::Starting,
+            ) {
+                return CommandResponse::fail(e.to_string());
+            }
+        }
+
+        let respawn = crate::services::deploy::respawn(
+            &svc.engine_id,
+            svc.deploy_method,
+            &svc.config_json,
+            actions.port_allocator.clone(),
+        )
+        .await;
+
+        let result = match respawn {
+            Ok(handle) => {
+                let conn = match actions.db.lock() {
+                    Ok(c) => c,
+                    Err(_) => return CommandResponse::fail("db pool poisoned"),
+                };
+                if let Err(e) = crate::services_repo::services::update_runtime(
+                    &conn,
+                    service_id,
+                    handle.pid,
+                    handle.port,
+                    handle.sidecar_port,
+                    handle.endpoint_url.as_deref(),
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+                if let Err(e) = crate::services_repo::services::update_status(
+                    &conn,
+                    service_id,
+                    crate::services_repo::services::ServiceStatus::Running,
+                ) {
+                    return CommandResponse::fail(e.to_string());
+                }
+                CommandResponse::ok(MeshCommandResponsePayload::ServiceActionResult)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if let Ok(conn) = actions.db.lock() {
+                    let _ = crate::services_repo::services::update_status(
+                        &conn,
+                        service_id,
+                        crate::services_repo::services::ServiceStatus::Failed,
+                    );
+                    let _ = crate::services_repo::services::update_health(
+                        &conn,
+                        service_id,
+                        false,
+                        Some(&msg),
+                    );
+                }
+                CommandResponse::fail(msg)
+            }
+        };
+
+        push_service_change_after_action(&actions, &self.local_node_id, service_id, false).await;
+        result
     }
 
     async fn handle_service_rename_remote(
@@ -502,11 +657,9 @@ impl MeshCommandExecutor {
                 Ok(c) => c,
                 Err(_) => return CommandResponse::fail("db pool poisoned"),
             };
-            if let Err(e) = crate::services_repo::services::update_display_name(
-                &conn,
-                service_id,
-                trimmed,
-            ) {
+            if let Err(e) =
+                crate::services_repo::services::update_display_name(&conn, service_id, trimmed)
+            {
                 return CommandResponse::fail(e.to_string());
             }
         }
@@ -1321,11 +1474,10 @@ fn resolve_deploy_method(
         "docker" => Ok(DeployMethod::Docker),
         "external" => Ok(DeployMethod::External),
         "native" => {
-            let native = manifest
-                .deploy
-                .native
-                .as_ref()
-                .ok_or_else(|| format!("engine '{}' has no [deploy.native]", manifest.engine.id))?;
+            let native =
+                manifest.deploy.native.as_ref().ok_or_else(|| {
+                    format!("engine '{}' has no [deploy.native]", manifest.engine.id)
+                })?;
             Ok(match native.runtime {
                 NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
                 NativeRuntime::Binary => DeployMethod::NativeBinary,

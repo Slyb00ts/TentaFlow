@@ -449,6 +449,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResPin(_) => "ServicePinResponse",
             tentaflow_protocol::ServicePayload::ReqPause(_) => "ServicePauseRequest",
             tentaflow_protocol::ServicePayload::ResPause(_) => "ServicePauseResponse",
+            tentaflow_protocol::ServicePayload::ReqStart(_) => "ServiceStartRequest",
+            tentaflow_protocol::ServicePayload::ResStart(_) => "ServiceStartResponse",
             tentaflow_protocol::ServicePayload::ReqRename(_) => "ServiceRenameRequest",
             tentaflow_protocol::ServicePayload::ResRename(_) => "ServiceRenameResponse",
         },

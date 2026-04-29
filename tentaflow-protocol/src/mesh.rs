@@ -434,17 +434,25 @@ pub struct MeshFullState {
 #[derive(Archive, Deserialize, Serialize, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshCommandType {
     /// Uruchomienie kontenera
-    ContainerStart { container_id: String },
+    ContainerStart {
+        container_id: String,
+    },
     /// Zatrzymanie kontenera
-    ContainerStop { container_id: String },
+    ContainerStop {
+        container_id: String,
+    },
     /// Restart kontenera
-    ContainerRestart { container_id: String },
+    ContainerRestart {
+        container_id: String,
+    },
     /// Lista kontenerow
     ListContainers,
     /// Lista obrazow Docker
     ListImages,
     /// Czyszczenie Docker (prune)
-    SystemPrune { volumes: bool },
+    SystemPrune {
+        volumes: bool,
+    },
     /// Wgranie certyfikatow TLS
     ProvisionCerts {
         cert_pem: String,
@@ -452,7 +460,9 @@ pub enum MeshCommandType {
         target_dir: String,
     },
     /// Dodanie serwisu na nodzie
-    AddService { service_config: String },
+    AddService {
+        service_config: String,
+    },
     /// Zmiana konfiguracji sieciowej na zdalnym nodzie
     NetworkConfig {
         interface: String,
@@ -507,11 +517,27 @@ pub enum MeshCommandType {
     // -- Cross-node service action forwarding (krok N3b). `service_id` is
     //    interpreted in the receiver's local SQLite namespace; the receiver
     //    runs the action against its own DB and returns the result.
-    ServiceStopRemote { service_id: i64 },
-    ServiceDeleteRemote { service_id: i64 },
-    ServicePinRemote { service_id: i64, pinned: bool },
-    ServicePauseRemote { service_id: i64, paused: bool },
-    ServiceRenameRemote { service_id: i64, display_name: String },
+    ServiceStopRemote {
+        service_id: i64,
+    },
+    ServiceStartRemote {
+        service_id: i64,
+    },
+    ServiceDeleteRemote {
+        service_id: i64,
+    },
+    ServicePinRemote {
+        service_id: i64,
+        pinned: bool,
+    },
+    ServicePauseRemote {
+        service_id: i64,
+        paused: bool,
+    },
+    ServiceRenameRemote {
+        service_id: i64,
+        display_name: String,
+    },
     /// Forwarded `ServiceManifestDeployRequest`. The receiver re-runs the same
     /// validation + tokio::spawn deploy that a local request would, and
     /// returns the synchronously generated `deploy_id` (slug). Logs continue
@@ -720,6 +746,10 @@ impl std::fmt::Debug for MeshCommandType {
                 .finish(),
             Self::ServiceStopRemote { service_id } => f
                 .debug_struct("ServiceStopRemote")
+                .field("service_id", service_id)
+                .finish(),
+            Self::ServiceStartRemote { service_id } => f
+                .debug_struct("ServiceStartRemote")
                 .field("service_id", service_id)
                 .finish(),
             Self::ServiceDeleteRemote { service_id } => f

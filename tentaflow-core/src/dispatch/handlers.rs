@@ -3366,9 +3366,10 @@ pub async fn service_manifest_deploy(
             deploy_method: payload.deploy_method.clone(),
             config_json: payload.config_json.clone(),
         };
-        let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
-            ProtocolError::internal("mesh transport not available on this node")
-        })?;
+        let iroh =
+            ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
         if let Some(security) = ctx.state.mesh_security.as_ref() {
             if !security.is_trusted(&target) {
                 return Err(ProtocolError::bad_request(format!(
@@ -3383,7 +3384,8 @@ pub async fn service_manifest_deploy(
             .map_err(|e| ProtocolError::internal(e.to_string()))?;
         if !resp.ok {
             return Err(ProtocolError::internal(
-                resp.error.unwrap_or_else(|| "remote deploy failed".to_string()),
+                resp.error
+                    .unwrap_or_else(|| "remote deploy failed".to_string()),
             ));
         }
         let (deploy_id, engine_id_resp, deploy_method_resp) = match resp.payload {
@@ -4736,10 +4738,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
 /// True when the request's `node_id` refers to another mesh node and the
 /// action must be forwarded over `MeshCommandType::Service*Remote`. `None`
 /// or the local node id falls through to local execution.
-fn forward_target_node<'a>(
-    ctx: &'a HandlerContext,
-    target: &'a Option<String>,
-) -> Option<&'a str> {
+fn forward_target_node<'a>(ctx: &'a HandlerContext, target: &'a Option<String>) -> Option<&'a str> {
     let target = target.as_deref()?;
     if target.is_empty() || target == ctx.state.local_node_id.as_ref() {
         None
@@ -5036,21 +5035,64 @@ pub async fn service_pause(
         };
         let (success, error) = forward_service_action(ctx, target, cmd).await;
         return Ok(MessageBody::ServiceBody(
-            tentaflow_protocol::ServicePayload::ResPause(tentaflow_protocol::ServicePauseResponse {
-                success,
-                error,
-            }),
+            tentaflow_protocol::ServicePayload::ResPause(
+                tentaflow_protocol::ServicePauseResponse { success, error },
+            ),
         ));
     }
 
-    let conn = ctx
-        .state
-        .db
-        .lock()
-        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
-    crate::services_repo::services::set_paused(&conn, payload.service_id, payload.paused)
-        .map_err(db_err)?;
-    drop(conn);
+    // When transitioning into paused, actively stop the runtime so the user's
+    // intent ("frozen, do not consume resources") is enforced. Unpause does
+    // the inverse only on the bookkeeping side — the user must press Start
+    // to bring the engine back up.
+    let mut stop_error: Option<String> = None;
+    if payload.paused {
+        let svc = fetch_service_row(ctx, payload.service_id)?;
+        if matches!(
+            svc.status,
+            crate::services_repo::services::ServiceStatus::Running
+                | crate::services_repo::services::ServiceStatus::Degraded
+                | crate::services_repo::services::ServiceStatus::Starting
+        ) {
+            let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+                ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+            })?;
+            if let Err(e) = crate::services::deploy::stop(&svc, port_allocator).await {
+                stop_error = Some(e.to_string());
+            } else {
+                let conn = ctx
+                    .state
+                    .db
+                    .lock()
+                    .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+                crate::services_repo::services::update_status(
+                    &conn,
+                    payload.service_id,
+                    crate::services_repo::services::ServiceStatus::Stopped,
+                )
+                .map_err(db_err)?;
+                crate::services_repo::services::update_runtime(
+                    &conn,
+                    payload.service_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(db_err)?;
+            }
+        }
+    }
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::set_paused(&conn, payload.service_id, payload.paused)
+            .map_err(db_err)?;
+    }
 
     let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
     audit(
@@ -5059,8 +5101,10 @@ pub async fn service_pause(
         "service.pause",
         None,
         Some(&format!(
-            "service_id={} paused={}",
-            payload.service_id, payload.paused
+            "service_id={} paused={} stop_err={}",
+            payload.service_id,
+            payload.paused,
+            stop_error.as_deref().unwrap_or("none")
         )),
     );
 
@@ -5068,8 +5112,160 @@ pub async fn service_pause(
 
     Ok(MessageBody::ServiceBody(
         tentaflow_protocol::ServicePayload::ResPause(tentaflow_protocol::ServicePauseResponse {
-            success: true,
-            error: None,
+            success: stop_error.is_none(),
+            error: stop_error,
+        }),
+    ))
+}
+
+#[handler(variant = "ServiceStartRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn service_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqStart(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqStart",
+            ))
+        }
+    };
+
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceStartRemote {
+            service_id: payload.service_id,
+        };
+        let (success, error) = forward_service_action(ctx, target, cmd).await;
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResStart(
+                tentaflow_protocol::ServiceStartResponse { success, error },
+            ),
+        ));
+    }
+
+    let svc = fetch_service_row(ctx, payload.service_id)?;
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::internal("port allocator not initialized (supervisor disabled)")
+    })?;
+
+    // Idempotent: a service that is already up and not paused stays as-is.
+    if matches!(
+        svc.status,
+        crate::services_repo::services::ServiceStatus::Running
+            | crate::services_repo::services::ServiceStatus::Degraded
+    ) && !svc.paused
+    {
+        return Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResStart(
+                tentaflow_protocol::ServiceStartResponse {
+                    success: true,
+                    error: None,
+                },
+            ),
+        ));
+    }
+
+    // Start clears the pause flag; the user explicitly asked for the engine
+    // to come back up.
+    if svc.paused {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::set_paused(&conn, payload.service_id, false)
+            .map_err(db_err)?;
+    }
+
+    {
+        let conn = ctx
+            .state
+            .db
+            .lock()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::update_status(
+            &conn,
+            payload.service_id,
+            crate::services_repo::services::ServiceStatus::Starting,
+        )
+        .map_err(db_err)?;
+    }
+
+    let respawn_result = crate::services::deploy::respawn(
+        &svc.engine_id,
+        svc.deploy_method,
+        &svc.config_json,
+        port_allocator,
+    )
+    .await;
+
+    let (success, error) = match respawn_result {
+        Ok(handle) => {
+            let conn = ctx
+                .state
+                .db
+                .lock()
+                .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+            crate::services_repo::services::update_runtime(
+                &conn,
+                payload.service_id,
+                handle.pid,
+                handle.port,
+                handle.sidecar_port,
+                handle.endpoint_url.as_deref(),
+            )
+            .map_err(db_err)?;
+            crate::services_repo::services::update_status(
+                &conn,
+                payload.service_id,
+                crate::services_repo::services::ServiceStatus::Running,
+            )
+            .map_err(db_err)?;
+            (true, None)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let conn = ctx
+                .state
+                .db
+                .lock()
+                .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+            let _ = crate::services_repo::services::update_status(
+                &conn,
+                payload.service_id,
+                crate::services_repo::services::ServiceStatus::Failed,
+            );
+            let _ = crate::services_repo::services::update_health(
+                &conn,
+                payload.service_id,
+                false,
+                Some(&msg),
+            );
+            (false, Some(msg))
+        }
+    };
+
+    let user_id = require_user_id(ctx).ok().and_then(|b| user_id_to_i64(&b));
+    audit(
+        ctx,
+        user_id,
+        "service.start",
+        Some(&svc.engine_id),
+        Some(&format!(
+            "service_id={} success={}",
+            payload.service_id, success
+        )),
+    );
+
+    push_service_updated(ctx, payload.service_id);
+
+    Ok(MessageBody::ServiceBody(
+        tentaflow_protocol::ServicePayload::ResStart(tentaflow_protocol::ServiceStartResponse {
+            success,
+            error,
         }),
     ))
 }
