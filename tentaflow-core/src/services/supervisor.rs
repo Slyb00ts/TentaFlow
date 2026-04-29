@@ -266,8 +266,87 @@ impl Supervisor {
                 .await;
         }
 
+        // Auto-start pinned services that are stopped/failed and not paused.
+        // Pinned auto-respawn is intentionally limited to the boot tick: the
+        // run loop never re-pins a service the supervisor's own restart-loop
+        // gave up on, so the user must press Start manually after a permanent
+        // failure. Health-check restart logic in run_loop handles the
+        // already-up-but-then-crashed case via its own backoff state.
+        if let Err(e) = self.auto_start_pinned().await {
+            tracing::warn!("supervisor: auto_start_pinned failed: {}", e);
+        }
+
         let snapshot = self.build_snapshot().await?;
         let _ = self.snapshot_tx.send(Arc::new(snapshot));
+        Ok(())
+    }
+
+    /// Iterates pinned services and re-launches every one that is stopped /
+    /// failed and not paused. Used exclusively by `run_first_tick`.
+    async fn auto_start_pinned(&self) -> Result<(), SupervisorError> {
+        let db = self.db.clone();
+        let pinned =
+            tokio::task::spawn_blocking(move || -> Result<Vec<ServiceRow>, SupervisorError> {
+                let conn = db
+                    .lock()
+                    .map_err(|e| SupervisorError::Database(format!("pool poisoned: {}", e)))?;
+                services_repo::list_pinned(&conn)
+                    .map_err(|e| SupervisorError::Database(e.to_string()))
+            })
+            .await
+            .map_err(|e| SupervisorError::Database(format!("join: {}", e)))??;
+
+        for svc in pinned {
+            if svc.paused {
+                tracing::debug!(
+                    "supervisor: skipping pinned but paused service {} ({})",
+                    svc.id,
+                    svc.engine_id
+                );
+                continue;
+            }
+            if !matches!(svc.status, ServiceStatus::Stopped | ServiceStatus::Failed) {
+                continue;
+            }
+            tracing::info!(
+                "supervisor: auto-starting pinned service {} ({})",
+                svc.id,
+                svc.engine_id
+            );
+            self.mark_status(svc.id, ServiceStatus::Starting, None)
+                .await;
+            match deploy::respawn(
+                &svc.engine_id,
+                svc.deploy_method,
+                &svc.config_json,
+                self.ports.clone(),
+            )
+            .await
+            {
+                Ok(handle) => {
+                    if let Err(e) = self.write_runtime(svc.id, &handle).await {
+                        tracing::warn!(
+                            "supervisor: write_runtime failed for pinned {} ({}): {}",
+                            svc.id,
+                            svc.engine_id,
+                            e
+                        );
+                    }
+                    self.mark_status(svc.id, ServiceStatus::Running, None).await;
+                }
+                Err(e) => {
+                    let msg = format!("pinned auto-start: {}", e);
+                    tracing::warn!(
+                        "supervisor: pinned auto-start failed for {} ({}): {}",
+                        svc.id,
+                        svc.engine_id,
+                        e
+                    );
+                    self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
+                        .await;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1049,5 +1128,135 @@ mod tests {
         assert_eq!(entry.weight, 75);
         assert_eq!(entry.max_concurrent, 16);
         assert!(snap.find_service_for_model("nope").is_none());
+    }
+
+    // ---- N4: pinned auto-start at boot --------------------------------------
+
+    #[tokio::test]
+    async fn auto_start_pinned_service_at_boot() {
+        let db = open_db();
+        let ports = ports_for_test(50_900, 50_910);
+        let conf = cfg(60_000, 1, 60_000);
+        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+
+        // Insert a pinned, stopped service with an engine_id absent from the
+        // global manifest registry. respawn() will fail, but auto_start_pinned
+        // must still try (and flip the row to Failed) — proving the pinned
+        // path was exercised.
+        let id = {
+            let conn = db.lock().unwrap();
+            let id = services_repo::insert(
+                &conn,
+                &NewService {
+                    engine_id: "supervisor-pinned-bogus".into(),
+                    category: "llm".into(),
+                    display_name: "supervisor-pinned-bogus".into(),
+                    deploy_method: DeployMethod::Docker,
+                    transport: Transport::HttpDirect,
+                    status: ServiceStatus::Stopped,
+                    pinned: true,
+                    paused: false,
+                    runtime_pid: None,
+                    runtime_port: None,
+                    sidecar_quic_port: None,
+                    endpoint_url: None,
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap();
+            id
+        };
+
+        sup.auto_start_pinned().await.unwrap();
+
+        let final_status = {
+            let conn = db.lock().unwrap();
+            services_repo::get(&conn, id).unwrap().unwrap().status
+        };
+        // respawn() on an unknown engine flips the row to Failed; the key
+        // assertion is that status moved away from Stopped — the pinned
+        // path ran.
+        assert_eq!(final_status, ServiceStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn auto_start_skips_paused_pinned() {
+        let db = open_db();
+        let ports = ports_for_test(50_920, 50_930);
+        let conf = cfg(60_000, 1, 60_000);
+        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+
+        let id = {
+            let conn = db.lock().unwrap();
+            services_repo::insert(
+                &conn,
+                &NewService {
+                    engine_id: "supervisor-pinned-paused".into(),
+                    category: "llm".into(),
+                    display_name: "supervisor-pinned-paused".into(),
+                    deploy_method: DeployMethod::Docker,
+                    transport: Transport::HttpDirect,
+                    status: ServiceStatus::Stopped,
+                    pinned: true,
+                    paused: true,
+                    runtime_pid: None,
+                    runtime_port: None,
+                    sidecar_quic_port: None,
+                    endpoint_url: None,
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap()
+        };
+
+        sup.auto_start_pinned().await.unwrap();
+
+        // Paused pinned must NOT have been touched — status stays Stopped.
+        let row = {
+            let conn = db.lock().unwrap();
+            services_repo::get(&conn, id).unwrap().unwrap()
+        };
+        assert_eq!(row.status, ServiceStatus::Stopped);
+        assert!(row.paused);
+    }
+
+    #[tokio::test]
+    async fn auto_start_skips_running_pinned() {
+        let db = open_db();
+        let ports = ports_for_test(50_940, 50_950);
+        let conf = cfg(60_000, 1, 60_000);
+        let (sup, _rx) = Supervisor::new(&conf, db.clone(), ports);
+
+        let id = {
+            let conn = db.lock().unwrap();
+            services_repo::insert(
+                &conn,
+                &NewService {
+                    engine_id: "supervisor-pinned-running".into(),
+                    category: "llm".into(),
+                    display_name: "supervisor-pinned-running".into(),
+                    deploy_method: DeployMethod::Docker,
+                    transport: Transport::HttpDirect,
+                    status: ServiceStatus::Running,
+                    pinned: true,
+                    paused: false,
+                    runtime_pid: None,
+                    runtime_port: None,
+                    sidecar_quic_port: None,
+                    endpoint_url: None,
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap()
+        };
+
+        sup.auto_start_pinned().await.unwrap();
+
+        // Already-Running pinned must be left alone — no respawn attempt.
+        let final_status = {
+            let conn = db.lock().unwrap();
+            services_repo::get(&conn, id).unwrap().unwrap().status
+        };
+        assert_eq!(final_status, ServiceStatus::Running);
     }
 }

@@ -2442,6 +2442,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ServiceBody(ServicePayload::ReqStart) — unpause + spawn. */
+  serviceStartRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeServiceStartRequest(Number(serviceId), nodeId ?? undefined);
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::ServiceBody(ServicePayload::ReqRename). */
   serviceRenameRequest(correlationId, { serviceId, displayName, nodeId }, sequence = 1) {
     assertReady();

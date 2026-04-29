@@ -1482,6 +1482,23 @@ pub fn encode_service_pin_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::ServiceBody(ServicePayload::ReqStart) — unpause + spawn the
+/// engine when stopped/failed/paused. Idempotent for already-running services.
+#[wasm_bindgen(js_name = encodeServiceStartRequest)]
+pub fn encode_service_start_request(
+    service_id: f64,
+    node_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServicePayload, ServiceStartRequest};
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqStart(
+        ServiceStartRequest {
+            service_id: service_id as i64,
+            node_id,
+        },
+    )))
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::ServiceBody(ServicePayload::ReqPause) — supervisor leaves a
 /// paused service untouched.
 #[wasm_bindgen(js_name = encodeServicePauseRequest)]
@@ -2032,6 +2049,18 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
         }
         SP::ResPause(r) => {
             set(obj, "variant", "ServicePauseResponse".into());
+            set(obj, "success", r.success.into());
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqStart(r) => {
+            set(obj, "variant", "ServiceStartRequest".into());
+            set(obj, "serviceId", (r.service_id as f64).into());
+            set(obj, "service_id", (r.service_id as f64).into());
+        }
+        SP::ResStart(r) => {
+            set(obj, "variant", "ServiceStartResponse".into());
             set(obj, "success", r.success.into());
             if let Some(e) = r.error {
                 set(obj, "error", e.into());

@@ -315,6 +315,8 @@ pub use message_body::{
     ServicePinResponse,
     ServiceRenameRequest,
     ServiceRenameResponse,
+    ServiceStartRequest,
+    ServiceStartResponse,
     ServiceStopRequest,
     ServiceStopResponse,
     SettingEntry,

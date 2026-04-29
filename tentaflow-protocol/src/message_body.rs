@@ -175,6 +175,19 @@ pub struct ServicePinResponse {
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceStartRequest {
+    pub service_id: i64,
+    /// See `ServiceStopRequest::node_id`.
+    pub node_id: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ServiceStartResponse {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct ServicePauseRequest {
     pub service_id: i64,
     pub paused: bool,
@@ -216,6 +229,8 @@ pub enum ServicePayload {
     ResPin(ServicePinResponse),
     ReqPause(ServicePauseRequest),
     ResPause(ServicePauseResponse),
+    ReqStart(ServiceStartRequest),
+    ResStart(ServiceStartResponse),
     ReqRename(ServiceRenameRequest),
     ResRename(ServiceRenameResponse),
 }
